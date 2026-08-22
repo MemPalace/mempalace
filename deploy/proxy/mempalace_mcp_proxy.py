@@ -69,9 +69,7 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 # ALLOWED_HOSTS: comma-separated list of permitted Host headers (no Origin).
 # INBOUND_TOKEN: optional bearer token required for all /mcp endpoints.
 ALLOWED_ORIGINS = frozenset(
-    o.strip()
-    for o in os.environ.get("ALLOWED_ORIGINS", "").split(",")
-    if o.strip()
+    o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()
 )
 ALLOWED_HOSTS = frozenset(
     h.strip().lower()
@@ -264,9 +262,7 @@ def _is_valid_jsonrpc_request(body: bytes) -> tuple[bool, str | None, int]:
         return False, "method must be a non-empty string", -32600
 
     # id may be absent (notification), but if present must be a valid type.
-    if "id" in req and not (
-        isinstance(req["id"], (str, int, float)) or req["id"] is None
-    ):
+    if "id" in req and not (isinstance(req["id"], (str, int, float)) or req["id"] is None):
         return False, "id must be a string, number, or null", -32600
 
     params = req.get("params")
