@@ -5012,12 +5012,27 @@ TOOLS = {
             "type": "object",
             "properties": {
                 "subject": {"type": "string", "description": "Entity the fact is about"},
-                "predicate": {"type": "string", "description": "Relationship type (e.g. 'found', 'announced')"},
+                "predicate": {
+                    "type": "string",
+                    "description": "Relationship type (e.g. 'found', 'announced')",
+                },
                 "object": {"type": "string", "description": "The target/value of the relationship"},
-                "source_wing": {"type": "string", "description": "Wing the fact originated from (optional)"},
-                "source_room": {"type": "string", "description": "Room the fact originated from (optional)"},
-                "priority": {"type": "string", "description": "critical, high, medium, or low (optional; detected from keywords if omitted)"},
-                "fanout": {"type": "integer", "description": "Max chatter nodes to involve (optional)"},
+                "source_wing": {
+                    "type": "string",
+                    "description": "Wing the fact originated from (optional)",
+                },
+                "source_room": {
+                    "type": "string",
+                    "description": "Room the fact originated from (optional)",
+                },
+                "priority": {
+                    "type": "string",
+                    "description": "critical, high, medium, or low (optional; detected from keywords if omitted)",
+                },
+                "fanout": {
+                    "type": "integer",
+                    "description": "Max chatter nodes to involve (optional)",
+                },
             },
             "required": ["subject", "predicate", "object"],
         },
