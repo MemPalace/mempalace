@@ -143,7 +143,10 @@ def _http_server_is_alive(server_config: dict) -> bool:
 def _http_request(url: str, payload: dict, headers: dict | None = None) -> dict:
     """POST a JSON-RPC request to an HTTP/SSE MCP endpoint and parse the response."""
     data = json.dumps(payload).encode("utf-8")
-    req_headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    req_headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
     if headers:
         req_headers.update(headers)
     req = urllib.request.Request(url, data=data, headers=req_headers, method="POST")
@@ -252,7 +255,9 @@ def list_tools(server_config: dict) -> list:
             raise RuntimeError(f"MCP init failed: {init_resp.get('error')}")
 
         # Send initialized notification
-        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+        proc.stdin.write(
+            json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"
+        )
         proc.stdin.flush()
 
         # Request tools/list
@@ -337,12 +342,23 @@ def main():
     arguments = tool_input.get("arguments", {})
 
     if not server_name or not requested_tool:
-        print(json.dumps({"decision": "block", "reason": "mcp_call_tool missing server_name or tool_name"}))
+        print(
+            json.dumps(
+                {"decision": "block", "reason": "mcp_call_tool missing server_name or tool_name"}
+            )
+        )
         return 1
 
     server_config = load_server_config(server_name)
     if not server_config:
-        print(json.dumps({"decision": "approve", "reason": f"no config found for server {server_name}; skipping validation"}))
+        print(
+            json.dumps(
+                {
+                    "decision": "approve",
+                    "reason": f"no config found for server {server_name}; skipping validation",
+                }
+            )
+        )
         return 0
 
     is_http = bool(server_config.get("url", "").startswith("http"))
@@ -356,13 +372,27 @@ def main():
             # skip validation and let the call fail with a real connectivity error
             # rather than masking it with validation.
             if not _http_server_is_reachable_cached(server_name, server_config):
-                print(json.dumps({"decision": "approve", "reason": f"{server_name} not reachable; skipping validation"}))
+                print(
+                    json.dumps(
+                        {
+                            "decision": "approve",
+                            "reason": f"{server_name} not reachable; skipping validation",
+                        }
+                    )
+                )
                 return 0
             try:
                 tools = _http_list_tools(server_config)
                 _save_cached_tools(server_name, tools)
             except Exception as e:
-                print(json.dumps({"decision": "approve", "reason": f"could not list tools for HTTP {server_name}: {e}; allowing call"}))
+                print(
+                    json.dumps(
+                        {
+                            "decision": "approve",
+                            "reason": f"could not list tools for HTTP {server_name}: {e}; allowing call",
+                        }
+                    )
+                )
                 return 0
         else:
             # stdio servers: spawn once, fetch tools/list, cache, and shut down.
@@ -370,12 +400,26 @@ def main():
                 tools = list_tools(server_config)
                 _save_cached_tools(server_name, tools)
             except Exception as e:
-                print(json.dumps({"decision": "approve", "reason": f"could not list tools for {server_name}: {e}; allowing call"}))
+                print(
+                    json.dumps(
+                        {
+                            "decision": "approve",
+                            "reason": f"could not list tools for {server_name}: {e}; allowing call",
+                        }
+                    )
+                )
                 return 0
 
     tool_def = next((t for t in tools if t.get("name") == requested_tool), None)
     if not tool_def:
-        print(json.dumps({"decision": "approve", "reason": f"tool {requested_tool} not found on server {server_name}; allowing call"}))
+        print(
+            json.dumps(
+                {
+                    "decision": "approve",
+                    "reason": f"tool {requested_tool} not found on server {server_name}; allowing call",
+                }
+            )
+        )
         return 0
 
     schema = tool_def.get("inputSchema", {})
