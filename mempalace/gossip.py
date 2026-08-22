@@ -232,7 +232,9 @@ def _merge_with_default(raw: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
-def load_gossip_config(path: Optional[str] = None, config: MempalaceConfig = None) -> dict[str, Any]:
+def load_gossip_config(
+    path: Optional[str] = None, config: MempalaceConfig = None
+) -> dict[str, Any]:
     """Load gossip configuration from ``path`` or the default location.
 
     If the file does not exist, the default configuration is returned and
@@ -370,7 +372,9 @@ class GossipProtocol:
         config: Optional[dict[str, Any]] = None,
     ):
         self.mempalace_config = mempalace_config
-        self.config = config if config is not None else load_gossip_config(config_path, mempalace_config)
+        self.config = (
+            config if config is not None else load_gossip_config(config_path, mempalace_config)
+        )
         self._chatter_nodes = [ChatterNode.from_dict(n) for n in self.config["chatter_nodes"]]
         self.kg = kg
         self._kg_path = kg_path
@@ -403,9 +407,7 @@ class GossipProtocol:
             return "general", priority
         return "general", "normal"
 
-    def _get_hallway_context(
-        self, message: GossipMessage
-    ) -> tuple[dict[str, float], set[str]]:
+    def _get_hallway_context(self, message: GossipMessage) -> tuple[dict[str, float], set[str]]:
         """Return (room_scores, related_entities) derived from within-wing hallways.
 
         Hallways are entity-pair co-occurrence records built at mine time. When a
@@ -417,9 +419,7 @@ class GossipProtocol:
         if not message.source_wing:
             return {}, set()
         try:
-            hallways = list_hallways(
-                wing=message.source_wing, config=self.mempalace_config
-            )
+            hallways = list_hallways(wing=message.source_wing, config=self.mempalace_config)
         except Exception:
             logger.debug("gossip: could not load hallways", exc_info=True)
             return {}, set()
@@ -471,17 +471,13 @@ class GossipProtocol:
                 # co-occurrence rooms are in different namespaces, so we match
                 # rooms to the node's ``rooms`` list rather than to ``hall``.
                 if room_scores and node.rooms:
-                    overlaps = set(room_scores.keys()) & {
-                        r.lower() for r in node.rooms
-                    }
+                    overlaps = set(room_scores.keys()) & {r.lower() for r in node.rooms}
                     for room in overlaps:
                         score += room_scores[room]
 
                 # Also boost if a related entity matches a specialty.
                 if related_entities and node.specialties:
-                    overlaps = related_entities & {
-                        s.lower() for s in node.specialties
-                    }
+                    overlaps = related_entities & {s.lower() for s in node.specialties}
                     score += min(0.3, len(overlaps) * 0.1)
 
             score = max(0.0, min(2.0, score))
@@ -629,9 +625,7 @@ class GossipProtocol:
                     )
                     report["triples_written"] += 1
                     node_report["successful_targets"] += 1
-                    node_report["targets"].append(
-                        {"wing": target_wing, "room": target_room}
-                    )
+                    node_report["targets"].append({"wing": target_wing, "room": target_room})
                     any_success = True
                     children.append(message.child(target_wing, target_room))
                 except Exception as exc:
@@ -752,9 +746,7 @@ class GossipDaemon:
             priority=priority,
             topic=detected_topic,
             ttl_seconds=self.protocol.config.get("ttl_seconds", 60),
-            max_hops=max_hops
-            if max_hops is not None
-            else self.protocol.config.get("max_hops", 3),
+            max_hops=max_hops if max_hops is not None else self.protocol.config.get("max_hops", 3),
         )
         with self._lock:
             self._queue.append(message)
@@ -819,11 +811,7 @@ class GossipDaemon:
         # that concurrent schedulers may have added.
         with self._lock:
             available = max(0, self.max_requeue - len(self._queue))
-            kept = [
-                c
-                for c in children
-                if not c.is_expired() and c.hops < c.max_hops
-            ][:available]
+            kept = [c for c in children if not c.is_expired() and c.hops < c.max_hops][:available]
             for c in kept:
                 self._queue.append(c)
         report["children_queued"] = len(kept)
