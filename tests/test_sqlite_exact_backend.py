@@ -1,5 +1,6 @@
 import math
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -186,12 +187,10 @@ def test_sqlite_exact_get_unfiltered_page_pushes_limit_offset(tmp_path):
     assert "OFFSET" in selects[0]
 
 
-def test_sqlite_exact_get_filtered_page_stays_on_full_scan(tmp_path):
+def test_sqlite_exact_get_equality_filter_pushes_limit(tmp_path):
     _backend, col = _collection(tmp_path)
     _seed(col, 6)
 
-    # With a filter the rows are dropped after the scan, so LIMIT/OFFSET must
-    # not reach SQL; the page is taken in Python over the filtered rows.
     result, selects = _doc_select_sql(
         col,
         lambda: col.get(where={"wing": "w"}, limit=2, offset=1, include=["metadatas"]),
@@ -199,8 +198,10 @@ def test_sqlite_exact_get_filtered_page_stays_on_full_scan(tmp_path):
 
     assert result.ids == ["d1", "d2"]
     assert len(selects) == 1
-    assert "LIMIT" not in selects[0]
-    assert "OFFSET" not in selects[0]
+    assert "LIMIT" in selects[0]
+    assert "OFFSET" in selects[0]
+    assert "embedding" not in selects[0].split("FROM documents")[0]
+    assert "document" not in selects[0].split("FROM documents")[0]
 
 
 def test_sqlite_exact_get_offset_only_and_limit_only_push(tmp_path):
@@ -282,19 +283,22 @@ def test_sqlite_exact_get_offset_zero_is_a_full_scan(tmp_path):
     assert "OFFSET" not in selects[0]
 
 
-def test_sqlite_exact_get_ids_with_page_slices_in_python(tmp_path):
+def test_sqlite_exact_get_ids_looks_up_by_primary_key(tmp_path):
     _backend, col = _collection(tmp_path)
     _seed(col, 5)
 
-    # ids force the Python path even with a page: the requested order is kept,
-    # then offset/limit slice the reordered list with no SQL LIMIT/OFFSET.
-    result, selects = _doc_select_sql(
-        col, lambda: col.get(ids=["d4", "d3", "d2", "d1"], offset=1, limit=2)
-    )
+    statements = []
+    conn = col._handle.conn
+    conn.set_trace_callback(statements.append)
+    try:
+        result = col.get(ids=["d4", "d3", "d2", "d1"], offset=1, limit=2)
+    finally:
+        conn.set_trace_callback(None)
+
     assert result.ids == ["d3", "d2"]
-    assert len(selects) == 1
-    assert "LIMIT" not in selects[0]
-    assert "OFFSET" not in selects[0]
+    in_selects = [s for s in statements if "FROM documents" in s and "IN (" in s]
+    assert in_selects
+    assert all("ORDER BY rowid" not in s for s in in_selects)
 
 
 def test_sqlite_exact_upsert_delete_and_multi_collection_isolation(tmp_path):
@@ -890,6 +894,53 @@ def test_search_union_uses_sqlite_exact_lexical_search(tmp_path, monkeypatch):
     assert result["results"][0]["matched_via"] == "bm25_backend"
 
 
+def test_search_closets_use_lexical_not_vector_on_sqlite_exact(tmp_path, monkeypatch):
+    import mempalace.backends.embedding_wrapper as embedding_wrapper
+    from mempalace.backends.sqlite_exact import SQLiteExactCollection
+    from mempalace.palace import get_collection, get_closets_collection
+    from mempalace.searcher import search_memories
+
+    monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
+    monkeypatch.setattr(
+        embedding_wrapper, "_embed_texts", lambda texts: [[1.0, 0.0] for _ in texts]
+    )
+
+    drawers = get_collection(str(tmp_path), create=True)
+    closets = get_closets_collection(str(tmp_path), create=True)
+    drawers.add(
+        ids=["d1"],
+        documents=["meshguard trust path"],
+        metadatas=[{"source_file": "a.md", "wing": "w", "room": "r", "chunk_index": 0}],
+    )
+    closets.add(
+        ids=["c1"],
+        documents=["topic|meshguard|→d1"],
+        metadatas=[{"source_file": "a.md", "wing": "w"}],
+    )
+
+    called = {"query": 0, "lex": 0}
+    orig_query = SQLiteExactCollection.query
+    orig_lex = SQLiteExactCollection.lexical_search
+
+    def wrapped_query(self, *args, **kwargs):
+        if self._collection_name == "mempalace_closets":
+            called["query"] += 1
+        return orig_query(self, *args, **kwargs)
+
+    def wrapped_lex(self, *args, **kwargs):
+        if self._collection_name == "mempalace_closets":
+            called["lex"] += 1
+        return orig_lex(self, *args, **kwargs)
+
+    monkeypatch.setattr(SQLiteExactCollection, "query", wrapped_query)
+    monkeypatch.setattr(SQLiteExactCollection, "lexical_search", wrapped_lex)
+
+    result = search_memories("meshguard", str(tmp_path), n_results=1)
+    assert "error" not in result
+    assert called["lex"] == 1
+    assert called["query"] == 0
+
+
 def test_search_union_reports_unsupported_lexical_capability(monkeypatch, tmp_path):
     import mempalace.searcher as searcher
 
@@ -986,3 +1037,337 @@ def test_concurrent_first_open_single_connection_no_leak(tmp_path, monkeypatch):
     backend.close()
     with pytest.raises(sqlite3.ProgrammingError):
         created[0].execute("SELECT 1")
+
+
+def test_sqlite_exact_backend_advertises_supports_metadata_facets():
+    assert "supports_metadata_facets" in SQLiteExactBackend.capabilities
+
+
+def test_sqlite_exact_collection_exposes_backend(tmp_path):
+    backend, col = _collection(tmp_path)
+    assert col._backend is backend
+    from mempalace.backends.embedding_wrapper import EmbeddingCollection
+
+    wrapped = EmbeddingCollection(col)
+    assert wrapped._backend is backend
+    assert "supports_metadata_facets" in wrapped._backend.capabilities
+
+
+def test_sqlite_exact_facet_counts(tmp_path):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["1", "2", "3", "4"],
+        documents=["a", "b", "c", "d"],
+        metadatas=[
+            {"wing": "alpha"},
+            {"wing": "alpha"},
+            {"wing": "beta"},
+            {"wing": "gamma"},
+        ],
+        embeddings=[[1, 0], [1, 0], [1, 0], [1, 0]],
+    )
+    assert col.facet_counts("wing") == {
+        "alpha": 2,
+        "beta": 1,
+        "gamma": 1,
+    }
+
+
+def test_sqlite_exact_facet_counts_where(tmp_path):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["1", "2", "3"],
+        documents=["a", "b", "c"],
+        metadatas=[
+            {"wing": "engineering", "room": "backend"},
+            {"wing": "engineering", "room": "frontend"},
+            {"wing": "design", "room": "ux"},
+        ],
+        embeddings=[[1, 0], [1, 0], [1, 0]],
+    )
+    assert col.facet_counts("room", where={"wing": "engineering"}) == {
+        "backend": 1,
+        "frontend": 1,
+    }
+
+
+def test_sqlite_exact_facet_counts_rejects_local_filters(tmp_path):
+    _backend, col = _collection(tmp_path)
+    with pytest.raises(UnsupportedCapabilityError):
+        col.facet_counts(
+            "room",
+            where={"$or": [{"wing": "a"}, {"wing": "b"}]},
+        )
+
+
+def test_sqlite_exact_facet_counts_ignores_missing_metadata(tmp_path):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["1", "2", "3"],
+        documents=["a", "b", "c"],
+        metadatas=[
+            {"wing": "alpha"},
+            {"wing": "beta"},
+            {},
+        ],
+        embeddings=[[1, 0], [1, 0], [1, 0]],
+    )
+    assert col.facet_counts("wing") == {"alpha": 1, "beta": 1}
+
+
+def test_sqlite_exact_facet_counts_empty_collection(tmp_path):
+    _backend, col = _collection(tmp_path)
+    assert col.facet_counts("wing") == {}
+
+
+def test_sqlite_exact_query_unfiltered_does_not_load_documents_for_ranking(tmp_path):
+    """Unfiltered query ranks from id+embedding only, then hydrates top-k."""
+    _backend, col = _collection(tmp_path)
+    _seed(col, 6)
+
+    statements = []
+    conn = col._handle.conn
+    conn.set_trace_callback(statements.append)
+    try:
+        result = col.query(
+            query_embeddings=[[5.0, 1.0]],
+            n_results=2,
+            include=["documents", "metadatas", "distances"],
+        )
+    finally:
+        conn.set_trace_callback(None)
+
+    assert result.ids[0][0] == "d5"
+    ranking = [
+        s
+        for s in statements
+        if "FROM documents" in s and "embedding" in s and "ORDER BY rowid" in s
+    ]
+    assert ranking, statements
+    for sql in ranking:
+        select_list = sql.split("FROM documents", 1)[0]
+        assert "embedding" in select_list
+        # Ranking may json_extract metadata keys but must not load the
+        # verbatim document column for every row.
+        assert re.search(r"\bdocument\b", select_list) is None
+
+
+def test_sqlite_exact_query_respects_equality_where(tmp_path):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["keep", "drop"],
+        documents=["keep me", "drop me"],
+        metadatas=[{"wing": "keep"}, {"wing": "drop"}],
+        embeddings=[[1.0, 0.0], [1.0, 0.0]],
+    )
+    ranked = col.query(
+        query_embeddings=[[1.0, 0.0]],
+        n_results=5,
+        where={"wing": "keep"},
+        include=["documents", "metadatas", "distances"],
+    )
+    assert ranked.ids[0] == ["keep"]
+    assert ranked.documents[0] == ["keep me"]
+
+
+def test_sqlite_exact_query_where_uses_cached_matrix(tmp_path):
+    """After the first scan, equality filters slice the cached matrix."""
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["keep", "drop"],
+        documents=["keep me", "drop me"],
+        metadatas=[{"wing": "keep"}, {"wing": "drop"}],
+        embeddings=[[1.0, 0.0], [0.0, 1.0]],
+    )
+    col.query(query_embeddings=[[1.0, 0.0]], n_results=2)
+    ranked = col.query(
+        query_embeddings=[[1.0, 0.0]],
+        n_results=5,
+        where={"wing": "keep"},
+        include=["documents"],
+    )
+    assert ranked.ids[0] == ["keep"]
+    assert ranked.documents[0] == ["keep me"]
+
+
+def test_sqlite_exact_query_cache_invalidates_on_add(tmp_path):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["old"],
+        documents=["old"],
+        metadatas=[{}],
+        embeddings=[[0.0, 1.0]],
+    )
+    first = col.query(query_embeddings=[[1.0, 0.0]], n_results=1)
+    assert first.ids[0] == ["old"]
+
+    col.add(
+        ids=["new"],
+        documents=["new"],
+        metadatas=[{}],
+        embeddings=[[1.0, 0.0]],
+    )
+    second = col.query(query_embeddings=[[1.0, 0.0]], n_results=1)
+    assert second.ids[0] == ["new"]
+
+
+def test_sqlite_exact_wing_room_counts(tmp_path):
+    from mempalace.backends.sqlite_exact import sqlite_wing_room_counts
+
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["1", "2", "3"],
+        documents=["a", "b", "c"],
+        metadatas=[
+            {"wing": "alpha", "room": "notes"},
+            {"wing": "alpha", "room": "code"},
+            {"wing": "beta", "room": "notes"},
+        ],
+        embeddings=[[1, 0], [1, 0], [1, 0]],
+    )
+
+    total, wing_rooms = sqlite_wing_room_counts(str(tmp_path), "mempalace_drawers")
+    assert total == 3
+    assert wing_rooms["alpha"]["notes"] == 1
+    assert wing_rooms["alpha"]["code"] == 1
+    assert wing_rooms["beta"]["notes"] == 1
+
+
+def test_sqlite_exact_get_metadatas_skips_document_and_embedding(tmp_path):
+    _backend, col = _collection(tmp_path)
+    _seed(col, 3)
+
+    result, selects = _doc_select_sql(col, lambda: col.get(limit=2, include=["metadatas"]))
+    assert result.ids == ["d0", "d1"]
+    assert result.documents == []
+    assert result.embeddings is None
+    assert len(selects) == 1
+    select_list = selects[0].split("FROM documents")[0]
+    assert "metadata_json" in select_list
+    assert re.search(r"\bdocument\b", select_list) is None
+    assert "embedding" not in select_list
+
+
+def test_sqlite_exact_room_wing_hall_counts(tmp_path):
+    from mempalace.backends.sqlite_exact import sqlite_room_wing_hall_counts
+
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["1", "2", "3"],
+        documents=["a", "b", "c"],
+        metadatas=[
+            {"room": "chromadb", "wing": "wing_code", "hall": "db", "date": "2026-01-02"},
+            {"room": "chromadb", "wing": "wing_project", "hall": "db"},
+            {"room": "auth", "wing": "wing_code", "hall": "security"},
+        ],
+        embeddings=[[1, 0], [1, 0], [1, 0]],
+    )
+    rows = sqlite_room_wing_hall_counts(str(tmp_path), "mempalace_drawers")
+    grouped = {(room, wing, hall): (n, last) for room, wing, hall, n, last in rows}
+    assert grouped[("chromadb", "wing_code", "db")] == (1, "2026-01-02")
+    assert grouped[("chromadb", "wing_project", "db")] == (1, "")
+    assert grouped[("auth", "wing_code", "security")] == (1, "")
+
+
+def test_sqlite_exact_locus_columns_and_index(tmp_path):
+    from mempalace.backends.sqlite_exact import _LOCUS_FIELDS, _LOCUS_INDEX
+
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a"],
+        documents=["alpha note"],
+        metadatas=[{"wing": "alpha", "room": "notes", "hall": "db"}],
+        embeddings=[[1.0, 0.0]],
+    )
+    conn = col._handle.conn
+    from mempalace.backends.sqlite_exact import _document_column_names
+
+    cols = _document_column_names(conn)
+    assert set(_LOCUS_FIELDS) <= cols
+    indexes = {row[1] for row in conn.execute("PRAGMA index_list(documents)").fetchall()}
+    assert _LOCUS_INDEX in indexes
+    row = conn.execute("SELECT wing, room, hall FROM documents WHERE id = 'a'").fetchone()
+    assert tuple(row) == ("alpha", "notes", "db")
+
+
+def test_sqlite_exact_equality_where_uses_locus_column(tmp_path):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["keep", "drop"],
+        documents=["keep me", "drop me"],
+        metadatas=[{"wing": "keep", "hall": "db"}, {"wing": "drop", "hall": "other"}],
+        embeddings=[[1.0, 0.0], [1.0, 0.0]],
+    )
+    result, selects = _doc_select_sql(
+        col, lambda: col.get(where={"wing": "keep"}, include=["metadatas"])
+    )
+    assert result.ids == ["keep"]
+    assert selects
+    assert "json_extract" not in selects[0]
+    assert "wing =" in selects[0] or "wing=?" in selects[0].replace(" ", "")
+
+    hall = col.get(where={"hall": "db"}, include=["metadatas"])
+    assert hall.ids == ["keep"]
+
+
+def test_sqlite_exact_migrates_locus_columns_on_existing_palace(tmp_path):
+    import numpy as np
+    from mempalace.backends.sqlite_exact import _LOCUS_FIELDS, _LOCUS_INDEX
+
+    db = tmp_path / "sqlite_exact.sqlite3"
+    conn = sqlite3.connect(str(db))
+    blob = np.asarray([1.0, 0.0], dtype=np.float32).tobytes()
+    conn.executescript(
+        """
+        CREATE TABLE collections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE documents (
+            collection_id INTEGER NOT NULL,
+            id TEXT NOT NULL,
+            document TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            embedding BLOB NOT NULL,
+            dim INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (collection_id, id)
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO collections(id, name, created_at) VALUES (1, 'mempalace_drawers', 't')"
+    )
+    conn.execute(
+        """
+        INSERT INTO documents
+            (collection_id, id, document, metadata_json, embedding, dim, created_at, updated_at)
+        VALUES (1, 'a', 'alpha note', ?, ?, 2, 't', 't')
+        """,
+        ('{"hall":"db","room":"notes","wing":"alpha"}', blob),
+    )
+    conn.commit()
+    conn.close()
+
+    _backend, col = _collection(tmp_path, create=False)
+    handle = col._handle.conn
+    from mempalace.backends.sqlite_exact import _document_column_names
+
+    cols = _document_column_names(handle)
+    assert set(_LOCUS_FIELDS) <= cols
+    indexes = {row[1] for row in handle.execute("PRAGMA index_list(documents)").fetchall()}
+    assert _LOCUS_INDEX in indexes
+    assert tuple(
+        handle.execute("SELECT wing, room, hall FROM documents WHERE id='a'").fetchone()
+    ) == (
+        "alpha",
+        "notes",
+        "db",
+    )
+    from mempalace.backends.sqlite_exact import sqlite_wing_room_counts
+
+    total, wings = sqlite_wing_room_counts(str(tmp_path), "mempalace_drawers")
+    assert total == 1
+    assert wings["alpha"]["notes"] == 1

@@ -10,7 +10,7 @@ def test_load_known_people_falls_back_when_config_missing(monkeypatch, tmp_path)
     monkeypatch.setattr(smf, "_KNOWN_NAMES_PATH", tmp_path / "missing.json")
     smf._KNOWN_NAMES_CACHE = None
 
-    assert smf._load_known_people() == smf._FALLBACK_KNOWN_PEOPLE
+    assert smf._load_known_people() == []
     assert smf._load_username_map() == {}
 
 
@@ -49,6 +49,13 @@ def test_extract_people_detects_names_from_content(monkeypatch):
     monkeypatch.setattr(smf, "KNOWN_PEOPLE", ["Alice", "Ben"])
     people = smf.extract_people(["> Alice reviewed the change with Ben\n"])
     assert people == ["Alice", "Ben"]
+
+
+def test_extract_people_empty_when_no_config(monkeypatch):
+    """Without known_names.json, no names should be detected — even for common names."""
+    monkeypatch.setattr(smf, "KNOWN_PEOPLE", [])
+    people = smf.extract_people(["> Max reviewed the change with Sam and Jordan\n"])
+    assert people == []
 
 
 # ── Config: force_reload and invalid JSON ──────────────────────────────

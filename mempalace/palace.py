@@ -1125,7 +1125,9 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
     `maybe_autoheal_fts5_index` rebuild `cmd_repair` already runs as its own
     preflight step — so a normal `mine` self-heals the recoverable case
     instead of forcing the operator to run `mempalace repair` by hand for a
-    derived index that regenerates from intact content.
+    derived index. Nothing re-files afterwards on this path, so the heal is the
+    last word here: it checks the content table against `embedding_metadata`
+    before rebuilding from it, and declines when it cannot.
     """
     if resolve_backend_name(palace_path) != "chroma":
         return

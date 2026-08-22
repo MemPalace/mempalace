@@ -10,6 +10,7 @@ on:
       - '.claude-plugin/marketplace.json'
       - '.claude-plugin/plugin.json'
       - '.codex-plugin/plugin.json'
+      - 'integrations/openclaw/SKILL.md'
       - '.github/workflows/version-guard.yml'
 
 jobs:
@@ -27,12 +28,16 @@ jobs:
           marketplace_version=$(jq -r '.plugins[0].version' .claude-plugin/marketplace.json)
           plugin_version=$(jq -r '.version' .claude-plugin/plugin.json)
           codex_version=$(jq -r '.version' .codex-plugin/plugin.json)
+          openclaw_version=$(grep -E '^version:' integrations/openclaw/SKILL.md | cut -d' ' -f2)
 
-          echo "py_version=$py_version" >> "$GITHUB_OUTPUT"
-          echo "pyproject_version=$pyproject_version" >> "$GITHUB_OUTPUT"
-          echo "marketplace_version=$marketplace_version" >> "$GITHUB_OUTPUT"
-          echo "plugin_version=$plugin_version" >> "$GITHUB_OUTPUT"
-          echo "codex_version=$codex_version" >> "$GITHUB_OUTPUT"
+          {
+            echo "py_version=$py_version"
+            echo "pyproject_version=$pyproject_version"
+            echo "marketplace_version=$marketplace_version"
+            echo "plugin_version=$plugin_version"
+            echo "codex_version=$codex_version"
+            echo "openclaw_version=$openclaw_version"
+          } >> "$GITHUB_OUTPUT"
 
           {
             echo "## Detected versions"
@@ -44,6 +49,7 @@ jobs:
             echo "| .claude-plugin/marketplace.json | \`$marketplace_version\` |"
             echo "| .claude-plugin/plugin.json | \`$plugin_version\` |"
             echo "| .codex-plugin/plugin.json | \`$codex_version\` |"
+            echo "| integrations/openclaw/SKILL.md | \`$openclaw_version\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify all sources agree
@@ -53,6 +59,7 @@ jobs:
           MARKETPLACE: ${{ steps.versions.outputs.marketplace_version }}
           PLUGIN: ${{ steps.versions.outputs.plugin_version }}
           CODEX: ${{ steps.versions.outputs.codex_version }}
+          OPENCLAW: ${{ steps.versions.outputs.openclaw_version }}
         run: |
           set -euo pipefail
           fail=0
@@ -63,11 +70,12 @@ jobs:
               fail=1
             fi
           }
-          # All five must agree with each other (use version.py as the reference, per CLAUDE.md)
+          # All six must agree with each other (use version.py as the reference, per CLAUDE.md)
           check "pyproject.toml" "$PYPROJECT" "$PY"
           check ".claude-plugin/marketplace.json" "$MARKETPLACE" "$PY"
           check ".claude-plugin/plugin.json" "$PLUGIN" "$PY"
           check ".codex-plugin/plugin.json" "$CODEX" "$PY"
+          check "integrations/openclaw/SKILL.md" "$OPENCLAW" "$PY"
           exit $fail
 
       - name: Verify tag matches manifest (tag pushes only)
@@ -94,7 +102,7 @@ jobs:
 
           if [[ "$tag_version" != "$PY" ]]; then
             echo "::error::tag $GITHUB_REF_NAME does not match manifest version $PY"
-            echo "Bump mempalace/version.py, pyproject.toml, and all plugin manifests before tagging a stable release."
+            echo "Bump mempalace/version.py, pyproject.toml, all plugin manifests, and the OpenClaw skill before tagging a stable release."
             echo "For an internal/staging tag, use a semver pre-release suffix (e.g. v${PY}-rc1)."
             exit 1
           fi

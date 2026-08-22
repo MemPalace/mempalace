@@ -39,6 +39,10 @@ in ``~/.mempalace/config.json``):
 
 Requesting an unavailable accelerator emits a warning and falls back to CPU
 rather than hard-failing — mining must still work on a laptop without CUDA.
+The same applies to an accelerator that runs but computes the model wrongly:
+``embeddinggemma`` on CoreML returns NaN or all-zero vectors without raising,
+so ``auto`` never selects CoreML for it and an explicitly requested one is
+rejected by a witness embedding at load time.
 """
 
 from __future__ import annotations
@@ -72,6 +76,24 @@ _AUTO_ORDER = [
     ("DmlExecutionProvider", "dml"),
 ]
 
+# Providers that must never be picked *automatically* for a given model,
+# keyed by model name.
+#
+# embeddinggemma × CoreML: CoreML claims only ~280 of the quantized graph's
+# 1647 nodes, split across 100+ partitions, and the result is corrupt —
+# last_hidden_state comes back all-NaN, so the pooled sentence_embedding is
+# NaN or all-zero (which one depends on how that run partitioned) — with no
+# error raised. Since embedding_device defaults to "auto" and CoreML sits
+# ahead of CPU, every Apple Silicon user running this model would otherwise
+# embed degenerate vectors silently; a `repair rebuild-index` would write them
+# over the whole palace. CoreML is also ~2x slower here when it does run
+# (7.9 vs 16.0 docs/s on an M4 Max), so nothing is lost by skipping it.
+# An explicit embedding_device=coreml is still honoured — the witness probe in
+# EmbeddinggemmaONNX._lazy_load catches it and falls back to CPU.
+_AUTO_PROVIDER_DENYLIST = {
+    "embeddinggemma": {"CoreMLExecutionProvider"},
+}
+
 _EF_CACHE: dict = {}
 # Check-then-construct on the cache must be atomic: without it, two threads
 # resolving the same key each keep their own EF instance, and each instance
@@ -80,13 +102,18 @@ _EF_CACHE_LOCK = threading.Lock()
 _WARNED: set = set()
 
 
-def _resolve_providers(device: str) -> tuple[list, str]:
+def _resolve_providers(device: str, model: Optional[str] = None) -> tuple[list, str]:
     """Return ``(provider_list, effective_device)`` for ``device``.
 
     Falls back to CPU (with a one-shot warning) when the requested
     accelerator is not compiled into the installed ``onnxruntime``.
+
+    ``model`` gates ``_AUTO_PROVIDER_DENYLIST``: a provider known to produce
+    wrong results for that model is skipped under ``auto``. Explicit device
+    requests are left alone — a user who names an accelerator gets it.
     """
     device = (device or "auto").strip().lower()
+    denied = _AUTO_PROVIDER_DENYLIST.get((model or "").strip().lower(), frozenset())
 
     try:
         import onnxruntime as ort
@@ -97,7 +124,7 @@ def _resolve_providers(device: str) -> tuple[list, str]:
 
     if device == "auto":
         for provider, name in _AUTO_ORDER:
-            if provider in available:
+            if provider in available and provider not in denied:
                 return ([provider, "CPUExecutionProvider"], name)
         return (["CPUExecutionProvider"], "cpu")
 
@@ -235,6 +262,9 @@ _EMBEDDINGGEMMA_MAX_LEN = 2048
 # a sub-batch by size rather than by arrival order (#2104), because the run
 # is priced on that padded length and not on the document count.
 _EMBEDDINGGEMMA_BATCH_SIZE = 32
+# Short document embedded once per model load to prove the execution provider
+# actually computes (see _embeddinggemma_session_is_healthy).
+_EMBEDDINGGEMMA_WITNESS = "mempalace embedding provider health check"
 
 
 def _sanitize_embeddinggemma_input_ids(tokenizer, input_ids, np):
@@ -272,6 +302,45 @@ def _sanitize_embeddinggemma_input_ids(tokenizer, input_ids, np):
     sanitized = input_ids.copy()
     sanitized[out_of_range] = unknown_token_id
     return sanitized
+
+
+def _embeddinggemma_forward(session, tokenizer, output_idx, np, texts):
+    """Run one sub-batch through the ONNX graph.
+
+    Returns the MRL-truncated, *unnormalized* ``sentence_embedding`` rows.
+    Shared by ``__call__`` and the provider witness probe so both exercise
+    exactly the same path — a probe that ran a different graph would not
+    prove anything about the vectors we hand back.
+    """
+    encs = tokenizer.encode_batch([_EMBEDDINGGEMMA_PREFIX + text for text in texts])
+    input_ids = np.asarray([e.ids for e in encs], dtype=np.int64)
+    input_ids = _sanitize_embeddinggemma_input_ids(tokenizer, input_ids, np)
+    attention_mask = np.asarray([e.attention_mask for e in encs], dtype=np.int64)
+    outputs = session.run(None, {"input_ids": input_ids, "attention_mask": attention_mask})
+    return outputs[output_idx][:, :_EMBEDDINGGEMMA_DIM]
+
+
+def _embeddinggemma_session_is_healthy(session, tokenizer, output_idx, np) -> bool:
+    """Embed a witness string and check the vector is usable.
+
+    An execution provider that only partially supports the graph can return
+    NaN or all-zero rows without raising (CoreML does exactly this on Apple
+    Silicon). Both are indistinguishable from a healthy vector once stored,
+    so the provider is checked once, at load, before anything is embedded.
+    """
+    try:
+        vectors = _embeddinggemma_forward(
+            session, tokenizer, output_idx, np, [_EMBEDDINGGEMMA_WITNESS]
+        )
+        norm = float(np.linalg.norm(vectors))
+    except Exception:
+        logger.warning(
+            "EmbeddingGemma witness embedding failed; treating the provider as unusable",
+            exc_info=True,
+        )
+        return False
+    # NaN/Inf fail the finite check; an all-zero vector fails the > 0 check.
+    return bool(np.isfinite(norm)) and norm > 0.0
 
 
 class EmbeddinggemmaONNX:
@@ -364,6 +433,39 @@ class EmbeddinggemmaONNX:
             tokenizer = Tokenizer.from_file(tok_path)
             tokenizer.enable_padding()
             tokenizer.enable_truncation(max_length=_EMBEDDINGGEMMA_MAX_LEN)
+
+            # Accelerators can compute this graph wrongly rather than refuse
+            # it, so an accelerated session has to prove itself before it
+            # embeds anything. CPU-only sessions skip the probe: CPU is the
+            # fallback, so a check there could only add a forward pass to
+            # every cold start.
+            if any(p != "CPUExecutionProvider" for p in self._providers):
+                if not _embeddinggemma_session_is_healthy(session, tokenizer, output_idx, np):
+                    logger.warning(
+                        "Embedding provider %s returned a degenerate vector (NaN or "
+                        "all-zero) for EmbeddingGemma — falling back to "
+                        "CPUExecutionProvider. Set embedding_device to 'cpu' in "
+                        "~/.mempalace/config.json to skip this check.",
+                        self._providers[0],
+                    )
+                    session = ort.InferenceSession(
+                        model_path,
+                        sess_options=_intra_op_session_options(self._intra_op_num_threads),
+                        providers=["CPUExecutionProvider"],
+                    )
+                    if not _embeddinggemma_session_is_healthy(session, tokenizer, output_idx, np):
+                        # No provider left to fall back to. Raising loses this
+                        # process's embeddings; continuing would write vectors
+                        # that are unsearchable and indistinguishable from
+                        # healthy ones once in the palace.
+                        raise RuntimeError(
+                            "EmbeddingGemma produced a degenerate vector on "
+                            "CPUExecutionProvider — refusing to embed rather than store "
+                            "unusable vectors. Reinstall onnxruntime, or switch "
+                            "embedding_model in ~/.mempalace/config.json."
+                        )
+                    self._providers = ["CPUExecutionProvider"]
+
             self._output_idx = output_idx
             self._tokenizer = tokenizer
             self._np = np
@@ -425,19 +527,13 @@ class EmbeddinggemmaONNX:
         # time (#1770).
         for start in range(0, len(order), self._batch_size):
             idxs = order[start : start + self._batch_size]
-            texts = [_EMBEDDINGGEMMA_PREFIX + input[i] for i in idxs]
-            encs = self._tokenizer.encode_batch(texts)
-            input_ids = np.asarray([e.ids for e in encs], dtype=np.int64)
-            input_ids = _sanitize_embeddinggemma_input_ids(
+            sent_emb = _embeddinggemma_forward(
+                self._session,
                 self._tokenizer,
-                input_ids,
+                self._output_idx,
                 np,
+                [input[i] for i in idxs],
             )
-            attention_mask = np.asarray([e.attention_mask for e in encs], dtype=np.int64)
-            outputs = self._session.run(
-                None, {"input_ids": input_ids, "attention_mask": attention_mask}
-            )
-            sent_emb = outputs[self._output_idx][:, :_EMBEDDINGGEMMA_DIM]
             # L2-normalize so cosine similarity == dot product (matches what the
             # MTEB methodology assumes; ChromaDB's distance is configured for it).
             norms = np.linalg.norm(sent_emb, axis=1, keepdims=True) + 1e-12
@@ -673,7 +769,7 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
         )
         return ef
 
-    providers, effective = _resolve_providers(device)
+    providers, effective = _resolve_providers(device, model)
     cache_key = (model, tuple(providers))
     cached = _EF_CACHE.get(cache_key)  # lock-free fast path; dict.get is GIL-atomic
     if cached is not None:
@@ -701,7 +797,7 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
     return ef
 
 
-def describe_device(device: Optional[str] = None) -> str:
+def describe_device(device: Optional[str] = None, model: Optional[str] = None) -> str:
     """Return a short human-readable label for the resolved embedding backend.
 
     Used by the miner CLI header / MCP status so users can see at a glance
@@ -717,7 +813,11 @@ def describe_device(device: Optional[str] = None) -> str:
             url = cfg.embedding_api_url
             return f"openai-compat ({url})" if url else "openai-compat"
         device = cfg.embedding_device
-    _, effective = _resolve_providers(device)
+        if model is None:
+            # The resolved device depends on the model (_AUTO_PROVIDER_DENYLIST),
+            # so the label would otherwise name a provider we won't use.
+            model = cfg.embedding_model
+    _, effective = _resolve_providers(device, model)
     return effective
 
 

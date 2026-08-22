@@ -37,7 +37,7 @@ import sqlite3
 import stat
 import time
 from collections import defaultdict
-from contextlib import closing
+from contextlib import closing, suppress
 from datetime import datetime
 import re
 from typing import Callable, Iterator, Optional
@@ -813,9 +813,8 @@ def print_sqlite_integrity_abort(palace_path: str, errors: list[str]) -> None:
 #   "fts5: corruption found reading blob N from table \"embedding_fulltext_search\""
 #     (SQLite >= ~3.5x, confirmed on 3.53.2 / Python 3.13.7 — the exact
 #     message this repo's own test fixture produces on that build)
-# Either failure is recoverable in place: the index is derived from the
-# intact ``embedding_fulltext_search_content`` shadow table, so rebuilding it
-# restores full-text search without touching any drawer rows. Concurrent
+# Either failure says the index and the ``embedding_fulltext_search_content``
+# shadow table disagree; neither names the side that is damaged. Concurrent
 # killed-mid-write mines are the usual cause (#1596). A regex matching only
 # the older phrasing would silently decline to auto-heal on newer SQLite —
 # the exact failure this repo's own test suite caught (test_repair.py's two
@@ -825,16 +824,96 @@ _FTS5_MALFORMED_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ``embedding_fulltext_search`` is derived data twice over: chroma writes each
+# document into ``embedding_metadata`` under ``chroma:document`` and into the
+# FTS5 table at ``rowid = embeddings.id``, and every read path returns the
+# metadata copy (checked against chromadb 1.5.7). So the content shadow table
+# has an authority to be checked against, and a rebuild that reads it is only
+# as good as that check.
+#
+# Both queries scan the metadata table: ``(id, key)`` is its primary key, so a
+# lookup by ``key`` alone cannot use it. An index for the heal alone would be
+# paid on every write instead, which is the worse trade.
+#
+# ``typeof(m.id) = 'integer'`` is not decoration. ``id`` is nullable — a NULL
+# is storable in that composite key — and feeding NULL into the content table's
+# ``INTEGER PRIMARY KEY`` makes SQLite assign a fresh rowid rather than conflict,
+# so such a row would never reconcile and the heal would decline on every run.
+_FTS5_CONTENT_TO_RESTORE_SQL = """
+    SELECT count(*)
+      FROM embedding_metadata AS m
+      LEFT JOIN embedding_fulltext_search_content AS c ON c.id = m.id
+     WHERE m.key = 'chroma:document'
+       AND typeof(m.id) = 'integer'
+       AND m.string_value IS NOT NULL
+       AND c.c0 IS NOT m.string_value
+"""
+
+# How much of the content table the authority can speak for. A row it cannot —
+# chroma's own update path stores ``{'chroma:document': None}`` by deleting the
+# metadata row while still writing the FTS row — keeps its content untouched,
+# because for those rows the shadow table may be the only copy. If the authority
+# can speak for none of them there is nothing to rebuild on, and a row at an id
+# no ``embeddings`` row uses says the table is not keyed the way this code reads
+# it: chroma's ``00003-full-text-tokenize`` migration populated the FTS table
+# from ``embedding_metadata.rowid`` over every string value, not from
+# ``embeddings.id`` over documents.
+_FTS5_CONTENT_CENSUS_SQL = """
+    SELECT coalesce(sum(CASE WHEN m.id IS NULL THEN 0 ELSE 1 END), 0),
+           coalesce(sum(CASE WHEN m.id IS NULL THEN 1 ELSE 0 END), 0),
+           coalesce(sum(CASE WHEN e.id IS NULL THEN 1 ELSE 0 END), 0)
+      FROM embedding_fulltext_search_content AS c
+      LEFT JOIN embedding_metadata AS m
+        ON m.id = c.id
+       AND m.key = 'chroma:document'
+       AND m.string_value IS NOT NULL
+      LEFT JOIN embeddings AS e ON e.id = c.id
+"""
+
+# Written to the shadow table directly, not through the virtual table: an
+# INSERT or DELETE on ``embedding_fulltext_search`` goes through the inverted
+# index, which is the structure quick_check has just called malformed. Writing
+# the content rows and then rebuilding is the one order that does not depend on
+# the damaged side. ``c0`` is FTS5's own column-naming convention for the first
+# indexed column, and the SELECT needs its WHERE clause for ``ON CONFLICT`` to
+# parse at all — dropping that predicate turns this into a syntax error.
+_FTS5_CONTENT_RESTORE_SQL = """
+    INSERT INTO embedding_fulltext_search_content(id, c0)
+    SELECT m.id, m.string_value
+      FROM embedding_metadata AS m
+     WHERE m.key = 'chroma:document'
+       AND typeof(m.id) = 'integer'
+       AND m.string_value IS NOT NULL
+        ON CONFLICT(id) DO UPDATE SET c0 = excluded.c0
+     WHERE embedding_fulltext_search_content.c0 IS NOT excluded.c0
+"""
+
+_FTS5_REBUILD_SQL = (
+    "INSERT INTO embedding_fulltext_search(embedding_fulltext_search) VALUES('rebuild')"  # noqa: E501
+)
+
 
 def _errors_are_isolated_fts5(errors: list[str]) -> bool:
     """True when every quick_check error is a malformed FTS5 inverted index.
 
-    Only an isolated FTS5 failure is safe to auto-heal: the inverted index is
-    derived data that ``rebuild`` regenerates from the content shadow table. If
-    quick_check also reports page/row corruption, the data itself may be damaged
-    and rebuilding the index over it would mask real loss — that still aborts.
+    Isolation is necessary but not sufficient for an auto-heal: it rules out
+    page/row corruption elsewhere in the file, and nothing more. Which of the
+    two FTS5 tables is damaged is still open — see
+    :func:`maybe_autoheal_fts5_index`, which settles that before writing.
     """
     return bool(errors) and all(_FTS5_MALFORMED_RE.search(e) for e in errors)
+
+
+def _fts5_content_rows_to_restore(conn: sqlite3.Connection) -> int:
+    """Count documents whose shadow copy is missing or says something else."""
+    return int(conn.execute(_FTS5_CONTENT_TO_RESTORE_SQL).fetchone()[0])
+
+
+def _fts5_content_census(conn: sqlite3.Connection) -> tuple[int, int, int]:
+    """Content rows a ``chroma:document`` can speak for, rows it cannot, rows
+    sitting at an id no ``embeddings`` row uses."""
+    checked, unverifiable, unkeyed = conn.execute(_FTS5_CONTENT_CENSUS_SQL).fetchone()
+    return int(checked), int(unverifiable), int(unkeyed)
 
 
 def maybe_autoheal_fts5_index(palace_path: str, errors: list[str], *, progress=print) -> list[str]:
@@ -842,15 +921,26 @@ def maybe_autoheal_fts5_index(palace_path: str, errors: list[str], *, progress=p
 
     The repair preflight aborts when ``PRAGMA quick_check`` reports SQLite-layer
     corruption. After concurrent killed-mid-write mines (#1596) the common
-    failure is an isolated ``malformed inverted index for FTS5 table``, which is
-    fully recoverable: the index rebuilds from the intact
-    ``embedding_fulltext_search_content`` table without touching drawer rows.
+    failure is an isolated ``malformed inverted index for FTS5 table``, and
+    ``rebuild`` recovers it by regenerating the index from
+    ``embedding_fulltext_search_content``.
 
-    When the errors are isolated to FTS5, rebuild the index under the palace
-    write lock (so a live mine cannot race the rebuild) and re-run quick_check.
-    Returns the remaining quick_check errors — empty when the heal succeeded.
-    Broader corruption, a lock held by another writer, or a rebuild failure
-    leaves ``errors`` unchanged so the caller still aborts with the banner.
+    That error says the index and the content table disagree; it does not say
+    which of them is wrong. So the content table is checked against
+    ``embedding_metadata`` first, and any row that disagrees is restored from it
+    before the rebuild reads it — otherwise a rebuild over a damaged content
+    table would overwrite an index that still held the drawer's own words and
+    leave quick_check clean, reporting success for a palace that lost full-text
+    reach. Both writes are derived from ``embedding_metadata``; rows that
+    table cannot speak for are left untouched.
+
+    Everything happens under the palace write lock (so a live mine cannot race
+    it) and in one transaction, which is why a restored row cannot outlive a
+    rebuild that then fails. Returns the remaining quick_check errors — empty
+    when the heal succeeded. Broader corruption, a lock held by another writer,
+    a content table that cannot be checked or cannot be brought into agreement,
+    a rebuild failure, or a quick_check still dirty afterwards leaves ``errors``
+    unchanged so the caller still aborts with the banner.
     """
     if not _errors_are_isolated_fts5(errors):
         return errors
@@ -864,17 +954,73 @@ def maybe_autoheal_fts5_index(palace_path: str, errors: list[str], *, progress=p
     from .palace import MineAlreadyRunning, mine_palace_lock
 
     progress(
-        "\n  Isolated FTS5 inverted-index corruption detected; attempting an\n"
-        "  in-place rebuild from the intact content table before aborting."
+        "\n  Isolated FTS5 inverted-index corruption detected; checking the content\n"
+        "  table against embedding_metadata before rebuilding the index from it."
     )
+    declined = False
+    to_restore = checked = unverifiable = unkeyed = 0
     try:
         with mine_palace_lock(palace_path):
             with closing(sqlite3.connect(sqlite_path, isolation_level=None)) as conn:
-                conn.execute(
-                    "INSERT INTO embedding_fulltext_search"
-                    "(embedding_fulltext_search) VALUES('rebuild')"
-                )
-                conn.commit()
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    to_restore = _fts5_content_rows_to_restore(conn)
+                    checked, unverifiable, unkeyed = _fts5_content_census(conn)
+                except sqlite3.Error as exc:
+                    # Suppressed: a failing ROLLBACK would replace the message
+                    # that says why the heal declined. Closing the connection
+                    # rolls the transaction back either way.
+                    with suppress(sqlite3.Error):
+                        conn.execute("ROLLBACK")
+                    declined = True
+                    progress(
+                        "  Skipped FTS5 rebuild: the content table cannot be checked against "
+                        f"embedding_metadata ({exc}). The index still holds the terms it was "
+                        "built from."
+                    )
+                if not declined and unverifiable and not checked and not to_restore:
+                    with suppress(sqlite3.Error):
+                        conn.execute("ROLLBACK")
+                    declined = True
+                    progress(
+                        "  Skipped FTS5 rebuild: no content row has an embedding_metadata "
+                        "document to check it against. The index still holds the terms it "
+                        "was built from."
+                    )
+                if not declined and to_restore:
+                    # Present tense on purpose: this prints before COMMIT, so it
+                    # is also what an operator sees on a run that then rolls back.
+                    progress(
+                        f"  Restoring {to_restore} content row(s) from embedding_metadata "
+                        "before rebuilding."
+                    )
+                    conn.execute(_FTS5_CONTENT_RESTORE_SQL)
+                    if _fts5_content_rows_to_restore(conn):
+                        with suppress(sqlite3.Error):
+                            conn.execute("ROLLBACK")
+                        declined = True
+                        progress(
+                            "  Skipped FTS5 rebuild: the content table still disagrees with "
+                            "embedding_metadata after restoring it. Nothing was written."
+                        )
+                    else:
+                        # Re-taken: a restore can add content rows the authority
+                        # has and the shadow table had lost, so the census from
+                        # before it would under-report what the rebuild reads.
+                        checked, unverifiable, unkeyed = _fts5_content_census(conn)
+                if not declined:
+                    if unverifiable:
+                        progress(
+                            f"  {unverifiable} content row(s) have no embedding_metadata document "
+                            "to check against; the rebuild indexes them as they stand."
+                        )
+                    if unkeyed:
+                        progress(
+                            f"  {unkeyed} content row(s) sit at an id no embeddings row uses; "
+                            "this table was not written by the current chromadb schema."
+                        )
+                    conn.execute(_FTS5_REBUILD_SQL)
+                    conn.execute("COMMIT")
     except MineAlreadyRunning as exc:
         progress(
             f"  Skipped FTS5 rebuild: palace is being written by another process ({exc}). "
@@ -882,14 +1028,23 @@ def maybe_autoheal_fts5_index(palace_path: str, errors: list[str], *, progress=p
         )
         return errors
     except Exception as exc:
-        progress(f"  FTS5 rebuild failed (leaving palace untouched): {exc}")
+        # Deliberately broad and deliberately not naming the rebuild: this now
+        # covers the lock, the transaction, both counts and the restore, and a
+        # heal that raises must never be what fails a mine.
+        progress(f"  FTS5 heal failed (leaving palace untouched): {exc}")
+        return errors
+
+    if declined:
         return errors
 
     remaining = sqlite_integrity_errors(palace_path)
     if remaining:
         progress("  FTS5 rebuild did not clear quick_check; aborting for safety.")
     else:
-        progress("  FTS5 index rebuilt from intact content; quick_check is clean.")
+        progress(
+            f"  FTS5 index rebuilt from content checked against embedding_metadata "
+            f"({checked} row(s)); quick_check is clean."
+        )
     return remaining
 
 
@@ -1898,10 +2053,12 @@ def resolve_repair_preflight_errors(
 
     The prediction is deliberately the optimistic branch, and it is stated as
     an attempt rather than a promise: the real heal still returns the errors
-    unchanged when another process holds the mine lock, when the rebuild
-    raises, or when ``quick_check`` is still dirty afterwards. A dry run cannot
-    tell those apart without taking the lock and writing, which is exactly what
-    it must not do, so the wording names them instead.
+    unchanged when another process holds the mine lock, when the content table
+    cannot be checked against ``embedding_metadata`` or cannot be brought into
+    agreement with it, when the rebuild raises, or when ``quick_check`` is still
+    dirty afterwards. A dry run cannot tell those apart without taking the lock
+    and writing, which is exactly what it must not do, so the wording names them
+    instead.
     """
     if not errors:
         return errors
@@ -1910,10 +2067,11 @@ def resolve_repair_preflight_errors(
     if _errors_are_isolated_fts5(errors):
         progress(
             "\n  DRY RUN — quick_check reports an isolated FTS5 inverted-index error.\n"
-            "  A real run would attempt an in-place rebuild of that index from the\n"
-            "  intact content table and continue if it succeeds; it aborts instead if\n"
-            "  another process holds the mine lock or the rebuild leaves quick_check\n"
-            "  dirty. This preview leaves the index untouched."
+            "  A real run would check the content table against embedding_metadata,\n"
+            "  restore any row that disagrees, rebuild the index from it and continue\n"
+            "  if that succeeds; it aborts instead if another process holds the mine\n"
+            "  lock, if the content table cannot be checked or restored, or if the\n"
+            "  rebuild leaves quick_check dirty. This preview leaves the index untouched."
         )
         return []
     return errors

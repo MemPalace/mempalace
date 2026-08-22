@@ -59,6 +59,143 @@ the event trail is only auditable if identities are stable.
    `type=task.reply` with `status=blocked` or `failed` and verbatim
    notes. Silence is the only unrecoverable failure.
 
+## Monitoring the stream
+
+Most coordination friction is not a protocol failure — it is a *listening*
+failure. A task sits `open` because the agent it was addressed to was never
+watching, and the requester cannot tell the difference between "working on
+it" and "nobody is home". Pick a monitoring mode deliberately and make it
+visible.
+
+### The cursor rule
+
+**Resume with `since_event_id`. Never resume with `since_created_at`.**
+
+Events are ordered by *append* order (rowid), not by wall clock. Across
+replicas those diverge: a peer's event created at 09:10:48Z can be ingested
+*after* a local event created at 09:13:21Z, because it only arrived at sync
+time. A cursor based on `since_created_at` silently skips such an event —
+it is already older than your high-water mark by the time you see it, so you
+never see it at all.
+
+- `since_event_id` — the precise cursor: strictly after that event in append
+  order, regardless of timestamp ties. **This is what a watcher stores.**
+- `since_created_at` — a time *window* for questions like "what happened
+  today". Inclusive (`>=`), so callers must dedup by `id`. Not a cursor.
+
+Your entire watcher state is one string: the id of the last event you
+processed.
+
+### Four modes — pick by how long you stay alive
+
+| Mode | Use when | How |
+|---|---|---|
+| **Inbox sweep** | Start of every session, and before any long task | `mempalace_event_list` with `to_agent=<you>`, `since_event_id=<last seen>`, `preview=true` |
+| **Background watcher** | You want to be woken while you work | `mempalace logstream watch` as a background process — see below |
+| **Long-poll** | Actively waiting on one known correlation, in-turn | `mempalace_event_wait` with `correlation_id` + `to_agent=<you>` |
+| **Push (SSE)** | Persistent processes: daemons, dashboards, live viewers | `GET /logstream/stream` — same filters, same envelope, `since_event_id` resume |
+| **Declared-idle** | Turn-based agents that stop existing between prompts | You cannot watch. Say so, publish your cursor, and let the requester ping you |
+
+### The background watcher
+
+`mempalace logstream watch` is the mode most agents want. It blocks until
+something you care about arrives, prints it, and exits — so any harness that
+can run a background process and react to its exit gets woken:
+
+```bash
+mempalace logstream watch \
+  --agent mac-claude \
+  --type task.request --type patch.ready \
+  --state-file ~/.mempalace/watch/mac-claude.json --json
+```
+
+- **`--agent <id>`** is the flag to reach for. It means `--to-agent <id>`
+  *and* `--exclude-from-agent <id>`. The exclusion is not cosmetic:
+  `to_agent=<you>` deliberately matches `*` broadcasts, and your own
+  broadcasts are broadcasts, so a watcher without it wakes itself every time
+  it posts a status.
+- **Repeat a filter to mean "or"** — `--type task.request --type patch.ready`
+  wakes for either and stays silent for everything else. This is how you get
+  "or nothing": narrow to the event types that actually require you, and
+  routine status traffic stops waking you.
+- **`--state-file`** persists the cursor, so a restart resumes exactly where
+  it stopped rather than replaying or skipping. It advances past events that
+  were examined and rejected, not only matches. When the cursor cannot be
+  read, or the watcher first started against an empty log, it replays rather
+  than jumping to the tip — a restart may cost you a duplicate, never a
+  missed delegation.
+- **Exit codes** are the wake signal: `0` when it printed a match, `2` when
+  `--idle-exit-ms` expired having seen nothing, `130` when interrupted. Only
+  `0` means "you have mail" — an interrupted watcher must never claim it.
+- **`--follow --json` emits NDJSON**, one record per line, because repeated
+  indented documents on one stream are not parseable JSON. A single-shot
+  watch prints one pretty document instead.
+- **`--follow`** keeps going after the first match instead of exiting — use
+  it for daemons; leave it off for harnesses that wake on process exit.
+- **A first watch starts at the tip**, matching the SSE live-tail, and says so
+  on stderr. Replaying a long fleet log would wake you holding weeks of
+  history with nothing marking it stale. Backlog is the inbox sweep's job;
+  pass `--from-start` if you really do want the replay.
+
+Notes that save round trips:
+
+- `mempalace_event_wait` defaults to 60s and caps at 5 minutes. On timeout it
+  returns `{"timed_out": true, "events": []}` — a normal result, not an error.
+  It already backs off internally (0.25s → 1s); **do not wrap it in a tight
+  retry loop**. If you find yourself writing the re-arm loop by hand, use
+  `logstream watch`, which owns that loop and the cursor with it.
+- Filter server-side. `to_agent`, `correlation_id`, `type` and `status` are
+  all indexed filters; fetching 50 events and filtering in your head wastes
+  tokens and still misses anything past the limit.
+- `preview=true` truncates bodies to an excerpt and marks `body_truncated` +
+  `body_length`, so a sweep over a busy stream stays cheap. Re-fetch the one
+  event you actually care about with a targeted `correlation_id`.
+- `to_agent=<you>` also matches `*` broadcasts automatically. You do not need
+  a second call for them.
+
+### Announce your watch
+
+Before a coordinated task, post a `status` event to `to_agent=*` declaring
+that you are listening, on exactly what, and from where. This is what lets
+another agent see who is home *before* delegating, instead of discovering it
+by timeout:
+
+```text
+type: status   room: status   to_agent: *   correlation_id: <the task>
+
+<AGENT_ID> is MONITORING this correlation for coordination replies
+(task.request / task.reply / patch.ready / status).
+
+Watching: to_agent=<AGENT_ID> and correlation_id=<id> on stream project/<name>.
+Cursor after: evt_20260811T112013_19320fbd7541
+
+If you are working <overlapping area>, reply on this correlation so we do not
+double-work. <What is already done and must not be redone.>
+```
+
+The four parts that make it useful: **the filter** (so others know what
+reaches you), **the cursor** (so others know what you have already seen),
+**the overlap warning** (so others do not duplicate), and **the fact that a
+watcher exists at all**.
+
+### Declare when you are *not* watching
+
+A turn-based agent — most chat-driven harnesses — has no background loop. It
+sweeps its inbox when a human prompts it and is otherwise deaf. That is a
+legitimate mode, but silent deafness is what makes coordination annoying.
+
+If you cannot monitor, say so in your reply and publish your cursor, so the
+requester knows a ping is required and knows where you left off:
+
+```text
+<AGENT_ID> is NOT monitoring — turn-based, no background watcher.
+Last seen: evt_20260820T053821_a5fdd770ec20
+Ping the operator to wake me; I sweep to_agent=<AGENT_ID> on every start.
+```
+
+Never claim to be monitoring when you are not. A false watcher is worse than
+a declared-absent one: the requester stops looking for a human to nudge.
+
 ## Hard rules
 
 - **Never apply a patch silently.** Fetching an artifact is free;
@@ -72,6 +209,10 @@ the event trail is only auditable if identities are stable.
   artifact and reference it.
 - **Close every loop.** Every `task.request` you claimed ends in an
   `applied`, `failed`, or `blocked` — no dangling `open` tasks.
+- **Never fake a watch.** Declare the monitoring mode you are actually in.
+  Claiming to listen when you are turn-based strands the requester.
+- **Cursors are event ids.** `since_created_at` is a time window, not a
+  resume point; using it as one drops late-arriving cross-replica events.
 - **File the outcome.** When a delegation concludes, write one drawer
   (`mempalace_add_drawer`) recording what was decided/learned, so the
   result is searchable without replaying the event trail.
@@ -99,8 +240,22 @@ Memory (recall + writing):
 
 Coordination (logstream):
 - Check your inbox when starting work and before long tasks:
-  mempalace_event_list with to_agent=<AGENT_ID> (new since your last
-  seen event id).
+  mempalace_event_list with to_agent=<AGENT_ID>, since_event_id=<last
+  event id you processed>, preview=true. Remember that id — it is your
+  cursor. Never resume with since_created_at: events are ordered by
+  append order, so a peer's event can arrive already "older" than a
+  timestamp cursor and be skipped forever.
+- Monitoring: if your harness can run a background process, start
+  `mempalace logstream watch --agent <AGENT_ID> --state-file <path> --json`
+  and treat its exit as "you have mail" (exit 0 = match, 2 = idle). Use
+  --agent, not --to-agent: it also excludes your own events, which
+  otherwise wake you via the '*' broadcast match. Repeat --type to wake
+  only for what needs you. In-turn, waiting on one known correlation,
+  mempalace_event_wait is enough. Before a coordinated task, post a
+  status event to to_agent=* naming your filter and your cursor so others
+  know you are listening. If you are turn-based and cannot watch between
+  prompts, say so and publish your cursor — never claim a watch you do
+  not have.
 - To delegate: mempalace_event_append (type=task.request, stream=
   project/<name>, room=delegation, correlation_id=task_..., status=open,
   body = goal + branch + base commit + definition of done), then

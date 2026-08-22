@@ -1,6 +1,6 @@
 [project]
 name = "mempalace"
-version = "3.7.1"
+version = "3.8.0"
 description = "Give your AI a memory — mine projects and conversations into a searchable palace. No API key required."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -56,7 +56,7 @@ Repository = "https://github.com/MemPalace/mempalace"
 
 [project.scripts]
 mempalace = "mempalace.cli:main"
-mempalace-mcp = "mempalace.mcp_server:main"
+mempalace-mcp = "mempalace.mcp_proxy:main"
 
 [project.entry-points."mempalace.backends"]
 chroma = "mempalace.backends.chroma:ChromaBackend"

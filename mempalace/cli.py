@@ -1531,6 +1531,256 @@ def _print_event_line(event):
     )
 
 
+def _watch_json(payload, *, follow: bool) -> str:
+    """Serialize one ``logstream watch`` record.
+
+    A single-shot watch prints exactly one document, so it is pretty-printed
+    and ``json.load``-able as-is. Under ``--follow`` there are many records
+    on one stream: indented documents concatenated back-to-back are *not*
+    valid JSON, and ``json.load`` / ``jq`` reject them with trailing data —
+    which defeats the point of a machine-readable flag on the mode meant for
+    daemons. Follow mode therefore emits NDJSON, one compact record per line.
+    """
+    import json
+
+    return (
+        json.dumps(payload, ensure_ascii=False)
+        if follow
+        else json.dumps(payload, indent=2, ensure_ascii=False)
+    )
+
+
+def _watch_spec(args, as_json) -> dict:
+    """Validate ``logstream watch`` arguments and build its filter spec.
+
+    Kept apart from the watch loop so every bad input is rejected before any
+    polling, any cursor resolution, and any checkpoint write — several of the
+    bugs on this path were arguments that only failed once the loop had
+    already started and persisted state.
+    """
+    from .logstream import normalize_watch_values, sanitize_watch_spec
+
+    if args.poll_timeout_ms is not None and args.poll_timeout_ms <= 0:
+        # A configured zero would make watch_events' expired-deadline branch
+        # yield forever without ever polling, burning a core.
+        _logstream_fail("--poll-timeout-ms must be a positive number of milliseconds", as_json)
+    if args.limit is not None and args.limit < 1:
+        # argparse accepts it; list_events would raise mid-loop, where the
+        # only handler is for KeyboardInterrupt — a traceback, and under
+        # --json no error document at all.
+        _logstream_fail("--limit must be a positive integer", as_json)
+    if args.idle_exit_ms is not None and args.idle_exit_ms < 0:
+        # Only 0 means "wait forever". A negative value arriving from config
+        # or from timeout arithmetic would otherwise take that same branch
+        # silently, leaving a harness waiting on a watcher it believes will
+        # time out.
+        _logstream_fail(
+            "--idle-exit-ms must be zero (wait forever) or a positive number of milliseconds",
+            as_json,
+        )
+
+    to_agents = list(args.to_agent or [])
+    exclude = list(args.exclude_from_agent or [])
+    if args.agent:
+        # The whole point of --agent: to_agent=<me> also matches '*'
+        # broadcasts, and your own broadcasts are broadcasts — so a watcher
+        # without this exclusion wakes itself every time it posts a status.
+        to_agents.append(args.agent)
+        exclude.append(args.agent)
+    spec = {
+        "streams": normalize_watch_values(args.stream),
+        "rooms": normalize_watch_values(args.room),
+        "types": normalize_watch_values(args.type),
+        "statuses": normalize_watch_values(args.status),
+        "to_agents": normalize_watch_values(to_agents),
+        "from_agents": normalize_watch_values(args.from_agent),
+        "exclude_from_agents": normalize_watch_values(exclude),
+        "correlation_ids": normalize_watch_values(args.correlation_id),
+    }
+    try:
+        spec = sanitize_watch_spec(spec)
+    except ValueError as exc:
+        _logstream_fail(str(exc), as_json)
+
+    return spec
+
+
+def _logstream_watch(ls, args, as_json):
+    """Run ``logstream watch`` — block until interesting events arrive.
+
+    Split out of ``cmd_logstream`` so that dispatcher stays under the
+    complexity gate: this branch carries cursor persistence, an idle timeout,
+    and follow-vs-exit semantics that no other subcommand needs.
+
+    Exit contract, chosen so a harness can background this process and treat
+    its exit as a wake-up: return (0) when a match was printed, 2 when the
+    idle timeout expired having seen nothing — the same convention
+    ``logstream wait`` uses for a timeout.
+    """
+    import time
+
+    from .logstream import (
+        WATCH_STATE_ABSENT,
+        WATCH_STATE_CORRUPT,
+        read_watch_state,
+        write_watch_cursor,
+    )
+
+    spec = _watch_spec(args, as_json)
+
+    stored_cursor, state_condition = read_watch_state(args.state_file)
+    # A missing cursor is four different facts, and only one of them may
+    # start at the tip. Treating a corrupt file or an empty-log restart as a
+    # first run skips everything that arrived since, then checkpoints past
+    # it — the loss is silent and permanent.
+    recovery_failed = state_condition == WATCH_STATE_CORRUPT
+    cursor = args.since_event_id or stored_cursor
+    skipped_from = None
+    if cursor is None and not args.from_start and state_condition == WATCH_STATE_ABSENT:
+        # Start at the tip, like the SSE live-tail does at connect time.
+        # Starting from the beginning of a long fleet log means a fresh
+        # watcher wakes holding weeks of history and cannot tell it is
+        # stale — measured 41 events, the oldest 49 days old, on a real
+        # shared brain. Backlog is the inbox sweep's job; a watcher is for
+        # what arrives from now on. Never silent: say what was skipped.
+        cursor = ls.latest_event_id()
+        skipped_from = cursor
+
+    # One place decides the starting position; one place records it. That
+    # position can arrive three ways — an explicit --since-event-id, the tip
+    # above, or None (an empty log, or --from-start) — and every one of them
+    # needs the same immediate checkpoint when no state file exists yet.
+    # Deferring to the first watch_events yield leaves a window of up to a
+    # full poll timeout in which an interrupt leaves no file behind, and the
+    # next launch calls itself a first run and jumps to the tip, skipping
+    # whatever arrived in between. Unlike later checkpoints this one cannot
+    # fail quietly: losing it costs a skipped event, not a replay.
+    if cursor is not None:
+        # Verify the anchor before it is written anywhere. list_events raises
+        # on an unknown since_event_id, and the required startup write below
+        # happens first — so a typo'd or stale --since-event-id would be
+        # persisted, then crash the first poll, and every later run without
+        # the flag would reload it and crash again until someone deleted the
+        # file by hand. Fail cleanly instead, leaving no state behind.
+        try:
+            ls.list_events(since_event_id=cursor, limit=1)
+        except ValueError as exc:
+            if args.since_event_id:
+                # Explicitly supplied and wrong: user error, so refuse
+                # without leaving anything behind to reload next time.
+                _logstream_fail(f"{exc}. Nothing was written to the state file.", as_json)
+            # A *stored* cursor whose event has gone (log rebuilt, replica
+            # reset) is corrupt state rather than user error, and refusing to
+            # start would strand the watcher exactly as an unreadable file
+            # would. Replay instead: a duplicate, never a missed delegation.
+            print(
+                f"Stored cursor {cursor} no longer exists in this log; replaying from the "
+                "start rather than refusing to run.",
+                file=sys.stderr,
+            )
+            cursor = None
+
+    if args.state_file and state_condition == WATCH_STATE_ABSENT:
+        try:
+            write_watch_cursor(args.state_file, cursor, agent=args.agent, required=True)
+        except OSError as exc:
+            _logstream_fail(
+                f"could not write the initial checkpoint to {args.state_file}: {exc}. "
+                "Refusing to start: without it a restart would skip every event "
+                "that arrives before then.",
+                as_json,
+            )
+    if not as_json:
+        where = args.agent or ", ".join(sorted(spec["to_agents"] or [])) or "everything"
+        print(f"Watching {where} from {cursor or 'now'}; Ctrl-C to stop.", file=sys.stderr)
+    if skipped_from:
+        print(
+            f"Starting at the tip ({skipped_from}); earlier events are not replayed. "
+            "Use --from-start to replay them, or sweep with `mempalace logstream list`.",
+            file=sys.stderr,
+        )
+    if recovery_failed:
+        print(
+            f"State file {args.state_file} is unreadable; replaying from the start "
+            "rather than skipping to the tip, so nothing since the last good "
+            "checkpoint is lost.",
+            file=sys.stderr,
+        )
+
+    idle_s = args.idle_exit_ms / 1000.0 if args.idle_exit_ms and args.idle_exit_ms > 0 else None
+    deadline = time.monotonic() + idle_s if idle_s else None
+    matched_any = False
+
+    def _poll_timeout_ms():
+        if deadline is None:
+            return args.poll_timeout_ms
+        remaining_ms = int((deadline - time.monotonic()) * 1000)
+        return min(args.poll_timeout_ms, remaining_ms)
+
+    try:
+        for matched, cursor in ls.watch_events(
+            cursor=cursor,
+            poll_timeout_ms=_poll_timeout_ms,
+            limit=args.limit,
+            **spec,
+        ):
+            if matched:
+                matched_any = True
+                if idle_s:
+                    deadline = time.monotonic() + idle_s
+                if as_json:
+                    print(
+                        _watch_json(
+                            {
+                                "events": matched,
+                                "count": len(matched),
+                                "cursor": cursor,
+                                "timed_out": False,
+                            },
+                            follow=args.follow,
+                        ),
+                        flush=True,
+                    )
+                else:
+                    print(f"{len(matched)} event(s):")
+                    for event in matched:
+                        _print_event_line(event)
+                    sys.stdout.flush()
+                # Matched batches checkpoint *after* stdout so a kill or
+                # broken pipe between the two replays the event instead of
+                # skipping it. Unmatched advances (below) are safe immediately:
+                # those events were examined and rejected.
+                write_watch_cursor(args.state_file, cursor, agent=args.agent)
+                if not args.follow:
+                    return
+                continue
+            write_watch_cursor(args.state_file, cursor, agent=args.agent)
+            if deadline is not None and time.monotonic() >= deadline:
+                if as_json:
+                    print(
+                        _watch_json(
+                            {"events": [], "count": 0, "cursor": cursor, "timed_out": True},
+                            follow=args.follow,
+                        )
+                    )
+                else:
+                    print("Idle timeout; no matching events.")
+                sys.exit(0 if matched_any else 2)
+    except KeyboardInterrupt:
+        # Exit 0 is the documented "a match was printed" signal, so an
+        # interrupted watcher must not use it — a supervisor would report
+        # mail that never arrived. 128 + SIGINT, the shell convention.
+        if not as_json:
+            print("Stopped.", file=sys.stderr)
+        sys.exit(130)
+    except ValueError as exc:
+        # Backstop. Every known bad input is rejected before the loop
+        # starts, but a validation error escaping mid-poll would otherwise
+        # surface as a traceback — and under --json as no error document at
+        # all, which a machine consumer cannot distinguish from a crash.
+        _logstream_fail(str(exc), as_json)
+
+
 def cmd_logstream(args):
     import json
 
@@ -1598,6 +1848,8 @@ def cmd_logstream(args):
                         _print_event_line(event)
             if result.get("timed_out"):
                 sys.exit(2)
+        elif args.logstream_action == "watch":
+            _logstream_watch(ls, args, as_json)
         elif args.logstream_action == "sync":
             from .logsync import load_peers, sync_all, sync_with_peer
 
@@ -3033,6 +3285,86 @@ def main():
         "--limit", type=int, default=50, help="Max events to return on match (default 50)"
     )
     p_ls_wait.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_ls_watch = logstream_sub.add_parser(
+        "watch",
+        help="Background watcher: block until interesting events arrive, then wake (exit 2 on idle)",
+    )
+    p_ls_watch.add_argument(
+        "--agent",
+        default=None,
+        help=(
+            "Your identity. Shorthand for --to-agent <id> --exclude-from-agent <id>: "
+            "wake for what is addressed to you (broadcasts included) but never for "
+            "your own events"
+        ),
+    )
+    p_ls_watch.add_argument(
+        "--stream", action="append", default=None, help="Stream (repeatable; matches any)"
+    )
+    p_ls_watch.add_argument(
+        "--room", action="append", default=None, help="Room (repeatable; matches any)"
+    )
+    p_ls_watch.add_argument(
+        "--type", action="append", default=None, help="Event type (repeatable; matches any)"
+    )
+    p_ls_watch.add_argument(
+        "--status", action="append", default=None, help="Status (repeatable; matches any)"
+    )
+    p_ls_watch.add_argument(
+        "--to-agent", action="append", default=None, help="Target agent (repeatable; '*' matches)"
+    )
+    p_ls_watch.add_argument(
+        "--from-agent", action="append", default=None, help="Writer agent (repeatable)"
+    )
+    p_ls_watch.add_argument(
+        "--exclude-from-agent",
+        action="append",
+        default=None,
+        help="Never wake for events written by this agent (repeatable)",
+    )
+    p_ls_watch.add_argument(
+        "--correlation-id", action="append", default=None, help="Correlation id (repeatable)"
+    )
+    p_ls_watch.add_argument(
+        "--since-event-id",
+        default=None,
+        help="Start strictly after this event id (overrides --state-file)",
+    )
+    p_ls_watch.add_argument(
+        "--state-file",
+        default=None,
+        help="Persist the cursor here so a restart resumes exactly where it stopped",
+    )
+    p_ls_watch.add_argument(
+        "--from-start",
+        action="store_true",
+        help=(
+            "Replay the log from the beginning when there is no cursor "
+            "(default: start at the tip, like the SSE live-tail)"
+        ),
+    )
+    p_ls_watch.add_argument(
+        "--follow",
+        action="store_true",
+        help="Keep watching after a match instead of exiting on the first one",
+    )
+    p_ls_watch.add_argument(
+        "--idle-exit-ms",
+        type=int,
+        default=0,
+        help="Give up after this long with no match (0 = wait forever)",
+    )
+    p_ls_watch.add_argument(
+        "--poll-timeout-ms",
+        type=int,
+        default=300000,
+        help="Long-poll length per iteration (default 300000, the server maximum)",
+    )
+    p_ls_watch.add_argument(
+        "--limit", type=int, default=50, help="Max events per poll (default 50)"
+    )
+    p_ls_watch.add_argument("--json", action="store_true", help="Machine-readable output")
 
     p_ls_ack = logstream_sub.add_parser(
         "ack", help="Acknowledge an event (appends event.ack, never mutates)"

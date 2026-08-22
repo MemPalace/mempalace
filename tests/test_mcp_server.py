@@ -113,15 +113,22 @@ def test_install_shutdown_signal_handlers_routes_term_to_system_exit():
 
 def _patch_mcp_server(monkeypatch, config, kg):
     """Patch the mcp_server module globals to use test fixtures."""
-    from mempalace import mcp_server, gossip as gossip_mod
+    from mempalace import mcp_server
 
     monkeypatch.setattr(mcp_server, "_config", config)
     # Accept varargs because production ``_get_kg`` now takes an optional
     # canonical_path; ``_call_kg`` passes the captured key through.
     monkeypatch.setattr(mcp_server, "_get_kg", lambda *a, **kw: kg)
-    # Use the example gossip topology for tests so the default install is not
-    # forced to carry project-specific names.
-    monkeypatch.setattr(gossip_mod, "DEFAULT_GOSSIP_CONFIG", gossip_mod.EXAMPLE_GOSSIP_CONFIG)
+    monkeypatch.setattr(mcp_server, "_taxonomy_cache", None)
+    monkeypatch.setattr(mcp_server, "_taxonomy_cache_time", 0.0)
+    from mempalace.palace_graph import invalidate_graph_cache
+
+    invalidate_graph_cache()
+
+
+def _unexpected_client_read(*_a, **_k):
+    """Tripwire for paths that must stay off the chroma client (and HNSW)."""
+    raise AssertionError("chroma collection opened — this path must read sqlite")
 
 
 def _get_collection(palace_path, create=False):
@@ -1364,6 +1371,143 @@ with mine_palace_lock(sys.argv[1]):
         assert stats["top_tunnels"] == [
             {"room": "chromadb", "wings": ["wing_code", "wing_project"], "count": 2}
         ]
+
+    def test_find_tunnels_uses_sqlite_fast_path(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        collection.add(
+            ids=["d_db_code", "d_db_proj"],
+            documents=["chromadb in code", "chromadb in project"],
+            metadatas=[
+                {"room": "chromadb", "wing": "wing_code", "hall": "db"},
+                {"room": "chromadb", "wing": "wing_project", "hall": "db"},
+            ],
+        )
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        def _no_client_open(*_a, **_k):
+            raise AssertionError("chroma collection opened — find_tunnels must use sqlite")
+
+        monkeypatch.setattr(mcp_server, "_get_collection", _no_client_open)
+        tunnels = mcp_server.tool_find_tunnels()
+        assert tunnels[0]["room"] == "chromadb"
+        assert set(tunnels[0]["wings"]) == {"wing_code", "wing_project"}
+
+    def test_list_drawers_uses_chroma_sqlite_metadata(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        collection.add(
+            ids=["keep", "drop"],
+            documents=["keep me", "drop me"],
+            metadatas=[
+                {"wing": "mempalace", "room": "notes"},
+                {"wing": "other", "room": "notes"},
+            ],
+        )
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        def _boom(*_a, **_k):
+            raise AssertionError("list_drawers paged col.get instead of chroma sqlite")
+
+        monkeypatch.setattr(mcp_server, "_fetch_drawer_rows", _boom)
+        monkeypatch.setattr(mcp_server, "_get_collection", _boom)
+        result = mcp_server.tool_list_drawers(wing="mempalace", limit=20)
+        assert result["total"] == 1
+        assert result["drawers"][0]["drawer_id"] == "keep"
+        assert "keep me" in result["drawers"][0]["content_preview"]
+
+    def test_list_drawers_scan_filters_in_sql_and_skips_documents(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        """The listing scan must not drag the palace's text through memory.
+
+        ``chroma:document`` lives in ``embedding_metadata`` alongside the
+        loci, so an unqualified join pulls every drawer's verbatim content in
+        to render one page — on a six-figure palace that is hundreds of MB and
+        seconds of wall clock. The wing/room filter belongs in SQL for the same
+        reason: filtering in Python means scanning the whole collection first.
+        """
+        collection.add(
+            ids=["keep", "drop"],
+            documents=["keep me", "drop me"],
+            metadatas=[
+                {"wing": "mempalace", "room": "notes"},
+                {"wing": "other", "room": "notes"},
+            ],
+        )
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+        from mempalace.backends import chroma as chroma_backend
+
+        statements = []
+        real_connect = chroma_backend.sqlite3.connect
+
+        def _tracing_connect(*a, **kw):
+            conn = real_connect(*a, **kw)
+            conn.set_trace_callback(statements.append)
+            return conn
+
+        monkeypatch.setattr(chroma_backend.sqlite3, "connect", _tracing_connect)
+        monkeypatch.setattr(mcp_server, "_fetch_drawer_rows", _unexpected_client_read)
+        monkeypatch.setattr(mcp_server, "_get_collection", _unexpected_client_read)
+
+        result = mcp_server.tool_list_drawers(wing="mempalace", limit=20)
+        assert result["total"] == 1
+        assert "keep me" in result["drawers"][0]["content_preview"]
+
+        scans = [s for s in statements if "FROM embeddings" in s and "ORDER BY e.id" in s]
+        assert scans, f"no listing scan observed in {statements}"
+        scan = scans[0]
+        # Documents are excluded from the scan and the filter is pushed down.
+        assert "chroma:document" in scan and "!=" in scan
+        assert scan.count("JOIN embedding_metadata") >= 2, scan
+        assert "string_value = " in scan or "string_value = ?" in scan
+
+        # The page's documents are fetched by id, not by re-reading everything.
+        doc_reads = [
+            s
+            for s in statements
+            if "chroma:document" in s and "FROM embedding_metadata" in s and " id IN " in s
+        ]
+        assert doc_reads, f"page previews did not use an id-scoped read: {statements}"
+
+    def test_find_tunnels_reports_recent_from_sqlite(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        """``recent`` survives the sqlite path — it is part of the tool's output."""
+        collection.add(
+            ids=["d_old", "d_new"],
+            documents=["chromadb in code", "chromadb in project"],
+            metadatas=[
+                {"room": "chromadb", "wing": "wing_code", "hall": "db", "date": "2026-01-02"},
+                {"room": "chromadb", "wing": "wing_project", "hall": "db", "date": "2026-03-04"},
+            ],
+        )
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_get_collection", _unexpected_client_read)
+        tunnels = mcp_server.tool_find_tunnels()
+        assert tunnels[0]["recent"] == "2026-03-04"
+
+    def test_graph_tools_report_a_missing_palace(self, monkeypatch, config, palace_path, kg):
+        """A palace with no database must diagnose, not look empty.
+
+        ``find_tunnels`` returning ``[]`` and ``traverse`` returning "room not
+        found" would tell the user their palace has no tunnels when in fact it
+        could not be opened at all.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        tunnels = mcp_server.tool_find_tunnels()
+        assert isinstance(tunnels, dict) and tunnels.get("error")
+
+        walked = mcp_server.tool_traverse_graph("anything")
+        assert isinstance(walked, dict) and walked.get("error")
+        assert "not found" not in walked["error"].lower()
 
     def test_no_palace_returns_error(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -3832,43 +3976,6 @@ class TestKGTools:
         assert "YYYY-MM-DDTHH:MM:SSZ" in result["error"]
 
 
-# ── Gossip Tools ────────────────────────────────────────────────────────
-
-
-class TestGossipTools:
-    def test_gossip_status(self, monkeypatch, config, palace_path, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
-        from mempalace.mcp_server import tool_gossip_status
-
-        result = tool_gossip_status()
-        assert "error" not in result
-        assert result["version"] == "1.0"
-        assert len(result["chatter_nodes"]) == 7
-
-    def test_gossip_propagates_and_writes_triples(self, monkeypatch, config, palace_path, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
-        _client, _col = _get_collection(palace_path, create=True)
-        del _client
-        from mempalace.mcp_server import tool_gossip
-
-        result = tool_gossip(
-            subject="audit",
-            predicate="found",
-            object="security vulnerability",
-            source_wing="orkid",
-            source_room="contracts",
-        )
-        assert "error" not in result
-        assert result["topic"] == "security_issues"
-        assert result["priority"] == "critical"
-        assert result["triples_written"] >= 1
-
-        # Verify the gossip triple reached the KG.
-        facts = kg.query_entity("audit", direction="outgoing")
-        gossip_facts = [f for f in facts if f["predicate"].startswith("gossiped_")]
-        assert len(gossip_facts) >= 1
-
-
 # ── Diary Tools ─────────────────────────────────────────────────────────
 
 
@@ -5592,15 +5699,6 @@ def test_read_only_refuses_every_daemon_write_tool():
 
     assert service.WRITE_TOOLS <= mcp_server._READ_ONLY_REFUSED_TOOLS
     assert "mempalace_hook_settings" in service.WRITE_TOOLS
-
-
-def test_gossip_tool_classified_as_write():
-    """mempalace_gossip is a mutation and must be classified as a write tool."""
-    from mempalace import mcp_server, service
-
-    assert "mempalace_gossip" in mcp_server._MUTATING_TOOLS
-    assert "mempalace_gossip" in service.WRITE_TOOLS
-    assert service.classify_tool("mempalace_gossip") == "write"
 
 
 def test_peer_writer_guard_does_not_gate_hook_settings(monkeypatch):

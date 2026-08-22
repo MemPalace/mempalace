@@ -491,3 +491,263 @@ class TestSizeLimits:
             assert evt["body"] == "x" * 10
         finally:
             ls.close()
+
+
+# ── Watch (background watchers) ───────────────────────────────────────────
+
+
+class TestWatchFilters:
+    """The multi-valued and negative filters ``list_events`` cannot express."""
+
+    def _event(self, **overrides):
+        base = {
+            "stream": "project/mempalace",
+            "room": "delegation",
+            "type": "task.request",
+            "status": "open",
+            "to_agent": "mac-claude",
+            "from_agent": "windows-grok",
+            "correlation_id": "task_1",
+        }
+        base.update(overrides)
+        return base
+
+    def test_normalize_treats_blank_as_absent_not_impossible(self):
+        from mempalace.logstream import normalize_watch_values
+
+        assert normalize_watch_values(None) is None
+        assert normalize_watch_values("a") == {"a"}
+        assert normalize_watch_values(["a", "b"]) == {"a", "b"}
+        # A blank filter must mean "any", never "match nothing" — otherwise a
+        # stray empty flag silently deafens the watcher forever.
+        assert normalize_watch_values(["", None]) is None
+
+    def test_own_broadcast_is_excluded(self):
+        """The bug that motivated --agent.
+
+        ``to_agent=<me>`` also matches '*' broadcasts, and an agent's own
+        broadcasts are broadcasts — so without the exclusion a watcher wakes
+        itself every time it posts a status.
+        """
+        from mempalace.logstream import event_matches_watch
+
+        own = self._event(from_agent="mac-claude", to_agent="*")
+        assert not event_matches_watch(
+            own, to_agents={"mac-claude"}, exclude_from_agents={"mac-claude"}
+        )
+        # The same broadcast from anyone else still reaches us.
+        other = self._event(from_agent="windows-grok", to_agent="*")
+        assert event_matches_watch(
+            other, to_agents={"mac-claude"}, exclude_from_agents={"mac-claude"}
+        )
+
+    def test_exclusion_beats_a_direct_address(self):
+        from mempalace.logstream import event_matches_watch
+
+        addressed = self._event(from_agent="noisy", to_agent="mac-claude")
+        assert not event_matches_watch(
+            addressed, to_agents={"mac-claude"}, exclude_from_agents={"noisy"}
+        )
+
+    def test_multi_valued_field_is_an_or(self):
+        from mempalace.logstream import event_matches_watch
+
+        evt = self._event(type="patch.ready")
+        assert event_matches_watch(evt, types={"task.request", "patch.ready"})
+        assert not event_matches_watch(evt, types={"task.request", "status.update"})
+
+    def test_absent_filter_matches_anything(self):
+        from mempalace.logstream import event_matches_watch
+
+        assert event_matches_watch(self._event(), types=None, streams=None)
+
+    def test_pushdown_only_takes_single_valued_filters(self):
+        from mempalace.logstream import pushdown_watch_filters
+
+        spec = {"types": {"task.request"}, "streams": {"a", "b"}, "rooms": None}
+        pushed = pushdown_watch_filters(spec)
+        # Multi-valued filters must stay client-side; pushing one arbitrary
+        # value would silently drop the others.
+        assert pushed == {"type": "task.request"}
+
+
+class TestWatchEvents:
+    def test_wakes_only_on_a_match_and_advances_cursor(self, logstream):
+        noise = _append(logstream, type="status.update", from_agent="windows-grok")
+        wanted = _append(logstream, type="patch.ready", from_agent="windows-grok")
+        watcher = logstream.watch_events(
+            poll_timeout_ms=200,
+            poll_interval_s=0.01,
+            types={"patch.ready"},
+        )
+        matched, cursor = next(watcher)
+        assert [e["id"] for e in matched] == [wanted["id"]]
+        # The cursor passes the rejected event too — re-judging it after a
+        # restart would be pure waste.
+        assert cursor == wanted["id"]
+        assert noise["id"] != cursor
+        watcher.close()
+
+    def test_idle_poll_yields_so_callers_can_time_out(self, logstream):
+        watcher = logstream.watch_events(
+            poll_timeout_ms=50, poll_interval_s=0.01, correlation_id=None, types={"nothing"}
+        )
+        matched, cursor = next(watcher)
+        assert matched == []
+        assert cursor is None
+        watcher.close()
+
+    def test_cursor_resumes_without_replaying(self, logstream):
+        first = _append(logstream)
+        watcher = logstream.watch_events(poll_timeout_ms=100, poll_interval_s=0.01)
+        matched, cursor = next(watcher)
+        assert [e["id"] for e in matched] == [first["id"]]
+        watcher.close()
+
+        second = _append(logstream)
+        resumed = logstream.watch_events(cursor=cursor, poll_timeout_ms=100, poll_interval_s=0.01)
+        matched, _ = next(resumed)
+        assert [e["id"] for e in matched] == [second["id"]]
+        resumed.close()
+
+    def test_self_broadcast_does_not_wake_the_author(self, logstream):
+        """End-to-end version of the --agent bug, through the real store."""
+        _append(logstream, from_agent="mac-claude", to_agent="*", type="status.update")
+        watcher = logstream.watch_events(
+            poll_timeout_ms=50,
+            poll_interval_s=0.01,
+            to_agents={"mac-claude"},
+            exclude_from_agents={"mac-claude"},
+        )
+        matched, cursor = next(watcher)
+        assert matched == []
+        # Still examined, so the cursor moved past it.
+        assert cursor is not None
+        watcher.close()
+
+
+class TestWatchCursorFile:
+    def test_roundtrip(self, tmp_path):
+        from mempalace.logstream import read_watch_cursor, write_watch_cursor
+
+        path = str(tmp_path / "nested" / "cursor.json")
+        write_watch_cursor(path, "evt_abc", agent="mac-claude")
+        assert read_watch_cursor(path) == "evt_abc"
+
+    def test_missing_or_corrupt_file_is_not_fatal(self, tmp_path):
+        """A truncated state file costs a replay; refusing to start costs
+        every event after it."""
+        from mempalace.logstream import read_watch_cursor
+
+        assert read_watch_cursor(str(tmp_path / "absent.json")) is None
+        corrupt = tmp_path / "corrupt.json"
+        corrupt.write_text("{not json", encoding="utf-8")
+        assert read_watch_cursor(str(corrupt)) is None
+        assert read_watch_cursor(None) is None
+
+    def test_write_leaves_no_temp_file_behind(self, tmp_path):
+        from mempalace.logstream import write_watch_cursor
+
+        path = str(tmp_path / "cursor.json")
+        write_watch_cursor(path, "evt_abc")
+        assert [p.name for p in tmp_path.iterdir()] == ["cursor.json"]
+
+    def test_non_object_json_is_treated_as_corrupt(self, tmp_path):
+        """Valid JSON that is not an object must degrade, not raise.
+
+        ``json.load(...).get()`` on ``null`` / ``[]`` / a bare string raises
+        AttributeError, which would stop the watcher from starting — the
+        exact opposite of the recovery contract.
+        """
+        from mempalace.logstream import read_watch_cursor
+
+        for payload in ("null", "[]", '"evt_abc"', "42"):
+            path = tmp_path / f"cursor_{abs(hash(payload))}.json"
+            path.write_text(payload, encoding="utf-8")
+            assert read_watch_cursor(str(path)) is None
+
+    def test_conditions_distinguish_absent_empty_and_corrupt(self, tmp_path):
+        """ "No cursor" is four facts; only ``absent`` may start at the tip."""
+        from mempalace.logstream import (
+            WATCH_STATE_ABSENT,
+            WATCH_STATE_CORRUPT,
+            WATCH_STATE_EMPTY,
+            WATCH_STATE_OK,
+            read_watch_state,
+            write_watch_cursor,
+        )
+
+        assert read_watch_state(str(tmp_path / "nope.json")) == (None, WATCH_STATE_ABSENT)
+        assert read_watch_state(None) == (None, WATCH_STATE_ABSENT)
+
+        good = tmp_path / "good.json"
+        write_watch_cursor(str(good), "evt_abc")
+        assert read_watch_state(str(good)) == ("evt_abc", WATCH_STATE_OK)
+
+        # Empty-log sentinel: the file exists and says so explicitly.
+        empty = tmp_path / "empty.json"
+        write_watch_cursor(str(empty), None)
+        assert read_watch_state(str(empty)) == (None, WATCH_STATE_EMPTY)
+
+        broken = tmp_path / "broken.json"
+        broken.write_text("{not json", encoding="utf-8")
+        assert read_watch_state(str(broken)) == (None, WATCH_STATE_CORRUPT)
+        broken.write_text("null", encoding="utf-8")
+        assert read_watch_state(str(broken)) == (None, WATCH_STATE_CORRUPT)
+        broken.write_text('{"other": 1}', encoding="utf-8")
+        assert read_watch_state(str(broken)) == (None, WATCH_STATE_CORRUPT)
+
+    def test_unreachable_file_is_corrupt_not_absent(self, tmp_path, monkeypatch):
+        """A checkpoint we cannot open must replay, never restart at the tip.
+
+        ``os.path.exists`` answers False both for "no such file" and for
+        "cannot traverse the parent directory", so a preflight check turns a
+        momentarily unreachable checkpoint into a fake first run and skips
+        every event since the stored cursor.
+        """
+        from mempalace.logstream import (
+            WATCH_STATE_ABSENT,
+            WATCH_STATE_CORRUPT,
+            read_watch_state,
+        )
+
+        # A directory where a file is expected: open() raises OSError on
+        # every platform (IsADirectoryError on POSIX, PermissionError on NT).
+        as_dir = tmp_path / "cursor.json"
+        as_dir.mkdir()
+        assert read_watch_state(str(as_dir)) == (None, WATCH_STATE_CORRUPT)
+
+        # Permission denied, simulated so the test is platform-independent.
+        real_open = open
+
+        def denied(path, *a, **k):
+            if str(path).endswith("locked.json"):
+                raise PermissionError(13, "Permission denied")
+            return real_open(path, *a, **k)
+
+        monkeypatch.setattr("builtins.open", denied)
+        assert read_watch_state(str(tmp_path / "locked.json")) == (None, WATCH_STATE_CORRUPT)
+
+        # A genuinely missing file is still absent, i.e. a real first run.
+        monkeypatch.undo()
+        assert read_watch_state(str(tmp_path / "gone.json")) == (None, WATCH_STATE_ABSENT)
+
+    def test_required_checkpoint_raises_instead_of_swallowing(self, tmp_path, monkeypatch):
+        """Best effort is safe only when a lost checkpoint costs a replay.
+
+        For the first checkpoint of a fresh watch it costs a skip instead, so
+        that one must surface the failure.
+        """
+        from mempalace.logstream import write_watch_cursor
+
+        target = str(tmp_path / "sub" / "cursor.json")
+
+        def denied(path, *a, **k):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr("builtins.open", denied)
+        # Ordinary checkpoint: swallowed, the watcher keeps running.
+        write_watch_cursor(target, "evt_abc")
+        # Initial checkpoint: raised, so the caller can refuse to start.
+        with pytest.raises(OSError):
+            write_watch_cursor(target, "evt_abc", required=True)

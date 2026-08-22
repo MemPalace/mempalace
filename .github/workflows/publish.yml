@@ -111,7 +111,7 @@ jobs:
           fi
           echo "Tag $TAG matches manifest version $py_version — OK."
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 

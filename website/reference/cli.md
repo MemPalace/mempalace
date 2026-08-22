@@ -200,6 +200,10 @@ mempalace logstream list --stream project/myapp --room delegation --json
 mempalace logstream wait --correlation-id task_123 --type patch.ready \
   --timeout-ms 300000 --json
 mempalace logstream ack evt_... --from-agent mac --status applied
+
+# Background watcher: blocks, wakes on what needs you, exits 0 on a match
+mempalace logstream watch --agent mac --type task.request --type patch.ready \
+  --state-file ~/.mempalace/watch/mac.json --json
 ```
 
 | Subcommand | Description |
@@ -207,6 +211,7 @@ mempalace logstream ack evt_... --from-agent mac --status applied
 | `append` | Append an immutable event (`--type`, `--stream`, `--room`, `--from-agent` required; `--body`/`--body-file`, `--artifact-id` repeatable) |
 | `list` | List events, oldest first (all routing fields as filters, `--since-event-id`, `--limit`) |
 | `wait` | Long-poll until a match or timeout (`--timeout-ms`, max 300000; exits `2` on timeout) |
+| `watch` | Background watcher: re-arms past the `wait` cap, carries the cursor, and exits `0` on a match / `2` on `--idle-exit-ms`. `--agent ID` is shorthand for `--to-agent ID --exclude-from-agent ID` so your own `*` broadcasts never wake you. Filters repeat to mean "or"; `--state-file` resumes exactly; `--follow` stays alive past the first match; a cursorless first run starts at the tip (`--from-start` to replay); exits `130` if interrupted; `--follow --json` emits NDJSON |
 | `ack` | Append an `event.ack` for an event (`--from-agent` required, `--status`, `--body`) |
 | `sync` | Pull missing events/artifacts from peer replicas (`--peer URL --token T`, or all peers in `peers.json`) |
 

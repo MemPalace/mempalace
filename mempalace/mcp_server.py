@@ -680,8 +680,7 @@ def _discard_mcp_storage_handles() -> None:
     _collection_open_error = None
     _palace_db_inode = 0
     _palace_db_mtime = 0.0
-    _metadata_cache = None
-    _metadata_cache_time = 0
+    _invalidate_overview_caches()
 
 
 def _release_mcp_writer_lock() -> None:
@@ -1216,8 +1215,7 @@ def _force_chroma_cache_reset() -> None:
     _collection_open_error = None
     _palace_db_inode = 0
     _palace_db_mtime = 0.0
-    _metadata_cache = None
-    _metadata_cache_time = 0
+    _invalidate_overview_caches()
     # This runs on the #1315 retry path, which drops caches precisely to
     # re-observe the palace after a transient index error. The capacity verdict
     # is another cached view of that same palace, so it must be dropped too, or
@@ -1387,8 +1385,7 @@ def _get_client():
         _collection_cache_backend = None
         _collection_cache_palace = None
         _collection_open_error = None
-        _metadata_cache = None
-        _metadata_cache_time = 0
+        _invalidate_overview_caches()
         _palace_db_inode = current_inode
         _palace_db_mtime = current_mtime
     return _client_cache
@@ -1475,8 +1472,7 @@ def _get_collection(create=False):
                     _collection_cache_backend = backend_name
                     _collection_cache_palace = _config.palace_path
                     _collection_open_error = None
-                    _metadata_cache = None
-                    _metadata_cache_time = 0
+                    _invalidate_overview_caches()
                 return _collection_cache
             except (BackendMismatchError, KeyError) as exc:
                 logger.warning("backend open failed for %s: %s", _config.palace_path, exc)
@@ -1490,8 +1486,7 @@ def _get_collection(create=False):
                 _collection_cache = None
                 _collection_cache_backend = None
                 _collection_cache_palace = None
-                _metadata_cache = None
-                _metadata_cache_time = 0
+                _invalidate_overview_caches()
                 return None
             except Exception:
                 logger.exception(
@@ -1503,8 +1498,7 @@ def _get_collection(create=False):
                 _collection_cache = None
                 _collection_cache_backend = None
                 _collection_cache_palace = None
-                _metadata_cache = None
-                _metadata_cache_time = 0
+                _invalidate_overview_caches()
                 _collection_open_error = {
                     "error": "Backend open failed",
                     "details": "Could not open the selected backend collection.",
@@ -1580,8 +1574,7 @@ def _get_collection(create=False):
                 _collection_cache_backend = "chroma"
                 _collection_cache_palace = _config.palace_path
                 _collection_open_error = None
-                _metadata_cache = None
-                _metadata_cache_time = 0
+                _invalidate_overview_caches()
             elif _collection_cache is None:
                 ef = ChromaBackend._resolve_embedding_function()
                 ef_kwargs = {"embedding_function": ef} if ef is not None else {}
@@ -1591,8 +1584,7 @@ def _get_collection(create=False):
                 _collection_cache_backend = "chroma"
                 _collection_cache_palace = _config.palace_path
                 _collection_open_error = None
-                _metadata_cache = None
-                _metadata_cache_time = 0
+                _invalidate_overview_caches()
             return _collection_cache
         except (BackendMismatchError, KeyError) as exc:
             _collection_open_error = {
@@ -1608,8 +1600,7 @@ def _get_collection(create=False):
             _collection_cache_palace = None
             _palace_db_inode = 0
             _palace_db_mtime = 0.0
-            _metadata_cache = None
-            _metadata_cache_time = 0
+            _invalidate_overview_caches()
             return None
         except Exception:
             logger.exception(
@@ -1629,8 +1620,7 @@ def _get_collection(create=False):
                 _collection_cache_palace = None
                 _palace_db_inode = 0
                 _palace_db_mtime = 0.0
-                _metadata_cache = None
-                _metadata_cache_time = 0
+                _invalidate_overview_caches()
                 _collection_open_error = {
                     "error": "Backend open failed",
                     "details": "Could not open the Chroma collection.",
@@ -1642,8 +1632,7 @@ def _get_collection(create=False):
     _collection_cache_palace = None
     _palace_db_inode = 0
     _palace_db_mtime = 0.0
-    _metadata_cache = None
-    _metadata_cache_time = 0
+    _invalidate_overview_caches()
     _collection_open_error = _collection_open_error or {
         "error": "Backend open failed",
         "details": "Could not open the selected backend collection.",
@@ -1764,7 +1753,19 @@ def _supports_metadata_facets(col) -> bool:
 _metadata_cache = None
 _metadata_cache_time = 0
 _METADATA_CACHE_TTL = 5.0  # seconds
+_taxonomy_cache = None
+_taxonomy_cache_time = 0.0
+_TAXONOMY_CACHE_TTL = 5.0  # seconds — same idea as the palace-graph cache
 _MAX_RESULTS = 100  # upper bound for search/list limit params
+
+
+def _invalidate_overview_caches():
+    """Drop status/list_wings taxonomy and metadata page caches after writes."""
+    global _metadata_cache, _metadata_cache_time, _taxonomy_cache, _taxonomy_cache_time
+    _metadata_cache = None
+    _metadata_cache_time = 0
+    _taxonomy_cache = None
+    _taxonomy_cache_time = 0.0
 
 
 def _get_cached_metadata(col, where=None):
@@ -1911,23 +1912,36 @@ def _tool_status_via_sqlite() -> dict:
 
 
 def _sqlite_taxonomy():
-    """Fast wing→room tally straight from ``chroma.sqlite3`` (#1748 / #1379).
+    """Fast wing→room tally from the backend's sqlite metadata (#1748 / #1379).
 
     Returns ``(total, {wing: {room: count}})`` or ``None`` to signal the
-    caller to fall back to the ChromaDB client pagination path. ``None`` means
-    a non-chroma backend, a missing/unbootstrapped palace, or a sqlite error —
-    exactly the cases ``backends.chroma._sqlite_wing_room_counts`` already
-    handles for the CLI ``miner.status()``. The point is to answer the
-    overview tools from the relational metadata without cold-loading the HNSW
-    index, which costs tens of seconds per call on large palaces and is what
-    times them out under the MCP host limit.
+    caller to fall back to the collection pagination path. ``None`` means
+    an unsupported backend, a missing/unbootstrapped palace, or a sqlite error.
+    Chroma reads ``chroma.sqlite3`` so status does not cold-load HNSW.
+    sqlite_exact reads ``sqlite_exact.sqlite3`` with one ``json_extract``
+    GROUP BY so status does not page every metadata row.
     """
-    if not _is_chroma_backend():
-        return None
+    global _taxonomy_cache, _taxonomy_cache_time
+    now = time.time()
+    cache_key = (_config.palace_path, _config.collection_name)
+    if (
+        _taxonomy_cache is not None
+        and _taxonomy_cache[0] == cache_key
+        and (now - _taxonomy_cache_time) < _TAXONOMY_CACHE_TTL
+    ):
+        return _taxonomy_cache[1]
+    counts = None
     try:
-        from .backends.chroma import _sqlite_wing_room_counts
+        if _is_chroma_backend():
+            from .backends.chroma import _sqlite_wing_room_counts
 
-        counts = _sqlite_wing_room_counts(_config.palace_path, _config.collection_name)
+            counts = _sqlite_wing_room_counts(_config.palace_path, _config.collection_name)
+        elif _selected_backend_name() == "sqlite_exact":
+            from .backends.sqlite_exact import sqlite_wing_room_counts
+
+            counts = sqlite_wing_room_counts(_config.palace_path, _config.collection_name)
+        else:
+            return None
     except Exception:
         logger.debug("sqlite taxonomy fast path failed; falling back", exc_info=True)
         return None
@@ -1948,7 +1962,10 @@ def _sqlite_taxonomy():
         for room, n in room_counts.items():
             rkey = _norm(room)
             dest[rkey] = dest.get(rkey, 0) + n
-    return total, normalized
+    result = total, normalized
+    _taxonomy_cache = (cache_key, result)
+    _taxonomy_cache_time = now
+    return result
 
 
 def _sqlite_graph_stats():
@@ -1968,105 +1985,92 @@ def _sqlite_graph_stats():
     wing and a usable room name (the catch-all ``"general"`` is excluded), and
     edges are the per-hall cross-wing crossings of multi-wing rooms.
     """
-    if not _is_chroma_backend():
-        return None
-    import sqlite3 as _sqlite3
-    from collections import Counter, defaultdict
-
-    if not _config.palace_path:
-        return None
-    db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
-    if not os.path.isfile(db_path):
-        return None
-    collection_name = _config.collection_name
-    # Treat any failure as a soft fallback to the client path (sqlite errors,
-    # but also an unexpected schema shape tripping the reconstruction) so
-    # graph_stats degrades to build_graph() rather than raising — mirroring the
-    # sibling sqlite fast paths (_sqlite_taxonomy / _sqlite_wing_room_counts).
+    rows = None
     try:
-        conn = _sqlite3.connect(sqlite_read_uri(db_path), uri=True)
-        try:
-            conn.execute("PRAGMA busy_timeout = 3000")
-            if (
-                conn.execute(
-                    "SELECT 1 FROM collections WHERE name = ?", (collection_name,)
-                ).fetchone()
-                is None
-            ):
-                return None
-            rows = conn.execute(
-                """
-                SELECT
-                    COALESCE(rm.string_value, CAST(rm.int_value AS TEXT),
-                             CAST(rm.float_value AS TEXT), '') AS room,
-                    COALESCE(wm.string_value, CAST(wm.int_value AS TEXT),
-                             CAST(wm.float_value AS TEXT), '') AS wing,
-                    COALESCE(hm.string_value, CAST(hm.int_value AS TEXT),
-                             CAST(hm.float_value AS TEXT), '') AS hall,
-                    COUNT(*) AS n
-                FROM embeddings e
-                JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
-                JOIN collections c ON s.collection = c.id
-                LEFT JOIN embedding_metadata rm ON rm.id = e.id AND rm.key = 'room'
-                LEFT JOIN embedding_metadata wm ON wm.id = e.id AND wm.key = 'wing'
-                LEFT JOIN embedding_metadata hm ON hm.id = e.id AND hm.key = 'hall'
-                WHERE c.name = ?
-                GROUP BY room, wing, hall
-                """,
-                (collection_name,),
-            ).fetchall()
-        finally:
-            conn.close()
+        if _is_chroma_backend():
+            rows = _chroma_room_wing_hall_counts()
+        elif _selected_backend_name() == "sqlite_exact":
+            from .backends.sqlite_exact import sqlite_room_wing_hall_counts
 
-        # Reconstruct build_graph()'s room_data, applying its per-drawer filter
-        # (`if room and room != "general" and wing`).
-        room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0})
-        for room, wing, hall, n in rows:
-            if not room or room == "general" or not wing:
-                continue
-            node = room_data[room]
-            node["wings"].add(wing)
-            if hall:
-                node["halls"].add(hall)
-            node["count"] += int(n)
-
-        tunnel_rooms = 0
-        total_edges = 0
-        wing_counts = Counter()
-        for data in room_data.values():
-            n_wings = len(data["wings"])
-            for wing in data["wings"]:
-                wing_counts[wing] += 1
-            if n_wings >= 2:
-                tunnel_rooms += 1
-                # Edges per multi-wing room: one per wing-pair per hall, matching
-                # build_graph's nested wa<wb × hall expansion.
-                total_edges += (n_wings * (n_wings - 1) // 2) * len(data["halls"])
-
-        top_tunnels = [
-            {"room": room, "wings": sorted(data["wings"]), "count": data["count"]}
-            # build_graph's graph_stats slices the top 10 by wing-count first,
-            # then keeps the multi-wing ones. An explicit room-name tiebreaker
-            # keeps the fast path deterministic across runs — preferable to
-            # leaning on SQLite's unspecified GROUP BY order. (Exact membership
-            # parity with the client path is unattainable anyway; the two never
-            # run on the same palace, since the backend picks one.)
-            for room, data in sorted(
-                room_data.items(), key=lambda kv: (-len(kv[1]["wings"]), kv[0])
-            )[:10]
-            if len(data["wings"]) >= 2
-        ]
-
-        return {
-            "total_rooms": len(room_data),
-            "tunnel_rooms": tunnel_rooms,
-            "total_edges": total_edges,
-            "rooms_per_wing": dict(wing_counts.most_common()),
-            "top_tunnels": top_tunnels,
-        }
+            rows = sqlite_room_wing_hall_counts(_config.palace_path, _config.collection_name)
+        else:
+            return None
     except Exception:
         logger.debug("sqlite graph_stats fast path failed; falling back", exc_info=True)
         return None
+    if rows is None:
+        return None
+    try:
+        return _graph_stats_from_grouped_rows(rows)
+    except Exception:
+        logger.debug("sqlite graph_stats reconstruction failed; falling back", exc_info=True)
+        return None
+
+
+def _graph_stats_from_grouped_rows(rows):
+    """Rebuild ``graph_stats`` from ``(room, wing, hall, n)`` grouped rows.
+
+    Backends may append a fifth ``last_date`` column for ``find_tunnels``;
+    stats do not use it, so extra columns are ignored rather than unpacked.
+    """
+    from collections import Counter, defaultdict
+
+    room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0})
+    for row in rows:
+        room, wing, hall, n = row[0], row[1], row[2], row[3]
+        if not room or room == "general" or not wing:
+            continue
+        node = room_data[room]
+        node["wings"].add(str(wing))
+        if hall:
+            node["halls"].add(str(hall))
+        node["count"] += int(n)
+
+    tunnel_rooms = 0
+    total_edges = 0
+    wing_counts = Counter()
+    for data in room_data.values():
+        n_wings = len(data["wings"])
+        for wing in data["wings"]:
+            wing_counts[wing] += 1
+        if n_wings >= 2:
+            tunnel_rooms += 1
+            total_edges += (n_wings * (n_wings - 1) // 2) * len(data["halls"])
+
+    top_tunnels = [
+        {"room": room, "wings": sorted(data["wings"]), "count": data["count"]}
+        for room, data in sorted(room_data.items(), key=lambda kv: (-len(kv[1]["wings"]), kv[0]))[
+            :10
+        ]
+        if len(data["wings"]) >= 2
+    ]
+    return {
+        "total_rooms": len(room_data),
+        "tunnel_rooms": tunnel_rooms,
+        "total_edges": total_edges,
+        "rooms_per_wing": dict(wing_counts.most_common()),
+        "top_tunnels": top_tunnels,
+    }
+
+
+def _graph_sqlite_reader():
+    """The sqlite grouped-counts reader for this palace, or ``None``.
+
+    ``None`` means the graph tools must go through the collection, which is
+    what keeps a missing or broken palace reporting a diagnostic instead of
+    an empty graph.
+    """
+    from .palace_graph import sqlite_grouped_counts_reader
+
+    return sqlite_grouped_counts_reader(_config)
+
+
+def _chroma_room_wing_hall_counts():
+    if not _config.palace_path:
+        return None
+    from .backends.chroma import sqlite_room_wing_hall_counts
+
+    return sqlite_room_wing_hall_counts(_config.palace_path, _config.collection_name)
 
 
 def tool_status():
@@ -2511,10 +2515,15 @@ def tool_get_aaak_spec():
 def tool_traverse_graph(start_room: str, max_hops: int = 2):
     """Walk the palace graph from a room. Find connected ideas across wings."""
     max_hops = max(1, min(max_hops, 10))
-    col = _get_collection()
-    if not col:
-        return _collection_error_or_no_palace()
-    return traverse(start_room, col=col, max_hops=max_hops)
+    # sqlite metadata path does not open HNSW. When it cannot serve, open the
+    # collection here so a missing/broken palace still reports why (#1379
+    # follow-up) instead of looking like a palace with no such room.
+    if _graph_sqlite_reader() is None:
+        col = _get_collection()
+        if not col:
+            return _collection_error_or_no_palace()
+        return traverse(start_room, col=col, max_hops=max_hops)
+    return traverse(start_room, max_hops=max_hops, config=_config)
 
 
 def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
@@ -2524,10 +2533,12 @@ def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
         wing_b = _sanitize_optional_name(wing_b, "wing_b")
     except ValueError as e:
         return {"error": str(e)}
-    col = _get_collection()
-    if not col:
-        return _collection_error_or_no_palace()
-    return find_tunnels(wing_a, wing_b, col=col)
+    if _graph_sqlite_reader() is None:
+        col = _get_collection()
+        if not col:
+            return _collection_error_or_no_palace()
+        return find_tunnels(wing_a, wing_b, col=col)
+    return find_tunnels(wing_a, wing_b, config=_config)
 
 
 def tool_graph_stats():
@@ -2838,15 +2849,18 @@ def _drawer_payload(record):
     return payload
 
 
-def _fetch_drawer_rows(col, where=None, page_size: int = 1000):
+def _fetch_drawer_rows(col, where=None, page_size: int = 1000, include=None):
+    include = include or ["documents", "metadatas"]
     ids = []
     documents = []
     metadatas = []
     offset = 0
+    want_docs = "documents" in include
+    want_meta = "metadatas" in include
 
     while True:
         kwargs = {
-            "include": ["documents", "metadatas"],
+            "include": include,
             "limit": page_size,
             "offset": offset,
         }
@@ -2864,14 +2878,72 @@ def _fetch_drawer_rows(col, where=None, page_size: int = 1000):
         ids.extend(batch_ids)
 
         for idx in range(len(batch_ids)):
-            documents.append(batch_docs[idx] if idx < len(batch_docs) else "")
-            metadatas.append(batch_metas[idx] if idx < len(batch_metas) else {})
+            documents.append(batch_docs[idx] if want_docs and idx < len(batch_docs) else "")
+            metadatas.append(batch_metas[idx] if want_meta and idx < len(batch_metas) else {})
 
         offset += len(batch_ids)
         if len(batch_ids) < page_size:
             break
 
     return ids, documents, metadatas
+
+
+def _page_physical_ids(page: list) -> list:
+    """The physical row ids backing one page of logical drawers."""
+    physical_ids = []
+    for drawer in page:
+        chunk_ids = drawer.get("chunk_ids") or (drawer.get("metadata") or {}).get("chunk_ids")
+        if chunk_ids:
+            physical_ids.extend(chunk_ids)
+        else:
+            physical_ids.append(drawer["drawer_id"])
+    return physical_ids
+
+
+def _apply_drawer_previews(page: list, docs_by_id: dict) -> None:
+    """Set ``content_preview`` from an already-fetched ``{id: document}`` map."""
+    for drawer in page:
+        chunk_ids = drawer.get("chunk_ids") or (drawer.get("metadata") or {}).get("chunk_ids")
+        if chunk_ids:
+            content = "".join(docs_by_id.get(cid, "") for cid in chunk_ids)
+        else:
+            content = docs_by_id.get(drawer["drawer_id"], "")
+        drawer["content_preview"] = _content_preview(content)
+
+
+def _fill_drawer_previews(col, page: list) -> None:
+    """Hydrate ``content_preview`` for a page of logical drawers only."""
+    physical_ids = _page_physical_ids(page)
+    if not physical_ids:
+        return
+    result = col.get(ids=physical_ids, include=["documents"])
+    ids = _chroma_field(result, "ids", []) or []
+    docs = _chroma_field(result, "documents", []) or []
+    docs_by_id = {doc_id: (docs[i] if i < len(docs) else "") or "" for i, doc_id in enumerate(ids)}
+    _apply_drawer_previews(page, docs_by_id)
+
+
+def _fill_drawer_previews_from_sqlite(page: list) -> None:
+    """Same, reading the page's documents straight from ``chroma.sqlite3``.
+
+    The list itself is answered from metadata only — joining documents into
+    that scan would pull the palace's entire verbatim text into memory to
+    render one page. This fetches just the rows on screen.
+    """
+    physical_ids = _page_physical_ids(page)
+    if not physical_ids:
+        return
+    from .backends.chroma import sqlite_documents_for_ids
+
+    docs_by_id = sqlite_documents_for_ids(
+        _config.palace_path, _config.collection_name, physical_ids
+    )
+    if docs_by_id is None:
+        # sqlite went unreadable between the two reads; previews are a
+        # display detail, so degrade to blank rather than fail the listing.
+        logger.debug("sqlite preview hydration failed; leaving previews empty")
+        return
+    _apply_drawer_previews(page, docs_by_id)
 
 
 def _collapse_drawer_rows(ids, documents, metadatas):
@@ -3055,7 +3127,7 @@ def tool_add_drawer(
                     "Drawer write was acknowledged but the new ID is not readable. "
                     "The palace index may be stale; run reconnect or repair."
                 )
-            _metadata_cache = None
+            _invalidate_overview_caches()
             logger.info(f"Filed drawer: {drawer_id} -> {wing}/{room}")
             return {
                 "success": True,
@@ -3090,7 +3162,7 @@ def tool_add_drawer(
                 "Drawer write was acknowledged but the new ID is not readable. "
                 "The palace index may be stale; run reconnect or repair."
             )
-        _metadata_cache = None
+        _invalidate_overview_caches()
         logger.info(f"Filed drawer: {drawer_id} -> {wing}/{room} ({len(chunk_ids)} chunks)")
         return {
             "success": True,
@@ -3128,7 +3200,7 @@ def tool_delete_drawer(drawer_id: str):
         )
 
         col.delete(ids=record["ids"])
-        _metadata_cache = None
+        _invalidate_overview_caches()
 
         logger.info("Deleted drawer: %s (%s rows)", drawer_id, len(record["ids"]))
 
@@ -3389,7 +3461,7 @@ def tool_mine(
         return payload
     finally:
         if not dry_run:
-            _metadata_cache = None
+            _invalidate_overview_caches()
 
 
 def _purge_source_closets(source_file: str, *, commit: bool) -> int:
@@ -3520,7 +3592,7 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
     )
     try:
         col.delete(where=where)
-        _metadata_cache = None
+        _invalidate_overview_caches()
         # Purge the matching closets too so the AAAK index doesn't keep stale
         # pointers at the now-deleted drawers (#1722). Done after the drawer
         # delete and intentionally best-effort: the drawers are already gone,
@@ -3580,7 +3652,7 @@ def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
             return {"success": False, "error": f"sync failed: {exc}"}
     finally:
         if apply:
-            _metadata_cache = None
+            _invalidate_overview_caches()
 
 
 def tool_get_drawer(drawer_id: str):
@@ -3629,10 +3701,6 @@ def tool_list_drawers(
     except ValueError as e:
         return {"error": str(e)}
 
-    col = _get_collection()
-    if not col:
-        return _collection_error_or_no_palace()
-
     try:
         where = None
         conditions = []
@@ -3647,7 +3715,22 @@ def tool_list_drawers(
         elif len(conditions) > 1:
             where = {"$and": conditions}
 
-        ids, documents, metadatas = _fetch_drawer_rows(col, where=where)
+        listed = None
+        if _is_chroma_backend() and _config.palace_path:
+            from .backends.chroma import sqlite_list_id_metadata
+
+            listed = sqlite_list_id_metadata(
+                _config.palace_path, _config.collection_name, where=where
+            )
+        if listed is not None:
+            # Documents are fetched for the displayed page only, below.
+            ids, metadatas = listed
+            documents = []
+        else:
+            col = _get_collection()
+            if not col:
+                return _collection_error_or_no_palace()
+            ids, documents, metadatas = _fetch_drawer_rows(col, where=where, include=["metadatas"])
         drawers = _collapse_drawer_rows(ids, documents, metadatas)
 
         if since_dt is not None or before_dt is not None:
@@ -3658,6 +3741,12 @@ def tool_list_drawers(
             ]
 
         page = drawers[offset : offset + limit]
+        if listed is not None:
+            _fill_drawer_previews_from_sqlite(page)
+        else:
+            col = _get_collection()
+            if col:
+                _fill_drawer_previews(col, page)
 
         return {
             "drawers": page,
@@ -3746,7 +3835,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             if stale_ids:
                 col.delete(ids=stale_ids)
 
-            _metadata_cache = None
+            _invalidate_overview_caches()
 
             logger.info("Updated drawer: %s (%s rows)", drawer_id, len(chunk_ids))
 
@@ -3765,7 +3854,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         update_kwargs["metadatas"] = [new_meta]
 
         col.update(**update_kwargs)
-        _metadata_cache = None
+        _invalidate_overview_caches()
 
         logger.info("Updated drawer: %s", drawer_id)
 
@@ -4557,8 +4646,10 @@ def _preview_event(event: dict) -> dict:
     Event bodies are stored verbatim and fleet status updates run to several
     KB, so listing many events full-body is a large payload. Preview keeps all
     routing/metadata fields and trims only ``body`` — enough to scan the stream
-    and decide which events to re-fetch in full (a targeted ``since_event_id``
-    call returns the untouched body)."""
+    and decide which events to re-fetch in full. ``since_event_id`` is
+    strictly *after* that id, so passing the truncated event's own id
+    skips it; repeat the original filters with ``preview=false`` (and
+    ``correlation_id`` / ``from_agent`` as needed) instead."""
     body = event.get("body") or ""
     if len(body) <= _PREVIEW_BODY_CHARS:
         return event
@@ -4586,8 +4677,9 @@ def tool_event_list(
 
     ``preview=True`` truncates each event's verbatim body to a short excerpt
     (marking ``body_truncated`` + ``body_length``) so scanning many events
-    stays cheap; re-fetch a specific event's full body with a targeted
-    ``since_event_id``.
+    stays cheap. ``since_event_id`` is strictly after that id, so do not
+    pass the truncated event's own id to re-fetch it — repeat the original
+    filters with ``preview=false``.
     """
     try:
         events = _call_logstream(
@@ -4924,7 +5016,7 @@ TOOLS = {
         "handler": tool_gossip_status,
     },
     "mempalace_mesh_peers": {
-        "description": "Mesh estate snapshot (RFC 004): this replica's identity, version vector and node profile; each configured peer's reachability, last sync outcome, remote version vector and advertised profile; origins known only transitively; and origin_profiles keyed by replica_id. Exactly the GET /sync/peers payload — tokens are never included.",
+        "description": "Mesh estate snapshot (RFC 004): this replica's identity, version vector and node profile; each configured peer's reachability, last sync outcome, remote version vector and advertised profile; origins known only transitively; origin_profiles keyed by replica_id; and estate_source saying whether the peer status was observed in this process or published by the palace's hub (with published_at and whether that hub is still alive). Exactly the GET /sync/peers payload — tokens are never included.",
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_mesh_peers,
     },
@@ -5472,8 +5564,16 @@ TOOLS = {
     },
     "mempalace_event_list": {
         "description": (
-            "List agent-coordination events with structured filters, oldest first. Use"
-            " since_event_id as the precise resume cursor (strictly after that event)."
+            "List agent-coordination events with structured filters, oldest first (append"
+            " order, not timestamp order). Use since_event_id as the resume cursor: it means"
+            " strictly after that event in append order, so it cannot skip anything. Do NOT"
+            " resume with since_created_at — a peer's event syncs in whenever it arrives, so"
+            " it can already be older than a timestamp cursor and be missed permanently;"
+            " since_created_at is a time window ('what happened today'), not a cursor. Store"
+            " the id of the last event you processed — that is your whole watcher state. Pass"
+            " preview=true when sweeping a busy stream. to_agent=<you> also matches '*'"
+            " broadcasts, so no second call is needed. To wait for something that has not"
+            " happened yet, use mempalace_event_wait instead of polling this."
         ),
         "input_schema": {
             "type": "object",
@@ -5498,8 +5598,10 @@ TOOLS = {
                 "since_created_at": {
                     "type": "string",
                     "description": (
-                        "Return events created at or after this time"
-                        " (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional)"
+                        "Time window filter, inclusive: events created at or after this time"
+                        " (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional). NOT a resume cursor"
+                        " — use since_event_id for that; a timestamp cursor silently drops"
+                        " peer events that sync in late. Dedup by id when using this."
                     ),
                 },
                 "limit": {"type": "integer", "description": "Max events to return (default 50)"},
@@ -5507,8 +5609,10 @@ TOOLS = {
                     "type": "boolean",
                     "description": (
                         "Truncate each event body to a short excerpt (marks body_truncated +"
-                        " body_length) so scanning many events stays cheap; re-fetch a specific"
-                        " event's full body with a targeted since_event_id (default false)"
+                        " body_length) so scanning many events stays cheap. since_event_id is"
+                        " strictly AFTER that id, so do not pass the truncated event's own id"
+                        " to re-fetch it — repeat the original filters with preview=false"
+                        " (default false)"
                     ),
                 },
             },
@@ -5517,8 +5621,14 @@ TOOLS = {
     },
     "mempalace_event_wait": {
         "description": (
-            "Block until a matching coordination event exists or the timeout expires (max 5"
-            " minutes). Returns {timed_out: true, events: []} on timeout instead of an error."
+            "Block until a matching coordination event exists or the timeout expires (default"
+            " 60s, max 5 minutes). Returns {timed_out: true, events: []} on timeout — a normal"
+            " result, not an error. This is the right tool for actively waiting on a"
+            " correlation_id you delegated or claimed. It already backs off internally, so do"
+            " not wrap it in a tight retry loop: on timeout just call it again with"
+            " since_event_id updated to the last event you processed. For long-lived consumers"
+            " (daemons, dashboards) prefer the push stream at GET /logstream/stream, which"
+            " takes the same filters and the same since_event_id resume."
         ),
         "input_schema": {
             "type": "object",
@@ -5543,8 +5653,8 @@ TOOLS = {
                 "since_created_at": {
                     "type": "string",
                     "description": (
-                        "Only match events created at or after this time"
-                        " (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional)"
+                        "Time window filter, inclusive (optional). NOT a resume cursor — use"
+                        " since_event_id, which cannot skip a late-syncing peer event."
                     ),
                 },
                 "timeout_ms": {
@@ -7304,15 +7414,58 @@ def _merge_known_profiles(profiles: dict) -> None:
         _KNOWN_PROFILES[origin] = profile
 
 
-def _known_profiles_snapshot() -> dict:
-    """Every origin profile this node can vouch for having seen — learned
-    ones first, own fresh self-profile last so it always wins for self."""
-    snapshot = dict(_KNOWN_PROFILES)
+def _known_profiles_snapshot(published: dict = None) -> dict:
+    """Every origin profile this node can vouch for having seen.
+
+    Published profiles first (the hub's, when this process is not the one
+    syncing), then any learned in this process, then our own fresh
+    self-profile last so it always wins for self.
+    """
+    if published is None:
+        published = _published_mesh_state()
+    snapshot = dict(published.get("profiles") or {})
+    snapshot.update(_KNOWN_PROFILES)
     try:
         snapshot[_call_logstream(lambda ls: ls.replica_id)] = _node_profile()
     except Exception:
         logger.debug("node profile: self profile unavailable", exc_info=True)
     return snapshot
+
+
+def _publish_mesh_state(palace_path: str) -> None:
+    """Write this process's estate where other local processes can read it.
+
+    The sync loop runs only in the HTTP transport, so without this the stdio
+    MCP servers agents connect through answer ``mempalace_mesh_peers`` from a
+    permanently empty ``_PEER_SYNC_STATE`` -- peers with a name and a url and
+    nothing else, and ``origin_profiles`` holding only this node. Never fatal:
+    a publish failure costs other processes their estate view, not this
+    process's convergence.
+    """
+    from . import server_registry
+
+    try:
+        server_registry.write_mesh_state(
+            palace_path,
+            peers=dict(_PEER_SYNC_STATE),
+            profiles=dict(_KNOWN_PROFILES),
+        )
+    except Exception:
+        logger.debug("mesh state publish failed", exc_info=True)
+
+
+def _published_mesh_state() -> dict:
+    """Read the estate published by this palace's hub, if any."""
+    from . import server_registry
+
+    palace_path = getattr(_config, "palace_path", None)
+    if not palace_path:
+        return {"peers": {}, "profiles": {}, "written_at": None, "writer_alive": False}
+    try:
+        return server_registry.read_mesh_state(palace_path)
+    except Exception:
+        logger.debug("mesh state read failed", exc_info=True)
+        return {"peers": {}, "profiles": {}, "written_at": None, "writer_alive": False}
 
 
 def _record_peer_sync(stats: dict) -> None:
@@ -7368,11 +7521,18 @@ def _mesh_peers_payload() -> dict:
         configured = load_peers(getattr(_config, "palace_path", None) or "")
     except (ValueError, TypeError):
         configured = []
+    # The peer sync loop lives in the HTTP transport, so in every other
+    # process _PEER_SYNC_STATE is empty and the only honest source is what
+    # the hub published. Prefer our own state when we have it (this process
+    # is the one syncing, so it is fresher than anything on disk) and fall
+    # back to the published estate per peer.
+    published = _published_mesh_state()
+    published_peers = published.get("peers") or {}
     named_origins = {replica_id}
     peers = []
     for peer in configured:
         name = peer.get("name") or peer["url"]
-        state = dict(_PEER_SYNC_STATE.get(name) or {})
+        state = dict(_PEER_SYNC_STATE.get(name) or published_peers.get(name) or {})
         state.pop("url", None)  # peers.json is authoritative for the url
         if state.get("replica_id"):
             named_origins.add(state["replica_id"])
@@ -7390,8 +7550,17 @@ def _mesh_peers_payload() -> dict:
         "unnamed_origins": sorted(set(local_vector) - named_origins),
         # Every self-described profile known here, keyed by replica_id —
         # including profiles of unnamed origins relayed through carriers.
-        "origin_profiles": _known_profiles_snapshot(),
+        "origin_profiles": _known_profiles_snapshot(published),
         "sync_interval_s": _peer_sync_interval_s(),
+        # Where the peer status above came from. in_process means this
+        # process runs the sync loop; otherwise the estate was published by
+        # the hub at published_at, and writer_alive says whether that hub is
+        # still running (a dead hub leaves a last-known-good reading).
+        "estate_source": {
+            "in_process": bool(_PEER_SYNC_STATE),
+            "published_at": published.get("written_at"),
+            "writer_alive": published.get("writer_alive", False),
+        },
     }
 
 
@@ -7443,6 +7612,9 @@ def _start_peer_sync_thread() -> None:
                             stats["pulled_events"],
                             stats["pulled_artifacts"],
                         )
+                # Publish once per round, not per peer: the estate is only
+                # coherent after every configured peer has been attempted.
+                _publish_mesh_state(palace_path)
                 malformed_logged = False
             except ValueError as exc:
                 if not malformed_logged:
