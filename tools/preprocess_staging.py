@@ -25,10 +25,12 @@ Intended to run as a step in a staging watcher pipeline::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import re
 import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger("preprocess_staging")
@@ -344,12 +346,24 @@ def preprocess_file(
     processed_dir: Path,
     max_lines: int,
     dry_run: bool = False,
+    rel: Path | None = None,
 ) -> list[Path]:
-    """Process a single file.  Returns list of output file paths."""
-    if should_skip(filepath):
+    """Process a single file.  Returns list of output file paths.
+
+    When *rel* is provided, it is the relative path inside *staging_dir* used
+    for output placement and skip checks; *filepath* is the actual source to
+    read.  This lets the caller preprocess a verified work copy of a file
+    while preserving the original staging tree layout.
+    """
+    if rel is None:
+        rel = filepath.relative_to(staging_dir)
+
+    # Skip checks are evaluated against the original staging path, not the
+    # work copy path, so filters like dotfiles and node_modules remain correct.
+    if should_skip(staging_dir / rel):
         return []
 
-    ext = filepath.suffix.lower()
+    ext = (staging_dir / rel).suffix.lower()
     if ext not in PROCESSABLE_EXTENSIONS and ext != "":
         return []
 
@@ -369,40 +383,60 @@ def preprocess_file(
     if dry_run:
         original_lines = len(content.split("\n"))
         cleaned_lines = len(cleaned.split("\n"))
-        print(f"  {filepath.name}: {original_lines} -> {cleaned_lines} lines")
+        print(f"  {rel.name}: {original_lines} -> {cleaned_lines} lines")
         return []
 
     # Preserve the directory structure of the staging tree under processed/
     # so that files with the same name in different subdirectories do not
     # overwrite each other.
-    rel = filepath.relative_to(staging_dir)
     output_dir = processed_dir / rel.parent
     output_dir.mkdir(parents=True, exist_ok=True)
 
     return split_file(rel, cleaned, max_lines, output_dir)
 
 
-def _read_batch_snapshot(snapshot_path: Path) -> list[Path] | None:
-    """Parse a batch snapshot file into a list of relative Paths.
+@dataclass(frozen=True)
+class _BatchRecord:
+    rel: Path
+    size: int
+    mtime: float
+    sha256: str
+
+
+def _sha256_file(path: Path) -> str:
+    """Return the hex SHA-256 of a file."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _read_batch_snapshot(snapshot_path: Path) -> list[_BatchRecord] | None:
+    """Parse a batch snapshot file into a list of _BatchRecord.
 
     Snapshots are unit-separator-delimited TSV records:
         rel_path\x1fsize\x1fmtime\x1fsha256\n
-    Only the relative path is used here.
+    All fields are used to verify the immutable claimed bytes before
+    preprocessing.
     """
-    rel_paths: list[Path] = []
+    records: list[_BatchRecord] = []
     try:
         with snapshot_path.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.rstrip("\n")
                 if not line:
                     continue
-                rel = line.split("\x1f", 1)[0]
-                if not rel:
+                parts = line.split("\x1f", 3)
+                if len(parts) < 4:
                     continue
-                rel_paths.append(Path(rel))
+                rel, size, mtime, sha256 = parts
+                if not rel or not sha256:
+                    continue
+                records.append(_BatchRecord(Path(rel), int(size), float(mtime), sha256))
     except (OSError, ValueError):
         return None
-    return rel_paths
+    return records
 
 
 def preprocess_directory(
@@ -414,8 +448,11 @@ def preprocess_directory(
     """Preprocess files in *staging_dir*.
 
     If *batch_snapshot* is provided, only the files listed in the snapshot are
-    preprocessed.  This prevents files that arrive after the batch was claimed
-    from being included in the current run.  Writes cleaned/split files to
+    preprocessed.  Each claimed file is copied into a private work directory
+    and verified against the sha256 recorded in the snapshot before its
+    content is read.  This makes preprocessing consume immutable claimed bytes
+    and prevents files that arrive or change after the batch was claimed from
+    being mined as part of the current run.  Writes cleaned/split files to
     ``staging_dir/processed/``.  Returns a stats dict.
     """
     staging = Path(staging_dir)
@@ -440,44 +477,79 @@ def preprocess_directory(
     }
 
     if batch_snapshot is not None:
-        snapshot_rels = _read_batch_snapshot(batch_snapshot)
-        if snapshot_rels is None:
+        records = _read_batch_snapshot(batch_snapshot)
+        if records is None:
             logger.warning("gossip: could not read batch snapshot %s", batch_snapshot)
             return stats
-        file_iter = (staging / rel for rel in snapshot_rels)
-    else:
-        file_iter = sorted(staging.rglob("*"))
 
-    for filepath in file_iter:
-        if not filepath.is_file():
-            continue
-        # Exclude anything inside the processed/ tree, including nested
-        # directories like processed/processed/... that could appear after
-        # failed retries.
-        rel = filepath.relative_to(staging)
-        if "processed" in rel.parts:
-            continue
-        if filepath.name == "mempalace.yaml":
-            continue
+        work_dir = staging / ".batch_work"
+        if work_dir.exists():
+            shutil.rmtree(work_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
 
-        stats["total_files"] += 1
+        for record in records:
+            rel = record.rel
+            src = staging / rel
+            if not src.is_file():
+                continue
+            if "processed" in rel.parts or ".batch_work" in rel.parts:
+                continue
+            if rel.name == "mempalace.yaml":
+                continue
 
-        if should_skip(filepath):
-            stats["skipped"] += 1
-            continue
+            # Copy to a private work directory and verify it matches the claim.
+            work_path = work_dir / rel
+            work_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, work_path)
 
-        try:
-            outputs = preprocess_file(filepath, staging, processed_dir, max_lines, dry_run)
-            if outputs:
-                stats["processed"] += 1
-                stats["output_files"] += len(outputs)
-                if len(outputs) > 1:
-                    stats["split"] += 1
-            elif not dry_run:
+            if _sha256_file(work_path) != record.sha256:
+                # The file changed after it was claimed. Do not mine the new
+                # content as part of this batch.
                 stats["skipped"] += 1
-        except Exception as e:
-            stats["errors"] += 1
-            print(f"  ERROR processing {filepath.name}: {e}", file=sys.stderr)
+                continue
+
+            stats["total_files"] += 1
+
+            try:
+                outputs = preprocess_file(
+                    work_path, staging, processed_dir, max_lines, dry_run, rel=rel
+                )
+                if outputs:
+                    stats["processed"] += 1
+                    stats["output_files"] += len(outputs)
+                    if len(outputs) > 1:
+                        stats["split"] += 1
+                elif not dry_run:
+                    stats["skipped"] += 1
+            except Exception as e:
+                stats["errors"] += 1
+                print(f"  ERROR processing {rel.name}: {e}", file=sys.stderr)
+
+    else:
+        for filepath in sorted(staging.rglob("*")):
+            if not filepath.is_file():
+                continue
+            # Exclude anything inside the processed/ or .batch_work/ trees.
+            rel = filepath.relative_to(staging)
+            if "processed" in rel.parts or ".batch_work" in rel.parts:
+                continue
+            if rel.name == "mempalace.yaml":
+                continue
+
+            stats["total_files"] += 1
+
+            try:
+                outputs = preprocess_file(filepath, staging, processed_dir, max_lines, dry_run)
+                if outputs:
+                    stats["processed"] += 1
+                    stats["output_files"] += len(outputs)
+                    if len(outputs) > 1:
+                        stats["split"] += 1
+                elif not dry_run:
+                    stats["skipped"] += 1
+            except Exception as e:
+                stats["errors"] += 1
+                print(f"  ERROR processing {rel.name}: {e}", file=sys.stderr)
 
     return stats
 
