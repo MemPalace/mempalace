@@ -106,33 +106,39 @@ def test_default_gossip_path_uses_home():
 
 
 def test_chatter_node_from_dict():
-    node = ChatterNode.from_dict({
-        "id": "x",
-        "name": "X",
-        "wing": "orkid",
-        "hall": "technical",
-        "role": "tech",
-        "specialties": ["defi"],
-        "gossip_radius": ["orkid"],
-        "chatter_level": "high",
-        "propagation_speed": "instant",
-    })
+    node = ChatterNode.from_dict(
+        {
+            "id": "x",
+            "name": "X",
+            "wing": "orkid",
+            "hall": "technical",
+            "role": "tech",
+            "specialties": ["defi"],
+            "gossip_radius": ["orkid"],
+            "chatter_level": "high",
+            "propagation_speed": "instant",
+        }
+    )
     assert node.id == "x"
     assert node.chatter_level == "high"
     assert node.match_score("new defi strategy", source_wing="orkid") > 0.5
 
 
 def test_chatter_node_match_score_ignores_unknown_wing():
-    node = ChatterNode.from_dict({
-        "id": "x",
-        "name": "X",
-        "wing": "orkid",
-        "hall": "technical",
-        "role": "tech",
-        "specialties": ["defi"],
-        "gossip_radius": ["orkid"],
-    })
-    assert node.match_score("defi", source_wing="unknown") < node.match_score("defi", source_wing="orkid")
+    node = ChatterNode.from_dict(
+        {
+            "id": "x",
+            "name": "X",
+            "wing": "orkid",
+            "hall": "technical",
+            "role": "tech",
+            "specialties": ["defi"],
+            "gossip_radius": ["orkid"],
+        }
+    )
+    assert node.match_score("defi", source_wing="unknown") < node.match_score(
+        "defi", source_wing="orkid"
+    )
 
 
 def test_gossip_message_expiry():

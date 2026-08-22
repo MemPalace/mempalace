@@ -222,7 +222,9 @@ def _merge_with_default(raw: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
-def load_gossip_config(path: Optional[str] = None, config: MempalaceConfig = None) -> dict[str, Any]:
+def load_gossip_config(
+    path: Optional[str] = None, config: MempalaceConfig = None
+) -> dict[str, Any]:
     """Load gossip configuration from ``path`` or the default location.
 
     If the file does not exist, the default configuration is returned and
@@ -359,7 +361,9 @@ class GossipProtocol:
         config: Optional[dict[str, Any]] = None,
     ):
         self.mempalace_config = mempalace_config
-        self.config = config if config is not None else load_gossip_config(config_path, mempalace_config)
+        self.config = (
+            config if config is not None else load_gossip_config(config_path, mempalace_config)
+        )
         self._chatter_nodes = [ChatterNode.from_dict(n) for n in self.config["chatter_nodes"]]
         self.kg = kg
         self._kg_path = kg_path
@@ -564,12 +568,12 @@ class GossipProtocol:
                     )
                     report["triples_written"] += 1
                     node_report["successful_targets"] += 1
-                    node_report["targets"].append(
-                        {"wing": target_wing, "room": target_room}
-                    )
+                    node_report["targets"].append({"wing": target_wing, "room": target_room})
                     any_success = True
                 except Exception as exc:
-                    logger.debug("gossip: kg add failed for %s/%s", target_wing, target_room, exc_info=True)
+                    logger.debug(
+                        "gossip: kg add failed for %s/%s", target_wing, target_room, exc_info=True
+                    )
                     node_report["failed_targets"].append(
                         {
                             "wing": target_wing,
