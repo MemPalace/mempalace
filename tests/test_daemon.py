@@ -1182,6 +1182,42 @@ def test_run_mine_invalid_mode_returns_structured_error(tmp_path):
     assert out["exit_code"] == 2
 
 
+def test_run_mine_source_adapter_dispatches_through_adapter_runner(tmp_path, monkeypatch):
+    """Daemon mine jobs preserve the CLI's explicit source-adapter dispatch."""
+    from mempalace import cli, service
+
+    received = {}
+
+    def fake_mine_source_adapter(**kwargs):
+        received.update(kwargs)
+        return 3
+
+    monkeypatch.setattr(cli, "mine_source_adapter", fake_mine_source_adapter)
+    palace = tmp_path / "palace"
+    out = service.run_mine(
+        {
+            "palace_path": str(palace),
+            "source": "/source",
+            "source_adapter": "fixture",
+            "dry_run": True,
+        }
+    )
+
+    assert received == {
+        "source_name": "fixture",
+        "source_path": "/source",
+        "palace_path": str(palace.resolve()),
+        "dry_run": True,
+    }
+    assert out == {
+        "success": True,
+        "kind": "mine",
+        "mode": "source",
+        "dry_run": True,
+        "exit_code": 0,
+    }
+
+
 def test_run_mcp_tool_rejects_non_dict_arguments():
     from mempalace import service
 

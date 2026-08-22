@@ -60,8 +60,10 @@ and violates MemPalace's "memory should feel instant" budget.
    stored content — quoting the exact words is the point of the system.
 5. After a substantive session, record continuity with
    `mempalace_diary_write` (skip if a background hook already saved).
-6. When a fact changes: `mempalace_kg_invalidate` the old fact, then
-   `mempalace_kg_add` the new one.
+6. When a fact changes: use `mempalace_kg_supersede` for
+   single-valued replacements, `mempalace_kg_invalidate` for facts that
+   ended without replacement, and `mempalace_kg_add` for
+   independent/coexisting facts.
 
 The full canonical protocol — shared verbatim with the Cursor recall
 rule and the other integrations — lives in
@@ -73,6 +75,7 @@ rule and the other integrations — lives in
 |---|---|
 | Find any memory by meaning | `mempalace_search` (start here) |
 | Relational / time-bound facts about an entity | `mempalace_kg_query` |
+| Replace a single-valued fact | `mempalace_kg_supersede` |
 | The chronological story of an entity | `mempalace_kg_timeline` |
 | Recent session continuity | `mempalace_diary_read` |
 | Which wings / rooms exist (scope unknown) | `mempalace_list_wings`, `mempalace_list_rooms` |
@@ -81,6 +84,13 @@ rule and the other integrations — lives in
 `mempalace_search` takes a short natural-language `query` (keywords or a
 question — not a system prompt or pasted conversation) plus optional
 `wing` / `room` filters and `limit` (default 5).
+
+**Active coordination is not recall.** When delegating work to another
+agent on the shared hub — or waiting for its reply or patch — use the
+logstream tools (`mempalace_event_append`, `mempalace_event_wait`,
+`mempalace_patch_submit`, `mempalace_artifact_get`), not drawers or
+search. The canonical protocol lives in
+[`integrations/shared/coordination-protocol.md`](../../integrations/shared/coordination-protocol.md).
 
 ## Unhappy paths
 
@@ -105,7 +115,9 @@ question — not a system prompt or pasted conversation) plus optional
   Do not attempt an in-process repair from the agent. Full steps are in
   the shared protocol's "Recovering a corrupt index" section.
 - **Conflicting facts.** Trust the knowledge graph's time-valid answer;
-  invalidate-then-add rather than overwriting silently.
+  use `mempalace_kg_supersede` for single-valued replacements,
+  `mempalace_kg_invalidate` for facts that ended without replacement,
+  and `mempalace_kg_add` for independent/coexisting facts.
 
 ## Anti-patterns — never do these
 

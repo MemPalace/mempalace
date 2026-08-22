@@ -44,6 +44,7 @@ except (OSError, AttributeError):
 sys.stdout = sys.stderr
 
 import argparse  # noqa: E402  (deferred until after stdio protection above)
+import contextlib  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
 import re  # noqa: E402
@@ -55,6 +56,7 @@ import time  # noqa: E402
 from datetime import date, datetime  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Optional  # noqa: E402
+from urllib.parse import urlparse  # noqa: E402
 
 from .config import (  # noqa: E402
     MempalaceConfig,
@@ -77,6 +79,7 @@ from .backends.chroma import (  # noqa: E402
     reset_hnsw_capacity_cache,
 )
 from .backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
+from .date_window import filed_at_in_window, parse_date_bound  # noqa: E402
 from .query_sanitizer import sanitize_query  # noqa: E402
 from .searcher import (  # noqa: E402
     _distance_to_similarity,
@@ -98,6 +101,7 @@ from .hallways import (  # noqa: E402
 )
 
 from .knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH  # noqa: E402
+from .logstream import LOGSTREAM_DB_FILENAME, Logstream  # noqa: E402
 from .collision_scan import assert_no_collisions  # noqa: E402
 from .ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
 
@@ -325,6 +329,9 @@ _READ_ONLY = bool(getattr(_args, "read_only", False)) or os.environ.get(
 
 _kg_by_path: dict[str, KnowledgeGraph] = {}
 _kg_cache_lock = threading.Lock()
+
+_logstream_by_path: dict[str, Logstream] = {}
+_logstream_cache_lock = threading.Lock()
 _palace_flag_given: bool = bool(_args.palace)
 
 # MCP server idle auto-exit (#1552).  Stale MCP servers from ended Claude
@@ -355,6 +362,21 @@ _SQLITE_INTEGRITY_ALLOWED_TOOLS = frozenset(
     {
         "mempalace_status",
         "mempalace_reconnect",
+        # RFC 003: logstream lives in its own logstream.sqlite3 with no
+        # Chroma/FTS5 dependency, so agent coordination stays available
+        # even while the main palace index is corrupt and under repair.
+        "mempalace_event_append",
+        "mempalace_event_list",
+        "mempalace_event_wait",
+        "mempalace_event_ack",
+        "mempalace_artifact_put",
+        "mempalace_artifact_get",
+        "mempalace_patch_submit",
+        # RFC 004: the estate is observability — logstream + sync state +
+        # peers.json, no FTS5 dependency (the profile's drawer count
+        # degrades gracefully). A damaged palace is exactly when mesh
+        # visibility matters most; caught live on the third replica.
+        "mempalace_mesh_peers",
     }
 )
 
@@ -464,8 +486,53 @@ _MUTATING_TOOLS = frozenset(
         "mempalace_sync",
         "mempalace_update_drawer",
         "mempalace_diary_write",
+        "mempalace_event_append",
+        "mempalace_event_ack",
+        "mempalace_artifact_put",
+        "mempalace_patch_submit",
     }
 )
+
+# Logstream mutating tools (RFC 003) write only to logstream.sqlite3 — an
+# independent WAL database with no Chroma/HNSW in-memory state — so the
+# peer-writer lease that protects Chroma does not apply to them. Exempting
+# them keeps agent coordination alive while a CLI mine or a peer stdio
+# writer holds the palace lock. They remain in _MUTATING_TOOLS so operator
+# read-only mode (--read-only / MEMPALACE_MCP_READ_ONLY) still hides and
+# refuses them.
+_PEER_WRITER_EXEMPT_TOOLS = frozenset(
+    {
+        "mempalace_event_append",
+        "mempalace_event_ack",
+        "mempalace_artifact_put",
+        "mempalace_patch_submit",
+    }
+)
+
+# The subset of _MUTATING_TOOLS whose write path reaches the chroma vector
+# segment. Deliberately narrower: the knowledge-graph and tunnel/hallway tools
+# keep their own sqlite/JSON state and never touch HNSW, so an unusable vector
+# index has no say over them.
+#
+# The distinction earns its keep because a write into a diverged HNSW segment
+# does not fail — it blocks inside chromadb's Rust upsert with no timeout of its
+# own, for the life of the process, while this server holds the palace mine lock
+# and the writer lease. One stuck call becomes a palace-wide outage that a still
+# healthy handshake hides.
+_VECTOR_WRITE_TOOLS = frozenset(
+    {
+        "mempalace_add_drawer",
+        "mempalace_update_drawer",
+        "mempalace_delete_drawer",
+        "mempalace_delete_by_source",
+        "mempalace_diary_write",
+        "mempalace_checkpoint",
+        "mempalace_mine",
+        "mempalace_sync",
+    }
+)
+
+_DIVERGED_INDEX_ERROR_CODE = -32004
 
 # Read-only mode (#1877) refuses a wider set than the peer-writer guard above.
 #
@@ -502,6 +569,107 @@ _READ_ONLY_REFUSED_TOOLS = _MUTATING_TOOLS | {
     "mempalace_hook_settings",
     "mempalace_memories_filed_away",
 }
+
+
+# Stale-library write gate (#899).
+#
+# A long-lived MCP server imports mempalace and its storage backend once and
+# then serves from those in-memory modules for the whole life of the process.
+# Upgrading the package on disk mid-session (`pip install -U mempalace`,
+# `uv tool upgrade`, `pipx install --force`) cannot reach it: Python caches
+# modules in sys.modules and never reloads them. The server keeps accepting
+# writes, produced by code the user no longer has installed, and reports
+# success for every one of them.
+#
+# #457 is the same condition with the volume turned up: upgrading mempalace
+# tightened its ChromaDB pin and moved the installed ChromaDB across a
+# storage-format boundary (downwards, 1.5.6 to 0.6.3), the running server kept
+# serving the modules it had already loaded, and every tool call then failed
+# with `no such column: collections.schema_str` until the host was restarted. That one
+# announced itself. #899 reports the quiet variant, where the writes succeed in
+# a format the newly-installed library may not read back and nothing surfaces
+# until a fresh process opens the palace. Either way nothing told the running
+# server to stop first; `mempalace migrate` (#502) only recovers such a palace
+# after the fact.
+#
+# Watched distributions are the ones whose code writes the palace on this
+# machine: mempalace itself, plus chromadb when chromadb is the backend
+# actually serving. Its on-disk format has moved between releases, which is
+# what makes a superseded copy of it dangerous. The networked backends
+# (pgvector/qdrant/milvus) keep their format server-side, so a client-library
+# upgrade does not rewrite local files the same way, and they are deliberately
+# left out rather than gated on a guess.
+#
+# chromadb is a hard dependency rather than an extra, so it is installed even
+# for someone serving from pgvector, and watching it unconditionally would
+# refuse that person's writes over an upgrade to a library that touches nothing
+# they own. The backend is read once here, at import, from the same config the
+# server goes on to serve with. One that cannot be resolved counts as chroma:
+# watching a distribution that turns out not to matter costs a restart, while
+# not watching the one that does costs the silent corruption this exists to
+# prevent.
+#
+# The resolved versions are cached behind a stat-only fingerprint, so the common
+# case reads no metadata at all. That is not the same as free: building the
+# fingerprint lists every search root once and stats the watched metadata files
+# it finds there, and on a normal environment the listing is most of the cost.
+# It is paid only by mutating tools — the refusal checks the tool name before
+# anything else, so a read leaves the filesystem alone entirely. The one
+# exception among reads is mempalace_status, which pays it deliberately, being
+# the surface that reports this state.
+#
+# The cache is invalidated by that fingerprint and never by elapsed time,
+# because a time window is precisely the gap a post-upgrade write slips
+# through. The fingerprint covers what installers actually do: a renamed or
+# removed metadata directory, and a metadata file rewritten in place. It cannot
+# see a rewrite that leaves both the size and the recorded mtime untouched,
+# which needs the replacement to be the same length AND to land inside the
+# filesystem's timestamp granularity — nanoseconds on ext4, but roughly 15 ms
+# on Windows and two seconds on FAT. An upgrade arriving minutes into a session
+# clears that comfortably; an archive restore or a rewrite in the same tick as
+# the previous reading does not, and that case fails open, leaving the gate no
+# worse than its absence.
+# -32004 belongs to the diverged-index gate; this one takes the next free code
+# so a client can tell "restart the server" from "rebuild the index" without
+# parsing the message.
+_STALE_LIBRARY_ERROR_CODE = -32005
+
+
+def _stale_library_watched_dists() -> tuple:
+    """Distributions worth comparing, given the backend this server serves with."""
+    watched = ["mempalace"]
+    try:
+        backend = str(_config.backend).strip().lower()
+    except Exception:
+        # Config trouble is not a reason to narrow the check.
+        logger.debug("stale-library backend could not be resolved", exc_info=True)
+        backend = "chroma"
+    if backend == "chroma":
+        watched.append("chromadb")
+    return tuple(watched)
+
+
+_STALE_LIBRARY_WATCHED_DISTS = _stale_library_watched_dists()
+_MCP_ALLOW_STALE_LIBRARY_ENV = "MEMPALACE_MCP_ALLOW_STALE_LIBRARY"
+# A distribution version is PEP 440 text. This metadata is a file on disk that
+# the server does not own, and its value is quoted back to the client, so its
+# shape is checked before it is echoed anywhere.
+_VERSION_TEXT_RE = re.compile(r"\A[A-Za-z0-9._+!-]{1,64}\Z")
+# Reported in place of a version when a distribution that was installed at
+# startup is no longer installed at all. Not a valid PEP 440 version, so it can
+# never collide with a real one.
+_UNINSTALLED = "not installed"
+_stale_library_cache_lock = threading.Lock()
+_stale_library_cache: dict = {"signature": None, "versions": {}, "errors": {}}
+# What has already been announced to the log, so a persistent condition is
+# reported once rather than on every mutating call. These have their own lock
+# because they are not part of the cached reading and outlive it: the cache is
+# dropped whenever a reading fails, while what was last logged has to survive
+# exactly that. Putting them behind the cache lock would also make the log
+# bookkeeping contend for it on every mutating call.
+_stale_library_log_lock = threading.Lock()
+_stale_library_reported_errors: dict = {}
+_stale_library_reported_drift: list = []
 
 
 def _truthy_env(name: str) -> bool:
@@ -572,8 +740,7 @@ def _discard_mcp_storage_handles() -> None:
     _collection_open_error = None
     _palace_db_inode = 0
     _palace_db_mtime = 0.0
-    _metadata_cache = None
-    _metadata_cache_time = 0
+    _invalidate_overview_caches()
 
 
 def _release_mcp_writer_lock() -> None:
@@ -869,7 +1036,7 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
 
 
 def _mcp_peer_writer_refusal(req_id, tool_name: str):
-    if tool_name not in _MUTATING_TOOLS:
+    if tool_name not in _MUTATING_TOOLS or tool_name in _PEER_WRITER_EXEMPT_TOOLS:
         return None
 
     ok, reason = _acquire_mcp_writer_lock()
@@ -1190,6 +1357,62 @@ def _call_kg(op):
             raise
 
 
+def _resolve_logstream_path() -> str:
+    """Resolve the RFC 003 logstream database path in the active palace.
+
+    Fails clearly (ValueError) when no palace path is configured — the
+    logstream must never silently write outside the palace directory.
+    """
+    palace_path = getattr(_config, "palace_path", None) or MempalaceConfig().palace_path
+    if not palace_path:
+        raise ValueError("no palace path configured; run mempalace init first")
+    return os.path.join(os.path.expanduser(palace_path), LOGSTREAM_DB_FILENAME)
+
+
+def _get_logstream(canonical_path=None) -> Logstream:
+    """Return the cached ``Logstream`` for the resolved palace.
+
+    Same canonical-key contract as :func:`_get_kg`: callers inside a retry
+    loop pass the captured key through so insert and evict keys cannot
+    drift apart under palace-path rotation.
+    """
+    path = (
+        canonical_path
+        if canonical_path is not None
+        else _canonicalize_kg_path(_resolve_logstream_path())
+    )
+    ls = _logstream_by_path.get(path)
+    if ls is not None:
+        return ls
+    with _logstream_cache_lock:
+        ls = _logstream_by_path.get(path)
+        if ls is None:
+            ls = Logstream(db_path=path)
+            _logstream_by_path[path] = ls
+    return ls
+
+
+def _call_logstream(op):
+    """Run ``op(logstream)`` with one-shot retry on a closed connection.
+
+    Mirrors :func:`_call_kg`: ``tool_reconnect`` on another thread can
+    close the cached handle between lookup and use; evict the stale entry
+    and retry once with a fresh instance.
+    """
+    path = _canonicalize_kg_path(_resolve_logstream_path())
+    for attempt in range(2):
+        ls = _get_logstream(path)
+        try:
+            return op(ls)
+        except sqlite3.ProgrammingError:
+            if attempt == 0:
+                with _logstream_cache_lock:
+                    if _logstream_by_path.get(path) is ls:
+                        _logstream_by_path.pop(path, None)
+                continue
+            raise
+
+
 _client_cache = None
 _collection_cache = None
 _collection_cache_backend = None
@@ -1242,8 +1465,7 @@ def _force_chroma_cache_reset() -> None:
     _collection_open_error = None
     _palace_db_inode = 0
     _palace_db_mtime = 0.0
-    _metadata_cache = None
-    _metadata_cache_time = 0
+    _invalidate_overview_caches()
     # This runs on the #1315 retry path, which drops caches precisely to
     # re-observe the palace after a transient index error. The capacity verdict
     # is another cached view of that same palace, so it must be dropped too, or
@@ -1401,13 +1623,19 @@ def _get_client():
         _refresh_vector_disabled_flag()
         if inode_changed or mtime_changed:
             ChromaBackend._quarantined_paths.discard(_config.palace_path)
+            # #2002: a peer process changed chroma.sqlite3 on disk. chromadb
+            # caches its System (and the live HNSW segment) keyed by path, so
+            # make_client() below would hand back the STALE segment, which then
+            # persists its outdated index over the peer's writes, driving the
+            # persisted count backwards. Drop chromadb's shared cache first so
+            # make_client() rebuilds the segment from the on-disk state.
+            _force_chroma_cache_reset()
         _client_cache = ChromaBackend.make_client(_config.palace_path)
         _collection_cache = None
         _collection_cache_backend = None
         _collection_cache_palace = None
         _collection_open_error = None
-        _metadata_cache = None
-        _metadata_cache_time = 0
+        _invalidate_overview_caches()
         _palace_db_inode = current_inode
         _palace_db_mtime = current_mtime
     return _client_cache
@@ -1494,8 +1722,7 @@ def _get_collection(create=False):
                     _collection_cache_backend = backend_name
                     _collection_cache_palace = _config.palace_path
                     _collection_open_error = None
-                    _metadata_cache = None
-                    _metadata_cache_time = 0
+                    _invalidate_overview_caches()
                 return _collection_cache
             except (BackendMismatchError, KeyError) as exc:
                 logger.warning("backend open failed for %s: %s", _config.palace_path, exc)
@@ -1509,8 +1736,7 @@ def _get_collection(create=False):
                 _collection_cache = None
                 _collection_cache_backend = None
                 _collection_cache_palace = None
-                _metadata_cache = None
-                _metadata_cache_time = 0
+                _invalidate_overview_caches()
                 return None
             except Exception:
                 logger.exception(
@@ -1522,8 +1748,7 @@ def _get_collection(create=False):
                 _collection_cache = None
                 _collection_cache_backend = None
                 _collection_cache_palace = None
-                _metadata_cache = None
-                _metadata_cache_time = 0
+                _invalidate_overview_caches()
                 _collection_open_error = {
                     "error": "Backend open failed",
                     "details": "Could not open the selected backend collection.",
@@ -1599,8 +1824,7 @@ def _get_collection(create=False):
                 _collection_cache_backend = "chroma"
                 _collection_cache_palace = _config.palace_path
                 _collection_open_error = None
-                _metadata_cache = None
-                _metadata_cache_time = 0
+                _invalidate_overview_caches()
             elif _collection_cache is None:
                 ef = ChromaBackend._resolve_embedding_function()
                 ef_kwargs = {"embedding_function": ef} if ef is not None else {}
@@ -1610,8 +1834,7 @@ def _get_collection(create=False):
                 _collection_cache_backend = "chroma"
                 _collection_cache_palace = _config.palace_path
                 _collection_open_error = None
-                _metadata_cache = None
-                _metadata_cache_time = 0
+                _invalidate_overview_caches()
             return _collection_cache
         except (BackendMismatchError, KeyError) as exc:
             _collection_open_error = {
@@ -1627,8 +1850,7 @@ def _get_collection(create=False):
             _collection_cache_palace = None
             _palace_db_inode = 0
             _palace_db_mtime = 0.0
-            _metadata_cache = None
-            _metadata_cache_time = 0
+            _invalidate_overview_caches()
             return None
         except Exception:
             logger.exception(
@@ -1648,8 +1870,7 @@ def _get_collection(create=False):
                 _collection_cache_palace = None
                 _palace_db_inode = 0
                 _palace_db_mtime = 0.0
-                _metadata_cache = None
-                _metadata_cache_time = 0
+                _invalidate_overview_caches()
                 _collection_open_error = {
                     "error": "Backend open failed",
                     "details": "Could not open the Chroma collection.",
@@ -1661,8 +1882,7 @@ def _get_collection(create=False):
     _collection_cache_palace = None
     _palace_db_inode = 0
     _palace_db_mtime = 0.0
-    _metadata_cache = None
-    _metadata_cache_time = 0
+    _invalidate_overview_caches()
     _collection_open_error = _collection_open_error or {
         "error": "Backend open failed",
         "details": "Could not open the selected backend collection.",
@@ -1783,7 +2003,19 @@ def _supports_metadata_facets(col) -> bool:
 _metadata_cache = None
 _metadata_cache_time = 0
 _METADATA_CACHE_TTL = 5.0  # seconds
+_taxonomy_cache = None
+_taxonomy_cache_time = 0.0
+_TAXONOMY_CACHE_TTL = 5.0  # seconds — same idea as the palace-graph cache
 _MAX_RESULTS = 100  # upper bound for search/list limit params
+
+
+def _invalidate_overview_caches():
+    """Drop status/list_wings taxonomy and metadata page caches after writes."""
+    global _metadata_cache, _metadata_cache_time, _taxonomy_cache, _taxonomy_cache_time
+    _metadata_cache = None
+    _metadata_cache_time = 0
+    _taxonomy_cache = None
+    _taxonomy_cache_time = 0.0
 
 
 def _get_cached_metadata(col, where=None):
@@ -1845,75 +2077,12 @@ def _sanitize_optional_source_file(value: str = None) -> str:
     return value
 
 
-def _parse_date_filter(value: Optional[str] = None, field_name: str = "date") -> Optional[datetime]:
-    """Parse an optional ISO-8601 date/datetime filter bound (#1128).
-
-    Accepts a date (``"2026-04-01"``), a naive timestamp
-    (``"2026-04-01T09:30:00"``), or one carrying a ``Z``/``+HH:MM`` offset.
-    Returns a naive ``datetime`` for wall-clock
-    comparison against drawer ``filed_at`` values, which are stored as naive
-    local ISO strings (``datetime.now().isoformat()``). Any timezone offset on
-    the input is dropped so an aware bound never raises a ``TypeError`` against
-    a naive ``filed_at``. Comparison is therefore wall-clock, which is what the
-    local-first single-machine model wants; an offset bound is matched on its
-    wall-clock fields, not its absolute instant, so a bound whose offset differs
-    from the zone ``filed_at`` was recorded in is matched by clock time.
-    The accepted grammar is a date, an ISO timestamp (optionally fractional),
-    and an optional ``Z``/``±HH:MM`` offset; other ISO 8601 forms (basic format,
-    week dates) are outside the contract and are rejected on the Python 3.9 floor
-    even where a newer ``fromisoformat`` would accept them.
-    Blank / whitespace-only means "no filter" (``None``).
-    Raises ``ValueError`` on an unparseable value so the caller can surface a
-    clear error, mirroring the wing/room sanitizers.
-    """
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise ValueError(f"{field_name} must be an ISO date string")
-    value = value.strip()
-    if not value:
-        return None
-    # datetime.fromisoformat before Python 3.11 rejects a trailing "Z" (Zulu),
-    # and appending "+00:00" would break a date-only value on 3.9/3.10
-    # ("2026-04-01+00:00" is rejected there). Any offset is dropped below for
-    # wall-clock comparison anyway, so just strip a trailing Z/z; both date and
-    # date-time Zulu inputs then parse on the 3.9 floor.
-    iso = value[:-1] if value.endswith(("Z", "z")) else value
-    try:
-        parsed = datetime.fromisoformat(iso)
-    except ValueError as exc:
-        raise ValueError(
-            f"{field_name} must be an ISO date string "
-            f"(e.g. '2026-04-01' or '2026-04-01T09:30:00'), got {value!r}"
-        ) from exc
-    if parsed.tzinfo is not None:
-        parsed = parsed.replace(tzinfo=None)
-    return parsed
-
-
-def _filed_at_in_window(
-    filed_at, since_dt: Optional[datetime], before_dt: Optional[datetime]
-) -> bool:
-    """True if a drawer's ``filed_at`` falls in ``[since, before)`` (#1128).
-
-    ``since`` is inclusive and ``before`` is exclusive, matching the issue spec.
-    Parsing (``Z``/offset normalization, tz drop) is delegated to
-    ``_parse_date_filter`` so a bound and a ``filed_at`` are compared
-    identically. A drawer whose ``filed_at`` is missing or unparseable cannot
-    be confirmed in-window, so it is EXCLUDED whenever a bound is active — a
-    date-filtered listing must never silently include rows of unknown age.
-    """
-    try:
-        filed_dt = _parse_date_filter(filed_at, "filed_at")
-    except ValueError:
-        return False
-    if filed_dt is None:
-        return False
-    if since_dt is not None and filed_dt < since_dt:
-        return False
-    if before_dt is not None and filed_dt >= before_dt:
-        return False
-    return True
+# The #1128 date-filter helpers moved to ``mempalace.date_window`` so the
+# search-side window (#463) can share them without importing this module
+# (whose import installs MCP stdio protection). Aliased under their
+# historical private names — every call site and test keeps working.
+_parse_date_filter = parse_date_bound
+_filed_at_in_window = filed_at_in_window
 
 
 # ==================== READ TOOLS ====================
@@ -1993,23 +2162,36 @@ def _tool_status_via_sqlite() -> dict:
 
 
 def _sqlite_taxonomy():
-    """Fast wing→room tally straight from ``chroma.sqlite3`` (#1748 / #1379).
+    """Fast wing→room tally from the backend's sqlite metadata (#1748 / #1379).
 
     Returns ``(total, {wing: {room: count}})`` or ``None`` to signal the
-    caller to fall back to the ChromaDB client pagination path. ``None`` means
-    a non-chroma backend, a missing/unbootstrapped palace, or a sqlite error —
-    exactly the cases ``backends.chroma._sqlite_wing_room_counts`` already
-    handles for the CLI ``miner.status()``. The point is to answer the
-    overview tools from the relational metadata without cold-loading the HNSW
-    index, which costs tens of seconds per call on large palaces and is what
-    times them out under the MCP host limit.
+    caller to fall back to the collection pagination path. ``None`` means
+    an unsupported backend, a missing/unbootstrapped palace, or a sqlite error.
+    Chroma reads ``chroma.sqlite3`` so status does not cold-load HNSW.
+    sqlite_exact reads ``sqlite_exact.sqlite3`` with one ``json_extract``
+    GROUP BY so status does not page every metadata row.
     """
-    if not _is_chroma_backend():
-        return None
+    global _taxonomy_cache, _taxonomy_cache_time
+    now = time.time()
+    cache_key = (_config.palace_path, _config.collection_name)
+    if (
+        _taxonomy_cache is not None
+        and _taxonomy_cache[0] == cache_key
+        and (now - _taxonomy_cache_time) < _TAXONOMY_CACHE_TTL
+    ):
+        return _taxonomy_cache[1]
+    counts = None
     try:
-        from .backends.chroma import _sqlite_wing_room_counts
+        if _is_chroma_backend():
+            from .backends.chroma import _sqlite_wing_room_counts
 
-        counts = _sqlite_wing_room_counts(_config.palace_path, _config.collection_name)
+            counts = _sqlite_wing_room_counts(_config.palace_path, _config.collection_name)
+        elif _selected_backend_name() == "sqlite_exact":
+            from .backends.sqlite_exact import sqlite_wing_room_counts
+
+            counts = sqlite_wing_room_counts(_config.palace_path, _config.collection_name)
+        else:
+            return None
     except Exception:
         logger.debug("sqlite taxonomy fast path failed; falling back", exc_info=True)
         return None
@@ -2030,7 +2212,10 @@ def _sqlite_taxonomy():
         for room, n in room_counts.items():
             rkey = _norm(room)
             dest[rkey] = dest.get(rkey, 0) + n
-    return total, normalized
+    result = total, normalized
+    _taxonomy_cache = (cache_key, result)
+    _taxonomy_cache_time = now
+    return result
 
 
 def _sqlite_graph_stats():
@@ -2050,105 +2235,92 @@ def _sqlite_graph_stats():
     wing and a usable room name (the catch-all ``"general"`` is excluded), and
     edges are the per-hall cross-wing crossings of multi-wing rooms.
     """
-    if not _is_chroma_backend():
-        return None
-    import sqlite3 as _sqlite3
-    from collections import Counter, defaultdict
-
-    if not _config.palace_path:
-        return None
-    db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
-    if not os.path.isfile(db_path):
-        return None
-    collection_name = _config.collection_name
-    # Treat any failure as a soft fallback to the client path (sqlite errors,
-    # but also an unexpected schema shape tripping the reconstruction) so
-    # graph_stats degrades to build_graph() rather than raising — mirroring the
-    # sibling sqlite fast paths (_sqlite_taxonomy / _sqlite_wing_room_counts).
+    rows = None
     try:
-        conn = _sqlite3.connect(sqlite_read_uri(db_path), uri=True)
-        try:
-            conn.execute("PRAGMA busy_timeout = 3000")
-            if (
-                conn.execute(
-                    "SELECT 1 FROM collections WHERE name = ?", (collection_name,)
-                ).fetchone()
-                is None
-            ):
-                return None
-            rows = conn.execute(
-                """
-                SELECT
-                    COALESCE(rm.string_value, CAST(rm.int_value AS TEXT),
-                             CAST(rm.float_value AS TEXT), '') AS room,
-                    COALESCE(wm.string_value, CAST(wm.int_value AS TEXT),
-                             CAST(wm.float_value AS TEXT), '') AS wing,
-                    COALESCE(hm.string_value, CAST(hm.int_value AS TEXT),
-                             CAST(hm.float_value AS TEXT), '') AS hall,
-                    COUNT(*) AS n
-                FROM embeddings e
-                JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
-                JOIN collections c ON s.collection = c.id
-                LEFT JOIN embedding_metadata rm ON rm.id = e.id AND rm.key = 'room'
-                LEFT JOIN embedding_metadata wm ON wm.id = e.id AND wm.key = 'wing'
-                LEFT JOIN embedding_metadata hm ON hm.id = e.id AND hm.key = 'hall'
-                WHERE c.name = ?
-                GROUP BY room, wing, hall
-                """,
-                (collection_name,),
-            ).fetchall()
-        finally:
-            conn.close()
+        if _is_chroma_backend():
+            rows = _chroma_room_wing_hall_counts()
+        elif _selected_backend_name() == "sqlite_exact":
+            from .backends.sqlite_exact import sqlite_room_wing_hall_counts
 
-        # Reconstruct build_graph()'s room_data, applying its per-drawer filter
-        # (`if room and room != "general" and wing`).
-        room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0})
-        for room, wing, hall, n in rows:
-            if not room or room == "general" or not wing:
-                continue
-            node = room_data[room]
-            node["wings"].add(wing)
-            if hall:
-                node["halls"].add(hall)
-            node["count"] += int(n)
-
-        tunnel_rooms = 0
-        total_edges = 0
-        wing_counts = Counter()
-        for data in room_data.values():
-            n_wings = len(data["wings"])
-            for wing in data["wings"]:
-                wing_counts[wing] += 1
-            if n_wings >= 2:
-                tunnel_rooms += 1
-                # Edges per multi-wing room: one per wing-pair per hall, matching
-                # build_graph's nested wa<wb × hall expansion.
-                total_edges += (n_wings * (n_wings - 1) // 2) * len(data["halls"])
-
-        top_tunnels = [
-            {"room": room, "wings": sorted(data["wings"]), "count": data["count"]}
-            # build_graph's graph_stats slices the top 10 by wing-count first,
-            # then keeps the multi-wing ones. An explicit room-name tiebreaker
-            # keeps the fast path deterministic across runs — preferable to
-            # leaning on SQLite's unspecified GROUP BY order. (Exact membership
-            # parity with the client path is unattainable anyway; the two never
-            # run on the same palace, since the backend picks one.)
-            for room, data in sorted(
-                room_data.items(), key=lambda kv: (-len(kv[1]["wings"]), kv[0])
-            )[:10]
-            if len(data["wings"]) >= 2
-        ]
-
-        return {
-            "total_rooms": len(room_data),
-            "tunnel_rooms": tunnel_rooms,
-            "total_edges": total_edges,
-            "rooms_per_wing": dict(wing_counts.most_common()),
-            "top_tunnels": top_tunnels,
-        }
+            rows = sqlite_room_wing_hall_counts(_config.palace_path, _config.collection_name)
+        else:
+            return None
     except Exception:
         logger.debug("sqlite graph_stats fast path failed; falling back", exc_info=True)
         return None
+    if rows is None:
+        return None
+    try:
+        return _graph_stats_from_grouped_rows(rows)
+    except Exception:
+        logger.debug("sqlite graph_stats reconstruction failed; falling back", exc_info=True)
+        return None
+
+
+def _graph_stats_from_grouped_rows(rows):
+    """Rebuild ``graph_stats`` from ``(room, wing, hall, n)`` grouped rows.
+
+    Backends may append a fifth ``last_date`` column for ``find_tunnels``;
+    stats do not use it, so extra columns are ignored rather than unpacked.
+    """
+    from collections import Counter, defaultdict
+
+    room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0})
+    for row in rows:
+        room, wing, hall, n = row[0], row[1], row[2], row[3]
+        if not room or room == "general" or not wing:
+            continue
+        node = room_data[room]
+        node["wings"].add(str(wing))
+        if hall:
+            node["halls"].add(str(hall))
+        node["count"] += int(n)
+
+    tunnel_rooms = 0
+    total_edges = 0
+    wing_counts = Counter()
+    for data in room_data.values():
+        n_wings = len(data["wings"])
+        for wing in data["wings"]:
+            wing_counts[wing] += 1
+        if n_wings >= 2:
+            tunnel_rooms += 1
+            total_edges += (n_wings * (n_wings - 1) // 2) * len(data["halls"])
+
+    top_tunnels = [
+        {"room": room, "wings": sorted(data["wings"]), "count": data["count"]}
+        for room, data in sorted(room_data.items(), key=lambda kv: (-len(kv[1]["wings"]), kv[0]))[
+            :10
+        ]
+        if len(data["wings"]) >= 2
+    ]
+    return {
+        "total_rooms": len(room_data),
+        "tunnel_rooms": tunnel_rooms,
+        "total_edges": total_edges,
+        "rooms_per_wing": dict(wing_counts.most_common()),
+        "top_tunnels": top_tunnels,
+    }
+
+
+def _graph_sqlite_reader():
+    """The sqlite grouped-counts reader for this palace, or ``None``.
+
+    ``None`` means the graph tools must go through the collection, which is
+    what keeps a missing or broken palace reporting a diagnostic instead of
+    an empty graph.
+    """
+    from .palace_graph import sqlite_grouped_counts_reader
+
+    return sqlite_grouped_counts_reader(_config)
+
+
+def _chroma_room_wing_hall_counts():
+    if not _config.palace_path:
+        return None
+    from .backends.chroma import sqlite_room_wing_hall_counts
+
+    return sqlite_room_wing_hall_counts(_config.palace_path, _config.collection_name)
 
 
 def tool_status():
@@ -2452,6 +2624,8 @@ def tool_search(
     wing: str = None,
     room: str = None,
     source_file: str = None,
+    since: str = None,
+    before: str = None,
     max_distance: float = 1.5,
     min_similarity: float = None,
     context: str = None,
@@ -2463,6 +2637,8 @@ def tool_search(
         source_file = _sanitize_optional_source_file(source_file)
     except ValueError as e:
         return {"error": str(e)}
+    # since/before are validated inside search_memories (shared
+    # parse_window), which returns the same {"error": ...} shape.
     # Backwards compat: accept old name
     # Backwards compat: convert old similarity scale (higher=stricter) to
     # distance scale (lower=stricter). Similarity 0.8 → distance 0.2.
@@ -2480,6 +2656,8 @@ def tool_search(
         wing=wing,
         room=room,
         source_file=source_file,
+        since=since,
+        before=before,
         n_results=limit,
         max_distance=dist,
         vector_disabled=_vector_disabled,
@@ -2498,6 +2676,8 @@ def tool_search(
             wing=wing,
             room=room,
             source_file=source_file,
+            since=since,
+            before=before,
             n_results=limit,
             max_distance=dist,
             vector_disabled=_vector_disabled,
@@ -2585,10 +2765,15 @@ def tool_get_aaak_spec():
 def tool_traverse_graph(start_room: str, max_hops: int = 2):
     """Walk the palace graph from a room. Find connected ideas across wings."""
     max_hops = max(1, min(max_hops, 10))
-    col = _get_collection()
-    if not col:
-        return _collection_error_or_no_palace()
-    return traverse(start_room, col=col, max_hops=max_hops)
+    # sqlite metadata path does not open HNSW. When it cannot serve, open the
+    # collection here so a missing/broken palace still reports why (#1379
+    # follow-up) instead of looking like a palace with no such room.
+    if _graph_sqlite_reader() is None:
+        col = _get_collection()
+        if not col:
+            return _collection_error_or_no_palace()
+        return traverse(start_room, col=col, max_hops=max_hops)
+    return traverse(start_room, max_hops=max_hops, config=_config)
 
 
 def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
@@ -2598,10 +2783,12 @@ def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
         wing_b = _sanitize_optional_name(wing_b, "wing_b")
     except ValueError as e:
         return {"error": str(e)}
-    col = _get_collection()
-    if not col:
-        return _collection_error_or_no_palace()
-    return find_tunnels(wing_a, wing_b, col=col)
+    if _graph_sqlite_reader() is None:
+        col = _get_collection()
+        if not col:
+            return _collection_error_or_no_palace()
+        return find_tunnels(wing_a, wing_b, col=col)
+    return find_tunnels(wing_a, wing_b, config=_config)
 
 
 def tool_graph_stats():
@@ -2616,6 +2803,14 @@ def tool_graph_stats():
     if not col:
         return _collection_error_or_no_palace()
     return graph_stats(col=col)
+
+
+def tool_mesh_peers():
+    """Mesh estate snapshot — the committed compat surface for PalaceMind's
+    mesh view: exactly the GET /sync/peers payload, produced by the same
+    function so the tool and the endpoint can never drift. Read-only;
+    peers.json tokens are never included."""
+    return _mesh_peers_payload()
 
 
 def tool_create_tunnel(
@@ -2752,10 +2947,44 @@ def _single_drawer_record(col, drawer_id: str):
     }
 
 
+# Two write paths stamp the logical-group id under different keys:
+# ``tool_add_drawer`` chunks carry ``parent_drawer_id`` (#1539, resolved as a
+# logical drawer by #1782) while ``tool_diary_write`` chunks carry
+# ``parent_entry_id`` (#1539). Both mean the same thing -- "physical chunk of
+# this logical drawer" -- so every read path must resolve either one, or the
+# id a write path hands back is unusable with get/update/delete (#2185).
+# New diary writes stamp both keys; the read paths below still accept the
+# ``parent_entry_id``-only shape so palaces written before this fix keep
+# working with no data migration.
+_PARENT_ID_KEYS = ("parent_drawer_id", "parent_entry_id")
+
+
+def _logical_parent_id(meta):
+    """Return the logical-group id from chunk metadata, whichever key holds it.
+
+    Returns ``None`` for rows that are not chunks of a larger drawer.
+    """
+    for key in _PARENT_ID_KEYS:
+        value = (meta or {}).get(key)
+        if value:
+            return value
+    return None
+
+
+def _logical_parent_where(drawer_id: str) -> dict:
+    """Chroma ``where`` matching every chunk of ``drawer_id`` under either key.
+
+    A chunk carrying both keys (diary writes after #2185) matches both
+    branches of the ``$or`` but is still returned once -- Chroma dedupes by
+    physical id -- so the joined content never repeats a chunk.
+    """
+    return {"$or": [{key: drawer_id} for key in _PARENT_ID_KEYS]}
+
+
 def _logical_chunk_group(col, drawer_id: str):
     try:
         result = col.get(
-            where={"parent_drawer_id": drawer_id},
+            where=_logical_parent_where(drawer_id),
             include=["documents", "metadatas"],
         )
     except Exception:
@@ -2820,15 +3049,18 @@ def _drawer_payload(record):
     return payload
 
 
-def _fetch_drawer_rows(col, where=None, page_size: int = 1000):
+def _fetch_drawer_rows(col, where=None, page_size: int = 1000, include=None):
+    include = include or ["documents", "metadatas"]
     ids = []
     documents = []
     metadatas = []
     offset = 0
+    want_docs = "documents" in include
+    want_meta = "metadatas" in include
 
     while True:
         kwargs = {
-            "include": ["documents", "metadatas"],
+            "include": include,
             "limit": page_size,
             "offset": offset,
         }
@@ -2846,14 +3078,72 @@ def _fetch_drawer_rows(col, where=None, page_size: int = 1000):
         ids.extend(batch_ids)
 
         for idx in range(len(batch_ids)):
-            documents.append(batch_docs[idx] if idx < len(batch_docs) else "")
-            metadatas.append(batch_metas[idx] if idx < len(batch_metas) else {})
+            documents.append(batch_docs[idx] if want_docs and idx < len(batch_docs) else "")
+            metadatas.append(batch_metas[idx] if want_meta and idx < len(batch_metas) else {})
 
         offset += len(batch_ids)
         if len(batch_ids) < page_size:
             break
 
     return ids, documents, metadatas
+
+
+def _page_physical_ids(page: list) -> list:
+    """The physical row ids backing one page of logical drawers."""
+    physical_ids = []
+    for drawer in page:
+        chunk_ids = drawer.get("chunk_ids") or (drawer.get("metadata") or {}).get("chunk_ids")
+        if chunk_ids:
+            physical_ids.extend(chunk_ids)
+        else:
+            physical_ids.append(drawer["drawer_id"])
+    return physical_ids
+
+
+def _apply_drawer_previews(page: list, docs_by_id: dict) -> None:
+    """Set ``content_preview`` from an already-fetched ``{id: document}`` map."""
+    for drawer in page:
+        chunk_ids = drawer.get("chunk_ids") or (drawer.get("metadata") or {}).get("chunk_ids")
+        if chunk_ids:
+            content = "".join(docs_by_id.get(cid, "") for cid in chunk_ids)
+        else:
+            content = docs_by_id.get(drawer["drawer_id"], "")
+        drawer["content_preview"] = _content_preview(content)
+
+
+def _fill_drawer_previews(col, page: list) -> None:
+    """Hydrate ``content_preview`` for a page of logical drawers only."""
+    physical_ids = _page_physical_ids(page)
+    if not physical_ids:
+        return
+    result = col.get(ids=physical_ids, include=["documents"])
+    ids = _chroma_field(result, "ids", []) or []
+    docs = _chroma_field(result, "documents", []) or []
+    docs_by_id = {doc_id: (docs[i] if i < len(docs) else "") or "" for i, doc_id in enumerate(ids)}
+    _apply_drawer_previews(page, docs_by_id)
+
+
+def _fill_drawer_previews_from_sqlite(page: list) -> None:
+    """Same, reading the page's documents straight from ``chroma.sqlite3``.
+
+    The list itself is answered from metadata only — joining documents into
+    that scan would pull the palace's entire verbatim text into memory to
+    render one page. This fetches just the rows on screen.
+    """
+    physical_ids = _page_physical_ids(page)
+    if not physical_ids:
+        return
+    from .backends.chroma import sqlite_documents_for_ids
+
+    docs_by_id = sqlite_documents_for_ids(
+        _config.palace_path, _config.collection_name, physical_ids
+    )
+    if docs_by_id is None:
+        # sqlite went unreadable between the two reads; previews are a
+        # display detail, so degrade to blank rather than fail the listing.
+        logger.debug("sqlite preview hydration failed; leaving previews empty")
+        return
+    _apply_drawer_previews(page, docs_by_id)
 
 
 def _collapse_drawer_rows(ids, documents, metadatas):
@@ -2863,7 +3153,7 @@ def _collapse_drawer_rows(ids, documents, metadatas):
     for idx, drawer_id in enumerate(ids):
         doc = documents[idx] if idx < len(documents) else ""
         meta = _safe_meta(metadatas[idx] if idx < len(metadatas) else {})
-        parent_id = meta.get("parent_drawer_id")
+        parent_id = _logical_parent_id(meta)
 
         if parent_id:
             groups.setdefault(parent_id, []).append(
@@ -3037,8 +3327,8 @@ def tool_add_drawer(
                     "Drawer write was acknowledged but the new ID is not readable. "
                     "The palace index may be stale; run reconnect or repair."
                 )
-            _metadata_cache = None
-            logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
+            _invalidate_overview_caches()
+            logger.info(f"Filed drawer: {drawer_id} -> {wing}/{room}")
             return {
                 "success": True,
                 "drawer_id": drawer_id,
@@ -3072,8 +3362,8 @@ def tool_add_drawer(
                 "Drawer write was acknowledged but the new ID is not readable. "
                 "The palace index may be stale; run reconnect or repair."
             )
-        _metadata_cache = None
-        logger.info(f"Filed drawer: {drawer_id} → {wing}/{room} ({len(chunk_ids)} chunks)")
+        _invalidate_overview_caches()
+        logger.info(f"Filed drawer: {drawer_id} -> {wing}/{room} ({len(chunk_ids)} chunks)")
         return {
             "success": True,
             "drawer_id": drawer_id,
@@ -3110,7 +3400,7 @@ def tool_delete_drawer(drawer_id: str):
         )
 
         col.delete(ids=record["ids"])
-        _metadata_cache = None
+        _invalidate_overview_caches()
 
         logger.info("Deleted drawer: %s (%s rows)", drawer_id, len(record["ids"]))
 
@@ -3122,6 +3412,10 @@ def tool_delete_drawer(drawer_id: str):
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+class _ProtocolStdoutRestoreFailure(BaseException):
+    """Fatal loss of the MCP protocol stream after fd-level redirection."""
 
 
 def _capture_fd_stdout(fn):
@@ -3151,29 +3445,67 @@ def _capture_fd_stdout(fn):
     import tempfile
 
     buf = io.StringIO()
-    sys.stdout.flush()
-    sys.stderr.flush()
-    try:
-        saved_fd = os.dup(1)
-    except (OSError, AttributeError):
+
+    def _capture_python_stdout():
         with contextlib.redirect_stdout(buf):
             result = fn()
         return result, buf.getvalue()
 
     try:
-        with tempfile.TemporaryFile() as tmp:
-            os.dup2(tmp.fileno(), 1)
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except (OSError, AttributeError, ValueError):
+        return _capture_python_stdout()
+
+    try:
+        saved_fd = os.dup(1)
+    except (OSError, AttributeError, ValueError):
+        return _capture_python_stdout()
+
+    redirected = False
+    try:
+        try:
+            tmp_file = tempfile.TemporaryFile()
+        except (OSError, AttributeError, ValueError):
+            return _capture_python_stdout()
+
+        with tmp_file as tmp:
+            try:
+                os.dup2(tmp.fileno(), 1)
+            except (OSError, AttributeError, ValueError):
+                # No callback has run and fd 1 was not replaced. Use the
+                # documented Python-level fallback.
+                return _capture_python_stdout()
+            redirected = True
             try:
                 with contextlib.redirect_stdout(buf):
                     result = fn()
             finally:
-                sys.stdout.flush()
-                os.dup2(saved_fd, 1)
+                flush_error = None
+                try:
+                    sys.stdout.flush()
+                except (OSError, AttributeError, ValueError) as exc:
+                    flush_error = exc
+                try:
+                    os.dup2(saved_fd, 1)
+                except (OSError, AttributeError, ValueError) as exc:
+                    # Ordinary tool and protocol handlers catch Exception. A
+                    # failed restore is process-fatal instead: continuing could
+                    # emit JSON-RPC into the temporary file and hang the client.
+                    # Keep saved_fd open for diagnostics/emergency recovery;
+                    # process exit will release it.
+                    raise _ProtocolStdoutRestoreFailure(
+                        "failed to restore MCP protocol stdout"
+                    ) from exc
+                redirected = False
+                if flush_error is not None:
+                    raise flush_error
             tmp.seek(0)
             fd_text = tmp.read().decode("utf-8", "replace")
         return result, buf.getvalue() + fd_text
     finally:
-        os.close(saved_fd)
+        if not redirected:
+            os.close(saved_fd)
 
 
 def tool_mine(
@@ -3329,7 +3661,7 @@ def tool_mine(
         return payload
     finally:
         if not dry_run:
-            _metadata_cache = None
+            _invalidate_overview_caches()
 
 
 def _purge_source_closets(source_file: str, *, commit: bool) -> int:
@@ -3460,7 +3792,7 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
     )
     try:
         col.delete(where=where)
-        _metadata_cache = None
+        _invalidate_overview_caches()
         # Purge the matching closets too so the AAAK index doesn't keep stale
         # pointers at the now-deleted drawers (#1722). Done after the drawer
         # delete and intentionally best-effort: the drawers are already gone,
@@ -3520,7 +3852,7 @@ def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
             return {"success": False, "error": f"sync failed: {exc}"}
     finally:
         if apply:
-            _metadata_cache = None
+            _invalidate_overview_caches()
 
 
 def tool_get_drawer(drawer_id: str):
@@ -3569,10 +3901,6 @@ def tool_list_drawers(
     except ValueError as e:
         return {"error": str(e)}
 
-    col = _get_collection()
-    if not col:
-        return _collection_error_or_no_palace()
-
     try:
         where = None
         conditions = []
@@ -3587,7 +3915,22 @@ def tool_list_drawers(
         elif len(conditions) > 1:
             where = {"$and": conditions}
 
-        ids, documents, metadatas = _fetch_drawer_rows(col, where=where)
+        listed = None
+        if _is_chroma_backend() and _config.palace_path:
+            from .backends.chroma import sqlite_list_id_metadata
+
+            listed = sqlite_list_id_metadata(
+                _config.palace_path, _config.collection_name, where=where
+            )
+        if listed is not None:
+            # Documents are fetched for the displayed page only, below.
+            ids, metadatas = listed
+            documents = []
+        else:
+            col = _get_collection()
+            if not col:
+                return _collection_error_or_no_palace()
+            ids, documents, metadatas = _fetch_drawer_rows(col, where=where, include=["metadatas"])
         drawers = _collapse_drawer_rows(ids, documents, metadatas)
 
         if since_dt is not None or before_dt is not None:
@@ -3598,6 +3941,12 @@ def tool_list_drawers(
             ]
 
         page = drawers[offset : offset + limit]
+        if listed is not None:
+            _fill_drawer_previews_from_sqlite(page)
+        else:
+            col = _get_collection()
+            if col:
+                _fill_drawer_previews(col, page)
 
         return {
             "drawers": page,
@@ -3686,7 +4035,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             if stale_ids:
                 col.delete(ids=stale_ids)
 
-            _metadata_cache = None
+            _invalidate_overview_caches()
 
             logger.info("Updated drawer: %s (%s rows)", drawer_id, len(chunk_ids))
 
@@ -3705,7 +4054,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         update_kwargs["metadatas"] = [new_meta]
 
         col.update(**update_kwargs)
-        _metadata_cache = None
+        _invalidate_overview_caches()
 
         logger.info("Updated drawer: %s", drawer_id)
 
@@ -3971,7 +4320,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
                 documents=[entry],
                 metadatas=[{**base_metadata, "chunk_index": 0}],
             )
-            logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic}")
+            logger.info(f"Diary entry: {entry_id} -> {wing}/diary/{topic}")
             return {
                 "success": True,
                 "entry_id": entry_id,
@@ -3983,14 +4332,17 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
 
         # Oversized entry: split into bounded per-chunk drawers so the
         # embedding model never sees a document above ``chunk_size``.
-        # Every chunk carries ``parent_entry_id`` so search can rejoin
-        # them and ``chunk_index`` for ordered reconstruction (#1539).
-        # Note on ``entry_id`` in the return value: for the chunked
-        # path the returned ``entry_id`` is the LOGICAL group handle
-        # (no drawer is stored under that exact id). The physical
-        # drawer ids are in ``chunk_ids``. Callers wanting to fetch
-        # by id should iterate ``chunk_ids``; callers wanting to
-        # query by metadata can filter on ``parent_entry_id``.
+        # Every chunk carries ``chunk_index`` for ordered reconstruction
+        # and the group id under BOTH ``parent_entry_id`` (the original
+        # #1539 key, kept so existing readers and palaces are unaffected)
+        # and ``parent_drawer_id`` (the key the logical-id read paths were
+        # built around in #1782) -- see ``_PARENT_ID_KEYS`` (#2185).
+        # Note on ``entry_id`` in the return value: for the chunked path
+        # the returned ``entry_id`` is the LOGICAL group handle -- no
+        # drawer is stored under that exact id, but it resolves through
+        # ``mempalace_get_drawer`` / ``update_drawer`` / ``delete_drawer``
+        # to the whole entry, exactly as an oversized ``add_drawer`` id
+        # does. The physical drawer ids remain available in ``chunk_ids``.
         # Use a single batched ``add`` so the embedding pass either
         # commits all chunks or none — avoids a half-written palace
         # if the embedding model fails mid-loop. ``col.add`` (not
@@ -4012,10 +4364,11 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
                     **base_metadata,
                     "chunk_index": chunk_idx,
                     "parent_entry_id": entry_id,
+                    "parent_drawer_id": entry_id,
                 }
             )
         col.add(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
-        logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic} ({len(chunk_ids)} chunks)")
+        logger.info(f"Diary entry: {entry_id} -> {wing}/diary/{topic} ({len(chunk_ids)} chunks)")
         return {
             "success": True,
             "entry_id": entry_id,
@@ -4287,6 +4640,13 @@ def tool_reconnect():
             except Exception:
                 pass
         _kg_by_path.clear()
+    with _logstream_cache_lock:
+        for ls in _logstream_by_path.values():
+            try:
+                ls.close()
+            except Exception:
+                pass
+        _logstream_by_path.clear()
     _refresh_sqlite_integrity_status()
     if _sqlite_integrity_errors:
         result = {
@@ -4430,6 +4790,226 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9, added_by=None):
                     wing=diary.get("wing", ""),
                 )
     return out
+
+
+# ==================== LOGSTREAM TOOLS (RFC 003) ====================
+#
+# Agent coordination over the shared hub: durable append-only events plus
+# exact artifacts, stored in logstream.sqlite3 in the active palace dir.
+# No Chroma dependency and no vector index open — these handlers must never
+# call _get_collection().
+
+
+def tool_event_append(
+    type: str,
+    stream: str,
+    room: str,
+    from_agent: str,
+    to_agent: str = None,
+    correlation_id: str = None,
+    branch: str = None,
+    base_commit: str = None,
+    status: str = None,
+    body: str = "",
+    metadata: dict = None,
+    artifact_ids: list = None,
+):
+    """Append one immutable coordination event."""
+    try:
+        event = _call_logstream(
+            lambda ls: ls.append_event(
+                type=type,
+                stream=stream,
+                room=room,
+                from_agent=from_agent,
+                to_agent=to_agent,
+                correlation_id=correlation_id,
+                branch=branch,
+                base_commit=base_commit,
+                status=status,
+                body=body,
+                metadata=metadata,
+                artifact_ids=artifact_ids,
+            )
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, "event": event}
+
+
+_PREVIEW_BODY_CHARS = 200
+
+
+def _preview_event(event: dict) -> dict:
+    """Truncate a verbatim body to a scannable excerpt (preview mode).
+
+    Event bodies are stored verbatim and fleet status updates run to several
+    KB, so listing many events full-body is a large payload. Preview keeps all
+    routing/metadata fields and trims only ``body`` — enough to scan the stream
+    and decide which events to re-fetch in full. ``since_event_id`` is
+    strictly *after* that id, so passing the truncated event's own id
+    skips it; repeat the original filters with ``preview=false`` (and
+    ``correlation_id`` / ``from_agent`` as needed) instead."""
+    body = event.get("body") or ""
+    if len(body) <= _PREVIEW_BODY_CHARS:
+        return event
+    out = dict(event)
+    out["body"] = body[:_PREVIEW_BODY_CHARS]
+    out["body_truncated"] = True
+    out["body_length"] = len(body)
+    return out
+
+
+def tool_event_list(
+    stream: str = None,
+    room: str = None,
+    type: str = None,
+    to_agent: str = None,
+    from_agent: str = None,
+    correlation_id: str = None,
+    status: str = None,
+    since_event_id: str = None,
+    since_created_at: str = None,
+    limit: int = 50,
+    preview: bool = False,
+):
+    """List coordination events with structured filters, oldest first.
+
+    ``preview=True`` truncates each event's verbatim body to a short excerpt
+    (marking ``body_truncated`` + ``body_length``) so scanning many events
+    stays cheap. ``since_event_id`` is strictly after that id, so do not
+    pass the truncated event's own id to re-fetch it — repeat the original
+    filters with ``preview=false``.
+    """
+    try:
+        events = _call_logstream(
+            lambda ls: ls.list_events(
+                stream=stream,
+                room=room,
+                type=type,
+                to_agent=to_agent,
+                from_agent=from_agent,
+                correlation_id=correlation_id,
+                status=status,
+                since_event_id=since_event_id,
+                since_created_at=since_created_at,
+                limit=limit,
+            )
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+    if preview:
+        events = [_preview_event(e) for e in events]
+    return {"events": events, "count": len(events)}
+
+
+def tool_event_wait(
+    stream: str = None,
+    room: str = None,
+    type: str = None,
+    to_agent: str = None,
+    from_agent: str = None,
+    correlation_id: str = None,
+    status: str = None,
+    since_event_id: str = None,
+    since_created_at: str = None,
+    timeout_ms: int = 60000,
+    limit: int = 50,
+):
+    """Block until a matching event exists or the timeout expires.
+
+    ``limit`` mirrors ``event_list`` so the two tools accept the same
+    filter set — agents kept tripping over wait rejecting a parameter
+    that list accepts (reported by windows-codex during dogfood).
+    """
+    try:
+        result = _call_logstream(
+            lambda ls: ls.wait_events(
+                timeout_ms=timeout_ms,
+                stream=stream,
+                room=room,
+                type=type,
+                to_agent=to_agent,
+                from_agent=from_agent,
+                correlation_id=correlation_id,
+                status=status,
+                since_event_id=since_event_id,
+                since_created_at=since_created_at,
+                limit=limit,
+            )
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+    result["count"] = len(result["events"])
+    return result
+
+
+def tool_event_ack(event_id: str, from_agent: str, status: str = None, body: str = ""):
+    """Append an event.ack referencing a prior event (never mutates it)."""
+    try:
+        event = _call_logstream(
+            lambda ls: ls.ack_event(event_id, from_agent=from_agent, status=status, body=body)
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, "event": event}
+
+
+def tool_artifact_put(kind: str, content: str, created_by: str, metadata: dict = None):
+    """Store exact artifact content (patch, file, log, json, note)."""
+    try:
+        artifact = _call_logstream(
+            lambda ls: ls.put_artifact(
+                kind=kind, content=content, created_by=created_by, metadata=metadata
+            )
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, "artifact": artifact}
+
+
+def tool_artifact_get(artifact_id: str):
+    """Fetch an artifact by id — exact content and metadata."""
+    try:
+        artifact = _call_logstream(lambda ls: ls.get_artifact(artifact_id))
+    except ValueError as e:
+        return {"error": str(e)}
+    if artifact is None:
+        return {"error": f"artifact {artifact_id!r} not found"}
+    return {"artifact": artifact}
+
+
+def tool_patch_submit(
+    content: str,
+    from_agent: str,
+    stream: str,
+    room: str = "patches",
+    to_agent: str = None,
+    correlation_id: str = None,
+    branch: str = None,
+    base_commit: str = None,
+    body: str = "",
+    metadata: dict = None,
+):
+    """Store a patch artifact and append its patch.ready event in one call."""
+    try:
+        result = _call_logstream(
+            lambda ls: ls.submit_patch(
+                content=content,
+                from_agent=from_agent,
+                stream=stream,
+                room=room,
+                to_agent=to_agent,
+                correlation_id=correlation_id,
+                branch=branch,
+                base_commit=base_commit,
+                body=body,
+                metadata=metadata,
+            )
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, "artifact": result["artifact"], "event": result["event"]}
 
 
 # ==================== MCP PROTOCOL ====================
@@ -4613,6 +5193,11 @@ TOOLS = {
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_graph_stats,
     },
+    "mempalace_mesh_peers": {
+        "description": "Mesh estate snapshot (RFC 004): this replica's identity, version vector and node profile; each configured peer's reachability, last sync outcome, remote version vector and advertised profile; origins known only transitively; origin_profiles keyed by replica_id; and estate_source saying whether the peer status was observed in this process or published by the palace's hub (with published_at and whether that hub is still alive). Exactly the GET /sync/peers payload — tokens are never included.",
+        "input_schema": {"type": "object", "properties": {}},
+        "handler": tool_mesh_peers,
+    },
     "mempalace_create_tunnel": {
         "description": "Create a cross-wing tunnel linking two palace locations. Use when content in one project relates to another — e.g., an API design in project_api connects to a database schema in project_database.",
         "input_schema": {
@@ -4721,6 +5306,22 @@ TOOLS = {
                         "stored path exactly (leading/trailing whitespace trimmed); no "
                         "glob or basename matching. Pass the value from a result's "
                         "'source_path' field; the displayed 'source_file' is only a basename."
+                    ),
+                },
+                "since": {
+                    "type": "string",
+                    "description": (
+                        "Only drawers filed on/after this ISO date or datetime "
+                        "(inclusive), e.g. '2026-04-01' or '2026-04-01T09:30:00'. "
+                        "Compares the drawer's created_at (filed_at) wall-clock; "
+                        "drawers without a filed_at are excluded while set."
+                    ),
+                },
+                "before": {
+                    "type": "string",
+                    "description": (
+                        "Only drawers filed strictly before this ISO date or "
+                        "datetime (exclusive). Same comparison rules as 'since'."
                     ),
                 },
                 "max_distance": {
@@ -5079,6 +5680,264 @@ TOOLS = {
         },
         "handler": tool_reconnect,
     },
+    "mempalace_event_append": {
+        "description": (
+            "Append an immutable agent-coordination event to the logstream (RFC 003). Use for"
+            " delegating work (task.request), replying (task.reply), and announcing artifacts"
+            " (patch.ready). Events are append-only; corrections are new events."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "description": "Event type, e.g. 'task.request', 'task.reply', 'patch.ready'",
+                },
+                "stream": {
+                    "type": "string",
+                    "description": "Logical stream, e.g. 'project/mempalace' or 'shared_agent_brain'",
+                },
+                "room": {
+                    "type": "string",
+                    "description": "Sub-channel, e.g. 'delegation', 'patches', 'reviews', 'status'",
+                },
+                "from_agent": {"type": "string", "description": "Writer agent identity"},
+                "to_agent": {
+                    "type": "string",
+                    "description": "Target agent, or '*' for broadcast (optional)",
+                },
+                "correlation_id": {
+                    "type": "string",
+                    "description": "Task/conversation id tying request and reply events (optional)",
+                },
+                "branch": {"type": "string", "description": "Git branch, when relevant (optional)"},
+                "base_commit": {
+                    "type": "string",
+                    "description": "Git commit the work started from (optional)",
+                },
+                "status": {
+                    "type": "string",
+                    "description": (
+                        "One of: open, claimed, ready, applied, blocked, failed, superseded"
+                        " (optional)"
+                    ),
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Verbatim human-readable content (optional, max 256 KiB)",
+                },
+                "metadata": {
+                    "type": "object",
+                    "description": "Extra structured fields, stored verbatim (optional)",
+                },
+                "artifact_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Ids of already-stored artifacts to reference (optional)",
+                },
+            },
+            "required": ["type", "stream", "room", "from_agent"],
+        },
+        "handler": tool_event_append,
+    },
+    "mempalace_event_list": {
+        "description": (
+            "List agent-coordination events with structured filters, oldest first (append"
+            " order, not timestamp order). Use since_event_id as the resume cursor: it means"
+            " strictly after that event in append order, so it cannot skip anything. Do NOT"
+            " resume with since_created_at — a peer's event syncs in whenever it arrives, so"
+            " it can already be older than a timestamp cursor and be missed permanently;"
+            " since_created_at is a time window ('what happened today'), not a cursor. Store"
+            " the id of the last event you processed — that is your whole watcher state. Pass"
+            " preview=true when sweeping a busy stream. to_agent=<you> also matches '*'"
+            " broadcasts, so no second call is needed. To wait for something that has not"
+            " happened yet, use mempalace_event_wait instead of polling this."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "stream": {"type": "string", "description": "Filter by stream (optional)"},
+                "room": {"type": "string", "description": "Filter by room (optional)"},
+                "type": {"type": "string", "description": "Filter by event type (optional)"},
+                "to_agent": {
+                    "type": "string",
+                    "description": "Filter by target agent; also matches '*' broadcasts (optional)",
+                },
+                "from_agent": {"type": "string", "description": "Filter by writer (optional)"},
+                "correlation_id": {
+                    "type": "string",
+                    "description": "Filter by correlation id (optional)",
+                },
+                "status": {"type": "string", "description": "Filter by status (optional)"},
+                "since_event_id": {
+                    "type": "string",
+                    "description": "Return only events strictly after this event id (optional)",
+                },
+                "since_created_at": {
+                    "type": "string",
+                    "description": (
+                        "Time window filter, inclusive: events created at or after this time"
+                        " (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional). NOT a resume cursor"
+                        " — use since_event_id for that; a timestamp cursor silently drops"
+                        " peer events that sync in late. Dedup by id when using this."
+                    ),
+                },
+                "limit": {"type": "integer", "description": "Max events to return (default 50)"},
+                "preview": {
+                    "type": "boolean",
+                    "description": (
+                        "Truncate each event body to a short excerpt (marks body_truncated +"
+                        " body_length) so scanning many events stays cheap. since_event_id is"
+                        " strictly AFTER that id, so do not pass the truncated event's own id"
+                        " to re-fetch it — repeat the original filters with preview=false"
+                        " (default false)"
+                    ),
+                },
+            },
+        },
+        "handler": tool_event_list,
+    },
+    "mempalace_event_wait": {
+        "description": (
+            "Block until a matching coordination event exists or the timeout expires (default"
+            " 60s, max 5 minutes). Returns {timed_out: true, events: []} on timeout — a normal"
+            " result, not an error. This is the right tool for actively waiting on a"
+            " correlation_id you delegated or claimed. It already backs off internally, so do"
+            " not wrap it in a tight retry loop: on timeout just call it again with"
+            " since_event_id updated to the last event you processed. For long-lived consumers"
+            " (daemons, dashboards) prefer the push stream at GET /logstream/stream, which"
+            " takes the same filters and the same since_event_id resume."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "stream": {"type": "string", "description": "Filter by stream (optional)"},
+                "room": {"type": "string", "description": "Filter by room (optional)"},
+                "type": {"type": "string", "description": "Filter by event type (optional)"},
+                "to_agent": {
+                    "type": "string",
+                    "description": "Filter by target agent; also matches '*' broadcasts (optional)",
+                },
+                "from_agent": {"type": "string", "description": "Filter by writer (optional)"},
+                "correlation_id": {
+                    "type": "string",
+                    "description": "Filter by correlation id (optional)",
+                },
+                "status": {"type": "string", "description": "Filter by status (optional)"},
+                "since_event_id": {
+                    "type": "string",
+                    "description": "Only match events strictly after this event id (optional)",
+                },
+                "since_created_at": {
+                    "type": "string",
+                    "description": (
+                        "Time window filter, inclusive (optional). NOT a resume cursor — use"
+                        " since_event_id, which cannot skip a late-syncing peer event."
+                    ),
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "How long to wait in milliseconds (default 60000, max 300000)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max events to return when matches exist (default 50)",
+                },
+            },
+        },
+        "handler": tool_event_wait,
+    },
+    "mempalace_event_ack": {
+        "description": (
+            "Acknowledge a coordination event: appends a new event.ack routed back to the"
+            " original writer with the correlation id copied. Never mutates the target event."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "event_id": {"type": "string", "description": "Id of the event to acknowledge"},
+                "from_agent": {"type": "string", "description": "Acknowledging agent identity"},
+                "status": {
+                    "type": "string",
+                    "description": (
+                        "One of: open, claimed, ready, applied, blocked, failed, superseded"
+                        " (optional)"
+                    ),
+                },
+                "body": {"type": "string", "description": "Verbatim ack notes (optional)"},
+            },
+            "required": ["event_id", "from_agent"],
+        },
+        "handler": tool_event_ack,
+    },
+    "mempalace_artifact_put": {
+        "description": (
+            "Store exact artifact content (unified diff patch, file, log, json, note) for agent"
+            " handoffs. Returns id, sha256, and size_bytes. UTF-8 text only, max 4 MiB."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "description": "One of: patch, file, log, json, note",
+                },
+                "content": {"type": "string", "description": "Exact artifact content"},
+                "created_by": {"type": "string", "description": "Writer agent identity"},
+                "metadata": {
+                    "type": "object",
+                    "description": "Extra structured fields, e.g. branch/base_commit (optional)",
+                },
+            },
+            "required": ["kind", "content", "created_by"],
+        },
+        "handler": tool_artifact_put,
+    },
+    "mempalace_artifact_get": {
+        "description": (
+            "Fetch a coordination artifact by id — exact content plus sha256 for verification."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "artifact_id": {"type": "string", "description": "Artifact id to fetch"},
+            },
+            "required": ["artifact_id"],
+        },
+        "handler": tool_artifact_get,
+    },
+    "mempalace_patch_submit": {
+        "description": (
+            "Convenience: store a patch artifact and append its patch.ready event in one call."
+            " Use when handing completed work to another agent."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "Unified diff content"},
+                "from_agent": {"type": "string", "description": "Submitting agent identity"},
+                "stream": {
+                    "type": "string",
+                    "description": "Logical stream, e.g. 'project/mempalace'",
+                },
+                "room": {"type": "string", "description": "Sub-channel (default 'patches')"},
+                "to_agent": {"type": "string", "description": "Target agent or '*' (optional)"},
+                "correlation_id": {
+                    "type": "string",
+                    "description": "Task id tying this patch to its request (optional)",
+                },
+                "branch": {"type": "string", "description": "Git branch (optional)"},
+                "base_commit": {
+                    "type": "string",
+                    "description": "Git commit the patch applies to (optional)",
+                },
+                "body": {"type": "string", "description": "Verbatim notes (optional)"},
+                "metadata": {"type": "object", "description": "Extra structured fields (optional)"},
+            },
+            "required": ["content", "from_agent", "stream"],
+        },
+        "handler": tool_patch_submit,
+    },
 }
 
 
@@ -5132,6 +5991,572 @@ def _mcp_read_only_refusal(req_id, tool_name: str):
     }
 
 
+def _mcp_diverged_index_refusal(req_id, tool_name: str):
+    """Refuse vector writes while the HNSW segment is known to be diverged.
+
+    The capacity probe (#1222) already routes *reads* around a diverged index:
+    ``search`` and ``check_duplicate`` fall back to BM25-only sqlite. Writes had
+    no such gate — they went straight to chromadb, where an upsert into that same
+    index can never come back. Observed on a 3.7.0 palace whose flushed segment
+    held 803 of 820 embeddings: three of five freshly generated vectors blocked
+    forever (25+ minutes, then killed), the other two committed in 0.03 s, and
+    the same vector reproduced the same verdict on every retry — so a write's
+    fate depended on where its embedding landed in the damaged graph. After
+    ``mempalace repair rebuild-index`` all five committed.
+
+    Refusing is also the honest answer for the write that does not hang: chromadb
+    acknowledges it into sqlite and the metadata segment, then leaves it out of
+    the HNSW segment. That drawer is filed and reported as success while being
+    invisible to vector search — 16 such drawers came out of a single checkpoint
+    that returned "completed successfully in 2s".
+
+    The probe behind this is pure sqlite + pickle, so the gate costs no chromadb
+    interaction on the path it is protecting.
+    """
+    if tool_name not in _VECTOR_WRITE_TOOLS:
+        return None
+
+    _refresh_vector_disabled_flag()
+
+    if not _vector_disabled:
+        return None
+
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": _DIVERGED_INDEX_ERROR_CODE,
+            "message": ("Palace vector index is diverged; refusing the write until it is rebuilt"),
+            "data": {
+                "tool": tool_name,
+                "palace": _config.palace_path or "",
+                "vector_disabled_reason": _vector_disabled_reason,
+                "hint": (
+                    "Stop the MemPalace MCP servers, run `mempalace repair rebuild-index`, "
+                    "then mempalace_reconnect. Recall keeps working meanwhile through the "
+                    "BM25 fallback; writes stay refused so they can neither hang inside "
+                    "chromadb nor land outside the index."
+                ),
+            },
+        },
+    }
+
+
+def _excluded_working_directory() -> str:
+    """The working directory to keep out of the metadata search, resolved once.
+
+    Read at import and never again. The value has to be identical for the
+    startup baseline and every later reading, or the set of watched directories
+    would shift under a server that never moved: a rename or a redeploy of the
+    checkout changes what ``os.getcwd()`` answers, and a directory that was
+    excluded at startup would quietly start counting. Resolving symlinks keeps
+    the comparison honest against a path spelled differently on either side.
+    """
+    try:
+        return os.path.realpath(os.getcwd())
+    except OSError:
+        # The working directory can be gone underneath a long-lived process.
+        # Nothing to exclude then, and no reason to stop answering.
+        return ""
+
+
+_DIST_PATH_EXCLUDED_CWD = _excluded_working_directory()
+
+
+def _dist_search_path() -> list[str]:
+    """``sys.path`` entries this server will trust to answer "what is installed".
+
+    The working directory is excluded. Under the documented launch
+    ``python -m mempalace.mcp_server`` (website/guide/mcp-integration.md) the
+    interpreter puts the MCP host's own working directory first on sys.path, so
+    a plain ``importlib.metadata.version()`` would resolve against whatever
+    project the user happens to have open. Any repository carrying a top-level
+    ``mempalace.egg-info/`` would then dictate this server's write policy — and
+    it would win again on every restart, so the gate's own "restart the server"
+    remedy could not clear it. Distribution metadata is an installation fact,
+    not a property of the directory the host was started in.
+
+    This is narrower than what the import system itself would resolve, and
+    deliberately so, but it introduces no asymmetry: the startup baseline and
+    every later reading come from this same path, so a directory left out here
+    is simply not watched and can never produce a mismatch on its own. Running
+    from a source tree is the case that narrowing costs, and it is already
+    outside what installed metadata can describe.
+    """
+    cwd = _DIST_PATH_EXCLUDED_CWD
+    search: list[str] = []
+    for entry in sys.path:
+        if not entry:
+            continue
+        if "\x00" in entry:
+            # No filesystem accepts this; the platforms disagree only about
+            # where it is refused. POSIX raises in the realpath below and the
+            # entry drops out there, while Windows resolves it and leaves every
+            # later call to fail on it instead — os.stat and os.listdir reject
+            # it in the argument conversion, which raises ValueError rather
+            # than the OSError those callers hold, so a single junk entry would
+            # take the whole reading down and switch the gate off. Dropped here
+            # so both platforms go on to search the same list.
+            continue
+        try:
+            resolved = os.path.realpath(entry)
+        except (OSError, ValueError):
+            continue
+        if cwd and resolved == cwd:
+            continue
+        search.append(entry)
+    return search
+
+
+def _stat_fingerprint(path: str) -> tuple:
+    try:
+        stat_result = os.stat(path)
+        return (path, stat_result.st_mtime_ns, stat_result.st_ino, stat_result.st_size)
+    except OSError:
+        # Missing is a state too: a dist-info that disappears must read as a
+        # change, not as "same as last time".
+        return (path, None, None, None)
+
+
+def _watched_metadata_files(root: str) -> list[str]:
+    """Metadata files under ``root`` belonging to the watched distributions.
+
+    Installers name these directories after the normalized distribution name,
+    and both watched names are already lowercase single words, so matching the
+    prefix is enough here without pulling in full PEP 503 normalization.
+    """
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return []
+
+    found = []
+    for dist in _STALE_LIBRARY_WATCHED_DISTS:
+        prefix = f"{dist}-"
+        for entry in entries:
+            lowered = entry.lower()
+            if lowered == f"{dist}.egg-info":
+                found.append(os.path.join(root, entry, "PKG-INFO"))
+                continue
+            if not lowered.startswith(prefix):
+                continue
+            # `name-version.dist-info`, `name-version.egg-info` and
+            # `name-version-pyX.Y.egg-info` are all layouts importlib.metadata
+            # resolves, so all three have to be watched or an upgrade in the
+            # unwatched one moves nothing this fingerprint can see. A
+            # normalized PEP 440 version always starts with a digit; requiring
+            # one is defence in depth rather than load-bearing, since PEP 427
+            # escaping already spells a sibling like `mempalace-remote` as
+            # `mempalace_remote-...` and that fails the prefix outright.
+            remainder = lowered[len(prefix) :]
+            if not remainder[:1].isdigit():
+                continue
+            if lowered.endswith(".dist-info"):
+                found.append(os.path.join(root, entry, "METADATA"))
+            elif lowered.endswith(".egg-info"):
+                found.append(os.path.join(root, entry, "PKG-INFO"))
+    return sorted(found)
+
+
+def _dist_search_signature(search_path: list[str]) -> tuple:
+    """Stat-only fingerprint used to decide whether the metadata must be reread.
+
+    Two things are watched, because an upgrade can show up as either. A normal
+    ``pip``/``uv`` upgrade removes one ``*.dist-info`` directory and creates
+    another, which moves the containing directory's mtime; but a metadata file
+    rewritten in place leaves that mtime untouched, so the metadata files
+    themselves are fingerprinted too. Watching only the directories left the
+    cache blind to the in-place case, and a cache that cannot see a change is
+    the same silent failure this gate exists to prevent.
+    """
+    signature = []
+    for entry in search_path:
+        signature.append(_stat_fingerprint(entry))
+        for metadata_file in _watched_metadata_files(entry):
+            signature.append(_stat_fingerprint(metadata_file))
+    return tuple(signature)
+
+
+def _unlistable_search_entries(search_path: list[str]) -> list[str]:
+    """Search roots that are there but refuse to be listed.
+
+    ``importlib.metadata`` scans a root with ``with suppress(Exception):
+    os.listdir(...)`` and falls through to an empty listing, so a permission
+    error or a file-descriptor exhaustion on site-packages arrives as "there
+    are no distributions here" — the same answer a genuine uninstall gives.
+    Read literally, that would make this gate refuse every write on a wholly
+    healthy install, and ``EMFILE`` is an ordinary peak-load condition for a
+    threaded server rather than a hypothetical one. Probing the roots directly
+    is the only way to tell the two apart, because the fault is swallowed
+    before any of it reaches us.
+    """
+    blocked = []
+    for entry in search_path:
+        try:
+            os.listdir(entry)
+        except (FileNotFoundError, NotADirectoryError):
+            # A sys.path entry that does not exist, or a zip/file rather than a
+            # directory, is ordinary; importlib reads those its own way.
+            continue
+        except OSError:
+            blocked.append(entry)
+    return blocked
+
+
+def _log_stale_library_errors(errors: dict[str, str]) -> None:
+    """Report metadata faults when they appear or change, not on every call.
+
+    A failed reading is deliberately never memoized, so this path runs again on
+    every mutating call for as long as the fault lasts. Logging it each time
+    would turn one persistent permission problem into a flood into the MCP
+    host's stderr, and file-descriptor exhaustion reaches this same branch, so
+    the flood would peak exactly when the server can least afford it.
+    """
+    global _stale_library_reported_errors
+
+    with _stale_library_log_lock:
+        if errors == _stale_library_reported_errors:
+            return
+        _stale_library_reported_errors = dict(errors)
+
+    for dist, reason in sorted(errors.items()):
+        logger.warning("stale-library gate inactive for %s: %s", dist, reason)
+
+
+def _log_stale_library_drift(drift: list, described: str) -> None:
+    """Announce a refusal when the drift appears or changes, not per call.
+
+    A client that retries a rejected write — an agent will — would otherwise get
+    one line per attempt for a condition that only clears on restart, which is
+    the same flood ``_log_stale_library_errors`` exists to avoid. The neighbours
+    (``_mcp_peer_writer_refusal``, ``_mcp_sqlite_integrity_refusal``) log nothing
+    at all on refusal; this logs once, because unlike theirs this condition has
+    no other place an operator would notice it.
+    """
+    global _stale_library_reported_drift
+
+    with _stale_library_log_lock:
+        if drift == _stale_library_reported_drift:
+            return
+        _stale_library_reported_drift = [dict(entry) for entry in drift]
+
+    logger.warning(
+        "Refusing writes: this server is running code that is no longer installed (%s)", described
+    )
+
+
+def _read_installed_dist_versions(search_path: list[str]) -> tuple[dict[str, str], dict[str, str]]:
+    """Read the watched distributions' versions from ``search_path``.
+
+    Returns ``(versions, errors)``. Three states, not two, and the caller has to
+    keep them apart: a distribution that is simply not installed is absent from
+    both maps, which reads as uninstalled and is the strongest form of drift
+    there is; one whose metadata could not be read is recorded in ``errors`` and
+    left uncompared. Collapsing the second into the first would refuse every
+    write over a filesystem fault, on an install where nothing is stale.
+
+    ``importlib.metadata`` gives us no help telling them apart: it suppresses
+    the failure at both levels it reads, the file (``read_text``) and the
+    directory (``FastPath.children``), so a fault arrives as an empty version or
+    as no distribution at all. Both are recovered here rather than trusted.
+    """
+    from importlib.metadata import DistributionFinder, MetadataPathFinder
+
+    versions: dict[str, str] = {}
+    errors: dict[str, str] = {}
+    finder = MetadataPathFinder()
+    # importlib.metadata memoizes each search root's directory listing against
+    # that root's mtime (``FastPath.search`` -> ``self.lookup(self.mtime)``), and
+    # that mtime is read in whole-ish seconds rather than the nanoseconds the
+    # fingerprint above compares. A removal and a creation that both land inside
+    # one timestamp tick therefore leave the memo answering from the listing
+    # taken before them, naming the dist-info the upgrade has already deleted.
+    # Its version then reads as empty, which this function records as unreadable
+    # and the caller leaves uncompared — the gate switching itself off for that
+    # distribution, permanently, since nothing here writes to the root to move
+    # its mtime again. That is the exact upgrade this gate exists to catch, so
+    # the memo is dropped instead of trusted. It costs one relisting per real
+    # change: this function is only reached when the fingerprint has already
+    # moved.
+    #
+    # Called on the instance rather than the class: before 3.11 it is not a
+    # classmethod, so ``MetadataPathFinder.invalidate_caches()`` is a TypeError
+    # on the 3.9 in CI.
+    try:
+        finder.invalidate_caches()
+    except Exception:
+        # Best effort by construction. Dropping a cache sharpens the reading; it
+        # is never what the reading depends on. A finder that cannot do it is
+        # still asked for the versions below, and still allowed to fail there,
+        # where the three states are told apart.
+        logger.debug("stale-library metadata cache could not be invalidated", exc_info=True)
+    # Probed only if something turns up missing: it costs a listing of every
+    # search root, and on a healthy installation nothing reaches that branch.
+    blocked: "list[str] | None" = None
+
+    for dist in _STALE_LIBRARY_WATCHED_DISTS:
+        try:
+            context = DistributionFinder.Context(name=dist, path=list(search_path))
+            found = next(iter(finder.find_distributions(context)), None)
+            raw = "" if found is None else str(found.version or "")
+        except Exception:
+            # Fail open — an unreadable metadata directory must not take the
+            # server down — but never silently: with the version unknown this
+            # gate cannot protect that distribution at all, and an operator has
+            # to be able to see that from mempalace_status. The reason is kept
+            # generic because it is quoted back to the client, and an OSError
+            # carries the full path it failed on; the detail goes to the log.
+            errors[dist] = "installed metadata could not be read"
+            logger.debug("stale-library metadata read failed for %s", dist, exc_info=True)
+            continue
+
+        if found is None:
+            if blocked is None:
+                blocked = _unlistable_search_entries(search_path)
+            if blocked:
+                # Nothing was found, but a search root would not open, and an
+                # unopenable root looks exactly like an empty one from here.
+                # Reporting this as uninstalled is what would refuse writes on
+                # a healthy install, so it is left uncompared instead.
+                errors[dist] = "distribution search path unreadable"
+                continue
+            # Genuinely absent from a path we could read end to end.
+            continue
+        if not raw:
+            # Present, but its version could not be read. importlib.metadata
+            # swallows PermissionError, FileNotFoundError, IsADirectoryError,
+            # NotADirectoryError and KeyError inside read_text, so a metadata
+            # file that is unreadable, missing or truncated arrives here as an
+            # empty version rather than as an exception.
+            errors[dist] = "version unreadable in installed metadata"
+            continue
+        if not _VERSION_TEXT_RE.match(raw):
+            errors[dist] = "malformed version metadata"
+            continue
+        versions[dist] = raw
+
+    return versions, errors
+
+
+def _installed_dist_state() -> tuple[dict[str, str], dict[str, str]]:
+    """``(versions, errors)`` for the watched distributions, read together.
+
+    One reader call, one cache generation. Reading the versions and the errors
+    separately let a caller pair a version map from one generation with an error
+    map from another, and both mixtures are wrong: one invents drift on an
+    installation where nothing changed, the other hides real drift behind an
+    error recorded a moment later.
+
+    A reading that produced errors is never memoized. The fingerprint is built
+    from stat data, and a permission change moves none of it, so caching a
+    failed reading would keep the gate answering from that failure long after
+    the cause was repaired. The cost of that is a full reread per call for as
+    long as a fault lasts, which is why the logging of it is deduplicated.
+    """
+    search_path = _dist_search_path()
+    signature = _dist_search_signature(search_path)
+
+    with _stale_library_cache_lock:
+        if _stale_library_cache["signature"] == signature:
+            return dict(_stale_library_cache["versions"]), dict(_stale_library_cache["errors"])
+
+    versions, errors = _read_installed_dist_versions(search_path)
+    _log_stale_library_errors(errors)
+
+    with _stale_library_cache_lock:
+        if errors:
+            # Left empty rather than filled with this reading: a slot keyed on a
+            # signature of None is never matched again, so storing the maps here
+            # would be a write nothing can read.
+            _stale_library_cache.update(signature=None, versions={}, errors={})
+        else:
+            _stale_library_cache.update(signature=signature, versions=versions, errors=errors)
+    return dict(versions), dict(errors)
+
+
+# Baseline: what was installed at the moment this module was imported, which is
+# the moment the code being served was loaded. Every watched distribution is
+# already in sys.modules by now — mempalace by definition, chromadb through the
+# unconditional `from chromadb.errors import NotFoundError as _ChromaNotFoundError`
+# above — so this snapshot describes the code actually running.
+#
+# Both sides of the comparison are therefore read the same way, from the same
+# metadata, and that is what keeps the gate honest. Comparing a live
+# `module.__version__` against installed metadata would instead drift apart on
+# its own: an editable checkout (`uv sync --extra dev`, the setup CONTRIBUTING
+# documents) moves version.py on every `git pull` while the recorded metadata
+# stays put, and chromadb hardcodes its own `__version__` literal, which a
+# repackaged build (conda, distro, `1.5.7+corp1`) can spell differently from
+# its metadata. Either would refuse every write on an installation where
+# nothing whatsoever is stale.
+#
+# Preserved across importlib.reload via globals(), like _logging_configured
+# above: a reload re-executes this module body but leaves sys.modules alone, so
+# the chromadb this server is serving is still the one loaded at startup.
+# Recomputing the baseline there would adopt the newly-installed version as
+# "what we are serving" and disarm the gate for the library the reload did not
+# actually replace.
+def _initial_dist_state() -> tuple[dict[str, str], dict[str, str]]:
+    """The baseline reading, which must never stop this module from importing.
+
+    Every other call into the gate happens inside a request and fails open
+    there. This one happens at import: an exception escaping it would abort the
+    import and the server would not start at all, which is a far worse outcome
+    than a gate that stays switched off for the life of the process.
+    """
+    try:
+        return _installed_dist_state()
+    except Exception:
+        logger.warning(
+            "stale-library baseline could not be read; the gate is inactive", exc_info=True
+        )
+        return {}, {}
+
+
+_STARTUP_DIST_STATE: tuple = globals().get("_STARTUP_DIST_STATE") or _initial_dist_state()
+_STARTUP_DIST_VERSIONS: dict[str, str] = _STARTUP_DIST_STATE[0]
+# Watched distributions whose metadata could not be read at import have no
+# baseline and can never be compared. That is the gate silently off for them,
+# so it is kept and reported rather than discarded.
+_STARTUP_DIST_ERRORS: dict[str, str] = _STARTUP_DIST_STATE[1]
+
+
+def _stale_library_report() -> tuple[list[dict], dict[str, str]]:
+    """``(drift, unreadable)``: what the gate found, from one metadata reading.
+
+    ``drift`` lists the watched distributions whose installed version moved
+    since startup; ``unreadable`` those whose metadata could not be read and
+    which are therefore not being compared at all. Both come out of a single
+    ``_installed_dist_state()`` call because they are two halves of one answer:
+    reading them separately would let a refusal be decided against one cache
+    generation and explained by another, which is how a status report ends up
+    naming a package as both drifted and uncompared.
+
+    Nothing is latched: rolling an install back to the version this process
+    started with leaves nothing stale, and a metadata read that lands
+    mid-upgrade (files half replaced) corrects itself on the next call instead
+    of wedging the server.
+
+    Never raises. This runs in request preflight, ahead of the dispatcher's own
+    error handling, and an exception here would leave the client waiting on a
+    reply that is never written.
+    """
+    try:
+        installed, unreadable = _installed_dist_state()
+        drift = []
+        for dist, startup_version in sorted(_STARTUP_DIST_VERSIONS.items()):
+            if dist in unreadable:
+                # The version could not be read at all, which is not evidence
+                # that the distribution went away. Refusing writes on a
+                # transient metadata failure would turn a filesystem hiccup
+                # into an outage, so this stays open and reports the gap
+                # through mempalace_status instead.
+                continue
+            # Absent now, present at startup, is the strongest form of this:
+            # the code being served is not merely a different version, it is a
+            # version that is no longer installed at all. `pipx install
+            # --force` and `uv tool upgrade` rebuild the environment rather
+            # than rewriting metadata in place, so this is the shape the common
+            # upgrade paths actually take. A distribution that was already
+            # absent at startup never enters this loop and stays uncompared.
+            current = installed.get(dist, _UNINSTALLED)
+            if current != startup_version:
+                drift.append({"package": dist, "serving": startup_version, "installed": current})
+        return drift, unreadable
+    except Exception:
+        # Fail open rather than refuse every write on a bug in the gate itself.
+        logger.warning("stale-library check failed; allowing the call", exc_info=True)
+        return [], {}
+
+
+def _stale_library_payload() -> dict:
+    """``mempalace_status`` view of the gate, so the state is diagnosable."""
+    drift, errors = _stale_library_report()
+    payload = {
+        "stale": bool(drift),
+        "serving": dict(_STARTUP_DIST_VERSIONS),
+        "packages": drift,
+    }
+    # Everything the gate is NOT covering, in one place. A distribution with no
+    # baseline is the quietest case of all: it was never resolvable when this
+    # process started, so nothing about it is compared and nothing about it
+    # would otherwise appear here — leaving "stale: false" to be read as
+    # "checked and fine" when it means "not checked at all".
+    inactive = dict(errors)
+    for dist in _STALE_LIBRARY_WATCHED_DISTS:
+        if dist not in _STARTUP_DIST_VERSIONS:
+            inactive.setdefault(
+                dist,
+                _STARTUP_DIST_ERRORS.get(
+                    dist, "no baseline: not resolved when this server started"
+                ),
+            )
+    if inactive:
+        payload["unreadable"] = inactive
+    if drift and _truthy_env(_MCP_ALLOW_STALE_LIBRARY_ENV):
+        payload["gate_disabled_by"] = _MCP_ALLOW_STALE_LIBRARY_ENV
+    return payload
+
+
+def _mcp_stale_library_refusal(req_id, tool_name: str):
+    """Refuse mutating tools once the served code is no longer what is installed (#899).
+
+    Reads stay available on purpose: the palace itself is intact at this point,
+    and a user who has just been told to restart still needs ``status`` and
+    ``search`` to see what state their memory is in. Only the writes are
+    stopped, because those are what a superseded library would persist in a
+    format the newly-installed one may not read back.
+
+    Restarting the server is the only remedy — ``mempalace_reconnect`` reopens
+    the database but cannot reload Python modules — so the hint says so.
+    """
+    if tool_name not in _MUTATING_TOOLS:
+        return None
+
+    if _truthy_env(_MCP_ALLOW_STALE_LIBRARY_ENV):
+        return None
+
+    drift, _unreadable = _stale_library_report()
+    if not drift:
+        return None
+
+    described = ", ".join(
+        f"{entry['package']} {entry['serving']} -> {entry['installed']}" for entry in drift
+    )
+    _log_stale_library_drift(drift, described)
+
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": _STALE_LIBRARY_ERROR_CODE,
+            "message": (
+                "Server is running a library version that is no longer installed "
+                f"({described}); refusing writes until it is restarted"
+            ),
+            "data": {
+                "tool": tool_name,
+                "packages": drift,
+                "action_required": "restart_mcp_server",
+                # Named as a field, not only in the prose below, so a client can
+                # find it without parsing English. The peer-writer gate spells
+                # the same idea the same way.
+                "override_env": _MCP_ALLOW_STALE_LIBRARY_ENV,
+                "hint": (
+                    "The package was upgraded after this server started, so it is "
+                    "still serving the previous code. Restart the MCP server (or the "
+                    "host application that spawned it) to pick up the installed "
+                    "version. mempalace_reconnect reopens the palace but cannot "
+                    "reload Python modules, so it will not clear this. An operator "
+                    "who wants writes to continue across upgrades can set "
+                    f"{_MCP_ALLOW_STALE_LIBRARY_ENV}=1 in the server's environment "
+                    "before it starts."
+                ),
+            },
+        },
+    }
+
+
 def _mcp_tool_preflight_refusal(req_id, tool_name: str):
     """Run MCP request preflight gates outside handle_request complexity."""
 
@@ -5139,9 +6564,27 @@ def _mcp_tool_preflight_refusal(req_id, tool_name: str):
     if read_only_error is not None:
         return read_only_error
 
+    # Corruption outranks staleness: a malformed palace is the more severe and
+    # more actionable condition, and reporting the stale library first would
+    # replace the -32002 message that tells the user to repair it.
     sqlite_integrity_error = _mcp_sqlite_integrity_refusal(req_id, tool_name)
     if sqlite_integrity_error is not None:
         return sqlite_integrity_error
+
+    # Staleness outranks a diverged index: the diverged gate's remedy is to run
+    # `mempalace repair rebuild-index`, which would execute the INSTALLED code
+    # against a palace this server is still writing with the superseded one.
+    # Restarting has to come first, and it also un-gates the index check for
+    # free — the probe re-runs per call. Ordering this way also skips the
+    # diverged gate's _refresh_vector_disabled_flag() read on a call that is
+    # refused either way.
+    stale_library_error = _mcp_stale_library_refusal(req_id, tool_name)
+    if stale_library_error is not None:
+        return stale_library_error
+
+    diverged_index_error = _mcp_diverged_index_refusal(req_id, tool_name)
+    if diverged_index_error is not None:
+        return diverged_index_error
 
     return _mcp_peer_writer_refusal(req_id, tool_name)
 
@@ -5151,6 +6594,7 @@ def _decorate_mcp_tool_result(tool_name: str, result):
 
     if tool_name == "mempalace_status" and isinstance(result, dict):
         result.setdefault("sqlite_integrity", _sqlite_integrity_payload())
+        result.setdefault("library_versions", _stale_library_payload())
         # Who may write this palace right now, and whether anyone is queued.
         # Deliberately here and not in tool_status(): status has several return
         # paths (sqlite fast path, degraded, full) and this belongs to all of
@@ -5301,7 +6745,10 @@ def handle_request(request):
             if "entry" not in tool_args or tool_args["entry"] is None:
                 tool_args["entry"] = content_val
         try:
-            result = _decorate_mcp_tool_result(tool_name, TOOLS[tool_name]["handler"](**tool_args))
+            with _write_stall_watch(tool_name):
+                result = _decorate_mcp_tool_result(
+                    tool_name, TOOLS[tool_name]["handler"](**tool_args)
+                )
 
             return {
                 "jsonrpc": "2.0",
@@ -5527,6 +6974,130 @@ def _maybe_eager_warmup_embedder() -> None:
         )
 
 
+_WRITE_STALL_WARN_ENV = "MEMPALACE_MCP_WRITE_STALL_WARN_SECS"
+_WRITE_STALL_WARN_DEFAULT = 60.0
+_WRITE_STALL_EXIT_ENV = "MEMPALACE_MCP_WRITE_STALL_EXIT_SECS"
+_WRITE_STALL_EXIT_DEFAULT = 0.0
+# EX_TEMPFAIL: the palace is fine, this process is not. A client that restarts
+# the server gets a working one; a zero exit would read as an orderly shutdown.
+_WRITE_STALL_EXIT_CODE = 75
+
+_write_stall_lock = threading.Lock()
+# Optional[dict]: {"tool": str, "since": float(monotonic), "warned": bool}
+_write_stall_inflight: Optional[dict] = None
+
+
+def _write_stall_secs(env_name: str, default: float) -> float:
+    raw = os.environ.get(env_name, "")
+    if not raw.strip():
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning("%s=%r is not a number; using %.0fs", env_name, raw, default)
+        return default
+
+
+def _write_stall_action(elapsed: float, warn_secs: float, exit_secs: float, warned: bool):
+    """Decide what an in-flight vector write has earned: ``None``/warn/exit.
+
+    Pure so the thresholds can be tested without a stalled write; ``exit`` is
+    checked first so a single tick can escalate straight past an unsent warning.
+    """
+    if exit_secs > 0 and elapsed >= exit_secs:
+        return "exit"
+    if warn_secs > 0 and elapsed >= warn_secs and not warned:
+        return "warn"
+    return None
+
+
+@contextlib.contextmanager
+def _write_stall_watch(tool_name: str):
+    """Register a vector write as in flight for the stall watchdog."""
+    global _write_stall_inflight
+
+    if tool_name not in _VECTOR_WRITE_TOOLS:
+        yield
+        return
+
+    with _write_stall_lock:
+        _write_stall_inflight = {
+            "tool": tool_name,
+            "since": time.monotonic(),
+            "warned": False,
+        }
+    try:
+        yield
+    finally:
+        with _write_stall_lock:
+            _write_stall_inflight = None
+
+
+def _start_write_stall_watchdog() -> None:
+    """Start a daemon thread that reports a vector write that stopped returning.
+
+    A chromadb write has no timeout of its own. When one blocks, this process
+    holds the dispatch lock, the palace mine lock and the writer lease, so it
+    answers nothing else and every peer session drops to read-only — and no log
+    on the server side says why. The only trace of a 25-minute outage was the
+    client's own "tool still running" ticks; the handshake stayed healthy, and
+    ``mempalace_status`` could not answer because the dispatch lock was held by
+    the stuck call. So the report has to come from a thread that is not waiting
+    on that lock, and it has to reach stderr, where the MCP host records it.
+
+    ``MEMPALACE_MCP_WRITE_STALL_WARN_SECS`` (default 60, 0 disables) sets when to
+    warn. ``MEMPALACE_MCP_WRITE_STALL_EXIT_SECS`` (default 0 = never) lets an
+    operator turn the wedge into a restartable failure: a server stuck inside
+    chromadb will not recover, and exiting is what releases the locks its peers
+    are queued behind.
+    """
+    warn_secs = _write_stall_secs(_WRITE_STALL_WARN_ENV, _WRITE_STALL_WARN_DEFAULT)
+    exit_secs = _write_stall_secs(_WRITE_STALL_EXIT_ENV, _WRITE_STALL_EXIT_DEFAULT)
+    if warn_secs <= 0 and exit_secs <= 0:
+        return
+
+    thresholds = [t for t in (warn_secs, exit_secs) if t > 0]
+    interval = max(1.0, min(15.0, min(thresholds) / 4))
+
+    def _watchdog() -> None:
+        while True:
+            time.sleep(interval)
+            with _write_stall_lock:
+                inflight = _write_stall_inflight
+                if inflight is None:
+                    continue
+                elapsed = time.monotonic() - inflight["since"]
+                action = _write_stall_action(elapsed, warn_secs, exit_secs, inflight["warned"])
+                tool = inflight["tool"]
+                if action == "warn":
+                    inflight["warned"] = True
+            if action == "warn":
+                logger.warning(
+                    "%s has been inside the palace write path for %.0fs and has not "
+                    "returned. chromadb writes have no timeout: this server now answers "
+                    "nothing else and holds the writer lease, so peer sessions are "
+                    "read-only. Check `mempalace repair --dry-run` for HNSW divergence; "
+                    "restarting this MCP server releases the locks.",
+                    tool,
+                    elapsed,
+                )
+            elif action == "exit":
+                logger.error(
+                    "%s stalled in the palace write path for %.0fs (limit %s=%.0fs); "
+                    "exiting so the palace locks are released and the client can "
+                    "reconnect. The stalled write is lost — rebuild the index before "
+                    "retrying it.",
+                    tool,
+                    elapsed,
+                    _WRITE_STALL_EXIT_ENV,
+                    exit_secs,
+                )
+                os._exit(_WRITE_STALL_EXIT_CODE)
+
+    t = threading.Thread(target=_watchdog, name="mcp-write-stall-watchdog", daemon=True)
+    t.start()
+
+
 def _start_idle_exit_watchdog() -> None:
     """Start a daemon thread that exits the process after an idle period.
 
@@ -5575,6 +7146,34 @@ def _json_rpc_parse_error(req_id=None):
 # exclude the writer-lease handoff watchdog through one lock, not two.
 _HTTP_REQUEST_LOCK = _REQUEST_DISPATCH_LOCK
 _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
+_HTTP_ACTIVE_CLIENT_WINDOW_S = 120.0
+
+# RFC 003 phase 5: logstream tools touch only logstream.sqlite3 (its own WAL
+# database with internal locking) — never Chroma or the KG. Dispatching them
+# outside _HTTP_REQUEST_LOCK keeps a five-minute mempalace_event_wait
+# long-poll from stalling every other agent on a shared hub, and lets the
+# SSE stream coexist with normal tool traffic.
+_HTTP_LOCK_FREE_TOOLS = frozenset(
+    {
+        "mempalace_event_append",
+        "mempalace_event_list",
+        "mempalace_event_wait",
+        "mempalace_event_ack",
+        "mempalace_artifact_put",
+        "mempalace_artifact_get",
+        "mempalace_patch_submit",
+    }
+)
+
+# SSE stream limits (GET /logstream/stream). Each connected client holds one
+# handler thread, so the cap is a thread-exhaustion guard, not a rate limit.
+_SSE_MAX_CLIENTS_ENV = "MEMPALACE_SSE_MAX_CLIENTS"
+_SSE_MAX_CLIENTS_DEFAULT = 8
+_SSE_HEARTBEAT_S = 15.0
+_SSE_POLL_BASE_S = 0.3
+_SSE_POLL_JITTER_S = 0.4
+_SSE_BATCH_LIMIT = 500
+_HTTP_RECENT_CLIENT_LIMIT = 50
 # Host literals that always denote this machine. Used both to decide whether a
 # bind is loopback (skip the network-exposure warning) and to pin the Host
 # header against DNS rebinding when serving on loopback.
@@ -5618,6 +7217,9 @@ def _http_is_loopback(host: str) -> bool:
     return (host or "").strip().lower() in _HTTP_LOOPBACK_HOSTS
 
 
+_HTTP_EXTRA_ALLOWED_HOSTS_ENV = "MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS"
+
+
 def _http_allowed_host_values(bind_host: str, port: int) -> set:
     """Host-header values accepted when Host pinning is enforced.
 
@@ -5626,6 +7228,13 @@ def _http_allowed_host_values(bind_host: str, port: int) -> set:
     so we pin ``Host`` to the loopback literals (and the bound host) with and
     without the port. Computed from the *actual* bound port so an ephemeral
     ``port=0`` bind (tests) still matches.
+
+    ``MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS`` (comma-separated ``host`` or
+    ``host:port`` values) extends the pin for the documented fronting-proxy
+    pattern ("terminate TLS at a proxy"): a loopback-bound server behind
+    ``tailscale serve``/nginx receives the *public* name in ``Host``, which
+    the loopback pin would otherwise reject. Entries are matched exactly
+    (lowercased); a bare hostname also matches ``host:<bound port>``.
     """
     names = set(_HTTP_LOOPBACK_HOSTS)
     if bind_host:
@@ -5634,6 +7243,13 @@ def _http_allowed_host_values(bind_host: str, port: int) -> set:
     for name in names:
         values.add(name)
         values.add(f"{name}:{port}")
+    for raw in os.environ.get(_HTTP_EXTRA_ALLOWED_HOSTS_ENV, "").split(","):
+        entry = raw.strip().lower()
+        if not entry:
+            continue
+        values.add(entry)
+        if ":" not in entry:
+            values.add(f"{entry}:{port}")
     return values
 
 
@@ -5654,6 +7270,671 @@ def _http_origin_allowed(origin: str) -> bool:
     return host in ("127.0.0.1", "localhost", "::1")
 
 
+def _http_client_identity(handler) -> tuple[str, dict]:
+    headers = handler.headers
+    peer = handler.client_address[0] if handler.client_address else ""
+    forwarded_for = (headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
+    real_ip = (headers.get("X-Real-IP") or "").strip()
+    tailnet_user = (headers.get("Tailscale-User-Login") or "").strip()
+    user_agent = (headers.get("User-Agent") or "").strip()
+    host_hdr = (headers.get("Host") or "").strip()
+    peer_hint = forwarded_for or real_ip or peer
+    basis = "|".join([peer_hint, tailnet_user, user_agent, host_hdr])
+    client_id = hashlib.sha256(basis.encode("utf-8", "replace")).hexdigest()[:16]
+    return client_id, {
+        "client_id": client_id,
+        "peer": peer,
+        "peer_hint": peer_hint,
+        "host": host_hdr,
+        "user_agent": user_agent[:160],
+        "tailscale_user": tailnet_user[:160],
+    }
+
+
+def _http_record_request(httpd, handler, status: int) -> None:
+    now = time.time()
+    now_iso = datetime.now().isoformat()
+    client_id, identity = _http_client_identity(handler)
+    with httpd.stats_lock:
+        httpd.request_count += 1
+        httpd.status_counts[str(status)] = httpd.status_counts.get(str(status), 0) + 1
+        entry = dict(httpd.recent_clients.get(client_id, identity))
+        entry.update(identity)
+        entry["last_seen"] = now_iso
+        entry["last_seen_monotonic"] = now
+        entry["request_count"] = int(entry.get("request_count", 0)) + 1
+        entry["last_method"] = handler.command
+        entry["last_path"] = urlparse(handler.path).path
+        entry["last_status"] = status
+        entry["authenticated"] = bool(
+            httpd.auth_token
+            and hmac.compare_digest(
+                handler.headers.get("Authorization", ""), f"Bearer {httpd.auth_token}"
+            )
+        )
+        httpd.recent_clients[client_id] = entry
+        overflow = len(httpd.recent_clients) - _HTTP_RECENT_CLIENT_LIMIT
+        if overflow > 0:
+            oldest = sorted(
+                httpd.recent_clients.items(),
+                key=lambda item: item[1].get("last_seen_monotonic", 0.0),
+            )
+            for stale_id, _entry in oldest[:overflow]:
+                httpd.recent_clients.pop(stale_id, None)
+
+
+def _http_status_payload(httpd) -> dict:
+    now = time.time()
+    with httpd.stats_lock:
+        recent = sorted(
+            (dict(entry) for entry in httpd.recent_clients.values()),
+            key=lambda entry: entry.get("last_seen_monotonic", 0.0),
+            reverse=True,
+        )
+        request_count = httpd.request_count
+        status_counts = dict(httpd.status_counts)
+
+    active = []
+    for entry in recent:
+        last_seen_monotonic = entry.pop("last_seen_monotonic", 0.0)
+        if now - last_seen_monotonic <= _HTTP_ACTIVE_CLIENT_WINDOW_S:
+            active.append(dict(entry))
+
+    writer = {
+        "read_only": _READ_ONLY,
+        "peer_writer_read_only": _MCP_WRITER_READ_ONLY,
+        "peer_writer_lock_failed": _MCP_WRITER_LOCK_FAILED,
+    }
+    if _MCP_WRITER_LOCK_ERROR:
+        writer["peer_writer_lock_error"] = _MCP_WRITER_LOCK_ERROR
+
+    integrity = _sqlite_integrity_payload()
+    palace_path = (
+        os.path.abspath(os.path.expanduser(_config.palace_path)) if _config.palace_path else ""
+    )
+    return {
+        "ok": bool(integrity.get("ok")),
+        "server": {
+            "name": "mempalace",
+            "version": __version__,
+            "transport": "http",
+            "scheme": getattr(httpd, "scheme", "http"),
+            "bind_host": httpd.bind_host,
+            "port": httpd.server_address[1],
+            "started_at": httpd.started_at,
+            "uptime_seconds": round(time.monotonic() - httpd.started_monotonic, 3),
+        },
+        "palace": {
+            "path_hash": hashlib.sha256(palace_path.encode("utf-8")).hexdigest()[:16]
+            if _config.palace_path
+            else "",
+            "backend": _config.backend,
+            "sqlite_integrity": integrity,
+        },
+        "writer": writer,
+        "requests": {
+            "total": request_count,
+            "by_status": status_counts,
+        },
+        "clients": {
+            "active_window_seconds": _HTTP_ACTIVE_CLIENT_WINDOW_S,
+            "active": active,
+            "recent": recent,
+        },
+    }
+
+
+def _http_request_rejected(handler, require_auth: bool) -> bool:
+    """Enforce HTTP Host/Origin/auth policy before dispatching a request."""
+    srv = handler.server
+    if srv.enforce_host_pin:
+        host_hdr = (handler.headers.get("Host") or "").strip().lower()
+        if host_hdr not in srv.allowed_hosts:
+            logger.warning("HTTP request rejected: Host %r not allowed", host_hdr)
+            handler.send_error(403, "Forbidden")
+            return True
+    origin = handler.headers.get("Origin")
+    if origin and not _http_origin_allowed(origin):
+        logger.warning("HTTP request rejected: cross-origin %r", origin)
+        handler.send_error(403, "Forbidden")
+        return True
+    if require_auth and srv.auth_token:
+        provided = handler.headers.get("Authorization", "")
+        if not hmac.compare_digest(provided, f"Bearer {srv.auth_token}"):
+            logger.warning("HTTP request rejected: missing/invalid bearer token")
+            handler.send_error(401, "Unauthorized")
+            return True
+    return False
+
+
+def _sse_max_clients() -> int:
+    try:
+        return max(0, int(os.environ.get(_SSE_MAX_CLIENTS_ENV, "") or _SSE_MAX_CLIENTS_DEFAULT))
+    except ValueError:
+        return _SSE_MAX_CLIENTS_DEFAULT
+
+
+def _http_dispatch(request):
+    """Dispatch one JSON-RPC request with the transport's locking policy.
+
+    The global request lock preserves the single-process / single-palace-
+    handle behavior stdio deployments rely on. Logstream tools are the one
+    exception: they never touch Chroma/KG state and carry their own database
+    lock, and serializing them would let one agent's event_wait long-poll
+    (up to 5 minutes) starve the whole hub.
+    """
+    if (
+        isinstance(request, dict)
+        and request.get("method") == "tools/call"
+        and isinstance(request.get("params"), dict)
+        and request["params"].get("name") in _HTTP_LOCK_FREE_TOOLS
+    ):
+        return handle_request(request)
+    with _HTTP_REQUEST_LOCK:
+        return handle_request(request)
+
+
+def _http_handle_get(handler) -> None:
+    """Route GET requests. Module-level (like the other _http_* helpers) to
+    keep _build_http_server under the C901 complexity ceiling.
+
+    /healthz is the only credential-free route (liveness probes); everything
+    else follows the bearer policy because it exposes palace/ops metadata.
+    """
+    path = urlparse(handler.path).path
+    if path == "/healthz":
+        if not handler._request_rejected(require_auth=False):
+            handler._send_bytes(200, b"ok\n", "text/plain; charset=utf-8")
+        return
+    if path == "/statusz":
+        if not handler._request_rejected(require_auth=True):
+            handler._send_json(200, handler._status_payload())
+        return
+    if path == "/logstream/stream":
+        # Events and artifacts expose work metadata and patch contents;
+        # the stream always follows the bearer policy.
+        if not handler._request_rejected(require_auth=True):
+            _http_serve_logstream_stream(handler)
+        return
+    if path.startswith("/sync/"):
+        if handler._request_rejected(require_auth=True):
+            return
+        if not _http_serve_sync(handler, path):
+            handler.send_error(404, "Not Found")
+        return
+    if handler._request_rejected(require_auth=False):
+        return
+    handler.send_error(404, "Not Found")
+
+
+def _http_serve_sync(handler, path: str) -> bool:
+    """RFC 004 step 0: pull-based anti-entropy endpoints for peer replicas.
+
+    GET /sync/version_vector           → {replica_id, version_vector}
+    GET /sync/ops?origin=&after=&limit → {origin, events, count} (author order)
+    GET /sync/artifact?id=             → {artifact} (exact content + sha256)
+
+    Bearer policy enforced by the caller; served lock-free like all
+    logstream traffic. Returns False when the path is not a sync route.
+    """
+    from urllib.parse import parse_qsl
+
+    query = dict(parse_qsl(urlparse(handler.path).query))
+    try:
+        if path == "/sync/version_vector":
+            handler._send_json(
+                200,
+                {
+                    "replica_id": _call_logstream(lambda ls: ls.replica_id),
+                    "version_vector": _call_logstream(lambda ls: ls.version_vector()),
+                    # Node-profile advertisement (additive): our own
+                    # self-description plus every profile we can relay, so
+                    # carriers propagate profiles for transitively-known
+                    # origins. Old peers ignore these fields.
+                    "profile": _node_profile(),
+                    "profiles": _known_profiles_snapshot(),
+                },
+            )
+            return True
+        if path == "/sync/ops":
+            origin = query.get("origin") or ""
+            after = int(query.get("after", "0") or 0)
+            limit = int(query.get("limit", "500") or 500)
+            events = _call_logstream(lambda ls: ls.list_ops(origin, after_seq=after, limit=limit))
+            handler._send_json(200, {"origin": origin, "events": events, "count": len(events)})
+            return True
+        if path == "/sync/artifact":
+            artifact_id = query.get("id") or ""
+            artifact = _call_logstream(lambda ls: ls.get_artifact(artifact_id))
+            if artifact is None:
+                handler._send_json(404, {"error": f"artifact {artifact_id!r} not found"})
+            else:
+                handler._send_json(200, {"artifact": artifact})
+            return True
+        if path == "/sync/peers":
+            handler._send_json(200, _mesh_peers_payload())
+            return True
+    except (ValueError, TypeError) as exc:
+        handler._send_json(400, {"error": str(exc)})
+        return True
+    return False
+
+
+# Estate data (RFC 004 A.1): what the mesh looks like from THIS replica.
+# Written by the sync loop after every round, read by /sync/peers. Values
+# are whole-entry replacements under the GIL, so readers never see a
+# half-updated peer record.
+_PEER_SYNC_STATE: dict = {}
+
+# Node profiles learned from peers (their self-descriptions, relayed
+# transitively), keyed by replica_id. LWW by advertised_at. The estate
+# renders roles/accelerator/counts from these instead of UI guesses.
+_KNOWN_PROFILES: dict = {}
+
+# Self profile is recomputed at most every TTL seconds — peers request it
+# every sync round and the drawer count / provider probe should not run
+# per request.
+_NODE_PROFILE_TTL_S = 60.0
+_node_profile_cache: dict = {}
+
+_ACCELERATOR_NAMES = {"cuda": "CUDA", "dml": "DirectML", "coreml": "CoreML", "cpu": "CPU"}
+
+
+def _node_profile() -> dict:
+    """This node's self-described profile — every field is pure derivation
+    (palace presence, logstream authorship, resolved onnxruntime provider),
+    never configuration, so the estate can render truth without guesses."""
+    import platform
+
+    cached = _node_profile_cache.get("profile")
+    if cached and time.monotonic() - _node_profile_cache.get("at", 0) < _NODE_PROFILE_TTL_S:
+        return cached
+
+    roles = []
+    drawers = None
+    try:
+        col = _get_collection(create=False)
+        if col is not None:
+            drawers = col.count()
+            roles.append("replica")
+    except Exception:
+        logger.debug("node profile: drawer count unavailable", exc_info=True)
+    try:
+        authored = _call_logstream(lambda ls: ls.version_vector().get(ls.replica_id, 0))
+        if authored:
+            roles.append("agents")
+    except Exception:
+        logger.debug("node profile: logstream authorship unavailable", exc_info=True)
+    accelerator = None
+    try:
+        from .embedding import _resolve_providers, current_model_name
+
+        device = getattr(_config, "embedding_device", None) or "auto"
+        _providers, effective = _resolve_providers(device)
+        accelerator = {
+            "provider": _ACCELERATOR_NAMES.get(effective, effective),
+            "embedder": current_model_name(),
+        }
+        roles.append("compute")
+    except Exception:
+        logger.debug("node profile: embedder resolution unavailable", exc_info=True)
+
+    profile = {
+        "roles": roles,
+        "accelerator": accelerator,
+        "drawers": drawers,
+        "hardware": platform.platform(),
+        "advertised_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    _node_profile_cache["profile"] = profile
+    _node_profile_cache["at"] = time.monotonic()
+    return profile
+
+
+def _merge_known_profiles(profiles: dict) -> None:
+    """Fold relayed profiles in, last-writer-wins by advertised_at."""
+    if not isinstance(profiles, dict):
+        return
+    for origin, profile in profiles.items():
+        if not isinstance(origin, str) or not isinstance(profile, dict):
+            continue
+        prior = _KNOWN_PROFILES.get(origin)
+        if prior and (prior.get("advertised_at") or "") >= (profile.get("advertised_at") or ""):
+            continue
+        _KNOWN_PROFILES[origin] = profile
+
+
+def _known_profiles_snapshot(published: dict = None) -> dict:
+    """Every origin profile this node can vouch for having seen.
+
+    Published profiles first (the hub's, when this process is not the one
+    syncing), then any learned in this process, then our own fresh
+    self-profile last so it always wins for self.
+    """
+    if published is None:
+        published = _published_mesh_state()
+    snapshot = dict(published.get("profiles") or {})
+    snapshot.update(_KNOWN_PROFILES)
+    try:
+        snapshot[_call_logstream(lambda ls: ls.replica_id)] = _node_profile()
+    except Exception:
+        logger.debug("node profile: self profile unavailable", exc_info=True)
+    return snapshot
+
+
+def _publish_mesh_state(palace_path: str) -> None:
+    """Write this process's estate where other local processes can read it.
+
+    The sync loop runs only in the HTTP transport, so without this the stdio
+    MCP servers agents connect through answer ``mempalace_mesh_peers`` from a
+    permanently empty ``_PEER_SYNC_STATE`` -- peers with a name and a url and
+    nothing else, and ``origin_profiles`` holding only this node. Never fatal:
+    a publish failure costs other processes their estate view, not this
+    process's convergence.
+    """
+    from . import server_registry
+
+    try:
+        server_registry.write_mesh_state(
+            palace_path,
+            peers=dict(_PEER_SYNC_STATE),
+            profiles=dict(_KNOWN_PROFILES),
+        )
+    except Exception:
+        logger.debug("mesh state publish failed", exc_info=True)
+
+
+def _published_mesh_state() -> dict:
+    """Read the estate published by this palace's hub, if any."""
+    from . import server_registry
+
+    palace_path = getattr(_config, "palace_path", None)
+    if not palace_path:
+        return {"peers": {}, "profiles": {}, "written_at": None, "writer_alive": False}
+    try:
+        return server_registry.read_mesh_state(palace_path)
+    except Exception:
+        logger.debug("mesh state read failed", exc_info=True)
+        return {"peers": {}, "profiles": {}, "written_at": None, "writer_alive": False}
+
+
+def _record_peer_sync(stats: dict) -> None:
+    """Fold one peer's round outcome into the estate state."""
+    name = stats.get("peer_name") or stats.get("peer_url") or "?"
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    prior = _PEER_SYNC_STATE.get(name) or {}
+    if stats.get("error"):
+        entry = {
+            "url": stats.get("peer_url") or prior.get("url"),
+            "replica_id": prior.get("replica_id"),
+            "reachable": False,
+            "last_error": stats["error"],
+            "last_error_at": now,
+            "last_success_at": prior.get("last_success_at"),
+            "remote_version_vector": prior.get("remote_version_vector"),
+            # Unreachable peers keep their last advertised profile — the
+            # estate renders "last seen as", never a blank node.
+            "profile": prior.get("profile"),
+        }
+    else:
+        entry = {
+            "url": stats.get("peer_url"),
+            "replica_id": stats.get("peer_replica"),
+            "reachable": True,
+            "last_error": None,
+            "last_error_at": prior.get("last_error_at"),
+            "last_success_at": now,
+            "last_pulled_events": stats.get("pulled_events", 0),
+            "last_pulled_artifacts": stats.get("pulled_artifacts", 0),
+            "remote_version_vector": stats.get("remote_version_vector") or {},
+            "profile": stats.get("remote_profile") or prior.get("profile"),
+        }
+        _merge_known_profiles(stats.get("remote_profiles") or {})
+        if stats.get("remote_profile") and stats.get("peer_replica"):
+            _merge_known_profiles({stats["peer_replica"]: stats["remote_profile"]})
+    _PEER_SYNC_STATE[name] = entry
+
+
+def _mesh_peers_payload() -> dict:
+    """The estate answer for one replica: who its peers are, whether they
+    were reachable last round, their vectors (drift is peer vector vs
+    self vector — computed by the consumer), and origins known only
+    transitively. peers.json tokens are NEVER included.
+    """
+    import socket
+
+    from .logsync import load_peers
+
+    replica_id = _call_logstream(lambda ls: ls.replica_id)
+    local_vector = _call_logstream(lambda ls: ls.version_vector())
+    try:
+        configured = load_peers(getattr(_config, "palace_path", None) or "")
+    except (ValueError, TypeError):
+        configured = []
+    # The peer sync loop lives in the HTTP transport, so in every other
+    # process _PEER_SYNC_STATE is empty and the only honest source is what
+    # the hub published. Prefer our own state when we have it (this process
+    # is the one syncing, so it is fresher than anything on disk) and fall
+    # back to the published estate per peer.
+    published = _published_mesh_state()
+    published_peers = published.get("peers") or {}
+    named_origins = {replica_id}
+    peers = []
+    for peer in configured:
+        name = peer.get("name") or peer["url"]
+        state = dict(_PEER_SYNC_STATE.get(name) or published_peers.get(name) or {})
+        state.pop("url", None)  # peers.json is authoritative for the url
+        if state.get("replica_id"):
+            named_origins.add(state["replica_id"])
+        peers.append({"name": name, "url": peer["url"], **state})
+    return {
+        "self": {
+            "replica_id": replica_id,
+            "name": socket.gethostname(),
+            "version_vector": local_vector,
+            "profile": _node_profile(),
+        },
+        "peers": peers,
+        # Origins present in the local log but not configured as peers —
+        # replicas this node only knows transitively (gossip carriers).
+        "unnamed_origins": sorted(set(local_vector) - named_origins),
+        # Every self-described profile known here, keyed by replica_id —
+        # including profiles of unnamed origins relayed through carriers.
+        "origin_profiles": _known_profiles_snapshot(published),
+        "sync_interval_s": _peer_sync_interval_s(),
+        # Where the peer status above came from. in_process means this
+        # process runs the sync loop; otherwise the estate was published by
+        # the hub at published_at, and writer_alive says whether that hub is
+        # still running (a dead hub leaves a last-known-good reading).
+        "estate_source": {
+            "in_process": bool(_PEER_SYNC_STATE),
+            "published_at": published.get("written_at"),
+            "writer_alive": published.get("writer_alive", False),
+        },
+    }
+
+
+def _peer_sync_interval_s() -> float:
+    try:
+        return float(os.environ.get("MEMPALACE_SYNC_INTERVAL", "") or 15)
+    except ValueError:
+        return 15.0
+
+
+def _start_peer_sync_thread() -> None:
+    """Background anti-entropy loop for the logstream (RFC 004 step 0).
+
+    Runs in the serving process so a hub with configured peers converges
+    with zero extra processes. Interval via MEMPALACE_SYNC_INTERVAL
+    (seconds, default 15; 0 disables). Errors are logged, never fatal —
+    a dead peer must not take the loop down (R1).
+
+    Membership is re-read from peers.json every round, never latched at
+    startup: joining the mesh is "write peers.json", and requiring a hub
+    restart for a file the docs describe as picked up "within one sync
+    cycle" is a silent no-op for anyone following the guide in order (hub
+    first, peers after). A malformed peers.json logs once per transition
+    rather than every round, so a typo is visible without flooding the log.
+    """
+    from .logsync import sync_all
+
+    palace_path = getattr(_config, "palace_path", None)
+    if not palace_path:
+        return
+    interval = _peer_sync_interval_s()
+    if interval <= 0:
+        return
+
+    def _loop():
+        malformed_logged = False
+        while True:
+            time.sleep(interval)
+            try:
+                ls = _get_logstream()
+                for stats in sync_all(ls, palace_path):
+                    _record_peer_sync(stats)
+                    if stats.get("error"):
+                        logger.warning("peer sync %s: %s", stats.get("peer_name"), stats["error"])
+                    elif stats.get("pulled_events"):
+                        logger.info(
+                            "peer sync %s: pulled %d event(s), %d artifact(s)",
+                            stats.get("peer_name"),
+                            stats["pulled_events"],
+                            stats["pulled_artifacts"],
+                        )
+                # Publish once per round, not per peer: the estate is only
+                # coherent after every configured peer has been attempted.
+                _publish_mesh_state(palace_path)
+                malformed_logged = False
+            except ValueError as exc:
+                if not malformed_logged:
+                    logger.error("peers.json is malformed; skipping peer sync: %s", exc)
+                    malformed_logged = True
+            except Exception:
+                logger.warning("peer sync round failed", exc_info=True)
+
+    thread = threading.Thread(target=_loop, name="mempalace-logsync", daemon=True)
+    thread.start()
+    logger.info("peer sync thread started (interval %.0fs)", interval)
+
+
+def _sse_acquire_slot(httpd) -> bool:
+    with httpd.sse_lock:
+        if httpd.sse_clients >= httpd.sse_max_clients:
+            return False
+        httpd.sse_clients += 1
+        return True
+
+
+def _sse_release_slot(httpd) -> None:
+    with httpd.sse_lock:
+        httpd.sse_clients -= 1
+
+
+def _http_serve_logstream_stream(handler) -> None:
+    """RFC 003 phase 5: live logstream tail over Server-Sent Events.
+
+    Query params are exactly the ``event_list`` filters plus
+    ``since_event_id`` (or the standard ``Last-Event-ID`` header): with a
+    cursor the server replays everything after it, then tails live; without
+    one it tails only post-connect events. Each event is one SSE frame
+    (``id:`` = event id, ``event: logstream``, ``data:`` = the same JSON
+    envelope event_list returns), with a ``: ping`` comment every ~15s so
+    proxies keep the pipe open. Never touches _HTTP_REQUEST_LOCK — the
+    stream must coexist with normal tool traffic, not starve it. Defined at
+    module level (like the other _http_* helpers) to keep
+    _build_http_server under the C901 complexity ceiling.
+    """
+    import random
+    from urllib.parse import parse_qsl
+
+    global _last_request_time
+
+    query = dict(parse_qsl(urlparse(handler.path).query))
+    filters = {
+        key: (query.get(key) or None)
+        for key in (
+            "stream",
+            "room",
+            "type",
+            "to_agent",
+            "from_agent",
+            "correlation_id",
+            "status",
+        )
+    }
+    cursor = query.get("since_event_id") or handler.headers.get("Last-Event-ID") or None
+
+    def _list_after(after_id):
+        return _call_logstream(
+            lambda ls: ls.list_events(since_event_id=after_id, limit=_SSE_BATCH_LIMIT, **filters)
+        )
+
+    try:
+        if cursor is None:
+            # Live tail: only post-connect events. On an empty log the
+            # cursor stays None and the whole log is post-connect.
+            cursor = _call_logstream(lambda ls: ls.latest_event_id())
+        # Validate filters (and an explicit cursor) before committing to a
+        # streaming response — errors must be a clean 400, not a half-open
+        # stream.
+        if cursor:
+            _list_after(cursor)
+        else:
+            _call_logstream(lambda ls: ls.list_events(limit=1, **filters))
+    except ValueError as exc:
+        handler._send_json(400, {"error": str(exc)})
+        return
+
+    if not _sse_acquire_slot(handler.server):
+        handler._record_request(503)
+        handler.send_response(503)
+        handler.send_header("Retry-After", "5")
+        handler.send_header("Content-Length", "0")
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+        handler.close_connection = True
+        return
+
+    try:
+        handler._record_request(200)
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header("X-Accel-Buffering", "no")
+        handler.end_headers()
+
+        last_write = time.monotonic()
+        while True:
+            _last_request_time = time.monotonic()
+            events = (
+                _list_after(cursor)
+                if cursor
+                else _call_logstream(lambda ls: ls.list_events(limit=_SSE_BATCH_LIMIT, **filters))
+            )
+            for event in events:
+                frame = (
+                    f"id: {event['id']}\n"
+                    f"event: logstream\n"
+                    f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                )
+                handler.wfile.write(frame.encode("utf-8"))
+                cursor = event["id"]
+                last_write = time.monotonic()
+            if events:
+                handler.wfile.flush()
+            elif time.monotonic() - last_write >= _SSE_HEARTBEAT_S:
+                handler.wfile.write(b": ping\n\n")
+                handler.wfile.flush()
+                last_write = time.monotonic()
+            time.sleep(_SSE_POLL_BASE_S + random.random() * _SSE_POLL_JITTER_S)
+    except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+        pass  # client went away — the normal way an SSE stream ends
+    finally:
+        _sse_release_slot(handler.server)
+        handler.close_connection = True
+
+
 def _build_http_server(host: str, port: int):
     """Construct (but do not start) the MCP HTTP server.
 
@@ -5664,7 +7945,6 @@ def _build_http_server(host: str, port: int):
     allowlist, Origin check, optional bearer token) is attached as attributes.
     """
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    from urllib.parse import urlparse
 
     auth_token = os.environ.get("MEMPALACE_MCP_HTTP_TOKEN", "").strip()
     if (
@@ -5716,7 +7996,18 @@ def _build_http_server(host: str, port: int):
         def log_message(self, fmt, *args):
             logger.info("HTTP %s - " + fmt, self.client_address[0], *args)
 
+        def send_error(self, code, message=None, explain=None):
+            self._record_request(code)
+            return super().send_error(code, message, explain)
+
+        def _record_request(self, status: int) -> None:
+            _http_record_request(self.server, self, status)
+
+        def _status_payload(self) -> dict:
+            return _http_status_payload(self.server)
+
         def _send_bytes(self, status: int, body: bytes, content_type: str) -> None:
+            self._record_request(status)
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
@@ -5730,44 +8021,10 @@ def _build_http_server(host: str, port: int):
             self._send_bytes(status, body, "application/json; charset=utf-8")
 
         def _request_rejected(self, require_auth: bool) -> bool:
-            """Enforce the transport's access policy before any dispatch.
-
-            The palace is the most sensitive data MemPalace holds and ``/mcp``
-            is unauthenticated by default, so this guards the two ways a local
-            HTTP server leaks to the network: DNS rebinding (Host/Origin) and,
-            when the operator opts in, a missing/incorrect bearer token.
-            """
-            srv = self.server
-            if srv.enforce_host_pin:
-                host_hdr = (self.headers.get("Host") or "").strip().lower()
-                if host_hdr not in srv.allowed_hosts:
-                    logger.warning("HTTP request rejected: Host %r not allowed", host_hdr)
-                    self.send_error(403, "Forbidden")
-                    return True
-            origin = self.headers.get("Origin")
-            if origin and not _http_origin_allowed(origin):
-                logger.warning("HTTP request rejected: cross-origin %r", origin)
-                self.send_error(403, "Forbidden")
-                return True
-            if require_auth and srv.auth_token:
-                provided = self.headers.get("Authorization", "")
-                if not hmac.compare_digest(provided, f"Bearer {srv.auth_token}"):
-                    logger.warning("HTTP request rejected: missing/invalid bearer token")
-                    self.send_error(401, "Unauthorized")
-                    return True
-            return False
+            return _http_request_rejected(self, require_auth)
 
         def do_GET(self):
-            # Liveness probe is policy-gated for Host/Origin but never requires
-            # the token, so an orchestrator's health check works without creds.
-            if self._request_rejected(require_auth=False):
-                return
-            path = urlparse(self.path).path
-            if path == "/healthz":
-                self._send_bytes(200, b"ok\n", "text/plain; charset=utf-8")
-                return
-
-            self.send_error(404, "Not Found")
+            _http_handle_get(self)
 
         def do_POST(self):
             if self._request_rejected(require_auth=True):
@@ -5801,14 +8058,13 @@ def _build_http_server(host: str, port: int):
                 self._send_json(400, _json_rpc_parse_error())
                 return
 
-            # Preserve the single-process / single-palace-handle behavior that
-            # stdio deployments rely on. HTTP gives us a safer transport, not
-            # concurrent Chroma/HNSW mutation.
-            with _HTTP_REQUEST_LOCK:
-                response = handle_request(request)
+            # Locking policy lives in _http_dispatch: global lock for
+            # Chroma-touching tools, lock-free for logstream tools.
+            response = _http_dispatch(request)
 
             if response is None:
                 # JSON-RPC notifications intentionally have no response body.
+                self._record_request(202)
                 self.send_response(202)
                 self.send_header("Content-Length", "0")
                 self.send_header("Connection", "close")
@@ -5828,6 +8084,16 @@ def _build_http_server(host: str, port: int):
     httpd.allowed_hosts = _http_allowed_host_values(host, bound_port)
     httpd.auth_token = auth_token
     httpd.scheme = "http"
+    httpd.bind_host = host
+    httpd.started_at = datetime.now().isoformat()
+    httpd.started_monotonic = time.monotonic()
+    httpd.stats_lock = threading.Lock()
+    httpd.request_count = 0
+    httpd.status_counts = {}
+    httpd.recent_clients = {}
+    httpd.sse_lock = threading.Lock()
+    httpd.sse_clients = 0
+    httpd.sse_max_clients = _sse_max_clients()
     if tls_cert:
         httpd.socket = _wrap_tls(httpd.socket, tls_cert, tls_key)
         httpd.scheme = "https"
@@ -5849,6 +8115,31 @@ def _serve_http(host: str, port: int) -> None:
         sys.exit(1)
 
     bound_port = httpd.server_address[1]
+
+    # Register this process as the palace's hub so local short-lived writers
+    # (save hooks, plain `mempalace mine`) forward their writes here instead
+    # of colliding with the MCP writer lease. Best-effort: discovery is an
+    # optimization, serving must not fail because the record could not be
+    # written.
+    _registered_palace = _config.palace_path
+    if _registered_palace:
+        try:
+            from . import server_registry
+
+            server_registry.write_serverinfo(
+                _registered_palace,
+                host=host,
+                port=bound_port,
+                scheme=getattr(httpd, "scheme", "http"),
+                read_only=_READ_ONLY,
+            )
+            import atexit
+
+            atexit.register(server_registry.clear_serverinfo, _registered_palace)
+        except Exception:
+            logger.debug("Failed to write hub serverinfo", exc_info=True)
+            _registered_palace = None
+
     if not _http_is_loopback(host):
         if httpd.auth_token:
             logger.warning(
@@ -5863,6 +8154,10 @@ def _serve_http(host: str, port: int) -> None:
                 host,
                 _HTTP_ALLOW_INSECURE_NO_TOKEN_ENV,
             )
+
+    # RFC 004 step 0: converge with peer replicas when peers.json exists.
+    _start_peer_sync_thread()
+
     with httpd:
         logger.info(
             "MemPalace MCP HTTP server listening on %s://%s:%s/mcp%s%s",
@@ -5876,6 +8171,14 @@ def _serve_http(host: str, port: int) -> None:
             httpd.serve_forever(poll_interval=0.5)
         except KeyboardInterrupt:
             logger.info("MemPalace MCP HTTP server shutting down")
+        finally:
+            if _registered_palace:
+                try:
+                    from . import server_registry
+
+                    server_registry.clear_serverinfo(_registered_palace)
+                except Exception:
+                    logger.debug("Failed to clear hub serverinfo", exc_info=True)
 
 
 def _startup_preflight() -> None:
@@ -5909,6 +8212,111 @@ def _drop_broken_stdout() -> None:
         os.close(devnull)
     except (OSError, ValueError, AttributeError):
         pass
+
+
+# Stdio→hub proxying. When a long-lived HTTP hub (`mempalace serve`) owns
+# this palace, a stdio server spawned by an agent harness must not open its
+# own Chroma handles: it could only ever be a read-only peer (writer lease,
+# #1818), and racing writers are exactly what corrupted FTS5 indexes in the
+# wild. Instead the stdio process forwards every JSON-RPC request to the hub
+# verbatim, adding the local bearer token. This makes stdio-only harnesses
+# (plugins, desktop apps) share the hub with zero client-side reconfiguration.
+# Shares the CLI forwarder's kill switch (MEMPALACE_HUB_FORWARD=0).
+_HUB_FORWARD_ENV = "MEMPALACE_HUB_FORWARD"
+_HUB_PROXY_TIMEOUT_S = 600.0
+_hub_proxy_announced = False
+
+
+def _hub_proxy_target():
+    """Return (base_url, headers) for a live hub serving our palace, or None."""
+    global _hub_proxy_announced
+    if _truthy_env_off(_HUB_FORWARD_ENV):
+        return None
+    try:
+        from . import server_registry
+
+        info = server_registry.read_live_serverinfo(_config.palace_path)
+        if not info or info.get("pid") == os.getpid():
+            return None
+        base_url = server_registry.client_base_url(info)
+        headers = {"Content-Type": "application/json"}
+        token = server_registry.load_server_token(_config.palace_path)
+    except Exception:
+        logger.debug("hub discovery failed; serving locally", exc_info=True)
+        return None
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if not _hub_proxy_announced:
+        _hub_proxy_announced = True
+        logger.info("Live palace hub detected at %s; proxying stdio requests to it", base_url)
+    return base_url, headers
+
+
+def _truthy_env_off(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"0", "false", "no", "off"}
+
+
+def _forward_request_to_hub(base_url: str, headers: dict, request: dict):
+    """POST one JSON-RPC request to the hub; None for notifications (202)."""
+    import urllib.request
+
+    body = json.dumps(request, ensure_ascii=False).encode("utf-8")
+    http_request = urllib.request.Request(f"{base_url}/mcp", data=body, headers=headers)
+    with urllib.request.urlopen(http_request, timeout=_HUB_PROXY_TIMEOUT_S) as resp:
+        raw = resp.read()
+    if not raw:
+        return None
+    return json.loads(raw.decode("utf-8"))
+
+
+def _request_is_mutating(request: dict) -> bool:
+    if request.get("method") != "tools/call":
+        return False
+    name = ((request.get("params") or {}).get("name")) or ""
+    return name in _MUTATING_TOOLS
+
+
+def _dispatch_stdio_request(request: dict):
+    """Route one stdio request: live hub first, local handling otherwise.
+
+    The hub check runs per request (a tiny local JSON read), so a hub that
+    starts, restarts on a new port, or dies mid-session is picked up without
+    restarting this process. Fallback to local handling is allowed only when
+    the failure provably happened before the hub accepted the request — a
+    mutating call that failed mid-flight must NOT be replayed locally (the
+    hub may still be executing it), so it surfaces as a JSON-RPC error.
+    """
+    import urllib.error
+
+    target = _hub_proxy_target()
+    if target is None:
+        return handle_request(request)
+    base_url, headers = target
+    try:
+        return _forward_request_to_hub(base_url, headers, request)
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        reached_hub = isinstance(exc, urllib.error.HTTPError)
+        if not reached_hub and not _request_is_mutating(request):
+            logger.warning("Hub at %s unreachable (%s); handling request locally", base_url, exc)
+            return handle_request(request)
+        if request.get("id") is None:
+            return None
+        return {
+            "jsonrpc": "2.0",
+            "id": request.get("id"),
+            "error": {
+                "code": -32000,
+                "message": f"palace hub proxy failed: {exc}",
+                "data": {
+                    "hub": base_url,
+                    "hint": (
+                        "The palace hub did not complete this request. Mutating tools "
+                        "are not replayed locally — the hub may still be executing the "
+                        "call. Check the hub process, then retry."
+                    ),
+                },
+            },
+        }
 
 
 def _run_stdio_loop() -> None:
@@ -5955,6 +8363,10 @@ def _run_stdio_loop() -> None:
     # _acquire_mcp_writer_lock (tests, embedders) never leak a thread.
     _start_writer_handoff_watchdog()
 
+    # Say so when a chromadb write stops coming back, from a thread the stuck
+    # call is not blocking.
+    _start_write_stall_watchdog()
+
     while True:
         try:
             line = sys.stdin.readline()
@@ -5965,10 +8377,10 @@ def _run_stdio_loop() -> None:
             # clean EOF — same meaning: the client is gone. Never loop on
             # it: an orphaned stdio server holding the mine_palace flock
             # blocked all palace writes for hours (2026-07-10 outage).
-            logger.info("stdin read failed (%s) — client disconnected, shutting down", exc)
+            logger.info("stdin read failed (%s) -- client disconnected, shutting down", exc)
             break
         if not line:
-            logger.info("stdin EOF — client disconnected, shutting down")
+            logger.info("stdin EOF -- client disconnected, shutting down")
             break
 
         line = line.strip()
@@ -5978,10 +8390,7 @@ def _run_stdio_loop() -> None:
         payload = None
         try:
             request = json.loads(line)
-            # Excludes the writer-lease handoff watchdog for the duration of
-            # the request: it must not close storage handles mid-dispatch.
-            with _REQUEST_DISPATCH_LOCK:
-                response = handle_request(request)
+            response = _dispatch_stdio_request(request)
             if response is not None:
                 payload = json.dumps(response, ensure_ascii=False)
         except KeyboardInterrupt:
@@ -6001,7 +8410,7 @@ def _run_stdio_loop() -> None:
             # The client's read end is gone; every future response write
             # would fail the same way, so treat it like stdin EOF and
             # shut down instead of swallowing it in the generic handler.
-            logger.info("stdout write failed (%s) — client disconnected, shutting down", exc)
+            logger.info("stdout write failed (%s) -- client disconnected, shutting down", exc)
             _drop_broken_stdout()
             break
 
@@ -6034,6 +8443,7 @@ def _run_http_loop() -> None:
         # No-op unless the operator opted this HTTP deployment into handing the
         # palace to peers (MEMPALACE_WRITER_HANDOFF_ENABLED).
         _start_writer_handoff_watchdog()
+        _start_write_stall_watchdog()
 
         raw_warmup = os.environ.get("MEMPALACE_EAGER_WARMUP", "").strip().lower()
         if raw_warmup in _WARMUP_TRUTHY:
@@ -6062,6 +8472,35 @@ def _run_http_loop() -> None:
                 _release_mcp_writer_lock()
 
 
+def _install_shutdown_signal_handlers() -> None:
+    """Route terminal signals through ``sys.exit`` so ``atexit`` runs.
+
+    The palace writer lease is released by an ``atexit`` callback registered
+    when the lock is acquired. CPython's default disposition for SIGTERM and
+    SIGHUP is immediate termination, which skips ``atexit`` and leaves
+    ``mine_palace_*.lock`` naming a dead PID until a contender's liveness
+    check reclaims it (#2205). Calling ``sys.exit(0)`` from the handler
+    unwinds the synchronous stdio/http loop and runs the existing release
+    path. SIGHUP is Unix-only (SSH session disconnect); Windows only gets
+    SIGTERM. Handlers are best-effort — signal registration only works from
+    the main thread and is a no-op when the platform omits the signal.
+    """
+    import signal
+
+    def _shutdown_handler(signum, frame):  # noqa: ARG001
+        raise SystemExit(0)
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _shutdown_handler)
+        except (ValueError, OSError):
+            # Not in the main thread, or the platform rejects the install.
+            pass
+
+
 def main():
     """MCP server entry point for the ``mempalace-mcp`` console script.
 
@@ -6083,6 +8522,8 @@ def main():
     # already protects this process from the same ABI mismatch; here we
     # extend the protection to children.
     os.environ.pop("PYTHONPATH", None)
+
+    _install_shutdown_signal_handlers()
 
     if _args.transport == "http":
         _run_http_loop()

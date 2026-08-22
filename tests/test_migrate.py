@@ -2,6 +2,7 @@
 
 import errno
 import os
+import socket
 import sqlite3
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -46,7 +47,7 @@ def test_migrate_aborts_without_confirmation(tmp_path, capsys):
             return_value=[{"id": "id1", "document": "doc", "metadata": {"wing": "w", "room": "r"}}],
         ),
         patch("builtins.input", return_value="n"),
-        patch("mempalace.migrate.shutil.copytree") as mock_copytree,
+        patch("mempalace.migrate.copy_palace_dir") as mock_backup_copy,
         patch("mempalace.migrate.shutil.rmtree") as mock_rmtree,
     ):
         result = migrate(str(palace_dir))
@@ -54,7 +55,7 @@ def test_migrate_aborts_without_confirmation(tmp_path, capsys):
     out = capsys.readouterr().out
     assert result is False
     assert "Aborted." in out
-    mock_copytree.assert_not_called()
+    mock_backup_copy.assert_not_called()
     mock_rmtree.assert_not_called()
 
 
@@ -304,7 +305,7 @@ def test_migrate_cleans_temp_palace_on_chromadb_failure(tmp_path):
             return_value=[{"id": "id1", "document": "doc", "metadata": {"wing": "w", "room": "r"}}],
         ),
         patch("builtins.input", return_value="y"),
-        patch("mempalace.migrate.shutil.copytree"),
+        patch("mempalace.migrate.copy_palace_dir"),
         patch("mempalace.migrate.tempfile.mkdtemp", side_effect=tracking_mkdtemp),
         patch.object(_chroma_mod, "ChromaBackend", return_value=failing_backend),
     ):
@@ -321,10 +322,10 @@ def test_migrate_cleans_temp_palace_on_chromadb_failure(tmp_path):
 def test_migrate_prunes_old_pre_migrate_backups(tmp_path, monkeypatch):
     """Repeated migrations must not accumulate full-palace copies forever.
 
-    The backup + prune happen right after copytree, before the (mocked)
-    chromadb step, so even a migration that fails afterward still trims the
-    backup set. We let copytree run for real so the fresh backup exists on
-    disk for the prune to evaluate.
+    The backup + prune happen right after the directory copy, before the
+    (mocked) chromadb step, so even a migration that fails afterward still
+    trims the backup set. We let the copy run for real so the fresh backup
+    exists on disk for the prune to evaluate.
     """
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()
@@ -365,6 +366,69 @@ def test_migrate_prunes_old_pre_migrate_backups(tmp_path, monkeypatch):
     # The two oldest stale backups must be gone.
     assert "palace.pre-migrate.20260100_000000" not in backups
     assert "palace.pre-migrate.20260101_000000" not in backups
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not hasattr(socket, "AF_UNIX"),
+    reason="Unix domain socket files are POSIX-only",
+)
+def test_migrate_backup_survives_a_socket_in_the_palace_directory(tmp_path, monkeypatch, capsys):
+    """#2207 in the second full-palace copy: migrate takes the same backup.
+
+    The backend is mocked to fail after the backup, so the expected
+    RuntimeError proves the copy got past the socket instead of dying on it.
+    """
+    # Retention comes from the user's config file otherwise, which this test
+    # must not read; the sibling backup tests pin it the same way.
+    monkeypatch.setenv("MEMPALACE_MAX_BACKUPS", "2")
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    (palace_dir / "chroma.sqlite3").write_text("db")
+    # Pins that migrate still copies with ``symlinks=True``: links are
+    # recreated as links, so a link to a file outside the palace does not get
+    # duplicated by content into every ``.pre-migrate.*`` copy. The target is
+    # real, so the link resolves and only the copy mode decides the outcome.
+    (tmp_path / "outside.json").write_text("payload", encoding="utf-8")
+    try:
+        (palace_dir / "tunnels.json").symlink_to(tmp_path / "outside.json")
+    except OSError as exc:
+        # Only a permission refusal is a skip; anything else is a bug here.
+        if os.name != "nt" and exc.errno not in (errno.EPERM, errno.EACCES):
+            raise
+        pytest.skip(f"symlink creation not permitted for this user: {exc}")
+    # Bound by relative name: the absolute tmp path can exceed the sun_path
+    # limit, which is tight on macOS.
+    monkeypatch.chdir(palace_dir)
+    leftover = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        leftover.bind("mcp.sock")
+    finally:
+        leftover.close()
+
+    failing_backend = MagicMock()
+    failing_backend.get_or_create_collection.side_effect = RuntimeError("chromadb boom")
+
+    import mempalace.backends.chroma as _chroma_mod
+
+    with (
+        patch("mempalace.migrate.detect_chromadb_version", return_value="0.5.x"),
+        patch(
+            "mempalace.migrate.extract_drawers_from_sqlite",
+            return_value=[{"id": "id1", "document": "doc", "metadata": {"wing": "w", "room": "r"}}],
+        ),
+        patch.object(_chroma_mod, "ChromaBackend", return_value=failing_backend),
+        pytest.raises(RuntimeError, match="chromadb boom"),
+    ):
+        migrate(str(palace_dir), confirm=True)
+
+    out = capsys.readouterr().out
+    assert "    mcp.sock (socket)" in out.splitlines()
+    backups = list(tmp_path.glob("palace.pre-migrate.*"))
+    assert len(backups) == 1
+    assert (backups[0] / "chroma.sqlite3").read_text() == "db"
+    assert not (backups[0] / "mcp.sock").exists()
+    assert (palace_dir / "mcp.sock").exists()
+    assert (backups[0] / "tunnels.json").is_symlink()
 
 
 def test_migrate_restores_palace_on_swap_failure(tmp_path, capsys):

@@ -829,6 +829,7 @@ def mine_lock(source_file: str):
     Prevents multiple agents from mining the same file simultaneously,
     which causes duplicate drawers when the delete+insert cycle interleaves.
     """
+    _maybe_reap_stale_mine_locks()
     lock_path = _mine_lock_path(source_file)
     lf = _acquire_mine_lock_file(lock_path)
     try:
@@ -1008,6 +1009,92 @@ def _cleanup_mine_lock_file(lock_path: str) -> None:
             lf.close()
 
 
+def reap_stale_mine_locks(*, min_age_seconds: int = 3600) -> tuple[int, int]:
+    """Best-effort garbage collection for orphaned per-source-file mine locks.
+
+    ``_cleanup_mine_lock_file`` reclaims a lock file correctly on the happy
+    path (see its docstring) — but only for the *specific* lock a
+    :func:`mine_lock` context manager just released. A process that dies
+    before reaching its own ``finally`` block (killed, crashed, force-quit,
+    host reboot) never runs that cleanup, and nothing else in this codebase
+    later revisits that lock file. Locks in ``~/.mempalace/locks/`` can
+    accumulate unboundedly over time as a result — one long-lived
+    installation was found with 5,636 stale entries, the oldest several
+    months old, none held by any live process (confirmed via ``lsof``).
+
+    This reuses :func:`_cleanup_mine_lock_file` itself for the actual
+    removal — same nonblocking-flock-reacquire safety mechanism, same
+    Windows/POSIX handling, no duplicated locking logic. A lock is only
+    ever removed after *this* process re-acquires it, so anything
+    genuinely held by a live process is left untouched regardless of
+    ``min_age_seconds``. ``min_age_seconds`` is a courtesy throttle only —
+    it avoids racing a lock that was *just* released and may still be
+    mid-rendezvous with a waiter on the same pathname; it is not a
+    substitute for the flock check, which is what actually makes removal
+    safe.
+
+    Skips ``mine_palace_*.lock`` files — those belong to the newer
+    palace-level :func:`mine_palace_lock` and have their own
+    lifecycle/holder tracking; this targets only the per-source-file locks
+    :func:`mine_lock` creates via :func:`_mine_lock_path`.
+
+    Returns ``(reaped, skipped)`` counts, for logging/testing — callers
+    don't need to act on them.
+    """
+    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
+    try:
+        entries = os.listdir(lock_dir)
+    except OSError:
+        return 0, 0
+
+    now = time.time()
+    reaped = 0
+    skipped = 0
+    for name in entries:
+        if not name.endswith(".lock") or name.startswith("mine_palace_"):
+            continue
+        lock_path = os.path.join(lock_dir, name)
+        try:
+            if now - os.path.getmtime(lock_path) < min_age_seconds:
+                continue
+        except OSError:
+            continue
+        _cleanup_mine_lock_file(lock_path)
+        if os.path.exists(lock_path):
+            skipped += 1
+        else:
+            reaped += 1
+    return reaped, skipped
+
+
+_LOCK_REAP_INTERVAL_SECONDS = 900  # 15 minutes between opportunistic sweeps
+
+
+def _maybe_reap_stale_mine_locks() -> None:
+    """Throttled, opportunistic call site for :func:`reap_stale_mine_locks`.
+
+    Runs at most once per ``_LOCK_REAP_INTERVAL_SECONDS``, piggybacking on
+    the natural cadence of mine operations rather than requiring a
+    background thread, a scheduled task, or any new CLI surface. Failures
+    are swallowed — lock maintenance must never be allowed to break an
+    actual mine.
+    """
+    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
+    marker = os.path.join(lock_dir, ".last_reap")
+    try:
+        if (
+            os.path.exists(marker)
+            and time.time() - os.path.getmtime(marker) < _LOCK_REAP_INTERVAL_SECONDS
+        ):
+            return
+        os.makedirs(lock_dir, exist_ok=True)
+        open(marker, "a").close()
+        os.utime(marker, None)
+        reap_stale_mine_locks()
+    except Exception:
+        logger.debug("Opportunistic mine-lock reap failed", exc_info=True)
+
+
 class MineAlreadyRunning(RuntimeError):
     """Raised when another `mempalace mine` already holds the per-palace lock."""
 
@@ -1038,7 +1125,9 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
     `maybe_autoheal_fts5_index` rebuild `cmd_repair` already runs as its own
     preflight step — so a normal `mine` self-heals the recoverable case
     instead of forcing the operator to run `mempalace repair` by hand for a
-    derived index that regenerates from intact content.
+    derived index. Nothing re-files afterwards on this path, so the heal is the
+    last word here: it checks the content table against `embedding_metadata`
+    before rebuilding from it, and declines when it cannot.
     """
     if resolve_backend_name(palace_path) != "chroma":
         return
@@ -1686,6 +1775,15 @@ def file_already_mined(
     that extraction mode so exchange-mode and general-mode drawers can coexist
     for the same source transcript. Legacy drawers without extract_mode are
     treated as exchange-mode drawers.
+
+    A drawer whose metadata carries ``chunk_total`` (see #21) is only
+    counted toward a match once its stored_mtime group has accumulated at
+    least that many drawers -- guarding against a mid-file crash between
+    upsert batches, where the surviving drawers share the current mtime
+    (the file itself was never touched) but are short of the full set. A
+    drawer with no ``chunk_total`` (legacy rows, or a single-shot
+    ``add_drawer()`` call with no partial-batch risk) is trusted on its own,
+    exactly as before.
     """
     try:
         # Under the additive-mining model, a single ``source_file`` can have
@@ -1702,6 +1800,9 @@ def file_already_mined(
         # first matching group regardless of ordering.
         current_mtime = os.path.getmtime(source_file) if check_mtime else None
         offset = 0
+        # Tracks, per matching stored_mtime group, how many drawers have
+        # been seen so far toward that group's own chunk_total (#21).
+        group_counts: dict = {}
         while True:
             results = collection.get(
                 where={"source_file": source_file},
@@ -1727,7 +1828,16 @@ def file_already_mined(
                 stored_mtime = meta.get("source_mtime")
                 if stored_mtime is None:
                     continue
-                if abs(float(stored_mtime) - current_mtime) < 0.001:
+                if abs(float(stored_mtime) - current_mtime) >= 0.001:
+                    continue
+                chunk_total = meta.get("chunk_total")
+                if chunk_total is None:
+                    # No completion marker on this drawer — can't verify
+                    # completeness for its group, trust the match as before.
+                    return True
+                seen = group_counts.get(stored_mtime, 0) + 1
+                group_counts[stored_mtime] = seen
+                if seen >= chunk_total:
                     return True
             if not ids:
                 break
@@ -1760,12 +1870,21 @@ def prefetch_mined_set(
     When extract_mode is set, mirrors file_already_mined(..., extract_mode=...)
     so conversation mines skip per extraction mode rather than per source file.
 
+    Completeness mirrors :func:`file_already_mined`'s ``chunk_total`` rule
+    (#2183): a source that only has a mid-file partial (surviving drawers
+    share the current mtime but are short of ``chunk_total``) is **omitted**
+    from the result so the bulk skip path re-mines instead of permanently
+    stranding the missing exchanges. Drawers with no ``chunk_total``
+    (legacy rows, registry sentinels) are trusted on their own, as before.
+
     The convo miner walks thousands of transcript files; per-file
     `collection.get(where={"source_file": X})` costs ~2s on a 150k-drawer
     palace, making a 2000-file sweep take >1h of pure skip-checking. This
     helper drops that to a single paginated scan plus O(1) lookups.
     """
-    mined: dict[str, Optional[float]] = {}
+    # Per source_file: per stored_mtime group → count + optional chunk_total.
+    # A source is only "mined" once some group is complete.
+    groups: dict[str, dict] = {}
     try:
         total = collection.count()
         offset = 0
@@ -1780,14 +1899,37 @@ def prefetch_mined_set(
                     continue
                 # Same default as file_already_mined: missing version == 1
                 version = meta.get("normalize_version", 1)
-                if version >= NORMALIZE_VERSION:
-                    stored_mtime = meta.get("source_mtime")
-                    mined[src] = float(stored_mtime) if stored_mtime is not None else None
+                if version < NORMALIZE_VERSION:
+                    continue
+                stored_mtime = meta.get("source_mtime")
+                mtime_key = float(stored_mtime) if stored_mtime is not None else None
+                entry = groups.setdefault(src, {}).setdefault(
+                    mtime_key, {"count": 0, "chunk_total": None}
+                )
+                entry["count"] += 1
+                chunk_total = meta.get("chunk_total")
+                if chunk_total is not None:
+                    try:
+                        entry["chunk_total"] = int(chunk_total)
+                    except (TypeError, ValueError):
+                        pass
             if not batch["ids"]:
                 break
             offset += len(batch["ids"])
     except Exception:
-        logger.warning("prefetch_mined_set: partial fetch, %d files loaded", len(mined))
+        logger.warning("prefetch_mined_set: partial fetch, %d source groups loaded", len(groups))
+
+    mined: dict[str, Optional[float]] = {}
+    for src, by_mtime in groups.items():
+        for mtime_key, entry in by_mtime.items():
+            chunk_total = entry["chunk_total"]
+            if chunk_total is None:
+                # Legacy / registry: no completion marker — trust membership.
+                mined[src] = mtime_key
+                break
+            if entry["count"] >= chunk_total:
+                mined[src] = mtime_key
+                break
     return mined
 
 

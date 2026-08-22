@@ -106,6 +106,33 @@ def test_healthz_ok(http_server):
     assert body == b"ok\n"
 
 
+def test_statusz_reports_machine_readable_server_and_client_state(http_server, monkeypatch):
+    monkeypatch.setattr(mcp, "_sqlite_integrity_payload", lambda: {"ok": True, "errors": []})
+    port, _ = http_server
+
+    assert _get(port, "/healthz", headers={"User-Agent": "codex-test"})[0] == 200
+    status, body = _get(port, "/statusz", headers={"User-Agent": "codex-test"})
+
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["ok"] is True
+    assert payload["server"]["name"] == "mempalace"
+    assert payload["server"]["transport"] == "http"
+    assert payload["server"]["port"] == port
+    assert payload["requests"]["total"] >= 1
+    assert payload["requests"]["by_status"]["200"] >= 1
+    assert payload["clients"]["active_window_seconds"] == mcp._HTTP_ACTIVE_CLIENT_WINDOW_S
+    assert payload["clients"]["recent"]
+    first = payload["clients"]["recent"][0]
+    assert first["peer"] == "127.0.0.1"
+    assert first["peer_hint"] == "127.0.0.1"
+    assert first["user_agent"] == "codex-test"
+    assert first["last_path"] == "/healthz"
+    assert "Authorization" not in json.dumps(payload)
+    if mcp._config.palace_path:
+        assert mcp._config.palace_path not in json.dumps(payload)
+
+
 def test_unknown_path_404(http_server):
     port, _ = http_server
     assert _post(port, "/nope", {"jsonrpc": "2.0", "id": 1, "method": "ping"})[0] == 404
@@ -179,6 +206,7 @@ def test_allows_loopback_origin(http_server):
 def test_bearer_token_enforced_when_configured(monkeypatch):
     """With MEMPALACE_MCP_HTTP_TOKEN set, /mcp requires a matching bearer token."""
     monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "s3cret")
+    monkeypatch.setattr(mcp, "_sqlite_integrity_payload", lambda: {"ok": True, "errors": []})
     httpd = mcp._build_http_server("127.0.0.1", 0)
     port = httpd.server_address[1]
     thread = threading.Thread(
@@ -195,6 +223,11 @@ def test_bearer_token_enforced_when_configured(monkeypatch):
         assert _post(port, "/mcp", ping, headers={"Authorization": "Bearer s3cret"})[0] == 200
         # /healthz never requires the token (orchestrator liveness probes).
         assert _get(port, "/healthz")[0] == 200
+        # /statusz exposes server/client metadata, so it follows the auth policy.
+        assert _get(port, "/statusz")[0] == 401
+        status, body = _get(port, "/statusz", headers={"Authorization": "Bearer s3cret"})
+        assert status == 200
+        assert "recent" in json.loads(body)["clients"]
     finally:
         httpd.shutdown()
         httpd.server_close()
@@ -600,3 +633,27 @@ def test_loopback_and_origin_helpers():
     assert not mcp._http_origin_allowed("garbage")
     allowed = mcp._http_allowed_host_values("127.0.0.1", 8765)
     assert "127.0.0.1:8765" in allowed and "localhost" in allowed
+
+
+def test_extra_allowed_hosts_extend_the_loopback_pin(monkeypatch):
+    """A loopback-bound server behind a fronting proxy (tailscale serve, nginx)
+    receives the public name in Host; the operator allowlists it via env."""
+    monkeypatch.setenv(
+        "MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS",
+        "mybox.tail1234.ts.net, Proxy.Example:8443",
+    )
+    allowed = mcp._http_allowed_host_values("127.0.0.1", 8765)
+    # Bare hostname matches with and without the bound port.
+    assert "mybox.tail1234.ts.net" in allowed
+    assert "mybox.tail1234.ts.net:8765" in allowed
+    # host:port entries match exactly (lowercased); no bound-port variant added.
+    assert "proxy.example:8443" in allowed
+    assert "proxy.example" not in allowed
+    # The loopback pin itself is unchanged.
+    assert "127.0.0.1:8765" in allowed
+
+
+def test_extra_allowed_hosts_default_empty(monkeypatch):
+    monkeypatch.delenv("MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS", raising=False)
+    allowed = mcp._http_allowed_host_values("127.0.0.1", 8765)
+    assert not any("ts.net" in v for v in allowed)

@@ -9,6 +9,7 @@ hooks/mempal_save_hook.sh and hooks/mempal_precompact_hook.sh.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 
@@ -71,9 +72,18 @@ def count_human_messages(path: str) -> int:
     Claude transcripts are UTF-8. Windows Python defaults to cp1252 in many
     environments, so the encoding must be explicit. Invalid bytes are ignored
     to match the hooks' fail-soft behavior.
+
+    A path that exists but is not a regular file counts zero rather than
+    being opened: opening a FIFO for reading blocks in the kernel until a
+    writer appears, and this function has no timeout. A path that does not
+    exist still raises from the ``open`` below, as before.
+    ``mempal_save_hook.sh`` screens with ``[ -f ]``, which is false for a
+    pipe, so the guard here covers callers that do not.
     """
 
     count = 0
+    if os.path.exists(path) and not os.path.isfile(path):
+        return count
     with open(path, encoding="utf-8", errors="ignore") as fh:
         for line in fh:
             try:

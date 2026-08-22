@@ -2,6 +2,7 @@
 dist/
 build/
 __pycache__/
+.hypothesis/
 *.pyc
 .pytest_cache/
 mempal.yaml

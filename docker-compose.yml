@@ -21,12 +21,15 @@ services:
     tty: false
     volumes:
       - mempalace-data:/data
-    environment:
-      # Everything defaults correctly from HOME=/data (palace ->
-      # /data/.mempalace/palace, config -> /data/.mempalace, model cache ->
-      # /data/.cache). Override here only for non-default locations, e.g.:
-      # - MEMPALACE_EMBEDDING_MODEL=embeddinggemma   # multilingual (default: minilm)
-      # - MEMPALACE_PALACE_PATH=/data/custom/palace
+    # Everything defaults correctly from HOME=/data (palace ->
+    # /data/.mempalace/palace, config -> /data/.mempalace, model cache ->
+    # /data/.cache), so no environment block is needed. Uncomment the key
+    # *together with* an entry under it for non-default locations — a bare
+    # `environment:` with only comments beneath parses as null, and Compose
+    # rejects the whole file with "services.mcp.environment must be a mapping".
+    # environment:
+    #   MEMPALACE_EMBEDDING_MODEL: embeddinggemma   # multilingual (default: minilm)
+    #   MEMPALACE_PALACE_PATH: /data/custom/palace
 
 volumes:
   mempalace-data:

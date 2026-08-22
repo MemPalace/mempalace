@@ -1378,7 +1378,7 @@ def test_ingest_transcript_daemon_opt_in_submits_job(tmp_path):
     mock_popen.assert_not_called()
     mock_submit.assert_called_once()
     payload = mock_submit.call_args.args[1]
-    assert payload["source"] == str(tmp_path)
+    assert payload["source"] == str(transcript.resolve())
     assert payload["mode"] == "convos"
     assert payload["wing"] == "sessions"
 
@@ -1398,7 +1398,7 @@ def test_ingest_transcript_skips_when_target_running(tmp_path):
                     "-m",
                     "mempalace",
                     "mine",
-                    str(transcript.parent),
+                    str(transcript.resolve()),
                     "--mode",
                     "convos",
                     "--wing",
@@ -1763,7 +1763,7 @@ def test_precompact_with_timeout(tmp_path):
     assert result == {}
 
 
-def test_precompact_mines_transcript_dir(tmp_path, monkeypatch):
+def test_precompact_mines_only_active_transcript(tmp_path, monkeypatch):
     """Precompact ingests the active transcript via _ingest_transcript.
 
     With no MEMPAL_DIR, _mine_sync is a no-op; the transcript ingest is
@@ -1787,8 +1787,8 @@ def test_precompact_mines_transcript_dir(tmp_path, monkeypatch):
     mock_run.assert_not_called()
     mock_popen.assert_called_once()
     cmd = mock_popen.call_args[0][0]
-    # Mines the transcript's parent dir as convos, into wing "sessions".
-    assert str(tmp_path) in cmd
+    # Mines only the active transcript as convos, into wing "sessions".
+    assert str(transcript.resolve()) in cmd
     assert cmd[cmd.index("--mode") + 1] == "convos"
     assert cmd[cmd.index("--wing") + 1] == "sessions"
 

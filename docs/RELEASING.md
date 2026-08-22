@@ -61,10 +61,11 @@ Done once per project; both steps require PyPI owner / GitHub admin rights.
 
 ### Cutting a release
 
-1. Bump the version in **all five** sources on `develop` so `version-guard.yml`
+1. Bump the version in **all six** sources on `develop` so `version-guard.yml`
    stays green (it is the single source of truth at `mempalace/version.py`,
    mirrored in `pyproject.toml`, `.claude-plugin/marketplace.json`,
-   `.claude-plugin/plugin.json`, and `.codex-plugin/plugin.json`).
+   `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, and
+   `integrations/openclaw/SKILL.md`).
 2. Land everything for the release on `develop`, then merge `develop → main`.
    Releases publish **only from `main`** — the workflow refuses any tag whose
    commit is not an ancestor of `main`. Don't commit the bump directly to

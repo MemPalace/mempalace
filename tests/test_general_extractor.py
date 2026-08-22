@@ -310,3 +310,29 @@ def test_extract_memories_chunk_index_contiguous_across_segments():
     assert indices == list(range(len(memories))), (
         f"chunk_index must be 0..N-1 sequential; got {indices}"
     )
+
+
+def test_markdown_emphasis_does_not_score_as_emotional():
+    """Markdown formatting syntax must not count as emotional content."""
+    text = (
+        "**Key reasons:** transactional guarantees and mature tooling. "
+        "The rollout plan is documented under **Migration notes**."
+    )
+
+    score, _ = _score_markers(text, ALL_MARKERS["emotional"])
+
+    assert score == 0.0
+
+
+def test_markdown_bold_does_not_override_decision_classification():
+    """Markdown-heavy technical prose must not outrank a real decision marker."""
+    text = (
+        "We decided to use PostgreSQL for the new service. "
+        "**Key reasons:** transactional guarantees and mature tooling. "
+        "The rollout details are documented under **Migration notes**."
+    )
+
+    memories = extract_memories(text, min_confidence=0.1)
+
+    assert len(memories) == 1
+    assert memories[0]["memory_type"] == "decision"

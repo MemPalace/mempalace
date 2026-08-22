@@ -362,7 +362,7 @@ def extract_text(
         logger.info("skip:unreadable (file gone after scan) %s", p)
         return None, ExtractionStatus.SKIP_UNREADABLE
     except OSError as exc:
-        logger.info("skip:unreadable %s — %s", p, exc)
+        logger.info("skip:unreadable %s -- %s", p, exc)
         return None, ExtractionStatus.SKIP_UNREADABLE
 
     # Fringe Case 5 — empty file. Skip silently.
@@ -433,9 +433,9 @@ def extract_text(
         # Fringe Case 4 vs Case 10: encrypted vs generic crash, by message.
         msg = str(exc)
         if _ENCRYPTED_PATTERNS.search(msg):
-            logger.info("skip:encrypted %s — %s", p, msg[:120])
+            logger.info("skip:encrypted %s -- %s", p, msg[:120])
             return None, ExtractionStatus.SKIP_ENCRYPTED
-        logger.warning("skip:extraction_error %s — %s: %s", p, type(exc).__name__, msg[:200])
+        logger.warning("skip:extraction_error %s -- %s: %s", p, type(exc).__name__, msg[:200])
         return None, ExtractionStatus.SKIP_EXTRACTION_ERROR
 
     # Either transformer can legitimately return None / empty (malformed
@@ -443,7 +443,7 @@ def extract_text(
     # so the caller knows to skip rather than file an empty drawer.
     if not text:
         transformer = "striprtf" if is_rtf else "markitdown"
-        logger.info("skip:extraction_error %s — %s returned None/empty", p, transformer)
+        logger.info("skip:extraction_error %s -- %s returned None/empty", p, transformer)
         return None, ExtractionStatus.SKIP_EXTRACTION_ERROR
 
     return text, ExtractionStatus.OK
@@ -803,7 +803,7 @@ def mine_formats(
         files = scan_formats(format_path)
 
         print(f"\n{'=' * 55}")
-        print("  MemPalace Mine — Format extraction")
+        print("  MemPalace Mine -- Format extraction")
         print(f"{'=' * 55}")
         print(f"  Wing:    {wing}")
         print(f"  Source:  {format_path}")
@@ -811,7 +811,7 @@ def mine_formats(
         print(f"  Files:   {len(files)}{limit_suffix}")
         print(f"  Palace:  {palace_path}")
         if dry_run:
-            print("  DRY RUN — nothing will be filed")
+            print("  DRY RUN -- nothing will be filed")
         print(f"{'-' * 55}\n")
 
         collection = get_collection(palace_path) if not dry_run else None
@@ -876,7 +876,7 @@ def mine_formats(
                 files_with_text += 1
 
                 if dry_run:
-                    print(f"    [DRY RUN] {filepath.name} → {len(chunks)} drawers")
+                    print(f"    [DRY RUN] {filepath.name} -> {len(chunks)} drawers")
                     total_drawers += len(chunks)
                     files_mined += 1
                     if limit > 0 and files_mined >= limit:

@@ -8,6 +8,7 @@ from mempalace.normalize import (
     _format_tool_result,
     _format_tool_use,
     _messages_to_transcript,
+    _try_chatgpt_export_json_split,
     _try_chatgpt_json,
     _try_claude_ai_json,
     _try_claude_code_jsonl,
@@ -16,9 +17,11 @@ from mempalace.normalize import (
     _try_gemini_jsonl,
     _try_continue_json,
     _try_normalize_json,
+    _try_normalize_json_split,
     _try_pi_jsonl,
     _try_slack_json,
     normalize,
+    normalize_conversations,
     strip_noise,
 )
 
@@ -1065,6 +1068,215 @@ def test_chatgpt_json_too_few_messages():
     }
     result = _try_chatgpt_json(data)
     assert result is None
+
+
+# ── _try_chatgpt_export_json_split ────────────────────────────────────
+
+
+def _chatgpt_convo(title, question, answer):
+    """One conversation object, shaped like a real ChatGPT export entry."""
+    return {
+        "title": title,
+        "create_time": 1740000000.0,
+        "mapping": {
+            "root": {"parent": None, "message": None, "children": ["msg1"]},
+            "msg1": {
+                "parent": "root",
+                "message": {
+                    "author": {"role": "user"},
+                    "content": {"parts": [question]},
+                },
+                "children": ["msg2"],
+            },
+            "msg2": {
+                "parent": "msg1",
+                "message": {
+                    "author": {"role": "assistant"},
+                    "content": {"parts": [answer]},
+                },
+                "children": [],
+            },
+        },
+    }
+
+
+def test_chatgpt_export_array_is_normalized():
+    """A real export is a top-level array, not a single conversation object."""
+    # Deliberately not in alphabetical order, so a sort would be caught.
+    data = [
+        _chatgpt_convo("Debug", "Why the segfault?", "You free the node twice."),
+        _chatgpt_convo("Trip", "Best month for Lisbon?", "May, for the light."),
+    ]
+    result = _try_chatgpt_export_json_split(data)
+    assert result is not None
+    assert len(result) == 2
+    # Export order is preserved, and neither segment bleeds into the other.
+    assert result[0] == "> Why the segfault?\nYou free the node twice.\n"
+    assert result[1] == "> Best month for Lisbon?\nMay, for the light.\n"
+
+
+def test_chatgpt_export_array_keeps_conversations_separate():
+    """Each conversation stays its own segment, as for Claude.ai bundles."""
+    data = [
+        _chatgpt_convo("One", "Q1", "A1"),
+        _chatgpt_convo("Two", "Q2", "A2"),
+    ]
+    split = _try_normalize_json_split(json.dumps(data))
+    assert split is not None
+    assert len(split) == 2
+    assert sum("> Q1" in segment for segment in split) == 1
+    assert sum("> Q2" in segment for segment in split) == 1
+
+
+def test_chatgpt_export_array_skips_entries_without_mapping():
+    """Export metadata entries alongside conversations must not break parsing."""
+    data = [
+        {"title": "no mapping here"},
+        _chatgpt_convo("Real", "Q1", "A1"),
+    ]
+    result = _try_chatgpt_export_json_split(data)
+    assert result is not None
+    assert len(result) == 1
+    assert "> Q1" in result[0]
+
+
+def test_chatgpt_export_array_ignores_unrelated_payloads():
+    """Anything that is not an array of ChatGPT conversations is declined."""
+    assert _try_chatgpt_export_json_split([]) is None
+    assert _try_chatgpt_export_json_split([1, 2, 3]) is None
+    assert _try_chatgpt_export_json_split({"mapping": {}}) is None
+    assert _try_chatgpt_export_json_split([{"role": "user", "content": "hi"}]) is None
+    # A .json file holding a bare scalar reaches the parsers too; it must not raise.
+    assert _try_chatgpt_export_json_split(42) is None
+    assert _try_chatgpt_export_json_split(None) is None
+
+
+def test_chatgpt_export_array_yields_none_when_every_conversation_is_empty():
+    """An array of unusable mappings must return None, never [].
+
+    Returning [] would be falsy at the call site today, but the contract is
+    Optional[list]; None is what makes the dispatcher fall through cleanly.
+    """
+    data = [
+        {
+            "mapping": {
+                "root": {"parent": None, "message": None, "children": ["m1"]},
+                "m1": {
+                    "parent": "root",
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"parts": ["only one turn"]},
+                    },
+                    "children": [],
+                },
+            }
+        }
+    ]
+    assert _try_chatgpt_export_json_split(data) is None
+
+
+def test_chatgpt_export_array_survives_malformed_mappings():
+    """Arrays are now fed element-wise to the parser, so it must not raise.
+
+    Any JSON array under the mined tree reaches this parser (an ES mapping
+    dump, a DB field map), and a raised exception would abort the whole
+    `mine --mode convos` run, since convo_miner only catches OSError/ValueError.
+    """
+    malformed = [
+        [{"mapping": [1, 2, 3]}],
+        [{"mapping": "oops"}],
+        [{"mapping": {"a": "not-a-dict"}}],
+        [{"mapping": {"r": {"parent": None, "message": {"author": None}, "children": []}}}],
+        [{"mapping": {"r": {"parent": None, "message": "text", "children": []}}}],
+        [{"mapping": {"r": {"parent": None, "message": None, "children": "nope"}}}],
+        [{"name": "users", "mapping": {"uid": "int", "email": "str"}}],
+        # Root is well formed but the node it points at is not a dict.
+        [{"mapping": {"r": {"parent": None, "message": None, "children": ["m1"]}, "m1": "oops"}}],
+        # `children` as a mapping would raise KeyError on children[0].
+        [{"mapping": {"r": {"parent": None, "message": None, "children": {"a": "m1"}}}}],
+        # A tree serialised with child objects instead of ids: unhashable ids.
+        [{"mapping": {"r": {"parent": None, "message": None, "children": [["x"]]}}}],
+        [
+            {
+                "name": "org-chart",
+                "mapping": {
+                    "r": {
+                        "parent": None,
+                        "message": None,
+                        "children": [{"id": "n1", "label": "Engineering"}],
+                    }
+                },
+            }
+        ],
+        # A cycle must terminate rather than spin.
+        [
+            {
+                "mapping": {
+                    "r": {"parent": None, "message": None, "children": ["a"]},
+                    "a": {"parent": "r", "message": None, "children": ["r"]},
+                }
+            }
+        ],
+    ]
+    for payload in malformed:
+        assert _try_chatgpt_export_json_split(payload) is None
+        assert _try_normalize_json_split(json.dumps(payload)) is None
+
+
+def test_chatgpt_json_string_parts_are_not_split_into_characters():
+    """`parts` must be a list; a bare string would be iterated character-wise."""
+    data = {
+        "mapping": {
+            "root": {"parent": None, "message": None, "children": ["m1"]},
+            "m1": {
+                "parent": "root",
+                "message": {"author": {"role": "user"}, "content": {"parts": "secret"}},
+                "children": ["m2"],
+            },
+            "m2": {
+                "parent": "m1",
+                "message": {"author": {"role": "assistant"}, "content": {"parts": ["ok"]}},
+                "children": [],
+            },
+        }
+    }
+    result = _try_chatgpt_json(data)
+    assert result is None or "s e c r e t" not in result
+
+
+def test_chatgpt_export_parser_does_not_shadow_slack_exports():
+    """A Slack export is also a top-level array; it must still reach its parser."""
+    slack = [
+        {"type": "message", "user": "U1", "text": "deploy is green"},
+        {"type": "message", "user": "U2", "text": "shipping it"},
+    ]
+    split = _try_normalize_json_split(json.dumps(slack))
+    assert split is not None
+    assert _SLACK_PROVENANCE_FOOTER.strip() in split[0]
+
+
+def test_chatgpt_export_array_end_to_end(tmp_path):
+    """The miner path: an export file yields one entry per conversation."""
+    f = tmp_path / "conversations.json"
+    f.write_text(
+        json.dumps(
+            [
+                _chatgpt_convo("One", "Q1", "A1"),
+                _chatgpt_convo("Two", "Q2", "A2"),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    conversations = normalize_conversations(str(f))
+    assert len(conversations) == 2
+    assert conversations[0].startswith("> Q1")
+    assert conversations[1].startswith("> Q2")
+
+    # normalize() joins the bundle, but must still produce a transcript
+    joined = normalize(str(f))
+    assert joined.startswith(">")
+    assert "> Q1" in joined
+    assert "> Q2" in joined
 
 
 # ── _try_slack_json ────────────────────────────────────────────────────

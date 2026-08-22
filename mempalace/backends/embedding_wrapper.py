@@ -8,14 +8,26 @@ from .base import BaseCollection
 
 
 def _embed_texts(texts: list[str]) -> list[list[float]]:
-    """Embed ``texts`` with the configured local embedding function."""
+    """Embed ``texts`` with the configured local embedding function.
+
+    Embedding functions return ``list[np.ndarray]`` (float32). ``list(arr)``
+    would unpack that into ``np.float32`` *scalars*, which ChromaDB's
+    ``normalize_embeddings`` rejects outright ("Expected embeddings to be a
+    list of floats or ints..."), so every write through this wrapper must
+    convert to real Python floats. ``.tolist()`` does that in C; the
+    ``float(x)`` branch covers embedders that already hand back plain
+    sequences.
+    """
     if not texts:
         return []
     from ..embedding import get_embedding_function
 
     ef = get_embedding_function()
     vectors = ef(input=texts)
-    return [list(v) for v in vectors]
+    return [
+        v.tolist() if hasattr(v, "tolist") else [float(x) for x in v]  # numpy | plain sequence
+        for v in vectors
+    ]
 
 
 def _as_list(value):

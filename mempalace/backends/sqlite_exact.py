@@ -3,6 +3,9 @@
 This backend is intentionally simple and local-first. It is a correctness
 backend, not a high-throughput ANN backend: vectors are stored as float32
 blobs and query uses exact cosine distance over the matching collection.
+Unfiltered query() ranks from the embedding column only (vectorized numpy),
+hydrates the top-k documents afterwards, and caches the matrix on the
+long-lived handle so a hub does not re-read every blob on the next search.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from .base import (
     PalaceNotFoundError,
     PalaceRef,
     QueryResult,
+    UnsupportedCapabilityError,
     UnsupportedFilterError,
     _IncludeSpec,
 )
@@ -210,6 +214,196 @@ def _matches_where(meta: dict, where: Optional[dict]) -> bool:
     return True
 
 
+_FACET_FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_CACHED_META_KEYS = frozenset({"wing", "room", "source_file"})
+# Palace loci. VIRTUAL generated columns + one composite index give
+# structured access (status, list_drawers where, graph_stats) without
+# rewriting the embedding blob table. Mirrors mempalace-structural's
+# "search the wing/room, not the whole palace" — as a sqlite index.
+_LOCUS_FIELDS = ("wing", "room", "hall")
+_LOCUS_INDEX = "idx_documents_coll_wing_room_hall"
+
+
+def _json_field_sql(key: str) -> str:
+    """SQL expression for a metadata key; locus fields are real columns."""
+    if key in _LOCUS_FIELDS:
+        return key
+    return f"json_extract(metadata_json, '$.{key}')"
+
+
+def _document_column_names(conn: sqlite3.Connection) -> set[str]:
+    """Column names including VIRTUAL generated columns.
+
+    ``PRAGMA table_info`` omits VIRTUAL generated columns on some SQLite
+    builds; ``table_xinfo`` reports them (hidden=2).
+    """
+    try:
+        rows = conn.execute("PRAGMA table_xinfo(documents)").fetchall()
+    except sqlite3.OperationalError:
+        rows = conn.execute("PRAGMA table_info(documents)").fetchall()
+    return {row[1] for row in rows}
+
+
+def _documents_has_locus_columns(conn: sqlite3.Connection) -> bool:
+    return set(_LOCUS_FIELDS) <= _document_column_names(conn)
+
+
+def _where_uses_only_cached_keys(where: Optional[dict]) -> bool:
+    """True when ``where`` can be evaluated against the cached wing/room/source_file."""
+    if not where:
+        return True
+    if not isinstance(where, dict):
+        return False
+    if list(where.keys()) == ["$and"]:
+        return all(_where_uses_only_cached_keys(child) for child in (where["$and"] or []))
+    for key, expected in where.items():
+        if key.startswith("$") or key not in _CACHED_META_KEYS or isinstance(expected, dict):
+            return False
+    return True
+
+
+def _equality_where_sql(where: Optional[dict]) -> Optional[tuple[str, list]]:
+    """Push equality / ``$and``-of-equality filters into SQL, else ``None``.
+
+    ``None`` means the filter needs the Python ``_matches_where`` path
+    (``$or``, comparisons, ``$contains``, non-identifier keys).
+    """
+    if not where:
+        return "1=1", []
+    if not isinstance(where, dict):
+        return None
+    if list(where.keys()) == ["$and"]:
+        clauses = []
+        params: list = []
+        for child in where["$and"] or []:
+            part = _equality_where_sql(child)
+            if part is None:
+                return None
+            sql, child_params = part
+            clauses.append(f"({sql})")
+            params.extend(child_params)
+        return (" AND ".join(clauses) if clauses else "1=1"), params
+    clauses = []
+    params = []
+    for key, expected in where.items():
+        if key.startswith("$") or isinstance(expected, dict) or not _FACET_FIELD_RE.match(key):
+            return None
+        clauses.append(f"{_json_field_sql(key)} = ?")
+        params.append(expected)
+    return (" AND ".join(clauses) if clauses else "1=1"), params
+
+
+def _cosine_distances(mat: np.ndarray, query: np.ndarray) -> np.ndarray:
+    """Exact cosine distance (1 - cos) for every row of ``mat`` vs ``query``."""
+    q = np.asarray(query, dtype=np.float32)
+    if mat.size == 0:
+        return np.zeros((0,), dtype=np.float32)
+    q_norm = float(np.linalg.norm(q))
+    norms = np.linalg.norm(mat, axis=1)
+    denom = norms * q_norm
+    dots = mat @ q
+    cos = np.zeros(dots.shape, dtype=np.float32)
+    np.divide(dots, denom, out=cos, where=denom > 0)
+    np.clip(cos, -1.0, 1.0, out=cos)
+    return 1.0 - cos
+
+
+def sqlite_wing_room_counts(
+    palace_path: str, collection_name: str
+) -> Optional[tuple[int, dict[str, dict[str, int]]]]:
+    """Tally drawers by wing/room from ``sqlite_exact.sqlite3`` without paging.
+
+    Returns ``(total, {wing: {room: count}})`` or ``None`` when the read
+    cannot be trusted. ``None``/missing wing-or-room values are stored as
+    ``"?"`` so ``mcp_server._sqlite_taxonomy`` can map them to ``"unknown"``.
+    """
+    db_path = os.path.join(palace_path, _DB_FILENAME)
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        db_uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True)
+        try:
+            conn.execute("PRAGMA busy_timeout=2000")
+            row = conn.execute(
+                "SELECT id FROM collections WHERE name = ?",
+                (collection_name,),
+            ).fetchone()
+            if row is None:
+                return None
+            collection_id = int(row[0])
+            total_row = conn.execute(
+                "SELECT COUNT(*) FROM documents WHERE collection_id = ?",
+                (collection_id,),
+            ).fetchone()
+            total = int(total_row[0]) if total_row and total_row[0] is not None else 0
+            wing_rooms: dict[str, dict[str, int]] = {}
+            locus = _documents_has_locus_columns(conn)
+            wing_expr = "wing" if locus else "json_extract(metadata_json, '$.wing')"
+            room_expr = "room" if locus else "json_extract(metadata_json, '$.room')"
+            for wing, room, n in conn.execute(
+                f"""
+                SELECT {wing_expr}, {room_expr}, COUNT(*)
+                FROM documents
+                WHERE collection_id = ?
+                GROUP BY 1, 2
+                """,
+                (collection_id,),
+            ):
+                wkey = "?" if wing is None else str(wing)
+                rkey = "?" if room is None else str(room)
+                dest = wing_rooms.setdefault(wkey, {})
+                dest[rkey] = dest.get(rkey, 0) + int(n)
+            return total, wing_rooms
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
+def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Optional[list[tuple]]:
+    """Grouped ``(room, wing, hall, n, last_date)`` rows, or ``None``.
+
+    ``last_date`` is the newest ``date`` metadata value in the group — enough
+    for ``find_tunnels``' ``recent`` field without paging every drawer.
+    """
+    db_path = os.path.join(palace_path, _DB_FILENAME)
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        db_uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True)
+        try:
+            conn.execute("PRAGMA busy_timeout=2000")
+            row = conn.execute(
+                "SELECT id FROM collections WHERE name = ?",
+                (collection_name,),
+            ).fetchone()
+            if row is None:
+                return None
+            collection_id = int(row[0])
+            locus = _documents_has_locus_columns(conn)
+            room_expr = "room" if locus else "json_extract(metadata_json, '$.room')"
+            wing_expr = "wing" if locus else "json_extract(metadata_json, '$.wing')"
+            hall_expr = "hall" if locus else "json_extract(metadata_json, '$.hall')"
+            return list(
+                conn.execute(
+                    f"""
+                    SELECT {room_expr}, {wing_expr}, {hall_expr}, COUNT(*),
+                           COALESCE(MAX(json_extract(metadata_json, '$.date')), '')
+                    FROM documents
+                    WHERE collection_id = ?
+                    GROUP BY 1, 2, 3
+                    """,
+                    (collection_id,),
+                )
+            )
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
 def _matches_where_document(document: str, where_document: Optional[dict]) -> bool:
     if not where_document:
         return True
@@ -267,12 +461,23 @@ class _SQLiteExactHandle:
         # never see, so the backend must reopen once those files appear.
         self.immutable = immutable
         self.closed = False
+        # collection_id -> (ids, float32 matrix, mini-metadata). Filled lazily
+        # by query() so a long-lived hub does not re-read every embedding blob
+        # on the next search. Mini-metadata is wing/room/source_file for
+        # in-memory equality filters. Cleared on any write.
+        self._vector_cache: dict[int, tuple[list[str], np.ndarray, list[dict]]] = {}
 
 
 class SQLiteExactCollection(BaseCollection):
-    def __init__(self, handle: _SQLiteExactHandle, collection_name: str):
+    def __init__(
+        self,
+        handle: _SQLiteExactHandle,
+        collection_name: str,
+        backend: Optional[SQLiteExactBackend] = None,
+    ):
         self._handle = handle
         self._collection_name = collection_name
+        self._backend = backend
         self._closed = False
 
     def _ensure_open(self) -> None:
@@ -310,6 +515,8 @@ class SQLiteExactCollection(BaseCollection):
                 raise
             else:
                 self._handle.conn.commit()
+                if write:
+                    self._handle._vector_cache.clear()
             finally:
                 cur.close()
 
@@ -531,23 +738,43 @@ class SQLiteExactCollection(BaseCollection):
                 )
                 self._replace_fts(cur, collection_id, doc_id, doc)
 
-    def _rows(self, cur, *, where=None, where_document=None, limit=None, offset=None) -> list[dict]:
+    def _rows(
+        self,
+        cur,
+        *,
+        where=None,
+        where_document=None,
+        limit=None,
+        offset=None,
+        spec: Optional[_IncludeSpec] = None,
+    ) -> list[dict]:
         _validate_where(where)
         _validate_where(where_document)
+        spec = spec or _IncludeSpec.resolve(None, default_distances=False)
         collection_id = self._collection_id(cur)
-        sql = (
-            "SELECT id, document, metadata_json, embedding\n"
-            "FROM documents\n"
-            "WHERE collection_id = ?\n"
-            "ORDER BY rowid"
-        )
-        params = [collection_id]
-        # Emit SQL LIMIT/OFFSET only on an unfiltered page. With a
-        # where/where_document the post-filter loop below drops rows *after*
-        # this scan, so a SQL LIMIT/OFFSET would cut the wrong rows; those
-        # callers scan in full and paginate in Python. SQLite requires a LIMIT
-        # before OFFSET, so an offset-only page uses "LIMIT -1" (unbounded).
-        if where is None and where_document is None and (limit is not None or offset):
+        push = None if where_document else _equality_where_sql(where)
+        python_where = where is not None and push is None
+        need_doc = spec.documents or bool(where_document)
+        need_meta = spec.metadatas or python_where
+        need_emb = spec.embeddings
+        cols = ["id"]
+        if need_doc:
+            cols.append("document")
+        if need_meta:
+            cols.append("metadata_json")
+        if need_emb:
+            cols.append("embedding")
+        sql = f"SELECT {', '.join(cols)}\nFROM documents\nWHERE collection_id = ?"
+        params: list = [collection_id]
+        if push is not None and where:
+            extra_sql, extra_params = push
+            sql += " AND " + extra_sql
+            params.extend(extra_params)
+        sql += "\nORDER BY rowid"
+        # Equality where is applied in SQL, so LIMIT/OFFSET are safe there too.
+        # Python-side filters still have to scan, then slice.
+        can_limit = (not python_where) and not where_document
+        if can_limit and (limit is not None or offset):
             if limit is not None:
                 sql += "\nLIMIT ?"
                 params.append(int(limit))
@@ -556,23 +783,80 @@ class SQLiteExactCollection(BaseCollection):
             if offset:
                 sql += "\nOFFSET ?"
                 params.append(int(offset))
-        rows = cur.execute(sql, params).fetchall()
+        raw = cur.execute(sql, params).fetchall()
         out = []
-        for doc_id, doc, meta_json, emb_blob in rows:
-            meta = _json_loads(meta_json)
-            if not _matches_where(meta, where):
+        for row in raw:
+            idx = 1
+            doc = ""
+            meta: dict = {}
+            emb_blob = None
+            if need_doc:
+                doc = row[idx] or ""
+                idx += 1
+            if need_meta:
+                meta = _json_loads(row[idx])
+                idx += 1
+            if need_emb:
+                emb_blob = row[idx]
+            if python_where and not _matches_where(meta, where):
                 continue
-            if not _matches_where_document(doc or "", where_document):
+            if where_document and not _matches_where_document(doc, where_document):
                 continue
             out.append(
                 {
-                    "id": doc_id,
-                    "document": doc or "",
+                    "id": row[0],
+                    "document": doc,
                     "metadata": meta,
                     "embedding": emb_blob,
                 }
             )
         return out
+
+    def _rows_by_ids(self, cur, collection_id: int, ids: list[str], spec: _IncludeSpec) -> dict:
+        """Fetch requested columns for ``ids`` via ``IN``, keyed by id."""
+        unique = []
+        seen = set()
+        for doc_id in ids:
+            if doc_id not in seen:
+                seen.add(doc_id)
+                unique.append(doc_id)
+        if not unique:
+            return {}
+        cols = ["id"]
+        if spec.documents:
+            cols.append("document")
+        if spec.metadatas:
+            cols.append("metadata_json")
+        if spec.embeddings:
+            cols.append("embedding")
+        by_id: dict = {}
+        for start in range(0, len(unique), 900):
+            chunk = unique[start : start + 900]
+            placeholders = ",".join("?" for _ in chunk)
+            for row in cur.execute(
+                f"SELECT {', '.join(cols)} FROM documents "
+                f"WHERE collection_id = ? AND id IN ({placeholders})",
+                (collection_id, *chunk),
+            ):
+                idx = 1
+                doc = ""
+                meta: dict = {}
+                emb_blob = None
+                if spec.documents:
+                    doc = row[idx] or ""
+                    idx += 1
+                if spec.metadatas:
+                    meta = _json_loads(row[idx])
+                    idx += 1
+                if spec.embeddings:
+                    emb_blob = row[idx]
+                by_id[row[0]] = {
+                    "id": row[0],
+                    "document": doc,
+                    "metadata": meta,
+                    "embedding": emb_blob,
+                }
+        return by_id
 
     def query(
         self,
@@ -599,38 +883,53 @@ class SQLiteExactCollection(BaseCollection):
         outer_metas: list[list[dict]] = []
         outer_dists: list[list[float]] = []
         outer_embeds: list[list[list[float]]] = []
+        n_results = max(0, int(n_results))
 
         with self._cursor() as cur:
             collection_id = self._collection_id(cur)
             expected_dim = self._collection_dimension(cur, collection_id)
-            rows = self._rows(cur, where=where, where_document=where_document)
-            row_vectors = [(row, _decode_array(row["embedding"])) for row in rows]
+            ids, mat = self._rank_vectors(
+                cur, collection_id, where=where, where_document=where_document
+            )
 
-        for query_vector in query_embeddings:
-            q = _as_vector_array(query_vector)
-            if expected_dim is not None and int(q.size) != expected_dim:
-                raise DimensionMismatchError(
-                    f"sqlite_exact collection {self._collection_name!r} expects "
-                    f"embedding dimension {expected_dim}, got {int(q.size)}"
-                )
-            q_norm = float(np.linalg.norm(q))
-            scored = []
-            for row, vec in row_vectors:
-                if vec is None or vec.size != q.size:
+            for query_vector in query_embeddings:
+                q = _as_vector_array(query_vector)
+                if expected_dim is not None and int(q.size) != expected_dim:
+                    raise DimensionMismatchError(
+                        f"sqlite_exact collection {self._collection_name!r} expects "
+                        f"embedding dimension {expected_dim}, got {int(q.size)}"
+                    )
+                if mat.size == 0 or n_results == 0:
+                    outer_ids.append([])
+                    outer_docs.append([])
+                    outer_metas.append([])
+                    outer_dists.append([])
+                    if spec.embeddings:
+                        outer_embeds.append([])
                     continue
-                denom = q_norm * float(np.linalg.norm(vec))
-                cos = 0.0 if denom <= 0 else float(np.dot(q, vec) / denom)
-                distance = 1.0 - max(-1.0, min(1.0, cos))
-                scored.append((distance, row, vec))
-            scored.sort(key=lambda item: item[0])
-            top = scored[:n_results]
-
-            outer_ids.append([row["id"] for _, row, _ in top])
-            outer_docs.append([row["document"] for _, row, _ in top] if spec.documents else [])
-            outer_metas.append([row["metadata"] for _, row, _ in top] if spec.metadatas else [])
-            outer_dists.append([float(dist) for dist, _, _ in top] if spec.distances else [])
-            if spec.embeddings:
-                outer_embeds.append([vec.astype(float).tolist() for _, _, vec in top])
+                if mat.shape[1] != q.size:
+                    raise DimensionMismatchError(
+                        f"sqlite_exact collection {self._collection_name!r} expects "
+                        f"embedding dimension {int(mat.shape[1])}, got {int(q.size)}"
+                    )
+                dist = _cosine_distances(mat, q)
+                k = min(n_results, int(dist.size))
+                order = np.argsort(dist, kind="mergesort")[:k]
+                top_ids = [ids[int(i)] for i in order]
+                docs_by_id: dict[str, str] = {}
+                metas_by_id: dict[str, dict] = {}
+                if spec.documents or spec.metadatas:
+                    docs_by_id, metas_by_id = self._hydrate(cur, collection_id, top_ids, spec)
+                outer_ids.append(top_ids)
+                outer_docs.append(
+                    [docs_by_id.get(doc_id, "") for doc_id in top_ids] if spec.documents else []
+                )
+                outer_metas.append(
+                    [metas_by_id.get(doc_id, {}) for doc_id in top_ids] if spec.metadatas else []
+                )
+                outer_dists.append([float(dist[i]) for i in order] if spec.distances else [])
+                if spec.embeddings:
+                    outer_embeds.append([mat[int(i)].astype(float).tolist() for i in order])
 
         return QueryResult(
             ids=outer_ids,
@@ -639,6 +938,109 @@ class SQLiteExactCollection(BaseCollection):
             distances=outer_dists,
             embeddings=outer_embeds if spec.embeddings else None,
         )
+
+    def _rank_vectors(
+        self,
+        cur,
+        collection_id: int,
+        *,
+        where,
+        where_document,
+    ) -> tuple[list[str], np.ndarray]:
+        """Load (ids, embedding matrix) for exact cosine ranking.
+
+        The full embedding matrix is cached on the handle after the first
+        scan so later searches — filtered or not — do not re-read blobs.
+        Equality filters then restrict by id; other filters fall back to
+        ``_rows`` only to decide membership.
+        """
+        _validate_where(where)
+        _validate_where(where_document)
+        expected = self._collection_dimension(cur, collection_id)
+        empty = np.zeros((0, expected or 0), dtype=np.float32)
+        cached = self._handle._vector_cache.get(collection_id)
+        if cached is None:
+            cached = self._load_all_vectors(cur, collection_id, expected)
+            self._handle._vector_cache[collection_id] = cached
+        ids, mat, metas = cached
+        if not where and not where_document:
+            return ids, mat
+        if mat.size == 0:
+            return ids, mat
+        if where_document or not _where_uses_only_cached_keys(where):
+            wanted = {
+                row["id"] for row in self._rows(cur, where=where, where_document=where_document)
+            }
+            keep = [i for i, doc_id in enumerate(ids) if doc_id in wanted]
+        else:
+            keep = [i for i, meta in enumerate(metas) if _matches_where(meta, where)]
+        if not keep:
+            return [], empty if mat.size == 0 else np.zeros((0, mat.shape[1]), dtype=np.float32)
+        idx = np.array(keep, dtype=np.intp)
+        return [ids[i] for i in keep], mat[idx]
+
+    def _load_all_vectors(
+        self, cur, collection_id: int, expected: Optional[int]
+    ) -> tuple[list[str], np.ndarray, list[dict]]:
+        rows = cur.execute(
+            """
+            SELECT id, embedding, wing, room,
+                   json_extract(metadata_json, '$.source_file')
+            FROM documents
+            WHERE collection_id = ?
+            ORDER BY rowid
+            """,
+            (collection_id,),
+        ).fetchall()
+        ids: list[str] = []
+        vecs: list[np.ndarray] = []
+        metas: list[dict] = []
+        for doc_id, blob, wing, room, source_file in rows:
+            vec = _decode_array(blob)
+            if vec is None:
+                continue
+            if expected is not None and vec.size != expected:
+                continue
+            ids.append(doc_id)
+            vecs.append(vec)
+            meta = {}
+            if wing is not None:
+                meta["wing"] = wing
+            if room is not None:
+                meta["room"] = room
+            if source_file is not None:
+                meta["source_file"] = source_file
+            metas.append(meta)
+        if not vecs:
+            return ids, np.zeros((0, expected or 0), dtype=np.float32), metas
+        return ids, np.stack(vecs), metas
+
+    def _hydrate(self, cur, collection_id: int, ids: list[str], spec) -> tuple[dict, dict]:
+        docs: dict[str, str] = {}
+        metas: dict[str, dict] = {}
+        if not ids:
+            return docs, metas
+        cols = ["id"]
+        if spec.documents:
+            cols.append("document")
+        if spec.metadatas:
+            cols.append("metadata_json")
+        for start in range(0, len(ids), 900):
+            chunk = ids[start : start + 900]
+            placeholders = ",".join("?" for _ in chunk)
+            for row in cur.execute(
+                f"SELECT {', '.join(cols)} FROM documents "
+                f"WHERE collection_id = ? AND id IN ({placeholders})",
+                (collection_id, *chunk),
+            ):
+                doc_id = row[0]
+                idx = 1
+                if spec.documents:
+                    docs[doc_id] = row[idx] or ""
+                    idx += 1
+                if spec.metadatas:
+                    metas[doc_id] = _json_loads(row[idx])
+        return docs, metas
 
     def get(
         self,
@@ -651,33 +1053,51 @@ class SQLiteExactCollection(BaseCollection):
         include=None,
     ) -> GetResult:
         spec = _IncludeSpec.resolve(include, default_distances=False)
-        # Fast path for the common unfiltered page (e.g. the prefetch_mined_set
-        # and status sweeps): push LIMIT/OFFSET into the scan instead of
-        # materializing the whole collection and slicing in Python. Safe only
-        # with no post-filter (ids/where/where_document drop rows after the
-        # scan) and non-negative bounds: SQLite does not honor a negative LIMIT
-        # or OFFSET the way a Python slice does, so those keep the slice path.
+        # get(ids=...) must not scan the collection: look up by primary key.
+        if ids is not None and where is None and where_document is None:
+            with self._cursor() as cur:
+                collection_id = self._collection_id(cur)
+                by_id = self._rows_by_ids(cur, collection_id, list(ids), spec)
+            rows = [by_id[doc_id] for doc_id in ids if doc_id in by_id]
+            if offset:
+                rows = rows[offset:]
+            if limit is not None:
+                rows = rows[:limit]
+            return self._get_result(rows, spec)
+
+        # Unfiltered (or SQL-pushable equality) pages: LIMIT/OFFSET in SQL.
+        # Negative bounds stay on the Python slice path — SQLite does not
+        # honor a negative LIMIT/OFFSET the way a Python slice does.
+        python_where = bool(where_document) or (
+            where is not None and _equality_where_sql(where) is None
+        )
         push_page = (
-            ids is None
-            and where is None
-            and where_document is None
+            not python_where
             and (limit is None or limit >= 0)
             and (offset is None or offset >= 0)
             and (limit is not None or offset)
         )
         with self._cursor() as cur:
             if push_page:
-                rows = self._rows(cur, limit=limit, offset=offset)
+                rows = self._rows(
+                    cur,
+                    where=where,
+                    where_document=where_document,
+                    limit=limit,
+                    offset=offset,
+                    spec=spec,
+                )
             else:
-                rows = self._rows(cur, where=where, where_document=where_document)
+                rows = self._rows(cur, where=where, where_document=where_document, spec=spec)
         if not push_page:
-            if ids is not None:
-                by_id = {row["id"]: row for row in rows}
-                rows = [by_id[doc_id] for doc_id in ids if doc_id in by_id]
             if offset:
                 rows = rows[offset:]
             if limit is not None:
                 rows = rows[:limit]
+        return self._get_result(rows, spec)
+
+    @staticmethod
+    def _get_result(rows: list[dict], spec: _IncludeSpec) -> GetResult:
         return GetResult(
             ids=[row["id"] for row in rows],
             documents=[row["document"] for row in rows] if spec.documents else [],
@@ -712,6 +1132,37 @@ class SQLiteExactCollection(BaseCollection):
                 (collection_id,),
             ).fetchone()
             return int(row[0]) if row else 0
+
+    def facet_counts(
+        self,
+        field: str,
+        where: Optional[dict] = None,
+        limit: int = 1000,
+    ) -> dict[str, int]:
+        _validate_where(where)
+        if not _FACET_FIELD_RE.match(field):
+            raise UnsupportedCapabilityError(f"facet field {field!r} is not a JSON key")
+        push = _equality_where_sql(where)
+        if push is None:
+            raise UnsupportedCapabilityError("facet_counts does not support local-only filters")
+        extra_sql, params = push
+        with self._cursor() as cur:
+            collection_id = self._collection_id(cur)
+            expr = _json_field_sql(field)
+            rows = cur.execute(
+                f"""
+                SELECT {expr} AS k, COUNT(*)
+                FROM documents
+                WHERE collection_id = ?
+                  AND {expr} IS NOT NULL
+                  AND ({extra_sql})
+                GROUP BY 1
+                ORDER BY 2 DESC, 1
+                LIMIT ?
+                """,
+                (collection_id, *params, int(limit)),
+            ).fetchall()
+        return {str(key): int(count) for key, count in rows if key is not None}
 
     def lexical_search(self, *, query: str, n_results: int = 10, where: Optional[dict] = None):
         _validate_where(where)
@@ -872,6 +1323,7 @@ class SQLiteExactBackend(BaseBackend):
             "supports_embeddings_passthrough",
             "supports_embeddings_out",
             "supports_metadata_filters",
+            "supports_metadata_facets",
             "supports_lexical_search",
             "local_mode",
         }
@@ -1048,6 +1500,7 @@ class SQLiteExactBackend(BaseBackend):
         columns = {row[1] for row in conn.execute("PRAGMA table_info(collections)").fetchall()}
         if "dimension" not in columns:
             conn.execute("ALTER TABLE collections ADD COLUMN dimension INTEGER")
+        self._ensure_locus_columns(conn)
         try:
             conn.execute(
                 """
@@ -1072,12 +1525,41 @@ class SQLiteExactBackend(BaseBackend):
             )
         conn.commit()
 
+    @staticmethod
+    def _ensure_locus_columns(conn: sqlite3.Connection) -> None:
+        """Add VIRTUAL wing/room/hall columns and a composite index.
+
+        VIRTUAL generated columns are metadata-only (no table rewrite), so a
+        1.6 GB palace does not copy embedding blobs. CREATE INDEX walks
+        metadata_json once and stores the loci. Existing palaces migrate
+        here on the next writable open.
+        """
+        cols = _document_column_names(conn)
+        for field in _LOCUS_FIELDS:
+            if field in cols:
+                continue
+            try:
+                conn.execute(
+                    f"ALTER TABLE documents ADD COLUMN {field} TEXT "
+                    f"GENERATED ALWAYS AS (json_extract(metadata_json, '$.{field}')) VIRTUAL"
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+        conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS {_LOCUS_INDEX}
+                ON documents(collection_id, wing, room, hall)
+            """
+        )
+
     def get_collection(
         self,
         *args,
         **kwargs,
     ) -> SQLiteExactCollection:
         palace, collection_name, create, read_only = self._normalize_args(args, kwargs)
+        self.require_namespace_support(palace)
         palace_path = palace.local_path
         if palace_path is None:
             raise PalaceNotFoundError("SQLiteExactBackend requires PalaceRef.local_path")
@@ -1100,7 +1582,7 @@ class SQLiteExactBackend(BaseBackend):
                         (collection_name, _utcnow()),
                     )
                     handle.conn.commit()
-        return SQLiteExactCollection(handle, collection_name)
+        return SQLiteExactCollection(handle, collection_name, backend=self)
 
     @staticmethod
     def _normalize_args(args, kwargs):
