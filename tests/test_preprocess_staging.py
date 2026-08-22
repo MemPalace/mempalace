@@ -1,5 +1,6 @@
 """Tests for tools/preprocess_staging.py — boilerplate stripping and file splitting."""
 
+import hashlib
 import sys
 import textwrap
 from pathlib import Path
@@ -342,11 +343,7 @@ def test_preprocess_directory_excludes_processed_descendants(tmp_path):
     staging = tmp_path / "staging"
     staging.mkdir()
     (staging / "real.py").write_text(
-        "x = 1\n"
-        "y = 2\n"
-        "z = 3\n"
-        "def main():\n"
-        "    print('hello')\n",
+        "x = 1\ny = 2\nz = 3\ndef main():\n    print('hello')\n",
         encoding="utf-8",
     )
 
@@ -385,12 +382,44 @@ def test_preprocess_directory_respects_batch_snapshot(tmp_path):
     (staging / "claimed.py").write_text("x = 1\ny = 2\nz = 3\n", encoding="utf-8")
     (staging / "late.py").write_text("a = 1\nb = 2\nc = 3\n", encoding="utf-8")
 
+    content = "x = 1\ny = 2\nz = 3\n"
+    (staging / "claimed.py").write_text(content, encoding="utf-8")
+    (staging / "late.py").write_text("a = 1\nb = 2\nc = 3\n", encoding="utf-8")
+
+    sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    size = len(content.encode("utf-8"))
+
     snapshot = staging / ".batch_snapshot"
     # Unit-separator-delimited: rel\x1fsize\x1fmtime\x1fsha256
-    snapshot.write_text("claimed.py\x1f0\x1f0\x1f0\n", encoding="utf-8")
+    snapshot.write_text(f"claimed.py\x1f{size}\x1f0\x1f{sha256}\n", encoding="utf-8")
 
     stats = pp.preprocess_directory(str(staging), max_lines=4000, batch_snapshot=snapshot)
 
     assert stats["processed"] == 1
     assert (staging / "processed" / "claimed.py").exists()
     assert not (staging / "processed" / "late.py").exists()
+
+
+def test_batch_snapshot_rejects_modified_source(tmp_path):
+    """A file modified after the snapshot is claimed is not mined in that batch."""
+    staging = tmp_path / "staging"
+    staging.mkdir()
+
+    original_content = "x = 1\ny = 2\nz = 3\n"
+    (staging / "claimed.py").write_text(original_content, encoding="utf-8")
+
+    sha256 = hashlib.sha256(original_content.encode("utf-8")).hexdigest()
+    size = len(original_content.encode("utf-8"))
+    snapshot = staging / ".batch_snapshot"
+    snapshot.write_text(f"claimed.py\x1f{size}\x1f0\x1f{sha256}\n", encoding="utf-8")
+
+    # Simulate a producer modifying the file after the batch was claimed.
+    (staging / "claimed.py").write_text("x = 999\n", encoding="utf-8")
+
+    stats = pp.preprocess_directory(str(staging), max_lines=4000, batch_snapshot=snapshot)
+
+    assert stats["processed"] == 0
+    assert stats["skipped"] == 1
+    assert not (staging / "processed" / "claimed.py").exists()
+    # The live source remains available for a later stable run.
+    assert (staging / "claimed.py").exists()
