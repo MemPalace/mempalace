@@ -1338,6 +1338,7 @@ def cmd_search(args):
             n_results=args.results,
             since=args.since,
             before=args.before,
+            expand_wings=getattr(args, "expand_wings", True),
         )
     except SearchError:
         sys.exit(1)
@@ -2951,6 +2952,12 @@ def main():
     p_search.add_argument("--wing", default=None, help="Limit to one project")
     p_search.add_argument("--room", default=None, help="Limit to one room")
     p_search.add_argument("--results", type=int, default=5, help="Number of results")
+    p_search.add_argument(
+        "--expand-wings",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When no --wing is given, automatically search the most relevant wings (default: true)",
+    )
     p_search.add_argument(
         "--since",
         default=None,
