@@ -2749,7 +2749,7 @@ def main():
     p_init.add_argument(
         "--llm-provider",
         default="ollama",
-        choices=["ollama", "openai-compat", "anthropic"],
+        choices=["ollama", "openai-compat", "anthropic", "orcarouter"],
         help="LLM provider (default: ollama). Pass --no-llm to disable LLM-assisted refinement entirely.",
     )
     p_init.add_argument(
@@ -2770,6 +2770,7 @@ def main():
         default=None,
         help=(
             "API key for the provider. For anthropic, defaults to $ANTHROPIC_API_KEY; "
+            "for orcarouter, defaults to $ORCAROUTER_API_KEY; "
             "for openai-compat, defaults to $OPENAI_API_KEY."
         ),
     )
