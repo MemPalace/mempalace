@@ -36,11 +36,18 @@ anything — the body records `PID + argv` purely so error messages and
 3. Poll ownership until it lands or `wait` expires. On expiry: the same
    `MineAlreadyRunning` as before the handoff existed.
 
+A wait that expires also puts this server on a short wait (1 s) for the next
+minute, instead of paying the full `WAIT` on every mutating call. Otherwise one
+peer that never answers — an older build, or a genuinely long write — would make
+every later write on this side slow.
+
 **Holder** (the MCP server's `mcp-writer-handoff` watchdog thread):
 
-1. Every `MEMPALACE_WRITER_HANDOFF_POLL_SECONDS`, probe demand — a non-blocking
-   attempt on the demand file. Nobody queued → do nothing.
-2. Refuse if the lease is younger than `MEMPALACE_WRITER_MIN_HOLD_SECONDS`.
+1. Every `MEMPALACE_WRITER_HANDOFF_POLL_SECONDS`, wake up. Decline immediately if
+   the lease is younger than `MEMPALACE_WRITER_MIN_HOLD_SECONDS` — the cheap check
+   comes first, before touching the filesystem.
+2. Probe demand: a non-blocking attempt on the demand file. Nobody queued → do
+   nothing.
 3. Take the dispatch lock without blocking; a request in flight means try again
    next tick.
 4. Open a handoff window (`begin_palace_lock_handoff`). It refuses while any
@@ -83,6 +90,11 @@ is the single place that policy lives; if the lock is narrowed further (#1984),
 whatever replaces it must still exclude the watchdog for every request that
 *does* touch storage.
 
+Proxying to a hub takes no lock either, and deliberately so: the forward in
+`_dispatch_stdio_request` is a network round trip, and holding the barrier
+across it would block every handoff for as long as the hub takes to answer. A
+proxied session touches no local storage, so there is nothing to protect.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -94,10 +106,10 @@ whatever replaces it must still exclude the watchdog for every request that
 | `MEMPALACE_WRITER_HANDOFF_ENABLED` | unset | Opt *in* for the HTTP transport (off there by default). |
 | `MEMPALACE_PALACE_LOCK_WAIT_SECONDS` | `0` | Makes non-MCP callers (`mempalace mine`, hooks) wait for the baton too. |
 
-Keep `WAIT > MIN_HOLD + POLL`: a contender must outlast the holder's floor, or a
+Keep WAIT > MIN_HOLD + POLL: a contender must outlast the holder's floor, or a
 lease taken moments earlier can never change hands inside the contender's window.
 
-`MIN_HOLD` is the anti-thrash knob. Handing off means closing and reopening
+`MEMPALACE_WRITER_MIN_HOLD_SECONDS` is the anti-thrash knob. Handing off means closing and reopening
 storage, so two chatty sessions with a floor of zero would ping-pong the lease on
 every write and be slower than the read-only refusal they replaced. Raise it when
 sessions write in bursts; lower it when they trade writes turn by turn.
@@ -150,9 +162,10 @@ make them the best shape. `mempalace serve` (HTTP) is one process owning the
 storage with several clients talking to it: there is no cross-process lease at
 all, concurrent writes from different sessions simply serialize inside the
 server, and none of the knobs on this page apply. The hub proxy makes that the
-default experience for stdio clients too — `_dispatch_stdio_request` forwards to
-a live hub when one is configured, and the local path below only runs when there
-is none.
+default experience for stdio clients too: `_dispatch_stdio_request` discovers a
+live server for this palace through the per-palace server registry and forwards
+each request to it, so the local path — and with it this whole page — only runs
+when no hub is up. `MEMPALACE_HUB_FORWARD=off` turns the forwarding off.
 
 Prefer the single server where you control the deployment. The handoff is for
 everywhere you do not: stdio sessions started by an editor or an agent harness,
