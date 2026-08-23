@@ -21,66 +21,66 @@ Implemented a lightning-fast gossip protocol with specialized chatter nodes to s
 
 ### Chatter Nodes (7 specialized nodes)
 
-#### 1. Chatter Orkid Tech
-- **Wing**: orkid
+#### 1. Chatter Alpha Tech
+- **Wing**: alpha
 - **Hall**: technical
 - **Role**: technical_gossip
 - **Specialties**: contracts, backend, defi, trading
-- **Gossip Radius**: orkid, past-performance
+- **Gossip Radius**: alpha, gamma
 - **Chatter Level**: high
 - **Propagation Speed**: instant
 
 #### 2. Chatter Marketing
-- **Wing**: brutal-marketing
+- **Wing**: beta
 - **Hall**: general
 - **Role**: marketing_gossip
 - **Specialties**: brand, messaging, content, storytelling
-- **Gossip Radius**: brutal-marketing, orkid
+- **Gossip Radius**: beta, alpha
 - **Chatter Level**: high
 - **Propagation Speed**: instant
 
 #### 3. Chatter Performance
-- **Wing**: past-performance
+- **Wing**: gamma
 - **Hall**: analytics
 - **Role**: performance_gossip
 - **Specialties**: metrics, validation, optimization, data
-- **Gossip Radius**: past-performance, orkid
+- **Gossip Radius**: gamma, alpha
 - **Chatter Level**: high
 - **Propagation Speed**: instant
 
 #### 4. Chatter Strategy
-- **Wing**: orkid
+- **Wing**: alpha
 - **Hall**: strategy
 - **Role**: strategy_gossip
 - **Specialties**: trading, revenue, business, planning
-- **Gossip Radius**: orkid, brutal-marketing
+- **Gossip Radius**: alpha, beta
 - **Chatter Level**: medium
 - **Propagation Speed**: fast
 
 #### 5. Chatter Security
-- **Wing**: orkid
+- **Wing**: alpha
 - **Hall**: security
 - **Role**: security_gossip
 - **Specialties**: audit, compliance, risk, validation
-- **Gossip Radius**: orkid, brutal-marketing
+- **Gossip Radius**: alpha, beta
 - **Chatter Level**: medium
 - **Propagation Speed**: fast
 
 #### 6. Chatter Creative
-- **Wing**: brutal-marketing
+- **Wing**: beta
 - **Hall**: creative
 - **Role**: creative_gossip
 - **Specialties**: design, visual, brand, aesthetic
-- **Gossip Radius**: brutal-marketing, orkid
+- **Gossip Radius**: beta, alpha
 - **Chatter Level**: medium
 - **Propagation Speed**: fast
 
-#### 7. Chatter Negentropy
-- **Wing**: negentropy
+#### 7. Chatter Delta
+- **Wing**: delta
 - **Hall**: creative
 - **Role**: theory_gossip
 - **Specialties**: information theory, physics, complexity, optimization
-- **Gossip Radius**: negentropy, orkid
+- **Gossip Radius**: delta, alpha
 - **Chatter Level**: low
 - **Propagation Speed**: normal
 
@@ -89,13 +89,13 @@ Implemented a lightning-fast gossip protocol with specialized chatter nodes to s
 ### 1. Technical Breakthroughs
 - **Priority**: critical
 - **Propagation**: instant
-- **Chatter Nodes**: chatter_orkid_tech, chatter_performance
+- **Chatter Nodes**: chatter_alpha_tech, chatter_performance
 - **Keywords**: breakthrough, innovation, discovery, achievement
 
 ### 2. Performance Alerts
 - **Priority**: high
 - **Propagation**: instant
-- **Chatter Nodes**: chatter_performance, chatter_orkid_tech
+- **Chatter Nodes**: chatter_performance, chatter_alpha_tech
 - **Keywords**: alert, issue, problem, degradation, failure
 
 ### 3. Marketing Campaigns
@@ -113,13 +113,13 @@ Implemented a lightning-fast gossip protocol with specialized chatter nodes to s
 ### 5. Security Issues
 - **Priority**: critical
 - **Propagation**: instant
-- **Chatter Nodes**: chatter_security, chatter_orkid_tech
+- **Chatter Nodes**: chatter_security, chatter_alpha_tech
 - **Keywords**: vulnerability, security, risk, threat, breach
 
 ### 6. Creative Inspiration
 - **Priority**: low
 - **Propagation**: normal
-- **Chatter Nodes**: chatter_creative, chatter_negentropy
+- **Chatter Nodes**: chatter_creative, chatter_delta
 - **Keywords**: inspiration, idea, creative, design, concept
 
 ## Gossip Mechanisms
@@ -247,7 +247,7 @@ The protocol produces meta-facts with a reserved subject namespace:
 Meta-gossip messages use the same pipeline as ordinary facts:
 1. **Topic detection**: meta-facts are assigned to the `meta` topic and `high` priority by default.
 2. **Channel selection**: `high` priority maps to the `fast` channel.
-3. **Chatter selection**: meta-gossip is preferentially routed to `chatter_performance`, `chatter_strategy`, and `chatter_orkid_tech`.
+3. **Chatter selection**: meta-gossip is preferentially routed to `chatter_performance`, `chatter_strategy`, and `chatter_alpha_tech`.
 4. **Echo-chamber attenuation**: meta-gossip also carries a `path` vector; a node suppresses a meta-fact it has already seen.
 5. **TTL**: meta-gossip uses the configured `ttl_seconds` (default 60s) and is re-emitted on each analytics pass.
 
@@ -302,9 +302,9 @@ Meta-gossip triples are written to the same `KnowledgeGraph` with `source_file =
 ## Network Topology
 
 ### Chatter Node Distribution
-- **High Level Chatter**: 3 nodes (orkid_tech, marketing, performance)
+- **High Level Chatter**: 3 nodes (alpha_tech, marketing, performance)
 - **Medium Level Chatter**: 3 nodes (strategy, security, creative)
-- **Low Level Chatter**: 1 node (negentropy)
+- **Low Level Chatter**: 1 node (delta)
 
 ### Wing Coverage
 - **Orkid Wing**: 4 chatter nodes (technical, strategy, security)

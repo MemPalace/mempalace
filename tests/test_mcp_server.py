@@ -4003,7 +4003,7 @@ class TestGossipTools:
             subject="audit",
             predicate="found",
             object="security vulnerability",
-            source_wing="orkid",
+            source_wing="alpha",
             source_room="contracts",
         )
         assert "error" not in result

@@ -41,27 +41,27 @@ def _sample_room_graph() -> tuple[dict, list]:
     """Return a tiny room graph with two connected rooms spanning two wings."""
     nodes = {
         "contracts": {
-            "wings": ["orkid", "defi"],
+            "wings": ["alpha", "defi"],
             "halls": ["technical"],
             "count": 10,
             "dates": [],
         },
         "audit_report": {
-            "wings": ["orkid", "security"],
+            "wings": ["alpha", "security"],
             "halls": ["security"],
             "count": 5,
             "dates": [],
         },
         "launch_blog": {
-            "wings": ["brutal-marketing"],
+            "wings": ["beta"],
             "halls": ["general"],
             "count": 3,
             "dates": [],
         },
     }
     edges = [
-        {"room": "contracts", "wing_a": "orkid", "wing_b": "defi", "hall": "technical"},
-        {"room": "audit_report", "wing_a": "orkid", "wing_b": "security", "hall": "security"},
+        {"room": "contracts", "wing_a": "alpha", "wing_b": "defi", "hall": "technical"},
+        {"room": "audit_report", "wing_a": "alpha", "wing_b": "security", "hall": "security"},
     ]
     return nodes, edges
 
@@ -91,9 +91,9 @@ def test_default_config_does_not_leak_project_topology():
         path = os.path.join(d, "gossip_config.json")
         cfg = load_gossip_config(path=path)
         combined = json.dumps(cfg)
-        assert "orkid" not in combined
-        assert "brutal-marketing" not in combined
-        assert "negentropy" not in combined
+        assert "alpha" not in combined
+        assert "beta" not in combined
+        assert "delta" not in combined
 
 
 def test_save_and_reload_config():
@@ -118,18 +118,18 @@ def test_chatter_node_from_dict():
         {
             "id": "x",
             "name": "X",
-            "wing": "orkid",
+            "wing": "alpha",
             "hall": "technical",
             "role": "tech",
             "specialties": ["defi"],
-            "gossip_radius": ["orkid"],
+            "gossip_radius": ["alpha"],
             "chatter_level": "high",
             "propagation_speed": "instant",
         }
     )
     assert node.id == "x"
     assert node.chatter_level == "high"
-    assert node.match_score("new defi strategy", source_wing="orkid") > 0.5
+    assert node.match_score("new defi strategy", source_wing="alpha") > 0.5
 
 
 def test_chatter_node_match_score_ignores_unknown_wing():
@@ -137,15 +137,15 @@ def test_chatter_node_match_score_ignores_unknown_wing():
         {
             "id": "x",
             "name": "X",
-            "wing": "orkid",
+            "wing": "alpha",
             "hall": "technical",
             "role": "tech",
             "specialties": ["defi"],
-            "gossip_radius": ["orkid"],
+            "gossip_radius": ["alpha"],
         }
     )
     assert node.match_score("defi", source_wing="unknown") < node.match_score(
-        "defi", source_wing="orkid"
+        "defi", source_wing="alpha"
     )
 
 
@@ -213,7 +213,7 @@ def test_select_chatter_nodes_respects_fanout():
             subject="s",
             predicate="p",
             obj="o",
-            source_wing="orkid",
+            source_wing="alpha",
             priority="high",
         )
         nodes = protocol.select_chatter_nodes(msg, fanout=2)
@@ -232,7 +232,7 @@ def test_propagate_writes_triples_and_returns_report():
             "audit",
             "found",
             "security vulnerability",
-            source_wing="orkid",
+            source_wing="alpha",
             source_room="contracts",
             room_graph=_sample_room_graph(),
         )
@@ -262,7 +262,7 @@ def test_propagate_with_no_room_graph_still_runs():
             "new",
             "is",
             "idea",
-            source_wing="orkid",
+            source_wing="alpha",
             source_room="contracts",
             room_graph=_empty_room_graph(),
             fanout=5,
@@ -289,7 +289,7 @@ def test_propagate_report_distinguishes_failed_writes():
             "audit",
             "found",
             "security vulnerability",
-            source_wing="orkid",
+            source_wing="alpha",
             source_room="contracts",
             room_graph=_sample_room_graph(),
             fanout=5,
@@ -328,7 +328,7 @@ def test_propagate_report_records_partial_write_success():
             "audit",
             "found",
             "security vulnerability",
-            source_wing="orkid",
+            source_wing="alpha",
             source_room="contracts",
             room_graph=_sample_room_graph(),
             fanout=5,
@@ -357,7 +357,7 @@ def test_propagate_suppresses_beyond_max_hops():
             subject="x",
             predicate="is",
             obj="y",
-            source_wing="orkid",
+            source_wing="alpha",
             hops=3,
         )
         selected = protocol.select_chatter_nodes(msg)
@@ -389,7 +389,7 @@ def test_gossip_convenience_function_uses_passed_kg():
             "launch",
             "announced",
             "campaign",
-            source_wing="brutal-marketing",
+            source_wing="beta",
             kg=kg,
             fanout=3,
             config=EXAMPLE_GOSSIP_CONFIG,
@@ -417,12 +417,12 @@ def test_select_chatter_nodes_uses_hallway_room(monkeypatch):
         protocol = GossipProtocol(kg_path=kg_path, config=EXAMPLE_GOSSIP_CONFIG)
 
         def _fake_list_hallways(wing=None, config=None):
-            if wing != "orkid":
+            if wing != "alpha":
                 return []
             return [
                 {
-                    "id": "hallway_orkid_audit_risk_abc12345",
-                    "wing": "orkid",
+                    "id": "hallway_alpha_audit_risk_abc12345",
+                    "wing": "alpha",
                     "entity_a": "audit",
                     "entity_b": "risk",
                     "co_occurrence_count": 4,
@@ -430,8 +430,8 @@ def test_select_chatter_nodes_uses_hallway_room(monkeypatch):
                     "rooms": ["audit_report"],
                 },
                 {
-                    "id": "hallway_orkid_audit_compliance_abc12345",
-                    "wing": "orkid",
+                    "id": "hallway_alpha_audit_compliance_abc12345",
+                    "wing": "alpha",
                     "entity_a": "audit",
                     "entity_b": "compliance",
                     "co_occurrence_count": 2,
@@ -445,7 +445,7 @@ def test_select_chatter_nodes_uses_hallway_room(monkeypatch):
             subject="audit",
             predicate="found",
             obj="risk",
-            source_wing="orkid",
+            source_wing="alpha",
             priority="high",
         )
         nodes = protocol.select_chatter_nodes(msg, fanout=3)
@@ -470,7 +470,7 @@ def test_select_chatter_nodes_without_hallways(monkeypatch):
             subject="audit",
             predicate="found",
             obj="risk",
-            source_wing="orkid",
+            source_wing="alpha",
             priority="high",
         )
         nodes = protocol.select_chatter_nodes(msg, fanout=3)
@@ -496,7 +496,7 @@ def test_daemon_run_once_propagates_scheduled_message():
             "audit",
             "found",
             "risk",
-            source_wing="orkid",
+            source_wing="alpha",
             priority="high",
         )
         report = daemon.run_once()
@@ -516,7 +516,7 @@ def test_daemon_drops_expired_message():
         protocol = GossipProtocol(kg_path=kg_path, config=EXAMPLE_GOSSIP_CONFIG)
         daemon = GossipDaemon(protocol, interval_seconds=60.0)
 
-        msg = daemon.schedule("x", "is", "y", source_wing="orkid")
+        msg = daemon.schedule("x", "is", "y", source_wing="alpha")
         # Force expiry by backdating start time.
         msg._started_at = datetime.now(timezone.utc) - timedelta(seconds=120)
         msg.ttl_seconds = 60
@@ -536,7 +536,7 @@ def test_daemon_start_stop_background_thread():
     assert daemon._worker is not None
     assert daemon._worker.is_alive()
 
-    daemon.schedule("test", "is", "active", source_wing="orkid")
+    daemon.schedule("test", "is", "active", source_wing="alpha")
     time.sleep(0.15)
 
     daemon.stop()
@@ -551,9 +551,9 @@ def test_daemon_run_once_isolates_message_failures():
         protocol = GossipProtocol(kg=kg, config=EXAMPLE_GOSSIP_CONFIG)
         daemon = GossipDaemon(protocol, interval_seconds=60.0, max_requeue=100)
 
-        daemon.schedule("audit", "found", "risk", source_wing="orkid", priority="high")
-        daemon.schedule("will", "explode", "now", source_wing="orkid", priority="high")
-        daemon.schedule("launch", "is", "active", source_wing="orkid", priority="high")
+        daemon.schedule("audit", "found", "risk", source_wing="alpha", priority="high")
+        daemon.schedule("will", "explode", "now", source_wing="alpha", priority="high")
+        daemon.schedule("launch", "is", "active", source_wing="alpha", priority="high")
 
         original = protocol._propagate_message
         calls = {"count": 0}
@@ -597,13 +597,13 @@ def test_daemon_requeue_respects_max_requeue():
 
         def _schedule_concurrent(*a, **kw):
             if not scheduled["done"]:
-                daemon.schedule("concurrent", "is", "active", source_wing="orkid")
+                daemon.schedule("concurrent", "is", "active", source_wing="alpha")
                 scheduled["done"] = True
             return original(*a, **kw)
 
         protocol._propagate_message = _schedule_concurrent
 
-        daemon.schedule("audit", "found", "risk", source_wing="orkid", priority="high")
+        daemon.schedule("audit", "found", "risk", source_wing="alpha", priority="high")
         report = daemon.run_once()
 
         assert report["processed"] == 1
@@ -633,7 +633,7 @@ def test_gossip_analytics_snapshot():
             "audit",
             "found",
             "security vulnerability",
-            source_wing="orkid",
+            source_wing="alpha",
             source_room="contracts",
             fanout=5,
         )
@@ -664,7 +664,7 @@ def test_propagate_uses_priority_channel_for_ttl_and_fanout():
             "audit",
             "found",
             "security vulnerability",
-            source_wing="orkid",
+            source_wing="alpha",
             priority="critical",
         )
         assert report["priority"] == "critical"
@@ -676,7 +676,7 @@ def test_propagate_uses_priority_channel_for_ttl_and_fanout():
             "idea",
             "is",
             "spark",
-            source_wing="brutal-marketing",
+            source_wing="beta",
             priority="low",
         )
         assert low["priority"] == "low"
@@ -696,7 +696,7 @@ def test_propagate_preserves_explicit_max_hops_over_channel_default():
             "audit",
             "found",
             "security vulnerability",
-            source_wing="orkid",
+            source_wing="alpha",
             priority="critical",
             max_hops=10,
         )
@@ -728,7 +728,7 @@ def test_echo_chamber_attenuates_repeated_similar_messages():
             subject="audit",
             predicate="found",
             obj="risk",
-            source_wing="orkid",
+            source_wing="alpha",
             priority="high",
             path=[f"{node.id}:audit found risk"],
         )
@@ -758,7 +758,7 @@ def test_echo_chamber_suppresses_after_reinforcement_count():
             subject="audit",
             predicate="found",
             obj="risk",
-            source_wing="orkid",
+            source_wing="alpha",
             priority="high",
             # Two prior similar visits meet the reinforcement count.
             path=[
@@ -786,7 +786,7 @@ def test_echo_chamber_similarity_threshold_ignores_dissimilar():
             subject="audit",
             predicate="found",
             obj="risk",
-            source_wing="orkid",
+            source_wing="alpha",
             priority="high",
             # The stored text is completely different from the current text.
             path=[f"{node.id}:completely unrelated message text"],
@@ -811,20 +811,20 @@ def test_chatter_status_includes_echo_chamber_config():
 def test_random_walk_swap_only_picks_off_radius_nodes():
     """Random walk replacements must be outside the source's gossip radius."""
     protocol = GossipProtocol(config=EXAMPLE_GOSSIP_CONFIG)
-    # Source from the negentropy wing; only chatter_negentropy is in-radius,
+    # Source from the delta wing; only chatter_delta is in-radius,
     # so a random-walk replacement must come from a node whose gossip_radius
-    # does not contain negentropy.
+    # does not contain delta.
     message = GossipMessage(
         subject="new",
         predicate="is",
         obj="theory",
-        source_wing="negentropy",
+        source_wing="delta",
         priority="high",
     )
     with unittest.mock.patch.object(random, "random", return_value=0.0):
         selected = protocol.select_chatter_nodes(message, fanout=1)
         assert len(selected) == 1
-        assert normalize_wing_name("negentropy") not in {
+        assert normalize_wing_name("delta") not in {
             normalize_wing_name(w) for w in selected[0].gossip_radius
         }
 
@@ -844,7 +844,7 @@ def test_gossip_on_gossip_propagates_trending_and_viral():
                 "audit",
                 "found",
                 "security vulnerability",
-                source_wing="orkid",
+                source_wing="alpha",
                 source_room="contracts",
                 fanout=5,
                 priority="high",
@@ -880,7 +880,7 @@ def test_gossip_on_gossip_disabled():
             "audit",
             "found",
             "security vulnerability",
-            source_wing="orkid",
+            source_wing="alpha",
             source_room="contracts",
             fanout=5,
             priority="high",

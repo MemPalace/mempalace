@@ -118,7 +118,7 @@ class TestQueries:
     def test_query_gossip_triples(self, kg):
         kg.add_triple(
             "X",
-            "gossiped_in_orkid",
+            "gossiped_in_alpha",
             "Y",
             valid_from="2026-08-01T00:00:00Z",
             source_file="gossip://security_issues",
