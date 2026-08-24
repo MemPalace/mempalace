@@ -50,7 +50,7 @@ Full wing → room → drawer count tree.
 
 ### `mempalace_search`
 
-Semantic search. Returns verbatim drawer content with similarity scores.
+Semantic search. When no `wing` is specified, automatically expands to the most relevant wings using palace graph tunnels and hallways. Returns verbatim drawer content with similarity scores.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -58,8 +58,13 @@ Semantic search. Returns verbatim drawer content with similarity scores.
 | `limit` | integer | No | Max results (default: 5) |
 | `wing` | string | No | Filter by wing |
 | `room` | string | No | Filter by room |
+| `source_file` | string | No | Filter to one exact source_file |
+| `since` | string | No | Only drawers filed on/after this ISO date |
+| `before` | string | No | Only drawers filed strictly before this ISO date |
+| `max_distance` | number | No | Max cosine distance threshold (default: 1.5, set 0 to disable) |
+| `expand_wings` | boolean | No | Auto-expand to relevant wings when no wing/room/source_file is given (default: true) |
 
-**Returns:** `{ query, filters, results: [{ text, wing, room, source_file, similarity }] }`
+**Returns:** `{ query, filters, wing_expansion?, results: [{ text, wing, room, source_file, similarity }] }`
 
 ---
 

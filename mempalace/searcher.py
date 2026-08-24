@@ -330,15 +330,56 @@ def _hybrid_rank(
     return results
 
 
-def build_where_filter(wing: str = None, room: str = None, source_file: str = None) -> dict:
+def _maybe_expand_wings(
+    query: str,
+    palace_path: str,
+    expand_wings: bool,
+    wing: str | None,
+    room: str | None,
+    source_file: str | None,
+) -> list[str] | None:
+    """Compute which wings to search when no explicit filter is given.
+
+    Returns ``None`` if expansion is disabled, the caller specified a
+    filter, or the affinity scorer could not find relevant wings. The
+    caller falls back to unfiltered search in all three cases.
+    """
+    if not expand_wings:
+        return None
+    if wing or room or source_file:
+        return None
+    try:
+        from .wing_affinity import expand_wings as _expand_wings
+
+        return _expand_wings(query, config=MempalaceConfig(palace_path=palace_path))
+    except Exception:
+        logger.debug("wing expansion failed; falling back to unfiltered", exc_info=True)
+        return None
+
+
+def build_where_filter(
+    wing: str = None,
+    room: str = None,
+    source_file: str = None,
+    wings: list[str] = None,
+) -> dict:
     """Build a ChromaDB where filter from optional wing/room/source_file.
 
     ChromaDB needs a ``$and`` only when ≥2 clauses are present; a single
     clause is returned bare and zero clauses yield an empty filter (#1815).
+
+    When ``wings`` (a list) is provided instead of a single ``wing``, the
+    wing clause becomes ``{"$or": [{"wing": w}, ...]}`` so the filter
+    matches any of the listed wings. This is used by wing-expansion search
+    to scope queries to the most relevant wings without multiple round-trips.
     """
     clauses = []
     if wing:
         clauses.append({"wing": wing})
+    elif wings and len(wings) == 1:
+        clauses.append({"wing": wings[0]})
+    elif wings and len(wings) > 1:
+        clauses.append({"$or": [{"wing": w} for w in wings]})
     if room:
         clauses.append({"room": room})
     if source_file:
@@ -609,6 +650,7 @@ def search(
     n_results: int = 5,
     since: str = None,
     before: str = None,
+    expand_wings: bool = True,
 ):
     """
     Search the palace. Returns verbatim drawer content.
@@ -666,7 +708,8 @@ def search(
     # creation — their similarity scores will be junk until they run repair.
     _warn_if_legacy_metric(col)
 
-    where = build_where_filter(wing, room)
+    expanded_wings = _maybe_expand_wings(query, palace_path, expand_wings, wing, room, None)
+    where = build_where_filter(wing, room, wings=expanded_wings)
 
     try:
         kwargs = {
@@ -1343,6 +1386,7 @@ def _search_result_envelope(
     candidates_fetched: int,
     pool_size: int,
     date_window_active: bool,
+    expanded_wings: list[str] | None = None,
 ) -> dict:
     """Assemble the ``search_memories`` response dict.
 
@@ -1365,6 +1409,11 @@ def _search_result_envelope(
     }
     if date_window_active and candidates_fetched >= pool_size:
         result["date_filter_pool_truncated"] = True
+    if expanded_wings:
+        result["wing_expansion"] = {
+            "expanded_wings": expanded_wings,
+            "expansion_enabled": True,
+        }
     return result
 
 
@@ -1543,7 +1592,7 @@ def _open_search_collection(palace_path: str, collection_name: str):
 
 
 def _query_drawers_with_filter_fallback(
-    drawers_col, dkwargs, query, n_results, wing, room, source_file=None
+    drawers_col, dkwargs, query, n_results, wing, room, source_file=None, wings=None
 ):
     """Run the filtered drawer query, falling back to an unfiltered query plus a
     Python-side post-filter when ChromaDB raises on the filtered query.
@@ -1581,6 +1630,8 @@ def _query_drawers_with_filter_fallback(
         ):
             meta = meta or {}
             if wing and meta.get("wing") != wing:
+                continue
+            if wings and meta.get("wing") not in wings:
                 continue
             if room and meta.get("room") != room:
                 continue
@@ -1663,6 +1714,7 @@ def search_memories(
     candidate_strategy: str = "vector",
     collection_name: str = None,
     lang: Optional[str] = None,
+    expand_wings: bool = False,
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
 
@@ -1748,7 +1800,15 @@ def search_memories(
         return open_error
 
     metric = _metric_for_collection(drawers_col)
-    where = build_where_filter(wing, room, source_file)
+
+    # Wing expansion: when no explicit wing is given and expansion is enabled,
+    # compute which wings are most relevant to the query using existing
+    # structural signals (tunnels, hallways, room names). This scopes the
+    # search to the most relevant wings instead of searching all drawers
+    # palace-wide and returning noise from unrelated wings.
+    expanded_wings = _maybe_expand_wings(query, palace_path, expand_wings, wing, room, source_file)
+
+    where = build_where_filter(wing, room, source_file, wings=expanded_wings)
 
     # Hybrid retrieval: always query drawers directly (the floor), then use
     # closet hits to boost rankings. Closets are a ranking SIGNAL, never a
@@ -1767,7 +1827,7 @@ def search_memories(
         if where:
             dkwargs["where"] = where
         drawer_results = _query_drawers_with_filter_fallback(
-            drawers_col, dkwargs, query, n_results, wing, room, source_file
+            drawers_col, dkwargs, query, n_results, wing, room, source_file, wings=expanded_wings
         )
     except Exception as e:
         return _search_error_result(f"Search error: {e}")
@@ -1947,6 +2007,7 @@ def search_memories(
         candidates_fetched=len(_first_or_empty(drawer_results, "documents")),
         pool_size=pool_size,
         date_window_active=date_window_active,
+        expanded_wings=expanded_wings,
     )
 
 
