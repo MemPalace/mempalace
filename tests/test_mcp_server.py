@@ -172,6 +172,29 @@ class TestColdStartDiagnostics:
     """
 
     @staticmethod
+    def _clean_home_env(tmp_path, *, with_palace: bool = False) -> dict:
+        """Env overrides pinning HOME to a dir that does (not) hold ``.mempalace``.
+
+        ``_run_main`` inherits the session environment, so without this these
+        cases depend on whether some earlier test happened to create the palace
+        root under the redirected HOME — the default-logfile handler attaches
+        only when ``~/.mempalace`` already exists, which made the outcome
+        order-dependent. Pinning HOME per test keeps each case deterministic
+        and lets both branches be asserted explicitly.
+        """
+        home = tmp_path / ("home_with_palace" if with_palace else "home_clean")
+        home.mkdir(exist_ok=True)
+        if with_palace:
+            (home / ".mempalace").mkdir(exist_ok=True)
+        drive, tail = os.path.splitdrive(str(home))
+        return {
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "HOMEDRIVE": drive or "C:",
+            "HOMEPATH": tail or str(home),
+        }
+
+    @staticmethod
     def _run_main(env_overrides: dict, extra_code: str = "", timeout: int = 30):
         env = {
             k: v
@@ -196,7 +219,7 @@ class TestColdStartDiagnostics:
 
     def test_log_file_unset_attaches_only_stream_handler(self, tmp_path):
         marker = tmp_path / "handlers.txt"
-        env_overrides = {"MEMPALACE_LOG_FILE": None}
+        env_overrides = {"MEMPALACE_LOG_FILE": None, **self._clean_home_env(tmp_path)}
         extra = (
             "import logging, pathlib\n"
             "from mempalace import mcp_server  # noqa: F401 — triggers _init_logging()\n"
@@ -211,7 +234,8 @@ class TestColdStartDiagnostics:
 
     def test_log_file_empty_string_attaches_only_stream_handler(self, tmp_path):
         marker = tmp_path / "handlers.txt"
-        env_overrides = {"MEMPALACE_LOG_FILE": "   "}  # whitespace counts as unset after .strip()
+        # whitespace counts as unset after .strip()
+        env_overrides = {"MEMPALACE_LOG_FILE": "   ", **self._clean_home_env(tmp_path)}
         extra = (
             "import logging, pathlib\n"
             "from mempalace import mcp_server  # noqa: F401\n"
@@ -223,6 +247,49 @@ class TestColdStartDiagnostics:
         result = self._run_main(env_overrides, extra_code=extra)
         assert result.returncode == 0, f"stderr={result.stderr!r}"
         assert marker.read_text().split(",") == ["StreamHandler"], marker.read_text()
+
+    def test_log_file_unset_attaches_file_handler_when_palace_exists(self, tmp_path):
+        """With no MEMPALACE_LOG_FILE, an *existing* ~/.mempalace gets the default log.
+
+        This is the other half of the branch the two tests above pin shut, and
+        the reason the default is safe: it rides on a palace root that is
+        already there rather than bringing one into existence.
+        """
+        marker = tmp_path / "handlers.txt"
+        env_overrides = {
+            "MEMPALACE_LOG_FILE": None,
+            **self._clean_home_env(tmp_path, with_palace=True),
+        }
+        extra = (
+            "import logging, pathlib\n"
+            "from mempalace import mcp_server  # noqa: F401 — triggers _init_logging()\n"
+            f"pathlib.Path({str(marker)!r}).write_text("
+            "','.join(type(h).__name__ for h in logging.getLogger().handlers)"
+            ")\n"
+            "raise SystemExit(0)\n"
+        )
+        result = self._run_main(env_overrides, extra_code=extra)
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert marker.read_text().split(",") == [
+            "StreamHandler",
+            "FileHandler",
+        ], marker.read_text()
+        log_path = tmp_path / "home_with_palace" / ".mempalace" / "mcp_server.log"
+        assert log_path.exists(), "default logfile was not written into the palace root"
+
+    def test_log_file_unset_never_creates_the_palace_root(self, tmp_path):
+        """#1676 kill-switch: a missing ~/.mempalace must survive importing the server.
+
+        A missing palace root is the documented way to disable autosave/mining
+        hooks. If the default-logfile path created it, importing the MCP server
+        would silently re-arm hooks the operator deliberately turned off.
+        """
+        env_overrides = {"MEMPALACE_LOG_FILE": None, **self._clean_home_env(tmp_path)}
+        result = self._run_main(env_overrides)
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert not (tmp_path / "home_clean" / ".mempalace").exists(), (
+            "importing mcp_server created the palace root, re-arming the kill-switch"
+        )
 
     def test_log_file_set_attaches_file_handler_and_persists_startup_line(self, tmp_path):
         log_path = tmp_path / "mcp.log"
@@ -533,7 +600,9 @@ class TestColdStartDiagnostics:
             ")\n"
             "raise SystemExit(0)\n"
         )
-        result = self._run_main({"MEMPALACE_LOG_FILE": None}, extra_code=extra)
+        result = self._run_main(
+            {"MEMPALACE_LOG_FILE": None, **self._clean_home_env(tmp_path)}, extra_code=extra
+        )
         assert result.returncode == 0, f"stderr={result.stderr!r}"
         state = marker.read_text()
         # Root logger must remain exactly as the host configured it.
@@ -3958,6 +4027,59 @@ class TestKGTools:
             assert result["success"] is False, value
             assert "ended" in result["error"]
             assert "YYYY-MM-DDTHH:MM:SSZ" in result["error"]
+
+    def test_kg_invalidate_accepts_long_object(self, monkeypatch, config, palace_path, kg):
+        """Invalidating a fact whose object > 128 chars must not be blocked by MAX_NAME_LENGTH.
+
+        The object parameter in kg_invalidate is a lookup key against existing
+        facts, not a new entity name.  MAX_NAME_LENGTH (128) applies to entity
+        identifiers — capping lookup keys silently blocks invalidation of any
+        legitimately long free-text fact written before the cap existed.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        long_obj = "a" * 200  # well over the 128-char entity-name cap
+
+        # Seed a fact with a long object directly (bypassing MCP write-path
+        # validation, which intentionally caps new entity names at 128 chars).
+        kg.add_triple("TestSubject", "has_note", long_obj, valid_from="2026-01-01")
+
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_kg_invalidate(
+            "TestSubject",
+            "has_note",
+            long_obj,
+            ended="2026-06-16",
+        )
+
+        assert result["success"] is True, f"invalidate rejected long object: {result}"
+
+    def test_kg_invalidate_long_object_write_path_unaffected(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Write-path object validation is unchanged by the invalidate fix.
+
+        tool_kg_add still enforces MAX_NAME_LENGTH on the object field so that
+        new entity names remain bounded.  The invalidate fix is scoped to the
+        lookup path only.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        from mempalace import mcp_server
+
+        long_obj = "b" * 200
+
+        result = mcp_server.tool_kg_add(
+            "TestSubject",
+            "has_note",
+            long_obj,
+            valid_from="2026-01-01",
+        )
+
+        # write-path still rejects long objects
+        assert result["success"] is False
+        assert "exceeds maximum length" in result["error"]
 
     def test_kg_add_rejects_timezone_offset_datetime(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -8138,3 +8260,116 @@ class TestSearchDateFilters:
         assert "before" in schema["properties"]
         assert schema["properties"]["since"]["type"] == "string"
         assert schema["properties"]["before"]["type"] == "string"
+
+
+class TestOversizedResponseBackstop:
+    """The MAX_RESPONSE_CHARS backstop must degrade structurally, not textually.
+
+    Slicing already-serialized JSON at a character offset produces text that no
+    longer parses, so a caller doing json.loads gets a decode error instead of a
+    smaller result — and a drawer's stored text can be cut mid-word. Every case
+    below asserts the shipped payload is still valid JSON.
+    """
+
+    def _fit(self, monkeypatch, result, cap=800, tool_name="mempalace_kg_query"):
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "MAX_RESPONSE_CHARS", cap)
+        return mcp_server._fit_response(result, tool_name=tool_name)
+
+    def test_small_response_passes_through_untouched(self, monkeypatch):
+        payload = {"entity": "x", "facts": [{"a": 1}], "count": 1}
+        result, text = self._fit(monkeypatch, payload)
+        assert result is payload
+        assert json.loads(text) == payload
+
+    def test_oversized_list_payload_stays_valid_json(self, monkeypatch):
+        payload = {
+            "entity": "hub",
+            "facts": [{"object": "y" * 200, "i": i} for i in range(200)],
+            "count": 200,
+        }
+        result, text = self._fit(monkeypatch, payload)
+        # The whole point: it must still parse.
+        parsed = json.loads(text)
+        assert parsed["truncated"] is True
+        assert parsed["total"] == 200
+        assert 0 < len(parsed["facts"]) < 200
+        assert "narrow your query" in parsed["notice"]
+
+    def test_kept_items_are_whole_never_sliced(self, monkeypatch):
+        """Every fact that ships must be intact — truncation drops, never cuts."""
+        facts = [{"object": "z" * 200, "i": i} for i in range(200)]
+        payload = {"entity": "hub", "facts": facts, "count": 200}
+        _result, text = self._fit(monkeypatch, payload)
+        parsed = json.loads(text)
+        for i, fact in enumerate(parsed["facts"]):
+            assert fact == facts[i], "a surviving fact was altered, not merely dropped"
+
+    def test_count_field_matches_what_actually_ships(self, monkeypatch):
+        payload = {
+            "entity": "hub",
+            "facts": [{"object": "q" * 200, "i": i} for i in range(200)],
+            "count": 200,
+        }
+        _result, text = self._fit(monkeypatch, payload)
+        parsed = json.loads(text)
+        assert parsed["count"] == len(parsed["facts"])
+
+    def test_result_fits_under_the_cap(self, monkeypatch):
+        payload = {"facts": [{"object": "w" * 200} for _ in range(200)]}
+        _result, text = self._fit(monkeypatch, payload, cap=900)
+        assert len(text) <= 900
+
+    def test_unshrinkable_payload_becomes_structured_object(self, monkeypatch):
+        """No list to drop from -> structured error, still valid JSON."""
+        payload = {"drawer": "m" * 5000}
+        _result, text = self._fit(monkeypatch, payload, cap=800, tool_name="mempalace_get_drawer")
+        parsed = json.loads(text)
+        assert parsed["error"] == "response_too_large"
+        assert parsed["tool"] == "mempalace_get_drawer"
+        assert parsed["truncated"] is True
+        assert parsed["cap_chars"] == 800
+        assert parsed["size_chars"] > 800
+
+    def test_stored_text_is_never_cut_mid_word(self, monkeypatch):
+        """A drawer's text either ships whole or does not ship at all."""
+        body = "the quick brown fox " * 400
+        payload = {"drawers": [{"id": i, "content": body} for i in range(20)]}
+        _result, text = self._fit(monkeypatch, payload, cap=3000)
+        parsed = json.loads(text)
+        for drawer in parsed.get("drawers", []):
+            assert drawer["content"] == body, "drawer content was truncated mid-value"
+
+    def test_non_dict_payload_still_valid_json(self, monkeypatch):
+        _result, text = self._fit(monkeypatch, ["item" * 500 for _ in range(50)], cap=800)
+        json.loads(text)  # must not raise
+
+    def test_dispatch_response_is_parseable_end_to_end(self, monkeypatch):
+        """Through the real chokepoint: the text field must always json.loads."""
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "MAX_RESPONSE_CHARS", 700)
+        monkeypatch.setitem(
+            mcp_server.TOOLS,
+            "mempalace_kg_stats",
+            {
+                **mcp_server.TOOLS["mempalace_kg_stats"],
+                "handler": lambda: {
+                    "facts": [{"object": "v" * 200, "i": i} for i in range(100)],
+                    "count": 100,
+                },
+            },
+        )
+        resp = mcp_server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {"name": "mempalace_kg_stats", "arguments": {}},
+            }
+        )
+        text = resp["result"]["content"][0]["text"]
+        assert len(text) <= 700
+        parsed = json.loads(text)
+        assert parsed["truncated"] is True
