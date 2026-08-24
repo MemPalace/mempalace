@@ -62,6 +62,40 @@ If no closets exist (palace created before this feature) — or all closet hits 
 
 > **BM25 hybrid re-rank** is on the roadmap (deferred to a follow-up PR alongside generic `LLM_*` env-var support); the current closet search ranks purely by ChromaDB cosine distance against the closet text.
 
+### One result per logical source
+
+A closet is evidence that a *source* is relevant; it does not make every
+chunk from that source a separate agent-facing answer. A chunked source can
+have several high-ranking drawer hits. When closet enrichment expands a hit,
+it chooses the query-best chunk from that source and includes its neighbors.
+Applying that enrichment independently to every matching chunk therefore
+produced the same expanded text repeatedly.
+
+Search now keeps the best ranked result for each logical source only when
+closet enrichment will run. The grouping key is the full `source_file` path
+plus `parent_drawer_id` when present, so unrelated logical drawers that share
+a file name remain separate. Direct `drawer` results and records without a
+`source_file` retain their established chunk-level behavior.
+
+This follows the same retrieval principle as [Qdrant's grouped
+search](https://qdrant.tech/documentation/search/search/#grouping): group
+chunk matches by document identity and keep one representative hit
+(`group_size=1`) to avoid redundant document answers. It is deliberately
+narrower than Qdrant's groups API: MemPalace does not return group envelopes,
+does not add a public `group_by` parameter, and does not collapse ordinary
+direct drawer search. It prevents only the duplicate response introduced by
+closet hydration.
+
+To reproduce this regression in a throwaway palace, run:
+
+```bash
+uv run python examples/reproduce_duplicate_hydrated_results.py
+```
+
+Before this behavior was fixed, that example found three results for one
+source and each one hydrated around the same query-best chunk. The expected
+result is now one `drawer+closet` response for that source.
+
 ## Limits
 
 | Setting | Value | Reason |

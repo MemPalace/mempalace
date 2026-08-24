@@ -1526,6 +1526,63 @@ class TestDrawerGrepExpansion:
         # on each side (chunk boundary may clip).
         assert "chunk_" in top["text"]
 
+    def test_hybrid_search_returns_one_hydrated_hit_per_source(self, palace_path):
+        """Multiple matching chunks of one source must not expand to repeats."""
+        col = get_collection(palace_path)
+        source = "/proj/deduplicated.md"
+        for i in range(5):
+            col.upsert(
+                ids=[f"drawer_proj_backend_deduplicated_{i:03d}"],
+                documents=[f"chunk_{i} covers JWT authentication flow"],
+                metadatas=[
+                    {
+                        "wing": "project",
+                        "room": "backend",
+                        "source_file": source,
+                        "chunk_index": i,
+                        "filed_at": "2026-04-13T00:00:00",
+                    }
+                ],
+            )
+        closets = get_closets_collection(palace_path)
+        closets.upsert(
+            ids=["closet_proj_backend_deduplicated_01"],
+            documents=["JWT auth|;|→drawer_proj_backend_deduplicated_002"],
+            metadatas=[{"wing": "project", "room": "backend", "source_file": source}],
+        )
+
+        result = search_memories("JWT authentication", palace_path, n_results=3)
+
+        source_hits = [h for h in result["results"] if h["source_path"] == source]
+        assert len(source_hits) == 1
+        assert source_hits[0]["matched_via"] == "drawer+closet"
+        assert source_hits[0]["total_drawers"] == 5
+
+    def test_direct_search_keeps_chunk_level_results(self, palace_path):
+        """Only closet-hydrated results collapse by source; direct hits do not."""
+        col = get_collection(palace_path)
+        source = "/proj/direct-chunks.md"
+        for i in range(3):
+            col.upsert(
+                ids=[f"drawer_proj_backend_direct_{i:03d}"],
+                documents=[f"chunk_{i} covers direct JWT search"],
+                metadatas=[
+                    {
+                        "wing": "project",
+                        "room": "backend",
+                        "source_file": source,
+                        "chunk_index": i,
+                        "filed_at": "2026-04-13T00:00:00",
+                    }
+                ],
+            )
+
+        result = search_memories("direct JWT search", palace_path, n_results=3)
+
+        source_hits = [h for h in result["results"] if h["source_path"] == source]
+        assert len(source_hits) == 3
+        assert all(hit["matched_via"] == "drawer" for hit in source_hits)
+
     def test_expand_isolates_chunks_by_parent_drawer_id_when_source_file_shared(self, palace_path):
         """Regression for #1580. After #1539 the chunked ``tool_add_drawer``
         path stores per-chunk drawers tagged with a ``parent_drawer_id``
