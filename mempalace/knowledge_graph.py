@@ -37,7 +37,9 @@ Usage:
 
 import hashlib
 import json
+import logging
 import os
+import re
 import sqlite3
 import threading
 from datetime import date, datetime
@@ -45,8 +47,103 @@ from pathlib import Path
 from typing import Optional
 from .config import sanitize_iso_temporal
 
+log = logging.getLogger(__name__)
 
 DEFAULT_KG_PATH = os.path.expanduser("~/.mempalace/knowledge_graph.sqlite3")
+
+# ---------------------------------------------------------------------------
+# Predicate vocabulary control (2026-08-24)
+#
+# The live KG accumulated ~236 distinct predicates because the LLM extractor
+# invents a new synonym every time it sees a relationship phrased differently
+# ("date_of_birth" / "born_on" / "dob" / "birth_date" ...). Downstream readers
+# that enumerate predicates (e.g. the boot people snapshot's REL_LABEL map)
+# then miss facts silently — the exact failure shape recorded in
+# feedback-a-closed-grammar-over-a-hand-curated-file-dies-silently.
+#
+# Strategy: NORMALISE at write time, never reject. A hard reject loses facts;
+# instead we canonicalise known synonyms onto one predicate and log unknowns so
+# the vocabulary converges instead of growing. Unknown predicates are still
+# stored verbatim (fail-open) — the log is the alarm, not a gate.
+# ---------------------------------------------------------------------------
+
+# Synonym families: every member collapses onto the first (canonical) form.
+PREDICATE_SYNONYMS: dict[str, str] = {
+    # birth
+    "born_on": "date_of_birth", "dob": "date_of_birth", "birth_date": "date_of_birth",
+    "birthdate": "date_of_birth", "born": "date_of_birth", "born_in": "place_of_birth",
+    "birth_place": "place_of_birth",
+    # residence / location
+    "lives_in": "place_of_residence", "resides_in": "place_of_residence",
+    "home_is": "place_of_residence", "address_is": "place_of_residence",
+    "located_in": "place_of_residence", "based_in": "place_of_residence",
+    # family (align with kg_recall_people.REL_LABEL vocabulary)
+    "is_married_to": "married_to", "wed_to": "married_to", "spouse_is": "married_to",
+    "husband_is": "married_to", "wife_is": "married_to",
+    "mother_is": "has_mother", "father_is": "has_father",
+    "brother_is": "has_brother", "sister_is": "has_sister",
+    "is_brother_of": "has_brother", "is_sister_of": "has_sister",
+    "is_wife_of": "married_to", "is_husband_of": "married_to",
+    "is_mother_of": "mother_of", "is_father_of": "father_of",
+    "is_parent_of": "parent_of", "is_child_of": "child_of",
+    "is_son_of": "son_of", "is_daughter_of": "daughter_of",
+    # work / affiliation
+    "works_at": "works_at", "employed_by": "works_at", "employer_is": "works_at",
+    "job_title": "role", "position_is": "role", "title_is": "role",
+    "studied_at": "educated_at", "school": "educated_at", "university": "educated_at",
+    "went_to": "educated_at", "alumni_of": "educated_at",
+    # contact
+    "phone_number": "phone", "email_address": "email", "email_is": "email",
+    "contact_number": "phone",
+}
+
+# Canonical snake_case shape: lowercase words joined by single underscores.
+_PREDICATE_SHAPE_RE = re.compile(r"[^a-z0-9_]+")
+
+# Where unknown-predicate warnings accumulate. One line per distinct unknown,
+# so repeated writes of the same predicate don't flood the log.
+UNKNOWN_PREDICATE_LOG_ENV = "MEMPALACE_KG_UNKNOWN_PREDICATE_LOG"
+
+
+def normalize_predicate(predicate: str) -> str:
+    """Canonicalise a predicate for storage.
+
+    Order matters: whitespace/shape normalisation → synonym collapse. Returns
+    the storage form; callers that need to know whether a rewrite happened can
+    compare against their input.
+    """
+    pred = (predicate or "").strip().lower().replace(" ", "_")
+    pred = _PREDICATE_SHAPE_RE.sub("_", pred)
+    pred = re.sub(r"_+", "_", pred).strip("_")
+    return PREDICATE_SYNONYMS.get(pred, pred)
+
+
+def _log_unknown_predicate(pred: str) -> None:
+    """Record an unrecognised predicate so vocabulary drift is visible.
+
+    Best-effort by design: telemetry must never make a fact-write fail.
+    """
+    try:
+        path = Path(
+            os.environ.get(
+                UNKNOWN_PREDICATE_LOG_ENV,
+                str(Path.home() / ".mempalace" / "unknown_predicates.log"),
+            )
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing: set[str] = set()
+        if path.exists():
+            existing = {
+                line.split(" | ", 1)[-1].strip()
+                for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
+                if " | " in line
+            }
+        if pred not in existing:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(f"{datetime.now().isoformat(timespec='seconds')} | {pred}\n")
+        log.debug("Unknown KG predicate stored verbatim: %r", pred)
+    except Exception:  # pragma: no cover - telemetry is best-effort
+        pass
 
 
 def _is_date_only_temporal(value: str) -> bool:
@@ -124,6 +221,65 @@ def _temporal_filter_sql(as_of: str) -> tuple[str, list[str]]:
         f"AND (t.valid_to IS NULL OR {valid_to_expr} >= ?)",
         [as_of_key, as_of_key],
     )
+
+
+def _is_known_predicate(pred: str) -> bool:
+    """True if ``pred`` is canonical vocabulary (a synonym target or a common
+    structural predicate). Used to decide whether an unknown-predicate log line
+    is worth writing."""
+    return pred in _KNOWN_PREDICATES
+
+
+_KNOWN_PREDICATES: frozenset[str] = frozenset(
+    set(PREDICATE_SYNONYMS.values())
+    | {
+        # family — mirrors kg_recall_people.REL_LABEL keys
+        "married_to", "married", "is_wife_of", "partner_of", "has_brother",
+        "has_sister", "has_sibling", "has_child", "parent_of", "father_of",
+        "mother_of", "child_of", "daughter_of", "son_of", "has_mother",
+        "has_father", "has_niece", "has_nephew", "niece_of", "nephew_of",
+        "grandparent_of", "grandchild_of", "uncle_of", "aunt_of",
+        "is_brother_of", "is_sister_of", "is_mother_of", "is_father_of",
+        "is_parent_of", "is_child_of", "is_son_of", "is_daughter_of",
+        "wed_to", "spouse_is", "husband_is", "wife_is", "brother_is",
+        "sister_is", "is_husband_of",
+        # gayatri write path (done.py)
+        "worked_on", "decided", "rationale",
+        # generic descriptive
+        "does", "loves", "likes", "dislikes", "prefers", "owns", "has",
+        "is_a", "member_of", "knows", "friend_of", "colleague_of",
+        "speaks", "language", "nationality_is", "religion_is",
+        "goal", "issue", "has_issue", "status_is", "role", "phone", "email",
+        "date_of_birth", "place_of_birth", "place_of_residence",
+        "educated_at", "works_at", "ended_on", "started_on",
+    }
+)
+
+# Relationship-shaped predicates whose object must NOT be a bare date —
+# the live DB contains 'hunnys_brother --married--> 2021-04-01', a type error
+# that silently corrupts the graph (a person slot holding a calendar value).
+_PERSON_RELATIONSHIP_PREDS = frozenset(
+    {
+        "married_to", "married", "partner_of", "child_of", "parent_of",
+        "father_of", "mother_of", "son_of", "daughter_of", "has_brother",
+        "has_sister", "has_sibling", "has_child", "has_mother", "has_father",
+        "has_niece", "has_nephew", "niece_of", "nephew_of", "friend_of",
+        "colleague_of", "sibling_of", "grandparent_of", "grandchild_of",
+        "uncle_of", "aunt_of",
+    }
+)
+
+_DATE_ONLY_VALUE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+
+def _validate_predicate_object_pair(pred: str, obj: str) -> None:
+    """Reject type errors between predicate and object at write time."""
+    if pred in _PERSON_RELATIONSHIP_PREDS and _DATE_ONLY_VALUE_RE.match(obj or ""):
+        raise ValueError(
+            f"predicate {pred!r} expects a person as its object but got a "
+            f"date-like value {obj!r}; store temporal facts via valid_from/"
+            f"valid_to instead of corrupting a relationship edge"
+        )
 
 
 class KnowledgeGraph:
@@ -279,7 +435,13 @@ class KnowledgeGraph:
 
         sub_id = self._entity_id(subject)
         obj_id = self._entity_id(obj)
-        pred = predicate.lower().replace(" ", "_")
+        raw_pred = predicate
+        pred = normalize_predicate(predicate)
+        _validate_predicate_object_pair(pred, obj)
+        if not _is_known_predicate(pred):
+            # Unknown vocabulary — stored verbatim (fail-open) but logged once
+            # per distinct predicate so drift stays visible.
+            _log_unknown_predicate(pred)
 
         # Auto-create entities if they don't exist
         with self._lock:
@@ -329,7 +491,7 @@ class KnowledgeGraph:
         """Mark a relationship as no longer valid (set valid_to date/time)."""
         sub_id = self._entity_id(subject)
         obj_id = self._entity_id(obj)
-        pred = predicate.lower().replace(" ", "_")
+        pred = normalize_predicate(predicate)
         ended = sanitize_iso_temporal(ended or date.today().isoformat(), "ended")
 
         with self._lock:
@@ -427,7 +589,7 @@ class KnowledgeGraph:
     def query_relationship(self, predicate: str, as_of: str = None):
         """Get all triples with a given relationship type."""
         as_of = sanitize_iso_temporal(as_of, "as_of")
-        pred = predicate.lower().replace(" ", "_")
+        pred = normalize_predicate(predicate)
 
         query = """
             SELECT t.*, s.name as sub_name, o.name as obj_name

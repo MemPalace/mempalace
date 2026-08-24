@@ -42,8 +42,11 @@ class TestSeedFromEntityFacts:
         kg.seed_from_entity_facts(facts)
         results = kg.query_entity("Max", direction="outgoing")
         predicates = {r["predicate"] for r in results}
+        # 2026-08-24: write-path predicate normalisation collapses the legacy
+        # 'is_child_of' alias onto the canonical 'child_of' — same edge, one
+        # vocabulary entry instead of two.
         assert "child_of" in predicates
-        assert "is_child_of" in predicates
+        assert "is_child_of" not in predicates
 
     def test_seed_sibling(self, kg):
         facts = {
