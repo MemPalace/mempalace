@@ -14,7 +14,7 @@ _os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 _logging.getLogger("chromadb.telemetry").setLevel(_logging.CRITICAL)
 # ---------------------------------------------------------------------------
 
-from .cli import main
-from .version import __version__
+from .cli import main  # noqa: E402 - telemetry opt-out must precede chromadb imports
+from .version import __version__  # noqa: E402 - keep package imports together
 
 __all__ = ["main", "__version__"]

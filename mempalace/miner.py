@@ -17,6 +17,8 @@ from collections import defaultdict
 
 import chromadb
 
+from . import file_state
+
 READABLE_EXTENSIONS = {
     ".txt",
     ".md",
@@ -403,7 +405,12 @@ def get_collection(palace_path: str):
 
 
 def file_already_mined(collection, source_file: str) -> bool:
-    """Fast check: has this file been filed before?"""
+    """Path-only check: does this path have any drawer at all?
+
+    Kept for callers that only need "have we ever seen this path". Mining
+    itself uses file_state.decide(), which also compares mtime and content
+    hash so an edited file gets re-filed instead of skipped forever.
+    """
     try:
         results = collection.get(where={"source_file": source_file}, limit=1)
         return len(results.get("ids", [])) > 0
@@ -412,24 +419,36 @@ def file_already_mined(collection, source_file: str) -> bool:
 
 
 def add_drawer(
-    collection, wing: str, room: str, content: str, source_file: str, chunk_index: int, agent: str
+    collection,
+    wing: str,
+    room: str,
+    content: str,
+    source_file: str,
+    chunk_index: int,
+    agent: str,
+    content_hash: str = None,
+    source_mtime: float = None,
 ):
     """Add one drawer to the palace."""
     drawer_id = f"drawer_{wing}_{room}_{hashlib.md5((source_file + str(chunk_index)).encode(), usedforsecurity=False).hexdigest()[:16]}"
+    metadata = {
+        "wing": wing,
+        "room": room,
+        "source_file": source_file,
+        "chunk_index": chunk_index,
+        "added_by": agent,
+        "filed_at": datetime.now().isoformat(),
+    }
+    # The stamp the next run reads to tell "unchanged" from "edited".
+    if content_hash is not None:
+        metadata["content_hash"] = content_hash
+    if source_mtime is not None:
+        metadata["source_mtime"] = float(source_mtime)
     try:
         collection.add(
             documents=[content],
             ids=[drawer_id],
-            metadatas=[
-                {
-                    "wing": wing,
-                    "room": room,
-                    "source_file": source_file,
-                    "chunk_index": chunk_index,
-                    "added_by": agent,
-                    "filed_at": datetime.now().isoformat(),
-                }
-            ],
+            metadatas=[metadata],
         )
         return True
     except Exception as e:
@@ -451,29 +470,47 @@ def process_file(
     rooms: list,
     agent: str,
     dry_run: bool,
-) -> int:
-    """Read, chunk, route, and file one file. Returns drawer count."""
+) -> tuple:
+    """Read, chunk, route, and file one file.
 
-    # Skip if already filed
+    Returns (action, drawer_count). The action is file_state.SKIP / MINE /
+    REMINE — the caller needs it to report "skipped, unchanged" separately
+    from "read it, and it held nothing worth filing".
+    """
+
     source_file = str(filepath)
-    if not dry_run and file_already_mined(collection, source_file):
-        return 0
+
+    if dry_run:
+        action, content_hash, source_mtime = file_state.MINE, None, None
+    else:
+        action, content_hash, source_mtime = file_state.decide(collection, source_file)
+        if action == file_state.SKIP:
+            return file_state.SKIP, 0
 
     try:
         content = filepath.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return 0
+        # Couldn't read it — leave whatever is already filed alone.
+        return action, 0
+
+    if action == file_state.REMINE:
+        # The old drawers hold content that no longer exists. Drop them before
+        # filing the new ones: chunk boundaries move when a file is edited, so
+        # overwriting by id would strand the tail of the previous version.
+        # Done after the read succeeds so a transient read error can't wipe
+        # good drawers.
+        file_state.drop_drawers(collection, source_file)
 
     content = content.strip()
     if len(content) < MIN_CHUNK_SIZE:
-        return 0
+        return action, 0
 
     room = detect_room(filepath, content, rooms, project_path)
     chunks = chunk_text(content, source_file)
 
     if dry_run:
         print(f"    [DRY RUN] {filepath.name} → room:{room} ({len(chunks)} drawers)")
-        return len(chunks)
+        return action, len(chunks)
 
     drawers_added = 0
     for chunk in chunks:
@@ -485,11 +522,13 @@ def process_file(
             source_file=source_file,
             chunk_index=chunk["chunk_index"],
             agent=agent,
+            content_hash=content_hash,
+            source_mtime=source_mtime,
         )
         if added:
             drawers_added += 1
 
-    return drawers_added
+    return action, drawers_added
 
 
 # =============================================================================
@@ -605,10 +644,11 @@ def mine(
 
     total_drawers = 0
     files_skipped = 0
+    files_remined = 0
     room_counts = defaultdict(int)
 
     for i, filepath in enumerate(files, 1):
-        drawers = process_file(
+        action, drawers = process_file(
             filepath=filepath,
             project_path=project_path,
             collection=collection,
@@ -617,19 +657,24 @@ def mine(
             agent=agent,
             dry_run=dry_run,
         )
-        if drawers == 0 and not dry_run:
+        if action == file_state.SKIP:
             files_skipped += 1
-        else:
-            total_drawers += drawers
+            continue
+        if action == file_state.REMINE:
+            files_remined += 1
+        total_drawers += drawers
+        if drawers:
             room = detect_room(filepath, "", rooms, project_path)
             room_counts[room] += 1
             if not dry_run:
-                print(f"  ✓ [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers}")
+                mark = "↻" if action == file_state.REMINE else "✓"
+                print(f"  {mark} [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers}")
 
     print(f"\n{'=' * 55}")
     print("  Done.")
     print(f"  Files processed: {len(files) - files_skipped}")
-    print(f"  Files skipped (already filed): {files_skipped}")
+    print(f"  Files skipped (unchanged): {files_skipped}")
+    print(f"  Files re-filed (content changed): {files_remined}")
     print(f"  Drawers filed: {total_drawers}")
     print("\n  By room:")
     for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):

@@ -17,6 +17,7 @@ from collections import defaultdict
 
 import chromadb
 
+from . import file_state
 from .normalize import normalize
 
 
@@ -221,6 +222,11 @@ def get_collection(palace_path: str):
 
 
 def file_already_mined(collection, source_file: str) -> bool:
+    """Path-only check: does this path have any drawer at all?
+
+    Mining uses file_state.decide() instead, which also compares mtime and
+    content hash so a session log that kept growing gets re-filed.
+    """
     try:
         results = collection.get(where={"source_file": source_file}, limit=1)
         return len(results.get("ids", [])) > 0
@@ -292,23 +298,37 @@ def mine_convos(
 
     total_drawers = 0
     files_skipped = 0
+    files_remined = 0
+    files_empty = 0
     room_counts = defaultdict(int)
 
     for i, filepath in enumerate(files, 1):
         source_file = str(filepath)
 
-        # Skip if already filed
-        if not dry_run and file_already_mined(collection, source_file):
-            files_skipped += 1
-            continue
+        # Skip only if the file is byte-for-byte what we already filed.
+        if dry_run:
+            action, content_hash, source_mtime = file_state.MINE, None, None
+        else:
+            action, content_hash, source_mtime = file_state.decide(collection, source_file)
+            if action == file_state.SKIP:
+                files_skipped += 1
+                continue
 
         # Normalize format
         try:
             content = normalize(str(filepath))
         except (OSError, ValueError):
+            # Couldn't read it — leave whatever is already filed alone.
             continue
 
+        if action == file_state.REMINE:
+            # Content moved on. Drop the old drawers before filing the new
+            # ones: exchange boundaries shift as a session grows, so writing
+            # by id would leave the previous version's tail behind.
+            file_state.drop_drawers(collection, source_file)
+
         if not content or len(content.strip()) < MIN_CHUNK_SIZE:
+            files_empty += 1
             continue
 
         # Chunk — either exchange pairs or general extraction
@@ -321,6 +341,7 @@ def mine_convos(
             chunks = chunk_exchanges(content)
 
         if not chunks:
+            files_empty += 1
             continue
 
         # Detect room from content (general mode uses memory_type instead)
@@ -371,6 +392,18 @@ def mine_convos(
                             "filed_at": datetime.now().isoformat(),
                             "ingest_mode": "convos",
                             "extract_mode": extract_mode,
+                            # The stamp the next run reads to tell
+                            # "unchanged" from "edited".
+                            **(
+                                {"content_hash": content_hash}
+                                if content_hash is not None
+                                else {}
+                            ),
+                            **(
+                                {"source_mtime": float(source_mtime)}
+                                if source_mtime is not None
+                                else {}
+                            ),
                         }
                     ],
                 )
@@ -379,13 +412,18 @@ def mine_convos(
                 if "already exists" not in str(e).lower():
                     raise
 
+        if action == file_state.REMINE:
+            files_remined += 1
         total_drawers += drawers_added
-        print(f"  ✓ [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
+        mark = "↻" if action == file_state.REMINE else "✓"
+        print(f"  {mark} [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
 
     print(f"\n{'=' * 55}")
     print("  Done.")
     print(f"  Files processed: {len(files) - files_skipped}")
-    print(f"  Files skipped (already filed): {files_skipped}")
+    print(f"  Files skipped (unchanged): {files_skipped}")
+    print(f"  Files re-filed (content changed): {files_remined}")
+    print(f"  Files with nothing to file: {files_empty}")
     print(f"  Drawers filed: {total_drawers}")
     if room_counts:
         print("\n  By room:")
