@@ -390,3 +390,97 @@ class TestSupersessionBoundary:
         assert self._models(kg, "2026-06-02") == ["A"]
         assert self._models(kg, "2026-06-02T23:00:00Z") == ["A"]
         assert self._models(kg, "2026-06-03") == []
+
+
+class TestReplicationMethods:
+    def test_dump_and_apply_rows_round_trip(self, kg, tmp_path):
+        kg.add_entity("Alice", entity_type="person")
+        kg.add_triple(
+            "Alice",
+            "knows",
+            "Bob",
+            valid_from="2026-01-01",
+        )
+
+        entity_rows = kg.dump_rows("entities")
+        triple_rows = kg.dump_rows("triples")
+
+        assert len(entity_rows) == 2
+        assert len(triple_rows) == 1
+        assert all("_rowid" in row for row in entity_rows + triple_rows)
+
+        replica = KnowledgeGraph(db_path=str(tmp_path / "replica.sqlite3"))
+        try:
+            for row in entity_rows:
+                replica.apply_row("entities", row)
+            for row in triple_rows:
+                replica.apply_row("triples", row)
+
+            assert replica.stats()["entities"] == 2
+            assert replica.stats()["triples"] == 1
+
+            facts = replica.query_entity("Alice", direction="outgoing")
+            assert len(facts) == 1
+            assert facts[0]["predicate"] == "knows"
+            assert facts[0]["object"] == "Bob"
+            assert facts[0]["valid_from"] == "2026-01-01"
+        finally:
+            replica.close()
+
+    def test_dump_rows_supports_pagination(self, kg):
+        kg.add_entity("Alice")
+        kg.add_entity("Bob")
+        kg.add_entity("Carol")
+
+        first_page = kg.dump_rows("entities", limit=2)
+        assert len(first_page) == 2
+
+        second_page = kg.dump_rows(
+            "entities",
+            after_rowid=first_page[-1]["_rowid"],
+            limit=2,
+        )
+        assert len(second_page) == 1
+        assert second_page[0]["_rowid"] > first_page[-1]["_rowid"]
+
+    def test_apply_row_replaces_existing_row(self, kg, tmp_path):
+        tid = kg.add_triple("Alice", "knows", "Bob", valid_from="2026-01-01")
+        original = kg.dump_rows("triples")[0]
+
+        replica = KnowledgeGraph(db_path=str(tmp_path / "replica.sqlite3"))
+        try:
+            for row in kg.dump_rows("entities"):
+                replica.apply_row("entities", row)
+            replica.apply_row("triples", original)
+
+            kg.invalidate("Alice", "knows", "Bob", ended="2026-06-01")
+            updated = kg.dump_rows("triples")[0]
+
+            replica.apply_row("triples", updated)
+
+            facts = replica.query_entity("Alice", direction="outgoing")
+            assert len(facts) == 1
+            assert facts[0]["current"] is False
+
+            historical = replica.query_entity(
+                "Alice",
+                as_of="2026-05-01",
+                direction="outgoing",
+            )
+            assert len(historical) == 1
+            assert historical[0]["object"] == "Bob"
+            assert historical[0]["predicate"] == "knows"
+            assert historical[0]["valid_from"] == "2026-01-01"
+            assert historical[0]["valid_to"] == "2026-06-01"
+        finally:
+            replica.close()
+
+    def test_replication_methods_validate_input(self, kg):
+        with pytest.raises(ValueError, match="table must be one of"):
+            kg.dump_rows("nope")
+
+        with pytest.raises(ValueError, match="table must be one of"):
+            kg.apply_row("nope", {"id": "x"})
+
+        with pytest.raises(ValueError, match="missing 'id'"):
+            kg.apply_row("entities", {"name": "Alice"})
