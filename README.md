@@ -185,6 +185,7 @@ variables, namespace behavior, and deployment notes.
 # Mine content into the palace
 mempalace mine ~/projects/myapp                    # project files
 mempalace mine ~/.claude/projects/ --mode convos   # Claude Code sessions (scope with --wing per project)
+mempalace mine ~/.kimi-code/sessions/ --mode convos # Kimi Code CLI sessions
 
 # Search
 mempalace search "why did we switch to GraphQL"

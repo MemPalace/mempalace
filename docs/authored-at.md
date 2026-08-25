@@ -1,8 +1,8 @@
 # Authored date (`authored_at`)
 
-Conversation transcripts carry a per-line ISO-8601 `timestamp` (both Claude Code and
-Codex JSONL). The miner records the most recent one per file as the drawer's
-**`authored_at`** — when the content was actually written.
+Conversation transcripts carry a per-line timestamp: ISO-8601 `timestamp` on Claude Code
+and Codex JSONL, epoch-millis `time` on Kimi Code `wire.jsonl`. The miner records the most
+recent one per file as the drawer's **`authored_at`** — when the content was actually written.
 
 This is distinct from the ingest date:
 

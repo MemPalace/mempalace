@@ -11,6 +11,7 @@ Supported:
     - OpenAI Codex CLI JSONL
     - Gemini CLI JSONL (~/.gemini/tmp/<project_hash>/chats/session-*.jsonl)
     - Pi agent JSONL
+    - Kimi Code CLI JSONL (~/.kimi-code/sessions/*/agents/*/wire.jsonl)
     - Gemini CLI / Google AI Studio JSON sessions (contents / messages / flat list)
     - Continue.dev session JSON (~/.continue/sessions/*.json)
     - Slack JSON export
@@ -250,6 +251,10 @@ def _try_normalize_json_split(content: str) -> Optional[list]:
         return [normalized]
 
     normalized = _try_pi_jsonl(content)
+    if normalized:
+        return [normalized]
+
+    normalized = _try_kimi_jsonl(content)
     if normalized:
         return [normalized]
 
@@ -501,6 +506,158 @@ def _try_pi_jsonl(content: str) -> Optional[str]:
     if len(messages) >= 2 and has_session_header:
         return _messages_to_transcript(messages)
     return None
+
+
+def _try_kimi_jsonl(content: str) -> Optional[str]:
+    """Kimi Code CLI sessions (~/.kimi-code/sessions/<workspace>/session-*/agents/*/wire.jsonl).
+
+    Kimi Code records each agent session as a JSONL *event stream*, not a
+    message log. The relevant event types:
+
+      - ``metadata``                header; carries ``protocol_version`` (detection gate)
+      - ``turn.prompt``             user turn input: ``{input:[{type,text}], origin:{kind}}``
+      - ``context.append_message``  user message: ``{message:{role,content:[blocks],origin}}``
+      - ``context.append_loop_event`` loop events; the assistant's output lives here as
+                                    ``event.type == "content.part"`` with ``part.type``
+                                    of ``think`` (reasoning) or ``text`` (visible reply)
+
+    Two traps a naive parse must avoid (verified against real session captures):
+
+      - Assistant text is NOT in ``context.append_message`` — every one of those
+        rows is ``role == "user"``. The assistant half only exists nested inside
+        ``context.append_loop_event`` content parts.
+      - Most ``context.append_message`` rows are not the user's words at all:
+        ``origin.kind`` is ``injection`` / ``system_trigger`` / ``background_task`` /
+        ``skill_activation`` for machine-generated chrome (permission reminders,
+        system prompts). Only ``origin.kind`` of ``"user"`` (or absent) is the human.
+
+    Detection requires BOTH the ``metadata.protocol_version`` header AND a
+    dot-namespaced Kimi event type, so this never misfires on Claude Code,
+    Codex, or Pi JSONL flowing through the same dispatch chain.
+    """
+    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    if not lines:
+        return None
+
+    if not _kimi_has_header(lines[0]) or not _kimi_has_event(lines):
+        return None
+
+    messages = []
+    seen_user_texts = set()  # dedupe turn.prompt vs context.append_message
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+
+        entry_type = entry.get("type", "")
+
+        if entry_type == "turn.prompt":
+            text = _kimi_user_prompt_text(entry)
+            if text:
+                messages.append(("user", text))
+                seen_user_texts.add(text.strip())
+
+        elif entry_type == "context.append_message":
+            text = _kimi_user_message_text(entry, seen_user_texts)
+            if text:
+                if messages and messages[-1][0] == "user":
+                    prev_role, prev_text = messages[-1]
+                    messages[-1] = (prev_role, prev_text + "\n" + text)
+                else:
+                    messages.append(("user", text))
+
+        elif entry_type == "context.append_loop_event":
+            text = _kimi_assistant_part_text(entry)
+            if text:
+                # Merge consecutive content parts into one assistant turn.
+                # Parts are streamed fragments of the same reply, so join
+                # WITHOUT a separator — a newline would split words.
+                if messages and messages[-1][0] == "assistant":
+                    prev_role, prev_text = messages[-1]
+                    messages[-1] = (prev_role, prev_text + text)
+                else:
+                    messages.append(("assistant", text))
+
+    if len(messages) >= 2:
+        return _messages_to_transcript(messages)
+    return None
+
+
+def _kimi_has_header(first_line: str) -> bool:
+    """Detection gate 1: first line must be a Kimi ``metadata`` record."""
+    try:
+        header = json.loads(first_line)
+    except json.JSONDecodeError:
+        return False
+    return (
+        isinstance(header, dict)
+        and header.get("type") == "metadata"
+        and "protocol_version" in header
+    )
+
+
+def _kimi_has_event(lines: list) -> bool:
+    """Detection gate 2: a dot-namespaced Kimi event type must appear.
+
+    Scans a bounded prefix so the check stays cheap on huge files.
+    """
+    for line in lines[1:50]:
+        if not line.startswith("{"):
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("type", "").startswith(("turn.prompt", "context.append_", "context.apply_")):
+            return True
+    return False
+
+
+def _kimi_user_prompt_text(entry: dict) -> str:
+    """User turn text from a ``turn.prompt`` event (origin must be the human)."""
+    origin = entry.get("origin", {})
+    if not isinstance(origin, dict) or origin.get("kind") != "user":
+        return ""
+    return _extract_content(entry.get("input", ""))
+
+
+def _kimi_user_message_text(entry: dict, seen_user_texts: set) -> str:
+    """User text from ``context.append_message``, filtering machine chrome.
+
+    Returns "" for injections / system triggers / background noise and for
+    texts already recorded from ``turn.prompt``.
+    """
+    message = entry.get("message", {})
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return ""
+    origin = message.get("origin", {})
+    if isinstance(origin, dict) and origin.get("kind") not in (None, "user"):
+        return ""
+    text = _extract_content(message.get("content", ""))
+    if not text or text.strip() in seen_user_texts:
+        return ""
+    return text
+
+
+def _kimi_assistant_part_text(entry: dict) -> str:
+    """Visible assistant reply text from a ``content.part`` loop event.
+
+    Only ``part.type == "text"`` is the reply; ``think`` (reasoning) and
+    tool.call / tool.result events return "".
+    """
+    event = entry.get("event", {})
+    if not isinstance(event, dict) or event.get("type") != "content.part":
+        return ""
+    part = event.get("part", {})
+    if not isinstance(part, dict) or part.get("type") != "text":
+        return ""
+    text = part.get("text", "")
+    return text if isinstance(text, str) and text.strip() else ""
 
 
 def _try_gemini_json(data) -> Optional[str]:

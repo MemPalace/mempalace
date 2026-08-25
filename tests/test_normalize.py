@@ -16,6 +16,7 @@ from mempalace.normalize import (
     _try_gemini_json,
     _try_gemini_jsonl,
     _try_continue_json,
+    _try_kimi_jsonl,
     _try_normalize_json,
     _try_normalize_json_split,
     _try_pi_jsonl,
@@ -2165,4 +2166,206 @@ def test_pi_jsonl_invalid_lines_skipped():
         json.dumps({"type": "message", "message": {"role": "assistant", "content": "A"}}),
     ]
     result = _try_pi_jsonl("\n".join(lines))
+    assert result is not None
+
+
+# ── _try_kimi_jsonl ─────────────────────────────────────────────────────
+
+
+def _kimi_header():
+    return json.dumps({"type": "metadata", "protocol_version": "1.4", "created_at": 1786085292006})
+
+
+def _kimi_user_prompt(text):
+    return json.dumps(
+        {
+            "type": "turn.prompt",
+            "input": [{"type": "text", "text": text}],
+            "origin": {"kind": "user"},
+            "time": 1,
+        }
+    )
+
+
+def _kimi_user_message(text, kind="user"):
+    return json.dumps(
+        {
+            "type": "context.append_message",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": text}],
+                "origin": {"kind": kind},
+                "toolCalls": [],
+            },
+            "time": 1,
+        }
+    )
+
+
+def _kimi_assistant_part(text):
+    return json.dumps(
+        {
+            "type": "context.append_loop_event",
+            "event": {"type": "content.part", "part": {"type": "text", "text": text}},
+            "time": 1,
+        }
+    )
+
+
+def _kimi_think_part(text):
+    return json.dumps(
+        {
+            "type": "context.append_loop_event",
+            "event": {"type": "content.part", "part": {"type": "think", "think": text}},
+            "time": 1,
+        }
+    )
+
+
+def test_kimi_jsonl_valid():
+    lines = [
+        _kimi_header(),
+        _kimi_user_prompt("Q"),
+        _kimi_assistant_part("A"),
+    ]
+    result = _try_kimi_jsonl("\n".join(lines))
+    assert result is not None
+    assert "> Q" in result
+    assert "A" in result
+
+
+def test_kimi_jsonl_requires_metadata_header():
+    """Without the metadata.protocol_version header, the parser returns None."""
+    lines = [_kimi_user_prompt("Q"), _kimi_assistant_part("A")]
+    assert _try_kimi_jsonl("\n".join(lines)) is None
+
+
+def test_kimi_jsonl_requires_kimi_event():
+    """A metadata header alone is not enough — a dot-namespaced Kimi event is required."""
+    lines = [
+        _kimi_header(),
+        json.dumps({"type": "unrelated", "data": "Q"}),
+        json.dumps({"type": "unrelated", "data": "A"}),
+    ]
+    assert _try_kimi_jsonl("\n".join(lines)) is None
+
+
+def test_kimi_jsonl_no_false_positive_on_claude_code():
+    """Claude Code JSONL must not be captured by the Kimi parser."""
+    lines = [
+        json.dumps({"type": "user", "message": {"content": "Q"}}),
+        json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "A"}]}}),
+    ]
+    assert _try_kimi_jsonl("\n".join(lines)) is None
+
+
+def test_kimi_jsonl_no_false_positive_on_codex():
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {}}),
+        json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "Q"}}),
+        json.dumps({"type": "event_msg", "payload": {"type": "agent_message", "message": "A"}}),
+    ]
+    assert _try_kimi_jsonl("\n".join(lines)) is None
+
+
+def test_kimi_jsonl_filters_injection_messages():
+    """origin.kind == injection/system_trigger/etc. must not be filed as user words."""
+    lines = [
+        _kimi_header(),
+        _kimi_user_prompt("real question"),
+        _kimi_user_message(
+            "<system-reminder>permission mode active</system-reminder>", kind="injection"
+        ),
+        _kimi_user_message("background task done", kind="background_task"),
+        _kimi_assistant_part("real answer"),
+    ]
+    result = _try_kimi_jsonl("\n".join(lines))
+    assert result is not None
+    assert "real question" in result
+    assert "real answer" in result
+    assert "permission mode" not in result
+    assert "background task done" not in result
+
+
+def test_kimi_jsonl_dedupes_prompt_and_message():
+    """turn.prompt and context.append_message carry the same input — keep only one."""
+    lines = [
+        _kimi_header(),
+        _kimi_user_prompt("same question"),
+        _kimi_user_message("same question", kind="user"),
+        _kimi_assistant_part("answer"),
+    ]
+    result = _try_kimi_jsonl("\n".join(lines))
+    assert result is not None
+    assert result.count("same question") == 1
+
+
+def test_kimi_jsonl_skips_think_parts():
+    """part.type == think (reasoning) is skipped; only part.type == text is kept."""
+    lines = [
+        _kimi_header(),
+        _kimi_user_prompt("Q"),
+        _kimi_think_part("let me think about this"),
+        _kimi_assistant_part("visible reply"),
+    ]
+    result = _try_kimi_jsonl("\n".join(lines))
+    assert result is not None
+    assert "visible reply" in result
+    assert "let me think" not in result
+
+
+def test_kimi_jsonl_merges_consecutive_assistant_parts():
+    """Streamed assistant content parts merge into one turn without separators."""
+    lines = [
+        _kimi_header(),
+        _kimi_user_prompt("Q"),
+        _kimi_assistant_part("Hello, "),
+        _kimi_assistant_part("world"),
+        _kimi_assistant_part("!"),
+    ]
+    result = _try_kimi_jsonl("\n".join(lines))
+    assert result is not None
+    assert "Hello, world!" in result
+
+
+def test_kimi_jsonl_skips_metadata_and_tool_events():
+    """llm.request / usage.record / tool.call / tool.result are metadata noise."""
+    lines = [
+        _kimi_header(),
+        _kimi_user_prompt("Q"),
+        json.dumps({"type": "llm.request", "kind": "loop", "messageCount": 2}),
+        json.dumps(
+            {
+                "type": "context.append_loop_event",
+                "event": {"type": "tool.call", "name": "Read", "args": {}},
+            }
+        ),
+        json.dumps({"type": "usage.record", "usage": {"output": 10}}),
+        _kimi_assistant_part("A"),
+    ]
+    result = _try_kimi_jsonl("\n".join(lines))
+    assert result is not None
+    assert "Read" not in result
+
+
+def test_kimi_jsonl_under_two_messages_returns_none():
+    lines = [_kimi_header(), _kimi_user_prompt("only one")]
+    assert _try_kimi_jsonl("\n".join(lines)) is None
+
+
+def test_kimi_jsonl_empty_content_returns_none():
+    assert _try_kimi_jsonl("") is None
+    assert _try_kimi_jsonl("   \n  \n") is None
+
+
+def test_kimi_jsonl_invalid_lines_skipped():
+    """Malformed JSON lines and non-dict entries after the header are tolerated."""
+    lines = [
+        _kimi_header(),
+        "not json",
+        json.dumps([1, 2, 3]),
+        _kimi_user_prompt("Q"),
+        _kimi_assistant_part("A"),
+    ]
+    result = _try_kimi_jsonl("\n".join(lines))
     assert result is not None

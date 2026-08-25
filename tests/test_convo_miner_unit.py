@@ -910,6 +910,26 @@ class TestExtractAuthoredAt:
         f.write_text('{"timestamp": 1}\n{"timestamp": false}\n')
         assert _extract_authored_at(f) is None
 
+    def test_kimi_epoch_millis_time(self, tmp_path):
+        """Kimi Code wire.jsonl uses epoch-millis ``time`` instead of ISO ``timestamp``."""
+        f = tmp_path / "wire.jsonl"
+        f.write_text(
+            '{"type": "metadata", "protocol_version": "1.4", "created_at": 1786085292006}\n'
+            '{"type": "turn.prompt", "time": 1786085292006}\n'  # 2026-07-08T...
+            '{"type": "context.append_loop_event", "time": 1786085400000}\n'
+        )
+        result = _extract_authored_at(f)
+        # Latest event wins and is rendered as ISO-8601 UTC.
+        assert result is not None
+        assert result.startswith("2026-")
+        assert result.endswith("+00:00")
+
+    def test_kimi_bool_time_is_ignored(self, tmp_path):
+        """A boolean ``time`` value must not be treated as epoch millis."""
+        f = tmp_path / "wire.jsonl"
+        f.write_text('{"type": "turn.prompt", "time": true}\n')
+        assert _extract_authored_at(f) is None
+
 
 def test_scan_convos_accepts_one_file_without_scanning_siblings(
     tmp_path,

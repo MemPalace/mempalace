@@ -4,7 +4,7 @@ MemPalace — Give your AI a memory. No API key required.
 
 Three ways to ingest:
   Projects:      mempalace mine ~/projects/my_app                  (code, docs, notes)
-  Conversations: mempalace mine <convo-dir> --mode convos          (Claude Code, Claude.ai, ChatGPT, Slack exports)
+  Conversations: mempalace mine <convo-dir> --mode convos          (Claude Code, Kimi Code, Codex, Gemini, Claude.ai, ChatGPT, Slack exports)
   Documents:     mempalace mine <docs-dir> --mode extract          (PDF, DOCX, PPTX, XLSX, RTF, EPUB — requires mempalace[extract])
   Adapters:      mempalace mine <source> --source <adapter-name>  (registered source adapters)
 

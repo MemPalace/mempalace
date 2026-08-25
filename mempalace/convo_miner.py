@@ -158,7 +158,18 @@ CONVO_EXTENSIONS = {
 # 12.8k drawers from tool-results files on one palace; a single file
 # produced 3.6k). Extends the generic SKIP_DIRS set for the convo scanner
 # only — project mining semantics are unchanged.
-CONVO_SKIP_DIRS = SKIP_DIRS | {"tool-results"}
+#
+# ``media-originals``: Kimi Code stores pasted/attached images under
+# ``<session>/media-originals/`` — binary blobs, never conversation text.
+CONVO_SKIP_DIRS = SKIP_DIRS | {"tool-results", "media-originals"}
+
+# Sidecar metadata files that live next to conversation transcripts but are
+# not themselves conversations. Exact-name matches only:
+#   - ``state.json`` — Kimi Code per-session metadata (title, workDir, agents)
+#   - ``session_index.jsonl`` — Kimi Code top-level session index
+# Without this, a convo mine of ``~/.kimi-code/sessions`` would file these
+# machine-metadata files as paragraph-chunked noise.
+CONVO_SKIP_FILES = {"state.json", "session_index.jsonl"}
 
 MIN_CHUNK_SIZE = 30
 CHUNK_SIZE = 800  # chars per drawer — align with miner.py
@@ -538,6 +549,8 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
         for filename in filenames:
             if filename.endswith(".meta.json"):
                 continue
+            if filename in CONVO_SKIP_FILES:
+                continue
             filepath = Path(root) / filename
             if filepath.suffix.lower() in CONVO_EXTENSIONS:
                 # Skip symlinks and oversized files
@@ -606,6 +619,7 @@ def _extract_authored_at(filepath):
     if path.suffix != ".jsonl":
         return None
     latest = None
+    latest_ms = None  # Kimi Code wire.jsonl carries epoch-millis ``time`` per event
     try:
         with path.open(encoding="utf-8", errors="ignore") as fh:
             for line in fh:
@@ -613,15 +627,31 @@ def _extract_authored_at(filepath):
                 if not line:
                     continue
                 try:
-                    ts = json.loads(line).get("timestamp")
+                    entry = json.loads(line)
                 except (ValueError, TypeError, AttributeError):
                     continue
+                if not isinstance(entry, dict):
+                    continue
+                # Claude Code / Codex: top-level ISO-8601 ``timestamp`` string.
+                ts = entry.get("timestamp")
                 # ISO-8601 timestamps are strings; guard against a non-string
                 # ``timestamp`` so a malformed line can't raise TypeError on compare.
                 if isinstance(ts, str) and (latest is None or ts > latest):
                     latest = ts
+                # Kimi Code: epoch-millis ``time`` number on each event.
+                tms = entry.get("time")
+                if isinstance(tms, (int, float)) and not isinstance(tms, bool):
+                    if latest_ms is None or tms > latest_ms:
+                        latest_ms = tms
     except OSError:
         return None
+    if latest is not None:
+        return latest
+    if latest_ms is not None:
+        # Convert epoch millis to an ISO-8601 UTC string for a consistent shape.
+        from datetime import datetime, timezone
+
+        return datetime.fromtimestamp(latest_ms / 1000, tz=timezone.utc).isoformat()
     return latest
 
 
@@ -777,6 +807,8 @@ def _is_ai_tool_path(path: Path) -> bool:
     or `.codex-archive` do NOT match):
       - any segment ``.codex`` (Codex CLI sessions / archives)
       - any segment ``.gemini`` (Gemini CLI sessions under ~/.gemini/tmp/...)
+      - any segment ``.kimi-code`` (Kimi Code CLI sessions under
+        ~/.kimi-code/sessions/...)
       - the consecutive segment pair ``.claude/projects`` (Claude Code).
         ``.claude`` alone is NOT matched — that is the settings/config dir,
         not a conversation source.
@@ -792,6 +824,8 @@ def _is_ai_tool_path(path: Path) -> bool:
     if ".codex" in parts:
         return True
     if ".gemini" in parts:
+        return True
+    if ".kimi-code" in parts:
         return True
     for i in range(len(parts) - 1):
         if parts[i] == ".claude" and parts[i + 1] == "projects":
