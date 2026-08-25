@@ -14,6 +14,7 @@ import math
 import os
 import re
 import sqlite3
+import json
 from pathlib import Path
 
 from .backends import CollectionNotInitializedError, PalaceNotFoundError
@@ -177,6 +178,235 @@ def build_where_filter(wing: str = None, room: str = None) -> dict:
     return {}
 
 
+def _chroma_where_id_lookup_failed(exc: Exception) -> bool:
+    """Return True for Chroma's filtered-HNSW id lookup failure.
+
+    This happens when SQLite metadata sees rows that the loaded HNSW segment
+    cannot resolve by internal id. Unfiltered vector search can still work,
+    but any matching ``where`` filter raises "Error finding id".
+    """
+    msg = str(exc)
+    return "Error finding id" in msg and "Internal error" in msg
+
+
+def _metadata_filter_sql(row_id_expr: str, wing: str = None, room: str = None) -> tuple[str, list]:
+    clauses = []
+    params = []
+    for key, value in (("wing", wing), ("room", room)):
+        if not value:
+            continue
+        clauses.append(
+            f"""
+            AND EXISTS (
+                SELECT 1
+                FROM embedding_metadata mf
+                WHERE mf.id = {row_id_expr}
+                  AND mf.key = ?
+                  AND COALESCE(
+                    mf.string_value,
+                    CAST(mf.int_value AS TEXT),
+                    CAST(mf.float_value AS TEXT),
+                    CAST(mf.bool_value AS TEXT)
+                  ) = ?
+            )
+            """
+        )
+        params.extend([key, value])
+    return "".join(clauses), params
+
+
+def _metadata_rows_for_embedding(conn: sqlite3.Connection, row_id: int) -> dict:
+    meta = {}
+    for key, string_value, int_value, float_value, bool_value in conn.execute(
+        """
+        SELECT key, string_value, int_value, float_value, bool_value
+        FROM embedding_metadata
+        WHERE id = ?
+        """,
+        (row_id,),
+    ):
+        if string_value is not None:
+            meta[key] = string_value
+        elif int_value is not None:
+            meta[key] = int_value
+        elif float_value is not None:
+            meta[key] = float_value
+        elif bool_value is not None:
+            meta[key] = bool(bool_value)
+    return meta
+
+
+def _sqlite_vector_filtered_search(
+    query: str,
+    palace_path: str,
+    wing: str = None,
+    room: str = None,
+    n_results: int = 5,
+    max_distance: float = 0.0,
+    collection_name: str = None,
+    max_candidates: int = 50000,
+    fallback_reason: str = "chroma_where_id_lookup_failed",
+) -> dict:
+    """Semantic filtered search over SQLite-stored vectors.
+
+    Chroma stores the current document vector in ``embeddings_queue`` and the
+    current metadata row in ``embeddings``/``embedding_metadata``. When Chroma's
+    HNSW filtered path cannot resolve a metadata-selected id, this path still
+    performs the same cosine-distance ranking without using Chroma's ``where``
+    planner.
+    """
+    if not wing and not room:
+        return {"error": "sqlite vector fallback requires a wing or room filter"}
+
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return {
+            "error": "No palace found",
+            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
+        }
+    if collection_name is None:
+        from .config import get_configured_collection_name
+
+        collection_name = get_configured_collection_name()
+
+    try:
+        from .embedding import get_embedding_function
+
+        embedding_function = get_embedding_function()
+        query_vector = embedding_function([query])[0]
+        import numpy as np
+
+        query_vector = np.asarray(query_vector, dtype=np.float32)
+    except Exception as exc:
+        logger.debug("sqlite vector fallback could not embed query", exc_info=True)
+        return {"error": f"sqlite vector fallback embed failed: {exc}"}
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        return {"error": f"sqlite open failed: {exc}"}
+
+    try:
+        conn.row_factory = sqlite3.Row
+        filter_sql, filter_params = _metadata_filter_sql("e.id", wing=wing, room=room)
+        rows = conn.execute(
+            f"""
+            SELECT
+                e.id AS row_id,
+                e.embedding_id AS embedding_id,
+                q.vector AS vector,
+                q.encoding AS encoding,
+                q.metadata AS queue_metadata,
+                f.string_value AS document
+            FROM embeddings e
+            JOIN segments s ON e.segment_id = s.id
+            JOIN collections c ON s.collection = c.id
+            LEFT JOIN embeddings_queue q
+              ON q.seq_id = e.seq_id AND q.id = e.embedding_id
+            LEFT JOIN embedding_fulltext_search f ON f.rowid = e.id
+            WHERE c.name = ?
+              AND q.vector IS NOT NULL
+            {filter_sql}
+            ORDER BY e.id DESC
+            LIMIT ?
+            """,
+            (collection_name, *filter_params, max_candidates),
+        ).fetchall()
+
+        candidates = []
+        vectors = []
+        for row in rows:
+            encoding = (row["encoding"] or "").upper()
+            if encoding and encoding != "FLOAT32":
+                continue
+            try:
+                vec = np.frombuffer(row["vector"], dtype=np.float32)
+            except Exception:
+                continue
+            if vec.shape != query_vector.shape:
+                continue
+            try:
+                meta = json.loads(row["queue_metadata"] or "{}")
+                if not isinstance(meta, dict):
+                    meta = {}
+            except json.JSONDecodeError:
+                meta = {}
+            if not meta:
+                meta = _metadata_rows_for_embedding(conn, int(row["row_id"]))
+            doc = meta.pop("chroma:document", None) or row["document"] or ""
+            candidates.append(
+                {
+                    "text": doc,
+                    "metadata": meta,
+                    "embedding_id": row["embedding_id"],
+                }
+            )
+            vectors.append(vec)
+    except sqlite3.Error as exc:
+        return {"error": f"sqlite vector fallback query failed: {exc}"}
+    finally:
+        conn.close()
+
+    if not candidates:
+        return {
+            "query": query,
+            "filters": {"wing": wing, "room": room},
+            "total_before_filter": 0,
+            "results": [],
+            "fallback": "sqlite_vector_filtered",
+            "fallback_reason": fallback_reason,
+        }
+
+    matrix = np.vstack(vectors).astype(np.float32, copy=False)
+    q_norm = float(np.linalg.norm(query_vector))
+    row_norms = np.linalg.norm(matrix, axis=1)
+    denom = row_norms * q_norm
+    sims = np.divide(
+        matrix @ query_vector,
+        denom,
+        out=np.zeros_like(row_norms, dtype=np.float32),
+        where=denom > 0,
+    )
+    distances = 1.0 - sims
+
+    hits = []
+    for candidate, dist in zip(candidates, distances):
+        dist = max(0.0, min(2.0, float(dist)))
+        if max_distance > 0.0 and dist > max_distance:
+            continue
+        meta = candidate["metadata"] or {}
+        source = meta.get("source_file", "") or ""
+        hits.append(
+            {
+                "text": candidate["text"] or "",
+                "wing": meta.get("wing", "unknown"),
+                "room": meta.get("room", "unknown"),
+                "source_file": Path(source).name if source else "?",
+                "created_at": meta.get("filed_at", "unknown"),
+                "similarity": round(max(0.0, 1 - dist), 3),
+                "distance": round(dist, 4),
+                "effective_distance": round(dist, 4),
+                "closet_boost": 0.0,
+                "matched_via": "drawer",
+                "_sort_key": dist,
+            }
+        )
+
+    hits.sort(key=lambda h: h["_sort_key"])
+    hits = _hybrid_rank(hits[: n_results * 3], query)[:n_results]
+    for h in hits:
+        h.pop("_sort_key", None)
+
+    return {
+        "query": query,
+        "filters": {"wing": wing, "room": room},
+        "total_before_filter": len(candidates),
+        "results": hits,
+        "fallback": "sqlite_vector_filtered",
+        "fallback_reason": fallback_reason,
+    }
+
+
 def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
     """Parse all `→drawer_id_a,drawer_id_b` pointers out of a closet document.
 
@@ -329,6 +559,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
 
     where = build_where_filter(wing, room)
 
+    fallback_hits = None
     try:
         kwargs = {
             "query_texts": [query],
@@ -341,30 +572,64 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         results = col.query(**kwargs)
 
     except Exception as e:
-        print(f"\n  Search error: {e}")
-        raise SearchError(f"Search error: {e}") from e
+        if where and _chroma_where_id_lookup_failed(e):
+            fallback = _sqlite_vector_filtered_search(
+                query,
+                palace_path,
+                wing=wing,
+                room=room,
+                n_results=n_results,
+                collection_name=None,
+                fallback_reason=f"chroma_where_error: {e}",
+            )
+            if "error" not in fallback:
+                fallback_hits = [
+                    {
+                        "text": h.get("text", ""),
+                        "distance": h.get("distance", 0.0),
+                        "bm25_score": h.get("bm25_score", 0.0),
+                        "metadata": {
+                            "source_file": h.get("source_file", "?"),
+                            "wing": h.get("wing", "?"),
+                            "room": h.get("room", "?"),
+                        },
+                    }
+                    for h in fallback.get("results", [])
+                ]
+            else:
+                print(f"\n  Search error: {e}; fallback failed: {fallback.get('error')}")
+                raise SearchError(f"Search error: {e}") from e
+        else:
+            print(f"\n  Search error: {e}")
+            raise SearchError(f"Search error: {e}") from e
 
-    docs = _first_or_empty(results, "documents")
-    metas = _first_or_empty(results, "metadatas")
-    dists = _first_or_empty(results, "distances")
+    if fallback_hits is None:
+        docs = _first_or_empty(results, "documents")
+        metas = _first_or_empty(results, "metadatas")
+        dists = _first_or_empty(results, "distances")
 
-    if not docs:
-        print(f'\n  No results found for: "{query}"')
-        return
+        if not docs:
+            print(f'\n  No results found for: "{query}"')
+            return
 
-    # Pure-cosine retrieval on the CLI path was missing lexical matches:
-    # a drawer whose text contains every query term can still score distance
-    # >= 1.0 against the natural-language query when the drawer is a
-    # mechanical artifact (directory listing, diff, log fragment) that
-    # embeds as file-tree noise rather than as prose about its subject.
-    # The MCP tool path already hybridizes BM25 with vector sim via
-    # `_hybrid_rank`; do the same here so CLI results match what agents
-    # see via `mempalace_search`.
-    hits = [
-        {"text": doc or "", "distance": float(dist), "metadata": meta or {}}
-        for doc, meta, dist in zip(docs, metas, dists)
-    ]
-    hits = _hybrid_rank(hits, query)
+        # Pure-cosine retrieval on the CLI path was missing lexical matches:
+        # a drawer whose text contains every query term can still score distance
+        # >= 1.0 against the natural-language query when the drawer is a
+        # mechanical artifact (directory listing, diff, log fragment) that
+        # embeds as file-tree noise rather than as prose about its subject.
+        # The MCP tool path already hybridizes BM25 with vector sim via
+        # `_hybrid_rank`; do the same here so CLI results match what agents
+        # see via `mempalace_search`.
+        hits = [
+            {"text": doc or "", "distance": float(dist), "metadata": meta or {}}
+            for doc, meta, dist in zip(docs, metas, dists)
+        ]
+        hits = _hybrid_rank(hits, query)
+    else:
+        hits = fallback_hits
+        if not hits:
+            print(f'\n  No results found for: "{query}"')
+            return
 
     print(f"\n{'=' * 60}")
     print(f'  Results for: "{query}"')
@@ -432,31 +697,6 @@ def _bm25_only_via_sqlite(
 
         collection_name = get_configured_collection_name()
 
-    def _metadata_filter_sql(row_id_expr: str) -> tuple[str, list[str]]:
-        clauses = []
-        params = []
-        for key, value in (("wing", wing), ("room", room)):
-            if not value:
-                continue
-            clauses.append(
-                f"""
-                AND EXISTS (
-                    SELECT 1
-                    FROM embedding_metadata mf
-                    WHERE mf.id = {row_id_expr}
-                      AND mf.key = ?
-                      AND COALESCE(
-                        mf.string_value,
-                        CAST(mf.int_value AS TEXT),
-                        CAST(mf.float_value AS TEXT),
-                        CAST(mf.bool_value AS TEXT)
-                      ) = ?
-                )
-                """
-            )
-            params.extend([key, value])
-        return "".join(clauses), params
-
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     except sqlite3.Error as e:
@@ -470,7 +710,11 @@ def _bm25_only_via_sqlite(
         use_recency_fallback = not tokens
         if tokens:
             fts_query = " OR ".join(tokens)
-            filter_sql, filter_params = _metadata_filter_sql("embedding_fulltext_search.rowid")
+            filter_sql, filter_params = _metadata_filter_sql(
+                "embedding_fulltext_search.rowid",
+                wing=wing,
+                room=room,
+            )
             try:
                 rows = conn.execute(
                     f"""
@@ -505,7 +749,7 @@ def _bm25_only_via_sqlite(
             # mismatch we fall back to ordering by primary-key id and finally
             # to an empty result rather than letting search raise.
             try:
-                filter_sql, filter_params = _metadata_filter_sql("e.id")
+                filter_sql, filter_params = _metadata_filter_sql("e.id", wing=wing, room=room)
                 rows = conn.execute(
                     f"""
                     SELECT e.id
@@ -836,6 +1080,22 @@ def search_memories(
             dkwargs["where"] = where
         drawer_results = drawers_col.query(**dkwargs)
     except Exception as e:
+        if where and _chroma_where_id_lookup_failed(e):
+            fallback = _sqlite_vector_filtered_search(
+                query,
+                palace_path,
+                wing=wing,
+                room=room,
+                n_results=n_results,
+                max_distance=max_distance,
+                collection_name=collection_name,
+                fallback_reason=f"chroma_where_error: {e}",
+            )
+            if "error" not in fallback:
+                return fallback
+            return {
+                "error": f"Search error: {e}; fallback failed: {fallback.get('error')}",
+            }
         return {"error": f"Search error: {e}"}
 
     # Gather closet hits (best-per-source) to build a boost lookup.

@@ -84,6 +84,45 @@ class TestSearchMemories:
         assert "error" in result
         assert "query failed" in result["error"]
 
+    def test_search_memories_filtered_where_id_error_uses_sqlite_vector_fallback(self):
+        """Chroma can fail filtered vector queries when metadata points at ids
+        missing from the loaded HNSW segment. A filtered search should still
+        return semantic hits via the SQLite vector fallback instead of bubbling
+        the Chroma planner error to MCP clients.
+        """
+        mock_col = MagicMock()
+        mock_col.query.side_effect = RuntimeError(
+            "Error executing plan: Internal error: Error finding id"
+        )
+        fallback_result = {
+            "query": "Hunny",
+            "filters": {"wing": None, "room": "diary"},
+            "total_before_filter": 1,
+            "results": [{"text": "diary hit", "wing": "w", "room": "diary"}],
+            "fallback": "sqlite_vector_filtered",
+        }
+
+        with (
+            patch("mempalace.searcher.get_collection", return_value=mock_col),
+            patch(
+                "mempalace.searcher._sqlite_vector_filtered_search",
+                return_value=fallback_result,
+            ) as fallback,
+        ):
+            result = search_memories(
+                "Hunny",
+                "/fake/path",
+                room="diary",
+                n_results=3,
+                max_distance=1.5,
+                collection_name="mempalace_drawers",
+            )
+
+        assert result == fallback_result
+        fallback.assert_called_once()
+        assert fallback.call_args.kwargs["room"] == "diary"
+        assert fallback.call_args.kwargs["collection_name"] == "mempalace_drawers"
+
     def test_search_memories_vector_path_uses_explicit_collection_name(self):
         mock_col = MagicMock()
         mock_col.query.return_value = {
