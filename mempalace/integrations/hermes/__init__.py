@@ -805,6 +805,93 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
 
     # ----- Optional: prompt + recall ----------------------------------------
 
+    @staticmethod
+    def _extract_factual_kg_query(query: str) -> tuple[str, Optional[str]]:
+        """Return (entity, as_of) for conservative factual/status questions.
+
+        This intentionally recognizes only explicit factual-status phrasing.
+        Conversational prompts such as "What did we discuss about the printer?"
+        must continue through ordinary semantic recall alone.
+
+        ``as_of`` is an ISO date when the user asks about a historical date;
+        otherwise the caller uses the current UTC instant.
+        """
+        text = " ".join((query or "").strip().split())
+        if not text:
+            return "", None
+
+        date_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
+        as_of = date_match.group(1) if date_match else None
+
+        patterns = (
+            r"^(?:what|who|where)\s+(?:is|was)\s+(.+?)['’]s\s+(?:current\s+)?(?:status|state)\b",
+            r"^(?:what|who|where)\s+(?:is|was)\s+(.+?)\s+(?:current\s+)?(?:status|state)\b",
+            r"^(?:what|who|where)\s+(?:is|was)\s+(?:the\s+)?(?:current\s+)?(?:status|state)\s+of\s+(.+?)\??$",
+            r"^(.+?)['’]s\s+(?:current\s+)?(?:status|state)\b",
+        )
+
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if not match:
+                continue
+            entity = match.group(1).strip(" ?!.,")
+            if as_of:
+                entity = re.sub(
+                    r"\s+(?:on|as\s+of)\s+\d{4}-\d{2}-\d{2}\s*$",
+                    "",
+                    entity,
+                    flags=re.IGNORECASE,
+                ).strip()
+            if entity:
+                return entity, as_of
+
+        return "", as_of
+
+    def _prefetch_kg_fact(self, query: str) -> str:
+        """Return authoritative KG context for an explicit factual query."""
+        entity, as_of = self._extract_factual_kg_query(query)
+        if not entity:
+            return ""
+
+        if as_of is None:
+            as_of = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        kg = KnowledgeGraph(db_path=self._kg_db_path())
+        try:
+            relations = kg.query_entity(entity, as_of=as_of, direction="both")
+        finally:
+            try:
+                kg.close()
+            except Exception:
+                pass
+
+        if not relations:
+            return ""
+
+        lines = [
+            "## MemPalace — authoritative factual context",
+            "KnowledgeGraph is authoritative for structured facts; use this over conflicting conversational memory.",
+        ]
+        for relation in relations:
+            direction = relation.get("direction", "outgoing")
+            if direction == "incoming":
+                fact = (
+                    f"{relation.get('subject', entity)} → "
+                    f"{relation.get('predicate', '')} → {relation.get('object', '')}"
+                )
+            else:
+                fact = (
+                    f"{relation.get('subject', entity)} → "
+                    f"{relation.get('predicate', '')} → {relation.get('object', '')}"
+                )
+            lines.append(
+                f"- {fact}"
+                f" (valid_from={relation.get('valid_from')!r}, "
+                f"valid_to={relation.get('valid_to')!r}, "
+                f"current={relation.get('current')!r})"
+            )
+        return "\n".join(lines)
+
     def system_prompt_block(self) -> str:
         if self._cron_skipped or not self._initialized:
             return ""
@@ -821,6 +908,8 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         if self._cron_skipped or not self._initialized or not query:
             return ""
         try:
+            factual_context = self._prefetch_kg_fact(query)
+
             n = max(1, min(int(self._config.get("n_prefetch", 3)), 20))
             result = search_memories(
                 query,
@@ -829,7 +918,7 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             )
             hits = result.get("results", []) if isinstance(result, dict) else []
             if not hits:
-                return ""
+                return factual_context
             lines = ["## MemPalace — relevant context"]
             for r in hits:
                 wing = r.get("wing", "")
@@ -838,7 +927,10 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 text = (r.get("text") or "").strip()
                 if text:
                     lines.append(f"{tag}{text}")
-            return "\n\n".join(lines)
+            semantic_context = "\n\n".join(lines)
+            if factual_context:
+                return factual_context + "\n\n" + semantic_context
+            return semantic_context
         except Exception as exc:
             logger.debug("MemPalace prefetch error: %s", exc)
             return ""
