@@ -5,6 +5,8 @@ import threading
 import types
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from _backend_conformance import assert_partition_isolation
 
@@ -26,6 +28,11 @@ from mempalace.backends.pgvector import (
     _as_vector_array,
     _strip_nul,
     _json_dumps,
+    _tokenize,
+    _bm25_scores,
+    _like_pattern,
+    _token_count,
+    _trgm_index_name,
 )
 
 
@@ -45,6 +52,11 @@ class _FakePgVectorClient:
         self.query_calls: list = []
         self.scroll_calls: list = []
         self.facet_calls: list = []
+        self.lexical_calls: list = []
+        self.lexical_asset_calls: list = []
+        # Flipped off by the tests that stand in for a palace created before the
+        # token_count column existed.
+        self.token_count_supported: bool = True
         _FakePgVectorClient.instances.append(self)
 
     def ping(self):
@@ -68,7 +80,13 @@ class _FakePgVectorClient:
             {"dimension": len(rows[0]["embedding"]) if rows else 0, "rows": {}},
         )
         for row in rows:
-            store["rows"][row["id"]] = dict(row)
+            stored = dict(row)
+            # Mirrors the real client: the count is derived server-side-ish, from
+            # the document that actually lands in the row, and only when the
+            # table carries the column.
+            if self.token_count_supported:
+                stored["token_count"] = _token_count(stored.get("document") or "")
+            store["rows"][row["id"]] = stored
 
     def _filtered(self, table, where):
         rows = list(self.tables.get(table, {"rows": {}})["rows"].values())
@@ -94,6 +112,55 @@ class _FakePgVectorClient:
             }
             out.append(item)
         return out
+
+    def lexical_candidates(self, table, *, tokens, where):
+        """Stand-in for the server-side ``ILIKE`` filter.
+
+        Deliberately models *substring* matching rather than tokenizer overlap:
+        that is what ``document ILIKE '%token%'`` actually does, and a fake that
+        re-used ``_tokenize`` here would agree with the collection by
+        construction and so could never catch a predicate that is narrower than
+        BM25's scoring set. No limit and no ranking, because the real query has
+        neither.
+        """
+        self.lexical_calls.append({"tokens": list(tokens), "where": where})
+        rows = []
+        for row in self._filtered(table, where):
+            document = (row.get("document") or "").lower()
+            if any(token in document for token in tokens):
+                rows.append(
+                    {
+                        "id": row["id"],
+                        "document": row["document"],
+                        "metadata": row.get("metadata") or {},
+                        "embedding": None,
+                        "distance": None,
+                    }
+                )
+        return rows
+
+    def lexical_corpus_stats(self, table, where):
+        rows = self._filtered(table, where)
+        if not rows:
+            return None
+        counts = [row.get("token_count") for row in rows]
+        if any(count is None for count in counts):
+            return None
+        return len(rows), sum(counts) / len(rows)
+
+    def has_token_count(self, table):
+        return self.token_count_supported
+
+    def ensure_lexical_assets(self, table):
+        self.lexical_asset_calls.append(table)
+
+    def backfill_token_counts(self, table, batch=2000):
+        filled = 0
+        for row in self.tables.get(table, {"rows": {}})["rows"].values():
+            if row.get("token_count") is None:
+                row["token_count"] = _token_count(row.get("document") or "")
+                filled += 1
+        return filled
 
     def scroll_rows(
         self,
@@ -156,6 +223,9 @@ class _FakePgVectorClient:
             counts[key] = counts.get(key, 0) + 1
         ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
         return dict(ordered[:limit])
+
+    def has_vector_index(self, table):
+        return False
 
     def drop_table(self, table):
         self.tables.pop(table, None)
@@ -1169,3 +1239,495 @@ def test_pgvector_facet_counts_passes_filter_to_sql_layer(tmp_path, fake_pgvecto
     _table, field, where, _limit = client.facet_calls[0]
     assert field == "room"
     assert where == {"wing": "engineering"}
+
+
+# ── Lexical pushdown (filter in SQL, BM25 in Python) ───────────────────
+
+
+def _capturing_client(monkeypatch):
+    """Real ``_PgVectorClient`` with ``_execute`` stubbed, plus the capture list.
+
+    Exercises the actual SQL-building code without psycopg or a server: every
+    statement and its bound parameters land in ``captured``.
+    """
+    captured = []
+
+    def fake_execute(sql, params=None, *, fetch=False, many=False):
+        captured.append({"sql": sql, "params": list(params or []), "fetch": fetch})
+        return []
+
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    monkeypatch.setattr(client, "_execute", fake_execute)
+    client._token_count_columns["drawers"] = True
+    return client, captured
+
+
+def test_like_pattern_escapes_wildcards_and_escape_char():
+    """The pattern must be a literal-substring test, not a wildcard expression."""
+    assert _like_pattern("plain") == "%plain%"
+    # '_' is a LIKE single-character wildcard and IS reachable: it is a \w char,
+    # so _tokenize emits it inside identifiers like foo_bar.
+    assert _like_pattern("foo_bar") == r"%foo\_bar%"
+    assert _like_pattern("50%") == r"%50\%%"
+    assert _like_pattern("a\\b") == "%a\\\\b%"
+
+
+@given(st.text(min_size=1, max_size=80))
+def test_every_token_is_a_literal_substring_of_the_lowered_document(text):
+    """The property the whole pushdown rests on.
+
+    ``_bm25_scores`` can only score a document above zero if the document shares
+    a token with the query, and every token the tokenizer emits is a span it
+    matched inside ``text.lower()``. So an ILIKE substring test on that token
+    cannot miss a document BM25 would have scored — the SQL filter is a superset
+    of the scored set, never a subset.
+    """
+    lowered = text.lower()
+    for token in _tokenize(text):
+        assert token in lowered
+
+
+def test_trgm_index_name_is_table_scoped_and_length_clamped():
+    """Two collections in one schema must not fight over one index name."""
+    assert _trgm_index_name("t_one") != _trgm_index_name("t_two")
+    assert _trgm_index_name("t_one") == "t_one_trgm_idx"
+
+    long_a = "x" * 70 + "a"
+    long_b = "x" * 70 + "b"
+    for name in (_trgm_index_name(long_a), _trgm_index_name(long_b)):
+        assert len(name.encode("utf-8")) <= 63
+    assert _trgm_index_name(long_a) != _trgm_index_name(long_b)
+
+
+def test_lexical_candidates_sql_has_no_limit_and_no_ranking(monkeypatch):
+    """Postgres decides which rows to *skip*, never which rows to return."""
+    client, captured = _capturing_client(monkeypatch)
+
+    client.lexical_candidates("drawers", tokens=["rareterm", "backend"], where=None)
+
+    sql = captured[-1]["sql"]
+    assert "LIMIT" not in sql.upper()
+    assert "ORDER BY" not in sql.upper()
+    assert "ts_rank" not in sql and "tsquery" not in sql
+    assert sql.count("document ILIKE %s ESCAPE '\\'") == 2
+    assert " OR " in sql
+    assert captured[-1]["params"] == ["%rareterm%", "%backend%"]
+
+
+def test_lexical_candidates_binds_patterns_before_where_params(monkeypatch):
+    """Positional binding order must match the order the placeholders appear."""
+    client, captured = _capturing_client(monkeypatch)
+
+    client.lexical_candidates("drawers", tokens=["alpha"], where={"wing": "project"})
+
+    call = captured[-1]
+    assert call["params"][0] == "%alpha%"
+    assert json.loads(call["params"][1]) == {"wing": "project"}
+    assert call["sql"].index("ILIKE") < call["sql"].index("metadata @>")
+
+
+def test_lexical_corpus_stats_returns_none_when_a_count_is_missing(monkeypatch):
+    """A single un-backfilled row must send the query to the exact local path."""
+    client, _captured = _capturing_client(monkeypatch)
+
+    monkeypatch.setattr(client, "_execute", lambda *a, **k: [(10, 100, 1)])
+    assert client.lexical_corpus_stats("drawers", None) is None
+
+    monkeypatch.setattr(client, "_execute", lambda *a, **k: [(10, 100, 0)])
+    assert client.lexical_corpus_stats("drawers", None) == (10, 10.0)
+
+    # An empty collection has no mean length to report.
+    monkeypatch.setattr(client, "_execute", lambda *a, **k: [(0, None, 0)])
+    assert client.lexical_corpus_stats("drawers", None) is None
+
+
+def test_create_table_adds_token_count_and_lexical_assets(monkeypatch):
+    client, captured = _capturing_client(monkeypatch)
+
+    client.create_table("drawers", 3)
+
+    statements = " | ".join(call["sql"] for call in captured)
+    assert '"token_count" integer)' in statements
+    assert 'ADD COLUMN IF NOT EXISTS "token_count"' in statements
+    assert "CREATE EXTENSION IF NOT EXISTS pg_trgm" in statements
+    assert "gin (document gin_trgm_ops)" in statements
+    # A tsvector expression index would enforce Postgres' 1 MB tsvector cap at
+    # write time, turning a large drawer from a slow write into a failed one.
+    assert "to_tsvector" not in statements
+
+
+def test_lexical_asset_failure_does_not_break_table_creation(monkeypatch):
+    """A role that may not ALTER or CREATE EXTENSION must still open a palace."""
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    seen = []
+
+    def flaky_execute(sql, params=None, *, fetch=False, many=False):
+        seen.append(sql)
+        if "ALTER TABLE" in sql or "CREATE EXTENSION" in sql or "CREATE INDEX" in sql:
+            raise BackendError("permission denied")
+        return []
+
+    monkeypatch.setattr(client, "_execute", flaky_execute)
+    client.create_table("drawers", 3)  # must not raise
+
+    assert any("CREATE TABLE" in sql for sql in seen)
+
+
+def test_upsert_counts_tokens_of_the_stored_document(monkeypatch):
+    """The stored length must describe the stored text, not the caller's.
+
+    Stripping a NUL can fuse two tokens into one, and a length that disagrees
+    with the document by even one token silently changes every future ranking.
+    """
+    client, captured = _capturing_client(monkeypatch)
+
+    client.upsert_rows(
+        "drawers",
+        [{"id": "a", "document": "ab\x00cd efgh", "metadata": {}, "embedding": [1, 0]}],
+    )
+
+    call = captured[-1]
+    assert '"token_count"' in call["sql"]
+    document, token_count = call["params"][0][1], call["params"][0][-1]
+    assert document == "abcd efgh"
+    assert token_count == _token_count("abcd efgh") == 2
+
+
+def test_upsert_omits_token_count_when_the_column_is_absent(monkeypatch):
+    """A pre-token_count table must keep ingesting, not fail on an unknown column."""
+    client, captured = _capturing_client(monkeypatch)
+    client._token_count_columns["drawers"] = False
+
+    client.upsert_rows(
+        "drawers",
+        [{"id": "a", "document": "alpha beta", "metadata": {}, "embedding": [1, 0]}],
+    )
+
+    call = captured[-1]
+    assert "token_count" not in call["sql"]
+    assert len(call["params"][0]) == 5
+
+
+def test_bm25_with_collection_statistics_matches_whole_collection_scoring():
+    """Scoring a filtered pool with collection-wide stats == scoring everything.
+
+    This is the arithmetic the pushdown depends on: the rows a query cannot
+    match contribute nothing but their count and their length to BM25, so
+    supplying those two numbers makes the filtered pool score identically.
+    """
+    documents = [
+        "alpha beta short",
+        "alpha " + " ".join(f"filler{i}" for i in range(60)),
+        "beta " + " ".join(f"other{i}" for i in range(30)),
+        "gamma delta epsilon with no query terms at all",
+        "unrelated text",
+    ]
+    query = "alpha beta"
+
+    whole = _bm25_scores(query, documents)
+    matched = [doc for doc, score in zip(documents, whole) if score > 0]
+    assert len(matched) < len(documents)
+
+    tokenized_lengths = [len(_tokenize(doc)) for doc in documents]
+    pooled = _bm25_scores(
+        query,
+        matched,
+        corpus_size=len(documents),
+        corpus_avgdl=sum(tokenized_lengths) / len(documents),
+    )
+    assert pooled == pytest.approx([score for score in whole if score > 0])
+
+    # Without the statistics the pool scores differently — which is exactly the
+    # bug this guards against.
+    naive = _bm25_scores(query, matched)
+    assert naive != pytest.approx([score for score in whole if score > 0])
+
+
+def _local_lexical(col, query, n_results, where=None):
+    """What ``lexical_search`` returns with the pushdown disabled."""
+    return [
+        (hit.id, hit.score)
+        for hit in col._lexical_search_local(query=query, n_results=n_results, where=where).hits
+    ]
+
+
+def _reviewer_corpus():
+    """Matches far outnumber the window, and the best hit is not the most 'relevant'
+    row by any server-side term-frequency measure.
+
+    ``short00`` carries both query terms in a short document, which is what BM25
+    rewards; the ``alpha*`` rows are long and carry one term each, which is what
+    a raw term-frequency ranking rewards. Any ranking done in SQL over a window
+    of 9 drops ``short00``'s peers.
+    """
+    documents = {"short00": "we shipped the alpha and beta change today"}
+    for i in range(30):
+        documents[f"alpha{i:02d}"] = (
+            "alpha " + " ".join(f"filler{j}" for j in range(60)) + f" release note {i}"
+        )
+    for i in range(15):
+        documents[f"beta{i:02d}"] = (
+            "beta " + " ".join(f"other{j}" for j in range(60)) + f" changelog {i}"
+        )
+    for i in range(4):
+        documents[f"short{i + 1:02d}"] = f"alpha beta quick note number {i}"
+    for i in range(10):
+        documents[f"noise{i:02d}"] = f"unrelated gamma delta epsilon text {i}"
+    return documents
+
+
+def _seed(col, documents):
+    ids = list(documents)
+    col.add(
+        ids=ids,
+        documents=[documents[i] for i in ids],
+        metadatas=[{"wing": "p"} for _ in ids],
+        embeddings=[[1.0, 0.0] for _ in ids],
+    )
+    return ids
+
+
+def test_pushdown_keeps_every_hit_when_matches_outnumber_the_window(tmp_path, fake_pgvector):
+    """The reviewer's scenario: 60 drawers, a window of 9, 50 of them match.
+
+    The searcher asks for ``n_results * 3`` candidates (searcher.py), so a
+    corpus where matches outnumber that window is the normal case, not a corner
+    one. Ranking in SQL picks a different 9 than BM25 does; filtering in SQL and
+    ranking here cannot.
+    """
+    _backend, col = _collection(tmp_path)
+    documents = _reviewer_corpus()
+    _seed(col, documents)
+    client = fake_pgvector.instances[0]
+
+    for n_results in (1, 5, 9, 30, 200):
+        client.lexical_calls.clear()
+        client.scroll_calls.clear()
+        pushed = [
+            (hit.id, hit.score)
+            for hit in col.lexical_search(query="alpha beta", n_results=n_results).hits
+        ]
+        assert client.lexical_calls, "the pushdown must be the path under test"
+        assert client.scroll_calls == [], "no document may cross the wire unmatched"
+        assert pushed == _local_lexical(col, "alpha beta", n_results)
+
+    # The specific loss the reviewer reported: the top BM25 hit and everything
+    # ranked with it survive a window smaller than the match count.
+    everything = _local_lexical(col, "alpha beta", 10_000)
+    assert len(everything) == 50 > 9
+    top_hit = everything[0][0]
+    window = [hit.id for hit in col.lexical_search(query="alpha beta", n_results=9).hits]
+    assert top_hit in window
+    assert window == [doc_id for doc_id, _ in everything[:9]]
+
+
+def test_pushdown_matches_local_path_across_queries_and_filters(tmp_path, fake_pgvector):
+    """Equivalence, not just recall: same ids, same scores, same order."""
+    _backend, col = _collection(tmp_path)
+    documents = _reviewer_corpus()
+    documents["mixed"] = "قصر الذاكرة يحفظ كلماتك alpha"
+    documents["cjk"] = "记忆宫殿笔记 beta"
+    documents["dev"] = "contact atk@atkabli.com about /etc/nginx/nginx.conf and npm.install"
+    _seed(col, documents)
+
+    queries = [
+        "alpha beta",
+        "alpha",
+        "gamma",
+        "الذاكرة",
+        "记忆宫殿笔记",
+        "atkabli",
+        "nginx",
+        "npm",
+        "nothingmatchesthisatall",
+    ]
+    for query in queries:
+        for n_results in (3, 9, 60):
+            assert [
+                (hit.id, hit.score)
+                for hit in col.lexical_search(query=query, n_results=n_results).hits
+            ] == _local_lexical(col, query, n_results), f"{query!r} n={n_results}"
+
+
+def test_pushdown_ranking_is_deterministic_on_ties(tmp_path, fake_pgvector):
+    """Equal scores must not make the cut at ``n_results`` a coin flip."""
+    _backend, col = _collection(tmp_path)
+    documents = {f"d{i:02d}": "alpha note here" for i in range(20)}
+    _seed(col, documents)
+
+    first = [hit.id for hit in col.lexical_search(query="alpha", n_results=5).hits]
+    assert first == sorted(first)
+    for _ in range(5):
+        assert [hit.id for hit in col.lexical_search(query="alpha", n_results=5).hits] == first
+
+
+def test_lexical_search_falls_back_for_non_pushdown_filter(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    _seed(col, {"a": "alpha note", "b": "beta note"})
+    client = fake_pgvector.instances[0]
+    client.lexical_calls.clear()
+    client.scroll_calls.clear()
+
+    hits = col.lexical_search(query="alpha", n_results=5, where={"$or": [{"wing": "p"}]}).hits
+
+    assert [hit.id for hit in hits] == ["a"]
+    assert client.lexical_calls == []
+    assert client.scroll_calls, "an $or filter belongs on the exact local path"
+
+
+def test_lexical_search_falls_back_for_null_operand(tmp_path, fake_pgvector):
+    """``metadata @> '{"k": null}'`` needs the key present; ``_matches_where`` does not.
+
+    The containment predicate is narrower than the Python filter here, so a row
+    with the key absent would never reach the client and no post-filter could
+    put it back.
+    """
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b"],
+        documents=["alpha note", "alpha other"],
+        metadatas=[{"wing": "p", "k": None}, {"wing": "p"}],
+        embeddings=[[1, 0], [1, 0]],
+    )
+    client = fake_pgvector.instances[0]
+    client.lexical_calls.clear()
+
+    hits = col.lexical_search(query="alpha", n_results=5, where={"k": None}).hits
+
+    assert client.lexical_calls == []
+    assert {hit.id for hit in hits} == {"a", "b"}
+
+
+def test_lexical_search_falls_back_when_token_counts_are_missing(tmp_path, fake_pgvector):
+    """A palace written before the column existed keeps working, just slower."""
+    _backend, col = _collection(tmp_path)
+    _seed(col, {"a": "alpha note", "b": "beta note"})
+    client = fake_pgvector.instances[0]
+    client.token_count_supported = False
+    for row in client.tables[col._table]["rows"].values():
+        row.pop("token_count", None)
+    client.lexical_calls.clear()
+    client.scroll_calls.clear()
+
+    hits = col.lexical_search(query="alpha", n_results=5).hits
+
+    assert [hit.id for hit in hits] == ["a"]
+    assert client.lexical_calls == []
+    assert client.scroll_calls
+
+
+def test_lexical_search_falls_back_when_postgres_fails(tmp_path, fake_pgvector, monkeypatch):
+    _backend, col = _collection(tmp_path)
+    _seed(col, {"a": "alpha note", "b": "beta note"})
+    client = fake_pgvector.instances[0]
+
+    def boom(*_args, **_kwargs):
+        raise BackendError("server exploded")
+
+    monkeypatch.setattr(client, "lexical_candidates", boom)
+    client.scroll_calls.clear()
+
+    hits = col.lexical_search(query="alpha", n_results=5).hits
+
+    assert [hit.id for hit in hits] == ["a"]
+    assert client.scroll_calls, "a server failure must fall back, not drop the arm"
+
+
+def test_lexical_search_propagates_unsupported_filter(tmp_path, fake_pgvector, monkeypatch):
+    """RFC 001: an operator the backend cannot honour is an error, not a slow path."""
+    from mempalace.backends import UnsupportedFilterError
+
+    _backend, col = _collection(tmp_path)
+    _seed(col, {"a": "alpha note"})
+    client = fake_pgvector.instances[0]
+
+    def boom(*_args, **_kwargs):
+        raise UnsupportedFilterError("operator '$nope' not pushed down by pgvector")
+
+    monkeypatch.setattr(client, "lexical_candidates", boom)
+
+    with pytest.raises(UnsupportedFilterError):
+        col.lexical_search(query="alpha", n_results=5)
+
+
+def test_lexical_search_empty_query_issues_no_sql(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    _seed(col, {"a": "alpha note"})
+    client = fake_pgvector.instances[0]
+    client.lexical_calls.clear()
+    client.scroll_calls.clear()
+
+    assert col.lexical_search(query="!!!", n_results=5).hits == []
+    assert client.lexical_calls == []
+    assert client.scroll_calls == []
+
+
+def test_lexical_search_raises_when_table_missing_but_marker_exists(tmp_path, fake_pgvector):
+    """Same not-initialized contract as the scan path, for every query shape.
+
+    The table check has to come before the empty-query shortcut, or the same
+    collection raises or returns ``[]`` depending only on the query text.
+    """
+    _backend, col = _collection(tmp_path)
+    _seed(col, {"a": "alpha backend note"})
+    fake_pgvector.instances[0].tables.clear()  # marker on disk, table gone
+
+    with pytest.raises(CollectionNotInitializedError):
+        col.lexical_search(query="backend", n_results=5)
+    with pytest.raises(CollectionNotInitializedError):
+        col.lexical_search(query="!!!", n_results=5)
+
+
+def test_existing_collection_gains_lexical_assets_on_open(tmp_path, fake_pgvector):
+    """A palace created before this release must pick the column up, not stay slow."""
+    backend, col = _collection(tmp_path)
+    _seed(col, {"a": "alpha note"})
+    client = fake_pgvector.instances[0]
+    client.lexical_asset_calls.clear()
+
+    # A second handle on the same, already-populated table: the open path, not
+    # the create path, is what an existing palace goes through.
+    reopened = backend.get_collection(
+        palace=PalaceRef(id=str(tmp_path), local_path=str(tmp_path)),
+        collection_name="drawers",
+        create=True,
+    )
+    reopened.add(ids=["b"], documents=["beta note"], metadatas=[{}], embeddings=[[0, 1]])
+
+    assert client.lexical_asset_calls == [col._table]
+    backend.close()
+
+
+def test_backfill_token_counts_uses_the_python_tokenizer(monkeypatch):
+    """Backfilled lengths must come from ``_tokenize``, not a Postgres regex.
+
+    A backfilled length that is off by one silently changes every future ranking
+    for that collection, so the count is computed by the same function BM25 uses.
+    """
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    client._token_count_columns["drawers"] = True
+    pending = [[("a", "alpha beta gamma"), ("b", "solo")], []]
+    updates = []
+
+    def fake_execute(sql, params=None, *, fetch=False, many=False):
+        if fetch:
+            return pending.pop(0)
+        updates.extend(params or [])
+        return []
+
+    monkeypatch.setattr(client, "_execute", fake_execute)
+
+    assert client.backfill_token_counts("drawers") == 2
+    assert updates == [(3, "a"), (1, "b")]
+
+
+def test_maintenance_state_reports_whether_the_pushdown_is_available(tmp_path, fake_pgvector):
+    """An operator has to be able to see which path their queries take."""
+    _backend, col = _collection(tmp_path)
+    _seed(col, {"a": "alpha note"})
+    assert col.maintenance_state()["lexical_pushdown"] is True
+
+    client = fake_pgvector.instances[0]
+    for row in client.tables[col._table]["rows"].values():
+        row["token_count"] = None
+    assert col.maintenance_state()["lexical_pushdown"] is False
