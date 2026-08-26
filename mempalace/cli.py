@@ -18,6 +18,8 @@ Commands:
     mempalace mine <dir> --mode extract   Mine binary office documents (PDF/DOCX/etc.)
     mempalace mine <source> --source NAME Mine through a registered source adapter
     mempalace search "query"              Find anything, exact words
+    mempalace export --output <dir>       Export palace to JSONL for git-based sync
+    mempalace import <dir>                Merge a JSONL export into the palace
     mempalace mcp                         Show MCP setup command
     mempalace wake-up                     Show L0 + L1 wake-up context
     mempalace wake-up --wing my_app       Wake-up for a specific project
@@ -1051,6 +1053,47 @@ def cmd_sweep(args):
             sys.exit(2)
     else:
         print(f"  ERROR: Not a file or directory: {target}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_export(args):
+    """Export the palace to a portable directory tree (#452)."""
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+
+    from .backends import detect_backend_for_path
+
+    if not os.path.isdir(palace_path) or detect_backend_for_path(palace_path) is None:
+        print(f"\n  No palace found at {palace_path}", file=sys.stderr)
+        sys.exit(1)
+
+    output_dir = os.path.expanduser(args.output)
+    print(f"\n{'=' * 55}")
+    print(f"  Exporting palace ({args.format})")
+    print(f"{'=' * 55}\n")
+    if args.format == "jsonl":
+        from .exporter import export_palace_jsonl
+
+        export_palace_jsonl(palace_path, output_dir)
+    else:
+        from .exporter import export_palace
+
+        export_palace(palace_path, output_dir)
+
+
+def cmd_import(args):
+    """Merge a JSONL export into the palace (#452)."""
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    input_dir = os.path.expanduser(args.dir)
+
+    from .importer import import_palace
+
+    print(f"\n{'=' * 55}")
+    print("  Importing palace export" + (" (dry run)" if args.dry_run else ""))
+    print(f"{'=' * 55}\n")
+    try:
+        import_palace(palace_path, input_dir, dry_run=args.dry_run)
+    except ValueError as exc:
+        print(f"  ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -2947,6 +2990,35 @@ def main():
         help="With --daemon, return a job id immediately instead of waiting",
     )
 
+    # export
+    p_export = sub.add_parser(
+        "export",
+        help="Export the palace to a portable directory tree (JSONL for sync, markdown for browsing)",
+    )
+    p_export.add_argument(
+        "--output",
+        default="~/.mempalace/export",
+        help="Directory to write the export tree into (default: ~/.mempalace/export)",
+    )
+    p_export.add_argument(
+        "--format",
+        choices=["jsonl", "markdown"],
+        default="jsonl",
+        help="jsonl (git-friendly, importable; default) or markdown (browsable, one-way)",
+    )
+
+    # import
+    p_import = sub.add_parser(
+        "import",
+        help="Merge a JSONL export into the palace (adds new drawers, skips existing by id)",
+    )
+    p_import.add_argument("dir", help="Directory containing a JSONL palace export")
+    p_import.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be imported without writing anything",
+    )
+
     # search
     p_search = sub.add_parser("search", help="Find anything, exact words")
     p_search.add_argument("query", help="What to search for")
@@ -3531,6 +3603,8 @@ def main():
         "search": cmd_search,
         "sweep": cmd_sweep,
         "sync": cmd_sync,
+        "export": cmd_export,
+        "import": cmd_import,
         "mcp": cmd_mcp,
         "serve": cmd_serve,
         "compress": cmd_compress,
