@@ -947,6 +947,7 @@ def test_factual_query_parser_identifies_current_status(integration_module):
 
     assert parser("What is Atlas's current status?") == ("Atlas", None)
     assert parser("What is Atlas current status?") == ("Atlas", None)
+    assert parser("What is the status of Atlas?") == ("Atlas", None)
     assert parser("Atlas's status?") == ("Atlas", None)
 
 

@@ -825,8 +825,8 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
 
         patterns = (
             r"^(?:what|who|where)\s+(?:is|was)\s+(.+?)['’]s\s+(?:current\s+)?(?:status|state)\b",
-            r"^(?:what|who|where)\s+(?:is|was)\s+(.+?)\s+(?:current\s+)?(?:status|state)\b",
             r"^(?:what|who|where)\s+(?:is|was)\s+(?:the\s+)?(?:current\s+)?(?:status|state)\s+of\s+(.+?)\??$",
+            r"^(?:what|who|where)\s+(?:is|was)\s+(.+?)\s+(?:current\s+)?(?:status|state)\b",
             r"^(.+?)['’]s\s+(?:current\s+)?(?:status|state)\b",
         )
 
