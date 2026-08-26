@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Features
+
+- **Layer 1 wake-up filters for salience.** Drawers that are structurally not prose are skipped: a harness wrapper opening the text, a bare timestamp, table soup, or too few letters to be writing at all. Outcome-shaped prose ranks first; prose carrying tool noise (fences, exit codes, tool-call names) is ranked lower but never dropped, since engineering writing quotes those constantly. No source file contributes more than two lines; near-duplicates collapse; snippets start and end on sentence/word boundaries. Deterministic and lexical, no LLM call in the hook path. Skipped drawers stay verbatim in the palace and in L2/L3 results. (#1629)
+
 ### Bug Fixes
 
 - **A palace with no database is no longer reported as one that passed its integrity check.** `sqlite_integrity_errors` answers `[]` when `chroma.sqlite3` is absent, and the MCP gate published that as `checked: true, ok: true`. Absence is now decided by `ENOENT` alone, which proves that nothing resolves under the path, and reported as the not-applicable shape #1931 introduced, `checked: false`/`ok: null` plus a reason. Every state that is not proven absent reaches the probe, and a probe that cannot open the file reports `PRAGMA quick_check failed`, which trips the existing `-32002` refusal: a dangling symlink, a database under an unreadable directory, a symlink loop, a name the filesystem rejects, an embedded NUL in the path, and, on POSIX, a palace path whose parent is a file. A palace directory named with a byte that is not valid UTF-8 reached the probe and, up to Python 3.12, raised out of it, which `mempalace mine` and `mempalace repair` never guarded against; it is now reported like every other unreadable path. `/statusz` reads an absent verdict as healthy, so the new `ok: null` does not turn a fresh install red, and non-chroma backends stop reporting themselves unhealthy, which they had done since the #1931 fix. The size-limited startup skip still publishes a clean verdict; the only change there is that it no longer inherits the previous probe's absence reason. (#2290)

@@ -17,6 +17,7 @@ and ~/.mempalace/identity.txt.
 """
 
 import os
+import re
 import sys
 from pathlib import Path
 from collections import defaultdict
@@ -76,6 +77,303 @@ class Layer0:
 # ---------------------------------------------------------------------------
 # Layer 1 — Essential Story (auto-generated from palace)
 # ---------------------------------------------------------------------------
+
+#: Words that mark a drawer as reporting an *outcome* — something settled,
+#: shipped, broken, or decided — rather than narrating work in progress. A
+#: match is a ranking boost, never a requirement: drawers without one still
+#: appear, just below the ones with one.
+#:
+#: This list is English, and so is the boost it drives. A non-English palace
+#: still gets every other part of Layer 1 (nothing else here is
+#: language-specific) but its drawers never earn this point, so ranking among
+#: them falls back to importance and recency. To change that, replace the
+#: keywords *and* recompile the regex, which is derived once at import::
+#:
+#:     layers.L1_OUTCOME_KEYWORDS = (...)
+#:     layers._L1_OUTCOME_RE = layers._l1_compile_outcome_re(layers.L1_OUTCOME_KEYWORDS)
+#:
+#: Reassigning the tuple alone does nothing.
+L1_OUTCOME_KEYWORDS = (
+    "shipped",
+    "shipping",
+    "fixed",
+    "broke",
+    "broken",
+    "done",
+    "verified",
+    "decided",
+    "decision",
+    "deployed",
+    "released",
+    "launched",
+    "merged",
+    "reverted",
+    "resolved",
+    "root cause",
+    "blocked",
+    "failed",
+    "passed",
+    "migrated",
+    "renamed",
+    "removed",
+    "replaced",
+    "agreed",
+    "chose",
+    "switched",
+)
+
+
+def _l1_compile_outcome_re(words) -> "re.Pattern":
+    """Build the outcome-keyword matcher. See :data:`L1_OUTCOME_KEYWORDS`."""
+    return re.compile(
+        r"\b(?:%s)\b" % "|".join(re.escape(word) for word in words),
+        re.IGNORECASE,
+    )
+
+
+_L1_OUTCOME_RE = _l1_compile_outcome_re(L1_OUTCOME_KEYWORDS)
+
+#: Structural harness wrappers: literal tags the tooling injects around text
+#: the user never typed. These are dropped from L1, but only when one *opens*
+#: the drawer, because that is the difference between a drawer that **is**
+#: harness output and a drawer that merely *mentions* one (a bug report about
+#: ``<system-reminder>`` is story; the reminder itself is not). Matching these
+#: anywhere in the body silently deleted real outcomes — see the regression
+#: test ``test_l1_salience_keeps_outcomes_that_mention_scaffolding``.
+_L1_HARNESS_WRAPPERS = (
+    "<system-reminder>",
+    "<command-message>",
+    "<local-command-caveat>",
+    "<task-notification>",
+    "[SYSTEM NOTIFICATION",
+)
+
+#: Words that read as tool noise rather than story. Unlike the wrappers above
+#: these are *never* grounds for exclusion — they appear constantly inside
+#: legitimate engineering prose ("the build died with Exit code: 137", "the
+#: agent looped on tool_use"). They only forfeit the clean-prose point, so a
+#: drawer carrying them ranks below an equally outcome-shaped one that does
+#: not. Actual log soup is caught by density and prose ratio, not by these.
+_L1_NOISE_MARKERS = (
+    "tool_use",
+    "tool_result",
+    "```",
+    "Exit code:",
+    "cwd was reset",
+    # Word-heavy machine output that clears the prose floor on letter count
+    # alone. Demoted rather than excluded, because a human writing "the fix
+    # for that Traceback (most recent call last) was a missing guard" is
+    # still telling the story.
+    "Traceback (most recent call last)",
+    "@@ -",
+)
+
+#: A drawer that is nothing but a timestamp, date, or separator rule. The
+#: letters allowed are the ISO-8601 designators only (``T``, ``Z``).
+_L1_TIMESTAMP_ONLY_RE = re.compile(r"^[\s\d:.,/+TZ_-]+$")
+
+#: Sentence boundary followed by the start of a new sentence.
+_L1_SENTENCE_START_RE = re.compile(r"[.!?]\s+(?=[A-Z#*\-])")
+
+#: Below this many characters a drawer cannot carry an outcome; above the pipe
+#: density it is a table, a diff, or an ASCII rule rather than prose.
+_L1_MIN_CHARS = 20
+_L1_TABLE_CHARS = "|-=+_"
+_L1_MAX_TABLE_DENSITY = 0.18
+
+#: Fraction of a drawer's characters that must be letters or spaces for it to
+#: count as prose at all. This is the general form of the old "does it contain
+#: a backtick fence" test: JSON, ``ls`` output, env dumps, URL lists, log lines
+#: and bare code fences all fail it without any marker being named, while an
+#: engineering sentence quoting a path, a version pin or a fence passes.
+#:
+#: Measured over the corpus in ``test_l1_salience_drops_soup_without_markers``
+#: the two populations sit at soup ``0.40-0.82`` against prose ``0.84-0.99``.
+#: The floor is set below that gap on purpose: a false drop loses a real
+#: memory forever, while a false keep only costs one wake-up line, so the
+#: threshold buys margin for prose and leaves the residue to be *demoted* by
+#: :data:`_L1_NOISE_MARKERS` rather than excluded.
+#:
+#: ``str.isalpha`` is Unicode-aware, so Arabic, Hebrew and CJK prose all score
+#: as letters. Counting characters rather than tokens is what makes that true:
+#: Chinese has no spaces, so a token-based ratio saw one giant "non-word".
+_L1_MIN_PROSE_RATIO = 0.78
+
+#: Ranking weights. Reporting an outcome is the point of Layer 1, so it is
+#: worth strictly more than the presentation signals — otherwise a drawer that
+#: is both an outcome and a little noisy ("the build died with Exit code: 137")
+#: would tie with background chatter that merely reads cleanly.
+_L1_SCORE_OUTCOME = 2
+_L1_SCORE_CLEAN_START = 1
+_L1_SCORE_NO_NOISE = 1
+
+#: How many snippets one source file may contribute to a single wake-up. One
+#: long transcript should not own the whole story.
+L1_MAX_PER_SOURCE = 2
+
+#: How alike two drawers must be, as a word-overlap fraction, before the later
+#: one is suppressed as a near-duplicate.
+#:
+#: This compares whole bodies rather than a leading slice. Matching on the
+#: first 80 characters silently collapsed *distinct* drawers that happened to
+#: share a templated opening, which mined session summaries routinely do: three
+#: summaries opening "Session summary for the mempalace project on ..." and then
+#: reporting three different outcomes scored as one drawer and two of the
+#: outcomes were lost. Whole-body overlap puts that case near ``0.27`` while
+#: genuine restatements of the same drawer stay above ``0.84``.
+_L1_DUPLICATE_SIMILARITY = 0.8
+
+
+def _l1_normalize(text: str) -> str:
+    """Collapse whitespace so drawers compare and render on one line."""
+    return " ".join(text.split())
+
+
+def _l1_prose_ratio(body: str) -> float:
+    """Fraction of ``body`` that is letters or spaces.
+
+    The measure of whether something was written or dumped. Near ``1.0`` for
+    prose in any script; low for JSON, command output and log lines, which are
+    mostly punctuation, digits, paths and identifiers.
+    """
+    if not body:
+        return 0.0
+    return sum(1 for char in body if char.isalpha() or char.isspace()) / len(body)
+
+
+def _l1_is_harness_output(body: str) -> bool:
+    """True when the drawer *is* a harness injection, not prose mentioning one.
+
+    Anchored at the start, because that is where an injected wrapper opens. A
+    drawer that quotes or discusses a wrapper part-way through is a human
+    writing about the tooling, and dropping it was the bug this guards.
+
+    Deliberately the only positional rule. Counting repeats anywhere in the
+    body was tried and removed: a drawer that names the same wrapper twice
+    while explaining it ("``<system-reminder>`` is injected per turn, so a
+    second ``<system-reminder>`` means the turn restarted") is prose, and a
+    genuine run of concatenated injections is already caught downstream by
+    table density and the prose-ratio floor, neither of which needs a marker
+    named.
+    """
+    return body.startswith(_L1_HARNESS_WRAPPERS)
+
+
+def _l1_salience(text: str) -> int:
+    """Score a drawer as an L1 candidate. Negative means "not story, drop it".
+
+    Deterministic and purely lexical — no LLM call, no embedding, no I/O.
+    Layer 1 runs inside the wake-up hook's latency budget, so this has to stay
+    a few passes over text already in memory.
+
+    Exclusion is deliberately narrow: only things that are *structurally* not
+    prose (a harness wrapper opening the drawer, a bare timestamp, table or
+    log soup, too few characters to say anything). Merely mentioning tooling
+    is not disqualifying — that test dropped real outcomes such as a build
+    that died on an exit code or an agent stuck emitting tool calls.
+
+    Returns:
+        ``-1`` junk, otherwise ``0``-``4``: points for reading like an outcome
+        (weighted highest), starting cleanly at a sentence, and being free of
+        tool noise.
+    """
+    body = _l1_normalize(text)
+    if len(body) < _L1_MIN_CHARS:
+        return -1
+    if _L1_TIMESTAMP_ONLY_RE.match(body):
+        return -1
+    if _l1_is_harness_output(body):
+        return -1
+    density = sum(body.count(char) for char in _L1_TABLE_CHARS) / len(body)
+    if density > _L1_MAX_TABLE_DENSITY:
+        return -1
+    if _l1_prose_ratio(body) < _L1_MIN_PROSE_RATIO:
+        return -1
+
+    score = 0
+    if _L1_OUTCOME_RE.search(body):
+        score += _L1_SCORE_OUTCOME
+    # A chunk that starts at a sentence or a heading reads as a whole thought;
+    # one that starts mid-sentence is a fragment of someone else's. Phrased as
+    # "not lowercase" rather than "is uppercase" so that uncased scripts
+    # (Arabic, Hebrew, CJK) are not permanently denied the point.
+    if not body[0].islower() or body[0] in "#*":
+        score += _L1_SCORE_CLEAN_START
+    # Clean prose outranks prose carrying tool noise, without excluding it.
+    if not any(marker in body for marker in _L1_NOISE_MARKERS):
+        score += _L1_SCORE_NO_NOISE
+    return score
+
+
+def _l1_snippet(text: str, max_chars: int = 200) -> str:
+    """Compose the snippet shown for one drawer.
+
+    Verbatim: the result is always a contiguous substring of the drawer, never
+    a paraphrase. What this chooses is where to start and stop.
+
+    * Chunked drawers frequently open mid-sentence. When the text starts
+      lowercase and a sentence boundary is close by, start after that boundary
+      instead, so the line does not begin in the middle of someone's thought.
+    * Truncation cuts on a word boundary, so the tail is never a half word.
+    """
+    body = _l1_normalize(text)
+    if body[:1].islower():
+        match = _L1_SENTENCE_START_RE.search(body[:300])
+        if match and len(body) - match.end() >= _L1_MIN_CHARS:
+            body = body[match.end() :]
+    if len(body) <= max_chars:
+        return body
+    keep = max_chars - 3
+    cut = body.rfind(" ", max_chars // 2, keep)
+    return body[: cut if cut > 0 else keep] + "..."
+
+
+def _l1_word_overlap(left: set, right: set) -> float:
+    """Jaccard overlap of two word sets: 1.0 identical, 0.0 nothing in common."""
+    union = len(left | right)
+    return len(left & right) / union if union else 0.0
+
+
+def _l1_select(scored: list, max_drawers: int, max_per_source: int = L1_MAX_PER_SOURCE) -> list:
+    """Choose the drawers that make up the essential story.
+
+    ``scored`` is the importance/recency-ordered candidate list, each entry
+    ``(importance, metadata, document)``. Selection keeps that order inside a
+    salience tier and applies three caps: junk is dropped, no source file may
+    contribute more than ``max_per_source`` snippets, and near-duplicate
+    drawers (mostly the same words) collapse to one.
+
+    Returns an empty list when every candidate scored as junk. The caller
+    decides what to do about that; L1 never silently renders nothing.
+    """
+    ranked = []
+    for entry in scored:
+        score = _l1_salience(entry[2])
+        if score >= 0:
+            ranked.append((score, entry))
+    # Stable: candidates keep their importance/recency order inside a tier.
+    ranked.sort(key=lambda item: item[0], reverse=True)
+
+    selected = []
+    per_source: dict = defaultdict(int)
+    seen_words: list = []
+    for _score, entry in ranked:
+        if len(selected) >= max_drawers:
+            break
+        _imp, meta, doc = entry
+        source = (meta or {}).get("source_file") or ""
+        # Drawers with no source_file cannot be attributed, so they are not
+        # capped: the cap exists to stop one known file dominating.
+        if source and per_source[source] >= max_per_source:
+            continue
+        words = set(_l1_normalize(doc).lower().split())
+        if any(_l1_word_overlap(words, prev) >= _L1_DUPLICATE_SIMILARITY for prev in seen_words):
+            continue
+        # Only ever as long as `max_drawers`, so the scan stays linear.
+        seen_words.append(words)
+        per_source[source] += 1
+        selected.append(entry)
+    return selected
 
 
 class Layer1:
@@ -156,11 +454,26 @@ class Layer1:
             recency = str(meta.get("filed_at") or "")
             scored.append((importance, recency, meta, doc))
 
-        # Sort by importance desc, then recency (filed_at) desc; take top N.
+        # Sort by importance desc, then recency (filed_at) desc.
         scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        top = [(imp, meta, doc) for imp, _recency, meta, doc in scored[: self.MAX_DRAWERS]]
+        candidates = [(imp, meta, doc) for imp, _recency, meta, doc in scored]
 
-        # Group by room for readability
+        # Then pick the story out of the candidates: drop scaffolding and
+        # table soup, prefer outcome-shaped prose, cap how much any one source
+        # file contributes, and collapse near-duplicates.
+        top = _l1_select(candidates, self.MAX_DRAWERS)
+        if not top:
+            # Everything scored as junk (a palace of pure tool logs, or drawers
+            # too short for the floor). An empty wake-up would be worse than an
+            # unfiltered one, so fall back to exactly the pre-filter behavior.
+            top = candidates[: self.MAX_DRAWERS]
+
+        # Group by room for readability. Insertion order, not alphabetical:
+        # `top` arrives in salience order, so a dict preserves "best room
+        # first". Sorting by name instead let MAX_CHARS truncate the story
+        # because of where a room sits in the alphabet, which threw away the
+        # highest-ranked drawer while keeping chatter from a room called
+        # "aaa_*". Selection ranking is worthless if rendering reshuffles it.
         by_room = defaultdict(list)
         for imp, meta, doc in top:
             room = meta.get("room", "general")
@@ -170,7 +483,7 @@ class Layer1:
         lines = ["## L1 — ESSENTIAL STORY"]
 
         total_len = 0
-        for room, entries in sorted(by_room.items()):
+        for room, entries in by_room.items():
             room_line = f"\n[{room}]"
             lines.append(room_line)
             total_len += len(room_line)
@@ -178,10 +491,7 @@ class Layer1:
             for _imp, meta, doc in entries:
                 source = Path(meta.get("source_file", "")).name if meta.get("source_file") else ""
 
-                # Truncate doc to keep L1 compact
-                snippet = doc.strip().replace("\n", " ")
-                if len(snippet) > 200:
-                    snippet = snippet[:197] + "..."
+                snippet = _l1_snippet(doc)
 
                 entry_line = f"  - {snippet}"
                 if source:
