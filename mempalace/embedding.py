@@ -4,7 +4,7 @@ Returns a ChromaDB-compatible embedding function — either a local ONNX model
 bound to a user-selected ONNX Runtime execution provider, or an
 OpenAI-compatible HTTP ``/v1/embeddings`` endpoint.
 
-Three embedding-model options are available, selected via
+Five embedding-model options are available, selected via
 ``MEMPALACE_EMBEDDING_MODEL`` or ``embedding_model`` in
 ``~/.mempalace/config.json``:
 
@@ -17,6 +17,17 @@ Three embedding-model options are available, selected via
   model is lazy-downloaded from HuggingFace on first use. Switching models
   on an existing palace requires ``mempalace repair rebuild-index``
   (different vector space).
+* ``e5-small`` — ``intfloat/multilingual-e5-small`` (fp32), 384-dim,
+  multilingual. A lighter alternative to embeddinggemma (~120 MB vs ~300 MB)
+  with strong non-English retrieval; see
+  :func:`mempalace.generic_onnx_embedding.e5_small_ef` for measured numbers.
+  Same rebuild-index caveat when switching an existing palace.
+* ``generic-onnx`` — any HuggingFace-hosted ONNX encoder, fully
+  config-driven (#1563, #1261): repo, ONNX file, pooling, prefixes and the
+  persisted EF name come from ``embedding_onnx_*`` settings in
+  ``config.json`` (each overridable via the matching
+  ``MEMPALACE_EMBEDDING_ONNX_*`` env var). See
+  :mod:`mempalace.generic_onnx_embedding`.
 * ``openai-compat`` — embeddings served by any OpenAI-compatible
   ``/v1/embeddings`` endpoint (LM Studio, llama.cpp, vLLM, Ollama's OpenAI
   shim, or a self-hosted server) instead of a local ONNX model. Useful for
@@ -782,6 +793,12 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
         threads = _resolve_intra_op_threads()
         if model == "embeddinggemma":
             ef = EmbeddinggemmaONNX(preferred_providers=providers, intra_op_num_threads=threads)
+        elif model in ("e5-small", "generic-onnx"):
+            from .generic_onnx_embedding import build_generic_onnx_ef
+
+            ef = build_generic_onnx_ef(
+                model, preferred_providers=providers, intra_op_num_threads=threads
+            )
         else:
             # Default: minilm (or anything we don't recognize — back-compat win).
             ef_cls = _build_ef_class()
