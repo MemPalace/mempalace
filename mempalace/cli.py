@@ -309,6 +309,10 @@ def cmd_init(args):
 
     cfg = MempalaceConfig()
 
+    # Bind the embedding model non-interactively (#442). Runs before any
+    # collection is created so the first mine records this identity.
+    _apply_init_model_choice(args, cfg)
+
     # Resolve entity-detection languages: --lang overrides config.
     lang_arg = getattr(args, "lang", None)
     if lang_arg:
@@ -499,6 +503,44 @@ def _format_size_mb(num_bytes: int) -> str:
     if mb < 1:
         return "<1 MB"
     return f"{mb:.0f} MB"
+
+
+def _apply_init_model_choice(args, cfg) -> None:
+    """Persist ``init --model`` to config.json (#442).
+
+    Same key onboarding writes; the palace's collections record this
+    identity at first creation (RFC 001), so ``init --model X`` + mine
+    yields a palace bound to X without the interactive onboarding step.
+
+    Dependencies are probed up front: a missing sentence-transformers
+    install must fail *init* with the install hint, not surface mid-mine —
+    and never silently fall back to the default model while config claims
+    the requested one (the fallback footgun from the #442 review).
+    """
+    model_arg = getattr(args, "model", None)
+    if not model_arg or not str(model_arg).strip():
+        return
+    from .embedding import ensure_model_dependencies
+
+    try:
+        ensure_model_dependencies(model_arg)
+    except ImportError as e:
+        print(f"\n  {e}")
+        sys.exit(2)
+    cfg.set_embedding_model(model_arg)
+    # MEMPALACE_EMBEDDING_MODEL outranks config.json on every read, so an
+    # inherited env var would silently override the flag for the auto-mine
+    # that follows — the palace would bind to the env model while the user
+    # believes they chose --model. An explicit flag wins for this process.
+    env_model = os.environ.get("MEMPALACE_EMBEDDING_MODEL")
+    if env_model and env_model.strip().lower() != str(model_arg).strip().lower():
+        print(
+            f"  Note: MEMPALACE_EMBEDDING_MODEL={env_model.strip()!r} is set; "
+            f"--model overrides it for this run. Unset the env var so future "
+            f"runs read config.json."
+        )
+        os.environ["MEMPALACE_EMBEDDING_MODEL"] = str(model_arg).strip()
+    print(f"  Embedding model: {cfg.embedding_model}")
 
 
 def _maybe_run_mine_after_init(args, cfg) -> None:
@@ -2711,6 +2753,20 @@ def main():
         "--backend",
         default=None,
         help="Storage backend to persist for this palace (default: chroma)",
+    )
+    p_init.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "Embedding model, persisted to config.json (the same setting "
+            "onboarding writes): 'embeddinggemma' (multilingual, default for "
+            "new installs), 'minilm' (English-only), or any "
+            "sentence-transformers model id such as "
+            "'intfloat/multilingual-e5-base' or 'BAAI/bge-m3' (requires: "
+            "pip install 'mempalace[multilingual]'). The palace records the "
+            "model on first mine; switching later requires "
+            "'mempalace repair rebuild-index'."
+        ),
     )
     p_init.add_argument(
         "--yes",

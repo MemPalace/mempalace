@@ -179,6 +179,49 @@ Select with `--backend <name>`, `MEMPALACE_BACKEND=<name>`, or
 [Storage backends](/guide/configuration#storage-backends) for connection
 variables, namespace behavior, and deployment notes.
 
+## Embedding models
+
+Every drawer is embedded with the model configured as `embedding_model` in
+`~/.mempalace/config.json` (or `MEMPALACE_EMBEDDING_MODEL`). Onboarding asks
+once on first run; `mempalace init <dir> --model <name>` sets it
+non-interactively. Each palace records the model it was built with and
+refuses reads under a silently-switched model — searching across a model
+swap silently degrades recall, so the mismatch is a hard error with recovery
+instructions.
+
+Pick the model that matches your content shape:
+
+| Model | When to pick | Disk | Context window |
+|---|---|---|---|
+| `embeddinggemma` _(default for new installs)_ | Multilingual notes, 100+ languages, no extra install | ~300 MB | 2048 tokens |
+| `minilm` (`all-MiniLM-L6-v2`) | English-only content, smallest download, fastest mining | ~30 MB | 256 tokens |
+| `intfloat/multilingual-e5-base` | Multilingual corpora where retrieval quality matters most — avg relevance 0.19 → 0.72 vs MiniLM on a 247-post Russian corpus | ~1.1 GB | 512 tokens |
+| `BAAI/bge-m3` | Long-form literary / scholarly text where 512-token chunks would break a passage mid-thought; strong coverage incl. Greek, Latin, French | ~2.3 GB | 8192 tokens |
+
+The last two rows stand in for *any*
+[sentence-transformers](https://www.sbert.net/) model id (HuggingFace repo
+or local checkpoint path). This path needs an extra install — **without it,
+`init` and `mine` fail with an install hint** rather than silently falling
+back to the default model:
+
+```bash
+pip install 'mempalace[multilingual]'   # sentence-transformers runtime
+
+mempalace init ~/library --model BAAI/bge-m3
+```
+
+Two calibration notes:
+
+- **Score ranges differ per model.** Cosine similarities for a clearly
+  relevant match cluster around ≥0.65 on MiniLM but around ≥0.50 on
+  `bge-m3` — a 0.60 from bge-m3 is a strong semantic match, not a weak
+  one. Calibrate any relevance thresholds against the palace's own model.
+- **Switching models re-embeds.** Set the new model (edit
+  `embedding_model` in `config.json` or use `MEMPALACE_EMBEDDING_MODEL`),
+  then run `mempalace repair rebuild-index` to rewrite the vectors. If you
+  know the existing vectors are compatible, `mempalace palace set-embedder
+  --model <name> --force` records the new identity without re-embedding.
+
 ## Quickstart
 
 ```bash
@@ -301,7 +344,7 @@ verbatim drawer per user/assistant message, idempotent and resume-safe.
 
 - Python 3.9+
 - A vector-store backend (ChromaDB by default)
-- ~300 MB disk for the embedding model. Onboarding (`python -m mempalace.onboarding`) offers `embeddinggemma-300m` (multilingual, 100+ languages, recommended) or `all-MiniLM-L6-v2` (English-only, ~30 MB). See the docstring at [`mempalace/embedding.py`](mempalace/embedding.py) for details and migration notes.
+- ~300 MB disk for the embedding model. Onboarding (`python -m mempalace.onboarding`) offers `embeddinggemma-300m` (multilingual, 100+ languages, recommended) or `all-MiniLM-L6-v2` (English-only, ~30 MB); any sentence-transformers model is also supported via `pip install 'mempalace[multilingual]'` — see [Embedding models](#embedding-models). Details and migration notes in the docstring at [`mempalace/embedding.py`](mempalace/embedding.py).
 - Optional — compute embeddings on a server instead of locally. Set `embedding_model: "openai-compat"` in `~/.mempalace/config.json` together with `embedding_api_url` / `embedding_api_model` (and `embedding_api_key` if the server needs auth) to use any OpenAI-compatible `/v1/embeddings` endpoint — LM Studio, llama.cpp, vLLM, Ollama's OpenAI shim, or a self-hosted server (e.g. a larger multilingual or GPU-served embedder). Each key is overridable via the matching `MEMPALACE_EMBEDDING_API_*` env var. When the endpoint is on your machine or LAN, no content leaves your network. Switching to it requires `mempalace repair rebuild-index` (different vector space).
 
 No API key is required for the core benchmark path.

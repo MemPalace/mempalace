@@ -120,9 +120,12 @@ pgvector = ["psycopg[binary]>=3.1"]
 gpu = ["onnxruntime-gpu>=1.16"]
 dml = ["onnxruntime-directml>=1.16"]
 coreml = ["onnxruntime>=1.16"]
-# Multilingual extra kept as a no-op alias for back-compat with
-# `pip install mempalace[multilingual]` — these deps now ship in core.
-multilingual = []
+# The embeddinggemma/minilm deps (huggingface_hub, tokenizers, numpy) ship
+# in core; this extra adds the sentence-transformers runtime needed to use
+# an arbitrary HF model id as embedding_model (e.g.
+# intfloat/multilingual-e5-base, BAAI/bge-m3). Still satisfies the older
+# no-op-alias contract: installing it never removes anything from core.
+multilingual = ["sentence-transformers>=3.0"]
 # Binary-format extraction for `mempalace mine --mode extract`. Per-format
 # transformer routing: striprtf for .rtf, MarkItDown for .pdf/.docx/.pptx/
 # .xlsx/.epub. MarkItDown requires Python ≥ 3.10 (env marker ensures it

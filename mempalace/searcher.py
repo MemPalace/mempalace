@@ -28,6 +28,7 @@ from .backends import (
 )
 from .config import MempalaceConfig, sqlite_read_uri
 from .date_window import filed_at_in_window, parse_window
+from .embedding import EmbeddingDependencyError
 from .i18n import _canonical_lang, get_stopwords
 from .palace import (
     _open_collection_or_explain,
@@ -1771,6 +1772,19 @@ def _open_search_collection(palace_path: str, collection_name: str):
             "Backend error",
             details=str(e),
             hint="Check the selected backend configuration and availability.",
+        )
+    except EmbeddingDependencyError as e:
+        # Without this arm the generic handler below reports "No palace
+        # found" and steers the agent toward re-init/re-mine — which would
+        # fail on the same missing package. Surface the install hint instead
+        # (#442 review: the MCP search path must not bury actionable
+        # embedding errors).
+        logger.error("Embedding dependency missing opening palace at %s: %s", palace_path, e)
+        return None, _search_error_result(
+            "Embedding dependency missing",
+            details=str(e),
+            hint="Run: pip install 'mempalace[multilingual]' "
+            "(or revert embedding_model to a built-in value).",
         )
     except Exception as e:
         logger.error("No palace found at %s: %s", palace_path, e)

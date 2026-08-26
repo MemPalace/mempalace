@@ -333,6 +333,92 @@ def test_cmd_init_with_entities_zero_total(mock_config_cls, tmp_path, capsys):
     assert "No entities detected" in out
 
 
+# ── _apply_init_model_choice (init --model, #442) ──────────────────────
+
+
+def test_init_model_choice_persists_to_config():
+    from mempalace.cli import _apply_init_model_choice
+
+    args = argparse.Namespace(model="intfloat/multilingual-e5-base")
+    cfg = MagicMock()
+    cfg.embedding_model = "intfloat/multilingual-e5-base"
+    with patch("mempalace.embedding.ensure_model_dependencies") as mock_ensure:
+        _apply_init_model_choice(args, cfg)
+    mock_ensure.assert_called_once_with("intfloat/multilingual-e5-base")
+    cfg.set_embedding_model.assert_called_once_with("intfloat/multilingual-e5-base")
+
+
+def test_init_model_choice_noop_without_flag():
+    from mempalace.cli import _apply_init_model_choice
+
+    cfg = MagicMock()
+    _apply_init_model_choice(argparse.Namespace(model=None), cfg)
+    _apply_init_model_choice(argparse.Namespace(model="   "), cfg)
+    _apply_init_model_choice(argparse.Namespace(), cfg)  # pre-#442 callers
+    cfg.set_embedding_model.assert_not_called()
+
+
+def test_init_model_choice_missing_dependency_exits_2(capsys):
+    from mempalace.cli import _apply_init_model_choice
+
+    args = argparse.Namespace(model="BAAI/bge-m3")
+    cfg = MagicMock()
+    with (
+        patch(
+            "mempalace.embedding.ensure_model_dependencies",
+            side_effect=ImportError("pip install 'mempalace[multilingual]'"),
+        ),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        _apply_init_model_choice(args, cfg)
+    assert exc_info.value.code == 2
+    assert "mempalace[multilingual]" in capsys.readouterr().out
+    cfg.set_embedding_model.assert_not_called()
+
+
+def test_init_model_choice_overrides_env_for_current_run(monkeypatch, capsys):
+    from mempalace.cli import _apply_init_model_choice
+
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "minilm")
+    args = argparse.Namespace(model="intfloat/multilingual-e5-base")
+    cfg = MagicMock()
+    cfg.embedding_model = "intfloat/multilingual-e5-base"
+    with patch("mempalace.embedding.ensure_model_dependencies"):
+        _apply_init_model_choice(args, cfg)
+    # Without this, the env var outranks config.json on every read and the
+    # auto-mine that follows would silently bind the palace to the env model.
+    assert os.environ["MEMPALACE_EMBEDDING_MODEL"] == "intfloat/multilingual-e5-base"
+    assert "overrides it for this run" in capsys.readouterr().out
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_init_wires_model_flag(mock_config_cls, tmp_path):
+    args = argparse.Namespace(dir=str(tmp_path), yes=True, model="intfloat/multilingual-e5-base")
+    with (
+        patch("mempalace.entity_detector.scan_for_detection", return_value=[]),
+        patch("mempalace.room_detector_local.detect_rooms_local"),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
+        patch("mempalace.embedding.ensure_model_dependencies"),
+    ):
+        cmd_init(args)
+    mock_config_cls.return_value.set_embedding_model.assert_called_once_with(
+        "intfloat/multilingual-e5-base"
+    )
+
+
+def test_init_parser_accepts_model_flag():
+    # The flag must parse; the wiring is covered by the tests above.
+    with (
+        patch("mempalace.cli.cmd_init") as mock_cmd,
+        patch("sys.argv", ["mempalace", "init", "/tmp/x", "--model", "BAAI/bge-m3"]),
+    ):
+        from mempalace.cli import main
+
+        main()
+    (args,) = mock_cmd.call_args.args
+    assert args.model == "BAAI/bge-m3"
+
+
 # ── _maybe_run_mine_after_init (init → mine prompt, #1181) ─────────────
 
 

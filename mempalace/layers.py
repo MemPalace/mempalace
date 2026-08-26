@@ -22,6 +22,7 @@ from pathlib import Path
 from collections import defaultdict
 
 from .config import MempalaceConfig
+from .embedding import EmbeddingDependencyError
 from .palace import get_collection as _get_collection
 from .searcher import (
     _distance_to_similarity,
@@ -98,6 +99,11 @@ class Layer1:
         """Pull top drawers from ChromaDB and format as compact L1 text."""
         try:
             col = _get_collection(self.palace_path, create=False)
+        except EmbeddingDependencyError as e:
+            # The palace likely exists — the configured model just can't be
+            # served. "No palace found" would steer users to a mine that
+            # fails on the same missing package; surface the hint instead.
+            return f"## L1 — Palace unavailable: {e}"
         except Exception:
             return "## L1 — No palace found. Run: mempalace mine <dir>"
 
@@ -217,6 +223,8 @@ class Layer2:
         """Retrieve drawers filtered by wing and/or room."""
         try:
             col = _get_collection(self.palace_path, create=False)
+        except EmbeddingDependencyError as e:
+            return f"Palace unavailable: {e}"
         except Exception:
             return "No palace found."
 
@@ -276,6 +284,8 @@ class Layer3:
         """Semantic search, returns compact result text."""
         try:
             col = _get_collection(self.palace_path, create=False)
+        except EmbeddingDependencyError as e:
+            return f"Palace unavailable: {e}"
         except Exception:
             return "No palace found."
 

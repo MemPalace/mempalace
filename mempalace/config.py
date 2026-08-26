@@ -742,19 +742,42 @@ class MempalaceConfig:
             return env_val.strip().lower()
         return str(self._file_config.get("embedding_device", "auto")).strip().lower()
 
+    @staticmethod
+    def _normalize_embedding_model(value) -> str:
+        """Lowercase built-in model ids; preserve case for everything else.
+
+        The built-ins (``minilm`` / ``embeddinggemma`` /
+        ``openai-compat``) are matched case-insensitively so ``MiniLM``
+        still selects the right class. Other values may be local checkpoint
+        paths, which are case-sensitive on Linux filesystems — lowercasing
+        them would break the lookup. (HuggingFace repo ids resolve
+        case-insensitively either way; identity comparisons go through
+        ``embedding.current_model_name``, which normalizes the same way.)
+        """
+        from .embedding import BUILTIN_MODELS
+
+        normalized = str(value).strip()
+        if normalized.lower() in BUILTIN_MODELS:
+            return normalized.lower()
+        return normalized
+
     @property
     def embedding_model(self):
         """Embedding model identifier.
 
         Values: ``"minilm"`` (ChromaDB's all-MiniLM-L6-v2 — English-only),
         ``"embeddinggemma"`` (multilingual, 100+ languages, default for
-        new installs since onboarding writes the choice), or
+        new installs since onboarding writes the choice),
         ``"openai-compat"`` (embeddings served by an OpenAI-compatible
         ``/v1/embeddings`` endpoint — see ``embedding_api_url`` /
-        ``embedding_api_model`` / ``embedding_api_key``). Read from env
-        ``MEMPALACE_EMBEDDING_MODEL`` first, then ``embedding_model`` in
-        ``config.json``, then ``"minilm"`` as a back-compat fallback for
-        palaces created before onboarding asked the question.
+        ``embedding_api_model`` / ``embedding_api_key``), or any
+        sentence-transformers model id (a HuggingFace repo such as
+        ``intfloat/multilingual-e5-base`` or ``BAAI/bge-m3``, or a local
+        checkpoint path — requires ``pip install mempalace[multilingual]``).
+        Read from env ``MEMPALACE_EMBEDDING_MODEL`` first, then
+        ``embedding_model`` in ``config.json``, then ``"minilm"`` as a
+        back-compat fallback for palaces created before onboarding asked
+        the question.
 
         Switching models on an existing palace requires re-embedding
         (different vector space) — ChromaDB rejects reads when the persisted
@@ -763,8 +786,8 @@ class MempalaceConfig:
         """
         env_val = os.environ.get("MEMPALACE_EMBEDDING_MODEL")
         if env_val:
-            return env_val.strip().lower()
-        return str(self._file_config.get("embedding_model", "minilm")).strip().lower()
+            return self._normalize_embedding_model(env_val)
+        return self._normalize_embedding_model(self._file_config.get("embedding_model", "minilm"))
 
     @property
     def embedding_threads(self) -> int:
@@ -800,12 +823,13 @@ class MempalaceConfig:
     def set_embedding_model(self, model: str) -> None:
         """Persist the embedding-model choice to ``config.json``.
 
-        Onboarding calls this once on first run. Accepts ``"minilm"`` or
-        ``"embeddinggemma"``; other values are normalized to lowercase and
-        passed through (``embedding.get_embedding_function`` falls back to
-        minilm for unrecognized values).
+        Onboarding calls this once on first run; ``mempalace init --model``
+        sets it non-interactively. Accepts ``"minilm"``, ``"embeddinggemma"``
+        (matched case-insensitively), or any sentence-transformers model id /
+        local checkpoint path (case preserved — see
+        :meth:`_normalize_embedding_model`).
         """
-        self._file_config["embedding_model"] = str(model).strip().lower()
+        self._file_config["embedding_model"] = self._normalize_embedding_model(model)
         self._config_dir.mkdir(parents=True, exist_ok=True)
         try:
             with open(self._config_file, "w", encoding="utf-8") as f:

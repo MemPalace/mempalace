@@ -80,6 +80,7 @@ from .backends.chroma import (  # noqa: E402
 )
 from .backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
 from .date_window import filed_at_in_window, parse_date_bound  # noqa: E402
+from .embedding import EmbeddingDependencyError  # noqa: E402
 from .query_sanitizer import sanitize_query  # noqa: E402
 from .searcher import (  # noqa: E402
     _distance_to_similarity,
@@ -1555,6 +1556,25 @@ def _get_collection(create=False):
                 _collection_cache_palace = None
                 _invalidate_overview_caches()
                 return None
+            except EmbeddingDependencyError as exc:
+                # Same missing-embedding-dependency arm as the chroma branch
+                # below: retrying cannot install a package, and the generic
+                # message would bury the actionable hint (#442 review). The
+                # dedicated subclass (not bare ImportError) keeps unrelated
+                # import failures — e.g. a missing backend driver — out of
+                # this arm and its [multilingual] hint.
+                _collection_open_error = {
+                    "error": "Embedding dependency missing",
+                    "details": str(exc),
+                    "hint": "Run: pip install 'mempalace[multilingual]' "
+                    "(or revert embedding_model to 'minilm' / 'embeddinggemma').",
+                }
+                _collection_cache = None
+                _collection_cache_backend = None
+                _collection_cache_palace = None
+                _metadata_cache = None
+                _metadata_cache_time = 0
+                return None
             except Exception:
                 logger.exception(
                     "_get_collection generic attempt %d/2 failed (palace=%s, create=%s)",
@@ -1668,6 +1688,29 @@ def _get_collection(create=False):
             _palace_db_inode = 0
             _palace_db_mtime = 0.0
             _invalidate_overview_caches()
+            return None
+        except EmbeddingDependencyError as exc:
+            # Missing optional dependency for the configured embedding model
+            # (sentence-transformers for a HuggingFace model id). Retrying
+            # cannot help, and letting this fall into the generic handler
+            # would bury the install instruction under "Backend open failed"
+            # — the misleading-error-on-the-MCP-path failure mode called out
+            # in the #442 review. The dedicated subclass (not bare
+            # ImportError) keeps unrelated import failures out of this arm.
+            _collection_open_error = {
+                "error": "Embedding dependency missing",
+                "details": str(exc),
+                "hint": "Run: pip install 'mempalace[multilingual]' "
+                "(or revert embedding_model to 'minilm' / 'embeddinggemma').",
+            }
+            _client_cache = None
+            _collection_cache = None
+            _collection_cache_backend = None
+            _collection_cache_palace = None
+            _palace_db_inode = 0
+            _palace_db_mtime = 0.0
+            _metadata_cache = None
+            _metadata_cache_time = 0
             return None
         except Exception:
             logger.exception(
@@ -3443,6 +3486,14 @@ def tool_mine(
                 "success": False,
                 "error": f"palace integrity check failed after mine: {exc}",
                 "error_class": "MineValidationError",
+            }
+        except EmbeddingDependencyError as exc:
+            # The configured embedding model needs the [multilingual] extra;
+            # the error text carries the install hint (#442).
+            return {
+                "success": False,
+                "error": f"mine failed: {exc}",
+                "error_class": "MissingDependency",
             }
         except ImportError as exc:
             # 'extract' mode pulls in the optional mempalace[extract] stack;
