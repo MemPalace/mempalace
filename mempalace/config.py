@@ -344,6 +344,77 @@ DEFAULT_HALL_KEYWORDS = {
 }
 
 
+# Kept in sync by hand with miner.READABLE_EXTENSIONS | miner.PHP_EXTENSIONS --
+# config.py can't import miner.py (miner.py imports config.py at module level,
+# so the reverse would be circular), so this is a duplicated literal, not a
+# derived one. Update both when either changes.
+DEFAULT_READABLE_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".py",
+    ".js",
+    ".ts",
+    ".jsx",
+    ".tsx",
+    ".json",
+    ".jsonl",
+    ".yaml",
+    ".yml",
+    ".html",
+    ".css",
+    ".java",
+    ".go",
+    ".rs",
+    ".swift",
+    ".kt",
+    ".kts",
+    ".rb",
+    ".sh",
+    ".csv",
+    ".sql",
+    ".toml",
+    ".tex",
+    ".bib",
+    # C# / .NET
+    ".cs",
+    ".csproj",
+    ".sln",
+    ".razor",
+    ".cshtml",
+    # C / C++
+    ".hpp",
+    ".cpp",
+    ".c",
+    ".h",
+} | {
+    # PHP_EXTENSIONS (miner.py) -- compound Blade templates such as
+    # ``view.blade.php`` are covered by the final ``.php`` suffix.
+    ".php",
+    ".php3",
+    ".php4",
+    ".php5",
+    ".php7",
+    ".php8",
+    ".phtml",
+    ".phps",
+    ".phpt",
+    ".inc",
+    ".aw",
+    ".fcgi",
+    ".ctp",
+    ".module",
+    ".install",
+    ".profile",
+    ".theme",
+    ".engine",
+    ".twig",
+    ".blade",
+    ".tpl",
+    ".latte",
+    ".volt",
+}
+
+
 class MempalaceConfig:
     """Configuration manager for MemPalace.
 
@@ -688,6 +759,11 @@ class MempalaceConfig:
         if coerced is None or coerced > self.chunk_size:
             return None
         return coerced
+
+    @property
+    def readable_extensions(self):
+        """Set of file extensions that are considered readable for mining."""
+        return set(self._file_config.get("readable_extensions", DEFAULT_READABLE_EXTENSIONS))
 
     @property
     def entity_languages(self):
@@ -1126,6 +1202,7 @@ class MempalaceConfig:
                 "collection_name": DEFAULT_COLLECTION_NAME,
                 "topic_wings": DEFAULT_TOPIC_WINGS,
                 "hall_keywords": DEFAULT_HALL_KEYWORDS,
+                "readable_extensions": list(DEFAULT_READABLE_EXTENSIONS),
             }
             with open(self._config_file, "w", encoding="utf-8") as f:
                 json.dump(default_config, f, indent=2)

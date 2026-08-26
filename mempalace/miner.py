@@ -168,7 +168,39 @@ READABLE_EXTENSIONS = {
     ".sln",
     ".razor",
     ".cshtml",
+    # C / C++
+    ".hpp",
+    ".cpp",
+    ".c",
+    ".h",
 } | PHP_EXTENSIONS
+
+
+_READABLE_EXTS_CACHE = None
+
+
+def get_readable_extensions() -> set:
+    """Get the set of readable file extensions, including any project override.
+
+    Defaults to READABLE_EXTENSIONS (this module's built-in set, kept in sync
+    with config.DEFAULT_READABLE_EXTENSIONS); config.json's own
+    ``readable_extensions`` key can replace it entirely for callers who want
+    a narrower or wider allow-list.
+
+    Cached for the life of the process after the first call, to avoid a
+    MempalaceConfig() construction (a config.json read + JSON parse) per file
+    in a large scan. Trade-off: a config.json edit to readable_extensions
+    made while a long-running process (e.g. the MCP server) is up won't take
+    effect until restart -- inherent to caching a config value past the
+    point it was read, not something specific to this cache.
+    """
+    global _READABLE_EXTS_CACHE
+    if _READABLE_EXTS_CACHE is None:
+        from .config import MempalaceConfig
+
+        _READABLE_EXTS_CACHE = MempalaceConfig().readable_extensions
+    return _READABLE_EXTS_CACHE
+
 
 SKIP_FILENAMES = {
     "entities.json",
@@ -1765,7 +1797,7 @@ def scan_project(
 
             if not force_include and filename in SKIP_FILENAMES:
                 continue
-            if filepath.suffix.lower() not in READABLE_EXTENSIONS and not exact_force_include:
+            if filepath.suffix.lower() not in get_readable_extensions() and not exact_force_include:
                 continue
             if respect_gitignore and active_matchers and not force_include:
                 if is_gitignored(filepath, active_matchers, is_dir=False):
