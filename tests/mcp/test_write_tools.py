@@ -11,6 +11,37 @@ from _mcp_server_helpers import (
 
 
 class TestWriteTools:
+    def test_add_drawer_records_the_directory_it_names(
+        self, monkeypatch, config, palace_path, kg, tmp_path
+    ):
+        """A drawer filed here names a source file the same way a mined one
+        does, and ``sync`` decides both by the same rule (#2320). Without the
+        identity this tool would file the one kind of drawer in a palace that
+        sync cannot protect."""
+        from mempalace import source_identity as si
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        source = tmp_path / "note.md"
+        source.write_text("hello")
+
+        result = tool_add_drawer(
+            wing="test_wing",
+            room="test_room",
+            content="A drawer filed with a source file behind it.",
+            source_file=str(source),
+        )
+
+        assert result["success"] is True
+        stored = col.get(ids=[result["drawer_id"]], include=["metadatas"])
+        expected = si.directory_identity(tmp_path)
+        assert expected is not None, "the filesystem reports no inode to record"
+        assert stored["metadatas"], stored
+        assert stored["metadatas"][0].get("source_dir_ino") == expected
+
     def test_add_drawer(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         _client, _col = _get_collection(palace_path, create=True)
