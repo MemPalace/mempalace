@@ -847,6 +847,44 @@ class TestNoneMetadataSafety:
         assert _safe_meta("not a dict") == {}
         assert _safe_meta(["wing", "x"]) == {}
 
+    def test_response_meta_drops_the_source_directory_identity(self):
+        """It is bookkeeping ``sync`` reads off the metadata itself, and it
+        describes the host's filesystem, which is why the path beside it is
+        already cut down to a basename (#2320)."""
+        from mempalace.mcp_server import _response_safe_meta
+
+        safe = _response_safe_meta(
+            {
+                "wing": "demo",
+                "source_file": "/home/someone/project/notes.md",
+                "source_dir_ino": "1515983",
+            }
+        )
+
+        assert "source_dir_ino" not in safe
+        assert safe["source_file"] == "notes.md"
+        assert safe["wing"] == "demo"
+
+    def test_response_meta_leaves_the_record_it_was_given_alone(self):
+        """``_safe_meta`` hands back the caller's own dict, and two of the
+        edits here are removals from an object something else may still be
+        holding. One of them takes the field a writer path decides by: a
+        record read for a response and then written back would come out of it
+        without an identity, and the drawer would be decided as if it had
+        never carried one (#2320)."""
+        from mempalace.mcp_server import _response_safe_meta
+
+        record = {
+            "wing": "demo",
+            "source_file": "/home/someone/project/notes.md",
+            "source_dir_ino": "1515983",
+        }
+        safe = _response_safe_meta(record)
+
+        assert safe is not record
+        assert record["source_dir_ino"] == "1515983"
+        assert record["source_file"] == "/home/someone/project/notes.md"
+
     def test_get_drawer_tolerates_none_metadata(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
 
