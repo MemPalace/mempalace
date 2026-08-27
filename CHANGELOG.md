@@ -31,6 +31,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `ANONYMIZED_TELEMETRY=False` (via `setdefault`, so an explicit operator export
   still wins) for any other chromadb client in the process. (GHSA-8h77)
 
+### Bug Fixes
+
+- **`sync --apply` no longer removes a drawer whose corroborating neighbour is in a different directory than the one its source was mined from.** #2322 made removal ask for a witness in the same directory, which three mount shapes defeat: a mount point whose lower layer holds a mined file of its own, a volume mounted over a directory the palace already knows a file in, and a bind mount of another directory over one it knows, which is what a container does with `-v /host/elsewhere:/project/sub`. Driven through real `mount` and `umount`, all three removed drawers of files that were on disk the whole time. Mining now records which directory each source was read from, as that directory's inode, and `sync` compares it against the inode answering when the verdict is formed. Nothing is written into the source tree for it, so the read-only mounts the README's container recipes use keep working; `st_dev` could not do it, since a bind mount puts both sides on one filesystem where it is the same number. Ten paths record the identity, and `update_drawer` carries it forward when it refiles a drawer as chunks, so every row `sync` can remove holds one. Four bounds: one volume swapped for another at the same path is not separated, a directory deleted and recreated may answer with a different inode and then keeps the drawers of files that really went, a filesystem reporting no inode of its own gains nothing and reproduces the bug in full, and the `gitignored` removal route is unchanged. An existing palace gains the field only as it is re-mined, which `file_already_mined` decides from the stored mtime. Closets are now purged per source a pass emptied rather than per source it removed a drawer from, so a source that kept one keeps the lines that index it. (#2367)
+
 ---
 
 ## [3.10.0] — 2026-09-15
