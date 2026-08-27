@@ -245,6 +245,17 @@ def normalize_milvus_consistency_level(value) -> str:
     raise ValueError(f"milvus_consistency_level must be one of: {allowed}")
 
 
+def normalize_embedding_model(value) -> str:
+    """Normalize an embedding model setting and reject combined variants."""
+    model = str(value).strip().lower()
+    if model.startswith("embeddinggemma:"):
+        raise ValueError(
+            "embedding_model does not accept a combined variant; set "
+            "embedding_model='embeddinggemma' and use embeddinggemma_variant instead"
+        )
+    return model
+
+
 def sqlite_read_uri(db_path: str) -> str:
     """Return a read-only ``file:`` URI for ``sqlite3.connect(..., uri=True)``.
 
@@ -763,8 +774,25 @@ class MempalaceConfig:
         """
         env_val = os.environ.get("MEMPALACE_EMBEDDING_MODEL")
         if env_val:
-            return env_val.strip().lower()
-        return str(self._file_config.get("embedding_model", "minilm")).strip().lower()
+            return normalize_embedding_model(env_val)
+        return normalize_embedding_model(self._file_config.get("embedding_model", "minilm"))
+
+    @property
+    def embeddinggemma_variant(self):
+        """ONNX precision variant for the local EmbeddingGemma model.
+
+        Values: ``"q8"`` (default, backward-compatible) or ``"fp16"``.
+        Read from ``MEMPALACE_EMBEDDINGGEMMA_VARIANT`` first, then
+        ``embeddinggemma_variant`` in ``config.json``.
+        """
+        env_val = os.environ.get("MEMPALACE_EMBEDDINGGEMMA_VARIANT")
+        if env_val:
+            variant = env_val.strip().lower()
+        else:
+            variant = str(self._file_config.get("embeddinggemma_variant", "q8")).strip().lower()
+        if variant not in {"fp16", "q8"}:
+            raise ValueError("embeddinggemma_variant must be one of: fp16, q8")
+        return variant
 
     @property
     def embedding_threads(self) -> int:
@@ -805,7 +833,7 @@ class MempalaceConfig:
         passed through (``embedding.get_embedding_function`` falls back to
         minilm for unrecognized values).
         """
-        self._file_config["embedding_model"] = str(model).strip().lower()
+        self._file_config["embedding_model"] = normalize_embedding_model(model)
         self._config_dir.mkdir(parents=True, exist_ok=True)
         try:
             with open(self._config_file, "w", encoding="utf-8") as f:

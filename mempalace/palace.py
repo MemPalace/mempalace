@@ -295,11 +295,10 @@ def set_palace_embedder_identity(
     the exact state being repaired — can be opened at all.
     """
     from .backends.base import EmbedderIdentity, EmbedderIdentityMismatchError
-    from .config import MempalaceConfig
-    from .embedding import get_embedder_identity
+    from .embedding import canonical_model_name, current_model_name, get_embedder_identity
 
-    configured = MempalaceConfig().embedding_model
-    target = (model or configured or "").strip().lower()
+    configured = current_model_name()
+    target = canonical_model_name(model) if model else configured
     if not target:
         # No model given and none configured — there is nothing to record, and
         # recording a nameless identity is a silent no-op in every backend.

@@ -185,8 +185,14 @@ def test_get_embedding_function_threads_cap_passed_to_embeddinggemma(monkeypatch
     captured = {}
 
     class DummyGemma:
-        def __init__(self, preferred_providers=None, intra_op_num_threads=0):
+        def __init__(
+            self,
+            preferred_providers=None,
+            intra_op_num_threads=0,
+            variant="q8",
+        ):
             captured["threads"] = intra_op_num_threads
+            captured["variant"] = variant
 
     monkeypatch.setattr(embedding, "EmbeddinggemmaONNX", DummyGemma)
     monkeypatch.setattr(
@@ -199,6 +205,7 @@ def test_get_embedding_function_threads_cap_passed_to_embeddinggemma(monkeypatch
     embedding.get_embedding_function("cpu", "embeddinggemma")
 
     assert captured["threads"] == 4
+    assert captured["variant"] == "q8"
 
 
 def test_minilm_ef_model_override_applies_thread_cap(monkeypatch):

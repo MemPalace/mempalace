@@ -21,6 +21,7 @@ from mempalace.cli import (
     cmd_instructions,
     cmd_daemon,
     cmd_mine,
+    cmd_palace_set_embedder,
     cmd_repair,
     cmd_search,
     cmd_split,
@@ -28,6 +29,50 @@ from mempalace.cli import (
     cmd_wakeup,
     main,
 )
+
+
+def test_cmd_palace_set_embedder_accepts_configured_fp16_identity(tmp_path, monkeypatch, capsys):
+    from mempalace.backends.base import EmbedderIdentity
+
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "embeddinggemma")
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", "fp16")
+    args = argparse.Namespace(
+        palace=str(tmp_path),
+        model=None,
+        force=False,
+        backend="sqlite_exact",
+    )
+    with patch(
+        "mempalace.palace.set_palace_embedder_identity",
+        return_value=(None, EmbedderIdentity("embeddinggemma:fp16", 384)),
+    ):
+        cmd_palace_set_embedder(args)
+
+    output = capsys.readouterr().out
+    assert "recorded embedder identity: embeddinggemma:fp16" in output
+    assert "configured model is" not in output
+
+
+def test_cmd_palace_set_embedder_explains_how_to_configure_fp16(tmp_path, monkeypatch, capsys):
+    from mempalace.backends.base import EmbedderIdentity
+
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "minilm")
+    args = argparse.Namespace(
+        palace=str(tmp_path),
+        model="embeddinggemma:fp16",
+        force=True,
+        backend="sqlite_exact",
+    )
+    with patch(
+        "mempalace.palace.set_palace_embedder_identity",
+        return_value=(None, EmbedderIdentity("embeddinggemma:fp16", 384)),
+    ):
+        cmd_palace_set_embedder(args)
+
+    output = capsys.readouterr().out
+    assert "MEMPALACE_EMBEDDING_MODEL=embeddinggemma" in output
+    assert "MEMPALACE_EMBEDDINGGEMMA_VARIANT=fp16" in output
+    assert "MEMPALACE_EMBEDDING_MODEL=embeddinggemma:fp16" not in output
 
 
 # ── CLI entry point: PYTHONPATH stripping ────────────────────────────────

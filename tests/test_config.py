@@ -137,6 +137,66 @@ def test_embedding_device_env_overrides_config(tmp_path, monkeypatch):
     assert cfg.embedding_device == "coreml"
 
 
+@pytest.mark.parametrize("source", ["env", "file"])
+def test_embedding_model_rejects_combined_embeddinggemma_variant(tmp_path, monkeypatch, source):
+    if source == "env":
+        monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "embeddinggemma:fp16")
+    else:
+        monkeypatch.delenv("MEMPALACE_EMBEDDING_MODEL", raising=False)
+        with open(tmp_path / "config.json", "w") as f:
+            json.dump({"embedding_model": "embeddinggemma:fp16"}, f)
+
+    with pytest.raises(ValueError, match="embeddinggemma_variant"):
+        _ = MempalaceConfig(config_dir=str(tmp_path)).embedding_model
+
+
+def test_set_embedding_model_rejects_combined_embeddinggemma_variant(tmp_path):
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    with pytest.raises(ValueError, match="embeddinggemma_variant"):
+        cfg.set_embedding_model("embeddinggemma:fp16")
+
+    assert not (tmp_path / "config.json").exists()
+
+
+def test_embeddinggemma_variant_defaults_to_q8(monkeypatch):
+    """Existing palaces keep the q8 vector space unless users opt in."""
+    monkeypatch.delenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", raising=False)
+
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+
+    assert cfg.embeddinggemma_variant == "q8"
+
+
+def test_embeddinggemma_variant_env_override_is_normalized(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embeddinggemma_variant": "q8"}, f)
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", "  FP16  ")
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    assert cfg.embeddinggemma_variant == "fp16"
+
+
+def test_embeddinggemma_variant_reads_config_file(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embeddinggemma_variant": " FP16 "}, f)
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    assert cfg.embeddinggemma_variant == "fp16"
+
+
+def test_embeddinggemma_variant_rejects_unknown_value(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", "fp32")
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    with pytest.raises(ValueError, match="embeddinggemma_variant.*fp16.*q8"):
+        _ = cfg.embeddinggemma_variant
+
+
 def test_embedding_threads_defaults_to_half_cpus(monkeypatch):
     monkeypatch.delenv("MEMPALACE_EMBEDDING_THREADS", raising=False)
     monkeypatch.setattr("os.cpu_count", lambda: 10)
