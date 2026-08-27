@@ -17,6 +17,7 @@ import os
 import sys
 import threading
 import types
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -37,7 +38,14 @@ def _install_stub_memory_provider() -> None:
     class MemoryProvider:  # mirrors the parts the integration class uses
         pass
 
+    @dataclass(frozen=True)
+    class RecallStatus:
+        provider_label: str
+        count: int
+        glyph: str = "🧠"
+
     mp_mod.MemoryProvider = MemoryProvider  # type: ignore[attr-defined]
+    mp_mod.RecallStatus = RecallStatus  # type: ignore[attr-defined]
     agent_mod.memory_provider = mp_mod  # type: ignore[attr-defined]
     sys.modules["agent"] = agent_mod
     sys.modules["agent.memory_provider"] = mp_mod
@@ -1078,3 +1086,94 @@ def test_prefetch_falls_back_to_semantic_when_kg_has_no_fact(
     assert "## MemPalace — relevant context" in result
     assert "No structured fact was recorded here." in result
     assert "authoritative factual context" not in result
+
+
+# ----- Deterministic recall indicator ---------------------------------------
+
+
+def test_recall_status_none_before_prefetch(provider):
+    assert provider.recall_status() is None
+
+
+def test_recall_status_reports_semantic_hit_count(
+    provider, integration_module, tmp_path, monkeypatch
+):
+    provider._initialized = True
+    provider._cron_skipped = False
+    provider._palace_path = str(tmp_path / "palace")
+    Path(provider._palace_path).mkdir()
+
+    monkeypatch.setattr(
+        integration_module,
+        "search_memories",
+        lambda query, **kwargs: {
+            "results": [
+                {"wing": "general", "room": "conversations", "text": "first"},
+                {"wing": "general", "room": "conversations", "text": "second"},
+            ]
+        },
+    )
+
+    result = provider.prefetch("What did we discuss?")
+
+    assert "first" in result
+    status = provider.recall_status()
+    assert status is not None
+    assert status.provider_label == "MemPalace"
+    assert status.count == 2
+
+
+def test_recall_status_reports_generic_for_kg_only(
+    provider, integration_module, tmp_path, monkeypatch
+):
+    provider._initialized = True
+    provider._cron_skipped = False
+    provider._palace_path = str(tmp_path / "palace")
+    Path(provider._palace_path).mkdir()
+
+    monkeypatch.setattr(
+        integration_module,
+        "search_memories",
+        lambda query, **kwargs: {"results": []},
+    )
+    monkeypatch.setattr(
+        provider,
+        "_prefetch_kg_fact",
+        lambda query: "- Atlas → status → alive",
+    )
+
+    result = provider.prefetch("What is Atlas's current status?")
+
+    assert "Atlas → status → alive" in result
+    status = provider.recall_status()
+    assert status is not None
+    assert status.count == 0
+
+
+def test_recall_status_clears_after_empty_prefetch(
+    provider, integration_module, tmp_path, monkeypatch
+):
+    provider._initialized = True
+    provider._cron_skipped = False
+    provider._palace_path = str(tmp_path / "palace")
+    Path(provider._palace_path).mkdir()
+
+    responses = iter(
+        [
+            {"results": [{"wing": "general", "room": "conversations", "text": "memory"}]},
+            {"results": []},
+        ]
+    )
+    monkeypatch.setattr(
+        integration_module,
+        "search_memories",
+        lambda query, **kwargs: next(responses),
+    )
+
+    provider.prefetch("first")
+    status = provider.recall_status()
+    assert status is not None
+    assert status.count == 1
+
+    assert provider.prefetch("second") == ""
+    assert provider.recall_status() is None

@@ -95,6 +95,18 @@ except ImportError:  # pragma: no cover - Hermes not installed
     class MemoryProvider:  # type: ignore[no-redef]
         """Stub used when ``agent.memory_provider`` cannot be imported."""
 
+try:
+    from agent.memory_provider import RecallStatus  # type: ignore[import-not-found]
+except (ImportError, AttributeError):  # pragma: no cover - older Hermes
+
+    class RecallStatus:  # type: ignore[no-redef]
+        """Stub used when Hermes' recall-indicator contract is unavailable."""
+
+        def __init__(self, provider_label: str, count: int, glyph: str = "🧠") -> None:
+            self.provider_label = provider_label
+            self.count = count
+            self.glyph = glyph
+
 
 logger = logging.getLogger("mempalace.hermes")
 
@@ -652,6 +664,11 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         self._hermes_home: str = ""
         self._turn_count = 0
 
+        # Deterministic UI recall indicator state. Tracks ONLY the most
+        # recent prefetch so a later empty turn can never report stale memory.
+        self._last_recall_returned = False
+        self._last_recall_count = 0
+
         # ChromaDB access through mempalace's own backend (matches embedding
         # function, fixes the dim-mismatch bug from prior PRs).
         self._backend = None
@@ -905,6 +922,11 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         return "\n\n".join(parts)
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        # Clear prior-turn state first so empty/error turns cannot leak a stale
+        # recall indicator into the current turn.
+        self._last_recall_returned = False
+        self._last_recall_count = 0
+
         if self._cron_skipped or not self._initialized or not query:
             return ""
         try:
@@ -918,7 +940,11 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             )
             hits = result.get("results", []) if isinstance(result, dict) else []
             if not hits:
+                if factual_context:
+                    self._last_recall_returned = True
+                    self._last_recall_count = 0
                 return factual_context
+
             lines = ["## MemPalace — relevant context"]
             for r in hits:
                 wing = r.get("wing", "")
@@ -928,12 +954,28 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 if text:
                     lines.append(f"{tag}{text}")
             semantic_context = "\n\n".join(lines)
+
+            # Each search hit is a discrete semantic memory. A KG-only
+            # injection uses count=0 and is rendered by Hermes as generic
+            # "recalled relevant memory".
+            self._last_recall_returned = True
+            self._last_recall_count = len(hits)
+
             if factual_context:
                 return factual_context + "\n\n" + semantic_context
             return semantic_context
         except Exception as exc:
             logger.debug("MemPalace prefetch error: %s", exc)
             return ""
+
+    def recall_status(self) -> Optional[RecallStatus]:
+        """Report what the most recent prefetch injected to Hermes' UI."""
+        if not self._last_recall_returned:
+            return None
+        return RecallStatus(
+            provider_label="MemPalace",
+            count=self._last_recall_count,
+        )
 
     def sync_turn(
         self,
