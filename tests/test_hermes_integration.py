@@ -974,6 +974,18 @@ def test_factual_query_parser_leaves_conversational_recall_alone(integration_mod
     assert parser("What did we discuss about the printer?") == ("", None)
 
 
+def test_system_prompt_declares_mempalace_as_active_provider(provider):
+    provider._initialized = True
+    provider._cron_skipped = False
+    provider._identity = ""
+    provider._wake_up_cache = ""
+
+    block = provider.system_prompt_block()
+
+    assert "MemPalace is the active Hermes memory provider" in block
+    assert "Do not use recalled conversation text as authoritative" in block
+
+
 def test_prefetch_uses_kg_for_current_and_historical_status(
     provider, integration_module, tmp_path, monkeypatch
 ):

@@ -912,9 +912,14 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
     def system_prompt_block(self) -> str:
         if self._cron_skipped or not self._initialized:
             return ""
-        if not self._identity and not self._wake_up_cache:
-            return ""
-        parts = ["# MemPalace context"]
+
+        parts = [
+            "# MemPalace context",
+            "MemPalace is the active Hermes memory provider for this agent.",
+            "When asked which memory provider is currently active, answer "
+            "MemPalace based on this runtime configuration. Do not use recalled "
+            "conversation text as authoritative for the current provider selection.",
+        ]
         if self._identity:
             parts.append(self._identity)
         if self._wake_up_cache:
