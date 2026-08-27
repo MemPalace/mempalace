@@ -16,7 +16,7 @@ PreInvocation) for background mining and startup memory injection.
 | PreInvocation   | `mempalace-wake` — injects memory on the first model call   |
 
 The full audit of which Antigravity surfaces we use, why, and what we
-deliberately do not ship is in [`hooks/antigravity/INVESTIGATION.md`](https://github.com/MemPalace/mempalace/blob/main/hooks/antigravity/INVESTIGATION.md).
+deliberately do not ship is in [`mempalace/hooks/antigravity/INVESTIGATION.md`](https://github.com/MemPalace/mempalace/blob/main/mempalace/hooks/antigravity/INVESTIGATION.md).
 
 ## Prerequisites
 
@@ -31,7 +31,7 @@ deliberately do not ship is in [`hooks/antigravity/INVESTIGATION.md`](https://gi
 From the cloned `mempalace` repo:
 
 ```bash
-bash hooks/antigravity/install.sh
+bash mempalace/hooks/antigravity/install.sh
 ```
 
 This installs to `~/.gemini/config/plugins/mempalace/`. Restart
@@ -41,13 +41,13 @@ Antigravity and the plugin loads automatically — you'll see
 ### Dry run first
 
 ```bash
-bash hooks/antigravity/install.sh --dry-run
+bash mempalace/hooks/antigravity/install.sh --dry-run
 ```
 
 ### Custom install dir (workspace-scoped)
 
 ```bash
-bash hooks/antigravity/install.sh \
+bash mempalace/hooks/antigravity/install.sh \
   --install-dir <workspace>/.agents/plugins/mempalace
 ```
 
@@ -64,7 +64,7 @@ run from CI.
 ### Uninstall
 
 ```bash
-bash hooks/antigravity/install.sh --uninstall
+bash mempalace/hooks/antigravity/install.sh --uninstall
 ```
 
 The uninstaller has two safety guards:
@@ -313,10 +313,10 @@ from event append to ack is about five seconds.
 
 ## See also
 
-- [`hooks/antigravity/INVESTIGATION.md`](https://github.com/MemPalace/mempalace/blob/main/hooks/antigravity/INVESTIGATION.md)
+- [`mempalace/hooks/antigravity/INVESTIGATION.md`](https://github.com/MemPalace/mempalace/blob/main/mempalace/hooks/antigravity/INVESTIGATION.md)
   — every Antigravity surface investigated, with verbatim quotes from
   the official docs.
-- [`hooks/antigravity/STDIN_SHAPE.md`](https://github.com/MemPalace/mempalace/blob/main/hooks/antigravity/STDIN_SHAPE.md)
+- [`mempalace/hooks/antigravity/STDIN_SHAPE.md`](https://github.com/MemPalace/mempalace/blob/main/mempalace/hooks/antigravity/STDIN_SHAPE.md)
   — exact wire format for both events.
 - [`examples/antigravity/`](https://github.com/MemPalace/mempalace/tree/main/examples/antigravity)
   — standalone `hooks.json` + `mcp_config.json` for users who don't

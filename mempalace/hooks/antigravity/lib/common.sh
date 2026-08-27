@@ -6,7 +6,7 @@
 #   * mempal_wake_hook_antigravity.sh   (PreInvocation event, gated to invocationNum==1)
 #
 # Mirrors the conventions of the existing Claude Code hook scripts
-# (hooks/mempal_save_hook.sh, hooks/mempal_precompact_hook.sh):
+# (mempalace/hooks/mempal_save_hook.sh, mempalace/hooks/mempal_precompact_hook.sh):
 #
 #   * STATE_DIR layout under ~/.mempalace/hook_state/
 #   * MEMPAL_PYTHON resolution order (override -> $PATH -> bare python3)
@@ -194,7 +194,7 @@ except Exception:
 # sentinel and per-line layout: bash 3.2 doesn't have `mapfile` or
 # `readarray`, and `eval`-on-shell-var is the wrong shape (every value
 # is user-controllable JSON). Sentinel + line offset is the same pattern
-# the existing Claude Code hook (hooks/mempal_save_hook.sh) uses.
+# the existing Claude Code hook (mempalace/hooks/mempal_save_hook.sh) uses.
 #
 # Output layout (one field per line; line numbers are stable and the
 # fields are documented in STDIN_SHAPE.md):

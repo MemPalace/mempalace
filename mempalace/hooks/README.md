@@ -2,15 +2,27 @@
 
 These hook scripts make MemPalace save automatically. No manual "save" commands needed.
 
+## Quick Setup (pip or uv users)
+
+The hooks are already bundled. Run:
+
+```bash
+mempalace hooks install          # prints config for Claude Code
+mempalace hooks install --format codex  # prints config for Codex CLI
+mempalace hooks path             # prints the installed hooks directory
+```
+
+Paste the output into your settings file and you're done.
+
 This file covers the **Claude Code** and **Codex CLI** hooks that live
-flat under `hooks/`. For the **Cursor IDE** hooks, see
-[`hooks/cursor/README.md`](cursor/README.md) or the rendered docs at
-[`website/guide/cursor-hooks.md`](../website/guide/cursor-hooks.md). The
+flat under `mempalace/hooks/`. For the **Cursor IDE** hooks, see
+[`mempalace/hooks/cursor/README.md`](cursor/README.md) or the rendered docs at
+[`website/guide/cursor-hooks.md`](../../website/guide/cursor-hooks.md). The
 two are additive and share the same `~/.mempalace/hook_state/`
 directory.
 
 If you are trying to protect existing Claude Code transcripts immediately,
-use the short checklist first: [`website/guide/claude-code-retention.md`](../website/guide/claude-code-retention.md).
+use the short checklist first: [`website/guide/claude-code-retention.md`](../../website/guide/claude-code-retention.md).
 It covers hook wiring, JSONL backup, and one-time backfill.
 
 ## What They Do
@@ -34,21 +46,21 @@ Add to `.claude/settings.local.json`:
       "matcher": "*",
       "hooks": [{
         "type": "command",
-        "command": "/absolute/path/to/hooks/mempal_save_hook.sh",
+        "command": "/absolute/path/to/mempalace/hooks/mempal_save_hook.sh",
         "timeout": 30
       }]
     }],
     "SessionEnd": [{
       "hooks": [{
         "type": "command",
-        "command": "/absolute/path/to/hooks/mempal_session_end_hook.sh",
+        "command": "/absolute/path/to/mempalace/hooks/mempal_session_end_hook.sh",
         "timeout": 10
       }]
     }],
     "PreCompact": [{
       "hooks": [{
         "type": "command",
-        "command": "/absolute/path/to/hooks/mempal_precompact_hook.sh",
+        "command": "/absolute/path/to/mempalace/hooks/mempal_precompact_hook.sh",
         "timeout": 30
       }]
     }]
@@ -64,7 +76,7 @@ mining in the foreground.
 
 Make them executable:
 ```bash
-chmod +x hooks/mempal_save_hook.sh hooks/mempal_session_end_hook.sh hooks/mempal_precompact_hook.sh
+chmod +x mempalace/hooks/mempal_save_hook.sh mempalace/hooks/mempal_session_end_hook.sh mempalace/hooks/mempal_precompact_hook.sh
 ```
 
 ## Install — Antigravity (Google)
@@ -75,13 +87,13 @@ wire format (camelCase JSON, `injectSteps[]` output) and event names
 installer:
 
 ```bash
-bash hooks/antigravity/install.sh
+bash mempalace/hooks/antigravity/install.sh
 ```
 
 This installs to `~/.gemini/config/plugins/mempalace/`, registers the
 MCP server, ships the `mempalace` skill, and wires the Stop +
-PreInvocation hooks. See [`hooks/antigravity/README.md`](antigravity/README.md)
-for the full guide and [`hooks/antigravity/INVESTIGATION.md`](antigravity/INVESTIGATION.md)
+PreInvocation hooks. See [`mempalace/hooks/antigravity/README.md`](antigravity/README.md)
+for the full guide and [`mempalace/hooks/antigravity/INVESTIGATION.md`](antigravity/INVESTIGATION.md)
 for the source-of-truth audit of which Antigravity surfaces the
 integration uses.
 
@@ -93,12 +105,12 @@ Add to `.codex/hooks.json`:
 {
   "Stop": [{
     "type": "command",
-    "command": "/absolute/path/to/hooks/mempal_save_hook.sh",
+    "command": "/absolute/path/to/mempalace/hooks/mempal_save_hook.sh",
     "timeout": 30
   }],
   "PreCompact": [{
     "type": "command",
-    "command": "/absolute/path/to/hooks/mempal_precompact_hook.sh",
+    "command": "/absolute/path/to/mempalace/hooks/mempal_precompact_hook.sh",
     "timeout": 30
   }]
 }

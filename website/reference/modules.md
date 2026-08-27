@@ -35,7 +35,7 @@ mempalace/
 │   ├── locomo_bench.py        ← LoCoMo runner
 │   ├── membench_bench.py      ← MemBench runner
 │   └── convomem_bench.py      ← ConvoMem runner
-├── hooks/                     ← Claude Code auto-save hooks
+├── mempalace/hooks/           ← packaged auto-save hooks
 │   ├── mempal_save_hook.sh    ← save every N messages
 │   └── mempal_precompact_hook.sh ← emergency save
 ├── examples/                  ← usage examples

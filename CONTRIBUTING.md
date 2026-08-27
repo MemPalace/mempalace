@@ -69,7 +69,7 @@ See [benchmarks/README.md](benchmarks/README.md) for data download instructions 
 ```
 mempalace/          ← core package (see mempalace/README.md for module guide)
 benchmarks/         ← reproducible benchmark runners
-hooks/              ← Claude Code auto-save hooks
+mempalace/hooks/    ← packaged auto-save hooks
 examples/           ← usage examples
 tests/              ← test suite
 assets/             ← logo + brand
@@ -141,4 +141,3 @@ git config user.email
 ```
 
 This is especially important when commits are created through agentic coding tools or automation, because those tools may not inherit your normal shell Git configuration. Avoid placeholder values such as `your@email.com` or localized template text; unresolved author emails can create avoidable provenance and SBOM review friction for downstream users.
-

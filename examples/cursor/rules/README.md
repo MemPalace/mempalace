@@ -50,7 +50,7 @@ Recall ships in three orthogonal layers — install any combination:
 
 | Layer | What it does | Where |
 |-------|--------------|-------|
-| `sessionStart` hook | Injects wing-scoped recall context once per new chat | [`hooks/cursor/`](../../../hooks/cursor/) |
+| `sessionStart` hook | Injects wing-scoped recall context once per new chat | [`mempalace/hooks/cursor/`](../../../mempalace/hooks/cursor/) |
 | `mempalace-recall` skill | Full search-before-answer protocol, model-invoked or attached | [`skills/mempalace-recall/`](../../../skills/mempalace-recall/) |
 | Recall rule (these files) | Nudges search-before-answer on recall-relevant turns | here, or the plugin root `rules/` |
 

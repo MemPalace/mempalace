@@ -2,7 +2,8 @@
 
 Mirrors ``tests/test_hooks_shell.py`` + ``tests/test_hooks_bash_compat.py``
 in shape so a future contributor recognises the pattern. The three
-hooks live at ``hooks/cursor/`` and source ``hooks/cursor/lib/common.sh``.
+hooks live at ``mempalace/hooks/cursor/`` and source
+``mempalace/hooks/cursor/lib/common.sh``.
 
 Covered contracts:
 
@@ -38,7 +39,7 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-HOOKS_DIR = REPO_ROOT / "hooks" / "cursor"
+HOOKS_DIR = REPO_ROOT / "mempalace" / "hooks" / "cursor"
 SAVE_HOOK = HOOKS_DIR / "mempal_save_hook_cursor.sh"
 PRECOMPACT_HOOK = HOOKS_DIR / "mempal_precompact_hook_cursor.sh"
 WAKE_HOOK = HOOKS_DIR / "mempal_wake_hook_cursor.sh"

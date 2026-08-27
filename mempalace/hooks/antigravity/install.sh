@@ -2,7 +2,7 @@
 # MEMPALACE ANTIGRAVITY INSTALLER
 #
 # Idempotent installer for the Antigravity plugin. Copies
-# .antigravity-plugin/* and hooks/antigravity/{lib,*.sh} into the
+# .antigravity-plugin/* and mempalace/hooks/antigravity/{lib,*.sh} into the
 # install directory (default ~/.gemini/config/plugins/mempalace/),
 # renders hooks.json.tmpl into hooks.json with absolute paths, and
 # leaves the result in a state Antigravity will discover on next
@@ -10,11 +10,11 @@
 #
 # === Usage ===
 #
-#   bash hooks/antigravity/install.sh                    # install with defaults
-#   bash hooks/antigravity/install.sh --dry-run          # show what would happen
-#   bash hooks/antigravity/install.sh --uninstall        # remove plugin
-#   bash hooks/antigravity/install.sh --install-dir <p>  # custom install dir
-#   bash hooks/antigravity/install.sh --log-level debug  # noisier output
+#   bash mempalace/hooks/antigravity/install.sh                    # install with defaults
+#   bash mempalace/hooks/antigravity/install.sh --dry-run          # show what would happen
+#   bash mempalace/hooks/antigravity/install.sh --uninstall        # remove plugin
+#   bash mempalace/hooks/antigravity/install.sh --install-dir <p>  # custom install dir
+#   bash mempalace/hooks/antigravity/install.sh --log-level debug  # noisier output
 #
 # === Idempotency ===
 #
@@ -41,9 +41,9 @@ set -u
 
 # ── Repo root resolution ─────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd -P)"
 PLUGIN_SRC="$REPO_ROOT/.antigravity-plugin"
-HOOKS_SRC="$REPO_ROOT/hooks/antigravity"
+HOOKS_SRC="$REPO_ROOT/mempalace/hooks/antigravity"
 
 # ── Defaults ─────────────────────────────────────────────────────────
 INSTALL_DIR_DEFAULT="$HOME/.gemini/config/plugins/mempalace"

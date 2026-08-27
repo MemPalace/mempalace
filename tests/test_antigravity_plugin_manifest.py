@@ -15,7 +15,7 @@ Covers:
 
 These are contract tests — they fail as soon as anyone changes the
 in-repo shape in a way that drifts from Antigravity's documented
-schema. See [hooks/antigravity/INVESTIGATION.md](../hooks/antigravity/INVESTIGATION.md)
+schema. See [mempalace/hooks/antigravity/INVESTIGATION.md](../mempalace/hooks/antigravity/INVESTIGATION.md)
 for the source-of-truth audit driving the assertions.
 """
 
@@ -38,7 +38,7 @@ PLUGIN_README = PLUGIN_DIR / "README.md"
 RECALL_SKILL_MD = PLUGIN_DIR / "skills" / "mempalace-recall" / "SKILL.md"
 RECALL_RULE_MD = PLUGIN_DIR / "rules" / "mempalace-recall.md"
 SHARED_PROTOCOL = REPO_ROOT / "integrations" / "shared" / "recall-protocol.md"
-INSTALL_SH = REPO_ROOT / "hooks" / "antigravity" / "install.sh"
+INSTALL_SH = REPO_ROOT / "mempalace" / "hooks" / "antigravity" / "install.sh"
 SHARED_PROTOCOL_REF = (
     "https://github.com/MemPalace/mempalace/blob/main/integrations/shared/recall-protocol.md"
 )

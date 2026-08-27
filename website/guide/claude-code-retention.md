@@ -24,7 +24,7 @@ From a local clone of this repository:
 
 ```bash
 pip install mempalace
-chmod +x hooks/mempal_save_hook.sh hooks/mempal_precompact_hook.sh
+chmod +x mempalace/hooks/mempal_save_hook.sh mempalace/hooks/mempal_precompact_hook.sh
 ```
 
 Add the hooks to `.claude/settings.local.json`:

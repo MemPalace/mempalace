@@ -23,6 +23,7 @@ class TestSaveHookAutoMines:
         independently of MEMPAL_DIR (which is for project files only)."""
         hook_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)),
+            "mempalace",
             "hooks",
             "mempal_save_hook.sh",
         )
@@ -45,6 +46,7 @@ class TestSaveHookAutoMines:
         not an empty string that silently disables mining."""
         hook_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)),
+            "mempalace",
             "hooks",
             "mempal_save_hook.sh",
         )
@@ -76,7 +78,7 @@ class TestShellHookTranscriptValidation:
 
     @staticmethod
     def _hook_src(name: str) -> str:
-        path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "hooks", name)
+        path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "mempalace", "hooks", name)
         return open(path).read()
 
     @staticmethod

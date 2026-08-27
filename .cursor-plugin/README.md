@@ -2,7 +2,7 @@
 
 A Cursor IDE plugin that gives your agent a persistent memory system. Auto-registers the `mempalace-mcp` server (44 MCP tools), ships 5 slash commands, two model-invocable skills (setup/mining/search and a recall protocol), and an optional recall rule.
 
-> Hooks (auto-save + session-start memory recall) are shipped separately under `hooks/cursor/` so the plugin is safe to install in any Cursor workspace without touching the agent loop. See [Hooks](#hooks-optional) below.
+> Hooks (auto-save + session-start memory recall) are shipped separately under `mempalace/hooks/cursor/` so the plugin is safe to install in any Cursor workspace without touching the agent loop. See [Hooks](#hooks-optional) below.
 
 ## Prerequisites
 
@@ -99,18 +99,18 @@ If it isn't, run `/init` (or `mempalace install` from a terminal) — `mempalace
 
 ## Hooks (optional)
 
-Cursor's hooks system is configured separately from plugins (in `~/.cursor/hooks.json` or `.cursor/hooks.json`), so this plugin does **not** wire hooks itself. The MemPalace repository ships three Cursor-native hooks under [`hooks/cursor/`](../hooks/cursor/) that you install with one command.
+Cursor's hooks system is configured separately from plugins (in `~/.cursor/hooks.json` or `.cursor/hooks.json`), so this plugin does **not** wire hooks itself. The MemPalace repository ships three Cursor-native hooks under [`mempalace/hooks/cursor/`](../mempalace/hooks/cursor/) that you install with one command.
 
 User scope — writes `~/.cursor/hooks.json`, applies to every Cursor workspace (recommended):
 
 ```bash
-hooks/cursor/install.sh --scope user --variant full
+mempalace/hooks/cursor/install.sh --scope user --variant full
 ```
 
 Project scope — writes `.cursor/hooks.json` under the current project only:
 
 ```bash
-hooks/cursor/install.sh --scope project --variant full
+mempalace/hooks/cursor/install.sh --scope project --variant full
 ```
 
 What you get:
@@ -121,7 +121,7 @@ What you get:
 | `stop`         | Counts agent turns; every N turns, emits a `followup_message` instructing a memory checkpoint         |
 | `preCompact`   | Synchronously mines the transcript before compaction, drops a marker so the next `stop` saves a diary |
 
-Full details: [`website/guide/cursor-hooks.md`](../website/guide/cursor-hooks.md) and [`hooks/cursor/README.md`](../hooks/cursor/README.md).
+Full details: [`website/guide/cursor-hooks.md`](../website/guide/cursor-hooks.md) and [`mempalace/hooks/cursor/README.md`](../mempalace/hooks/cursor/README.md).
 
 ## Uninstall
 
@@ -136,7 +136,7 @@ Then in Cursor: <kbd>Cmd</kbd>-<kbd>Shift</kbd>-<kbd>P</kbd> → **Developer: Re
 If you also installed the hooks, remove them (leaves any unrelated hooks in `hooks.json` untouched):
 
 ```bash
-hooks/cursor/install.sh --scope user --uninstall
+mempalace/hooks/cursor/install.sh --scope user --uninstall
 ```
 
 ## Full Documentation

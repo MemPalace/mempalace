@@ -1,7 +1,7 @@
 # Cursor Hook Stdin Shape — Reference
 
 This file documents the JSON payloads the Cursor IDE sends to the
-MemPalace hook scripts in `hooks/cursor/`. It exists so a future
+MemPalace hook scripts in `mempalace/hooks/cursor/`. It exists so a future
 contributor does not have to re-discover the schema by writing a
 probe hook.
 
@@ -11,7 +11,7 @@ v1 schema (`{"version": 1, ...}` at the top of `hooks.json`).
 
 If you suspect Cursor has changed the payload shape since that fetch
 date, re-verify against the upstream docs and update both this file
-and `hooks/cursor/lib/common.sh::mempal_parse_stdin`. The hook
+and `mempalace/hooks/cursor/lib/common.sh::mempal_parse_stdin`. The hook
 scripts deliberately ignore fields they do not consume, so adding
 new fields is non-breaking.
 

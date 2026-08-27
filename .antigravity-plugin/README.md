@@ -22,7 +22,7 @@ This directory is the source of truth for what gets installed at
 └── README.md              # this file
 ```
 
-The hook scripts themselves live at `hooks/antigravity/`. The installer
+The hook scripts themselves live at `mempalace/hooks/antigravity/`. The installer
 copies them into `<install-dir>/hooks/` and renders `hooks.json.tmpl`
 into a `hooks.json` whose `command` paths point at the absolute install
 location.
@@ -33,7 +33,7 @@ MemPalace can store everything, but it only helps if the agent actually
 *reads* the palace before answering. Three layers wire that in, from
 eager to on-demand:
 
-1. **Wake hook** (`hooks/antigravity/mempal_wake_hook_antigravity.sh`,
+1. **Wake hook** (`mempalace/hooks/antigravity/mempal_wake_hook_antigravity.sh`,
    `PreInvocation` event, gated to `invocationNum == 1`). On the first
    model call of a conversation it runs `mempalace wake-up` and injects
    the **actual palace content verbatim** via Antigravity's
@@ -59,19 +59,19 @@ so the skill and rule never drift.
 ## Install
 
 ```bash
-bash hooks/antigravity/install.sh
+bash mempalace/hooks/antigravity/install.sh
 ```
 
 The installer is idempotent and the uninstaller matches by basename, so
 re-runs and partial installs are safe.
 
 See [website/guide/antigravity.md](../website/guide/antigravity.md) for
-the full user-facing guide and [hooks/antigravity/README.md](../hooks/antigravity/README.md)
+the full user-facing guide and [mempalace/hooks/antigravity/README.md](../mempalace/hooks/antigravity/README.md)
 for the hooks-specific documentation.
 
 ## Verified surfaces
 
 Every file in this directory maps to a surface verified against
 [Google's Antigravity docs](https://antigravity.google/docs/). See
-[hooks/antigravity/INVESTIGATION.md](../hooks/antigravity/INVESTIGATION.md)
+[mempalace/hooks/antigravity/INVESTIGATION.md](../mempalace/hooks/antigravity/INVESTIGATION.md)
 for the full audit, including the surfaces deliberately not shipped.

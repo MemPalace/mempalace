@@ -1,4 +1,4 @@
-"""Contract tests for ``hooks/cursor/install.sh``.
+"""Contract tests for ``mempalace/hooks/cursor/install.sh``.
 
 The installer's job is to merge MemPalace hook entries into a Cursor
 ``hooks.json`` file without:
@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-INSTALL_SH = REPO_ROOT / "hooks" / "cursor" / "install.sh"
+INSTALL_SH = REPO_ROOT / "mempalace" / "hooks" / "cursor" / "install.sh"
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="install.sh is POSIX-only")
 

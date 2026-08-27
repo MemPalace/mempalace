@@ -12,7 +12,7 @@
 #
 # === USAGE ===
 #
-#   hooks/cursor/install.sh [options]
+#   mempalace/hooks/cursor/install.sh [options]
 #
 # Options:
 #   --scope user|project   Target scope. Default: user.
@@ -203,7 +203,7 @@ MERGE_PY="$(mktemp "${TMPDIR:-/tmp}/mempal-install-merge.XXXXXX")"
 trap 'rm -f "$MERGE_PY"' EXIT
 
 cat > "$MERGE_PY" <<'PYEOF'
-"""hooks.json merge helper for hooks/cursor/install.sh.
+"""hooks.json merge helper for mempalace/hooks/cursor/install.sh.
 
 Argv:
     sys.argv[1]: path to hooks.json (may not exist)

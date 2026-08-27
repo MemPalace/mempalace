@@ -1,7 +1,7 @@
 # MemPalace — Antigravity examples
 
 Two standalone configs for users who don't want to use the
-`hooks/antigravity/install.sh` installer.
+`mempalace/hooks/antigravity/install.sh` installer.
 
 ## Files
 
@@ -28,7 +28,7 @@ If you'd rather have the paths absolutized automatically, run the
 installer:
 
 ```bash
-bash hooks/antigravity/install.sh
+bash mempalace/hooks/antigravity/install.sh
 ```
 
 That writes a fully rendered `hooks.json` to
@@ -68,7 +68,7 @@ ls ~/.mempalace/                 # confirm palace exists (run `mempalace init` i
 Restart Antigravity. The `mempalace` MCP server should appear in the
 MCP store; the Stop and PreInvocation hooks fire automatically.
 
-See [`hooks/antigravity/STDIN_SHAPE.md`](../../hooks/antigravity/STDIN_SHAPE.md)
+See [`mempalace/hooks/antigravity/STDIN_SHAPE.md`](../../mempalace/hooks/antigravity/STDIN_SHAPE.md)
 for the exact wire format Antigravity uses, and
 [`website/guide/antigravity.md`](../../website/guide/antigravity.md)
 for the full user-facing guide.

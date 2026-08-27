@@ -6,7 +6,7 @@
 # transcript every Nth save into the user's MemPalace, and to write a
 # diary checkpoint via `mempalace mine --mode convos`.
 #
-# Mirrors the Claude Code (hooks/mempal_save_hook.sh) and Codex
+# Mirrors the Claude Code (mempalace/hooks/mempal_save_hook.sh) and Codex
 # (.codex-plugin/hooks/mempal-hook.sh) integrations as closely as the
 # Antigravity stdin/stdout contract allows. Differences:
 #

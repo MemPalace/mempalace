@@ -1,12 +1,12 @@
 # MemPalace Cursor IDE Hooks
 
 Auto-save and session-recall hooks for the [Cursor](https://cursor.com) IDE,
-matching the behaviour of the existing Claude Code + Codex hooks at the repo
-root and adding two Cursor-only capabilities (`sessionStart` recall and a
+matching the behaviour of the existing Claude Code + Codex hooks under
+`mempalace/hooks/` and adding two Cursor-only capabilities (`sessionStart` recall and a
 preCompact transcript snapshot).
 
 For the rendered documentation see
-[`website/guide/cursor-hooks.md`](../../website/guide/cursor-hooks.md) or
+[`website/guide/cursor-hooks.md`](../../../website/guide/cursor-hooks.md) or
 the published version at
 [mempalaceofficial.com/guide/cursor-hooks](https://mempalaceofficial.com/guide/cursor-hooks.html).
 
@@ -26,13 +26,13 @@ the published version at
 Preview first (writes nothing, prints the would-be JSON to stdout):
 
 ```bash
-hooks/cursor/install.sh --scope user --dry-run
+mempalace/hooks/cursor/install.sh --scope user --dry-run
 ```
 
 Apply — writes `~/.cursor/hooks.json` and copies the scripts to `~/.mempalace/hooks/cursor/`:
 
 ```bash
-hooks/cursor/install.sh --scope user
+mempalace/hooks/cursor/install.sh --scope user
 ```
 
 Pass `--scope project --target <repo>` to write `<repo>/.cursor/hooks.json` instead.
@@ -50,7 +50,7 @@ The minimum wiring is `stop` only. Add to `~/.cursor/hooks.json`:
   "hooks": {
     "stop": [
       {
-        "command": "/absolute/path/to/hooks/cursor/mempal_save_hook_cursor.sh",
+        "command": "/absolute/path/to/mempalace/hooks/cursor/mempal_save_hook_cursor.sh",
         "loop_limit": 1
       }
     ]
@@ -59,7 +59,7 @@ The minimum wiring is `stop` only. Add to `~/.cursor/hooks.json`:
 ```
 
 For the full triple (recommended), also wire `sessionStart` and `preCompact`
-— see [`examples/cursor/hooks.json`](../../examples/cursor/hooks.json).
+— see [`examples/cursor/hooks.json`](../../../examples/cursor/hooks.json).
 
 After editing the file, Cursor watches `hooks.json` and reloads
 automatically. If hooks still do not fire, restart Cursor and check the
@@ -112,7 +112,7 @@ misconfiguration cannot grow disk usage.
 
 ## What differs from the Claude Code hooks
 
-| Aspect                  | Claude Code hooks (`hooks/mempal_*.sh`)        | Cursor hooks (`hooks/cursor/*.sh`)                  |
+| Aspect                  | Claude Code hooks (`mempalace/hooks/mempal_*.sh`)        | Cursor hooks (`mempalace/hooks/cursor/*.sh`)                  |
 |-------------------------|------------------------------------------------|-----------------------------------------------------|
 | Counter key             | `session_id`                                   | `conversation_id` (Cursor's stable per-conv id)     |
 | Loop guard              | `stop_hook_active` flag in stdin               | `loop_count` field in stdin                         |
@@ -126,7 +126,7 @@ misconfiguration cannot grow disk usage.
 | Log file                | `hook.log`                                     | `cursor_hook.log` (kept separate to avoid cross-tool log churn) |
 
 See [`STDIN_SHAPE.md`](STDIN_SHAPE.md) for the per-event schema and
-[`website/guide/cursor-hooks.md`](../../website/guide/cursor-hooks.md) for
+[`website/guide/cursor-hooks.md`](../../../website/guide/cursor-hooks.md) for
 the full walkthrough with diagrams.
 
 ## Why the followup is on by default (Cursor-specific)

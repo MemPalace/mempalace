@@ -15,7 +15,7 @@
 #
 # === WHY THE FOLLOWUP FIRES BY DEFAULT (differs from the Claude hook) ===
 #
-# The Claude Code hook (hooks/mempal_save_hook.sh) is SILENT by default:
+# The Claude Code hook (mempalace/hooks/mempal_save_hook.sh) is SILENT by default:
 # its background `mempalace mine --mode convos` captures the verbatim
 # transcript on its own, and the LLM-driven diary nudge is opt-IN behind
 # MEMPAL_VERBOSE. That works because mempalace/normalize.py has a Claude
@@ -42,9 +42,9 @@
 #
 # === INSTALL ===
 #
-# Recommended path: run `hooks/cursor/install.sh` from a cloned repo,
+# Recommended path: run `mempalace/hooks/cursor/install.sh` from a cloned repo,
 # which copies the scripts to ~/.mempalace/hooks/cursor/ and merges
-# the wiring into your ~/.cursor/hooks.json. See hooks/cursor/README.md
+# the wiring into your ~/.cursor/hooks.json. See mempalace/hooks/cursor/README.md
 # for the full walkthrough, or website/guide/cursor-hooks.md for the
 # rendered version.
 #

@@ -160,6 +160,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mempalace"]
+artifacts = [
+    "mempalace/hooks/**/*.md",
+    "mempalace/hooks/**/*.sh",
+]
 
 [tool.ruff]
 line-length = 100

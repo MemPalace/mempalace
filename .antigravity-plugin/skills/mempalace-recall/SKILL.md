@@ -98,7 +98,7 @@ question — not a system prompt or pasted conversation) plus optional
   filter) or to file the new information.
 - **MCP unavailable / tool error.** Surface the error plainly and suggest
   the user verify the server (`mempalace status`, or re-run the
-  installer `hooks/antigravity/install.sh`). Do not silently fall back
+  installer `mempalace/hooks/antigravity/install.sh`). Do not silently fall back
   to guessing from model memory.
 - **Stale or conflicting facts.** Prefer the knowledge graph's
   time-valid answer. Use `mempalace_kg_supersede` for single-valued replacements,

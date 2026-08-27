@@ -3,7 +3,7 @@
 Lifecycle hooks for the [Antigravity IDE](https://antigravity.google/).
 
 This is the third sibling of the Claude Code and Codex integrations
-(see `hooks/mempal_save_hook.sh` and `.codex-plugin/hooks/`). The
+(see `mempalace/hooks/mempal_save_hook.sh` and `.codex-plugin/hooks/`). The
 overall shape is the same — a Stop event triggers a background save,
 a startup-time event injects memory into the agent — but the wire
 format and STDOUT contract are Antigravity-specific (see
@@ -14,7 +14,7 @@ format and STDOUT contract are Antigravity-specific (see
 From the repo root:
 
 ```bash
-bash hooks/antigravity/install.sh
+bash mempalace/hooks/antigravity/install.sh
 ```
 
 This installs the plugin to `~/.gemini/config/plugins/mempalace/`.
@@ -24,13 +24,13 @@ automatically.
 To dry-run first:
 
 ```bash
-bash hooks/antigravity/install.sh --dry-run
+bash mempalace/hooks/antigravity/install.sh --dry-run
 ```
 
 To uninstall:
 
 ```bash
-bash hooks/antigravity/install.sh --uninstall
+bash mempalace/hooks/antigravity/install.sh --uninstall
 ```
 
 ## What gets installed
@@ -105,7 +105,7 @@ If you want MemPalace to load only inside a specific workspace,
 manually copy the rendered plugin into your workspace's `.agents/plugins/`:
 
 ```bash
-bash hooks/antigravity/install.sh --install-dir /tmp/render-stage
+bash mempalace/hooks/antigravity/install.sh --install-dir /tmp/render-stage
 mkdir -p <workspace>/.agents/plugins/
 cp -r /tmp/render-stage <workspace>/.agents/plugins/mempalace
 rm -rf /tmp/render-stage
@@ -166,7 +166,7 @@ canonical UX and what we recommend.
   Antigravity uses, with worked examples.
 - [../mempal_save_hook.sh](../mempal_save_hook.sh) — Claude Code
   equivalent.
-- [../../.codex-plugin/hooks/](../../.codex-plugin/hooks/) — Codex
+- [../../../.codex-plugin/hooks/](../../../.codex-plugin/hooks/) — Codex
   equivalent.
-- [../../website/guide/antigravity.md](../../website/guide/antigravity.md)
+- [../../../website/guide/antigravity.md](../../../website/guide/antigravity.md)
   — full user-facing guide.

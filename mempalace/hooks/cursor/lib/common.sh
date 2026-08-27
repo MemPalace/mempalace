@@ -3,7 +3,7 @@
 #
 # Sourced by the three Cursor hooks (stop / preCompact / sessionStart).
 # Mirrors the conventions of the existing Claude Code hook scripts
-# (hooks/mempal_save_hook.sh, hooks/mempal_precompact_hook.sh) so a
+# (mempalace/hooks/mempal_save_hook.sh, mempalace/hooks/mempal_precompact_hook.sh) so a
 # user who already debugs one knows how to debug the other:
 #
 #   * STATE_DIR layout under ~/.mempalace/hook_state/
@@ -461,7 +461,7 @@ mempal_infer_wing() {
 
 # ── Transcript path validation ────────────────────────────────────────
 #
-# Mirrors hooks/mempal_save_hook.sh::is_valid_transcript_path so the
+# Mirrors mempalace/hooks/mempal_save_hook.sh::is_valid_transcript_path so the
 # Cursor and Claude Code hooks reject the same shapes:
 #   * non-empty
 #   * .json or .jsonl suffix

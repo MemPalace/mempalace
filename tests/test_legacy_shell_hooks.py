@@ -5,7 +5,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _hook(name):
-    return (ROOT / "hooks" / name).read_text(encoding="utf-8")
+    return (ROOT / "mempalace" / "hooks" / name).read_text(encoding="utf-8")
 
 
 def test_save_hook_uses_shared_parser_and_utf8_counter():

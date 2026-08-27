@@ -80,7 +80,7 @@ Edit your `~/.gemini/settings.json` and add the following:
 
 Make sure the hook scripts are executable:
 ```bash
-chmod +x hooks/*.sh
+chmod +x mempalace/hooks/*.sh
 ```
 
 ## 5. Usage

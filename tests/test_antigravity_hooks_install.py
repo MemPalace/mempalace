@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-INSTALL_SH = REPO_ROOT / "hooks" / "antigravity" / "install.sh"
+INSTALL_SH = REPO_ROOT / "mempalace" / "hooks" / "antigravity" / "install.sh"
 
 # Skip on Windows — install.sh is bash and uses POSIX path semantics.
 pytestmark = pytest.mark.skipif(

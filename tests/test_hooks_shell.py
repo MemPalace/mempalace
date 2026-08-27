@@ -30,9 +30,10 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SAVE_HOOK = REPO_ROOT / "hooks" / "mempal_save_hook.sh"
-PRECOMPACT_HOOK = REPO_ROOT / "hooks" / "mempal_precompact_hook.sh"
-SESSION_END_HOOK = REPO_ROOT / "hooks" / "mempal_session_end_hook.sh"
+HOOKS_DIR = REPO_ROOT / "mempalace" / "hooks"
+SAVE_HOOK = HOOKS_DIR / "mempal_save_hook.sh"
+PRECOMPACT_HOOK = HOOKS_DIR / "mempal_precompact_hook.sh"
+SESSION_END_HOOK = HOOKS_DIR / "mempal_session_end_hook.sh"
 PLUGIN_SESSION_END_HOOK = REPO_ROOT / ".claude-plugin" / "hooks" / "mempal-session-end-hook.sh"
 
 

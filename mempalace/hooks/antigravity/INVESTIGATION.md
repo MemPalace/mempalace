@@ -234,9 +234,9 @@ We ship a minimal `plugin.json` of `{"name": "mempalace"}`.
 | Plugin manifest           | `.antigravity-plugin/plugin.json` — minimal, verified shape               |
 | MCP auto-registration     | `.antigravity-plugin/mcp_config.json` — registers `mempalace-mcp` stdio    |
 | Skill                     | `.antigravity-plugin/skills/mempalace/SKILL.md` — real file, frontmatter   |
-| `Stop` hook               | `hooks/antigravity/mempal_save_hook_antigravity.sh` — counter + auto-mine |
-| `PreInvocation` hook      | `hooks/antigravity/mempal_wake_hook_antigravity.sh` — wake injection       |
-| Installer                 | `hooks/antigravity/install.sh` — idempotent, basename-match uninstall      |
+| `Stop` hook               | `mempalace/hooks/antigravity/mempal_save_hook_antigravity.sh` — counter + auto-mine |
+| `PreInvocation` hook      | `mempalace/hooks/antigravity/mempal_wake_hook_antigravity.sh` — wake injection       |
+| Installer                 | `mempalace/hooks/antigravity/install.sh` — idempotent, basename-match uninstall      |
 | User-facing docs          | `website/guide/antigravity.md` + sidebar wiring                            |
 | Examples                  | `examples/antigravity/{hooks.json,mcp_config.json,README.md}`              |
 | Tests                     | 3 test files mirroring the cursor blueprint                                |
@@ -282,7 +282,7 @@ directory; we do not impose them.
 
 The installer writes to the global location at
 `~/.gemini/config/plugins/mempalace/`. Workspace-scoped installs are
-documented in `hooks/antigravity/README.md` for users who want to
+documented in `mempalace/hooks/antigravity/README.md` for users who want to
 limit MemPalace to one workspace; they can `cp -r .antigravity-plugin
 <workspace>/.agents/plugins/mempalace`. We do not install there
 automatically because the canonical UX is global.
