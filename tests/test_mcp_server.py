@@ -1675,6 +1675,44 @@ class TestNoneMetadataSafety:
         assert _safe_meta("not a dict") == {}
         assert _safe_meta(["wing", "x"]) == {}
 
+    def test_response_meta_drops_the_source_directory_identity(self):
+        """It is bookkeeping ``sync`` reads off the metadata itself, and it
+        describes the host's filesystem, which is why the path beside it is
+        already cut down to a basename (#2320)."""
+        from mempalace.mcp_server import _response_safe_meta
+
+        safe = _response_safe_meta(
+            {
+                "wing": "demo",
+                "source_file": "/home/someone/project/notes.md",
+                "source_dir_ino": "1515983",
+            }
+        )
+
+        assert "source_dir_ino" not in safe
+        assert safe["source_file"] == "notes.md"
+        assert safe["wing"] == "demo"
+
+    def test_response_meta_leaves_the_record_it_was_given_alone(self):
+        """``_safe_meta`` hands back the caller's own dict, so both edits here
+        are removals from an object something else may still be holding. One
+        of them takes the field a writer path decides by: a record read for a
+        response and then written back would come out of it without an
+        identity, and the drawer would be decided as if it had never carried
+        one (#2320)."""
+        from mempalace.mcp_server import _response_safe_meta
+
+        record = {
+            "wing": "demo",
+            "source_file": "/home/someone/project/notes.md",
+            "source_dir_ino": "1515983",
+        }
+        safe = _response_safe_meta(record)
+
+        assert safe is not record
+        assert record["source_dir_ino"] == "1515983"
+        assert record["source_file"] == "/home/someone/project/notes.md"
+
     def test_get_drawer_tolerates_none_metadata(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from unittest.mock import MagicMock
@@ -2113,6 +2151,37 @@ class TestSearchTool:
 
 
 class TestWriteTools:
+    def test_add_drawer_records_the_directory_it_names(
+        self, monkeypatch, config, palace_path, kg, tmp_path
+    ):
+        """A drawer filed here names a source file the same way a mined one
+        does, and ``sync`` decides both by the same rule (#2320). Without the
+        identity this tool would file the one kind of drawer in a palace that
+        sync cannot protect."""
+        from mempalace import source_identity as si
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        source = tmp_path / "note.md"
+        source.write_text("hello")
+
+        result = tool_add_drawer(
+            wing="test_wing",
+            room="test_room",
+            content="A drawer filed with a source file behind it.",
+            source_file=str(source),
+        )
+
+        assert result["success"] is True
+        stored = col.get(ids=[result["drawer_id"]], include=["metadatas"])
+        expected = si.directory_identity(tmp_path)
+        assert expected is not None, "the filesystem reports no inode to record"
+        assert stored["metadatas"], stored
+        assert stored["metadatas"][0].get("source_dir_ino") == expected
+
     def test_add_drawer(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         _client, _col = _get_collection(palace_path, create=True)

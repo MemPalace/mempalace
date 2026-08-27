@@ -927,3 +927,118 @@ def test_scan_convos_accepts_one_file_without_scanning_siblings(
     )
 
     assert scan_convos(str(selected)) == [selected.resolve()]
+
+
+class TestSourceDirectoryIdentity:
+    """A transcript on a volume that goes away must not have its drawers
+    pruned by a witness that was never on that volume (#2320)."""
+
+    def test_the_identity_is_stamped_on_every_chunk(self, monkeypatch):
+        import contextlib
+
+        import mempalace.convo_miner as convo_miner
+
+        class FakeCol:
+            def __init__(self):
+                self.metadatas: list = []
+
+            def get(self, *args, **kwargs):
+                return {"ids": []}
+
+            def delete(self, *args, **kwargs):
+                pass
+
+            def upsert(self, documents, ids, metadatas):
+                self.metadatas.extend(metadatas)
+
+        chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3)]
+        col = FakeCol()
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        _file_chunks_locked(
+            col,
+            "chat.txt",
+            chunks,
+            "wing",
+            "general",
+            "agent",
+            "exchange",
+            source_dir_ino="1000000",
+        )
+
+        assert col.metadatas
+        assert all(m["source_dir_ino"] == "1000000" for m in col.metadatas), col.metadatas
+
+    def test_no_identity_leaves_the_key_off(self, monkeypatch):
+        import contextlib
+
+        import mempalace.convo_miner as convo_miner
+
+        class FakeCol:
+            def __init__(self):
+                self.metadatas: list = []
+
+            def get(self, *args, **kwargs):
+                return {"ids": []}
+
+            def delete(self, *args, **kwargs):
+                pass
+
+            def upsert(self, documents, ids, metadatas):
+                self.metadatas.extend(metadatas)
+
+        col = FakeCol()
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        _file_chunks_locked(
+            col,
+            "chat.txt",
+            [{"content": "chunk " * 40, "chunk_index": 0}],
+            "w",
+            "g",
+            "a",
+            "exchange",
+        )
+
+        assert col.metadatas
+        assert all("source_dir_ino" not in m for m in col.metadatas), col.metadatas
+
+
+def test_mine_convos_passes_the_directory_it_read_from(tmp_path, monkeypatch):
+    """The storing half is covered above; this covers the wiring, so removing
+    the call in ``_mine_convos_impl`` cannot pass unnoticed (#2320)."""
+    from mempalace import convo_miner
+    from mempalace import source_identity as si
+
+    transcripts = tmp_path / "transcripts"
+    transcripts.mkdir()
+    transcript = transcripts / "session.jsonl"
+    transcript.write_text(
+        '{"type":"user","message":{"role":"user","content":"'
+        + "a conversation long enough to file a drawer " * 6
+        + '"},"timestamp":"2026-04-13T10:00:00Z","uuid":"u1","sessionId":"s1"}\n',
+        encoding="utf-8",
+    )
+
+    seen = {}
+
+    def record(*args, **kwargs):
+        seen["source_dir_ino"] = kwargs.get("source_dir_ino")
+        # Same shape the real helper returns: (drawers_added, room_delta,
+        # skipped), with the middle one a mapping the caller merges.
+        return (0, {}, True)
+
+    monkeypatch.setattr(convo_miner, "_file_chunks_locked", record)
+    # The stub returns what the real helper returns, so the pass runs to the
+    # end and a failure after the recorded call is a failure of this test.
+    convo_miner.mine_convos(str(transcripts), str(tmp_path / "palace"))
+
+    assert seen.get("source_dir_ino") == si.directory_identity(transcripts)
