@@ -10,6 +10,7 @@ from mempalace.palace import (
 )
 from mempalace.searcher import (
     _candidate_pool_limits,
+    _closet_boosts,
     _dedupe_rendered_hits,
     _enrich_closet_hits,
     search_memories,
@@ -68,97 +69,76 @@ def test_rendered_dedup_preserves_first_ranked_closet_hit_and_plain_repeats():
 def test_closet_enrichment_memoises_by_source_and_parent_group():
     drawers_col = MagicMock()
 
-    def get_group(
-        *,
-        where,
-        include,
-    ):
-        assert include == [
-            "documents",
-            "metadatas",
-        ]
-
+    def get_group(*, where, include):
+        assert include == ["documents", "metadatas"]
         parent = where["$and"][1]["parent_drawer_id"]
-
         return SimpleNamespace(
-            documents=[
-                (f"{parent} token best chunk"),
-                (f"{parent} neighboring context"),
-            ],
-            metadatas=[
-                {
-                    "chunk_index": 0,
-                },
-                {
-                    "chunk_index": 1,
-                },
-            ],
+            documents=[f"{parent} raw {index}" for index in range(5)],
+            metadatas=[{"chunk_index": index} for index in range(5)],
         )
 
     drawers_col.get.side_effect = get_group
-
     hits = [
         {
-            "drawer_id": "a-0",
-            "text": "raw a0",
-            "matched_via": ("drawer+closet"),
-            "_source_file_full": ("/shared/log.md"),
-            "_parent_drawer_id": ("parent-a"),
+            "drawer_id": "a_0",
+            "text": "parent-a raw 0",
+            "matched_via": "drawer+closet",
+            "_source_file_full": "/shared/log.md",
+            "_parent_drawer_id": "parent-a",
+            "_chunk_index": 0,
         },
         {
-            "drawer_id": "a-1",
-            "text": "raw a1",
-            "matched_via": ("drawer+closet"),
-            "_source_file_full": ("/shared/log.md"),
-            "_parent_drawer_id": ("parent-a"),
+            "drawer_id": "a_4",
+            "text": "parent-a raw 4",
+            "matched_via": "drawer+closet",
+            "_source_file_full": "/shared/log.md",
+            "_parent_drawer_id": "parent-a",
+            "_chunk_index": 4,
         },
         {
-            "drawer_id": "b-0",
-            "text": "raw b0",
-            "matched_via": ("drawer+closet"),
-            "_source_file_full": ("/shared/log.md"),
-            "_parent_drawer_id": ("parent-b"),
+            "drawer_id": "b_2",
+            "text": "parent-b raw 2",
+            "matched_via": "drawer+closet",
+            "_source_file_full": "/shared/log.md",
+            "_parent_drawer_id": "parent-b",
+            "_chunk_index": 2,
         },
     ]
 
-    _enrich_closet_hits(
-        hits,
-        drawers_col,
-        "token",
-    )
+    _enrich_closet_hits(hits, drawers_col, "token")
 
     assert drawers_col.get.call_count == 2
-    assert hits[0]["text"] == hits[1]["text"]
-    assert "parent-a" in hits[0]["text"]
-    assert "parent-b" in hits[2]["text"]
-    assert hits[0]["text"] != hits[2]["text"]
+    assert "parent-a raw 0" in hits[0]["text"]
+    assert "parent-a raw 4" not in hits[0]["text"]
+    assert "parent-a raw 4" in hits[1]["text"]
+    assert "parent-a raw 0" not in hits[1]["text"]
+    assert "parent-b raw 2" in hits[2]["text"]
+    assert [hit["drawer_id"] for hit in hits] == ["a_0", "a_4", "b_2"]
+    assert [hit["drawer_index"] for hit in hits] == [0, 4, 2]
 
 
-def test_search_promotes_distinct_results_from_wider_pool_and_fetches_source_once():
+def test_search_promotes_only_drawers_named_by_matching_closet():
     repeated_source = "/project/large.md"
     query = "quasar authentication token rotation"
-
-    repeated_documents = [(f"raw repeated-source drawer {index}") for index in range(5)]
-    fallback_documents = [(f"independent fallback passage {index}") for index in range(4)]
-    documents = repeated_documents + fallback_documents
-
-    repeated_metadatas = [
+    documents = [f"source drawer {index}" for index in range(5)] + [
+        f"independent fallback passage {index}" for index in range(4)
+    ]
+    metadatas = [
         {
-            "source_file": (repeated_source),
+            "source_file": repeated_source,
             "wing": "code",
             "room": "docs",
             "chunk_index": index,
-            "filed_at": (f"2026-08-04T00:00:0{index}"),
+            "filed_at": f"2026-08-04T00:00:0{index}",
         }
         for index in range(5)
-    ]
-    fallback_metadatas = [
+    ] + [
         {
-            "source_file": (f"/project/fallback-{index}.md"),
+            "source_file": f"/project/fallback-{index}.md",
             "wing": "code",
             "room": "docs",
             "chunk_index": 0,
-            "filed_at": (f"2026-08-04T00:01:0{index}"),
+            "filed_at": f"2026-08-04T00:01:0{index}",
         }
         for index in range(4)
     ]
@@ -167,101 +147,38 @@ def test_search_promotes_distinct_results_from_wider_pool_and_fetches_source_onc
     drawers_col.distance_metric = "cosine"
     drawers_col.query.return_value = {
         "ids": [
-            [
-                *[f"same-{index}" for index in range(5)],
-                *[f"fallback-{index}" for index in range(4)],
-            ]
+            [*[f"same_{index}" for index in range(5)], *[f"fallback_{index}" for index in range(4)]]
         ],
         "documents": [documents],
-        "metadatas": [(repeated_metadatas + fallback_metadatas)],
-        "distances": [
-            [
-                0.05,
-                0.06,
-                0.07,
-                0.08,
-                0.09,
-                0.45,
-                0.46,
-                0.47,
-                0.48,
-            ]
-        ],
+        "metadatas": [metadatas],
+        "distances": [[0.05, 0.06, 0.07, 0.08, 0.09, 0.45, 0.46, 0.47, 0.48]],
     }
     drawers_col.get.return_value = SimpleNamespace(
-        documents=[
-            ("context before the target"),
-            ("quasar authentication token rotation exact target"),
-            ("context after the target"),
-        ],
-        metadatas=[
-            {
-                "chunk_index": 0,
-            },
-            {
-                "chunk_index": 1,
-            },
-            {
-                "chunk_index": 2,
-            },
-        ],
+        documents=[f"source drawer {index}" for index in range(5)],
+        metadatas=[{"chunk_index": index} for index in range(5)],
     )
 
     closets_col = MagicMock()
     closets_col.query.return_value = {
-        "ids": [
-            [
-                "closet-1",
-            ]
-        ],
-        "documents": [
-            [
-                query,
-            ]
-        ],
-        "metadatas": [
-            [
-                {
-                    "source_file": (repeated_source),
-                }
-            ]
-        ],
-        "distances": [
-            [
-                0.1,
-            ]
-        ],
+        "ids": [["closet_1"]],
+        "documents": [[f"{query}|topic|→same_2"]],
+        "metadatas": [[{"source_file": repeated_source}]],
+        "distances": [[0.1]],
     }
 
-    with patch(
-        "mempalace.searcher.get_collection",
-        return_value=drawers_col,
-    ):
-        with patch(
-            "mempalace.searcher.get_closets_collection",
-            return_value=closets_col,
-        ):
-            result = search_memories(
-                query,
-                "/fake/palace",
-                n_results=5,
-            )
+    with patch("mempalace.searcher.get_collection", return_value=drawers_col):
+        with patch("mempalace.searcher.get_closets_collection", return_value=closets_col):
+            result = search_memories(query, "/fake/palace", n_results=9)
 
-    hits = result["results"]
-    rendered_keys = {
-        (
-            hit["source_path"],
-            hit["text"],
-        )
-        for hit in hits
-    }
-
-    assert len(hits) == 5
-    assert len(rendered_keys) == 5
-    assert hits[0]["drawer_id"] == "same-0"
-    assert drawers_col.query.call_args.kwargs["n_results"] == 20
+    by_id = {hit["drawer_id"]: hit for hit in result["results"]}
     assert drawers_col.get.call_count == 1
-    assert sum(hit["source_path"] == repeated_source for hit in hits) == 1
+    assert by_id["same_2"]["matched_via"] == "drawer+closet"
+    assert by_id["same_2"]["closet_boost"] > 0
+    assert "source drawer 2" in by_id["same_2"]["text"]
+    for drawer_id in ("same_0", "same_1", "same_3", "same_4"):
+        assert by_id[drawer_id]["matched_via"] == "drawer"
+        assert by_id[drawer_id]["closet_boost"] == 0
+        assert by_id[drawer_id]["text"] == documents[int(drawer_id.rsplit("_", 1)[1])]
 
 
 def test_process_file_preserves_legitimate_exact_repeats_at_different_positions(
@@ -414,3 +331,22 @@ def test_candidate_pool_limits_widen_only_default_vector_strategy():
         15,
         5,
     )
+
+
+def test_closet_boosts_ignore_unreferenced_siblings_from_same_source():
+    closets_col = MagicMock()
+    closets_col.query.return_value = {
+        "ids": [["closet_1"]],
+        "documents": [["target topic|entity|→keep_id,second_id"]],
+        "metadatas": [[{"source_file": "/shared/source.md"}]],
+        "distances": [[0.12]],
+    }
+    boosts = _closet_boosts(
+        closets_col,
+        query="target topic",
+        n_results=5,
+        where={},
+    )
+    assert set(boosts) == {"keep_id", "second_id"}
+    assert "unrelated_same_source_id" not in boosts
+    assert boosts["keep_id"][1] == 0.12
