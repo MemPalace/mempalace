@@ -117,11 +117,13 @@ enough because each long-lived process can retain SQLite/WAL, FTS, or vector
 index state between calls.
 
 - A writable daemon owns the palace writer lease for its full lifetime.
-- Writable MCP HTTP acquires that lease before binding, holds it through the
-  full serving lifetime, and releases it after active requests stop.
+- Writable MCP HTTP acquires that lease before binding. It releases the lease
+  after a configurable write-idle period and reacquires it on the next
+  mutating request.
 - MCP stdio opens `sqlite_exact` read-only until it acquires the writer lease.
   It may therefore coexist for reads; mutating tools refuse while another
-  process owns the lease and reopen writable storage after that owner exits.
+  process owns the lease. A server that owns the lease releases it after the
+  same write-idle period and reacquires it when it next needs to write.
 - Read-only MCP HTTP may coexist with the writer.
 - Read-only `sqlite_exact` clients use an immutable connection for a clean
   checkpointed database, or `mode=ro` when an active writer's complete WAL
@@ -144,6 +146,48 @@ Do not delete or unlink a live palace lock to recover ownership. Stop the
 owning process cleanly; the operating system releases its lock automatically.
 If corruption is suspected, back up the palace and run integrity/repair
 operations offline, with no writable service running.
+
+### Idle MCP writer lease release
+
+The stdio and HTTP MCP transports start a writer-idle watchdog. When no
+mutating tool has completed for 10 minutes, and no storage-touching request is
+in flight, the watchdog closes this process's storage handles and releases its
+writer lease. The next mutating request tries to acquire the lease again. It
+continues normally if the lease is free, or returns the peer-writer refusal if
+another process acquired it during the idle gap.
+
+Configure the threshold with `MEMPALACE_MCP_WRITER_IDLE_MINUTES`. The default
+is `10`; `0` disables idle release and restores hold-until-exit behavior. An
+unparseable value uses the 10-minute default, and a negative value is treated
+as `0`.
+
+This watchdog is independent of `MEMPALACE_MCP_IDLE_HOURS`. Setting the
+process idle timeout to `0` keeps an MCP server running, but does not disable
+writer-lease release. This separation lets an always-on server remain
+available without keeping local peers read-only while it is not writing.
+
+### Prefer one server where you control the deployment
+
+Where every client can use HTTP, prefer one `mempalace serve` process as the
+palace's writer. Concurrent client requests then serialize inside one process
+instead of moving the writer lease between processes. The systemd template is
+[`deploy/mempalace-server.service`](../deploy/mempalace-server.service).
+
+Local stdio clients and compatible CLI operations can discover that server
+through the per-palace registry in `~/.mempalace/server/<key>/`. The registry
+and its bearer token live under the current operating-system user's home. A
+server running under a dedicated service account therefore does not publish a
+registry that a human user's local clients can see. Discovery fails quietly in
+that topology and the client uses its local path, where the writer lease still
+applies. Configure those clients to use the HTTP server explicitly, or run the
+server and local forwarders under the same account.
+
+For a filesystem-level backup of a palace owned by an always-on service, stop
+the service, capture the complete palace, then restart the service and verify
+it. Do not make the backup conditional on `pgrep` finding no process under the
+service account: an always-on server makes that condition permanently false,
+so the backup would be skipped every time. Networked backends should use their
+backend-native snapshot procedure.
 
 ## Follow-up PRs
 
