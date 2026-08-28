@@ -24,6 +24,7 @@ from urllib import request as urlrequest
 
 import numpy as np
 
+from ..version import __version__
 from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
     BackendClosedError,
@@ -383,7 +384,10 @@ class _QdrantRESTClient:
         if query:
             url = f"{url}?{urlparse.urlencode(query)}"
         data = None
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": f"mempalace/{__version__}",
+        }
         if self._config.api_key:
             headers["api-key"] = self._config.api_key
         if body is not None:

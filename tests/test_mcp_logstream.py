@@ -1,7 +1,7 @@
 """
 test_mcp_logstream.py — MCP surface tests for the RFC 003 logstream tools.
 
-Covers handle_request dispatch for the seven logstream tools, read-only
+Covers handle_request dispatch for the eight logstream tools, read-only
 mode (hidden from tools/list AND refused at dispatch), the peer-writer
 exemption, the Chroma-integrity-gate exemption, and a cross-thread
 append/wait round trip through the dispatch layer.
@@ -18,6 +18,7 @@ from mempalace import mcp_server
 LOGSTREAM_TOOLS = frozenset(
     {
         "mempalace_event_append",
+        "mempalace_task_create",
         "mempalace_event_list",
         "mempalace_event_wait",
         "mempalace_event_ack",
@@ -29,6 +30,7 @@ LOGSTREAM_TOOLS = frozenset(
 LOGSTREAM_MUTATING = frozenset(
     {
         "mempalace_event_append",
+        "mempalace_task_create",
         "mempalace_event_ack",
         "mempalace_artifact_put",
         "mempalace_patch_submit",
@@ -97,6 +99,61 @@ class TestRegistration:
 
 
 class TestDispatch:
+    def test_task_create_builds_the_same_high_level_handoff_for_remote_clients(
+        self, patched_server
+    ):
+        created = _result(
+            _call(
+                patched_server,
+                "mempalace_task_create",
+                {
+                    "project": "mempalace",
+                    "from_agent": "mac-claude",
+                    "to_agent": "windows-codex",
+                    "goal": "Fix remote task creation.",
+                    "branch": "fix/remote-task",
+                    "base_commit": "abc1234",
+                    "done": "Focused tests pass and a patch is submitted.",
+                },
+            )
+        )
+
+        assert created["success"] is True
+        assert created["task"]["type"] == "task.request"
+        assert created["task"]["correlation_id"].startswith("task_fix_remote_task_creation_")
+        assert created["handoff"].startswith("Open MemPalace task task_fix_remote_task_creation_")
+        assert created["task"]["body"] == (
+            "Goal:\nFix remote task creation.\n\n"
+            "Definition of done:\nFocused tests pass and a patch is submitted.\n\n"
+            "Delivery:\nClose the loop through MemPalace: claim the request, then submit a patch "
+            "with mempalace_patch_submit or reply with blocked/failed evidence."
+        )
+
+    def test_task_create_rejects_a_mutable_base_reference(self, patched_server):
+        created = _result(
+            _call(
+                patched_server,
+                "mempalace_task_create",
+                {
+                    "project": "mempalace",
+                    "from_agent": "mac-claude",
+                    "to_agent": "windows-codex",
+                    "goal": "Fix remote task creation.",
+                    "branch": "fix/remote-task",
+                    "base_commit": "main",
+                    "done": "Focused tests pass and a patch is submitted.",
+                },
+            )
+        )
+
+        assert created == {
+            "success": False,
+            "error": (
+                "task base commit must be a hexadecimal Git object id "
+                "(at least 7 characters), not a branch or tag"
+            ),
+        }
+
     def test_append_then_list(self, patched_server):
         appended = _result(_call(patched_server, "mempalace_event_append", APPEND_ARGS))
         assert appended["success"] is True

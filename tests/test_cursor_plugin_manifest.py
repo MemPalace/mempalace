@@ -299,6 +299,41 @@ class TestSkills:
         """
         assert (SKILLS_DIR / "mempalace-recall" / "SKILL.md").is_file()
 
+    def test_mempalace_task_skill_exists(self):
+        assert (SKILLS_DIR / "mempalace-task" / "SKILL.md").is_file()
+
+    def test_setup_skill_covers_skill_first_shared_brain_onboarding(self):
+        body = (SKILLS_DIR / "mempalace" / "SKILL.md").read_text(encoding="utf-8")
+        for contract in (
+            "uv tool install mempalace",
+            "private local palace",
+            "shared-brain hub",
+            "client joining an existing hub",
+            "mempalace rules --agent",
+            "mempalace logstream",
+        ):
+            assert contract in body, f"setup skill is missing onboarding contract: {contract}"
+
+    def test_task_skill_uses_the_task_cli_and_requires_exact_preview(self):
+        body = (SKILLS_DIR / "mempalace-task" / "SKILL.md").read_text(encoding="utf-8")
+        for contract in (
+            "mempalace_task_create",
+            "mempalace task create",
+            "exact normalized task",
+            "Ready to paste",
+            "mempalace task launch",
+            "coordination-protocol.md",
+        ):
+            assert contract in body, f"task skill is missing workflow contract: {contract}"
+
+    def test_standalone_skills_do_not_link_outside_the_installed_directory(self):
+        for skill_path in SKILLS_DIR.glob("*/SKILL.md"):
+            body = skill_path.read_text(encoding="utf-8")
+            assert "](../../" not in body, (
+                f"{skill_path.relative_to(REPO_ROOT)} links outside its copied skill directory; "
+                "use a stable public URL for npx skills add installations"
+            )
+
     def test_each_skill_has_valid_frontmatter(self):
         """Every SKILL.md must declare ``name`` (kebab-case) and a
         non-empty ``description``. Skills missing these fields silently

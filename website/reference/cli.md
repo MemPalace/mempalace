@@ -217,6 +217,64 @@ mempalace logstream watch --agent mac --type task.request --type task.reply --ty
 
 All subcommands accept `--json` for scriptable output.
 
+## `mempalace task`
+
+High-level task creation and controlled execution over the logstream. This
+interface creates the complete canonical `task.request` envelope and prints a
+short handoff that can be pasted into a destination agent; callers do not need
+to construct event fields or correlation ids themselves. Like the other
+logstream CLI commands, it operates on the local palace. A client connected to
+a remote shared-brain hub should call the equivalent
+`mempalace_task_create` MCP tool so the task is appended on the hub.
+
+```bash
+mempalace task create \
+  --project myapp \
+  --from-agent mac-claude \
+  --to-agent windows-codex \
+  --goal "Fix the flaky integration test." \
+  --branch fix/flaky-integration \
+  --base-commit 2668053 \
+  --done "The focused test passes and a patch is submitted."
+```
+
+The command appends an immutable `task.request`, generates a
+`task_<goal>_<entropy>` correlation id, and prints a `Ready to paste` line.
+Use `--goal-file` or `--done-file` when the exact text is multiline. `--json`
+returns `{"task": <event>, "handoff": <line>}`.
+`--base-commit` must be an immutable hexadecimal object id (abbreviated or
+full), not a branch or tag whose target could move after the event is stored.
+
+An explicitly controlled workflow can start a supported headless runner from
+the stored task:
+
+```bash
+mempalace task launch task_fix_the_flaky_integration_test_7f3a9c10 \
+  --runner codex --workspace /path/to/trusted/checkout
+```
+
+For a remote-only MCP client, fetch the full single `task.request` event through
+`mempalace_event_list`, save the exact event object as JSON on the destination
+machine, and use `--task-file` instead of a task id. This avoids accidentally
+resolving the task from an unrelated local palace:
+
+```bash
+mempalace task launch --task-file task-request.json \
+  --runner codex --workspace /path/to/trusted/checkout
+```
+
+Supported runners are `codex` and `claude`. The launcher verifies the task's
+addressed identity, refuses to override it, rejects a runner that conflicts
+with a conventional `*-codex` or `*-claude` identity, releases its logstream
+connection, and starts the runner without a shell. Broadcast tasks require a
+concrete `--agent`. It does not add permission-bypass flags or weaken the
+runner's sandbox and approval policy.
+
+| Subcommand | Description |
+|------------|-------------|
+| `create` | Append a canonical task request and print a pasteable handoff (`--project`, `--from-agent`, `--to-agent`, `--goal`/`--goal-file`, `--branch`, `--base-commit`, and `--done`/`--done-file`) |
+| `launch` | Resolve and execute an existing task with `--runner codex\|claude` in a trusted `--workspace`; `--agent` accepts broadcasts but cannot impersonate an addressed worker |
+
 ## `mempalace artifact`
 
 Exact artifact exchange for agent handoffs — unified diffs, files, logs.

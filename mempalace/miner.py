@@ -162,6 +162,14 @@ READABLE_EXTENSIONS = {
     ".toml",
     ".tex",
     ".bib",
+    # C / C++
+    ".c",
+    ".h",
+    ".cpp",
+    ".hpp",
+    ".cc",
+    ".cxx",
+    ".inl",
     # C# / .NET
     ".cs",
     ".csproj",

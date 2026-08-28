@@ -374,6 +374,7 @@ _SQLITE_INTEGRITY_ALLOWED_TOOLS = frozenset(
         # Chroma/FTS5 dependency, so agent coordination stays available
         # even while the main palace index is corrupt and under repair.
         "mempalace_event_append",
+        "mempalace_task_create",
         "mempalace_event_list",
         "mempalace_event_wait",
         "mempalace_event_ack",
@@ -433,6 +434,7 @@ _MUTATING_TOOLS = frozenset(
         "mempalace_update_drawer",
         "mempalace_diary_write",
         "mempalace_event_append",
+        "mempalace_task_create",
         "mempalace_event_ack",
         "mempalace_artifact_put",
         "mempalace_patch_submit",
@@ -449,6 +451,7 @@ _MUTATING_TOOLS = frozenset(
 _PEER_WRITER_EXEMPT_TOOLS = frozenset(
     {
         "mempalace_event_append",
+        "mempalace_task_create",
         "mempalace_event_ack",
         "mempalace_artifact_put",
         "mempalace_patch_submit",
@@ -3405,8 +3408,16 @@ def tool_mine(
         }
 
     src = os.path.expanduser(source) if source else ""
-    if not src or not os.path.isdir(src):
-        return {"success": False, "error": f"source directory not found: {source!r}"}
+    # convos accepts one conversation file as well as a directory — the CLI has
+    # always documented it that way ("Directory to mine, or one conversation
+    # file with --mode convos"), and the hooks rely on it: _ingest_transcript
+    # submits a single .jsonl. Because cmd_mine forwards to the hub whenever one
+    # is live, a directory-only precondition here made that documented form
+    # unreachable in the configuration most users run, so every hook transcript
+    # ingest failed against a running hub (#2281). The other modes still walk a
+    # tree, so they keep the directory requirement.
+    if not src or not (os.path.isdir(src) or (mode == "convos" and os.path.isfile(src))):
+        return {"success": False, "error": f"source not found: {source!r}"}
 
     def _run():
         if mode == "convos":
@@ -4719,6 +4730,36 @@ def tool_event_append(
     return {"success": True, "event": event}
 
 
+def tool_task_create(
+    project: str,
+    from_agent: str,
+    to_agent: str,
+    goal: str,
+    branch: str,
+    base_commit: str,
+    done: str,
+):
+    """Create one canonical task request for local or remote MCP clients."""
+    from .tasks import create_task
+
+    try:
+        result = _call_logstream(
+            lambda ls: create_task(
+                ls,
+                project=project,
+                from_agent=from_agent,
+                to_agent=to_agent,
+                goal=goal,
+                branch=branch,
+                base_commit=base_commit,
+                done=done,
+            )
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, **result}
+
+
 _PREVIEW_BODY_CHARS = 200
 
 
@@ -5324,6 +5365,7 @@ TOOLS = {
     "mempalace_mine": {
         "description": (
             "Mine a directory into the palace — the MCP equivalent of `mempalace mine`. "
+            "mode='convos' also accepts a single conversation file. "
             "mode='projects' (default) ingests code/docs; mode='convos' ingests chat "
             "transcripts; mode='extract' ingests office documents (PDF/DOCX/RTF, requires "
             "the mempalace[extract] extra). Runs synchronously and returns the miner's "
@@ -5336,7 +5378,7 @@ TOOLS = {
             "properties": {
                 "source": {
                     "type": "string",
-                    "description": "Directory to mine.",
+                    "description": "Directory to mine, or one conversation file with mode='convos'.",
                 },
                 "mode": {
                     "type": "string",
@@ -5626,6 +5668,45 @@ TOOLS = {
             "required": ["type", "stream", "room", "from_agent"],
         },
         "handler": tool_event_append,
+    },
+    "mempalace_task_create": {
+        "description": (
+            "Create a complete immutable task.request for another agent and return its exact"
+            " stored event plus one short ready-to-paste handoff line. Use this instead of"
+            " assembling raw task fields, especially when connected to a remote shared-brain"
+            " hub. The caller must preview the exact task with the user before this append."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string", "description": "Project routing name"},
+                "from_agent": {"type": "string", "description": "Requesting agent identity"},
+                "to_agent": {"type": "string", "description": "Worker agent identity"},
+                "goal": {"type": "string", "description": "Exact verbatim task goal"},
+                "branch": {"type": "string", "description": "Git branch for the work"},
+                "base_commit": {
+                    "type": "string",
+                    "description": (
+                        "Immutable hexadecimal commit id the worker must start from;"
+                        " branches and tags are rejected"
+                    ),
+                },
+                "done": {
+                    "type": "string",
+                    "description": "Exact verbatim definition of done",
+                },
+            },
+            "required": [
+                "project",
+                "from_agent",
+                "to_agent",
+                "goal",
+                "branch",
+                "base_commit",
+                "done",
+            ],
+        },
+        "handler": tool_task_create,
     },
     "mempalace_event_list": {
         "description": (
@@ -7037,6 +7118,7 @@ _HTTP_ACTIVE_CLIENT_WINDOW_S = 120.0
 _HTTP_LOCK_FREE_TOOLS = frozenset(
     {
         "mempalace_event_append",
+        "mempalace_task_create",
         "mempalace_event_list",
         "mempalace_event_wait",
         "mempalace_event_ack",
