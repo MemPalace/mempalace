@@ -121,7 +121,10 @@ index state between calls.
   full serving lifetime, and releases it after active requests stop.
 - MCP stdio opens `sqlite_exact` read-only until it acquires the writer lease.
   It may therefore coexist for reads; mutating tools refuse while another
-  process owns the lease and reopen writable storage after that owner exits.
+  process owns the lease. Waiting for that owner to *exit* is no longer the only
+  way out: an idle holder hands the lease over on demand, so a peer becomes
+  writable in seconds without either process restarting. See
+  `docs/writer-lease-handoff.md`.
 - Read-only MCP HTTP may coexist with the writer.
 - Read-only `sqlite_exact` clients use an immutable connection for a clean
   checkpointed database, or `mode=ro` when an active writer's complete WAL

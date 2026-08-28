@@ -1176,21 +1176,40 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
 # stale state so a forked child correctly hits the fcntl path. Access is guarded
 # by ``_palace_lock_guard`` because the set is now shared across threads.
 #
-# Fork safety: ``_palace_lock_guard`` is a real ``threading.Lock``, so a child
-# forked while another thread held it would inherit it locked (the holder thread
-# does not exist in the child) and deadlock on the next acquire. An at-fork
-# handler (registered below) replaces the guard with a fresh unlocked lock and
-# clears state in the child, which must reacquire the flock anyway.
-_palace_lock_guard = threading.Lock()
+# Fork safety: ``_palace_lock_guard`` is a real lock, so a child forked while
+# another thread held it would inherit it locked (the holder thread does not
+# exist in the child) and deadlock on the next acquire. An at-fork handler
+# (registered below) replaces the guard with a fresh unlocked lock and clears
+# state in the child, which must reacquire the flock anyway.
+#
+# The guard is a ``Condition`` (not a bare ``Lock``) because the writer-lease
+# handoff below has to *wait* for in-flight write frames to drain and, in the
+# other direction, park an arriving writer while the lease is being handed to a
+# peer process. Every existing ``with _palace_lock_guard:`` block keeps working
+# unchanged — a Condition is its own context manager.
+_palace_lock_guard = threading.Condition()
 _palace_lock_pid = None
 _palace_lock_keys = set()
+# Active *write* frames per lock key. A frame is any ``mine_palace_lock`` body
+# that is currently executing, whether it acquired the OS lock itself or took
+# re-entrant pass-through credit from an outer holder. Long-lived leases
+# (``lease=True``) deliberately do NOT count: a parked lease is exactly the
+# "holding the lock but not writing" state that the handoff exists to break.
+_palace_lock_depth: dict[str, int] = {}
+# Lock keys whose OS lock is being released for a peer right now. Arriving
+# writers park on the condition instead of taking pass-through credit, so no
+# write can start under a lease that is about to disappear.
+_palace_lock_handoff: set[str] = set()
 
 
 def _reset_palace_lock_state_after_fork() -> None:
     """Reset lock state in a forked child to avoid an inherited-locked deadlock."""
     global _palace_lock_guard, _palace_lock_pid, _palace_lock_keys
-    _palace_lock_guard = threading.Lock()
+    global _palace_lock_depth, _palace_lock_handoff
+    _palace_lock_guard = threading.Condition()
     _palace_lock_keys = set()
+    _palace_lock_depth = {}
+    _palace_lock_handoff = set()
     _palace_lock_pid = os.getpid()
 
 
@@ -1204,10 +1223,12 @@ def _holder_keys_locked():
 
     Caller MUST hold ``_palace_lock_guard``.
     """
-    global _palace_lock_pid, _palace_lock_keys
+    global _palace_lock_pid, _palace_lock_keys, _palace_lock_depth, _palace_lock_handoff
     current_pid = os.getpid()
     if _palace_lock_pid != current_pid:
         _palace_lock_keys = set()
+        _palace_lock_depth = {}
+        _palace_lock_handoff = set()
         _palace_lock_pid = current_pid
     return _palace_lock_keys
 
@@ -1218,14 +1239,58 @@ def _held_by_this_process(lock_key: str) -> bool:
         return lock_key in _holder_keys_locked()
 
 
-def _mark_held(lock_key: str) -> None:
+def _enter_frame_locked(lock_key: str, *, lease: bool) -> None:
+    """Register one active frame. Caller MUST hold ``_palace_lock_guard``."""
+    if lease:
+        return
+    _palace_lock_depth[lock_key] = _palace_lock_depth.get(lock_key, 0) + 1
+
+
+def _exit_frame_locked(lock_key: str, *, lease: bool) -> None:
+    """Drop one active frame. Caller MUST hold ``_palace_lock_guard``."""
+    if lease:
+        return
+    remaining = _palace_lock_depth.get(lock_key, 0) - 1
+    if remaining > 0:
+        _palace_lock_depth[lock_key] = remaining
+    else:
+        _palace_lock_depth.pop(lock_key, None)
+
+
+def _take_reentrant_credit(lock_key: str, *, lease: bool) -> bool:
+    """Take a pass-through frame if this process already owns ``lock_key``.
+
+    Parks while a handoff is quiescing that key: the OS lock is about to be
+    released to a peer, so handing out pass-through credit here would let a
+    write run with no lock at all — the exact double-writer window the
+    per-palace lock exists to prevent.
+    """
+    with _palace_lock_guard:
+        while lock_key in _palace_lock_handoff:
+            _palace_lock_guard.wait()
+        if lock_key not in _holder_keys_locked():
+            return False
+        _enter_frame_locked(lock_key, lease=lease)
+        return True
+
+
+def _drop_reentrant_credit(lock_key: str, *, lease: bool) -> None:
+    with _palace_lock_guard:
+        _exit_frame_locked(lock_key, lease=lease)
+        _palace_lock_guard.notify_all()
+
+
+def _mark_held(lock_key: str, *, lease: bool = False) -> None:
     with _palace_lock_guard:
         _holder_keys_locked().add(lock_key)
+        _enter_frame_locked(lock_key, lease=lease)
 
 
-def _mark_released(lock_key: str) -> None:
+def _mark_released(lock_key: str, *, lease: bool = False) -> None:
     with _palace_lock_guard:
         _holder_keys_locked().discard(lock_key)
+        _exit_frame_locked(lock_key, lease=lease)
+        _palace_lock_guard.notify_all()
 
 
 def _format_lock_holder(content: str) -> str:
@@ -1279,8 +1344,275 @@ def _write_lock_holder(lock_file) -> None:
         pass
 
 
+# ── Writer-lease handoff (semaphore with a baton) ───────────────────────────
+#
+# The palace lock is exclusive for a reason (one Chroma/SQLite writer per
+# palace), but a long-lived MCP server takes it as a *lease* and keeps it for
+# the whole process lifetime, even while it sits idle. Every other server on
+# the same palace is then read-only until that process dies. The handoff turns
+# the lease into a baton: a contender announces demand on a second lock file
+# and the idle holder — knowing no write frame is active — closes its storage
+# handles and drops the lock so the contender can take it.
+#
+# Two files per palace, both plain OS locks so a crashed process never leaves
+# stale state behind (the kernel releases both on process death):
+#
+#   mine_palace_<key>.lock   ownership. Whoever holds it may write.
+#   mine_palace_<key>.want   demand. A contender holds it while queued, so
+#                            "is anyone waiting?" is a non-blocking lock probe
+#                            rather than a timestamp/heartbeat to garbage-collect.
+#
+# Holding .want also serializes contenders: only the head of the queue polls
+# for ownership, so N idle servers cannot stampede one holder into N handoffs.
+_LOCK_WAIT_ENV = "MEMPALACE_PALACE_LOCK_WAIT_SECONDS"
+_LOCK_POLL_SECONDS = 0.05
+
+
+def _lock_wait_default() -> float:
+    """Default handoff wait for callers that do not pass one explicitly.
+
+    Zero (the default) preserves the historical fail-fast contract: hook-spawned
+    `mempalace mine` copies must keep exiting immediately instead of piling up
+    as waiters. Operators can opt the CLI into waiting via the env var; the MCP
+    writer lease passes its own wait explicitly.
+    """
+    raw = os.environ.get(_LOCK_WAIT_ENV, "").strip()
+    if not raw:
+        return 0.0
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r (expected seconds)", _LOCK_WAIT_ENV, raw)
+        return 0.0
+    return max(0.0, value)
+
+
+def palace_lock_key(palace_path: str) -> str:
+    """Stable per-palace lock key: sha256 of the fully normalized path."""
+    resolved = os.path.realpath(os.path.expanduser(palace_path))
+    return hashlib.sha256(os.path.normcase(resolved).encode()).hexdigest()[:16]
+
+
+def _palace_lock_dir() -> str:
+    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
+    os.makedirs(lock_dir, exist_ok=True)
+    return lock_dir
+
+
+def _palace_lock_paths(palace_path: str) -> tuple[str, str]:
+    """Return (ownership path, demand path) for ``palace_path``."""
+    key = palace_lock_key(palace_path)
+    lock_dir = _palace_lock_dir()
+    return (
+        os.path.join(lock_dir, f"mine_palace_{key}.lock"),
+        os.path.join(lock_dir, f"mine_palace_{key}.want"),
+    )
+
+
+def _open_palace_lock_file(lock_path: str):
+    """Open (creating if needed) a palace lock file for read+write.
+
+    ``r+b`` rather than ``w``/``a+``: ``w`` would erase the recorded holder
+    identity and ``a+`` parks the file position at EOF, which breaks
+    ``msvcrt.locking`` (it locks one byte at the *current* position, so two
+    contenders would lock different bytes and both "acquire").
+    """
+    if not os.path.exists(lock_path):
+        # Not O_EXCL: a concurrent contender creating it first is fine.
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
+            os.close(fd)
+        except FileExistsError:
+            pass
+    return open(lock_path, "r+b")
+
+
+def _try_exclusive(lock_file) -> bool:
+    """Non-blocking exclusive lock on byte 0. True on success.
+
+    Only *contention* returns False. A broken lock mechanism (ENOLCK, a
+    filesystem without locking, a bad descriptor) still raises, because callers
+    treat "someone else holds it" and "locking does not work here" very
+    differently — the first is normal, the second must be loud.
+    """
+    lock_file.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            # msvcrt reports contention as EDEADLOCK after its internal
+            # retries and gives no way to tell it apart from other failures.
+            return False
+    import fcntl
+
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+
+
+def _release_exclusive(lock_file) -> None:
+    """Best-effort unlock of byte 0. Closing the file also releases it."""
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+    except Exception:
+        logger.debug("Palace lock release failed", exc_info=True)
+
+
+def palace_lock_wanted(palace_path: str) -> bool:
+    """Return True if another process is queued for this palace's lock.
+
+    Probes the demand file with a non-blocking exclusive lock on a *fresh*
+    descriptor that is always closed again: failing to take it means a
+    contender is queued. The holder of the ownership lock never keeps the
+    demand file locked, so this never reports its own demand.
+    """
+    _, want_path = _palace_lock_paths(palace_path)
+    try:
+        probe = _open_palace_lock_file(want_path)
+    except OSError:
+        logger.debug("Palace demand probe could not open %s", want_path, exc_info=True)
+        return False
+    try:
+        if _try_exclusive(probe):
+            _release_exclusive(probe)
+            return False
+        return True
+    finally:
+        probe.close()
+
+
+def palace_lock_waiter(palace_path: str) -> str:
+    """Best-effort identity of the queued contender, for logs/diagnostics."""
+    _, want_path = _palace_lock_paths(palace_path)
+    return _identity_in_lock_file(want_path)
+
+
+def palace_lock_holder(palace_path: str) -> str:
+    """Best-effort identity of the current owner, for logs/diagnostics.
+
+    Advisory only: the body is written by the last process to *take* the lock,
+    so it can name a process that has since released or died. Ownership itself
+    is always decided by the OS lock, never by this string — pair this with
+    :func:`palace_lock_is_held` before presenting it as the current owner.
+    """
+    lock_path, _ = _palace_lock_paths(palace_path)
+    return _identity_in_lock_file(lock_path)
+
+
+def palace_lock_is_held(palace_path: str) -> bool:
+    """Return True if some process currently owns this palace's lock.
+
+    Asks the kernel instead of reading the lock-file body, which records only
+    whoever took the lock *last* and will happily name a process that has since
+    exited — reporting a dead PID as the current owner is worse than reporting
+    nothing. Probes on a fresh descriptor and releases immediately, so a free
+    lock is held for microseconds and a real owner is never disturbed.
+
+    An owner in this same process reports True: flock is per open file
+    description, so our own lease conflicts with the probe.
+    """
+    lock_path, _ = _palace_lock_paths(palace_path)
+    try:
+        probe = _open_palace_lock_file(lock_path)
+    except OSError:
+        logger.debug("Palace ownership probe could not open %s", lock_path, exc_info=True)
+        return False
+    try:
+        if _try_exclusive(probe):
+            _release_exclusive(probe)
+            return False
+        return True
+    finally:
+        probe.close()
+
+
+def _identity_in_lock_file(path: str) -> str:
+    try:
+        with open(path, "rb") as fh:
+            return _read_lock_holder(fh)
+    except OSError:
+        return "another writer (identity not recorded)"
+
+
 @contextlib.contextmanager
-def mine_palace_lock(palace_path: str):
+def _queued_for_palace_lock(want_path: str, deadline: float, poll: float):
+    """Hold the demand file for the duration of a wait.
+
+    Yields True once this process is the head of the queue (and therefore the
+    one the holder should hand off to), False if the queue head did not free up
+    before ``deadline``. The descriptor is closed on exit — releasing by close
+    rather than by explicit unlock, so a leaked reference can never leave the
+    demand file locked and block every future contender from queueing.
+    """
+    want = _open_palace_lock_file(want_path)
+    try:
+        queued = False
+        while True:
+            if _try_exclusive(want):
+                queued = True
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(poll)
+        if queued:
+            # Record who is waiting so the holder's log line (and a human
+            # reading the lock dir) can name the contender.
+            _write_lock_holder(want)
+        yield queued
+    finally:
+        want.close()
+
+
+def begin_palace_lock_handoff(palace_path: str) -> bool:
+    """Reserve a quiesced window so the caller can release its lease.
+
+    Returns True only when this process owns the lock and no write frame is
+    active; from then until :func:`end_palace_lock_handoff`, writers arriving
+    on other threads park instead of taking pass-through credit. The caller
+    MUST call ``end_palace_lock_handoff`` (``try/finally``) and should close
+    storage handles and exit the lease context inside the window.
+    """
+    lock_key = palace_lock_key(palace_path)
+    with _palace_lock_guard:
+        if lock_key not in _holder_keys_locked():
+            return False
+        if lock_key in _palace_lock_handoff:
+            return False
+        if _palace_lock_depth.get(lock_key, 0) > 0:
+            return False
+        _palace_lock_handoff.add(lock_key)
+        return True
+
+
+def end_palace_lock_handoff(palace_path: str) -> None:
+    """Close the window opened by :func:`begin_palace_lock_handoff`."""
+    lock_key = palace_lock_key(palace_path)
+    with _palace_lock_guard:
+        _palace_lock_handoff.discard(lock_key)
+        _palace_lock_guard.notify_all()
+
+
+@contextlib.contextmanager
+def mine_palace_lock(
+    palace_path: str,
+    *,
+    lease: bool = False,
+    wait: Optional[float] = None,
+    poll: Optional[float] = None,
+):
     """Per-palace non-blocking lock around the full `mine` pipeline.
 
     The per-file `mine_lock` only protects delete+insert interleave for a
@@ -1311,64 +1643,62 @@ def mine_palace_lock(palace_path: str):
     the outer lock for the entire mine pipeline) without self-deadlock, and
     lets the threaded MCP HTTP transport write from a worker thread while the
     long-lived writer-lease is held on another thread of the same process.
-    """
-    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
-    os.makedirs(lock_dir, exist_ok=True)
-    resolved = os.path.realpath(os.path.expanduser(palace_path))
-    lock_key_source = os.path.normcase(resolved)
-    palace_key = hashlib.sha256(lock_key_source.encode()).hexdigest()[:16]
-    lock_path = os.path.join(lock_dir, f"mine_palace_{palace_key}.lock")
 
-    if _held_by_this_process(palace_key):
+    ``wait`` (seconds) opts into the handoff protocol instead of failing
+    immediately: this process queues on the palace's demand file, an idle
+    holder notices and releases, and we take ownership as soon as it lands.
+    ``None`` reads ``MEMPALACE_PALACE_LOCK_WAIT_SECONDS`` (default 0 = the
+    historical fail-fast behavior, which hook-spawned mines depend on).
+
+    ``lease=True`` marks a long-lived hold that is not itself a write — the
+    MCP/daemon writer lease. Such a hold owns the lock but leaves the write
+    depth at zero, which is what lets :func:`begin_palace_lock_handoff` give
+    the lock away while the owner is idle. Never pass it for an actual write.
+    """
+    resolved = os.path.realpath(os.path.expanduser(palace_path))
+    palace_key = palace_lock_key(palace_path)
+    lock_path, want_path = _palace_lock_paths(palace_path)
+    wait_seconds = _lock_wait_default() if wait is None else max(0.0, float(wait))
+    poll_seconds = _LOCK_POLL_SECONDS if poll is None else max(0.001, float(poll))
+
+    if _take_reentrant_credit(palace_key, lease=lease):
         # This process already holds the lock for this palace — pass through.
-        yield
+        try:
+            yield
+        finally:
+            _drop_reentrant_credit(palace_key, lease=lease)
         return
 
-    # Ensure the file exists, then open r+ so we can both read the prior
-    # holder's identity (for failure diagnostics) and write our own. "w"
-    # truncates and erases the prior holder. "a+" puts the position at EOF,
-    # which on Windows breaks ``msvcrt.locking`` (it locks 1 byte at the
-    # *current* position, so two contenders end up locking different bytes
-    # and silently both acquire — observed as Windows-CI lock test
-    # failures during #1264 development).
-    if not os.path.exists(lock_path):
-        # Touch atomically: O_CREAT|O_EXCL would fail if a concurrent
-        # contender just created it, which is fine — we proceed to open.
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
-            os.close(fd)
-        except FileExistsError:
-            pass
-    lf = open(lock_path, "r+b")
+    lf = _open_palace_lock_file(lock_path)
     acquired = False
     try:
-        # Lock byte 0 explicitly. msvcrt.locking is byte-position dependent;
-        # fcntl.flock is whole-file but the seek is harmless there.
-        lf.seek(0)
-        if os.name == "nt":
-            import msvcrt
-
-            try:
-                msvcrt.locking(lf.fileno(), msvcrt.LK_NBLCK, 1)
-                acquired = True
-            except OSError as exc:
-                holder = _read_lock_holder(lf)
-                raise MineAlreadyRunning(
-                    f"palace {resolved} is held by {holder}; "
-                    "wait for it to finish or stop the holder before retrying"
-                ) from exc
+        # Fast path: uncontended, or contended but we are not willing to wait.
+        # When we *are* willing to wait, yield to an already-queued contender
+        # first — otherwise a holder that just handed the lock off could grab
+        # it straight back and starve the process it handed it to.
+        if wait_seconds > 0 and palace_lock_wanted(palace_path):
+            acquired = False
         else:
-            import fcntl
+            acquired = _try_exclusive(lf)
 
-            try:
-                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-            except BlockingIOError as exc:
-                holder = _read_lock_holder(lf)
-                raise MineAlreadyRunning(
-                    f"palace {resolved} is held by {holder}; "
-                    "wait for it to finish or stop the holder before retrying"
-                ) from exc
+        if not acquired and wait_seconds > 0:
+            deadline = time.monotonic() + wait_seconds
+            with _queued_for_palace_lock(want_path, deadline, poll_seconds) as queued:
+                if queued:
+                    while not acquired:
+                        acquired = _try_exclusive(lf)
+                        if acquired or time.monotonic() >= deadline:
+                            break
+                        time.sleep(poll_seconds)
+
+        if not acquired:
+            holder = _read_lock_holder(lf)
+            waited = "" if wait_seconds <= 0 else f" after waiting {wait_seconds:g}s for a handoff"
+            raise MineAlreadyRunning(
+                f"palace {resolved} is held by {holder}{waited}; "
+                "wait for it to finish or stop the holder before retrying"
+            )
+
         # Record our own identity for any later contender's diagnostic message.
         _write_lock_holder(lf)
         # Mark the hold from inside the try so it always pairs with
@@ -1378,25 +1708,13 @@ def mine_palace_lock(palace_path: str):
         # flock, so the in-memory hold would outlive the OS lock and a later
         # re-entrant acquire would pass through and write without the flock.
         try:
-            _mark_held(palace_key)
+            _mark_held(palace_key, lease=lease)
             yield
         finally:
-            _mark_released(palace_key)
+            _mark_released(palace_key, lease=lease)
     finally:
         if acquired:
-            try:
-                if os.name == "nt":
-                    import msvcrt
-
-                    # Match the lock region: byte 0.
-                    lf.seek(0)
-                    msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(lf, fcntl.LOCK_UN)
-            except Exception:
-                pass
+            _release_exclusive(lf)
         lf.close()
 
 

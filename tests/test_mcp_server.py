@@ -5874,7 +5874,7 @@ def test_peer_writer_lock_setup_failure_retries_and_recovers(monkeypatch):
 
     calls = {"count": 0}
 
-    def flaky_mine_palace_lock(palace_path):
+    def flaky_mine_palace_lock(palace_path, **kwargs):
         calls["count"] += 1
         if calls["count"] == 1:
             raise RuntimeError(f"permission denied for {palace_path}")
@@ -5914,7 +5914,7 @@ def test_peer_writer_override_cannot_bypass_local_backend_lock(monkeypatch):
 
     calls = {"count": 0}
 
-    def tracked_lock(palace_path):
+    def tracked_lock(palace_path, **kwargs):
         calls["count"] += 1
         return _DummyLock()
 
@@ -5941,7 +5941,7 @@ def test_peer_writer_override_remains_available_for_remote_backend(monkeypatch):
     monkeypatch.setattr(
         palace,
         "mine_palace_lock",
-        lambda path: pytest.fail("remote backend should not take the local writer lease"),
+        lambda path, **kwargs: pytest.fail("remote backend should not take the local writer lease"),
     )
     monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
     monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", False)
@@ -5965,7 +5965,7 @@ def test_peer_writer_readonly_self_heals_after_peer_exits(monkeypatch):
 
     calls = {"count": 0}
 
-    def flaky_mine_palace_lock(palace_path):
+    def flaky_mine_palace_lock(palace_path, **kwargs):
         calls["count"] += 1
         if calls["count"] == 1:
             # First attempt: a live peer still holds the lease.

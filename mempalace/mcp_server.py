@@ -417,6 +417,68 @@ _MCP_WRITER_LOCK_ERROR = ""
 _MCP_WRITER_ATEXIT_REGISTERED = False
 _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
 
+# Writer-lease handoff.
+#
+# The lease above is correct but sticky: the first server to touch a palace
+# keeps it until the process exits, so every later session on the same palace
+# is read-only for its whole life even when the holder has been idle for hours.
+# The handoff makes the lease a baton. A server that wants to write queues on
+# the palace's demand file (palace.mine_palace_lock(wait=...)); the holder's
+# watchdog notices the demand and — only when it has no write in flight —
+# closes its storage handles and drops the lock. Both halves are OS locks, so a
+# killed process still releases everything.
+#
+# Knobs (all seconds):
+#   MEMPALACE_WRITER_HANDOFF_WAIT_SECONDS  how long a contender waits for the
+#       baton before falling back to today's read-only refusal (0 disables
+#       waiting on this side).
+#   MEMPALACE_WRITER_MIN_HOLD_SECONDS  minimum ownership time before this
+#       server will give the lease away. Reopening storage is not free, so a
+#       floor here is what stops two chatty sessions from ping-ponging the
+#       lease on every write.
+#   MEMPALACE_WRITER_HANDOFF_POLL_SECONDS  how often the holder probes for
+#       demand.
+#   MEMPALACE_WRITER_HANDOFF_DISABLED  opt out entirely (pre-handoff behavior).
+#
+# The defaults are related, not independent: a contender must be willing to
+# wait longer than the holder's floor, or a lease taken moments ago could never
+# be handed over inside the contender's window (wait > min hold + poll + the
+# cost of reopening storage).
+_MCP_WRITER_HANDOFF_WAIT_ENV = "MEMPALACE_WRITER_HANDOFF_WAIT_SECONDS"
+_MCP_WRITER_HANDOFF_WAIT_DEFAULT = 15.0
+_MCP_WRITER_MIN_HOLD_ENV = "MEMPALACE_WRITER_MIN_HOLD_SECONDS"
+_MCP_WRITER_MIN_HOLD_DEFAULT = 5.0
+_MCP_WRITER_HANDOFF_POLL_ENV = "MEMPALACE_WRITER_HANDOFF_POLL_SECONDS"
+_MCP_WRITER_HANDOFF_POLL_DEFAULT = 1.0
+_MCP_WRITER_HANDOFF_DISABLED_ENV = "MEMPALACE_WRITER_HANDOFF_DISABLED"
+#   MEMPALACE_WRITER_HANDOFF_ENABLED  opt *in* for the HTTP transport, where a
+#       writable server is a deliberate single-writer service that refuses to
+#       start without ownership — giving the palace away mid-flight there is an
+#       operator decision, not a default.
+_MCP_WRITER_HANDOFF_ENABLED_ENV = "MEMPALACE_WRITER_HANDOFF_ENABLED"
+# A peer that predates this protocol (or one stuck in a long write) never
+# answers the demand probe. Waiting the full timeout on every single mutating
+# call would turn one unresponsive peer into a permanently sluggish server, so
+# a timed-out wait puts this side on a short wait for a while.
+_MCP_WRITER_HANDOFF_BACKOFF_SECONDS = 60.0
+_MCP_WRITER_HANDOFF_BACKOFF_WAIT = 1.0
+_MCP_WRITER_HANDOFF_BACKOFF_UNTIL = 0.0
+_MCP_WRITER_LEASE_SINCE = 0.0
+_MCP_WRITER_HANDOFF_THREAD = None
+_MCP_WRITER_HANDOFFS_GRANTED = 0
+_MCP_WRITER_HANDOFFS_TAKEN = 0
+
+# Held for the duration of every dispatched request, on both transports.
+#
+# HTTP already serialized requests with this lock (one Chroma/HNSW handle per
+# process, whatever the transport). The handoff watchdog needs the same barrier
+# in stdio: reads serve from cached storage handles *without* taking the palace
+# lock, so closing those handles between the readline and the response would be
+# a use-after-close. Reentrant so a nested acquire on the dispatch thread can
+# never deadlock against itself; the watchdog is a different thread and its
+# non-blocking acquire simply fails while a request is in flight.
+_REQUEST_DISPATCH_LOCK = threading.RLock()
+
 _MUTATING_TOOLS = frozenset(
     {
         "mempalace_kg_add",
@@ -711,6 +773,165 @@ def _release_mcp_writer_lock() -> None:
         lock_cm.__exit__(None, None, None)
 
 
+def _env_seconds(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r (expected seconds)", name, raw)
+        return default
+    return max(0.0, value)
+
+
+def _writer_handoff_enabled() -> bool:
+    if _truthy_env(_MCP_WRITER_HANDOFF_DISABLED_ENV):
+        return False
+    if getattr(_args, "transport", "stdio") != "stdio":
+        return _truthy_env(_MCP_WRITER_HANDOFF_ENABLED_ENV)
+    return True
+
+
+def _writer_handoff_wait_seconds() -> float:
+    """Seconds this server will wait for the baton on the next acquire."""
+    if not _writer_handoff_enabled():
+        return 0.0
+    wait = _env_seconds(_MCP_WRITER_HANDOFF_WAIT_ENV, _MCP_WRITER_HANDOFF_WAIT_DEFAULT)
+    if wait <= 0:
+        return 0.0
+    if time.monotonic() < _MCP_WRITER_HANDOFF_BACKOFF_UNTIL:
+        return min(wait, _MCP_WRITER_HANDOFF_BACKOFF_WAIT)
+    return wait
+
+
+def _maybe_hand_off_writer_lease(*, force: bool = False) -> bool:
+    """Give the writer lease to a queued peer when this server is idle.
+
+    Returns True when the lease was released. Declines — without blocking —
+    whenever a handoff would be unsafe or pointless: no lease held, handoff
+    disabled, still inside the minimum hold, nobody waiting, a request being
+    dispatched, or a write frame currently active on any thread.
+
+    The two exclusions that matter for correctness:
+
+    * ``_REQUEST_DISPATCH_LOCK`` — reads use cached storage handles without
+      taking the palace lock, so closing those handles under a running request
+      would be a use-after-close. Acquiring it non-blocking also means the
+      watchdog never stalls a request; it simply retries on the next tick.
+    * ``palace.begin_palace_lock_handoff`` — refuses while any
+      ``mine_palace_lock`` frame is executing and parks writers that arrive
+      mid-release, so the lock can never be handed away out from under a write
+      that is already running on the re-entrant pass-through path.
+    """
+
+    global _MCP_WRITER_READ_ONLY, _MCP_WRITER_LOCK_ERROR, _MCP_WRITER_HANDOFFS_GRANTED
+
+    if _MCP_WRITER_LOCK_CM is None or not _writer_handoff_enabled():
+        return False
+
+    from .palace import (
+        begin_palace_lock_handoff,
+        end_palace_lock_handoff,
+        palace_lock_waiter,
+        palace_lock_wanted,
+    )
+
+    if not force:
+        min_hold = _env_seconds(_MCP_WRITER_MIN_HOLD_ENV, _MCP_WRITER_MIN_HOLD_DEFAULT)
+        if time.monotonic() - _MCP_WRITER_LEASE_SINCE < min_hold:
+            return False
+        if not palace_lock_wanted(_config.palace_path):
+            return False
+
+    if not _REQUEST_DISPATCH_LOCK.acquire(blocking=False):
+        return False
+    try:
+        if not begin_palace_lock_handoff(_config.palace_path):
+            return False
+        try:
+            waiter = palace_lock_waiter(_config.palace_path)
+            _release_mcp_writer_lock()
+        finally:
+            end_palace_lock_handoff(_config.palace_path)
+    finally:
+        _REQUEST_DISPATCH_LOCK.release()
+
+    _MCP_WRITER_HANDOFFS_GRANTED += 1
+    _MCP_WRITER_READ_ONLY = True
+    _MCP_WRITER_LOCK_ERROR = (
+        f"writer lease handed to {waiter}; this server reacquires it on its next write"
+    )
+    logger.info(
+        "Writer lease for %s handed off to %s (held %.1fs, %d total)",
+        _config.palace_path,
+        waiter,
+        time.monotonic() - _MCP_WRITER_LEASE_SINCE,
+        _MCP_WRITER_HANDOFFS_GRANTED,
+    )
+    return True
+
+
+def _writer_handoff_watchdog_loop(poll: float) -> None:
+    while True:
+        time.sleep(poll)
+        try:
+            _maybe_hand_off_writer_lease()
+        except Exception:  # pragma: no cover - watchdog must never die
+            logger.debug("Writer-lease handoff probe failed", exc_info=True)
+
+
+def _start_writer_handoff_watchdog() -> None:
+    """Start the single background thread that answers demand for the lease.
+
+    A demand check on the write path alone would never fire for the case that
+    hurts: a server that took the lease, went idle, and now blocks every other
+    session while it does nothing.
+    """
+    global _MCP_WRITER_HANDOFF_THREAD
+
+    if _MCP_WRITER_HANDOFF_THREAD is not None or not _writer_handoff_enabled():
+        return
+    poll = _env_seconds(_MCP_WRITER_HANDOFF_POLL_ENV, _MCP_WRITER_HANDOFF_POLL_DEFAULT)
+    if poll <= 0:
+        return
+    thread = threading.Thread(
+        target=_writer_handoff_watchdog_loop,
+        args=(poll,),
+        name="mcp-writer-handoff",
+        daemon=True,
+    )
+    _MCP_WRITER_HANDOFF_THREAD = thread
+    thread.start()
+
+
+def _writer_lease_status() -> dict:
+    """Ownership snapshot for ``mempalace_status`` — who writes, who waits."""
+    from .palace import palace_lock_holder, palace_lock_is_held, palace_lock_wanted
+
+    held = _MCP_WRITER_LOCK_CM is not None
+    status = {
+        "held_by_this_server": held,
+        "handoff_enabled": _writer_handoff_enabled(),
+        "handoffs_granted": _MCP_WRITER_HANDOFFS_GRANTED,
+        "handoffs_taken": _MCP_WRITER_HANDOFFS_TAKEN,
+    }
+    if held:
+        status["held_for_seconds"] = round(time.monotonic() - _MCP_WRITER_LEASE_SINCE, 1)
+        status["peer_waiting"] = palace_lock_wanted(_config.palace_path)
+    else:
+        # Ask the kernel who owns the palace instead of trusting the lock-file
+        # body: the body names whoever took the lock *last*, so once that
+        # process exits it reports a dead PID as the current owner — a
+        # diagnostic that actively misleads whoever is debugging a stuck write.
+        owned = palace_lock_is_held(_config.palace_path)
+        status["palace_locked"] = owned
+        status["holder"] = palace_lock_holder(_config.palace_path) if owned else None
+        if _MCP_WRITER_LOCK_ERROR:
+            status["last_reason"] = _MCP_WRITER_LOCK_ERROR
+    return status
+
+
 def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     """Acquire this process's per-palace MCP writer lease.
 
@@ -727,10 +948,20 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     ``_MCP_WRITER_LOCK_FAILED`` are now only status flags for the last attempt;
     neither short-circuits a later retry. Peer ownership and transient setup
     failures can both be corrected without restarting the MCP host.
+
+    Waiting for the baton: rather than only retrying an instantaneous probe,
+    this queues on the palace's demand file for
+    ``MEMPALACE_WRITER_HANDOFF_WAIT_SECONDS``. A holder running this protocol
+    sees the demand and releases the lease as soon as it is idle, so a peer no
+    longer has to *exit* for this server to become writable. If nobody hands
+    off in time, the outcome is exactly the pre-handoff one — a read-only
+    refusal that the next mutating call retries.
     """
 
     global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY, _MCP_WRITER_LOCK_FAILED
     global _MCP_WRITER_LOCK_ERROR, _MCP_WRITER_ATEXIT_REGISTERED
+    global _MCP_WRITER_LEASE_SINCE, _MCP_WRITER_HANDOFF_BACKOFF_UNTIL
+    global _MCP_WRITER_HANDOFFS_TAKEN
 
     if _MCP_WRITER_LOCK_CM is not None:
         return True, ""
@@ -740,6 +971,8 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     # repaired while this long-lived stdio host remains alive. Each mutating
     # request therefore gets a fresh ownership attempt.
 
+    wait_seconds = 0.0
+    started = time.monotonic()
     try:
         from .palace import (
             MineAlreadyRunning,
@@ -758,10 +991,18 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
                 backend_name,
             )
 
-        lock_cm = mine_palace_lock(_config.palace_path)
+        wait_seconds = _writer_handoff_wait_seconds()
+        lock_cm = mine_palace_lock(_config.palace_path, lease=True, wait=wait_seconds)
         lock_cm.__enter__()
     except MineAlreadyRunning as exc:
         _MCP_WRITER_READ_ONLY = True
+        if wait_seconds > 0:
+            # The peer either predates the handoff protocol or is genuinely
+            # busy writing. Either way, stop paying the full wait on every
+            # mutating call for the next backoff window.
+            _MCP_WRITER_HANDOFF_BACKOFF_UNTIL = (
+                time.monotonic() + _MCP_WRITER_HANDOFF_BACKOFF_SECONDS
+            )
         _MCP_WRITER_LOCK_ERROR = (
             "another mempalace writer already holds the palace lock for "
             f"{_config.palace_path!r}: {exc}"
@@ -788,6 +1029,17 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     # collection. Drop it while ownership is held so the pending mutating
     # request reopens a writable handle rather than failing on query_only.
     _discard_mcp_storage_handles()
+    elapsed = time.monotonic() - started
+    _MCP_WRITER_LEASE_SINCE = time.monotonic()
+    _MCP_WRITER_HANDOFF_BACKOFF_UNTIL = 0.0
+    if wait_seconds > 0 and elapsed > 0.1:
+        # Not instantaneous: a peer let go while we were queued.
+        _MCP_WRITER_HANDOFFS_TAKEN += 1
+        logger.info(
+            "Took the writer lease for %s after %.1fs in the queue",
+            _config.palace_path,
+            elapsed,
+        )
     _MCP_WRITER_READ_ONLY = False
     _MCP_WRITER_LOCK_FAILED = False
     _MCP_WRITER_LOCK_ERROR = ""
@@ -6560,6 +6812,14 @@ def _decorate_mcp_tool_result(tool_name: str, result):
     if tool_name == "mempalace_status" and isinstance(result, dict):
         result.setdefault("sqlite_integrity", _sqlite_integrity_payload())
         result.setdefault("library_versions", _stale_library_payload())
+        # Who may write this palace right now, and whether anyone is queued.
+        # Deliberately here and not in tool_status(): status has several return
+        # paths (sqlite fast path, degraded, full) and this belongs to all of
+        # them. Reading it must never take the lease itself (#1934).
+        try:
+            result.setdefault("writer_lease", _writer_lease_status())
+        except Exception:  # pragma: no cover - diagnostics must not break status
+            logger.debug("writer_lease status probe failed", exc_info=True)
 
     return result
 
@@ -7097,7 +7357,11 @@ def _json_rpc_parse_error(req_id=None):
 # Module-level constants for the HTTP transport.
 # Defined here (not inside main()) so _serve_http() / _build_http_server()
 # can reference them as free names without a NameError.
-_HTTP_REQUEST_LOCK = threading.Lock()
+#
+# The HTTP request lock IS the shared dispatch lock — same object, kept under
+# the old name for callers and tests that reference it. Both transports must
+# exclude the writer-lease handoff watchdog through one lock, not two.
+_HTTP_REQUEST_LOCK = _REQUEST_DISPATCH_LOCK
 _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 _HTTP_ACTIVE_CLIENT_WINDOW_S = 120.0
 
@@ -7373,24 +7637,41 @@ def _sse_max_clients() -> int:
         return _SSE_MAX_CLIENTS_DEFAULT
 
 
-def _http_dispatch(request):
-    """Dispatch one JSON-RPC request with the transport's locking policy.
+def _request_is_lock_free(request) -> bool:
+    """True for the tools that may run outside the dispatch lock.
 
-    The global request lock preserves the single-process / single-palace-
-    handle behavior stdio deployments rely on. Logstream tools are the one
-    exception: they never touch Chroma/KG state and carry their own database
-    lock, and serializing them would let one agent's event_wait long-poll
-    (up to 5 minutes) starve the whole hub.
+    They reach only ``logstream.sqlite3`` — an independent WAL database with
+    its own locking and no Chroma/KG in-memory state — which is also why they
+    sit in ``_PEER_WRITER_EXEMPT_TOOLS``. Every handler in the set goes through
+    ``_call_logstream``.
     """
-    if (
+    return (
         isinstance(request, dict)
         and request.get("method") == "tools/call"
         and isinstance(request.get("params"), dict)
         and request["params"].get("name") in _HTTP_LOCK_FREE_TOOLS
-    ):
+    )
+
+
+def _dispatch_locally(request):
+    """Handle one JSON-RPC request in this process under the locking policy.
+
+    The dispatch lock preserves the single-process / single-palace-handle
+    behavior both transports rely on, and it is what keeps the writer-lease
+    handoff watchdog from closing storage handles under a running request.
+    Logstream tools are the one exception: they never touch Chroma/KG state and
+    carry their own database lock, so serializing them would let one agent's
+    five-minute ``event_wait`` long-poll starve the hub — and, in stdio, defer
+    every writer-lease handoff behind that same long-poll.
+    """
+    if _request_is_lock_free(request):
         return handle_request(request)
-    with _HTTP_REQUEST_LOCK:
+    with _REQUEST_DISPATCH_LOCK:
         return handle_request(request)
+
+
+# Kept as the HTTP transport's name for the shared policy.
+_http_dispatch = _dispatch_locally
 
 
 def _http_handle_get(handler) -> None:
@@ -8017,7 +8298,7 @@ def _build_http_server(host: str, port: int):
                 self._send_json(400, _json_rpc_parse_error())
                 return
 
-            # Locking policy lives in _http_dispatch: global lock for
+            # Locking policy lives in _dispatch_locally: dispatch lock for
             # Chroma-touching tools, lock-free for logstream tools.
             response = _http_dispatch(request)
 
@@ -8249,7 +8530,7 @@ def _dispatch_stdio_request(request: dict):
 
     target = _hub_proxy_target()
     if target is None:
-        return handle_request(request)
+        return _dispatch_locally(request)
     base_url, headers = target
     try:
         return _forward_request_to_hub(base_url, headers, request)
@@ -8257,7 +8538,7 @@ def _dispatch_stdio_request(request: dict):
         reached_hub = isinstance(exc, urllib.error.HTTPError)
         if not reached_hub and not _request_is_mutating(request):
             logger.warning("Hub at %s unreachable (%s); handling request locally", base_url, exc)
-            return handle_request(request)
+            return _dispatch_locally(request)
         if request.get("id") is None:
             return None
         return {
@@ -8316,6 +8597,11 @@ def _run_stdio_loop() -> None:
     # Idle auto-exit: release ChromaDB file handles from stale servers
     # that outlived their Claude Code session (#1552).
     _start_idle_exit_watchdog()
+
+    # Answer peers that queue for the writer lease while this server is idle.
+    # Started here rather than at lease acquisition so that direct callers of
+    # _acquire_mcp_writer_lock (tests, embedders) never leak a thread.
+    _start_writer_handoff_watchdog()
 
     # Say so when a chromadb write stops coming back, from a thread the stuck
     # call is not blocking.
@@ -8394,6 +8680,9 @@ def _run_http_loop() -> None:
         # soon as the process is alive.
         _refresh_vector_disabled_flag()
         _start_idle_exit_watchdog()
+        # No-op unless the operator opted this HTTP deployment into handing the
+        # palace to peers (MEMPALACE_WRITER_HANDOFF_ENABLED).
+        _start_writer_handoff_watchdog()
         _start_write_stall_watchdog()
 
         raw_warmup = os.environ.get("MEMPALACE_EAGER_WARMUP", "").strip().lower()

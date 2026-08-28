@@ -425,8 +425,8 @@ def test_holder_set_not_orphaned_by_interrupt_after_mark_held(tmp_path, monkeypa
     # raise, as a signal arriving at that instant would.
     real_mark_held = palace_mod._mark_held
 
-    def _mark_then_interrupt(lock_key):
-        real_mark_held(lock_key)
+    def _mark_then_interrupt(lock_key, **kwargs):
+        real_mark_held(lock_key, **kwargs)
         raise KeyboardInterrupt
 
     palace_mod._mark_held = _mark_then_interrupt
