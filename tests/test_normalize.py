@@ -403,6 +403,228 @@ def test_codex_jsonl_valid():
     assert "> Q" in result
 
 
+def test_codex_jsonl_item_completed_turns():
+    """Current paginated Codex rollouts store conversation text on turn items."""
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {}}),
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "content": [
+                            {"type": "text", "text": "Question line 1"},
+                            {"type": "text", "text": "Question line 2"},
+                        ],
+                    },
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "AgentMessage",
+                        "content": [{"type": "Text", "text": "Answer"}],
+                    },
+                },
+            }
+        ),
+    ]
+
+    result = _try_codex_jsonl("\n".join(lines))
+
+    assert result is not None
+    assert "> Question line 1\nQuestion line 2" in result
+    assert "Answer" in result
+
+
+def test_codex_jsonl_item_completed_accepts_bare_string_spans():
+    """String spans are text too; mixed content must not be silently truncated."""
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {}}),
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "content": ["Question prefix", {"type": "text", "text": "Question suffix"}],
+                    },
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {"type": "AgentMessage", "content": ["Bare answer"]},
+                },
+            }
+        ),
+    ]
+
+    result = _try_codex_jsonl("\n".join(lines))
+
+    assert result is not None
+    assert "> Question prefix\nQuestion suffix" in result
+    assert "Bare answer" in result
+
+
+def test_codex_jsonl_item_completed_ignores_response_items():
+    """Raw response items can duplicate canonical turns or inject context."""
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {}}),
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "synthetic context"}],
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "canonical question"}],
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "content": [{"type": "text", "text": "canonical question"}],
+                    },
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "AgentMessage",
+                        "content": [{"type": "Text", "text": "canonical answer"}],
+                    },
+                },
+            }
+        ),
+    ]
+
+    result = _try_codex_jsonl("\n".join(lines))
+
+    assert result is not None
+    assert result.count("canonical question") == 1
+    assert result.count("canonical answer") == 1
+    assert "synthetic context" not in result
+
+
+def test_codex_jsonl_item_completed_skips_malformed_items():
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {}}),
+        json.dumps({"type": "event_msg", "payload": {"type": "item_completed", "item": []}}),
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {"type": "item_completed", "item": {"type": []}},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {"type": "UserMessage", "content": "not a list"},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "content": [None, {"text": 123}, {"text": "Q"}],
+                    },
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {"type": "AgentMessage", "content": [{"text": "A"}]},
+                },
+            }
+        ),
+    ]
+
+    result = _try_codex_jsonl("\n".join(lines))
+
+    assert result is not None
+    assert "> Q" in result
+    assert "A" in result
+
+
+def test_current_codex_jsonl_normalizes_via_public_entrypoint(tmp_path):
+    transcript = tmp_path / "rollout.jsonl"
+    transcript.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "session_meta", "payload": {}}),
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "item_completed",
+                            "item": {
+                                "type": "UserMessage",
+                                "content": [{"type": "text", "text": "Question"}],
+                            },
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "item_completed",
+                            "item": {
+                                "type": "AgentMessage",
+                                "content": [{"type": "Text", "text": "Answer"}],
+                            },
+                        },
+                    }
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = normalize(str(transcript))
+
+    assert result.startswith("> Question\nAnswer")
+    assert '"item_completed"' not in result
+
+
 def test_codex_jsonl_no_session_meta():
     """Without session_meta, codex parser returns None."""
     lines = [

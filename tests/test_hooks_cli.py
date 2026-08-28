@@ -226,6 +226,101 @@ def test_count_malformed_json_lines(tmp_path):
     assert _count_human_messages(str(transcript)) == 1
 
 
+def test_count_human_messages_supports_current_codex_events(tmp_path):
+    transcript = tmp_path / "codex.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "legacy"}},
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "content": [
+                            {"type": "text", "text": "current"},
+                            {"type": "text", "text": "question"},
+                        ],
+                    },
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {"type": "UserMessage", "content": ["bare string turn"]},
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "AgentMessage",
+                        "content": [{"type": "Text", "text": "answer"}],
+                    },
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "content": [{"text": "<command-message>status</command-message>"}],
+                    },
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "content": [{"text": "duplicate"}],
+                    },
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "content": [{"text": 123}],
+                    },
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {"type": "UserMessage", "content": []},
+                },
+            },
+        ],
+    )
+
+    assert _count_human_messages(str(transcript)) == 3
+
+
+def test_count_human_messages_preserves_empty_legacy_codex_turns(tmp_path):
+    """The legacy counter counted string-valued empty messages; keep that contract."""
+    transcript = tmp_path / "legacy-codex.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {"type": "event_msg", "payload": {"type": "user_message", "message": ""}},
+            {"type": "event_msg", "payload": {"type": "user_message"}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "   "}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": 123}},
+        ],
+    )
+
+    assert _count_human_messages(str(transcript)) == 3
+
+
 # --- _extract_recent_messages ---
 
 
@@ -258,6 +353,66 @@ def test_extract_recent_messages_skips_commands(tmp_path):
 
 def test_extract_recent_messages_missing_file():
     assert _extract_recent_messages("/nonexistent.jsonl") == []
+
+
+def test_extract_recent_messages_supports_current_codex_events(tmp_path):
+    transcript = tmp_path / "codex.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "legacy"}},
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "content": [
+                            "bare prefix",
+                            {"text": "line 1"},
+                            {"text": "line 2"},
+                            {"text": 123},
+                        ],
+                    },
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "AgentMessage",
+                        "content": [{"type": "Text", "text": "answer"}],
+                    },
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "content": [{"text": "duplicate"}],
+                    },
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "content": [{"text": "<system-reminder>noise</system-reminder>"}],
+                    },
+                },
+            },
+        ],
+    )
+
+    assert _extract_recent_messages(str(transcript)) == [
+        "legacy",
+        "bare prefix\nline 1\nline 2",
+    ]
 
 
 # --- hook_stop ---
@@ -346,6 +501,40 @@ def test_stop_hook_saves_silently_at_interval(tmp_path):
     # tmp_path has no "-Projects-" segment, so _wing_from_transcript_path falls back to "wing_sessions"
     mock_save.assert_called_once_with(
         str(transcript), "test", wing="wing_sessions", toast=False, agent_name="claude"
+    )
+
+
+def test_stop_hook_current_codex_events_reach_save_interval(tmp_path):
+    transcript = tmp_path / "codex.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "content": [{"type": "text", "text": f"msg {i}"}],
+                    },
+                },
+            }
+            for i in range(SAVE_INTERVAL)
+        ],
+    )
+    save_result = {"count": SAVE_INTERVAL, "themes": ["codex"]}
+
+    with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result) as mock_save:
+        result = _capture_hook_output(
+            hook_stop,
+            {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
+            harness="codex",
+            state_dir=tmp_path,
+        )
+
+    assert "systemMessage" in result
+    mock_save.assert_called_once_with(
+        str(transcript), "test", wing="wing_sessions", toast=False, agent_name="codex"
     )
 
 

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 from mempalace.config import MempalaceConfig
+from mempalace.normalize import _extract_codex_event_turn
 from mempalace.write_routing import (
     ResolvedWriteRoutingPolicy,
     WriteRoutingDecision,
@@ -178,13 +179,12 @@ def _count_human_messages(transcript_path: str) -> int:
                             if "<command-message>" in text:
                                 continue
                         count += 1
-                    # Also handle Codex CLI transcript format
-                    # {"type": "event_msg", "payload": {"type": "user_message", "message": "..."}}
+                    # Also handle legacy and current Codex CLI transcript formats.
                     elif entry.get("type") == "event_msg":
-                        payload = entry.get("payload", {})
-                        if isinstance(payload, dict) and payload.get("type") == "user_message":
-                            msg_text = payload.get("message", "")
-                            if isinstance(msg_text, str) and "<command-message>" not in msg_text:
+                        turn = _extract_codex_event_turn(entry)
+                        if turn is not None:
+                            role, msg_text = turn
+                            if role == "user" and "<command-message>" not in msg_text:
                                 count += 1
                 except (json.JSONDecodeError, AttributeError):
                     pass
@@ -903,14 +903,15 @@ def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUN
                         if "<command-message>" in content or "<system-reminder>" in content:
                             continue
                         messages.append(content.strip()[:200])
-                    # Codex CLI format
+                    # Legacy and current Codex CLI formats.
                     elif entry.get("type") == "event_msg":
-                        payload = entry.get("payload", {})
-                        if isinstance(payload, dict) and payload.get("type") == "user_message":
-                            text = payload.get("message", "")
-                            if isinstance(text, str) and text.strip():
-                                if "<command-message>" not in text:
-                                    messages.append(text.strip()[:200])
+                        turn = _extract_codex_event_turn(entry)
+                        if turn is not None:
+                            role, text = turn
+                            if role != "user" or not text.strip():
+                                continue
+                            if "<command-message>" not in text and "<system-reminder>" not in text:
+                                messages.append(text.strip()[:200])
                 except (json.JSONDecodeError, AttributeError):
                     pass
     except OSError:
