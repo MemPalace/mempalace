@@ -481,11 +481,34 @@ def _legacy_tunnel_file() -> str:
     return os.path.join(os.path.expanduser("~"), ".mempalace", "tunnels.json")
 
 
+def _is_valid_tunnel_endpoint(endpoint) -> bool:
+    """Return whether an endpoint has the minimum traversable shape."""
+    if not isinstance(endpoint, dict):
+        return False
+    return all(
+        isinstance(endpoint.get(field), str) and endpoint[field].strip()
+        for field in ("wing", "room")
+    )
+
+
+def _is_valid_tunnel_record(record) -> bool:
+    """Return whether a decoded JSON value is safe for every tunnel consumer."""
+    return (
+        isinstance(record, dict)
+        and isinstance(record.get("id"), str)
+        and bool(record["id"].strip())
+        and _is_valid_tunnel_endpoint(record.get("source"))
+        and _is_valid_tunnel_endpoint(record.get("target"))
+    )
+
+
 def _load_tunnels(config=None):
     """Load explicit tunnels from disk.
 
     Returns an empty list if the file is missing or corrupt (e.g. truncated
     by a crash mid-write on a system that lacks atomic-rename semantics).
+    Structurally invalid records inside an otherwise valid JSON list are
+    ignored so one hand-edited value cannot break every tunnel operation.
 
     Backwards-compatibility: prior to 3.3.6 the tunnel file was hardcoded at
     ``~/.mempalace/tunnels.json`` regardless of the configured palace_path.
@@ -510,7 +533,23 @@ def _load_tunnels(config=None):
                 current_tunnel_file,
             )
             return []
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            logger.warning(
+                "Mempalace tunnels file '%s' has invalid root type %s; "
+                "expected a JSON list; starting empty.",
+                current_tunnel_file,
+                type(data).__name__,
+            )
+            return []
+        tunnels = [record for record in data if _is_valid_tunnel_record(record)]
+        invalid_count = len(data) - len(tunnels)
+        if invalid_count:
+            logger.warning(
+                "Mempalace tunnels file '%s': ignored %d invalid record(s).",
+                current_tunnel_file,
+                invalid_count,
+            )
+        return tunnels
 
     legacy = _legacy_tunnel_file()
     if legacy != current_tunnel_file and os.path.exists(legacy):

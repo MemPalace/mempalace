@@ -1,5 +1,6 @@
 """Tests for explicit tunnel helpers in mempalace.palace_graph."""
 
+import json
 import logging
 import os
 import stat
@@ -33,6 +34,42 @@ def _use_tmp_tunnel_file(monkeypatch, tmp_path):
     return tunnel_file
 
 
+def _mixed_valid_and_malformed_tunnels():
+    """Return one legacy-compatible tunnel mixed with unusable JSON values."""
+    source = {"wing": "wing_a", "room": "r1"}
+    target = {"wing": "wing_b", "room": "r2"}
+    valid = {
+        "id": "valid-tunnel",
+        "source": source,
+        "target": target,
+        "label": "legacy record without optional fields",
+    }
+    malformed = [
+        None,
+        "junk",
+        [],
+        {},
+        42,
+        {"id": 42, "source": source, "target": target},
+        {"source": source, "target": target},
+        {"id": "missing-source", "target": target},
+        {"id": "missing-target", "source": source},
+        {"id": "null-source", "source": None, "target": target},
+        {"id": "wrong-source-type", "source": "secret-value", "target": target},
+        {
+            "id": "missing-wing",
+            "source": {"room": "r1"},
+            "target": target,
+        },
+        {
+            "id": "blank-target-room",
+            "source": source,
+            "target": {"wing": "wing_b", "room": "   "},
+        },
+    ]
+    return [*malformed, valid], valid, len(malformed)
+
+
 class TestTunnelStorage:
     def test_load_tunnels_missing_file_returns_empty_list(self, tmp_path, monkeypatch):
         _use_tmp_tunnel_file(monkeypatch, tmp_path)
@@ -55,6 +92,79 @@ class TestTunnelStorage:
         ]
         palace_graph._save_tunnels(tunnels)
         assert palace_graph._load_tunnels() == tunnels
+
+    def test_load_tunnels_filters_malformed_records_and_warns(self, tmp_path, monkeypatch, caplog):
+        tunnel_file = _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        records, valid, malformed_count = _mixed_valid_and_malformed_tunnels()
+        palace_graph._save_tunnels(records)
+
+        with caplog.at_level(logging.WARNING, logger="mempalace_graph"):
+            loaded = palace_graph._load_tunnels()
+
+        assert loaded == [valid]
+        assert str(tunnel_file) in caplog.text
+        assert f"ignored {malformed_count} invalid record(s)" in caplog.text
+        assert len(caplog.records) == 1
+        assert "junk" not in caplog.text
+        assert "secret-value" not in caplog.text
+
+    def test_load_tunnels_warns_on_non_list_root_without_logging_contents(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        tunnel_file = _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        unsupported_root = {
+            "id": "single-record",
+            "source": {"wing": "wing_a", "room": "r1"},
+            "target": {"wing": "wing_b", "room": "r2"},
+            "label": "secret-root-label",
+        }
+        palace_graph._save_tunnels(unsupported_root)
+        original_contents = tunnel_file.read_bytes()
+
+        with caplog.at_level(logging.WARNING, logger="mempalace_graph"):
+            loaded = palace_graph._load_tunnels()
+
+        assert loaded == []
+        assert tunnel_file.read_bytes() == original_contents
+        assert str(tunnel_file) in caplog.text
+        assert "invalid root type dict" in caplog.text
+        assert "secret-root-label" not in caplog.text
+
+    @pytest.mark.parametrize("operation", ["create", "list", "follow", "delete"])
+    def test_tunnel_operations_tolerate_malformed_records(self, operation, tmp_path, monkeypatch):
+        tunnel_file = _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        records, valid, _ = _mixed_valid_and_malformed_tunnels()
+        palace_graph._save_tunnels(records)
+
+        if operation == "create":
+            created = palace_graph.create_tunnel(
+                "wing_c", "topic:new", "wing_d", "topic:new", kind="topic"
+            )
+            assert {t["id"] for t in palace_graph._load_tunnels()} == {
+                valid["id"],
+                created["id"],
+            }
+            assert {t["id"] for t in json.loads(tunnel_file.read_text(encoding="utf-8"))} == {
+                valid["id"],
+                created["id"],
+            }
+        elif operation == "list":
+            save = MagicMock(side_effect=AssertionError("read-only list must not rewrite"))
+            monkeypatch.setattr(palace_graph, "_save_tunnels", save)
+            assert palace_graph.list_tunnels("wing_a") == [valid]
+            save.assert_not_called()
+            assert json.loads(tunnel_file.read_text(encoding="utf-8")) == records
+        elif operation == "follow":
+            save = MagicMock(side_effect=AssertionError("read-only follow must not rewrite"))
+            monkeypatch.setattr(palace_graph, "_save_tunnels", save)
+            connections = palace_graph.follow_tunnels("wing_a", "r1")
+            save.assert_not_called()
+            assert [c["tunnel_id"] for c in connections] == [valid["id"]]
+            assert json.loads(tunnel_file.read_text(encoding="utf-8")) == records
+        else:
+            assert palace_graph.delete_tunnel("missing") == {"deleted": "missing"}
+            assert palace_graph._load_tunnels() == [valid]
+            assert json.loads(tunnel_file.read_text(encoding="utf-8")) == [valid]
 
     @pytest.mark.skipif(
         sys.platform == "win32",
