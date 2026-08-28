@@ -20,6 +20,7 @@ from mempalace.backends.chroma import (
     _hnsw_element_count,
     _vector_segment_id,
     hnsw_capacity_status,
+    hnsw_segment_signature,
     reset_hnsw_capacity_cache,
 )
 from mempalace.searcher import _bm25_only_via_sqlite
@@ -160,6 +161,46 @@ def test_vector_segment_id_unknown_collection(tmp_path):
     seg = "11111111-2222-3333-4444-555555555555"
     _seed_chroma_db(str(tmp_path), sqlite_count=10, segment_id=seg)
     assert _vector_segment_id(str(tmp_path), "nope") is None
+
+
+# ── hnsw_segment_signature ────────────────────────────────────────────
+
+
+def test_hnsw_segment_signature_none_without_palace(tmp_path):
+    assert hnsw_segment_signature(str(tmp_path), COLLECTION) is None
+
+
+def test_hnsw_segment_signature_none_without_vector_segment(tmp_path):
+    _seed_chroma_db(str(tmp_path), sqlite_count=1, segment_id="seg-v")
+    assert hnsw_segment_signature(str(tmp_path), "nope") is None
+
+
+def test_hnsw_segment_signature_tracks_segment_files(tmp_path):
+    seg = "seg-vector"
+    _seed_chroma_db(str(tmp_path), sqlite_count=1, segment_id=seg)
+    seg_dir = tmp_path / seg
+    seg_dir.mkdir()
+    (seg_dir / "data_level0.bin").write_bytes(b"abc")
+
+    sig = hnsw_segment_signature(str(tmp_path), COLLECTION)
+    assert sig is not None
+    assert sig[0] == seg
+    assert hnsw_segment_signature(str(tmp_path), COLLECTION) == sig
+
+    (seg_dir / "data_level0.bin").write_bytes(b"abcdef")
+    resized = hnsw_segment_signature(str(tmp_path), COLLECTION)
+    assert resized != sig
+
+    (seg_dir / "header.bin").write_bytes(b"x")
+    assert hnsw_segment_signature(str(tmp_path), COLLECTION) != resized
+
+
+def test_hnsw_segment_signature_empty_dir_is_stable(tmp_path):
+    """A segment id with no flushed files still yields a usable signature."""
+    seg = "seg-vector"
+    _seed_chroma_db(str(tmp_path), sqlite_count=1, segment_id=seg)
+    sig = hnsw_segment_signature(str(tmp_path), COLLECTION)
+    assert sig == (seg, ())
 
 
 # ── _hnsw_element_count ───────────────────────────────────────────────

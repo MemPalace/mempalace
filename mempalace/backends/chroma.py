@@ -867,6 +867,24 @@ def _pickle_signature(palace_path: str, segment_id: Optional[str]) -> tuple[int,
     return _stat_signature(os.path.join(palace_path, segment_id, "index_metadata.pickle"))
 
 
+def hnsw_segment_signature(
+    palace_path: str, collection_name: str = "mempalace_drawers"
+) -> Optional[tuple]:
+    """Fingerprint the VECTOR segment's on-disk files, or ``None`` if unresolvable."""
+    segment_id = _vector_segment_id(palace_path, collection_name)
+    if not segment_id:
+        return None
+    segment_dir = os.path.join(palace_path, segment_id)
+    try:
+        names = sorted(os.listdir(segment_dir))
+    except OSError:
+        names = []
+    return (
+        segment_id,
+        tuple((name, _stat_signature(os.path.join(segment_dir, name))) for name in names),
+    )
+
+
 def _segment_id_safe(palace_path: str, collection_name: str) -> Optional[str]:
     """``_vector_segment_id`` that never raises, for the pre-probe signature."""
     try:
