@@ -207,9 +207,11 @@ _STARTUP_INTEGRITY_MAX_MB_DEFAULT = 512.0
 #
 # The existing per-operation palace lock serializes individual writes, but it
 # cannot make another long-lived Chroma PersistentClient forget stale in-memory
-# HNSW/FTS state. Hold the same per-palace mine lock for this MCP process
-# lifetime. A peer MCP process can still serve read tools, but mutating tools
-# refuse before touching Chroma or the knowledge graph.
+# HNSW/FTS state. Acquire the same per-palace mine lock as a process-scoped
+# lease. The idle-release watchdog may drop it after a write-idle gap, and the
+# next mutating call reacquires it. While the lease is held, a peer MCP process
+# can still serve read tools, but mutating tools refuse before touching Chroma
+# or the knowledge graph.
 _MCP_WRITER_LOCK_CM = None
 _MCP_WRITER_READ_ONLY = False
 _MCP_WRITER_LOCK_FAILED = False
@@ -219,8 +221,8 @@ _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
 
 # Writer-lease idle release.
 #
-# The lease above is otherwise held for the life of the process, so an
-# orphaned-but-alive stdio server (client machine rebooted; SSH never
+# Without the watchdog, the lease above is held for the life of the process,
+# so an orphaned-but-alive stdio server (client machine rebooted; SSH never
 # delivered EOF) keeps every peer session read-only for hours. Acquisition is
 # already self-healing per mutating call, so the lease can be dropped whenever
 # this process has not written for a while: the next mutating call
