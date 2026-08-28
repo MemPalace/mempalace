@@ -4307,6 +4307,72 @@ class TestDiaryTools:
         )
 
 
+# ── Silent checkpoint acknowledgement ─────────────────────────────────
+
+
+def _checkpoint_ack_file(tmp_path, monkeypatch):
+    """Point the checkpoint tool at an isolated cross-platform home."""
+    home = tmp_path / "home"
+    state_dir = home / ".mempalace" / "hook_state"
+    state_dir.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    drive, tail = os.path.splitdrive(str(home))
+    monkeypatch.setenv("HOMEDRIVE", drive or "C:")
+    monkeypatch.setenv("HOMEPATH", tail or str(home))
+    return state_dir / "last_checkpoint"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [None, [], "sensitive checkpoint text", 42, True],
+    ids=["null", "array", "string", "number", "boolean"],
+)
+def test_memories_filed_away_consumes_non_object_json(tmp_path, monkeypatch, payload):
+    """Valid JSON roots that are not objects are malformed checkpoints."""
+    from mempalace import mcp_server
+
+    ack_file = _checkpoint_ack_file(tmp_path, monkeypatch)
+    ack_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = mcp_server.tool_memories_filed_away()
+
+    assert result == {
+        "status": "error",
+        "message": "\u2726 Journal entry filed in the palace",
+        "count": 0,
+        "timestamp": None,
+    }
+    assert not ack_file.exists()
+    assert "sensitive checkpoint text" not in json.dumps(result)
+
+
+def test_memories_filed_away_preserves_existing_outcomes(tmp_path, monkeypatch):
+    """Valid, invalid-syntax, and missing checkpoints retain their contract."""
+    from mempalace import mcp_server
+
+    ack_file = _checkpoint_ack_file(tmp_path, monkeypatch)
+    ack_file.write_text(json.dumps({"msgs": 7, "ts": "2026-01-01T00:00:00"}), encoding="utf-8")
+    assert mcp_server.tool_memories_filed_away() == {
+        "status": "ok",
+        "message": "\u2726 7 messages tucked into drawers",
+        "count": 7,
+        "timestamp": "2026-01-01T00:00:00",
+    }
+    assert not ack_file.exists()
+
+    ack_file.write_text("{not-json", encoding="utf-8")
+    assert mcp_server.tool_memories_filed_away()["status"] == "error"
+    assert not ack_file.exists()
+
+    assert mcp_server.tool_memories_filed_away() == {
+        "status": "quiet",
+        "message": "No recent journal entry",
+        "count": 0,
+        "timestamp": None,
+    }
+
+
 # ── Cache Invalidation (inode/mtime) ──────────────────────────────────
 
 
