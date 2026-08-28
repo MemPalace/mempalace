@@ -950,6 +950,18 @@ def test_on_memory_write_skips_unknown_target_and_non_add(initialized_provider):
 # ----- Automatic KnowledgeGraph factual prefetch -------------------------
 
 
+def test_active_provider_query_is_detected(integration_module):
+    checker = integration_module.MempalaceProvider._is_active_provider_query
+
+    assert checker("What memory provider are you currently using?") is True
+    assert checker(
+        "What memory provider are you currently using? Answer with only the provider name."
+    ) is True
+    assert checker("What memory provider are you using?") is True
+    assert checker("Which memory provider is currently active?") is True
+    assert checker("What did we discuss about the printer?") is False
+
+
 def test_factual_query_parser_identifies_current_status(integration_module):
     parser = integration_module.MempalaceProvider._extract_factual_kg_query
 
@@ -984,6 +996,41 @@ def test_system_prompt_declares_mempalace_as_active_provider(provider):
 
     assert "MemPalace is the active Hermes memory provider" in block
     assert "Do not use recalled conversation text as authoritative" in block
+    assert "FINAL MEMPALACE PRECEDENCE RULE" in block
+    assert block.index("FINAL MEMPALACE PRECEDENCE RULE") > block.index("MemPalace is the active Hermes memory provider")
+
+
+def test_prefetch_skips_semantic_recall_for_active_provider_query(
+    provider, integration_module, tmp_path, monkeypatch
+):
+    provider._initialized = True
+    provider._cron_skipped = False
+    provider._palace_path = str(tmp_path / "palace")
+    Path(provider._palace_path).mkdir()
+
+    calls = []
+
+    def fake_search(query, **kwargs):
+        calls.append(query)
+        return {
+            "results": [
+                {
+                    "wing": "general",
+                    "room": "conversations",
+                    "text": "Assistant: holographic",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(integration_module, "search_memories", fake_search)
+
+    result = provider.prefetch(
+        "What memory provider are you currently using? Answer with only the provider name."
+    )
+
+    assert result == ""
+    assert calls == []
+    assert provider.recall_status() is None
 
 
 def test_prefetch_uses_kg_for_current_and_historical_status(

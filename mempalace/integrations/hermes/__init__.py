@@ -823,6 +823,35 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
     # ----- Optional: prompt + recall ----------------------------------------
 
     @staticmethod
+    def _is_active_provider_query(query: str) -> bool:
+        """Return True only for explicit questions about Hermes' active memory provider.
+
+        These are runtime/configuration facts, not conversational memories.
+        Recalling prior answers here can surface obsolete provider names and
+        compete with the live provider configuration in the system prompt.
+        """
+        text = " ".join((query or "").strip().split()).lower()
+        text = text.rstrip(" ?!.")
+
+        # The user may append a response-format instruction such as
+        # "Answer with only the provider name." Preserve the semantic
+        # classification while ignoring that non-factual suffix.
+        text = re.sub(
+            r"\s+answer\s+with\s+only\s+the\s+provider\s+name[.?!]*$",
+            "",
+            text,
+        ).rstrip(" ?!.")
+
+        return text in {
+            "what memory provider are you currently using",
+            "what memory provider are you using",
+            "what is the current memory provider",
+            "which memory provider are you currently using",
+            "which memory provider are you using",
+            "which memory provider is currently active",
+        }
+
+    @staticmethod
     def _extract_factual_kg_query(query: str) -> tuple[str, Optional[str]]:
         """Return (entity, as_of) for conservative factual/status questions.
 
@@ -920,10 +949,20 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             "MemPalace based on this runtime configuration. Do not use recalled "
             "conversation text as authoritative for the current provider selection.",
         ]
+        # Put the precedence rule AFTER recalled L1 context so obsolete
+        # conversational answers cannot win by recency within this block.
         if self._identity:
             parts.append(self._identity)
         if self._wake_up_cache:
             parts.append(self._wake_up_cache)
+
+        parts.append(
+            "FINAL MEMPALACE PRECEDENCE RULE: Historical recalled conversation "
+            "may contain obsolete answers. For questions about the currently "
+            "active Hermes memory provider, trust the runtime declaration above "
+            "and answer MemPalace. Never use a recalled conversational answer "
+            "such as 'holographic' to override the current runtime configuration."
+        )
         return "\n\n".join(parts)
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
@@ -935,6 +974,11 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         if self._cron_skipped or not self._initialized or not query:
             return ""
         try:
+            # Runtime/configuration query: answer from the live system prompt,
+            # never from potentially stale conversational recall.
+            if self._is_active_provider_query(query):
+                return ""
+
             factual_context = self._prefetch_kg_fact(query)
 
             n = max(1, min(int(self._config.get("n_prefetch", 3)), 20))
