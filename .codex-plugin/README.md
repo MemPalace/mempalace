@@ -33,11 +33,21 @@ codex
 
 | Skill | Description |
 |-------|-------------|
-| `$mempalace:help` | Show available commands and usage tips |
-| `$mempalace:init` | Initialize a new memory palace |
-| `$mempalace:search` | Semantic search across all mined memories |
-| `$mempalace:mine` | Mine a project or conversation into your palace |
-| `$mempalace:status` | Show palace status, room counts, and health |
+| `$mempalace:mempalace` | Install, configure, and operate MemPalace, including a private local palace, a shared-brain hub, or a client joining an existing hub |
+| `$mempalace:mempalace-recall` | Recall protocol for MemPalace — search the palace before answering about past work, people, projects, or prior decisions |
+| `$mempalace:mempalace-task` | Create, hand off, claim, execute, and close agent tasks through the MemPalace logstream |
+
+### Skill Commands
+
+The main `$mempalace:mempalace` skill can be invoked with five different subcommands. `$mempalace <command>` can be used as a short form invocation. 
+
+| Command | Description |
+|---------| ------------|
+| `$mempalace help` | Show available commands and usage tips |
+| `$mempalace init` | Initialize a new memory palace |
+| `$mempalace search` | Semantic search across all mined memories |
+| `$mempalace mine` | Mine a project or conversation into your palace |
+| `$mempalace status` | Show palace status, room counts, and health |
 
 ## Hooks
 
