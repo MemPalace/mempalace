@@ -9,7 +9,11 @@ This file is RED-first. The corresponding implementation lives in
 ``mempalace/hallways.py`` and is written to make these tests pass.
 """
 
+import json
+import logging
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 
 # Mock chromadb at import time so the hallways module can be loaded even
@@ -54,6 +58,16 @@ def _fake_collection(drawers):
     return col
 
 
+def _valid_hallway(hallway_id="h1", wing="wing_a", entity_a="A", entity_b="B"):
+    """Return the minimum hallway shape supported since the feature shipped."""
+    return {
+        "id": hallway_id,
+        "wing": wing,
+        "entity_a": entity_a,
+        "entity_b": entity_b,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Storage primitives — _load_hallways / _save_hallways
 # ─────────────────────────────────────────────────────────────────────────────
@@ -68,6 +82,37 @@ class TestHallwayStorage:
         hallway_file = _use_tmp_hallway_file(monkeypatch, tmp_path)
         hallway_file.write_text("{not valid json", encoding="utf-8")
         assert hallways_mod._load_hallways() == []
+
+    def test_load_hallways_invalid_utf8_returns_empty_list(self, tmp_path, monkeypatch):
+        hallway_file = _use_tmp_hallway_file(monkeypatch, tmp_path)
+        hallway_file.write_bytes(b'[{"id":"h1"},\xff]')
+        assert hallways_mod._load_hallways() == []
+
+    @pytest.mark.parametrize("decode_error", [ValueError("integer too large"), RecursionError()])
+    def test_load_hallways_decoder_limits_return_empty_list(
+        self, tmp_path, monkeypatch, decode_error
+    ):
+        hallway_file = _use_tmp_hallway_file(monkeypatch, tmp_path)
+        hallway_file.write_text("[]", encoding="utf-8")
+        monkeypatch.setattr(hallways_mod.json, "load", MagicMock(side_effect=decode_error))
+        assert hallways_mod._load_hallways() == []
+
+    def test_load_hallways_decoder_error_does_not_reflect_exception_text(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        hallway_file = _use_tmp_hallway_file(monkeypatch, tmp_path)
+        hallway_file.write_text("[]", encoding="utf-8")
+        monkeypatch.setattr(
+            hallways_mod.json,
+            "load",
+            MagicMock(side_effect=ValueError("SECRET_DECODER_PAYLOAD")),
+        )
+
+        with caplog.at_level(logging.DEBUG, logger="mempalace_hallways"):
+            assert hallways_mod._load_hallways() == []
+
+        assert str(hallway_file) in caplog.text
+        assert "SECRET_DECODER_PAYLOAD" not in caplog.text
 
     def test_save_and_load_round_trip(self, tmp_path, monkeypatch):
         _use_tmp_hallway_file(monkeypatch, tmp_path)
@@ -84,6 +129,131 @@ class TestHallwayStorage:
         ]
         hallways_mod._save_hallways(sample)
         assert hallways_mod._load_hallways() == sample
+
+    @pytest.mark.parametrize("storage_format", ["envelope", "legacy-list"])
+    def test_load_skips_malformed_records_without_logging_contents(
+        self, tmp_path, monkeypatch, caplog, storage_format
+    ):
+        hallway_file = _use_tmp_hallway_file(monkeypatch, tmp_path)
+        valid = {
+            **_valid_hallway(),
+            "strength": 0.75,
+            "legacy_optional_field": "preserved",
+        }
+        records = [
+            None,
+            "SECRET_RECORD_CONTENT",
+            42,
+            True,
+            [],
+            {},
+            {"id": "partial", "wing": "wing_a", "entity_a": "A"},
+            {"id": "wrong-type", "wing": "wing_a", "entity_a": "A", "entity_b": []},
+            {"id": "   ", "wing": "wing_a", "entity_a": "A", "entity_b": "B"},
+            {"id": "blank-wing", "wing": "\t", "entity_a": "A", "entity_b": "B"},
+            {"id": "bad-a", "wing": "wing_a", "entity_a": None, "entity_b": "B"},
+            {"id": "bad-b", "wing": "wing_a", "entity_a": "A", "entity_b": "  "},
+            {"id": 7, "wing": "wing_a", "entity_a": "A", "entity_b": "B"},
+            {**_valid_hallway("bad-count-1"), "co_occurrence_count": "SECRET_BAD_COUNT"},
+            {**_valid_hallway("bad-count-2"), "co_occurrence_count": None},
+            {**_valid_hallway("bad-count-3"), "co_occurrence_count": True},
+            {**_valid_hallway("bad-count-4"), "co_occurrence_count": float("nan")},
+            {**_valid_hallway("bad-count-5"), "co_occurrence_count": float("inf")},
+            {**_valid_hallway("bad-count-6"), "co_occurrence_count": float("-inf")},
+            {**_valid_hallway("bad-rooms-1"), "rooms": 7},
+            {**_valid_hallway("bad-rooms-2"), "rooms": [{}]},
+            {**_valid_hallway("bad-rooms-3"), "rooms": "room_a"},
+            {**_valid_hallway("bad-rooms-4"), "rooms": None},
+            {**_valid_hallway("bad-unicode"), "label": "\ud800"},
+            valid,
+        ]
+        payload = (
+            {"schema_version": 1, "hallways": records} if storage_format == "envelope" else records
+        )
+        hallway_file.write_text(json.dumps(payload), encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING, logger="mempalace_hallways"):
+            loaded = hallways_mod._load_hallways()
+
+        assert loaded == [valid]
+        assert "Skipped 24 malformed hallway records" in caplog.text
+        assert str(hallway_file) in caplog.text
+        assert "SECRET_RECORD_CONTENT" not in caplog.text
+        assert "SECRET_BAD_COUNT" not in caplog.text
+
+    @pytest.mark.parametrize(
+        ("payload", "private_marker"),
+        [
+            ("SECRET_ROOT_CONTENT", "SECRET_ROOT_CONTENT"),
+            (
+                {"schema_version": 1, "hallways": {"SECRET_FIELD_KEY": "private"}},
+                "SECRET_FIELD_KEY",
+            ),
+            (
+                {"schema_version": 1, "SECRET_ENVELOPE_FIELD": "private"},
+                "SECRET_ENVELOPE_FIELD",
+            ),
+        ],
+    )
+    def test_load_rejects_non_list_payload_without_logging_contents(
+        self, tmp_path, monkeypatch, caplog, payload, private_marker
+    ):
+        hallway_file = _use_tmp_hallway_file(monkeypatch, tmp_path)
+        original = json.dumps(payload).encode("utf-8")
+        hallway_file.write_bytes(original)
+
+        with caplog.at_level(logging.WARNING, logger="mempalace_hallways"):
+            loaded = hallways_mod._load_hallways()
+
+        assert loaded == []
+        assert hallway_file.read_bytes() == original
+        assert "expected a JSON list" in caplog.text
+        assert str(hallway_file) in caplog.text
+        assert private_marker not in caplog.text
+
+        assert hallways_mod.delete_hallway("missing") is False
+        assert hallway_file.read_bytes() == original
+
+    @pytest.mark.parametrize("storage_format", ["envelope", "legacy-list"])
+    def test_list_and_delete_recover_from_mixed_records(
+        self, tmp_path, monkeypatch, storage_format
+    ):
+        hallway_file = _use_tmp_hallway_file(monkeypatch, tmp_path)
+        deleted = _valid_hallway()
+        kept = _valid_hallway("h2", "wing_b", "C", "D")
+        records = [
+            None,
+            "junk",
+            {**_valid_hallway("bad-count"), "co_occurrence_count": "SECRET_BAD_COUNT"},
+            {**_valid_hallway("bad-unicode"), "label": "\ud800"},
+            deleted,
+            kept,
+        ]
+        payload = (
+            {"schema_version": 1, "hallways": records} if storage_format == "envelope" else records
+        )
+        original = json.dumps(payload)
+        hallway_file.write_text(original, encoding="utf-8")
+
+        assert hallways_mod.list_hallways(wing="wing_a") == [deleted]
+        assert hallway_file.read_text(encoding="utf-8") == original
+
+        assert hallways_mod.delete_hallway("h1") is True
+        assert json.loads(hallway_file.read_text(encoding="utf-8")) == {
+            "schema_version": 1,
+            "hallways": [kept],
+        }
+
+    def test_unknown_delete_preserves_mixed_file_bytes(self, tmp_path, monkeypatch):
+        hallway_file = _use_tmp_hallway_file(monkeypatch, tmp_path)
+        original = json.dumps(
+            {"schema_version": 1, "hallways": [None, _valid_hallway()]},
+            indent=3,
+        )
+        hallway_file.write_text(original, encoding="utf-8")
+
+        assert hallways_mod.delete_hallway("missing") is False
+        assert hallway_file.read_text(encoding="utf-8") == original
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -109,6 +279,32 @@ class TestComputeHallways:
         assert len(created) == 1
         assert hallways_mod.list_hallways(config=selected_cfg) == created
         assert hallways_mod.list_hallways(config=default_cfg) == []
+
+    def test_compute_skips_malformed_records_and_preserves_valid_other_wings(
+        self, tmp_path, monkeypatch
+    ):
+        hallway_file = _use_tmp_hallway_file(monkeypatch, tmp_path)
+        other_wing = _valid_hallway("other-hallway", "wing_b", "B", "C")
+        hallway_file.write_text(
+            json.dumps({"schema_version": 1, "hallways": [None, "junk", other_wing]}),
+            encoding="utf-8",
+        )
+        col = _fake_collection(
+            [
+                {"wing": "wing_a", "room": "room_1", "entities": "A;B"},
+                {"wing": "wing_a", "room": "room_2", "entities": "A;B"},
+            ]
+        )
+
+        created = hallways_mod.compute_hallways_for_wing("wing_a", col=col)
+
+        assert len(created) == 1
+        persisted = json.loads(hallway_file.read_text(encoding="utf-8"))
+        assert persisted["schema_version"] == 1
+        assert {record["id"] for record in persisted["hallways"]} == {
+            "other-hallway",
+            created[0]["id"],
+        }
 
     def test_returns_empty_for_unknown_wing(self, tmp_path, monkeypatch):
         """Wing with no drawers → no hallways, no crash."""
@@ -315,7 +511,7 @@ class TestHallwayQuery:
 
     def test_delete_hallway_unknown_id_returns_false(self, tmp_path, monkeypatch):
         _use_tmp_hallway_file(monkeypatch, tmp_path)
-        hallways_mod._save_hallways([{"id": "h1", "wing": "wing_aya"}])
+        hallways_mod._save_hallways([_valid_hallway("h1", "wing_aya", "Aya", "Lumi")])
         assert hallways_mod.delete_hallway("nonexistent") is False
 
     def test_delete_hallway_uses_selected_palace_config(self, tmp_path):
@@ -323,7 +519,7 @@ class TestHallwayQuery:
 
         default_cfg = MempalaceConfig(palace_path=tmp_path / "default" / "palace")
         selected_cfg = MempalaceConfig(palace_path=tmp_path / "selected" / "palace")
-        record = {"id": "h1", "wing": "wing_aya"}
+        record = _valid_hallway("h1", "wing_aya", "Aya", "Lumi")
         hallways_mod._save_hallways([record], default_cfg)
         hallways_mod._save_hallways([record], selected_cfg)
 
