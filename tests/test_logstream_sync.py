@@ -8,6 +8,7 @@ engine's two-replica convergence (including a partition with duplicate
 claims), and the CLI sync command.
 """
 
+import errno
 import http.client
 import json
 import multiprocessing
@@ -210,6 +211,50 @@ class TestReplicaIdentity:
         with pytest.raises(PermissionError, match="publication denied"):
             get_replica_id(palace_a)
 
+        assert not os.path.exists(os.path.join(palace_a, "replica.json"))
+        assert os.listdir(palace_a) == []
+
+    @pytest.mark.parametrize("errno_name", ["EOPNOTSUPP", "ENOTSUP"])
+    def test_unsupported_hard_link_errno_is_actionable_and_fail_closed(
+        self, palace_a, monkeypatch, errno_name
+    ):
+        error_number = getattr(errno, errno_name, None)
+        if error_number is None:
+            pytest.skip(f"{errno_name} is not defined on this platform")
+
+        def reject_hard_link(_candidate, _destination):
+            raise OSError(error_number, f"{errno_name}: hard links unsupported")
+
+        monkeypatch.setattr(replica_module.os, "link", reject_hard_link)
+
+        with pytest.raises(
+            OSError, match="safe first-mint publication requires hard-link support"
+        ) as exc_info:
+            get_replica_id(palace_a)
+
+        assert "no replica identity was written to replica.json" in str(exc_info.value)
+        assert "Move the palace to a filesystem with hard-link support" in str(exc_info.value)
+        assert not os.path.exists(os.path.join(palace_a, "replica.json"))
+        assert os.listdir(palace_a) == []
+
+    @pytest.mark.parametrize("winerror", [1, 50])
+    def test_windows_unsupported_hard_link_error_is_actionable_and_fail_closed(
+        self, palace_a, monkeypatch, winerror
+    ):
+        def reject_hard_link(_candidate, _destination):
+            error = OSError(errno.EINVAL, "hard links unsupported")
+            error.winerror = winerror
+            raise error
+
+        monkeypatch.setattr(replica_module.os, "link", reject_hard_link)
+
+        with pytest.raises(
+            OSError, match="safe first-mint publication requires hard-link support"
+        ) as exc_info:
+            get_replica_id(palace_a)
+
+        assert "no replica identity was written to replica.json" in str(exc_info.value)
+        assert "Move the palace to a filesystem with hard-link support" in str(exc_info.value)
         assert not os.path.exists(os.path.join(palace_a, "replica.json"))
         assert os.listdir(palace_a) == []
 

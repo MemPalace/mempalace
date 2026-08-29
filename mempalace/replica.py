@@ -13,6 +13,7 @@ The id never syncs and never rotates silently; it names the seat (this
 machine's copy of the palace), not the model or the agent.
 """
 
+import errno
 import json
 import os
 import re
@@ -23,6 +24,13 @@ from pathlib import Path
 REPLICA_FILENAME = "replica.json"
 
 _REPLICA_ID_RE = re.compile(r"^rep_(?:[0-9a-f]{12}|[0-9a-f]{32})$")
+
+_UNSUPPORTED_HARD_LINK_ERRNOS = frozenset(
+    getattr(errno, name) for name in ("EOPNOTSUPP", "ENOTSUP") if hasattr(errno, name)
+)
+# Win32 ERROR_INVALID_FUNCTION and ERROR_NOT_SUPPORTED.  Python exposes these
+# via ``winerror``; their translated POSIX errno is not stable enough to test.
+_UNSUPPORTED_HARD_LINK_WINERRORS = frozenset({1, 50})
 
 
 def _mint() -> str:
@@ -59,6 +67,27 @@ def _fsync_directory(path: Path) -> None:
         pass
 
 
+def _hard_link_is_unsupported(exc: OSError) -> bool:
+    """Recognize only platform errors that mean hard links are unavailable."""
+    return (
+        exc.errno in _UNSUPPORTED_HARD_LINK_ERRNOS
+        or getattr(exc, "winerror", None) in _UNSUPPORTED_HARD_LINK_WINERRORS
+    )
+
+
+def _unsupported_hard_link_error(path: Path, exc: OSError) -> OSError:
+    error_number = exc.errno
+    if error_number is None:
+        error_number = getattr(errno, "ENOTSUP", getattr(errno, "EOPNOTSUPP", errno.EINVAL))
+    return OSError(
+        error_number,
+        "safe first-mint publication requires hard-link support, but this "
+        f"filesystem rejected it; no replica identity was written to {path.name}. "
+        "Move the palace to a filesystem with hard-link support and retry.",
+        str(path),
+    )
+
+
 def get_replica_id(palace_path: str) -> str:
     """Return this palace's stable replica id, minting it on first use.
 
@@ -66,7 +95,8 @@ def get_replica_id(palace_path: str) -> str:
     Concurrent first callers all adopt the one no-clobber winner, while a
     corrupt or foreign-shaped file fails loudly rather than silently minting
     a second identity — two ids for one replica would fork its op-log
-    provenance.
+    provenance. Filesystems without hard-link support fail closed before
+    ``replica.json`` is published.
     """
     path = Path(os.path.expanduser(palace_path)) / REPLICA_FILENAME
     try:
@@ -92,6 +122,10 @@ def get_replica_id(palace_path: str) -> str:
             os.link(tmp, path)
         except FileExistsError:
             return _read_replica_id(path)
+        except OSError as exc:
+            if not _hard_link_is_unsupported(exc):
+                raise
+            raise _unsupported_hard_link_error(path, exc) from exc
 
         _fsync_directory(path.parent)
         return replica_id
