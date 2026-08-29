@@ -621,7 +621,8 @@ class _FakeMsvcrt:
     def locking(self, fileno, mode, nbytes):
         self.calls += 1
         if self.calls <= self.fail_times:
-            raise OSError(errno.EDEADLOCK, "Resource deadlock avoided")
+            deadlock_errno = getattr(errno, "EDEADLOCK", errno.EDEADLK)
+            raise OSError(deadlock_errno, "Resource deadlock avoided")
 
 
 def test_windows_blocking_lock_retries_past_lk_lock_timeout(tmp_path, monkeypatch):
