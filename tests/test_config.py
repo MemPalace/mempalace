@@ -1086,3 +1086,56 @@ def test_lang_explicit_ignores_entity_languages_fallback():
     cfg = MempalaceConfig(config_dir=tmpdir)
     assert cfg.lang_explicit is None
     assert cfg.lang == "ko"  # display-side fallback still works
+
+
+def test_hooks_mine_transcript_default():
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.hooks_mine_transcript is True
+
+
+def test_hooks_mine_transcript_from_config():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"hooks": {"mine_transcript": False}}, f)
+    cfg = MempalaceConfig(config_dir=tmpdir)
+    assert cfg.hooks_mine_transcript is False
+
+
+def test_hooks_mine_transcript_independent_of_auto_save():
+    """The checkpoint and the raw transcript mine are separate switches."""
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"hooks": {"auto_save": True, "mine_transcript": False}}, f)
+    cfg = MempalaceConfig(config_dir=tmpdir)
+    assert cfg.hooks_auto_save is True
+    assert cfg.hooks_mine_transcript is False
+
+
+def test_hooks_mine_transcript_env_override_false():
+    os.environ["MEMPALACE_HOOKS_MINE_TRANSCRIPT"] = "false"
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert cfg.hooks_mine_transcript is False
+    finally:
+        del os.environ["MEMPALACE_HOOKS_MINE_TRANSCRIPT"]
+
+
+def test_hooks_mine_transcript_env_override_true():
+    """Env var wins over a config file that disabled the mine."""
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"hooks": {"mine_transcript": False}}, f)
+    os.environ["MEMPALACE_HOOKS_MINE_TRANSCRIPT"] = "true"
+    try:
+        cfg = MempalaceConfig(config_dir=tmpdir)
+        assert cfg.hooks_mine_transcript is True
+    finally:
+        del os.environ["MEMPALACE_HOOKS_MINE_TRANSCRIPT"]
+
+
+def test_hooks_mine_transcript_non_dict_hooks_falls_back():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"hooks": "nonsense"}, f)
+    cfg = MempalaceConfig(config_dir=tmpdir)
+    assert cfg.hooks_mine_transcript is True
