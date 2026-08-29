@@ -947,6 +947,101 @@ def _extract_themes(messages: list[str], max_themes: int = 3) -> list[str]:
     return [w for w, _ in words.most_common(max_themes)]
 
 
+# A long-lived hub (``mempalace serve``) holds the palace writer lease for its
+# whole lifetime, so an in-process write from a hook is refused on every machine
+# running one — which is the documented shared-brain setup. The transcript mine
+# already survives that (it spawns the CLI, and ``cli._forward_mine_to_hub``
+# hands the job to the hub); the diary checkpoint did not, so on a hub machine
+# hooks archived the entire transcript and lost the one compressed entry that
+# continuity actually reads back. Shares the CLI forwarder's kill switch.
+_HUB_FORWARD_ENV = "MEMPALACE_HUB_FORWARD"
+_HUB_HEALTH_TIMEOUT_S = 2.0
+_HUB_DIARY_TIMEOUT_S = 60.0
+
+
+def _forward_diary_to_hub(agent_name: str, entry: str, topic: str, wing: str):
+    """File one diary checkpoint inside the palace hub, if a live one serves us.
+
+    Returns True when the hub filed it, False when there is no usable hub
+    (the caller then writes in-process, as before), and None when the hub
+    answered but the write failed — the entry may already be filed, so the
+    caller must not retry locally.
+    """
+    import urllib.error
+    import urllib.request
+
+    from . import server_registry
+
+    if os.environ.get(_HUB_FORWARD_ENV, "").strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    try:
+        palace_path = MempalaceConfig().palace_path
+        info = server_registry.read_live_serverinfo(palace_path)
+        if not info or info.get("read_only") or info.get("pid") == os.getpid():
+            return False
+        base_url = server_registry.client_base_url(info)
+        headers = {"Content-Type": "application/json"}
+        token = server_registry.load_server_token(palace_path)
+    except Exception as exc:
+        _log(f"Hub discovery failed ({exc}); writing diary checkpoint directly")
+        return False
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        health = urllib.request.Request(f"{base_url}/healthz", headers=headers)
+        with urllib.request.urlopen(health, timeout=_HUB_HEALTH_TIMEOUT_S) as resp:
+            if resp.status != 200:
+                return False
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+    body = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "mempalace_diary_write",
+                "arguments": {
+                    "agent_name": agent_name,
+                    "entry": entry,
+                    "topic": topic,
+                    "wing": wing,
+                },
+            },
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    try:
+        request = urllib.request.Request(f"{base_url}/mcp", data=body, headers=headers)
+        with urllib.request.urlopen(request, timeout=_HUB_DIARY_TIMEOUT_S) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        _log(f"Hub rejected diary checkpoint ({exc.code} {exc.reason})")
+        return None
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        # Never fall back here: the hub may have filed it already, and a
+        # second write would duplicate verbatim content.
+        _log(f"Hub at {base_url} did not complete the diary checkpoint ({exc})")
+        return None
+
+    if payload.get("error"):
+        _log(f"Hub refused diary checkpoint: {payload['error'].get('message', 'unknown')}")
+        return None
+    try:
+        result = json.loads(payload["result"]["content"][0]["text"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        _log("Hub returned an unrecognized diary response")
+        return None
+    if not result.get("success"):
+        _log(f"Hub diary checkpoint failed: {result.get('error', 'unknown')}")
+        return None
+    _log(f"Diary checkpoint saved via hub: {result.get('entry_id', '?')}")
+    return True
+
+
 def _save_diary_direct(
     transcript_path: str,
     session_id: str,
@@ -1034,6 +1129,24 @@ def _save_diary_direct(
             _log(f"Daemon diary checkpoint failed: {result.get('error', job.get('error'))}")
             return {"count": 0}
 
+        # Prefer the hub: it owns the writer lease, so an in-process write
+        # loses to it. No hub means no contention, and we write directly.
+        hub_status = _forward_diary_to_hub(agent_name, entry, "checkpoint", wing)
+        if hub_status is None:
+            return {"count": 0}
+        if hub_status:
+            try:
+                ack_file = STATE_DIR / "last_checkpoint"
+                ack_file.write_text(
+                    json.dumps({"msgs": len(messages), "ts": now.isoformat()}),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+            if toast:
+                _desktop_toast(f"Checkpoint saved \u2014 {len(messages)} messages archived")
+            return {"count": len(messages), "themes": themes}
+
         from .mcp_server import tool_diary_write
 
         result = tool_diary_write(
@@ -1075,7 +1188,10 @@ def _ingest_transcript(transcript_path: str):
         return
 
     try:
-        MempalaceConfig()  # validate config loads
+        # Also validates that config loads at all.
+        if not MempalaceConfig().hooks_mine_transcript:
+            _log("Transcript ingest skipped (hooks.mine_transcript is false)")
+            return
     except Exception:
         return
 
@@ -1587,9 +1703,29 @@ def hook_precompact(data: dict, harness: str):
             _output(_blocked_hook_output(routing))
             return
 
+        try:
+            config = MempalaceConfig()
+            mine_transcript = config.hooks_mine_transcript
+            toast = config.hook_desktop_toast
+        except Exception:
+            mine_transcript = True
+            toast = False
+
         # Capture tool output via our normalize path before compaction loses it
         if transcript_path:
-            _ingest_transcript(transcript_path)
+            if mine_transcript:
+                _ingest_transcript(transcript_path)
+            else:
+                # Compaction is the moment context is dropped. With the
+                # transcript mine off this hook would otherwise capture
+                # nothing at all, so file the compressed checkpoint instead.
+                _save_diary_direct(
+                    transcript_path,
+                    session_id,
+                    wing=_wing_from_transcript_path(transcript_path),
+                    toast=toast,
+                    agent_name=_diary_agent_for_harness(harness),
+                )
 
         # Mine MEMPAL_DIR synchronously so project data lands before
         # compaction proceeds. Transcript convos were already kicked off

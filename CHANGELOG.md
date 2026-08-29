@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Features
+
+- **The diary checkpoint and the raw transcript mine have separate switches.** `hooks.auto_save` was introduced (#711) to toggle automatic *diary saves*; the verbatim transcript ingest was added under the same gate later, and the two have nothing in common but their trigger. A checkpoint is one drawer built from recent user prompts, truncated, with no assistant text and no tool output. A transcript mine files the whole JSONL session verbatim — one long session measured here filed 1654 drawers, and because MemPalace never redacts, every token a command printed went in as printed. Wanting continuity without that archive left only one option: turn off auto-save entirely and lose the checkpoints too. The new `hooks.mine_transcript` (config `hooks.mine_transcript`, env `MEMPALACE_HOOKS_MINE_TRANSCRIPT`, default `true` — behavior unchanged) gates the ingest alone, in `_ingest_transcript`, so all three hooks honor it from one place. With the mine off, `PreCompact` files a checkpoint instead of mining, so the moment context is dropped is never captured as nothing. (#2403)
+
+### Bug Fixes
+
+- **Hook diary checkpoints reach a palace served by a hub.** A long-lived `mempalace serve` holds the writer lease for its whole process lifetime, which `cli._forward_mine_to_hub` already accounts for: the hook's transcript mine spawns the CLI, and the CLI hands the job to the hub over HTTP. The checkpoint took the other path — `hooks_cli._save_diary_direct` imports `mcp_server.tool_diary_write` and calls it in-process — and no hub forwarding existed there, so on exactly the machines the shared-brain guide tells you to set up, every checkpoint was refused with `palace ... is held by PID <hub>` while the raw mine beside it succeeded. The two failure modes compounded: the layer that costs thousands of drawers kept working, the compressed layer that the next session reads back was silently lost, and the hook log recorded both outcomes one line apart. `_save_diary_direct` now discovers a live, writable hub the same way the CLI does — `read_live_serverinfo`, a `/healthz` probe, then a `tools/call` for `mempalace_diary_write` with the local bearer token — and writes in-process only when no hub answers. A hub that answers and fails is not retried locally, since it may have filed the entry already. Honors the CLI forwarder's `MEMPALACE_HUB_FORWARD=0` kill switch and skips read-only hubs. (#2403)
+
 ---
 
 ## [3.9.0] — 2026-08-31
