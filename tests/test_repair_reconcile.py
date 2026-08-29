@@ -275,6 +275,22 @@ def test_extract_only_ids_filters(tmp_path):
     assert got["d-2"][1] == {"wing": "w", "room": "r"}
 
 
+def test_extract_only_ids_preserves_sparse_metadata_rows(tmp_path):
+    _seed(str(tmp_path), ["d-0", "d-1"], hnsw_ids=["d-0"])
+    conn = sqlite3.connect(tmp_path / "chroma.sqlite3")
+    try:
+        row = conn.execute("SELECT id FROM embeddings WHERE embedding_id = ?", ("d-1",)).fetchone()
+        assert row is not None
+        conn.execute("DELETE FROM embedding_metadata WHERE id = ?", (row[0],))
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert list(extract_via_sqlite(str(tmp_path), COLLECTION, only_ids={"d-1"})) == [
+        ("d-1", "", {})
+    ]
+
+
 def test_extract_only_ids_empty_yields_nothing(tmp_path):
     _seed(str(tmp_path), _ids(6), hnsw_ids=_ids(2))
     assert list(extract_via_sqlite(str(tmp_path), COLLECTION, only_ids=set())) == []

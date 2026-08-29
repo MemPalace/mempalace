@@ -1803,15 +1803,17 @@ def _emit_extracted_rows(
         f"""
         SELECT e.embedding_id, em.key, em.string_value, em.int_value,
                em.float_value, em.bool_value
-        FROM embedding_metadata em
-        JOIN embeddings e ON em.id = e.id
+        FROM embeddings e
+        LEFT JOIN embedding_metadata em ON em.id = e.id
         WHERE e.segment_id = ?{id_filter}
-        ORDER BY em.id
+        ORDER BY e.id
         """,
         params,
     ):
         if emb_id not in per_id:
             order.append(emb_id)
+        if key is None:
+            continue
         if sv is not None:
             per_id[emb_id][key] = sv
         elif iv is not None:
