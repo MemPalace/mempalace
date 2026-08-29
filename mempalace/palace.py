@@ -1655,29 +1655,29 @@ def prefetch_content_hashes(
     """
     hashes: dict[tuple[str, str], str] = {}
     try:
-        total = collection.count()
-        offset = 0
-        while offset < total:
-            batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
-            for meta in batch["metadatas"]:
-                meta = meta or {}
-                content_hash_field = meta.get("content_hash")
-                src = meta.get("source_file")
-                wing = meta.get("wing")
-                if not content_hash_field or not src or not wing:
-                    continue
-                if not _metadata_matches_extract_mode(meta, extract_mode):
-                    continue
-                version = meta.get("normalize_version", 1)
-                if version < NORMALIZE_VERSION:
-                    continue
-                for content_hash in content_hash_field.split(","):
-                    key = (wing, content_hash)
-                    if content_hash and key not in hashes:
-                        hashes[key] = src
-            if not batch["ids"]:
-                break
-            offset += len(batch["ids"])
+        # One bulk pass via the backend hook rather than a
+        # ``collection.get(limit=, offset=)`` loop: on backends whose get()
+        # materializes the full result set and Python-slices it (qdrant's
+        # _rows -> _scroll_all), that loop is O(n^2) in collection size, each
+        # page re-walking everything to discard all but its slice (#1796).
+        # BaseCollection.get_all_metadata's default *is* that limit/offset
+        # paging, so backends without an override keep identical behavior.
+        for meta in collection.get_all_metadata():
+            meta = meta or {}
+            content_hash_field = meta.get("content_hash")
+            src = meta.get("source_file")
+            wing = meta.get("wing")
+            if not content_hash_field or not src or not wing:
+                continue
+            if not _metadata_matches_extract_mode(meta, extract_mode):
+                continue
+            version = meta.get("normalize_version", 1)
+            if version < NORMALIZE_VERSION:
+                continue
+            for content_hash in content_hash_field.split(","):
+                key = (wing, content_hash)
+                if content_hash and key not in hashes:
+                    hashes[key] = src
     except Exception:
         logger.warning("prefetch_content_hashes: partial fetch, %d hashes loaded", len(hashes))
     return hashes

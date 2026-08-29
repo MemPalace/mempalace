@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **A convo mine no longer re-walks the whole collection once per thousand drawers.** `prefetch_content_hashes` builds the `(wing, content_hash) -> source_file` map every `mempalace mine --mode convos` consults before filing, and it paged the collection with `get(limit=1000, offset=N)`. That shape assumes `limit`/`offset` reach the store, which is true of Chroma's SQL cursor and false of Qdrant, where `get()` goes through `_rows() -> _scroll_all()` to materialize every matching row and slices the result in Python afterwards: each page walked the entire collection to keep a thousandth of it, so the scan cost grew with the square of palace size. On a 260,415-drawer Qdrant palace that was 261 passes over 260,415 rows -- roughly 68 million payloads fetched and JSON-decoded, 17+ minutes of a pegged core and 800 MB resident -- to build a map the miner then consulted for a single transcript. The hook-driven mine that runs every few exchanges meant one core stayed pegged for the length of a working session. It now takes the single-cursor `get_all_metadata()` path added for exactly this in #1832, the same one `mcp_server._fetch_all_metadata()` already uses, which brings that palace to 4.1 s and the whole dry-run mine to 4.5 s. `BaseCollection.get_all_metadata` defaults to the identical offset loop, so backends with a real server-side cursor are behaviorally unchanged. (#1796)
+
 ---
 
 ## [3.9.0] — 2026-08-31
