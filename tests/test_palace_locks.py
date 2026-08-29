@@ -9,6 +9,7 @@ against *different* palaces must still be free to run in parallel.
 
 from __future__ import annotations
 
+import hashlib
 import multiprocessing
 import os
 import threading
@@ -552,22 +553,99 @@ def test_reap_never_removes_a_lock_held_by_another_process(tmp_path, monkeypatch
         assert holder.exitcode == 0
 
 
-def test_reap_skips_mine_palace_prefixed_locks(tmp_path, monkeypatch):
-    """mine_palace_*.lock belongs to the newer per-palace lock (mine_palace_lock)
-    with its own lifecycle and holder tracking — this reaper targets only the
-    per-source-file locks mine_lock creates, and must not touch those."""
+def test_reap_reclaims_stale_mine_palace_lock(tmp_path, monkeypatch):
+    """A mine_palace_*.lock whose flock is free (writer died) and whose mtime
+    is old is reclaimed — the palace lock's release path never unlinks the
+    file, so a crashed writer orphans it just like a per-source lock."""
     _isolate_home(monkeypatch, tmp_path)
     lock_dir = tmp_path / ".mempalace" / "locks"
     lock_dir.mkdir(parents=True)
-    palace_lock = lock_dir / "mine_palace_deadbeefdeadbeef.lock"
-    palace_lock.write_bytes(b"")
-    old_time = time.time() - 7200
-    os.utime(palace_lock, (old_time, old_time))
+    palace_path = str(tmp_path / "some_palace")
+    key = hashlib.sha256(os.path.normcase(os.path.realpath(palace_path)).encode()).hexdigest()[:16]
+    stale = lock_dir / f"mine_palace_{key}.lock"
+    stale.write_bytes(b"\x00dead-beef")
+    old_time = time.time() - 7200  # 2h old, past the default 1h threshold
+    os.utime(stale, (old_time, old_time))
 
     reaped, skipped = reap_stale_mine_locks(min_age_seconds=3600)
 
-    assert reaped == 0
-    assert palace_lock.exists()
+    assert reaped == 1
+    assert skipped == 0
+    assert not stale.exists()
+
+
+def test_reap_never_removes_live_mine_palace_lock(tmp_path, monkeypatch):
+    """The core safety property for palace locks: a mine_palace_*.lock held
+    by a live writer process is never removed, however old it looks by mtime
+    — the flock check is the safety mechanism, not the age threshold."""
+    _isolate_home(monkeypatch, tmp_path)
+    palace_path = str(tmp_path / "held_palace")
+    ready = str(tmp_path / "ready")
+    release = str(tmp_path / "release")
+
+    ctx = _get_mp_context()
+    holder = ctx.Process(target=_hold_lock, args=(palace_path, ready, release))
+    holder.start()
+    try:
+        for _ in range(500):
+            if os.path.exists(ready):
+                break
+            time.sleep(0.01)
+        assert os.path.exists(ready), "holder failed to acquire palace lock in time"
+
+        lock_dir = tmp_path / ".mempalace" / "locks"
+        key = hashlib.sha256(os.path.normcase(os.path.realpath(palace_path)).encode()).hexdigest()[
+            :16
+        ]
+        lock_path = lock_dir / f"mine_palace_{key}.lock"
+        assert lock_path.exists(), "expected the held palace lock file to exist"
+
+        # Windows: byte 0 is mandatory-locked while held - read from byte 1
+        # (same convention as mempalace._read_lock_holder) to compare bodies.
+        def _body():
+            with open(lock_path, "rb") as fh:
+                fh.seek(1)
+                return fh.read()
+
+        body_before = _body()
+        assert str(holder.pid).encode() in body_before, "body must carry the holder PID"
+        # Backdate mtime so it would be a reap candidate by age alone —
+        # the flock held by the child process must still protect it.
+        old_time = time.time() - 7200
+        os.utime(lock_path, (old_time, old_time))
+
+        reaped, skipped = reap_stale_mine_locks(min_age_seconds=3600)
+
+        assert reaped == 0
+        assert skipped == 1
+        assert lock_path.exists(), "a held palace lock must never be removed by the reaper"
+        assert _body() == body_before, "held lock body must not be damaged"
+    finally:
+        open(release, "w").close()
+        holder.join(timeout=5)
+        assert holder.exitcode == 0
+
+
+def test_reap_skips_self_held_mine_palace_lock(tmp_path, monkeypatch):
+    """A mine_palace_*.lock this process itself still holds (re-entrancy,
+    e.g. the long-lived MCP writer lease) is skipped, not removed."""
+    _isolate_home(monkeypatch, tmp_path)
+    palace_path = str(tmp_path / "self_held_palace")
+    with mine_palace_lock(palace_path):
+        lock_dir = tmp_path / ".mempalace" / "locks"
+        key = hashlib.sha256(os.path.normcase(os.path.realpath(palace_path)).encode()).hexdigest()[
+            :16
+        ]
+        lock_path = lock_dir / f"mine_palace_{key}.lock"
+        assert lock_path.exists()
+        old_time = time.time() - 7200
+        os.utime(lock_path, (old_time, old_time))
+
+        reaped, skipped = reap_stale_mine_locks(min_age_seconds=3600)
+
+        assert reaped == 0
+        assert skipped == 1
+        assert lock_path.exists(), "a self-held palace lock must never be removed"
 
 
 def test_reap_missing_lock_dir_is_a_noop(tmp_path, monkeypatch):

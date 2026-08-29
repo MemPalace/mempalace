@@ -8,7 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
----
+### Bug Fixes
+
+- **Stale writer records are now reaped.** `mine_palace_*.lock` files whose writer died are removed by the existing `reap_stale_mine_locks` sweep (same nonblocking flock-reacquire gate as per-source locks — a lock held by a live writer is never touched, and locks this process still holds are skipped via the re-entrancy set), and `server_registry.reap_stale_serverinfo()` removes serverinfo records whose recorded hub PID is provably dead (positive int + not alive; live hubs, malformed records, and unparseable JSON are conservatively left in place). The Windows `_pid_alive` probe now uses `GetExitCodeProcess == STILL_ACTIVE`, matching `hooks_cli._pid_alive`, so a hub that exited is recognized as dead immediately instead of lingering until handle cleanup.
 
 ## [3.7.1] — 2026-08-12
 
