@@ -97,6 +97,92 @@ def mesh_state_path(palace_path: str) -> Path:
     return server_state_dir(palace_path) / "mesh_state.json"
 
 
+def stdio_writer_path(palace_path: str) -> Path:
+    """Path of the stdio MCP writer marker for this palace.
+
+    Distinct from the HTTP-hub ``serverinfo.json``: stdio MCP replicas (the
+    long-lived ``mempalace.mcp_server`` processes an agent connects through)
+    do not bind a host/port and are never the hub, but they do contend for
+    the per-palace single-writer lease via ``flock``. The marker records which
+    replica currently holds that lease so a read-only peer can name the holder
+    instead of reporting an opaque "Peer MCP writer active".
+    """
+    return server_state_dir(palace_path) / "stdio_writer.json"
+
+
+def write_stdio_writer(palace_path: str) -> Path:
+    """Mark this process as the current stdio MCP writer for ``palace_path``.
+
+    Called by ``mcp_server._acquire_mcp_writer_lock`` right after the flock
+    lease is won. Reversible: :func:`clear_stdio_writer` removes it on lease
+    release, and readers ignore it if the recorded pid is no longer alive.
+    """
+    path = stdio_writer_path(palace_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(str(path.parent), 0o700)
+    except OSError:
+        pass
+    payload = {
+        "pid": os.getpid(),
+        "role": "writer",
+        "started_at": _utc_now(),
+        "palace_path": _canonical(palace_path),
+    }
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+            fh.write("\n")
+    except BaseException:
+        try:
+            os.unlink(str(path))
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def clear_stdio_writer(palace_path: str) -> None:
+    """Remove the stdio writer marker if it still names this process.
+
+    Guarded on the recorded pid so a slow exit from a previous writer cannot
+    delete the marker of a newer one that just won the lease for this palace.
+    """
+    path = stdio_writer_path(palace_path)
+    try:
+        recorded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if recorded.get("pid") != os.getpid():
+        return
+    try:
+        path.unlink()
+    except OSError:
+        logger.debug("stdio writer cleanup failed for %s", path, exc_info=True)
+
+
+def read_stdio_writer(palace_path: str):
+    """Return the current stdio MCP writer marker for this palace, or None.
+
+    None when no marker exists, it is unreadable, or the recorded pid is no
+    longer alive (crashed writer — stale marker, ignore it). This mirrors the
+    liveness handling of :func:`read_live_serverinfo`.
+    """
+    path = stdio_writer_path(palace_path)
+    try:
+        info = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(info, dict):
+        return None
+    if not _pid_alive(info.get("pid")):
+        return None
+    if info.get("role") != "writer":
+        return None
+    return info
+
+
 def write_mesh_state(palace_path: str, *, peers: dict, profiles: dict) -> Path:
     """Publish the hub's mesh estate so other local processes can read it.
 
