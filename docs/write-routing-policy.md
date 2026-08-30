@@ -182,6 +182,18 @@ that topology and the client uses its local path, where the writer lease still
 applies. Configure those clients to use the HTTP server explicitly, or run the
 server and local forwarders under the same account.
 
+Hook diary checkpoints still write directly on a server machine. `mempalace
+mine` forwards a hook-spawned transcript ingest to a live server, but the
+session-end checkpoint writes ChromaDB in process through
+`_save_diary_direct`, and the hook entry points read no server registry. Every
+session end therefore opens the server's palace from a second process. That is
+the direct hook write the routing rules above tell you not to run beside a
+writable owner. The palace lock does not observe it, because the checkpoint
+takes no writer lease. The contention appears at the SQLite layer, where a
+checkpoint that wedges mid-write holds the write lock that the server's next
+request needs. Until the checkpoint forwards the way the mine already does,
+treat a session end on a server machine as a second writer.
+
 For a filesystem-level backup of a palace owned by an always-on service, stop
 the service, capture the complete palace, then restart the service and verify
 it. Do not make the backup conditional on `pgrep` finding no process under the
