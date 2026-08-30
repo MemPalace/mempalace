@@ -817,9 +817,7 @@ def _mcp_peer_writer_refusal(req_id, tool_name: str):
     except Exception:
         logger.debug("could not read stdio writer marker", exc_info=True)
 
-    message = (
-        "Peer MCP writer active; this server is read-only for mutating tools"
-    )
+    message = "Peer MCP writer active; this server is read-only for mutating tools"
     if holder:
         message += f" (writer: pid {holder.get('pid')} since {holder.get('started_at')})"
 
