@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **Drawer updates apply case-only wing and room renames.** `mempalace_update_drawer` now compares sanitized metadata values exactly, so consolidating names such as `Projects` and `projects` updates the stored drawer instead of reporting success while retaining the old casing. (#2395)
+
 ---
 
 ## [3.9.0] — 2026-08-31
