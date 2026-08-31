@@ -395,6 +395,95 @@ def test_stop_hook_tracks_save_point(tmp_path):
     mock_save.assert_not_called()
 
 
+def test_stop_hook_failed_diary_does_not_refire_dispatched_ingest(tmp_path):
+    """#2403 defect 4: the save marker used to advance only on diary
+    success, while the expensive transcript ingest fired unconditionally
+    before it. On a machine whose diary write kept failing (a hub holding
+    the writer lease refuses in-process writes), EVERY subsequent Stop
+    re-triggered a full mine of the transcript — observed live as
+    `TRIGGERING SAVE at exchange 5193` repeating turn after turn on a
+    75 MB transcript, starving the hub. Once the ingest is dispatched,
+    the marker must advance even when the diary failed."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    data = {
+        "session_id": "test",
+        "stop_hook_active": False,
+        "transcript_path": str(transcript),
+    }
+
+    # First fire: diary fails (count 0), but the transcript mine is dispatched.
+    with (
+        patch("mempalace.hooks_cli._save_diary_direct", return_value={"count": 0}),
+        patch("mempalace.hooks_cli._ingest_transcript", return_value=True) as mock_ingest,
+    ):
+        result = _capture_hook_output(hook_stop, data, state_dir=tmp_path)
+    assert result == {}
+    mock_ingest.assert_called_once()
+
+    # Second fire at the same exchange count: the marker advanced, so the
+    # ingest must NOT be re-dispatched — this is the self-DoS loop.
+    with (
+        patch("mempalace.hooks_cli._save_diary_direct", return_value={"count": 0}) as mock_save,
+        patch("mempalace.hooks_cli._ingest_transcript", return_value=True) as mock_ingest,
+    ):
+        result = _capture_hook_output(hook_stop, data, state_dir=tmp_path)
+    assert result == {}
+    mock_save.assert_not_called()
+    mock_ingest.assert_not_called()
+
+
+def test_stop_hook_retries_when_nothing_succeeded(tmp_path):
+    """The counterpart guard: when the diary failed AND the ingest could
+    not be dispatched (blocked routing, spawn failure), the marker must
+    stay put so the whole burst retries at the next fire — a checkpoint
+    should not be silently dropped because one fire hit a dead palace."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    data = {
+        "session_id": "test",
+        "stop_hook_active": False,
+        "transcript_path": str(transcript),
+    }
+
+    with (
+        patch("mempalace.hooks_cli._save_diary_direct", return_value={"count": 0}),
+        patch("mempalace.hooks_cli._ingest_transcript", return_value=False),
+    ):
+        result = _capture_hook_output(hook_stop, data, state_dir=tmp_path)
+    assert result == {}
+
+    # Marker did not advance — the next fire retries the full burst.
+    with (
+        patch("mempalace.hooks_cli._save_diary_direct", return_value={"count": 0}) as mock_save,
+        patch("mempalace.hooks_cli._ingest_transcript", return_value=False) as mock_ingest,
+    ):
+        result = _capture_hook_output(hook_stop, data, state_dir=tmp_path)
+    assert result == {}
+    mock_save.assert_called_once()
+    mock_ingest.assert_called_once()
+
+
+def test_spawn_mine_reports_already_running_as_dispatched(tmp_path):
+    """_spawn_mine must return True when a live mine already holds the
+    target's PID slot: 'already running' is in-flight work, and callers
+    advancing throttle markers on the return value would otherwise re-arm
+    on every fire for the whole duration of a long mine (#2403)."""
+    from mempalace.hooks_cli import _spawn_mine
+
+    with (
+        patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
+        patch("mempalace.hooks_cli._claim_mine_slot", return_value=None),
+    ):
+        assert _spawn_mine(["python", "-m", "mempalace", "mine", "x"]) is True
+
+
 # --- #1693: hook checkpoints must be discoverable by diary_read ---
 
 
@@ -2446,9 +2535,7 @@ def test_stop_hook_checkpoints_without_mining(tmp_path):
         mock_cfg_cls.return_value.hook_silent_save = True
         mock_cfg_cls.return_value.hook_desktop_toast = False
         mock_cfg_cls.return_value.hooks_mine_transcript = False
-        with patch(
-            "mempalace.hooks_cli._save_diary_direct", return_value=save_result
-        ) as mock_save:
+        with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result) as mock_save:
             with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
                 result = _capture_hook_output(
                     hook_stop,
@@ -2533,11 +2620,7 @@ def test_save_diary_direct_forwards_to_live_hub(tmp_path):
         [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(3)],
     )
     body = json.dumps(
-        {
-            "result": {
-                "content": [{"text": json.dumps({"success": True, "entry_id": "e1"})}]
-            }
-        }
+        {"result": {"content": [{"text": json.dumps({"success": True, "entry_id": "e1"})}]}}
     ).encode("utf-8")
 
     with contextlib.ExitStack() as stack:
