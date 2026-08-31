@@ -458,6 +458,218 @@ def test_codex_jsonl_payload_not_dict():
     assert result is not None
 
 
+# ── _try_codex_jsonl: v2 item_completed format (cli >= 0.149) ──────────
+
+
+def _codex_v2_item(item_type, item_id, text, content_type="text"):
+    """One anonymized v2 item_completed line, shaped like real 0.151 output."""
+    return json.dumps(
+        {
+            "timestamp": "2026-08-31T11:47:05.221Z",
+            "ordinal": 9,
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "thread_id": "01a00000-0000-7000-8000-000000000001",
+                "turn_id": "01a00000-0000-7000-8000-000000000002",
+                "item": {
+                    "type": item_type,
+                    "id": item_id,
+                    "content": [{"type": content_type, "text": text}],
+                },
+            },
+        }
+    )
+
+
+_CODEX_V2_META = json.dumps(
+    {
+        "timestamp": "2026-08-31T11:47:00.656Z",
+        "ordinal": 0,
+        "type": "session_meta",
+        "payload": {
+            "session_id": "01a00000-0000-7000-8000-000000000001",
+            "id": "01a00000-0000-7000-8000-000000000001",
+            "cwd": "/tmp/example",
+            "originator": "Codex Desktop",
+            "cli_version": "0.151.0-alpha.7.2",
+            "source": "vscode",
+            "thread_source": "user",
+        },
+    }
+)
+
+
+def test_codex_jsonl_v2_item_completed_verbatim():
+    """v2 sessions (item_completed, no user_message events) parse verbatim.
+
+    Real AgentMessage content blocks use "Text" (capital T) while
+    UserMessage uses "text" — both must extract.
+    """
+    user_text = "привет, найди баг в parser.py"
+    agent_text = "Нашёл: off-by-one в строке 42."
+    lines = [
+        _CODEX_V2_META,
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "01a00000-0000-7000-8000-000000000002",
+                },
+            }
+        ),
+        _codex_v2_item("UserMessage", "01a00000-0000-7000-8000-00000000000a", user_text),
+        _codex_v2_item("Reasoning", "rs_0000", "internal chain of thought"),
+        _codex_v2_item("CommandExecution", "cmd_0000", "rm -rf build/"),
+        _codex_v2_item("AgentMessage", "msg_0000", agent_text, content_type="Text"),
+        json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {}}}),
+    ]
+    result = _try_codex_jsonl("\n".join(lines))
+    assert result is not None
+    assert user_text in result
+    assert agent_text in result
+    # Non-conversation items must never leak into the transcript.
+    assert "internal chain of thought" not in result
+    assert "rm -rf build/" not in result
+
+
+def test_codex_jsonl_v2_multiple_text_blocks_joined():
+    line = json.dumps(
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "UserMessage",
+                    "id": "01a00000-0000-7000-8000-00000000000b",
+                    "content": [
+                        {"type": "text", "text": "part one"},
+                        {"type": "image", "url": "attachment://x"},
+                        {"type": "text", "text": "part two"},
+                    ],
+                },
+            },
+        }
+    )
+    lines = [
+        _CODEX_V2_META,
+        line,
+        _codex_v2_item("AgentMessage", "msg_0001", "reply", content_type="Text"),
+    ]
+    result = _try_codex_jsonl("\n".join(lines))
+    assert result is not None
+    assert "part one" in result
+    assert "part two" in result
+
+
+def test_codex_jsonl_mixed_v1_v2_resumed_session():
+    """A session resumed across the 0.149 format change carries both shapes
+    and repeated session_meta lines; every turn must survive, once each."""
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {"id": "01a0-old"}}),
+        json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "old Q"}}),
+        json.dumps({"type": "event_msg", "payload": {"type": "agent_message", "message": "old A"}}),
+        json.dumps({"type": "session_meta", "payload": {"id": "01a0-old"}}),
+        json.dumps({"type": "session_meta", "payload": {"id": "01a0-old"}}),
+        _codex_v2_item("UserMessage", "01a0-new-u", "new Q"),
+        _codex_v2_item("AgentMessage", "01a0-new-a", "new A", content_type="Text"),
+    ]
+    result = _try_codex_jsonl("\n".join(lines))
+    assert result is not None
+    for turn in ("old Q", "old A", "new Q", "new A"):
+        assert result.count(turn) == 1
+
+
+def test_codex_jsonl_compacted_replacement_history_not_ingested():
+    """`compacted` records re-embed earlier user messages verbatim in
+    replacement_history — ingesting them would double-file every message
+    said before the compaction."""
+    user_text = "unique question about the deploy"
+    compacted = json.dumps(
+        {
+            "type": "compacted",
+            "payload": {
+                "message": "",
+                "replacement_history": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": user_text}],
+                    },
+                    {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{"type": "input_text", "text": "SENTINEL-DEV-PROMPT"}],
+                    },
+                ],
+            },
+        }
+    )
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {}}),
+        json.dumps(
+            {"type": "event_msg", "payload": {"type": "user_message", "message": user_text}}
+        ),
+        json.dumps({"type": "event_msg", "payload": {"type": "agent_message", "message": "A"}}),
+        compacted,
+        json.dumps({"type": "event_msg", "payload": {"type": "context_compacted"}}),
+    ]
+    result = _try_codex_jsonl("\n".join(lines))
+    assert result is not None
+    assert result.count(user_text) == 1
+    assert "SENTINEL-DEV-PROMPT" not in result
+
+
+def test_codex_jsonl_v2_context_compaction_item_skipped():
+    lines = [
+        _CODEX_V2_META,
+        _codex_v2_item("UserMessage", "u1", "Q"),
+        _codex_v2_item("ContextCompaction", "cc1", "compaction summary noise"),
+        _codex_v2_item("AgentMessage", "a1", "A", content_type="Text"),
+    ]
+    result = _try_codex_jsonl("\n".join(lines))
+    assert result is not None
+    assert "compaction summary noise" not in result
+
+
+def test_codex_jsonl_v2_item_not_dict_tolerated():
+    lines = [
+        _CODEX_V2_META,
+        json.dumps({"type": "event_msg", "payload": {"type": "item_completed", "item": "bogus"}}),
+        _codex_v2_item("UserMessage", "u1", "Q"),
+        _codex_v2_item("AgentMessage", "a1", "A", content_type="Text"),
+    ]
+    result = _try_codex_jsonl("\n".join(lines))
+    assert result is not None
+
+
+def test_codex_jsonl_unknown_format_warns_not_silent(caplog):
+    """A rollout whose messages arrive in an unrecognized shape must warn:
+    silence here is how new-format sessions quietly stop being mined."""
+    lines = [
+        _CODEX_V2_META,
+        _codex_v2_item("FutureMessage", "f1", "text in a shape we do not know"),
+        _codex_v2_item("FutureMessage", "f2", "more of it"),
+    ]
+    with caplog.at_level("WARNING", logger="mempalace_normalize"):
+        result = _try_codex_jsonl("\n".join(lines))
+    assert result is None
+    assert any("Codex rollout" in rec.message for rec in caplog.records)
+
+
+def test_codex_jsonl_no_warning_for_normal_parse(caplog):
+    lines = [
+        _CODEX_V2_META,
+        _codex_v2_item("UserMessage", "u1", "Q"),
+        _codex_v2_item("AgentMessage", "a1", "A", content_type="Text"),
+    ]
+    with caplog.at_level("WARNING", logger="mempalace_normalize"):
+        result = _try_codex_jsonl("\n".join(lines))
+    assert result is not None
+    assert not caplog.records
+
+
 # ── _try_gemini_jsonl ──────────────────────────────────────────────────
 #
 # Gemini CLI sessions live at ``~/.gemini/tmp/<project_hash>/chats/`` as
