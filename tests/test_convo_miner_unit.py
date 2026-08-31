@@ -752,57 +752,76 @@ class TestFileChunksLocked:
             "crash would leave mtime-stamped partials that skip forever (#2183)"
         )
 
-    def test_cleans_partial_drawers_after_batch_upsert_failure(self, monkeypatch, tmp_path):
-        """A failed later batch must not leave mtime-stamped partials (#2183)."""
+    def test_upsert_failure_leaves_existing_drawers_untouched(self, monkeypatch, tmp_path):
+        """A failed later batch must not cost the palace data it already
+        held (#2403 defect 2: the old purge-before-refile contract meant an
+        interrupted re-mine left a partial index — observed live as 5,765 of
+        8,022 drawers after a SIGTERM). Under the incremental contract
+        nothing is deleted before the new set is fully written, and the
+        interrupted pass's mixed mtime groups each fall short of
+        chunk_total, so file_already_mined stays False and the next mine
+        repairs (#2183)."""
         import mempalace.convo_miner as convo_miner
+        from mempalace.ids import make_convo_drawer_id
+        from mempalace.palace import NORMALIZE_VERSION, file_already_mined
 
         class FailingCol:
             def __init__(self):
-                self.records = []
+                self.records = {}
                 self.upsert_calls = 0
                 self.deleted_ids = []
 
             def get(self, where=None, limit=None, offset=0, include=None, ids=None, **kwargs):
                 if ids is not None:
-                    return {"ids": [], "metadatas": []}
-                records = self.records
+                    hits = [(i, self.records[i]) for i in ids if i in self.records]
+                    return {
+                        "ids": [i for i, _ in hits],
+                        "metadatas": [m for _, m in hits],
+                    }
+                records = list(self.records.items())
                 if where and "source_file" in where:
                     records = [
-                        r
-                        for r in records
-                        if r["metadata"].get("source_file") == where["source_file"]
+                        (i, m) for i, m in records if m.get("source_file") == where["source_file"]
                     ]
                 page = records[offset : offset + (limit or len(records))]
                 return {
-                    "ids": [r["id"] for r in page],
-                    "metadatas": [r["metadata"] for r in page],
+                    "ids": [i for i, _ in page],
+                    "metadatas": [m for _, m in page],
                 }
 
-            def delete(self, ids=None, where=None, **kwargs):
-                if ids:
-                    self.deleted_ids.extend(ids)
-                    id_set = set(ids)
-                    self.records = [r for r in self.records if r["id"] not in id_set]
-                    return
-                if where and "source_file" in where:
-                    src = where["source_file"]
-                    self.records = [
-                        r for r in self.records if r["metadata"].get("source_file") != src
-                    ]
+            def delete(self, ids=None, **kwargs):
+                self.deleted_ids.extend(ids or [])
+                for drawer_id in ids or []:
+                    self.records.pop(drawer_id, None)
+
+            def update(self, ids, metadatas):
+                for drawer_id, meta in zip(ids, metadatas):
+                    self.records[drawer_id] = meta
 
             def upsert(self, documents, ids, metadatas):
                 self.upsert_calls += 1
                 if self.upsert_calls == 2:
                     raise RuntimeError("simulated second-batch failure")
-                self.records.extend(
-                    {"id": drawer_id, "metadata": metadata}
-                    for drawer_id, metadata in zip(ids, metadatas)
-                )
+                for drawer_id, meta in zip(ids, metadatas):
+                    self.records[drawer_id] = meta
 
         source = tmp_path / "chat.txt"
         source.write_text("content\n", encoding="utf-8")
         chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3)]
         col = FailingCol()
+        # The palace already holds an OLD complete pass for this source
+        # (stale mtime, no chunk_hash — pre-incremental rows).
+        for i in range(3):
+            old_id = make_convo_drawer_id("wing", "general", str(source), "exchange", i)
+            col.records[old_id] = {
+                "source_file": str(source),
+                "chunk_index": i,
+                "extract_mode": "exchange",
+                "normalize_version": NORMALIZE_VERSION,
+                "source_mtime": 1.0,
+                "chunk_total": 3,
+            }
+        pre_existing = set(col.records)
         monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
         monkeypatch.setattr(
             convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
@@ -813,11 +832,125 @@ class TestFileChunksLocked:
         with pytest.raises(RuntimeError, match="second-batch failure"):
             _file_chunks_locked(col, str(source), chunks, "wing", "general", "agent", "exchange")
 
-        assert col.records == [], (
-            "partial convo drawers survived a mid-file upsert failure — the "
-            "next mine would skip this incomplete file forever (#2183)"
+        assert col.deleted_ids == [], (
+            "an interrupted incremental pass deleted drawers — the palace "
+            "now holds less than before the mine started (#2403 defect 2)"
         )
-        assert col.deleted_ids, "cleanup did not delete the partial drawer ids"
+        assert pre_existing <= set(col.records), (
+            "pre-existing drawers vanished during a failed incremental pass"
+        )
+        # The real completion check must still see the file as unfinished so
+        # the next mine repairs it instead of skipping forever (#2183).
+        assert not file_already_mined(
+            col, str(source), check_mtime=True, extract_mode="exchange"
+        ), "an interrupted pass reads as complete — the missing chunks never come back"
+
+    def test_remine_of_grown_file_only_upserts_changed_chunks(self, monkeypatch, tmp_path):
+        """#2403 defect 1: re-mining a grown transcript must be incremental.
+
+        An active Claude Code session appends to its own transcript every
+        turn; the old purge-and-refile contract re-embedded the entire file
+        each auto-save (observed live: >5 min per pass on a 75 MB
+        transcript, O(n²) over a session). Unchanged chunks must keep their
+        embeddings and only get a metadata refresh; orphaned ids are
+        deleted only after the new set is fully written."""
+        import mempalace.convo_miner as convo_miner
+        from mempalace.ids import make_convo_drawer_id
+        from mempalace.palace import file_already_mined
+
+        class FakeCol:
+            def __init__(self):
+                self.records = {}
+                self.upserted_ids = []
+                self.updated_ids = []
+                self.deleted_ids = []
+
+            def get(self, where=None, limit=None, offset=0, include=None, ids=None, **kwargs):
+                if ids is not None:
+                    hits = [(i, self.records[i]) for i in ids if i in self.records]
+                    return {
+                        "ids": [i for i, _ in hits],
+                        "metadatas": [m for _, m in hits],
+                    }
+                records = list(self.records.items())
+                if where and "source_file" in where:
+                    records = [
+                        (i, m) for i, m in records if m.get("source_file") == where["source_file"]
+                    ]
+                page = records[offset : offset + (limit or len(records))]
+                return {
+                    "ids": [i for i, _ in page],
+                    "metadatas": [m for _, m in page],
+                }
+
+            def delete(self, ids=None, **kwargs):
+                self.deleted_ids.extend(ids or [])
+                for drawer_id in ids or []:
+                    self.records.pop(drawer_id, None)
+
+            def update(self, ids, metadatas):
+                self.updated_ids.extend(ids)
+                for drawer_id, meta in zip(ids, metadatas):
+                    self.records[drawer_id] = meta
+
+            def upsert(self, documents, ids, metadatas):
+                self.upserted_ids.extend(ids)
+                for drawer_id, meta in zip(ids, metadatas):
+                    self.records[drawer_id] = meta
+
+        source = tmp_path / "chat.txt"
+        source.write_text("content\n", encoding="utf-8")
+        col = FakeCol()
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        chunks_v1 = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3)]
+        drawers, _, skipped = _file_chunks_locked(
+            col, str(source), chunks_v1, "wing", "general", "agent", "exchange"
+        )
+        assert (drawers, skipped) == (3, False)
+        first_pass_ids = list(col.upserted_ids)
+
+        # The transcript grows by two exchanges; the first three are untouched.
+        source.write_text("content\nmore\n", encoding="utf-8")
+        col.upserted_ids.clear()
+        chunks_v2 = chunks_v1 + [
+            {"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3, 5)
+        ]
+        drawers, _, skipped = _file_chunks_locked(
+            col, str(source), chunks_v2, "wing", "general", "agent", "exchange"
+        )
+
+        assert skipped is False
+        assert drawers == 2, "unchanged chunks were re-embedded on a grown-file re-mine"
+        assert set(col.upserted_ids).isdisjoint(first_pass_ids), (
+            "a chunk that did not change was re-upserted"
+        )
+        assert set(col.updated_ids) == set(first_pass_ids), (
+            "unchanged chunks did not get their completion metadata refreshed"
+        )
+        assert col.deleted_ids == [], "a purely-grown file has no orphans to delete"
+        # After the incremental pass the file must read as complete.
+        assert all(m.get("chunk_total") == 5 for m in col.records.values())
+        assert file_already_mined(col, str(source), check_mtime=True, extract_mode="exchange")
+
+        # A rewrite that drops the tail (e.g. /compact) orphans the extra
+        # ids; they are deleted, but only after the new set is written.
+        source.write_text("rewritten\n", encoding="utf-8")
+        drawers, _, skipped = _file_chunks_locked(
+            col, str(source), chunks_v1, "wing", "general", "agent", "exchange"
+        )
+        assert skipped is False
+        orphaned = {
+            make_convo_drawer_id("wing", "general", str(source), "exchange", i) for i in (3, 4)
+        }
+        assert set(col.deleted_ids) == orphaned, (
+            "a shrunk re-mine must delete exactly the orphaned ids, nothing else"
+        )
+        assert file_already_mined(col, str(source), check_mtime=True, extract_mode="exchange")
 
 
 class TestSourceFileDeleteIds:
