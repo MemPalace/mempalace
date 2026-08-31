@@ -4,6 +4,20 @@ All commands accept `--palace <path>` to override the default palace location.
 The top-level command also accepts `--backend <name>` to select a storage
 backend such as `sqlite_exact`, `milvus`, `qdrant`, or `pgvector`.
 
+## `mempalace update`
+
+Release checks are disabled by default. Enable weekly checks explicitly with
+`mempalace update configure --enable --installer uv-tool` (using `pipx` or
+`pip` when that is how the runtime was installed), or disable them with `--disable`.
+`mempalace update check` performs an explicit check regardless of that setting.
+`mempalace update plan` prints the runtime, skill, restart, and tool-refresh
+actions but never executes them. Command actions use structured `argv`; for a
+`pip` installation the first argument is the exact interpreter running
+MemPalace, not whichever `python` happens to be on `PATH`. For an explicit check made without saved setup
+state, pass the matching installer to `plan --installer`. Cached state appears in `mempalace_status` so
+agents can ask the user to authorize an upgrade without blocking on a network
+request.
+
 ## `mempalace init`
 
 Scan a project directory for people, projects, and rooms, and set up the palace.
@@ -216,6 +230,64 @@ mempalace logstream watch --agent mac --type task.request --type task.reply --ty
 | `sync` | Pull missing events/artifacts from peer replicas (`--peer URL --token T`, or all peers in `peers.json`) |
 
 All subcommands accept `--json` for scriptable output.
+
+## `mempalace task`
+
+High-level task creation and controlled execution over the logstream. This
+interface creates the complete canonical `task.request` envelope and prints a
+short handoff that can be pasted into a destination agent; callers do not need
+to construct event fields or correlation ids themselves. Like the other
+logstream CLI commands, it operates on the local palace. A client connected to
+a remote shared-brain hub should call the equivalent
+`mempalace_task_create` MCP tool so the task is appended on the hub.
+
+```bash
+mempalace task create \
+  --project myapp \
+  --from-agent mac-claude \
+  --to-agent windows-codex \
+  --goal "Fix the flaky integration test." \
+  --branch fix/flaky-integration \
+  --base-commit 2668053 \
+  --done "The focused test passes and a patch is submitted."
+```
+
+The command appends an immutable `task.request`, generates a
+`task_<goal>_<entropy>` correlation id, and prints a `Ready to paste` line.
+Use `--goal-file` or `--done-file` when the exact text is multiline. `--json`
+returns `{"task": <event>, "handoff": <line>}`.
+`--base-commit` must be an immutable hexadecimal object id (abbreviated or
+full), not a branch or tag whose target could move after the event is stored.
+
+An explicitly controlled workflow can start a supported headless runner from
+the stored task:
+
+```bash
+mempalace task launch task_fix_the_flaky_integration_test_7f3a9c10 \
+  --runner codex --workspace /path/to/trusted/checkout
+```
+
+For a remote-only MCP client, fetch the full single `task.request` event through
+`mempalace_event_list`, save the exact event object as JSON on the destination
+machine, and use `--task-file` instead of a task id. This avoids accidentally
+resolving the task from an unrelated local palace:
+
+```bash
+mempalace task launch --task-file task-request.json \
+  --runner codex --workspace /path/to/trusted/checkout
+```
+
+Supported runners are `codex` and `claude`. The launcher verifies the task's
+addressed identity, refuses to override it, rejects a runner that conflicts
+with a conventional `*-codex` or `*-claude` identity, releases its logstream
+connection, and starts the runner without a shell. Broadcast tasks require a
+concrete `--agent`. It does not add permission-bypass flags or weaken the
+runner's sandbox and approval policy.
+
+| Subcommand | Description |
+|------------|-------------|
+| `create` | Append a canonical task request and print a pasteable handoff (`--project`, `--from-agent`, `--to-agent`, `--goal`/`--goal-file`, `--branch`, `--base-commit`, and `--done`/`--done-file`) |
+| `launch` | Resolve and execute an existing task with `--runner codex\|claude` in a trusted `--workspace`; `--agent` accepts broadcasts but cannot impersonate an addressed worker |
 
 ## `mempalace artifact`
 

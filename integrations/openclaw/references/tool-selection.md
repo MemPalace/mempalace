@@ -49,7 +49,15 @@ intent before destructive actions.
   `mempalace_create_tunnel`, `mempalace_delete_tunnel`,
   `mempalace_list_hallways`, `mempalace_delete_hallway`,
   `mempalace_graph_stats`.
-- Ingest/cleanup: `mempalace_mine`, `mempalace_sync`,
-  `mempalace_delete_by_source`, `mempalace_delete_drawer`.
+- `mempalace_mine` — mine a directory, or one conversation file with
+  `mode="convos"`. `source` is the directory or conversation file; optional
+  controls include `mode`, `wing`, `agent`, `limit`, `dry_run`, and the convos
+  `extract` strategy (`exchange` or `general`).
+- `mempalace_sync` — prune drawers for ignored, deleted, or moved source files.
+  Scope with `project_dir` or `wing`; preview first and set `apply` only after
+  confirming the deletion set.
+- `mempalace_delete_by_source` — bulk-delete one exact `source_file` metadata
+  value. Keep its default dry run for the first call.
+- `mempalace_delete_drawer` — irreversibly remove one drawer by ID.
 - System/session: `mempalace_reconnect`, `mempalace_hook_settings`,
   `mempalace_memories_filed_away`.

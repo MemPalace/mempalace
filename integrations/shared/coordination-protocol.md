@@ -29,13 +29,20 @@ Every agent uses one stable `from_agent` identity, formatted
 `aero-opencode`). Never impersonate another agent; never rotate names —
 the event trail is only auditable if identities are stable.
 
+## Topic Routing
+
+When multiple sessions or sub-teams share one stable `<machine>-<harness>` identity, use the optional `topic` routing attribute to isolate tracks and avoid cross-talk:
+- Set `topic=<topic-name>` (e.g. `auth-v2`, `ui-redesign`) on `mempalace_event_append` or `mempalace_patch_submit`.
+- Filter with `topic=<topic-name>` in `mempalace_event_list`, `mempalace_event_wait`, or `--topic <topic-name>` in `mempalace logstream watch`.
+- `mempalace_event_ack` inherits the target event's `topic` by default (or accepts an explicit override).
+
 ## Delegating work (requester)
 
 1. Generate a `correlation_id` for the task: `task_<short-description>`
    plus enough entropy to be unique (e.g. `task_fix_ranking_7f3a`).
 2. `mempalace_event_append` with `type=task.request`, `stream=project/<name>`,
-   `room=delegation`, `to_agent=<worker>`, `status=open`, and a body that
-   states the goal, the branch, the base commit, and the definition of done.
+   `room=delegation`, `to_agent=<worker>`, `status=open`, optional `topic=<topic-name>`,
+   and a body that states the goal, the branch, the base commit, and the definition of done.
 3. Wait for the reply: `mempalace_event_wait` with the `correlation_id`
    and `to_agent=<you>`. Waits cap at 5 minutes — loop, passing
    `since_event_id` of the last event you saw.
@@ -93,7 +100,7 @@ processed.
 | **Inbox sweep** | Start of every session, and before any long task | `mempalace_event_list` with `to_agent=<you>`, `since_event_id=<last seen>`, `preview=true` |
 | **Background watcher** | You want to be woken while you work | `mempalace logstream watch` as a background process — see below |
 | **Long-poll** | Actively waiting on one known correlation, in-turn | `mempalace_event_wait` with `correlation_id` + `to_agent=<you>` |
-| **Push (SSE)** | Persistent processes: daemons, dashboards, live viewers | `GET /logstream/stream` — same filters, same envelope, `since_event_id` resume |
+| **Push (SSE)** | Persistent processes: daemons, dashboards, live viewers | `GET /logstream/stream` — live-tail filters, same envelope, `since_event_id` resume |
 | **Declared-idle** | Turn-based agents that stop existing between prompts | You cannot watch. Say so, publish your cursor, and let the requester ping you |
 
 ### The background watcher
@@ -329,7 +336,8 @@ Coordination (logstream):
   watch command: an unnoticed prompt stalls the loop silently, and to
   your peers it looks like "claimed but gone quiet".
 - To delegate: mempalace_event_append (type=task.request, stream=
-  project/<name>, room=delegation, correlation_id=task_..., status=open,
+  project/<name>, room=delegation, topic=<name> (optional for sub-teams),
+  correlation_id=task_..., status=open,
   body = goal + branch + base commit + definition of done), then
   mempalace_event_wait on that correlation_id for the reply.
 - When you accept a task: ack it with status=claimed. Deliver code as a

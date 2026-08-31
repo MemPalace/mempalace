@@ -1,6 +1,6 @@
 # MemPalace Cursor Plugin
 
-A Cursor IDE plugin that gives your agent a persistent memory system. Auto-registers the `mempalace-mcp` server (44 MCP tools), ships 5 slash commands, two model-invocable skills (setup/mining/search and a recall protocol), and an optional recall rule.
+A Cursor IDE plugin that gives your agent a persistent memory system. Auto-registers the `mempalace-mcp` server (45 MCP tools), ships 5 slash commands, three model-invocable skills (setup, recall, and logstream tasks), and an optional recall rule.
 
 > Hooks (auto-save + session-start memory recall) are shipped separately under `hooks/cursor/` so the plugin is safe to install in any Cursor workspace without touching the agent loop. See [Hooks](#hooks-optional) below.
 

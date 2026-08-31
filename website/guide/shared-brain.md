@@ -173,7 +173,8 @@ Coordination (logstream):
   watch command: an unnoticed prompt stalls the loop silently, and to
   your peers it looks like "claimed but gone quiet".
 - To delegate: mempalace_event_append (type=task.request, stream=
-  project/<name>, room=delegation, correlation_id=task_..., status=open,
+  project/<name>, room=delegation, topic=<name> (optional for sub-teams),
+  correlation_id=task_..., status=open,
   body = goal + branch + base commit + definition of done), then
   mempalace_event_wait on that correlation_id for the reply.
 - When you accept a task: ack it with status=claimed. Deliver code as a

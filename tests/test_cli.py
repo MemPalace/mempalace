@@ -283,6 +283,16 @@ def test_cmd_init_honors_palace_flag(tmp_path, monkeypatch):
     monkeypatch.delenv("MEMPALACE_PALACE_PATH")
     monkeypatch.delenv("MEMPAL_PALACE_PATH")
 
+    # cmd_init's MempalaceConfig() has no config_dir, so an unpatched call
+    # here now persists this test's tmp_path into the shared ~/.mempalace
+    # (#2366's fix made init() write what actually resolved, not a constant).
+    from mempalace.config import MempalaceConfig
+
+    monkeypatch.setattr(
+        "mempalace.cli.MempalaceConfig",
+        lambda *a, **kw: MempalaceConfig(*a, config_dir=str(tmp_path / ".mempalace"), **kw),
+    )
+
     args = argparse.Namespace(
         dir=str(project),
         palace=str(palace),

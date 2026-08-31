@@ -45,6 +45,33 @@ Architecture, concepts, and mining flows:
 
 ## Install
 
+### Agent-guided setup
+
+Install the MemPalace skills first, then ask your coding agent to set up
+MemPalace. The setup skill detects your system, installs the Python package,
+configures MCP, and asks whether you want a private local palace, a shared-brain
+hub, or a client connected to an existing hub:
+
+```bash
+npx skills add MemPalace/mempalace
+```
+
+The repository exposes three skills: `mempalace` for guided installation and
+operations, `mempalace-recall` for search-before-answer recall, and
+`mempalace-task` for logstream delegation. Installing a skill does not by
+itself install the MemPalace CLI or MCP server; the setup skill guides the
+agent through those system changes and verifies the live connection.
+
+During guided setup the agent can offer weekly stable-release checks. They are
+disabled by default, contact only PyPI when enabled, and never install updates
+automatically. Cached availability appears in scoped `mempalace_status` fields
+for the serving runtime and, when a local proxy is present, its client runtime,
+allowing the agent to explain the release and request authorization before showing an exact
+upgrade plan. Setup records whether the runtime came from `uv tool`, `pipx`, or
+`pip` so the plan never proposes an upgrade command for the wrong installation.
+
+### Direct CLI setup
+
 MemPalace ships a CLI, so install it in an isolated environment to avoid
 PEP 668 errors on Debian/Ubuntu/Homebrew Pythons and to keep mempalace's
 deps (`chromadb`, `numpy`, `grpcio`, …) from conflicting with anything
@@ -262,7 +289,7 @@ Usage and tool reference:
 
 ## MCP server
 
-44 MCP tools cover palace reads/writes, knowledge-graph operations,
+45 MCP tools cover palace reads/writes, knowledge-graph operations,
 cross-wing navigation, drawer management, agent diaries, and agent
 coordination (logstream events + artifact handoffs). Installation
 and the full tool list:
@@ -324,7 +351,7 @@ PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 MIT — see [LICENSE](LICENSE).
 
 <!-- Link Definitions -->
-[version-shield]: https://img.shields.io/badge/version-3.8.0-4dc9f6?style=flat-square&labelColor=0a0e14
+[version-shield]: https://img.shields.io/badge/version-3.9.0-4dc9f6?style=flat-square&labelColor=0a0e14
 [release-link]: https://github.com/MemPalace/mempalace/releases
 [python-shield]: https://img.shields.io/badge/python-3.9+-7dd8f8?style=flat-square&labelColor=0a0e14&logo=python&logoColor=7dd8f8
 [python-link]: https://www.python.org/

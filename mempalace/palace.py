@@ -98,7 +98,14 @@ def clear_validated_embedder_identity(palace_path: Optional[str] = None) -> None
         _VALIDATED_IDENTITY.discard(key)
 
 
-def _enforce_embedder_identity(collection, palace_path, collection_name, *, create) -> None:
+def _enforce_embedder_identity(
+    collection,
+    palace_path,
+    collection_name,
+    *,
+    create,
+    repeat_unknown_warning=False,
+) -> None:
     """Check (and, for a brand-new collection, record) embedder identity (RFC 001).
 
     Check at open so a model swap fails fast — before any query silently
@@ -107,6 +114,9 @@ def _enforce_embedder_identity(collection, palace_path, collection_name, *, crea
     vectors from an unknown model would mislabel it, so populated-but-unrecorded
     collections warn instead and are resolved with
     ``mempalace palace set-embedder``.
+
+    ``repeat_unknown_warning`` bypasses the process cache so a long-lived Hub
+    can reproduce the warning a standalone CLI process emits on every search.
 
     Bookkeeping must never break memory operations: only the deliberate
     identity/dimension mismatch propagates; every other error is swallowed.
@@ -144,7 +154,7 @@ def _enforce_embedder_identity(collection, palace_path, collection_name, *, crea
 
     model_name = current.model_name
     key = (str(palace_path), str(collection_name), model_name)
-    if key in _VALIDATED_IDENTITY:
+    if key in _VALIDATED_IDENTITY and not repeat_unknown_warning:
         return
 
     try:
@@ -1167,8 +1177,8 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
 # different worker thread. A thread-local guard makes those handlers fail to see
 # the process-held lease, re-acquire the flock, and self-conflict
 # ("palace ... is held by PID <self>"). flock is per-process and HTTP writes are
-# serialized by `_HTTP_REQUEST_LOCK`, so the process is the correct re-entrancy
-# boundary.
+# serialized by ``_HTTP_REQUEST_LOCK``'s exclusive side, so the process is the
+# correct re-entrancy boundary even though palace reads may overlap.
 #
 # The holder set is tagged with ``pid`` so that a forked child does NOT inherit
 # re-entrant credit from its parent: the OS-level flock IS NOT inherited as a
