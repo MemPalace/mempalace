@@ -1,6 +1,6 @@
 # MemPalace - Codex CLI Plugin
 
-Give your AI a persistent memory -- mine projects and conversations into a searchable palace backed by ChromaDB, with 44 MCP tools, auto-save hooks, and guided skills.
+Give your AI a persistent memory -- mine projects and conversations into a searchable palace backed by ChromaDB, with 44 MCP tools and guided skills.
 
 ## Prerequisites
 
@@ -68,11 +68,24 @@ codex /init
 | `/mine` | Mine a project or conversation into your palace |
 | `/status` | Show palace status, room counts, and health |
 
-## Hooks
+## Capturing conversations
 
-The plugin includes auto-save hooks that run on session stop (every 15 messages) and before context compaction, automatically preserving conversation context into your palace.
+Codex's plugin manifest supports skills and MCP servers, but not lifecycle
+hooks — so this plugin cannot auto-save turns as they happen. Capture works
+by mining the session transcripts Codex already writes to disk:
 
-Set the `MEMPAL_DIR` environment variable to a directory path to automatically run `mempalace mine` on that directory during each save trigger.
+```bash
+mempalace mine ~/.codex
+```
+
+or `/mine` from inside Codex. Mining is incremental — re-running it picks up
+new sessions without duplicating what is already filed. Both the legacy
+(`user_message`/`agent_message`) and current (`item_completed`, Codex
+>= 0.149) transcript formats are supported.
+
+A `hooks.json` and hook scripts ship in this directory for the day Codex's
+plugin schema gains lifecycle hooks; today no supported manifest field can
+reference them, and they are not active after installation.
 
 ## Support
 
