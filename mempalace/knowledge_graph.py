@@ -525,6 +525,7 @@ class KnowledgeGraph:
                             "valid_to": row["valid_to"],
                             "confidence": row["confidence"],
                             "source_closet": row["source_closet"],
+                            "source_file": row["source_file"],
                             "current": row["valid_to"] is None,
                         }
                     )
@@ -547,6 +548,7 @@ class KnowledgeGraph:
                             "valid_to": row["valid_to"],
                             "confidence": row["confidence"],
                             "source_closet": row["source_closet"],
+                            "source_file": row["source_file"],
                             "current": row["valid_to"] is None,
                         }
                     )
