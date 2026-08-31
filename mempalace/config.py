@@ -75,6 +75,24 @@ def normalize_wing_name(name: str) -> str:
     return name.lower().replace(" ", "_").replace("-", "_").strip("_")
 
 
+def wing_from_path(path: str) -> str:
+    r"""Derive a wing slug from a filesystem path.
+
+    ``normalize_wing_name`` expects a *dirname* — typically Claude Code's
+    path-encoded ``-home-user-proj`` — and deliberately leaves ``/`` alone.
+    Handing it a full path therefore returns a slug with separators still in
+    it, which ``sanitize_name`` rejects. This converts the separators first
+    so both routes into a wing name agree: ``/home/user/proj`` and the
+    encoded dirname ``-home-user-proj`` both yield ``home_user_proj``.
+
+    Windows paths are folded too. Backslashes become separators and the
+    drive colon becomes ``_``, because ``:`` is outside the character set
+    ``sanitize_name`` accepts.
+    """
+    converted = str(path or "").replace("\\", "/").replace(":", "_").replace("/", "_")
+    return normalize_wing_name(converted)
+
+
 def sanitize_name(value: str, field_name: str = "name") -> str:
     """Validate and sanitize a wing/room/entity name.
 
@@ -989,6 +1007,25 @@ class MempalaceConfig:
             return env_val.lower() not in ("false", "0", "no")
         hooks = self._file_config.get("hooks", {})
         return hooks.get("auto_save", True)
+
+    @property
+    def hooks_wing_from_cwd(self):
+        """Whether hooks should mine into a wing derived from the payload cwd.
+
+        Off by default. With it off, ``mine --mode convos`` sees a transcript
+        under ``~/.claude/projects`` and files it into the shared ``wing_api``
+        bucket (``convo_miner._resolve_wing``) — the right grouping for a user
+        with no per-project wings.
+
+        Users who do keep per-project wings can opt in, so automatic mining
+        lands in the wing their recall already queries instead of one nothing
+        reads.
+        """
+        env_val = os.environ.get("MEMPALACE_HOOKS_WING_FROM_CWD")
+        if env_val is not None:
+            return env_val.lower() not in ("false", "0", "no")
+        hooks = self._file_config.get("hooks", {})
+        return bool(hooks.get("wing_from_cwd", False))
 
     @property
     def topic_wings(self):
