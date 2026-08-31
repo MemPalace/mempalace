@@ -190,3 +190,137 @@ def test_plugin_hook_wrapper_falls_back_to_python_when_python3_cannot_import(
     )
     assert stdin_file.read_text(encoding="utf-8") == payload
     assert not bad_python3_used.exists()
+
+
+def _versioned_mempalace_stub(
+    version: str, args_file: Path, stdin_file: Path
+) -> str:
+    return (
+        "#!/bin/sh\n"
+        'if [ "$1" = "--version" ]; then\n'
+        f"  printf 'MemPalace {version}\\n'\n"
+        "  exit 0\n"
+        "fi\n"
+        f'printf \'%s\' "$*" > "{_shell_path(args_file)}"\n'
+        f"{_capture_stdin_to(stdin_file)}"
+        "printf '{}\\n'\n"
+    )
+
+
+@pytest.mark.parametrize(("script_name", "hook_name"), SCRIPT_CASES)
+def test_plugin_hook_wrapper_skips_stale_mempalace_binary(
+    tmp_path: Path, script_name: str, hook_name: str
+) -> None:
+    """A PATH binary older than the plugin must not handle the hook."""
+    stale_args_file = tmp_path / "stale_args.txt"
+    stale_stdin_file = tmp_path / "stale_stdin.json"
+    args_file = tmp_path / "args.txt"
+    stdin_file = tmp_path / "stdin.json"
+    pythonpath_file = tmp_path / "pythonpath.txt"
+    probe_file = tmp_path / "probe.txt"
+
+    python3_stub = (
+        "#!/bin/sh\n"
+        'if [ "$1" = "-c" ]; then\n'
+        f'  printf \'%s\' "$2" > "{_shell_path(probe_file)}"\n'
+        "  exit 0\n"
+        "fi\n"
+        f'printf \'%s\' "$PYTHONPATH" > "{_shell_path(pythonpath_file)}"\n'
+        f'printf \'%s\' "$*" > "{_shell_path(args_file)}"\n'
+        f"{_capture_stdin_to(stdin_file)}"
+        "printf '{}\\n'\n"
+    )
+    bin_dir = _make_bin_dir(
+        tmp_path,
+        {
+            "mempalace": _versioned_mempalace_stub(
+                "0.0.1", stale_args_file, stale_stdin_file
+            ),
+            "python3": python3_stub,
+        },
+    )
+
+    payload = '{"session_id":"stale-binary"}'
+    result = _run_hook(script_name, payload, bin_dir)
+
+    assert result.returncode == 0
+    assert result.stdout == "{}\n"
+    assert "older than plugin" in result.stderr
+    assert (
+        args_file.read_text(encoding="utf-8")
+        == f"-m mempalace hook run --hook {hook_name} --harness claude-code"
+    )
+    assert stdin_file.read_text(encoding="utf-8") == payload
+    # The stale binary answered --version only — never the hook itself
+    # (the stub records args only for non-version invocations).
+    assert not stale_args_file.exists()
+    # The bundled package must win over any stale site-packages copy.
+    pythonpath = pythonpath_file.read_text(encoding="utf-8")
+    assert pythonpath.split(":")[0] == REPO_ROOT.as_posix()
+    # The probe must exercise the modules `-m mempalace` loads at startup
+    # (cli.main() imports miner unconditionally), not just the package root.
+    probe = probe_file.read_text(encoding="utf-8")
+    for module in ("mempalace.cli", "mempalace.hooks_cli", "mempalace.miner"):
+        assert module in probe
+
+
+@pytest.mark.parametrize(("script_name", "hook_name"), SCRIPT_CASES)
+def test_plugin_hook_wrapper_uses_stale_binary_when_no_python(
+    tmp_path: Path, script_name: str, hook_name: str
+) -> None:
+    """With no python runner, a stale binary still beats a hard failure."""
+    args_file = tmp_path / "args.txt"
+    stdin_file = tmp_path / "stdin.json"
+
+    bin_dir = _make_bin_dir(
+        tmp_path,
+        {
+            "mempalace": _versioned_mempalace_stub(
+                "0.0.1", args_file, stdin_file
+            ),
+        },
+    )
+
+    payload = '{"session_id":"stale-last-resort"}'
+    result = _run_hook(script_name, payload, bin_dir)
+
+    assert result.returncode == 0
+    assert result.stdout == "{}\n"
+    assert "older than plugin" in result.stderr
+    assert "falling back to stale mempalace" in result.stderr
+    assert (
+        args_file.read_text(encoding="utf-8")
+        == f"hook run --hook {hook_name} --harness claude-code"
+    )
+    assert stdin_file.read_text(encoding="utf-8") == payload
+
+
+@pytest.mark.parametrize(("script_name", "hook_name"), SCRIPT_CASES)
+def test_plugin_hook_wrapper_uses_current_mempalace_binary(
+    tmp_path: Path, script_name: str, hook_name: str
+) -> None:
+    """A binary at or above the plugin version handles the hook directly."""
+    args_file = tmp_path / "args.txt"
+    stdin_file = tmp_path / "stdin.json"
+
+    bin_dir = _make_bin_dir(
+        tmp_path,
+        {
+            "mempalace": _versioned_mempalace_stub(
+                "999.0.0", args_file, stdin_file
+            ),
+            "python3": "#!/bin/sh\nexit 99\n",
+        },
+    )
+
+    payload = '{"session_id":"current-binary"}'
+    result = _run_hook(script_name, payload, bin_dir)
+
+    assert result.returncode == 0
+    assert result.stdout == "{}\n"
+    assert "older than plugin" not in result.stderr
+    assert (
+        args_file.read_text(encoding="utf-8")
+        == f"hook run --hook {hook_name} --harness claude-code"
+    )
+    assert stdin_file.read_text(encoding="utf-8") == payload
