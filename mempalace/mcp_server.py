@@ -714,6 +714,14 @@ def _release_mcp_writer_lock() -> None:
         # repeatedly without exiting the same context manager twice.
         _MCP_WRITER_LOCK_CM = None
         _MCP_WRITER_READ_ONLY = False
+        # Best-effort: drop the stdio writer marker only if it still names us,
+        # so a stale clear cannot remove a newer writer's record.
+        try:
+            from .server_registry import clear_stdio_writer
+
+            clear_stdio_writer(_config.palace_path)
+        except Exception:
+            logger.debug("could not clear stdio writer marker", exc_info=True)
         lock_cm.__exit__(None, None, None)
 
 
@@ -790,6 +798,16 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     if not _MCP_WRITER_ATEXIT_REGISTERED:
         atexit.register(_release_mcp_writer_lock)
         _MCP_WRITER_ATEXIT_REGISTERED = True
+    # Publish this process as the stdio MCP writer for this palace so read-only
+    # peers can name the lease holder in their refusal instead of an opaque
+    # "Peer MCP writer active". Best-effort: failure to write the marker never
+    # fails the acquire — the OS flock remains the real authority.
+    try:
+        from .server_registry import write_stdio_writer
+
+        write_stdio_writer(_config.palace_path)
+    except Exception:
+        logger.debug("could not publish stdio writer marker", exc_info=True)
     # Reads performed before promotion may have cached a query-only SQLite
     # collection. Drop it while ownership is held so the pending mutating
     # request reopens a writable handle rather than failing on query_only.
@@ -808,18 +826,33 @@ def _mcp_peer_writer_refusal(req_id, tool_name: str):
     if ok:
         return None
 
+    holder = None
+    try:
+        from .server_registry import read_stdio_writer
+
+        holder = read_stdio_writer(_config.palace_path)
+    except Exception:
+        logger.debug("could not read stdio writer marker", exc_info=True)
+
+    message = "Peer MCP writer active; this server is read-only for mutating tools"
+    if holder:
+        message += f" (writer: pid {holder.get('pid')} since {holder.get('started_at')})"
+
+    data = {
+        "tool": tool_name,
+        "palace": _config.palace_path,
+        "reason": reason,
+        "override_env": _MCP_ALLOW_PEER_WRITER_ENV,
+        "writer": holder,
+    }
+
     return {
         "jsonrpc": "2.0",
         "id": req_id,
         "error": {
             "code": -32001,
-            "message": "Peer MCP writer active; this server is read-only for mutating tools",
-            "data": {
-                "tool": tool_name,
-                "palace": _config.palace_path,
-                "reason": reason,
-                "override_env": _MCP_ALLOW_PEER_WRITER_ENV,
-            },
+            "message": message,
+            "data": data,
         },
     }
 
