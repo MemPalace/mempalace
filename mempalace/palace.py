@@ -1043,10 +1043,18 @@ def reap_stale_mine_locks(*, min_age_seconds: int = 3600) -> tuple[int, int]:
     substitute for the flock check, which is what actually makes removal
     safe.
 
-    Skips ``mine_palace_*.lock`` files — those belong to the newer
-    palace-level :func:`mine_palace_lock` and have their own
-    lifecycle/holder tracking; this targets only the per-source-file locks
-    :func:`mine_lock` creates via :func:`_mine_lock_path`.
+    Also reaps ``mine_palace_*.lock`` files — the palace-level locks from
+    :func:`mine_palace_lock` — which the release path *never* unlinks, so a
+    killed or force-quit writer (or a hub that died without atexit) leaves
+    its lock file behind even though the OS lock itself was released on
+    process death. The same flock re-acquire gate applies to them: a file is
+    only ever removed after *this* process wins the nonblocking lock, so a
+    lock genuinely held by a live writer is left untouched regardless of
+    age, and a lock this process itself still holds is skipped via the
+    process-wide re-entrancy set (:func:`_held_by_this_process`). The holder
+    text (see :func:`_read_lock_holder`) may name a dead PID, but it is
+    advisory only — removal is gated on the OS lock being free, never on
+    parsing the body.
 
     Returns ``(reaped, skipped)`` counts, for logging/testing — callers
     don't need to act on them.
@@ -1061,8 +1069,17 @@ def reap_stale_mine_locks(*, min_age_seconds: int = 3600) -> tuple[int, int]:
     reaped = 0
     skipped = 0
     for name in entries:
-        if not name.endswith(".lock") or name.startswith("mine_palace_"):
+        if not name.endswith(".lock"):
             continue
+        if name.startswith("mine_palace_"):
+            # Re-entrancy: this process still holds the palace lock (e.g. the
+            # long-lived MCP writer lease). The flock re-acquire gate below
+            # would reject it anyway, but skipping explicitly keeps the
+            # count honest and avoids a pointless failed-acquire on Windows.
+            key = name[len("mine_palace_") : -len(".lock")]
+            if _held_by_this_process(key):
+                skipped += 1
+                continue
         lock_path = os.path.join(lock_dir, name)
         try:
             if now - os.path.getmtime(lock_path) < min_age_seconds:

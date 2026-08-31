@@ -210,14 +210,26 @@ def _pid_alive(pid) -> bool:
     if not isinstance(pid, int) or pid <= 0:
         return False
     if os.name == "nt":  # pragma: no cover - exercised on Windows CI only
+        # OpenProcess alone can return a handle for a process that has exited
+        # but not fully cleaned up; GetExitCodeProcess == STILL_ACTIVE is the
+        # canonical "still running" probe (mirrors hooks_cli._pid_alive, which
+        # must never poison its mine child with os.kill -> TerminateProcess).
         import ctypes
+        from ctypes import wintypes
 
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
             return False
-        ctypes.windll.kernel32.CloseHandle(handle)
-        return True
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -247,6 +259,66 @@ def read_live_serverinfo(palace_path: str):
     if not isinstance(info.get("port"), int) or not info.get("host"):
         return None
     return info
+
+
+def reap_stale_serverinfo(palace_path=None, min_age_seconds: int = 0) -> int:
+    """Remove serverinfo records whose recorded hub PID is provably dead.
+
+    ``mempalace serve`` writes a record per palace under
+    ``~/.mempalace/server/<key>/serverinfo.json`` and deletes it via
+    :func:`clear_serverinfo` on clean exit (atexit). A hub that is killed,
+    crashes, or loses its machine never runs that cleanup, so stale records
+    with a dead PID accumulate; every reader already ignores them via
+    :func:`read_live_serverinfo`, but the files remain.
+
+    Sweeps all palace state directories by default, or just the one for
+    ``palace_path`` when given. Only records whose ``pid`` is a positive
+    int that :func:`_pid_alive` reports as dead are removed — a live hub's
+    record is never touched, no matter how old, and records with a
+    missing/non-int/<=0 pid or unparseable JSON are conservatively left in
+    place (mirroring the reader's own tolerance). Removal is a plain unlink
+    of a dead record: the reaper never holds a lock, never writes, and
+    cannot race a live hub the way a lock reaper must. ``min_age_seconds``
+    is an optional courtesy throttle for callers that want one; the
+    liveness check, not age, is the safety gate, so the default of 0 is
+    always safe.
+
+    Returns the number of records removed.
+    """
+    server_root = Path.home() / ".mempalace" / "server"
+    if palace_path is not None:
+        candidates = [server_state_dir(palace_path)]
+    else:
+        try:
+            candidates = [server_root / entry for entry in os.listdir(str(server_root))]
+        except OSError:
+            return 0
+    removed = 0
+    for state_dir in candidates:
+        path = state_dir / "serverinfo.json"
+        try:
+            info = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(info, dict):
+            continue
+        pid = info.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            continue
+        if min_age_seconds:
+            try:
+                if time.time() - path.stat().st_mtime < min_age_seconds:
+                    continue
+            except OSError:
+                continue
+        if _pid_alive(pid):
+            continue
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            logger.debug("serverinfo reap failed for %s", path, exc_info=True)
+    return removed
 
 
 def client_base_url(info: dict) -> str:
