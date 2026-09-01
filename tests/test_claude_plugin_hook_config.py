@@ -30,6 +30,12 @@ EVENT_TIMEOUT_BOUNDS: dict[str, tuple[int, int]] = {
     "PreCompact": (60, 90),
 }
 
+WRAPPER_SCRIPTS = {
+    "Stop": "mempal-stop-hook.sh",
+    "SessionEnd": "mempal-session-end-hook.sh",
+    "PreCompact": "mempal-precompact-hook.sh",
+}
+
 
 @pytest.fixture(scope="module")
 def hook_config() -> dict:
@@ -111,3 +117,16 @@ def test_session_end_hook_uses_background_wrapper(hook_config: dict) -> None:
 
     assert any("mempal-session-end-hook.sh" in command for command in commands)
     assert not any("mempal-precompact-hook.sh" in command for command in commands)
+
+
+@pytest.mark.parametrize("event, wrapper", sorted(WRAPPER_SCRIPTS.items()))
+def test_plugin_hooks_normalize_wrapper_paths_for_bash(
+    hook_config: dict, event: str, wrapper: str
+) -> None:
+    """Plugin hooks must preserve wrappers without passing Windows paths as bash source."""
+    command = hook_config["hooks"][event][0]["hooks"][0]["command"]
+
+    assert command == (
+        "bash -c 'script=${1//\\\\//}; exec bash \"$script\"' -- "
+        f'"${{CLAUDE_PLUGIN_ROOT}}/hooks/{wrapper}"'
+    )
