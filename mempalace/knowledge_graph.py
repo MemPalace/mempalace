@@ -588,8 +588,16 @@ class KnowledgeGraph:
                 )
         return results
 
-    def timeline(self, entity_name: str = None):
-        """Get all facts in chronological order, optionally filtered by entity."""
+    def timeline(self, entity_name: str = None, limit: int = 100, offset: int = 0):
+        """Get facts in chronological order, optionally filtered by entity.
+
+        Paginated with ``limit``/``offset`` (same convention as drawer
+        listing); defaults preserve the historical behavior of returning
+        the first 100 facts. Use :meth:`timeline_total` for the full
+        matching count.
+        """
+        limit = max(1, int(limit))
+        offset = max(0, int(offset))
         with self._lock:
             conn = self._conn()
             if entity_name:
@@ -602,19 +610,22 @@ class KnowledgeGraph:
                     JOIN entities o ON t.object = o.id
                     WHERE (t.subject = ? OR t.object = ?)
                     ORDER BY t.valid_from ASC NULLS LAST
-                    LIMIT 100
+                    LIMIT ? OFFSET ?
                 """,
-                    (eid, eid),
+                    (eid, eid, limit, offset),
                 ).fetchall()
             else:
-                rows = conn.execute("""
+                rows = conn.execute(
+                    """
                     SELECT t.*, s.name as sub_name, o.name as obj_name
                     FROM triples t
                     JOIN entities s ON t.subject = s.id
                     JOIN entities o ON t.object = o.id
                     ORDER BY t.valid_from ASC NULLS LAST
-                    LIMIT 100
-                """).fetchall()
+                    LIMIT ? OFFSET ?
+                """,
+                    (limit, offset),
+                ).fetchall()
 
         return [
             {
@@ -627,6 +638,20 @@ class KnowledgeGraph:
             }
             for r in rows
         ]
+
+    def timeline_total(self, entity_name: str = None) -> int:
+        """Total number of facts a :meth:`timeline` query matches (all pages)."""
+        with self._lock:
+            conn = self._conn()
+            if entity_name:
+                eid = self._entity_id(entity_name)
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM triples WHERE subject = ? OR object = ?",
+                    (eid, eid),
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT COUNT(*) FROM triples").fetchone()
+        return row[0]
 
     # ── Stats ─────────────────────────────────────────────────────────────
 
