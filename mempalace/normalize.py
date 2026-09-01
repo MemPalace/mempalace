@@ -47,6 +47,17 @@ _NOISE_TAGS = (
     "system-reminder",
     "command-message",
     "command-name",
+    # Rest of the slash-command envelope Claude Code injects around every
+    # slash-command invocation (#1333). Before this only the middle three tags
+    # were covered, so the caveat, args, and captured stdout/stderr streams
+    # leaked into drawers verbatim. ``local-command-stderr`` is included even
+    # though the #1333 root-cause sketch listed only five tags — it is emitted
+    # for commands that write to stderr and was found in real transcripts
+    # alongside the other five.
+    "command-args",
+    "local-command-caveat",
+    "local-command-stdout",
+    "local-command-stderr",
     "task-notification",
     "user-prompt-submit-hook",
     "hook_output",
@@ -55,11 +66,15 @@ _NOISE_TAGS = (
 
 def _tag_pattern(name: str) -> "re.Pattern[str]":
     # Opening tag must begin a line (optionally after a `> ` blockquote marker,
-    # since _messages_to_transcript prefixes lines with `> `). Body is lazy but
-    # forbidden from crossing a blank line, so a dangling open tag can't span
-    # multiple messages. Closing tag eats optional trailing whitespace + newline.
+    # since _messages_to_transcript prefixes lines with `> `). The body is lazy
+    # and halts at the next opening tag of the same name, so a dangling open tag
+    # can't span past the next same-tag block — while still allowing blank lines
+    # *inside* the tag (multi-paragraph <local-command-stdout> output, tables,
+    # stack traces; #1333). Combined with the line-start anchor this keeps a
+    # stray tag from eating neighbouring messages. Closing tag eats optional
+    # trailing whitespace + newline.
     return re.compile(
-        rf"(?m)^(?:> )?<{name}(?:\s[^>]*)?>" rf"(?:(?!\n\s*\n)[\s\S])*?" rf"</{name}>[ \t]*\n?"
+        rf"(?m)^(?:> )?<{name}(?:\s[^>]*)?>" rf"(?:(?!<{name}\b)[\s\S])*?" rf"</{name}>[ \t]*\n?"
     )
 
 
@@ -95,6 +110,23 @@ _HOOK_LINE_RE = re.compile(
 # "… +N lines" collapsed-output marker, line-anchored.
 _COLLAPSED_LINES_RE = re.compile(r"(?m)^(?:> )?…\s*\+\d+ lines.*\n?")
 
+# ANSI escape sequences that Claude Code's Bash tool preserves verbatim from
+# terminal output (#1333). Each escape is several BPE tokens, so they bloat
+# embeddings and pollute search. Unlike the patterns above these are NOT
+# line-anchored — they are anchored on the literal ESC byte (0x1B), a control
+# character that never appears in legitimate prose, so text that merely *names*
+# a sequence like "[1m" or "ESC[0m" survives untouched. Both follow ECMA-48 and
+# are ReDoS-safe by construction (disjoint / negated character classes, no
+# overlapping nested quantifiers).
+#
+# CSI (Control Sequence Introducer): ESC [ , parameter bytes (0x30-0x3F),
+# intermediate bytes (0x20-0x2F), one final byte (0x40-0x7E). Covers all SGR
+# color/style codes (the dominant Bash-output noise) plus cursor/erase.
+_ANSI_CSI_RE = re.compile(r"\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]")
+# OSC (Operating System Command): ESC ] , string payload, terminated by BEL
+# (0x07) or ST (ESC \). Covers hyperlinks (ESC]8;;URL BEL) and window titles.
+_ANSI_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
 
 def strip_noise(text: str) -> str:
     """Remove system tags, hook output, and Claude Code UI chrome from text.
@@ -111,6 +143,11 @@ def strip_noise(text: str) -> str:
     # Strip the Claude Code collapsed-output chrome "[N tokens] (ctrl+o to expand)".
     # Narrow shape — a bare "(ctrl+o to expand)" in user prose stays intact.
     text = re.sub(r"\s*\[\d+\s+tokens?\]\s*\(ctrl\+o to expand\)", "", text)
+    # Strip ANSI escape sequences from terminal / Bash-tool output (#1333).
+    # Applied after tag removal so escapes nested inside a stripped envelope
+    # (e.g. <local-command-stdout>) are already gone with the tag.
+    text = _ANSI_OSC_RE.sub("", text)
+    text = _ANSI_CSI_RE.sub("", text)
     # Collapse runs of blank lines created by the removals
     text = re.sub(r"\n{4,}", "\n\n\n", text)
     return text.strip()

@@ -2038,6 +2038,10 @@ class TestStripNoiseRemovesSystemChrome:
             "system-reminder",
             "command-message",
             "command-name",
+            "command-args",
+            "local-command-caveat",
+            "local-command-stdout",
+            "local-command-stderr",
             "task-notification",
             "user-prompt-submit-hook",
             "hook_output",
@@ -2054,6 +2058,68 @@ class TestStripNoiseRemovesSystemChrome:
         assert "line two" in out
         # Should collapse to no more than 3 newlines
         assert "\n\n\n\n" not in out
+
+
+class TestStripNoiseClaudeCodeEnvelopeAndAnsi:
+    """#1333: strip the rest of the slash-command envelope and ANSI escapes from
+    Bash-tool output, while prose that merely *names* them survives (verbatim is
+    sacred)."""
+
+    def test_strips_multiparagraph_local_command_stdout(self):
+        # The old blank-line-halt regex stopped at the first blank line and left
+        # the tail + closing tag behind. Real slash-command stdout is often
+        # multi-paragraph — the whole envelope must go.
+        text = (
+            "> User:\n"
+            "> <local-command-stdout>Set defaultPermissionMode to default\n"
+            "\n"
+            "Disabled auto-compact for all sessions</local-command-stdout>\n"
+            "> Real message."
+        )
+        out = strip_noise(text)
+        assert "local-command-stdout" not in out
+        assert "defaultPermissionMode" not in out
+        assert "Disabled auto-compact" not in out
+        assert "Real message." in out
+
+    def test_strips_local_command_stderr(self):
+        text = "> <local-command-stderr>command failed: boom</local-command-stderr>\n> Real."
+        out = strip_noise(text)
+        assert "local-command-stderr" not in out
+        assert "boom" not in out
+        assert "Real." in out
+
+    def test_strips_empty_command_args_remnant(self):
+        text = "> User:\n> <command-args></command-args>\n> Real."
+        out = strip_noise(text)
+        assert "command-args" not in out
+        assert "Real." in out
+
+    def test_strips_local_command_caveat(self):
+        text = "> <local-command-caveat>caveat text</local-command-caveat>\n> Real."
+        out = strip_noise(text)
+        assert "local-command-caveat" not in out
+        assert "caveat text" not in out
+        assert "Real." in out
+
+    def test_strips_ansi_csi_sgr_codes(self):
+        text = "> Assistant: \x1b[38;2;153;153;153m├\x1b[39m mempalace_add_drawer done"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert "[38;2;153" not in out
+        assert "mempalace_add_drawer done" in out
+
+    def test_strips_ansi_osc_hyperlink(self):
+        text = "> Assistant: see \x1b]8;;https://example.com\x07link\x1b]8;;\x07 here"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert "link here" in out
+
+    def test_prose_naming_ansi_survives(self):
+        # No literal ESC byte — text that merely *documents* an escape sequence
+        # must survive verbatim.
+        text = "> User: the SGR reset code is written ESC[0m in the docs."
+        assert strip_noise(text) == text.strip()
 
 
 # ── _try_pi_jsonl ──────────────────────────────────────────────────────
