@@ -243,9 +243,9 @@ def build_graph(col=None, config=None):
             # Skip these silently rather than crash the whole graph
             # build — a single None drawer shouldn't take down /stats
             # or any caller of build_graph for the entire palace. Caught
-            # 2026-04-25 by palace-daemon's verify-routes.sh smoke test
-            # against the canonical 151K palace. Closes the same gap as
-            # upstream #999 / fork PR #1094 in a different read path.
+            # 2026-04-25 during smoke testing against a canonical 151K
+            # palace. Closes the same gap as upstream #999 / fork
+            # PR #1094 in a different read path.
             if meta is None:
                 continue
             room = meta.get("room", "")
