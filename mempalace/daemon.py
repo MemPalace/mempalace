@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
 from urllib.parse import parse_qs, urlparse
@@ -85,10 +85,22 @@ SHUTDOWN_DRAIN_SECONDS = 10.0
 # holds verbatim payloads) doesn't grow without bound across a long-lived
 # daemon. Override via env for operators who want a longer/shorter window.
 JOB_RETENTION_DAYS = int(os.environ.get("MEMPALACE_DAEMON_RETENTION_DAYS", "7") or "7")
+_fcntl: Any
 try:
     import fcntl as _fcntl  # POSIX only; absent on Windows
 except ImportError:  # pragma: no cover - Windows fallback
     _fcntl = None
+_msvcrt: Any
+try:
+    import msvcrt as _msvcrt  # Windows only; absent on POSIX
+except ImportError:  # pragma: no cover - POSIX fallback
+    _msvcrt = None
+
+# Bounded wait for the Windows spawn-mutex poll loop (see _wait_lock_start_file).
+# msvcrt has no indefinite-blocking lock mode, so this stands in for POSIX
+# flock(LOCK_EX)'s unbounded wait with a generous but finite ceiling instead.
+_LOCK_WAIT_TIMEOUT = 30.0
+_LOCK_POLL_INTERVAL = 0.05
 
 
 def _chmod_private(path: Path) -> None:
@@ -1271,6 +1283,65 @@ def _detached_kwargs(log_path: Path) -> dict[str, Any]:
     return kwargs
 
 
+def _try_lock_start_file(lock_fh: IO[Any]) -> bool:
+    """Non-blocking attempt to acquire the spawn-mutex on ``lock_fh``.
+
+    Returns True if this caller now holds the exclusive lock. Uses
+    ``fcntl.flock`` on POSIX and ``msvcrt.locking`` on Windows -- both are
+    advisory locks on the open file description/handle that release
+    automatically when it is closed, including on process crash (verified:
+    a force-killed holder on Windows releases the lock immediately, with no
+    stale-lock cleanup needed).
+    """
+    if _fcntl is not None:
+        try:
+            _fcntl.flock(lock_fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+    if _msvcrt is not None:  # pragma: no cover - Windows only
+        try:
+            _msvcrt.locking(lock_fh.fileno(), _msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+    return False  # pragma: no cover - no locking primitive on this platform
+
+
+def _wait_lock_start_file(lock_fh: IO[Any]) -> None:
+    """Block until the spawn-mutex on ``lock_fh`` can be acquired.
+
+    ``fcntl.flock(LOCK_EX)`` blocks indefinitely. ``msvcrt`` has no
+    equivalent (``LK_LOCK`` only retries for ~10s before giving up), so the
+    Windows path polls the non-blocking primitive with its own, longer
+    bounded timeout instead.
+
+    Raises ``DaemonError`` (never a raw ``OSError``) so callers can handle it
+    the same way as every other daemon failure -- ``cli.py``'s ``cmd_daemon``
+    and ``_submit_daemon_cli_job`` both catch only ``DaemonError``, so a raw
+    ``OSError`` here would escape as an unhandled traceback.
+    """
+    if _fcntl is not None:
+        try:
+            _fcntl.flock(lock_fh.fileno(), _fcntl.LOCK_EX)
+        except OSError as exc:
+            raise DaemonError(f"failed waiting for the daemon spawn lock: {exc}") from exc
+        return
+    if _msvcrt is not None:  # pragma: no cover - Windows only
+        deadline = time.monotonic() + _LOCK_WAIT_TIMEOUT
+        while True:
+            try:
+                _msvcrt.locking(lock_fh.fileno(), _msvcrt.LK_NBLCK, 1)
+                return
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    raise DaemonError(
+                        f"timed out after {_LOCK_WAIT_TIMEOUT:g}s waiting for another "
+                        f"daemon start to finish: {exc}"
+                    ) from exc
+                time.sleep(_LOCK_POLL_INTERVAL)
+
+
 def start_daemon(
     palace_path: str,
     *,
@@ -1295,18 +1366,25 @@ def start_daemon(
 
     # Spawn mutual exclusion: two concurrent `daemon start` callers would both
     # observe no running daemon and both spawn a child, double-claiming jobs.
-    # A non-blocking flock serializes the check-then-spawn; the loser waits for
-    # the winner to finish coming up, then re-checks and reuses that daemon.
-    lock_fh = open(sd / "start.lock", "w") if _fcntl is not None else None
-    if _fcntl is not None and lock_fh is not None:
+    # A non-blocking exclusive lock serializes the check-then-spawn; the loser
+    # waits for the winner to finish coming up, then re-checks and reuses that
+    # daemon. Cross-platform: fcntl.flock on POSIX, msvcrt.locking on Windows.
+    lock_fh = open(sd / "start.lock", "w") if (_fcntl is not None or _msvcrt is not None) else None
+    if lock_fh is not None:
         _chmod_private(sd / "start.lock")
-        try:
-            _fcntl.flock(lock_fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-        except OSError:
+        if not _try_lock_start_file(lock_fh):
             # Another start is in flight — wait for it, then reuse its daemon.
-            _fcntl.flock(lock_fh.fileno(), _fcntl.LOCK_EX)
-            existing = get_client_if_running(palace_path)
+            # Both exits here leave the function before the readiness-probe
+            # ``try`` below, so neither is covered by its ``finally``: close the
+            # handle explicitly or it leaks into the caller's process.
+            try:
+                _wait_lock_start_file(lock_fh)
+                existing = get_client_if_running(palace_path)
+            except BaseException:
+                lock_fh.close()
+                raise
             if existing is not None:
+                lock_fh.close()
                 return existing
             # The other starter failed without bringing the daemon up; fall
             # through and spawn ourselves (we now hold the lock).

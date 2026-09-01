@@ -1124,6 +1124,267 @@ def test_start_daemon_kills_orphan_on_readiness_timeout(tmp_path, monkeypatch):
     assert fake.killed is True
 
 
+def test_try_lock_start_file_returns_false_when_already_locked(tmp_path):
+    """The non-blocking spawn-mutex primitive must actually contend.
+
+    Regression guard for #47/#83: the old code only ever attempted this via
+    ``fcntl``, which is ``None`` on Windows, so the whole guard silently
+    no-oped there. This exercises whatever primitive the current platform
+    provides (``msvcrt`` on Windows, ``fcntl`` on POSIX) directly.
+    """
+    path = tmp_path / "start.lock"
+    f1 = open(path, "w")
+    f2 = open(path, "w")
+    try:
+        assert daemon._try_lock_start_file(f1) is True
+        assert daemon._try_lock_start_file(f2) is False
+    finally:
+        f1.close()
+        f2.close()
+
+
+def test_wait_lock_start_file_unblocks_after_release(tmp_path):
+    """The blocking spawn-mutex wait must actually wake once the holder lets go."""
+    path = tmp_path / "start.lock"
+    f1 = open(path, "w")
+    f2 = open(path, "w")
+    assert daemon._try_lock_start_file(f1) is True
+    assert daemon._try_lock_start_file(f2) is False
+
+    released = threading.Event()
+
+    def release_soon():
+        time.sleep(0.2)
+        f1.close()
+        released.set()
+
+    releaser = threading.Thread(target=release_soon)
+    releaser.start()
+    try:
+        daemon._wait_lock_start_file(f2)
+    finally:
+        releaser.join(timeout=5)
+        f2.close()
+    assert released.is_set()
+
+
+def test_start_daemon_closes_lock_handle_when_reusing_winner_daemon(tmp_path, monkeypatch):
+    """The lock file handle must not leak on the "reuse the winner's daemon" path.
+
+    ``start_daemon``'s ``finally`` that closes ``lock_fh`` is attached to the
+    readiness-probe ``try``, which begins *after* the spawn. Every path that
+    leaves the function before that point -- this one, and the lock-wait
+    failure below -- skipped the close entirely and leaked an open handle to
+    ``start.lock`` into the caller's process.
+    """
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    daemon.ensure_token(str(palace))
+
+    seen = {}
+
+    def capturing_try_lock(fh):
+        seen["fh"] = fh
+        return False  # force the "another start is in flight" branch
+
+    sentinel = object()
+    calls = []
+
+    def fake_get_client(*a, **kw):
+        calls.append(1)
+        # First call (before the lock) sees nothing; after waiting out the
+        # winner, its daemon is up and we reuse it.
+        return sentinel if len(calls) > 1 else None
+
+    monkeypatch.setattr(daemon, "_try_lock_start_file", capturing_try_lock)
+    monkeypatch.setattr(daemon, "_wait_lock_start_file", lambda fh: None)
+    monkeypatch.setattr(daemon, "get_client_if_running", fake_get_client)
+
+    result = daemon.start_daemon(str(palace))
+
+    assert result is sentinel
+    assert seen["fh"].closed, "lock file handle leaked on the reuse-existing-daemon path"
+
+
+def test_wait_lock_start_file_translates_posix_flock_error(tmp_path, monkeypatch):
+    """The POSIX branch must translate a flock OSError into DaemonError too.
+
+    Runs on every platform (the fcntl module is faked), so the POSIX-side
+    translation keeps regression coverage on the Windows CI job as well --
+    the timeout tests below are msvcrt-gated and skip on Linux/macOS, which
+    would otherwise leave this branch untested everywhere.
+    """
+
+    class _FakeFcntl:
+        LOCK_EX = 2
+        LOCK_NB = 4
+
+        @staticmethod
+        def flock(fd, operation):
+            raise OSError(4, "Interrupted system call")
+
+    monkeypatch.setattr(daemon, "_fcntl", _FakeFcntl)
+    fh = open(tmp_path / "start.lock", "w")
+    try:
+        with pytest.raises(daemon.DaemonError):
+            daemon._wait_lock_start_file(fh)
+    finally:
+        fh.close()
+
+
+@pytest.mark.skipif(
+    daemon._msvcrt is None,
+    reason="the bounded wait ceiling only exists on the Windows/msvcrt path",
+)
+def test_wait_lock_start_file_raises_daemon_error_on_timeout(tmp_path, monkeypatch):
+    """Hitting the Windows wait ceiling must surface as DaemonError, not OSError.
+
+    Every production auto-start entrypoint (cli.py's cmd_daemon and
+    _submit_daemon_cli_job) catches only DaemonError, so a raw
+    OSError/PermissionError escapes as an unhandled traceback instead of the
+    module's normal "mempalace: daemon error: ..." exit-1 behavior.
+    """
+    monkeypatch.setattr(daemon, "_LOCK_WAIT_TIMEOUT", 0.2)
+    path = tmp_path / "start.lock"
+    holder = open(path, "w")
+    waiter = open(path, "w")
+    try:
+        assert daemon._try_lock_start_file(holder) is True
+        with pytest.raises(daemon.DaemonError):
+            daemon._wait_lock_start_file(waiter)
+    finally:
+        holder.close()
+        waiter.close()
+
+
+@pytest.mark.skipif(
+    daemon._msvcrt is None,
+    reason="the bounded wait ceiling only exists on the Windows/msvcrt path",
+)
+def test_start_daemon_lock_wait_timeout_is_daemon_error_and_closes_handle(tmp_path, monkeypatch):
+    """The wait-ceiling path must translate the error AND release the handle."""
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    daemon.ensure_token(str(palace))
+    monkeypatch.setattr(daemon, "_LOCK_WAIT_TIMEOUT", 0.2)
+    monkeypatch.setattr(daemon, "get_client_if_running", lambda *a, **kw: None)
+
+    seen = {}
+    real_try_lock = daemon._try_lock_start_file
+
+    def capturing_try_lock(fh):
+        seen["fh"] = fh
+        return real_try_lock(fh)
+
+    monkeypatch.setattr(daemon, "_try_lock_start_file", capturing_try_lock)
+
+    sd = daemon.state_dir(str(palace))
+    sd.mkdir(parents=True, exist_ok=True)
+    holder = open(sd / "start.lock", "w")
+    try:
+        # Someone else holds the spawn mutex and never lets go.
+        assert real_try_lock(holder) is True
+        with pytest.raises(daemon.DaemonError):
+            daemon.start_daemon(str(palace))
+        assert seen["fh"].closed, "lock file handle leaked on the lock-wait-timeout path"
+    finally:
+        holder.close()
+
+
+def test_start_daemon_serializes_concurrent_spawners(tmp_path, monkeypatch):
+    """Two racing auto-start callers must not both spawn a daemon.
+
+    Regression test for #47/#83: start_daemon()'s spawn mutex was built
+    exclusively on fcntl.flock, which is unavailable on Windows (`_fcntl` is
+    `None` there — the operator's actual production platform), so the whole
+    ``if _fcntl is not None`` guard was skipped and two near-simultaneous
+    callers (e.g. two hooks firing back-to-back) both observed no running
+    daemon and both spawned a child, leaking an orphaned, unstoppable second
+    daemon process. This uses the real on-disk lock file and whatever
+    locking primitive the current platform provides (not mocked) so it
+    actually exercises the fix; only ``subprocess.Popen`` and the readiness
+    probe (``DaemonClient``) are faked.
+    """
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    daemon.ensure_token(str(palace))
+
+    spawn_count = 0
+    spawn_count_lock = threading.Lock()
+    daemon_up = threading.Event()
+    sentinel_client = object()
+
+    # Force the two threads' *first* (pre-lock) liveness check to rendezvous,
+    # so both deterministically observe "not running yet" at the same instant
+    # -- closing the race window instead of relying on scheduler luck.
+    pre_check_barrier = threading.Barrier(2)
+    pre_check_count = 0
+    pre_check_count_lock = threading.Lock()
+
+    def fake_get_client_if_running(*a, **kw):
+        nonlocal pre_check_count
+        with pre_check_count_lock:
+            pre_check_count += 1
+            my_turn = pre_check_count
+        if my_turn <= 2:
+            pre_check_barrier.wait(timeout=5)
+        return sentinel_client if daemon_up.is_set() else None
+
+    class FakeProc:
+        returncode = None
+
+        def poll(self):
+            return None
+
+    def fake_popen(*a, **kw):
+        nonlocal spawn_count
+        with spawn_count_lock:
+            spawn_count += 1
+        return FakeProc()
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def health(self):
+            daemon_up.set()
+            return {"status": "ok"}
+
+    monkeypatch.setattr(daemon, "get_client_if_running", fake_get_client_if_running)
+    monkeypatch.setattr(daemon.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(daemon, "DaemonClient", FakeClient)
+
+    results = [None, None]
+    errors = []
+    start_barrier = threading.Barrier(2)
+
+    def call(index):
+        start_barrier.wait(timeout=5)
+        try:
+            results[index] = daemon.start_daemon(str(palace), timeout=5.0)
+        except Exception as exc:  # noqa: BLE001 - surfaced via `errors` below
+            errors.append(exc)
+
+    # daemon=True: if a regression ever deadlocks start_daemon, these threads
+    # must not keep the pytest process alive past the join timeout below.
+    t1 = threading.Thread(target=call, args=(0,), daemon=True)
+    t2 = threading.Thread(target=call, args=(1,), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    assert not errors, f"start_daemon raised: {errors}"
+    assert spawn_count == 1, (
+        f"expected exactly one daemon spawn, got {spawn_count} "
+        "(the spawn mutex failed to serialize concurrent callers)"
+    )
+    assert all(r is not None for r in results)
+
+
 # --- service.run_* happy-path coverage ---
 # These close the draft PR's follow-up ("Add focused happy-path tests for
 # service.run_mine / run_diary_write / run_mcp_tool") and, now that the daemon
