@@ -57,6 +57,7 @@ def test_dialect_compress_samples():
         "zh-CN": "我们决定从SQLite迁移到PostgreSQL以获得更好的并发写入。Ben昨天批准了PR。",
         "id": "Kami memutuskan untuk migrasi dari SQLite ke PostgreSQL untuk penulisan bersamaan yang lebih baik. Ben telah menyetujui PR kemarin.",
         "be": "Мы вырашылі перайсці з SQLite на PostgreSQL для паляпшэння паралельнага запісу. Зміцер ухваліў PR ўчора.",
+        "ca": "Marc va dir que la instal·lació del paquet va anar bé.",
     }
 
     for lang, text in samples.items():
