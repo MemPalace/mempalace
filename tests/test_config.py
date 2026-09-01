@@ -375,6 +375,34 @@ def test_sanitize_name_cyrillic():
     assert sanitize_name("Алексей") == "Алексей"
 
 
+def test_sanitize_name_accepts_ampersand():
+    # Real curated/emergent wings routinely contain "&" — reads must not reject a
+    # name the store already holds. (Regression: MCP list_drawers 503'd with
+    # "wing contains invalid characters" for wings like "Archive & Storage".)
+    assert sanitize_name("Archive & Storage") == "Archive & Storage"
+    assert sanitize_name("Health & Fitness") == "Health & Fitness"
+
+
+def test_sanitize_name_accepts_comma_colon_parens():
+    assert sanitize_name("Q1, Q2 goals") == "Q1, Q2 goals"
+    assert sanitize_name("role: engineer") == "role: engineer"
+    assert sanitize_name("Notes (2026) archive") == "Notes (2026) archive"
+
+
+def test_sanitize_name_still_rejects_trailing_punctuation():
+    # First/last char must remain alphanumeric — the broadened set applies to the
+    # interior only, so a name can't start/end with the new punctuation.
+    for bad in ("& leading", "trailing )", "trailing_"):
+        with pytest.raises(ValueError):
+            sanitize_name(bad)
+
+
+def test_sanitize_name_still_rejects_shell_metacharacters():
+    for bad in ("a;b", "a|b", "a$b", "a`b"):
+        with pytest.raises(ValueError):
+            sanitize_name(bad)
+
+
 def test_sanitize_name_rejects_leading_underscore():
     with pytest.raises(ValueError):
         sanitize_name("_foo")

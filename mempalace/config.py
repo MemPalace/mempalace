@@ -30,7 +30,16 @@ from .write_routing import (
 # in file paths, SQLite, or ChromaDB metadata.
 
 MAX_NAME_LENGTH = 128
-_SAFE_NAME_RE = re.compile(r"^(?:[^\W_]|[^\W_][\w .'-]{0,126}[^\W_])$")
+# Allowed characters for wing/room/entity names. Alphanumerics of any script,
+# plus a small set of connective punctuation that emergent + curated names
+# legitimately contain: space . , : ' & ( ) - . `&` in particular is common in
+# real area names ("Archive & Storage", "Health & Fitness", "Legal & Disputes"),
+# and reads (list_drawers etc.) rejecting a name the store already holds made
+# those wings unreadable. First/last char must still be alphanumeric (no leading
+# "_" or trailing punctuation), and path traversal (`..` `/` `\\`) + NUL bytes are
+# blocked separately below — those, not this class, are the security boundary.
+# (Mirrors the broader set `sanitize_kg_value` already permits.)
+_SAFE_NAME_RE = re.compile(r"^(?:[^\W_]|[^\W_][\w .,:'&()-]{0,126}[^\W_])$")
 
 # MCP clients (e.g. Claude Desktop, WorkBuddy) occasionally relay lone UTF-16
 # surrogates (U+D800–U+DFFF) when proxying binary-in-Unicode or corrupted
