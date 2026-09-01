@@ -150,7 +150,34 @@ class TestTimeline:
                 "hub", "connects_to", f"spoke_{i}", valid_from=f"2025-01-{(i % 28) + 1:02d}"
             )
         tl = kg.timeline("hub")
-        assert len(tl) == 100  # LIMIT 100 on entity-filtered branch
+        assert len(tl) == 100  # default limit preserves historical behavior
+
+    def test_timeline_pagination_walks_all_facts(self, kg):
+        for i in range(105):
+            kg.add_triple(f"entity_{i}", "relates_to", f"entity_{i + 1}")
+        pages = [kg.timeline(limit=50, offset=o) for o in (0, 50, 100)]
+        assert [len(p) for p in pages] == [50, 50, 5]
+        seen = [(t["subject"], t["predicate"], t["object"]) for page in pages for t in page]
+        assert len(seen) == len(set(seen)) == 105  # disjoint pages, full coverage
+
+    def test_timeline_entity_pagination(self, kg):
+        for i in range(105):
+            kg.add_triple(
+                "hub", "connects_to", f"spoke_{i}", valid_from=f"2025-01-{(i % 28) + 1:02d}"
+            )
+        page = kg.timeline("hub", limit=10, offset=100)
+        assert len(page) == 5
+
+    def test_timeline_total(self, kg):
+        for i in range(105):
+            kg.add_triple(f"entity_{i}", "relates_to", f"entity_{i + 1}")
+        kg.add_triple("hub", "connects_to", "entity_0")
+        assert kg.timeline_total() == 106
+        assert kg.timeline_total("hub") == 1
+
+    def test_timeline_clamps_bad_pagination_args(self, kg):
+        kg.add_triple("a", "relates_to", "b")
+        assert len(kg.timeline(limit=0, offset=-5)) == 1  # clamped to limit=1, offset=0
 
 
 class TestWALMode:
