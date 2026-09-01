@@ -107,6 +107,7 @@ from .knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH  # noqa: E402
 from .logstream import LOGSTREAM_DB_FILENAME, Logstream  # noqa: E402
 from .collision_scan import assert_no_collisions  # noqa: E402
 from .ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
+from .importance import score_importance  # noqa: E402
 
 
 class _MempalaceLogFilter(logging.Filter):
@@ -3199,6 +3200,7 @@ def tool_add_drawer(
         "added_by": added_by,
         "filed_at": datetime.now().isoformat(),
         "id_recipe": ID_RECIPE,
+        "importance": score_importance(content),
     }
 
     # Idempotency. Three cases to detect a prior committed write:
@@ -4249,6 +4251,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             "agent": agent_name,
             "filed_at": now.isoformat(),
             "date": now.strftime("%Y-%m-%d"),
+            "importance": score_importance(entry),
         }
         chunk_size = _config.chunk_size
         if len(entry) <= chunk_size:

@@ -21,6 +21,7 @@ from collections import defaultdict
 from typing import Optional
 
 from .backends import PalaceNotFoundError
+from .importance import score_importance
 from .collision_scan import assert_no_collisions
 from .ids import (
     ID_RECIPE,
@@ -134,6 +135,7 @@ def file_conversation_exchange(
         "extract_mode": "exchange",
         "normalize_version": NORMALIZE_VERSION,
         "id_recipe": ID_RECIPE,
+        "importance": score_importance(text),
     }
     if extra_metadata:
         for key, value in extra_metadata.items():

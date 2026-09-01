@@ -45,6 +45,7 @@ from .palace import (
 # ``_compute_topic_tunnels_for_wing`` post-mine block.
 from .collision_scan import assert_no_collisions
 from .hallways import compute_hallways_for_wing
+from .importance import score_importance
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
 
 logger = logging.getLogger("mempalace_mcp")
@@ -1453,6 +1454,7 @@ def _build_drawer_metadata(
     if chunk_total is not None:
         metadata["chunk_total"] = chunk_total
     metadata["hall"] = detect_hall(content)
+    metadata["importance"] = score_importance(content)
     entities = _extract_entities_for_metadata(content)
     if entities:
         metadata["entities"] = entities
