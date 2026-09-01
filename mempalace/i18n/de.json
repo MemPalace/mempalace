@@ -36,10 +36,11 @@
     "instruction": "Auf Deutsch komprimieren. Bindestriche zwischen Wörtern, Pipes zwischen Konzepten. Artikel und Füllwörter weglassen. Eigennamen und Zahlen exakt beibehalten."
   },
   "regex": {
-    "topic_pattern": "[A-ZÄÖÜß][a-zäöüß]{2,}|[A-Za-zÄÖÜäöüß]{3,}",
+    "topic_pattern": "[^\\W\\d_][\\w-]{2,}",
     "stop_words": "der die das ein eine eines einer einem einen den dem des und oder aber denn weil wenn als ob auch noch schon sehr viel nur nicht mehr kann wird hat ist sind war waren sein haben wurde mit von zu für auf in an um über nach durch",
     "quote_pattern": "\\u201E([^\\u201C]{10,200})\\u201C|\"([^\"]{10,200})\"",
-    "action_pattern": "(?:gebaut|behoben|geschrieben|hinzugefügt|gepusht|gemessen|getestet|überprüft|erstellt|gelöscht|aktualisiert|konfiguriert|bereitgestellt|migriert)\\s+[\\wÄÖÜäöüß\\s]{3,30}"
+    "action_pattern": "(?:gebaut|behoben|geschrieben|hinzugefügt|gepusht|gemessen|getestet|überprüft|erstellt|gelöscht|aktualisiert|konfiguriert|bereitgestellt|migriert)\\s+[\\wÄÖÜäöüß\\s]{3,30}",
+    "decision_words": "entschieden entschied weil stattdessen bevorzugt gewechselt wählte gewählt erkannt wichtig kritisch entscheidend entdeckt gelernt schlussfolgerung lösung grund warum durchbruch erkenntnis beschlossen deshalb daher"
   },
   "entity": {
     "candidate_pattern": "[A-ZÄÖÜ][a-zäöüß]{1,19}",

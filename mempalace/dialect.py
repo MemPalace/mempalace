@@ -296,6 +296,30 @@ _STOP_WORDS = {
     "need",
 }
 
+# Default (English) decision/insight words used to score key sentences. A
+# locale can override these via its regex.decision_words entry (finding #50);
+# locales without it fall back to this set.
+_DECISION_WORDS = {
+    "decided",
+    "because",
+    "instead",
+    "prefer",
+    "switched",
+    "chose",
+    "realized",
+    "important",
+    "key",
+    "critical",
+    "discovered",
+    "learned",
+    "conclusion",
+    "solution",
+    "reason",
+    "why",
+    "breakthrough",
+    "insight",
+}
+
 
 class Dialect:
     """
@@ -347,6 +371,18 @@ class Dialect:
         self.aaak_instruction = t("aaak.instruction")
         self.lang_regex = get_regex()
 
+        # Derive locale-aware extraction inputs from lang_regex, falling back to
+        # the English module defaults when a locale omits a key (finding #50:
+        # these were loaded but never consulted, so non-English content ran
+        # through ASCII-only English patterns).
+        _sw = self.lang_regex.get("stop_words")
+        self._stop_words = set(_sw.split()) if _sw else _STOP_WORDS
+        # Tokenizer: locale topic_pattern captures the script's letters (incl.
+        # umlauts); the ASCII default [a-zA-Z]... split German words at umlauts.
+        self._topic_pattern = self.lang_regex.get("topic_pattern") or r"[^\W\d_][\w-]{2,}"
+        _dw = self.lang_regex.get("decision_words")
+        self._decision_words = set(_dw.split()) if _dw else _DECISION_WORDS
+
     @classmethod
     def from_config(cls, config_path: str) -> "Dialect":
         """Load entity mappings from a JSON config file.
@@ -397,8 +433,14 @@ class Dialect:
             return self.entity_codes[name]
         if name.lower() in self.entity_codes:
             return self.entity_codes[name.lower()]
+        # Whole-word match only: a registered name must appear as a full word
+        # in the query, not as a bare substring inside a longer word. Without
+        # this, "Ann" wrongly claims "Annabelle"'s code (finding #53), while a
+        # legitimate multi-word query like "Alice Cooper" must still match
+        # "Alice".
+        name_lower = name.lower()
         for key, code in self.entity_codes.items():
-            if key.lower() in name.lower():
+            if re.search(rf"\b{re.escape(key.lower())}\b", name_lower):
                 return code
         # Auto-code: first 3 chars uppercase
         return name[:3].upper()
@@ -454,20 +496,21 @@ class Dialect:
 
     def _extract_topics(self, text: str, max_topics: int = 3) -> List[str]:
         """Extract key topic words from plain text."""
-        # Tokenize: alphanumeric words, lowercase
-        words = re.findall(r"[a-zA-Z][a-zA-Z_-]{2,}", text)
-        # Count frequency, skip stop words
+        # Tokenize with the locale topic pattern (keeps umlauts/non-ASCII letters
+        # whole; the ASCII default split German words at the umlaut — finding #50).
+        words = re.findall(self._topic_pattern, text)
+        # Count frequency, skip locale stop words
         freq = {}
         for w in words:
             w_lower = w.lower()
-            if w_lower in _STOP_WORDS or len(w_lower) < 3:
+            if w_lower in self._stop_words or len(w_lower) < 3:
                 continue
             freq[w_lower] = freq.get(w_lower, 0) + 1
 
         # Also boost words that look like proper nouns or technical terms
         for w in words:
             w_lower = w.lower()
-            if w_lower in _STOP_WORDS:
+            if w_lower in self._stop_words:
                 continue
             if w[0].isupper() and w_lower in freq:
                 freq[w_lower] += 2
@@ -488,32 +531,15 @@ class Dialect:
             return ""
 
         # Score each sentence
-        decision_words = {
-            "decided",
-            "because",
-            "instead",
-            "prefer",
-            "switched",
-            "chose",
-            "realized",
-            "important",
-            "key",
-            "critical",
-            "discovered",
-            "learned",
-            "conclusion",
-            "solution",
-            "reason",
-            "why",
-            "breakthrough",
-            "insight",
-        }
         scored = []
         for s in sentences:
             score = 0
             s_lower = s.lower()
-            for w in decision_words:
-                if w in s_lower:
+            for w in self._decision_words:
+                # Whole-word match: "key" must not score on "monkey", and this
+                # is what lets locale decision words (self._decision_words) count
+                # for non-English text (finding #50).
+                if re.search(rf"\b{re.escape(w)}\b", s_lower):
                     score += 2
             # Prefer shorter, punchier sentences
             if len(s) < 80:
@@ -552,7 +578,7 @@ class Dialect:
                 and clean[0].isupper()
                 and clean[1:].islower()
                 and i > 0
-                and clean.lower() not in _STOP_WORDS
+                and clean.lower() not in self._stop_words
             ):
                 code = clean[:3].upper()
                 if code not in found:
