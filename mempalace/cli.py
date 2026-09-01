@@ -1666,6 +1666,52 @@ def cmd_hallways(args):
         print(f"    {label}")
 
 
+def cmd_dream(args):
+    """Consolidate the palace on a non-destructive copy (a 'dream')."""
+    from .dream import dream
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    report = dream(
+        palace_path,
+        wing=args.wing,
+        threshold=args.threshold,
+        candidate_path=os.path.expanduser(args.candidate) if args.candidate else None,
+        retire_conflicts=args.retire_conflicts,
+    )
+
+    bar = "=" * 55
+    print(f"\n{bar}")
+    print("  MemPalace Dream — consolidation candidate ready")
+    print(bar)
+    print(f"  Wing:    {report['wing'] or '(whole palace)'}")
+    print(
+        f"  Drawers: {report['drawers_before']:,} → {report['drawers_after']:,} "
+        f"(-{report['drawers_merged']:,} merged)"
+    )
+    if args.retire_conflicts:
+        print(
+            f"  KG contradictions: {len(report['kg_conflicts'])} flagged, "
+            f"{report['kg_facts_retired']} retired"
+        )
+    else:
+        print(
+            f"  KG contradictions: {len(report['kg_conflicts'])} flagged "
+            "(review-only; --retire-conflicts to retire)"
+        )
+    for c in report["kg_conflicts"][:10]:
+        objs = ", ".join(name for name, _ in c["objects"])
+        print(f"    ? {c['subject']} {c['predicate']} → {{{objs}}}")
+    print("-" * 55)
+    print(f"  Candidate: {report['candidate']}")
+    print("  Review, then adopt or discard:")
+    print(
+        f"    adopt:   mv {report['palace']} {report['palace']}.pre-dream "
+        f"&& mv {report['candidate']} {report['palace']}"
+    )
+    print(f"    discard: rm -rf {report['candidate']}")
+    print(f"{bar}\n")
+
+
 def cmd_status(args):
     from .miner import status
 
@@ -3386,6 +3432,28 @@ def main():
     )
 
     # search
+    p_dream = sub.add_parser(
+        "dream",
+        help="Consolidate memory on a non-destructive copy (dedup drawers + flag KG contradictions)",
+    )
+    p_dream.add_argument("--wing", default=None, help="Limit consolidation to one wing")
+    p_dream.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Near-duplicate similarity threshold for drawer merge (default: dedup default)",
+    )
+    p_dream.add_argument(
+        "--candidate",
+        default=None,
+        help="Where to write the candidate palace (default: <palace>.dream-<wing>-<timestamp>)",
+    )
+    p_dream.add_argument(
+        "--retire-conflicts",
+        action="store_true",
+        help="Also invalidate the older side of each KG contradiction (candidate only)",
+    )
+
     p_search = sub.add_parser("search", help="Find anything, exact words")
     p_search.add_argument("query", help="What to search for")
     p_search.add_argument(
@@ -4061,6 +4129,7 @@ def main():
         "split": cmd_split,
         "search": cmd_search,
         "sweep": cmd_sweep,
+        "dream": cmd_dream,
         "sync": cmd_sync,
         "mcp": cmd_mcp,
         "serve": cmd_serve,
