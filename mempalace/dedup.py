@@ -100,15 +100,40 @@ def dedup_source_group(col, drawer_ids, threshold=DEFAULT_THRESHOLD, dry_run=Tru
 
     Greedy: sort by doc length (longest first), keep if not too similar
     to any already-kept drawer. Returns (kept_ids, deleted_ids).
+
+    The similarity probe is scoped to the group's ``source_file`` (when the
+    metadata carries one). On a large palace the *global* nearest neighbors
+    of a chunk are routinely near-duplicates from other sources, so an
+    unscoped top-5 never surfaces the in-group twin and the dedup silently
+    under-deletes. Legacy drawers without ``source_file`` metadata keep the
+    historical unscoped probe.
+
+    Stored embeddings are reused when the backend returns them, avoiding one
+    embedding forward pass per candidate; one extra result slot absorbs the
+    candidate's own self-match (it is in the collection at distance ~0 and
+    must not displace the kept twin it would otherwise be compared against).
     """
-    data = col.get(ids=drawer_ids, include=["documents", "metadatas"])
-    items = list(zip(data["ids"], data["documents"], data["metadatas"]))
+    data = col.get(ids=drawer_ids, include=["documents", "metadatas", "embeddings"])
+    embeddings = data.get("embeddings") if isinstance(data, dict) else data["embeddings"]
+    if embeddings is None:
+        embeddings = [None] * len(data["ids"])
+    items = list(zip(data["ids"], data["documents"], data["metadatas"], embeddings))
     items.sort(key=lambda x: len(x[1] or ""), reverse=True)
+
+    # Scope the probe to this group's source file when known. Groups are
+    # built per source_file in get_source_groups, so the first tagged meta
+    # speaks for the whole group.
+    group_where = None
+    for _, _, meta, _ in items:
+        src = (meta or {}).get("source_file")
+        if src:
+            group_where = {"source_file": src}
+            break
 
     kept = []
     to_delete = []
 
-    for did, doc, _meta in items:
+    for did, doc, _meta, emb in items:
         if not doc or len(doc) < 20:
             to_delete.append(did)
             continue
@@ -118,16 +143,25 @@ def dedup_source_group(col, drawer_ids, threshold=DEFAULT_THRESHOLD, dry_run=Tru
             continue
 
         try:
-            results = col.query(
-                query_texts=[doc],
-                n_results=min(len(kept), 5),
-                include=["distances"],
-            )
+            kwargs = {
+                # +1 slot for the candidate's own self-match.
+                "n_results": min(len(kept) + 1, 6),
+                "include": ["distances"],
+            }
+            if emb is not None:
+                kwargs["query_embeddings"] = [emb]
+            else:
+                kwargs["query_texts"] = [doc]
+            if group_where is not None:
+                kwargs["where"] = group_where
+            results = col.query(**kwargs)
             dists = results["distances"][0] if results["distances"] else []
             kept_ids_set = {k[0] for k in kept}
 
             is_dup = False
             for rid, dist in zip(results["ids"][0], dists):
+                if rid == did:
+                    continue  # the candidate itself, distance ~0 — not a twin
                 if rid in kept_ids_set and dist < threshold:
                     is_dup = True
                     break

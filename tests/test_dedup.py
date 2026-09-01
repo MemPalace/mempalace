@@ -305,3 +305,109 @@ def test_dedup_palace_no_groups(mock_get_collection, mock_groups, mock_dedup_gro
     mock_groups.return_value = {}
     dedup.dedup_palace(palace_path=str(tmp_path), dry_run=True)
     mock_dedup_group.assert_not_called()
+
+
+# ── dedup_source_group — group scoping (the under-deletion bug) ────────
+
+
+class _ScopedFakeCol:
+    """Fake collection with a global corpus: query() honors the `where`
+    source_file filter the way ChromaDB does. Models the failure mode on a
+    large palace: the globally nearest neighbors of a doc are near-dups from
+    OTHER sources, so an unscoped top-5 never surfaces the in-group twin.
+    """
+
+    def __init__(self):
+        # d1/d2 are twins in a.txt; x1..x5 are foreign near-dups in other files.
+        self.docs = {
+            "d1": ("aaa bbb ccc ddd eee fff ggg hhh", "a.txt"),
+            "d2": ("aaa bbb ccc ddd eee fff ggg hhh", "a.txt"),
+            **{f"x{i}": ("aaa bbb ccc ddd eee fff ggg hhh", f"other{i}.txt") for i in range(1, 6)},
+        }
+        self.query_calls = []
+
+    def get(self, ids=None, include=None, **kw):
+        return {
+            "ids": list(ids),
+            "documents": [self.docs[i][0] for i in ids],
+            "metadatas": [{"source_file": self.docs[i][1]} for i in ids],
+        }
+
+    def query(
+        self, query_texts=None, query_embeddings=None, n_results=5, where=None, include=None, **kw
+    ):
+        self.query_calls.append({"where": where, "n_results": n_results})
+        pool = [i for i, (_, src) in self.docs.items()]
+        if where and "source_file" in where:
+            pool = [i for i in pool if self.docs[i][1] == where["source_file"]]
+        # Everything is a near-identical twin: distance 0.01 for all.
+        hits = pool[:n_results]
+        return {"ids": [hits], "distances": [[0.01] * len(hits)]}
+
+    def delete(self, ids=None, **kw):
+        pass
+
+
+def test_dedup_source_group_scopes_query_to_source_file():
+    """The in-group twin must be found even when 5+ foreign near-dups are
+    globally closer — the query must carry where={'source_file': ...}."""
+    col = _ScopedFakeCol()
+    kept, deleted = dedup.dedup_source_group(col, ["d1", "d2"], threshold=0.15, dry_run=True)
+    assert deleted == ["d2"]
+    assert len(kept) == 1
+    assert all(c["where"] == {"source_file": "a.txt"} for c in col.query_calls)
+
+
+def test_dedup_source_group_unscoped_without_source_metadata():
+    """Legacy drawers without source_file metadata keep the unscoped query."""
+    col = MagicMock()
+    col.get.return_value = {
+        "ids": ["d1", "d2"],
+        "documents": ["long document one content here", "different document two here"],
+        "metadatas": [{}, {}],
+    }
+    col.query.return_value = {"ids": [["d1"]], "distances": [[0.8]]}
+    kept, deleted = dedup.dedup_source_group(col, ["d1", "d2"], threshold=0.15, dry_run=True)
+    assert len(kept) == 2
+    _, kwargs = col.query.call_args
+    assert kwargs.get("where") is None
+
+
+def test_dedup_source_group_self_match_does_not_consume_slots():
+    """The candidate itself is in the collection and comes back at distance
+    ~0. It must be skipped (not treated as a kept-twin) and must not consume
+    one of the neighbor slots that could have held the real kept twin."""
+    col = MagicMock()
+    col.get.return_value = {
+        "ids": ["d1", "d2"],
+        "documents": [
+            "long document content that is fairly long",
+            "long document content that is fairly lonG",
+        ],
+        "metadatas": [{"source_file": "a.txt"}, {"source_file": "a.txt"}],
+    }
+    # Query for d2 returns d2 itself first, then the kept twin d1.
+    col.query.return_value = {"ids": [["d2", "d1"]], "distances": [[0.0, 0.05]]}
+    kept, deleted = dedup.dedup_source_group(col, ["d1", "d2"], threshold=0.15, dry_run=True)
+    assert deleted == ["d2"]
+    _, kwargs = col.query.call_args
+    # One extra slot requested to absorb the self-match.
+    assert kwargs.get("n_results") == 2
+
+
+def test_dedup_source_group_reuses_stored_embeddings():
+    """When the initial get() returns embeddings, query with query_embeddings
+    (no re-embedding of every candidate doc)."""
+    col = MagicMock()
+    col.get.return_value = {
+        "ids": ["d1", "d2"],
+        "documents": ["long document one content here", "different document two here"],
+        "metadatas": [{"source_file": "a.txt"}, {"source_file": "a.txt"}],
+        "embeddings": [[0.1, 0.2], [0.3, 0.4]],
+    }
+    col.query.return_value = {"ids": [["d1"]], "distances": [[0.8]]}
+    kept, deleted = dedup.dedup_source_group(col, ["d1", "d2"], threshold=0.15, dry_run=True)
+    assert len(kept) == 2
+    _, kwargs = col.query.call_args
+    assert kwargs.get("query_embeddings") is not None
+    assert kwargs.get("query_texts") is None
