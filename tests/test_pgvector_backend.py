@@ -1169,3 +1169,178 @@ def test_pgvector_facet_counts_passes_filter_to_sql_layer(tmp_path, fake_pgvecto
     _table, field, where, _limit = client.facet_calls[0]
     assert field == "room"
     assert where == {"wing": "engineering"}
+
+
+class _DropOnceCursor:
+    """Raises a server-drop error on the first execute, then succeeds."""
+
+    def __init__(self, conn, exc_factory):
+        self._conn = conn
+        self._exc_factory = exc_factory
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        if self._conn.should_drop:
+            self._conn.should_drop = False
+            self._conn.closed = True
+            raise self._exc_factory()
+        return None
+
+    def executemany(self, sql, params=None):
+        return self.execute(sql, params)
+
+    def fetchall(self):
+        return [(1,)]
+
+
+class _DropOnceConn:
+    def __init__(self, exc_factory, drop=False):
+        self.closed = False
+        self.broken = False
+        self.should_drop = drop
+        self._exc_factory = exc_factory
+        self.rolled_back = 0
+
+    def cursor(self):
+        return _DropOnceCursor(self, self._exc_factory)
+
+    def commit(self):
+        return None
+
+    def rollback(self):
+        self.rolled_back += 1
+
+    def close(self):
+        self.closed = True
+
+
+def _install_fake_psycopg(monkeypatch, conns):
+    """Serve ``conns`` in order from a fake ``psycopg.connect``."""
+    import sys
+    import types
+
+    handed_out = []
+    fake_psycopg = types.ModuleType("psycopg")
+
+    def fake_connect(dsn):
+        conn = conns[len(handed_out)]
+        handed_out.append(conn)
+        return conn
+
+    fake_psycopg.connect = fake_connect
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+    return handed_out
+
+
+class _AdminShutdown(Exception):
+    """Stand-in for psycopg's 57P01 (``terminating connection ...``)."""
+
+    sqlstate = "57P01"
+
+
+class _UniqueViolation(Exception):
+    """Stand-in for a statement-level failure that leaves the connection usable."""
+
+    sqlstate = "23505"
+
+
+def test_execute_retries_once_after_admin_shutdown(monkeypatch):
+    """A Postgres restart kills the pooled connection; the next query must not
+    surface it. Retry on a fresh connection instead (#57P01)."""
+    from mempalace.backends.pgvector import _PgVectorClient, _PgVectorConfig
+
+    dropped = _DropOnceConn(_AdminShutdown, drop=True)
+    fresh = _DropOnceConn(_AdminShutdown, drop=False)
+    handed_out = _install_fake_psycopg(monkeypatch, [dropped, fresh])
+
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    assert client._execute("SELECT 1", fetch=True) == [(1,)]
+
+    assert len(handed_out) == 2, "expected a reconnect after the drop"
+    assert dropped.closed, "stale connection should be discarded"
+    assert client._conn is fresh
+
+
+def test_execute_retries_when_handle_is_closed_without_sqlstate(monkeypatch):
+    """A mid-query TCP drop arrives with no SQLSTATE; the closed handle is the
+    only signal, and it must still trigger the retry."""
+    from mempalace.backends.pgvector import _PgVectorClient, _PgVectorConfig
+
+    class _BareDropError(Exception):
+        pass
+
+    dropped = _DropOnceConn(_BareDropError, drop=True)
+    fresh = _DropOnceConn(_BareDropError, drop=False)
+    handed_out = _install_fake_psycopg(monkeypatch, [dropped, fresh])
+
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    assert client._execute("SELECT 1", fetch=True) == [(1,)]
+    assert len(handed_out) == 2
+
+
+def test_execute_does_not_retry_statement_level_errors(monkeypatch):
+    """A constraint violation leaves the connection usable. Retrying would run
+    the same failing statement twice; it must propagate on the first attempt."""
+    from mempalace.backends.pgvector import _PgVectorClient, _PgVectorConfig
+
+    class _AliveConn(_DropOnceConn):
+        def cursor(self):
+            class _Cur:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+                def execute(self, sql, params=None):
+                    raise _UniqueViolation("duplicate key")
+
+                def fetchall(self):  # pragma: no cover - never reached
+                    return []
+
+            return _Cur()
+
+    conn = _AliveConn(_UniqueViolation)
+    handed_out = _install_fake_psycopg(monkeypatch, [conn])
+
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    with pytest.raises(BackendError, match="pgvector query failed"):
+        client._execute("INSERT ...")
+
+    assert len(handed_out) == 1, "a live connection must not be discarded"
+    assert conn.rolled_back == 1
+    assert not conn.closed
+
+
+def test_execute_surfaces_a_second_drop_as_backend_error(monkeypatch):
+    """Two drops in a row is a real outage, not a stale pooled handle. It must
+    reach the caller as the BackendError they already handle."""
+    from mempalace.backends.pgvector import _PgVectorClient, _PgVectorConfig
+
+    first = _DropOnceConn(_AdminShutdown, drop=True)
+    second = _DropOnceConn(_AdminShutdown, drop=True)
+    handed_out = _install_fake_psycopg(monkeypatch, [first, second])
+
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    with pytest.raises(BackendError, match="after reconnect"):
+        client._execute("SELECT 1", fetch=True)
+
+    assert len(handed_out) == 2, "exactly one retry, no retry storm"
+
+
+def test_execute_retry_covers_executemany(monkeypatch):
+    """``upsert_rows`` goes through ``many=True``; the retry must cover it too."""
+    from mempalace.backends.pgvector import _PgVectorClient, _PgVectorConfig
+
+    dropped = _DropOnceConn(_AdminShutdown, drop=True)
+    fresh = _DropOnceConn(_AdminShutdown, drop=False)
+    handed_out = _install_fake_psycopg(monkeypatch, [dropped, fresh])
+
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    client._execute("INSERT ...", [(1,), (2,)], many=True)
+    assert len(handed_out) == 2
