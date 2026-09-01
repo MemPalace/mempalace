@@ -19,6 +19,8 @@ Commands:
     mempalace mine <source> --source NAME Mine through a registered source adapter
     mempalace search "query"              Find anything, exact words
     mempalace mcp                         Show MCP setup command
+    mempalace task create ...             Create a complete agent handoff
+    mempalace task launch ...             Run a stored task headlessly
     mempalace wake-up                     Show L0 + L1 wake-up context
     mempalace wake-up --wing my_app       Wake-up for a specific project
     mempalace status                      Show what's been filed
@@ -1915,6 +1917,172 @@ def cmd_logstream(args):
         ls.close()
 
 
+def _codex_task_runner(workspace: Path, prompt: str) -> tuple[list[str], dict]:
+    return ["codex", "exec", "--cd", str(workspace), prompt], {}
+
+
+def _claude_task_runner(workspace: Path, prompt: str) -> tuple[list[str], dict]:
+    return ["claude", "--print", prompt], {"cwd": str(workspace)}
+
+
+_TASK_RUNNER_ADAPTERS = {
+    "codex": ("-codex", _codex_task_runner),
+    "claude": ("-claude", _claude_task_runner),
+}
+
+
+def _validate_task_workspace(workspace: Path, task: dict) -> None:
+    """Prove a controlled launch starts from the task's exact clean Git state."""
+    import subprocess
+
+    def git(*arguments: str) -> str:
+        completed = subprocess.run(
+            ["git", "-C", str(workspace), *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "git command failed"
+            raise ValueError(f"workspace Git validation failed: {detail}")
+        return completed.stdout.strip()
+
+    branch = git("branch", "--show-current")
+    if branch != task["branch"]:
+        raise ValueError(
+            f"workspace branch is {branch or '(detached)'!r}; task requires {task['branch']!r}"
+        )
+    try:
+        expected_commit = git("rev-parse", "--verify", f"{task['base_commit']}^{{commit}}")
+    except ValueError as exc:
+        raise ValueError(
+            f"task base commit {task['base_commit']!r} does not resolve in the workspace"
+        ) from exc
+    head_commit = git("rev-parse", "HEAD")
+    if head_commit != expected_commit:
+        raise ValueError(f"workspace base commit is {head_commit}; task requires {expected_commit}")
+    if git("status", "--porcelain"):
+        raise ValueError(
+            "workspace has uncommitted changes; controlled launch requires a clean checkout"
+        )
+
+
+def cmd_task(args):
+    """Create and run complete logstream tasks through a small public interface."""
+    import json
+
+    from .tasks import create_task, task_handoff, validate_task_request
+
+    as_json = getattr(args, "json", False)
+    task_file = getattr(args, "task_file", None)
+    ls = None
+    if args.task_action == "create" or not task_file:
+        try:
+            ls = _open_logstream(args)
+        except Exception as exc:
+            _logstream_fail(str(exc), as_json)
+    try:
+        if args.task_action == "create":
+            try:
+                goal = _read_text_arg(args.goal, args.goal_file)
+                done = _read_text_arg(args.done, args.done_file)
+                result = create_task(
+                    ls,
+                    project=args.project,
+                    from_agent=args.from_agent,
+                    to_agent=args.to_agent,
+                    goal=goal,
+                    branch=args.branch,
+                    base_commit=args.base_commit,
+                    done=done,
+                )
+            except (ValueError, OSError) as exc:
+                _logstream_fail(str(exc), as_json)
+            event = result["task"]
+            handoff = result["handoff"]
+            correlation_id = event["correlation_id"]
+            if as_json:
+                print(json.dumps({"task": event, "handoff": handoff}, indent=2, ensure_ascii=False))
+            else:
+                print(f"Task created: {correlation_id}")
+                print(f"Event: {event['id']}")
+                print(f"To: {args.to_agent}")
+                print("\nReady to paste:")
+                print(handoff)
+        elif args.task_action == "launch":
+            import subprocess
+
+            try:
+                if task_file:
+                    task = json.loads(Path(task_file).read_text(encoding="utf-8"))
+                    validate_task_request(task, source="--task-file")
+                    correlation_id = task["correlation_id"]
+                else:
+                    correlation_id = args.correlation_id
+                    events = ls.list_events(
+                        type="task.request", correlation_id=correlation_id, limit=2
+                    )
+                    if not events:
+                        raise ValueError(f"task {correlation_id!r} not found")
+                    if len(events) > 1:
+                        raise ValueError(
+                            f"task {correlation_id!r} has multiple requests; refusing to guess"
+                        )
+                    task = validate_task_request(events[0], source=f"task {correlation_id!r}")
+                addressed_agent = task["to_agent"]
+                if args.agent and addressed_agent not in (None, "*", args.agent):
+                    raise ValueError(
+                        f"task is addressed to {addressed_agent!r}, not {args.agent!r}"
+                    )
+                agent = args.agent or addressed_agent
+                if not agent or agent == "*":
+                    raise ValueError(
+                        "broadcast tasks require --agent for a concrete worker identity"
+                    )
+                expected_suffix, runner_adapter = _TASK_RUNNER_ADAPTERS[args.runner]
+                actual_suffix = next(
+                    (
+                        suffix
+                        for suffix, _adapter in _TASK_RUNNER_ADAPTERS.values()
+                        if agent.endswith(suffix)
+                    ),
+                    None,
+                )
+                if actual_suffix is not None and actual_suffix != expected_suffix:
+                    raise ValueError(
+                        f"runner {args.runner} does not match addressed identity {agent!r}"
+                    )
+                workspace = Path(os.path.expanduser(args.workspace)).resolve()
+                if not workspace.is_dir():
+                    raise ValueError(f"workspace is not a directory: {workspace}")
+                _validate_task_workspace(workspace, task)
+            except (ValueError, OSError, json.JSONDecodeError) as exc:
+                _logstream_fail(str(exc), as_json)
+
+            prompt = task_handoff(correlation_id, agent)
+            command, runner_kwargs = runner_adapter(workspace, prompt)
+            print(f"Launching {correlation_id} with {args.runner} as {agent}")
+            # Release the SQLite handle before the child connects back to the
+            # same logstream. The child owns its own process lifetime and MCP
+            # connection; no shell is involved in constructing this command.
+            if ls is not None:
+                ls.close()
+                ls = None
+            try:
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    **runner_kwargs,
+                )
+            except OSError as exc:
+                _logstream_fail(f"could not start {args.runner}: {exc}", as_json)
+            if completed.returncode:
+                sys.exit(completed.returncode)
+    finally:
+        if ls is not None:
+            ls.close()
+
+
 def cmd_artifact(args):
     import json
 
@@ -2329,6 +2497,13 @@ def cmd_instructions(args):
     from .instructions_cli import run_instructions
 
     run_instructions(name=args.name)
+
+
+def cmd_rules(args):
+    """Output the shared-brain agent rules block for a given agent identity."""
+    from .instructions_cli import run_rules
+
+    run_rules(agent_id=args.agent)
 
 
 def cmd_mcp(args):
@@ -3034,6 +3209,20 @@ def main():
     for instr_name in ["init", "search", "mine", "help", "status"]:
         instructions_sub.add_parser(instr_name, help=f"Output {instr_name} instructions")
 
+    # rules
+    p_rules = sub.add_parser(
+        "rules",
+        help=(
+            "Output the canonical shared-brain agent rules block for a system "
+            "prompt (CLAUDE.md, GEMINI.md, AGENTS.md, ...)"
+        ),
+    )
+    p_rules.add_argument(
+        "--agent",
+        required=True,
+        help="Stable agent identity to render into the rules, e.g. mac-claude",
+    )
+
     # repair
     p_repair = sub.add_parser(
         "repair",
@@ -3400,6 +3589,60 @@ def main():
     p_ls_sync.add_argument("--token", default=None, help="Bearer token for --peer")
     p_ls_sync.add_argument("--json", action="store_true", help="Machine-readable output")
 
+    # task — guided logstream task lifecycle
+    p_task = sub.add_parser("task", help="Create or run complete agent tasks over the logstream")
+    task_sub = p_task.add_subparsers(dest="task_action")
+
+    p_task_create = task_sub.add_parser(
+        "create", help="Create a canonical task.request and print a pasteable handoff"
+    )
+    p_task_create.add_argument("--project", required=True, help="Project name for routing")
+    p_task_create.add_argument("--from-agent", required=True, help="Requesting agent identity")
+    p_task_create.add_argument("--to-agent", required=True, help="Worker agent identity")
+    task_goal = p_task_create.add_mutually_exclusive_group(required=True)
+    task_goal.add_argument("--goal", default=None, help="Verbatim task goal")
+    task_goal.add_argument(
+        "--goal-file", default=None, help="Read the task goal from a file ('-' for stdin)"
+    )
+    p_task_create.add_argument("--branch", required=True, help="Git branch for the work")
+    p_task_create.add_argument(
+        "--base-commit",
+        required=True,
+        help="Immutable hexadecimal commit id the worker must start from (not a branch or tag)",
+    )
+    task_done = p_task_create.add_mutually_exclusive_group(required=True)
+    task_done.add_argument("--done", default=None, help="Verbatim definition of done")
+    task_done.add_argument(
+        "--done-file",
+        default=None,
+        help="Read the definition of done from a file ('-' for stdin)",
+    )
+    p_task_create.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_task_launch = task_sub.add_parser(
+        "launch", help="Run an existing task through a supported headless coding agent"
+    )
+    task_source = p_task_launch.add_mutually_exclusive_group(required=True)
+    task_source.add_argument("correlation_id", nargs="?", help="Task correlation id")
+    task_source.add_argument(
+        "--task-file",
+        default=None,
+        help="Exact task.request event JSON fetched through remote MCP",
+    )
+    p_task_launch.add_argument(
+        "--runner",
+        required=True,
+        choices=tuple(_TASK_RUNNER_ADAPTERS),
+        help="Headless agent runner",
+    )
+    p_task_launch.add_argument("--workspace", required=True, help="Trusted workspace directory")
+    p_task_launch.add_argument(
+        "--agent",
+        default=None,
+        help="Worker identity (required for broadcasts; must match addressed tasks)",
+    )
+    p_task_launch.add_argument("--json", action="store_true", help="Machine-readable errors")
+
     # artifact (RFC 003 exact content exchange)
     p_artifact = sub.add_parser(
         "artifact", help="Exact artifact exchange for agent handoffs (RFC 003)"
@@ -3488,6 +3731,13 @@ def main():
         cmd_logstream(args)
         return
 
+    if args.command == "task":
+        if not getattr(args, "task_action", None):
+            p_task.print_help()
+            return
+        cmd_task(args)
+        return
+
     if args.command == "artifact":
         if not getattr(args, "artifact_action", None):
             p_artifact.print_help()
@@ -3504,6 +3754,7 @@ def main():
 
     dispatch = {
         "init": cmd_init,
+        "rules": cmd_rules,
         "mine": cmd_mine,
         "split": cmd_split,
         "search": cmd_search,

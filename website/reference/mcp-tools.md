@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 44 MCP tools.
+Detailed parameter schemas for all 45 MCP tools.
 
 ## Palace — Read Tools
 
@@ -135,11 +135,11 @@ Delete a drawer by ID. Irreversible.
 
 ### `mempalace_mine`
 
-Mine a directory into the palace — the MCP equivalent of `mempalace mine`. Wraps the same in-process miners the CLI uses; runs synchronously and returns the miner's summary as `output`. The palace write lock is automatic — a concurrent mine returns a structured already-running error. Orphan cleanup is separate (see `mempalace_sync`).
+Mine a directory into the palace — the MCP equivalent of `mempalace mine`. `mode='convos'` also accepts a single conversation file. Wraps the same in-process miners the CLI uses; runs synchronously and returns the miner's summary as `output`. The palace write lock is automatic — a concurrent mine returns a structured already-running error. Orphan cleanup is separate (see `mempalace_sync`).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `source` | string | **Yes** | Directory to mine |
+| `source` | string | **Yes** | Directory to mine, or one conversation file with `mode='convos'` |
 | `mode` | string | No | `projects` (code/docs, default), `convos` (chat transcripts), or `extract` (office docs; needs the `mempalace[extract]` extra) |
 | `wing` | string | No | Target wing (default: source directory name) |
 | `agent` | string | No | Recorded on every drawer (default: `mempalace`) |
@@ -491,7 +491,29 @@ Force a reconnect to the palace database. Use this after external scripts or CLI
 
 ## Agent Coordination Tools (Logstream)
 
-Append-only coordination events and exact artifacts for multi-agent work — see the [Agent Logstream](/concepts/agent-logstream) concept page. Backed by `logstream.sqlite3` in the palace directory, independent of the vector index. In `--read-only` mode the mutating tools (`event_append`, `event_ack`, `artifact_put`, `patch_submit`) are hidden and refused.
+Append-only coordination events and exact artifacts for multi-agent work — see the [Agent Logstream](/concepts/agent-logstream) concept page. Backed by `logstream.sqlite3` in the palace directory, independent of the vector index. In `--read-only` mode the mutating tools (`task_create`, `event_append`, `event_ack`, `artifact_put`, `patch_submit`) are hidden and refused.
+
+### `mempalace_task_create`
+
+Create a complete canonical `task.request` and return the stored event plus a
+short handoff line. This is the preferred task-creation interface for agents
+connected to a remote shared-brain hub; it keeps correlation-id generation,
+body structure, and routing identical to `mempalace task create`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project` | string | **Yes** | Project routing name |
+| `from_agent` | string | **Yes** | Requesting agent identity |
+| `to_agent` | string | **Yes** | Worker agent identity |
+| `goal` | string | **Yes** | Exact verbatim task goal |
+| `branch` | string | **Yes** | Git branch for the work |
+| `base_commit` | string | **Yes** | Immutable hexadecimal commit id the worker must start from; branches and tags are rejected |
+| `done` | string | **Yes** | Exact verbatim definition of done |
+
+**Returns:** `{ success, task, handoff }`. The caller must preview the exact
+task with the user before invoking this immutable append.
+
+---
 
 ### `mempalace_event_append`
 

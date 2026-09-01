@@ -45,6 +45,25 @@ Architecture, concepts, and mining flows:
 
 ## Install
 
+### Agent-guided setup
+
+Install the MemPalace skills first, then ask your coding agent to set up
+MemPalace. The setup skill detects your system, installs the Python package,
+configures MCP, and asks whether you want a private local palace, a shared-brain
+hub, or a client connected to an existing hub:
+
+```bash
+npx skills add MemPalace/mempalace
+```
+
+The repository exposes three skills: `mempalace` for guided installation and
+operations, `mempalace-recall` for search-before-answer recall, and
+`mempalace-task` for logstream delegation. Installing a skill does not by
+itself install the MemPalace CLI or MCP server; the setup skill guides the
+agent through those system changes and verifies the live connection.
+
+### Direct CLI setup
+
 MemPalace ships a CLI, so install it in an isolated environment to avoid
 PEP 668 errors on Debian/Ubuntu/Homebrew Pythons and to keep mempalace's
 deps (`chromadb`, `numpy`, `grpcio`, …) from conflicting with anything
@@ -262,7 +281,7 @@ Usage and tool reference:
 
 ## MCP server
 
-44 MCP tools cover palace reads/writes, knowledge-graph operations,
+45 MCP tools cover palace reads/writes, knowledge-graph operations,
 cross-wing navigation, drawer management, agent diaries, and agent
 coordination (logstream events + artifact handoffs). Installation
 and the full tool list:

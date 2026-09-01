@@ -94,6 +94,7 @@ from .palace_graph import (  # noqa: E402
     list_tunnels,
     delete_tunnel,
     follow_tunnels,
+    _load_tunnels as _load_graph_tunnels,
 )
 from .hallways import (  # noqa: E402
     list_hallways,
@@ -373,6 +374,7 @@ _SQLITE_INTEGRITY_ALLOWED_TOOLS = frozenset(
         # Chroma/FTS5 dependency, so agent coordination stays available
         # even while the main palace index is corrupt and under repair.
         "mempalace_event_append",
+        "mempalace_task_create",
         "mempalace_event_list",
         "mempalace_event_wait",
         "mempalace_event_ack",
@@ -432,6 +434,7 @@ _MUTATING_TOOLS = frozenset(
         "mempalace_update_drawer",
         "mempalace_diary_write",
         "mempalace_event_append",
+        "mempalace_task_create",
         "mempalace_event_ack",
         "mempalace_artifact_put",
         "mempalace_patch_submit",
@@ -448,6 +451,7 @@ _MUTATING_TOOLS = frozenset(
 _PEER_WRITER_EXEMPT_TOOLS = frozenset(
     {
         "mempalace_event_append",
+        "mempalace_task_create",
         "mempalace_event_ack",
         "mempalace_artifact_put",
         "mempalace_patch_submit",
@@ -2048,7 +2052,7 @@ def _sqlite_graph_stats():
     (non-chroma backend, missing/unbootstrapped palace, sqlite error). The
     reconstruction mirrors ``palace_graph.build_graph`` /
     ``palace_graph.graph_stats`` exactly: a node is a room with a non-empty
-    wing and a usable room name (the catch-all ``"general"`` is excluded), and
+    wing and a usable room name (including the catch-all ``"general"``), and
     edges are the per-hall cross-wing crossings of multi-wing rooms.
     """
     rows = None
@@ -2074,25 +2078,30 @@ def _sqlite_graph_stats():
 
 
 def _graph_stats_from_grouped_rows(rows):
-    """Rebuild ``graph_stats`` from ``(room, wing, hall, n)`` grouped rows.
+    """Rebuild ``graph_stats`` from grouped sqlite metadata rows.
 
-    Backends may append a fifth ``last_date`` column for ``find_tunnels``;
-    stats do not use it, so extra columns are ignored rather than unpacked.
+    Rows are ``(room, wing, hall, n)`` with an optional fifth ``last_date``
+    column. Because grouping includes ``hall``, one room placement can occupy
+    multiple SQL rows; room instances therefore use a distinct ``(wing, room)`` set.
     """
     from collections import Counter, defaultdict
 
     room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0})
+    room_instances = set()
     for row in rows:
         room, wing, hall, n = row[0], row[1], row[2], row[3]
-        if not room or room == "general" or not wing:
+        if not room or not wing:
             continue
-        node = room_data[room]
-        node["wings"].add(str(wing))
+        room_key = str(room)
+        wing_key = str(wing)
+        room_instances.add((wing_key, room_key))
+        node = room_data[room_key]
+        node["wings"].add(wing_key)
         if hall:
             node["halls"].add(str(hall))
         node["count"] += int(n)
 
-    tunnel_rooms = 0
+    passive_tunnel_rooms = 0
     total_edges = 0
     wing_counts = Counter()
     for data in room_data.values():
@@ -2100,20 +2109,25 @@ def _graph_stats_from_grouped_rows(rows):
         for wing in data["wings"]:
             wing_counts[wing] += 1
         if n_wings >= 2:
-            tunnel_rooms += 1
+            passive_tunnel_rooms += 1
             total_edges += (n_wings * (n_wings - 1) // 2) * len(data["halls"])
 
     top_tunnels = [
         {"room": room, "wings": sorted(data["wings"]), "count": data["count"]}
-        for room, data in sorted(room_data.items(), key=lambda kv: (-len(kv[1]["wings"]), kv[0]))[
-            :10
-        ]
+        for room, data in sorted(
+            room_data.items(), key=lambda item: (-len(item[1]["wings"]), item[0])
+        )[:10]
         if len(data["wings"]) >= 2
     ]
+    explicit_tunnel_count = len(_load_graph_tunnels(_config))
     return {
         "total_rooms": len(room_data),
-        "tunnel_rooms": tunnel_rooms,
+        "total_room_instances": len(room_instances),
+        "tunnel_rooms": passive_tunnel_rooms,
+        "passive_tunnel_rooms": passive_tunnel_rooms,
+        "explicit_tunnels": explicit_tunnel_count,
         "total_edges": total_edges,
+        "total_connections": total_edges + explicit_tunnel_count,
         "rooms_per_wing": dict(wing_counts.most_common()),
         "top_tunnels": top_tunnels,
     }
@@ -2445,6 +2459,7 @@ def tool_search(
     max_distance: float = 1.5,
     min_similarity: float = None,
     context: str = None,
+    candidate_strategy: str = "vector",
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
@@ -2455,6 +2470,9 @@ def tool_search(
         return {"error": str(e)}
     # since/before are validated inside search_memories (shared
     # parse_window), which returns the same {"error": ...} shape.
+    candidate_strategy = candidate_strategy or "vector"
+    if not isinstance(candidate_strategy, str) or candidate_strategy not in {"vector", "union"}:
+        return {"error": "candidate_strategy must be one of ('vector', 'union')"}
     # Backwards compat: accept old name
     # Backwards compat: convert old similarity scale (higher=stricter) to
     # distance scale (lower=stricter). Similarity 0.8 → distance 0.2.
@@ -2477,6 +2495,7 @@ def tool_search(
         n_results=limit,
         max_distance=dist,
         vector_disabled=_vector_disabled,
+        candidate_strategy=candidate_strategy,
         collection_name=_config.collection_name,
     )
     if _is_transient_index_error(result):
@@ -2497,6 +2516,7 @@ def tool_search(
             n_results=limit,
             max_distance=dist,
             vector_disabled=_vector_disabled,
+            candidate_strategy=candidate_strategy,
             collection_name=_config.collection_name,
         )
         if not _is_transient_index_error(result):
@@ -3218,13 +3238,24 @@ def tool_delete_drawer(drawer_id: str):
         col.delete(ids=record["ids"])
         _invalidate_overview_caches()
 
-        logger.info("Deleted drawer: %s (%s rows)", drawer_id, len(record["ids"]))
+        # Closets are keyed by source_file, not drawer_id (#1722), so a
+        # drawer-only delete strands a closet quoting the now-deleted text (#2325).
+        source_file = record["metadata"].get("source_file")
+        closets_deleted = _purge_source_closets(source_file, commit=True) if source_file else 0
+
+        logger.info(
+            "Deleted drawer: %s (%s rows, %s closet(s) purged)",
+            drawer_id,
+            len(record["ids"]),
+            closets_deleted,
+        )
 
         return {
             "success": True,
             "drawer_id": drawer_id,
             "deleted_ids": record["ids"],
             "chunks_deleted": len(record["ids"]),
+            "closets_deleted": closets_deleted,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -3377,8 +3408,16 @@ def tool_mine(
         }
 
     src = os.path.expanduser(source) if source else ""
-    if not src or not os.path.isdir(src):
-        return {"success": False, "error": f"source directory not found: {source!r}"}
+    # convos accepts one conversation file as well as a directory — the CLI has
+    # always documented it that way ("Directory to mine, or one conversation
+    # file with --mode convos"), and the hooks rely on it: _ingest_transcript
+    # submits a single .jsonl. Because cmd_mine forwards to the hub whenever one
+    # is live, a directory-only precondition here made that documented form
+    # unreachable in the configuration most users run, so every hook transcript
+    # ingest failed against a running hub (#2281). The other modes still walk a
+    # tree, so they keep the directory requirement.
+    if not src or not (os.path.isdir(src) or (mode == "convos" and os.path.isfile(src))):
+        return {"success": False, "error": f"source not found: {source!r}"}
 
     def _run():
         if mode == "convos":
@@ -3833,6 +3872,13 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             },
         )
 
+        # A closet quotes the source file, not the stored drawer, so it only
+        # goes stale on a content change; wing/room alone leaves it correct (#2325).
+        closets_deleted = 0
+        source_file = old_meta.get("source_file")
+        if content is not None and source_file:
+            closets_deleted = _purge_source_closets(source_file, commit=True)
+
         chunk_size = max(1, int(getattr(_config, "chunk_size", 800) or 800))
         should_chunk = bool(record.get("chunked")) or len(new_doc) > chunk_size
 
@@ -3862,6 +3908,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 "room": new_meta.get("room", ""),
                 "chunks": len(chunk_ids),
                 "chunk_ids": chunk_ids,
+                "closets_deleted": closets_deleted,
             }
 
         update_kwargs = {"ids": [record["ids"][0]]}
@@ -3879,6 +3926,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             "drawer_id": drawer_id,
             "wing": new_meta.get("wing", ""),
             "room": new_meta.get("room", ""),
+            "closets_deleted": closets_deleted,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -4362,6 +4410,31 @@ def tool_memories_filed_away():
 # ==================== SETTINGS TOOLS ====================
 
 
+def _attach_stale_library_warning(result: dict) -> dict:
+    """Stamp the stale-library write-guard state onto a reconnect result.
+
+    Reconnect reopens the database but cannot reload Python modules, so it
+    never clears the stale-library gate (#899). Without this, a reconnect
+    after an upgrade answers "success: Reconnected to palace" while every
+    write keeps failing — the caller has no way to tell the two states
+    apart from the reconnect result alone.
+    """
+    payload = _stale_library_payload()
+    if payload.get("stale") and "gate_disabled_by" not in payload:
+        described = ", ".join(
+            f"{entry['package']} {entry['serving']} -> {entry['installed']}"
+            for entry in payload.get("packages", [])
+        )
+        result["library_versions"] = payload
+        result["restart_required"] = True
+        result["warning"] = (
+            f"Reconnected, but this server is still running superseded code ({described}); "
+            "writes stay refused until the MCP server (or the host application that "
+            "spawned it) is restarted — reconnect cannot reload Python modules."
+        )
+    return result
+
+
 def tool_reconnect():
     """Force the MCP server to drop cached ChromaDB + KnowledgeGraph state.
 
@@ -4499,21 +4572,25 @@ def tool_reconnect():
                 result["error"] = "; ".join(close_errors)
             return result
         if close_errors:
-            return {
-                "success": False,
-                "message": "Reconnect reopened the palace but failed to fully reset cached handles",
+            return _attach_stale_library_warning(
+                {
+                    "success": False,
+                    "message": "Reconnect reopened the palace but failed to fully reset cached handles",
+                    "drawers": col.count(),
+                    "vector_disabled": _vector_disabled,
+                    "vector_disabled_reason": _vector_disabled_reason,
+                    "error": "; ".join(close_errors),
+                }
+            )
+        return _attach_stale_library_warning(
+            {
+                "success": True,
+                "message": "Reconnected to palace",
                 "drawers": col.count(),
                 "vector_disabled": _vector_disabled,
                 "vector_disabled_reason": _vector_disabled_reason,
-                "error": "; ".join(close_errors),
             }
-        return {
-            "success": True,
-            "message": "Reconnected to palace",
-            "drawers": col.count(),
-            "vector_disabled": _vector_disabled,
-            "vector_disabled_reason": _vector_disabled_reason,
-        }
+        )
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -4651,6 +4728,36 @@ def tool_event_append(
     except ValueError as e:
         return {"success": False, "error": str(e)}
     return {"success": True, "event": event}
+
+
+def tool_task_create(
+    project: str,
+    from_agent: str,
+    to_agent: str,
+    goal: str,
+    branch: str,
+    base_commit: str,
+    done: str,
+):
+    """Create one canonical task request for local or remote MCP clients."""
+    from .tasks import create_task
+
+    try:
+        result = _call_logstream(
+            lambda ls: create_task(
+                ls,
+                project=project,
+                from_agent=from_agent,
+                to_agent=to_agent,
+                goal=goal,
+                branch=branch,
+                base_commit=base_commit,
+                done=done,
+            )
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, **result}
 
 
 _PREVIEW_BODY_CHARS = 200
@@ -5144,6 +5251,11 @@ TOOLS = {
                     "type": "number",
                     "description": "Max cosine distance threshold (0=identical, 2=opposite). Results further than this are dropped. Lower = stricter. Default 1.5. Set to 0 to disable.",
                 },
+                "candidate_strategy": {
+                    "type": "string",
+                    "enum": ["vector", "union"],
+                    "description": "Candidate source strategy. 'vector' preserves default semantic search; 'union' also merges backend BM25 lexical candidates before reranking.",
+                },
                 "context": {
                     "type": "string",
                     "description": "Background context for the search (optional). NOT used for embedding — only for future re-ranking.",
@@ -5253,6 +5365,7 @@ TOOLS = {
     "mempalace_mine": {
         "description": (
             "Mine a directory into the palace — the MCP equivalent of `mempalace mine`. "
+            "mode='convos' also accepts a single conversation file. "
             "mode='projects' (default) ingests code/docs; mode='convos' ingests chat "
             "transcripts; mode='extract' ingests office documents (PDF/DOCX/RTF, requires "
             "the mempalace[extract] extra). Runs synchronously and returns the miner's "
@@ -5265,7 +5378,7 @@ TOOLS = {
             "properties": {
                 "source": {
                     "type": "string",
-                    "description": "Directory to mine.",
+                    "description": "Directory to mine, or one conversation file with mode='convos'.",
                 },
                 "mode": {
                     "type": "string",
@@ -5555,6 +5668,45 @@ TOOLS = {
             "required": ["type", "stream", "room", "from_agent"],
         },
         "handler": tool_event_append,
+    },
+    "mempalace_task_create": {
+        "description": (
+            "Create a complete immutable task.request for another agent and return its exact"
+            " stored event plus one short ready-to-paste handoff line. Use this instead of"
+            " assembling raw task fields, especially when connected to a remote shared-brain"
+            " hub. The caller must preview the exact task with the user before this append."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string", "description": "Project routing name"},
+                "from_agent": {"type": "string", "description": "Requesting agent identity"},
+                "to_agent": {"type": "string", "description": "Worker agent identity"},
+                "goal": {"type": "string", "description": "Exact verbatim task goal"},
+                "branch": {"type": "string", "description": "Git branch for the work"},
+                "base_commit": {
+                    "type": "string",
+                    "description": (
+                        "Immutable hexadecimal commit id the worker must start from;"
+                        " branches and tags are rejected"
+                    ),
+                },
+                "done": {
+                    "type": "string",
+                    "description": "Exact verbatim definition of done",
+                },
+            },
+            "required": [
+                "project",
+                "from_agent",
+                "to_agent",
+                "goal",
+                "branch",
+                "base_commit",
+                "done",
+            ],
+        },
+        "handler": tool_task_create,
     },
     "mempalace_event_list": {
         "description": (
@@ -6346,9 +6498,15 @@ def _mcp_stale_library_refusal(req_id, tool_name: str):
         "id": req_id,
         "error": {
             "code": _STALE_LIBRARY_ERROR_CODE,
+            # The remedy rides in the message itself, not only in data.hint:
+            # several MCP clients surface only the top-level message of an
+            # error, so a hint-only remedy never reaches the model that has
+            # to act on it.
             "message": (
                 "Server is running a library version that is no longer installed "
-                f"({described}); refusing writes until it is restarted"
+                f"({described}); refusing writes until it is restarted. Restart the "
+                "MCP server (or the host application that spawned it) to pick up the "
+                "installed version — mempalace_reconnect cannot clear this"
             ),
             "data": {
                 "tool": tool_name,
@@ -6960,6 +7118,7 @@ _HTTP_ACTIVE_CLIENT_WINDOW_S = 120.0
 _HTTP_LOCK_FREE_TOOLS = frozenset(
     {
         "mempalace_event_append",
+        "mempalace_task_create",
         "mempalace_event_list",
         "mempalace_event_wait",
         "mempalace_event_ack",

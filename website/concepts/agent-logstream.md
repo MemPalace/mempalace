@@ -64,6 +64,23 @@ applying anything. v1 artifacts are UTF-8 text, up to 4 MiB.
 
 ## The delegation loop
 
+For the common case, use the task interface instead of constructing the raw
+request envelope:
+
+```bash
+mempalace task create --project myapp \
+  --from-agent mac-claude --to-agent windows-codex \
+  --goal "Fix the flaky test." --branch fix/flaky-test \
+  --base-commit 2668053 --done "Focused tests pass and a patch is submitted."
+```
+
+It creates the canonical request and prints a short, ready-to-paste wake-up
+line. The complete task remains verbatim in the logstream. The
+`mempalace-task` skill guides preview, creation, claiming, delivery, and loop
+closure. Remote shared-brain clients call `mempalace_task_create` through MCP;
+the CLI form operates on the local palace. The primitives below remain
+available for custom integrations.
+
 The canonical two-agent exchange:
 
 **Requester (agent A):**
@@ -94,7 +111,7 @@ on it for longer waits, passing `since_event_id` to avoid reprocessing.
 
 ## Tools and CLI
 
-Seven MCP tools serve the logstream: `mempalace_event_append`,
+Eight MCP tools serve the logstream: `mempalace_task_create`, `mempalace_event_append`,
 `mempalace_event_list`, `mempalace_event_wait`, `mempalace_event_ack`,
 `mempalace_artifact_put`, `mempalace_artifact_get`, and
 `mempalace_patch_submit` — see the [MCP tools reference](/reference/mcp-tools)

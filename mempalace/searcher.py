@@ -273,6 +273,64 @@ def _metric_for_collection(col) -> str:
     return metric if metric in ("cosine", "l2", "ip") else "cosine"
 
 
+def _vector_distance(
+    query_vector: list[float], candidate_vector: list[float], metric: str
+) -> float:
+    """Return a backend-style distance between two already-normalized vectors."""
+    if not query_vector or not candidate_vector or len(query_vector) != len(candidate_vector):
+        raise ValueError("embedding dimensions do not match")
+
+    if metric == "l2":
+        return math.sqrt(sum((a - b) ** 2 for a, b in zip(query_vector, candidate_vector)))
+
+    dot = sum(a * b for a, b in zip(query_vector, candidate_vector))
+    if metric == "ip":
+        return -dot
+
+    q_norm = math.sqrt(sum(a * a for a in query_vector))
+    c_norm = math.sqrt(sum(b * b for b in candidate_vector))
+    if q_norm == 0.0 or c_norm == 0.0:
+        raise ValueError("zero-norm embedding")
+    return 1.0 - (dot / (q_norm * c_norm))
+
+
+def _lexical_hit_vector_distances(drawers_col, query: str, lexical_hits: list, metric: str) -> dict:
+    """Compute vector distances for lexical hits when stored embeddings are available."""
+    ids = [hit.id for hit in lexical_hits if getattr(hit, "id", None)]
+    if not ids:
+        return {}
+
+    try:
+        from .backends.embedding_wrapper import _embed_texts
+
+        query_vector = _embed_texts([query])[0]
+        stored = drawers_col.get(ids=ids, include=["embeddings"])
+    except Exception:
+        logger.debug(
+            "candidate_strategy=union: failed to load lexical hit embeddings", exc_info=True
+        )
+        return {}
+
+    stored_ids = getattr(stored, "ids", None) if not isinstance(stored, dict) else stored.get("ids")
+    embeddings = (
+        getattr(stored, "embeddings", None)
+        if not isinstance(stored, dict)
+        else stored.get("embeddings")
+    )
+    if not stored_ids or not embeddings:
+        return {}
+
+    distances = {}
+    for doc_id, candidate_vector in zip(stored_ids, embeddings):
+        try:
+            distances[doc_id] = _vector_distance(query_vector, candidate_vector, metric)
+        except Exception:
+            logger.debug(
+                "candidate_strategy=union: failed to score lexical hit %s", doc_id, exc_info=True
+            )
+    return distances
+
+
 def _hybrid_rank(
     results: list,
     query: str,
@@ -1099,18 +1157,12 @@ def _merge_bm25_union_candidates(
     contributing chunk M of the same file. Falls back to ``source_file``
     only when full-path/chunk metadata is absent.
 
-    BM25-only additions carry ``distance=None`` so ``_hybrid_rank`` scores
-    them on BM25 contribution alone.
-
-    When ``max_distance > 0.0`` (a strict vector-distance threshold is
-    set), BM25-only candidates are skipped entirely — they have no vector
-    distance to satisfy the threshold, and silently injecting them would
-    break the existing ``max_distance`` guarantee that hybrid results lie
-    within the requested vector-distance bound.
+    BM25-only additions carry ``distance=None`` unless a strict
+    ``max_distance`` threshold is set. Under a threshold, union mode loads
+    stored embeddings for lexical hits and computes their vector distance
+    before admitting them, preserving the same distance guarantee as the
+    vector-only path.
     """
-    if max_distance > 0.0:
-        return
-
     where = build_where_filter(wing, room, source_file)
     try:
         lexical = drawers_col.lexical_search(
@@ -1124,6 +1176,13 @@ def _merge_bm25_union_candidates(
         logger.debug("candidate_strategy=union: lexical fetch failed", exc_info=True)
         return
 
+    metric = _metric_for_collection(drawers_col)
+    lexical_distances = (
+        _lexical_hit_vector_distances(drawers_col, query, lexical.hits, metric)
+        if max_distance > 0.0
+        else {}
+    )
+
     bm25_extra = []
     for hit in lexical.hits:
         meta = hit.metadata or {}
@@ -1135,6 +1194,11 @@ def _merge_bm25_union_candidates(
         ):
             continue
         full_source = meta.get("source_file", "") or ""
+        distance = lexical_distances.get(hit.id)
+        if max_distance > 0.0:
+            if distance is None or distance > max_distance:
+                continue
+            distance = round(distance, 4)
         bm25_extra.append(
             {
                 "drawer_id": _result_drawer_id(meta, hit.id),
@@ -1145,9 +1209,13 @@ def _merge_bm25_union_candidates(
                 "source_path": full_source,
                 "created_at": meta.get("filed_at", "unknown"),
                 "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
-                "similarity": None,
-                "distance": None,
-                "effective_distance": None,
+                "similarity": (
+                    None
+                    if distance is None
+                    else round(_distance_to_similarity(distance, metric), 3)
+                ),
+                "distance": distance,
+                "effective_distance": distance,
                 "closet_boost": 0.0,
                 "matched_via": "bm25_backend",
                 "bm25_score": round(float(hit.score), 3),
@@ -1171,8 +1239,6 @@ def _merge_bm25_union_candidates(
         key = _dedup_key(bh)
         if not key or key == "?" or key in seen:
             continue
-        bh["distance"] = None
-        bh["effective_distance"] = None
         bh["closet_boost"] = 0.0
         hits.append(bh)
         seen.add(key)
@@ -1196,6 +1262,238 @@ def _candidate_pool_size(n_results: int, date_window_active: bool) -> int:
     if not date_window_active:
         return n_results * 3
     return max(min(n_results * 15, 500), n_results)
+
+
+_CLOSET_RESULT_POOL_MULTIPLIER = 4
+_MAX_HYDRATION_CHARS = 10000
+
+
+def _candidate_pool_limits(
+    candidate_strategy: str,
+    n_results: int,
+    date_window_active: bool = False,
+) -> tuple[int, int]:
+    """Return vector-query and pre-enrichment candidate limits.
+
+    Date-window searches retain the wider current-develop pool because the
+    timestamp constraint is applied after retrieval. The normal vector path
+    also remains at least four times wide through closet enrichment. Union
+    mode keeps only the requested top vector candidates before lexical merge.
+    """
+    base_query_limit = _candidate_pool_size(
+        n_results,
+        date_window_active,
+    )
+
+    if candidate_strategy == "union":
+        return base_query_limit, n_results
+
+    widened = max(
+        base_query_limit,
+        n_results * _CLOSET_RESULT_POOL_MULTIPLIER,
+    )
+    return widened, widened
+
+
+def _enrich_closet_hits(
+    hits: list,
+    drawers_col,
+    query: str,
+    stop_words: frozenset = frozenset(),
+) -> list:
+    """Hydrate closet-boosted hits and memoise each source/group fetch."""
+    query_terms = set(
+        _tokenize(
+            query,
+            stop_words,
+        )
+    )
+    source_cache: dict = {}
+
+    for hit in hits:
+        if hit.get("matched_via") == "drawer":
+            continue
+
+        full_source = hit.get("_source_file_full") or ""
+
+        if not full_source:
+            continue
+
+        parent_drawer_id = hit.get("_parent_drawer_id") or None
+        cache_key = (
+            full_source,
+            parent_drawer_id,
+        )
+
+        if cache_key not in source_cache:
+            try:
+                source_drawers = drawers_col.get(
+                    where=(
+                        _scoped_source_filter(
+                            full_source,
+                            parent_drawer_id,
+                        )
+                    ),
+                    include=[
+                        "documents",
+                        "metadatas",
+                    ],
+                )
+            except Exception:
+                logger.debug(
+                    "Neighbor fetch failed for %s",
+                    full_source,
+                    exc_info=True,
+                )
+                source_cache[cache_key] = None
+            else:
+                source_cache[cache_key] = (
+                    list(
+                        getattr(
+                            source_drawers,
+                            "documents",
+                            None,
+                        )
+                        or []
+                    ),
+                    list(
+                        getattr(
+                            source_drawers,
+                            "metadatas",
+                            None,
+                        )
+                        or []
+                    ),
+                )
+
+        cached = source_cache[cache_key]
+
+        if cached is None:
+            continue
+
+        docs, metadatas = cached
+
+        if len(docs) <= 1:
+            continue
+
+        indexed = []
+
+        for index, (
+            document,
+            metadata,
+        ) in enumerate(
+            zip(
+                docs,
+                metadatas,
+            )
+        ):
+            chunk_index = (
+                metadata.get(
+                    "chunk_index",
+                    index,
+                )
+                if isinstance(
+                    metadata,
+                    dict,
+                )
+                else index
+            )
+
+            if not isinstance(
+                chunk_index,
+                int,
+            ):
+                chunk_index = index
+
+            indexed.append(
+                (
+                    chunk_index,
+                    document or "",
+                )
+            )
+
+        indexed.sort(key=lambda pair: pair[0])
+        ordered_docs = [document for _, document in indexed]
+
+        best_index = 0
+        best_score = -1
+
+        for index, document in enumerate(ordered_docs):
+            lowered = document.lower()
+            score = sum(1 for term in query_terms if term in lowered)
+
+            if score > best_score:
+                best_score = score
+                best_index = index
+
+        start = max(
+            0,
+            best_index - 1,
+        )
+        end = min(
+            len(ordered_docs),
+            best_index + 2,
+        )
+        expanded = "\n\n".join(ordered_docs[start:end])
+
+        if len(expanded) > _MAX_HYDRATION_CHARS:
+            expanded = expanded[:_MAX_HYDRATION_CHARS] + (
+                f"\n\n[...truncated. "
+                f"{len(ordered_docs)} total drawers. "
+                "Use mempalace_get_drawer "
+                "for full content.]"
+            )
+
+        hit["text"] = expanded
+        hit["drawer_index"] = best_index
+        hit["total_drawers"] = len(ordered_docs)
+
+    return hits
+
+
+def _dedupe_rendered_hits(
+    hits: list,
+) -> list:
+    """Drop repeated closet-rendered passages while preserving rank order.
+
+    Plain drawer hits retain their historical behavior, including legitimate
+    exact repeats at different source positions. A duplicate is removed only
+    when either occurrence came through closet enrichment.
+    """
+    unique = []
+    first_by_key: dict = {}
+
+    for hit in hits:
+        source = hit.get("_source_file_full") or hit.get("source_path") or hit.get("source_file")
+        text = hit.get("text")
+
+        if not source or not isinstance(
+            text,
+            str,
+        ):
+            unique.append(hit)
+            continue
+
+        key = (
+            source,
+            text,
+        )
+        previous = first_by_key.get(key)
+
+        if previous is None:
+            first_by_key[key] = hit
+            unique.append(hit)
+            continue
+
+        previous_is_closet = previous.get("matched_via") == "drawer+closet"
+        current_is_closet = hit.get("matched_via") == "drawer+closet"
+
+        if previous_is_closet or current_is_closet:
+            continue
+
+        unique.append(hit)
+
+    return unique
 
 
 # Strategy dispatch — keeps search_memories' branch count under the
@@ -1292,14 +1590,20 @@ def _finalize_candidate_hits(
             ),
         )
 
-    hits = _hybrid_rank(
-        hits, query, metric=_metric_for_collection(drawers_col), stop_words=stop_words
-    )[:n_results]
-    for h in hits:
-        h.pop("_sort_key", None)
-        h.pop("_source_file_full", None)
-        h.pop("_chunk_index", None)
-        h.pop("_parent_drawer_id", None)
+    ranked = _hybrid_rank(
+        hits,
+        query,
+        metric=_metric_for_collection(drawers_col),
+        stop_words=stop_words,
+    )
+    hits = _dedupe_rendered_hits(ranked)[:n_results]
+
+    for hit in hits:
+        hit.pop("_sort_key", None)
+        hit.pop("_source_file_full", None)
+        hit.pop("_chunk_index", None)
+        hit.pop("_parent_drawer_id", None)
+
     return hits, None
 
 
@@ -1697,7 +2001,7 @@ def search_memories(
         candidate_strategy: How candidates for the hybrid re-rank are gathered.
 
             * ``"vector"`` (default) — preserves historical behavior: top
-              ``n_results * 3`` rows from the vector index are the rerank pool.
+              ``n_results * 4`` rows from the vector index are the rerank pool.
               Cheap; works well when query and target docs agree in the
               embedding space.
             * ``"union"`` — also pull top ``n_results * 3`` lexical candidates
@@ -1708,8 +2012,8 @@ def search_memories(
               characterized.
 
               When ``max_distance > 0.0`` is also set, BM25-only candidates
-              are skipped — they have no vector distance and would silently
-              violate the requested distance threshold.
+              are admitted only if their stored embeddings can be loaded and
+              their computed vector distance satisfies that threshold.
         lang: Locale code for BM25 stop-word filtering (opt-in). When
             omitted, reads ``MempalaceConfig().lang_explicit`` — returns an
             empty set unless the user has set ``MEMPALACE_LANG`` /
@@ -1757,7 +2061,11 @@ def search_memories(
     # This avoids the "weak-closets regression" where narrative content
     # produces low-signal closets (regex extraction matches few topics)
     # and closet-first routing hides drawers that direct search would find.
-    pool_size = _candidate_pool_size(n_results, date_window_active)
+    pool_size, pre_enrichment_limit = _candidate_pool_limits(
+        candidate_strategy,
+        n_results,
+        date_window_active,
+    )
     try:
         dkwargs = {
             "query_texts": [query],
@@ -1851,65 +2159,16 @@ def search_memories(
         scored.append(entry)
 
     scored.sort(key=lambda h: h["_sort_key"])
-    hits = scored[:n_results]
+    hits = scored[:pre_enrichment_limit]
 
-    # Drawer-grep enrichment: for closet-boosted hits whose source has
-    # multiple drawers, return the keyword-best chunk + its immediate
-    # neighbors instead of just the drawer vector search landed on. The
-    # closet said "this source is relevant"; vector may have picked the
-    # wrong chunk within it; grep picks the right one.
-    MAX_HYDRATION_CHARS = 10000
-    for h in hits:
-        if h["matched_via"] == "drawer":
-            continue
-        full_source = h.get("_source_file_full") or ""
-        if not full_source:
-            continue
-        # Narrow by ``parent_drawer_id`` when present so unrelated
-        # chunked drawers sharing ``source_file`` do not stitch (#1580).
-        try:
-            source_drawers = drawers_col.get(
-                where=_scoped_source_filter(full_source, h.get("_parent_drawer_id")),
-                include=["documents", "metadatas"],
-            )
-        except Exception:
-            logger.debug("Neighbor fetch failed for %s", full_source, exc_info=True)
-            continue
-        docs = source_drawers.documents
-        metas_ = source_drawers.metadatas
-        if len(docs) <= 1:
-            continue
-
-        # Sort by chunk_index so best_idx + neighbors are positional.
-        indexed = []
-        for idx, (d, m) in enumerate(zip(docs, metas_)):
-            ci = m.get("chunk_index", idx) if isinstance(m, dict) else idx
-            if not isinstance(ci, int):
-                ci = idx
-            indexed.append((ci, d))
-        indexed.sort(key=lambda p: p[0])
-        ordered_docs = [d for _, d in indexed]
-
-        query_terms = set(_tokenize(query, stop_words))
-        best_idx, best_score = 0, -1
-        for idx, d in enumerate(ordered_docs):
-            d_lower = d.lower()
-            s = sum(1 for t in query_terms if t in d_lower)
-            if s > best_score:
-                best_score, best_idx = s, idx
-
-        start = max(0, best_idx - 1)
-        end = min(len(ordered_docs), best_idx + 2)
-        expanded = "\n\n".join(ordered_docs[start:end])
-        if len(expanded) > MAX_HYDRATION_CHARS:
-            expanded = (
-                expanded[:MAX_HYDRATION_CHARS]
-                + f"\n\n[...truncated. {len(ordered_docs)} total drawers. "
-                "Use mempalace_get_drawer for full content.]"
-            )
-        h["text"] = expanded
-        h["drawer_index"] = best_idx
-        h["total_drawers"] = len(ordered_docs)
+    # Drawer-grep enrichment: retain the wider pool until repeated
+    # closet-rendered passages can be replaced by distinct candidates.
+    _enrich_closet_hits(
+        hits,
+        drawers_col,
+        query,
+        stop_words=stop_words,
+    )
 
     # Candidate strategy hook: optionally widen the rerank pool's *source*
     # before ranking. Default ("vector") is a no-op; "union" merges top-K

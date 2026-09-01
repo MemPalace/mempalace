@@ -129,8 +129,8 @@ tool-specific workflow below says to.
   - `drawer_id` (required)
 
 ### Ingest & Cleanup
-- `mempalace_mine` — Mine a directory into the palace. Host-level ingest; call only when the user asks to import files.
-  - `source` (required): directory to mine
+- `mempalace_mine` — Mine a directory into the palace, or one conversation file with `mode='convos'`. Host-level ingest; call only when the user asks to import files.
+  - `source` (required): directory to mine, or one conversation file with `mode='convos'`
   - `mode`: `projects` (default), `convos`, or `extract`
   - `wing`: target wing (default: source directory name)
   - `agent`: recorded on every drawer (default `mempalace`)

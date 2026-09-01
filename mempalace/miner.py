@@ -162,6 +162,14 @@ READABLE_EXTENSIONS = {
     ".toml",
     ".tex",
     ".bib",
+    # C / C++
+    ".c",
+    ".h",
+    ".cpp",
+    ".hpp",
+    ".cc",
+    ".cxx",
+    ".inl",
     # C# / .NET
     ".cs",
     ".csproj",
@@ -549,7 +557,7 @@ def load_config(project_dir: str) -> dict:
                     }
                 ],
             }
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 

@@ -269,6 +269,48 @@ For a manual re-test:
 rm -rf ~/.mempalace/hook_state/antigravity_woke_*
 ```
 
+## Joining the shared brain (multi-agent)
+
+If other agents on this machine (Claude Code, Codex, …) share one palace,
+the Antigravity agent can join the fleet as a first-class peer: same
+memory, same logstream, its own identity. Two pieces make it work.
+
+### 1. Global rules (`~/.gemini/config/GEMINI.md`)
+
+Antigravity discovers `GEMINI.md` rules in its global config directory and
+applies them to every workspace. Render the canonical shared-brain rules
+block with a stable identity for this agent and drop it there:
+
+```bash
+mempalace rules --agent mac-antigravity > ~/.gemini/config/GEMINI.md
+mkdir -p ~/.mempalace/watch
+```
+
+If the file already has other content, paste the rendered block into it
+instead of overwriting. The block comes from
+`integrations/shared/coordination-protocol.md` — the single source of
+truth for the protocol — so re-run the command after an upgrade to pick up
+protocol fixes rather than editing the copy by hand.
+
+Pick an identity distinct from your other agents (`mac-antigravity` next
+to `mac-claude`, …). Identities share nothing: inbox filters, cursors,
+and watcher state files are all keyed by it, and two agents sharing one
+name will silently eat each other's mail.
+
+### 2. Allowlist the tools, or the loop stalls
+
+Antigravity gates terminal commands and MCP writes behind approval prompts
+by default. An unnoticed prompt silently stalls an ack, reply, or patch
+submission — to the requesting agent this looks like "claimed but gone
+quiet", indistinguishable from a crash. For unattended coordination,
+allowlist the mempalace MCP tools and the `mempalace logstream watch`
+command in Antigravity's permission settings.
+
+With both pieces in place the agent arms a background watcher at session
+start, wakes on inbox events, acks with `mempalace_event_ack`, and
+re-arms on its own. Measured on an otherwise idle machine, the round trip
+from event append to ack is about five seconds.
+
 ## See also
 
 - [`hooks/antigravity/INVESTIGATION.md`](https://github.com/MemPalace/mempalace/blob/main/hooks/antigravity/INVESTIGATION.md)

@@ -1362,12 +1362,12 @@ with mine_palace_lock(sys.argv[1]):
         monkeypatch.setattr(mcp_server, "_get_collection", _no_client_open)
 
         stats = mcp_server.tool_graph_stats()
-        # "general" room and the wing-less drawer are excluded, matching
-        # build_graph's per-drawer filter.
-        assert stats["total_rooms"] == 2
+        # "general" is a real room; the wing-less drawer is still excluded.
+        # Existing tripwires above guarantee the collection/HNSW path stays unopened.
+        assert stats["total_rooms"] == 3
         assert stats["tunnel_rooms"] == 1
         assert stats["total_edges"] == 1
-        assert stats["rooms_per_wing"] == {"wing_code": 2, "wing_project": 1}
+        assert stats["rooms_per_wing"] == {"wing_code": 3, "wing_project": 1}
         assert stats["top_tunnels"] == [
             {"room": "chromadb", "wings": ["wing_code", "wing_project"], "count": 2}
         ]
@@ -1894,6 +1894,35 @@ class TestSearchTool:
         result_loose = tool_search(query="JWT", max_distance=0.01, min_similarity=999.0)
         assert len(result_strict["results"]) <= len(result_loose["results"])
 
+    def test_search_passes_candidate_strategy(self, monkeypatch, config, kg):
+        """MCP callers can opt into backend BM25/vector union candidate gathering."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        seen = {}
+
+        def fake_search(*args, **kwargs):
+            seen["candidate_strategy"] = kwargs.get("candidate_strategy")
+            return {"results": []}
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+
+        result = mcp_server.tool_search(query="rareterm", candidate_strategy="union")
+
+        assert "error" not in result
+        assert seen["candidate_strategy"] == "union"
+
+    def test_search_rejects_invalid_candidate_strategy(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "search_memories", lambda *a, **kw: pytest.fail())
+
+        result = mcp_server.tool_search(query="rareterm", candidate_strategy="bm25")
+
+        assert "error" in result
+        assert "candidate_strategy" in result["error"]
+
     def test_list_rooms_rejects_invalid_wing(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server
@@ -1955,11 +1984,11 @@ class TestSearchTool:
                 collection_name="custom_drawers",
             ),
         )
-        seen_collection_names = []
+        seen_calls = []
 
         def fake_search(*args, **kwargs):
-            seen_collection_names.append(kwargs.get("collection_name"))
-            if len(seen_collection_names) == 1:
+            seen_calls.append((kwargs.get("collection_name"), kwargs.get("candidate_strategy")))
+            if len(seen_calls) == 1:
                 return {
                     "error": "Search error: Error executing plan: Internal error: Error finding id"
                 }
@@ -1969,10 +1998,12 @@ class TestSearchTool:
         monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", lambda: None)
         monkeypatch.setattr(mcp_server.time, "sleep", lambda _: None)
 
-        result = mcp_server.tool_search(query="anything", wing="wing_api")
+        result = mcp_server.tool_search(
+            query="anything", wing="wing_api", candidate_strategy="union"
+        )
 
         assert "results" in result
-        assert seen_collection_names == ["custom_drawers", "custom_drawers"]
+        assert seen_calls == [("custom_drawers", "union"), ("custom_drawers", "union")]
 
     def test_search_does_not_retry_on_non_transient_error(self, monkeypatch, config, kg):
         """Validation / unrelated errors must not trigger the retry path."""
@@ -2226,6 +2257,31 @@ class TestWriteTools:
 
         result = tool_delete_drawer("nonexistent_drawer")
         assert result["success"] is False
+
+    def test_delete_drawer_purges_matching_closets(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """Deleting a drawer purges its source's closets too, so the AAAK
+        index keeps no stale pointer at the now-deleted drawer (#2325)."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_delete_drawer
+        from mempalace.palace import get_closets_collection
+
+        closets_col = get_closets_collection(palace_path, create=True)
+        closets_col.add(
+            ids=["auth_closet_01"],
+            documents=["topic: JWT session tokens"],
+            metadatas=[{"source_file": "auth.py"}],
+        )
+
+        result = tool_delete_drawer("drawer_proj_backend_aaa")
+        assert result["success"] is True
+        assert result["closets_deleted"] == 1
+
+        # Re-acquire: the staleness reconnect drops chromadb's path-keyed
+        # System cache (#2002), so a handle taken before the call is dead now.
+        closets_col = get_closets_collection(palace_path, create=False)
+        assert closets_col.get(include=[])["ids"] == []
 
     def test_check_duplicate_handles_none_metadata(self, monkeypatch, config, kg):
         """tool_check_duplicate must tolerate None entries in the result lists
@@ -2879,6 +2935,52 @@ class TestWriteTools:
         assert result["success"] is True
         assert result["wing"] == "new_wing"
         assert result["room"] == "new_room"
+
+    def test_update_drawer_content_purges_matching_closets(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """Correcting a drawer's content purges its source's closets, which
+        otherwise keep quoting the pre-correction text indefinitely (#2325)."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_update_drawer
+        from mempalace.palace import get_closets_collection
+
+        closets_col = get_closets_collection(palace_path, create=True)
+        closets_col.add(
+            ids=["auth_closet_01"],
+            documents=["topic: JWT session tokens"],
+            metadatas=[{"source_file": "auth.py"}],
+        )
+
+        result = tool_update_drawer("drawer_proj_backend_aaa", content="[RETRACTED]")
+        assert result["success"] is True
+        assert result["closets_deleted"] == 1
+
+        closets_col = get_closets_collection(palace_path, create=False)
+        assert closets_col.get(include=[])["ids"] == []
+
+    def test_update_drawer_wing_and_room_does_not_purge_closets(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """A wing/room move alone leaves the quoted text correct, so it must
+        not purge closets the way a content edit does (#2325)."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_update_drawer
+        from mempalace.palace import get_closets_collection
+
+        closets_col = get_closets_collection(palace_path, create=True)
+        closets_col.add(
+            ids=["auth_closet_01"],
+            documents=["topic: JWT session tokens"],
+            metadatas=[{"source_file": "auth.py"}],
+        )
+
+        result = tool_update_drawer("drawer_proj_backend_aaa", wing="new_wing", room="new_room")
+        assert result["success"] is True
+        assert result["closets_deleted"] == 0
+
+        closets_col = get_closets_collection(palace_path, create=False)
+        assert len(closets_col.get(include=[])["ids"]) == 1
 
     def test_update_drawer_not_found(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -6574,6 +6676,66 @@ class TestStaleLibraryGate:
         assert "mempalace_reconnect" in hint, "the hint must rule out the wrong remedy by name"
         assert "MEMPALACE_MCP_ALLOW_STALE_LIBRARY" in hint
 
+    def test_refusal_message_names_the_remedy(self, monkeypatch):
+        """Several MCP clients surface only the top-level message and drop
+        `data`, so the message alone must be enough to act on."""
+        from mempalace import mcp_server
+
+        self._reset(monkeypatch)
+        self._versions(monkeypatch, {"mempalace": "3.6.0"}, {"mempalace": "3.7.0"})
+
+        refusal = mcp_server._mcp_stale_library_refusal(1, "mempalace_add_drawer")
+
+        message = refusal["error"]["message"].lower()
+        assert "restart" in message
+        assert "mempalace_reconnect cannot clear this" in refusal["error"]["message"]
+
+    def test_reconnect_result_warns_when_stale(self, monkeypatch):
+        """A reconnect after an upgrade must not answer plain success while
+        every write keeps failing — reconnect cannot reload Python modules."""
+        from mempalace import mcp_server
+
+        self._reset(monkeypatch)
+        self._versions(monkeypatch, {"mempalace": "3.6.0"}, {"mempalace": "3.7.0"})
+
+        result = mcp_server._attach_stale_library_warning(
+            {"success": True, "message": "Reconnected to palace"}
+        )
+
+        assert result["restart_required"] is True
+        assert "restart" in result["warning"].lower()
+        assert "writes stay refused" in result["warning"]
+        assert result["library_versions"]["packages"] == [
+            {"package": "mempalace", "serving": "3.6.0", "installed": "3.7.0"}
+        ]
+
+    def test_reconnect_result_clean_when_versions_match(self, monkeypatch):
+        from mempalace import mcp_server
+
+        self._reset(monkeypatch)
+        self._versions(monkeypatch, {"mempalace": "3.6.0"}, {"mempalace": "3.6.0"})
+
+        result = mcp_server._attach_stale_library_warning(
+            {"success": True, "message": "Reconnected to palace"}
+        )
+
+        assert set(result) == {"success", "message"}
+
+    def test_reconnect_warning_suppressed_by_escape_hatch(self, monkeypatch):
+        """With the gate disabled writes actually work, so warning that they
+        are refused would be false."""
+        from mempalace import mcp_server
+
+        self._reset(monkeypatch)
+        self._versions(monkeypatch, {"mempalace": "3.6.0"}, {"mempalace": "3.7.0"})
+        monkeypatch.setenv("MEMPALACE_MCP_ALLOW_STALE_LIBRARY", "1")
+
+        result = mcp_server._attach_stale_library_warning(
+            {"success": True, "message": "Reconnected to palace"}
+        )
+
+        assert set(result) == {"success", "message"}
+
     def test_status_payload_carries_its_documented_fields(self, monkeypatch):
         """website/reference/mcp-tools.md promises these keys."""
         from mempalace import mcp_server
@@ -8138,3 +8300,40 @@ class TestSearchDateFilters:
         assert "before" in schema["properties"]
         assert schema["properties"]["since"]["type"] == "string"
         assert schema["properties"]["before"]["type"] == "string"
+
+
+def test_2288_grouped_graph_stats_count_distinct_room_instances(monkeypatch):
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(
+        mcp_server,
+        "_load_graph_tunnels",
+        lambda config=None: [{"id": "t1"}, {"id": "t2"}],
+    )
+    rows = [
+        ("fact", "desercion", "facts", 1, "2026-01-01"),
+        ("general", "desercion-pascual", "misc", 1, "2026-01-01"),
+        ("general", "desertion", "misc", 2, "2026-01-02"),
+        # Same placement, different hall: this must not add a room instance.
+        ("general", "desertion", "other", 3, "2026-01-03"),
+        ("heatstgnn-model-selection", "desertion", "models", 1, "2026-01-01"),
+        ("diary", "desertion", "journal", 1, "2026-01-01"),
+        ("general", "matlab-drive", "misc", 1, "2026-01-01"),
+        ("documentation", "octopus", "docs", 1, "2026-01-01"),
+        ("plans", "octopus", "plans", 1, "2026-01-01"),
+        ("controller", "octopus", "control", 1, "2026-01-01"),
+    ]
+    stats = mcp_server._graph_stats_from_grouped_rows(rows)
+
+    assert stats["total_rooms"] == 7
+    assert stats["total_room_instances"] == 9
+    assert stats["tunnel_rooms"] == stats["passive_tunnel_rooms"] == 1
+    assert stats["explicit_tunnels"] == 2
+    assert stats["total_connections"] == stats["total_edges"] + 2
+    assert set(stats["rooms_per_wing"]) == {
+        "desercion",
+        "desercion-pascual",
+        "desertion",
+        "matlab-drive",
+        "octopus",
+    }

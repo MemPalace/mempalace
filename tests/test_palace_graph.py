@@ -113,14 +113,15 @@ class TestBuildGraph:
         assert edges[0]["wing_b"] == "wing_project"
         assert edges[0]["hall"] == "databases"
 
-    def test_general_room_excluded(self):
+    def test_general_room_included(self):
         col = _make_fake_collection(
             [
                 {"room": "general", "wing": "wing_code", "hall": "misc", "date": ""},
             ]
         )
         nodes, edges = build_graph(col=col)
-        assert "general" not in nodes
+        assert "general" in nodes
+        assert nodes["general"]["wings"] == ["wing_code"]
 
     def test_missing_wing_excluded(self):
         col = _make_fake_collection(
@@ -356,3 +357,54 @@ class TestSqliteGroupedCountsReader:
         (palace / "chroma.sqlite3").write_bytes(self.MAGIC)
         (palace / "sqlite_exact.sqlite3").write_bytes(self.MAGIC)
         assert sqlite_grouped_counts_reader(self._config(str(palace))) is None
+
+
+def test_2288_grouped_general_room_is_not_filtered():
+    from mempalace.palace_graph import _nodes_edges_from_grouped_rows
+
+    nodes, edges = _nodes_edges_from_grouped_rows(
+        [
+            ("general", "wing_a", "hall_one", 2, "2026-01-01"),
+            ("general", "wing_a", "hall_two", 3, "2026-01-02"),
+            ("general", "wing_b", "hall_one", 1, "2026-01-03"),
+        ]
+    )
+    assert nodes["general"]["wings"] == ["wing_a", "wing_b"]
+    assert nodes["general"]["halls"] == ["hall_one", "hall_two"]
+    assert nodes["general"]["count"] == 6
+    assert len(edges) == 2
+
+
+def test_2288_graph_stats_preserve_room_names_and_count_room_instances():
+    invalidate_graph_cache()
+    col = _make_fake_collection(
+        [
+            {"room": "fact", "wing": "desercion"},
+            {"room": "general", "wing": "desercion-pascual"},
+            {"room": "general", "wing": "desertion"},
+            {"room": "heatstgnn-model-selection", "wing": "desertion"},
+            {"room": "diary", "wing": "desertion"},
+            {"room": "general", "wing": "matlab-drive"},
+            {"room": "documentation", "wing": "octopus"},
+            {"room": "plans", "wing": "octopus"},
+            {"room": "controller", "wing": "octopus"},
+        ]
+    )
+    with patch.dict(
+        graph_stats.__globals__,
+        {"_load_tunnels": lambda config=None: [{"id": "t1"}, {"id": "t2"}]},
+    ):
+        stats = graph_stats(col=col)
+
+    assert stats["total_rooms"] == 7
+    assert stats["total_room_instances"] == 9
+    assert stats["tunnel_rooms"] == stats["passive_tunnel_rooms"] == 1
+    assert stats["explicit_tunnels"] == 2
+    assert stats["total_connections"] == stats["total_edges"] + 2
+    assert set(stats["rooms_per_wing"]) == {
+        "desercion",
+        "desercion-pascual",
+        "desertion",
+        "matlab-drive",
+        "octopus",
+    }
