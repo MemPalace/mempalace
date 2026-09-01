@@ -601,6 +601,41 @@ def test_kg_query_tool_rejects_missing_entity(initialized_provider):
     assert "error" in result
 
 
+def test_kg_query_tool_defaults_to_current_time(initialized_provider, palace_path):
+    """Omitting ``since`` must not leak expired KG facts."""
+    from mempalace.knowledge_graph import KnowledgeGraph
+
+    db_path = str(Path(palace_path).parent / "knowledge_graph.sqlite3")
+    kg = KnowledgeGraph(db_path=db_path)
+    try:
+        kg.add_triple(
+            "_kg_query_default_time",
+            "status",
+            "active",
+            valid_from="2026-01-01",
+        )
+        kg.supersede(
+            "_kg_query_default_time",
+            "status",
+            "active",
+            "revoked",
+            at="2026-02-01",
+        )
+    finally:
+        kg.close()
+
+    result = json.loads(
+        initialized_provider.handle_tool_call(
+            "mempalace_kg_query",
+            {"entity": "_kg_query_default_time"},
+        )
+    )
+
+    objects = {r.get("object") for r in result.get("relations", [])}
+    assert "revoked" in objects
+    assert "active" not in objects
+
+
 # ----- Diary roundtrip ----------------------------------------------------
 
 

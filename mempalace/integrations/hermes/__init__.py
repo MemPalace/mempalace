@@ -1659,7 +1659,8 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             return {"error": "Missing required parameter: entity"}
         kg = KnowledgeGraph(db_path=self._kg_db_path())
         try:
-            relations = kg.query_entity(entity, as_of=since or "")
+            since = since or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            relations = kg.query_entity(entity, as_of=since, direction="both")
         finally:
             try:
                 kg.close()
