@@ -39,14 +39,15 @@ _SLACK_PROVENANCE_FOOTER = (
 # into transcripts. These waste drawer space and pollute search results.
 #
 # Verbatim is sacred — every pattern here is anchored to line boundaries and
-# refuses to cross blank lines, so a stray unclosed tag in one message can
-# never eat content from neighboring messages. When in doubt, leave text
-# alone.
+# a tag body may not swallow another opening of the same tag, so a stray
+# unclosed tag can never merge with a later block and eat the real content
+# between them. When in doubt, leave text alone.
 
 _NOISE_TAGS = (
     "system-reminder",
     "command-message",
     "command-name",
+    "command-args",
     "task-notification",
     "user-prompt-submit-hook",
     "hook_output",
@@ -54,12 +55,18 @@ _NOISE_TAGS = (
 
 
 def _tag_pattern(name: str) -> "re.Pattern[str]":
-    # Opening tag must begin a line (optionally after a `> ` blockquote marker,
-    # since _messages_to_transcript prefixes lines with `> `). Body is lazy but
-    # forbidden from crossing a blank line, so a dangling open tag can't span
-    # multiple messages. Closing tag eats optional trailing whitespace + newline.
+    # Opening tag must begin a line — only a `> ` blockquote marker (added by
+    # _messages_to_transcript) and/or indentation may precede it, since Claude
+    # Code emits slash-command chrome with indented tags. Body is lazy and
+    # may cross blank lines — task-notification and system-reminder blocks
+    # legitimately carry multi-paragraph payloads (subagent results, recalled
+    # memories) — but may not contain another opening of the same tag, so a
+    # dangling open tag can never merge with a later block and eat the content
+    # between them. Closing tag eats optional trailing whitespace + newline.
     return re.compile(
-        rf"(?m)^(?:> )?<{name}(?:\s[^>]*)?>" rf"(?:(?!\n\s*\n)[\s\S])*?" rf"</{name}>[ \t]*\n?"
+        rf"(?m)^(?:> )?[ \t]*<{name}(?:\s[^>]*)?>"
+        rf"(?:(?!<{name}[\s>])[\s\S])*?"
+        rf"</{name}>[ \t]*\n?"
     )
 
 
