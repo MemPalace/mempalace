@@ -175,6 +175,16 @@ class TestTimeline:
         assert kg.timeline_total() == 106
         assert kg.timeline_total("hub") == 1
 
+    def test_timeline_pagination_stable_under_tied_valid_from(self, kg):
+        # All facts share one valid_from; without a unique ORDER BY tiebreaker
+        # SQLite gives no ordering guarantee and pages could overlap or skip.
+        for i in range(30):
+            kg.add_triple(f"e{i}", "relates_to", f"e{i + 1}", valid_from="2026-01-01")
+        pages = [kg.timeline(limit=7, offset=o) for o in range(0, 30, 7)]
+        seen = [(t["subject"], t["object"]) for page in pages for t in page]
+        assert len(seen) == len(set(seen)) == 30  # disjoint pages, full coverage
+        assert seen == [(t["subject"], t["object"]) for t in kg.timeline(limit=30)]
+
     def test_timeline_clamps_bad_pagination_args(self, kg):
         kg.add_triple("a", "relates_to", "b")
         assert len(kg.timeline(limit=0, offset=-5)) == 1  # clamped to limit=1, offset=0

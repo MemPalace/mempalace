@@ -609,7 +609,7 @@ class KnowledgeGraph:
                     JOIN entities s ON t.subject = s.id
                     JOIN entities o ON t.object = o.id
                     WHERE (t.subject = ? OR t.object = ?)
-                    ORDER BY t.valid_from ASC NULLS LAST
+                    ORDER BY t.valid_from ASC NULLS LAST, t.id ASC
                     LIMIT ? OFFSET ?
                 """,
                     (eid, eid, limit, offset),
@@ -621,7 +621,7 @@ class KnowledgeGraph:
                     FROM triples t
                     JOIN entities s ON t.subject = s.id
                     JOIN entities o ON t.object = o.id
-                    ORDER BY t.valid_from ASC NULLS LAST
+                    ORDER BY t.valid_from ASC NULLS LAST, t.id ASC
                     LIMIT ? OFFSET ?
                 """,
                     (limit, offset),
