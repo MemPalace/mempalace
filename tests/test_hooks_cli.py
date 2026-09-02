@@ -2401,11 +2401,12 @@ def test_session_end_flushes_exact_frozen_pending_payload_before_advancing(tmp_p
             return_value={"success": True, "entry_id": "saved"},
         ) as write,
     ):
-        saved = hooks_cli_mod._flush_pending_session_checkpoints(
+        saved, flushed_ids = hooks_cli_mod._flush_pending_session_checkpoints(
             str(transcript), "sess", "wing_sessions", "claude"
         )
 
     assert saved is True
+    assert flushed_ids == {"stop:initial:15"}
     assert write.call_args.kwargs["entry"] == frozen_entry
     assert list(tmp_path.glob("pending_checkpoint_*.json")) == []
 
@@ -2445,6 +2446,42 @@ def test_failed_final_session_snapshot_stays_pending(tmp_path):
         payload = json.loads(pending[0].read_text(encoding="utf-8"))
         assert payload["checkpoint_id"].startswith("session-end:initial:35:")
         assert hooks_cli_mod._session_checkpoint_epoch("sess") == "initial"
+
+
+def test_session_end_does_not_duplicate_replayed_final_boundary(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(15)],
+    )
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        hooks_cli_mod._prepare_checkpoint_payload(
+            str(transcript),
+            "sess",
+            "wing_sessions",
+            "claude",
+            "session-end:initial:15:old-attempt",
+        )
+
+    with patch("mempalace.hooks_cli.MempalaceConfig") as config:
+        config.return_value.hooks_auto_save = True
+        config.return_value.hook_desktop_toast = False
+        with (
+            patch(
+                "mempalace.hooks_cli._save_diary_direct",
+                return_value={"count": 15, "themes": []},
+            ) as save,
+            patch("mempalace.hooks_cli._ingest_transcript", return_value=False),
+            patch("mempalace.hooks_cli._maybe_auto_ingest"),
+        ):
+            _capture_hook_output(
+                hook_session_end,
+                {"session_id": "sess", "transcript_path": str(transcript)},
+                state_dir=tmp_path,
+            )
+
+    assert save.call_count == 1
+    assert save.call_args.kwargs["checkpoint_id"] == "session-end:initial:15:old-attempt"
 
 
 def test_session_end_defaults_to_saving_when_config_unreadable(tmp_path):

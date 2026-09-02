@@ -1197,14 +1197,14 @@ def test_content_hash_prefetch_ignores_staged_generations():
     class Collection:
         @staticmethod
         def count():
-            return 2
+            return 5
 
         @staticmethod
         def get(limit, offset, include):
             if offset:
                 return {"ids": [], "metadatas": []}
             return {
-                "ids": ["staged", "committed"],
+                "ids": ["staged", "committed", "retired", "active", "marker"],
                 "metadatas": [
                     {
                         "wing": "wing",
@@ -1221,13 +1221,36 @@ def test_content_hash_prefetch_ignores_staged_generations():
                         "normalize_version": NORMALIZE_VERSION,
                         "content_hash": "committed-hash",
                     },
+                    {
+                        "wing": "wing",
+                        "source_file": "retired.jsonl",
+                        "extract_mode": "exchange",
+                        "normalize_version": NORMALIZE_VERSION,
+                        "content_hash": "retired-hash",
+                        "mine_generation_token": "retired-token",
+                    },
+                    {
+                        "wing": "wing",
+                        "source_file": "active.jsonl",
+                        "extract_mode": "exchange",
+                        "normalize_version": NORMALIZE_VERSION,
+                        "content_hash": "active-hash",
+                        "mine_generation_token": "active-token",
+                    },
+                    {
+                        "mine_staged": True,
+                        "mine_commit_marker": True,
+                        "mine_generation_commit": "active-token",
+                    },
                 ],
             }
 
     hashes = prefetch_content_hashes(Collection(), extract_mode="exchange")
 
     assert ("wing", "staged-hash") not in hashes
+    assert ("wing", "retired-hash") not in hashes
     assert hashes[("wing", "committed-hash")] == "committed.jsonl"
+    assert hashes[("wing", "active-hash")] == "active.jsonl"
 
 
 def test_pending_commit_finishes_when_stale_rows_are_already_gone():

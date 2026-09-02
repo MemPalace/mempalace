@@ -1456,9 +1456,10 @@ def _flush_pending_session_checkpoints(
     wing: str,
     agent_name: str,
     toast: bool = False,
-) -> bool:
+) -> tuple[bool, set[str]]:
     """Replay and acknowledge each frozen Stop payload before SessionEnd advances."""
     all_saved = True
+    flushed_ids = set()
     for path in _pending_checkpoints_for_session(session_id):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1481,7 +1482,9 @@ def _flush_pending_session_checkpoints(
             path.unlink()
         except OSError:
             all_saved = False
-    return all_saved
+            continue
+        flushed_ids.add(checkpoint_id)
+    return all_saved, flushed_ids
 
 
 def _ingest_transcript(transcript_path: str) -> Optional[bool]:
@@ -2032,7 +2035,7 @@ def hook_session_end(data: dict, harness: str):
             if valid_transcript:
                 target_wing = _wing_from_transcript_path(valid_transcript)
                 agent_name = _diary_agent_for_harness(harness)
-                pending_flushed = _flush_pending_session_checkpoints(
+                pending_flushed, flushed_checkpoint_ids = _flush_pending_session_checkpoints(
                     valid_transcript,
                     session_id,
                     target_wing,
@@ -2042,24 +2045,28 @@ def hook_session_end(data: dict, harness: str):
                 final_boundary = _count_human_messages(valid_transcript)
                 import uuid
 
-                final_checkpoint_id = (
-                    f"session-end:{_session_checkpoint_epoch(session_id)}:"
-                    f"{final_boundary}:{uuid.uuid4().hex}"
+                final_prefix = (
+                    f"session-end:{_session_checkpoint_epoch(session_id)}:{final_boundary}:"
                 )
-                final_result = _save_diary_direct(
-                    valid_transcript,
-                    session_id,
-                    wing=target_wing,
-                    toast=toast,
-                    agent_name=agent_name,
-                    checkpoint_id=final_checkpoint_id,
+                final_captured = any(
+                    checkpoint_id.startswith(final_prefix)
+                    for checkpoint_id in flushed_checkpoint_ids
                 )
-                if final_result.get("count", 0) > 0:
-                    _discard_pending_checkpoint(session_id, final_checkpoint_id)
+                if not final_captured:
+                    final_checkpoint_id = f"{final_prefix}{uuid.uuid4().hex}"
+                    final_result = _save_diary_direct(
+                        valid_transcript,
+                        session_id,
+                        wing=target_wing,
+                        toast=toast,
+                        agent_name=agent_name,
+                        checkpoint_id=final_checkpoint_id,
+                    )
+                    final_captured = final_result.get("count", 0) > 0
+                    if final_captured:
+                        _discard_pending_checkpoint(session_id, final_checkpoint_id)
                 ingest_status = _ingest_transcript(valid_transcript)
-                session_end_complete = pending_flushed and (
-                    final_result.get("count", 0) > 0 or ingest_status is True
-                )
+                session_end_complete = pending_flushed and (final_captured or ingest_status is True)
             _maybe_auto_ingest()
 
         _output({})

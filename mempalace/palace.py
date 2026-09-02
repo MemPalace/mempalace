@@ -1681,32 +1681,40 @@ def prefetch_content_hashes(
     the point is not to track every alias.
     """
     hashes: dict[tuple[str, str], str] = {}
+    all_metadatas = []
     try:
         total = collection.count()
         offset = 0
         while offset < total:
             batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
-            for meta in batch["metadatas"]:
-                meta = meta or {}
-                if meta.get("mine_staged") is True:
-                    continue
-                content_hash_field = meta.get("content_hash")
-                src = meta.get("source_file")
-                wing = meta.get("wing")
-                if not content_hash_field or not src or not wing:
-                    continue
-                if not _metadata_matches_extract_mode(meta, extract_mode):
-                    continue
-                version = meta.get("normalize_version", 1)
-                if version < NORMALIZE_VERSION:
-                    continue
-                for content_hash in content_hash_field.split(","):
-                    key = (wing, content_hash)
-                    if content_hash and key not in hashes:
-                        hashes[key] = src
+            all_metadatas.extend(meta or {} for meta in batch["metadatas"])
             if not batch["ids"]:
                 break
             offset += len(batch["ids"])
     except Exception:
         logger.warning("prefetch_content_hashes: partial fetch, %d hashes loaded", len(hashes))
+    committed_tokens = {
+        meta.get("mine_generation_commit")
+        for meta in all_metadatas
+        if meta.get("mine_commit_marker") is True and meta.get("mine_generation_commit")
+    }
+    for meta in all_metadatas:
+        generation_token = meta.get("mine_generation_token")
+        if meta.get("mine_staged") is True and generation_token not in committed_tokens:
+            continue
+        if generation_token and generation_token not in committed_tokens:
+            continue
+        content_hash_field = meta.get("content_hash")
+        src = meta.get("source_file")
+        wing = meta.get("wing")
+        if not content_hash_field or not src or not wing:
+            continue
+        if not _metadata_matches_extract_mode(meta, extract_mode):
+            continue
+        if meta.get("normalize_version", 1) < NORMALIZE_VERSION:
+            continue
+        for content_hash in content_hash_field.split(","):
+            key = (wing, content_hash)
+            if content_hash and key not in hashes:
+                hashes[key] = src
     return hashes
