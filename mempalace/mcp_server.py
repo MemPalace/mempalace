@@ -3921,7 +3921,11 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 wing = sanitize_name(wing, "wing")
             except ValueError as e:
                 return {"success": False, "error": str(e)}
-            if wing.lower() != str(old_meta.get("wing") or "").lower():
+            # Case-sensitive comparison: a case-only rename IS a rename.
+            # ``list_drawers`` is case-sensitive, so case-duplicate wings are
+            # distinct destinations, and the caller's exact casing is
+            # authoritative (#2395).
+            if wing != str(old_meta.get("wing") or ""):
                 new_meta["wing"] = wing
 
         if room is not None:
@@ -3929,7 +3933,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 room = sanitize_name(room, "room")
             except ValueError as e:
                 return {"success": False, "error": str(e)}
-            if room.lower() != str(old_meta.get("room") or "").lower():
+            if room != str(old_meta.get("room") or ""):
                 new_meta["room"] = room
 
         _wal_log(
