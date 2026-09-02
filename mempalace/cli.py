@@ -42,6 +42,11 @@ import warnings
 from pathlib import Path
 
 from .config import MempalaceConfig
+from .cli_write_routing import (
+    add_cli_write_routing_flags,
+    resolve_cli_write_routing,
+)
+from .write_routing import WriteRoutingError
 from .corpus_origin import detect_origin_heuristic, detect_origin_llm
 from .llm_client import LLMError, get_provider
 from .version import __version__
@@ -102,6 +107,21 @@ def _maintenance_requires_chroma(palace_path: str, command_name: str) -> bool:
         file=sys.stderr,
     )
     return False
+
+
+def _resolve_cli_write_routing_or_exit(args, operation: str):
+    """Resolve routine CLI routing and render configuration errors."""
+    try:
+        return resolve_cli_write_routing(
+            args,
+            operation=operation,
+        )
+    except WriteRoutingError as exc:
+        print(
+            f"mempalace: invalid CLI write routing: {exc}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from exc
 
 
 def _gather_origin_samples(project_dir) -> list:
@@ -567,6 +587,39 @@ def _maybe_run_mine_after_init(args, cfg) -> None:
             return
 
     palace_path = cfg.palace_path
+    routing = _resolve_cli_write_routing_or_exit(
+        args,
+        "init auto-mine",
+    )
+
+    if routing.use_daemon:
+        payload = {
+            "source": project_dir,
+            "mode": "projects",
+            "wing": None,
+            "agent": "mempalace",
+            "limit": 0,
+            "dry_run": False,
+            "extract": "exchange",
+            "no_gitignore": False,
+            "include_ignored": [],
+            "max_chunks_per_file": None,
+            "redetect_origin": False,
+            "files": (
+                [str(file_path) for file_path in scanned_files]
+                if scanned_files is not None
+                else None
+            ),
+        }
+        _submit_daemon_cli_job(
+            "mine",
+            payload,
+            args,
+            background=False,
+            auto_start=routing.decision.auto_start_daemon,
+        )
+        return
+
     try:
         mine(
             project_dir=project_dir,
@@ -956,27 +1009,43 @@ def cmd_mine(args):
     for raw in args.include_ignored or []:
         include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
 
-    if getattr(args, "background", False) and not getattr(args, "daemon", False):
-        print("mempalace: --background requires --daemon", file=sys.stderr)
-        sys.exit(2)
+    payload = {
+        "source": args.dir,
+        "mode": mode,
+        "wing": args.wing,
+        "agent": args.agent,
+        "limit": args.limit,
+        "dry_run": args.dry_run,
+        "extract": args.extract,
+        "no_gitignore": args.no_gitignore,
+        "include_ignored": include_ignored,
+        "max_chunks_per_file": getattr(
+            args,
+            "max_chunks_per_file",
+            None,
+        ),
+        "redetect_origin": getattr(
+            args,
+            "redetect_origin",
+            False,
+        ),
+    }
 
-    if getattr(args, "daemon", False):
-        payload = {
-            "source": args.dir,
-            "mode": mode,
-            "wing": args.wing,
-            "agent": args.agent,
-            "limit": args.limit,
-            "dry_run": args.dry_run,
-            "extract": args.extract,
-            "no_gitignore": args.no_gitignore,
-            "include_ignored": include_ignored,
-            "max_chunks_per_file": getattr(args, "max_chunks_per_file", None),
-            "redetect_origin": getattr(args, "redetect_origin", False),
-        }
-        if source_adapter:
-            payload["source_adapter"] = source_adapter
-        _submit_daemon_cli_job("mine", payload, args, background=getattr(args, "background", False))
+    if source_adapter:
+        payload["source_adapter"] = source_adapter
+
+    routing = _resolve_cli_write_routing_or_exit(
+        args,
+        "mine",
+    )
+    if routing.use_daemon:
+        _submit_daemon_cli_job(
+            "mine",
+            payload,
+            args,
+            background=bool(getattr(args, "background", False)),
+            auto_start=routing.decision.auto_start_daemon,
+        )
         return
 
     from .palace import MineAlreadyRunning, MineValidationError
@@ -1260,6 +1329,19 @@ def cmd_sweep(args):
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     target = os.path.expanduser(args.target)
+    routing = _resolve_cli_write_routing_or_exit(
+        args,
+        "sweep",
+    )
+    if routing.use_daemon:
+        _submit_daemon_cli_job(
+            "sweep",
+            {"target": target},
+            args,
+            background=bool(getattr(args, "background", False)),
+            auto_start=routing.decision.auto_start_daemon,
+        )
+        return
 
     if os.path.isfile(target):
         result = sweep(target, palace_path)
@@ -1292,18 +1374,25 @@ def cmd_sync(args):
     """Prune drawers whose source files are gitignored, deleted, or moved (#1252)."""
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
 
-    if getattr(args, "background", False) and not getattr(args, "daemon", False):
-        print("mempalace: --background requires --daemon", file=sys.stderr)
-        sys.exit(2)
+    payload = {
+        "dir": args.dir,
+        "root": list(args.root or []),
+        "wing": args.wing,
+        "dry_run": args.dry_run,
+    }
 
-    if getattr(args, "daemon", False):
-        payload = {
-            "dir": args.dir,
-            "root": list(args.root or []),
-            "wing": args.wing,
-            "dry_run": args.dry_run,
-        }
-        _submit_daemon_cli_job("sync", payload, args, background=getattr(args, "background", False))
+    routing = _resolve_cli_write_routing_or_exit(
+        args,
+        "sync",
+    )
+    if routing.use_daemon:
+        _submit_daemon_cli_job(
+            "sync",
+            payload,
+            args,
+            background=bool(getattr(args, "background", False)),
+            auto_start=routing.decision.auto_start_daemon,
+        )
         return
 
     from .palace import MineAlreadyRunning
@@ -1406,7 +1495,14 @@ def cmd_sync(args):
     print(f"\n{'=' * 55}\n")
 
 
-def _submit_daemon_cli_job(kind: str, payload: dict, args, *, background: bool) -> None:
+def _submit_daemon_cli_job(
+    kind: str,
+    payload: dict,
+    args,
+    *,
+    background: bool,
+    auto_start: bool = True,
+) -> None:
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     backend = _backend_arg(args)
     from .daemon import DaemonError, submit_job
@@ -1418,7 +1514,7 @@ def _submit_daemon_cli_job(kind: str, payload: dict, args, *, background: bool) 
             palace_path=palace_path,
             backend=backend,
             wait=not background,
-            auto_start=True,
+            auto_start=auto_start,
             # A job refused the palace lock is deferred, not failed (#2014), so
             # it never becomes terminal while the holder lives. Waiting it out
             # would strand this terminal behind a peer that can outlive the
@@ -3240,6 +3336,11 @@ def main():
         ),
     )
 
+    add_cli_write_routing_flags(
+        p_init,
+        allow_background=False,
+    )
+
     # mine
     p_mine = sub.add_parser("mine", help="Mine files into the palace")
     p_mine.add_argument(
@@ -3302,16 +3403,7 @@ def main():
     p_mine.add_argument(
         "--dry-run", action="store_true", help="Show what would be filed without filing"
     )
-    p_mine.add_argument(
-        "--daemon",
-        action="store_true",
-        help="Submit this mine to the opt-in local daemon queue",
-    )
-    p_mine.add_argument(
-        "--background",
-        action="store_true",
-        help="With --daemon, return a job id immediately instead of waiting",
-    )
+    add_cli_write_routing_flags(p_mine)
     p_mine.add_argument(
         "--extract",
         choices=["exchange", "general"],
@@ -3354,6 +3446,8 @@ def main():
         help="A .jsonl transcript file, or a directory to scan recursively",
     )
 
+    add_cli_write_routing_flags(p_sweep)
+
     # sync
     p_sync = sub.add_parser(
         "sync",
@@ -3385,16 +3479,7 @@ def main():
         action="store_false",
         help="Actually delete drawers (overrides --dry-run; requires --wing or a project root)",
     )
-    p_sync.add_argument(
-        "--daemon",
-        action="store_true",
-        help="Submit this sync to the opt-in local daemon queue",
-    )
-    p_sync.add_argument(
-        "--background",
-        action="store_true",
-        help="With --daemon, return a job id immediately instead of waiting",
-    )
+    add_cli_write_routing_flags(p_sync)
 
     # search
     p_search = sub.add_parser("search", help="Find anything, exact words")
