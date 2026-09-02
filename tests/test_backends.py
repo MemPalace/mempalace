@@ -624,6 +624,40 @@ def test_chroma_client_rebuild_closes_displaced_client(tmp_path, monkeypatch):
         backend.close()
 
 
+def test_chroma_client_rebuild_stops_each_displaced_system(tmp_path, monkeypatch):
+    """#2375: every external-change rebuild must stop its displaced System."""
+    from chromadb.config import System
+
+    stopped = []
+    original_stop = System.stop
+
+    def recording_stop(system, *args, **kwargs):
+        stopped.append(system)
+        return original_stop(system, *args, **kwargs)
+
+    monkeypatch.setattr(System, "stop", recording_stop)
+
+    palace_path = tmp_path / "palace"
+    backend = ChromaBackend()
+    displaced_systems = []
+
+    try:
+        client = backend._client(str(palace_path))
+        db_file = palace_path / "chroma.sqlite3"
+        assert db_file.is_file()
+
+        for _ in range(3):
+            displaced_systems.append(client._system)
+            st = db_file.stat()
+            os.utime(db_file, (st.st_atime, st.st_mtime + 60))
+            client = backend._client(str(palace_path))
+
+        assert stopped == displaced_systems
+        assert client._system not in displaced_systems
+    finally:
+        backend.close()
+
+
 def test_base_collection_update_default_rejects_mismatched_lengths():
     """The ABC default update() raises ValueError rather than silently misaligning."""
     from mempalace.backends.base import BaseCollection
@@ -2030,64 +2064,80 @@ def test_chroma_backend_requarantines_after_inode_replacement(tmp_path, monkeypa
 
 
 def test_chroma_backend_resets_system_cache_on_inode_change(tmp_path, monkeypatch):
-    """#2028: ``_client`` must drop chromadb's path-keyed ``SharedSystemClient``
-    cache *before* reconstructing ``PersistentClient`` on an inode/mtime change.
-
-    chromadb caches its ``System`` (and live HNSW segment) keyed by path, so a
-    bare reopen reuses the stale segment and persists an outdated index over a
-    peer/rebuild's on-disk changes -- the #2002 data-loss class reached via
-    ``_client`` instead of ``mcp_server._get_client``. The reset must fire only
-    on a genuine external change (not first open) and must precede the reopen.
-    """
+    """#2028/#2375: drain owned clients, clear the cache, then reopen."""
     palace = tmp_path / "palace"
     palace.mkdir()
     (palace / "chroma.sqlite3").write_text("")
-
+    other_palace = tmp_path / "other-palace"
     events = []
 
-    # Neutralize the on-disk HNSW pre-checks so the test exercises only the
-    # cache-reset / client-rebuild ordering.
-    for _name in (
+    # Neutralize the on-disk HNSW pre-checks so this test exercises only the
+    # client-close / cache-reset / client-rebuild ordering.
+    for name in (
         "_fix_missing_collection_type",
         "_fix_blob_seq_ids",
         "quarantine_invalid_hnsw_metadata",
         "quarantine_stale_hnsw",
     ):
-        monkeypatch.setattr(f"mempalace.backends.chroma.{_name}", lambda path, *a, **k: [])
+        monkeypatch.setattr(
+            f"mempalace.backends.chroma.{name}",
+            lambda path, *args, **kwargs: [],
+        )
 
     monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
 
     class DummyClient:
-        pass
+        def __init__(self, label):
+            self.label = label
 
-    def _record_open(path):
+        def close(self):
+            events.append(("close", self.label))
+
+    def record_open(path):
         events.append(("open", path))
-        return DummyClient()
+        return DummyClient(path)
 
-    monkeypatch.setattr("mempalace.backends.chroma.chromadb.PersistentClient", _record_open)
+    monkeypatch.setattr(
+        "mempalace.backends.chroma.chromadb.PersistentClient",
+        record_open,
+    )
 
     from chromadb.api.client import SharedSystemClient
 
-    def _record_clear(*args, **kwargs):
+    def record_clear(*args, **kwargs):
         events.append(("clear", None))
 
-    monkeypatch.setattr(SharedSystemClient, "clear_system_cache", _record_clear)
+    monkeypatch.setattr(
+        SharedSystemClient,
+        "clear_system_cache",
+        record_clear,
+    )
 
     backend = ChromaBackend()
-    # ``_db_stat`` is called twice per ``_client`` call (freshness check, then
-    # re-stat after reopen). Same inode on the first call (first open, no prior
-    # freshness -> no reset), changed inode on the second (external change).
+
+    # _db_stat is called before each decision and after each open. The second
+    # call observes an external inode change.
     stats = iter([(1, 1.0), (1, 1.0), (2, 2.0), (2, 2.0)])
     monkeypatch.setattr(backend, "_db_stat", lambda path: next(stats))
 
-    backend._client(str(palace))  # first open: no external change -> no clear
-    backend._client(str(palace))  # inode 1 -> 2: clear, then reopen
+    try:
+        backend._client(str(palace))
+        backend._clients[str(other_palace)] = DummyClient(str(other_palace))
+        backend._freshness[str(other_palace)] = (7, 7.0)
 
-    assert events == [
-        ("open", str(palace)),  # first open, no cache reset
-        ("clear", None),  # #2028: reset fires on the inode change...
-        ("open", str(palace)),  # ...strictly before the PersistentClient reopen
-    ], events
+        backend._client(str(palace))
+
+        assert events == [
+            ("open", str(palace)),
+            ("close", str(palace)),
+            ("close", str(other_palace)),
+            ("clear", None),
+            ("open", str(palace)),
+        ]
+        assert set(backend._clients) == {str(palace)}
+        assert set(backend._freshness) == {str(palace)}
+    finally:
+        backend.close()
 
 
 def test_explain_ef_mismatch_recognizes_chromadb_conflict():
