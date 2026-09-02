@@ -8,10 +8,10 @@ import errno
 import hashlib
 import json
 import os
-import stat
 import re
+import secrets
+import stat
 import sys
-import tempfile
 from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
@@ -395,6 +395,56 @@ def _fsync_directory(directory: Path) -> None:
         os.close(fd)
 
 
+_TEMP_NAME_ATTEMPTS = 64
+
+
+def _bounded_mkstemp(
+    directory: Path,
+    *,
+    prefix: str,
+    suffix: str = "",
+) -> tuple[int, str]:
+    """Create a private temporary file without an unbounded retry loop.
+
+    ``tempfile.mkstemp`` retries ``PermissionError`` as a candidate-name
+    collision on Windows while the parent directory appears writable. An ACL,
+    filter driver, or injected EPERM can therefore run through billions of
+    attempts. Generate names locally, retain exclusive/no-follow creation, and
+    retry only real collisions plus Windows' directory-at-candidate case.
+    """
+    directory = Path(directory)
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    last_collision = None
+
+    for _ in range(_TEMP_NAME_ATTEMPTS):
+        candidate = directory / f"{prefix}{secrets.token_hex(12)}{suffix}"
+        try:
+            fd = os.open(str(candidate), flags, 0o600)
+        except FileExistsError as exc:
+            last_collision = exc
+            continue
+        except PermissionError as exc:
+            # Opening an existing directory as a file can be reported as
+            # PermissionError on Windows rather than FileExistsError.
+            if os.name == "nt" and candidate.is_dir():
+                last_collision = exc
+                continue
+            raise
+        return fd, str(candidate)
+
+    raise FileExistsError(
+        errno.EEXIST,
+        (f"could not allocate a unique temporary file after {_TEMP_NAME_ATTEMPTS} attempts"),
+        str(directory),
+    ) from last_collision
+
+
 def _keep_unreadable_file(path: Path):
     """Move a file whose contents did not parse aside, keeping its bytes.
 
@@ -412,8 +462,8 @@ def _keep_unreadable_file(path: Path):
     """
     path = _write_target(path)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    fd, target = tempfile.mkstemp(
-        dir=str(path.parent),
+    fd, target = _bounded_mkstemp(
+        path.parent,
         prefix=f"{path.name}.unreadable-{stamp}-",
     )
     os.close(fd)
@@ -519,7 +569,11 @@ def _atomic_write_json(path: Path, payload) -> None:
         # directory for a name of its own instead: what it says about a name
         # it chooses is about the directory.
         try:
-            fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+            fd, tmp = _bounded_mkstemp(
+                path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+            )
         except OSError as exc:
             if exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
                 raise
