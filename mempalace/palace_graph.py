@@ -476,6 +476,19 @@ def _get_tunnel_file(config=None) -> str:
     return config.tunnel_file
 
 
+def _ensure_secure_tunnel_permissions(tunnel_file: str) -> None:
+    """Best-effort permission hardening for explicit tunnel storage."""
+    try:
+        os.chmod(os.path.dirname(tunnel_file), 0o700)
+    except (OSError, NotImplementedError):
+        pass
+    try:
+        if os.path.exists(tunnel_file):
+            os.chmod(tunnel_file, 0o600)
+    except (OSError, NotImplementedError):
+        pass
+
+
 def _legacy_tunnel_file() -> str:
     """The pre-3.3.6 hardcoded path. Kept only for one-time orphan detection."""
     return os.path.join(os.path.expanduser("~"), ".mempalace", "tunnels.json")
@@ -501,6 +514,7 @@ def _load_tunnels(config=None):
     """
     current_tunnel_file = _get_tunnel_file(config)
     if os.path.exists(current_tunnel_file):
+        _ensure_secure_tunnel_permissions(current_tunnel_file)
         try:
             with open(current_tunnel_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -542,13 +556,17 @@ def _save_tunnels(tunnels, config=None):
     tunnel_file = _get_tunnel_file(config)
     parent = os.path.dirname(tunnel_file)
     os.makedirs(parent, exist_ok=True)
-    try:
-        os.chmod(parent, 0o700)
-    except (OSError, NotImplementedError):
-        # Windows / unsupported filesystems — tolerate.
-        pass
+    _ensure_secure_tunnel_permissions(tunnel_file)
     tmp_path = tunnel_file + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except (AttributeError, OSError, NotImplementedError):
+        try:
+            os.chmod(tmp_path, 0o600)
+        except (OSError, NotImplementedError):
+            pass
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(tunnels, f, indent=2)
         f.flush()
         try:

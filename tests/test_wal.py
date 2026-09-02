@@ -42,6 +42,40 @@ def test_wal_log_redacts_and_writes(tmp_path, monkeypatch):
     assert entry["params"]["safe"] == "ok"
 
 
+def test_wal_log_hardens_existing_file_before_append(tmp_path, monkeypatch):
+    """A mode-drifted WAL is re-hardened before it is opened for append."""
+    from pathlib import Path
+
+    from mempalace import wal
+
+    wal_dir = tmp_path / "wal"
+    wal_dir.mkdir()
+    wal_file = wal_dir / "write_log.jsonl"
+    wal_file.write_text("", encoding="utf-8")
+    monkeypatch.setattr(wal, "_WAL_FILE", wal_file)
+    monkeypatch.setattr(wal, "_WAL_INITIALIZED_DIR", wal_dir)
+
+    events = []
+    real_chmod = Path.chmod
+    real_open = wal.os.open
+
+    def record_chmod(self, mode):
+        events.append(("chmod", self, mode))
+        return real_chmod(self, mode)
+
+    def record_open(path, flags, mode=0o777, *args, **kwargs):
+        events.append(("open", Path(path), mode))
+        return real_open(path, flags, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "chmod", record_chmod)
+    monkeypatch.setattr(wal.os, "open", record_open)
+
+    wal._wal_log("op", {"safe": "ok"})
+
+    assert events[0] == ("chmod", wal_file, 0o600)
+    assert events[1][0] == "open"
+
+
 def test_wal_ensure_is_idempotent_and_cached(tmp_path, monkeypatch):
     """_ensure_wal hardens the dir once, then short-circuits on the cached path.
 
