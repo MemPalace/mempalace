@@ -675,8 +675,8 @@ class MempalaceConfig:
 
         A long-running Hub keeps this configuration snapshot and may also keep
         a collection opened from it.  CLI search forwarding compares this
-        digest with a freshly loaded config so a changed ``config.json`` falls
-        back to the direct path instead of querying stale Hub state.
+        digest with a freshly loaded config so a changed ``config.json``
+        refuses a second local index load instead of querying stale Hub state.
 
         Hash only resolved settings that affect the currently selected search
         backend.  This detects relevant file edits and Hub-start environment
@@ -692,8 +692,8 @@ class MempalaceConfig:
             backend_resolution_error = None
         except Exception as exc:  # noqa: BLE001 - fingerprint must remain total
             # A mismatched or otherwise invalid palace still needs a stable
-            # digest so the Hub gate can fall back to the direct path, where
-            # normal backend opening reports the actionable error.
+            # digest so the Hub gate can refuse forwarding rather than query
+            # a Hub that no longer matches this process.
             backend = self.backend
             backend_resolution_error = f"{type(exc).__name__}: {exc}"
         embedding_model = self.embedding_model
