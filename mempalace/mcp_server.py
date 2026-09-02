@@ -81,6 +81,7 @@ from .backends.chroma import (  # noqa: E402
 from .backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
 from .date_window import filed_at_in_window, parse_date_bound  # noqa: E402
 from .query_sanitizer import sanitize_query  # noqa: E402
+from .source_identity import identity_metadata  # noqa: E402
 from .searcher import (  # noqa: E402
     SearchError,
     _distance_to_similarity,
@@ -2824,9 +2825,19 @@ def _chunk_index(meta):
 
 
 def _response_safe_meta(meta):
-    safe_meta = _safe_meta(meta)
+    # A copy, because ``_safe_meta`` hands back the caller's own dict and the
+    # two edits below are removals. No caller today reads a record back after
+    # passing it through here, so this is not a live path; it is the shape of
+    # one. Cutting ``source_file`` to a basename in place was already wrong,
+    # and popping ``source_dir_ino`` from a record a writer still holds would
+    # drop the field from whatever it wrote next.
+    safe_meta = dict(_safe_meta(meta))
     if safe_meta.get("source_file"):
         safe_meta["source_file"] = Path(safe_meta["source_file"]).name
+    # ``source_dir_ino`` is bookkeeping for ``sync``, which reads the metadata
+    # directly. It says nothing a caller can use and it describes the host's
+    # filesystem, which is the same reason the path above is cut to its name.
+    safe_meta.pop("source_dir_ino", None)
     return safe_meta
 
 
@@ -3200,6 +3211,12 @@ def tool_add_drawer(
         "filed_at": datetime.now().isoformat(),
         "id_recipe": ID_RECIPE,
     }
+    if source_file:
+        # A drawer filed here names a source file the same way a mined one
+        # does, and ``sync`` decides both by the same rule, so it records the
+        # same directory identity (#2320). Without it this tool would file the
+        # one kind of drawer in a palace that sync cannot protect.
+        base_meta.update(identity_metadata(source_file))
 
     # Idempotency. Three cases to detect a prior committed write:
     # (a) Single-doc path: drawer_id row exists (the only id used).

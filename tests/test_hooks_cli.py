@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 from hypothesis import given
@@ -282,6 +282,15 @@ def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None):
     type(mock_config).hook_silent_save = PropertyMock(return_value=True)
     type(mock_config).hook_desktop_toast = PropertyMock(return_value=False)
     patches.append(patch("mempalace.config.MempalaceConfig", return_value=mock_config))
+    # A Stop or PreCompact hook spawns the transcript ingest through
+    # ``_spawn_mine``, and a real child here outlives the test that started
+    # it: it holds the palace's writer lease, and the next test file to ask
+    # for one is refused with "Peer MCP writer active". Nothing in this file
+    # asserts on a real mine. A test that asserts on the spawn installs its
+    # own stand-in before calling this helper, so only put one here when the
+    # attribute is still the real ``Popen``.
+    if not isinstance(hooks_cli_mod.subprocess.Popen, Mock):
+        patches.append(patch("mempalace.hooks_cli.subprocess.Popen"))
     with contextlib.ExitStack() as stack:
         for p in patches:
             stack.enter_context(p)

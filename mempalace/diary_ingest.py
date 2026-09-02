@@ -34,6 +34,7 @@ from .palace import (
     purge_file_closets,
     upsert_closet_lines,
 )
+from .source_identity import identity_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +191,9 @@ def ingest_diaries(
                 "source_session": "daily_diary",
                 "filed_at": now_iso,
             }
+            # Which directory this diary was read from, so ``sync`` decides an
+            # ingested drawer by the same reading as a mined one (#2320).
+            base_meta.update(identity_metadata(source_file))
             if entities:
                 base_meta["entities"] = entities
 
