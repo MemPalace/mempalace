@@ -43,9 +43,50 @@ class _FixtureAdapter(BaseSourceAdapter):
 class _FakeCollection:
     def __init__(self):
         self.upserts = []
+        self.rows = {}
 
     def upsert(self, **kwargs):
         self.upserts.append(kwargs)
+        for drawer_id, document, metadata in zip(
+            kwargs["ids"], kwargs["documents"], kwargs["metadatas"]
+        ):
+            self.rows[drawer_id] = {"document": document, "metadata": metadata}
+
+    def get(self, *, where=None, limit=None, **_kwargs):
+        def matches(row):
+            if not where:
+                return True
+            if "$and" in where:
+                return all(_matches(row["metadata"], clause) for clause in where["$and"])
+            return _matches(row["metadata"], where)
+
+        rows = [(key, value) for key, value in self.rows.items() if matches(value)]
+        if limit is not None:
+            rows = rows[:limit]
+        return {
+            "ids": [key for key, _ in rows],
+            "documents": [value["document"] for _, value in rows],
+            "metadatas": [value["metadata"] for _, value in rows],
+        }
+
+    def delete(self, *, ids=None, **_kwargs):
+        for drawer_id in ids or []:
+            self.rows.pop(drawer_id, None)
+
+
+class _CleanupFailingCollection(_FakeCollection):
+    def __init__(self):
+        super().__init__()
+        self.fail_cleanup = False
+
+    def delete(self, *, ids=None, **kwargs):
+        if self.fail_cleanup:
+            raise RuntimeError("simulated cleanup failure")
+        super().delete(ids=ids, **kwargs)
+
+
+def _matches(metadata, where):
+    return all(metadata.get(key) == value for key, value in where.items())
 
 
 class _FakeKnowledgeGraph:
@@ -103,10 +144,47 @@ class _IncrementalAdapter(BaseSourceAdapter):
     capabilities = frozenset({"supports_incremental"})
 
     def ingest(self, *, source, palace):
-        raise AssertionError("incremental adapters must be rejected before ingest")
+        yield SourceItemMetadata(source_file="fixture://incremental", version="v1")
+        yield DrawerRecord(content="incremental content", source_file="fixture://incremental")
 
     def describe_schema(self):
         return AdapterSchema(version="1.0", fields={})
+
+
+class _VersionedIncrementalAdapter(BaseSourceAdapter):
+    name = "versioned-incremental"
+    capabilities = frozenset({"supports_incremental", "supports_deletion_tombstones"})
+
+    def __init__(self):
+        self.version = "v1"
+        self.content = "first"
+        self.fail_after_drawer = False
+        self.deleted = False
+        self.empty = False
+        self.close_calls = 0
+
+    def ingest(self, *, source, palace):
+        item = SourceItemMetadata(source_file="fixture://versioned", version=self.version)
+        if self.deleted:
+            yield SourceItemMetadata(source_file=item.source_file, version="__deleted__")
+            return
+        yield item
+        if self.empty:
+            return
+        if palace._skip_requested:
+            return
+        yield DrawerRecord(content=self.content, source_file=item.source_file)
+        if self.fail_after_drawer:
+            raise RuntimeError("simulated extraction failure")
+
+    def is_current(self, *, item, existing_metadata):
+        return bool(existing_metadata and existing_metadata.get("source_version") == item.version)
+
+    def describe_schema(self):
+        return AdapterSchema(version="1.0", fields={})
+
+    def close(self):
+        self.close_calls += 1
 
 
 class _MetadataAdapter(BaseSourceAdapter):
@@ -384,15 +462,255 @@ def test_mine_source_dry_run_preserves_initialized_sqlite_exact_artifacts(tmp_pa
     assert after == before
 
 
-def test_mine_source_rejects_incremental_adapter_before_ingest():
-    register("incremental", _IncrementalAdapter)
+def test_mine_source_runs_incremental_adapter(monkeypatch, tmp_path):
+    from mempalace import knowledge_graph, palace
 
-    with pytest.raises(cli.UnsupportedSourceAdapterProtocolError, match="incremental ingestion"):
+    collection = _FakeCollection()
+    register("incremental", _IncrementalAdapter)
+    monkeypatch.setattr(cli, "MempalaceConfig", _FakeConfig)
+    monkeypatch.setattr(palace, "get_collection", lambda *_a, **_k: collection)
+    monkeypatch.setattr(knowledge_graph, "KnowledgeGraph", _FakeKnowledgeGraph)
+
+    assert (
         cli.mine_source_adapter(
             source_name="incremental",
             source_path="/source",
-            palace_path="/fake/palace",
+            palace_path=str(tmp_path),
         )
+        == 1
+    )
+    metadata = next(iter(collection.rows.values()))["metadata"]
+    assert metadata["source_generation_state"] == "staging"
+    assert metadata["source_version"] == "v1"
+
+
+def test_incremental_sqlite_exact_replaces_changed_item_and_skips_current(tmp_path, monkeypatch):
+    from mempalace.palace import get_collection
+
+    adapter = _VersionedIncrementalAdapter()
+    register(adapter.name, lambda: adapter)
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    palace_path = str(tmp_path / "palace")
+
+    assert (
+        cli.mine_source_adapter(
+            source_name=adapter.name, source_path="/source", palace_path=palace_path
+        )
+        == 1
+    )
+    adapter.version = "v2"
+    adapter.content = "second"
+    assert (
+        cli.mine_source_adapter(
+            source_name=adapter.name, source_path="/source", palace_path=palace_path
+        )
+        == 1
+    )
+    assert (
+        cli.mine_source_adapter(
+            source_name=adapter.name, source_path="/source", palace_path=palace_path
+        )
+        == 0
+    )
+
+    visible = get_collection(palace_path).get(where={"source_file": "fixture://versioned"})
+    assert visible.documents == ["second"]
+    assert visible.metadatas[0]["source_version"] == "v2"
+
+
+def test_incremental_sqlite_exact_failure_keeps_last_active_item(tmp_path, monkeypatch):
+    from mempalace.palace import get_collection
+
+    adapter = _VersionedIncrementalAdapter()
+    register(adapter.name, lambda: adapter)
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    palace_path = str(tmp_path / "palace")
+
+    cli.mine_source_adapter(
+        source_name=adapter.name, source_path="/source", palace_path=palace_path
+    )
+    adapter.version = "v2"
+    adapter.content = "broken replacement"
+    adapter.fail_after_drawer = True
+    with pytest.raises(RuntimeError, match="simulated extraction failure"):
+        cli.mine_source_adapter(
+            source_name=adapter.name, source_path="/source", palace_path=palace_path
+        )
+
+    visible = get_collection(palace_path).get(where={"source_file": "fixture://versioned"})
+    assert visible.documents == ["first"]
+    assert visible.metadatas[0]["source_version"] == "v1"
+
+    adapter.fail_after_drawer = False
+    assert (
+        cli.mine_source_adapter(
+            source_name=adapter.name, source_path="/source", palace_path=palace_path
+        )
+        == 1
+    )
+
+    visible = get_collection(palace_path).get(where={"source_file": "fixture://versioned"})
+    assert visible.documents == ["broken replacement"]
+    assert visible.metadatas[0]["source_version"] == "v2"
+
+
+def test_incremental_cleanup_failure_does_not_roll_back_active_generation(tmp_path, monkeypatch):
+    from mempalace import knowledge_graph, palace
+    from mempalace.sources.lifecycle import SourceLifecycleStore
+
+    adapter = _VersionedIncrementalAdapter()
+    collection = _CleanupFailingCollection()
+    register(adapter.name, lambda: adapter)
+    monkeypatch.setattr(cli, "MempalaceConfig", _FakeConfig)
+    monkeypatch.setattr(palace, "get_collection", lambda *_a, **_k: collection)
+    monkeypatch.setattr(knowledge_graph, "KnowledgeGraph", _FakeKnowledgeGraph)
+    palace_path = str(tmp_path)
+
+    cli.mine_source_adapter(
+        source_name=adapter.name, source_path="/source", palace_path=palace_path
+    )
+    adapter.version = "v2"
+    adapter.content = "second"
+    collection.fail_cleanup = True
+
+    assert (
+        cli.mine_source_adapter(
+            source_name=adapter.name, source_path="/source", palace_path=palace_path
+        )
+        == 1
+    )
+    active = SourceLifecycleStore(str(tmp_path / "knowledge_graph.sqlite3")).active(
+        adapter_name=adapter.name, source_file="fixture://versioned"
+    )
+    assert active.version == "v2"
+    assert any(row["metadata"]["source_version"] == "v2" for row in collection.rows.values())
+
+    collection.fail_cleanup = False
+    adapter.version = "v3"
+    adapter.content = "third"
+    assert (
+        cli.mine_source_adapter(
+            source_name=adapter.name, source_path="/source", palace_path=palace_path
+        )
+        == 1
+    )
+    assert [row["metadata"]["source_version"] for row in collection.rows.values()] == ["v3"]
+
+
+def test_source_adapter_is_closed_after_ingest(tmp_path, monkeypatch):
+    from mempalace import knowledge_graph, palace
+
+    adapter = _VersionedIncrementalAdapter()
+    collection = _FakeCollection()
+    register(adapter.name, lambda: adapter)
+    monkeypatch.setattr(cli, "MempalaceConfig", _FakeConfig)
+    monkeypatch.setattr(palace, "get_collection", lambda *_a, **_k: collection)
+    monkeypatch.setattr(knowledge_graph, "KnowledgeGraph", _FakeKnowledgeGraph)
+
+    cli.mine_source_adapter(
+        source_name=adapter.name, source_path="/source", palace_path=str(tmp_path)
+    )
+
+    assert adapter.close_calls == 1
+
+
+def test_incremental_sqlite_exact_tombstone_hides_and_purges_item(tmp_path, monkeypatch):
+    from mempalace.palace import get_collection
+
+    adapter = _VersionedIncrementalAdapter()
+    register(adapter.name, lambda: adapter)
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    palace_path = str(tmp_path / "palace")
+
+    assert (
+        cli.mine_source_adapter(
+            source_name=adapter.name, source_path="/source", palace_path=palace_path
+        )
+        == 1
+    )
+    adapter.deleted = True
+    assert (
+        cli.mine_source_adapter(
+            source_name=adapter.name, source_path="/source", palace_path=palace_path
+        )
+        == 0
+    )
+
+    visible = get_collection(palace_path).get(where={"source_file": "fixture://versioned"})
+    assert visible.ids == []
+
+
+def test_incremental_sqlite_exact_empty_replacement_hides_prior_item_and_skips_retry(
+    tmp_path, monkeypatch
+):
+    from mempalace.palace import get_collection
+
+    adapter = _VersionedIncrementalAdapter()
+    register(adapter.name, lambda: adapter)
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    palace_path = str(tmp_path / "palace")
+    assert (
+        cli.mine_source_adapter(
+            source_name=adapter.name, source_path="/source", palace_path=palace_path
+        )
+        == 1
+    )
+
+    adapter.version = "v2"
+    adapter.empty = True
+    assert (
+        cli.mine_source_adapter(
+            source_name=adapter.name, source_path="/source", palace_path=palace_path
+        )
+        == 0
+    )
+    assert get_collection(palace_path).get(where={"source_file": "fixture://versioned"}).ids == []
+    # The registry-provided source_version lets the adapter skip this empty
+    # generation rather than repeatedly treating it as unseen.
+    assert (
+        cli.mine_source_adapter(
+            source_name=adapter.name, source_path="/source", palace_path=palace_path
+        )
+        == 0
+    )
+
+
+def test_incremental_visibility_filters_lexical_results_and_refreshes_per_read(
+    tmp_path, monkeypatch
+):
+    from mempalace.palace import get_collection
+
+    adapter = _VersionedIncrementalAdapter()
+    register(adapter.name, lambda: adapter)
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    palace_path = str(tmp_path / "palace")
+    cli.mine_source_adapter(
+        source_name=adapter.name, source_path="/source", palace_path=palace_path
+    )
+
+    visible = get_collection(palace_path)
+    raw = get_collection(palace_path, _include_staging=True)
+    raw.upsert(
+        ids=["staged-only"],
+        documents=["stagedonlytoken"],
+        metadatas=[
+            {
+                "source_file": "fixture://versioned",
+                "adapter_name": adapter.name,
+                "source_generation": "not-active",
+                "source_generation_state": "staging",
+            }
+        ],
+    )
+    assert visible.lexical_search(query="stagedonlytoken", n_results=5).hits == []
+
+    adapter.version = "v2"
+    adapter.content = "second"
+    cli.mine_source_adapter(
+        source_name=adapter.name, source_path="/source", palace_path=palace_path
+    )
+    refreshed = visible.get(where={"source_file": "fixture://versioned"})
+    assert refreshed.documents == ["second"]
 
 
 def test_mine_source_accepts_non_incremental_metadata(monkeypatch, recwarn):

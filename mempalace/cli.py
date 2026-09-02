@@ -35,6 +35,7 @@ Examples:
 
 import argparse
 import contextlib
+import logging
 import os
 import shlex
 import sys
@@ -1152,7 +1153,7 @@ class _DryRunKnowledgeGraphProxy:
         self.operations.append(("supersede", args, kwargs))
 
 
-def mine_source_adapter(
+def mine_source_adapter(  # noqa: C901 - incremental lifecycle states are deliberately co-located
     *,
     source_name: str,
     source_path: str,
@@ -1175,6 +1176,7 @@ def mine_source_adapter(
         get_adapter,
         resolve_adapter_for_source,
     )
+    from .sources.lifecycle import SourceLifecycleStore
 
     adapter_name = resolve_adapter_for_source(explicit=source_name)
     try:
@@ -1185,10 +1187,11 @@ def mine_source_adapter(
             "check the adapter name with `mempalace mine --help`"
         ) from exc
 
-    if "supports_incremental" in adapter.capabilities:
+    incremental = "supports_incremental" in adapter.capabilities
+    if incremental and "supports_kg_triples" in adapter.capabilities:
         raise UnsupportedSourceAdapterProtocolError(
-            f"source adapter {adapter_name!r} requires incremental ingestion, which "
-            "mempalace mine does not support yet"
+            f"source adapter {adapter_name!r} combines incremental drawer ingestion with "
+            "knowledge-graph writes; generation-safe KG replacement is not supported yet"
         )
 
     # A dry run must never open a collection: backend opens can create or
@@ -1198,12 +1201,18 @@ def mine_source_adapter(
     lock = mine_palace_lock(palace_path) if not dry_run else contextlib.nullcontext()
     with lock:
         knowledge_graph = None
+        lifecycle = None
+        pending_item = None
+        pending_generation = None
         try:
             if dry_run:
                 drawer_collection = _DryRunCollectionProxy()
                 knowledge_graph = _DryRunKnowledgeGraphProxy()
             else:
-                drawer_collection = get_collection(palace_path)
+                if incremental:
+                    drawer_collection = get_collection(palace_path, _include_staging=True)
+                else:
+                    drawer_collection = get_collection(palace_path)
                 knowledge_graph = KnowledgeGraph(
                     db_path=os.path.join(palace_path, "knowledge_graph.sqlite3")
                 )
@@ -1216,15 +1225,153 @@ def mine_source_adapter(
                 adapter_version=adapter.adapter_version,
             )
             drawers_written = 0
+            lifecycle = (
+                SourceLifecycleStore(os.path.join(palace_path, "knowledge_graph.sqlite3"))
+                if incremental and not dry_run
+                else None
+            )
+
+            def _existing_source(source_file):
+                active = (
+                    lifecycle.active(adapter_name=adapter.name, source_file=source_file)
+                    if lifecycle is not None
+                    else None
+                )
+                if active is not None:
+                    existing = drawer_collection.get(
+                        where={
+                            "$and": [
+                                {"source_file": source_file},
+                                {"source_generation": active.generation},
+                            ]
+                        },
+                        limit=1,
+                    )
+                else:
+                    # First incremental replacement may be upgrading legacy
+                    # drawers, which have no generation metadata.
+                    existing = drawer_collection.get(where={"source_file": source_file}, limit=1)
+                metadatas = existing.get("metadatas") or []
+                if metadatas:
+                    return existing, metadatas[0]
+                if active is not None:
+                    # Empty items and tombstones have an active lifecycle
+                    # generation but no drawer from which to read provenance.
+                    # The registry remains the palace cursor in that case.
+                    return existing, {
+                        "source_file": source_file,
+                        "source_version": active.version,
+                        "adapter_name": adapter.name,
+                    }
+                return existing, None
+
+            def _cleanup_staged(generation):
+                staged = drawer_collection.get(
+                    where={
+                        "$and": [
+                            {"source_file": generation.source_file},
+                            {"source_generation": generation.generation},
+                        ]
+                    }
+                )
+                ids = staged.get("ids") or []
+                if ids:
+                    drawer_collection.delete(ids=ids)
+                lifecycle.abandon(generation)
+
+            def _commit_pending():
+                nonlocal pending_item, pending_generation
+                if pending_generation is None:
+                    return
+                # Switching the registry is the atomic visibility boundary.
+                # Staged rows stay physically marked ``staging`` forever;
+                # ordinary collection views resolve their visibility against
+                # the registry, so a failure before this point exposes none
+                # of the new item and a failure during cleanup cannot restore
+                # retired content.
+                generation = pending_generation
+                lifecycle.activate(generation)
+                # From this point on the registry is authoritative. A failed
+                # physical cleanup may leave unreachable rows behind, but it
+                # must never trigger the outer rollback path and remove this
+                # newly active generation.
+                pending_generation = None
+                try:
+                    candidates = drawer_collection.get(
+                        where={"source_file": generation.source_file}
+                    )
+                    stale_ids = [
+                        drawer_id
+                        for drawer_id, metadata in zip(
+                            candidates.get("ids") or [], candidates.get("metadatas") or []
+                        )
+                        if (metadata or {}).get("adapter_name") == adapter.name
+                        and (metadata or {}).get("source_generation") != generation.generation
+                    ]
+                    if stale_ids:
+                        drawer_collection.delete(ids=stale_ids)
+                    lifecycle.prune_retired(
+                        adapter_name=adapter.name, source_file=generation.source_file
+                    )
+                except Exception:
+                    logging.getLogger(__name__).warning(
+                        "incremental source cleanup failed after activating %s; "
+                        "the retired generation remains hidden and will be retried "
+                        "on the next replacement",
+                        generation.source_file,
+                        exc_info=True,
+                    )
+                pending_item = None
+                context.finish_source_item()
+
             for result in adapter.ingest(
                 source=SourceRef(local_path=source_path),
                 palace=context,
             ):
                 if isinstance(result, SourceItemMetadata):
-                    # Non-incremental adapters may report a cursor or version
-                    # while still doing a complete re-extract.  Incremental
-                    # adapters are rejected before ingest above, so accepting
-                    # this avoids a late partial-ingest failure.
+                    if incremental:
+                        _commit_pending()
+                        if result.version == "__deleted__":
+                            if "supports_deletion_tombstones" not in adapter.capabilities:
+                                raise UnsupportedSourceAdapterProtocolError(
+                                    f"source adapter {adapter_name!r} yielded a deletion tombstone "
+                                    "without supports_deletion_tombstones"
+                                )
+                            if not dry_run:
+                                lifecycle.tombstone(
+                                    adapter_name=adapter.name,
+                                    source_file=result.source_file,
+                                )
+                                # Physical deletion is deliberately after the
+                                # registry switch: an interrupted purge leaves
+                                # drawers hidden rather than falsely visible.
+                                stale = drawer_collection.get(
+                                    where={"source_file": result.source_file}
+                                )
+                                stale_ids = stale.get("ids") or []
+                                if stale_ids:
+                                    drawer_collection.delete(ids=stale_ids)
+                            context.finish_source_item()
+                            continue
+                        existing, existing_metadata = _existing_source(result.source_file)
+                        context.begin_source_item(result)
+                        if adapter.is_current(item=result, existing_metadata=existing_metadata):
+                            context.skip_current_item()
+                        elif dry_run:
+                            # Preserve dry-run's no-storage invariant while
+                            # still exercising the RFC currentness handshake.
+                            pending_item = result
+                        else:
+                            pending_item = result
+                            pending_generation = lifecycle.begin(
+                                adapter_name=adapter.name,
+                                source_file=result.source_file,
+                                version=result.version,
+                            )
+                            context.begin_source_item(
+                                result, generation=pending_generation.generation
+                            )
+                        continue
                     warnings.warn(
                         f"Source adapter {adapter_name!r} yielded non-incremental item "
                         "metadata; ignoring it during complete ingest",
@@ -1233,6 +1380,14 @@ def mine_source_adapter(
                     )
                     continue
                 if isinstance(result, DrawerRecord):
+                    if incremental and pending_item is None:
+                        raise ValueError(
+                            "incremental adapters must yield SourceItemMetadata before drawers"
+                        )
+                    if incremental and context._skip_requested:
+                        raise ValueError(
+                            "incremental adapter yielded drawers after core marked its item current"
+                        )
                     drawers_written += 1
                     context.upsert_drawer(result)
                     continue
@@ -1240,10 +1395,29 @@ def mine_source_adapter(
                     f"source adapter {adapter_name!r} yielded unsupported result type "
                     f"{type(result).__name__}"
                 )
+            _commit_pending()
             return drawers_written
+        except Exception:
+            if pending_generation is not None and lifecycle is not None:
+                _cleanup_staged(pending_generation)
+                context.finish_source_item()
+            raise
         finally:
-            if knowledge_graph is not None and hasattr(knowledge_graph, "close"):
-                knowledge_graph.close()
+            primary_error = sys.exc_info()[0] is not None
+            try:
+                adapter.close()
+            except Exception:
+                if primary_error:
+                    logging.getLogger(__name__).warning(
+                        "source adapter %r close failed while handling an ingest error",
+                        adapter_name,
+                        exc_info=True,
+                    )
+                else:
+                    raise
+            finally:
+                if knowledge_graph is not None and hasattr(knowledge_graph, "close"):
+                    knowledge_graph.close()
 
 
 def cmd_sweep(args):
