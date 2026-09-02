@@ -285,6 +285,34 @@ class TestSearchMemories:
         assert [hit.id for hit in resolved] == ["current"]
         assert resolved[0].document == "target phrase in current content"
 
+    def test_closet_source_rows_prefer_active_token_over_newer_stale_row(self):
+        from mempalace.searcher import _collapse_physical_generation_rows
+
+        rows = [
+            (
+                "stale-b",
+                "obsolete text",
+                {
+                    "logical_drawer_id": "logical",
+                    "mine_generation_token": "old-token",
+                    "filed_at": "2026-09-03T00:00:00",
+                },
+            ),
+            (
+                "active-a",
+                "current text",
+                {
+                    "logical_drawer_id": "logical",
+                    "mine_generation_token": "active-token",
+                    "filed_at": "2026-09-01T00:00:00",
+                },
+            ),
+        ]
+
+        collapsed = _collapse_physical_generation_rows(rows, {"active-token"})
+
+        assert [(row[0], row[1]) for row in collapsed] == [("active-a", "current text")]
+
     def test_wing_and_room_filter(self, palace_path, seeded_collection):
         result = search_memories("code", palace_path, wing="project", room="frontend")
         assert all(r["wing"] == "project" and r["room"] == "frontend" for r in result["results"])
@@ -1317,6 +1345,41 @@ def test_bm25_commit_marker_is_scoped_to_selected_collection(tmp_path):
         collection_name="target_drawers",
     )
     assert [hit["drawer_id"] for hit in visible["results"]] == ["staged-drawer"]
+
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        INSERT INTO embeddings VALUES (4, 'target-seg', 'old-b', '2026-09-03');
+        INSERT INTO embeddings VALUES (5, 'target-seg', 'active-a', '2026-09-01');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (4, 'obsolete dinosaur only');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (5, 'current replacement text');
+        INSERT INTO embedding_metadata VALUES
+            (4, 'chroma:document', 'obsolete dinosaur only', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (4, 'logical_drawer_id', 'logical-revert', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (4, 'filed_at', '2026-09-03T00:00:00', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (5, 'chroma:document', 'current replacement text', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (5, 'logical_drawer_id', 'logical-revert', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (5, 'mine_generation_token', 'shared-token', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (5, 'filed_at', '2026-09-01T00:00:00', NULL, NULL, NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    reverted = searcher._bm25_only_via_sqlite(
+        "obsolete dinosaur",
+        str(tmp_path),
+        collection_name="target_drawers",
+    )
+    assert reverted["results"] == []
 
 
 def test_finalize_candidate_hits_forwards_stop_words_to_hybrid_rank(monkeypatch):

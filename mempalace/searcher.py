@@ -117,6 +117,28 @@ def _collapse_logical_generation_hits(hits: list) -> list:
     return passthrough + [item[1] for item in chosen.values()]
 
 
+def _collapse_physical_generation_rows(rows, committed_tokens) -> list:
+    """Keep the active physical row per logical id; retain ordinary rows."""
+    chosen = {}
+    ordinary = []
+    for physical_id, document, metadata in rows:
+        metadata = metadata or {}
+        if _is_staged_metadata(metadata, committed_tokens):
+            continue
+        logical_id = metadata.get("logical_drawer_id")
+        if not logical_id:
+            ordinary.append((physical_id, document, metadata))
+            continue
+        key = (
+            metadata.get("mine_generation_token") in committed_tokens,
+            metadata.get("filed_at", ""),
+            physical_id,
+        )
+        if logical_id not in chosen or key > chosen[logical_id][0]:
+            chosen[logical_id] = (key, (physical_id, document, metadata))
+    return ordinary + [item[1] for item in chosen.values()]
+
+
 def _tokenize(text: str, stop_words: frozenset = frozenset()) -> list:
     """Lowercase + strip to alphanumeric tokens of length ≥ 2.
 
@@ -492,6 +514,130 @@ def _sqlite_staged_value_sql(conn) -> str:
     if "bool_value" in columns:
         return "COALESCE(staged.bool_value, staged.int_value, 0)"
     return "COALESCE(staged.int_value, 0)"
+
+
+def _sqlite_active_generation_rows(
+    db_path: str,
+    collection_name: str,
+    logical_ids: set[str],
+) -> dict[str, dict]:
+    """Hydrate marker-selected physical rows for logical IDs from sqlite."""
+    if not logical_ids:
+        return {}
+    conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+    try:
+        placeholders = ",".join("?" for _ in logical_ids)
+        active = conn.execute(
+            f"""
+            SELECT e.id, e.embedding_id, logical.string_value
+            FROM embedding_metadata logical
+            JOIN embeddings e ON e.id = logical.id
+            JOIN segments s ON e.segment_id = s.id
+            JOIN collections c ON s.collection = c.id
+            JOIN embedding_metadata token
+              ON token.id = e.id AND token.key = 'mine_generation_token'
+            JOIN embedding_metadata marker
+              ON marker.key = 'mine_generation_commit'
+             AND marker.string_value = token.string_value
+            JOIN embeddings marker_embedding ON marker_embedding.id = marker.id
+            JOIN segments marker_segment ON marker_segment.id = marker_embedding.segment_id
+            JOIN collections marker_collection ON marker_collection.id = marker_segment.collection
+            WHERE c.name = ?
+              AND marker_collection.name = ?
+              AND logical.key = 'logical_drawer_id'
+              AND logical.string_value IN ({placeholders})
+            """,
+            (collection_name, collection_name, *sorted(logical_ids)),
+        ).fetchall()
+        if not active:
+            return {}
+        internal_ids = [row[0] for row in active]
+        by_internal = {
+            row[0]: {
+                "drawer_id": row[1],
+                "logical_id": row[2],
+                "metadata": {},
+                "document": "",
+            }
+            for row in active
+        }
+        id_placeholders = ",".join("?" for _ in internal_ids)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(embedding_metadata)")}
+        value_columns = [
+            column
+            for column in ("string_value", "int_value", "float_value", "bool_value")
+            if column in columns
+        ]
+        metadata_rows = conn.execute(
+            f"""
+            SELECT id, key, {", ".join(value_columns)}
+            FROM embedding_metadata
+            WHERE id IN ({id_placeholders})
+            """,
+            internal_ids,
+        ).fetchall()
+        for row in metadata_rows:
+            target = by_internal.get(row[0])
+            if target is None or not row[1]:
+                continue
+            value = next((value for value in row[2:] if value is not None), None)
+            if row[1] == "chroma:document":
+                target["document"] = value or ""
+            elif value is not None:
+                target["metadata"][row[1]] = value
+        return {item["logical_id"]: item for item in by_internal.values()}
+    finally:
+        conn.close()
+
+
+def _resolve_sqlite_generation_candidates(candidates, query, db_path, collection_name):
+    logical_ids = {
+        candidate.get("_logical_generation_id")
+        for candidate in candidates
+        if candidate.get("_logical_generation_id")
+    }
+    try:
+        active = _sqlite_active_generation_rows(db_path, collection_name, logical_ids)
+    except sqlite3.Error:
+        logger.warning("Could not resolve sqlite active generations", exc_info=True)
+        active = {}
+    resolved = []
+    emitted = set()
+    for candidate in candidates:
+        logical_id = candidate.get("_logical_generation_id")
+        if not logical_id:
+            resolved.append(candidate)
+            continue
+        if logical_id in emitted:
+            continue
+        emitted.add(logical_id)
+        current = active.get(logical_id)
+        if current is None:
+            resolved.append(candidate)
+            continue
+        if _bm25_scores(query, [current["document"]])[0] <= 0:
+            continue
+        metadata = current["metadata"]
+        full_source = metadata.get("source_file", "") or ""
+        replacement = dict(candidate)
+        replacement.update(
+            {
+                "drawer_id": logical_id,
+                "text": current["document"],
+                "wing": metadata.get("wing", "unknown"),
+                "room": metadata.get("room", "unknown"),
+                "source_file": Path(full_source).name if full_source else "?",
+                "source_path": full_source,
+                "created_at": metadata.get("filed_at", "unknown"),
+                "authored_at": metadata.get("authored_at", metadata.get("filed_at", "unknown")),
+                "_source_file_full": full_source,
+                "_chunk_index": metadata.get("chunk_index"),
+                "_physical_drawer_id": current["drawer_id"],
+                "_active_generation": True,
+            }
+        )
+        resolved.append(replacement)
+    return resolved
 
 
 def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
@@ -1273,6 +1419,7 @@ def _bm25_only_via_sqlite(
         )
 
     # Local BM25 over the candidate set.
+    candidates = _resolve_sqlite_generation_candidates(candidates, query, db_path, collection_name)
     candidates = _collapse_logical_generation_hits(candidates)
     docs = [c["text"] for c in candidates]
     bm25_raw = _bm25_scores(query, docs, stop_words=stop_words)
@@ -1588,6 +1735,14 @@ def _enrich_closet_hits(
             else:
                 source_cache[cache_key] = (
                     list(
+                        (
+                            source_drawers.get("ids", [])
+                            if isinstance(source_drawers, dict)
+                            else getattr(source_drawers, "ids", None)
+                        )
+                        or []
+                    ),
+                    list(
                         getattr(
                             source_drawers,
                             "documents",
@@ -1610,24 +1765,21 @@ def _enrich_closet_hits(
         if cached is None:
             continue
 
-        docs, metadatas = cached
+        physical_ids, docs, metadatas = cached
+        if len(physical_ids) < len(docs):
+            physical_ids.extend(
+                f"_hydrated_row_{index}" for index in range(len(physical_ids), len(docs))
+            )
 
         if len(docs) <= 1:
             continue
 
         indexed = []
 
-        for index, (
-            document,
-            metadata,
-        ) in enumerate(
-            zip(
-                docs,
-                metadatas,
-            )
-        ):
-            if _is_staged_metadata(metadata, committed_tokens):
-                continue
+        source_rows = _collapse_physical_generation_rows(
+            list(zip(physical_ids, docs, metadatas)), committed_tokens
+        )
+        for index, (_, document, metadata) in enumerate(source_rows):
             chunk_index = (
                 metadata.get(
                     "chunk_index",
