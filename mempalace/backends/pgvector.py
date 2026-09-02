@@ -16,6 +16,17 @@ Isolation model (RFC 001 isolation contract): one table per
 table name, so this backend advertises ``supports_namespace_isolation`` and
 satisfies the cross-namespace conformance arm.
 
+Shared multi-node databases: the per-palace component of a table name is a
+hash of ``PalaceRef.id``, which is the palace's *local filesystem path*. That
+is the right default (two palaces on one host never collide), but it makes a
+palace shared by several machines shard silently — a laptop at
+``/Users/ada/.mempalace/palace`` and a server at ``/srv/mempalace/palace``
+pointed at one Postgres hash to different prefixes, so each node writes and
+reads its own private tables and no error is ever raised. Setting
+``pgvector_shared_namespace`` (see :func:`_shared_namespace_slug`) replaces
+that path hash with a name every node can agree on, so a fleet converges on
+one set of tables. Unset — the default — nothing changes.
+
 Dependency posture: the live client needs the optional ``psycopg`` dependency
 (``pip install mempalace[pgvector]``), imported lazily so the package imports
 fine without it. CI runs against an in-memory fake client; the live Postgres
@@ -65,6 +76,10 @@ _DEFAULT_DSN = "postgresql://localhost:5432/mempalace"
 _MARKER_FILENAME = "pgvector_backend.json"
 _MAX_IDENTIFIER = 63  # Postgres identifier byte limit.
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
+# Shared-namespace normalization (see _shared_namespace_slug): separators that
+# fold to "_", and the character set the result must then consist of.
+_SHARED_NAMESPACE_SEPARATOR_RE = re.compile(r"[\s\-./:_]+")
+_SHARED_NAMESPACE_RE = re.compile(r"^[a-z0-9_]*[a-z0-9][a-z0-9_]*$")
 # Operators that translate to a JSONB containment predicate and so can be
 # pushed down to SQL. Comparisons, $or and $contains stay on the local exact
 # path (Python filtering), mirroring the Qdrant backend's local fallback.
@@ -379,6 +394,90 @@ def _slug(value: str, fallback: str = "palace") -> str:
     return f"{safe[:35]}_{digest}"
 
 
+def _shared_namespace_slug(value: str) -> str:
+    """Normalize a shared-namespace setting into a safe Postgres identifier part.
+
+    ``pgvector_shared_namespace`` names a *logical* palace that several machines
+    share. Its whole contract is that every node derives the same table name
+    from it, so normalization is strict and total:
+
+    * lower-cased — identifiers are quoted by this backend, so ``Fleet`` and
+      ``fleet`` would otherwise be two different tables and re-introduce the
+      silent sharding this setting exists to prevent;
+    * common separators (whitespace, ``-``, ``.``, ``/``, ``:`` and ``_``
+      itself) collapse to a *single* ``_``, and leading/trailing ``_`` are
+      trimmed, so ``atk-fleet``, ``atk fleet``, ``atk__fleet`` and
+      ``atk_fleet`` are one namespace. ``_`` has to fold like every other
+      separator: leaving it alone made ``atk--fleet`` equal ``atk-fleet`` while
+      ``atk__fleet`` stayed distinct, so a doubled underscore in one node's
+      config sharded the fleet silently, which is the exact failure this
+      setting exists to prevent;
+    * anything left outside ``[a-z0-9_]`` — quotes, semicolons, non-ASCII — is
+      **rejected** with ``ValueError``.
+
+    Rejecting rather than scrubbing follows :func:`mempalace.config.sanitize_name`
+    and :func:`mempalace.config.normalize_milvus_consistency_level`, which also
+    raise ``ValueError`` on an unusable setting. It matters more here than it
+    does for :func:`_slug`: scrubbing maps distinct inputs onto one identifier
+    (``"日本"`` and ``"한국"`` both reduce to nothing), and two nodes quietly
+    landing on the same or different tables is exactly the failure this setting
+    is meant to make impossible. A loud error at config time is cheap; silently
+    mismatched fleet memory is not.
+
+    Over-length values are clamped here rather than by :func:`_slug`: 35 chars
+    (trailing ``_`` trimmed) plus a 12-hex digest of the normalized value, which
+    is deterministic across nodes. The clamp is written out instead of delegated
+    so the result never contains a doubled ``_``, which keeps this function
+    idempotent — :class:`_PgVectorConfig` re-normalizes an already-normalized
+    value on every reconstruction, so ``f(f(x)) != f(x)`` would silently move a
+    long namespace onto a second table. The final table name is additionally
+    clamped to Postgres' 63-byte limit by :func:`_pg_identifier`.
+    """
+    if not isinstance(value, str):
+        raise ValueError("pgvector_shared_namespace must be a string")
+    normalized = _SHARED_NAMESPACE_SEPARATOR_RE.sub("_", value.strip().lower()).strip("_")
+    if not normalized or not _SHARED_NAMESPACE_RE.match(normalized):
+        raise ValueError(
+            "pgvector_shared_namespace must contain at least one ASCII letter or "
+            "digit and may only use letters, digits, '_', '-', '.', '/', ':' and "
+            f"spaces (got {value!r})"
+        )
+    if len(normalized) <= 48:
+        return normalized
+    digest = sha256(normalized.encode("utf-8")).hexdigest()[:12]
+    return f"{normalized[:35].rstrip('_')}_{digest}"
+
+
+def _shared_namespace_key(namespace_slug: str, shared_namespace: str) -> str:
+    """Unambiguous table-prefix segment for a shared namespace.
+
+    The prefix is ``_``-joined and both the tenant namespace slug and the shared
+    namespace slug are variable length, so the readable spelling alone does not
+    determine the pair: namespace ``acme`` with shared namespace ``prod_fleet``
+    and namespace ``acme_prod`` with shared namespace ``fleet`` both render
+    ``mempalace_acme_prod_fleet``. Two unrelated tenants would land on one table
+    with no error — the same silent merge this feature exists to prevent, but
+    across the isolation boundary the backend advertises with
+    ``supports_namespace_isolation``.
+
+    A fixed-width digest of the *pair*, with an explicit boundary between the
+    two components, restores the information the join loses. It also keeps a
+    shared namespace from ever colliding with the default per-palace slot: that
+    slot is 16 hex characters, and ``<slug>_<12 hex>`` cannot spell 16 hex
+    characters because ``_`` is not a hex digit.
+
+    ``namespace_slug`` is the *slugged* tenant segment, not the raw setting, so
+    the tenant dimension keeps exactly the identity it has today: two raw
+    namespaces that already slug alike stay one tenant whether or not a shared
+    namespace is set.
+
+    Palaces without a shared namespace keep byte-identical table names, so this
+    costs no migration.
+    """
+    digest = sha256(f"{namespace_slug}\x00{shared_namespace}".encode("utf-8")).hexdigest()[:12]
+    return f"{shared_namespace}_{digest}"
+
+
 def _pg_identifier(name: str) -> str:
     """Clamp an identifier to Postgres' 63-byte limit, hashing the overflow."""
     if len(name.encode("utf-8")) <= _MAX_IDENTIFIER:
@@ -467,8 +566,28 @@ def _where_to_sql(where: Optional[dict], params: list) -> str:
 
 @dataclass(frozen=True)
 class _PgVectorConfig:
+    """Resolved pgvector target.
+
+    ``namespace`` is the tenant dimension (``PalaceRef.namespace`` /
+    ``pgvector_namespace``): it partitions *in addition to* the palace.
+    ``shared_namespace`` is the fleet dimension (``pgvector_shared_namespace``):
+    it *replaces* the per-palace path hash so several machines converge on one
+    set of tables. The two are orthogonal and may be combined.
+
+    ``shared_namespace`` is normalized and validated on construction, so every
+    instance holds a value that is already a safe identifier part.
+    """
+
     dsn: str = _DEFAULT_DSN
     namespace: Optional[str] = None
+    shared_namespace: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.shared_namespace is None:
+            return
+        # frozen dataclass: normalize in place so every construction path
+        # (from_options, _table_name's re-derivation, direct calls) validates.
+        object.__setattr__(self, "shared_namespace", _shared_namespace_slug(self.shared_namespace))
 
     @classmethod
     def from_options(cls, options: Optional[dict] = None) -> "_PgVectorConfig":
@@ -491,9 +610,15 @@ class _PgVectorConfig:
             or os.environ.get("MEMPALACE_PGVECTOR_NAMESPACE")
             or getattr(cfg, "pgvector_namespace", None)
         )
+        shared_namespace = (
+            options.get("shared_namespace")
+            or os.environ.get("MEMPALACE_PGVECTOR_SHARED_NAMESPACE")
+            or getattr(cfg, "pgvector_shared_namespace", None)
+        )
         return cls(
             dsn=str(dsn).strip() or _DEFAULT_DSN,
             namespace=str(namespace).strip() or None if namespace else None,
+            shared_namespace=str(shared_namespace).strip() or None if shared_namespace else None,
         )
 
 
@@ -1365,10 +1490,32 @@ class PgVectorBackend(BaseBackend):
         return sha256(palace.id.encode("utf-8", errors="surrogatepass")).hexdigest()[:16]
 
     def _table_prefix(self, *, palace: PalaceRef, config: _PgVectorConfig) -> str:
+        """Table-name prefix for one palace: ``mempalace[_<namespace>]_<key>``.
+
+        ``<key>`` is normally :meth:`_palace_hash` — a hash of the palace's local
+        path — which keeps two palaces on one host apart. When
+        ``shared_namespace`` is configured it takes that slot instead, and the
+        prefix stops depending on the local path entirely: every node that sets
+        the same ``pgvector_shared_namespace`` against the same DSN resolves the
+        same tables, which is what makes a fleet share one memory store rather
+        than silently shard into a private table set per machine.
+
+        That substitution is deliberate and opt-in: within one shared namespace,
+        distinct local palace paths are declared to *be* the same logical palace,
+        so the per-palace partition no longer applies to them. Palaces that must
+        stay apart need distinct namespaces (or no shared namespace at all).
+        ``namespace`` — the tenant dimension — still partitions either way, and
+        :func:`_shared_namespace_key` carries a digest of the pair so the
+        variable-length join cannot smear the two dimensions into each other.
+        """
         parts = ["mempalace"]
-        if config.namespace:
-            parts.append(_slug(config.namespace, "namespace"))
-        parts.append(self._palace_hash(palace))
+        namespace_slug = _slug(config.namespace, "namespace") if config.namespace else ""
+        if namespace_slug:
+            parts.append(namespace_slug)
+        if config.shared_namespace:
+            parts.append(_shared_namespace_key(namespace_slug, config.shared_namespace))
+        else:
+            parts.append(self._palace_hash(palace))
         return "_".join(parts)
 
     def _table_name(
@@ -1377,6 +1524,7 @@ class PgVectorBackend(BaseBackend):
         config = _PgVectorConfig(
             dsn=config.dsn,
             namespace=palace.namespace or config.namespace,
+            shared_namespace=config.shared_namespace,
         )
         prefix = self._table_prefix(palace=palace, config=config)
         return _pg_identifier(f"{prefix}_{_slug(collection_name, 'collection')}")
@@ -1397,6 +1545,13 @@ class PgVectorBackend(BaseBackend):
         target.update(
             {
                 "namespace": config.namespace,
+                # Recorded even when a shared namespace displaces it from the
+                # table name, so a marker still identifies the node that wrote
+                # it. Absent from pre-existing markers, "shared_namespace"
+                # compares equal to the unset default, so old markers keep
+                # validating; setting one changes "table_prefix" too and is
+                # correctly reported as a target change.
+                "shared_namespace": config.shared_namespace,
                 "palace_hash": self._palace_hash(palace),
                 "table_prefix": self._table_prefix(palace=palace, config=config),
             }
@@ -1498,7 +1653,11 @@ class PgVectorBackend(BaseBackend):
         palace, collection_name, create, options = self._normalize_args(args, kwargs)
         config = _PgVectorConfig.from_options(options)
         if palace.namespace and palace.namespace != config.namespace:
-            config = _PgVectorConfig(dsn=config.dsn, namespace=palace.namespace)
+            config = _PgVectorConfig(
+                dsn=config.dsn,
+                namespace=palace.namespace,
+                shared_namespace=config.shared_namespace,
+            )
         client = self._client(config)
         if palace.local_path:
             marker_path = self._marker_path(palace.local_path)

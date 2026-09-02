@@ -967,6 +967,26 @@ class MempalaceConfig:
         return str(value).strip() if value else None
 
     @property
+    def pgvector_shared_namespace(self):
+        """Optional shared table namespace for a pgvector palace spanning hosts.
+
+        By default the pgvector backend derives each table name from a hash of
+        the palace's *local* path, so several machines pointed at one Postgres
+        silently write to separate tables instead of sharing memory. Set this to
+        any name the whole fleet agrees on (letters, digits and ``_ - . / :``
+        or spaces) and every node resolves the same tables.
+
+        Leave unset — the default — for single-machine palaces; table naming is
+        then exactly as before and no migration is needed. It is orthogonal to
+        ``pgvector_namespace``, which stays the tenant-isolation dimension.
+        """
+        env_val = os.environ.get("MEMPALACE_PGVECTOR_SHARED_NAMESPACE")
+        if env_val:
+            return env_val.strip()
+        value = self._file_config.get("pgvector_shared_namespace")
+        return str(value).strip() if value else None
+
+    @property
     def people_map(self):
         """Mapping of name variants to canonical names."""
         if self._people_map_file.exists():

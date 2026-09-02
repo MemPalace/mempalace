@@ -101,6 +101,37 @@ available.
 | -------- | ------- | ----------- |
 | `MEMPALACE_PGVECTOR_DSN` | `postgresql://localhost:5432/mempalace` | Postgres connection string |
 | `MEMPALACE_PGVECTOR_NAMESPACE` | _(none)_ | Schema namespace (tenant isolation) |
+| `MEMPALACE_PGVECTOR_SHARED_NAMESPACE` | _(none)_ | Shared table namespace for one palace spanning several machines |
+
+#### Sharing one palace across machines
+
+Table names normally include a hash of the palace's **local** path, so two
+machines pointed at the same database write to different tables and never see
+each other's memory — with no error to warn you. If you want a laptop, a
+desktop and a server to share one memory store, give every node the same
+shared namespace:
+
+```bash
+export MEMPALACE_PGVECTOR_DSN=postgresql://user:pass@db.internal:5432/mempalace
+export MEMPALACE_PGVECTOR_SHARED_NAMESPACE=fleet
+```
+
+or `"pgvector_shared_namespace": "fleet"` in `config.json`. The local path then
+drops out of the table name and every node resolves the same tables.
+
+- Leave it unset for a single-machine palace — naming is unchanged and existing
+  palaces need no migration.
+- Setting it on a palace that already has data points at *new*, empty tables;
+  MemPalace refuses to open the palace rather than appear to lose data, so
+  choose the namespace before you mine.
+- Every palace that shares a namespace shares its memory, including two palaces
+  on the *same* machine. The setting declares "these are one logical palace", so
+  give anything that must stay separate its own namespace.
+- Allowed characters are letters, digits and `_ - . / :` or spaces; the value is
+  lower-cased and runs of separators fold to a single `_`, so `Team-A`,
+  `team_a` and `team__a` are all the same namespace. Anything else is rejected.
+- It is independent of `MEMPALACE_PGVECTOR_NAMESPACE`: that one still isolates
+  tenants, and the two can be combined.
 
 For an end-to-end deployment that puts a server-mode backend behind the MCP
 server, see [Remote / Team Server](/guide/remote-server).

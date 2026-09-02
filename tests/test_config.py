@@ -97,6 +97,38 @@ def test_milvus_config_from_env_and_file(tmp_path, monkeypatch):
     assert cfg.milvus_consistency_level == "Eventually"
 
 
+def test_pgvector_config_from_env_and_file(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump(
+            {
+                "pgvector_dsn": "postgresql://config.example:5432/memdb",
+                "pgvector_namespace": "config-ns",
+                "pgvector_shared_namespace": "config-fleet",
+            },
+            f,
+        )
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.pgvector_dsn == "postgresql://config.example:5432/memdb"
+    assert cfg.pgvector_namespace == "config-ns"
+    assert cfg.pgvector_shared_namespace == "config-fleet"
+
+    monkeypatch.setenv("MEMPALACE_PGVECTOR_DSN", "postgresql://env.example:5432/memdb")
+    monkeypatch.setenv("MEMPALACE_PGVECTOR_NAMESPACE", "env-ns")
+    monkeypatch.setenv("MEMPALACE_PGVECTOR_SHARED_NAMESPACE", "env-fleet")
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    assert cfg.pgvector_dsn == "postgresql://env.example:5432/memdb"
+    assert cfg.pgvector_namespace == "env-ns"
+    assert cfg.pgvector_shared_namespace == "env-fleet"
+
+
+def test_pgvector_shared_namespace_unset_by_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_PGVECTOR_SHARED_NAMESPACE", raising=False)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.pgvector_shared_namespace is None
+
+
 def test_milvus_config_rejects_invalid_consistency_level(tmp_path, monkeypatch):
     monkeypatch.setenv("MEMPALACE_MILVUS_CONSISTENCY_LEVEL", "linearizable")
     cfg = MempalaceConfig(config_dir=str(tmp_path))
