@@ -1127,6 +1127,99 @@ def test_end_of_mine_hallways_read_then_fts_validation_write(tmp_path, monkeypat
     assert gate.events[-4:] == ["read-enter", "read-exit", "write-enter", "write-exit"]
 
 
+def test_publication_rollback_stays_inside_one_write_gate():
+    import mempalace.convo_miner as convo_miner
+
+    class Gate:
+        def __init__(self):
+            self.active = False
+            self.events = []
+
+        @contextlib.contextmanager
+        def write_lock(self):
+            assert not self.active
+            self.active = True
+            self.events.append("write-enter")
+            try:
+                yield
+            finally:
+                self.events.append("write-exit")
+                self.active = False
+
+    class Collection:
+        def __init__(self, gate):
+            self.gate = gate
+            self.updates = []
+
+        def update(self, ids, metadatas):
+            assert self.gate.active
+            self.updates.append((list(ids), list(metadatas)))
+
+        def delete(self, ids):
+            assert self.gate.active
+            raise RuntimeError("cleanup failed")
+
+    gate = Gate()
+    collection = Collection(gate)
+    previous = {"old": {"source_mtime": 1.0, "mine_staged": False}}
+    result = convo_miner._publish_changed_generations(
+        collection,
+        final_metadata=[
+            ("old", {"source_mtime": 2.0, "mine_staged": False}),
+            ("new", {"source_mtime": 2.0, "mine_staged": False}),
+        ],
+        staged_upserts=[("new", "new text", {"source_mtime": 2.0, "mine_staged": False})],
+        stale_ids=["stale"],
+        previous_metadata=previous,
+        source_file="chat.jsonl",
+        access_gate=gate,
+    )
+
+    assert result is False
+    assert gate.events == ["write-enter", "write-exit"]
+    assert collection.updates[-1][1][0] == previous["old"]
+    assert collection.updates[-1][1][1]["mine_staged"] is True
+
+
+def test_content_hash_prefetch_ignores_staged_generations():
+    from mempalace.palace import NORMALIZE_VERSION, prefetch_content_hashes
+
+    class Collection:
+        @staticmethod
+        def count():
+            return 2
+
+        @staticmethod
+        def get(limit, offset, include):
+            if offset:
+                return {"ids": [], "metadatas": []}
+            return {
+                "ids": ["staged", "committed"],
+                "metadatas": [
+                    {
+                        "wing": "wing",
+                        "source_file": "staged.jsonl",
+                        "extract_mode": "exchange",
+                        "normalize_version": NORMALIZE_VERSION,
+                        "content_hash": "staged-hash",
+                        "mine_staged": True,
+                    },
+                    {
+                        "wing": "wing",
+                        "source_file": "committed.jsonl",
+                        "extract_mode": "exchange",
+                        "normalize_version": NORMALIZE_VERSION,
+                        "content_hash": "committed-hash",
+                    },
+                ],
+            }
+
+    hashes = prefetch_content_hashes(Collection(), extract_mode="exchange")
+
+    assert ("wing", "staged-hash") not in hashes
+    assert hashes[("wing", "committed-hash")] == "committed.jsonl"
+
+
 class TestSourceFileDeleteIds:
     """#104: the sweeper writes drawers with no extract_mode at all
     (ingest_mode="sweep"). convo_miner's default exchange-mode purge

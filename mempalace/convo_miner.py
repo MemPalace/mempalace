@@ -691,18 +691,42 @@ def _publish_changed_generations(
     access_gate=None,
 ) -> bool:
     """Publish a complete staged target set and retire old generations."""
+    staged_ids = {drawer_id for drawer_id, _, _ in staged_upserts}
+
+    def _rollback_metadata():
+        rollback = []
+        for drawer_id, final_meta in final_metadata:
+            if drawer_id in previous_metadata:
+                rollback.append((drawer_id, previous_metadata[drawer_id]))
+                continue
+            if drawer_id in staged_ids:
+                staged_meta = dict(final_meta)
+                staged_meta["mine_staged"] = True
+                staged_meta.pop("source_mtime", None)
+                rollback.append((drawer_id, staged_meta))
+        for batch_start in range(0, len(rollback), DRAWER_UPSERT_BATCH_SIZE):
+            batch = rollback[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+            collection.update(
+                ids=[drawer_id for drawer_id, _ in batch],
+                metadatas=[meta for _, meta in batch],
+            )
+
     try:
         with _access_write(access_gate):
-            # Publication and superseded-generation cleanup are one
-            # reader-visible step. The HTTP gate stays exclusive across every
-            # metadata batch and the final delete.
-            for batch_start in range(0, len(final_metadata), DRAWER_UPSERT_BATCH_SIZE):
-                batch = final_metadata[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
-                collection.update(
-                    ids=[drawer_id for drawer_id, _ in batch],
-                    metadatas=[meta for _, meta in batch],
-                )
-            collection.delete(ids=stale_ids)
+            try:
+                # Publication, cleanup, and any rollback are one
+                # reader-visible step. Never release the HTTP write gate while
+                # partially published metadata can be observed.
+                for batch_start in range(0, len(final_metadata), DRAWER_UPSERT_BATCH_SIZE):
+                    batch = final_metadata[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+                    collection.update(
+                        ids=[drawer_id for drawer_id, _ in batch],
+                        metadatas=[meta for _, meta in batch],
+                    )
+                collection.delete(ids=stale_ids)
+            except Exception:
+                _rollback_metadata()
+                raise
         return True
     except Exception:
         logger.warning(
@@ -713,36 +737,6 @@ def _publish_changed_generations(
             source_file,
             exc_info=True,
         )
-
-    # A normal backend exception can land after some publication batches but
-    # before cleanup. Hide every newly staged physical generation again;
-    # unchanged old rows remain searchable.
-    staged_ids = {drawer_id for drawer_id, _, _ in staged_upserts}
-    rollback = []
-    for drawer_id, final_meta in final_metadata:
-        if drawer_id in previous_metadata:
-            rollback.append((drawer_id, previous_metadata[drawer_id]))
-            continue
-        if drawer_id in staged_ids:
-            staged_meta = dict(final_meta)
-            staged_meta["mine_staged"] = True
-            staged_meta.pop("source_mtime", None)
-            rollback.append((drawer_id, staged_meta))
-    for batch_start in range(0, len(rollback), DRAWER_UPSERT_BATCH_SIZE):
-        batch = rollback[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
-        try:
-            with _access_write(access_gate):
-                collection.update(
-                    ids=[drawer_id for drawer_id, _ in batch],
-                    metadatas=[meta for _, meta in batch],
-                )
-        except Exception:
-            logger.warning(
-                "Failed to restore staged visibility for %s",
-                source_file,
-                exc_info=True,
-            )
-            break
     return False
 
 

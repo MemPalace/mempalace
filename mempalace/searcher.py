@@ -423,6 +423,28 @@ def _visible_sqlite_drawers(drawers) -> list:
     return [drawer for drawer in drawers if not _is_staged_metadata(drawer.get("metadata"))]
 
 
+def _visible_drawer_where(where: dict) -> dict:
+    """Exclude staged rows in the backend before its top-K limit is applied."""
+    committed = {"mine_staged": {"$ne": True}}
+    if not where:
+        return committed
+    clauses = where.get("$and") if isinstance(where, dict) else None
+    if isinstance(clauses, list):
+        return {"$and": [*clauses, committed]}
+    return {"$and": [where, committed]}
+
+
+def _sqlite_staged_value_sql(conn) -> str:
+    """Return a staged-flag expression compatible with old Chroma schemas."""
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(embedding_metadata)")}
+    except sqlite3.Error:
+        columns = set()
+    if "bool_value" in columns:
+        return "COALESCE(staged.bool_value, staged.int_value, 0)"
+    return "COALESCE(staged.int_value, 0)"
+
+
 def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
     """Parse all `→drawer_id_a,drawer_id_b` pointers out of a closet document.
 
@@ -742,7 +764,7 @@ def search(
     # creation — their similarity scores will be junk until they run repair.
     _warn_if_legacy_metric(col)
 
-    where = build_where_filter(wing, room)
+    where = _visible_drawer_where(build_where_filter(wing, room))
 
     try:
         kwargs = {
@@ -918,8 +940,20 @@ def _bm25_only_via_sqlite(
 
         collection_name = get_configured_collection_name()
 
+    staged_value_sql = "COALESCE(staged.int_value, 0)"
+
     def _metadata_filter_sql(row_id_expr: str) -> tuple[str, list[str]]:
-        clauses = []
+        clauses = [
+            f"""
+            AND NOT EXISTS (
+                SELECT 1
+                FROM embedding_metadata staged
+                WHERE staged.id = {row_id_expr}
+                  AND staged.key = 'mine_staged'
+                  AND {staged_value_sql} = 1
+            )
+            """
+        ]
         params = []
         for key, value in (("wing", wing), ("room", room), ("source_file", source_file)):
             if not value:
@@ -960,6 +994,8 @@ def _bm25_only_via_sqlite(
         conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
     except sqlite3.Error as e:
         return _search_error_result(f"sqlite open failed: {e}")
+
+    staged_value_sql = _sqlite_staged_value_sql(conn)
 
     window_active = since_dt is not None or before_dt is not None
     try:
@@ -1190,7 +1226,7 @@ def _merge_bm25_union_candidates(
     before admitting them, preserving the same distance guarantee as the
     vector-only path.
     """
-    where = build_where_filter(wing, room, source_file)
+    where = _visible_drawer_where(build_where_filter(wing, room, source_file))
     try:
         lexical = drawers_col.lexical_search(
             query=query,
@@ -2088,6 +2124,7 @@ def search_memories(
 
     metric = _metric_for_collection(drawers_col)
     where = build_where_filter(wing, room, source_file)
+    drawer_where = _visible_drawer_where(where)
 
     # Hybrid retrieval: always query drawers directly (the floor), then use
     # closet hits to boost rankings. Closets are a ranking SIGNAL, never a
@@ -2107,8 +2144,7 @@ def search_memories(
             "n_results": pool_size,  # over-fetch for re-ranking
             "include": ["documents", "metadatas", "distances"],
         }
-        if where:
-            dkwargs["where"] = where
+        dkwargs["where"] = drawer_where
         drawer_results = _query_drawers_with_filter_fallback(
             drawers_col, dkwargs, query, n_results, wing, room, source_file
         )

@@ -1665,6 +1665,8 @@ def prefetch_content_hashes(
             batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
             for meta in batch["metadatas"]:
                 meta = meta or {}
+                if meta.get("mine_staged") is True:
+                    continue
                 content_hash_field = meta.get("content_hash")
                 src = meta.get("source_file")
                 wing = meta.get("wing")

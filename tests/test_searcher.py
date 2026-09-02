@@ -78,23 +78,34 @@ class TestSearchMemories:
 
     def test_staged_conversation_generation_is_not_searchable(self, palace_path, collection):
         staged_text = "unpublished generation sentinel phrase"
+        staged_ids = [f"staged-generation-{index}" for index in range(8)]
         collection.upsert(
-            ids=["staged-generation"],
-            documents=[staged_text],
+            ids=[*staged_ids, "committed-generation"],
+            documents=[*[staged_text] * len(staged_ids), staged_text],
             metadatas=[
+                *[
+                    {
+                        "wing": "sessions",
+                        "room": "general",
+                        "source_file": f"/tmp/staged-{index}.jsonl",
+                        "filed_at": "2026-09-02T00:00:00",
+                        "mine_staged": True,
+                    }
+                    for index in range(len(staged_ids))
+                ],
                 {
                     "wing": "sessions",
                     "room": "general",
-                    "source_file": "/tmp/session.jsonl",
+                    "source_file": "/tmp/committed.jsonl",
                     "filed_at": "2026-09-02T00:00:00",
-                    "mine_staged": True,
-                }
+                },
             ],
         )
 
-        result = search_memories(staged_text, palace_path, n_results=10)
+        result = search_memories(staged_text, palace_path, n_results=1)
 
-        assert all(hit["text"] != staged_text for hit in result["results"])
+        assert len(result["results"]) == 1
+        assert result["results"][0]["source_path"] == "/tmp/committed.jsonl"
 
     def test_wing_filter(self, palace_path, seeded_collection):
         result = search_memories("planning", palace_path, wing="notes")
