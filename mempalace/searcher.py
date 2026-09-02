@@ -129,6 +129,9 @@ def _collapse_physical_generation_rows(rows, committed_tokens) -> list:
         if not logical_id:
             ordinary.append((physical_id, document, metadata))
             continue
+        generation_token = metadata.get("mine_generation_token")
+        if generation_token and generation_token not in committed_tokens:
+            continue
         key = (
             metadata.get("mine_generation_token") in committed_tokens,
             metadata.get("filed_at", ""),
@@ -613,7 +616,8 @@ def _resolve_sqlite_generation_candidates(candidates, query, db_path, collection
         emitted.add(logical_id)
         current = active.get(logical_id)
         if current is None:
-            resolved.append(candidate)
+            if not candidate.get("_generation_token"):
+                resolved.append(candidate)
             continue
         if _bm25_scores(query, [current["document"]])[0] <= 0:
             continue
@@ -1415,6 +1419,7 @@ def _bm25_only_via_sqlite(
                 "_logical_generation_id": meta.get("logical_drawer_id"),
                 "_physical_drawer_id": d["_stored_drawer_id"],
                 "_active_generation": meta.get("mine_generation_token") in committed_tokens,
+                "_generation_token": meta.get("mine_generation_token"),
             }
         )
 
@@ -1440,6 +1445,7 @@ def _bm25_only_via_sqlite(
             h.pop("_logical_generation_id", None)
             h.pop("_physical_drawer_id", None)
             h.pop("_active_generation", None)
+            h.pop("_generation_token", None)
 
     result = {
         "query": query,
@@ -2269,6 +2275,9 @@ def _current_generation_ids_for_query(collection, raw, committed_tokens) -> dict
     for index, physical_id in enumerate(ids):
         meta = metas[index] if index < len(metas) else {}
         if _is_staged_metadata(meta, committed_tokens):
+            continue
+        generation_token = (meta or {}).get("mine_generation_token")
+        if generation_token and generation_token not in committed_tokens:
             continue
         logical_id = (meta or {}).get("logical_drawer_id")
         key = (

@@ -307,6 +307,15 @@ class TestSearchMemories:
                     "filed_at": "2026-09-01T00:00:00",
                 },
             ),
+            (
+                "removed-chunk",
+                "removed text",
+                {
+                    "logical_drawer_id": "removed-logical",
+                    "mine_generation_token": "retired-token",
+                    "filed_at": "2026-09-04T00:00:00",
+                },
+            ),
         ]
 
         collapsed = _collapse_physical_generation_rows(rows, {"active-token"})
@@ -1380,6 +1389,29 @@ def test_bm25_commit_marker_is_scoped_to_selected_collection(tmp_path):
         collection_name="target_drawers",
     )
     assert reverted["results"] == []
+
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        INSERT INTO embeddings VALUES (6, 'target-seg', 'removed-chunk', '2026-09-04');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (6, 'removed unicorn memory');
+        INSERT INTO embedding_metadata VALUES
+            (6, 'chroma:document', 'removed unicorn memory', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (6, 'logical_drawer_id', 'removed-logical', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (6, 'mine_generation_token', 'retired-token', NULL, NULL, NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+    removed = searcher._bm25_only_via_sqlite(
+        "removed unicorn",
+        str(tmp_path),
+        collection_name="target_drawers",
+    )
+    assert removed["results"] == []
 
 
 def test_finalize_candidate_hits_forwards_stop_words_to_hybrid_rank(monkeypatch):
