@@ -804,6 +804,61 @@ class TestSearchCLI:
         mock_probe.assert_not_called()
         mock_open.assert_called_once_with(fake_palace_path, opener=get_collection)
 
+    def test_cli_filtered_query_fallback_engaged_when_where_present(self, fake_palace_path, capsys):
+        """Regression for #2373: CLI `search()` with a wing/room filter must
+        route the filtered ``query(where=...)`` call through the same recovery
+        helper `search_memories()` already uses.
+
+        A ChromaDB HNSW/SQLite index mismatch surfaces as a hard
+        "Error finding id" on *filtered* queries even when unfiltered queries
+        work. Before this fix the CLI path — the one an operator runs by hand
+        — was the only search entry point that surfaced the raw crash while
+        the MCP tool path silently recovered.
+
+        The fallback contract: retry without the ``where`` clause (over-fetch),
+        then post-filter by wing/room in Python. This test asserts that
+        contract end-to-end: the first ``col.query`` raises with the real
+        HNSW error, the second returns a mixed-wing set, and the CLI output
+        contains only the wing the operator asked for.
+        """
+        mock_col = MagicMock()
+        mock_col.metadata = {"hnsw:space": "cosine"}
+        mock_col.query.side_effect = [
+            RuntimeError("Error finding id"),
+            {
+                "documents": [["drop document", "keep document"]],
+                "metadatas": [
+                    [
+                        {"source_file": "drop.md", "wing": "other-wing", "room": "notes"},
+                        {"source_file": "keep.md", "wing": "keep-wing", "room": "notes"},
+                    ]
+                ],
+                "distances": [[1.0, 0.3]],
+            },
+        ]
+        with (
+            patch("mempalace.searcher.resolve_backend_name", return_value="chroma"),
+            patch(
+                "mempalace.backends.chroma.hnsw_capacity_status",
+                return_value={"diverged": False, "status": "ok"},
+            ),
+            patch("mempalace.searcher.get_collection", return_value=mock_col),
+        ):
+            # Must NOT raise SearchError — the helper catches the filtered-query
+            # failure and the unfiltered retry succeeds.
+            search("needle", fake_palace_path, wing="keep-wing")
+
+        captured = capsys.readouterr()
+        # Fallback engaged: both the failing filtered call and the recovery
+        # unfiltered call hit the backend.
+        assert mock_col.query.call_count == 2
+        # The keep-wing drawer made it through to the printed results.
+        assert "keep document" in captured.out
+        assert "keep-wing" in captured.out
+        # The other wing was dropped by the Python-side post-filter.
+        assert "drop document" not in captured.out
+        assert "other-wing" not in captured.out
+
 
 # ── _tokenize stop-word filter ─────────────────────────────────────────
 

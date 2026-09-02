@@ -743,7 +743,15 @@ def search(
         if where:
             kwargs["where"] = where
 
-        results = col.query(**kwargs)
+        # Route the filtered drawer query through the same recovery helper
+        # `search_memories()` uses. A ChromaDB HNSW/SQLite mismatch makes
+        # `query(where=...)` raise "Error finding id" while an unfiltered
+        # query still works; without this the CLI was the one search path
+        # that surfaced the hard error. The CLI has no source_file dimension
+        # (its filter surface is wing/room only), so let the helper's
+        # source_file default to None and its re-filter re-apply wing/room.
+        # See #1245 / #2373.
+        results = _query_drawers_with_filter_fallback(col, kwargs, query, n_results, wing, room)
 
     except Exception as e:
         print(f"\n  Search error: {e}")
