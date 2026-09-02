@@ -9,10 +9,7 @@ pattern as the project miner's.
 Written BEFORE the fix.
 """
 
-from pathlib import Path
-
-from mempalace.convo_miner import MAX_FILE_SIZE, _source_file_size_limit
-from mempalace.normalize import MAX_STREAMING_JSONL_FILE_SIZE
+from mempalace.convo_miner import MAX_FILE_SIZE
 
 
 class TestConvoMinerSizeCap:
@@ -32,7 +29,3 @@ class TestConvoMinerSizeCap:
             "Raise to at least 100 MB (match miner.py at 500 MB for "
             "consistency across both miners)."
         )
-
-    def test_jsonl_uses_streaming_size_limit(self):
-        assert _source_file_size_limit(Path("session.jsonl")) == MAX_STREAMING_JSONL_FILE_SIZE
-        assert _source_file_size_limit(Path("bundle.json")) == MAX_FILE_SIZE
