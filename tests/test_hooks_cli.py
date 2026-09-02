@@ -1625,6 +1625,7 @@ def test_queued_mine_restores_claimed_request_after_spawn_failure(tmp_path):
         patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
         patch("mempalace.hooks_cli._slot_file_pid_alive", return_value=False),
         patch("mempalace.hooks_cli._mempalace_python", return_value=sys.executable),
+        patch("mempalace.hooks_cli.time.sleep") as sleep,
         patch(
             "mempalace.hooks_cli.subprocess.Popen",
             side_effect=[OSError("executable missing"), replacement],
@@ -1634,6 +1635,8 @@ def test_queued_mine_restores_claimed_request_after_spawn_failure(tmp_path):
 
     assert pending_file.exists()
     assert popen.call_count == 2
+    assert sleep.call_args_list[-1].args == (1.0,)
+    assert json.loads(pending_file.read_text(encoding="utf-8"))["watcher_attempt"] == 1
     assert watcher_file.read_text(encoding="ascii").split()[0] == "654321"
 
 

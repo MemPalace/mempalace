@@ -504,6 +504,12 @@ def _run_queued_mine(pid_path: str, pending_path: str, watcher_path: str) -> Non
             if pending_file.exists():
                 claimed_file.unlink()
             else:
+                try:
+                    payload = json.loads(claimed_file.read_text(encoding="utf-8"))
+                    payload["watcher_attempt"] = int(payload.get("watcher_attempt", 0)) + 1
+                    claimed_file.write_text(json.dumps(payload), encoding="utf-8")
+                except (OSError, ValueError, TypeError):
+                    pass
                 os.replace(claimed_file, pending_file)
         except OSError:
             pass
@@ -565,20 +571,29 @@ def _run_queued_mine(pid_path: str, pending_path: str, watcher_path: str) -> Non
             pass
         if pending_file.exists() and not watcher_file.exists():
             try:
-                latest = json.loads(pending_file.read_text(encoding="utf-8"))["cmd"]
+                payload = json.loads(pending_file.read_text(encoding="utf-8"))
+                latest = payload["cmd"]
+                attempt = max(0, int(payload.get("watcher_attempt", 0)))
             except (OSError, ValueError, KeyError, TypeError):
                 latest = None
+                attempt = 0
             if latest:
-                _queue_mine_followup(latest, pid_file)
+                if attempt:
+                    time.sleep(min(60.0, 2.0 ** min(attempt - 1, 6)))
+                if pending_file.exists() and not watcher_file.exists():
+                    _queue_mine_followup(latest, pid_file, watcher_attempt=attempt)
 
 
-def _queue_mine_followup(cmd: list[str], pid_file: Path) -> bool:
+def _queue_mine_followup(cmd: list[str], pid_file: Path, *, watcher_attempt: int = 0) -> bool:
     """Durably coalesce one latest-state mine behind the active snapshot."""
     pending_file = pid_file.with_suffix(".pending.json")
     watcher_file = pid_file.with_suffix(".watcher.pid")
     try:
         temp_file = pending_file.with_name(f".{pending_file.name}.{os.getpid()}.tmp")
-        temp_file.write_text(json.dumps({"cmd": cmd}), encoding="utf-8")
+        temp_file.write_text(
+            json.dumps({"cmd": cmd, "watcher_attempt": max(0, watcher_attempt)}),
+            encoding="utf-8",
+        )
         os.replace(temp_file, pending_file)
     except OSError:
         return False
