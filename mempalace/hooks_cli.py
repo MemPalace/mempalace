@@ -2034,13 +2034,17 @@ def hook_session_end(data: dict, harness: str):
                     agent_name,
                     toast=toast,
                 )
-                _save_diary_direct(
+                final_checkpoint_id = f"session-end:{_session_checkpoint_epoch(session_id)}"
+                final_result = _save_diary_direct(
                     valid_transcript,
                     session_id,
                     wing=target_wing,
                     toast=toast,
                     agent_name=agent_name,
+                    checkpoint_id=final_checkpoint_id,
                 )
+                if final_result.get("count", 0) > 0:
+                    _discard_pending_checkpoint(session_id, final_checkpoint_id)
                 _ingest_transcript(valid_transcript)
             _maybe_auto_ingest()
 

@@ -2296,7 +2296,12 @@ def test_session_end_uses_detached_paths_not_sync_mine(tmp_path):
     mock_auto.assert_called_once()
     mock_sync.assert_not_called()
     mock_save.assert_called_once_with(
-        expected_path, "sess", wing="wing_sessions", toast=False, agent_name="claude"
+        expected_path,
+        "sess",
+        wing="wing_sessions",
+        toast=False,
+        agent_name="claude",
+        checkpoint_id="session-end:initial",
     )
     # The session is over; its per-session save marker is cleared.
     assert not last_save_file.exists()
@@ -2403,6 +2408,43 @@ def test_session_end_flushes_exact_frozen_pending_payload_before_advancing(tmp_p
     assert saved is True
     assert write.call_args.kwargs["entry"] == frozen_entry
     assert list(tmp_path.glob("pending_checkpoint_*.json")) == []
+
+
+def test_failed_final_session_snapshot_stays_pending(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(35)],
+    )
+    last_save_file = tmp_path / "sess_last_save"
+    last_save_file.write_text("15", encoding="utf-8")
+
+    with patch("mempalace.hooks_cli.MempalaceConfig") as config:
+        config.return_value.hooks_auto_save = True
+        config.return_value.hook_desktop_toast = False
+        config.return_value.hook_use_daemon = False
+        with (
+            patch("mempalace.server_registry.read_live_serverinfo", return_value=None),
+            patch(
+                "mempalace.mcp_server.tool_diary_write",
+                return_value={"success": False, "error": "temporary failure"},
+            ),
+            patch("mempalace.hooks_cli._ingest_transcript", return_value=False),
+            patch("mempalace.hooks_cli._maybe_auto_ingest"),
+        ):
+            _capture_hook_output(
+                hook_session_end,
+                {"session_id": "sess", "transcript_path": str(transcript)},
+                state_dir=tmp_path,
+            )
+
+    assert last_save_file.exists()
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        pending = hooks_cli_mod._pending_checkpoints_for_session("sess")
+        assert len(pending) == 1
+        payload = json.loads(pending[0].read_text(encoding="utf-8"))
+        assert payload["checkpoint_id"] == "session-end:initial"
+        assert hooks_cli_mod._session_checkpoint_epoch("sess") == "initial"
 
 
 def test_session_end_defaults_to_saving_when_config_unreadable(tmp_path):
