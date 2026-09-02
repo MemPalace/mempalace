@@ -9,6 +9,7 @@ Supported:
       array of them that a real data export ships)
     - Claude Code JSONL (with tool_use/tool_result block capture)
     - OpenAI Codex CLI JSONL
+    - Google Antigravity / Gemini IDE transcript JSONL (~/.gemini/antigravity-ide/brain/.../transcript.jsonl)
     - Gemini CLI JSONL (~/.gemini/tmp/<project_hash>/chats/session-*.jsonl)
     - Pi agent JSONL
     - Gemini CLI / Google AI Studio JSON sessions (contents / messages / flat list)
@@ -237,6 +238,10 @@ def _try_normalize_json_split(content: str) -> Optional[list]:
     a separate list entry (bundle formats) or a single-element list.
     """
 
+    normalized = _try_antigravity_jsonl(content)
+    if normalized:
+        return [normalized]
+
     normalized = _try_claude_code_jsonl(content)
     if normalized:
         return [normalized]
@@ -275,6 +280,59 @@ def _try_normalize_json_split(content: str) -> Optional[list]:
         if normalized:
             return [normalized]
 
+    return None
+
+
+def _try_antigravity_jsonl(content: str) -> Optional[str]:
+    """Google Antigravity / Gemini IDE transcript JSONL sessions (~/.gemini/antigravity-ide/brain/.../transcript.jsonl)."""
+    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    messages = []
+    has_antigravity_markers = False
+
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+
+        step_type = entry.get("type", "")
+        source = entry.get("source", "")
+        content_val = entry.get("content", "")
+
+        if step_type == "USER_INPUT" or source in ("USER_EXPLICIT", "USER_SYSTEM"):
+            has_antigravity_markers = True
+            if not isinstance(content_val, str):
+                continue
+            # Extract actual user request if enclosed in tags
+            m = re.search(r"<USER_REQUEST>\s*([\s\S]*?)\s*</USER_REQUEST>", content_val)
+            text = m.group(1).strip() if m else content_val.strip()
+            # Clean additional metadata / user settings tags
+            text = re.sub(r"<ADDITIONAL_METADATA>[\s\S]*?</ADDITIONAL_METADATA>", "", text).strip()
+            text = re.sub(r"<USER_SETTINGS_CHANGE>[\s\S]*?</USER_SETTINGS_CHANGE>", "", text).strip()
+            text = strip_noise(text)
+            if text:
+                messages.append(("user", text))
+
+        elif step_type == "PLANNER_RESPONSE" or source == "MODEL":
+            has_antigravity_markers = True
+            text = content_val.strip() if isinstance(content_val, str) else ""
+            tool_calls = entry.get("tool_calls", [])
+            if not text and tool_calls and isinstance(tool_calls, list):
+                tool_names = [tc.get("name", "tool") for tc in tool_calls if isinstance(tc, dict)]
+                if tool_names:
+                    text = f"[Action: {', '.join(tool_names)}]"
+            text = strip_noise(text)
+            if text:
+                if messages and messages[-1][0] == "assistant":
+                    prev_role, prev_text = messages[-1]
+                    messages[-1] = (prev_role, prev_text + "\n" + text)
+                else:
+                    messages.append(("assistant", text))
+
+    if len(messages) >= 2 and has_antigravity_markers:
+        return _messages_to_transcript(messages)
     return None
 
 
