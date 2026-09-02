@@ -981,7 +981,14 @@ def _file_chunks_locked(
         # is deliberately withheld until cleanup succeeds, so the next mine
         # retries even when the source itself stays unchanged.
         if stale_ids or pending_cleanup:
-            final_metadata = to_touch + [(drawer_id, meta) for drawer_id, _, meta in to_upsert]
+            final_metadata = []
+            for drawer_id, meta in to_touch + [
+                (item_id, item_meta) for item_id, _, item_meta in to_upsert
+            ]:
+                published_meta = dict(meta)
+                published_meta["mine_staged"] = False
+                published_meta["mine_generation_token"] = generation_token
+                final_metadata.append((drawer_id, published_meta))
             if not _publish_changed_generations(
                 collection,
                 final_metadata=final_metadata,

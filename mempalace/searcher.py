@@ -107,6 +107,7 @@ def _collapse_logical_generation_hits(hits: list) -> list:
             passthrough.append(hit)
             continue
         key = (
+            bool(hit.get("_active_generation")),
             hit.get("created_at") or "",
             hit.get("_physical_drawer_id") or "",
         )
@@ -893,6 +894,7 @@ def search(
             "created_at": (meta or {}).get("filed_at", ""),
             "_logical_generation_id": (meta or {}).get("logical_drawer_id"),
             "_physical_drawer_id": stored_id,
+            "_active_generation": (meta or {}).get("mine_generation_token") in committed_tokens,
         }
         for stored_id, doc, meta, dist in zip(stored_ids, docs, metas, dists)
     ]
@@ -1084,6 +1086,7 @@ def _bm25_only_via_sqlite(
     staged_value_sql = _sqlite_staged_value_sql(conn)
 
     window_active = since_dt is not None or before_dt is not None
+    committed_tokens = set()
     try:
         # FTS5 MATCH expects whitespace-separated tokens. Drop tokens
         # shorter than 3 chars (trigram tokenizer can't match them).
@@ -1191,6 +1194,23 @@ def _bm25_only_via_sqlite(
             """,
             candidate_ids,
         ).fetchall()
+        committed_tokens = {
+            row[0]
+            for row in conn.execute(
+                """
+                SELECT marker.string_value
+                FROM embedding_metadata marker
+                JOIN embeddings e ON e.id = marker.id
+                JOIN segments s ON e.segment_id = s.id
+                JOIN collections c ON s.collection = c.id
+                WHERE c.name = ?
+                  AND marker.key = 'mine_generation_commit'
+                  AND marker.string_value IS NOT NULL
+                """,
+                (collection_name,),
+            ).fetchall()
+            if row[0]
+        }
     finally:
         conn.close()
 
@@ -1248,6 +1268,7 @@ def _bm25_only_via_sqlite(
                 "_chunk_index": meta.get("chunk_index"),
                 "_logical_generation_id": meta.get("logical_drawer_id"),
                 "_physical_drawer_id": d["_stored_drawer_id"],
+                "_active_generation": meta.get("mine_generation_token") in committed_tokens,
             }
         )
 
@@ -1271,6 +1292,7 @@ def _bm25_only_via_sqlite(
             h.pop("_chunk_index", None)
             h.pop("_logical_generation_id", None)
             h.pop("_physical_drawer_id", None)
+            h.pop("_active_generation", None)
 
     result = {
         "query": query,
@@ -1436,6 +1458,7 @@ def _merge_bm25_union_candidates(
                 "_chunk_index": meta.get("chunk_index"),
                 "_logical_generation_id": meta.get("logical_drawer_id"),
                 "_physical_drawer_id": hit.id,
+                "_active_generation": meta.get("mine_generation_token") in committed_tokens,
             }
         )
 
@@ -1824,6 +1847,7 @@ def _finalize_candidate_hits(
         hit.pop("_parent_drawer_id", None)
         hit.pop("_logical_generation_id", None)
         hit.pop("_physical_drawer_id", None)
+        hit.pop("_active_generation", None)
 
     return hits, None
 
@@ -2095,7 +2119,11 @@ def _current_generation_ids_for_query(collection, raw, committed_tokens) -> dict
         if _is_staged_metadata(meta, committed_tokens):
             continue
         logical_id = (meta or {}).get("logical_drawer_id")
-        key = ((meta or {}).get("filed_at", ""), physical_id)
+        key = (
+            (meta or {}).get("mine_generation_token") in committed_tokens,
+            (meta or {}).get("filed_at", ""),
+            physical_id,
+        )
         if logical_id and (logical_id not in current or key > current[logical_id][0]):
             current[logical_id] = (key, physical_id)
     return {logical_id: item[1] for logical_id, item in current.items()}
@@ -2457,6 +2485,7 @@ def search_memories(
             "_parent_drawer_id": meta.get("parent_drawer_id"),
             "_logical_generation_id": meta.get("logical_drawer_id"),
             "_physical_drawer_id": stored_drawer_id,
+            "_active_generation": meta.get("mine_generation_token") in committed_tokens,
         }
         if closet_preview:
             entry["closet_preview"] = closet_preview

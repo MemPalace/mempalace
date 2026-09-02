@@ -2960,6 +2960,7 @@ def _logical_generation_record(col, drawer_id: str):
             continue
         rows.append(
             (
+                meta.get("mine_generation_token") in committed,
                 meta.get("filed_at", ""),
                 physical_id,
                 docs[index] if index < len(docs) else "",
@@ -2968,13 +2969,13 @@ def _logical_generation_record(col, drawer_id: str):
         )
     if not rows:
         return None
-    rows.sort(key=lambda row: (row[0], row[1]), reverse=True)
-    _, physical_id, document, metadata = rows[0]
+    rows.sort(key=lambda row: (row[0], row[1], row[2]), reverse=True)
+    _, _, physical_id, document, metadata = rows[0]
     return {
         "drawer_id": drawer_id,
-        "ids": [row[1] for row in rows],
-        "documents": [row[2] or "" for row in rows],
-        "metadatas": [row[3] for row in rows],
+        "ids": [row[2] for row in rows],
+        "documents": [row[3] or "" for row in rows],
+        "metadatas": [row[4] for row in rows],
         "content": document or "",
         "metadata": metadata,
         "chunked": False,
@@ -3108,7 +3109,7 @@ def _fill_drawer_previews_from_sqlite(page: list) -> None:
     _apply_drawer_previews(page, docs_by_id)
 
 
-def _collapse_drawer_rows(ids, documents, metadatas):
+def _collapse_drawer_rows(ids, documents, metadatas, committed_tokens=frozenset()):
     groups = {}
     singles = []
 
@@ -3130,12 +3131,18 @@ def _collapse_drawer_rows(ids, documents, metadatas):
     chosen_singles = {}
     for physical_id, doc, meta in singles:
         logical_id = meta.get("logical_drawer_id") or physical_id
-        candidate = (meta.get("filed_at", ""), physical_id, doc, meta)
+        candidate = (
+            meta.get("mine_generation_token") in committed_tokens,
+            meta.get("filed_at", ""),
+            physical_id,
+            doc,
+            meta,
+        )
         current = chosen_singles.get(logical_id)
-        if current is None or candidate[:2] > current[:2]:
+        if current is None or candidate[:3] > current[:3]:
             chosen_singles[logical_id] = candidate
 
-    for logical_id, (_, physical_id, doc, meta) in chosen_singles.items():
+    for logical_id, (_, _, physical_id, doc, meta) in chosen_singles.items():
         # If both a legacy logical row and chunks exist, display one logical row.
         if logical_id in grouped_ids:
             continue
@@ -3970,6 +3977,7 @@ def tool_list_drawers(
             [row[0] for row in visible_rows],
             [row[1] for row in visible_rows],
             [row[2] for row in visible_rows],
+            committed_tokens,
         )
 
         if since_dt is not None or before_dt is not None:
