@@ -359,6 +359,30 @@ class LexicalResult:
 # ---------------------------------------------------------------------------
 
 
+def initialize_last_modified_metadata(metadatas):
+    """Initialize last_modified from filed_at without mutating caller data."""
+    if metadatas is None:
+        return None
+
+    items = [metadatas] if isinstance(metadatas, dict) else list(metadatas)
+    result = []
+
+    for metadata in items:
+        if not isinstance(metadata, dict):
+            result.append(metadata)
+            continue
+
+        updated = dict(metadata)
+        filed_at = updated.get("filed_at")
+
+        if filed_at and not updated.get("last_modified"):
+            updated["last_modified"] = filed_at
+
+        result.append(updated)
+
+    return result
+
+
 class BaseCollection(ABC):
     """Per-collection read/write surface every backend must implement."""
 

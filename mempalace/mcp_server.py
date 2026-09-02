@@ -2824,7 +2824,9 @@ def _chunk_index(meta):
 
 
 def _response_safe_meta(meta):
-    safe_meta = _safe_meta(meta)
+    safe_meta = dict(_safe_meta(meta))
+    if not safe_meta.get("last_modified") and safe_meta.get("filed_at"):
+        safe_meta["last_modified"] = safe_meta["filed_at"]
     if safe_meta.get("source_file"):
         safe_meta["source_file"] = Path(safe_meta["source_file"]).name
     return safe_meta
@@ -3200,6 +3202,7 @@ def tool_add_drawer(
         "filed_at": datetime.now().isoformat(),
         "id_recipe": ID_RECIPE,
     }
+    base_meta["last_modified"] = base_meta["filed_at"]
 
     # Idempotency. Three cases to detect a prior committed write:
     # (a) Single-doc path: drawer_id row exists (the only id used).
@@ -3932,6 +3935,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             if room.lower() != str(old_meta.get("room") or "").lower():
                 new_meta["room"] = room
 
+        new_meta["last_modified"] = datetime.now().isoformat()
         _wal_log(
             "update_drawer",
             {
