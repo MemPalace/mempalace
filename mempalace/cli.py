@@ -847,12 +847,13 @@ def _mine_args_forwardable(args, include_ignored) -> bool:
 def _forward_mine_to_hub(args, palace_path: str) -> bool:
     """Run this mine inside the palace's HTTP hub, if one is alive.
 
-    A long-lived hub (``mempalace serve``) holds the MCP writer lease for
-    its whole lifetime, so a direct mine from this process — including the
-    background save hooks, which spawn exactly this CLI — would be refused
-    and transcript capture would silently stop on the hub machine. The hub
-    itself may mine (the palace lock is process-re-entrant there, #1859),
-    so the fix is to hand it the job over HTTP.
+    A live hub (``mempalace serve``) is the intended writer for its palace. A
+    direct mine from this process — including the background save hooks, which
+    spawn exactly this CLI — would either be refused while the hub owns the
+    lease or take ownership after the hub releases an idle lease. Forwarding
+    keeps one process authoritative and avoids making the hub reacquire on its
+    next write. The hub itself may mine (the palace lock is process-re-entrant
+    there, #1859), so the job is handed to it over HTTP.
 
     Returns True when the hub handled the mine (this function has already
     printed the outcome and exited non-zero on failure). Returns False when
