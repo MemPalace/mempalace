@@ -67,6 +67,12 @@ from .config import (  # noqa: E402
     sqlite_read_uri,
     strip_lone_surrogates,
 )
+from .dynamics import (  # noqa: E402
+    apply_decay,
+    drawer_salience,
+    initialize_drawer_dynamics_fields,
+    potentiate,
+)
 from .version import __version__  # noqa: E402
 from chromadb.errors import NotFoundError as _ChromaNotFoundError  # noqa: E402
 
@@ -422,6 +428,7 @@ _MCP_WRITER_LOCK_FAILED = False
 _MCP_WRITER_LOCK_ERROR = ""
 _MCP_WRITER_ATEXIT_REGISTERED = False
 _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
+_SALIENCE_POTENTIATE_ENV = "MEMPALACE_SALIENCE_POTENTIATE"
 
 _MUTATING_TOOLS = frozenset(
     {
@@ -629,6 +636,10 @@ _stale_library_reported_drift: list = []
 
 def _truthy_env(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _discard_mcp_storage_handles() -> None:
@@ -2608,7 +2619,76 @@ def tool_search(
         }
     if context:
         result["context_received"] = True
+    if "results" in result:
+        _maybe_potentiate_search_results(result["results"])
+        for hit in result["results"]:
+            hit.pop("_parent_drawer_id", None)
     return result
+
+
+def _can_potentiate_on_search() -> bool:
+    if not _truthy_env(_SALIENCE_POTENTIATE_ENV):
+        return False
+    if _READ_ONLY:
+        return False
+    if _MCP_WRITER_LOCK_CM is not None:
+        return True
+    ok, _reason = _acquire_mcp_writer_lock()
+    return ok and _MCP_WRITER_LOCK_CM is not None
+
+
+def _logical_ids_from_search_hits(hits: list[dict]) -> list[str]:
+    ids = []
+    seen = set()
+    for hit in hits:
+        drawer_id = hit.get("_parent_drawer_id") or hit.get("id") or hit.get("drawer_id")
+        if not drawer_id:
+            continue
+        if drawer_id in seen:
+            continue
+        seen.add(drawer_id)
+        ids.append(drawer_id)
+    return ids
+
+
+def _maybe_potentiate_search_results(hits: list[dict]) -> None:
+    """Best-effort opt-in salience write for logical drawers surfaced by search.
+
+    Chunked drawers are counted once per logical parent. We persist identical
+    salience metadata to every physical chunk in the parent group, so listing
+    and direct chunk reads observe a consistent value. The read-modify-write is
+    intentionally best effort for v1; concurrent searches may lose increments.
+    """
+
+    global _metadata_cache
+
+    if not hits or not _can_potentiate_on_search():
+        return
+
+    col = _get_collection()
+    if not col:
+        return
+
+    now = _now()
+    for drawer_id in _logical_ids_from_search_hits(hits):
+        try:
+            record = _logical_drawer_record(col, drawer_id)
+            if record is None:
+                continue
+            base_meta = dict(_safe_meta(record["metadata"]))
+            initialize_drawer_dynamics_fields(base_meta, now=now)
+            apply_decay(base_meta, now=now)
+            potentiate(base_meta, now=now)
+            update_metas = []
+            for old_meta in record["metadatas"]:
+                merged = dict(_safe_meta(old_meta))
+                for key in ("strength", "stability", "last_activated", "access_count"):
+                    merged[key] = base_meta[key]
+                update_metas.append(merged)
+            col.update(ids=record["ids"], metadatas=update_metas)
+            _metadata_cache = None
+        except Exception:
+            logger.debug("drawer salience potentiation failed for %s", drawer_id, exc_info=True)
 
 
 def tool_check_duplicate(content: str, threshold: float = 0.9):
@@ -2946,6 +3026,7 @@ def _drawer_payload(record):
         "content": record["content"],
         "wing": safe_meta.get("wing", ""),
         "room": safe_meta.get("room", ""),
+        "salience": drawer_salience(record["metadata"], now=_now()),
         "metadata": safe_meta,
     }
 
@@ -2956,6 +3037,19 @@ def _drawer_payload(record):
         payload["metadata"]["chunk_ids"] = record["ids"]
 
     return payload
+
+
+def _metadata_where_filter(wing: str = None, room: str = None):
+    conditions = []
+    if wing:
+        conditions.append({"wing": wing})
+    if room:
+        conditions.append({"room": room})
+    if len(conditions) == 1:
+        return conditions[0]
+    if len(conditions) > 1:
+        return {"$and": conditions}
+    return None
 
 
 def _fetch_drawer_rows(col, where=None, page_size: int = 1000, include=None):
@@ -3830,18 +3924,7 @@ def tool_list_drawers(
         return {"error": str(e)}
 
     try:
-        where = None
-        conditions = []
-
-        if wing:
-            conditions.append({"wing": wing})
-        if room:
-            conditions.append({"room": room})
-
-        if len(conditions) == 1:
-            where = conditions[0]
-        elif len(conditions) > 1:
-            where = {"$and": conditions}
+        where = _metadata_where_filter(wing=wing, room=room)
 
         listed = None
         if _is_chroma_backend() and _config.palace_path:
@@ -3885,6 +3968,66 @@ def tool_list_drawers(
         }
     except Exception as e:
         logger.exception("tool_list_drawers failed")
+        return {"error": str(e)}
+
+
+def tool_drawer_salience(
+    wing: str = None,
+    room: str = None,
+    limit: int = 100,
+    order_by: str = "strength",
+):
+    """List lazy-decayed drawer salience at logical drawer granularity."""
+
+    limit = max(1, min(limit, _MAX_RESULTS))
+    if order_by not in {"strength", "access_count", "last_activated"}:
+        return {"error": "order_by must be one of: strength, access_count, last_activated"}
+
+    try:
+        wing = _sanitize_optional_name(wing, "wing")
+        room = _sanitize_optional_name(room, "room")
+    except ValueError as e:
+        return {"error": str(e)}
+
+    col = _get_collection()
+    if not col:
+        return _collection_error_or_no_palace()
+
+    try:
+        ids, documents, metadatas = _fetch_drawer_rows(
+            col, where=_metadata_where_filter(wing=wing, room=room)
+        )
+        drawers = _collapse_drawer_rows(ids, documents, metadatas)
+        rows = []
+        now = _now()
+        for drawer in drawers:
+            salience = drawer_salience(drawer.get("metadata", {}), now=now)
+            rows.append(
+                {
+                    "id": drawer["drawer_id"],
+                    "wing": drawer.get("wing", ""),
+                    "room": drawer.get("room", ""),
+                    **salience,
+                }
+            )
+
+        def sort_key(item):
+            value = item.get(order_by)
+            if order_by == "last_activated":
+                parsed = datetime.min.replace(tzinfo=timezone.utc)
+                try:
+                    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                except (TypeError, ValueError):
+                    pass
+                return (parsed, item["id"])
+            return (value, item["id"])
+
+        rows.sort(key=sort_key, reverse=True)
+        return {"drawers": rows[:limit]}
+    except Exception as e:
+        logger.exception("tool_drawer_salience failed")
         return {"error": str(e)}
 
 
@@ -5650,6 +5793,28 @@ TOOLS = {
             },
         },
         "handler": tool_list_drawers,
+    },
+    "mempalace_drawer_salience": {
+        "description": "List lazy-decayed per-drawer salience at logical drawer granularity. Chunked drawers are deduped by parent_drawer_id.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "wing": {"type": "string", "description": "Filter by wing (optional)"},
+                "room": {"type": "string", "description": "Filter by room (optional)"},
+                "limit": {
+                    "type": "integer",
+                    "description": "Max drawers to return (default 100, max 100)",
+                    "minimum": 1,
+                    "maximum": 100,
+                },
+                "order_by": {
+                    "type": "string",
+                    "enum": ["strength", "access_count", "last_activated"],
+                    "description": "Sort field (default strength)",
+                },
+            },
+        },
+        "handler": tool_drawer_salience,
     },
     "mempalace_update_drawer": {
         "description": "Update an existing drawer's content and/or metadata (wing, room). Fetches existing drawer first; returns error if not found.",

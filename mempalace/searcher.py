@@ -28,6 +28,7 @@ from .backends import (
 )
 from .config import MempalaceConfig, sqlite_read_uri
 from .date_window import filed_at_in_window, parse_window
+from .dynamics import drawer_salience
 from .i18n import _canonical_lang, get_stopwords
 from .palace import (
     _open_collection_or_explain,
@@ -2150,6 +2151,7 @@ def search_memories(
             "effective_distance": round(effective_dist, 4),
             "closet_boost": round(boost, 3),
             "matched_via": matched_via,
+            "salience": drawer_salience(meta),
             # Internal: retain the full source_file path + chunk_index so the
             # enrichment step below doesn't have to reverse-lookup via
             # basename-suffix matching (which silently collides when two
