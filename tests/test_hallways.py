@@ -508,3 +508,88 @@ class TestHallwayDynamicsIntegration:
         )
         assert after[0]["access_count"] == 33
         assert after[0]["stability"] == 1.9
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# rekey_hallway_wings — follow drawers after a wing rename (#1938)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _hallway(wing, a, b, count=2, rooms=("r",), **dyn):
+    rec = {
+        "id": hallways_mod._hallway_id(wing, *sorted([a, b])),
+        "wing": wing,
+        "entity_a": a,
+        "entity_b": b,
+        "co_occurrence_count": count,
+        "rooms": list(rooms),
+        "label": hallways_mod._hallway_label(a, b, count, list(rooms)),
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "created_by": "auto",
+    }
+    rec.update(dyn)
+    return rec
+
+
+class TestRekeyHallwayWings:
+    def test_noop_when_map_empty(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        hallways_mod._save_hallways([_hallway("_alpha", "Alice", "Bob")])
+        assert hallways_mod.rekey_hallway_wings({}) == 0
+        assert hallways_mod.list_hallways()[0]["wing"] == "_alpha"
+
+    def test_plain_rename_regenerates_id_and_preserves_dynamics(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        hallways_mod._save_hallways(
+            [
+                _hallway(
+                    "_alpha",
+                    "Alice",
+                    "Bob",
+                    strength=7.5,
+                    access_count=42,
+                    last_activated="2030-01-01T00:00:00+00:00",
+                )
+            ]
+        )
+        assert hallways_mod.rekey_hallway_wings({"_alpha": "alpha"}) == 1
+        recs = hallways_mod.list_hallways()
+        assert len(recs) == 1
+        r = recs[0]
+        assert r["wing"] == "alpha"
+        assert r["id"] == hallways_mod._hallway_id("alpha", "Alice", "Bob")
+        # dynamics carried across the rename, not reset
+        assert r["strength"] == 7.5
+        assert r["access_count"] == 42
+        assert r["last_activated"] == "2030-01-01T00:00:00+00:00"
+
+    def test_collision_merges_counts_rooms_and_dynamics(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        hallways_mod._save_hallways(
+            [
+                _hallway(
+                    "gamma", "Alice", "Bob", count=2, rooms=("r1",), strength=3.0, access_count=5
+                ),
+                _hallway(
+                    "_gamma", "Alice", "Bob", count=3, rooms=("r2",), strength=9.0, access_count=10
+                ),
+            ]
+        )
+        assert hallways_mod.rekey_hallway_wings({"_gamma": "gamma"}) == 1
+        recs = hallways_mod.list_hallways()
+        assert len(recs) == 1  # merged, not duplicated
+        r = recs[0]
+        assert r["wing"] == "gamma"
+        assert r["co_occurrence_count"] == 5  # 2 + 3
+        assert r["rooms"] == ["r1", "r2"]  # unioned
+        assert r["strength"] == 9.0  # max
+        assert r["access_count"] == 15  # summed
+        assert "co-occur in 5 drawers" in r["label"]
+
+    def test_untouched_wing_left_alone(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        hallways_mod._save_hallways(
+            [_hallway("_alpha", "Alice", "Bob"), _hallway("beta", "Alice", "Carol")]
+        )
+        hallways_mod.rekey_hallway_wings({"_alpha": "alpha"})
+        assert sorted(h["wing"] for h in hallways_mod.list_hallways()) == ["alpha", "beta"]
