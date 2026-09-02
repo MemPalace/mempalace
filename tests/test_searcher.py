@@ -76,6 +76,26 @@ class TestSearchMemories:
         assert len(result["results"]) > 0
         assert result["query"] == "JWT authentication"
 
+    def test_staged_conversation_generation_is_not_searchable(self, palace_path, collection):
+        staged_text = "unpublished generation sentinel phrase"
+        collection.upsert(
+            ids=["staged-generation"],
+            documents=[staged_text],
+            metadatas=[
+                {
+                    "wing": "sessions",
+                    "room": "general",
+                    "source_file": "/tmp/session.jsonl",
+                    "filed_at": "2026-09-02T00:00:00",
+                    "mine_staged": True,
+                }
+            ],
+        )
+
+        result = search_memories(staged_text, palace_path, n_results=10)
+
+        assert all(hit["text"] != staged_text for hit in result["results"])
+
     def test_wing_filter(self, palace_path, seeded_collection):
         result = search_memories("planning", palace_path, wing="notes")
         assert all(r["wing"] == "notes" for r in result["results"])

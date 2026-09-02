@@ -1583,7 +1583,10 @@ def hook_stop(data: dict, harness: str):
                         wing=project_wing,
                         toast=toast,
                         agent_name=_diary_agent_for_harness(harness),
-                        checkpoint_id=f"stop:{last_save + SAVE_INTERVAL}",
+                        checkpoint_id=(
+                            f"stop:{_session_checkpoint_epoch(session_id)}:"
+                            f"{last_save + SAVE_INTERVAL}"
+                        ),
                     )
                     ingest_dispatched = _ingest_transcript(transcript_path) is True
                 _maybe_auto_ingest()
@@ -1671,6 +1674,29 @@ def _clear_session_last_save(session_id: str) -> None:
     """
     try:
         (STATE_DIR / f"{session_id}_last_save").unlink()
+    except OSError:
+        pass
+
+
+def _session_checkpoint_epoch(session_id: str) -> str:
+    """Return the durable checkpoint generation for one resumable session."""
+    try:
+        epoch = (STATE_DIR / f"{session_id}_checkpoint_epoch").read_text(encoding="utf-8").strip()
+    except OSError:
+        return "initial"
+    return epoch or "initial"
+
+
+def _advance_session_checkpoint_epoch(session_id: str) -> None:
+    """Start a fresh checkpoint generation after SessionEnd clears its marker."""
+    import uuid
+
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        epoch_file = STATE_DIR / f"{session_id}_checkpoint_epoch"
+        temp_file = STATE_DIR / f".{session_id}_checkpoint_epoch.{os.getpid()}.tmp"
+        temp_file.write_text(uuid.uuid4().hex, encoding="utf-8")
+        os.replace(temp_file, epoch_file)
     except OSError:
         pass
 
@@ -1772,6 +1798,7 @@ def hook_session_end(data: dict, harness: str):
 
         _output({})
     finally:
+        _advance_session_checkpoint_epoch(session_id)
         _clear_session_last_save(session_id)
 
 

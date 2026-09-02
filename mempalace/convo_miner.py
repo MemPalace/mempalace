@@ -680,6 +680,72 @@ def _extract_authored_at(filepath):
     return latest
 
 
+def _publish_changed_generations(
+    collection,
+    *,
+    final_metadata,
+    staged_upserts,
+    stale_ids,
+    previous_metadata,
+    source_file,
+    access_gate=None,
+) -> bool:
+    """Publish a complete staged target set and retire old generations."""
+    try:
+        with _access_write(access_gate):
+            # Publication and superseded-generation cleanup are one
+            # reader-visible step. The HTTP gate stays exclusive across every
+            # metadata batch and the final delete.
+            for batch_start in range(0, len(final_metadata), DRAWER_UPSERT_BATCH_SIZE):
+                batch = final_metadata[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+                collection.update(
+                    ids=[drawer_id for drawer_id, _ in batch],
+                    metadatas=[meta for _, meta in batch],
+                )
+            collection.delete(ids=stale_ids)
+        return True
+    except Exception:
+        logger.warning(
+            "Failed to publish changed generations or delete %d orphaned "
+            "convo drawers for %s; leaving the source incomplete so the "
+            "next mine retries",
+            len(stale_ids),
+            source_file,
+            exc_info=True,
+        )
+
+    # A normal backend exception can land after some publication batches but
+    # before cleanup. Hide every newly staged physical generation again;
+    # unchanged old rows remain searchable.
+    staged_ids = {drawer_id for drawer_id, _, _ in staged_upserts}
+    rollback = []
+    for drawer_id, final_meta in final_metadata:
+        if drawer_id in previous_metadata:
+            rollback.append((drawer_id, previous_metadata[drawer_id]))
+            continue
+        if drawer_id in staged_ids:
+            staged_meta = dict(final_meta)
+            staged_meta["mine_staged"] = True
+            staged_meta.pop("source_mtime", None)
+            rollback.append((drawer_id, staged_meta))
+    for batch_start in range(0, len(rollback), DRAWER_UPSERT_BATCH_SIZE):
+        batch = rollback[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+        try:
+            with _access_write(access_gate):
+                collection.update(
+                    ids=[drawer_id for drawer_id, _ in batch],
+                    metadatas=[meta for _, meta in batch],
+                )
+        except Exception:
+            logger.warning(
+                "Failed to restore staged visibility for %s",
+                source_file,
+                exc_info=True,
+            )
+            break
+    return False
+
+
 def _file_chunks_locked(
     collection,
     source_file,
@@ -802,6 +868,7 @@ def _file_chunks_locked(
                 new_ids.add(physical_id)
                 touched = dict(prev)
                 touched["logical_drawer_id"] = logical_drawer_id
+                touched["mine_staged"] = False
                 touched["chunk_total"] = chunk_total
                 if source_mtime is not None:
                     touched["source_mtime"] = source_mtime
@@ -836,6 +903,7 @@ def _file_chunks_locked(
                 "normalize_version": NORMALIZE_VERSION,
                 "id_recipe": ID_RECIPE,
                 "logical_drawer_id": logical_drawer_id,
+                "mine_staged": False,
                 "chunk_total": chunk_total,
                 "chunk_hash": chunk_hash,
             }
@@ -874,6 +942,7 @@ def _file_chunks_locked(
                 for _, _, final_meta in batch:
                     incomplete_meta = dict(final_meta)
                     incomplete_meta.pop("source_mtime", None)
+                    incomplete_meta["mine_staged"] = True
                     batch_metas.append(incomplete_meta)
             else:
                 batch_metas = [meta for _, _, meta in batch]
@@ -906,27 +975,17 @@ def _file_chunks_locked(
         # is deliberately withheld until cleanup succeeds, so the next mine
         # retries even when the source itself stays unchanged.
         if stale_ids:
-            try:
-                with _access_write(access_gate):
-                    collection.delete(ids=stale_ids)
-            except Exception:
-                logger.warning(
-                    "Failed to delete %d orphaned convo drawers for %s; "
-                    "leaving the source incomplete so the next mine retries",
-                    len(stale_ids),
-                    source_file,
-                    exc_info=True,
-                )
-                return drawers_added, room_counts_delta, True
-
             final_metadata = to_touch + [(drawer_id, meta) for drawer_id, _, meta in to_upsert]
-            for batch_start in range(0, len(final_metadata), DRAWER_UPSERT_BATCH_SIZE):
-                batch = final_metadata[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
-                with _access_write(access_gate):
-                    collection.update(
-                        ids=[drawer_id for drawer_id, _ in batch],
-                        metadatas=[meta for _, meta in batch],
-                    )
+            if not _publish_changed_generations(
+                collection,
+                final_metadata=final_metadata,
+                staged_upserts=to_upsert,
+                stale_ids=stale_ids,
+                previous_metadata=existing,
+                source_file=source_file,
+                access_gate=access_gate,
+            ):
+                return drawers_added, room_counts_delta, True
     return drawers_added, room_counts_delta, False
 
 

@@ -940,6 +940,9 @@ class TestFileChunksLocked:
         assert {
             drawer_id: col.documents[drawer_id] for drawer_id in pre_existing
         } == old_documents, "a failed later batch overwrote old verbatim drawer contents"
+        staged_ids = set(col.records) - pre_existing
+        assert staged_ids
+        assert all(col.records[drawer_id].get("mine_staged") is True for drawer_id in staged_ids)
         # The real completion check must still see the file as unfinished so
         # the next mine repairs it instead of skipping forever (#2183).
         assert not file_already_mined(

@@ -1506,6 +1506,8 @@ def file_already_mined(
             metadatas = results.get("metadatas") or []
             for meta in metadatas:
                 meta = meta or {}
+                if meta.get("mine_staged") is True:
+                    continue
                 # extract_mode scoping (was the existing ``else`` branch):
                 if extract_mode is not None and not _metadata_matches_extract_mode(
                     meta, extract_mode
@@ -1584,6 +1586,8 @@ def prefetch_mined_set(
             batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
             for meta in batch["metadatas"]:
                 meta = meta or {}
+                if meta.get("mine_staged") is True:
+                    continue
                 src = meta.get("source_file")
                 if not src:
                     continue

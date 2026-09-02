@@ -408,6 +408,21 @@ def build_where_filter(wing: str = None, room: str = None, source_file: str = No
     return {"$and": clauses}
 
 
+def _is_staged_metadata(metadata) -> bool:
+    """True for an unpublished conversation-mine physical generation."""
+    if not isinstance(metadata, dict):
+        return False
+    value = metadata.get("mine_staged")
+    # Chroma returns bools; the sqlite-only fallback reconstructs them from
+    # ``int_value`` as 0/1.
+    return value is True or value == 1
+
+
+def _visible_sqlite_drawers(drawers) -> list:
+    """Filter unpublished generations outside the BM25 fallback's hot loop."""
+    return [drawer for drawer in drawers if not _is_staged_metadata(drawer.get("metadata"))]
+
+
 def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
     """Parse all `→drawer_id_a,drawer_id_b` pointers out of a closet document.
 
@@ -753,6 +768,15 @@ def search(
     metas = _first_or_empty(results, "metadatas")
     dists = _first_or_empty(results, "distances")
 
+    visible = [
+        (doc, meta, dist)
+        for doc, meta, dist in zip(docs, metas, dists)
+        if not _is_staged_metadata(meta)
+    ]
+    docs = [item[0] for item in visible]
+    metas = [item[1] for item in visible]
+    dists = [item[2] for item in visible]
+
     if date_window_active:
         kept = [
             (doc, meta, dist)
@@ -1068,7 +1092,7 @@ def _bm25_only_via_sqlite(
     # Apply wing/room filters in Python (FTS5 candidates may include
     # entries from other wings).
     candidates = []
-    for d in drawers.values():
+    for d in _visible_sqlite_drawers(drawers.values()):
         meta = d["metadata"]
         if wing and meta.get("wing") != wing:
             continue
@@ -1189,6 +1213,8 @@ def _merge_bm25_union_candidates(
     bm25_extra = []
     for hit in lexical.hits:
         meta = hit.metadata or {}
+        if _is_staged_metadata(meta):
+            continue
         # The window applies to every candidate source; a lexically strong
         # drawer outside [since, before) must not enter through this side
         # door (the vector-path candidates are filtered upstream).
@@ -1390,6 +1416,8 @@ def _enrich_closet_hits(
                 metadatas,
             )
         ):
+            if _is_staged_metadata(metadata):
+                continue
             chunk_index = (
                 metadata.get(
                     "chunk_index",
@@ -1733,6 +1761,8 @@ def _candidate_out_of_scope(dist, meta, max_distance, since_dt, before_dt) -> bo
     loss (pre-existing behavior); the date window applies whenever a bound
     is set, with the shared ``[since, before)`` semantics.
     """
+    if _is_staged_metadata(meta):
+        return True
     if max_distance > 0.0 and dist > max_distance:
         return True
     if (since_dt is not None or before_dt is not None) and not filed_at_in_window(
@@ -1887,6 +1917,8 @@ def _query_drawers_with_filter_fallback(
             _first_or_empty(raw, "distances"),
         ):
             meta = meta or {}
+            if _is_staged_metadata(meta):
+                continue
             if wing and meta.get("wing") != wing:
                 continue
             if room and meta.get("room") != room:

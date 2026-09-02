@@ -397,7 +397,7 @@ def test_stop_hook_saves_silently_at_interval(tmp_path):
         wing="wing_sessions",
         toast=False,
         agent_name="claude",
-        checkpoint_id="stop:15",
+        checkpoint_id="stop:initial:15",
     )
 
 
@@ -423,7 +423,7 @@ def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
         wing="wing_myproject",
         toast=False,
         agent_name="claude",
-        checkpoint_id="stop:15",
+        checkpoint_id="stop:initial:15",
     )
 
 
@@ -2248,6 +2248,18 @@ def test_session_end_uses_detached_paths_not_sync_mine(tmp_path):
     )
     # The session is over; its per-session save marker is cleared.
     assert not last_save_file.exists()
+    epoch = (tmp_path / "sess_checkpoint_epoch").read_text(encoding="utf-8").strip()
+    assert epoch and epoch != "initial"
+
+
+def test_session_checkpoint_epoch_changes_resume_identity(tmp_path):
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        assert hooks_cli_mod._session_checkpoint_epoch("sess") == "initial"
+        hooks_cli_mod._advance_session_checkpoint_epoch("sess")
+        resumed_epoch = hooks_cli_mod._session_checkpoint_epoch("sess")
+
+    assert resumed_epoch != "initial"
+    assert f"stop:{resumed_epoch}:15" != "stop:initial:15"
 
 
 def test_session_end_disabled_by_config_clears_marker(tmp_path):
@@ -2642,8 +2654,8 @@ def test_stop_hook_retries_failed_checkpoint_when_mining_disabled(tmp_path):
         assert _capture_hook_output(hook_stop, data, state_dir=tmp_path) == {}
 
     assert mock_save.call_count == 2
-    assert mock_save.call_args_list[0].kwargs["checkpoint_id"] == "stop:15"
-    assert mock_save.call_args_list[1].kwargs["checkpoint_id"] == "stop:15"
+    assert mock_save.call_args_list[0].kwargs["checkpoint_id"] == "stop:initial:15"
+    assert mock_save.call_args_list[1].kwargs["checkpoint_id"] == "stop:initial:15"
     mock_popen.assert_not_called()
     assert not (tmp_path / "test_last_save").exists()
 
