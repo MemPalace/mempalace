@@ -4354,6 +4354,30 @@ class TestDiaryTools:
         assert r["entries"][0]["topic"] == "architecture"
         assert "authentication" in r["entries"][0]["content"]
 
+    def test_diary_write_invalid_wing_returns_error_not_raises(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """An invalid wing must return {"success": False}, not raise.
+
+        The wing was sanitized outside the try/except, so a ValueError
+        escaped tool_diary_write and the MCP dispatcher's blanket handler
+        turned it into an opaque -32000 "Internal tool error".
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_diary_write
+
+        r = tool_diary_write(
+            agent_name="TestAgent",
+            entry="entry body",
+            topic="general",
+            wing="../escape",
+        )
+        assert r["success"] is False
+        # Error names the offending field rather than the generic "name".
+        assert "wing" in r["error"]
+
     def test_diary_read_empty(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         _client, _col = _get_collection(palace_path, create=True)

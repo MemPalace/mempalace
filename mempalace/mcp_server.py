@@ -4267,12 +4267,17 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         agent_name = sanitize_name(agent_name, "agent_name").lower()
         entry = sanitize_content(entry)
         topic = sanitize_name(topic, "topic")
+        # Validated inside the guard: an invalid wing raised an uncaught
+        # ValueError that surfaced to the caller as an opaque -32000
+        # "Internal tool error" instead of the actionable message the other
+        # sanitized params get. Passing the field name keeps the error
+        # "wing contains invalid characters" rather than "name ...".
+        if wing:
+            wing = sanitize_name(wing, "wing")
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
-    if wing:
-        wing = sanitize_name(wing)
-    else:
+    if not wing:
         wing = f"wing_{agent_name.replace(' ', '_')}"
     room = "diary"
     col = _get_collection(create=True)
