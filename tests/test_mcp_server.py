@@ -8601,3 +8601,122 @@ def test_2288_grouped_graph_stats_count_distinct_room_instances(monkeypatch):
         "matlab-drive",
         "octopus",
     }
+
+
+# ── #2272 — memories_filed_away: non-object JSON root ───────────────────
+#
+# tool_memories_filed_away reads ~/.mempalace/hook_state/last_checkpoint,
+# json.loads it, and then immediately calls data.get("msgs", 0). A valid
+# JSON root that is not a dict (null / [] / "text" / 42 / true) parses
+# cleanly so the except (JSONDecodeError, OSError) branch does not fire,
+# and .get() raises AttributeError *after* the ack marker has already been
+# unlinked. Per the contract, all of these shapes must take the same
+# fail-soft path as malformed JSON: marker consumed, status "error", count
+# 0, timestamp None, no exception raised.
+
+
+def _write_checkpoint(home_dir, body_text):
+    """Write last_checkpoint under an isolated HOME, returning the Path."""
+    from pathlib import Path
+
+    state_dir = Path(home_dir) / ".mempalace" / "hook_state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    ack = state_dir / "last_checkpoint"
+    ack.write_text(body_text, encoding="utf-8")
+    return ack
+
+
+def test_filed_away_null_root_is_error(monkeypatch, tmp_path):
+    from pathlib import Path
+
+    from mempalace import mcp_server
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ack = _write_checkpoint(tmp_path, "null")
+
+    result = mcp_server.tool_memories_filed_away()
+
+    assert result["status"] == "error"
+    assert result["count"] == 0
+    assert result["timestamp"] is None
+    assert not Path(ack).exists()
+
+
+def test_filed_away_array_root_is_error(monkeypatch, tmp_path):
+    from pathlib import Path
+
+    from mempalace import mcp_server
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ack = _write_checkpoint(tmp_path, "[]")
+
+    result = mcp_server.tool_memories_filed_away()
+
+    assert result["status"] == "error"
+    assert result["count"] == 0
+    assert result["timestamp"] is None
+    assert not Path(ack).exists()
+
+
+def test_filed_away_string_root_is_error(monkeypatch, tmp_path):
+    from pathlib import Path
+
+    from mempalace import mcp_server
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ack = _write_checkpoint(tmp_path, '"hello"')
+
+    result = mcp_server.tool_memories_filed_away()
+
+    assert result["status"] == "error"
+    assert result["count"] == 0
+    assert result["timestamp"] is None
+    assert not Path(ack).exists()
+
+
+def test_filed_away_number_root_is_error(monkeypatch, tmp_path):
+    from pathlib import Path
+
+    from mempalace import mcp_server
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ack = _write_checkpoint(tmp_path, "42")
+
+    result = mcp_server.tool_memories_filed_away()
+
+    assert result["status"] == "error"
+    assert result["count"] == 0
+    assert result["timestamp"] is None
+    assert not Path(ack).exists()
+
+
+def test_filed_away_bool_root_is_error(monkeypatch, tmp_path):
+    from pathlib import Path
+
+    from mempalace import mcp_server
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ack = _write_checkpoint(tmp_path, "true")
+
+    result = mcp_server.tool_memories_filed_away()
+
+    assert result["status"] == "error"
+    assert result["count"] == 0
+    assert result["timestamp"] is None
+    assert not Path(ack).exists()
+
+
+def test_filed_away_object_root_success_unchanged(monkeypatch, tmp_path):
+    from pathlib import Path
+
+    from mempalace import mcp_server
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ack = _write_checkpoint(tmp_path, '{"msgs": 5, "ts": "2026-01-01T00:00:00Z"}')
+
+    result = mcp_server.tool_memories_filed_away()
+
+    assert result["status"] == "ok"
+    assert result["count"] == 5
+    assert result["timestamp"] == "2026-01-01T00:00:00Z"
+    assert not Path(ack).exists()
