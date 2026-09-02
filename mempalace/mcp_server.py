@@ -7334,13 +7334,21 @@ class _RWLock:
         self._cond = threading.Condition(threading.Lock())
         self._readers = 0
         self._writer = False
+        self._waiting_readers = 0
         self._waiting_writers = 0
+        self._reader_entries = 0
 
     def acquire_read(self) -> None:
         with self._cond:
-            while self._writer or self._waiting_writers:
-                self._cond.wait()
-            self._readers += 1
+            self._waiting_readers += 1
+            try:
+                while self._writer or self._waiting_writers:
+                    self._cond.wait()
+                self._readers += 1
+                self._reader_entries += 1
+                self._cond.notify_all()
+            finally:
+                self._waiting_readers -= 1
 
     def release_read(self) -> None:
         with self._cond:
@@ -7362,6 +7370,24 @@ class _RWLock:
         with self._cond:
             self._writer = False
             self._cond.notify_all()
+
+    def yield_to_waiting_reader(self) -> None:
+        """Let one queued reader enter before this thread starts another write.
+
+        The core policy remains writer-preferring, which prevents an endless
+        stream of new searches from starving a mutation. Conversation mining,
+        however, performs many short write bursts back-to-back. Without this
+        explicit handoff the mining thread can re-queue as a writer before a
+        reader awakened by ``release_write`` gets scheduled, starving that
+        already-waiting search for the full mine.
+        """
+        with self._cond:
+            if not self._waiting_readers:
+                return
+            entries_before = self._reader_entries
+            self._cond.notify_all()
+            while self._waiting_readers and self._reader_entries == entries_before:
+                self._cond.wait()
 
     def read_lock(self):
         lock = self
@@ -7422,9 +7448,14 @@ class _HTTPMineAccessGate:
     @staticmethod
     @contextlib.contextmanager
     def write_lock():
-        with _HTTP_REQUEST_LOCK.write_lock():
-            with _write_stall_watch("mempalace_mine", burst=True):
-                yield
+        try:
+            with _HTTP_REQUEST_LOCK.write_lock():
+                with _write_stall_watch("mempalace_mine", burst=True):
+                    yield
+        finally:
+            # A conversation mine can immediately request its next write
+            # burst. Hand an already-queued search one entry opportunity first.
+            _HTTP_REQUEST_LOCK.yield_to_waiting_reader()
 
 
 _HTTP_MINE_ACCESS_GATE = _HTTPMineAccessGate()
@@ -7434,6 +7465,13 @@ def _current_http_mine_access_gate():
     if getattr(_http_interleaved_mine_state, "active", False):
         return _HTTP_MINE_ACCESS_GATE
     return None
+
+
+def _release_http_writer_lease() -> None:
+    """Release the Hub lease after every in-flight palace mutation is done."""
+    with _HTTP_MUTATION_LOCK:
+        with _HTTP_REQUEST_LOCK.write_lock():
+            _release_mcp_writer_lock()
 
 
 @contextlib.contextmanager
@@ -8808,12 +8846,10 @@ def _run_http_loop() -> None:
         _serve_http(_args.host, _args.port)
     finally:
         if owns_writer_lease:
-            # _serve_http uses daemon request threads, so synchronize with the
-            # dispatch lock before closing storage and exposing the palace to
-            # another process. Response serialization happens after this lock
-            # and no longer touches the backend.
-            with _HTTP_REQUEST_LOCK:
-                _release_mcp_writer_lock()
+            # Match dispatch's mutation -> backend lock order. Otherwise an
+            # interleaved mine could still own the mutation lifecycle while
+            # shutdown closes storage and exposes the palace to another process.
+            _release_http_writer_lease()
 
 
 def _install_shutdown_signal_handlers() -> None:

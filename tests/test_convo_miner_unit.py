@@ -1045,6 +1045,57 @@ class TestFileChunksLocked:
         assert file_already_mined(col, str(source), check_mtime=True, extract_mode="exchange")
 
 
+def test_end_of_mine_hallways_read_then_fts_validation_write(tmp_path, monkeypatch):
+    import mempalace.convo_miner as convo_miner
+
+    class RecordingGate:
+        def __init__(self):
+            self.mode = None
+            self.events = []
+
+        @contextlib.contextmanager
+        def _lock(self, mode):
+            assert self.mode is None
+            self.mode = mode
+            self.events.append(f"{mode}-enter")
+            try:
+                yield
+            finally:
+                self.events.append(f"{mode}-exit")
+                self.mode = None
+
+        def read_lock(self):
+            return self._lock("read")
+
+        def write_lock(self):
+            return self._lock("write")
+
+    gate = RecordingGate()
+    collection = object()
+    monkeypatch.setattr(convo_miner, "scan_convos", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(convo_miner, "_open_convo_collection", lambda *_args, **_kwargs: collection)
+    monkeypatch.setattr(convo_miner, "prefetch_mined_set", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(convo_miner, "prefetch_content_hashes", lambda *_args, **_kwargs: {})
+
+    def hallways(*_args, **_kwargs):
+        assert gate.mode == "read"
+
+    def validate(*_args, **_kwargs):
+        assert gate.mode == "write"
+
+    monkeypatch.setattr(convo_miner, "_compute_hallways_for_wing_safe", hallways)
+    monkeypatch.setattr(convo_miner, "_validate_palace_fts5_after_mine", validate)
+
+    convo_miner._mine_convos_impl(
+        str(tmp_path),
+        str(tmp_path / "palace"),
+        wing="test-wing",
+        access_gate=gate,
+    )
+
+    assert gate.events[-4:] == ["read-enter", "read-exit", "write-enter", "write-exit"]
+
+
 class TestSourceFileDeleteIds:
     """#104: the sweeper writes drawers with no extract_mode at all
     (ingest_mode="sweep"). convo_miner's default exchange-mode purge

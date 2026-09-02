@@ -2603,13 +2603,16 @@ def _hub_patches(stack, tmp_path, mcp_body):
     stack.enter_context(
         patch("mempalace.server_registry.client_base_url", return_value="http://127.0.0.1:8765")
     )
-    stack.enter_context(patch("mempalace.server_registry.load_server_token", return_value="tok"))
-    return stack.enter_context(
+    mock_health = stack.enter_context(
+        patch("urllib.request.urlopen", return_value=_FakeHubResponse())
+    )
+    mock_server_open = stack.enter_context(
         patch(
-            "urllib.request.urlopen",
-            side_effect=[_FakeHubResponse(), _FakeHubResponse(mcp_body)],
+            "mempalace.server_registry.urlopen_with_server_tokens",
+            return_value=_FakeHubResponse(mcp_body),
         )
     )
+    return mock_health, mock_server_open
 
 
 def test_save_diary_direct_forwards_to_live_hub(tmp_path):
@@ -2624,7 +2627,7 @@ def test_save_diary_direct_forwards_to_live_hub(tmp_path):
     ).encode("utf-8")
 
     with contextlib.ExitStack() as stack:
-        mock_urlopen = _hub_patches(stack, tmp_path, body)
+        mock_health, mock_server_open = _hub_patches(stack, tmp_path, body)
         mock_tool = stack.enter_context(patch("mempalace.mcp_server.tool_diary_write"))
         result = _save_diary_direct(
             str(transcript), "sess1", wing="wing_project", agent_name="claude"
@@ -2632,10 +2635,13 @@ def test_save_diary_direct_forwards_to_live_hub(tmp_path):
 
     assert result["count"] == 3
     mock_tool.assert_not_called()
-    posted = json.loads(mock_urlopen.call_args_list[1].args[0].data.decode("utf-8"))
+    mock_health.assert_called_once()
+    mock_server_open.assert_called_once()
+    posted = json.loads(mock_server_open.call_args.kwargs["data"].decode("utf-8"))
     assert posted["params"]["name"] == "mempalace_diary_write"
     assert posted["params"]["arguments"]["agent_name"] == "claude"
     assert posted["params"]["arguments"]["wing"] == "wing_project"
+    assert mock_server_open.call_args.args[1] == "http://127.0.0.1:8765/mcp"
 
 
 def test_save_diary_direct_does_not_retry_locally_when_hub_refuses(tmp_path):

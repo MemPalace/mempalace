@@ -1380,6 +1380,10 @@ def _mine_convos_impl(
         # some Chroma builds and make the hallway fetch fail.
         with _access_read(access_gate):
             _compute_hallways_for_wing_safe(wing, collection, total_drawers, config=palace_config)
+        # Validation may close cached Chroma handles and rebuild the FTS index,
+        # so it is a mutation even when the common healthy path is read-only.
+        # Keep peer searches out until that maintenance work is complete.
+        with _access_write(access_gate):
             _validate_palace_fts5_after_mine(palace_path)
 
     _mine_print(f"\n{'=' * 55}")

@@ -988,12 +988,9 @@ def _forward_diary_to_hub(agent_name: str, entry: str, topic: str, wing: str):
             return False
         base_url = server_registry.client_base_url(info)
         headers = {"Content-Type": "application/json"}
-        token = server_registry.load_server_token(palace_path)
     except Exception as exc:
         _log(f"Hub discovery failed ({exc}); writing diary checkpoint directly")
         return False
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
 
     try:
         health = urllib.request.Request(f"{base_url}/healthz", headers=headers)
@@ -1022,8 +1019,13 @@ def _forward_diary_to_hub(agent_name: str, entry: str, topic: str, wing: str):
     ).encode("utf-8")
 
     try:
-        request = urllib.request.Request(f"{base_url}/mcp", data=body, headers=headers)
-        with urllib.request.urlopen(request, timeout=_HUB_DIARY_TIMEOUT_S) as resp:
+        with server_registry.urlopen_with_server_tokens(
+            palace_path,
+            f"{base_url}/mcp",
+            data=body,
+            headers=headers,
+            timeout=_HUB_DIARY_TIMEOUT_S,
+        ) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         _log(f"Hub rejected diary checkpoint ({exc.code} {exc.reason})")

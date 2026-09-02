@@ -253,9 +253,11 @@ class TestPalaceReadsDoNotStarveTheHub:
         enter_write = threading.Event()
         write_started = threading.Event()
         release_write = threading.Event()
+        second_write_started = threading.Event()
         second_search_started = threading.Event()
         mutation_started = threading.Event()
         errors = []
+        handoff_order = []
         search_calls = {"count": 0}
         search_lock = threading.Lock()
 
@@ -271,12 +273,16 @@ class TestPalaceReadsDoNotStarveTheHub:
                 assert inflight["tool"] == "mempalace_mine"
                 write_started.set()
                 assert release_write.wait(timeout=5)
+            with gate.write_lock():
+                handoff_order.append("write-2")
+                second_write_started.set()
             return {"success": True}
 
         def search(**_kwargs):
             with search_lock:
                 search_calls["count"] += 1
                 if search_calls["count"] == 2:
+                    handoff_order.append("search-2")
                     second_search_started.set()
             return {"query": "x", "results": []}
 
@@ -344,6 +350,8 @@ class TestPalaceReadsDoNotStarveTheHub:
 
         assert not errors, errors
         assert second_search_started.is_set()
+        assert second_write_started.is_set()
+        assert handoff_order == ["search-2", "write-2"]
         assert mutation_started.is_set()
         assert mcp._write_stall_inflight is None
 
@@ -764,6 +772,40 @@ def test_writable_http_releases_writer_lease_after_bind_failure(monkeypatch):
     assert exc_info.value.code == 1
     assert events == ["bind-failed", "discard", "lease-exit"]
     assert mcp._MCP_WRITER_LOCK_CM is None
+
+
+def test_http_writer_lease_release_uses_dispatch_lock_order(monkeypatch):
+    events = []
+
+    class RecordingContext:
+        def __init__(self, name):
+            self.name = name
+
+        def __enter__(self):
+            events.append(f"{self.name}-enter")
+
+        def __exit__(self, *exc):
+            events.append(f"{self.name}-exit")
+            return False
+
+    class RecordingRequestLock:
+        @staticmethod
+        def write_lock():
+            return RecordingContext("request")
+
+    monkeypatch.setattr(mcp, "_HTTP_MUTATION_LOCK", RecordingContext("mutation"))
+    monkeypatch.setattr(mcp, "_HTTP_REQUEST_LOCK", RecordingRequestLock())
+    monkeypatch.setattr(mcp, "_release_mcp_writer_lock", lambda: events.append("release"))
+
+    mcp._release_http_writer_lease()
+
+    assert events == [
+        "mutation-enter",
+        "request-enter",
+        "release",
+        "request-exit",
+        "mutation-exit",
+    ]
 
 
 def _hook_settings_call(req_id):
