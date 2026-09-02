@@ -861,6 +861,7 @@ class TestFileChunksLocked:
         class FailingCol:
             def __init__(self):
                 self.records = {}
+                self.documents = {}
                 self.upsert_calls = 0
                 self.deleted_ids = []
 
@@ -886,6 +887,7 @@ class TestFileChunksLocked:
                 self.deleted_ids.extend(ids or [])
                 for drawer_id in ids or []:
                     self.records.pop(drawer_id, None)
+                    self.documents.pop(drawer_id, None)
 
             def update(self, ids, metadatas):
                 for drawer_id, meta in zip(ids, metadatas):
@@ -895,8 +897,9 @@ class TestFileChunksLocked:
                 self.upsert_calls += 1
                 if self.upsert_calls == 2:
                     raise RuntimeError("simulated second-batch failure")
-                for drawer_id, meta in zip(ids, metadatas):
+                for drawer_id, document, meta in zip(ids, documents, metadatas):
                     self.records[drawer_id] = meta
+                    self.documents[drawer_id] = document
 
         source = tmp_path / "chat.txt"
         source.write_text("content\n", encoding="utf-8")
@@ -914,7 +917,9 @@ class TestFileChunksLocked:
                 "source_mtime": 1.0,
                 "chunk_total": 3,
             }
+            col.documents[old_id] = f"old verbatim chunk {i}"
         pre_existing = set(col.records)
+        old_documents = dict(col.documents)
         monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
         monkeypatch.setattr(
             convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
@@ -932,6 +937,9 @@ class TestFileChunksLocked:
         assert pre_existing <= set(col.records), (
             "pre-existing drawers vanished during a failed incremental pass"
         )
+        assert {
+            drawer_id: col.documents[drawer_id] for drawer_id in pre_existing
+        } == old_documents, "a failed later batch overwrote old verbatim drawer contents"
         # The real completion check must still see the file as unfinished so
         # the next mine repairs it instead of skipping forever (#2183).
         assert not file_already_mined(

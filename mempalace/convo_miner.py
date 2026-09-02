@@ -27,6 +27,7 @@ from .collision_scan import assert_no_collisions
 from .ids import (
     ID_RECIPE,
     make_convo_drawer_id,
+    make_convo_generation_id,
     make_convo_sentinel_id,
     make_exchange_drawer_id,
 )
@@ -695,21 +696,17 @@ def _file_chunks_locked(
 
     Combines the per-file serialization that prevents concurrent agents from
     duplicating work (via mine_lock) with an incremental re-mine contract
-    (#2403): drawer ids are deterministic over
+    (#2403): logical drawer ids are deterministic over
     ``(source_file, extract_mode, chunk_index)``, so a re-mine of a changed
     source — a Claude Code session appends to its own transcript every turn,
     and /compact or /clear can rewrite one in place — only re-embeds the
-    chunks whose content actually changed. Unchanged chunks get a cheap
-    metadata-only refresh (``source_mtime`` / ``chunk_total``) so the
-    completion check in ``file_already_mined`` still sees one full
-    current-mtime group. Existing drawers are never deleted before the new
-    set is fully written: orphaned ids (a shrunk/rewritten source, or an id
-    recipe migration) are deleted last, after every upsert and metadata
-    touch has succeeded, so a crash mid-operation leaves everything the
-    palace previously held (append-only ingest; CLAUDE.md "Incremental
-    only"). Any interrupted pass leaves mixed mtime groups, each short of
-    its ``chunk_total`` — ``file_already_mined`` returns False and the next
-    mine repairs (#2183).
+    chunks whose content actually changed. A changed chunk is staged under a
+    content-addressed physical generation instead of overwriting its old
+    logical position. Unchanged chunks get a cheap metadata-only refresh
+    (``source_mtime`` / ``chunk_total``). Existing generations are deleted
+    only after every new batch succeeds, so a crash mid-operation leaves the
+    prior verbatim set untouched; a crash after staging leaves a retryable
+    incomplete group that reuses the staged embeddings (#2183).
 
     Returns (drawers_added, room_counts_delta, skipped) where drawers_added
     counts only new/changed drawers actually upserted this pass.
@@ -768,25 +765,43 @@ def _file_chunks_locked(
         # only needs its completion metadata refreshed; everything else is
         # (re-)upserted. Drawers written before ``chunk_hash`` existed have no
         # hash to compare, count as changed once, and migrate themselves.
-        to_upsert: list = []  # (drawer_id, content, meta)
-        to_touch: list = []  # (drawer_id, refreshed_meta)
+        # Physical ids can differ from their stable logical ids after a
+        # changed-content re-mine. Group every existing generation by logical
+        # position so a crash-left staging generation can be resumed without
+        # re-embedding it, while legacy deterministic ids remain compatible.
+        existing_by_logical: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+        for physical_id, stored_meta in existing.items():
+            logical_id = stored_meta.get("logical_drawer_id")
+            if not isinstance(logical_id, str) or not logical_id:
+                logical_id = physical_id
+            existing_by_logical[logical_id].append((physical_id, stored_meta))
+
+        to_upsert: list = []  # (physical_id, content, final_meta)
+        to_touch: list = []  # (physical_id, refreshed_meta)
         new_ids: set = set()
         for chunk in chunks:
             chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
             if extract_mode == "general":
                 room_counts_delta[chunk_room] += 1
-            drawer_id = make_convo_drawer_id(
+            logical_drawer_id = make_convo_drawer_id(
                 wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
             )
-            new_ids.add(drawer_id)
             chunk_hash = hashlib.sha256(chunk["content"].encode("utf-8")).hexdigest()
-            prev = existing.get(drawer_id)
-            if (
-                prev is not None
-                and prev.get("chunk_hash") == chunk_hash
-                and prev.get("normalize_version", 1) >= NORMALIZE_VERSION
-            ):
+            candidates = existing_by_logical.get(logical_drawer_id, [])
+            current = next(
+                (
+                    (physical_id, stored_meta)
+                    for physical_id, stored_meta in candidates
+                    if stored_meta.get("chunk_hash") == chunk_hash
+                    and stored_meta.get("normalize_version", 1) >= NORMALIZE_VERSION
+                ),
+                None,
+            )
+            if current is not None:
+                physical_id, prev = current
+                new_ids.add(physical_id)
                 touched = dict(prev)
+                touched["logical_drawer_id"] = logical_drawer_id
                 touched["chunk_total"] = chunk_total
                 if source_mtime is not None:
                     touched["source_mtime"] = source_mtime
@@ -798,8 +813,14 @@ def _file_chunks_locked(
                 # dedup keeps seeing conversations added since the last pass.
                 if content_hash is not None and chunk.get("chunk_index", 0) == 0:
                     touched["content_hash"] = content_hash
-                to_touch.append((drawer_id, touched))
+                to_touch.append((physical_id, touched))
                 continue
+            physical_id = (
+                make_convo_generation_id(logical_drawer_id, chunk_hash)
+                if candidates
+                else logical_drawer_id
+            )
+            new_ids.add(physical_id)
             meta = {
                 "wing": wing,
                 "room": chunk_room,
@@ -814,6 +835,7 @@ def _file_chunks_locked(
                 "extract_mode": extract_mode,
                 "normalize_version": NORMALIZE_VERSION,
                 "id_recipe": ID_RECIPE,
+                "logical_drawer_id": logical_drawer_id,
                 "chunk_total": chunk_total,
                 "chunk_hash": chunk_hash,
             }
@@ -825,7 +847,7 @@ def _file_chunks_locked(
             # it scans all drawers and splits comma-joined hash fields.
             if content_hash is not None and chunk.get("chunk_index", 0) == 0:
                 meta["content_hash"] = content_hash
-            to_upsert.append((drawer_id, chunk["content"], meta))
+            to_upsert.append((physical_id, chunk["content"], meta))
 
         # A shrink/rewrite needs a two-phase completion marker. New/changed
         # rows are first written without the current source mtime; unchanged

@@ -636,6 +636,7 @@ def test_save_diary_direct_daemon_opt_in_submits_job(tmp_path):
     assert payload["agent_name"] == "claude"
     assert payload["wing"] == "wing_project"
     assert payload["topic"] == "checkpoint"
+    assert payload["idempotency_key"].startswith("hook-checkpoint:")
     assert (tmp_path / "last_checkpoint").exists()
 
 
@@ -2756,7 +2757,10 @@ def test_save_diary_direct_forwards_to_live_hub(tmp_path):
     assert posted["params"]["name"] == "mempalace_diary_write"
     assert posted["params"]["arguments"]["agent_name"] == "claude"
     assert posted["params"]["arguments"]["wing"] == "wing_project"
+    assert posted["params"]["arguments"]["idempotency_key"].startswith("hook-checkpoint:")
     assert mock_server_open.call_args.args[1] == "http://127.0.0.1:8765/mcp"
+    assert mock_health.call_args.kwargs["timeout"] <= 0.05
+    assert mock_server_open.call_args.kwargs["timeout"] <= 0.35
 
 
 def test_save_diary_direct_does_not_retry_locally_when_hub_refuses(tmp_path):
@@ -2795,8 +2799,16 @@ def test_save_diary_direct_writes_in_process_without_a_hub(tmp_path):
                 result = _save_diary_direct(
                     str(transcript), "sess1", wing="wing_project", agent_name="claude"
                 )
+                retry = _save_diary_direct(
+                    str(transcript), "sess1", wing="wing_project", agent_name="claude"
+                )
     assert result["count"] == 3
-    mock_tool.assert_called_once()
+    assert retry["count"] == 3
+    assert mock_tool.call_count == 2
+    first_key = mock_tool.call_args_list[0].kwargs["idempotency_key"]
+    retry_key = mock_tool.call_args_list[1].kwargs["idempotency_key"]
+    assert first_key.startswith("hook-checkpoint:")
+    assert retry_key == first_key
 
 
 def test_forward_diary_to_hub_respects_kill_switch(tmp_path):

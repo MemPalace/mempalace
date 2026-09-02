@@ -963,17 +963,25 @@ def _extract_themes(messages: list[str], max_themes: int = 3) -> list[str]:
 # hooks archived the entire transcript and lost the one compressed entry that
 # continuity actually reads back. Shares the CLI forwarder's kill switch.
 _HUB_FORWARD_ENV = "MEMPALACE_HUB_FORWARD"
-_HUB_HEALTH_TIMEOUT_S = 2.0
-_HUB_DIARY_TIMEOUT_S = 60.0
+_HUB_DIARY_BUDGET_S = 0.35
+_HUB_HEALTH_TIMEOUT_S = 0.05
 
 
-def _forward_diary_to_hub(agent_name: str, entry: str, topic: str, wing: str):
+def _forward_diary_to_hub(
+    agent_name: str,
+    entry: str,
+    topic: str,
+    wing: str,
+    idempotency_key: str = "",
+):
     """File one diary checkpoint inside the palace hub, if a live one serves us.
 
-    Returns True when the hub filed it, False when there is no usable hub
-    (the caller then writes in-process, as before), and None when the hub
-    answered but the write failed — the entry may already be filed, so the
-    caller must not retry locally.
+    Returns True when the hub filed it, False only when no writable hub is
+    registered (the caller may write in-process), and None once a matching
+    hub exists but forwarding is unconfirmed. The latter includes timeout,
+    authentication and response failures: the stable idempotency key makes a
+    later hook retry safe, while an immediate local write could contend with
+    the Hub's writer lease.
     """
     import urllib.error
     import urllib.request
@@ -982,6 +990,7 @@ def _forward_diary_to_hub(agent_name: str, entry: str, topic: str, wing: str):
 
     if os.environ.get(_HUB_FORWARD_ENV, "").strip().lower() in {"0", "false", "no", "off"}:
         return False
+    deadline = time.monotonic() + _HUB_DIARY_BUDGET_S
     try:
         palace_path = MempalaceConfig().palace_path
         info = server_registry.read_live_serverinfo(palace_path)
@@ -994,12 +1003,17 @@ def _forward_diary_to_hub(agent_name: str, entry: str, topic: str, wing: str):
         return False
 
     try:
+        health_remaining = deadline - time.monotonic()
+        if health_remaining <= 0:
+            _log("Hub diary checkpoint skipped: hook forwarding budget exhausted")
+            return None
         health = urllib.request.Request(f"{base_url}/healthz", headers=headers)
-        with urllib.request.urlopen(health, timeout=_HUB_HEALTH_TIMEOUT_S) as resp:
+        health_timeout = min(_HUB_HEALTH_TIMEOUT_S, health_remaining)
+        with urllib.request.urlopen(health, timeout=health_timeout) as resp:
             if resp.status != 200:
-                return False
+                return None
     except (urllib.error.URLError, OSError, ValueError):
-        return False
+        return None
 
     body = json.dumps(
         {
@@ -1013,6 +1027,7 @@ def _forward_diary_to_hub(agent_name: str, entry: str, topic: str, wing: str):
                     "entry": entry,
                     "topic": topic,
                     "wing": wing,
+                    "idempotency_key": idempotency_key,
                 },
             },
         },
@@ -1020,12 +1035,19 @@ def _forward_diary_to_hub(agent_name: str, entry: str, topic: str, wing: str):
     ).encode("utf-8")
 
     try:
+        token_count = max(1, len(server_registry.load_server_tokens(palace_path)))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _log("Hub diary checkpoint skipped: hook forwarding budget exhausted")
+            return None
         with server_registry.urlopen_with_server_tokens(
             palace_path,
             f"{base_url}/mcp",
             data=body,
             headers=headers,
-            timeout=_HUB_DIARY_TIMEOUT_S,
+            # The helper may make one attempt per local token after a safe
+            # pre-dispatch 401. Split the one hook-wide deadline across them.
+            timeout=max(0.001, remaining / token_count),
         ) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
@@ -1089,6 +1111,19 @@ def _save_diary_direct(
 
     themes = _extract_themes(messages)
 
+    checkpoint_key_material = json.dumps(
+        {
+            "agent": agent_name,
+            "session": session_id,
+            "wing": wing,
+            "messages": messages,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    idempotency_key = "hook-checkpoint:" + hashlib.sha256(checkpoint_key_material).hexdigest()
+
     # Build a compressed diary entry from recent conversation
     now = datetime.now()
     topics = "|".join(m[:80] for m in messages[-10:])
@@ -1107,6 +1142,7 @@ def _save_diary_direct(
                         "entry": entry,
                         "topic": "checkpoint",
                         "wing": wing,
+                        "idempotency_key": idempotency_key,
                     },
                     priority=10,
                     wait=True,
@@ -1141,7 +1177,13 @@ def _save_diary_direct(
 
         # Prefer the hub: it owns the writer lease, so an in-process write
         # loses to it. No hub means no contention, and we write directly.
-        hub_status = _forward_diary_to_hub(agent_name, entry, "checkpoint", wing)
+        hub_status = _forward_diary_to_hub(
+            agent_name,
+            entry,
+            "checkpoint",
+            wing,
+            idempotency_key=idempotency_key,
+        )
         if hub_status is None:
             return {"count": 0}
         if hub_status:
@@ -1164,6 +1206,7 @@ def _save_diary_direct(
             entry=entry,
             topic="checkpoint",
             wing=wing,
+            idempotency_key=idempotency_key,
         )
         if result.get("success"):
             _log(f"Diary checkpoint saved: {result.get('entry_id', '?')}")
