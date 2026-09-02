@@ -1281,6 +1281,44 @@ def test_pending_commit_finishes_when_stale_rows_are_already_gone():
     assert collection.marker["mine_cleanup_pending"] is False
 
 
+def test_pending_marker_only_blocks_its_own_extract_mode():
+    from mempalace.palace import NORMALIZE_VERSION, prefetch_mined_set
+
+    class Collection:
+        @staticmethod
+        def count():
+            return 2
+
+        @staticmethod
+        def get(limit, offset, include):
+            if offset:
+                return {"ids": [], "metadatas": []}
+            return {
+                "ids": ["general-marker", "exchange-drawer"],
+                "metadatas": [
+                    {
+                        "source_file": "chat.jsonl",
+                        "extract_mode": "general",
+                        "mine_commit_marker": True,
+                        "mine_cleanup_pending": True,
+                    },
+                    {
+                        "source_file": "chat.jsonl",
+                        "extract_mode": "exchange",
+                        "normalize_version": NORMALIZE_VERSION,
+                        "source_mtime": 42.0,
+                        "chunk_total": 1,
+                    },
+                ],
+            }
+
+    exchange = prefetch_mined_set(Collection(), extract_mode="exchange")
+    general = prefetch_mined_set(Collection(), extract_mode="general")
+
+    assert exchange == {"chat.jsonl": 42.0}
+    assert general == {}
+
+
 class TestSourceFileDeleteIds:
     """#104: the sweeper writes drawers with no extract_mode at all
     (ingest_mode="sweep"). convo_miner's default exchange-mode purge

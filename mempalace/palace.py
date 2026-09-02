@@ -1600,7 +1600,11 @@ def prefetch_mined_set(
             for meta in batch["metadatas"]:
                 meta = meta or {}
                 if meta.get("mine_commit_marker") is True:
-                    if meta.get("mine_cleanup_pending") is True and meta.get("source_file"):
+                    if (
+                        meta.get("mine_cleanup_pending") is True
+                        and meta.get("source_file")
+                        and _metadata_matches_extract_mode(meta, extract_mode)
+                    ):
                         pending_sources.add(meta["source_file"])
                     continue
                 if meta.get("mine_staged") is True:
