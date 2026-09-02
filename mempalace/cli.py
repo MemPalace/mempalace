@@ -460,7 +460,10 @@ def cmd_init(args):
             # without this, hyphenated dirnames silently lose tunnels).
             wing = normalize_wing_name(project_path.name)
             registry_path = add_to_known_entities(confirmed, wing=wing)
-            print(f"  Registry updated: {registry_path}")
+            if registry_path:
+                print(f"  Registry updated: {registry_path}")
+            # ``None`` means the registry was left alone and said why on
+            # stderr, so reporting an update here would contradict it.
     else:
         print("  No entities detected -- proceeding with directory-based rooms.")
 
