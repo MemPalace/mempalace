@@ -35,7 +35,6 @@ _SLACK_PROVENANCE_FOOTER = (
 )
 
 MAX_IN_MEMORY_FILE_SIZE = 500 * 1024 * 1024
-MAX_STREAMING_JSONL_FILE_SIZE = 2 * 1024 * 1024 * 1024
 
 
 # ─── Noise stripping ─────────────────────────────────────────────────────
@@ -309,11 +308,11 @@ def _try_normalize_jsonl_file(filepath: str) -> Optional[str]:
     JSONL still falls back to the regular read path so plain-text pass-through
     is unchanged.
     """
-    with _open_transcript_file(filepath, MAX_STREAMING_JSONL_FILE_SIZE) as lines:
+    with _open_transcript_file(filepath) as lines:
         parser = _detect_jsonl_line_parser(lines)
     if parser is None:
         return None
-    with _open_transcript_file(filepath, MAX_STREAMING_JSONL_FILE_SIZE) as lines:
+    with _open_transcript_file(filepath) as lines:
         return parser(lines)
 
 

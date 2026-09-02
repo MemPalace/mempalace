@@ -28,7 +28,7 @@ from .ids import (
     make_convo_sentinel_id,
     make_exchange_drawer_id,
 )
-from .normalize import MAX_STREAMING_JSONL_FILE_SIZE, normalize_conversations
+from .normalize import normalize_conversations
 from .entities import entities_metadata
 from .palace import (
     NORMALIZE_VERSION,
@@ -166,15 +166,9 @@ _LINE_GROUP_SIZE = 25  # lines per fallback group when no paragraph breaks
 _LINE_FALLBACK_MIN_NEWLINES = 20  # trigger line-group fallback above this newline count
 DRAWER_UPSERT_BATCH_SIZE = 1000
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
-# Matches miner.py for formats that still require whole-file reads. Known
-# JSONL formats use a bounded streaming normalizer and can safely use its
-# larger limit without admitting multi-gigabyte JSON bundles or plain text.
-
-
-def _source_file_size_limit(filepath: Path) -> int:
-    if filepath.suffix.lower() == ".jsonl":
-        return MAX_STREAMING_JSONL_FILE_SIZE
-    return MAX_FILE_SIZE
+# Matches miner.py. Streaming recognized JSONL avoids retaining the complete
+# source string, but normalized conversation text is still materialized before
+# chunking, so every format stays behind the same conservative input cap.
 
 
 def _path_within_root(path: Path, root: Path) -> bool:
@@ -203,7 +197,7 @@ def _is_regular_source_file(filepath: Path, root: Path) -> bool:
                 raise
             fd = os.open(filepath, flags & ~getattr(os, "O_NONBLOCK", 0))
         st = os.fstat(fd)
-        return stat.S_ISREG(st.st_mode) and st.st_size <= _source_file_size_limit(filepath)
+        return stat.S_ISREG(st.st_mode) and st.st_size <= MAX_FILE_SIZE
     except OSError:
         return False
     finally:
@@ -567,7 +561,7 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
                         )
                         continue
                     file_size = file_stat.st_size
-                    file_size_limit = _source_file_size_limit(filepath)
+                    file_size_limit = MAX_FILE_SIZE
                     if file_size > file_size_limit:
                         print(
                             f"  SKIP: {filepath.name} ({file_size / (1024 * 1024):.1f} MB)"
@@ -974,9 +968,12 @@ def _normalize_convo_conversations(
     """
     try:
         conversations = [c for c in normalize_conversations(str(filepath)) if c]
-    except (OSError, ValueError):
-        if not dry_run:
-            _register_file(collection, source_file, wing, agent, extract_mode)
+    except (OSError, ValueError) as exc:
+        # A normalization failure is not an empty, successfully processed
+        # transcript. Registering a sentinel here makes the unchanged source
+        # look permanently mined, so future runs never retry after format,
+        # permission, or size-limit failures.
+        print(f"  SKIP: {filepath.name} (normalize error: {exc})", file=sys.stderr)
         return None
 
     total_len = sum(len(c.strip()) for c in conversations)

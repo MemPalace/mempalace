@@ -1,10 +1,10 @@
 import json
 import stat
+import tracemalloc
 from unittest.mock import patch
 
 from mempalace.normalize import (
     MAX_IN_MEMORY_FILE_SIZE,
-    MAX_STREAMING_JSONL_FILE_SIZE,
     _SLACK_PROVENANCE_FOOTER,
     _extract_content,
     _format_tool_result,
@@ -137,8 +137,8 @@ def test_known_jsonl_formats_bypass_full_file_read(tmp_path):
             assert normalize_conversations(str(source)) == [expected]
 
 
-def test_known_jsonl_can_exceed_in_memory_limit(tmp_path):
-    """The larger safety rail applies only after a known JSONL schema is detected."""
+def test_known_jsonl_cannot_exceed_in_memory_limit(tmp_path):
+    """Streaming input stays capped while normalized output is materialized in memory."""
     source = tmp_path / "codex.jsonl"
     source.write_text(
         "\n".join(
@@ -157,10 +157,57 @@ def test_known_jsonl_can_exceed_in_memory_limit(tmp_path):
         st_size = MAX_IN_MEMORY_FILE_SIZE + 1
 
     with patch("mempalace.normalize.os.fstat", return_value=_LargeRegularFile()):
-        result = normalize(str(source))
+        try:
+            normalize(str(source))
+            assert False, "Should have enforced the shared in-memory input cap"
+        except IOError as exc:
+            assert "too large" in str(exc).lower()
 
-    assert result.startswith("> Q")
-    assert MAX_STREAMING_JSONL_FILE_SIZE > MAX_IN_MEMORY_FILE_SIZE
+
+def test_known_jsonl_peak_memory_does_not_scale_with_ignored_source(tmp_path):
+    """Ignored JSONL records are consumed incrementally, not retained as one source string."""
+    source = tmp_path / "large-codex.jsonl"
+    ignored_line = (
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {"type": "reasoning", "text": "x" * 2048},
+            }
+        )
+        + "\n"
+    )
+    with source.open("w", encoding="utf-8") as stream:
+        stream.write(json.dumps({"type": "session_meta", "payload": {}}) + "\n")
+        for _ in range(6144):
+            stream.write(ignored_line)
+        stream.write(
+            json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "Q"}})
+            + "\n"
+        )
+        stream.write(
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "message": "A"},
+                }
+            )
+            + "\n"
+        )
+
+    source_size = source.stat().st_size
+    assert source_size >= 12 * 1024 * 1024
+
+    tracemalloc.start()
+    try:
+        result = normalize(str(source))
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert result == "> Q\nA\n"
+    assert peak < source_size // 3, (
+        f"streaming normalization peaked at {peak} bytes for a {source_size}-byte source"
+    )
 
 
 # ── _extract_content ───────────────────────────────────────────────────
