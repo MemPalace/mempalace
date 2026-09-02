@@ -2830,7 +2830,9 @@ def test_forward_diary_hard_stops_a_drip_feed_at_the_absolute_budget(tmp_path):
 
     assert result is None
     assert elapsed < 0.25
-    assert slow_response.closed is True
+    # The deadline-owning hook thread must not call HTTPResponse.close(); on
+    # real urllib responses that can block on the reader thread's internal lock.
+    assert slow_response.closed is False
 
 
 def test_save_diary_direct_writes_in_process_without_a_hub(tmp_path):

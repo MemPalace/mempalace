@@ -968,39 +968,6 @@ _HUB_DIARY_BUDGET_S = 0.35
 _HUB_HEALTH_TIMEOUT_S = 0.05
 
 
-def _read_response_before_deadline(response, deadline: float) -> bytes:
-    """Read an HTTP response under one absolute wall-clock deadline.
-
-    ``urllib`` socket timeouts apply to each receive separately, so a peer
-    that drip-feeds bytes can keep ``response.read()`` alive indefinitely.
-    Run that read in a daemon thread and close the response when the one
-    hook-wide monotonic deadline expires.
-    """
-    finished = threading.Event()
-    outcome = {}
-
-    def _reader():
-        try:
-            outcome["body"] = response.read()
-        except BaseException as exc:  # propagate the worker's exact transport error
-            outcome["error"] = exc
-        finally:
-            finished.set()
-
-    reader = threading.Thread(target=_reader, name="mempalace-hook-hub-read", daemon=True)
-    reader.start()
-    remaining = deadline - time.monotonic()
-    if remaining <= 0 or not finished.wait(remaining):
-        try:
-            response.close()
-        except Exception:
-            pass
-        raise TimeoutError("Hub diary response exceeded the hook forwarding deadline")
-    if "error" in outcome:
-        raise outcome["error"]
-    return outcome.get("body", b"")
-
-
 def _forward_diary_to_hub(
     agent_name: str,
     entry: str,
@@ -1074,16 +1041,42 @@ def _forward_diary_to_hub(
         if remaining <= 0:
             _log("Hub diary checkpoint skipped: hook forwarding budget exhausted")
             return None
-        with server_registry.urlopen_with_server_tokens(
-            palace_path,
-            f"{base_url}/mcp",
-            data=body,
-            headers=headers,
-            # The helper may make one attempt per local token after a safe
-            # pre-dispatch 401. Split the one hook-wide deadline across them.
-            timeout=max(0.001, remaining / token_count),
-        ) as resp:
-            payload = json.loads(_read_response_before_deadline(resp, deadline).decode("utf-8"))
+        finished = threading.Event()
+        outcome = {}
+
+        def _post_and_read():
+            try:
+                # Keep the complete response lifecycle in this daemon worker.
+                # HTTPResponse.close() can wait on a blocked reader's internal
+                # lock, so the deadline-owning hook thread must never touch it.
+                with server_registry.urlopen_with_server_tokens(
+                    palace_path,
+                    f"{base_url}/mcp",
+                    data=body,
+                    headers=headers,
+                    # The helper may make one attempt per local token after a
+                    # safe pre-dispatch 401. Split the socket budget across them.
+                    timeout=max(0.001, remaining / token_count),
+                ) as resp:
+                    outcome["body"] = resp.read()
+            except Exception as exc:
+                outcome["error"] = exc
+            finally:
+                finished.set()
+
+        worker = threading.Thread(
+            target=_post_and_read,
+            name="mempalace-hook-hub-post",
+            daemon=True,
+        )
+        worker.start()
+        wait_remaining = deadline - time.monotonic()
+        if wait_remaining <= 0 or not finished.wait(wait_remaining):
+            _log("Hub diary response exceeded the hook forwarding deadline")
+            return None
+        if "error" in outcome:
+            raise outcome["error"]
+        payload = json.loads(outcome.get("body", b"").decode("utf-8"))
     except urllib.error.HTTPError as exc:
         _log(f"Hub rejected diary checkpoint ({exc.code} {exc.reason})")
         return None
