@@ -3881,6 +3881,20 @@ def tool_list_drawers(
                 return _collection_error_or_no_palace()
             ids, documents, metadatas = _fetch_drawer_rows(col, where=where, include=["metadatas"])
         drawers = _collapse_drawer_rows(ids, documents, metadatas)
+        committed_tokens = {
+            drawer.get("metadata", {}).get("mine_generation_commit")
+            for drawer in drawers
+            if drawer.get("metadata", {}).get("mine_commit_marker") is True
+        }
+        drawers = [
+            drawer
+            for drawer in drawers
+            if drawer.get("metadata", {}).get("mine_commit_marker") is not True
+            and (
+                drawer.get("metadata", {}).get("mine_staged") is not True
+                or drawer.get("metadata", {}).get("mine_generation_token") in committed_tokens
+            )
+        ]
 
         if since_dt is not None or before_dt is not None:
             drawers = [

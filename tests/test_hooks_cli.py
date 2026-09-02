@@ -537,8 +537,10 @@ def test_spawn_mine_reports_already_running_as_dispatched(tmp_path):
     with (
         patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
         patch("mempalace.hooks_cli._claim_mine_slot", return_value=None),
+        patch("mempalace.hooks_cli._queue_mine_followup", return_value=True) as queue,
     ):
         assert _spawn_mine(["python", "-m", "mempalace", "mine", "x"]) is True
+    queue.assert_called_once()
 
 
 # --- #1693: hook checkpoints must be discoverable by diary_read ---
@@ -1300,8 +1302,8 @@ def test_maybe_auto_ingest_oserror(tmp_path):
                     _maybe_auto_ingest()  # should not raise
 
 
-def test_maybe_auto_ingest_skips_when_mine_running(tmp_path):
-    """Does not spawn a new mine process if a mine for the same target is alive."""
+def test_maybe_auto_ingest_queues_followup_when_mine_running(tmp_path):
+    """Coalesces a latest-state follow-up while the same target is alive."""
     mempal_dir = tmp_path / "project"
     mempal_dir.mkdir()
     pid_dir = tmp_path / "mine_pids"
@@ -1326,9 +1328,15 @@ def test_maybe_auto_ingest_skips_when_mine_running(tmp_path):
 
                 pid_file.write_text(f"{os.getpid()} {int(_time.time())}")
                 with patch("mempalace.hooks_cli._mempalace_python", return_value=sys.executable):
-                    with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                    with (
+                        patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen,
+                        patch(
+                            "mempalace.hooks_cli._queue_mine_followup", return_value=True
+                        ) as mock_queue,
+                    ):
                         _maybe_auto_ingest()
                         mock_popen.assert_not_called()
+                        mock_queue.assert_called_once()
 
 
 # --- _detached_popen_kwargs ---
@@ -1400,8 +1408,8 @@ def test_spawn_mine_uses_detached_kwargs(tmp_path):
                 assert kwargs.get("close_fds") is True
 
 
-def test_spawn_mine_skips_when_target_running(tmp_path):
-    """A second spawn for the same cmd target while the first is alive must skip."""
+def test_spawn_mine_queues_followup_when_target_running(tmp_path):
+    """A second same-target request queues behind the live snapshot."""
     import time as _time
 
     pid_dir = tmp_path / "mine_pids"
@@ -1414,9 +1422,13 @@ def test_spawn_mine_skips_when_target_running(tmp_path):
             pid_file.parent.mkdir(parents=True, exist_ok=True)
             pid_file.write_text(f"{os.getpid()} {int(_time.time())}")  # live PID, fresh
 
-            with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+            with (
+                patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen,
+                patch("mempalace.hooks_cli._queue_mine_followup", return_value=True) as mock_queue,
+            ):
                 _spawn_mine(cmd)
                 mock_popen.assert_not_called()
+                mock_queue.assert_called_once_with(cmd, pid_file)
 
 
 def test_spawn_mine_distinct_targets_dont_block_each_other(tmp_path):
@@ -1557,9 +1569,45 @@ def test_ingest_transcript_skips_when_target_running(tmp_path):
 
                 pid_file.write_text(f"{os.getpid()} {int(_time.time())}")  # live target, fresh
 
-                with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
-                    _ingest_transcript(str(transcript))
+                with (
+                    patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen,
+                    patch(
+                        "mempalace.hooks_cli._queue_mine_followup", return_value=True
+                    ) as mock_queue,
+                ):
+                    assert _ingest_transcript(str(transcript)) is True
                     mock_popen.assert_not_called()
+                    mock_queue.assert_called_once()
+
+
+def test_ingest_transcript_reports_vanished_source_as_undispatched(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("x" * 200, encoding="utf-8")
+    transcript.unlink()
+
+    from mempalace.hooks_cli import _ingest_transcript
+
+    assert _ingest_transcript(str(transcript)) is False
+
+
+def test_queue_mine_followup_persists_latest_command_and_starts_one_watcher(tmp_path):
+    from mempalace.hooks_cli import _queue_mine_followup
+
+    pid_file = tmp_path / "mine_target.pid"
+    pid_file.write_text(f"{os.getpid()} {int(time.time())}", encoding="ascii")
+    command = [sys.executable, "-m", "mempalace", "mine", "/tmp/chat.jsonl"]
+    with (
+        patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
+        patch("mempalace.hooks_cli._mempalace_python", return_value=sys.executable),
+        patch("mempalace.hooks_cli.subprocess.Popen") as popen,
+    ):
+        popen.return_value.pid = 424242
+        assert _queue_mine_followup(command, pid_file) is True
+
+    pending = json.loads(pid_file.with_suffix(".pending.json").read_text(encoding="utf-8"))
+    assert pending["cmd"] == command
+    assert pid_file.with_suffix(".watcher.pid").read_text().split()[0] == "424242"
+    popen.assert_called_once()
 
 
 # --- _mine_already_running ---
@@ -2897,6 +2945,52 @@ def test_save_diary_direct_writes_in_process_without_a_hub(tmp_path):
     retry_key = mock_tool.call_args_list[1].kwargs["idempotency_key"]
     assert first_key.startswith("hook-checkpoint:")
     assert retry_key == first_key
+
+
+def test_failed_checkpoint_retry_reuses_persisted_payload(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(3)],
+    )
+    with (
+        patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
+        patch("mempalace.server_registry.read_live_serverinfo", return_value=None),
+        patch(
+            "mempalace.mcp_server.tool_diary_write",
+            side_effect=[
+                {"success": False, "error": "ambiguous failure"},
+                {"success": True, "entry_id": "e1"},
+            ],
+        ) as mock_tool,
+    ):
+        first = _save_diary_direct(
+            str(transcript),
+            "sess1",
+            wing="wing_project",
+            agent_name="claude",
+            checkpoint_id="stop:15",
+        )
+        with transcript.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"message": {"role": "user", "content": "later"}}) + "\n")
+        retry = _save_diary_direct(
+            str(transcript),
+            "sess1",
+            wing="wing_project",
+            agent_name="claude",
+            checkpoint_id="stop:15",
+        )
+
+    assert first["count"] == 0
+    assert retry["count"] == 3
+    assert (
+        mock_tool.call_args_list[0].kwargs["entry"] == mock_tool.call_args_list[1].kwargs["entry"]
+    )
+    assert (
+        mock_tool.call_args_list[0].kwargs["idempotency_key"]
+        == mock_tool.call_args_list[1].kwargs["idempotency_key"]
+    )
+    assert list(tmp_path.glob("pending_checkpoint_*.json")) == []
 
 
 def test_forward_diary_to_hub_respects_kill_switch(tmp_path):

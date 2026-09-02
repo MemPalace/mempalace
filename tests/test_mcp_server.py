@@ -2932,6 +2932,38 @@ class TestWriteTools:
         assert result["count"] == 4
         assert len(result["drawers"]) == 4
 
+    def test_list_drawers_hides_markers_and_uncommitted_generations(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        collection.add(
+            ids=["hidden", "published", "marker", "ordinary"],
+            documents=["hidden", "published", "[commit]", "ordinary"],
+            metadatas=[
+                {
+                    "mine_staged": True,
+                    "mine_generation_token": "hidden-token",
+                },
+                {
+                    "mine_staged": True,
+                    "mine_generation_token": "published-token",
+                },
+                {
+                    "mine_staged": True,
+                    "mine_commit_marker": True,
+                    "mine_generation_commit": "published-token",
+                },
+                {"wing": "w", "room": "r"},
+            ],
+        )
+
+        from mempalace.mcp_server import tool_list_drawers
+
+        result = tool_list_drawers(limit=20)
+        ids = {drawer["drawer_id"] for drawer in result["drawers"]}
+        assert ids == {"published", "ordinary"}
+        assert result["total"] == 2
+
     def test_list_drawers_with_wing_filter(
         self, monkeypatch, config, palace_path, seeded_collection, kg
     ):

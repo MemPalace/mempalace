@@ -482,6 +482,117 @@ def _claim_mine_slot(cmd: list[str]) -> Optional[Path]:
         return None
 
 
+def _slot_file_pid_alive(slot_file: Path) -> bool:
+    try:
+        token = slot_file.read_text(encoding="ascii").split()[0]
+        return token.isdigit() and _pid_alive(int(token))
+    except (OSError, IndexError):
+        return False
+
+
+def _run_queued_mine(pid_path: str, pending_path: str, watcher_path: str) -> None:
+    """Detached follow-up worker: wait for the active snapshot, then mine latest."""
+    pid_file = Path(pid_path)
+    pending_file = Path(pending_path)
+    watcher_file = Path(watcher_path)
+    try:
+        deadline = time.monotonic() + max(_mine_slot_timeout_secs(), 3600.0)
+        while _slot_file_pid_alive(pid_file) and time.monotonic() < deadline:
+            time.sleep(0.25)
+        if _slot_file_pid_alive(pid_file):
+            return
+        try:
+            command = json.loads(pending_file.read_text(encoding="utf-8"))["cmd"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return
+        try:
+            pid_file.unlink()
+        except OSError:
+            pass
+        try:
+            _create_mine_slot_with_placeholder(pid_file)
+        except (OSError, FileExistsError):
+            return
+        child_env = os.environ.copy()
+        child_env[_MINE_PID_FILE_ENV] = str(pid_file)
+        log_path = STATE_DIR / "hook.log"
+        with open(log_path, "a") as log_file:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdout=log_file,
+                    stderr=log_file,
+                    env=child_env,
+                    **_detached_popen_kwargs(),
+                )
+            except OSError:
+                try:
+                    pid_file.unlink()
+                except OSError:
+                    pass
+                return
+        try:
+            pid_file.write_text(f"{process.pid} {int(time.time())}", encoding="ascii")
+            pending_file.unlink()
+        except OSError:
+            pass
+    finally:
+        try:
+            watcher_file.unlink()
+        except OSError:
+            pass
+
+
+def _queue_mine_followup(cmd: list[str], pid_file: Path) -> bool:
+    """Durably coalesce one latest-state mine behind the active snapshot."""
+    pending_file = pid_file.with_suffix(".pending.json")
+    watcher_file = pid_file.with_suffix(".watcher.pid")
+    try:
+        temp_file = pending_file.with_name(f".{pending_file.name}.{os.getpid()}.tmp")
+        temp_file.write_text(json.dumps({"cmd": cmd}), encoding="utf-8")
+        os.replace(temp_file, pending_file)
+    except OSError:
+        return False
+
+    if watcher_file.exists() and _slot_file_pid_alive(watcher_file):
+        return True
+    try:
+        watcher_file.unlink()
+    except OSError:
+        pass
+    try:
+        _create_mine_slot_with_placeholder(watcher_file)
+    except (OSError, FileExistsError):
+        return _slot_file_pid_alive(watcher_file)
+
+    script = (
+        "from mempalace.hooks_cli import _run_queued_mine;"
+        "import sys;_run_queued_mine(sys.argv[1],sys.argv[2],sys.argv[3])"
+    )
+    try:
+        watcher = subprocess.Popen(
+            [
+                _mempalace_python(),
+                "-c",
+                script,
+                str(pid_file),
+                str(pending_file),
+                str(watcher_file),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            **_detached_popen_kwargs(),
+        )
+        watcher_file.write_text(f"{watcher.pid} {int(time.time())}", encoding="ascii")
+        return True
+    except OSError:
+        try:
+            watcher_file.unlink()
+        except OSError:
+            pass
+        return False
+
+
 def _spawn_mine(cmd: list) -> bool:
     """Spawn a mine subprocess if no live mine is already targeting it.
 
@@ -501,8 +612,13 @@ def _spawn_mine(cmd: list) -> bool:
     log_path = STATE_DIR / "hook.log"
     pid_file = _claim_mine_slot(cmd)
     if pid_file is None:
-        _log(f"Skipping mine: target already running ({' '.join(cmd[-3:])})")
-        return True
+        target_slot = _pid_file_for_cmd(cmd)
+        queued = _queue_mine_followup(cmd, target_slot)
+        _log(
+            f"Mine target already running; latest-state follow-up "
+            f"{'queued' if queued else 'could not be queued'} ({' '.join(cmd[-3:])})"
+        )
+        return queued
     child_env = os.environ.copy()
     child_env[_MINE_PID_FILE_ENV] = str(pid_file)
     with open(log_path, "a") as log_f:
@@ -1085,6 +1201,90 @@ def _forward_diary_to_hub(
     return True
 
 
+def _pending_checkpoint_path(session_id: str, checkpoint_id: str) -> Path:
+    digest = hashlib.sha256(f"{session_id}\0{checkpoint_id}".encode()).hexdigest()[:24]
+    return STATE_DIR / f"pending_checkpoint_{digest}.json"
+
+
+def _discard_pending_checkpoint(session_id: str, checkpoint_id: str) -> None:
+    try:
+        _pending_checkpoint_path(session_id, checkpoint_id).unlink()
+    except OSError:
+        pass
+
+
+def _prepare_checkpoint_payload(
+    transcript_path: str,
+    session_id: str,
+    wing: str,
+    agent_name: str,
+    checkpoint_id: str,
+):
+    """Load a frozen pending payload or create and persist the next one."""
+    pending_file = _pending_checkpoint_path(session_id, checkpoint_id) if checkpoint_id else None
+    pending = None
+    if pending_file is not None:
+        try:
+            pending = json.loads(pending_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            pass
+    if (
+        isinstance(pending, dict)
+        and isinstance(pending.get("messages"), list)
+        and isinstance(pending.get("themes"), list)
+        and isinstance(pending.get("idempotency_key"), str)
+        and isinstance(pending.get("entry"), str)
+    ):
+        return (
+            pending["messages"],
+            pending["themes"],
+            pending["idempotency_key"],
+            pending["entry"],
+            pending_file,
+        )
+
+    messages = _extract_recent_messages(transcript_path)
+    if not messages:
+        return None
+    themes = _extract_themes(messages)
+    identity = {"agent": agent_name, "session": session_id, "wing": wing}
+    identity["checkpoint_id" if checkpoint_id else "messages"] = checkpoint_id or messages
+    material = json.dumps(
+        identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    idempotency_key = "hook-checkpoint:" + hashlib.sha256(material).hexdigest()
+    created = datetime.now()
+    topics = "|".join(message[:80] for message in messages[-10:])
+    entry = (
+        f"CHECKPOINT:{created.strftime('%Y-%m-%d')}|session:{session_id}"
+        f"|msgs:{len(messages)}|recent:{topics}"
+    )
+    if pending_file is not None:
+        try:
+            pending_file.parent.mkdir(parents=True, exist_ok=True)
+            temp_file = pending_file.with_name(f".{pending_file.name}.{os.getpid()}.tmp")
+            temp_file.write_text(
+                json.dumps(
+                    {
+                        "messages": messages,
+                        "themes": themes,
+                        "idempotency_key": idempotency_key,
+                        "entry": entry,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            try:
+                temp_file.chmod(0o600)
+            except (OSError, NotImplementedError):
+                pass
+            os.replace(temp_file, pending_file)
+        except OSError:
+            pass
+    return messages, themes, idempotency_key, entry, pending_file
+
+
 def _save_diary_direct(
     transcript_path: str,
     session_id: str,
@@ -1107,10 +1307,13 @@ def _save_diary_direct(
     the entry is queued and the daemon files it once the holder exits, so the
     checkpoint marker is deliberately not advanced.
     """
-    messages = _extract_recent_messages(transcript_path)
-    if not messages:
+    prepared = _prepare_checkpoint_payload(
+        transcript_path, session_id, wing, agent_name, checkpoint_id
+    )
+    if prepared is None:
         _log("No recent messages to save")
         return {"count": 0}
+    messages, themes, idempotency_key, entry, pending_file = prepared
 
     routing = _current_hook_write_routing()
     if routing.blocked:
@@ -1121,35 +1324,14 @@ def _save_diary_direct(
             "routing_message": routing.notice,
         }
 
-    themes = _extract_themes(messages)
-
-    checkpoint_identity = {
-        "agent": agent_name,
-        "session": session_id,
-        "wing": wing,
-    }
-    if checkpoint_id:
-        # Stop-hook retries derive this from the persisted last-save marker.
-        # Until a checkpoint is acknowledged that marker stays put, so new
-        # prompts cannot accidentally mint a second key for the pending write.
-        checkpoint_identity["checkpoint_id"] = checkpoint_id
-    else:
-        checkpoint_identity["messages"] = messages
-    checkpoint_key_material = json.dumps(
-        checkpoint_identity,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    idempotency_key = "hook-checkpoint:" + hashlib.sha256(checkpoint_key_material).hexdigest()
-
-    # Build a compressed diary entry from recent conversation
     now = datetime.now()
-    topics = "|".join(m[:80] for m in messages[-10:])
-    entry = (
-        f"CHECKPOINT:{now.strftime('%Y-%m-%d')}|session:{session_id}"
-        f"|msgs:{len(messages)}|recent:{topics}"
-    )
+
+    def _clear_pending():
+        if pending_file is not None:
+            try:
+                pending_file.unlink()
+            except OSError:
+                pass
 
     try:
         if routing.use_daemon:
@@ -1184,6 +1366,7 @@ def _save_diary_direct(
                     pass
                 if toast:
                     _desktop_toast(f"Checkpoint saved - {len(messages)} messages archived")
+                _clear_pending()
                 return {"count": len(messages), "themes": themes}
             if _job_deferred_by_lock(job):
                 # Queued behind the palace lock: the entry is held and the daemon
@@ -1216,6 +1399,7 @@ def _save_diary_direct(
                 pass
             if toast:
                 _desktop_toast(f"Checkpoint saved \u2014 {len(messages)} messages archived")
+            _clear_pending()
             return {"count": len(messages), "themes": themes}
 
         from .mcp_server import tool_diary_write
@@ -1240,6 +1424,7 @@ def _save_diary_direct(
                 pass
             if toast:
                 _desktop_toast(f"Checkpoint saved \u2014 {len(messages)} messages archived")
+            _clear_pending()
             return {"count": len(messages), "themes": themes}
         else:
             _log(f"Diary checkpoint failed: {result.get('error', 'unknown')}")
@@ -1259,12 +1444,12 @@ def _ingest_transcript(transcript_path: str) -> Optional[bool]:
     """
     path = _validate_transcript_path(transcript_path)
     if path is None:
-        return True
+        return False
     try:
         if not path.is_file() or path.stat().st_size < 100:
-            return True
+            return False
     except OSError:
-        return True
+        return False
 
     try:
         # Also validates that config loads at all.
@@ -1576,6 +1761,9 @@ def hook_stop(data: dict, harness: str):
                 # Save directly via Python API — systemMessage renders in terminal
                 result = {"count": 0}
                 ingest_dispatched = False
+                checkpoint_id = (
+                    f"stop:{_session_checkpoint_epoch(session_id)}:{last_save + SAVE_INTERVAL}"
+                )
                 if transcript_path:
                     result = _save_diary_direct(
                         transcript_path,
@@ -1583,10 +1771,7 @@ def hook_stop(data: dict, harness: str):
                         wing=project_wing,
                         toast=toast,
                         agent_name=_diary_agent_for_harness(harness),
-                        checkpoint_id=(
-                            f"stop:{_session_checkpoint_epoch(session_id)}:"
-                            f"{last_save + SAVE_INTERVAL}"
-                        ),
+                        checkpoint_id=checkpoint_id,
                     )
                     ingest_dispatched = _ingest_transcript(transcript_path) is True
                 _maybe_auto_ingest()
@@ -1603,6 +1788,8 @@ def hook_stop(data: dict, harness: str):
                 # stay put for a full retry at the next fire.
                 count = result.get("count", 0)
                 if count > 0 or ingest_dispatched:
+                    if count <= 0:
+                        _discard_pending_checkpoint(session_id, checkpoint_id)
                     try:
                         last_save_file.write_text(str(exchange_count), encoding="utf-8")
                     except OSError:
