@@ -764,14 +764,24 @@ def _file_chunks_locked(
     room_counts_delta: dict = defaultdict(int)
     drawers_added = 0
     with mine_lock(source_file):
+        commit_id = make_convo_commit_id(source_file, extract_mode)
         # Re-check after lock — another agent may have just finished this file
         # at the current schema/mtime. A stale hit here returns False, so we
         # still fall through to the incremental path below.
-        with _access_read(access_gate):
-            if file_already_mined(
-                collection, source_file, check_mtime=True, extract_mode=extract_mode
-            ):
-                return 0, room_counts_delta, True
+        try:
+            with _access_read(access_gate):
+                marker_result = collection.get(ids=[commit_id], include=["metadatas"])
+                pending_cleanup = any(
+                    (meta or {}).get("mine_cleanup_pending") is True
+                    for meta in (marker_result.get("metadatas") or [])
+                )
+                if not pending_cleanup and file_already_mined(
+                    collection, source_file, check_mtime=True, extract_mode=extract_mode
+                ):
+                    return 0, room_counts_delta, True
+        except Exception:
+            logger.warning("Conversation mine re-check failed for %s", source_file, exc_info=True)
+            return 0, room_counts_delta, True
 
         # Snapshot what the palace already holds for this source+mode. A
         # failed snapshot must abort this file's mine attempt rather than
@@ -909,7 +919,6 @@ def _file_chunks_locked(
         # changes again.
         stale_ids = [drawer_id for drawer_id in existing if drawer_id not in new_ids]
         generation_token = hashlib.sha256("\0".join(sorted(new_ids)).encode()).hexdigest()
-        commit_id = make_convo_commit_id(source_file, extract_mode)
         commit_metadata = {
             "wing": wing,
             "room": "_registry",
@@ -923,12 +932,6 @@ def _file_chunks_locked(
             "mine_generation_commit": generation_token,
             "mine_cleanup_pending": True,
         }
-        with _access_read(access_gate):
-            marker_result = collection.get(ids=[commit_id], include=["metadatas"])
-        pending_cleanup = any(
-            (meta or {}).get("mine_cleanup_pending") is True
-            for meta in (marker_result.get("metadatas") or [])
-        )
 
         # Batch into bounded requests so large transcripts keep most of the
         # embedding speedup without one huge Chroma/SQLite request.

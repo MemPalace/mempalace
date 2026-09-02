@@ -696,7 +696,7 @@ class TestFileChunksLocked:
 
         assert (drawers, skipped) == (3, False)
         assert col.batch_sizes == [2, 1]
-        assert gate.events.count("read-enter") == 3
+        assert gate.events.count("read-enter") == 2
         assert gate.events.count("write-enter") == 2
         assert gate.mode is None
 

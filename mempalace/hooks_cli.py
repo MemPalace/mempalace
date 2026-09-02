@@ -502,8 +502,10 @@ def _run_queued_mine(pid_path: str, pending_path: str, watcher_path: str) -> Non
             time.sleep(0.25)
         if _slot_file_pid_alive(pid_file):
             return
+        claimed_file = pending_file.with_name(f".{pending_file.name}.claimed.{os.getpid()}")
         try:
-            command = json.loads(pending_file.read_text(encoding="utf-8"))["cmd"]
+            os.replace(pending_file, claimed_file)
+            command = json.loads(claimed_file.read_text(encoding="utf-8"))["cmd"]
         except (OSError, ValueError, KeyError, TypeError):
             return
         try:
@@ -534,13 +536,31 @@ def _run_queued_mine(pid_path: str, pending_path: str, watcher_path: str) -> Non
                 return
         try:
             pid_file.write_text(f"{process.pid} {int(time.time())}", encoding="ascii")
-            pending_file.unlink()
+            claimed_file.unlink()
         except OSError:
             pass
+        if pending_file.exists():
+            _run_queued_mine(pid_path, pending_path, watcher_path)
+        else:
+            try:
+                recorded = watcher_file.read_text(encoding="ascii").split()[0]
+                if recorded.isdigit() and int(recorded) == os.getpid():
+                    watcher_file.unlink()
+            except (OSError, IndexError):
+                pass
+            if pending_file.exists():
+                try:
+                    latest = json.loads(pending_file.read_text(encoding="utf-8"))["cmd"]
+                except (OSError, ValueError, KeyError, TypeError):
+                    latest = None
+                if latest:
+                    _queue_mine_followup(latest, pid_file)
     finally:
         try:
-            watcher_file.unlink()
-        except OSError:
+            recorded = watcher_file.read_text(encoding="ascii").split()[0]
+            if recorded.isdigit() and int(recorded) == os.getpid():
+                watcher_file.unlink()
+        except (OSError, IndexError):
             pass
 
 
@@ -1478,12 +1498,12 @@ def _flush_pending_session_checkpoints(
         if result.get("count", 0) <= 0:
             all_saved = False
             continue
+        flushed_ids.add(checkpoint_id)
         try:
             path.unlink()
         except OSError:
             all_saved = False
             continue
-        flushed_ids.add(checkpoint_id)
     return all_saved, flushed_ids
 
 
