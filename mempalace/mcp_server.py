@@ -2931,7 +2931,64 @@ def _logical_chunk_group(col, drawer_id: str):
     }
 
 
+def _logical_generation_record(col, drawer_id: str):
+    """Resolve a stable conversation logical id to its visible physical row."""
+    try:
+        result = col.get(
+            where={"logical_drawer_id": drawer_id},
+            include=["documents", "metadatas"],
+        )
+        markers = col.get(
+            where={"mine_commit_marker": True},
+            include=["metadatas"],
+        )
+    except Exception:
+        logger.debug("generation lookup failed for %s", drawer_id, exc_info=True)
+        return None
+    committed = {
+        (meta or {}).get("mine_generation_commit")
+        for meta in (_chroma_field(markers, "metadatas", []) or [])
+        if (meta or {}).get("mine_generation_commit")
+    }
+    rows = []
+    ids = _chroma_field(result, "ids", []) or []
+    docs = _chroma_field(result, "documents", []) or []
+    metas = _chroma_field(result, "metadatas", []) or []
+    for index, physical_id in enumerate(ids):
+        meta = _safe_meta(metas[index] if index < len(metas) else {})
+        if meta.get("mine_staged") is True and meta.get("mine_generation_token") not in committed:
+            continue
+        generation_token = meta.get("mine_generation_token")
+        if generation_token and generation_token not in committed:
+            continue
+        rows.append(
+            (
+                meta.get("mine_generation_token") in committed,
+                meta.get("filed_at", ""),
+                physical_id,
+                docs[index] if index < len(docs) else "",
+                meta,
+            )
+        )
+    if not rows:
+        return None
+    rows.sort(key=lambda row: (row[0], row[1], row[2]), reverse=True)
+    _, _, physical_id, document, metadata = rows[0]
+    return {
+        "drawer_id": drawer_id,
+        "ids": [row[2] for row in rows],
+        "documents": [row[3] or "" for row in rows],
+        "metadatas": [row[4] for row in rows],
+        "content": document or "",
+        "metadata": metadata,
+        "chunked": False,
+    }
+
+
 def _logical_drawer_record(col, drawer_id: str):
+    generation = _logical_generation_record(col, drawer_id)
+    if generation is not None:
+        return generation
     direct = _single_drawer_record(col, drawer_id)
     if direct is not None:
         return direct
@@ -3005,7 +3062,7 @@ def _page_physical_ids(page: list) -> list:
         if chunk_ids:
             physical_ids.extend(chunk_ids)
         else:
-            physical_ids.append(drawer["drawer_id"])
+            physical_ids.append(drawer.get("_physical_id") or drawer["drawer_id"])
     return physical_ids
 
 
@@ -3016,7 +3073,7 @@ def _apply_drawer_previews(page: list, docs_by_id: dict) -> None:
         if chunk_ids:
             content = "".join(docs_by_id.get(cid, "") for cid in chunk_ids)
         else:
-            content = docs_by_id.get(drawer["drawer_id"], "")
+            content = docs_by_id.get(drawer.get("_physical_id") or drawer["drawer_id"], "")
         drawer["content_preview"] = _content_preview(content)
 
 
@@ -3055,7 +3112,7 @@ def _fill_drawer_previews_from_sqlite(page: list) -> None:
     _apply_drawer_previews(page, docs_by_id)
 
 
-def _collapse_drawer_rows(ids, documents, metadatas):
+def _collapse_drawer_rows(ids, documents, metadatas, committed_tokens=frozenset()):
     groups = {}
     singles = []
 
@@ -3074,15 +3131,29 @@ def _collapse_drawer_rows(ids, documents, metadatas):
     grouped_ids = set(groups)
     drawers = []
 
-    for drawer_id, doc, meta in singles:
-        # If both a legacy logical row and chunks exist, display one logical row.
-        if drawer_id in grouped_ids:
-            continue
+    chosen_singles = {}
+    for physical_id, doc, meta in singles:
+        logical_id = meta.get("logical_drawer_id") or physical_id
+        candidate = (
+            meta.get("mine_generation_token") in committed_tokens,
+            meta.get("filed_at", ""),
+            physical_id,
+            doc,
+            meta,
+        )
+        current = chosen_singles.get(logical_id)
+        if current is None or candidate[:3] > current[:3]:
+            chosen_singles[logical_id] = candidate
 
+    for logical_id, (_, _, physical_id, doc, meta) in chosen_singles.items():
+        # If both a legacy logical row and chunks exist, display one logical row.
+        if logical_id in grouped_ids:
+            continue
         safe_meta = _response_safe_meta(meta)
         drawers.append(
             {
-                "drawer_id": drawer_id,
+                "drawer_id": logical_id,
+                "_physical_id": physical_id,
                 "wing": safe_meta.get("wing", ""),
                 "room": safe_meta.get("room", ""),
                 "content_preview": _content_preview(doc),
@@ -3492,6 +3563,8 @@ def tool_mine(
     if not src or not (os.path.isdir(src) or (mode == "convos" and os.path.isfile(src))):
         return {"success": False, "error": f"source not found: {source!r}"}
 
+    http_mine_access_gate = _current_http_mine_access_gate() if mode == "convos" else None
+
     def _run():
         if mode == "convos":
             from .convo_miner import mine_convos
@@ -3504,6 +3577,7 @@ def tool_mine(
                 limit=limit,
                 dry_run=dry_run,
                 extract_mode=extract,
+                access_gate=http_mine_access_gate,
             )
         if mode == "extract":
             from .format_miner import mine_formats
@@ -3529,7 +3603,25 @@ def tool_mine(
 
     try:
         try:
-            _result, output = _capture_fd_stdout(_run)
+            if http_mine_access_gate is None:
+                _result, output = _capture_fd_stdout(_run)
+            else:
+                # redirect_stdout/dup2 are process-global and would capture
+                # peer request output while this long mine interleaves with
+                # searches. Convo mining has a thread-local progress router,
+                # so the HTTP path can capture only this request's messages.
+                import io
+
+                from .convo_miner import mine_output_streams
+
+                output_buffer = io.StringIO()
+                error_buffer = io.StringIO()
+                with mine_output_streams(output_buffer, error_buffer):
+                    _result = _run()
+                output = output_buffer.getvalue()
+                error_output = error_buffer.getvalue().strip()
+                if error_output:
+                    logger.warning("mempalace_mine: %s", error_output)
         # Order matters: typed handlers precede the bare Exception (mirroring
         # tool_sync) so MineAlreadyRunning / MineValidationError / ValueError
         # don't fall into the generic "mine failed" branch.
@@ -3844,9 +3936,19 @@ def tool_list_drawers(
             where = {"$and": conditions}
 
         listed = None
+        committed_tokens = set()
         if _is_chroma_backend() and _config.palace_path:
-            from .backends.chroma import sqlite_list_id_metadata
+            from .backends.chroma import (
+                sqlite_generation_commit_tokens,
+                sqlite_list_id_metadata,
+            )
 
+            marker_tokens = sqlite_generation_commit_tokens(
+                _config.palace_path,
+                _config.collection_name,
+            )
+            if marker_tokens is not None:
+                committed_tokens = marker_tokens
             listed = sqlite_list_id_metadata(
                 _config.palace_path, _config.collection_name, where=where
             )
@@ -3859,7 +3961,31 @@ def tool_list_drawers(
             if not col:
                 return _collection_error_or_no_palace()
             ids, documents, metadatas = _fetch_drawer_rows(col, where=where, include=["metadatas"])
-        drawers = _collapse_drawer_rows(ids, documents, metadatas)
+            marker_result = col.get(where={"mine_commit_marker": True}, include=["metadatas"])
+            committed_tokens = {
+                (meta or {}).get("mine_generation_commit")
+                for meta in (marker_result.get("metadatas") or [])
+                if (meta or {}).get("mine_generation_commit")
+            }
+        visible_rows = [
+            (drawer_id, documents[index] if index < len(documents) else "", meta or {})
+            for index, (drawer_id, meta) in enumerate(zip(ids, metadatas))
+            if (meta or {}).get("mine_commit_marker") is not True
+            and (
+                (meta or {}).get("mine_staged") is not True
+                or (meta or {}).get("mine_generation_token") in committed_tokens
+            )
+            and (
+                not (meta or {}).get("mine_generation_token")
+                or (meta or {}).get("mine_generation_token") in committed_tokens
+            )
+        ]
+        drawers = _collapse_drawer_rows(
+            [row[0] for row in visible_rows],
+            [row[1] for row in visible_rows],
+            [row[2] for row in visible_rows],
+            committed_tokens,
+        )
 
         if since_dt is not None or before_dt is not None:
             drawers = [
@@ -3875,6 +4001,8 @@ def tool_list_drawers(
             col = _get_collection()
             if col:
                 _fill_drawer_previews(col, page)
+        for drawer in page:
+            drawer.pop("_physical_id", None)
 
         return {
             "drawers": page,
@@ -3990,6 +4118,8 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         update_kwargs["metadatas"] = [new_meta]
 
         col.update(**update_kwargs)
+        if len(record["ids"]) > 1:
+            col.delete(ids=record["ids"][1:])
         _invalidate_overview_caches()
 
         logger.info("Updated drawer: %s", drawer_id)
@@ -4248,7 +4378,27 @@ def tool_kg_stats():
 # ==================== AGENT DIARY ====================
 
 
-def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: str = ""):
+def _diary_entry_physical_ids(collection, entry_id: str) -> set[str]:
+    """Return direct and chunked physical rows for one logical diary entry."""
+    physical_ids: set[str] = set()
+    direct = collection.get(ids=[entry_id], include=["metadatas"])
+    physical_ids.update(direct.get("ids") or [])
+    for parent_key in _PARENT_ID_KEYS:
+        grouped = collection.get(
+            where={parent_key: entry_id},
+            include=["metadatas"],
+        )
+        physical_ids.update(grouped.get("ids") or [])
+    return physical_ids
+
+
+def tool_diary_write(
+    agent_name: str,
+    entry: str,
+    topic: str = "general",
+    wing: str = "",
+    idempotency_key: str = "",
+):
     """
     Write a diary entry for this agent. Entries are timestamped and
     accumulate over time in a diary room.
@@ -4269,6 +4419,13 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         topic = sanitize_name(topic, "topic")
     except ValueError as e:
         return {"success": False, "error": str(e)}
+    if idempotency_key is None:
+        idempotency_key = ""
+    if not isinstance(idempotency_key, str):
+        return {"success": False, "error": "idempotency_key must be a string"}
+    idempotency_key = idempotency_key.strip()
+    if len(idempotency_key) > 512:
+        return {"success": False, "error": "idempotency_key must be at most 512 characters"}
 
     if wing:
         wing = sanitize_name(wing)
@@ -4280,10 +4437,18 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         return _collection_error_or_no_palace()
 
     now = datetime.now()
-    entry_id = (
-        f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S%f')}_"
-        f"{hashlib.sha256(entry.encode()).hexdigest()[:12]}"
-    )
+    idempotency_hash = ""
+    if idempotency_key:
+        idempotency_hash = hashlib.sha256(
+            f"{agent_name}\0{wing}\0{topic}\0{idempotency_key}".encode()
+        ).hexdigest()
+        entry_id = f"diary_{wing}_idem_{idempotency_hash[:24]}"
+    else:
+        entry_id = (
+            f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S%f')}_"
+            f"{hashlib.sha256(entry.encode()).hexdigest()[:12]}"
+        )
+    prior_physical_ids = _diary_entry_physical_ids(col, entry_id) if idempotency_key else set()
 
     _wal_log(
         "diary_write",
@@ -4310,13 +4475,19 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             "filed_at": now.isoformat(),
             "date": now.strftime("%Y-%m-%d"),
         }
+        if idempotency_hash:
+            base_metadata["idempotency_key_hash"] = idempotency_hash
+        write_drawers = col.upsert if idempotency_key else col.add
         chunk_size = _config.chunk_size
         if len(entry) <= chunk_size:
-            col.add(
+            write_drawers(
                 ids=[entry_id],
                 documents=[entry],
                 metadatas=[{**base_metadata, "chunk_index": 0}],
             )
+            obsolete_ids = prior_physical_ids - {entry_id}
+            if obsolete_ids:
+                col.delete(ids=sorted(obsolete_ids))
             logger.info(f"Diary entry: {entry_id} -> {wing}/diary/{topic}")
             return {
                 "success": True,
@@ -4340,15 +4511,11 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         # ``mempalace_get_drawer`` / ``update_drawer`` / ``delete_drawer``
         # to the whole entry, exactly as an oversized ``add_drawer`` id
         # does. The physical drawer ids remain available in ``chunk_ids``.
-        # Use a single batched ``add`` so the embedding pass either
-        # commits all chunks or none — avoids a half-written palace
-        # if the embedding model fails mid-loop. ``col.add`` (not
-        # ``upsert``) is intentional here: ``entry_id`` is timestamp-
-        # based with microsecond precision, so every call generates a
-        # fresh id and a duplicate is by definition a same-microsecond
-        # clash that should surface as an error rather than silently
-        # overwrite the prior entry (cf. ``tool_add_drawer`` whose
-        # content-hash ids are deliberately idempotent and use upsert).
+        # Use one batched write so the embedding pass either commits all
+        # chunks or none. Ordinary diary calls retain ``add`` and their
+        # timestamp-unique IDs; callers supplying an idempotency key use
+        # ``upsert`` so an ambiguous transport retry heals the same logical
+        # entry instead of creating a duplicate.
         chunk_ids: list[str] = []
         chunk_docs: list[str] = []
         chunk_metas: list[dict] = []
@@ -4364,7 +4531,10 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
                     "parent_drawer_id": entry_id,
                 }
             )
-        col.add(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
+        write_drawers(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
+        obsolete_ids = prior_physical_ids - set(chunk_ids)
+        if obsolete_ids:
+            col.delete(ids=sorted(obsolete_ids))
         logger.info(f"Diary entry: {entry_id} -> {wing}/diary/{topic} ({len(chunk_ids)} chunks)")
         return {
             "success": True,
@@ -5694,6 +5864,11 @@ TOOLS = {
                 "wing": {
                     "type": "string",
                     "description": "Target wing for this diary entry (optional). If omitted, uses wing_{agent_name}. Use this to write diary entries to a project wing instead of an agent-specific wing.",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": "Stable retry key for exactly-once diary writes (optional). Reusing it updates the same logical entry instead of creating a duplicate.",
+                    "maxLength": 512,
                 },
                 "content": {
                     "type": "string",
@@ -7132,6 +7307,10 @@ _WRITE_STALL_EXIT_CODE = 75
 _write_stall_lock = threading.Lock()
 # Optional[dict]: {"tool": str, "since": float(monotonic), "warned": bool}
 _write_stall_inflight: Optional[dict] = None
+# HTTP conversation mines run outside the request-wide RW write lock and take
+# it only for backend access bursts. The request-level watchdog must therefore
+# stay quiet; the burst gate arms it around the actual Chroma mutation.
+_http_interleaved_mine_state = threading.local()
 
 
 def _write_stall_secs(env_name: str, default: float) -> float:
@@ -7159,11 +7338,21 @@ def _write_stall_action(elapsed: float, warn_secs: float, exit_secs: float, warn
 
 
 @contextlib.contextmanager
-def _write_stall_watch(tool_name: str):
+def _write_stall_watch(tool_name: str, *, burst: bool = False):
     """Register a vector write as in flight for the stall watchdog."""
     global _write_stall_inflight
 
     if tool_name not in _VECTOR_WRITE_TOOLS:
+        yield
+        return
+    if (
+        tool_name == "mempalace_mine"
+        and getattr(_http_interleaved_mine_state, "active", False)
+        and not burst
+    ):
+        # The interleaved HTTP path watches each short write burst through
+        # _HTTPMineAccessGate instead of timing parsing/chunking/embedding prep
+        # as if the backend itself had stalled (#2403 defect 5).
         yield
         return
 
@@ -7299,13 +7488,21 @@ class _RWLock:
         self._cond = threading.Condition(threading.Lock())
         self._readers = 0
         self._writer = False
+        self._waiting_readers = 0
         self._waiting_writers = 0
+        self._reader_entries = 0
 
     def acquire_read(self) -> None:
         with self._cond:
-            while self._writer or self._waiting_writers:
-                self._cond.wait()
-            self._readers += 1
+            self._waiting_readers += 1
+            try:
+                while self._writer or self._waiting_writers:
+                    self._cond.wait()
+                self._readers += 1
+                self._reader_entries += 1
+                self._cond.notify_all()
+            finally:
+                self._waiting_readers -= 1
 
     def release_read(self) -> None:
         with self._cond:
@@ -7328,6 +7525,24 @@ class _RWLock:
             self._writer = False
             self._cond.notify_all()
 
+    def yield_to_waiting_reader(self) -> None:
+        """Let one queued reader enter before this thread starts another write.
+
+        The core policy remains writer-preferring, which prevents an endless
+        stream of new searches from starving a mutation. Conversation mining,
+        however, performs many short write bursts back-to-back. Without this
+        explicit handoff the mining thread can re-queue as a writer before a
+        reader awakened by ``release_write`` gets scheduled, starving that
+        already-waiting search for the full mine.
+        """
+        with self._cond:
+            if not self._waiting_readers:
+                return
+            entries_before = self._reader_entries
+            self._cond.notify_all()
+            while self._waiting_readers and self._reader_entries == entries_before:
+                self._cond.wait()
+
     def read_lock(self):
         lock = self
 
@@ -7342,6 +7557,20 @@ class _RWLock:
 
         return _Read()
 
+    def write_lock(self):
+        lock = self
+
+        class _Write:
+            def __enter__(self):
+                lock.acquire_write()
+                return lock
+
+            def __exit__(self, exc_type, exc, tb):
+                lock.release_write()
+                return False
+
+        return _Write()
+
     def __enter__(self):
         self.acquire_write()
         return self
@@ -7352,10 +7581,74 @@ class _RWLock:
 
 
 _HTTP_REQUEST_LOCK = _RWLock()
+# Serialize palace mutations independently from the read/write access gate.
+# An interleaved conversation mine owns this lock for its full lifecycle, so
+# another update/delete cannot slip between its crash-safe batches, while
+# searches still share _HTTP_REQUEST_LOCK between actual backend writes.
+_HTTP_MUTATION_LOCK = threading.Lock()
 _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 _HTTP_ACTIVE_CLIENT_WINDOW_S = 120.0
 
 _HTTP_PROTOCOL_METHODS = frozenset({"initialize", "ping", "tools/list"})
+
+
+class _HTTPMineAccessGate:
+    """Gate backend access for one interleaved HTTP conversation mine."""
+
+    @staticmethod
+    def read_lock():
+        return _HTTP_REQUEST_LOCK.read_lock()
+
+    @staticmethod
+    @contextlib.contextmanager
+    def write_lock():
+        try:
+            with _HTTP_REQUEST_LOCK.write_lock():
+                with _write_stall_watch("mempalace_mine", burst=True):
+                    yield
+        finally:
+            # A conversation mine can immediately request its next write
+            # burst. Hand an already-queued search one entry opportunity first.
+            _HTTP_REQUEST_LOCK.yield_to_waiting_reader()
+
+
+_HTTP_MINE_ACCESS_GATE = _HTTPMineAccessGate()
+
+
+def _current_http_mine_access_gate():
+    if getattr(_http_interleaved_mine_state, "active", False):
+        return _HTTP_MINE_ACCESS_GATE
+    return None
+
+
+def _release_http_writer_lease() -> None:
+    """Release the Hub lease after every in-flight palace mutation is done."""
+    with _HTTP_MUTATION_LOCK:
+        with _HTTP_REQUEST_LOCK.write_lock():
+            _release_mcp_writer_lock()
+
+
+@contextlib.contextmanager
+def _http_interleaved_mine_scope():
+    previous = getattr(_http_interleaved_mine_state, "active", False)
+    _http_interleaved_mine_state.active = True
+    try:
+        yield
+    finally:
+        _http_interleaved_mine_state.active = previous
+
+
+def _is_interleavable_http_convo_mine(request, tool_name) -> bool:
+    if tool_name != "mempalace_mine":
+        return False
+    params = request.get("params") if isinstance(request, dict) else None
+    arguments = params.get("arguments") if isinstance(params, dict) else None
+    if not isinstance(arguments, dict):
+        return False
+    return arguments.get("mode", "projects") == "convos" and not bool(
+        arguments.get("dry_run", False)
+    )
+
 
 # RFC 003 phase 5: logstream tools touch only logstream.sqlite3 (its own WAL
 # database with internal locking) — never Chroma or the KG. Dispatching them
@@ -7654,6 +7947,14 @@ def _http_dispatch(request):
         tool_name = request["params"].get("name")
     if tool_name in _HTTP_LOCK_FREE_TOOLS:
         return handle_request(request)
+    if _is_interleavable_http_convo_mine(request, tool_name):
+        # Keep one palace mutation owner for the complete crash-safe re-mine,
+        # but let searches run during scan/normalize/chunk phases. The miner's
+        # access gate takes the RW lock around Chroma reads and bounded write
+        # bursts, so readers pause only for real backend work (#2403 defect 5).
+        with _HTTP_MUTATION_LOCK:
+            with _http_interleaved_mine_scope():
+                return handle_request(request)
     # service.classify_tool is the authoritative read/write registry. The
     # lock-free set above is a storage-boundary override for independent DBs.
     from .service import classify_tool
@@ -7661,8 +7962,9 @@ def _http_dispatch(request):
     if classify_tool(tool_name) == "read":
         with _HTTP_REQUEST_LOCK.read_lock():
             return handle_request(request)
-    with _HTTP_REQUEST_LOCK:
-        return handle_request(request)
+    with _HTTP_MUTATION_LOCK:
+        with _HTTP_REQUEST_LOCK.write_lock():
+            return handle_request(request)
 
 
 def _http_handle_get(handler) -> None:
@@ -8698,12 +9000,10 @@ def _run_http_loop() -> None:
         _serve_http(_args.host, _args.port)
     finally:
         if owns_writer_lease:
-            # _serve_http uses daemon request threads, so synchronize with the
-            # dispatch lock before closing storage and exposing the palace to
-            # another process. Response serialization happens after this lock
-            # and no longer touches the backend.
-            with _HTTP_REQUEST_LOCK:
-                _release_mcp_writer_lock()
+            # Match dispatch's mutation -> backend lock order. Otherwise an
+            # interleaved mine could still own the mutation lifecycle while
+            # shutdown closes storage and exposes the palace to another process.
+            _release_http_writer_lease()
 
 
 def _install_shutdown_signal_handlers() -> None:

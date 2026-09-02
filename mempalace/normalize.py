@@ -21,11 +21,14 @@ No API key. No internet. Everything local.
 
 import errno
 import json
+import logging
 import os
 import re
 import stat
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger("mempalace_normalize")
 
 # Provenance footer appended to Slack transcript output so downstream consumers
 # know the speaker roles are positionally assigned, not verified.
@@ -340,12 +343,90 @@ def _try_claude_code_jsonl(content: str) -> Optional[str]:
     return None
 
 
+# item_completed payloads carry many item types (Reasoning, CommandExecution,
+# FileChange, ContextCompaction, ...). Only these two are conversation turns.
+_CODEX_ITEM_ROLES = {"UserMessage": "user", "AgentMessage": "assistant"}
+
+
+def _codex_item_text(item: dict) -> str:
+    """Extract joined text from a v2 ``item_completed`` conversation item.
+
+    Content blocks are ``{"type": "text", "text": ...}`` on UserMessage but
+    ``{"type": "Text", ...}`` on AgentMessage, so the type match is
+    case-insensitive. Non-text blocks (images, attachments) are skipped.
+    """
+    blocks = item.get("content")
+    if not isinstance(blocks, list):
+        return ""
+    parts = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if str(block.get("type", "")).lower() != "text":
+            continue
+        text = block.get("text")
+        if isinstance(text, str) and text.strip():
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def _codex_event_turn(entry: dict) -> Optional[tuple[str, str]]:
+    """Return one conversational Codex event as ``(role, text)``.
+
+    This parser is shared by transcript normalization and Stop-hook message
+    accounting so a Codex wire-format upgrade cannot make mining understand a
+    turn while the hook silently decides that the same session is empty.
+    """
+    if entry.get("type") != "event_msg":
+        return None
+    payload = entry.get("payload")
+    if not isinstance(payload, dict):
+        return None
+
+    payload_type = payload.get("type")
+    if payload_type == "item_completed":
+        item = payload.get("item")
+        if not isinstance(item, dict):
+            return None
+        role = _CODEX_ITEM_ROLES.get(item.get("type"))
+        if role is None:
+            return None
+        text = _codex_item_text(item)
+        return (role, text) if text else None
+
+    role = {"user_message": "user", "agent_message": "assistant"}.get(payload_type)
+    message = payload.get("message")
+    if role is None or not isinstance(message, str) or not message.strip():
+        return None
+    return role, message
+
+
 def _try_codex_jsonl(content: str) -> Optional[str]:
     """OpenAI Codex CLI sessions (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl).
 
-    Uses only event_msg entries (user_message / agent_message) which represent
-    the canonical conversation turns. response_item entries are skipped because
-    they include synthetic context injections and duplicate the real messages.
+    Two wire formats coexist in real corpora:
+
+    - v1 (cli < 0.149): ``event_msg`` entries of type ``user_message`` /
+      ``agent_message`` with the text in ``payload.message``.
+    - v2 (cli >= 0.149.0-alpha.4.1): ``event_msg`` entries of type
+      ``item_completed`` whose ``payload.item`` is a ``UserMessage`` /
+      ``AgentMessage`` with text in ``item.content[].text`` (and native
+      ``thread_id`` / ``turn_id`` / ``item.id`` identifiers).
+
+    Skipped on purpose:
+
+    - ``response_item`` entries — synthetic context injections that
+      duplicate the real messages.
+    - top-level ``compacted`` records — their ``replacement_history``
+      re-embeds earlier user messages verbatim, so ingesting them would
+      double-file everything said before each compaction.
+    - ``item_completed`` items of any other type (Reasoning,
+      CommandExecution, ContextCompaction, ...) — not conversation turns.
+
+    A file that carries ``session_meta`` (so it *is* a Codex rollout) but
+    yields no conversation text logs a warning instead of failing silently:
+    that is the signature of a future format change, and silence here means
+    sessions quietly stop being mined.
     """
     lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
     messages = []
@@ -360,31 +441,22 @@ def _try_codex_jsonl(content: str) -> Optional[str]:
 
         entry_type = entry.get("type", "")
         if entry_type == "session_meta":
+            # Resume appends the same session_meta again; repeats are normal.
             has_session_meta = True
             continue
 
-        if entry_type != "event_msg":
-            continue
-
-        payload = entry.get("payload", {})
-        if not isinstance(payload, dict):
-            continue
-
-        payload_type = payload.get("type", "")
-        msg = payload.get("message")
-        if not isinstance(msg, str):
-            continue
-        text = msg.strip()
-        if not text:
-            continue
-
-        if payload_type == "user_message":
-            messages.append(("user", text))
-        elif payload_type == "agent_message":
-            messages.append(("assistant", text))
+        turn = _codex_event_turn(entry)
+        if turn is not None:
+            messages.append(turn)
 
     if len(messages) >= 2 and has_session_meta:
         return _messages_to_transcript(messages)
+    if has_session_meta and not messages:
+        logger.warning(
+            "Codex rollout detected (session_meta present) but no conversation "
+            "messages were extracted — possible new Codex transcript format; "
+            "this session will not be mined"
+        )
     return None
 
 

@@ -15,6 +15,7 @@ import math
 import os
 import re
 import sqlite3
+from types import SimpleNamespace
 from datetime import timedelta
 from pathlib import Path
 from typing import Optional
@@ -88,7 +89,57 @@ def _result_drawer_id(meta, stored_drawer_id):
     Kept in sync with ``mcp_server._PARENT_ID_KEYS``.
     """
     meta = meta or {}
-    return meta.get("parent_drawer_id") or meta.get("parent_entry_id") or stored_drawer_id
+    return (
+        meta.get("parent_drawer_id")
+        or meta.get("parent_entry_id")
+        or meta.get("logical_drawer_id")
+        or stored_drawer_id
+    )
+
+
+def _collapse_logical_generation_hits(hits: list) -> list:
+    """Keep the newest visible physical generation for each stable logical id."""
+    chosen = {}
+    passthrough = []
+    for hit in hits:
+        logical_id = hit.get("_logical_generation_id")
+        if not logical_id:
+            passthrough.append(hit)
+            continue
+        key = (
+            bool(hit.get("_active_generation")),
+            hit.get("created_at") or "",
+            hit.get("_physical_drawer_id") or "",
+        )
+        current = chosen.get(logical_id)
+        if current is None or key > current[0]:
+            chosen[logical_id] = (key, hit)
+    return passthrough + [item[1] for item in chosen.values()]
+
+
+def _collapse_physical_generation_rows(rows, committed_tokens) -> list:
+    """Keep the active physical row per logical id; retain ordinary rows."""
+    chosen = {}
+    ordinary = []
+    for physical_id, document, metadata in rows:
+        metadata = metadata or {}
+        if _is_staged_metadata(metadata, committed_tokens):
+            continue
+        logical_id = metadata.get("logical_drawer_id")
+        if not logical_id:
+            ordinary.append((physical_id, document, metadata))
+            continue
+        generation_token = metadata.get("mine_generation_token")
+        if generation_token and generation_token not in committed_tokens:
+            continue
+        key = (
+            metadata.get("mine_generation_token") in committed_tokens,
+            metadata.get("filed_at", ""),
+            physical_id,
+        )
+        if logical_id not in chosen or key > chosen[logical_id][0]:
+            chosen[logical_id] = (key, (physical_id, document, metadata))
+    return ordinary + [item[1] for item in chosen.values()]
 
 
 def _tokenize(text: str, stop_words: frozenset = frozenset()) -> list:
@@ -406,6 +457,191 @@ def build_where_filter(wing: str = None, room: str = None, source_file: str = No
     if len(clauses) == 1:
         return clauses[0]
     return {"$and": clauses}
+
+
+def _is_staged_metadata(metadata, committed_tokens=frozenset()) -> bool:
+    """True for an unpublished conversation-mine physical generation."""
+    if not isinstance(metadata, dict):
+        return False
+    value = metadata.get("mine_staged")
+    # Chroma returns bools; the sqlite-only fallback reconstructs them from
+    # ``int_value`` as 0/1.
+    if not (value is True or value == 1):
+        return False
+    token = metadata.get("mine_generation_token")
+    return not token or token not in committed_tokens
+
+
+def _committed_generation_tokens(collection) -> frozenset[str]:
+    """Read crash-atomic conversation generation markers from the drawer store."""
+    try:
+        result = collection.get(
+            where={"mine_commit_marker": True},
+            include=["metadatas"],
+        )
+        return frozenset(
+            meta.get("mine_generation_commit")
+            for meta in (result.get("metadatas") or [])
+            if isinstance(meta, dict) and meta.get("mine_generation_commit")
+        )
+    except Exception:
+        logger.warning("Could not read conversation generation commit markers", exc_info=True)
+        return frozenset()
+
+
+def _visible_drawer_where(where: dict, committed_tokens=frozenset()) -> dict:
+    """Exclude staged rows in the backend before its top-K limit is applied."""
+    committed = {"mine_staged": {"$ne": True}}
+    visibility = committed
+    if committed_tokens:
+        visibility = {
+            "$or": [
+                committed,
+                {"mine_generation_token": {"$in": sorted(committed_tokens)}},
+            ]
+        }
+    if not where:
+        return visibility
+    clauses = where.get("$and") if isinstance(where, dict) else None
+    if isinstance(clauses, list):
+        return {"$and": [*clauses, visibility]}
+    return {"$and": [where, visibility]}
+
+
+def _sqlite_staged_value_sql(conn) -> str:
+    """Return a staged-flag expression compatible with old Chroma schemas."""
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(embedding_metadata)")}
+    except sqlite3.Error:
+        columns = set()
+    if "bool_value" in columns:
+        return "COALESCE(staged.bool_value, staged.int_value, 0)"
+    return "COALESCE(staged.int_value, 0)"
+
+
+def _sqlite_active_generation_rows(
+    db_path: str,
+    collection_name: str,
+    logical_ids: set[str],
+) -> dict[str, dict]:
+    """Hydrate marker-selected physical rows for logical IDs from sqlite."""
+    if not logical_ids:
+        return {}
+    conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+    try:
+        placeholders = ",".join("?" for _ in logical_ids)
+        active = conn.execute(
+            f"""
+            SELECT e.id, e.embedding_id, logical.string_value
+            FROM embedding_metadata logical
+            JOIN embeddings e ON e.id = logical.id
+            JOIN segments s ON e.segment_id = s.id
+            JOIN collections c ON s.collection = c.id
+            JOIN embedding_metadata token
+              ON token.id = e.id AND token.key = 'mine_generation_token'
+            JOIN embedding_metadata marker
+              ON marker.key = 'mine_generation_commit'
+             AND marker.string_value = token.string_value
+            JOIN embeddings marker_embedding ON marker_embedding.id = marker.id
+            JOIN segments marker_segment ON marker_segment.id = marker_embedding.segment_id
+            JOIN collections marker_collection ON marker_collection.id = marker_segment.collection
+            WHERE c.name = ?
+              AND marker_collection.name = ?
+              AND logical.key = 'logical_drawer_id'
+              AND logical.string_value IN ({placeholders})
+            """,
+            (collection_name, collection_name, *sorted(logical_ids)),
+        ).fetchall()
+        if not active:
+            return {}
+        internal_ids = [row[0] for row in active]
+        by_internal = {
+            row[0]: {
+                "drawer_id": row[1],
+                "logical_id": row[2],
+                "metadata": {},
+                "document": "",
+            }
+            for row in active
+        }
+        id_placeholders = ",".join("?" for _ in internal_ids)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(embedding_metadata)")}
+        value_columns = [
+            column
+            for column in ("string_value", "int_value", "float_value", "bool_value")
+            if column in columns
+        ]
+        metadata_rows = conn.execute(
+            f"""
+            SELECT id, key, {", ".join(value_columns)}
+            FROM embedding_metadata
+            WHERE id IN ({id_placeholders})
+            """,
+            internal_ids,
+        ).fetchall()
+        for row in metadata_rows:
+            target = by_internal.get(row[0])
+            if target is None or not row[1]:
+                continue
+            value = next((value for value in row[2:] if value is not None), None)
+            if row[1] == "chroma:document":
+                target["document"] = value or ""
+            elif value is not None:
+                target["metadata"][row[1]] = value
+        return {item["logical_id"]: item for item in by_internal.values()}
+    finally:
+        conn.close()
+
+
+def _resolve_sqlite_generation_candidates(candidates, query, db_path, collection_name):
+    logical_ids = {
+        candidate.get("_logical_generation_id")
+        for candidate in candidates
+        if candidate.get("_logical_generation_id")
+    }
+    try:
+        active = _sqlite_active_generation_rows(db_path, collection_name, logical_ids)
+    except sqlite3.Error:
+        logger.warning("Could not resolve sqlite active generations", exc_info=True)
+        active = {}
+    resolved = []
+    emitted = set()
+    for candidate in candidates:
+        logical_id = candidate.get("_logical_generation_id")
+        if not logical_id:
+            resolved.append(candidate)
+            continue
+        if logical_id in emitted:
+            continue
+        emitted.add(logical_id)
+        current = active.get(logical_id)
+        if current is None:
+            if not candidate.get("_generation_token"):
+                resolved.append(candidate)
+            continue
+        if _bm25_scores(query, [current["document"]])[0] <= 0:
+            continue
+        metadata = current["metadata"]
+        full_source = metadata.get("source_file", "") or ""
+        replacement = dict(candidate)
+        replacement.update(
+            {
+                "drawer_id": logical_id,
+                "text": current["document"],
+                "wing": metadata.get("wing", "unknown"),
+                "room": metadata.get("room", "unknown"),
+                "source_file": Path(full_source).name if full_source else "?",
+                "source_path": full_source,
+                "created_at": metadata.get("filed_at", "unknown"),
+                "authored_at": metadata.get("authored_at", metadata.get("filed_at", "unknown")),
+                "_source_file_full": full_source,
+                "_chunk_index": metadata.get("chunk_index"),
+                "_physical_drawer_id": current["drawer_id"],
+                "_active_generation": True,
+            }
+        )
+        resolved.append(replacement)
+    return resolved
 
 
 def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
@@ -727,7 +963,8 @@ def search(
     # creation — their similarity scores will be junk until they run repair.
     _warn_if_legacy_metric(col)
 
-    where = build_where_filter(wing, room)
+    committed_tokens = _committed_generation_tokens(col)
+    where = _visible_drawer_where(build_where_filter(wing, room), committed_tokens)
 
     try:
         kwargs = {
@@ -743,7 +980,15 @@ def search(
         if where:
             kwargs["where"] = where
 
-        results = col.query(**kwargs)
+        results = _query_drawers_with_filter_fallback(
+            col,
+            kwargs,
+            query,
+            n_results,
+            wing,
+            room,
+            committed_tokens=committed_tokens,
+        )
 
     except Exception as e:
         print(f"\n  Search error: {e}")
@@ -752,19 +997,31 @@ def search(
     docs = _first_or_empty(results, "documents")
     metas = _first_or_empty(results, "metadatas")
     dists = _first_or_empty(results, "distances")
+    stored_ids = _aligned_query_ids(results, len(docs))
+
+    visible = [
+        (stored_id, doc, meta, dist)
+        for stored_id, doc, meta, dist in zip(stored_ids, docs, metas, dists)
+        if not _is_staged_metadata(meta, committed_tokens)
+    ]
+    stored_ids = [item[0] for item in visible]
+    docs = [item[1] for item in visible]
+    metas = [item[2] for item in visible]
+    dists = [item[3] for item in visible]
 
     if date_window_active:
         kept = [
-            (doc, meta, dist)
-            for doc, meta, dist in zip(docs, metas, dists)
+            (stored_id, doc, meta, dist)
+            for stored_id, doc, meta, dist in zip(stored_ids, docs, metas, dists)
             if filed_at_in_window((meta or {}).get("filed_at"), since_dt, before_dt)
         ]
         # Keep the whole in-window pool here; the hybrid re-rank below must
         # see every survivor before the display cut to n_results, or a
         # BM25-strong drawer deep in the pool could never surface.
-        docs = [k[0] for k in kept]
-        metas = [k[1] for k in kept]
-        dists = [k[2] for k in kept]
+        stored_ids = [k[0] for k in kept]
+        docs = [k[1] for k in kept]
+        metas = [k[2] for k in kept]
+        dists = [k[3] for k in kept]
 
     if not docs:
         print(f'\n  No results found for: "{query}"')
@@ -780,9 +1037,19 @@ def search(
     # see via `mempalace_search`.
     metric = _metric_for_collection(col)
     hits = [
-        {"text": doc or "", "distance": float(dist), "metadata": meta or {}}
-        for doc, meta, dist in zip(docs, metas, dists)
+        {
+            "drawer_id": _result_drawer_id(meta, stored_id),
+            "text": doc or "",
+            "distance": float(dist),
+            "metadata": meta or {},
+            "created_at": (meta or {}).get("filed_at", ""),
+            "_logical_generation_id": (meta or {}).get("logical_drawer_id"),
+            "_physical_drawer_id": stored_id,
+            "_active_generation": (meta or {}).get("mine_generation_token") in committed_tokens,
+        }
+        for stored_id, doc, meta, dist in zip(stored_ids, docs, metas, dists)
     ]
+    hits = _collapse_logical_generation_hits(hits)
     hits = _hybrid_rank(hits, query, metric=metric, stop_words=stop_words)
     if date_window_active:
         # The widened fetch exists only to survive the window filter; the
@@ -894,9 +1161,64 @@ def _bm25_only_via_sqlite(
 
         collection_name = get_configured_collection_name()
 
+    staged_value_sql = "COALESCE(staged.int_value, 0)"
+
     def _metadata_filter_sql(row_id_expr: str) -> tuple[str, list[str]]:
-        clauses = []
-        params = []
+        clauses = [
+            f"""
+            AND (
+                NOT EXISTS (
+                    SELECT 1
+                    FROM embedding_metadata staged
+                    WHERE staged.id = {row_id_expr}
+                      AND staged.key = 'mine_staged'
+                      AND {staged_value_sql} = 1
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM embedding_metadata token
+                    JOIN embedding_metadata marker
+                      ON marker.key = 'mine_generation_commit'
+                     AND marker.string_value = token.string_value
+                    JOIN embeddings marker_embedding
+                      ON marker_embedding.id = marker.id
+                    JOIN segments marker_segment
+                      ON marker_segment.id = marker_embedding.segment_id
+                    JOIN collections marker_collection
+                      ON marker_collection.id = marker_segment.collection
+                    WHERE token.id = {row_id_expr}
+                      AND token.key = 'mine_generation_token'
+                      AND marker_collection.name = ?
+                )
+            )
+            """,
+            f"""
+            AND (
+                NOT EXISTS (
+                    SELECT 1 FROM embedding_metadata tokened
+                    WHERE tokened.id = {row_id_expr}
+                      AND tokened.key = 'mine_generation_token'
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM embedding_metadata tokened
+                    JOIN embedding_metadata marker
+                      ON marker.key = 'mine_generation_commit'
+                     AND marker.string_value = tokened.string_value
+                    JOIN embeddings marker_embedding
+                      ON marker_embedding.id = marker.id
+                    JOIN segments marker_segment
+                      ON marker_segment.id = marker_embedding.segment_id
+                    JOIN collections marker_collection
+                      ON marker_collection.id = marker_segment.collection
+                    WHERE tokened.id = {row_id_expr}
+                      AND tokened.key = 'mine_generation_token'
+                      AND marker_collection.name = ?
+                )
+            )
+            """,
+        ]
+        params = [collection_name, collection_name]
         for key, value in (("wing", wing), ("room", room), ("source_file", source_file)):
             if not value:
                 continue
@@ -937,7 +1259,10 @@ def _bm25_only_via_sqlite(
     except sqlite3.Error as e:
         return _search_error_result(f"sqlite open failed: {e}")
 
+    staged_value_sql = _sqlite_staged_value_sql(conn)
+
     window_active = since_dt is not None or before_dt is not None
+    committed_tokens = set()
     try:
         # FTS5 MATCH expects whitespace-separated tokens. Drop tokens
         # shorter than 3 chars (trigram tokenizer can't match them).
@@ -1045,6 +1370,23 @@ def _bm25_only_via_sqlite(
             """,
             candidate_ids,
         ).fetchall()
+        committed_tokens = {
+            row[0]
+            for row in conn.execute(
+                """
+                SELECT marker.string_value
+                FROM embedding_metadata marker
+                JOIN embeddings e ON e.id = marker.id
+                JOIN segments s ON e.segment_id = s.id
+                JOIN collections c ON s.collection = c.id
+                WHERE c.name = ?
+                  AND marker.key = 'mine_generation_commit'
+                  AND marker.string_value IS NOT NULL
+                """,
+                (collection_name,),
+            ).fetchall()
+            if row[0]
+        }
     finally:
         conn.close()
 
@@ -1100,10 +1442,16 @@ def _bm25_only_via_sqlite(
                 # multiple chunks. Stripped before this helper returns.
                 "_source_file_full": full_source,
                 "_chunk_index": meta.get("chunk_index"),
+                "_logical_generation_id": meta.get("logical_drawer_id"),
+                "_physical_drawer_id": d["_stored_drawer_id"],
+                "_active_generation": meta.get("mine_generation_token") in committed_tokens,
+                "_generation_token": meta.get("mine_generation_token"),
             }
         )
 
     # Local BM25 over the candidate set.
+    candidates = _resolve_sqlite_generation_candidates(candidates, query, db_path, collection_name)
+    candidates = _collapse_logical_generation_hits(candidates)
     docs = [c["text"] for c in candidates]
     bm25_raw = _bm25_scores(query, docs, stop_words=stop_words)
     max_bm25 = max(bm25_raw) if bm25_raw else 0.0
@@ -1120,6 +1468,10 @@ def _bm25_only_via_sqlite(
         if not _include_internal:
             h.pop("_source_file_full", None)
             h.pop("_chunk_index", None)
+            h.pop("_logical_generation_id", None)
+            h.pop("_physical_drawer_id", None)
+            h.pop("_active_generation", None)
+            h.pop("_generation_token", None)
 
     result = {
         "query": query,
@@ -1132,6 +1484,83 @@ def _bm25_only_via_sqlite(
     if window_pool_truncated:
         result["date_filter_pool_truncated"] = True
     return result
+
+
+def _resolve_lexical_generation_hits(drawers_col, hits, query, committed_tokens):
+    """Replace stale lexical hits with their newest visible physical generation."""
+    logical_metas = [
+        hit.metadata or {} for hit in hits if (hit.metadata or {}).get("logical_drawer_id")
+    ]
+    current_ids = _current_generation_ids_for_query(
+        drawers_col,
+        {"metadatas": [logical_metas]},
+        committed_tokens,
+    )
+    by_physical = {hit.id: hit for hit in hits}
+    missing_ids = sorted(set(current_ids.values()) - set(by_physical))
+    if missing_ids:
+        try:
+            fetched = drawers_col.get(
+                ids=missing_ids,
+                include=["documents", "metadatas"],
+            )
+            fetched_ids = fetched.get("ids") or []
+            fetched_docs = fetched.get("documents") or []
+            fetched_metas = fetched.get("metadatas") or []
+            for index, physical_id in enumerate(fetched_ids):
+                document = fetched_docs[index] if index < len(fetched_docs) else ""
+                metadata = fetched_metas[index] if index < len(fetched_metas) else {}
+                score = _bm25_scores(query, [document or ""])[0]
+                if score > 0:
+                    by_physical[physical_id] = SimpleNamespace(
+                        id=physical_id,
+                        document=document or "",
+                        metadata=metadata or {},
+                        score=score,
+                    )
+        except Exception:
+            logger.warning("Could not hydrate current lexical generations", exc_info=True)
+
+    resolved = []
+    emitted_logical = set()
+    for hit in hits:
+        logical_id = (hit.metadata or {}).get("logical_drawer_id")
+        if not logical_id:
+            resolved.append(hit)
+            continue
+        if logical_id in emitted_logical:
+            continue
+        emitted_logical.add(logical_id)
+        current = by_physical.get(current_ids.get(logical_id))
+        if current is not None:
+            resolved.append(current)
+        elif not (hit.metadata or {}).get("mine_generation_token"):
+            resolved.append(hit)
+    return resolved
+
+
+def _fetch_resolved_lexical_hits(drawers_col, query, where, target_results, committed_tokens):
+    limit = max(1, target_results)
+    total = None
+    while True:
+        result = drawers_col.lexical_search(
+            query=query,
+            n_results=limit,
+            where=where or None,
+        )
+        resolved = _resolve_lexical_generation_hits(
+            drawers_col, result.hits, query, committed_tokens
+        )
+        if len(resolved) >= target_results or len(result.hits) < limit:
+            return resolved
+        if total is None:
+            try:
+                total = max(1, int(drawers_col.count()))
+            except (AttributeError, TypeError, ValueError):
+                return resolved
+        if limit >= total:
+            return resolved
+        limit = min(total, max(limit + 1, limit * 2))
 
 
 def _merge_bm25_union_candidates(
@@ -1166,12 +1595,15 @@ def _merge_bm25_union_candidates(
     before admitting them, preserving the same distance guarantee as the
     vector-only path.
     """
-    where = build_where_filter(wing, room, source_file)
+    committed_tokens = _committed_generation_tokens(drawers_col)
+    where = _visible_drawer_where(build_where_filter(wing, room, source_file), committed_tokens)
     try:
-        lexical = drawers_col.lexical_search(
-            query=query,
-            n_results=n_results * 3,
-            where=where or None,
+        lexical_hits = _fetch_resolved_lexical_hits(
+            drawers_col,
+            query,
+            where,
+            n_results * 3,
+            committed_tokens,
         )
     except UnsupportedCapabilityError:
         raise
@@ -1181,14 +1613,16 @@ def _merge_bm25_union_candidates(
 
     metric = _metric_for_collection(drawers_col)
     lexical_distances = (
-        _lexical_hit_vector_distances(drawers_col, query, lexical.hits, metric)
+        _lexical_hit_vector_distances(drawers_col, query, lexical_hits, metric)
         if max_distance > 0.0
         else {}
     )
 
     bm25_extra = []
-    for hit in lexical.hits:
+    for hit in lexical_hits:
         meta = hit.metadata or {}
+        if _is_staged_metadata(meta, committed_tokens):
+            continue
         # The window applies to every candidate source; a lexically strong
         # drawer outside [since, before) must not enter through this side
         # door (the vector-path candidates are filtered upstream).
@@ -1224,6 +1658,9 @@ def _merge_bm25_union_candidates(
                 "bm25_score": round(float(hit.score), 3),
                 "_source_file_full": full_source,
                 "_chunk_index": meta.get("chunk_index"),
+                "_logical_generation_id": meta.get("logical_drawer_id"),
+                "_physical_drawer_id": hit.id,
+                "_active_generation": meta.get("mine_generation_token") in committed_tokens,
             }
         )
 
@@ -1303,6 +1740,7 @@ def _enrich_closet_hits(
     drawers_col,
     query: str,
     stop_words: frozenset = frozenset(),
+    committed_tokens=None,
 ) -> list:
     """Hydrate closet-boosted hits and memoise each source/group fetch."""
     query_terms = set(
@@ -1312,6 +1750,8 @@ def _enrich_closet_hits(
         )
     )
     source_cache: dict = {}
+    if committed_tokens is None:
+        committed_tokens = _committed_generation_tokens(drawers_col)
 
     for hit in hits:
         if hit.get("matched_via") == "drawer":
@@ -1352,6 +1792,14 @@ def _enrich_closet_hits(
             else:
                 source_cache[cache_key] = (
                     list(
+                        (
+                            source_drawers.get("ids", [])
+                            if isinstance(source_drawers, dict)
+                            else getattr(source_drawers, "ids", None)
+                        )
+                        or []
+                    ),
+                    list(
                         getattr(
                             source_drawers,
                             "documents",
@@ -1374,22 +1822,21 @@ def _enrich_closet_hits(
         if cached is None:
             continue
 
-        docs, metadatas = cached
+        physical_ids, docs, metadatas = cached
+        if len(physical_ids) < len(docs):
+            physical_ids.extend(
+                f"_hydrated_row_{index}" for index in range(len(physical_ids), len(docs))
+            )
 
         if len(docs) <= 1:
             continue
 
         indexed = []
 
-        for index, (
-            document,
-            metadata,
-        ) in enumerate(
-            zip(
-                docs,
-                metadatas,
-            )
-        ):
+        source_rows = _collapse_physical_generation_rows(
+            list(zip(physical_ids, docs, metadatas)), committed_tokens
+        )
+        for index, (_, document, metadata) in enumerate(source_rows):
             chunk_index = (
                 metadata.get(
                     "chunk_index",
@@ -1593,6 +2040,7 @@ def _finalize_candidate_hits(
             ),
         )
 
+    hits[:] = _collapse_logical_generation_hits(hits)
     ranked = _hybrid_rank(
         hits,
         query,
@@ -1606,6 +2054,9 @@ def _finalize_candidate_hits(
         hit.pop("_source_file_full", None)
         hit.pop("_chunk_index", None)
         hit.pop("_parent_drawer_id", None)
+        hit.pop("_logical_generation_id", None)
+        hit.pop("_physical_drawer_id", None)
+        hit.pop("_active_generation", None)
 
     return hits, None
 
@@ -1726,13 +2177,17 @@ def _window_and_fallback_gate(
     return since_dt, before_dt, active, None
 
 
-def _candidate_out_of_scope(dist, meta, max_distance, since_dt, before_dt) -> bool:
+def _candidate_out_of_scope(
+    dist, meta, max_distance, since_dt, before_dt, committed_tokens=frozenset()
+) -> bool:
     """True when a drawer candidate fails the distance or date-window gate.
 
     Distance is checked on the raw value before rounding to avoid precision
     loss (pre-existing behavior); the date window applies whenever a bound
     is set, with the shared ``[since, before)`` semantics.
     """
+    if _is_staged_metadata(meta, committed_tokens):
+        return True
     if max_distance > 0.0 and dist > max_distance:
         return True
     if (since_dt is not None or before_dt is not None) and not filed_at_in_window(
@@ -1849,8 +2304,87 @@ def _open_search_collection(palace_path: str, collection_name: str):
         )
 
 
+def _current_generation_ids_for_query(collection, raw, committed_tokens) -> dict:
+    logical_ids = {
+        (meta or {}).get("logical_drawer_id")
+        for meta in _first_or_empty(raw, "metadatas")
+        if (meta or {}).get("logical_drawer_id")
+    }
+    if not logical_ids:
+        return {}
+    try:
+        generations = collection.get(
+            where={"logical_drawer_id": {"$in": sorted(logical_ids)}},
+            include=["metadatas"],
+        )
+    except Exception:
+        logger.warning("Could not resolve current conversation generations", exc_info=True)
+        return {}
+    current = {}
+    ids = generations.get("ids") or []
+    metas = generations.get("metadatas") or []
+    for index, physical_id in enumerate(ids):
+        meta = metas[index] if index < len(metas) else {}
+        if _is_staged_metadata(meta, committed_tokens):
+            continue
+        generation_token = (meta or {}).get("mine_generation_token")
+        if generation_token and generation_token not in committed_tokens:
+            continue
+        logical_id = (meta or {}).get("logical_drawer_id")
+        key = (
+            (meta or {}).get("mine_generation_token") in committed_tokens,
+            (meta or {}).get("filed_at", ""),
+            physical_id,
+        )
+        if logical_id and (logical_id not in current or key > current[logical_id][0]):
+            current[logical_id] = (key, physical_id)
+    return {logical_id: item[1] for logical_id, item in current.items()}
+
+
+def _post_filter_drawer_query(collection, raw, wing, room, source_file, committed_tokens):
+    raw_docs = _first_or_empty(raw, "documents")
+    raw_ids = _aligned_query_ids(raw, len(raw_docs))
+    current_generations = _current_generation_ids_for_query(collection, raw, committed_tokens)
+    fids, fdocs, fmetas, fdists = [], [], [], []
+    for stored_drawer_id, doc, meta, dist in zip(
+        raw_ids,
+        raw_docs,
+        _first_or_empty(raw, "metadatas"),
+        _first_or_empty(raw, "distances"),
+    ):
+        meta = meta or {}
+        if _is_staged_metadata(meta, committed_tokens):
+            continue
+        logical_id = meta.get("logical_drawer_id")
+        if logical_id and current_generations.get(logical_id) != stored_drawer_id:
+            continue
+        if wing and meta.get("wing") != wing:
+            continue
+        if room and meta.get("room") != room:
+            continue
+        if source_file and meta.get("source_file") != source_file:
+            continue
+        fids.append(stored_drawer_id)
+        fdocs.append(doc)
+        fmetas.append(meta)
+        fdists.append(dist)
+    return {
+        "ids": [fids],
+        "documents": [fdocs],
+        "metadatas": [fmetas],
+        "distances": [fdists],
+    }
+
+
 def _query_drawers_with_filter_fallback(
-    drawers_col, dkwargs, query, n_results, wing, room, source_file=None
+    drawers_col,
+    dkwargs,
+    query,
+    n_results,
+    wing,
+    room,
+    source_file=None,
+    committed_tokens=None,
 ):
     """Run the filtered drawer query, falling back to an unfiltered query plus a
     Python-side post-filter when ChromaDB raises on the filtered query.
@@ -1863,8 +2397,12 @@ def _query_drawers_with_filter_fallback(
     See #1245 / #1035.
     """
     where = dkwargs.get("where")
+    target_results = max(1, int(dkwargs.get("n_results") or n_results))
+    total = None
+    fetch_limit = target_results
+    filtered_query = True
     try:
-        return drawers_col.query(**dkwargs)
+        raw = drawers_col.query(**{**dkwargs, "n_results": fetch_limit})
     except Exception as filter_err:
         if not where:
             raise
@@ -1872,37 +2410,44 @@ def _query_drawers_with_filter_fallback(
             "Filtered search failed (%s); falling back to unfiltered + post-filter",
             filter_err,
         )
+        if committed_tokens is None:
+            committed_tokens = _committed_generation_tokens(drawers_col)
+        filtered_query = False
+        total = max(1, int(drawers_col.count()))
+        fetch_limit = min(total, max(1, target_results * 15))
         raw = drawers_col.query(
             query_texts=[query],
-            n_results=min(n_results * 15, 500),
+            n_results=fetch_limit,
             include=["documents", "metadatas", "distances"],
         )
-        raw_docs = _first_or_empty(raw, "documents")
-        raw_ids = _aligned_query_ids(raw, len(raw_docs))
-        fids, fdocs, fmetas, fdists = [], [], [], []
-        for stored_drawer_id, doc, meta, dist in zip(
-            raw_ids,
-            raw_docs,
-            _first_or_empty(raw, "metadatas"),
-            _first_or_empty(raw, "distances"),
-        ):
-            meta = meta or {}
-            if wing and meta.get("wing") != wing:
-                continue
-            if room and meta.get("room") != room:
-                continue
-            if source_file and meta.get("source_file") != source_file:
-                continue
-            fids.append(stored_drawer_id)
-            fdocs.append(doc)
-            fmetas.append(meta)
-            fdists.append(dist)
-        return {
-            "ids": [fids],
-            "documents": [fdocs],
-            "metadatas": [fmetas],
-            "distances": [fdists],
+    else:
+        if committed_tokens is None:
+            committed_tokens = _committed_generation_tokens(drawers_col)
+
+    while True:
+        filtered = _post_filter_drawer_query(
+            drawers_col, raw, wing, room, source_file, committed_tokens
+        )
+        if len(filtered["documents"][0]) >= target_results:
+            return filtered
+        if len(_first_or_empty(raw, "documents")) < fetch_limit:
+            return filtered
+        if total is None:
+            try:
+                total = max(1, int(drawers_col.count()))
+            except (AttributeError, TypeError, ValueError):
+                return filtered
+        if fetch_limit >= total:
+            return filtered
+        fetch_limit = min(total, max(fetch_limit + 1, fetch_limit * 2))
+        query_kwargs = {
+            "query_texts": [query],
+            "n_results": fetch_limit,
+            "include": ["documents", "metadatas", "distances"],
         }
+        if filtered_query:
+            query_kwargs["where"] = where
+        raw = drawers_col.query(**query_kwargs)
 
 
 def _backend_capabilities(col) -> frozenset:
@@ -2056,6 +2601,8 @@ def search_memories(
 
     metric = _metric_for_collection(drawers_col)
     where = build_where_filter(wing, room, source_file)
+    committed_tokens = _committed_generation_tokens(drawers_col)
+    drawer_where = _visible_drawer_where(where, committed_tokens)
 
     # Hybrid retrieval: always query drawers directly (the floor), then use
     # closet hits to boost rankings. Closets are a ranking SIGNAL, never a
@@ -2075,10 +2622,16 @@ def search_memories(
             "n_results": pool_size,  # over-fetch for re-ranking
             "include": ["documents", "metadatas", "distances"],
         }
-        if where:
-            dkwargs["where"] = where
+        dkwargs["where"] = drawer_where
         drawer_results = _query_drawers_with_filter_fallback(
-            drawers_col, dkwargs, query, n_results, wing, room, source_file
+            drawers_col,
+            dkwargs,
+            query,
+            n_results,
+            wing,
+            room,
+            source_file,
+            committed_tokens=committed_tokens,
         )
     except Exception as e:
         return _search_error_result(f"Search error: {e}")
@@ -2111,7 +2664,7 @@ def search_memories(
     ):
         meta = meta or {}
         doc = doc or ""
-        if _candidate_out_of_scope(dist, meta, max_distance, since_dt, before_dt):
+        if _candidate_out_of_scope(dist, meta, max_distance, since_dt, before_dt, committed_tokens):
             continue
 
         meta = meta or {}
@@ -2158,11 +2711,15 @@ def search_memories(
             "_source_file_full": source,
             "_chunk_index": meta.get("chunk_index"),
             "_parent_drawer_id": meta.get("parent_drawer_id"),
+            "_logical_generation_id": meta.get("logical_drawer_id"),
+            "_physical_drawer_id": stored_drawer_id,
+            "_active_generation": meta.get("mine_generation_token") in committed_tokens,
         }
         if closet_preview:
             entry["closet_preview"] = closet_preview
         scored.append(entry)
 
+    scored = _collapse_logical_generation_hits(scored)
     scored.sort(key=lambda h: h["_sort_key"])
     hits = scored[:pre_enrichment_limit]
 
@@ -2173,6 +2730,7 @@ def search_memories(
         drawers_col,
         query,
         stop_words=stop_words,
+        committed_tokens=committed_tokens,
     )
 
     # Candidate strategy hook: optionally widen the rerank pool's *source*

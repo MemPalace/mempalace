@@ -1478,6 +1478,18 @@ def file_already_mined(
     exactly as before.
     """
     try:
+        if extract_mode is not None:
+            from .ids import make_convo_commit_id
+
+            commit_marker = collection.get(
+                ids=[make_convo_commit_id(source_file, extract_mode)],
+                include=["metadatas"],
+            )
+            if any(
+                (meta or {}).get("mine_cleanup_pending") is True
+                for meta in (commit_marker.get("metadatas") or [])
+            ):
+                return False
         # Under the additive-mining model, a single ``source_file`` can have
         # multiple ``parent_drawer_id`` groups in the palace — one per
         # mining pass — each with its own stored ``source_mtime`` and
@@ -1506,6 +1518,8 @@ def file_already_mined(
             metadatas = results.get("metadatas") or []
             for meta in metadatas:
                 meta = meta or {}
+                if meta.get("mine_staged") is True:
+                    continue
                 # extract_mode scoping (was the existing ``else`` branch):
                 if extract_mode is not None and not _metadata_matches_extract_mode(
                     meta, extract_mode
@@ -1577,6 +1591,7 @@ def prefetch_mined_set(
     # Per source_file: per stored_mtime group → count + optional chunk_total.
     # A source is only "mined" once some group is complete.
     groups: dict[str, dict] = {}
+    pending_sources: set[str] = set()
     try:
         total = collection.count()
         offset = 0
@@ -1584,6 +1599,16 @@ def prefetch_mined_set(
             batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
             for meta in batch["metadatas"]:
                 meta = meta or {}
+                if meta.get("mine_commit_marker") is True:
+                    if (
+                        meta.get("mine_cleanup_pending") is True
+                        and meta.get("source_file")
+                        and _metadata_matches_extract_mode(meta, extract_mode)
+                    ):
+                        pending_sources.add(meta["source_file"])
+                    continue
+                if meta.get("mine_staged") is True:
+                    continue
                 src = meta.get("source_file")
                 if not src:
                     continue
@@ -1613,6 +1638,8 @@ def prefetch_mined_set(
 
     mined: dict[str, Optional[float]] = {}
     for src, by_mtime in groups.items():
+        if src in pending_sources:
+            continue
         for mtime_key, entry in by_mtime.items():
             chunk_total = entry["chunk_total"]
             if chunk_total is None:
@@ -1654,30 +1681,40 @@ def prefetch_content_hashes(
     the point is not to track every alias.
     """
     hashes: dict[tuple[str, str], str] = {}
+    all_metadatas = []
     try:
         total = collection.count()
         offset = 0
         while offset < total:
             batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
-            for meta in batch["metadatas"]:
-                meta = meta or {}
-                content_hash_field = meta.get("content_hash")
-                src = meta.get("source_file")
-                wing = meta.get("wing")
-                if not content_hash_field or not src or not wing:
-                    continue
-                if not _metadata_matches_extract_mode(meta, extract_mode):
-                    continue
-                version = meta.get("normalize_version", 1)
-                if version < NORMALIZE_VERSION:
-                    continue
-                for content_hash in content_hash_field.split(","):
-                    key = (wing, content_hash)
-                    if content_hash and key not in hashes:
-                        hashes[key] = src
+            all_metadatas.extend(meta or {} for meta in batch["metadatas"])
             if not batch["ids"]:
                 break
             offset += len(batch["ids"])
     except Exception:
         logger.warning("prefetch_content_hashes: partial fetch, %d hashes loaded", len(hashes))
+    committed_tokens = {
+        meta.get("mine_generation_commit")
+        for meta in all_metadatas
+        if meta.get("mine_commit_marker") is True and meta.get("mine_generation_commit")
+    }
+    for meta in all_metadatas:
+        generation_token = meta.get("mine_generation_token")
+        if meta.get("mine_staged") is True and generation_token not in committed_tokens:
+            continue
+        if generation_token and generation_token not in committed_tokens:
+            continue
+        content_hash_field = meta.get("content_hash")
+        src = meta.get("source_file")
+        wing = meta.get("wing")
+        if not content_hash_field or not src or not wing:
+            continue
+        if not _metadata_matches_extract_mode(meta, extract_mode):
+            continue
+        if meta.get("normalize_version", 1) < NORMALIZE_VERSION:
+            continue
+        for content_hash in content_hash_field.split(","):
+            key = (wing, content_hash)
+            if content_hash and key not in hashes:
+                hashes[key] = src
     return hashes

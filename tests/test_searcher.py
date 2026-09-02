@@ -7,6 +7,7 @@ plus mock-based tests for error paths.
 
 import sqlite3
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -76,6 +77,66 @@ class TestSearchMemories:
         assert len(result["results"]) > 0
         assert result["query"] == "JWT authentication"
 
+    def test_staged_conversation_generation_is_not_searchable(self, palace_path, collection):
+        staged_text = "unpublished generation sentinel phrase"
+        staged_ids = [f"staged-generation-{index}" for index in range(8)]
+        collection.upsert(
+            ids=[*staged_ids, "old-generation", "committed-generation"],
+            documents=[
+                *[staged_text] * len(staged_ids),
+                staged_text,
+                "committed fallback text",
+            ],
+            metadatas=[
+                *[
+                    {
+                        "wing": "sessions",
+                        "room": "general",
+                        "source_file": f"/tmp/staged-{index}.jsonl",
+                        "filed_at": "2026-09-02T00:00:00",
+                        "mine_staged": True,
+                        "mine_generation_token": "generation-token",
+                        "logical_drawer_id": "logical-generation",
+                    }
+                    for index in range(len(staged_ids))
+                ],
+                {
+                    "wing": "sessions",
+                    "room": "general",
+                    "source_file": "/tmp/old.jsonl",
+                    "filed_at": "2026-09-03T00:00:00",
+                    "logical_drawer_id": "logical-generation",
+                },
+                {
+                    "wing": "sessions",
+                    "room": "general",
+                    "source_file": "/tmp/committed.jsonl",
+                    "filed_at": "2026-09-02T00:00:00",
+                },
+            ],
+        )
+
+        result = search_memories(staged_text, palace_path, n_results=1)
+
+        assert len(result["results"]) == 1
+        assert result["results"][0]["source_path"] == "/tmp/old.jsonl"
+
+        collection.upsert(
+            ids=["generation-commit"],
+            documents=["[commit]"],
+            metadatas=[
+                {
+                    "mine_staged": True,
+                    "mine_commit_marker": True,
+                    "mine_generation_commit": "generation-token",
+                }
+            ],
+        )
+        published = search_memories(staged_text, palace_path, n_results=10)
+        assert published["results"][0]["source_path"].startswith("/tmp/staged-")
+        assert published["results"][0]["drawer_id"] == "logical-generation"
+        assert sum(hit["drawer_id"] == "logical-generation" for hit in published["results"]) == 1
+
     def test_wing_filter(self, palace_path, seeded_collection):
         result = search_memories("planning", palace_path, wing="notes")
         assert all(r["wing"] == "notes" for r in result["results"])
@@ -83,6 +144,263 @@ class TestSearchMemories:
     def test_room_filter(self, palace_path, seeded_collection):
         result = search_memories("database", palace_path, room="backend")
         assert all(r["room"] == "backend" for r in result["results"])
+
+    def test_filtered_query_fallback_refills_past_staged_top_k(self):
+        from mempalace.searcher import _query_drawers_with_filter_fallback
+
+        class Collection:
+            def __init__(self):
+                self.unfiltered_limits = []
+
+            @staticmethod
+            def count():
+                return 20
+
+            @staticmethod
+            def get(**_kwargs):
+                return {"ids": [], "metadatas": []}
+
+            def query(self, **kwargs):
+                if "where" in kwargs:
+                    raise RuntimeError("filtered HNSW mismatch")
+                limit = kwargs["n_results"]
+                self.unfiltered_limits.append(limit)
+                ids = [f"staged-{index}" for index in range(min(limit, 19))]
+                docs = ["staged"] * len(ids)
+                metas = [{"mine_staged": True}] * len(ids)
+                if limit >= 20:
+                    ids.append("committed")
+                    docs.append("committed")
+                    metas.append({"source_file": "/tmp/committed"})
+                return {
+                    "ids": [ids],
+                    "documents": [docs],
+                    "metadatas": [metas],
+                    "distances": [[0.1] * len(ids)],
+                }
+
+        collection = Collection()
+        result = _query_drawers_with_filter_fallback(
+            collection,
+            {"where": {"mine_staged": {"$ne": True}}},
+            "query",
+            1,
+            None,
+            None,
+        )
+
+        assert collection.unfiltered_limits == [15, 20]
+        assert result["ids"] == [["committed"]]
+
+    def test_filtered_query_refills_until_current_logical_generation_is_present(self):
+        from mempalace.searcher import _query_drawers_with_filter_fallback
+
+        old_meta = {
+            "logical_drawer_id": "logical",
+            "filed_at": "2026-09-01T00:00:00",
+        }
+        current_meta = {
+            "logical_drawer_id": "logical",
+            "filed_at": "2026-09-02T00:00:00",
+        }
+
+        class Collection:
+            def __init__(self):
+                self.query_limits = []
+
+            @staticmethod
+            def count():
+                return 2
+
+            @staticmethod
+            def get(where, include):
+                if "mine_commit_marker" in where:
+                    return {"ids": [], "metadatas": []}
+                return {
+                    "ids": ["old", "current"],
+                    "metadatas": [old_meta, current_meta],
+                }
+
+            def query(self, **kwargs):
+                limit = kwargs["n_results"]
+                self.query_limits.append(limit)
+                ids = ["old"] if limit == 1 else ["old", "current"]
+                metas = [old_meta] if limit == 1 else [old_meta, current_meta]
+                return {
+                    "ids": [ids],
+                    "documents": [["old"] if limit == 1 else ["old", "current"]],
+                    "metadatas": [metas],
+                    "distances": [[0.1] if limit == 1 else [0.1, 1.0]],
+                }
+
+        collection = Collection()
+        result = _query_drawers_with_filter_fallback(
+            collection,
+            {"where": {"mine_staged": {"$ne": True}}, "n_results": 1},
+            "query",
+            1,
+            None,
+            None,
+        )
+
+        assert collection.query_limits == [1, 2]
+        assert result["ids"] == [["current"]]
+
+    def test_lexical_union_replaces_old_hit_with_current_generation(self):
+        from mempalace.searcher import _resolve_lexical_generation_hits
+
+        old_meta = {
+            "logical_drawer_id": "logical",
+            "filed_at": "2026-09-01T00:00:00",
+        }
+        current_meta = {
+            "logical_drawer_id": "logical",
+            "filed_at": "2026-09-02T00:00:00",
+        }
+        old_hit = SimpleNamespace(
+            id="old",
+            document="target phrase in stale content",
+            metadata=old_meta,
+            score=10.0,
+        )
+
+        class Collection:
+            @staticmethod
+            def get(**kwargs):
+                if "where" in kwargs:
+                    return {
+                        "ids": ["old", "current"],
+                        "metadatas": [old_meta, current_meta],
+                    }
+                return {
+                    "ids": ["current"],
+                    "documents": ["target phrase in current content"],
+                    "metadatas": [current_meta],
+                }
+
+        resolved = _resolve_lexical_generation_hits(
+            Collection(), [old_hit], "target phrase", frozenset()
+        )
+
+        assert [hit.id for hit in resolved] == ["current"]
+        assert resolved[0].document == "target phrase in current content"
+
+        retired_hit = SimpleNamespace(
+            id="retired",
+            document="retired text",
+            metadata={
+                "logical_drawer_id": "removed-logical",
+                "mine_generation_token": "retired-token",
+            },
+            score=5.0,
+        )
+
+        class NoCurrentCollection:
+            @staticmethod
+            def get(**_kwargs):
+                return {"ids": [], "metadatas": []}
+
+        assert (
+            _resolve_lexical_generation_hits(
+                NoCurrentCollection(), [retired_hit], "retired", frozenset()
+            )
+            == []
+        )
+
+    def test_lexical_union_refills_after_retired_hits_are_dropped(self):
+        from mempalace.searcher import _fetch_resolved_lexical_hits
+
+        retired = [
+            SimpleNamespace(
+                id=f"retired-{index}",
+                document="retired",
+                metadata={
+                    "logical_drawer_id": f"removed-{index}",
+                    "mine_generation_token": "retired-token",
+                },
+                score=10.0,
+            )
+            for index in range(3)
+        ]
+        ordinary = [
+            SimpleNamespace(
+                id=f"ordinary-{index}",
+                document="ordinary",
+                metadata={},
+                score=1.0,
+            )
+            for index in range(3)
+        ]
+
+        class Collection:
+            def __init__(self):
+                self.limits = []
+
+            @staticmethod
+            def count():
+                return 6
+
+            @staticmethod
+            def get(**_kwargs):
+                return {"ids": [], "metadatas": []}
+
+            def lexical_search(self, query, n_results, where):
+                self.limits.append(n_results)
+                hits = retired if n_results == 3 else [*retired, *ordinary]
+                return SimpleNamespace(hits=hits)
+
+        collection = Collection()
+        resolved = _fetch_resolved_lexical_hits(
+            collection,
+            "query",
+            {"mine_staged": {"$ne": True}},
+            3,
+            frozenset(),
+        )
+
+        assert collection.limits == [3, 6]
+        assert [hit.id for hit in resolved] == [
+            "ordinary-0",
+            "ordinary-1",
+            "ordinary-2",
+        ]
+
+    def test_closet_source_rows_prefer_active_token_over_newer_stale_row(self):
+        from mempalace.searcher import _collapse_physical_generation_rows
+
+        rows = [
+            (
+                "stale-b",
+                "obsolete text",
+                {
+                    "logical_drawer_id": "logical",
+                    "mine_generation_token": "old-token",
+                    "filed_at": "2026-09-03T00:00:00",
+                },
+            ),
+            (
+                "active-a",
+                "current text",
+                {
+                    "logical_drawer_id": "logical",
+                    "mine_generation_token": "active-token",
+                    "filed_at": "2026-09-01T00:00:00",
+                },
+            ),
+            (
+                "removed-chunk",
+                "removed text",
+                {
+                    "logical_drawer_id": "removed-logical",
+                    "mine_generation_token": "retired-token",
+                    "filed_at": "2026-09-04T00:00:00",
+                },
+            ),
+        ]
+
+        collapsed = _collapse_physical_generation_rows(rows, {"active-token"})
+
+        assert [(row[0], row[1]) for row in collapsed] == [("active-a", "current text")]
 
     def test_wing_and_room_filter(self, palace_path, seeded_collection):
         result = search_memories("code", palace_path, wing="project", room="frontend")
@@ -1056,6 +1374,144 @@ def test_bm25_only_via_sqlite_forwards_stop_words_to_bm25_scores(monkeypatch, tm
     )
 
     assert captured["stop_words"] == frozenset({"the"})
+
+
+def test_bm25_commit_marker_is_scoped_to_selected_collection(tmp_path):
+    from mempalace import searcher
+
+    db = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE VIRTUAL TABLE embedding_fulltext_search USING fts5(string_value, tokenize='trigram');
+        CREATE TABLE embedding_metadata (
+            id INTEGER, key TEXT, string_value TEXT, int_value INTEGER,
+            float_value REAL, bool_value INTEGER
+        );
+        CREATE TABLE collections (id TEXT PRIMARY KEY, name TEXT);
+        CREATE TABLE segments (id TEXT PRIMARY KEY, collection TEXT);
+        CREATE TABLE embeddings (
+            id INTEGER PRIMARY KEY, segment_id TEXT, embedding_id TEXT, created_at TEXT
+        );
+        INSERT INTO collections VALUES ('target', 'target_drawers');
+        INSERT INTO collections VALUES ('other', 'other_drawers');
+        INSERT INTO segments VALUES ('target-seg', 'target');
+        INSERT INTO segments VALUES ('other-seg', 'other');
+        INSERT INTO embeddings VALUES (1, 'target-seg', 'staged-drawer', '2026-09-02');
+        INSERT INTO embeddings VALUES (2, 'other-seg', 'foreign-marker', '2026-09-02');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (1, 'scoped generation phrase');
+        INSERT INTO embedding_metadata VALUES
+            (1, 'chroma:document', 'scoped generation phrase', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (1, 'mine_staged', NULL, NULL, NULL, 1);
+        INSERT INTO embedding_metadata VALUES
+            (1, 'mine_generation_token', 'shared-token', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (2, 'mine_generation_commit', 'shared-token', NULL, NULL, NULL);
+        """
+    )
+    conn.commit()
+
+    hidden = searcher._bm25_only_via_sqlite(
+        "scoped generation",
+        str(tmp_path),
+        collection_name="target_drawers",
+    )
+    assert hidden["results"] == []
+
+    conn.execute("INSERT INTO embeddings VALUES (3, 'target-seg', 'local-marker', '2026-09-02')")
+    conn.execute(
+        "INSERT INTO embedding_metadata VALUES "
+        "(3, 'mine_generation_commit', 'shared-token', NULL, NULL, NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    visible = searcher._bm25_only_via_sqlite(
+        "scoped generation",
+        str(tmp_path),
+        collection_name="target_drawers",
+    )
+    assert [hit["drawer_id"] for hit in visible["results"]] == ["staged-drawer"]
+
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        INSERT INTO embeddings VALUES (4, 'target-seg', 'old-b', '2026-09-03');
+        INSERT INTO embeddings VALUES (5, 'target-seg', 'active-a', '2026-09-01');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (4, 'obsolete dinosaur only');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (5, 'current replacement text');
+        INSERT INTO embedding_metadata VALUES
+            (4, 'chroma:document', 'obsolete dinosaur only', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (4, 'logical_drawer_id', 'logical-revert', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (4, 'filed_at', '2026-09-03T00:00:00', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (5, 'chroma:document', 'current replacement text', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (5, 'logical_drawer_id', 'logical-revert', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (5, 'mine_generation_token', 'shared-token', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (5, 'filed_at', '2026-09-01T00:00:00', NULL, NULL, NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    reverted = searcher._bm25_only_via_sqlite(
+        "obsolete dinosaur",
+        str(tmp_path),
+        collection_name="target_drawers",
+    )
+    assert reverted["results"] == []
+
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        INSERT INTO embeddings VALUES (6, 'target-seg', 'removed-chunk', '2026-09-04');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (6, 'removed unicorn memory');
+        INSERT INTO embedding_metadata VALUES
+            (6, 'chroma:document', 'removed unicorn memory', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (6, 'logical_drawer_id', 'removed-logical', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (6, 'mine_generation_token', 'retired-token', NULL, NULL, NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+    removed = searcher._bm25_only_via_sqlite(
+        "removed unicorn",
+        str(tmp_path),
+        collection_name="target_drawers",
+    )
+    assert removed["results"] == []
+
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        INSERT INTO embeddings VALUES (7, 'target-seg', 'ordinary-match', '2026-09-05');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (7, 'removed unicorn ordinary');
+        INSERT INTO embedding_metadata VALUES
+            (7, 'chroma:document', 'removed unicorn ordinary', NULL, NULL, NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+    limited = searcher._bm25_only_via_sqlite(
+        "removed unicorn",
+        str(tmp_path),
+        collection_name="target_drawers",
+        max_candidates=1,
+    )
+    assert [hit["drawer_id"] for hit in limited["results"]] == ["ordinary-match"]
 
 
 def test_finalize_candidate_hits_forwards_stop_words_to_hybrid_rank(monkeypatch):

@@ -649,16 +649,24 @@ def _search_args_forwardable(args) -> bool:
     return True
 
 
+def _abort_live_hub_search(reason: str) -> None:
+    """Refuse a second local HNSW load after a live matching hub was found."""
+    print(
+        f"mempalace: {reason}. "
+        "Not falling back to a direct local search because that would load "
+        "another full HNSW index. Repair the hub, or set "
+        f"{_HUB_FORWARD_ENV}=0 only after accepting the extra HNSW memory cost.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def _print_hub_search_result(args, result: dict) -> bool:
     """Render an MCP search result using the CLI's human-readable shape."""
     if not isinstance(result, dict):
         return False
 
-    error = result.get("error")
-    if error:
-        details = result.get("details")
-        message = f"{error}: {details}" if details else str(error)
-        print(f"mempalace: hub search failed: {message}", file=sys.stderr)
+    if result.get("error"):
         return False
 
     cli_output = result.get("cli_output")
@@ -723,8 +731,8 @@ def _forward_search_to_hub(args, palace_path: str) -> bool:
 
     A local Chroma search cold-loads the palace's full HNSW index. Reusing the
     long-lived hub prevents every shell command or agent worker from holding a
-    private copy. If the hub accepts the request but fails mid-flight, do not
-    fall back locally: that would recreate the memory spike this path avoids.
+    private copy. Once a live matching hub record exists, do not fall back
+    locally: that would recreate the memory spike this path avoids.
     """
     import json
     import urllib.error
@@ -737,11 +745,15 @@ def _forward_search_to_hub(args, palace_path: str) -> bool:
     info = server_registry.read_live_serverinfo(palace_path)
     if not info:
         return False
+    if not _search_args_forwardable(args):
+        _abort_live_hub_search(
+            "this search cannot be represented exactly through the live hub contract"
+        )
     if "search_cli_compatible" not in info.get("capabilities", []):
-        return False
+        _abort_live_hub_search("the live hub does not advertise CLI-compatible search")
     current_config = MempalaceConfig(palace_path=palace_path)
     if info.get("search_config_fingerprint") != current_config.search_config_fingerprint:
-        return False
+        _abort_live_hub_search("the live hub search configuration no longer matches this process")
 
     base_url = server_registry.client_base_url(info)
     headers = {"Content-Type": "application/json"}
@@ -750,9 +762,9 @@ def _forward_search_to_hub(args, palace_path: str) -> bool:
         health = urllib.request.Request(f"{base_url}/healthz", headers=headers)
         with urllib.request.urlopen(health, timeout=_HUB_HEALTH_TIMEOUT_S) as resp:
             if resp.status != 200:
-                return False
+                _abort_live_hub_search("the registered hub health check failed")
     except (urllib.error.URLError, OSError, ValueError):
-        return False
+        _abort_live_hub_search("the registered hub is unreachable")
 
     arguments = {
         "query": args.query,
@@ -785,43 +797,33 @@ def _forward_search_to_hub(args, palace_path: str) -> bool:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
-            # Authentication failed before the Hub accepted the search, so
-            # direct execution is still safe. This covers Hubs started with
-            # an explicit/env token that is intentionally not persisted in
-            # the per-palace token file, as well as a stale local token.
-            return False
-        print(f"mempalace: hub rejected search ({exc.code} {exc.reason})", file=sys.stderr)
-        sys.exit(1)
-    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
-        print(
-            f"mempalace: hub at {base_url} did not complete the search ({exc}); "
-            "not retrying directly because that would load another full index. "
-            f"Set {_HUB_FORWARD_ENV}=0 to force a direct search.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+            reason = "the live hub rejected authentication or no usable token is available"
+        else:
+            reason = "the live hub rejected the search"
+        _abort_live_hub_search(reason)
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+        _abort_live_hub_search("the registered hub did not complete the search")
 
     print(
         f"mempalace: forwarding search to palace hub {base_url} (pid {info.get('pid')})",
         file=sys.stderr,
     )
 
+    if not isinstance(payload, dict):
+        _abort_live_hub_search("the live hub returned an unrecognized search response")
+
     if payload.get("error"):
-        err = payload["error"]
-        print(
-            f"mempalace: hub refused search: {err.get('message', 'unknown error')}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        _abort_live_hub_search("the live hub refused the search")
 
     try:
         result = json.loads(payload["result"]["content"][0]["text"])
     except (KeyError, IndexError, TypeError, ValueError):
-        print("mempalace: hub returned an unrecognized search response", file=sys.stderr)
-        sys.exit(1)
+        _abort_live_hub_search("the live hub returned an unrecognized search response")
 
+    if isinstance(result, dict) and result.get("error"):
+        _abort_live_hub_search("the live hub search failed")
     if not _print_hub_search_result(args, result):
-        sys.exit(1)
+        _abort_live_hub_search("the live hub returned an unrecognized search response")
     return True
 
 
@@ -1561,7 +1563,7 @@ def cmd_daemon(args):
 
 def cmd_search(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
-    if _search_args_forwardable(args) and _forward_search_to_hub(args, palace_path):
+    if _forward_search_to_hub(args, palace_path):
         return
 
     from .searcher import search, SearchError
