@@ -1267,6 +1267,8 @@ def _prepare_checkpoint_payload(
             temp_file.write_text(
                 json.dumps(
                     {
+                        "session_id": session_id,
+                        "checkpoint_id": checkpoint_id,
                         "messages": messages,
                         "themes": themes,
                         "idempotency_key": idempotency_key,
@@ -1284,6 +1286,30 @@ def _prepare_checkpoint_payload(
         except OSError:
             return None
     return messages, themes, idempotency_key, entry, pending_file
+
+
+def _pending_checkpoints_for_session(session_id: str) -> list[Path]:
+    pending = []
+    try:
+        candidates = list(STATE_DIR.glob("pending_checkpoint_*.json"))
+    except OSError:
+        return pending
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if payload.get("session_id") == session_id:
+            pending.append(path)
+    return pending
+
+
+def _discard_session_pending_checkpoints(session_id: str) -> None:
+    for path in _pending_checkpoints_for_session(session_id):
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def _save_diary_direct(
@@ -1927,6 +1953,7 @@ def hook_session_end(data: dict, harness: str):
 
         # Respect auto_save config toggle (clean opt-out)
         if not auto_save:
+            _discard_session_pending_checkpoints(session_id)
             _output({})
             return
 
@@ -1964,20 +1991,23 @@ def hook_session_end(data: dict, harness: str):
                 return
 
             if valid_transcript:
-                _save_diary_direct(
+                diary_result = _save_diary_direct(
                     valid_transcript,
                     session_id,
                     wing=_wing_from_transcript_path(valid_transcript),
                     toast=toast,
                     agent_name=_diary_agent_for_harness(harness),
                 )
-                _ingest_transcript(valid_transcript)
+                ingest_status = _ingest_transcript(valid_transcript)
+                if diary_result.get("count", 0) > 0 or ingest_status is True:
+                    _discard_session_pending_checkpoints(session_id)
             _maybe_auto_ingest()
 
         _output({})
     finally:
-        _advance_session_checkpoint_epoch(session_id)
-        _clear_session_last_save(session_id)
+        if not _pending_checkpoints_for_session(session_id):
+            _advance_session_checkpoint_epoch(session_id)
+            _clear_session_last_save(session_id)
 
 
 def hook_precompact(data: dict, harness: str):

@@ -2336,6 +2336,40 @@ def test_session_end_disabled_by_config_clears_marker(tmp_path):
     assert not last_save_file.exists()
 
 
+def test_failed_session_end_preserves_pending_checkpoint_epoch_and_marker(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(15)],
+    )
+    last_save_file = tmp_path / "sess_last_save"
+    last_save_file.write_text("0", encoding="utf-8")
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        prepared = hooks_cli_mod._prepare_checkpoint_payload(
+            str(transcript), "sess", "wing_sessions", "claude", "stop:initial:15"
+        )
+    assert prepared is not None
+
+    with patch("mempalace.hooks_cli.MempalaceConfig") as config:
+        config.return_value.hooks_auto_save = True
+        config.return_value.hook_desktop_toast = False
+        with (
+            patch("mempalace.hooks_cli._save_diary_direct", return_value={"count": 0}),
+            patch("mempalace.hooks_cli._ingest_transcript", return_value=False),
+            patch("mempalace.hooks_cli._maybe_auto_ingest"),
+        ):
+            _capture_hook_output(
+                hook_session_end,
+                {"session_id": "sess", "transcript_path": str(transcript)},
+                state_dir=tmp_path,
+            )
+
+    assert last_save_file.exists()
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        assert hooks_cli_mod._session_checkpoint_epoch("sess") == "initial"
+        assert len(hooks_cli_mod._pending_checkpoints_for_session("sess")) == 1
+
+
 def test_session_end_defaults_to_saving_when_config_unreadable(tmp_path):
     """A corrupt/unreadable config must not lose the final save: the handler
     defaults to auto-save on (toasts off) instead of crashing the hook."""

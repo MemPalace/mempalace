@@ -307,6 +307,64 @@ class TestSearchMemories:
             == []
         )
 
+    def test_lexical_union_refills_after_retired_hits_are_dropped(self):
+        from mempalace.searcher import _fetch_resolved_lexical_hits
+
+        retired = [
+            SimpleNamespace(
+                id=f"retired-{index}",
+                document="retired",
+                metadata={
+                    "logical_drawer_id": f"removed-{index}",
+                    "mine_generation_token": "retired-token",
+                },
+                score=10.0,
+            )
+            for index in range(3)
+        ]
+        ordinary = [
+            SimpleNamespace(
+                id=f"ordinary-{index}",
+                document="ordinary",
+                metadata={},
+                score=1.0,
+            )
+            for index in range(3)
+        ]
+
+        class Collection:
+            def __init__(self):
+                self.limits = []
+
+            @staticmethod
+            def count():
+                return 6
+
+            @staticmethod
+            def get(**_kwargs):
+                return {"ids": [], "metadatas": []}
+
+            def lexical_search(self, query, n_results, where):
+                self.limits.append(n_results)
+                hits = retired if n_results == 3 else [*retired, *ordinary]
+                return SimpleNamespace(hits=hits)
+
+        collection = Collection()
+        resolved = _fetch_resolved_lexical_hits(
+            collection,
+            "query",
+            {"mine_staged": {"$ne": True}},
+            3,
+            frozenset(),
+        )
+
+        assert collection.limits == [3, 6]
+        assert [hit.id for hit in resolved] == [
+            "ordinary-0",
+            "ordinary-1",
+            "ordinary-2",
+        ]
+
     def test_closet_source_rows_prefer_active_token_over_newer_stale_row(self):
         from mempalace.searcher import _collapse_physical_generation_rows
 
@@ -1434,6 +1492,26 @@ def test_bm25_commit_marker_is_scoped_to_selected_collection(tmp_path):
         collection_name="target_drawers",
     )
     assert removed["results"] == []
+
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        INSERT INTO embeddings VALUES (7, 'target-seg', 'ordinary-match', '2026-09-05');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (7, 'removed unicorn ordinary');
+        INSERT INTO embedding_metadata VALUES
+            (7, 'chroma:document', 'removed unicorn ordinary', NULL, NULL, NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+    limited = searcher._bm25_only_via_sqlite(
+        "removed unicorn",
+        str(tmp_path),
+        collection_name="target_drawers",
+        max_candidates=1,
+    )
+    assert [hit["drawer_id"] for hit in limited["results"]] == ["ordinary-match"]
 
 
 def test_finalize_candidate_hits_forwards_stop_words_to_hybrid_rank(monkeypatch):

@@ -1190,9 +1190,34 @@ def _bm25_only_via_sqlite(
                       AND marker_collection.name = ?
                 )
             )
-            """
+            """,
+            f"""
+            AND (
+                NOT EXISTS (
+                    SELECT 1 FROM embedding_metadata tokened
+                    WHERE tokened.id = {row_id_expr}
+                      AND tokened.key = 'mine_generation_token'
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM embedding_metadata tokened
+                    JOIN embedding_metadata marker
+                      ON marker.key = 'mine_generation_commit'
+                     AND marker.string_value = tokened.string_value
+                    JOIN embeddings marker_embedding
+                      ON marker_embedding.id = marker.id
+                    JOIN segments marker_segment
+                      ON marker_segment.id = marker_embedding.segment_id
+                    JOIN collections marker_collection
+                      ON marker_collection.id = marker_segment.collection
+                    WHERE tokened.id = {row_id_expr}
+                      AND tokened.key = 'mine_generation_token'
+                      AND marker_collection.name = ?
+                )
+            )
+            """,
         ]
-        params = [collection_name]
+        params = [collection_name, collection_name]
         for key, value in (("wing", wing), ("room", room), ("source_file", source_file)):
             if not value:
                 continue
@@ -1513,6 +1538,30 @@ def _resolve_lexical_generation_hits(drawers_col, hits, query, committed_tokens)
     return resolved
 
 
+def _fetch_resolved_lexical_hits(drawers_col, query, where, target_results, committed_tokens):
+    limit = max(1, target_results)
+    total = None
+    while True:
+        result = drawers_col.lexical_search(
+            query=query,
+            n_results=limit,
+            where=where or None,
+        )
+        resolved = _resolve_lexical_generation_hits(
+            drawers_col, result.hits, query, committed_tokens
+        )
+        if len(resolved) >= target_results or len(result.hits) < limit:
+            return resolved
+        if total is None:
+            try:
+                total = max(1, int(drawers_col.count()))
+            except (AttributeError, TypeError, ValueError):
+                return resolved
+        if limit >= total:
+            return resolved
+        limit = min(total, max(limit + 1, limit * 2))
+
+
 def _merge_bm25_union_candidates(
     hits: list,
     drawers_col,
@@ -1548,10 +1597,12 @@ def _merge_bm25_union_candidates(
     committed_tokens = _committed_generation_tokens(drawers_col)
     where = _visible_drawer_where(build_where_filter(wing, room, source_file), committed_tokens)
     try:
-        lexical = drawers_col.lexical_search(
-            query=query,
-            n_results=n_results * 3,
-            where=where or None,
+        lexical_hits = _fetch_resolved_lexical_hits(
+            drawers_col,
+            query,
+            where,
+            n_results * 3,
+            committed_tokens,
         )
     except UnsupportedCapabilityError:
         raise
@@ -1559,9 +1610,6 @@ def _merge_bm25_union_candidates(
         logger.debug("candidate_strategy=union: lexical fetch failed", exc_info=True)
         return
 
-    lexical_hits = _resolve_lexical_generation_hits(
-        drawers_col, lexical.hits, query, committed_tokens
-    )
     metric = _metric_for_collection(drawers_col)
     lexical_distances = (
         _lexical_hit_vector_distances(drawers_col, query, lexical_hits, metric)
