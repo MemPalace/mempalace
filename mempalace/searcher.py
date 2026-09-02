@@ -987,6 +987,7 @@ def search(
             n_results,
             wing,
             room,
+            committed_tokens=committed_tokens,
         )
 
     except Exception as e:
@@ -1739,6 +1740,7 @@ def _enrich_closet_hits(
     drawers_col,
     query: str,
     stop_words: frozenset = frozenset(),
+    committed_tokens=None,
 ) -> list:
     """Hydrate closet-boosted hits and memoise each source/group fetch."""
     query_terms = set(
@@ -1748,7 +1750,8 @@ def _enrich_closet_hits(
         )
     )
     source_cache: dict = {}
-    committed_tokens = _committed_generation_tokens(drawers_col)
+    if committed_tokens is None:
+        committed_tokens = _committed_generation_tokens(drawers_col)
 
     for hit in hits:
         if hit.get("matched_via") == "drawer":
@@ -2374,7 +2377,14 @@ def _post_filter_drawer_query(collection, raw, wing, room, source_file, committe
 
 
 def _query_drawers_with_filter_fallback(
-    drawers_col, dkwargs, query, n_results, wing, room, source_file=None
+    drawers_col,
+    dkwargs,
+    query,
+    n_results,
+    wing,
+    room,
+    source_file=None,
+    committed_tokens=None,
 ):
     """Run the filtered drawer query, falling back to an unfiltered query plus a
     Python-side post-filter when ChromaDB raises on the filtered query.
@@ -2400,7 +2410,8 @@ def _query_drawers_with_filter_fallback(
             "Filtered search failed (%s); falling back to unfiltered + post-filter",
             filter_err,
         )
-        committed_tokens = _committed_generation_tokens(drawers_col)
+        if committed_tokens is None:
+            committed_tokens = _committed_generation_tokens(drawers_col)
         filtered_query = False
         total = max(1, int(drawers_col.count()))
         fetch_limit = min(total, max(1, target_results * 15))
@@ -2410,7 +2421,8 @@ def _query_drawers_with_filter_fallback(
             include=["documents", "metadatas", "distances"],
         )
     else:
-        committed_tokens = _committed_generation_tokens(drawers_col)
+        if committed_tokens is None:
+            committed_tokens = _committed_generation_tokens(drawers_col)
 
     while True:
         filtered = _post_filter_drawer_query(
@@ -2612,7 +2624,14 @@ def search_memories(
         }
         dkwargs["where"] = drawer_where
         drawer_results = _query_drawers_with_filter_fallback(
-            drawers_col, dkwargs, query, n_results, wing, room, source_file
+            drawers_col,
+            dkwargs,
+            query,
+            n_results,
+            wing,
+            room,
+            source_file,
+            committed_tokens=committed_tokens,
         )
     except Exception as e:
         return _search_error_result(f"Search error: {e}")
@@ -2711,6 +2730,7 @@ def search_memories(
         drawers_col,
         query,
         stop_words=stop_words,
+        committed_tokens=committed_tokens,
     )
 
     # Candidate strategy hook: optionally widen the rerank pool's *source*
