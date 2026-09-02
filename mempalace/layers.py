@@ -430,6 +430,54 @@ class MemoryStack:
         """Deep L3 semantic search."""
         return self.l3.search(query, wing=wing, room=room, n_results=n_results)
 
+    def brief(self, wing: str = None, room: str = None, n_results: int = 20) -> str:
+        """Compressed overview of a wing/room - deduplicated top drawers."""
+        # Use L2 to get drawers but with more results for broader coverage
+        raw = self.l2.retrieve(wing=wing, room=room, n_results=n_results)
+        if raw.startswith("No ") or raw.startswith("Retrieval error"):
+            return raw
+
+        # Parse the L2 output to get individual drawer lines
+        lines = raw.split("\n")
+        content_lines = [
+            line.strip() for line in lines if line.strip() and not line.startswith("## ")
+        ]
+
+        # Deduplicate: skip lines with >70% overlap with already-seen content
+        seen = []
+        unique = []
+        for line in content_lines:
+            words = set(line.lower().split())
+            is_dupe = False
+            for prev_words in seen:
+                if len(words & prev_words) > 0.7 * max(len(words), len(prev_words), 1):
+                    is_dupe = True
+                    break
+            if not is_dupe:
+                unique.append(line)
+                seen.append(words)
+
+        # Format as brief overview
+        label_parts = []
+        if wing:
+            label_parts.append(f"wing={wing}")
+        if room:
+            label_parts.append(f"room={room}")
+        label = ", ".join(label_parts) if label_parts else "all"
+
+        header = f"## Brief - {label} ({len(unique)} topics)"
+        # Truncate to ~2000 chars total
+        result_lines = [header]
+        total = len(header)
+        for line in unique:
+            if total + len(line) > 2000:
+                result_lines.append("  ...")
+                break
+            result_lines.append(line)
+            total += len(line)
+
+        return "\n".join(result_lines)
+
     def status(self) -> dict:
         """Status of all layers."""
         result = {
