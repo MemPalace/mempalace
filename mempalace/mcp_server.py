@@ -461,6 +461,17 @@ _PEER_WRITER_EXEMPT_TOOLS = frozenset(
         "mempalace_event_ack",
         "mempalace_artifact_put",
         "mempalace_patch_submit",
+        # Knowledge-graph tools (#2297): KnowledgeGraph opens its own
+        # knowledge_graph.sqlite3 in WAL mode with its own threading.Lock.
+        # None of these paths touch Chroma or the HNSW segment, so the
+        # peer-writer lease — which exists to serialise two Chroma
+        # PersistentClients against the same palace — has no claim on them.
+        # Gate them through the lease and a second session loses the ability
+        # to record durable facts for the lifetime of the other session,
+        # even though the write is provably safe.
+        "mempalace_kg_add",
+        "mempalace_kg_invalidate",
+        "mempalace_kg_supersede",
     }
 )
 

@@ -6093,6 +6093,63 @@ def test_peer_writer_guard_does_not_gate_hook_settings(monkeypatch):
     assert "mempalace_hook_settings" not in mcp_server._MUTATING_TOOLS
 
 
+def test_peer_writer_guard_does_not_gate_kg_tools(monkeypatch):
+    """kg_add/kg_invalidate/kg_supersede never touch Chroma (#2297).
+
+    KnowledgeGraph opens its own ``knowledge_graph.sqlite3`` in WAL mode with
+    its own ``threading.Lock``; none of the three write paths reach the HNSW
+    segment. The peer-writer lease exists to serialise two Chroma
+    ``PersistentClient``s against one palace, so it has no claim on these
+    tools. Were any of them left ungated, a second session would lose the
+    ability to record durable facts for the life of the other session, even
+    though the write is provably safe — the logstream tools were already
+    exempted for exactly this reason.
+    """
+    from mempalace import mcp_server
+
+    # The gate must exempt all three KG tools.
+    for name in ("mempalace_kg_add", "mempalace_kg_invalidate", "mempalace_kg_supersede"):
+        assert name in mcp_server._MUTATING_TOOLS, f"{name} must stay a palace-write tool"
+        assert name in mcp_server._PEER_WRITER_EXEMPT_TOOLS, (
+            f"{name} must be exempt from the peer-writer lease"
+        )
+
+    def forbidden_lock():
+        raise AssertionError("KG tools should not acquire the peer-writer lock")
+
+    monkeypatch.setattr(mcp_server, "_acquire_mcp_writer_lock", forbidden_lock)
+
+    for name in ("mempalace_kg_add", "mempalace_kg_invalidate", "mempalace_kg_supersede"):
+        # Replace the handler so the test exercises the gate, not the KG
+        # write path (which would need a live KnowledgeGraph fixture).
+        monkeypatch.setitem(
+            mcp_server.TOOLS,
+            name,
+            {
+                "description": "test KG tool",
+                "input_schema": {"type": "object", "properties": {}},
+                "handler": lambda: {"ok": True},
+            },
+        )
+        response = mcp_server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": {}},
+            }
+        )
+        assert "error" not in response, f"{name} must not be refused under a peer writer"
+        assert '"ok": true' in response["result"]["content"][0]["text"]
+
+    # Read-only mode keeps refusing them — the exemption is the peer-writer
+    # lease only, not operator read-only.
+    monkeypatch.setattr(mcp_server, "_READ_ONLY", True)
+    for name in ("mempalace_kg_add", "mempalace_kg_invalidate", "mempalace_kg_supersede"):
+        assert name in mcp_server._READ_ONLY_REFUSED_TOOLS
+        assert mcp_server._mcp_read_only_refusal(1, name) is not None
+
+
 def test_status_tool_does_not_acquire_peer_writer_lock(monkeypatch):
     from mempalace import mcp_server
 
