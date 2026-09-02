@@ -577,16 +577,16 @@ def test_a_rename_the_directory_refuses_falls_back(tmp_path, monkeypatch, capsys
 
 
 def test_eperm_on_both_names_falls_back_too(tmp_path, monkeypatch, capsys):
-    """``EPERM`` reaches the gate from a filesystem that refuses the operation
-    rather than the caller, an NFS export among them. It belongs beside
-    ``EACCES`` and ``EROFS``, and nothing else pins it."""
+    """EPERM falls back promptly instead of entering tempfile's Windows loop."""
     _config_file(tmp_path).write_text(json.dumps(REAL))
     cfg = MempalaceConfig(config_dir=str(tmp_path))
     real_open = os.open
+    denied_temp_names = []
 
     def not_permitted(path, *args, **kwargs):
         name = os.path.basename(str(path))
         if name.startswith("config.json.") or name.startswith(".config.json."):
+            denied_temp_names.append(name)
             raise OSError(errno.EPERM, "Operation not permitted")
         return real_open(path, *args, **kwargs)
 
@@ -595,6 +595,54 @@ def test_eperm_on_both_names_falls_back_too(tmp_path, monkeypatch, capsys):
 
     assert json.loads(_config_file(tmp_path).read_text())["backend"] == "qdrant"
     assert "written in place" in capsys.readouterr().err
+    assert len(denied_temp_names) == 2
+    assert denied_temp_names[0].startswith("config.json.tmp-")
+    assert denied_temp_names[1].startswith(".config.json.")
+
+
+def test_bounded_mkstemp_retries_collision_then_creates_exclusively(tmp_path, monkeypatch):
+    """Only a real name collision is retried; its contents stay untouched."""
+    from mempalace import config as config_module
+
+    tokens = iter(("occupied", "fresh"))
+    monkeypatch.setattr(config_module.secrets, "token_hex", lambda _: next(tokens))
+    occupied = tmp_path / ".config.json.occupied.tmp"
+    occupied.write_text("occupied")
+
+    fd, created = config_module._bounded_mkstemp(
+        tmp_path,
+        prefix=".config.json.",
+        suffix=".tmp",
+    )
+    try:
+        os.write(fd, b"fresh")
+    finally:
+        os.close(fd)
+
+    assert occupied.read_text() == "occupied"
+    assert created == str(tmp_path / ".config.json.fresh.tmp")
+    assert (tmp_path / ".config.json.fresh.tmp").read_bytes() == b"fresh"
+
+
+def test_bounded_mkstemp_exhausts_collisions_at_local_limit(tmp_path, monkeypatch):
+    """A hostile or crowded namespace has a deterministic local upper bound."""
+    from mempalace import config as config_module
+
+    monkeypatch.setattr(config_module.secrets, "token_hex", lambda _: "collision")
+    occupied = tmp_path / ".config.json.collision.tmp"
+    occupied.write_text("occupied")
+
+    with pytest.raises(
+        FileExistsError,
+        match=str(config_module._TEMP_NAME_ATTEMPTS),
+    ):
+        config_module._bounded_mkstemp(
+            tmp_path,
+            prefix=".config.json.",
+            suffix=".tmp",
+        )
+
+    assert occupied.read_text() == "occupied"
 
 
 @needs_unprivileged_posix
