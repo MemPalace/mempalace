@@ -479,7 +479,7 @@ def _claim_mine_slot(cmd: list[str]) -> Optional[Path]:
         return None
 
 
-def _spawn_mine(cmd: list) -> None:
+def _spawn_mine(cmd: list) -> bool:
     """Spawn a mine subprocess if no live mine is already targeting it.
 
     The PID slot is claimed atomically *before* the spawn, so two near-
@@ -487,13 +487,19 @@ def _spawn_mine(cmd: list) -> None:
     claimed slot and silently skips. The spawned process inherits a
     ``MEMPALACE_MINE_PID_FILE`` env var so its cleanup hook can remove
     the slot on exit without scanning the directory.
+
+    Returns True when the target's work is in flight after the call —
+    either this call spawned it, or a live mine already held the slot.
+    Callers use this to advance throttling markers (#2403 defect 4):
+    "already running" must count as dispatched, or every hook fire
+    during a long mine re-arms itself.
     """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     log_path = STATE_DIR / "hook.log"
     pid_file = _claim_mine_slot(cmd)
     if pid_file is None:
         _log(f"Skipping mine: target already running ({' '.join(cmd[-3:])})")
-        return
+        return True
     child_env = os.environ.copy()
     child_env[_MINE_PID_FILE_ENV] = str(pid_file)
     with open(log_path, "a") as log_f:
@@ -517,6 +523,7 @@ def _spawn_mine(cmd: list) -> None:
         pid_file.write_text(f"{proc.pid} {int(time.time())}")
     except OSError:
         pass
+    return True
 
 
 def _hooks_daemon_enabled() -> bool:
@@ -947,6 +954,101 @@ def _extract_themes(messages: list[str], max_themes: int = 3) -> list[str]:
     return [w for w, _ in words.most_common(max_themes)]
 
 
+# A long-lived hub (``mempalace serve``) holds the palace writer lease for its
+# whole lifetime, so an in-process write from a hook is refused on every machine
+# running one — which is the documented shared-brain setup. The transcript mine
+# already survives that (it spawns the CLI, and ``cli._forward_mine_to_hub``
+# hands the job to the hub); the diary checkpoint did not, so on a hub machine
+# hooks archived the entire transcript and lost the one compressed entry that
+# continuity actually reads back. Shares the CLI forwarder's kill switch.
+_HUB_FORWARD_ENV = "MEMPALACE_HUB_FORWARD"
+_HUB_HEALTH_TIMEOUT_S = 2.0
+_HUB_DIARY_TIMEOUT_S = 60.0
+
+
+def _forward_diary_to_hub(agent_name: str, entry: str, topic: str, wing: str):
+    """File one diary checkpoint inside the palace hub, if a live one serves us.
+
+    Returns True when the hub filed it, False when there is no usable hub
+    (the caller then writes in-process, as before), and None when the hub
+    answered but the write failed — the entry may already be filed, so the
+    caller must not retry locally.
+    """
+    import urllib.error
+    import urllib.request
+
+    from . import server_registry
+
+    if os.environ.get(_HUB_FORWARD_ENV, "").strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    try:
+        palace_path = MempalaceConfig().palace_path
+        info = server_registry.read_live_serverinfo(palace_path)
+        if not info or info.get("read_only") or info.get("pid") == os.getpid():
+            return False
+        base_url = server_registry.client_base_url(info)
+        headers = {"Content-Type": "application/json"}
+        token = server_registry.load_server_token(palace_path)
+    except Exception as exc:
+        _log(f"Hub discovery failed ({exc}); writing diary checkpoint directly")
+        return False
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        health = urllib.request.Request(f"{base_url}/healthz", headers=headers)
+        with urllib.request.urlopen(health, timeout=_HUB_HEALTH_TIMEOUT_S) as resp:
+            if resp.status != 200:
+                return False
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+    body = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "mempalace_diary_write",
+                "arguments": {
+                    "agent_name": agent_name,
+                    "entry": entry,
+                    "topic": topic,
+                    "wing": wing,
+                },
+            },
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    try:
+        request = urllib.request.Request(f"{base_url}/mcp", data=body, headers=headers)
+        with urllib.request.urlopen(request, timeout=_HUB_DIARY_TIMEOUT_S) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        _log(f"Hub rejected diary checkpoint ({exc.code} {exc.reason})")
+        return None
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        # Never fall back here: the hub may have filed it already, and a
+        # second write would duplicate verbatim content.
+        _log(f"Hub at {base_url} did not complete the diary checkpoint ({exc})")
+        return None
+
+    if payload.get("error"):
+        _log(f"Hub refused diary checkpoint: {payload['error'].get('message', 'unknown')}")
+        return None
+    try:
+        result = json.loads(payload["result"]["content"][0]["text"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        _log("Hub returned an unrecognized diary response")
+        return None
+    if not result.get("success"):
+        _log(f"Hub diary checkpoint failed: {result.get('error', 'unknown')}")
+        return None
+    _log(f"Diary checkpoint saved via hub: {result.get('entry_id', '?')}")
+    return True
+
+
 def _save_diary_direct(
     transcript_path: str,
     session_id: str,
@@ -1034,6 +1136,24 @@ def _save_diary_direct(
             _log(f"Daemon diary checkpoint failed: {result.get('error', job.get('error'))}")
             return {"count": 0}
 
+        # Prefer the hub: it owns the writer lease, so an in-process write
+        # loses to it. No hub means no contention, and we write directly.
+        hub_status = _forward_diary_to_hub(agent_name, entry, "checkpoint", wing)
+        if hub_status is None:
+            return {"count": 0}
+        if hub_status:
+            try:
+                ack_file = STATE_DIR / "last_checkpoint"
+                ack_file.write_text(
+                    json.dumps({"msgs": len(messages), "ts": now.isoformat()}),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+            if toast:
+                _desktop_toast(f"Checkpoint saved \u2014 {len(messages)} messages archived")
+            return {"count": len(messages), "themes": themes}
+
         from .mcp_server import tool_diary_write
 
         result = tool_diary_write(
@@ -1063,26 +1183,37 @@ def _save_diary_direct(
     return {"count": 0}
 
 
-def _ingest_transcript(transcript_path: str):
-    """Mine a Claude Code session transcript into the palace as a conversation."""
+def _ingest_transcript(transcript_path: str) -> bool:
+    """Mine a Claude Code session transcript into the palace as a conversation.
+
+    Returns True when no ingest work is left pending for this transcript —
+    the mine was dispatched (spawned, already in flight, or handed to the
+    daemon), or ingest is deliberately off (``hooks.mine_transcript``
+    false, nothing to mine). Returns False when work exists but could not
+    be dispatched (blocked routing, spawn failure), so the caller keeps its
+    throttling marker and retries at the next fire (#2403 defect 4).
+    """
     path = _validate_transcript_path(transcript_path)
     if path is None:
-        return
+        return True
     try:
         if not path.is_file() or path.stat().st_size < 100:
-            return
+            return True
     except OSError:
-        return
+        return True
 
     try:
-        MempalaceConfig()  # validate config loads
+        # Also validates that config loads at all.
+        if not MempalaceConfig().hooks_mine_transcript:
+            _log("Transcript ingest skipped (hooks.mine_transcript is false)")
+            return True
     except Exception:
-        return
+        return True
 
     routing = _current_hook_write_routing()
     if routing.blocked:
         _log_hook_write_blocked(routing, "transcript ingest")
-        return
+        return False
 
     try:
         if routing.use_daemon:
@@ -1100,14 +1231,17 @@ def _ingest_transcript(transcript_path: str):
                 )
                 _log(f"Transcript ingest submitted to daemon: {path.name}")
             except Exception as exc:
-                # Daemon accepted context — don't fall back (would double-mine).
+                # Daemon accepted context — don't fall back (would double-mine),
+                # and count the attempt as dispatched for the same reason: the
+                # daemon may hold the job, so an eager local retry loop is the
+                # worse failure mode.
                 _log(f"Daemon transcript ingest failed: {exc}")
-            return
+            return True
 
         # Route through ``_spawn_mine`` so the per-target PID guard kicks
         # in here too — repeated Stop/PreCompact fires for the same
         # transcript should not stack up parallel ingest mines.
-        _spawn_mine(
+        dispatched = _spawn_mine(
             [
                 _mempalace_python(),
                 "-m",
@@ -1121,13 +1255,15 @@ def _ingest_transcript(transcript_path: str):
             ]
         )
         _log(f"Transcript ingest started: {path.name}")
+        return dispatched
     except OSError:
-        pass
+        return False
     except Exception as exc:
         # Non-daemon ingest spawn path failed. Hooks must never crash the
         # user's shell — log and continue (not a daemon failure; the daemon
         # block above handles its own errors).
         _log(f"transcript ingest hook failed: {exc}")
+        return False
 
 
 SUPPORTED_HARNESSES = {"claude-code", "codex"}
@@ -1374,6 +1510,7 @@ def hook_stop(data: dict, harness: str):
             if silent:
                 # Save directly via Python API — systemMessage renders in terminal
                 result = {"count": 0}
+                ingest_dispatched = False
                 if transcript_path:
                     result = _save_diary_direct(
                         transcript_path,
@@ -1382,15 +1519,26 @@ def hook_stop(data: dict, harness: str):
                         toast=toast,
                         agent_name=_diary_agent_for_harness(harness),
                     )
-                    _ingest_transcript(transcript_path)
+                    ingest_dispatched = _ingest_transcript(transcript_path)
                 _maybe_auto_ingest()
-                # Only advance save marker after successful save
+                # Advance the save marker when the diary checkpoint landed OR
+                # the transcript ingest is in flight. Gating it on the diary
+                # alone (#2403 defect 4) meant a machine whose diary write
+                # kept failing — e.g. refused in-process by a hub holding the
+                # writer lease — re-fired the unconditional, expensive
+                # transcript mine on EVERY subsequent Stop: the mine occupied
+                # the write path, which kept the diary failing, which kept
+                # re-triggering the mine. Observed live as `TRIGGERING SAVE
+                # at exchange 5193` repeating turn after turn on a 75 MB
+                # transcript. Only when NOTHING succeeded does the marker
+                # stay put for a full retry at the next fire.
                 count = result.get("count", 0)
-                if count > 0:
+                if count > 0 or ingest_dispatched:
                     try:
                         last_save_file.write_text(str(exchange_count), encoding="utf-8")
                     except OSError:
                         pass
+                if count > 0:
                     themes = result.get("themes", [])
                     if themes:
                         tag = " \u2014 " + ", ".join(themes)
@@ -1587,9 +1735,29 @@ def hook_precompact(data: dict, harness: str):
             _output(_blocked_hook_output(routing))
             return
 
+        try:
+            config = MempalaceConfig()
+            mine_transcript = config.hooks_mine_transcript
+            toast = config.hook_desktop_toast
+        except Exception:
+            mine_transcript = True
+            toast = False
+
         # Capture tool output via our normalize path before compaction loses it
         if transcript_path:
-            _ingest_transcript(transcript_path)
+            if mine_transcript:
+                _ingest_transcript(transcript_path)
+            else:
+                # Compaction is the moment context is dropped. With the
+                # transcript mine off this hook would otherwise capture
+                # nothing at all, so file the compressed checkpoint instead.
+                _save_diary_direct(
+                    transcript_path,
+                    session_id,
+                    wing=_wing_from_transcript_path(transcript_path),
+                    toast=toast,
+                    agent_name=_diary_agent_for_harness(harness),
+                )
 
         # Mine MEMPAL_DIR synchronously so project data lands before
         # compaction proceeds. Transcript convos were already kicked off

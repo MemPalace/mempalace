@@ -991,6 +991,27 @@ class MempalaceConfig:
         return hooks.get("auto_save", True)
 
     @property
+    def hooks_mine_transcript(self):
+        """Whether hooks mine the raw session transcript into the palace.
+
+        Separate from ``hooks_auto_save``, which gates the compressed diary
+        checkpoint. The checkpoint holds the last user prompts, truncated;
+        the transcript mine files the whole session verbatim, tool output
+        included. Those have very different privacy and volume profiles —
+        one Bash result can carry a token, and one long session can file
+        thousands of drawers — so they need separate switches. Default True
+        keeps existing behavior; set False to keep continuity checkpoints
+        without archiving every command's output.
+        """
+        env_val = os.environ.get("MEMPALACE_HOOKS_MINE_TRANSCRIPT")
+        if env_val is not None:
+            return env_val.lower() not in ("false", "0", "no")
+        hooks = self._file_config.get("hooks", {})
+        if not isinstance(hooks, dict):
+            return True
+        return hooks.get("mine_transcript", True)
+
+    @property
     def topic_wings(self):
         """List of topic wing names."""
         return self._file_config.get("topic_wings", DEFAULT_TOPIC_WINGS)

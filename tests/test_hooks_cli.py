@@ -395,6 +395,95 @@ def test_stop_hook_tracks_save_point(tmp_path):
     mock_save.assert_not_called()
 
 
+def test_stop_hook_failed_diary_does_not_refire_dispatched_ingest(tmp_path):
+    """#2403 defect 4: the save marker used to advance only on diary
+    success, while the expensive transcript ingest fired unconditionally
+    before it. On a machine whose diary write kept failing (a hub holding
+    the writer lease refuses in-process writes), EVERY subsequent Stop
+    re-triggered a full mine of the transcript — observed live as
+    `TRIGGERING SAVE at exchange 5193` repeating turn after turn on a
+    75 MB transcript, starving the hub. Once the ingest is dispatched,
+    the marker must advance even when the diary failed."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    data = {
+        "session_id": "test",
+        "stop_hook_active": False,
+        "transcript_path": str(transcript),
+    }
+
+    # First fire: diary fails (count 0), but the transcript mine is dispatched.
+    with (
+        patch("mempalace.hooks_cli._save_diary_direct", return_value={"count": 0}),
+        patch("mempalace.hooks_cli._ingest_transcript", return_value=True) as mock_ingest,
+    ):
+        result = _capture_hook_output(hook_stop, data, state_dir=tmp_path)
+    assert result == {}
+    mock_ingest.assert_called_once()
+
+    # Second fire at the same exchange count: the marker advanced, so the
+    # ingest must NOT be re-dispatched — this is the self-DoS loop.
+    with (
+        patch("mempalace.hooks_cli._save_diary_direct", return_value={"count": 0}) as mock_save,
+        patch("mempalace.hooks_cli._ingest_transcript", return_value=True) as mock_ingest,
+    ):
+        result = _capture_hook_output(hook_stop, data, state_dir=tmp_path)
+    assert result == {}
+    mock_save.assert_not_called()
+    mock_ingest.assert_not_called()
+
+
+def test_stop_hook_retries_when_nothing_succeeded(tmp_path):
+    """The counterpart guard: when the diary failed AND the ingest could
+    not be dispatched (blocked routing, spawn failure), the marker must
+    stay put so the whole burst retries at the next fire — a checkpoint
+    should not be silently dropped because one fire hit a dead palace."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    data = {
+        "session_id": "test",
+        "stop_hook_active": False,
+        "transcript_path": str(transcript),
+    }
+
+    with (
+        patch("mempalace.hooks_cli._save_diary_direct", return_value={"count": 0}),
+        patch("mempalace.hooks_cli._ingest_transcript", return_value=False),
+    ):
+        result = _capture_hook_output(hook_stop, data, state_dir=tmp_path)
+    assert result == {}
+
+    # Marker did not advance — the next fire retries the full burst.
+    with (
+        patch("mempalace.hooks_cli._save_diary_direct", return_value={"count": 0}) as mock_save,
+        patch("mempalace.hooks_cli._ingest_transcript", return_value=False) as mock_ingest,
+    ):
+        result = _capture_hook_output(hook_stop, data, state_dir=tmp_path)
+    assert result == {}
+    mock_save.assert_called_once()
+    mock_ingest.assert_called_once()
+
+
+def test_spawn_mine_reports_already_running_as_dispatched(tmp_path):
+    """_spawn_mine must return True when a live mine already holds the
+    target's PID slot: 'already running' is in-flight work, and callers
+    advancing throttle markers on the return value would otherwise re-arm
+    on every fire for the whole duration of a long mine (#2403)."""
+    from mempalace.hooks_cli import _spawn_mine
+
+    with (
+        patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
+        patch("mempalace.hooks_cli._claim_mine_slot", return_value=None),
+    ):
+        assert _spawn_mine(["python", "-m", "mempalace", "mine", "x"]) is True
+
+
 # --- #1693: hook checkpoints must be discoverable by diary_read ---
 
 
@@ -2400,3 +2489,210 @@ def test_regular_file_at_palace_root_treated_as_absent(tmp_path, monkeypatch):
     # The stray file is left untouched; we never try to convert it.
     assert fake_root.is_file()
     assert fake_root.read_text() == "oops, this is a file not a directory"
+
+
+# --- hooks.mine_transcript toggle ---
+
+
+def test_ingest_transcript_skipped_when_mine_transcript_false(tmp_path):
+    """The raw transcript mine has its own switch, independent of auto_save."""
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("x" * 200)
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+            mock_cfg_cls.return_value.hooks_mine_transcript = False
+            with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                from mempalace.hooks_cli import _ingest_transcript
+
+                _ingest_transcript(str(transcript))
+    mock_popen.assert_not_called()
+
+
+def test_ingest_transcript_runs_when_mine_transcript_true(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("x" * 200)
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        with patch("mempalace.hooks_cli._MINE_PID_DIR", tmp_path / "mine_pids"):
+            with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+                mock_cfg_cls.return_value.hooks_mine_transcript = True
+                with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                    from mempalace.hooks_cli import _ingest_transcript
+
+                    _ingest_transcript(str(transcript))
+    assert mock_popen.called
+
+
+def test_stop_hook_checkpoints_without_mining(tmp_path):
+    """auto_save on + mine_transcript off = checkpoint filed, nothing mined."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    save_result = {"count": 4, "themes": []}
+    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+        mock_cfg_cls.return_value.hooks_auto_save = True
+        mock_cfg_cls.return_value.hook_silent_save = True
+        mock_cfg_cls.return_value.hook_desktop_toast = False
+        mock_cfg_cls.return_value.hooks_mine_transcript = False
+        with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result) as mock_save:
+            with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                result = _capture_hook_output(
+                    hook_stop,
+                    {
+                        "session_id": "test",
+                        "stop_hook_active": False,
+                        "transcript_path": str(transcript),
+                    },
+                    state_dir=tmp_path,
+                )
+    mock_save.assert_called_once()
+    mock_popen.assert_not_called()
+    assert "4 memories" in result["systemMessage"]
+
+
+def test_precompact_checkpoints_when_mining_disabled(tmp_path):
+    """Compaction still captures something when the transcript mine is off."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(5)],
+    )
+    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+        mock_cfg_cls.return_value.hooks_auto_save = True
+        mock_cfg_cls.return_value.hooks_mine_transcript = False
+        mock_cfg_cls.return_value.hook_desktop_toast = False
+        with patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest:
+            with patch(
+                "mempalace.hooks_cli._save_diary_direct", return_value={"count": 5}
+            ) as mock_save:
+                with patch("mempalace.hooks_cli._mine_sync"):
+                    _capture_hook_output(
+                        hook_precompact,
+                        {"session_id": "test", "transcript_path": str(transcript)},
+                        state_dir=tmp_path,
+                    )
+    mock_ingest.assert_not_called()
+    mock_save.assert_called_once()
+
+
+# --- diary checkpoint forwards to a live hub ---
+
+
+class _FakeHubResponse:
+    def __init__(self, body=b"", status=200):
+        self._body = body
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def _hub_patches(stack, tmp_path, mcp_body):
+    """Point server_registry at a live hub and stub its HTTP responses."""
+    stack.enter_context(patch("mempalace.hooks_cli.STATE_DIR", tmp_path))
+    stack.enter_context(
+        patch("mempalace.server_registry.read_live_serverinfo", return_value={"pid": 999999})
+    )
+    stack.enter_context(
+        patch("mempalace.server_registry.client_base_url", return_value="http://127.0.0.1:8765")
+    )
+    stack.enter_context(patch("mempalace.server_registry.load_server_token", return_value="tok"))
+    return stack.enter_context(
+        patch(
+            "urllib.request.urlopen",
+            side_effect=[_FakeHubResponse(), _FakeHubResponse(mcp_body)],
+        )
+    )
+
+
+def test_save_diary_direct_forwards_to_live_hub(tmp_path):
+    """A running hub holds the writer lease, so the checkpoint must go to it."""
+    transcript = tmp_path / "session.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(3)],
+    )
+    body = json.dumps(
+        {"result": {"content": [{"text": json.dumps({"success": True, "entry_id": "e1"})}]}}
+    ).encode("utf-8")
+
+    with contextlib.ExitStack() as stack:
+        mock_urlopen = _hub_patches(stack, tmp_path, body)
+        mock_tool = stack.enter_context(patch("mempalace.mcp_server.tool_diary_write"))
+        result = _save_diary_direct(
+            str(transcript), "sess1", wing="wing_project", agent_name="claude"
+        )
+
+    assert result["count"] == 3
+    mock_tool.assert_not_called()
+    posted = json.loads(mock_urlopen.call_args_list[1].args[0].data.decode("utf-8"))
+    assert posted["params"]["name"] == "mempalace_diary_write"
+    assert posted["params"]["arguments"]["agent_name"] == "claude"
+    assert posted["params"]["arguments"]["wing"] == "wing_project"
+
+
+def test_save_diary_direct_does_not_retry_locally_when_hub_refuses(tmp_path):
+    """The hub may have filed it already — a local retry would duplicate."""
+    transcript = tmp_path / "session.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(3)],
+    )
+    body = json.dumps({"error": {"message": "nope"}}).encode("utf-8")
+
+    with contextlib.ExitStack() as stack:
+        _hub_patches(stack, tmp_path, body)
+        mock_tool = stack.enter_context(patch("mempalace.mcp_server.tool_diary_write"))
+        result = _save_diary_direct(
+            str(transcript), "sess1", wing="wing_project", agent_name="claude"
+        )
+
+    assert result["count"] == 0
+    mock_tool.assert_not_called()
+
+
+def test_save_diary_direct_writes_in_process_without_a_hub(tmp_path):
+    """No hub means no contention — the original direct path still runs."""
+    transcript = tmp_path / "session.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(3)],
+    )
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        with patch("mempalace.server_registry.read_live_serverinfo", return_value=None):
+            with patch(
+                "mempalace.mcp_server.tool_diary_write",
+                return_value={"success": True, "entry_id": "e1"},
+            ) as mock_tool:
+                result = _save_diary_direct(
+                    str(transcript), "sess1", wing="wing_project", agent_name="claude"
+                )
+    assert result["count"] == 3
+    mock_tool.assert_called_once()
+
+
+def test_forward_diary_to_hub_respects_kill_switch(tmp_path):
+    from mempalace.hooks_cli import _forward_diary_to_hub
+
+    with patch.dict("os.environ", {"MEMPALACE_HUB_FORWARD": "0"}):
+        with patch("mempalace.server_registry.read_live_serverinfo") as mock_read:
+            assert _forward_diary_to_hub("claude", "entry", "checkpoint", "wing") is False
+    mock_read.assert_not_called()
+
+
+def test_forward_diary_to_hub_skips_read_only_hub(tmp_path):
+    from mempalace.hooks_cli import _forward_diary_to_hub
+
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        with patch(
+            "mempalace.server_registry.read_live_serverinfo",
+            return_value={"pid": 999999, "read_only": True},
+        ):
+            assert _forward_diary_to_hub("claude", "entry", "checkpoint", "wing") is False
