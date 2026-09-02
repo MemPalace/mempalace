@@ -392,7 +392,12 @@ def test_stop_hook_saves_silently_at_interval(tmp_path):
     assert "hooks" in result["systemMessage"]
     # tmp_path has no "-Projects-" segment, so _wing_from_transcript_path falls back to "wing_sessions"
     mock_save.assert_called_once_with(
-        str(transcript), "test", wing="wing_sessions", toast=False, agent_name="claude"
+        str(transcript),
+        "test",
+        wing="wing_sessions",
+        toast=False,
+        agent_name="claude",
+        checkpoint_id="stop:15",
     )
 
 
@@ -413,7 +418,12 @@ def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
             state_dir=tmp_path,
         )
     mock_save.assert_called_once_with(
-        str(transcript), "test", wing="wing_myproject", toast=False, agent_name="claude"
+        str(transcript),
+        "test",
+        wing="wing_myproject",
+        toast=False,
+        agent_name="claude",
+        checkpoint_id="stop:15",
     )
 
 
@@ -2624,9 +2634,16 @@ def test_stop_hook_retries_failed_checkpoint_when_mining_disabled(tmp_path):
         mock_cfg_cls.return_value.hook_desktop_toast = False
         mock_cfg_cls.return_value.hooks_mine_transcript = False
         assert _capture_hook_output(hook_stop, data, state_dir=tmp_path) == {}
+        with transcript.open("a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps({"message": {"role": "user", "content": "new prompt after failure"}})
+                + "\n"
+            )
         assert _capture_hook_output(hook_stop, data, state_dir=tmp_path) == {}
 
     assert mock_save.call_count == 2
+    assert mock_save.call_args_list[0].kwargs["checkpoint_id"] == "stop:15"
+    assert mock_save.call_args_list[1].kwargs["checkpoint_id"] == "stop:15"
     mock_popen.assert_not_called()
     assert not (tmp_path / "test_last_save").exists()
 
@@ -2844,13 +2861,25 @@ def test_save_diary_direct_writes_in_process_without_a_hub(tmp_path):
                 return_value={"success": True, "entry_id": "e1"},
             ) as mock_tool:
                 result = _save_diary_direct(
-                    str(transcript), "sess1", wing="wing_project", agent_name="claude"
+                    str(transcript),
+                    "sess1",
+                    wing="wing_project",
+                    agent_name="claude",
+                    checkpoint_id="stop:15",
                 )
+                with transcript.open("a", encoding="utf-8") as stream:
+                    stream.write(
+                        json.dumps({"message": {"role": "user", "content": "later prompt"}}) + "\n"
+                    )
                 retry = _save_diary_direct(
-                    str(transcript), "sess1", wing="wing_project", agent_name="claude"
+                    str(transcript),
+                    "sess1",
+                    wing="wing_project",
+                    agent_name="claude",
+                    checkpoint_id="stop:15",
                 )
     assert result["count"] == 3
-    assert retry["count"] == 3
+    assert retry["count"] == 4
     assert mock_tool.call_count == 2
     first_key = mock_tool.call_args_list[0].kwargs["idempotency_key"]
     retry_key = mock_tool.call_args_list[1].kwargs["idempotency_key"]

@@ -1092,6 +1092,7 @@ def _save_diary_direct(
     toast: bool = False,
     *,
     agent_name: str,
+    checkpoint_id: str = "",
 ) -> dict:
     """Write a diary checkpoint by calling the tool function directly (no MCP roundtrip).
 
@@ -1122,13 +1123,20 @@ def _save_diary_direct(
 
     themes = _extract_themes(messages)
 
+    checkpoint_identity = {
+        "agent": agent_name,
+        "session": session_id,
+        "wing": wing,
+    }
+    if checkpoint_id:
+        # Stop-hook retries derive this from the persisted last-save marker.
+        # Until a checkpoint is acknowledged that marker stays put, so new
+        # prompts cannot accidentally mint a second key for the pending write.
+        checkpoint_identity["checkpoint_id"] = checkpoint_id
+    else:
+        checkpoint_identity["messages"] = messages
     checkpoint_key_material = json.dumps(
-        {
-            "agent": agent_name,
-            "session": session_id,
-            "wing": wing,
-            "messages": messages,
-        },
+        checkpoint_identity,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -1575,6 +1583,7 @@ def hook_stop(data: dict, harness: str):
                         wing=project_wing,
                         toast=toast,
                         agent_name=_diary_agent_for_harness(harness),
+                        checkpoint_id=f"stop:{last_save + SAVE_INTERVAL}",
                     )
                     ingest_dispatched = _ingest_transcript(transcript_path) is True
                 _maybe_auto_ingest()
