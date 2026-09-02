@@ -2937,8 +2937,8 @@ class TestWriteTools:
     ):
         _patch_mcp_server(monkeypatch, config, kg)
         collection.add(
-            ids=["hidden", "old", "published", "marker", "ordinary"],
-            documents=["hidden", "old", "published", "[commit]", "ordinary"],
+            ids=["hidden", "old", "published", "removed", "marker", "ordinary"],
+            documents=["hidden", "old", "published", "removed", "[commit]", "ordinary"],
             metadatas=[
                 {
                     "wing": "w",
@@ -2959,6 +2959,12 @@ class TestWriteTools:
                     "mine_generation_token": "published-token",
                     "logical_drawer_id": "logical-published",
                     "filed_at": "2026-09-02T00:00:00",
+                },
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "logical_drawer_id": "removed-logical",
+                    "mine_generation_token": "retired-token",
                 },
                 {
                     "wing": "w",
@@ -2988,6 +2994,7 @@ class TestWriteTools:
         deleted = tool_delete_drawer("logical-published")
         assert set(deleted["deleted_ids"]) == {"old", "published"}
         assert "error" in tool_get_drawer("logical-published")
+        assert "error" in tool_get_drawer("removed-logical")
 
     def test_list_drawers_with_wing_filter(
         self, monkeypatch, config, palace_path, seeded_collection, kg

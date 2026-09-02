@@ -2958,6 +2958,9 @@ def _logical_generation_record(col, drawer_id: str):
         meta = _safe_meta(metas[index] if index < len(metas) else {})
         if meta.get("mine_staged") is True and meta.get("mine_generation_token") not in committed:
             continue
+        generation_token = meta.get("mine_generation_token")
+        if generation_token and generation_token not in committed:
+            continue
         rows.append(
             (
                 meta.get("mine_generation_token") in committed,
@@ -3970,6 +3973,10 @@ def tool_list_drawers(
             if (meta or {}).get("mine_commit_marker") is not True
             and (
                 (meta or {}).get("mine_staged") is not True
+                or (meta or {}).get("mine_generation_token") in committed_tokens
+            )
+            and (
+                not (meta or {}).get("mine_generation_token")
                 or (meta or {}).get("mine_generation_token") in committed_tokens
             )
         ]

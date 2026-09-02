@@ -1470,8 +1470,6 @@ def _resolve_lexical_generation_hits(drawers_col, hits, query, committed_tokens)
         {"metadatas": [logical_metas]},
         committed_tokens,
     )
-    if not current_ids:
-        return hits
     by_physical = {hit.id: hit for hit in hits}
     missing_ids = sorted(set(current_ids.values()) - set(by_physical))
     if missing_ids:
@@ -1510,6 +1508,8 @@ def _resolve_lexical_generation_hits(drawers_col, hits, query, committed_tokens)
         current = by_physical.get(current_ids.get(logical_id))
         if current is not None:
             resolved.append(current)
+        elif not (hit.metadata or {}).get("mine_generation_token"):
+            resolved.append(hit)
     return resolved
 
 

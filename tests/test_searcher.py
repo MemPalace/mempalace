@@ -285,6 +285,28 @@ class TestSearchMemories:
         assert [hit.id for hit in resolved] == ["current"]
         assert resolved[0].document == "target phrase in current content"
 
+        retired_hit = SimpleNamespace(
+            id="retired",
+            document="retired text",
+            metadata={
+                "logical_drawer_id": "removed-logical",
+                "mine_generation_token": "retired-token",
+            },
+            score=5.0,
+        )
+
+        class NoCurrentCollection:
+            @staticmethod
+            def get(**_kwargs):
+                return {"ids": [], "metadatas": []}
+
+        assert (
+            _resolve_lexical_generation_hits(
+                NoCurrentCollection(), [retired_hit], "retired", frozenset()
+            )
+            == []
+        )
+
     def test_closet_source_rows_prefer_active_token_over_newer_stale_row(self):
         from mempalace.searcher import _collapse_physical_generation_rows
 
