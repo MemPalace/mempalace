@@ -191,6 +191,60 @@ class TestSearchMemories:
         assert collection.unfiltered_limits == [15, 20]
         assert result["ids"] == [["committed"]]
 
+    def test_filtered_query_refills_until_current_logical_generation_is_present(self):
+        from mempalace.searcher import _query_drawers_with_filter_fallback
+
+        old_meta = {
+            "logical_drawer_id": "logical",
+            "filed_at": "2026-09-01T00:00:00",
+        }
+        current_meta = {
+            "logical_drawer_id": "logical",
+            "filed_at": "2026-09-02T00:00:00",
+        }
+
+        class Collection:
+            def __init__(self):
+                self.query_limits = []
+
+            @staticmethod
+            def count():
+                return 2
+
+            @staticmethod
+            def get(where, include):
+                if "mine_commit_marker" in where:
+                    return {"ids": [], "metadatas": []}
+                return {
+                    "ids": ["old", "current"],
+                    "metadatas": [old_meta, current_meta],
+                }
+
+            def query(self, **kwargs):
+                limit = kwargs["n_results"]
+                self.query_limits.append(limit)
+                ids = ["old"] if limit == 1 else ["old", "current"]
+                metas = [old_meta] if limit == 1 else [old_meta, current_meta]
+                return {
+                    "ids": [ids],
+                    "documents": [["old"] if limit == 1 else ["old", "current"]],
+                    "metadatas": [metas],
+                    "distances": [[0.1] if limit == 1 else [0.1, 1.0]],
+                }
+
+        collection = Collection()
+        result = _query_drawers_with_filter_fallback(
+            collection,
+            {"where": {"mine_staged": {"$ne": True}}, "n_results": 1},
+            "query",
+            1,
+            None,
+            None,
+        )
+
+        assert collection.query_limits == [1, 2]
+        assert result["ids"] == [["current"]]
+
     def test_wing_and_room_filter(self, palace_path, seeded_collection):
         result = search_memories("code", palace_path, wing="project", room="frontend")
         assert all(r["wing"] == "project" and r["room"] == "frontend" for r in result["results"])

@@ -828,7 +828,14 @@ def search(
         if where:
             kwargs["where"] = where
 
-        results = col.query(**kwargs)
+        results = _query_drawers_with_filter_fallback(
+            col,
+            kwargs,
+            query,
+            n_results,
+            wing,
+            room,
+        )
 
     except Exception as e:
         print(f"\n  Search error: {e}")
@@ -2007,9 +2014,40 @@ def _open_search_collection(palace_path: str, collection_name: str):
         )
 
 
-def _post_filter_drawer_query(raw, wing, room, source_file, committed_tokens):
+def _current_generation_ids_for_query(collection, raw, committed_tokens) -> dict:
+    logical_ids = {
+        (meta or {}).get("logical_drawer_id")
+        for meta in _first_or_empty(raw, "metadatas")
+        if (meta or {}).get("logical_drawer_id")
+    }
+    if not logical_ids:
+        return {}
+    try:
+        generations = collection.get(
+            where={"logical_drawer_id": {"$in": sorted(logical_ids)}},
+            include=["metadatas"],
+        )
+    except Exception:
+        logger.warning("Could not resolve current conversation generations", exc_info=True)
+        return {}
+    current = {}
+    ids = generations.get("ids") or []
+    metas = generations.get("metadatas") or []
+    for index, physical_id in enumerate(ids):
+        meta = metas[index] if index < len(metas) else {}
+        if _is_staged_metadata(meta, committed_tokens):
+            continue
+        logical_id = (meta or {}).get("logical_drawer_id")
+        key = ((meta or {}).get("filed_at", ""), physical_id)
+        if logical_id and (logical_id not in current or key > current[logical_id][0]):
+            current[logical_id] = (key, physical_id)
+    return {logical_id: item[1] for logical_id, item in current.items()}
+
+
+def _post_filter_drawer_query(collection, raw, wing, room, source_file, committed_tokens):
     raw_docs = _first_or_empty(raw, "documents")
     raw_ids = _aligned_query_ids(raw, len(raw_docs))
+    current_generations = _current_generation_ids_for_query(collection, raw, committed_tokens)
     fids, fdocs, fmetas, fdists = [], [], [], []
     for stored_drawer_id, doc, meta, dist in zip(
         raw_ids,
@@ -2019,6 +2057,9 @@ def _post_filter_drawer_query(raw, wing, room, source_file, committed_tokens):
     ):
         meta = meta or {}
         if _is_staged_metadata(meta, committed_tokens):
+            continue
+        logical_id = meta.get("logical_drawer_id")
+        if logical_id and current_generations.get(logical_id) != stored_drawer_id:
             continue
         if wing and meta.get("wing") != wing:
             continue
@@ -2052,8 +2093,12 @@ def _query_drawers_with_filter_fallback(
     See #1245 / #1035.
     """
     where = dkwargs.get("where")
+    target_results = max(1, int(dkwargs.get("n_results") or n_results))
+    total = None
+    fetch_limit = target_results
+    filtered_query = True
     try:
-        return drawers_col.query(**dkwargs)
+        raw = drawers_col.query(**{**dkwargs, "n_results": fetch_limit})
     except Exception as filter_err:
         if not where:
             raise
@@ -2062,18 +2107,41 @@ def _query_drawers_with_filter_fallback(
             filter_err,
         )
         committed_tokens = _committed_generation_tokens(drawers_col)
+        filtered_query = False
         total = max(1, int(drawers_col.count()))
-        fetch_limit = min(total, max(1, n_results * 15))
-        while True:
-            raw = drawers_col.query(
-                query_texts=[query],
-                n_results=fetch_limit,
-                include=["documents", "metadatas", "distances"],
-            )
-            filtered = _post_filter_drawer_query(raw, wing, room, source_file, committed_tokens)
-            if len(filtered["documents"][0]) >= n_results or fetch_limit >= total:
+        fetch_limit = min(total, max(1, target_results * 15))
+        raw = drawers_col.query(
+            query_texts=[query],
+            n_results=fetch_limit,
+            include=["documents", "metadatas", "distances"],
+        )
+    else:
+        committed_tokens = _committed_generation_tokens(drawers_col)
+
+    while True:
+        filtered = _post_filter_drawer_query(
+            drawers_col, raw, wing, room, source_file, committed_tokens
+        )
+        if len(filtered["documents"][0]) >= target_results:
+            return filtered
+        if len(_first_or_empty(raw, "documents")) < fetch_limit:
+            return filtered
+        if total is None:
+            try:
+                total = max(1, int(drawers_col.count()))
+            except (AttributeError, TypeError, ValueError):
                 return filtered
-            fetch_limit = min(total, max(fetch_limit + 1, fetch_limit * 2))
+        if fetch_limit >= total:
+            return filtered
+        fetch_limit = min(total, max(fetch_limit + 1, fetch_limit * 2))
+        query_kwargs = {
+            "query_texts": [query],
+            "n_results": fetch_limit,
+            "include": ["documents", "metadatas", "distances"],
+        }
+        if filtered_query:
+            query_kwargs["where"] = where
+        raw = drawers_col.query(**query_kwargs)
 
 
 def _backend_capabilities(col) -> frozenset:
