@@ -65,6 +65,7 @@ milvus = "mempalace.backends.milvus:MilvusBackend"
 pgvector = "mempalace.backends.pgvector:PgVectorBackend"
 qdrant = "mempalace.backends.qdrant:QdrantBackend"
 sqlite_exact = "mempalace.backends.sqlite_exact:SQLiteExactBackend"
+sqlite_vec = "mempalace.backends.sqlite_vec:SQLiteVecBackend"
 
 # RFC 002 source-adapter entry-point group. Core publishes no first-party
 # adapters under this group yet; ``miner.py`` and ``convo_miner.py`` migrate
@@ -113,6 +114,9 @@ milvus = [
 # MEMPALACE_BACKEND=pgvector / --backend pgvector; never required for the
 # default (Chroma) install.
 pgvector = ["psycopg[binary]>=3.1"]
+# Opt-in sqlite-vec ANN backend. Requires the sqlite-vec Python package.
+# Selected via MEMPALACE_BACKEND=sqlite_vec / --backend sqlite_vec.
+sqlite_vec = ["sqlite-vec>=0.1.9"]
 # Hardware acceleration for the ONNX embedding model. Install exactly one:
 #   pip install mempalace[gpu]       — NVIDIA CUDA
 #   pip install mempalace[dml]       — DirectML (Windows AMD/Intel/NVIDIA)

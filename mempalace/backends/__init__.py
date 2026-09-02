@@ -40,6 +40,7 @@ from .milvus import MilvusBackend, MilvusCollection
 from .pgvector import PgVectorBackend, PgVectorCollection
 from .qdrant import QdrantBackend, QdrantCollection
 from .sqlite_exact import SQLiteExactBackend, SQLiteExactCollection
+from .sqlite_vec import SQLiteVecBackend, SQLiteVecCollection
 from .registry import (
     available_backends,
     detect_backend_for_path,
@@ -79,6 +80,8 @@ __all__ = [
     "QueryResult",
     "SQLiteExactBackend",
     "SQLiteExactCollection",
+    "SQLiteVecBackend",
+    "SQLiteVecCollection",
     "UnsupportedCapabilityError",
     "UnsupportedFilterError",
     "UnsupportedMaintenanceKindError",
