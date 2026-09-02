@@ -10,6 +10,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 MARKETPLACE_PATH = REPO_ROOT / ".agents" / "plugins" / "marketplace.json"
 MANIFEST_PATH = REPO_ROOT / ".codex-plugin" / "plugin.json"
 MCP_PATH = REPO_ROOT / ".mcp.json"
+HOOKS_PATH = REPO_ROOT / "hooks" / "hooks.json"
+LEGACY_HOOKS_PATH = REPO_ROOT / ".codex-plugin" / "hooks.json"
+LEGACY_RUNNER_PATH = REPO_ROOT / ".codex-plugin" / "hooks" / "mempal-hook.sh"
 
 
 def _read_json(path: Path) -> dict:
@@ -33,6 +36,12 @@ def test_plugin_manifest_references_supported_components():
 
     assert manifest["mcpServers"] == "./.mcp.json"
     assert "hooks" not in manifest
+
+
+def test_default_hook_definition_uses_canonical_plugin_root_layout():
+    assert HOOKS_PATH.is_file(), f"missing default Codex hook definition: {HOOKS_PATH}"
+    assert not LEGACY_HOOKS_PATH.exists(), f"legacy hook definition remains: {LEGACY_HOOKS_PATH}"
+    assert not LEGACY_RUNNER_PATH.exists(), f"legacy hook runner remains: {LEGACY_RUNNER_PATH}"
 
 
 def test_mcp_config_registers_mempalace_server():
