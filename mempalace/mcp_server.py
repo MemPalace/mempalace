@@ -3504,6 +3504,7 @@ def tool_mine(
                 limit=limit,
                 dry_run=dry_run,
                 extract_mode=extract,
+                access_gate=_current_http_mine_access_gate(),
             )
         if mode == "extract":
             from .format_miner import mine_formats
@@ -7132,6 +7133,10 @@ _WRITE_STALL_EXIT_CODE = 75
 _write_stall_lock = threading.Lock()
 # Optional[dict]: {"tool": str, "since": float(monotonic), "warned": bool}
 _write_stall_inflight: Optional[dict] = None
+# HTTP conversation mines run outside the request-wide RW write lock and take
+# it only for backend access bursts. The request-level watchdog must therefore
+# stay quiet; the burst gate arms it around the actual Chroma mutation.
+_http_interleaved_mine_state = threading.local()
 
 
 def _write_stall_secs(env_name: str, default: float) -> float:
@@ -7159,11 +7164,21 @@ def _write_stall_action(elapsed: float, warn_secs: float, exit_secs: float, warn
 
 
 @contextlib.contextmanager
-def _write_stall_watch(tool_name: str):
+def _write_stall_watch(tool_name: str, *, burst: bool = False):
     """Register a vector write as in flight for the stall watchdog."""
     global _write_stall_inflight
 
     if tool_name not in _VECTOR_WRITE_TOOLS:
+        yield
+        return
+    if (
+        tool_name == "mempalace_mine"
+        and getattr(_http_interleaved_mine_state, "active", False)
+        and not burst
+    ):
+        # The interleaved HTTP path watches each short write burst through
+        # _HTTPMineAccessGate instead of timing parsing/chunking/embedding prep
+        # as if the backend itself had stalled (#2403 defect 5).
         yield
         return
 
@@ -7342,6 +7357,20 @@ class _RWLock:
 
         return _Read()
 
+    def write_lock(self):
+        lock = self
+
+        class _Write:
+            def __enter__(self):
+                lock.acquire_write()
+                return lock
+
+            def __exit__(self, exc_type, exc, tb):
+                lock.release_write()
+                return False
+
+        return _Write()
+
     def __enter__(self):
         self.acquire_write()
         return self
@@ -7352,10 +7381,62 @@ class _RWLock:
 
 
 _HTTP_REQUEST_LOCK = _RWLock()
+# Serialize palace mutations independently from the read/write access gate.
+# An interleaved conversation mine owns this lock for its full lifecycle, so
+# another update/delete cannot slip between its crash-safe batches, while
+# searches still share _HTTP_REQUEST_LOCK between actual backend writes.
+_HTTP_MUTATION_LOCK = threading.Lock()
 _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 _HTTP_ACTIVE_CLIENT_WINDOW_S = 120.0
 
 _HTTP_PROTOCOL_METHODS = frozenset({"initialize", "ping", "tools/list"})
+
+
+class _HTTPMineAccessGate:
+    """Gate backend access for one interleaved HTTP conversation mine."""
+
+    @staticmethod
+    def read_lock():
+        return _HTTP_REQUEST_LOCK.read_lock()
+
+    @staticmethod
+    @contextlib.contextmanager
+    def write_lock():
+        with _HTTP_REQUEST_LOCK.write_lock():
+            with _write_stall_watch("mempalace_mine", burst=True):
+                yield
+
+
+_HTTP_MINE_ACCESS_GATE = _HTTPMineAccessGate()
+
+
+def _current_http_mine_access_gate():
+    if getattr(_http_interleaved_mine_state, "active", False):
+        return _HTTP_MINE_ACCESS_GATE
+    return None
+
+
+@contextlib.contextmanager
+def _http_interleaved_mine_scope():
+    previous = getattr(_http_interleaved_mine_state, "active", False)
+    _http_interleaved_mine_state.active = True
+    try:
+        yield
+    finally:
+        _http_interleaved_mine_state.active = previous
+
+
+def _is_interleavable_http_convo_mine(request, tool_name) -> bool:
+    if tool_name != "mempalace_mine":
+        return False
+    params = request.get("params") if isinstance(request, dict) else None
+    arguments = params.get("arguments") if isinstance(params, dict) else None
+    if not isinstance(arguments, dict):
+        return False
+    return arguments.get("mode", "projects") == "convos" and not bool(
+        arguments.get("dry_run", False)
+    )
+
 
 # RFC 003 phase 5: logstream tools touch only logstream.sqlite3 (its own WAL
 # database with internal locking) — never Chroma or the KG. Dispatching them
@@ -7654,6 +7735,14 @@ def _http_dispatch(request):
         tool_name = request["params"].get("name")
     if tool_name in _HTTP_LOCK_FREE_TOOLS:
         return handle_request(request)
+    if _is_interleavable_http_convo_mine(request, tool_name):
+        # Keep one palace mutation owner for the complete crash-safe re-mine,
+        # but let searches run during scan/normalize/chunk phases. The miner's
+        # access gate takes the RW lock around Chroma reads and bounded write
+        # bursts, so readers pause only for real backend work (#2403 defect 5).
+        with _HTTP_MUTATION_LOCK:
+            with _http_interleaved_mine_scope():
+                return handle_request(request)
     # service.classify_tool is the authoritative read/write registry. The
     # lock-free set above is a storage-boundary override for independent DBs.
     from .service import classify_tool
@@ -7661,8 +7750,9 @@ def _http_dispatch(request):
     if classify_tool(tool_name) == "read":
         with _HTTP_REQUEST_LOCK.read_lock():
             return handle_request(request)
-    with _HTTP_REQUEST_LOCK:
-        return handle_request(request)
+    with _HTTP_MUTATION_LOCK:
+        with _HTTP_REQUEST_LOCK.write_lock():
+            return handle_request(request)
 
 
 def _http_handle_get(handler) -> None:

@@ -245,6 +245,145 @@ class TestPalaceReadsDoNotStarveTheHub:
         write_thread.join(timeout=5)
         assert write_started.is_set()
 
+    def test_convo_mine_interleaves_reads_only_between_bounded_write_bursts(
+        self, http_server, monkeypatch
+    ):
+        port, _ = http_server
+        parse_started = threading.Event()
+        enter_write = threading.Event()
+        write_started = threading.Event()
+        release_write = threading.Event()
+        second_search_started = threading.Event()
+        mutation_started = threading.Event()
+        errors = []
+        search_calls = {"count": 0}
+        search_lock = threading.Lock()
+
+        def interleaved_mine(**_kwargs):
+            gate = mcp._current_http_mine_access_gate()
+            assert gate is mcp._HTTP_MINE_ACCESS_GATE
+            assert mcp._write_stall_inflight is None
+            parse_started.set()
+            assert enter_write.wait(timeout=5)
+            with gate.write_lock():
+                inflight = mcp._write_stall_inflight
+                assert inflight is not None
+                assert inflight["tool"] == "mempalace_mine"
+                write_started.set()
+                assert release_write.wait(timeout=5)
+            return {"success": True}
+
+        def search(**_kwargs):
+            with search_lock:
+                search_calls["count"] += 1
+                if search_calls["count"] == 2:
+                    second_search_started.set()
+            return {"query": "x", "results": []}
+
+        def mutation(**_kwargs):
+            mutation_started.set()
+            return {"success": True}
+
+        def run(callable_):
+            try:
+                callable_()
+            except Exception as exc:
+                errors.append(exc)
+
+        monkeypatch.setattr(mcp, "_mcp_tool_preflight_refusal", lambda *_args: None)
+        monkeypatch.setitem(mcp.TOOLS["mempalace_mine"], "handler", interleaved_mine)
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", search)
+        monkeypatch.setitem(mcp.TOOLS["mempalace_add_drawer"], "handler", mutation)
+
+        mine_thread = threading.Thread(
+            target=lambda: run(
+                lambda: self._call(
+                    port,
+                    "mempalace_mine",
+                    {"source": "/tmp", "mode": "convos"},
+                    req_id=41,
+                )
+            )
+        )
+        mine_thread.start()
+        assert parse_started.wait(timeout=2)
+
+        started_at = time.perf_counter()
+        self._call(port, "mempalace_search", {"query": "x"}, req_id=42)
+        assert time.perf_counter() - started_at < 0.4
+
+        mutation_thread = threading.Thread(
+            target=lambda: run(
+                lambda: self._call(
+                    port,
+                    "mempalace_add_drawer",
+                    {"content": "x", "wing": "w", "room": "r"},
+                    req_id=43,
+                )
+            )
+        )
+        mutation_thread.start()
+        time.sleep(0.2)
+        assert not mutation_started.is_set(), "a second mutation entered during the mine"
+
+        enter_write.set()
+        assert write_started.wait(timeout=2)
+        second_search_thread = threading.Thread(
+            target=lambda: run(
+                lambda: self._call(port, "mempalace_search", {"query": "x"}, req_id=44)
+            )
+        )
+        second_search_thread.start()
+        time.sleep(0.2)
+        assert not second_search_started.is_set(), "a search overlapped a Chroma write burst"
+
+        release_write.set()
+        for thread in (mine_thread, second_search_thread, mutation_thread):
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+        assert not errors, errors
+        assert second_search_started.is_set()
+        assert mutation_started.is_set()
+        assert mcp._write_stall_inflight is None
+
+    def test_project_mine_keeps_request_wide_exclusive_lock(self, http_server, monkeypatch):
+        port, _ = http_server
+        mine_started = threading.Event()
+        release_mine = threading.Event()
+        search_started = threading.Event()
+
+        def project_mine(**_kwargs):
+            mine_started.set()
+            release_mine.wait(timeout=5)
+            return {"success": True}
+
+        def search(**_kwargs):
+            search_started.set()
+            return {"query": "x", "results": []}
+
+        monkeypatch.setattr(mcp, "_mcp_tool_preflight_refusal", lambda *_args: None)
+        monkeypatch.setitem(mcp.TOOLS["mempalace_mine"], "handler", project_mine)
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", search)
+
+        mine_thread = threading.Thread(
+            target=lambda: self._call(
+                port, "mempalace_mine", {"source": "/tmp", "mode": "projects"}, req_id=51
+            )
+        )
+        mine_thread.start()
+        assert mine_started.wait(timeout=2)
+        search_thread = threading.Thread(
+            target=lambda: self._call(port, "mempalace_search", {"query": "x"}, req_id=52)
+        )
+        search_thread.start()
+        time.sleep(0.2)
+        assert not search_started.is_set()
+        release_mine.set()
+        mine_thread.join(timeout=5)
+        search_thread.join(timeout=5)
+        assert search_started.is_set()
+
 
 def test_healthz_ok(http_server):
     port, _ = http_server

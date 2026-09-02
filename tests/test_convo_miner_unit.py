@@ -607,6 +607,76 @@ class TestScanConvos:
 
 
 class TestFileChunksLocked:
+    def test_access_gate_bounds_backend_reads_and_write_batches(self, monkeypatch):
+        import mempalace.convo_miner as convo_miner
+
+        class RecordingGate:
+            def __init__(self):
+                self.mode = None
+                self.events = []
+
+            @contextlib.contextmanager
+            def read_lock(self):
+                assert self.mode is None
+                self.mode = "read"
+                self.events.append("read-enter")
+                try:
+                    yield
+                finally:
+                    self.events.append("read-exit")
+                    self.mode = None
+
+            @contextlib.contextmanager
+            def write_lock(self):
+                assert self.mode is None
+                self.mode = "write"
+                self.events.append("write-enter")
+                try:
+                    yield
+                finally:
+                    self.events.append("write-exit")
+                    self.mode = None
+
+        class FakeCol:
+            def __init__(self, gate):
+                self.gate = gate
+                self.batch_sizes = []
+
+            def get(self, **_kwargs):
+                assert self.gate.mode in {"read", "write"}
+                return {"ids": [], "metadatas": []}
+
+            def upsert(self, documents, ids, metadatas):
+                assert self.gate.mode == "write"
+                self.batch_sizes.append(len(documents))
+
+        gate = RecordingGate()
+        col = FakeCol(gate)
+        chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3)]
+        monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        drawers, _, skipped = _file_chunks_locked(
+            col,
+            "chat.txt",
+            chunks,
+            "wing",
+            "general",
+            "agent",
+            "exchange",
+            access_gate=gate,
+        )
+
+        assert (drawers, skipped) == (3, False)
+        assert col.batch_sizes == [2, 1]
+        assert gate.events.count("read-enter") == 2
+        assert gate.events.count("write-enter") == 2
+        assert gate.mode is None
+
     def test_uses_bounded_upsert_batches(self, monkeypatch):
         import mempalace.convo_miner as convo_miner
 
