@@ -1252,17 +1252,35 @@ def test_run_diary_write_forwards_args_and_sets_exit_code(monkeypatch):
 
     captured = {}
 
-    def fake_diary(agent_name, entry, topic, wing):
-        captured.update(agent_name=agent_name, entry=entry, topic=topic, wing=wing)
+    def fake_diary(agent_name, entry, topic, wing, idempotency_key):
+        captured.update(
+            agent_name=agent_name,
+            entry=entry,
+            topic=topic,
+            wing=wing,
+            idempotency_key=idempotency_key,
+        )
         return {"success": True}
 
     monkeypatch.setattr(mcp, "tool_diary_write", fake_diary)
     out = service.run_diary_write(
-        {"agent_name": "alice", "entry": "hello", "topic": "t", "wing": "w"}
+        {
+            "agent_name": "alice",
+            "entry": "hello",
+            "topic": "t",
+            "wing": "w",
+            "idempotency_key": "hook-checkpoint:stable",
+        }
     )
     assert out["success"] is True
     assert out["exit_code"] == 0
-    assert captured == {"agent_name": "alice", "entry": "hello", "topic": "t", "wing": "w"}
+    assert captured == {
+        "agent_name": "alice",
+        "entry": "hello",
+        "topic": "t",
+        "wing": "w",
+        "idempotency_key": "hook-checkpoint:stable",
+    }
 
 
 def test_run_mine_applies_backend_before_mode_validation(tmp_path):
