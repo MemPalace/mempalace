@@ -495,6 +495,19 @@ def _run_queued_mine(pid_path: str, pending_path: str, watcher_path: str) -> Non
     pid_file = Path(pid_path)
     pending_file = Path(pending_path)
     watcher_file = Path(watcher_path)
+    claimed_file = pending_file.with_name(f".{pending_file.name}.claimed.{os.getpid()}")
+
+    def _restore_claimed():
+        if not claimed_file.exists():
+            return
+        try:
+            if pending_file.exists():
+                claimed_file.unlink()
+            else:
+                os.replace(claimed_file, pending_file)
+        except OSError:
+            pass
+
     try:
         timeout = _mine_slot_timeout_secs()
         deadline = None if timeout <= 0 else time.monotonic() + timeout
@@ -502,11 +515,11 @@ def _run_queued_mine(pid_path: str, pending_path: str, watcher_path: str) -> Non
             time.sleep(0.25)
         if _slot_file_pid_alive(pid_file):
             return
-        claimed_file = pending_file.with_name(f".{pending_file.name}.claimed.{os.getpid()}")
         try:
             os.replace(pending_file, claimed_file)
             command = json.loads(claimed_file.read_text(encoding="utf-8"))["cmd"]
         except (OSError, ValueError, KeyError, TypeError):
+            _restore_claimed()
             return
         try:
             pid_file.unlink()
@@ -515,12 +528,13 @@ def _run_queued_mine(pid_path: str, pending_path: str, watcher_path: str) -> Non
         try:
             _create_mine_slot_with_placeholder(pid_file)
         except (OSError, FileExistsError):
+            _restore_claimed()
             return
         child_env = os.environ.copy()
         child_env[_MINE_PID_FILE_ENV] = str(pid_file)
         log_path = STATE_DIR / "hook.log"
-        with open(log_path, "a") as log_file:
-            try:
+        try:
+            with open(log_path, "a") as log_file:
                 process = subprocess.Popen(
                     command,
                     stdout=log_file,
@@ -528,12 +542,13 @@ def _run_queued_mine(pid_path: str, pending_path: str, watcher_path: str) -> Non
                     env=child_env,
                     **_detached_popen_kwargs(),
                 )
+        except OSError:
+            try:
+                pid_file.unlink()
             except OSError:
-                try:
-                    pid_file.unlink()
-                except OSError:
-                    pass
-                return
+                pass
+            _restore_claimed()
+            return
         try:
             pid_file.write_text(f"{process.pid} {int(time.time())}", encoding="ascii")
             claimed_file.unlink()
@@ -541,20 +556,6 @@ def _run_queued_mine(pid_path: str, pending_path: str, watcher_path: str) -> Non
             pass
         if pending_file.exists():
             _run_queued_mine(pid_path, pending_path, watcher_path)
-        else:
-            try:
-                recorded = watcher_file.read_text(encoding="ascii").split()[0]
-                if recorded.isdigit() and int(recorded) == os.getpid():
-                    watcher_file.unlink()
-            except (OSError, IndexError):
-                pass
-            if pending_file.exists():
-                try:
-                    latest = json.loads(pending_file.read_text(encoding="utf-8"))["cmd"]
-                except (OSError, ValueError, KeyError, TypeError):
-                    latest = None
-                if latest:
-                    _queue_mine_followup(latest, pid_file)
     finally:
         try:
             recorded = watcher_file.read_text(encoding="ascii").split()[0]
@@ -562,6 +563,13 @@ def _run_queued_mine(pid_path: str, pending_path: str, watcher_path: str) -> Non
                 watcher_file.unlink()
         except (OSError, IndexError):
             pass
+        if pending_file.exists() and not watcher_file.exists():
+            try:
+                latest = json.loads(pending_file.read_text(encoding="utf-8"))["cmd"]
+            except (OSError, ValueError, KeyError, TypeError):
+                latest = None
+            if latest:
+                _queue_mine_followup(latest, pid_file)
 
 
 def _queue_mine_followup(cmd: list[str], pid_file: Path) -> bool:

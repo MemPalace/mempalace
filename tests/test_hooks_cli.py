@@ -1610,6 +1610,33 @@ def test_queue_mine_followup_persists_latest_command_and_starts_one_watcher(tmp_
     popen.assert_called_once()
 
 
+def test_queued_mine_restores_claimed_request_after_spawn_failure(tmp_path):
+    from mempalace.hooks_cli import _run_queued_mine
+
+    pid_file = tmp_path / "mine.pid"
+    pending_file = tmp_path / "mine.pending.json"
+    watcher_file = tmp_path / "mine.watcher.pid"
+    pending_file.write_text(
+        json.dumps({"cmd": ["mempalace", "mine", "/tmp/chat"]}), encoding="utf-8"
+    )
+    watcher_file.write_text(f"{os.getpid()} 1", encoding="ascii")
+    replacement = MagicMock(pid=654321)
+    with (
+        patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
+        patch("mempalace.hooks_cli._slot_file_pid_alive", return_value=False),
+        patch("mempalace.hooks_cli._mempalace_python", return_value=sys.executable),
+        patch(
+            "mempalace.hooks_cli.subprocess.Popen",
+            side_effect=[OSError("executable missing"), replacement],
+        ) as popen,
+    ):
+        _run_queued_mine(str(pid_file), str(pending_file), str(watcher_file))
+
+    assert pending_file.exists()
+    assert popen.call_count == 2
+    assert watcher_file.read_text(encoding="ascii").split()[0] == "654321"
+
+
 # --- _mine_already_running ---
 
 
