@@ -1151,6 +1151,66 @@ def test_bm25_only_via_sqlite_forwards_stop_words_to_bm25_scores(monkeypatch, tm
     assert captured["stop_words"] == frozenset({"the"})
 
 
+def test_bm25_commit_marker_is_scoped_to_selected_collection(tmp_path):
+    from mempalace import searcher
+
+    db = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE VIRTUAL TABLE embedding_fulltext_search USING fts5(string_value, tokenize='trigram');
+        CREATE TABLE embedding_metadata (
+            id INTEGER, key TEXT, string_value TEXT, int_value INTEGER,
+            float_value REAL, bool_value INTEGER
+        );
+        CREATE TABLE collections (id TEXT PRIMARY KEY, name TEXT);
+        CREATE TABLE segments (id TEXT PRIMARY KEY, collection TEXT);
+        CREATE TABLE embeddings (
+            id INTEGER PRIMARY KEY, segment_id TEXT, embedding_id TEXT, created_at TEXT
+        );
+        INSERT INTO collections VALUES ('target', 'target_drawers');
+        INSERT INTO collections VALUES ('other', 'other_drawers');
+        INSERT INTO segments VALUES ('target-seg', 'target');
+        INSERT INTO segments VALUES ('other-seg', 'other');
+        INSERT INTO embeddings VALUES (1, 'target-seg', 'staged-drawer', '2026-09-02');
+        INSERT INTO embeddings VALUES (2, 'other-seg', 'foreign-marker', '2026-09-02');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (1, 'scoped generation phrase');
+        INSERT INTO embedding_metadata VALUES
+            (1, 'chroma:document', 'scoped generation phrase', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (1, 'mine_staged', NULL, NULL, NULL, 1);
+        INSERT INTO embedding_metadata VALUES
+            (1, 'mine_generation_token', 'shared-token', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (2, 'mine_generation_commit', 'shared-token', NULL, NULL, NULL);
+        """
+    )
+    conn.commit()
+
+    hidden = searcher._bm25_only_via_sqlite(
+        "scoped generation",
+        str(tmp_path),
+        collection_name="target_drawers",
+    )
+    assert hidden["results"] == []
+
+    conn.execute("INSERT INTO embeddings VALUES (3, 'target-seg', 'local-marker', '2026-09-02')")
+    conn.execute(
+        "INSERT INTO embedding_metadata VALUES "
+        "(3, 'mine_generation_commit', 'shared-token', NULL, NULL, NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    visible = searcher._bm25_only_via_sqlite(
+        "scoped generation",
+        str(tmp_path),
+        collection_name="target_drawers",
+    )
+    assert [hit["drawer_id"] for hit in visible["results"]] == ["staged-drawer"]
+
+
 def test_finalize_candidate_hits_forwards_stop_words_to_hybrid_rank(monkeypatch):
     """`_finalize_candidate_hits` must forward `stop_words` into the final
     `_hybrid_rank` re-rank — the BM25 site on the vector/union path. (The

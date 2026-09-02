@@ -983,13 +983,20 @@ def _bm25_only_via_sqlite(
                     JOIN embedding_metadata marker
                       ON marker.key = 'mine_generation_commit'
                      AND marker.string_value = token.string_value
+                    JOIN embeddings marker_embedding
+                      ON marker_embedding.id = marker.id
+                    JOIN segments marker_segment
+                      ON marker_segment.id = marker_embedding.segment_id
+                    JOIN collections marker_collection
+                      ON marker_collection.id = marker_segment.collection
                     WHERE token.id = {row_id_expr}
                       AND token.key = 'mine_generation_token'
+                      AND marker_collection.name = ?
                 )
             )
             """
         ]
-        params = []
+        params = [collection_name]
         for key, value in (("wing", wing), ("room", room), ("source_file", source_file)):
             if not value:
                 continue

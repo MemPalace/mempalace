@@ -712,7 +712,8 @@ def _publish_changed_generations(
                     ids=[drawer_id for drawer_id, _ in batch],
                     metadatas=[meta for _, meta in batch],
                 )
-            collection.delete(ids=stale_ids)
+            if stale_ids:
+                collection.delete(ids=stale_ids)
             completed_marker = dict(commit_metadata)
             completed_marker["mine_cleanup_pending"] = False
             collection.update(ids=[commit_id], metadatas=[completed_marker])
@@ -922,6 +923,12 @@ def _file_chunks_locked(
             "mine_generation_commit": generation_token,
             "mine_cleanup_pending": True,
         }
+        with _access_read(access_gate):
+            marker_result = collection.get(ids=[commit_id], include=["metadatas"])
+        pending_cleanup = any(
+            (meta or {}).get("mine_cleanup_pending") is True
+            for meta in (marker_result.get("metadatas") or [])
+        )
 
         # Batch into bounded requests so large transcripts keep most of the
         # embedding speedup without one huge Chroma/SQLite request.
@@ -957,7 +964,7 @@ def _file_chunks_locked(
             except Exception as e:
                 if "already exists" not in str(e).lower():
                     raise
-        if not stale_ids:
+        if not stale_ids and not pending_cleanup:
             for batch_start in range(0, len(to_touch), DRAWER_UPSERT_BATCH_SIZE):
                 batch = to_touch[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
                 with _access_write(access_gate):
@@ -973,7 +980,7 @@ def _file_chunks_locked(
         # crash window leaves transient duplicates. The current-mtime marker
         # is deliberately withheld until cleanup succeeds, so the next mine
         # retries even when the source itself stays unchanged.
-        if stale_ids:
+        if stale_ids or pending_cleanup:
             final_metadata = to_touch + [(drawer_id, meta) for drawer_id, _, meta in to_upsert]
             if not _publish_changed_generations(
                 collection,

@@ -696,7 +696,7 @@ class TestFileChunksLocked:
 
         assert (drawers, skipped) == (3, False)
         assert col.batch_sizes == [2, 1]
-        assert gate.events.count("read-enter") == 2
+        assert gate.events.count("read-enter") == 3
         assert gate.events.count("write-enter") == 2
         assert gate.mode is None
 
@@ -1228,6 +1228,57 @@ def test_content_hash_prefetch_ignores_staged_generations():
 
     assert ("wing", "staged-hash") not in hashes
     assert hashes[("wing", "committed-hash")] == "committed.jsonl"
+
+
+def test_pending_commit_finishes_when_stale_rows_are_already_gone():
+    import mempalace.convo_miner as convo_miner
+
+    class Collection:
+        def __init__(self):
+            self.marker = None
+            self.fail_completion = True
+
+        def upsert(self, ids, documents, metadatas):
+            self.marker = dict(metadatas[0])
+
+        def update(self, ids, metadatas):
+            if ids == ["commit"] and metadatas[0].get("mine_cleanup_pending") is False:
+                if self.fail_completion:
+                    self.fail_completion = False
+                    raise RuntimeError("crash before marker completion")
+                self.marker = dict(metadatas[0])
+
+        def delete(self, ids):
+            pass
+
+    collection = Collection()
+    marker = {
+        "mine_staged": True,
+        "mine_commit_marker": True,
+        "mine_generation_commit": "token",
+        "mine_cleanup_pending": True,
+    }
+    first = convo_miner._publish_changed_generations(
+        collection,
+        final_metadata=[],
+        stale_ids=["already-deleted"],
+        commit_id="commit",
+        commit_metadata=marker,
+        source_file="chat.jsonl",
+    )
+    assert first is False
+    assert collection.marker["mine_cleanup_pending"] is True
+
+    retry = convo_miner._publish_changed_generations(
+        collection,
+        final_metadata=[],
+        stale_ids=[],
+        commit_id="commit",
+        commit_metadata=marker,
+        source_file="chat.jsonl",
+    )
+    assert retry is True
+    assert collection.marker["mine_cleanup_pending"] is False
 
 
 class TestSourceFileDeleteIds:
