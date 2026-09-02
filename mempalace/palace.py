@@ -9,6 +9,7 @@ import hashlib
 import logging
 import os
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -1117,7 +1118,16 @@ class MineValidationError(RuntimeError):
             raise ValueError("MineValidationError requires at least one error string")
         if not palace_path:
             raise ValueError("MineValidationError requires a non-empty palace_path")
-        super().__init__(f"FTS5/SQLite quick_check failed: {len(errors)} issue(s)")
+        # Name the SQLite that produced the verdict. #2240 points at this
+        # post-mine check by name: a build that cannot detect a given FTS5
+        # fault reports the same "clean" as one that can. The CLI handler
+        # renders the abort banner, which carries the version; the MCP `mine`
+        # tool and the daemon's job runner render this message instead, so it
+        # belongs in the message.
+        super().__init__(
+            f"FTS5/SQLite quick_check failed: {len(errors)} issue(s) "
+            f"(SQLite {sqlite3.sqlite_version})"
+        )
         self.palace_path = palace_path
         # Freeze the forensic snapshot so handlers cannot mutate it.
         self.errors: tuple[str, ...] = tuple(errors)
@@ -1154,11 +1164,19 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
 
     errors = sqlite_integrity_errors(palace_path)
     if errors:
-        # progress=logger.info, not the default print: this runs inside the
-        # MCP server process too (mcp_server.tool_mine -> miner.mine), where
-        # stdout is the JSON-RPC transport -- a stray print() here would
-        # corrupt the protocol stream and crash the connection.
-        errors = maybe_autoheal_fts5_index(palace_path, errors, progress=logger.info)
+        # Not the default print: this runs inside the MCP server process too
+        # (mcp_server.tool_mine -> miner.mine), where stdout is the JSON-RPC
+        # transport -- a stray print() here would corrupt the protocol stream
+        # and crash the connection.
+        #
+        # warning, not info: this module logs through the `mempalace_mcp`
+        # logger, which sets no level of its own, and nothing configures logging
+        # on the `mempalace mine` path -- so root keeps its default and info
+        # records are dropped. Every message this call can emit describes a palace whose
+        # quick_check already failed -- a rebuild being attempted, refused, or
+        # completed against the operator's data -- so warning is both the level
+        # that survives and the level that fits.
+        errors = maybe_autoheal_fts5_index(palace_path, errors, progress=logger.warning)
     if errors:
         raise MineValidationError(palace_path, errors)
 

@@ -362,9 +362,10 @@ _sqlite_integrity_check_error = ""
 # Why no verdict exists, when none does. An empty _sqlite_integrity_errors is
 # ambiguous on its own: quick_check found nothing wrong, or it never ran. Four
 # exits in the refresh leave the list empty and only one of them means the
-# database came back clean. This names one of the others, the palace with no
-# chroma.sqlite3, so the status payload can report an absence rather than a
-# clean bill of health.
+# database came back clean. This names the others — the palace with no
+# chroma.sqlite3 (#2290), and the palace whose database is over the startup
+# probe's size limit (#2240) — so the status payload can report an absence
+# rather than a clean bill of health.
 _sqlite_integrity_no_verdict_reason = ""
 # Serializes quick_check runs between the async startup preflight thread and
 # lazy consumers on the protocol thread (double-checked in
@@ -851,6 +852,31 @@ def _startup_integrity_size_limit_bytes() -> int:
     return int(mb * 1024 * 1024)
 
 
+def _rendered_mb(*byte_counts: float) -> tuple[str, ...]:
+    """Render byte counts as MB strings that stay distinguishable from each other.
+
+    Whole megabytes turned a 1.4 MB database against a 1 MB limit into "is 1 MB,
+    over the 1 MB limit", and a sub-megabyte limit into "0 MB, over the 0 MB
+    limit" — a sentence that reads as a contradiction and hides the very
+    comparison it is reporting. The limit is read from the environment as a
+    float, so neither end is guaranteed to be a round number. Widening the
+    precision until the rendered values differ keeps the common case ("1954 MB,
+    over the 512 MB limit") free of noise digits.
+    """
+    values = [count / (1024 * 1024) for count in byte_counts]
+    for digits in range(4):
+        rendered = tuple(f"{value:.{digits}f}" for value in values)
+        # Distinct is not enough on its own: 0.6 MB over a 0.5 MB limit renders
+        # as "1" over "0" at zero digits, which is distinct and wrong in both
+        # numbers. A value that survives rounding to nothing has been rounded
+        # past the point of describing itself.
+        if len(set(rendered)) == len(rendered) and not any(
+            float(text) == 0 and value > 0 for text, value in zip(rendered, values)
+        ):
+            return rendered
+    return tuple(f"{value:.3f}" for value in values)
+
+
 def _refresh_sqlite_integrity_status() -> None:
     """Refresh the MCP startup SQLite/FTS5 integrity gate.
 
@@ -872,6 +898,18 @@ def _refresh_sqlite_integrity_status_locked() -> None:
     global _sqlite_integrity_check_error
     global _sqlite_integrity_no_verdict_reason
 
+    # Deliberately not cleared up front. _sqlite_integrity_payload reads these
+    # globals without the lock, and _ensure_sqlite_integrity_status short-
+    # circuits on _sqlite_integrity_checked, which a previous skip already set
+    # to True. Clearing here and re-populating after os.path.getsize would open
+    # a window in which a reader sees checked=True, errors=[] and no reason —
+    # the clean verdict nobody produced that this whole path exists to prevent.
+    # Each exit below sets it instead, and the order within an exit is chosen
+    # so every window falls on the safe side. Entering the skip records the
+    # reason before the other three, so a reader cannot catch an empty error
+    # list that nothing explains. Leaving it clears the reason only once the
+    # fresh errors are in place, so the reader catching that half sees a stale
+    # "no verdict" rather than a clean one it was never entitled to.
     if not _config.palace_path or not _is_chroma_backend():
         _sqlite_integrity_checked = True
         _sqlite_integrity_errors = []
@@ -887,25 +925,33 @@ def _refresh_sqlite_integrity_status_locked() -> None:
         except OSError:
             db_bytes = 0
         if db_bytes > max_bytes:
-            _sqlite_integrity_checked = True
-            _sqlite_integrity_errors = []
-            _sqlite_integrity_check_error = ""
-            # This exit is its own kind of "no verdict" and does not yet name
-            # itself (#2240). It must at least not inherit the previous
-            # probe's reason: a palace that had no database when the server
-            # started, and has an oversized one now, would otherwise be
-            # described as having no database at all.
-            _sqlite_integrity_no_verdict_reason = ""
+            # Reason first: it is the field that distinguishes this state from a
+            # clean verdict, so a lock-free reader must never catch the other
+            # three updated while it still says nothing was skipped. Writing
+            # this exit's own reason also keeps it from inheriting the previous
+            # probe's: a palace that had no database when the server started,
+            # and has an oversized one now, must not still be described as
+            # having no database at all.
+            db_mb, limit_mb = _rendered_mb(db_bytes, max_bytes)
+            _sqlite_integrity_no_verdict_reason = (
+                f"startup integrity check skipped: {sqlite_path} is "
+                f"{db_mb} MB, over the {limit_mb} MB limit "
+                f"({_STARTUP_INTEGRITY_MAX_MB_ENV}); no quick_check has run "
+                "against this palace. Run `mempalace repair` for a full check."
+            )
             logger.warning(
-                "SQLite startup integrity check skipped: %s is %.0f MB "
-                "(> %.0f MB limit); PRAGMA quick_check would block MCP "
+                "SQLite startup integrity check skipped: %s is %s MB "
+                "(> %s MB limit); PRAGMA quick_check would block MCP "
                 "startup. Run `mempalace repair` for a full check, or set "
                 "%s (MB; 0 disables the limit).",
                 sqlite_path,
-                db_bytes / (1024 * 1024),
-                max_bytes / (1024 * 1024),
+                db_mb,
+                limit_mb,
                 _STARTUP_INTEGRITY_MAX_MB_ENV,
             )
+            _sqlite_integrity_checked = True
+            _sqlite_integrity_errors = []
+            _sqlite_integrity_check_error = ""
             return
 
     try:
@@ -945,8 +991,9 @@ def _refresh_sqlite_integrity_status_locked() -> None:
 
     if _sqlite_integrity_errors:
         logger.error(
-            "SQLite integrity check failed for palace=%s: %s",
+            "SQLite integrity check failed for palace=%s (SQLite %s): %s",
             _config.palace_path,
+            sqlite3.sqlite_version,
             "; ".join(_sqlite_integrity_errors[:3]),
         )
 
@@ -997,6 +1044,9 @@ def _sqlite_integrity_payload() -> dict:
             return {
                 "checked": False,
                 "ok": None,
+                # A property of this process, not of the backend, and every
+                # payload shape is deliberately kept parallel on it.
+                "sqlite_version": sqlite3.sqlite_version,
                 "palace": _config.palace_path or "",
                 "sqlite_path": "",
                 "error_count": 0,
@@ -1006,16 +1056,24 @@ def _sqlite_integrity_payload() -> dict:
                     f"{backend_name or 'unknown'!r}"
                 ),
             }
-        # Same shape, second way this payload reports an absent verdict: the
-        # backend is chroma, but there was no database to open. Reporting
-        # checked/ok true here would claim a quick_check that never ran. A
-        # palace whose file is unreachable rather than absent does not arrive
-        # here at all: its probe recorded an error, so it falls through to the
-        # verdict payload below with `ok: false`.
+
+        # Same rule, and the refresh records a reason for each way of reaching
+        # it: the startup probe skipped above a size limit, where the palace in
+        # #2240 is roughly four times the default, and a chroma palace with no
+        # database to open (#2290). Reporting checked/ok true for either says a
+        # build examined the database and found it clean when none ever opened
+        # it. A palace whose file is unreachable rather than absent does not
+        # arrive here at all: its probe recorded an error, so it falls through
+        # to the verdict payload below with `ok: false`.
+        #
+        # Asked after the backend and not before it: both reasons describe a
+        # chroma path, so a server running something else has to be told that
+        # rather than handed a reason about a chroma.sqlite3 it never uses.
         if _sqlite_integrity_no_verdict_reason:
             return {
                 "checked": False,
                 "ok": None,
+                "sqlite_version": sqlite3.sqlite_version,
                 "palace": _config.palace_path or "",
                 "sqlite_path": os.path.join(_config.palace_path, "chroma.sqlite3")
                 if _config.palace_path
@@ -1028,6 +1086,10 @@ def _sqlite_integrity_payload() -> dict:
     payload = {
         "checked": _sqlite_integrity_checked,
         "ok": not _sqlite_integrity_errors,
+        # Which SQLite produced this verdict. An "ok" from a build that cannot
+        # detect a given FTS5 fault is not the same claim as an "ok" from one
+        # that can, and the two are otherwise indistinguishable here (#2240).
+        "sqlite_version": sqlite3.sqlite_version,
         "palace": _config.palace_path,
         "sqlite_path": os.path.join(_config.palace_path, "chroma.sqlite3")
         if _config.palace_path
@@ -1073,6 +1135,9 @@ def _mcp_sqlite_integrity_refusal(req_id, tool_name: str):
                 ),
                 "errors": _sqlite_integrity_errors[:10],
                 "error_count": len(_sqlite_integrity_errors),
+                # This is the payload an operator is most likely to paste into
+                # a report, so it carries the build behind the verdict too.
+                "sqlite_version": sqlite3.sqlite_version,
                 "hint": (
                     "Stop all MemPalace MCP clients/writers, back up the palace, "
                     "repair the SQLite/FTS5 corruption offline, then run "
@@ -7573,9 +7638,10 @@ def _http_status_payload(httpd) -> dict:
         os.path.abspath(os.path.expanduser(_config.palace_path)) if _config.palace_path else ""
     )
     return {
-        # `ok` is None in the two cases the payload reports as an absent
-        # verdict: a non-chroma backend (#1931), and a chroma palace with no
-        # database file yet. That is an absence, not a failure, and collapsing
+        # `ok` is None in the three cases the payload reports as an absent
+        # verdict: a non-chroma backend (#1931), a chroma palace with no
+        # database file yet (#2290), and a palace above the startup probe's
+        # size limit (#2240). That is an absence, not a failure, and collapsing
         # it with bool() would report a freshly installed server as unhealthy.
         # A missing key is not one of those cases and still fails closed.
         "ok": integrity.get("ok", False) is not False,
