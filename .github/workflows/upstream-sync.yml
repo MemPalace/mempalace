@@ -1,0 +1,28 @@
+name: upstream-sync
+# Keeps durante-tech/mempalace (private mirror) on latest MemPalace/mempalace.
+# Fast-forward ONLY: if the mirror's develop ever diverges from upstream, the
+# job fails loudly instead of rewriting history — divergence means someone
+# committed to the mirror's develop directly (work belongs on branches + PRs,
+# e.g. fix/quarantine-respects-sync-threshold).
+on:
+  schedule:
+    - cron: "17 6 * * *" # daily 06:17 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0
+      - name: Fast-forward develop from upstream
+        run: |
+          git remote add upstream https://github.com/MemPalace/mempalace.git
+          git fetch upstream develop --tags
+          git merge --ff-only upstream/develop
+          git push origin develop --tags

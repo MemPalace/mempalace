@@ -95,3 +95,19 @@ def _wal_log(operation: str, params: dict, result: dict = None):
             f.write(json.dumps(entry, default=str) + "\n")
     except Exception as e:
         logger.error(f"WAL write failed: {e}")
+    # Optional secondary audit sink: when MEMPALACE_AUDIT_LOG is set to a file
+    # path, mirror the same (already-redacted) entry there so an external
+    # system can consume one unified write-audit stream without adopting the
+    # WAL's location or lifecycle. Same guarantees as the WAL append:
+    # append-only, file mode 0o600, and non-fatal on any failure.
+    audit_path = os.environ.get("MEMPALACE_AUDIT_LOG")
+    if audit_path:
+        try:
+            parent = os.path.dirname(audit_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            fd = os.open(audit_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, default=str) + "\n")
+        except Exception as e:
+            logger.error(f"audit log write failed: {e}")
