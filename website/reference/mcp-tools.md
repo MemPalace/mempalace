@@ -86,6 +86,21 @@ Check if content already exists in the palace before filing.
 
 ---
 
+### `mempalace_find_duplicates`
+
+Read-only duplicate audit. Returns connected clusters of near-duplicate logical drawers with pairwise cosine distances — never raw vectors or content. Clusters are the connected components of the "distance < threshold" graph (similarity is symmetric but not transitive). Chunked drawers are deduped by `parent_drawer_id`, and each drawer's own chunks are never reported as duplicates of one another.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `wing` | string | No | Filter by wing |
+| `room` | string | No | Filter by room |
+| `threshold` | number | No | Cosine distance threshold (default 0.15). Lower is stricter. |
+| `max_clusters` | integer | No | Maximum number of clusters to return |
+
+**Returns:** `{ clusters: [{ drawer_ids, pairs: [{ a, b, distance }], size }], params }`
+
+---
+
 ### `mempalace_get_aaak_spec`
 
 Returns the AAAK dialect specification.
