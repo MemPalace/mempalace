@@ -16,8 +16,8 @@ access and nothing decays them over time. Wiring that up is a separate
 question (which access counts as a co-access?); this docstring previously
 said those modules invoked these functions, which was not accurate.
 
-Read strength with ``effective_strength(connection, now)``. It is pure and
-side-effect free, so a read cannot change a ranking.
+Read strength with ``effective_strength(connection, now=...)``. It is pure
+and side-effect free, so a read cannot change a ranking.
 
 Schema fields added to hall + tunnel records (all default-safe — existing
 records without them work via ``initialize_dynamics_fields``):
@@ -181,10 +181,15 @@ def effective_strength(connection: dict, *, now: Optional[datetime] = None) -> f
     maintenance pass to schedule, to forget, or to accidentally run twice.
     See ``apply_decay``'s note for what happens otherwise.
 
-    ``now`` is dependency injection for tests.
+    ``now`` is dependency injection for tests. A naive datetime is read as
+    UTC rather than raising: ``_parse_iso`` already forces awareness on the
+    stored timestamp, so without the same treatment here a caller passing
+    ``datetime.now()`` gets a TypeError from the subtraction below.
     """
     if now is None:
         now = datetime.now(timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
 
     last_activated_str = connection.get("last_activated") or connection.get("created_at")
     last_dt = _parse_iso(last_activated_str)

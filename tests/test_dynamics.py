@@ -365,6 +365,17 @@ class TestEffectiveStrength:
         conn = {"strength": 2.0, "stability": 5.0, "last_activated": "not-a-date"}
         assert effective_strength(conn, now=T0) == 2.0
 
+    def test_naive_now_is_read_as_utc(self):
+        """A caller passing datetime.now() must not get a TypeError. The
+        stored timestamp is forced tz-aware by _parse_iso, so an unaware
+        ``now`` would otherwise fail the subtraction."""
+        conn = {"strength": 1.0, "stability": 5.0, "last_activated": T0.isoformat()}
+        naive = (T0 + timedelta(days=10)).replace(tzinfo=None)
+
+        assert effective_strength(conn, now=naive) == pytest.approx(
+            effective_strength(conn, now=T0 + timedelta(days=10))
+        )
+
     def test_never_below_the_floor(self):
         conn = _fresh_connection()
         assert effective_strength(conn, now=T0 + timedelta(days=3650)) == STRENGTH_FLOOR
