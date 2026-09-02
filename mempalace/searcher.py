@@ -408,30 +408,53 @@ def build_where_filter(wing: str = None, room: str = None, source_file: str = No
     return {"$and": clauses}
 
 
-def _is_staged_metadata(metadata) -> bool:
+def _is_staged_metadata(metadata, committed_tokens=frozenset()) -> bool:
     """True for an unpublished conversation-mine physical generation."""
     if not isinstance(metadata, dict):
         return False
     value = metadata.get("mine_staged")
     # Chroma returns bools; the sqlite-only fallback reconstructs them from
     # ``int_value`` as 0/1.
-    return value is True or value == 1
+    if not (value is True or value == 1):
+        return False
+    token = metadata.get("mine_generation_token")
+    return not token or token not in committed_tokens
 
 
-def _visible_sqlite_drawers(drawers) -> list:
-    """Filter unpublished generations outside the BM25 fallback's hot loop."""
-    return [drawer for drawer in drawers if not _is_staged_metadata(drawer.get("metadata"))]
+def _committed_generation_tokens(collection) -> frozenset[str]:
+    """Read crash-atomic conversation generation markers from the drawer store."""
+    try:
+        result = collection.get(
+            where={"mine_commit_marker": True},
+            include=["metadatas"],
+        )
+        return frozenset(
+            meta.get("mine_generation_commit")
+            for meta in (result.get("metadatas") or [])
+            if isinstance(meta, dict) and meta.get("mine_generation_commit")
+        )
+    except Exception:
+        logger.warning("Could not read conversation generation commit markers", exc_info=True)
+        return frozenset()
 
 
-def _visible_drawer_where(where: dict) -> dict:
+def _visible_drawer_where(where: dict, committed_tokens=frozenset()) -> dict:
     """Exclude staged rows in the backend before its top-K limit is applied."""
     committed = {"mine_staged": {"$ne": True}}
+    visibility = committed
+    if committed_tokens:
+        visibility = {
+            "$or": [
+                committed,
+                {"mine_generation_token": {"$in": sorted(committed_tokens)}},
+            ]
+        }
     if not where:
-        return committed
+        return visibility
     clauses = where.get("$and") if isinstance(where, dict) else None
     if isinstance(clauses, list):
-        return {"$and": [*clauses, committed]}
-    return {"$and": [where, committed]}
+        return {"$and": [*clauses, visibility]}
+    return {"$and": [where, visibility]}
 
 
 def _sqlite_staged_value_sql(conn) -> str:
@@ -764,7 +787,8 @@ def search(
     # creation — their similarity scores will be junk until they run repair.
     _warn_if_legacy_metric(col)
 
-    where = _visible_drawer_where(build_where_filter(wing, room))
+    committed_tokens = _committed_generation_tokens(col)
+    where = _visible_drawer_where(build_where_filter(wing, room), committed_tokens)
 
     try:
         kwargs = {
@@ -793,7 +817,7 @@ def search(
     visible = [
         (doc, meta, dist)
         for doc, meta, dist in zip(docs, metas, dists)
-        if not _is_staged_metadata(meta)
+        if not _is_staged_metadata(meta, committed_tokens)
     ]
     docs = [item[0] for item in visible]
     metas = [item[1] for item in visible]
@@ -945,12 +969,23 @@ def _bm25_only_via_sqlite(
     def _metadata_filter_sql(row_id_expr: str) -> tuple[str, list[str]]:
         clauses = [
             f"""
-            AND NOT EXISTS (
-                SELECT 1
-                FROM embedding_metadata staged
-                WHERE staged.id = {row_id_expr}
-                  AND staged.key = 'mine_staged'
-                  AND {staged_value_sql} = 1
+            AND (
+                NOT EXISTS (
+                    SELECT 1
+                    FROM embedding_metadata staged
+                    WHERE staged.id = {row_id_expr}
+                      AND staged.key = 'mine_staged'
+                      AND {staged_value_sql} = 1
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM embedding_metadata token
+                    JOIN embedding_metadata marker
+                      ON marker.key = 'mine_generation_commit'
+                     AND marker.string_value = token.string_value
+                    WHERE token.id = {row_id_expr}
+                      AND token.key = 'mine_generation_token'
+                )
             )
             """
         ]
@@ -1128,7 +1163,7 @@ def _bm25_only_via_sqlite(
     # Apply wing/room filters in Python (FTS5 candidates may include
     # entries from other wings).
     candidates = []
-    for d in _visible_sqlite_drawers(drawers.values()):
+    for d in drawers.values():
         meta = d["metadata"]
         if wing and meta.get("wing") != wing:
             continue
@@ -1226,7 +1261,8 @@ def _merge_bm25_union_candidates(
     before admitting them, preserving the same distance guarantee as the
     vector-only path.
     """
-    where = _visible_drawer_where(build_where_filter(wing, room, source_file))
+    committed_tokens = _committed_generation_tokens(drawers_col)
+    where = _visible_drawer_where(build_where_filter(wing, room, source_file), committed_tokens)
     try:
         lexical = drawers_col.lexical_search(
             query=query,
@@ -1249,7 +1285,7 @@ def _merge_bm25_union_candidates(
     bm25_extra = []
     for hit in lexical.hits:
         meta = hit.metadata or {}
-        if _is_staged_metadata(meta):
+        if _is_staged_metadata(meta, committed_tokens):
             continue
         # The window applies to every candidate source; a lexically strong
         # drawer outside [since, before) must not enter through this side
@@ -1374,6 +1410,7 @@ def _enrich_closet_hits(
         )
     )
     source_cache: dict = {}
+    committed_tokens = _committed_generation_tokens(drawers_col)
 
     for hit in hits:
         if hit.get("matched_via") == "drawer":
@@ -1452,7 +1489,7 @@ def _enrich_closet_hits(
                 metadatas,
             )
         ):
-            if _is_staged_metadata(metadata):
+            if _is_staged_metadata(metadata, committed_tokens):
                 continue
             chunk_index = (
                 metadata.get(
@@ -1790,14 +1827,16 @@ def _window_and_fallback_gate(
     return since_dt, before_dt, active, None
 
 
-def _candidate_out_of_scope(dist, meta, max_distance, since_dt, before_dt) -> bool:
+def _candidate_out_of_scope(
+    dist, meta, max_distance, since_dt, before_dt, committed_tokens=frozenset()
+) -> bool:
     """True when a drawer candidate fails the distance or date-window gate.
 
     Distance is checked on the raw value before rounding to avoid precision
     loss (pre-existing behavior); the date window applies whenever a bound
     is set, with the shared ``[since, before)`` semantics.
     """
-    if _is_staged_metadata(meta):
+    if _is_staged_metadata(meta, committed_tokens):
         return True
     if max_distance > 0.0 and dist > max_distance:
         return True
@@ -1915,6 +1954,37 @@ def _open_search_collection(palace_path: str, collection_name: str):
         )
 
 
+def _post_filter_drawer_query(raw, wing, room, source_file, committed_tokens):
+    raw_docs = _first_or_empty(raw, "documents")
+    raw_ids = _aligned_query_ids(raw, len(raw_docs))
+    fids, fdocs, fmetas, fdists = [], [], [], []
+    for stored_drawer_id, doc, meta, dist in zip(
+        raw_ids,
+        raw_docs,
+        _first_or_empty(raw, "metadatas"),
+        _first_or_empty(raw, "distances"),
+    ):
+        meta = meta or {}
+        if _is_staged_metadata(meta, committed_tokens):
+            continue
+        if wing and meta.get("wing") != wing:
+            continue
+        if room and meta.get("room") != room:
+            continue
+        if source_file and meta.get("source_file") != source_file:
+            continue
+        fids.append(stored_drawer_id)
+        fdocs.append(doc)
+        fmetas.append(meta)
+        fdists.append(dist)
+    return {
+        "ids": [fids],
+        "documents": [fdocs],
+        "metadatas": [fmetas],
+        "distances": [fdists],
+    }
+
+
 def _query_drawers_with_filter_fallback(
     drawers_col, dkwargs, query, n_results, wing, room, source_file=None
 ):
@@ -1938,39 +2008,19 @@ def _query_drawers_with_filter_fallback(
             "Filtered search failed (%s); falling back to unfiltered + post-filter",
             filter_err,
         )
-        raw = drawers_col.query(
-            query_texts=[query],
-            n_results=min(n_results * 15, 500),
-            include=["documents", "metadatas", "distances"],
-        )
-        raw_docs = _first_or_empty(raw, "documents")
-        raw_ids = _aligned_query_ids(raw, len(raw_docs))
-        fids, fdocs, fmetas, fdists = [], [], [], []
-        for stored_drawer_id, doc, meta, dist in zip(
-            raw_ids,
-            raw_docs,
-            _first_or_empty(raw, "metadatas"),
-            _first_or_empty(raw, "distances"),
-        ):
-            meta = meta or {}
-            if _is_staged_metadata(meta):
-                continue
-            if wing and meta.get("wing") != wing:
-                continue
-            if room and meta.get("room") != room:
-                continue
-            if source_file and meta.get("source_file") != source_file:
-                continue
-            fids.append(stored_drawer_id)
-            fdocs.append(doc)
-            fmetas.append(meta)
-            fdists.append(dist)
-        return {
-            "ids": [fids],
-            "documents": [fdocs],
-            "metadatas": [fmetas],
-            "distances": [fdists],
-        }
+        committed_tokens = _committed_generation_tokens(drawers_col)
+        total = max(1, int(drawers_col.count()))
+        fetch_limit = min(total, max(1, n_results * 15))
+        while True:
+            raw = drawers_col.query(
+                query_texts=[query],
+                n_results=fetch_limit,
+                include=["documents", "metadatas", "distances"],
+            )
+            filtered = _post_filter_drawer_query(raw, wing, room, source_file, committed_tokens)
+            if len(filtered["documents"][0]) >= n_results or fetch_limit >= total:
+                return filtered
+            fetch_limit = min(total, max(fetch_limit + 1, fetch_limit * 2))
 
 
 def _backend_capabilities(col) -> frozenset:
@@ -2124,7 +2174,8 @@ def search_memories(
 
     metric = _metric_for_collection(drawers_col)
     where = build_where_filter(wing, room, source_file)
-    drawer_where = _visible_drawer_where(where)
+    committed_tokens = _committed_generation_tokens(drawers_col)
+    drawer_where = _visible_drawer_where(where, committed_tokens)
 
     # Hybrid retrieval: always query drawers directly (the floor), then use
     # closet hits to boost rankings. Closets are a ranking SIGNAL, never a
@@ -2179,7 +2230,7 @@ def search_memories(
     ):
         meta = meta or {}
         doc = doc or ""
-        if _candidate_out_of_scope(dist, meta, max_distance, since_dt, before_dt):
+        if _candidate_out_of_scope(dist, meta, max_distance, since_dt, before_dt, committed_tokens):
             continue
 
         meta = meta or {}

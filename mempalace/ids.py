@@ -110,6 +110,12 @@ def make_convo_generation_id(logical_drawer_id: str, chunk_hash: str) -> str:
     return f"{logical_drawer_id}_gen_{generation}"
 
 
+def make_convo_commit_id(source_file: str, extract_mode: str) -> str:
+    """Stable registry ID holding one source's published generation token."""
+    digest = _delimited_sha256(("convo-commit", source_file, extract_mode), _HASH_TRUNC_DRAWER)
+    return f"_reg_commit_{digest}"
+
+
 def make_convo_sentinel_id(source_file: str, extract_mode: str) -> str:
     """Sentinel registry ID for the conversation miner zero-chunk-file path.
 

@@ -1150,6 +1150,11 @@ def test_publication_rollback_stays_inside_one_write_gate():
         def __init__(self, gate):
             self.gate = gate
             self.updates = []
+            self.upserts = []
+
+        def upsert(self, ids, documents, metadatas):
+            assert self.gate.active
+            self.upserts.append((list(ids), list(documents), list(metadatas)))
 
         def update(self, ids, metadatas):
             assert self.gate.active
@@ -1161,24 +1166,29 @@ def test_publication_rollback_stays_inside_one_write_gate():
 
     gate = Gate()
     collection = Collection(gate)
-    previous = {"old": {"source_mtime": 1.0, "mine_staged": False}}
+    marker = {
+        "mine_staged": True,
+        "mine_commit_marker": True,
+        "mine_generation_commit": "token",
+        "mine_cleanup_pending": True,
+    }
     result = convo_miner._publish_changed_generations(
         collection,
         final_metadata=[
             ("old", {"source_mtime": 2.0, "mine_staged": False}),
             ("new", {"source_mtime": 2.0, "mine_staged": False}),
         ],
-        staged_upserts=[("new", "new text", {"source_mtime": 2.0, "mine_staged": False})],
         stale_ids=["stale"],
-        previous_metadata=previous,
+        commit_id="commit",
+        commit_metadata=marker,
         source_file="chat.jsonl",
         access_gate=gate,
     )
 
     assert result is False
     assert gate.events == ["write-enter", "write-exit"]
-    assert collection.updates[-1][1][0] == previous["old"]
-    assert collection.updates[-1][1][1]["mine_staged"] is True
+    assert collection.upserts[0][0] == ["commit"]
+    assert collection.upserts[0][2][0]["mine_cleanup_pending"] is True
 
 
 def test_content_hash_prefetch_ignores_staged_generations():

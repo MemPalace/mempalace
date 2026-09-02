@@ -26,6 +26,7 @@ from .backends import PalaceNotFoundError
 from .collision_scan import assert_no_collisions
 from .ids import (
     ID_RECIPE,
+    make_convo_commit_id,
     make_convo_drawer_id,
     make_convo_generation_id,
     make_convo_sentinel_id,
@@ -332,6 +333,8 @@ def _source_file_existing(collection, source_file: str, extract_mode: str) -> di
         batch_ids = batch.get("ids") or []
         metadatas = batch.get("metadatas") or []
         for drawer_id, meta in zip(batch_ids, metadatas):
+            if (meta or {}).get("mine_commit_marker") is True:
+                continue
             if _metadata_matches_extract_mode(meta or {}, extract_mode):
                 existing[drawer_id] = meta or {}
         if not batch_ids:
@@ -684,49 +687,35 @@ def _publish_changed_generations(
     collection,
     *,
     final_metadata,
-    staged_upserts,
     stale_ids,
-    previous_metadata,
+    commit_id,
+    commit_metadata,
     source_file,
     access_gate=None,
 ) -> bool:
-    """Publish a complete staged target set and retire old generations."""
-    staged_ids = {drawer_id for drawer_id, _, _ in staged_upserts}
-
-    def _rollback_metadata():
-        rollback = []
-        for drawer_id, final_meta in final_metadata:
-            if drawer_id in previous_metadata:
-                rollback.append((drawer_id, previous_metadata[drawer_id]))
-                continue
-            if drawer_id in staged_ids:
-                staged_meta = dict(final_meta)
-                staged_meta["mine_staged"] = True
-                staged_meta.pop("source_mtime", None)
-                rollback.append((drawer_id, staged_meta))
-        for batch_start in range(0, len(rollback), DRAWER_UPSERT_BATCH_SIZE):
-            batch = rollback[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
-            collection.update(
-                ids=[drawer_id for drawer_id, _ in batch],
-                metadatas=[meta for _, meta in batch],
-            )
-
+    """Atomically publish a staged token, finalize rows, and retire old ones."""
     try:
         with _access_write(access_gate):
-            try:
-                # Publication, cleanup, and any rollback are one
-                # reader-visible step. Never release the HTTP write gate while
-                # partially published metadata can be observed.
-                for batch_start in range(0, len(final_metadata), DRAWER_UPSERT_BATCH_SIZE):
-                    batch = final_metadata[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
-                    collection.update(
-                        ids=[drawer_id for drawer_id, _ in batch],
-                        metadatas=[meta for _, meta in batch],
-                    )
-                collection.delete(ids=stale_ids)
-            except Exception:
-                _rollback_metadata()
-                raise
+            # One marker upsert is the crash-atomic visibility switch. Before
+            # it, every new generation is hidden. After it, the complete staged
+            # token is searchable even if the process dies during metadata
+            # finalization or stale-row cleanup. ``cleanup_pending`` keeps the
+            # source retryable until every follow-up write succeeds.
+            collection.upsert(
+                ids=[commit_id],
+                documents=[f"[conversation generation commit] {source_file}"],
+                metadatas=[commit_metadata],
+            )
+            for batch_start in range(0, len(final_metadata), DRAWER_UPSERT_BATCH_SIZE):
+                batch = final_metadata[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+                collection.update(
+                    ids=[drawer_id for drawer_id, _ in batch],
+                    metadatas=[meta for _, meta in batch],
+                )
+            collection.delete(ids=stale_ids)
+            completed_marker = dict(commit_metadata)
+            completed_marker["mine_cleanup_pending"] = False
+            collection.update(ids=[commit_id], metadatas=[completed_marker])
         return True
     except Exception:
         logger.warning(
@@ -918,6 +907,21 @@ def _file_chunks_locked(
         # remains visibly incomplete and retries even if the source never
         # changes again.
         stale_ids = [drawer_id for drawer_id in existing if drawer_id not in new_ids]
+        generation_token = hashlib.sha256("\0".join(sorted(new_ids)).encode()).hexdigest()
+        commit_id = make_convo_commit_id(source_file, extract_mode)
+        commit_metadata = {
+            "wing": wing,
+            "room": "_registry",
+            "source_file": source_file,
+            "extract_mode": extract_mode,
+            "ingest_mode": "registry",
+            "normalize_version": NORMALIZE_VERSION,
+            "id_recipe": ID_RECIPE,
+            "mine_staged": True,
+            "mine_commit_marker": True,
+            "mine_generation_commit": generation_token,
+            "mine_cleanup_pending": True,
+        }
 
         # Batch into bounded requests so large transcripts keep most of the
         # embedding speedup without one huge Chroma/SQLite request.
@@ -937,6 +941,7 @@ def _file_chunks_locked(
                     incomplete_meta = dict(final_meta)
                     incomplete_meta.pop("source_mtime", None)
                     incomplete_meta["mine_staged"] = True
+                    incomplete_meta["mine_generation_token"] = generation_token
                     batch_metas.append(incomplete_meta)
             else:
                 batch_metas = [meta for _, _, meta in batch]
@@ -973,9 +978,9 @@ def _file_chunks_locked(
             if not _publish_changed_generations(
                 collection,
                 final_metadata=final_metadata,
-                staged_upserts=to_upsert,
                 stale_ids=stale_ids,
-                previous_metadata=existing,
+                commit_id=commit_id,
+                commit_metadata=commit_metadata,
                 source_file=source_file,
                 access_gate=access_gate,
             ):

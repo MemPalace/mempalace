@@ -81,7 +81,7 @@ class TestSearchMemories:
         staged_ids = [f"staged-generation-{index}" for index in range(8)]
         collection.upsert(
             ids=[*staged_ids, "committed-generation"],
-            documents=[*[staged_text] * len(staged_ids), staged_text],
+            documents=[*[staged_text] * len(staged_ids), "committed fallback text"],
             metadatas=[
                 *[
                     {
@@ -90,6 +90,7 @@ class TestSearchMemories:
                         "source_file": f"/tmp/staged-{index}.jsonl",
                         "filed_at": "2026-09-02T00:00:00",
                         "mine_staged": True,
+                        "mine_generation_token": "generation-token",
                     }
                     for index in range(len(staged_ids))
                 ],
@@ -107,6 +108,20 @@ class TestSearchMemories:
         assert len(result["results"]) == 1
         assert result["results"][0]["source_path"] == "/tmp/committed.jsonl"
 
+        collection.upsert(
+            ids=["generation-commit"],
+            documents=["[commit]"],
+            metadatas=[
+                {
+                    "mine_staged": True,
+                    "mine_commit_marker": True,
+                    "mine_generation_commit": "generation-token",
+                }
+            ],
+        )
+        published = search_memories(staged_text, palace_path, n_results=1)
+        assert published["results"][0]["source_path"].startswith("/tmp/staged-")
+
     def test_wing_filter(self, palace_path, seeded_collection):
         result = search_memories("planning", palace_path, wing="notes")
         assert all(r["wing"] == "notes" for r in result["results"])
@@ -114,6 +129,53 @@ class TestSearchMemories:
     def test_room_filter(self, palace_path, seeded_collection):
         result = search_memories("database", palace_path, room="backend")
         assert all(r["room"] == "backend" for r in result["results"])
+
+    def test_filtered_query_fallback_refills_past_staged_top_k(self):
+        from mempalace.searcher import _query_drawers_with_filter_fallback
+
+        class Collection:
+            def __init__(self):
+                self.unfiltered_limits = []
+
+            @staticmethod
+            def count():
+                return 20
+
+            @staticmethod
+            def get(**_kwargs):
+                return {"ids": [], "metadatas": []}
+
+            def query(self, **kwargs):
+                if "where" in kwargs:
+                    raise RuntimeError("filtered HNSW mismatch")
+                limit = kwargs["n_results"]
+                self.unfiltered_limits.append(limit)
+                ids = [f"staged-{index}" for index in range(min(limit, 19))]
+                docs = ["staged"] * len(ids)
+                metas = [{"mine_staged": True}] * len(ids)
+                if limit >= 20:
+                    ids.append("committed")
+                    docs.append("committed")
+                    metas.append({"source_file": "/tmp/committed"})
+                return {
+                    "ids": [ids],
+                    "documents": [docs],
+                    "metadatas": [metas],
+                    "distances": [[0.1] * len(ids)],
+                }
+
+        collection = Collection()
+        result = _query_drawers_with_filter_fallback(
+            collection,
+            {"where": {"mine_staged": {"$ne": True}}},
+            "query",
+            1,
+            None,
+            None,
+        )
+
+        assert collection.unfiltered_limits == [15, 20]
+        assert result["ids"] == [["committed"]]
 
     def test_wing_and_room_filter(self, palace_path, seeded_collection):
         result = search_memories("code", palace_path, wing="project", room="frontend")
