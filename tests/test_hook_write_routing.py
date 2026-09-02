@@ -495,7 +495,7 @@ def test_precompact_require_unavailable_skips_all_writes(
     assert "systemMessage" in output
 
 
-def test_session_end_require_unavailable_skips_all_writes_and_cleans_marker(
+def test_session_end_require_unavailable_skips_writes_and_preserves_marker(
     tmp_path,
 ):
     config = _HookConfig(WriteRoutingPolicy.REQUIRE)
@@ -544,7 +544,7 @@ def test_session_end_require_unavailable_skips_all_writes_and_cleans_marker(
     ingest.assert_not_called()
     auto_ingest.assert_not_called()
 
-    assert not marker.exists()
+    assert marker.exists()
     assert "systemMessage" in output
 
 

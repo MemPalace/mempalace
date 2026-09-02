@@ -2011,6 +2011,9 @@ def hook_session_end(data: dict, harness: str):
             else:
                 valid_transcript = str(validated)
 
+        if valid_transcript:
+            session_end_complete = False
+
         # Flush. The diary checkpoint (in-process ChromaDB write) runs FIRST,
         # before any detached mine is spawned, so it never contends for the
         # palace lock; this handler is already backgrounded by the wrapper, so it
@@ -2027,7 +2030,6 @@ def hook_session_end(data: dict, harness: str):
                 return
 
             if valid_transcript:
-                session_end_complete = False
                 target_wing = _wing_from_transcript_path(valid_transcript)
                 agent_name = _diary_agent_for_harness(harness)
                 pending_flushed = _flush_pending_session_checkpoints(
