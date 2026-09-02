@@ -30,6 +30,7 @@ from .ids import (
 )
 from .normalize import normalize_conversations
 from .entities import entities_metadata
+from .importance import score_importance
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
@@ -132,6 +133,7 @@ def file_conversation_exchange(
         "authored_at": authored_at if authored_at is not None else filed_at,
         "ingest_mode": "convos",
         "extract_mode": "exchange",
+        "importance": score_importance(text),
         "normalize_version": NORMALIZE_VERSION,
         "id_recipe": ID_RECIPE,
     }
@@ -728,6 +730,7 @@ def _file_chunks_locked(
                         "authored_at": authored_at if authored_at is not None else filed_at,
                         "ingest_mode": "convos",
                         "extract_mode": extract_mode,
+                        "importance": score_importance(chunk["content"]),
                         "normalize_version": NORMALIZE_VERSION,
                         "id_recipe": ID_RECIPE,
                         "chunk_total": chunk_total,

@@ -46,6 +46,7 @@ from .palace import (
 from .collision_scan import assert_no_collisions
 from .hallways import compute_hallways_for_wing
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
+from .importance import score_importance
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -1408,6 +1409,7 @@ def _build_drawer_metadata(
     line_end: Optional[int] = None,
     content_date: Optional[str] = None,
     chunk_total: Optional[int] = None,
+    importance: Optional[float] = None,
 ) -> dict:
     """Build the metadata dict for one drawer without upserting.
 
@@ -1452,6 +1454,12 @@ def _build_drawer_metadata(
         metadata["content_date"] = content_date
     if chunk_total is not None:
         metadata["chunk_total"] = chunk_total
+    # Importance (#2409): explicit override wins, else infer from the
+    # chunk's content so L1 wake-up ranking can surface critical chunks.
+    if isinstance(importance, (int, float)):
+        metadata["importance"] = float(importance)
+    else:
+        metadata["importance"] = score_importance(content)
     metadata["hall"] = detect_hall(content)
     entities = _extract_entities_for_metadata(content)
     if entities:
@@ -1460,13 +1468,17 @@ def _build_drawer_metadata(
 
 
 def add_drawer(
-    collection, wing: str, room: str, content: str, source_file: str, chunk_index: int, agent: str
+    collection, wing: str, room: str, content: str, source_file: str, chunk_index: int, agent: str,
+    importance: Optional[float] = None,
 ):
     """Add one drawer to the palace.
 
     Kept for backward compatibility with external callers. In-tree the
     miner uses ``_build_drawer_metadata`` + a batched ``collection.upsert``
     to amortize the embedding model's forward-pass cost across chunks.
+
+    ``importance`` (optional, 1.0-5.0) — explicit ranking override; omitted
+    values are inferred from content via ``score_importance``.
     """
     drawer_id = make_drawer_id_from_chunk(wing, room, source_file, chunk_index)
     try:
@@ -1474,7 +1486,7 @@ def add_drawer(
     except OSError:
         source_mtime = None
     metadata = _build_drawer_metadata(
-        wing, room, source_file, chunk_index, agent, content, source_mtime
+        wing, room, source_file, chunk_index, agent, content, source_mtime, importance=importance
     )
     collection.upsert(
         documents=[content],

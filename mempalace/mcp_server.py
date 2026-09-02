@@ -107,6 +107,7 @@ from .knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH  # noqa: E402
 from .logstream import LOGSTREAM_DB_FILENAME, Logstream  # noqa: E402
 from .collision_scan import assert_no_collisions  # noqa: E402
 from .ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
+from .importance import score_importance  # noqa: E402
 
 
 class _MempalaceLogFilter(logging.Filter):
@@ -3148,9 +3149,21 @@ def _build_chunk_rows(drawer_id: str, content: str, meta: dict, chunk_size: int)
 
 
 def tool_add_drawer(
-    wing: str, room: str, content: str, source_file: str = None, added_by: str = "mcp"
+    wing: str,
+    room: str,
+    content: str,
+    source_file: str = None,
+    added_by: str = "mcp",
+    importance: float = None,
 ):
     """File verbatim content into a wing/room. Checks for duplicates first.
+
+    ``importance`` is an optional 1.0–5.0 override for the drawer's
+    ranking priority. When omitted, the drawer's importance is inferred
+    from its content via ``score_importance`` (critical facts like health
+    or credentials score 5.0, identity 4.0, everything else 3.0) so that
+    Layer-1 wake-up context can surface critical memories over trivia
+    (#2409). An explicit value always wins over the inferred one.
 
     Content above ``chunk_size`` is split into bounded per-chunk drawers
     via a single batched upsert. Each chunk carries ``parent_drawer_id``
@@ -3192,12 +3205,20 @@ def tool_add_drawer(
     )
 
     chunk_size = _config.chunk_size
+    # Importance: explicit caller override wins; otherwise infer from
+    # content so L1 wake-up ranking can surface critical memories
+    # (health / credentials) over trivia (#2409).
+    if isinstance(importance, (int, float)):
+        importance_value = float(importance)
+    else:
+        importance_value = score_importance(content)
     base_meta = {
         "wing": wing,
         "room": room,
         "source_file": source_file or "",
         "added_by": added_by,
         "filed_at": datetime.now().isoformat(),
+        "importance": importance_value,
         "id_recipe": ID_RECIPE,
     }
 
@@ -5453,6 +5474,10 @@ TOOLS = {
                 },
                 "source_file": {"type": "string", "description": "Where this came from (optional)"},
                 "added_by": {"type": "string", "description": "Who is filing this (default: mcp)"},
+                "importance": {
+                    "type": "number",
+                    "description": "Optional ranking priority, 1.0-5.0. Omit to auto-infer from content (critical facts like health/credentials score 5.0, identity 4.0, default 3.0). Used to prioritize L1 wake-up context.",
+                },
             },
             "required": ["wing", "room", "content"],
         },
