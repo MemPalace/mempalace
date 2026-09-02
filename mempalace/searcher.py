@@ -1304,13 +1304,14 @@ def _enrich_closet_hits(
     query: str,
     stop_words: frozenset = frozenset(),
 ) -> list:
-    """Hydrate closet-boosted hits and memoise each source/group fetch."""
-    query_terms = set(
-        _tokenize(
-            query,
-            stop_words,
-        )
-    )
+    """Hydrate closet-boosted hits around the hit's own drawer chunk.
+
+    Closet agreement may widen the rendered context, but it must never
+    substitute another drawer's text under the original ``drawer_id``.
+    Source/group fetches are memoised for the search. If the candidate's
+    ``chunk_index`` cannot be resolved exactly and unambiguously, the
+    original direct-drawer text is preserved unchanged.
+    """
     source_cache: dict = {}
 
     for hit in hits:
@@ -1318,29 +1319,18 @@ def _enrich_closet_hits(
             continue
 
         full_source = hit.get("_source_file_full") or ""
-
-        if not full_source:
+        chunk_index = hit.get("_chunk_index")
+        if not full_source or not isinstance(chunk_index, int):
             continue
 
         parent_drawer_id = hit.get("_parent_drawer_id") or None
-        cache_key = (
-            full_source,
-            parent_drawer_id,
-        )
+        cache_key = (full_source, parent_drawer_id)
 
         if cache_key not in source_cache:
             try:
                 source_drawers = drawers_col.get(
-                    where=(
-                        _scoped_source_filter(
-                            full_source,
-                            parent_drawer_id,
-                        )
-                    ),
-                    include=[
-                        "documents",
-                        "metadatas",
-                    ],
+                    where=_scoped_source_filter(full_source, parent_drawer_id),
+                    include=["documents", "metadatas"],
                 )
             except Exception:
                 logger.debug(
@@ -1351,105 +1341,55 @@ def _enrich_closet_hits(
                 source_cache[cache_key] = None
             else:
                 source_cache[cache_key] = (
-                    list(
-                        getattr(
-                            source_drawers,
-                            "documents",
-                            None,
-                        )
-                        or []
-                    ),
-                    list(
-                        getattr(
-                            source_drawers,
-                            "metadatas",
-                            None,
-                        )
-                        or []
-                    ),
+                    list(getattr(source_drawers, "documents", None) or []),
+                    list(getattr(source_drawers, "metadatas", None) or []),
                 )
 
         cached = source_cache[cache_key]
-
         if cached is None:
             continue
 
         docs, metadatas = cached
-
-        if len(docs) <= 1:
-            continue
-
         indexed = []
-
-        for index, (
-            document,
-            metadata,
-        ) in enumerate(
-            zip(
-                docs,
-                metadatas,
-            )
-        ):
-            chunk_index = (
-                metadata.get(
-                    "chunk_index",
-                    index,
-                )
-                if isinstance(
-                    metadata,
-                    dict,
-                )
-                else index
-            )
-
-            if not isinstance(
-                chunk_index,
-                int,
-            ):
-                chunk_index = index
-
-            indexed.append(
-                (
-                    chunk_index,
-                    document or "",
-                )
-            )
+        for index, (document, metadata) in enumerate(zip(docs, metadatas)):
+            metadata = metadata if isinstance(metadata, dict) else {}
+            candidate_index = metadata.get("chunk_index", index)
+            if not isinstance(candidate_index, int):
+                candidate_index = index
+            indexed.append((candidate_index, document or ""))
 
         indexed.sort(key=lambda pair: pair[0])
-        ordered_docs = [document for _, document in indexed]
+        positions = [
+            position
+            for position, (candidate_index, _) in enumerate(indexed)
+            if candidate_index == chunk_index
+        ]
+        if len(positions) != 1:
+            continue
 
-        best_index = 0
-        best_score = -1
+        matched_position = positions[0]
+        start = max(0, matched_position - 1)
+        end = min(len(indexed), matched_position + 2)
+        expanded = "\n\n".join(document for _, document in indexed[start:end])
 
-        for index, document in enumerate(ordered_docs):
-            lowered = document.lower()
-            score = sum(1 for term in query_terms if term in lowered)
-
-            if score > best_score:
-                best_score = score
-                best_index = index
-
-        start = max(
-            0,
-            best_index - 1,
-        )
-        end = min(
-            len(ordered_docs),
-            best_index + 2,
-        )
-        expanded = "\n\n".join(ordered_docs[start:end])
+        original_text = hit.get("text", "") or ""
+        if original_text and original_text not in expanded:
+            logger.debug(
+                "Closet enrichment provenance mismatch for %s chunk %s; keeping raw hit",
+                full_source,
+                chunk_index,
+            )
+            continue
 
         if len(expanded) > _MAX_HYDRATION_CHARS:
             expanded = expanded[:_MAX_HYDRATION_CHARS] + (
-                f"\n\n[...truncated. "
-                f"{len(ordered_docs)} total drawers. "
-                "Use mempalace_get_drawer "
-                "for full content.]"
+                f"\n\n[...truncated. {len(indexed)} total drawers. "
+                "Use mempalace_get_drawer for full content.]"
             )
 
         hit["text"] = expanded
-        hit["drawer_index"] = best_index
-        hit["total_drawers"] = len(ordered_docs)
+        hit["drawer_index"] = chunk_index
+        hit["total_drawers"] = len(indexed)
 
     return hits
 
@@ -1915,11 +1855,11 @@ def _backend_capabilities(col) -> frozenset:
 
 
 def _closet_boosts(closets_col, *, query: str, n_results: int, where: dict) -> dict:
-    """Best-per-source closet hits used as a rank boost, never a gate.
+    """Best-per-drawer closet hits used as a rank boost, never a gate.
 
-    sqlite_exact (and any lexical backend) uses FTS instead of a second
-    exact-cosine scan over the closet collection — closets are pointer
-    lines, so BM25 is the better signal anyway.
+    A closet document names the drawers it supports through ``→drawer_id``
+    pointers. Boost only those exact drawer ids; sharing ``source_file`` is
+    not evidence that an unrelated sibling drawer matched the closet (#2377).
     """
     boosts: dict = {}
     n_hits = max(1, n_results * 2)
@@ -1927,11 +1867,10 @@ def _closet_boosts(closets_col, *, query: str, n_results: int, where: dict) -> d
         result = closets_col.lexical_search(query=query, n_results=n_hits, where=where or None)
         hits = getattr(result, "hits", None) or []
         for rank, hit in enumerate(hits):
-            meta = hit.metadata or {}
-            source = meta.get("source_file", "")
-            if source and source not in boosts:
-                preview = (hit.document or "")[:200]
-                boosts[source] = (rank, 0.0, preview)
+            preview = (hit.document or "")[:200]
+            for drawer_id in _extract_drawer_ids_from_closet(hit.document or ""):
+                if drawer_id not in boosts:
+                    boosts[drawer_id] = (rank, 0.0, preview)
         return boosts
 
     ckwargs = {
@@ -1942,17 +1881,17 @@ def _closet_boosts(closets_col, *, query: str, n_results: int, where: dict) -> d
     if where:
         ckwargs["where"] = where
     closet_results = closets_col.query(**ckwargs)
-    for rank, (cdoc, cmeta, cdist) in enumerate(
+    for rank, (cdoc, _cmeta, cdist) in enumerate(
         zip(
             _first_or_empty(closet_results, "documents"),
             _first_or_empty(closet_results, "metadatas"),
             _first_or_empty(closet_results, "distances"),
         )
     ):
-        cmeta = cmeta or {}
-        source = cmeta.get("source_file", "")
-        if source and source not in boosts:
-            boosts[source] = (rank, cdist, (cdoc or "")[:200])
+        preview = (cdoc or "")[:200]
+        for drawer_id in _extract_drawer_ids_from_closet(cdoc or ""):
+            if drawer_id not in boosts:
+                boosts[drawer_id] = (rank, cdist, preview)
     return boosts
 
 
@@ -2084,10 +2023,10 @@ def search_memories(
         return _search_error_result(f"Search error: {e}")
 
     # Gather closet hits (best-per-source) to build a boost lookup.
-    closet_boost_by_source: dict = {}  # source_file -> (rank, closet_dist, preview)
+    closet_boost_by_drawer: dict = {}  # drawer_id -> (rank, closet_dist, preview)
     try:
         closets_col = get_closets_collection(palace_path, create=False)
-        closet_boost_by_source = _closet_boosts(
+        closet_boost_by_drawer = _closet_boosts(
             closets_col, query=query, n_results=n_results, where=where
         )
     except Exception:
@@ -2119,8 +2058,8 @@ def search_memories(
         boost = 0.0
         matched_via = "drawer"
         closet_preview = None
-        if source in closet_boost_by_source:
-            c_rank, c_dist, c_preview = closet_boost_by_source[source]
+        if stored_drawer_id in closet_boost_by_drawer:
+            c_rank, c_dist, c_preview = closet_boost_by_drawer[stored_drawer_id]
             if c_dist <= CLOSET_DISTANCE_CAP and c_rank < len(CLOSET_RANK_BOOSTS):
                 boost = CLOSET_RANK_BOOSTS[c_rank]
                 matched_via = "drawer+closet"
