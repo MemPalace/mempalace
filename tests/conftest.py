@@ -142,14 +142,49 @@ def _stable_embedding_function_for_tests(request, monkeypatch):
     yield
 
 
+def _reset_loaded_mcp_writer_state(mcp_server) -> None:
+    """Release process-global MCP writer state between tests.
+
+    The atexit-registration flag is deliberately preserved. Its callback is
+    registered for the lifetime of the Python process, so resetting the flag
+    would allow later writer acquisitions to register duplicate callbacks.
+    """
+    release_writer_lock = getattr(
+        mcp_server,
+        "_release_mcp_writer_lock",
+        None,
+    )
+    try:
+        if callable(release_writer_lock):
+            release_writer_lock()
+    finally:
+        # Normalize status even when the prior test left a failed/read-only
+        # attempt rather than an acquired context manager.
+        for name, value in (
+            ("_MCP_WRITER_LOCK_CM", None),
+            ("_MCP_WRITER_READ_ONLY", False),
+            ("_MCP_WRITER_LOCK_FAILED", False),
+            ("_MCP_WRITER_LOCK_ERROR", ""),
+        ):
+            if hasattr(mcp_server, name):
+                setattr(mcp_server, name, value)
+
+
 @pytest.fixture(autouse=True)
-def _reset_mcp_cache():
+def _reset_mcp_cache(monkeypatch):
     """Reset cached MCP state between tests without importing mcp_server.
 
-    If mempalace.mcp_server is already imported, close/clear its KG cache and
-    Chroma client cache. If it has not been imported, leave it unloaded so
-    fork/spawn-based tests do not inherit extra Chroma/SQLite state.
+    If mempalace.mcp_server is already imported, release its writer lease,
+    reset writer-status globals, and close/clear its KG and storage caches. If
+    it has not been imported, leave it unloaded so fork/spawn-based tests do
+    not inherit extra Chroma/SQLite state.
+
+    ``monkeypatch`` is an intentional ordering dependency. This fixture must
+    tear down before monkeypatch restores module globals; otherwise a writer
+    context acquired after a test patches ``_MCP_WRITER_LOCK_CM`` can be
+    discarded without its ``__exit__`` method running.
     """
+    del monkeypatch
 
     def _clear_cache():
         try:
@@ -157,6 +192,7 @@ def _reset_mcp_cache():
 
             mcp_server = sys.modules.get("mempalace.mcp_server")
             if mcp_server is not None:
+                _reset_loaded_mcp_writer_state(mcp_server)
                 for kg in list(getattr(mcp_server, "_kg_by_path", {}).values()):
                     close = getattr(kg, "close", None)
                     if close is not None:
