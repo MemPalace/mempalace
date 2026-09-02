@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 from mempalace.config import MempalaceConfig
+from mempalace.normalize import _codex_event_turn
 from mempalace.write_routing import (
     ResolvedWriteRoutingPolicy,
     WriteRoutingDecision,
@@ -178,14 +179,15 @@ def _count_human_messages(transcript_path: str) -> int:
                             if "<command-message>" in text:
                                 continue
                         count += 1
-                    # Also handle Codex CLI transcript format
-                    # {"type": "event_msg", "payload": {"type": "user_message", "message": "..."}}
-                    elif entry.get("type") == "event_msg":
-                        payload = entry.get("payload", {})
-                        if isinstance(payload, dict) and payload.get("type") == "user_message":
-                            msg_text = payload.get("message", "")
-                            if isinstance(msg_text, str) and "<command-message>" not in msg_text:
-                                count += 1
+                    # Codex CLI v1 user_message and v2 item_completed records.
+                    else:
+                        turn = _codex_event_turn(entry)
+                        if (
+                            turn is not None
+                            and turn[0] == "user"
+                            and "<command-message>" not in turn[1]
+                        ):
+                            count += 1
                 except (json.JSONDecodeError, AttributeError):
                     pass
     except OSError:
@@ -910,14 +912,13 @@ def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUN
                         if "<command-message>" in content or "<system-reminder>" in content:
                             continue
                         messages.append(content.strip()[:200])
-                    # Codex CLI format
-                    elif entry.get("type") == "event_msg":
-                        payload = entry.get("payload", {})
-                        if isinstance(payload, dict) and payload.get("type") == "user_message":
-                            text = payload.get("message", "")
-                            if isinstance(text, str) and text.strip():
-                                if "<command-message>" not in text:
-                                    messages.append(text.strip()[:200])
+                    # Codex CLI v1 user_message and v2 item_completed records.
+                    else:
+                        turn = _codex_event_turn(entry)
+                        if turn is not None and turn[0] == "user":
+                            text = turn[1]
+                            if "<command-message>" not in text and "<system-reminder>" not in text:
+                                messages.append(text[:200])
                 except (json.JSONDecodeError, AttributeError):
                     pass
     except OSError:
@@ -1185,15 +1186,14 @@ def _save_diary_direct(
     return {"count": 0}
 
 
-def _ingest_transcript(transcript_path: str) -> bool:
+def _ingest_transcript(transcript_path: str) -> Optional[bool]:
     """Mine a Claude Code session transcript into the palace as a conversation.
 
-    Returns True when no ingest work is left pending for this transcript —
-    the mine was dispatched (spawned, already in flight, or handed to the
-    daemon), or ingest is deliberately off (``hooks.mine_transcript``
-    false, nothing to mine). Returns False when work exists but could not
-    be dispatched (blocked routing, spawn failure), so the caller keeps its
-    throttling marker and retries at the next fire (#2403 defect 4).
+    Returns True when the mine was dispatched (spawned, already in flight,
+    or handed to the daemon), False when work exists but could not be
+    dispatched, and None when transcript mining is deliberately disabled.
+    The distinct disabled status prevents a failed diary checkpoint from
+    being acknowledged merely because there was no transcript work to do.
     """
     path = _validate_transcript_path(transcript_path)
     if path is None:
@@ -1208,9 +1208,9 @@ def _ingest_transcript(transcript_path: str) -> bool:
         # Also validates that config loads at all.
         if not MempalaceConfig().hooks_mine_transcript:
             _log("Transcript ingest skipped (hooks.mine_transcript is false)")
-            return True
+            return None
     except Exception:
-        return True
+        return None
 
     routing = _current_hook_write_routing()
     if routing.blocked:
@@ -1521,7 +1521,7 @@ def hook_stop(data: dict, harness: str):
                         toast=toast,
                         agent_name=_diary_agent_for_harness(harness),
                     )
-                    ingest_dispatched = _ingest_transcript(transcript_path)
+                    ingest_dispatched = _ingest_transcript(transcript_path) is True
                 _maybe_auto_ingest()
                 # Advance the save marker when the diary checkpoint landed OR
                 # the transcript ingest is in flight. Gating it on the diary

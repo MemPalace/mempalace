@@ -226,6 +226,35 @@ def test_count_malformed_json_lines(tmp_path):
     assert _count_human_messages(str(transcript)) == 1
 
 
+def _codex_item_completed(item_type, text, *, content_type="text"):
+    return {
+        "type": "event_msg",
+        "payload": {
+            "type": "item_completed",
+            "item": {
+                "type": item_type,
+                "content": [{"type": content_type, "text": text}],
+            },
+        },
+    }
+
+
+def test_count_human_messages_supports_codex_item_completed(tmp_path):
+    transcript = tmp_path / "codex.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            _codex_item_completed("UserMessage", "first prompt"),
+            _codex_item_completed("AgentMessage", "answer", content_type="Text"),
+            _codex_item_completed("Reasoning", "internal"),
+            _codex_item_completed("UserMessage", "<command-message>status</command-message>"),
+            _codex_item_completed("UserMessage", "second prompt"),
+        ],
+    )
+
+    assert _count_human_messages(str(transcript)) == 2
+
+
 # --- _extract_recent_messages ---
 
 
@@ -258,6 +287,22 @@ def test_extract_recent_messages_skips_commands(tmp_path):
 
 def test_extract_recent_messages_missing_file():
     assert _extract_recent_messages("/nonexistent.jsonl") == []
+
+
+def test_extract_recent_messages_supports_codex_item_completed(tmp_path):
+    transcript = tmp_path / "codex.jsonl"
+    user = _codex_item_completed("UserMessage", "part one")
+    user["payload"]["item"]["content"].append({"type": "text", "text": "part two"})
+    _write_transcript(
+        transcript,
+        [
+            user,
+            _codex_item_completed("AgentMessage", "answer", content_type="Text"),
+            _codex_item_completed("CommandExecution", "tool output"),
+        ],
+    )
+
+    assert _extract_recent_messages(str(transcript)) == ["part one\npart two"]
 
 
 # --- hook_stop ---
@@ -2504,7 +2549,8 @@ def test_ingest_transcript_skipped_when_mine_transcript_false(tmp_path):
             with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
                 from mempalace.hooks_cli import _ingest_transcript
 
-                _ingest_transcript(str(transcript))
+                result = _ingest_transcript(str(transcript))
+    assert result is None
     mock_popen.assert_not_called()
 
 
@@ -2549,6 +2595,37 @@ def test_stop_hook_checkpoints_without_mining(tmp_path):
     mock_save.assert_called_once()
     mock_popen.assert_not_called()
     assert "4 memories" in result["systemMessage"]
+
+
+def test_stop_hook_retries_failed_checkpoint_when_mining_disabled(tmp_path):
+    """Disabled ingestion must not acknowledge a diary write that never landed."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    data = {
+        "session_id": "test",
+        "stop_hook_active": False,
+        "transcript_path": str(transcript),
+    }
+
+    with (
+        patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls,
+        patch("mempalace.hooks_cli._save_diary_direct", return_value={"count": 0}) as mock_save,
+        patch("mempalace.hooks_cli._maybe_auto_ingest"),
+        patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen,
+    ):
+        mock_cfg_cls.return_value.hooks_auto_save = True
+        mock_cfg_cls.return_value.hook_silent_save = True
+        mock_cfg_cls.return_value.hook_desktop_toast = False
+        mock_cfg_cls.return_value.hooks_mine_transcript = False
+        assert _capture_hook_output(hook_stop, data, state_dir=tmp_path) == {}
+        assert _capture_hook_output(hook_stop, data, state_dir=tmp_path) == {}
+
+    assert mock_save.call_count == 2
+    mock_popen.assert_not_called()
+    assert not (tmp_path / "test_last_save").exists()
 
 
 def test_precompact_checkpoints_when_mining_disabled(tmp_path):

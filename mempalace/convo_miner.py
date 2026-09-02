@@ -827,6 +827,14 @@ def _file_chunks_locked(
                 meta["content_hash"] = content_hash
             to_upsert.append((drawer_id, chunk["content"], meta))
 
+        # A shrink/rewrite needs a two-phase completion marker. New/changed
+        # rows are first written without the current source mtime; unchanged
+        # rows keep their old mtime. Only after orphan cleanup succeeds do we
+        # stamp the whole target set current. A transient delete failure then
+        # remains visibly incomplete and retries even if the source never
+        # changes again.
+        stale_ids = [drawer_id for drawer_id in existing if drawer_id not in new_ids]
+
         # Batch into bounded requests so large transcripts keep most of the
         # embedding speedup without one huge Chroma/SQLite request.
         #
@@ -839,7 +847,14 @@ def _file_chunks_locked(
             batch = to_upsert[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
             batch_ids = [drawer_id for drawer_id, _, _ in batch]
             batch_docs = [content for _, content, _ in batch]
-            batch_metas = [meta for _, _, meta in batch]
+            if stale_ids:
+                batch_metas = []
+                for _, _, final_meta in batch:
+                    incomplete_meta = dict(final_meta)
+                    incomplete_meta.pop("source_mtime", None)
+                    batch_metas.append(incomplete_meta)
+            else:
+                batch_metas = [meta for _, _, meta in batch]
             try:
                 with _access_write(access_gate):
                     assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
@@ -852,22 +867,22 @@ def _file_chunks_locked(
             except Exception as e:
                 if "already exists" not in str(e).lower():
                     raise
-        for batch_start in range(0, len(to_touch), DRAWER_UPSERT_BATCH_SIZE):
-            batch = to_touch[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
-            with _access_write(access_gate):
-                collection.update(
-                    ids=[drawer_id for drawer_id, _ in batch],
-                    metadatas=[meta for _, meta in batch],
-                )
+        if not stale_ids:
+            for batch_start in range(0, len(to_touch), DRAWER_UPSERT_BATCH_SIZE):
+                batch = to_touch[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+                with _access_write(access_gate):
+                    collection.update(
+                        ids=[drawer_id for drawer_id, _ in batch],
+                        metadatas=[meta for _, meta in batch],
+                    )
 
         # Delete orphaned drawers LAST — ids the current source no longer
         # produces (shrunk/rewritten file, id recipe migration). Deleting
         # them only after the full new set is in place means an interrupted
         # pass never leaves the palace with less than it had; the worst
-        # crash window leaves transient duplicates that the next
-        # content-change mine sweeps. A failed delete is logged, not fatal,
-        # for the same reason.
-        stale_ids = [drawer_id for drawer_id in existing if drawer_id not in new_ids]
+        # crash window leaves transient duplicates. The current-mtime marker
+        # is deliberately withheld until cleanup succeeds, so the next mine
+        # retries even when the source itself stays unchanged.
         if stale_ids:
             try:
                 with _access_write(access_gate):
@@ -875,11 +890,21 @@ def _file_chunks_locked(
             except Exception:
                 logger.warning(
                     "Failed to delete %d orphaned convo drawers for %s; "
-                    "they remain as duplicates until the next content change",
+                    "leaving the source incomplete so the next mine retries",
                     len(stale_ids),
                     source_file,
                     exc_info=True,
                 )
+                return drawers_added, room_counts_delta, True
+
+            final_metadata = to_touch + [(drawer_id, meta) for drawer_id, _, meta in to_upsert]
+            for batch_start in range(0, len(final_metadata), DRAWER_UPSERT_BATCH_SIZE):
+                batch = final_metadata[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+                with _access_write(access_gate):
+                    collection.update(
+                        ids=[drawer_id for drawer_id, _ in batch],
+                        metadatas=[meta for _, meta in batch],
+                    )
     return drawers_added, room_counts_delta, False
 
 

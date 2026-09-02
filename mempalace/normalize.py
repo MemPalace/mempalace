@@ -370,6 +370,37 @@ def _codex_item_text(item: dict) -> str:
     return "\n".join(parts)
 
 
+def _codex_event_turn(entry: dict) -> Optional[tuple[str, str]]:
+    """Return one conversational Codex event as ``(role, text)``.
+
+    This parser is shared by transcript normalization and Stop-hook message
+    accounting so a Codex wire-format upgrade cannot make mining understand a
+    turn while the hook silently decides that the same session is empty.
+    """
+    if entry.get("type") != "event_msg":
+        return None
+    payload = entry.get("payload")
+    if not isinstance(payload, dict):
+        return None
+
+    payload_type = payload.get("type")
+    if payload_type == "item_completed":
+        item = payload.get("item")
+        if not isinstance(item, dict):
+            return None
+        role = _CODEX_ITEM_ROLES.get(item.get("type"))
+        if role is None:
+            return None
+        text = _codex_item_text(item)
+        return (role, text) if text else None
+
+    role = {"user_message": "user", "agent_message": "assistant"}.get(payload_type)
+    message = payload.get("message")
+    if role is None or not isinstance(message, str) or not message.strip():
+        return None
+    return role, message.strip()
+
+
 def _try_codex_jsonl(content: str) -> Optional[str]:
     """OpenAI Codex CLI sessions (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl).
 
@@ -414,39 +445,9 @@ def _try_codex_jsonl(content: str) -> Optional[str]:
             has_session_meta = True
             continue
 
-        if entry_type != "event_msg":
-            # Covers response_item and compacted, among others.
-            continue
-
-        payload = entry.get("payload", {})
-        if not isinstance(payload, dict):
-            continue
-
-        payload_type = payload.get("type", "")
-
-        if payload_type == "item_completed":
-            item = payload.get("item")
-            if not isinstance(item, dict):
-                continue
-            role = _CODEX_ITEM_ROLES.get(item.get("type"))
-            if role is None:
-                continue
-            text = _codex_item_text(item)
-            if text:
-                messages.append((role, text))
-            continue
-
-        msg = payload.get("message")
-        if not isinstance(msg, str):
-            continue
-        text = msg.strip()
-        if not text:
-            continue
-
-        if payload_type == "user_message":
-            messages.append(("user", text))
-        elif payload_type == "agent_message":
-            messages.append(("assistant", text))
+        turn = _codex_event_turn(entry)
+        if turn is not None:
+            messages.append(turn)
 
     if len(messages) >= 2 and has_session_meta:
         return _messages_to_transcript(messages)

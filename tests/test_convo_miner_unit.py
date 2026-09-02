@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import os
 import sys
 import threading
 
@@ -956,6 +957,7 @@ class TestFileChunksLocked:
                 self.upserted_ids = []
                 self.updated_ids = []
                 self.deleted_ids = []
+                self.fail_delete = False
 
             def get(self, where=None, limit=None, offset=0, include=None, ids=None, **kwargs):
                 if ids is not None:
@@ -976,6 +978,8 @@ class TestFileChunksLocked:
                 }
 
             def delete(self, ids=None, **kwargs):
+                if self.fail_delete:
+                    raise RuntimeError("simulated orphan cleanup failure")
                 self.deleted_ids.extend(ids or [])
                 for drawer_id in ids or []:
                     self.records.pop(drawer_id, None)
@@ -992,6 +996,7 @@ class TestFileChunksLocked:
 
         source = tmp_path / "chat.txt"
         source.write_text("content\n", encoding="utf-8")
+        first_mtime = source.stat().st_mtime
         col = FakeCol()
         monkeypatch.setattr(
             convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
@@ -1008,6 +1013,7 @@ class TestFileChunksLocked:
 
         # The transcript grows by two exchanges; the first three are untouched.
         source.write_text("content\nmore\n", encoding="utf-8")
+        os.utime(source, (first_mtime + 10, first_mtime + 10))
         col.upserted_ids.clear()
         chunks_v2 = chunks_v1 + [
             {"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3, 5)
@@ -1030,8 +1036,22 @@ class TestFileChunksLocked:
         assert file_already_mined(col, str(source), check_mtime=True, extract_mode="exchange")
 
         # A rewrite that drops the tail (e.g. /compact) orphans the extra
-        # ids; they are deleted, but only after the new set is written.
+        # ids. A transient cleanup failure must leave the target set visibly
+        # incomplete so the unchanged source retries on the next mine.
         source.write_text("rewritten\n", encoding="utf-8")
+        os.utime(source, (first_mtime + 20, first_mtime + 20))
+        col.fail_delete = True
+        _, _, skipped = _file_chunks_locked(
+            col, str(source), chunks_v1, "wing", "general", "agent", "exchange"
+        )
+        assert skipped is True
+        assert not file_already_mined(
+            col, str(source), check_mtime=True, extract_mode="exchange"
+        ), "failed orphan cleanup made the rewritten source look complete"
+
+        # The source mtime is unchanged, but the incomplete marker forces a
+        # retry; once cleanup succeeds the target rows are finalized current.
+        col.fail_delete = False
         drawers, _, skipped = _file_chunks_locked(
             col, str(source), chunks_v1, "wing", "general", "agent", "exchange"
         )
