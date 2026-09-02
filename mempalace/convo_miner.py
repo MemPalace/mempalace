@@ -16,6 +16,7 @@ import json
 import hashlib
 import logging
 import stat
+import threading
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -45,6 +46,37 @@ from .palace import (
 )
 
 logger = logging.getLogger("mempalace_mcp")
+_mine_output_state = threading.local()
+
+
+@contextlib.contextmanager
+def mine_output_streams(stdout, stderr):
+    """Route convo-miner progress for this thread without replacing sys streams."""
+    missing = object()
+    previous_stdout = getattr(_mine_output_state, "stdout", missing)
+    previous_stderr = getattr(_mine_output_state, "stderr", missing)
+    _mine_output_state.stdout = stdout
+    _mine_output_state.stderr = stderr
+    try:
+        yield
+    finally:
+        if previous_stdout is missing:
+            del _mine_output_state.stdout
+        else:
+            _mine_output_state.stdout = previous_stdout
+        if previous_stderr is missing:
+            del _mine_output_state.stderr
+        else:
+            _mine_output_state.stderr = previous_stderr
+
+
+def _mine_print(*args, **kwargs):
+    target = kwargs.get("file")
+    if target is sys.stderr:
+        kwargs["file"] = getattr(_mine_output_state, "stderr", sys.stderr)
+    elif target is None:
+        kwargs["file"] = getattr(_mine_output_state, "stdout", sys.stdout)
+    print(*args, **kwargs)
 
 
 def _access_read(access_gate):
@@ -566,7 +598,7 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
                 if filepath.is_symlink():
                     rel = filepath.relative_to(convo_path).as_posix()
                     try:
-                        print(f"  SKIP: {rel} (symlink)", file=sys.stderr)
+                        _mine_print(f"  SKIP: {rel} (symlink)", file=sys.stderr)
                     except OSError:
                         pass
                     continue
@@ -581,14 +613,14 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
                     # before any reader touches them — see the matching
                     # gate in ``miner.scan_project``.
                     if not stat.S_ISREG(file_stat.st_mode):
-                        print(
+                        _mine_print(
                             f"  SKIP: {filepath.name} (not a regular file)",
                             file=sys.stderr,
                         )
                         continue
                     file_size = file_stat.st_size
                     if file_size > MAX_FILE_SIZE:
-                        print(
+                        _mine_print(
                             f"  SKIP: {filepath.name} ({file_size / (1024 * 1024):.1f} MB)"
                             f" exceeds {MAX_FILE_SIZE // (1024 * 1024)} MB limit",
                             file=sys.stderr,
@@ -598,7 +630,7 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
                     # Prefer ``exc.strerror`` so the path isn't duplicated in
                     # the output (see the matching comment in
                     # ``miner.scan_project``).
-                    print(
+                    _mine_print(
                         f"  SKIP: {filepath.name} (stat error: {exc.strerror or exc})",
                         file=sys.stderr,
                     )
@@ -707,7 +739,7 @@ def _file_chunks_locked(
             with _access_read(access_gate):
                 existing = _source_file_existing(collection, source_file, extract_mode)
         except Exception as exc:
-            print(
+            _mine_print(
                 f"  ! [skip] existing-drawer snapshot failed for {source_file!r} "
                 f"({exc!r}); leaving existing drawers untouched, will retry "
                 f"on the next mine",
@@ -1035,7 +1067,7 @@ def _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=None
 
         compute_hallways_for_wing(wing, col=collection, config=config)
     except Exception as exc:
-        print(f"  (hallways skipped: {exc})")
+        _mine_print(f"  (hallways skipped: {exc})")
 
 
 def _normalize_convo_conversations(
@@ -1145,17 +1177,17 @@ def _mine_convos_impl(
 
     files = scan_convos(convo_dir, include_subagents=include_subagents)
 
-    print(f"\n{'=' * 55}")
-    print("  MemPalace Mine -- Conversations")
-    print(f"{'=' * 55}")
-    print(f"  Wing:    {wing}")
-    print(f"  Source:  {convo_path}")
+    _mine_print(f"\n{'=' * 55}")
+    _mine_print("  MemPalace Mine -- Conversations")
+    _mine_print(f"{'=' * 55}")
+    _mine_print(f"  Wing:    {wing}")
+    _mine_print(f"  Source:  {convo_path}")
     limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
-    print(f"  Files:   {len(files)}{limit_suffix}")
-    print(f"  Palace:  {palace_path}")
+    _mine_print(f"  Files:   {len(files)}{limit_suffix}")
+    _mine_print(f"  Palace:  {palace_path}")
     if dry_run:
-        print("  DRY RUN -- nothing will be filed")
-    print(f"{'-' * 55}\n")
+        _mine_print("  DRY RUN -- nothing will be filed")
+    _mine_print(f"{'-' * 55}\n")
 
     collection = _open_convo_collection(
         palace_path,
@@ -1247,7 +1279,7 @@ def _mine_convos_impl(
                     access_gate=access_gate,
                 )
             dup_source = duplicates[0][1]
-            print(
+            _mine_print(
                 f"  = [{i:4}/{len(files)}] {filepath.name[:50]:50} "
                 f"duplicate of {Path(dup_source).name}"
             )
@@ -1294,9 +1326,11 @@ def _mine_convos_impl(
 
                 type_counts = Counter(c.get("memory_type", "general") for c in chunks)
                 types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
-                print(f"    [DRY RUN] {filepath.name} -> {len(chunks)} memories ({types_str})")
+                _mine_print(
+                    f"    [DRY RUN] {filepath.name} -> {len(chunks)} memories ({types_str})"
+                )
             else:
-                print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
+                _mine_print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
             total_drawers += len(chunks)
             # Track room counts
             if extract_mode == "general":
@@ -1336,7 +1370,7 @@ def _mine_convos_impl(
             mined_content_hashes[(wing, h)] = source_file
         total_drawers += drawers_added
         files_mined += 1
-        print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
+        _mine_print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
         if limit > 0 and files_mined >= limit:
             break
 
@@ -1348,22 +1382,24 @@ def _mine_convos_impl(
             _compute_hallways_for_wing_safe(wing, collection, total_drawers, config=palace_config)
             _validate_palace_fts5_after_mine(palace_path)
 
-    print(f"\n{'=' * 55}")
-    print("  Done.")
-    print(f"  Files processed: {files_processed - files_skipped}")
-    print(f"  Files skipped (already filed): {files_skipped}")
-    print(f"  Drawers filed: {total_drawers}")
+    _mine_print(f"\n{'=' * 55}")
+    _mine_print("  Done.")
+    _mine_print(f"  Files processed: {files_processed - files_skipped}")
+    _mine_print(f"  Files skipped (already filed): {files_skipped}")
+    _mine_print(f"  Drawers filed: {total_drawers}")
     if room_counts:
-        print("\n  By room:")
+        _mine_print("\n  By room:")
         for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
-            print(f"    {room:20} {count} files")
-    print('\n  Next: mempalace search "what you\'re looking for"')
-    print(f"{'=' * 55}\n")
+            _mine_print(f"    {room:20} {count} files")
+    _mine_print('\n  Next: mempalace search "what you\'re looking for"')
+    _mine_print(f"{'=' * 55}\n")
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python convo_miner.py <convo_dir> [--palace PATH] [--limit N] [--dry-run]")
+        _mine_print(
+            "Usage: python convo_miner.py <convo_dir> [--palace PATH] [--limit N] [--dry-run]"
+        )
         sys.exit(1)
     from .config import MempalaceConfig
 

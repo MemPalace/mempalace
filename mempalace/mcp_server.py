@@ -3492,6 +3492,8 @@ def tool_mine(
     if not src or not (os.path.isdir(src) or (mode == "convos" and os.path.isfile(src))):
         return {"success": False, "error": f"source not found: {source!r}"}
 
+    http_mine_access_gate = _current_http_mine_access_gate() if mode == "convos" else None
+
     def _run():
         if mode == "convos":
             from .convo_miner import mine_convos
@@ -3504,7 +3506,7 @@ def tool_mine(
                 limit=limit,
                 dry_run=dry_run,
                 extract_mode=extract,
-                access_gate=_current_http_mine_access_gate(),
+                access_gate=http_mine_access_gate,
             )
         if mode == "extract":
             from .format_miner import mine_formats
@@ -3530,7 +3532,25 @@ def tool_mine(
 
     try:
         try:
-            _result, output = _capture_fd_stdout(_run)
+            if http_mine_access_gate is None:
+                _result, output = _capture_fd_stdout(_run)
+            else:
+                # redirect_stdout/dup2 are process-global and would capture
+                # peer request output while this long mine interleaves with
+                # searches. Convo mining has a thread-local progress router,
+                # so the HTTP path can capture only this request's messages.
+                import io
+
+                from .convo_miner import mine_output_streams
+
+                output_buffer = io.StringIO()
+                error_buffer = io.StringIO()
+                with mine_output_streams(output_buffer, error_buffer):
+                    _result = _run()
+                output = output_buffer.getvalue()
+                error_output = error_buffer.getvalue().strip()
+                if error_output:
+                    logger.warning("mempalace_mine: %s", error_output)
         # Order matters: typed handlers precede the bare Exception (mirroring
         # tool_sync) so MineAlreadyRunning / MineValidationError / ValueError
         # don't fall into the generic "mine failed" branch.

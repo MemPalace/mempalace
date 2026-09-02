@@ -1,7 +1,9 @@
 """Unit tests for convo_miner pure functions (no chromadb needed)."""
 
 import contextlib
+import io
 import sys
+import threading
 
 import pytest
 
@@ -11,10 +13,30 @@ from mempalace.convo_miner import (
     _extract_authored_at,
     _file_chunks_locked,
     _source_file_delete_ids,
+    _mine_print,
     chunk_exchanges,
     detect_convo_room,
+    mine_output_streams,
     scan_convos,
 )
+
+
+def test_mine_output_streams_are_thread_local(capsys):
+    output = io.StringIO()
+    errors = io.StringIO()
+
+    with mine_output_streams(output, errors):
+        _mine_print("mine-progress")
+        _mine_print("mine-error", file=sys.stderr)
+        peer = threading.Thread(target=lambda: _mine_print("peer-progress"))
+        peer.start()
+        peer.join(timeout=2)
+
+    captured = capsys.readouterr()
+    assert output.getvalue() == "mine-progress\n"
+    assert errors.getvalue() == "mine-error\n"
+    assert captured.out == "peer-progress\n"
+    assert captured.err == ""
 
 
 class TestChunkExchanges:

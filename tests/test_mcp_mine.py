@@ -187,6 +187,33 @@ def test_interleaved_http_convos_passes_backend_access_gate(monkeypatch, config,
     assert captured.pop() is mcp_server._HTTP_MINE_ACCESS_GATE
 
 
+def test_interleaved_http_convos_avoids_process_global_stdout_capture(
+    monkeypatch, config, tmp_dir, caplog
+):
+    from mempalace import convo_miner, mcp_server
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "convos")
+    os.makedirs(src)
+
+    def fake_mine_convos(**_kwargs):
+        convo_miner._mine_print("mine-progress")
+        convo_miner._mine_print("mine-warning", file=sys.stderr)
+
+    def forbidden_capture(_fn):
+        raise AssertionError("interleaved HTTP mine used process-global stdout capture")
+
+    monkeypatch.setattr(convo_miner, "mine_convos", fake_mine_convos)
+    monkeypatch.setattr(mcp_server, "_capture_fd_stdout", forbidden_capture)
+
+    with mcp_server._http_interleaved_mine_scope():
+        result = mcp_server.tool_mine(source=src, mode="convos")
+
+    assert result["success"] is True
+    assert result["output"] == "mine-progress\n"
+    assert "mine-warning" in caplog.text
+
+
 def test_projects_mode_still_rejects_a_file(monkeypatch, config, tmp_dir):
     """Only convos gained the single-file form; projects still needs a tree.
 
