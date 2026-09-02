@@ -965,7 +965,6 @@ def _extract_themes(messages: list[str], max_themes: int = 3) -> list[str]:
 # continuity actually reads back. Shares the CLI forwarder's kill switch.
 _HUB_FORWARD_ENV = "MEMPALACE_HUB_FORWARD"
 _HUB_DIARY_BUDGET_S = 0.35
-_HUB_HEALTH_TIMEOUT_S = 0.05
 
 
 def _forward_diary_to_hub(
@@ -985,8 +984,6 @@ def _forward_diary_to_hub(
     the Hub's writer lease.
     """
     import urllib.error
-    import urllib.request
-
     from . import server_registry
 
     if os.environ.get(_HUB_FORWARD_ENV, "").strip().lower() in {"0", "false", "no", "off"}:
@@ -1002,19 +999,6 @@ def _forward_diary_to_hub(
     except Exception as exc:
         _log(f"Hub discovery failed ({exc}); writing diary checkpoint directly")
         return False
-
-    try:
-        health_remaining = deadline - time.monotonic()
-        if health_remaining <= 0:
-            _log("Hub diary checkpoint skipped: hook forwarding budget exhausted")
-            return None
-        health = urllib.request.Request(f"{base_url}/healthz", headers=headers)
-        health_timeout = min(_HUB_HEALTH_TIMEOUT_S, health_remaining)
-        with urllib.request.urlopen(health, timeout=health_timeout) as resp:
-            if resp.status != 200:
-                return None
-    except (urllib.error.URLError, OSError, ValueError):
-        return None
 
     body = json.dumps(
         {

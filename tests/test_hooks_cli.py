@@ -2739,16 +2739,13 @@ def _hub_patches(stack, tmp_path, mcp_body):
     stack.enter_context(
         patch("mempalace.server_registry.client_base_url", return_value="http://127.0.0.1:8765")
     )
-    mock_health = stack.enter_context(
-        patch("urllib.request.urlopen", return_value=_FakeHubResponse())
-    )
     mock_server_open = stack.enter_context(
         patch(
             "mempalace.server_registry.urlopen_with_server_tokens",
             return_value=_FakeHubResponse(mcp_body),
         )
     )
-    return mock_health, mock_server_open
+    return mock_server_open
 
 
 def test_save_diary_direct_forwards_to_live_hub(tmp_path):
@@ -2763,7 +2760,7 @@ def test_save_diary_direct_forwards_to_live_hub(tmp_path):
     ).encode("utf-8")
 
     with contextlib.ExitStack() as stack:
-        mock_health, mock_server_open = _hub_patches(stack, tmp_path, body)
+        mock_server_open = _hub_patches(stack, tmp_path, body)
         mock_tool = stack.enter_context(patch("mempalace.mcp_server.tool_diary_write"))
         result = _save_diary_direct(
             str(transcript), "sess1", wing="wing_project", agent_name="claude"
@@ -2771,7 +2768,6 @@ def test_save_diary_direct_forwards_to_live_hub(tmp_path):
 
     assert result["count"] == 3
     mock_tool.assert_not_called()
-    mock_health.assert_called_once()
     mock_server_open.assert_called_once()
     posted = json.loads(mock_server_open.call_args.kwargs["data"].decode("utf-8"))
     assert posted["params"]["name"] == "mempalace_diary_write"
@@ -2779,7 +2775,6 @@ def test_save_diary_direct_forwards_to_live_hub(tmp_path):
     assert posted["params"]["arguments"]["wing"] == "wing_project"
     assert posted["params"]["arguments"]["idempotency_key"].startswith("hook-checkpoint:")
     assert mock_server_open.call_args.args[1] == "http://127.0.0.1:8765/mcp"
-    assert mock_health.call_args.kwargs["timeout"] <= 0.05
     assert mock_server_open.call_args.kwargs["timeout"] <= 0.35
 
 
@@ -2812,7 +2807,7 @@ def test_forward_diary_hard_stops_a_drip_feed_at_the_absolute_budget(tmp_path):
     slow_response = _SlowHubResponse(body)
 
     with contextlib.ExitStack() as stack:
-        _, mock_server_open = _hub_patches(stack, tmp_path, body)
+        mock_server_open = _hub_patches(stack, tmp_path, body)
         mock_server_open.return_value = slow_response
         stack.enter_context(patch("mempalace.hooks_cli._HUB_DIARY_BUDGET_S", 0.05))
         stack.enter_context(
