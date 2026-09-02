@@ -3128,6 +3128,22 @@ class TestWriteTools:
         assert result["wing"] == "new_wing"
         assert result["room"] == "new_room"
 
+    def test_update_drawer_applies_case_only_wing_and_room_changes(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_get_drawer, tool_update_drawer
+
+        result = tool_update_drawer("drawer_proj_backend_aaa", wing="Project", room="Backend")
+
+        assert result["success"] is True
+        assert result["wing"] == "Project"
+        assert result["room"] == "Backend"
+
+        fetched = tool_get_drawer("drawer_proj_backend_aaa")
+        assert fetched["wing"] == "Project"
+        assert fetched["room"] == "Backend"
+
     def test_update_drawer_content_purges_matching_closets(
         self, monkeypatch, config, palace_path, seeded_collection, kg
     ):
