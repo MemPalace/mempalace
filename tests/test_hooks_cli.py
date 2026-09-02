@@ -1898,7 +1898,10 @@ def test_stop_hook_oserror_on_write(tmp_path):
     save_result = {"count": 15, "themes": []}
     with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
         with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result):
-            with patch.object(Path, "write_text", bad_write_text):
+            with (
+                patch.object(Path, "write_text", bad_write_text),
+                patch("mempalace.hooks_cli._discard_pending_checkpoint") as discard,
+            ):
                 result = _capture_hook_output(
                     hook_stop,
                     {
@@ -1909,6 +1912,7 @@ def test_stop_hook_oserror_on_write(tmp_path):
                     state_dir=tmp_path,
                 )
     assert "systemMessage" in result
+    discard.assert_not_called()
 
 
 # --- hook_precompact with MEMPAL_DIR ---
@@ -2939,12 +2943,14 @@ def test_save_diary_direct_writes_in_process_without_a_hub(tmp_path):
                     checkpoint_id="stop:15",
                 )
     assert result["count"] == 3
-    assert retry["count"] == 4
+    assert retry["count"] == 3
     assert mock_tool.call_count == 2
     first_key = mock_tool.call_args_list[0].kwargs["idempotency_key"]
     retry_key = mock_tool.call_args_list[1].kwargs["idempotency_key"]
     assert first_key.startswith("hook-checkpoint:")
     assert retry_key == first_key
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        hooks_cli_mod._discard_pending_checkpoint("sess1", "stop:15")
 
 
 def test_failed_checkpoint_retry_reuses_persisted_payload(tmp_path):
@@ -2990,6 +2996,9 @@ def test_failed_checkpoint_retry_reuses_persisted_payload(tmp_path):
         mock_tool.call_args_list[0].kwargs["idempotency_key"]
         == mock_tool.call_args_list[1].kwargs["idempotency_key"]
     )
+    assert len(list(tmp_path.glob("pending_checkpoint_*.json"))) == 1
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        hooks_cli_mod._discard_pending_checkpoint("sess1", "stop:15")
     assert list(tmp_path.glob("pending_checkpoint_*.json")) == []
 
 

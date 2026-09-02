@@ -2937,8 +2937,8 @@ class TestWriteTools:
     ):
         _patch_mcp_server(monkeypatch, config, kg)
         collection.add(
-            ids=["hidden", "published", "marker", "ordinary"],
-            documents=["hidden", "published", "[commit]", "ordinary"],
+            ids=["hidden", "old", "published", "marker", "ordinary"],
+            documents=["hidden", "old", "published", "[commit]", "ordinary"],
             metadatas=[
                 {
                     "wing": "w",
@@ -2949,8 +2949,16 @@ class TestWriteTools:
                 {
                     "wing": "w",
                     "room": "r",
+                    "logical_drawer_id": "logical-published",
+                    "filed_at": "2026-09-01T00:00:00",
+                },
+                {
+                    "wing": "w",
+                    "room": "r",
                     "mine_staged": True,
                     "mine_generation_token": "published-token",
+                    "logical_drawer_id": "logical-published",
+                    "filed_at": "2026-09-02T00:00:00",
                 },
                 {
                     "wing": "w",
@@ -2963,12 +2971,16 @@ class TestWriteTools:
             ],
         )
 
-        from mempalace.mcp_server import tool_list_drawers
+        from mempalace.mcp_server import tool_get_drawer, tool_list_drawers
 
         result = tool_list_drawers(wing="w", room="r", limit=20)
         ids = {drawer["drawer_id"] for drawer in result["drawers"]}
-        assert ids == {"published", "ordinary"}
+        assert ids == {"logical-published", "ordinary"}
         assert result["total"] == 2
+
+        fetched = tool_get_drawer("logical-published")
+        assert fetched["drawer_id"] == "logical-published"
+        assert fetched["content"] == "published"
 
     def test_list_drawers_with_wing_filter(
         self, monkeypatch, config, palace_path, seeded_collection, kg

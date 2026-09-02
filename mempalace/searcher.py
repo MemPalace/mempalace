@@ -88,7 +88,12 @@ def _result_drawer_id(meta, stored_drawer_id):
     Kept in sync with ``mcp_server._PARENT_ID_KEYS``.
     """
     meta = meta or {}
-    return meta.get("parent_drawer_id") or meta.get("parent_entry_id") or stored_drawer_id
+    return (
+        meta.get("parent_drawer_id")
+        or meta.get("parent_entry_id")
+        or meta.get("logical_drawer_id")
+        or stored_drawer_id
+    )
 
 
 def _tokenize(text: str, stop_words: frozenset = frozenset()) -> list:

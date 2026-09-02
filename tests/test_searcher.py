@@ -91,6 +91,7 @@ class TestSearchMemories:
                         "filed_at": "2026-09-02T00:00:00",
                         "mine_staged": True,
                         "mine_generation_token": "generation-token",
+                        "logical_drawer_id": "logical-generation",
                     }
                     for index in range(len(staged_ids))
                 ],
@@ -121,6 +122,7 @@ class TestSearchMemories:
         )
         published = search_memories(staged_text, palace_path, n_results=1)
         assert published["results"][0]["source_path"].startswith("/tmp/staged-")
+        assert published["results"][0]["drawer_id"] == "logical-generation"
 
     def test_wing_filter(self, palace_path, seeded_collection):
         result = search_memories("planning", palace_path, wing="notes")

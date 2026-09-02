@@ -2931,7 +2931,59 @@ def _logical_chunk_group(col, drawer_id: str):
     }
 
 
+def _logical_generation_record(col, drawer_id: str):
+    """Resolve a stable conversation logical id to its visible physical row."""
+    try:
+        result = col.get(
+            where={"logical_drawer_id": drawer_id},
+            include=["documents", "metadatas"],
+        )
+        markers = col.get(
+            where={"mine_commit_marker": True},
+            include=["metadatas"],
+        )
+    except Exception:
+        logger.debug("generation lookup failed for %s", drawer_id, exc_info=True)
+        return None
+    committed = {
+        (meta or {}).get("mine_generation_commit")
+        for meta in (_chroma_field(markers, "metadatas", []) or [])
+        if (meta or {}).get("mine_generation_commit")
+    }
+    rows = []
+    ids = _chroma_field(result, "ids", []) or []
+    docs = _chroma_field(result, "documents", []) or []
+    metas = _chroma_field(result, "metadatas", []) or []
+    for index, physical_id in enumerate(ids):
+        meta = _safe_meta(metas[index] if index < len(metas) else {})
+        if meta.get("mine_staged") is True and meta.get("mine_generation_token") not in committed:
+            continue
+        rows.append(
+            (
+                meta.get("filed_at", ""),
+                physical_id,
+                docs[index] if index < len(docs) else "",
+                meta,
+            )
+        )
+    if not rows:
+        return None
+    _, physical_id, document, metadata = max(rows, key=lambda row: (row[0], row[1]))
+    return {
+        "drawer_id": drawer_id,
+        "ids": [physical_id],
+        "documents": [document or ""],
+        "metadatas": [metadata],
+        "content": document or "",
+        "metadata": metadata,
+        "chunked": False,
+    }
+
+
 def _logical_drawer_record(col, drawer_id: str):
+    generation = _logical_generation_record(col, drawer_id)
+    if generation is not None:
+        return generation
     direct = _single_drawer_record(col, drawer_id)
     if direct is not None:
         return direct
@@ -3005,7 +3057,7 @@ def _page_physical_ids(page: list) -> list:
         if chunk_ids:
             physical_ids.extend(chunk_ids)
         else:
-            physical_ids.append(drawer["drawer_id"])
+            physical_ids.append(drawer.get("_physical_id") or drawer["drawer_id"])
     return physical_ids
 
 
@@ -3016,7 +3068,7 @@ def _apply_drawer_previews(page: list, docs_by_id: dict) -> None:
         if chunk_ids:
             content = "".join(docs_by_id.get(cid, "") for cid in chunk_ids)
         else:
-            content = docs_by_id.get(drawer["drawer_id"], "")
+            content = docs_by_id.get(drawer.get("_physical_id") or drawer["drawer_id"], "")
         drawer["content_preview"] = _content_preview(content)
 
 
@@ -3074,15 +3126,23 @@ def _collapse_drawer_rows(ids, documents, metadatas):
     grouped_ids = set(groups)
     drawers = []
 
-    for drawer_id, doc, meta in singles:
-        # If both a legacy logical row and chunks exist, display one logical row.
-        if drawer_id in grouped_ids:
-            continue
+    chosen_singles = {}
+    for physical_id, doc, meta in singles:
+        logical_id = meta.get("logical_drawer_id") or physical_id
+        candidate = (meta.get("filed_at", ""), physical_id, doc, meta)
+        current = chosen_singles.get(logical_id)
+        if current is None or candidate[:2] > current[:2]:
+            chosen_singles[logical_id] = candidate
 
+    for logical_id, (_, physical_id, doc, meta) in chosen_singles.items():
+        # If both a legacy logical row and chunks exist, display one logical row.
+        if logical_id in grouped_ids:
+            continue
         safe_meta = _response_safe_meta(meta)
         drawers.append(
             {
-                "drawer_id": drawer_id,
+                "drawer_id": logical_id,
+                "_physical_id": physical_id,
                 "wing": safe_meta.get("wing", ""),
                 "room": safe_meta.get("room", ""),
                 "content_preview": _content_preview(doc),
@@ -3921,6 +3981,8 @@ def tool_list_drawers(
             col = _get_collection()
             if col:
                 _fill_drawer_previews(col, page)
+        for drawer in page:
+            drawer.pop("_physical_id", None)
 
         return {
             "drawers": page,

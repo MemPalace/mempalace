@@ -1327,13 +1327,6 @@ def _save_diary_direct(
 
     now = datetime.now()
 
-    def _clear_pending():
-        if pending_file is not None:
-            try:
-                pending_file.unlink()
-            except OSError:
-                pass
-
     try:
         if routing.use_daemon:
             try:
@@ -1367,7 +1360,6 @@ def _save_diary_direct(
                     pass
                 if toast:
                     _desktop_toast(f"Checkpoint saved - {len(messages)} messages archived")
-                _clear_pending()
                 return {"count": len(messages), "themes": themes}
             if _job_deferred_by_lock(job):
                 # Queued behind the palace lock: the entry is held and the daemon
@@ -1400,7 +1392,6 @@ def _save_diary_direct(
                 pass
             if toast:
                 _desktop_toast(f"Checkpoint saved \u2014 {len(messages)} messages archived")
-            _clear_pending()
             return {"count": len(messages), "themes": themes}
 
         from .mcp_server import tool_diary_write
@@ -1425,7 +1416,6 @@ def _save_diary_direct(
                 pass
             if toast:
                 _desktop_toast(f"Checkpoint saved \u2014 {len(messages)} messages archived")
-            _clear_pending()
             return {"count": len(messages), "themes": themes}
         else:
             _log(f"Diary checkpoint failed: {result.get('error', 'unknown')}")
@@ -1789,12 +1779,12 @@ def hook_stop(data: dict, harness: str):
                 # stay put for a full retry at the next fire.
                 count = result.get("count", 0)
                 if count > 0 or ingest_dispatched:
-                    if count <= 0:
-                        _discard_pending_checkpoint(session_id, checkpoint_id)
                     try:
                         last_save_file.write_text(str(exchange_count), encoding="utf-8")
                     except OSError:
                         pass
+                    else:
+                        _discard_pending_checkpoint(session_id, checkpoint_id)
                 if count > 0:
                     themes = result.get("themes", [])
                     if themes:
