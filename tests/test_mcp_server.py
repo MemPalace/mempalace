@@ -2971,7 +2971,11 @@ class TestWriteTools:
             ],
         )
 
-        from mempalace.mcp_server import tool_get_drawer, tool_list_drawers
+        from mempalace.mcp_server import (
+            tool_delete_drawer,
+            tool_get_drawer,
+            tool_list_drawers,
+        )
 
         result = tool_list_drawers(wing="w", room="r", limit=20)
         ids = {drawer["drawer_id"] for drawer in result["drawers"]}
@@ -2981,6 +2985,9 @@ class TestWriteTools:
         fetched = tool_get_drawer("logical-published")
         assert fetched["drawer_id"] == "logical-published"
         assert fetched["content"] == "published"
+        deleted = tool_delete_drawer("logical-published")
+        assert set(deleted["deleted_ids"]) == {"old", "published"}
+        assert "error" in tool_get_drawer("logical-published")
 
     def test_list_drawers_with_wing_filter(
         self, monkeypatch, config, palace_path, seeded_collection, kg

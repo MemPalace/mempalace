@@ -96,6 +96,25 @@ def _result_drawer_id(meta, stored_drawer_id):
     )
 
 
+def _collapse_logical_generation_hits(hits: list) -> list:
+    """Keep the newest visible physical generation for each stable logical id."""
+    chosen = {}
+    passthrough = []
+    for hit in hits:
+        logical_id = hit.get("_logical_generation_id")
+        if not logical_id:
+            passthrough.append(hit)
+            continue
+        key = (
+            hit.get("created_at") or "",
+            hit.get("_physical_drawer_id") or "",
+        )
+        current = chosen.get(logical_id)
+        if current is None or key > current[0]:
+            chosen[logical_id] = (key, hit)
+    return passthrough + [item[1] for item in chosen.values()]
+
+
 def _tokenize(text: str, stop_words: frozenset = frozenset()) -> list:
     """Lowercase + strip to alphanumeric tokens of length ≥ 2.
 
@@ -818,28 +837,31 @@ def search(
     docs = _first_or_empty(results, "documents")
     metas = _first_or_empty(results, "metadatas")
     dists = _first_or_empty(results, "distances")
+    stored_ids = _aligned_query_ids(results, len(docs))
 
     visible = [
-        (doc, meta, dist)
-        for doc, meta, dist in zip(docs, metas, dists)
+        (stored_id, doc, meta, dist)
+        for stored_id, doc, meta, dist in zip(stored_ids, docs, metas, dists)
         if not _is_staged_metadata(meta, committed_tokens)
     ]
-    docs = [item[0] for item in visible]
-    metas = [item[1] for item in visible]
-    dists = [item[2] for item in visible]
+    stored_ids = [item[0] for item in visible]
+    docs = [item[1] for item in visible]
+    metas = [item[2] for item in visible]
+    dists = [item[3] for item in visible]
 
     if date_window_active:
         kept = [
-            (doc, meta, dist)
-            for doc, meta, dist in zip(docs, metas, dists)
+            (stored_id, doc, meta, dist)
+            for stored_id, doc, meta, dist in zip(stored_ids, docs, metas, dists)
             if filed_at_in_window((meta or {}).get("filed_at"), since_dt, before_dt)
         ]
         # Keep the whole in-window pool here; the hybrid re-rank below must
         # see every survivor before the display cut to n_results, or a
         # BM25-strong drawer deep in the pool could never surface.
-        docs = [k[0] for k in kept]
-        metas = [k[1] for k in kept]
-        dists = [k[2] for k in kept]
+        stored_ids = [k[0] for k in kept]
+        docs = [k[1] for k in kept]
+        metas = [k[2] for k in kept]
+        dists = [k[3] for k in kept]
 
     if not docs:
         print(f'\n  No results found for: "{query}"')
@@ -855,9 +877,18 @@ def search(
     # see via `mempalace_search`.
     metric = _metric_for_collection(col)
     hits = [
-        {"text": doc or "", "distance": float(dist), "metadata": meta or {}}
-        for doc, meta, dist in zip(docs, metas, dists)
+        {
+            "drawer_id": _result_drawer_id(meta, stored_id),
+            "text": doc or "",
+            "distance": float(dist),
+            "metadata": meta or {},
+            "created_at": (meta or {}).get("filed_at", ""),
+            "_logical_generation_id": (meta or {}).get("logical_drawer_id"),
+            "_physical_drawer_id": stored_id,
+        }
+        for stored_id, doc, meta, dist in zip(stored_ids, docs, metas, dists)
     ]
+    hits = _collapse_logical_generation_hits(hits)
     hits = _hybrid_rank(hits, query, metric=metric, stop_words=stop_words)
     if date_window_active:
         # The widened fetch exists only to survive the window filter; the
@@ -1207,10 +1238,13 @@ def _bm25_only_via_sqlite(
                 # multiple chunks. Stripped before this helper returns.
                 "_source_file_full": full_source,
                 "_chunk_index": meta.get("chunk_index"),
+                "_logical_generation_id": meta.get("logical_drawer_id"),
+                "_physical_drawer_id": d["_stored_drawer_id"],
             }
         )
 
     # Local BM25 over the candidate set.
+    candidates = _collapse_logical_generation_hits(candidates)
     docs = [c["text"] for c in candidates]
     bm25_raw = _bm25_scores(query, docs, stop_words=stop_words)
     max_bm25 = max(bm25_raw) if bm25_raw else 0.0
@@ -1227,6 +1261,8 @@ def _bm25_only_via_sqlite(
         if not _include_internal:
             h.pop("_source_file_full", None)
             h.pop("_chunk_index", None)
+            h.pop("_logical_generation_id", None)
+            h.pop("_physical_drawer_id", None)
 
     result = {
         "query": query,
@@ -1334,6 +1370,8 @@ def _merge_bm25_union_candidates(
                 "bm25_score": round(float(hit.score), 3),
                 "_source_file_full": full_source,
                 "_chunk_index": meta.get("chunk_index"),
+                "_logical_generation_id": meta.get("logical_drawer_id"),
+                "_physical_drawer_id": hit.id,
             }
         )
 
@@ -1706,6 +1744,7 @@ def _finalize_candidate_hits(
             ),
         )
 
+    hits[:] = _collapse_logical_generation_hits(hits)
     ranked = _hybrid_rank(
         hits,
         query,
@@ -1719,6 +1758,8 @@ def _finalize_candidate_hits(
         hit.pop("_source_file_full", None)
         hit.pop("_chunk_index", None)
         hit.pop("_parent_drawer_id", None)
+        hit.pop("_logical_generation_id", None)
+        hit.pop("_physical_drawer_id", None)
 
     return hits, None
 
@@ -2289,11 +2330,14 @@ def search_memories(
             "_source_file_full": source,
             "_chunk_index": meta.get("chunk_index"),
             "_parent_drawer_id": meta.get("parent_drawer_id"),
+            "_logical_generation_id": meta.get("logical_drawer_id"),
+            "_physical_drawer_id": stored_drawer_id,
         }
         if closet_preview:
             entry["closet_preview"] = closet_preview
         scored.append(entry)
 
+    scored = _collapse_logical_generation_hits(scored)
     scored.sort(key=lambda h: h["_sort_key"])
     hits = scored[:pre_enrichment_limit]
 

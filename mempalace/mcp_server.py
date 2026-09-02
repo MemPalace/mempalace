@@ -2968,12 +2968,13 @@ def _logical_generation_record(col, drawer_id: str):
         )
     if not rows:
         return None
-    _, physical_id, document, metadata = max(rows, key=lambda row: (row[0], row[1]))
+    rows.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    _, physical_id, document, metadata = rows[0]
     return {
         "drawer_id": drawer_id,
-        "ids": [physical_id],
-        "documents": [document or ""],
-        "metadatas": [metadata],
+        "ids": [row[1] for row in rows],
+        "documents": [row[2] or "" for row in rows],
+        "metadatas": [row[3] for row in rows],
         "content": document or "",
         "metadata": metadata,
         "chunked": False,
@@ -3956,16 +3957,20 @@ def tool_list_drawers(
                 for meta in (marker_result.get("metadatas") or [])
                 if (meta or {}).get("mine_generation_commit")
             }
-        drawers = _collapse_drawer_rows(ids, documents, metadatas)
-        drawers = [
-            drawer
-            for drawer in drawers
-            if drawer.get("metadata", {}).get("mine_commit_marker") is not True
+        visible_rows = [
+            (drawer_id, documents[index] if index < len(documents) else "", meta or {})
+            for index, (drawer_id, meta) in enumerate(zip(ids, metadatas))
+            if (meta or {}).get("mine_commit_marker") is not True
             and (
-                drawer.get("metadata", {}).get("mine_staged") is not True
-                or drawer.get("metadata", {}).get("mine_generation_token") in committed_tokens
+                (meta or {}).get("mine_staged") is not True
+                or (meta or {}).get("mine_generation_token") in committed_tokens
             )
         ]
+        drawers = _collapse_drawer_rows(
+            [row[0] for row in visible_rows],
+            [row[1] for row in visible_rows],
+            [row[2] for row in visible_rows],
+        )
 
         if since_dt is not None or before_dt is not None:
             drawers = [
@@ -4098,6 +4103,8 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         update_kwargs["metadatas"] = [new_meta]
 
         col.update(**update_kwargs)
+        if len(record["ids"]) > 1:
+            col.delete(ids=record["ids"][1:])
         _invalidate_overview_caches()
 
         logger.info("Updated drawer: %s", drawer_id)

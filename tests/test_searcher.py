@@ -80,8 +80,12 @@ class TestSearchMemories:
         staged_text = "unpublished generation sentinel phrase"
         staged_ids = [f"staged-generation-{index}" for index in range(8)]
         collection.upsert(
-            ids=[*staged_ids, "committed-generation"],
-            documents=[*[staged_text] * len(staged_ids), "committed fallback text"],
+            ids=[*staged_ids, "old-generation", "committed-generation"],
+            documents=[
+                *[staged_text] * len(staged_ids),
+                staged_text,
+                "committed fallback text",
+            ],
             metadatas=[
                 *[
                     {
@@ -98,6 +102,13 @@ class TestSearchMemories:
                 {
                     "wing": "sessions",
                     "room": "general",
+                    "source_file": "/tmp/old.jsonl",
+                    "filed_at": "2026-09-01T00:00:00",
+                    "logical_drawer_id": "logical-generation",
+                },
+                {
+                    "wing": "sessions",
+                    "room": "general",
                     "source_file": "/tmp/committed.jsonl",
                     "filed_at": "2026-09-02T00:00:00",
                 },
@@ -107,7 +118,7 @@ class TestSearchMemories:
         result = search_memories(staged_text, palace_path, n_results=1)
 
         assert len(result["results"]) == 1
-        assert result["results"][0]["source_path"] == "/tmp/committed.jsonl"
+        assert result["results"][0]["source_path"] == "/tmp/old.jsonl"
 
         collection.upsert(
             ids=["generation-commit"],
@@ -120,9 +131,10 @@ class TestSearchMemories:
                 }
             ],
         )
-        published = search_memories(staged_text, palace_path, n_results=1)
+        published = search_memories(staged_text, palace_path, n_results=10)
         assert published["results"][0]["source_path"].startswith("/tmp/staged-")
         assert published["results"][0]["drawer_id"] == "logical-generation"
+        assert sum(hit["drawer_id"] == "logical-generation" for hit in published["results"]) == 1
 
     def test_wing_filter(self, palace_path, seeded_collection):
         result = search_memories("planning", palace_path, wing="notes")
