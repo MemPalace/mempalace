@@ -1,4 +1,5 @@
 """Metrics: timing extraction, VRAM measurement, embedding similarity, percentiles."""
+
 from __future__ import annotations
 
 import json
@@ -11,6 +12,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+from mempalace.llm_client import USER_AGENT
 
 
 # ── Thinking-token stripping ─────────────────────────────────────────────
@@ -147,9 +150,10 @@ def vram_resident_mb(
     is missing in older Ollama versions (verified against 0.23.2).
     """
     try:
-        with urlopen(f"{endpoint}/api/ps", timeout=timeout) as resp:
+        req = Request(f"{endpoint}/api/ps", headers={"User-Agent": USER_AGENT})
+        with urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
-    except (URLError, HTTPError, OSError, json.JSONDecodeError):
+    except (URLError, HTTPError, OSError, ValueError):
         return None
     for model in data.get("models", []) or []:
         if not isinstance(model, dict):
@@ -243,15 +247,15 @@ def embed_text(
 ) -> Optional[list[float]]:
     """Get an embedding from Ollama's /api/embeddings. Returns None on failure."""
     body = json.dumps({"model": model, "prompt": text}).encode("utf-8")
-    req = Request(
-        f"{endpoint}/api/embeddings",
-        data=body,
-        headers={"Content-Type": "application/json"},
-    )
     try:
+        req = Request(
+            f"{endpoint}/api/embeddings",
+            data=body,
+            headers={"User-Agent": USER_AGENT, "Content-Type": "application/json"},
+        )
         with urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
-    except (URLError, HTTPError, OSError, json.JSONDecodeError):
+    except (URLError, HTTPError, OSError, ValueError):
         return None
     return data.get("embedding")
 
@@ -330,11 +334,13 @@ def gather_host_info() -> HostInfo:
             info.ram_gb = round(kb / (1024 * 1024), 1)
             break
 
-    nvidia = _run([
-        "nvidia-smi",
-        "--query-gpu=name,memory.total",
-        "--format=csv,noheader,nounits",
-    ])
+    nvidia = _run(
+        [
+            "nvidia-smi",
+            "--query-gpu=name,memory.total",
+            "--format=csv,noheader,nounits",
+        ]
+    )
     if nvidia:
         first = nvidia.strip().splitlines()[0]
         if "," in first:
@@ -347,7 +353,11 @@ def gather_host_info() -> HostInfo:
 
     info.ollama_version = (_run(["ollama", "--version"]) or "").strip()
 
-    info.os = (_read_file("/etc/os-release") or "").splitlines()[0] if _read_file("/etc/os-release") else ""
+    info.os = (
+        (_read_file("/etc/os-release") or "").splitlines()[0]
+        if _read_file("/etc/os-release")
+        else ""
+    )
     if info.os.startswith("PRETTY_NAME="):
         info.os = info.os.split("=", 1)[1].strip('"')
 

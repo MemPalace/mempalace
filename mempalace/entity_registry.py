@@ -23,6 +23,8 @@ import urllib.parse
 from pathlib import Path
 from typing import Optional
 
+from .llm_client import USER_AGENT
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Common English words that could be confused with names
@@ -188,7 +190,7 @@ def _wikipedia_lookup(word: str) -> dict:
     """
     try:
         url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(word)}"
-        req = urllib.request.Request(url, headers={"User-Agent": "MemPalace/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read())
 
