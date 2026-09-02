@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -2709,6 +2711,24 @@ class _FakeHubResponse:
     def read(self):
         return self._body
 
+    def close(self):
+        pass
+
+
+class _SlowHubResponse(_FakeHubResponse):
+    def __init__(self, body=b"", status=200):
+        super().__init__(body=body, status=status)
+        self._release = threading.Event()
+        self.closed = False
+
+    def read(self):
+        self._release.wait(timeout=2)
+        return self._body
+
+    def close(self):
+        self.closed = True
+        self._release.set()
+
 
 def _hub_patches(stack, tmp_path, mcp_body):
     """Point server_registry at a live hub and stub its HTTP responses."""
@@ -2781,6 +2801,36 @@ def test_save_diary_direct_does_not_retry_locally_when_hub_refuses(tmp_path):
 
     assert result["count"] == 0
     mock_tool.assert_not_called()
+
+
+def test_forward_diary_hard_stops_a_drip_feed_at_the_absolute_budget(tmp_path):
+    from mempalace.hooks_cli import _forward_diary_to_hub
+
+    body = json.dumps(
+        {"result": {"content": [{"text": json.dumps({"success": True, "entry_id": "e1"})}]}}
+    ).encode("utf-8")
+    slow_response = _SlowHubResponse(body)
+
+    with contextlib.ExitStack() as stack:
+        _, mock_server_open = _hub_patches(stack, tmp_path, body)
+        mock_server_open.return_value = slow_response
+        stack.enter_context(patch("mempalace.hooks_cli._HUB_DIARY_BUDGET_S", 0.05))
+        stack.enter_context(
+            patch("mempalace.server_registry.load_server_tokens", return_value=("tok",))
+        )
+        started = time.monotonic()
+        result = _forward_diary_to_hub(
+            "claude",
+            "entry",
+            "checkpoint",
+            "wing",
+            idempotency_key="stable-key",
+        )
+        elapsed = time.monotonic() - started
+
+    assert result is None
+    assert elapsed < 0.25
+    assert slow_response.closed is True
 
 
 def test_save_diary_direct_writes_in_process_without_a_hub(tmp_path):

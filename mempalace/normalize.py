@@ -366,7 +366,7 @@ def _codex_item_text(item: dict) -> str:
             continue
         text = block.get("text")
         if isinstance(text, str) and text.strip():
-            parts.append(text.strip())
+            parts.append(text)
     return "\n".join(parts)
 
 
@@ -398,7 +398,7 @@ def _codex_event_turn(entry: dict) -> Optional[tuple[str, str]]:
     message = payload.get("message")
     if role is None or not isinstance(message, str) or not message.strip():
         return None
-    return role, message.strip()
+    return role, message
 
 
 def _try_codex_jsonl(content: str) -> Optional[str]:

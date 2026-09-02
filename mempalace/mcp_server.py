@@ -4269,6 +4269,20 @@ def tool_kg_stats():
 # ==================== AGENT DIARY ====================
 
 
+def _diary_entry_physical_ids(collection, entry_id: str) -> set[str]:
+    """Return direct and chunked physical rows for one logical diary entry."""
+    physical_ids: set[str] = set()
+    direct = collection.get(ids=[entry_id], include=["metadatas"])
+    physical_ids.update(direct.get("ids") or [])
+    for parent_key in _PARENT_ID_KEYS:
+        grouped = collection.get(
+            where={parent_key: entry_id},
+            include=["metadatas"],
+        )
+        physical_ids.update(grouped.get("ids") or [])
+    return physical_ids
+
+
 def tool_diary_write(
     agent_name: str,
     entry: str,
@@ -4325,6 +4339,7 @@ def tool_diary_write(
             f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S%f')}_"
             f"{hashlib.sha256(entry.encode()).hexdigest()[:12]}"
         )
+    prior_physical_ids = _diary_entry_physical_ids(col, entry_id) if idempotency_key else set()
 
     _wal_log(
         "diary_write",
@@ -4361,6 +4376,9 @@ def tool_diary_write(
                 documents=[entry],
                 metadatas=[{**base_metadata, "chunk_index": 0}],
             )
+            obsolete_ids = prior_physical_ids - {entry_id}
+            if obsolete_ids:
+                col.delete(ids=sorted(obsolete_ids))
             logger.info(f"Diary entry: {entry_id} -> {wing}/diary/{topic}")
             return {
                 "success": True,
@@ -4405,6 +4423,9 @@ def tool_diary_write(
                 }
             )
         write_drawers(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
+        obsolete_ids = prior_physical_ids - set(chunk_ids)
+        if obsolete_ids:
+            col.delete(ids=sorted(obsolete_ids))
         logger.info(f"Diary entry: {entry_id} -> {wing}/diary/{topic} ({len(chunk_ids)} chunks)")
         return {
             "success": True,

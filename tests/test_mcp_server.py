@@ -4393,6 +4393,39 @@ class TestDiaryTools:
         assert read["total"] == 1
         assert read["entries"][0]["content"] == "stable checkpoint body"
 
+    def test_keyed_diary_short_retry_removes_old_chunk_representation(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_diary_read, tool_diary_write
+
+        long_entry = "first generation " * (config.chunk_size // 8 + 10)
+        first = tool_diary_write(
+            agent_name="TestAgent",
+            entry=long_entry,
+            topic="checkpoint",
+            wing="wing_project",
+            idempotency_key="hook-checkpoint:resize",
+        )
+        assert first["success"] is True
+        assert first["chunks"] > 1
+
+        retry = tool_diary_write(
+            agent_name="TestAgent",
+            entry="short replacement",
+            topic="checkpoint",
+            wing="wing_project",
+            idempotency_key="hook-checkpoint:resize",
+        )
+
+        assert retry["success"] is True
+        assert retry["entry_id"] == first["entry_id"]
+        read = tool_diary_read(agent_name="TestAgent", wing="wing_project")
+        assert read["total"] == 1
+        assert [item["content"] for item in read["entries"]] == ["short replacement"]
+
     def test_diary_write_same_second_shared_prefix_no_collision(
         self, monkeypatch, config, palace_path, kg
     ):
