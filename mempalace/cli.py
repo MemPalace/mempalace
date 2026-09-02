@@ -1261,15 +1261,20 @@ def cmd_sweep(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     target = os.path.expanduser(args.target)
 
+    # --room only takes effect alongside --wing (a room needs a wing to nest
+    # in); flag the no-op rather than dropping the value silently.
+    if args.room and not args.wing:
+        print("  WARNING: --room is ignored without --wing.", file=sys.stderr)
+
     if os.path.isfile(target):
-        result = sweep(target, palace_path)
+        result = sweep(target, palace_path, wing=args.wing, room=args.room)
         print(
             f"  Swept {target}: +{result['drawers_added']} new, "
             f"{result['drawers_already_present']} already present, "
             f"{result['drawers_skipped']} skipped (< cursor)."
         )
     elif os.path.isdir(target):
-        result = sweep_directory(target, palace_path)
+        result = sweep_directory(target, palace_path, wing=args.wing, room=args.room)
         print(
             f"  Swept {result['files_succeeded']}/{result['files_attempted']} "
             f"files from {target}: +{result['drawers_added']} new, "
@@ -3352,6 +3357,17 @@ def main():
     p_sweep.add_argument(
         "target",
         help="A .jsonl transcript file, or a directory to scan recursively",
+    )
+    p_sweep.add_argument(
+        "--wing",
+        default=None,
+        help="Classify swept drawers under this wing (like `mine --wing`); "
+        "default leaves them unclassified as ?/?",
+    )
+    p_sweep.add_argument(
+        "--room",
+        default=None,
+        help="Room for swept drawers when --wing is set (default: general)",
     )
 
     # sync

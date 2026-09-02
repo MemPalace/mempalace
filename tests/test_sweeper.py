@@ -417,3 +417,175 @@ class TestSweeperDuplicateMessageIds:
         assert repeated_document == "USER: second copy, same uuid"
         assert repeated_metadata["timestamp"] == "2020-01-01T00:00:02.000Z"
         assert by_id[assistant_id][0] == "ASSISTANT: ok"
+
+
+class TestSweeperTaxonomy:
+    """#1207 / #1979: `sweep` can classify drawers under a wing/room so
+    message-level catch-up drawers are searchable next to `mine` drawers
+    instead of being stranded as ``?/?`` in status and search."""
+
+    def test_sweep_stamps_wing_and_room_when_provided(self, mock_claude_jsonl, tmp_path):
+        from mempalace.palace import get_collection
+        from mempalace.sweeper import sweep
+
+        palace_path = str(tmp_path / "palace")
+        sweep(str(mock_claude_jsonl), palace_path, wing="my_project", room="transcript")
+
+        col = get_collection(palace_path, create=False)
+        metas = col.get(include=["metadatas"])["metadatas"]
+        assert metas, "No drawers written"
+        for m in metas:
+            assert m.get("wing") == "my_project", f"swept drawer missing wing: {m}"
+            assert m.get("room") == "transcript", f"swept drawer missing room: {m}"
+
+    def test_sweep_defaults_room_to_general_when_only_wing(self, mock_claude_jsonl, tmp_path):
+        """`sweep --wing X` with no --room mirrors `mine --wing X` → room 'general'."""
+        from mempalace.palace import get_collection
+        from mempalace.sweeper import sweep
+
+        palace_path = str(tmp_path / "palace")
+        sweep(str(mock_claude_jsonl), palace_path, wing="my_project")
+
+        col = get_collection(palace_path, create=False)
+        metas = col.get(include=["metadatas"])["metadatas"]
+        assert metas, "No drawers written"
+        for m in metas:
+            assert m.get("wing") == "my_project"
+            assert m.get("room") == "general", (
+                f"room should default to 'general' (matching `mine --wing`), got {m.get('room')!r}"
+            )
+
+    def test_sweep_without_wing_stays_unclassified(self, mock_claude_jsonl, tmp_path):
+        """Backward compatibility: no --wing → no wing/room keys at all, so
+        existing sweep callers keep the historical ``?/?`` behavior and no
+        blank taxonomy is written."""
+        from mempalace.palace import get_collection
+        from mempalace.sweeper import sweep
+
+        palace_path = str(tmp_path / "palace")
+        sweep(str(mock_claude_jsonl), palace_path)
+
+        col = get_collection(palace_path, create=False)
+        metas = col.get(include=["metadatas"])["metadatas"]
+        assert metas, "No drawers written"
+        for m in metas:
+            assert "wing" not in m, f"unexpected wing on an unclassified sweep: {m}"
+            assert "room" not in m, f"unexpected room on an unclassified sweep: {m}"
+
+    def test_sweep_blank_wing_is_ignored(self, mock_claude_jsonl, tmp_path):
+        """A whitespace-only --wing/--room must not create a blank taxonomy."""
+        from mempalace.palace import get_collection
+        from mempalace.sweeper import sweep
+
+        palace_path = str(tmp_path / "palace")
+        sweep(str(mock_claude_jsonl), palace_path, wing="   ", room="   ")
+
+        col = get_collection(palace_path, create=False)
+        metas = col.get(include=["metadatas"])["metadatas"]
+        assert metas, "No drawers written"
+        for m in metas:
+            assert "wing" not in m, f"blank wing leaked into metadata: {m}"
+            assert "room" not in m, f"blank room leaked into metadata: {m}"
+
+    def test_sweep_directory_threads_wing_and_room(self, mock_claude_jsonl, tmp_path):
+        """`sweep <dir> --wing X --room Y` stamps every swept file's drawers."""
+        from mempalace.palace import get_collection
+        from mempalace.sweeper import sweep_directory
+
+        palace_path = str(tmp_path / "palace")
+        sweep_directory(str(mock_claude_jsonl.parent), palace_path, wing="proj", room="chat")
+
+        col = get_collection(palace_path, create=False)
+        metas = col.get(include=["metadatas"])["metadatas"]
+        assert metas, "No drawers written"
+        for m in metas:
+            assert m.get("wing") == "proj", f"sweep_directory dropped wing: {m}"
+            assert m.get("room") == "chat", f"sweep_directory dropped room: {m}"
+
+    def test_sweep_with_taxonomy_is_still_idempotent(self, mock_claude_jsonl, tmp_path):
+        """Adding taxonomy must not disturb the cursor / idempotency contract."""
+        from mempalace.sweeper import sweep
+
+        palace_path = str(tmp_path / "palace")
+        first = sweep(str(mock_claude_jsonl), palace_path, wing="proj")
+        second = sweep(str(mock_claude_jsonl), palace_path, wing="proj")
+        assert first["drawers_added"] == 4
+        assert second["drawers_added"] == 0, (
+            f"Second sweep must be a no-op; got {second['drawers_added']} — "
+            "taxonomy changed the drawer id or cursor logic."
+        )
+
+
+class TestSweeperCLI:
+    """The `sweep` subcommand exposes --wing/--room and threads them through."""
+
+    def test_cli_sweep_accepts_and_threads_wing_room(
+        self, mock_claude_jsonl, tmp_path, monkeypatch
+    ):
+        import mempalace.sweeper as sweeper
+        from mempalace import cli
+
+        captured = {}
+
+        def fake_sweep(jsonl_path, palace_path, source_label=None, wing=None, room=None):
+            captured["wing"] = wing
+            captured["room"] = room
+            return {
+                "drawers_added": 0,
+                "drawers_already_present": 0,
+                "drawers_upserted": 0,
+                "drawers_skipped": 0,
+                "cursor_by_session": {},
+            }
+
+        # cmd_sweep does `from .sweeper import sweep` at call time, so patching
+        # the module attribute is enough to intercept the threaded kwargs.
+        monkeypatch.setattr(sweeper, "sweep", fake_sweep)
+        palace_path = str(tmp_path / "palace")
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "mempalace",
+                "--palace",
+                palace_path,
+                "sweep",
+                str(mock_claude_jsonl),
+                "--wing",
+                "cli_wing",
+                "--room",
+                "cli_room",
+            ],
+        )
+        cli.main()
+        assert captured == {"wing": "cli_wing", "room": "cli_room"}
+
+    def test_cli_sweep_room_without_wing_warns_and_skips_taxonomy(
+        self, mock_claude_jsonl, tmp_path, monkeypatch, capsys
+    ):
+        """`--room` without `--wing` is a no-op: it warns and writes no taxonomy
+        (a room needs a wing to nest in) rather than dropping it silently."""
+        from mempalace import cli
+        from mempalace.palace import get_collection
+
+        palace_path = str(tmp_path / "palace")
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "mempalace",
+                "--palace",
+                palace_path,
+                "sweep",
+                str(mock_claude_jsonl),
+                "--room",
+                "orphan",
+            ],
+        )
+        cli.main()
+        assert "--room is ignored without --wing" in capsys.readouterr().err
+
+        col = get_collection(palace_path, create=False)
+        metas = col.get(include=["metadatas"])["metadatas"]
+        assert metas, "No drawers written"
+        for m in metas:
+            assert "wing" not in m, f"unexpected wing without --wing: {m}"
+            assert "room" not in m, f"orphan --room leaked into metadata: {m}"

@@ -200,7 +200,13 @@ def _drawer_id_for_message(session_id: str, message_uuid: str) -> str:
     return f"sweep_{session_id}_{message_uuid}"
 
 
-def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None) -> dict:
+def sweep(
+    jsonl_path: str,
+    palace_path: str,
+    source_label: Optional[str] = None,
+    wing: Optional[str] = None,
+    room: Optional[str] = None,
+) -> dict:
     """Ingest every user/assistant message not already represented.
 
     For each message in the jsonl:
@@ -214,6 +220,16 @@ def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None)
         `get(ids=...)` and counted as "already present", not "added").
       - Else, upsert a drawer with deterministic ID so reruns dedupe.
 
+    Args:
+        source_label: Value stored as each drawer's ``source_file`` metadata
+            (defaults to ``jsonl_path``).
+        wing: When set, classify swept drawers under this wing like
+            ``mine --wing`` so they leave the ``?/?`` bucket; blank/whitespace
+            is treated as unset. When unset, no wing/room metadata is written
+            and the historical unclassified behavior is preserved.
+        room: Room for the swept drawers when ``wing`` is set; defaults to the
+            miners' fallback room ``"general"``. Ignored when ``wing`` is unset.
+
     Returns ``{drawers_added, drawers_already_present, drawers_skipped,
     drawers_upserted, cursor_by_session}``:
 
@@ -225,6 +241,16 @@ def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None)
     * ``drawers_upserted`` — total writes = added + already_present.
     """
     collection = get_collection(palace_path, create=True)
+
+    # Optional taxonomy (#1207, #1979): when a wing is given, swept drawers are
+    # classified under wing/room like ``mine --wing`` (room defaults to the
+    # miners' fallback room "general") so message-level catch-up is searchable
+    # instead of stranded as ``?/?`` in status and search. With no wing we stamp
+    # nothing, preserving the historical unclassified behavior for existing callers.
+    wing = (wing or "").strip() or None
+    room = (room or "").strip() or None
+    taxonomy = {"wing": wing, "room": room or "general"} if wing else {}
+
     cursors: dict = {}
 
     drawers_added = 0
@@ -309,6 +335,7 @@ def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None)
             "source_file": source_label or jsonl_path,
             "filed_at": datetime.now().isoformat(),
             "ingest_mode": "sweep",
+            **taxonomy,
         }
 
         batch_ids.append(drawer_id)
@@ -329,8 +356,16 @@ def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None)
     }
 
 
-def sweep_directory(dir_path: str, palace_path: str) -> dict:
+def sweep_directory(
+    dir_path: str,
+    palace_path: str,
+    wing: Optional[str] = None,
+    room: Optional[str] = None,
+) -> dict:
     """Sweep every .jsonl file in a directory (recursive).
+
+    ``wing`` / ``room`` are forwarded unchanged to each file's :func:`sweep`
+    call, so a whole directory is classified under one wing in a single run.
 
     Returns aggregated summary across all files. ``files_attempted``
     includes files that raised, so the count reflects discovery rather
@@ -369,7 +404,7 @@ def sweep_directory(dir_path: str, palace_path: str) -> dict:
             print(f"  SKIP: {f.name} (not a regular file)", file=sys.stderr)
             continue
         try:
-            result = sweep(str(f), palace_path, source_label=str(f))
+            result = sweep(str(f), palace_path, source_label=str(f), wing=wing, room=room)
         except Exception as exc:
             logger.error("sweeper: sweep failed on %s: %s", f, exc)
             print(f"  WARNING: sweep failed on {f}: {exc}", file=sys.stderr)
