@@ -226,6 +226,10 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
 DEFAULT_BACKEND = "chroma"
+# ChromaDB writes its SQLite store under exactly this filename inside the
+# palace directory. It is the artifact the canonical-leaf normalisation uses
+# for sibling detection; see ``canonical_palace_path`` (#2404).
+_CHROMA_SQLITE_NAME = "chroma.sqlite3"
 DEFAULT_MILVUS_CONSISTENCY_LEVEL = "Strong"
 _MILVUS_CONSISTENCY_LEVELS = {
     "strong": "Strong",
@@ -263,6 +267,52 @@ def sqlite_read_uri(db_path: str) -> str:
 
     db_path = os.fspath(db_path)
     return f"file:{pathname2url(db_path)}?mode=ro"
+
+
+def canonical_palace_path(palace_path: str) -> str:
+    """Return the canonical *leaf* palace directory for ``palace_path`` (#2404).
+
+    A palace is the single directory that holds the ChromaDB SQLite store
+    (``chroma.sqlite3``). When a caller names a *parent* directory whose
+    children each hold their own store — the ``--palace`` flag, a
+    ``config.json`` entry, or the ``MEMPALACE_PALACE_PATH`` env var —
+    resolving to the parent silently opens an **empty** reader database while
+    the real corpus lives in one of the child leaves. That is the reader/
+    writer split-brain tracked in :issue:`2404`: ``mine`` may have written to
+    the child (via a CLI env var that landed there) while ``search`` opens the
+    parent and sees nothing.
+
+    The resolution rules, checked in order:
+
+    1. ``palace_path`` itself holds ``chroma.sqlite3`` — it already **is** the
+       leaf (or is an empty leaf about to be created) — return it unchanged.
+    2. Otherwise, exactly one immediate child directory holds a store —
+       return that child, which is unambiguously the intended palace.
+    3. Otherwise (no child holds a store, or more than one does) return
+       ``palace_path`` unchanged. An ambiguous or not-yet-initialised palace
+       must never be re-pointed to a guessed sibling.
+
+    This keeps the invariant "the reader opens the same store the writer
+    wrote to" in one place, so every consumer of ``palace_path`` benefits.
+    """
+    base = os.path.abspath(os.path.expanduser(palace_path))
+    if os.path.isfile(os.path.join(base, _CHROMA_SQLITE_NAME)):
+        return base
+    try:
+        entries = os.listdir(base)
+    except OSError:
+        # Not a directory yet (first-run palace) or unreadable: nothing to
+        # re-point to; let the caller fall through and create it.
+        return base
+    leaves = [
+        os.path.join(base, name)
+        for name in entries
+        if os.path.isdir(os.path.join(base, name))
+        and os.path.isfile(os.path.join(base, name, _CHROMA_SQLITE_NAME))
+    ]
+    if len(leaves) == 1:
+        return leaves[0]
+    return base
 
 
 @lru_cache(maxsize=1)
@@ -802,16 +852,26 @@ class MempalaceConfig:
 
     @property
     def palace_path(self):
-        """Path to the memory palace data directory."""
+        """Path to the memory palace data directory.
+
+        Every resolution path (constructor override, env var, config file)
+        is canonicalised through :func:`canonical_palace_path` so the reader
+        always opens the leaf that actually holds the ChromaDB store, even
+        when the caller named a parent directory (#2404). See the helper for
+        the full invariant.
+        """
         if self._palace_path_override is not None:
-            return self._palace_path_override
+            return canonical_palace_path(self._palace_path_override)
         env_val = os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALACE_PATH")
         if env_val:
             # Normalize: expand ~ and collapse .. to match the CLI --palace
             # code path (mcp_server.py:62) and prevent surprise redirection
-            # when the env var contains unresolved components.
-            return os.path.abspath(os.path.expanduser(env_val))
-        return os.path.expanduser(self._file_config.get("palace_path", DEFAULT_PALACE_PATH))
+            # when the env var contains unresolved components. Then
+            # canonicalise to the leaf store directory (#2404).
+            return canonical_palace_path(os.path.abspath(os.path.expanduser(env_val)))
+        return canonical_palace_path(
+            os.path.expanduser(self._file_config.get("palace_path", DEFAULT_PALACE_PATH))
+        )
 
     @property
     def tunnel_file(self):

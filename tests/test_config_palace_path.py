@@ -3,7 +3,75 @@
 import json
 import os
 import tempfile
-from mempalace.config import MempalaceConfig
+from mempalace.config import MempalaceConfig, canonical_palace_path
+
+
+def _make_leaf(root: str, name: str = "palace") -> str:
+    leaf = os.path.join(root, name) if name else root
+    os.makedirs(leaf, exist_ok=True)
+    with open(os.path.join(leaf, "chroma.sqlite3"), "wb") as fh:
+        fh.write(b"SQLite format 3\x00")
+    return leaf
+
+
+def test_canonical_leaf_returns_itself_when_dir_holds_store(tmp_path):
+    leaf = _make_leaf(str(tmp_path / "palace"))
+    assert canonical_palace_path(leaf) == leaf
+
+
+def test_canonical_leaf_repoints_parent_to_single_leaf(tmp_path):
+    leaf = _make_leaf(str(tmp_path), name="palace")
+    assert canonical_palace_path(str(tmp_path)) == leaf
+
+
+def test_canonical_leaf_returns_parent_when_no_child_has_store(tmp_path):
+    os.makedirs(str(tmp_path / "not-a-palace"))
+    assert canonical_palace_path(str(tmp_path)) == os.path.abspath(str(tmp_path))
+
+
+def test_canonical_leaf_is_ambiguous_with_multiple_leaves(tmp_path):
+    _make_leaf(str(tmp_path), name="a")
+    _make_leaf(str(tmp_path), name="b")
+    # Two store-holding siblings: never guess, return the parent unchanged.
+    assert canonical_palace_path(str(tmp_path)) == os.path.abspath(str(tmp_path))
+
+
+def test_canonical_leaf_missing_dir_passes_through(tmp_path):
+    missing = tmp_path / "does-not-exist"
+    assert canonical_palace_path(str(missing)) == os.path.abspath(str(missing))
+
+
+def test_palace_path_property_repoints_env_parent_to_leaf(tmp_path, monkeypatch):
+    leaf = _make_leaf(str(tmp_path), name="palace")
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_path))
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.palace_path == leaf
+
+
+def test_palace_path_property_keeps_leaf_env(tmp_path, monkeypatch):
+    leaf = _make_leaf(str(tmp_path), name="palace")
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", leaf)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.palace_path == leaf
+
+
+def test_palace_path_constructor_override_repoints_parent(tmp_path):
+    leaf = _make_leaf(str(tmp_path), name="palace")
+    cfg = MempalaceConfig(config_dir=str(tmp_path), palace_path=str(tmp_path))
+    assert cfg.palace_path == leaf
+
+
+def test_palace_path_constructor_override_keeps_leaf(tmp_path):
+    leaf = _make_leaf(str(tmp_path), name="palace")
+    cfg = MempalaceConfig(config_dir=str(tmp_path), palace_path=leaf)
+    assert cfg.palace_path == leaf
+
+
+def test_palace_path_property_config_file_parent_repoints(tmp_path):
+    leaf = _make_leaf(str(tmp_path), name="palace")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    cfg._file_config["palace_path"] = str(tmp_path)
+    assert cfg.palace_path == leaf
 
 
 def test_palace_path_expands_tilde_from_config_file():
