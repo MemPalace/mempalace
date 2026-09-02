@@ -2628,6 +2628,44 @@ def test_stop_hook_retries_failed_checkpoint_when_mining_disabled(tmp_path):
     assert not (tmp_path / "test_last_save").exists()
 
 
+def test_stop_hook_retries_when_daemon_transcript_submission_fails(tmp_path):
+    """A daemon liveness race must not acknowledge two failed capture paths."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    data = {
+        "session_id": "test",
+        "stop_hook_active": False,
+        "transcript_path": str(transcript),
+    }
+
+    with (
+        patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls,
+        patch("mempalace.hooks_cli._daemon_available", return_value=True),
+        patch(
+            "mempalace.hooks_cli._submit_daemon_job",
+            side_effect=RuntimeError("daemon disappeared before enqueue"),
+        ) as mock_submit,
+        patch("mempalace.hooks_cli._save_diary_direct", return_value={"count": 0}) as mock_save,
+        patch("mempalace.hooks_cli._maybe_auto_ingest"),
+        patch("mempalace.hooks_cli._spawn_mine") as mock_spawn,
+    ):
+        mock_cfg_cls.return_value.hooks_auto_save = True
+        mock_cfg_cls.return_value.hook_silent_save = True
+        mock_cfg_cls.return_value.hook_desktop_toast = False
+        mock_cfg_cls.return_value.hooks_mine_transcript = True
+        mock_cfg_cls.return_value.hook_use_daemon = True
+        assert _capture_hook_output(hook_stop, data, state_dir=tmp_path) == {}
+        assert _capture_hook_output(hook_stop, data, state_dir=tmp_path) == {}
+
+    assert mock_save.call_count == 2
+    assert mock_submit.call_count == 2
+    mock_spawn.assert_not_called()
+    assert not (tmp_path / "test_last_save").exists()
+
+
 def test_precompact_checkpoints_when_mining_disabled(tmp_path):
     """Compaction still captures something when the transcript mine is off."""
     transcript = tmp_path / "t.jsonl"

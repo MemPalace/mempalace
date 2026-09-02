@@ -1233,11 +1233,12 @@ def _ingest_transcript(transcript_path: str) -> Optional[bool]:
                 )
                 _log(f"Transcript ingest submitted to daemon: {path.name}")
             except Exception as exc:
-                # Daemon accepted context — don't fall back (would double-mine),
-                # and count the attempt as dispatched for the same reason: the
-                # daemon may hold the job, so an eager local retry loop is the
-                # worse failure mode.
+                # Do not fall back inside this fire: the request may have been
+                # accepted before the transport failed. Report it as pending,
+                # though, so a failed diary beside it is not acknowledged. The
+                # next Stop retries through the dedupe-keyed daemon path.
                 _log(f"Daemon transcript ingest failed: {exc}")
+                return False
             return True
 
         # Route through ``_spawn_mine`` so the per-target PID guard kicks
