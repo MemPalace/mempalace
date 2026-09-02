@@ -33,6 +33,12 @@ needs_posix_filenames = pytest.mark.skipif(
 )
 
 
+needs_posix_symlink_loop_errno = pytest.mark.skipif(
+    os.name == "nt",
+    reason="the loop is proven by errno.ELOOP, which only POSIX specifies for this shape",
+)
+
+
 def _symlink_or_skip(link, target):
     """Create ``link`` pointing at ``target``, or skip if the platform refuses.
 
@@ -944,6 +950,161 @@ def test_status_default_uses_configured_drawer_collection(tmp_path):
 
     assert capacity_status.call_args_list[0].args == (str(tmp_path), "custom_drawers")
     assert capacity_status.call_args_list[1].args == (str(tmp_path), "mempalace_closets")
+
+
+def _palace_with_a_readable_database(tmp_path, name="palace"):
+    """A palace whose ``chroma.sqlite3`` ``repair.status`` can really count.
+
+    Built through ``ChromaBackend`` rather than a hand-rolled table, because
+    ``sqlite_drawer_count`` joins ``embeddings``/``segments``/``collections``
+    and answers ``None`` for anything else. On a stand-in schema the reported
+    count is ``(unreadable)`` whatever the permissions are, and an assertion
+    about reachability made against one would hold in both worlds.
+    """
+    palace = tmp_path / name
+    palace.mkdir()
+    _seed_palace(palace, repair._drawers_collection_name(), [("d1", "a drawer", {"wing": "w"})])
+    return palace
+
+
+def _reported_drawer_count(printed):
+    """The count printed under ``[drawers]``, or the literal printed in its place.
+
+    Scoped to that block rather than taking the first match: ``status`` prints
+    one ``sqlite count:`` line per collection, so a change of print order would
+    otherwise turn every assertion here into one about closets.
+    """
+    in_drawers = False
+    for line in printed.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_drawers = stripped == "[drawers]"
+        elif in_drawers and "sqlite count:" in line:
+            return line.split("sqlite count:", 1)[1].strip()
+    return None
+
+
+@needs_unprivileged_posix
+def test_status_does_not_call_an_unreachable_palace_uninitialized(tmp_path, capsys):
+    """Losing the right to look is not evidence the palace never had a database.
+
+    ``os.path.isfile`` folds the ``EACCES`` from the directory into False, and
+    the answer built on it — "exists but has no chroma.sqlite3 yet" — is a
+    statement about the palace that nothing measured (#2293).
+
+    The same palace is read twice, once reachable and once not, so the reported
+    count is what separates the two worlds. Without the first half the second
+    proves nothing: a palace whose schema ``sqlite_drawer_count`` cannot read
+    prints ``(unreadable)`` with its permissions untouched.
+    """
+    palace = _palace_with_a_readable_database(tmp_path)
+
+    repair.status(palace_path=str(palace))
+    assert _reported_drawer_count(capsys.readouterr().out) == "1"
+
+    os.chmod(palace, 0o000)
+    try:
+        result = repair.status(palace_path=str(palace))
+    finally:
+        os.chmod(palace, 0o755)
+
+    printed = capsys.readouterr().out
+    assert "has no chroma.sqlite3 yet" not in printed
+    assert result.get("status") != "uninitialized"
+    assert "drawers" in result and "closets" in result
+    assert _reported_drawer_count(printed) == "(unreadable)"
+
+    # Nothing about the database changed between the two reads. Asked of
+    # sqlite directly rather than by calling status a third time, because
+    # hnsw_capacity_status caches a fully-measured verdict per palace and
+    # would serve the first read's answer back without touching the file.
+    with closing(sqlite3.connect(palace / "chroma.sqlite3")) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] == 1
+
+
+def test_status_does_not_call_a_dangling_symlink_uninitialized(tmp_path, capsys):
+    """A name that now points at nothing is damage, not a palace awaiting its
+    first write. ``os.path.isfile`` follows the link and reports False (#2293).
+    """
+    palace = _palace_with_a_readable_database(tmp_path)
+    (palace / "chroma.sqlite3").rename(palace / "moved-away.sqlite3")
+    _symlink_or_skip(palace / "chroma.sqlite3", palace / "gone.sqlite3")
+
+    result = repair.status(palace_path=str(palace))
+
+    printed = capsys.readouterr().out
+    assert "has no chroma.sqlite3 yet" not in printed
+    assert result.get("status") != "uninitialized"
+    assert "drawers" in result and "closets" in result
+    # The read must not bring the link's target into existence.
+    assert not (palace / "gone.sqlite3").exists()
+    assert (palace / "moved-away.sqlite3").stat().st_size > 0
+
+
+@needs_posix_symlink_loop_errno
+def test_status_does_not_call_a_symlink_loop_uninitialized(tmp_path, capsys):
+    """``ELOOP`` is another failure to reach, and reaches the same wrong answer.
+
+    The loop is asserted before the call: a platform that resolves this name
+    some other way would leave the test passing on a state it never built. That
+    ``stat`` is also the one this file makes of ``_is_a_named_pipe``'s failure
+    branch, which answers False and lets the read report the loop.
+    """
+    palace = _palace_with_a_readable_database(tmp_path)
+    (palace / "chroma.sqlite3").rename(palace / "moved-away.sqlite3")
+    _symlink_or_skip(palace / "chroma.sqlite3", palace / "chroma.sqlite3")
+
+    try:
+        os.stat(palace / "chroma.sqlite3")
+    except OSError as exc:
+        if exc.errno != errno.ELOOP:
+            raise
+    else:
+        pytest.fail("the symlink loop was not built: stat() resolved the name")
+
+    result = repair.status(palace_path=str(palace))
+
+    printed = capsys.readouterr().out
+    assert "has no chroma.sqlite3 yet" not in printed
+    assert result.get("status") != "uninitialized"
+    assert "drawers" in result and "closets" in result
+
+
+def test_status_does_not_call_a_directory_named_chroma_sqlite3_uninitialized(tmp_path, capsys):
+    """A directory under that name is damage too, and it reads as damage.
+
+    No special case handles it: ``stat`` succeeds and says "not a FIFO", so it
+    goes to the read like every other state, which reports what it found.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").mkdir()
+
+    result = repair.status(palace_path=str(palace))
+
+    printed = capsys.readouterr().out
+    assert "has no chroma.sqlite3 yet" not in printed
+    assert result.get("status") != "uninitialized"
+    # Not asserting the printed literal: what sqlite says when handed a
+    # directory is its own business and is only measured here on Linux.
+    assert "drawers" in result and "closets" in result
+
+
+def test_status_reads_a_database_reached_through_a_symlink(tmp_path, capsys):
+    """The common legitimate shape must survive the move off ``os.path.isfile``.
+
+    ``isfile`` followed symlinks; absence is now proven with ``lstat``, which
+    does not. A palace whose database lives on another volume and is linked
+    into place has to keep being read, and that is the regression this pins.
+    """
+    palace = _palace_with_a_readable_database(tmp_path)
+    elsewhere = tmp_path / "elsewhere.sqlite3"
+    (palace / "chroma.sqlite3").rename(elsewhere)
+    _symlink_or_skip(palace / "chroma.sqlite3", elsewhere)
+
+    repair.status(palace_path=str(palace))
+
+    assert _reported_drawer_count(capsys.readouterr().out) == "1"
 
 
 @patch("mempalace.repair._copy_file_no_follow")

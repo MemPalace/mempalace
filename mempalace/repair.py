@@ -698,12 +698,23 @@ def sqlite_drawer_count(palace_path: str, collection_name: Optional[str] = None)
     stale and repair would destroy the difference.
 
     Returns ``None`` when the schema isn't readable (chromadb version
-    drift, missing tables, locked file). Callers treat ``None`` as
-    "unknown" and fall back to the cap-detection check.
+    drift, missing tables, locked file), and without opening anything when
+    nothing resolves under the path or when the path names a FIFO. Callers
+    treat ``None`` as "unknown" and fall back to the cap-detection check.
     """
     collection_name = collection_name or _drawers_collection_name()
     sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
-    if not os.path.exists(sqlite_path):
+    # os.path.exists lets a FIFO through, and the connect below opens read-only,
+    # which parks in the kernel until a writer arrives. The type check belongs
+    # here rather than only at the caller: one made further up can be answered
+    # while the path is unreachable, and a permission change between the two
+    # calls then hands this one the pipe anyway (#2293). Checking here narrows
+    # that window to the lines below; only handing sqlite3 a descriptor would
+    # close it. os.path.exists folds errors the way os.path.isfile did in
+    # status(), and that is right here: None means "could not count", not
+    # "there is no database", so a folded error and a real absence want the
+    # same answer.
+    if _is_a_named_pipe(sqlite_path) or not os.path.exists(sqlite_path):
         return None
     try:
         import sqlite3
@@ -786,6 +797,40 @@ def _integrity_target_is_absent(sqlite_path: str) -> bool:
     except (OSError, ValueError):
         return False
     return False
+
+
+def _is_a_named_pipe(sqlite_path: str) -> bool:
+    """Return True only when ``sqlite_path`` provably names a FIFO.
+
+    A read that fails is an answer; a read that never returns is not. Opening a
+    FIFO for reading parks in the kernel until a writer arrives, so it has to
+    be decided about before reading rather than by reading.
+    ``miner._read_text_no_follow`` meets the same hazard and answers it with
+    ``O_NONBLOCK``; there is no open to pass flags to here, because the open
+    happens inside sqlite3.
+
+    The other types this palace could hold need no special case: measured
+    against ``sqlite3.connect(..., mode=ro)``, a directory, a socket, a block
+    device and a character device each answered with an ``OperationalError`` in
+    well under a second, and landed in the same "unreadable" report as a
+    database behind a permission. Which error each answers with is not worth
+    recording here — it varies with the device and with the permissions on it.
+    The FIFO is the only one that does not answer at all.
+
+    ``os.stat`` follows symlinks on purpose, so a link pointing at a FIFO is
+    refused too — unlike :func:`_integrity_target_is_absent`, which uses
+    ``lstat`` because there the question is whether the NAME resolves at all.
+    A ``stat`` that fails leaves the question open and answers False, which
+    lets the path go on; that is the same fail-toward-the-probe rule, and it is
+    what keeps an unreadable directory or a broken link described rather than
+    swallowed. It is also why :func:`sqlite_drawer_count` makes this check
+    itself rather than trusting one made further up: answered while the path is
+    unreachable, it cannot speak for the moment of the open.
+    """
+    try:
+        return stat.S_ISFIFO(os.stat(sqlite_path).st_mode)
+    except (OSError, ValueError):
+        return False
 
 
 def _quick_check_errors(sqlite_path: str) -> list[str]:
@@ -2343,8 +2388,21 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
     hnswlib — it reads ``chroma.sqlite3`` and ``index_metadata.pickle``
     directly via :func:`mempalace.backends.chroma.hnsw_capacity_status`.
 
-    Returns the capacity-status dict (also printed). Returns a dict with
-    ``status="unknown"`` when no palace exists at the given path.
+    Returns the capacity-status dict (also printed), or a one-key dict in its
+    place: ``status="unknown"`` when no palace directory is reachable at the
+    given path or when ``chroma.sqlite3`` resolves to a named pipe,
+    ``status="uninitialized"`` when the palace directory is there but nothing
+    resolves under ``chroma.sqlite3``, and ``status="empty"`` when the
+    database is readable and holds no drawers.
+
+    A state this gate cannot settle takes neither early return: the capacity
+    report below answers for it instead, returning the ``{"drawers": …,
+    "closets": …}`` shape a healthy palace returns with both counts printed as
+    unreadable. That report reaches its verdict through its own probes, not by
+    opening the file: with ``sqlite3.connect`` instrumented, an unreadable
+    directory, a broken link and a symlink loop each produce zero opens of
+    ``chroma.sqlite3``, while the same instrumentation counts opens on a
+    healthy palace.
     """
     palace_path = palace_path or _get_palace_path()
     collection_name = collection_name or _drawers_collection_name()
@@ -2358,9 +2416,28 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
         return {"status": "unknown", "message": "no palace at path"}
 
     db_path = os.path.join(palace_path, "chroma.sqlite3")
-    if not os.path.isfile(db_path):
+    # "uninitialized" is a statement about the palace, so it needs proof that
+    # nothing is there. os.path.isfile folds OSError and ValueError alike into
+    # False, which reports a database behind an unreadable directory, or one
+    # whose name is now a broken symlink, as one that was never created
+    # (#2293). _integrity_target_is_absent accepts only ENOENT as proof;
+    # everything it cannot settle skips this early return and is described by
+    # the capacity report below.
+    if _integrity_target_is_absent(db_path):
         print(f"  Palace dir at {palace_path} exists but has no chroma.sqlite3 yet.\n")
         return {"status": "uninitialized", "message": "palace has no chroma.sqlite3 yet"}
+
+    # This is not what keeps the read from parking: sqlite_drawer_count refuses
+    # a FIFO next to its own open, and measured, that check alone already
+    # answers this state in well under a second. What this one buys is the
+    # name. Without it the operator is told "(unreadable)", the same answer a
+    # database behind a permission gets, for a palace whose actual problem is
+    # that chroma.sqlite3 is not a database at all.
+    if _is_a_named_pipe(db_path):
+        # "resolves to", not "is": the name may be a symlink, and an operator
+        # told to delete a pipe should not be pointed at the link instead.
+        print(f"  chroma.sqlite3 at {palace_path} resolves to a named pipe, not a database.\n")
+        return {"status": "unknown", "message": "chroma.sqlite3 resolves to a named pipe"}
 
     # Cheap collection-existence check via sqlite. By design this function
     # never opens a chromadb client (see the docstring); sqlite_drawer_count
