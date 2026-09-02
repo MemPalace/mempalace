@@ -2266,6 +2266,18 @@ def status(palace_path: str):
         print("  Run `mempalace repair --mode from-sqlite --archive-existing` first.")
         return
 
+    # Fast path: single-pass metadata fetch for backends that expose
+    # get_all_metadata() (#1796). Avoids the O(n^2) offset loop below.
+    get_all = getattr(col, "get_all_metadata", None)
+    if callable(get_all):
+        metas = get_all()
+        wing_rooms: dict = defaultdict(lambda: defaultdict(int))
+        for m in metas:
+            m = m or {}
+            wing_rooms[m.get("wing", "?")][m.get("room", "?")] += 1
+        _print_status(len(metas), wing_rooms)
+        return
+
     # Count by wing and room — paginate to avoid SQLite "too many SQL
     # variables" error on large palaces (see #802, #850).
     total = col.count()
