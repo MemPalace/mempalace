@@ -71,6 +71,7 @@ sqlite_exact = "mempalace.backends.sqlite_exact:SQLiteExactBackend"
 # onto ``BaseSourceAdapter`` in a follow-up PR. Third-party adapter packages
 # (``mempalace-source-cursor``, ``mempalace-source-git``, …) register here.
 [project.entry-points."mempalace.sources"]
+openclaw = "mempalace.sources.openclaw:OpenClawSourceAdapter"
 
 [project.optional-dependencies]
 dev = [
