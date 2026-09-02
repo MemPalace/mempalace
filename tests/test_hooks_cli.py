@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 from hypothesis import given
@@ -2301,7 +2301,7 @@ def test_session_end_uses_detached_paths_not_sync_mine(tmp_path):
         wing="wing_sessions",
         toast=False,
         agent_name="claude",
-        checkpoint_id="session-end:initial",
+        checkpoint_id=ANY,
     )
     # The session is over; its per-session save marker is cleared.
     assert not last_save_file.exists()
@@ -2443,7 +2443,7 @@ def test_failed_final_session_snapshot_stays_pending(tmp_path):
         pending = hooks_cli_mod._pending_checkpoints_for_session("sess")
         assert len(pending) == 1
         payload = json.loads(pending[0].read_text(encoding="utf-8"))
-        assert payload["checkpoint_id"] == "session-end:initial"
+        assert payload["checkpoint_id"].startswith("session-end:initial:35:")
         assert hooks_cli_mod._session_checkpoint_epoch("sess") == "initial"
 
 
@@ -2472,9 +2472,8 @@ def test_session_end_defaults_to_saving_when_config_unreadable(tmp_path):
     mock_auto.assert_called_once()
 
 
-def test_session_end_clears_marker_even_if_capture_raises(tmp_path):
-    """Marker cleanup runs in a ``finally`` so a failing ingest still cleans up
-    and never wedges the per-session marker on."""
+def test_session_end_preserves_marker_if_capture_raises(tmp_path):
+    """A failed final capture keeps the boundary retryable on resume."""
     last_save_file = tmp_path / "boom_last_save"
     last_save_file.write_text("5", encoding="utf-8")
     with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
@@ -2493,7 +2492,7 @@ def test_session_end_clears_marker_even_if_capture_raises(tmp_path):
                     {"session_id": "boom", "transcript_path": str(tmp_path / "x.jsonl")},
                     "claude-code",
                 )
-    assert not last_save_file.exists()
+    assert last_save_file.exists()
 
 
 def test_session_end_clears_marker_on_parse_failure(tmp_path):

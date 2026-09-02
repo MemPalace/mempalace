@@ -1969,6 +1969,7 @@ def hook_session_end(data: dict, harness: str):
     # Parse inside the try so a malformed payload (e.g. non-dict stdin that
     # makes _parse_harness_input raise) still runs the finally cleanup below.
     session_id = "unknown"
+    session_end_complete = True
     try:
         parsed = _parse_harness_input(data, harness)
         session_id = parsed["session_id"]
@@ -1988,6 +1989,7 @@ def hook_session_end(data: dict, harness: str):
         # Respect auto_save config toggle (clean opt-out)
         if not auto_save:
             _discard_session_pending_checkpoints(session_id)
+            session_end_complete = True
             _output({})
             return
 
@@ -2025,16 +2027,23 @@ def hook_session_end(data: dict, harness: str):
                 return
 
             if valid_transcript:
+                session_end_complete = False
                 target_wing = _wing_from_transcript_path(valid_transcript)
                 agent_name = _diary_agent_for_harness(harness)
-                _flush_pending_session_checkpoints(
+                pending_flushed = _flush_pending_session_checkpoints(
                     valid_transcript,
                     session_id,
                     target_wing,
                     agent_name,
                     toast=toast,
                 )
-                final_checkpoint_id = f"session-end:{_session_checkpoint_epoch(session_id)}"
+                final_boundary = _count_human_messages(valid_transcript)
+                import uuid
+
+                final_checkpoint_id = (
+                    f"session-end:{_session_checkpoint_epoch(session_id)}:"
+                    f"{final_boundary}:{uuid.uuid4().hex}"
+                )
                 final_result = _save_diary_direct(
                     valid_transcript,
                     session_id,
@@ -2045,12 +2054,15 @@ def hook_session_end(data: dict, harness: str):
                 )
                 if final_result.get("count", 0) > 0:
                     _discard_pending_checkpoint(session_id, final_checkpoint_id)
-                _ingest_transcript(valid_transcript)
+                ingest_status = _ingest_transcript(valid_transcript)
+                session_end_complete = pending_flushed and (
+                    final_result.get("count", 0) > 0 or ingest_status is True
+                )
             _maybe_auto_ingest()
 
         _output({})
     finally:
-        if not _pending_checkpoints_for_session(session_id):
+        if session_end_complete and not _pending_checkpoints_for_session(session_id):
             _advance_session_checkpoint_epoch(session_id)
             _clear_session_last_save(session_id)
 
