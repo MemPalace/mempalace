@@ -2941,14 +2941,20 @@ class TestWriteTools:
             documents=["hidden", "published", "[commit]", "ordinary"],
             metadatas=[
                 {
+                    "wing": "w",
+                    "room": "r",
                     "mine_staged": True,
                     "mine_generation_token": "hidden-token",
                 },
                 {
+                    "wing": "w",
+                    "room": "r",
                     "mine_staged": True,
                     "mine_generation_token": "published-token",
                 },
                 {
+                    "wing": "w",
+                    "room": "_registry",
                     "mine_staged": True,
                     "mine_commit_marker": True,
                     "mine_generation_commit": "published-token",
@@ -2959,7 +2965,7 @@ class TestWriteTools:
 
         from mempalace.mcp_server import tool_list_drawers
 
-        result = tool_list_drawers(limit=20)
+        result = tool_list_drawers(wing="w", room="r", limit=20)
         ids = {drawer["drawer_id"] for drawer in result["drawers"]}
         assert ids == {"published", "ordinary"}
         assert result["total"] == 2

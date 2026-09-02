@@ -496,8 +496,9 @@ def _run_queued_mine(pid_path: str, pending_path: str, watcher_path: str) -> Non
     pending_file = Path(pending_path)
     watcher_file = Path(watcher_path)
     try:
-        deadline = time.monotonic() + max(_mine_slot_timeout_secs(), 3600.0)
-        while _slot_file_pid_alive(pid_file) and time.monotonic() < deadline:
+        timeout = _mine_slot_timeout_secs()
+        deadline = None if timeout <= 0 else time.monotonic() + timeout
+        while _slot_file_pid_alive(pid_file) and (deadline is None or time.monotonic() < deadline):
             time.sleep(0.25)
         if _slot_file_pid_alive(pid_file):
             return
@@ -1281,7 +1282,7 @@ def _prepare_checkpoint_payload(
                 pass
             os.replace(temp_file, pending_file)
         except OSError:
-            pass
+            return None
     return messages, themes, idempotency_key, entry, pending_file
 
 

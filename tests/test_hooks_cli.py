@@ -2993,6 +2993,57 @@ def test_failed_checkpoint_retry_reuses_persisted_payload(tmp_path):
     assert list(tmp_path.glob("pending_checkpoint_*.json")) == []
 
 
+def test_checkpoint_is_not_dispatched_when_payload_freeze_fails(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": "important prompt"}}],
+    )
+    with (
+        patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
+        patch.object(Path, "write_text", side_effect=OSError("disk full")),
+        patch("mempalace.mcp_server.tool_diary_write") as write,
+    ):
+        result = _save_diary_direct(
+            str(transcript),
+            "sess1",
+            wing="wing_project",
+            agent_name="claude",
+            checkpoint_id="stop:15",
+        )
+
+    assert result["count"] == 0
+    write.assert_not_called()
+
+
+def test_queued_mine_timeout_zero_waits_until_active_pid_exits(tmp_path):
+    from mempalace.hooks_cli import _run_queued_mine
+
+    pid_file = tmp_path / "mine.pid"
+    pending_file = tmp_path / "mine.pending.json"
+    watcher_file = tmp_path / "mine.watcher.pid"
+    pid_file.write_text("123 1", encoding="ascii")
+    pending_file.write_text(json.dumps({"cmd": ["mempalace", "mine", "/tmp/chat"]}))
+    watcher_file.write_text("456 1", encoding="ascii")
+    with (
+        patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
+        patch("mempalace.hooks_cli._mine_slot_timeout_secs", return_value=0),
+        patch(
+            "mempalace.hooks_cli._slot_file_pid_alive",
+            side_effect=[True, True, False, False],
+        ),
+        patch("mempalace.hooks_cli.time.monotonic", side_effect=AssertionError),
+        patch("mempalace.hooks_cli.time.sleep") as sleep,
+        patch("mempalace.hooks_cli._create_mine_slot_with_placeholder"),
+        patch("mempalace.hooks_cli.subprocess.Popen") as popen,
+    ):
+        popen.return_value.pid = 789
+        _run_queued_mine(str(pid_file), str(pending_file), str(watcher_file))
+
+    assert sleep.call_count == 2
+    popen.assert_called_once()
+
+
 def test_forward_diary_to_hub_respects_kill_switch(tmp_path):
     from mempalace.hooks_cli import _forward_diary_to_hub
 

@@ -3865,9 +3865,19 @@ def tool_list_drawers(
             where = {"$and": conditions}
 
         listed = None
+        committed_tokens = set()
         if _is_chroma_backend() and _config.palace_path:
-            from .backends.chroma import sqlite_list_id_metadata
+            from .backends.chroma import (
+                sqlite_generation_commit_tokens,
+                sqlite_list_id_metadata,
+            )
 
+            marker_tokens = sqlite_generation_commit_tokens(
+                _config.palace_path,
+                _config.collection_name,
+            )
+            if marker_tokens is not None:
+                committed_tokens = marker_tokens
             listed = sqlite_list_id_metadata(
                 _config.palace_path, _config.collection_name, where=where
             )
@@ -3880,12 +3890,13 @@ def tool_list_drawers(
             if not col:
                 return _collection_error_or_no_palace()
             ids, documents, metadatas = _fetch_drawer_rows(col, where=where, include=["metadatas"])
+            marker_result = col.get(where={"mine_commit_marker": True}, include=["metadatas"])
+            committed_tokens = {
+                (meta or {}).get("mine_generation_commit")
+                for meta in (marker_result.get("metadatas") or [])
+                if (meta or {}).get("mine_generation_commit")
+            }
         drawers = _collapse_drawer_rows(ids, documents, metadatas)
-        committed_tokens = {
-            drawer.get("metadata", {}).get("mine_generation_commit")
-            for drawer in drawers
-            if drawer.get("metadata", {}).get("mine_commit_marker") is True
-        }
         drawers = [
             drawer
             for drawer in drawers

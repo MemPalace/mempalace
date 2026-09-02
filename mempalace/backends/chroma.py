@@ -1405,6 +1405,35 @@ def sqlite_list_id_metadata(
     return ids, metas
 
 
+def sqlite_generation_commit_tokens(palace_path: str, collection_name: str) -> Optional[set[str]]:
+    """Read only published conversation-generation tokens without opening HNSW."""
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        try:
+            rows = conn.execute(
+                """
+                SELECT marker.string_value
+                FROM embedding_metadata marker
+                JOIN embeddings e ON e.id = marker.id
+                JOIN segments s ON e.segment_id = s.id
+                JOIN collections c ON s.collection = c.id
+                WHERE c.name = ?
+                  AND marker.key = 'mine_generation_commit'
+                  AND marker.string_value IS NOT NULL
+                """,
+                (collection_name,),
+            ).fetchall()
+            return {row[0] for row in rows if row[0]}
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        logger.debug("sqlite_generation_commit_tokens failed", exc_info=True)
+        return None
+
+
 def sqlite_documents_for_ids(
     palace_path: str,
     collection_name: str,
