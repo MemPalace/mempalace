@@ -6754,6 +6754,30 @@ def _decorate_mcp_tool_result(tool_name: str, result):
     return result
 
 
+def _normalize_envelope(request: dict) -> "tuple[str, dict]":
+    """Read `method` and `params` off a request without raising.
+
+    `or ""` / `or {}` only rescue falsy values, so a truthy non-string method
+    reached `.startswith()` and truthy non-object params reached `.get()`,
+    raising AttributeError out of `handle_request`. Over stdio that surfaced
+    as no response at all, leaving the client waiting on an id forever.
+
+    A malformed value falls back to the same default its falsy counterpart has
+    always been given, so nothing that used to be answered stops being
+    answered: `params: []` is legal by-position params this server does not
+    support, and it kept working as an empty mapping before this guard existed.
+    """
+    method = request.get("method")
+    if not isinstance(method, str):
+        method = ""
+
+    params = request.get("params")
+    if not isinstance(params, dict):
+        params = {}
+
+    return method, params
+
+
 def handle_request(request):
     global _last_request_time
     if not isinstance(request, dict):
@@ -6763,9 +6787,8 @@ def handle_request(request):
             "error": {"code": -32600, "message": "Invalid Request"},
         }
     _last_request_time = time.monotonic()
-    method = request.get("method") or ""
-    params = request.get("params") or {}
     req_id = request.get("id")
+    method, params = _normalize_envelope(request)
 
     if method == "initialize":
         client_version = params.get("protocolVersion", SUPPORTED_PROTOCOL_VERSIONS[-1])
@@ -6813,6 +6836,12 @@ def handle_request(request):
                     "message": "Invalid params: 'name' is required for tools/call",
                 },
             }
+        if _tool_call_members_invalid(params):
+            return _json_rpc_error(
+                req_id,
+                -32602,
+                "Invalid params: 'name' must be a string and 'arguments' an object",
+            )
         tool_name = params.get("name")
         tool_args = params.get("arguments") or {}
         if tool_name not in TOOLS:
@@ -6940,11 +6969,7 @@ def handle_request(request):
     # Notifications (missing id) must never get a response
     if req_id is None:
         return None
-    return {
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "error": {"code": -32601, "message": f"Unknown method: {method}"},
-    }
+    return _unknown_method_error(req_id, request)
 
 
 def _restore_stdout():
@@ -7276,12 +7301,57 @@ def _start_idle_exit_watchdog() -> None:
     t.start()
 
 
-def _json_rpc_parse_error(req_id=None):
+def _json_rpc_error(req_id, code: int, message: str) -> dict:
     return {
         "jsonrpc": "2.0",
         "id": req_id,
-        "error": {"code": -32700, "message": "Parse error"},
+        "error": {"code": code, "message": message},
     }
+
+
+def _json_rpc_parse_error(req_id=None):
+    return _json_rpc_error(req_id, -32700, "Parse error")
+
+
+def _tool_call_members_invalid(params: dict) -> bool:
+    """True when `tools/call` params carry an unusable `name` / `arguments`.
+
+    The same `or {}` trap as the envelope, one level down: a truthy non-mapping
+    `arguments` survived the fallback and blew up on `**` unpacking, and an
+    unhashable `name` raised TypeError on the `in TOOLS` membership test.
+    """
+    name = params.get("name")
+    args = params.get("arguments")
+    return not isinstance(name, str) or not isinstance(args, (dict, type(None)))
+
+
+def _unknown_method_error(req_id, request: dict) -> dict:
+    """Name the real problem when `method` was coerced for dispatch.
+
+    A non-string method is mapped to "" so it lands on the long-standing
+    `method: null` path, but rendering that verbatim gives "Unknown method: "
+    with nothing after it, and makes 123 indistinguishable from "123".
+    """
+    raw_method = request.get("method")
+    if not isinstance(raw_method, str):
+        return _json_rpc_error(
+            req_id,
+            -32601,
+            f"Unknown method: expected a string, got {type(raw_method).__name__}",
+        )
+    return _json_rpc_error(req_id, -32601, f"Unknown method: {raw_method}")
+
+
+def _json_rpc_internal_error(req_id) -> dict:
+    """Dispatch-level failure.
+
+    Deliberately generic: unlike `_internal_tool_error`, which reports a known
+    handler's own exception text, this fires for arbitrary code paths whose
+    exception may name internal helpers or filesystem layout. `-32603` also
+    keeps the transport-level failure distinct from the `-32000` this module
+    already uses for application-level tool failures.
+    """
+    return _json_rpc_error(req_id, -32603, "Internal error")
 
 
 # Module-level constants for the HTTP transport.
@@ -8293,7 +8363,29 @@ def _build_http_server(host: str, port: int):
 
             # Locking policy lives in _http_dispatch: global lock for
             # Chroma-touching tools, lock-free for logstream tools.
-            response = _http_dispatch(request)
+            try:
+                response = _http_dispatch(request)
+            except Exception:
+                # Without this the exception escaped into BaseHTTPRequestHandler,
+                # which closes the connection with no reply at all -- the client
+                # sees a dropped socket instead of a JSON-RPC error. Log with the
+                # traceback: -32603 tells the client nothing diagnostic, so the
+                # stack is the only record of what actually failed.
+                logger.exception("HTTP JSON-RPC dispatch error")
+                req_id = request.get("id") if isinstance(request, dict) else None
+                if req_id is None:
+                    # A notification is owed no response body, failure included,
+                    # matching the 202 branch below and the stdio loop. The
+                    # status still reports the failure at the transport level.
+                    self._record_request(500)
+                    self.send_response(500)
+                    self.send_header("Content-Length", "0")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.close_connection = True
+                    return
+                self._send_json(500, _json_rpc_internal_error(req_id))
+                return
 
             if response is None:
                 # JSON-RPC notifications intentionally have no response body.
@@ -8509,8 +8601,13 @@ def _forward_request_to_hub(base_url: str, headers: dict, request: dict, palace_
 def _request_is_mutating(request: dict) -> bool:
     if request.get("method") != "tools/call":
         return False
-    name = ((request.get("params") or {}).get("name")) or ""
-    return name in _MUTATING_TOOLS
+    # This decides whether a mid-flight failure may be replayed locally, so it
+    # must return a verdict rather than raise: the same `or {}` trap made a
+    # non-mapping `params` throw AttributeError instead of answering "not
+    # mutating", and an unhashable name broke the membership test.
+    _, params = _normalize_envelope(request)
+    name = params.get("name")
+    return isinstance(name, str) and name in _MUTATING_TOOLS
 
 
 def _dispatch_stdio_request(request: dict):
@@ -8627,14 +8724,34 @@ def _run_stdio_loop() -> None:
         payload = None
         try:
             request = json.loads(line)
-            response = _dispatch_stdio_request(request)
-            if response is not None:
-                payload = json.dumps(response, ensure_ascii=False)
         except KeyboardInterrupt:
             break
-        except Exception as e:
-            logger.error(f"Server error: {e}")
-            continue
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            # Narrow on purpose: reporting a MemoryError or RecursionError as
+            # "Parse error" would be a lie. The id is unknowable here, so it is
+            # null per JSON-RPC 2.0 section 5 -- the "never answer a
+            # notification" rule cannot bind when the notification is exactly
+            # what could not be parsed. Staying silent left the client waiting
+            # on a request it had already sent, while the HTTP transport has
+            # answered -32700 all along.
+            logger.error("Server error: %s", exc)
+            payload = json.dumps(_json_rpc_parse_error(), ensure_ascii=False)
+        else:
+            try:
+                response = _dispatch_stdio_request(request)
+                if response is not None:
+                    payload = json.dumps(response, ensure_ascii=False)
+            except KeyboardInterrupt:
+                break
+            except Exception:
+                # Log with the traceback: the client only gets a generic
+                # -32603, so the stack is the only record of what failed.
+                logger.exception("Server error")
+                req_id = request.get("id") if isinstance(request, dict) else None
+                if req_id is None:
+                    # A notification is owed no response, failure included.
+                    continue
+                payload = json.dumps(_json_rpc_internal_error(req_id), ensure_ascii=False)
 
         if payload is None:
             continue
