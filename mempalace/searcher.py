@@ -15,6 +15,7 @@ import math
 import os
 import re
 import sqlite3
+from types import SimpleNamespace
 from datetime import timedelta
 from pathlib import Path
 from typing import Optional
@@ -1284,6 +1285,59 @@ def _bm25_only_via_sqlite(
     return result
 
 
+def _resolve_lexical_generation_hits(drawers_col, hits, query, committed_tokens):
+    """Replace stale lexical hits with their newest visible physical generation."""
+    logical_metas = [
+        hit.metadata or {} for hit in hits if (hit.metadata or {}).get("logical_drawer_id")
+    ]
+    current_ids = _current_generation_ids_for_query(
+        drawers_col,
+        {"metadatas": [logical_metas]},
+        committed_tokens,
+    )
+    if not current_ids:
+        return hits
+    by_physical = {hit.id: hit for hit in hits}
+    missing_ids = sorted(set(current_ids.values()) - set(by_physical))
+    if missing_ids:
+        try:
+            fetched = drawers_col.get(
+                ids=missing_ids,
+                include=["documents", "metadatas"],
+            )
+            fetched_ids = fetched.get("ids") or []
+            fetched_docs = fetched.get("documents") or []
+            fetched_metas = fetched.get("metadatas") or []
+            for index, physical_id in enumerate(fetched_ids):
+                document = fetched_docs[index] if index < len(fetched_docs) else ""
+                metadata = fetched_metas[index] if index < len(fetched_metas) else {}
+                score = _bm25_scores(query, [document or ""])[0]
+                if score > 0:
+                    by_physical[physical_id] = SimpleNamespace(
+                        id=physical_id,
+                        document=document or "",
+                        metadata=metadata or {},
+                        score=score,
+                    )
+        except Exception:
+            logger.warning("Could not hydrate current lexical generations", exc_info=True)
+
+    resolved = []
+    emitted_logical = set()
+    for hit in hits:
+        logical_id = (hit.metadata or {}).get("logical_drawer_id")
+        if not logical_id:
+            resolved.append(hit)
+            continue
+        if logical_id in emitted_logical:
+            continue
+        emitted_logical.add(logical_id)
+        current = by_physical.get(current_ids.get(logical_id))
+        if current is not None:
+            resolved.append(current)
+    return resolved
+
+
 def _merge_bm25_union_candidates(
     hits: list,
     drawers_col,
@@ -1330,15 +1384,18 @@ def _merge_bm25_union_candidates(
         logger.debug("candidate_strategy=union: lexical fetch failed", exc_info=True)
         return
 
+    lexical_hits = _resolve_lexical_generation_hits(
+        drawers_col, lexical.hits, query, committed_tokens
+    )
     metric = _metric_for_collection(drawers_col)
     lexical_distances = (
-        _lexical_hit_vector_distances(drawers_col, query, lexical.hits, metric)
+        _lexical_hit_vector_distances(drawers_col, query, lexical_hits, metric)
         if max_distance > 0.0
         else {}
     )
 
     bm25_extra = []
-    for hit in lexical.hits:
+    for hit in lexical_hits:
         meta = hit.metadata or {}
         if _is_staged_metadata(meta, committed_tokens):
             continue

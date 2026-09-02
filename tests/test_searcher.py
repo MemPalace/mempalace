@@ -7,6 +7,7 @@ plus mock-based tests for error paths.
 
 import sqlite3
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -244,6 +245,45 @@ class TestSearchMemories:
 
         assert collection.query_limits == [1, 2]
         assert result["ids"] == [["current"]]
+
+    def test_lexical_union_replaces_old_hit_with_current_generation(self):
+        from mempalace.searcher import _resolve_lexical_generation_hits
+
+        old_meta = {
+            "logical_drawer_id": "logical",
+            "filed_at": "2026-09-01T00:00:00",
+        }
+        current_meta = {
+            "logical_drawer_id": "logical",
+            "filed_at": "2026-09-02T00:00:00",
+        }
+        old_hit = SimpleNamespace(
+            id="old",
+            document="target phrase in stale content",
+            metadata=old_meta,
+            score=10.0,
+        )
+
+        class Collection:
+            @staticmethod
+            def get(**kwargs):
+                if "where" in kwargs:
+                    return {
+                        "ids": ["old", "current"],
+                        "metadatas": [old_meta, current_meta],
+                    }
+                return {
+                    "ids": ["current"],
+                    "documents": ["target phrase in current content"],
+                    "metadatas": [current_meta],
+                }
+
+        resolved = _resolve_lexical_generation_hits(
+            Collection(), [old_hit], "target phrase", frozenset()
+        )
+
+        assert [hit.id for hit in resolved] == ["current"]
+        assert resolved[0].document == "target phrase in current content"
 
     def test_wing_and_room_filter(self, palace_path, seeded_collection):
         result = search_memories("code", palace_path, wing="project", room="frontend")
