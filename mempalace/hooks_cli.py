@@ -1450,6 +1450,40 @@ def _save_diary_direct(
     return {"count": 0}
 
 
+def _flush_pending_session_checkpoints(
+    transcript_path: str,
+    session_id: str,
+    wing: str,
+    agent_name: str,
+    toast: bool = False,
+) -> bool:
+    """Replay and acknowledge each frozen Stop payload before SessionEnd advances."""
+    all_saved = True
+    for path in _pending_checkpoints_for_session(session_id):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            checkpoint_id = payload["checkpoint_id"]
+        except (OSError, ValueError, KeyError, TypeError):
+            all_saved = False
+            continue
+        result = _save_diary_direct(
+            transcript_path,
+            session_id,
+            wing=wing,
+            toast=toast,
+            agent_name=agent_name,
+            checkpoint_id=checkpoint_id,
+        )
+        if result.get("count", 0) <= 0:
+            all_saved = False
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            all_saved = False
+    return all_saved
+
+
 def _ingest_transcript(transcript_path: str) -> Optional[bool]:
     """Mine a Claude Code session transcript into the palace as a conversation.
 
@@ -1991,16 +2025,23 @@ def hook_session_end(data: dict, harness: str):
                 return
 
             if valid_transcript:
-                diary_result = _save_diary_direct(
+                target_wing = _wing_from_transcript_path(valid_transcript)
+                agent_name = _diary_agent_for_harness(harness)
+                _flush_pending_session_checkpoints(
                     valid_transcript,
                     session_id,
-                    wing=_wing_from_transcript_path(valid_transcript),
+                    target_wing,
+                    agent_name,
                     toast=toast,
-                    agent_name=_diary_agent_for_harness(harness),
                 )
-                ingest_status = _ingest_transcript(valid_transcript)
-                if diary_result.get("count", 0) > 0 or ingest_status is True:
-                    _discard_session_pending_checkpoints(session_id)
+                _save_diary_direct(
+                    valid_transcript,
+                    session_id,
+                    wing=target_wing,
+                    toast=toast,
+                    agent_name=agent_name,
+                )
+                _ingest_transcript(valid_transcript)
             _maybe_auto_ingest()
 
         _output({})

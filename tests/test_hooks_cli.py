@@ -2370,6 +2370,41 @@ def test_failed_session_end_preserves_pending_checkpoint_epoch_and_marker(tmp_pa
         assert len(hooks_cli_mod._pending_checkpoints_for_session("sess")) == 1
 
 
+def test_session_end_flushes_exact_frozen_pending_payload_before_advancing(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(15)],
+    )
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        hooks_cli_mod._prepare_checkpoint_payload(
+            str(transcript), "sess", "wing_sessions", "claude", "stop:initial:15"
+        )
+        pending_path = hooks_cli_mod._pending_checkpoints_for_session("sess")[0]
+        frozen_entry = json.loads(pending_path.read_text(encoding="utf-8"))["entry"]
+    with transcript.open("a", encoding="utf-8") as stream:
+        for index in range(15, 35):
+            stream.write(
+                json.dumps({"message": {"role": "user", "content": f"msg {index}"}}) + "\n"
+            )
+
+    with (
+        patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
+        patch("mempalace.server_registry.read_live_serverinfo", return_value=None),
+        patch(
+            "mempalace.mcp_server.tool_diary_write",
+            return_value={"success": True, "entry_id": "saved"},
+        ) as write,
+    ):
+        saved = hooks_cli_mod._flush_pending_session_checkpoints(
+            str(transcript), "sess", "wing_sessions", "claude"
+        )
+
+    assert saved is True
+    assert write.call_args.kwargs["entry"] == frozen_entry
+    assert list(tmp_path.glob("pending_checkpoint_*.json")) == []
+
+
 def test_session_end_defaults_to_saving_when_config_unreadable(tmp_path):
     """A corrupt/unreadable config must not lose the final save: the handler
     defaults to auto-save on (toasts off) instead of crashing the hook."""
