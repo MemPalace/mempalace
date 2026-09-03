@@ -4019,6 +4019,34 @@ class TestKGTools:
 
         result = tool_kg_timeline(entity="Alice")
         assert result["count"] > 0
+        assert result["total"] >= result["count"]
+        assert result["offset"] == 0
+        assert result["limit"] == 100
+
+    def test_kg_timeline_paginates(self, monkeypatch, config, palace_path, seeded_kg):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_timeline
+
+        full = tool_kg_timeline()
+        total = full["total"]
+        assert total == full["count"]  # seeded KG fits in one default page
+
+        page1 = tool_kg_timeline(limit=2, offset=0)
+        page2 = tool_kg_timeline(limit=2, offset=2)
+        assert page1["count"] == 2
+        assert page1["total"] == total
+        assert page1["offset"] == 0 and page1["limit"] == 2
+        assert page2["offset"] == 2
+        # pages are disjoint and in timeline order
+        assert page1["timeline"] + page2["timeline"] == full["timeline"][: 2 + page2["count"]]
+
+    def test_kg_timeline_clamps_pagination_args(self, monkeypatch, config, palace_path, seeded_kg):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_timeline
+
+        result = tool_kg_timeline(limit=10_000, offset=-3)
+        assert result["limit"] == 100  # clamped to _MAX_RESULTS
+        assert result["offset"] == 0
 
     def test_kg_stats(self, monkeypatch, config, palace_path, seeded_kg):
         _patch_mcp_server(monkeypatch, config, seeded_kg)
