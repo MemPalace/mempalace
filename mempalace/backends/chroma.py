@@ -2564,6 +2564,10 @@ class ChromaBackend(BaseBackend):
         Chroma's cache reset is process-global. Draining only the palace that
         changed would leave this backend's other clients untracked after the
         reset, so their later ``close()`` calls could not stop their Systems.
+
+        Draining invalidates every ``ChromaCollection`` previously returned by
+        those clients, including collections for unchanged palaces. Callers
+        must reacquire them through :meth:`get_collection`.
         """
         clients = list(self._clients.values())
         self._clients.clear()
