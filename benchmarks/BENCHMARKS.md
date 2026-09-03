@@ -294,12 +294,11 @@ The target session said "I still remember the happy high school experiences such
 Built independently from the hybrid track. Different architecture, same ceiling.
 
 **Architecture:**
-```
-PALACE
-  └── HALL (concept: travel, work, health, relationships, general)
-        └── Two-pass retrieval:
-              Pass 1: tight search within inferred hall
-              Pass 2: full haystack with hall-based score bonuses
+```mermaid
+flowchart TD
+    PA[PALACE] --> HA["HALL<br/>(travel · work · health · relationships · general)"]
+    HA --> P1["Pass 1 — tight search within inferred hall"]
+    HA --> P2["Pass 2 — full haystack with hall-based score bonuses"]
 ```
 
 The palace classifies each question into one of 5 halls. Pass 1 searches only within that hall — high precision, catches the obvious match. Pass 2 searches the full corpus with the hall affinity as a tiebreaker — catches cases where the relevant session was miscategorized.
