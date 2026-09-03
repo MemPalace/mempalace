@@ -7,6 +7,10 @@ import mempalace.embedding as embedding
 def isolate_embedding_state(monkeypatch):
     monkeypatch.setattr(embedding, "_EF_CACHE", {})
     monkeypatch.setattr(embedding, "_WARNED", set())
+    # Inert the one-shot GPU DLL preload by default so tests that fake CUDA
+    # availability don't run the real onnxruntime.preload_dlls(); the preload
+    # tests below opt back in explicitly.
+    monkeypatch.setattr(embedding, "_PRELOAD_DONE", True)
 
 
 def test_auto_picks_cuda(monkeypatch):
@@ -47,7 +51,7 @@ def test_auto_skips_coreml_for_embeddinggemma(monkeypatch):
 
 
 def test_auto_still_picks_coreml_for_other_models(monkeypatch):
-    """The denylist is per-model — it must not disable CoreML globally."""
+    """The denylist is per-model â€” it must not disable CoreML globally."""
     monkeypatch.setattr(
         "onnxruntime.get_available_providers",
         lambda: ["CoreMLExecutionProvider", "CPUExecutionProvider"],
@@ -265,7 +269,7 @@ def test_minilm_ef_model_override_applies_thread_cap(monkeypatch):
 
 def test_minilm_ef_model_override_falls_back_when_uncapped(monkeypatch):
     """With no cap (0), the override must defer to the parent build via
-    ``super().model`` — not reach into ``cached_property`` internals (#1068
+    ``super().model`` â€” not reach into ``cached_property`` internals (#1068
     review). Proves super() resolves the parent descriptor without error."""
     import onnxruntime as ort
 
@@ -279,7 +283,7 @@ def test_minilm_ef_model_override_falls_back_when_uncapped(monkeypatch):
 
     ef_cls = embedding._build_ef_class()
     ef = ef_cls(preferred_providers=["CPUExecutionProvider"], intra_op_num_threads=0)
-    session = ef.model  # cap <= 0 → super().model (upstream builder)
+    session = ef.model  # cap <= 0 â†’ super().model (upstream builder)
 
     assert session is not None
     # Upstream leaves intra_op at ORT's default (0 = unset), confirming we
@@ -298,7 +302,7 @@ def test_describe_device_uses_resolved_effective_device(monkeypatch):
 
 
 def test_describe_device_reports_the_model_aware_resolution(monkeypatch):
-    """The status header must show the device that will actually be used —
+    """The status header must show the device that will actually be used â€”
     which now depends on the model, since CoreML is off the table for
     embeddinggemma."""
     monkeypatch.setattr(
@@ -325,7 +329,7 @@ class _NumpyEmbeddingFunction:
     """Mimics the real EF contract: a list of float32 ``np.ndarray`` rows.
 
     Both shipped embedders (ChromaDB's ONNX MiniLM and EmbeddingGemma) return
-    numpy arrays, not Python lists — that difference is the whole point here.
+    numpy arrays, not Python lists â€” that difference is the whole point here.
     """
 
     def __init__(self, dim: int = 8):
@@ -393,7 +397,7 @@ def test_embed_texts_handles_plain_sequence_embedders(monkeypatch):
     ``_embed_texts`` branches on ``hasattr(v, "tolist")``. The numpy side is
     covered above, but the fallback exists for embedders that hand back plain
     sequences (custom/BYO EFs, and rows that arrive as tuples), and nothing
-    exercised it — so a regression there would surface only in the field, on a
+    exercised it â€” so a regression there would surface only in the field, on a
     non-default embedder, as the same ChromaDB ``ValueError``.
 
     Yields ``Decimal`` rather than ``float`` so the assertion proves a real
@@ -423,7 +427,7 @@ def test_embed_texts_short_circuits_on_empty_input(monkeypatch):
     """Empty input must return ``[]`` without constructing an embedding function.
 
     Callers pass empty batches (a drawer set fully filtered by dedup), and
-    loading the EF is the expensive part — on the ONNX default it spins up a
+    loading the EF is the expensive part â€” on the ONNX default it spins up a
     native session. Guards the early return so it cannot be refactored away.
     """
     from mempalace.backends import embedding_wrapper as ew
@@ -434,3 +438,66 @@ def test_embed_texts_short_circuits_on_empty_input(monkeypatch):
     monkeypatch.setattr(embedding, "get_embedding_function", _explode)
 
     assert ew._embed_texts([]) == []
+
+
+# â”€â”€ GPU DLL preload (#1495-adjacent: pip-wheel CUDA runtimes on Windows) â”€â”€
+
+
+def test_resolve_providers_preloads_gpu_dlls_once(monkeypatch):
+    """The first GPU provider resolution must call onnxruntime.preload_dlls()
+    exactly once per process â€” not per resolution."""
+    calls = []
+    monkeypatch.setattr(embedding, "_PRELOAD_DONE", False)
+    monkeypatch.setattr(
+        "onnxruntime.get_available_providers",
+        lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    monkeypatch.setattr("onnxruntime.preload_dlls", lambda: calls.append(1), raising=False)
+
+    assert embedding._resolve_providers("auto")[1] == "cuda"
+    assert embedding._resolve_providers("cuda")[1] == "cuda"
+    assert calls == [1]
+
+
+def test_resolve_providers_skips_preload_on_cpu(monkeypatch):
+    """CPU-only resolutions must not pay the DLL preload."""
+    calls = []
+    monkeypatch.setattr(embedding, "_PRELOAD_DONE", False)
+    monkeypatch.setattr("onnxruntime.get_available_providers", lambda: ["CPUExecutionProvider"])
+    monkeypatch.setattr("onnxruntime.preload_dlls", lambda: calls.append(1), raising=False)
+
+    assert embedding._resolve_providers("cpu")[1] == "cpu"
+    assert embedding._resolve_providers("auto")[1] == "cpu"
+    assert calls == []
+
+
+def test_resolve_providers_tolerates_missing_preload_dlls(monkeypatch):
+    """onnxruntime < 1.21 has no preload_dlls; resolution must still work."""
+    monkeypatch.setattr(embedding, "_PRELOAD_DONE", False)
+    monkeypatch.setattr(
+        "onnxruntime.get_available_providers",
+        lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    monkeypatch.delattr("onnxruntime.preload_dlls", raising=False)
+
+    assert embedding._resolve_providers("cuda") == (
+        ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        "cuda",
+    )
+
+
+def test_resolve_providers_swallows_preload_failure(monkeypatch):
+    """A crashing preload must not break provider resolution â€” the session
+    path already handles the resulting CPU fallback."""
+
+    def boom():
+        raise OSError("dll search path soup")
+
+    monkeypatch.setattr(embedding, "_PRELOAD_DONE", False)
+    monkeypatch.setattr(
+        "onnxruntime.get_available_providers",
+        lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    monkeypatch.setattr("onnxruntime.preload_dlls", boom, raising=False)
+
+    assert embedding._resolve_providers("cuda")[1] == "cuda"
