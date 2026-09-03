@@ -7,13 +7,18 @@ regex extraction on narrative content) could hide drawers that direct
 search would have found.
 """
 
+import mempalace.searcher as searcher_mod
 from mempalace.palace import (
     get_backend_for_palace,
     get_closets_collection,
     get_collection,
     upsert_closet_lines,
 )
-from mempalace.searcher import _hybrid_rank, search_memories
+from mempalace.searcher import (
+    _hybrid_rank,
+    _resolve_hybrid_rank_weights,
+    search_memories,
+)
 
 
 def _close_palace(palace_path: str) -> None:
@@ -246,3 +251,66 @@ def test_hybrid_rank_tiebreak_handles_top_level_authored_at():
     _hybrid_rank(results, "alpha beta gamma")
     assert results[0]["authored_at"] == "2026-06-27T10:00:00.000Z"
     assert results[1]["authored_at"] == "2026-06-21T10:00:00.000Z"
+
+
+# ── configurable vector/BM25 blend weights (#2298) ───────────────────────
+# The re-rank blend (vector vs BM25) used to be hardcoded 0.6/0.4. It now
+# resolves MempalaceConfig().hybrid_rank_*_weight (env > config.json >
+# default) through _resolve_hybrid_rank_weights, and _hybrid_rank accepts the
+# weights as explicit params. These tests prove the whole chain is live and
+# that a bad config value can never take a search down.
+
+
+def test_resolve_hybrid_rank_weights_defaults_when_config_unset(monkeypatch):
+    monkeypatch.delenv("MEMPALACE_HYBRID_VECTOR_WEIGHT", raising=False)
+    monkeypatch.delenv("MEMPALACE_HYBRID_BM25_WEIGHT", raising=False)
+    vector_weight, bm25_weight = _resolve_hybrid_rank_weights()
+    assert (vector_weight, bm25_weight) == (0.6, 0.4)
+
+
+def test_resolve_hybrid_rank_weights_honors_env(monkeypatch):
+    monkeypatch.setenv("MEMPALACE_HYBRID_VECTOR_WEIGHT", "0.9")
+    monkeypatch.setenv("MEMPALACE_HYBRID_BM25_WEIGHT", "0.1")
+    vector_weight, bm25_weight = _resolve_hybrid_rank_weights()
+    assert (vector_weight, bm25_weight) == (0.9, 0.1)
+
+
+def test_resolve_hybrid_rank_weights_falls_back_when_config_raises(monkeypatch):
+    """A config that blows up must not take a search down — resolver returns defaults."""
+
+    class _Boom:
+        def __init__(self):
+            raise RuntimeError("config dir unreadable")
+
+    monkeypatch.setattr(searcher_mod, "MempalaceConfig", _Boom)
+    vector_weight, bm25_weight = _resolve_hybrid_rank_weights()
+    assert (vector_weight, bm25_weight) == (0.6, 0.4)
+
+
+def test_hybrid_rank_weights_change_the_blend_and_therefore_order():
+    """The weight params must actually reach the blend, not just be accepted.
+
+    A (distance 0.0 -> vector sim 1.0, no lexical overlap -> BM25 norm 0) vs B
+    (distance 1.0 -> vector sim 0.0, matches the query -> BM25 norm 1.0).
+    The vector-favoured default 0.6/0.4 gives A = 0.6, B = 0.4, so A wins; a
+    BM25-favoured 0.1/0.9 gives A = 0.1, B = 0.9, so B wins. Same two
+    candidates, same query, opposite winners - proof the configurable weights
+    flow into _hybrid_rank's scored sort key rather than being accepted and
+    ignored.
+    """
+    query = "quantum entanglement"
+    # distance 0.0 keeps A inside the cosine [0, 2] range; distance 1.0 is
+    # orthogonal (sim max(0, 1-1)=0), leaving B's whole score to BM25.
+    a = {"text": "zebra quark", "distance": 0.0}
+    b = {"text": "quantum entanglement", "distance": 1.0}
+
+    default_order = [r["text"] for r in _hybrid_rank([dict(a), dict(b)], query)]
+    assert default_order[0] == "zebra quark", "default 0.6/0.4 should favour the vector hit"
+
+    custom_order = [
+        r["text"]
+        for r in _hybrid_rank([dict(a), dict(b)], query, vector_weight=0.1, bm25_weight=0.9)
+    ]
+    assert custom_order[0] == "quantum entanglement", (
+        "a BM25-heavy blend must favour the lexical hit"
+    )
