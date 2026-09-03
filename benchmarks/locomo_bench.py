@@ -23,14 +23,13 @@ import os
 import sys
 import json
 import re
-import string
 import shutil
 import tempfile
 import argparse
 import urllib.request
 import urllib.error
 from pathlib import Path
-from collections import Counter, defaultdict
+from collections import defaultdict
 from datetime import datetime
 
 import chromadb
@@ -87,35 +86,6 @@ CATEGORIES = {
     4: "Open-domain",
     5: "Adversarial",
 }
-
-
-# =============================================================================
-# METRICS (from LoCoMo's evaluation.py)
-# =============================================================================
-
-
-def normalize_answer(s):
-    """Normalize answer for F1 comparison."""
-    s = s.replace(",", "")
-    s = re.sub(r"\b(a|an|the|and)\b", " ", s)
-    s = " ".join(s.split())
-    s = "".join(ch for ch in s if ch not in string.punctuation)
-    return s.lower().strip()
-
-
-def f1_score(prediction, ground_truth):
-    """Token-level F1 with normalization."""
-    pred_tokens = normalize_answer(prediction).split()
-    truth_tokens = normalize_answer(ground_truth).split()
-    if not pred_tokens or not truth_tokens:
-        return float(pred_tokens == truth_tokens)
-    common = Counter(pred_tokens) & Counter(truth_tokens)
-    num_same = sum(common.values())
-    if num_same == 0:
-        return 0.0
-    precision = num_same / len(pred_tokens)
-    recall = num_same / len(truth_tokens)
-    return (2 * precision * recall) / (precision + recall)
 
 
 # =============================================================================
@@ -441,34 +411,6 @@ def _assign_room(session_text, api_key, model="claude-haiku-4-5-20251001"):
         if first_word and first_word in room:
             return room
     return "general"
-
-
-def _route_question(question, api_key, model="claude-haiku-4-5-20251001"):
-    """Ask LLM which 1-2 rooms a question is about. Returns list of room names."""
-    prompt = (
-        f"Which 1 or 2 rooms from the list below does this question relate to?\n"
-        f"Reply with ONLY room name(s), comma-separated if two, nothing else.\n\n"
-        f"Rooms:\n{_PALACE_ROOM_LIST}\n\n"
-        f"Question: {question}"
-    )
-    raw = _llm_call(prompt, api_key, model=model, max_tokens=40)
-    raw_lower = raw.lower()
-    found = []
-    for room in PALACE_ROOMS:
-        if room in raw_lower:
-            found.append(room)
-        if len(found) >= 2:
-            break
-    if not found:
-        # fallback: partial word match
-        for part in re.split(r"[,\s]+", raw_lower):
-            part = part.strip("_").strip()
-            for room in PALACE_ROOMS:
-                if part and part in room and room not in found:
-                    found.append(room)
-                if len(found) >= 2:
-                    break
-    return found or PALACE_ROOMS  # if routing fails, search everywhere
 
 
 def palace_assign_rooms(sessions, sample_id, api_key, cache, model="claude-haiku-4-5-20251001"):
