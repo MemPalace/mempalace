@@ -163,6 +163,28 @@ def _resolve_stop_words(lang: Optional[str]) -> frozenset:
     return _stopwords_for_lang(lang)
 
 
+def _resolve_hybrid_rank_weights() -> tuple:
+    """Resolve the vector/BM25 weights for the hybrid re-rank (#2298).
+
+    Reads ``MempalaceConfig().hybrid_rank_vector_weight`` /
+    ``.hybrid_rank_bm25_weight`` — which themselves resolve env var
+    (``MEMPALACE_HYBRID_VECTOR_WEIGHT`` / ``MEMPALACE_HYBRID_BM25_WEIGHT``)
+    > ``config.json`` > the built-in defaults (0.6 / 0.4). Any failure — a
+    config that cannot be read or a setting that failed validation — falls
+    back to the same defaults, so a bad config value never takes a search
+    down. Leaving the settings unset reproduces the previously-hardcoded
+    blend byte-for-byte.
+    """
+    try:
+        cfg = MempalaceConfig()
+        vector_weight = float(cfg.hybrid_rank_vector_weight)
+        bm25_weight = float(cfg.hybrid_rank_bm25_weight)
+        return vector_weight, bm25_weight
+    except Exception:
+        logger.debug("hybrid rank weight resolution failed, using defaults", exc_info=True)
+        return 0.6, 0.4
+
+
 def _bm25_scores(
     query: str,
     documents: list,
@@ -783,7 +805,15 @@ def search(
         {"text": doc or "", "distance": float(dist), "metadata": meta or {}}
         for doc, meta, dist in zip(docs, metas, dists)
     ]
-    hits = _hybrid_rank(hits, query, metric=metric, stop_words=stop_words)
+    vector_weight, bm25_weight = _resolve_hybrid_rank_weights()
+    hits = _hybrid_rank(
+        hits,
+        query,
+        vector_weight=vector_weight,
+        bm25_weight=bm25_weight,
+        metric=metric,
+        stop_words=stop_words,
+    )
     if date_window_active:
         # The widened fetch exists only to survive the window filter; the
         # display contract stays "top n_results", now cut AFTER the re-rank.
@@ -1593,9 +1623,12 @@ def _finalize_candidate_hits(
             ),
         )
 
+    vector_weight, bm25_weight = _resolve_hybrid_rank_weights()
     ranked = _hybrid_rank(
         hits,
         query,
+        vector_weight=vector_weight,
+        bm25_weight=bm25_weight,
         metric=_metric_for_collection(drawers_col),
         stop_words=stop_words,
     )

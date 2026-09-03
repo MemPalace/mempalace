@@ -7,6 +7,7 @@ Priority: env vars > config file (~/.mempalace/config.json) > defaults
 import errno
 import hashlib
 import json
+import math
 import os
 import stat
 import re
@@ -239,6 +240,13 @@ _MILVUS_CONSISTENCY_LEVELS = {
 # migrate`` and ``mempalace repair max-seq-id`` — see
 # ``MempalaceConfig.max_backups``.
 DEFAULT_MAX_BACKUPS = 10
+
+# Weights for the hybrid re-rank blend (vector embedding-similarity vs BM25
+# lexical) in ``searcher._hybrid_rank``. These were the function's hardcoded
+# defaults; surfaced as config so users can retune the blend without patching
+# site-packages (#2298).
+DEFAULT_HYBRID_VECTOR_WEIGHT = 0.6
+DEFAULT_HYBRID_BM25_WEIGHT = 0.4
 
 
 def normalize_milvus_consistency_level(value) -> str:
@@ -1241,6 +1249,41 @@ class MempalaceConfig:
             return _EMBEDDINGGEMMA_BATCH_SIZE
         return val if val > 0 else _EMBEDDINGGEMMA_BATCH_SIZE
 
+    @property
+    def hybrid_rank_vector_weight(self) -> float:
+        """Weight of the vector (embedding-similarity) signal in the hybrid
+        re-rank (``searcher._hybrid_rank``).
+
+        Read from env ``MEMPALACE_HYBRID_VECTOR_WEIGHT`` first, then
+        ``hybrid_rank_vector_weight`` in ``config.json``, then the built-in
+        default (``0.6``). Unset, non-numeric, infinite, or negative values
+        fall back to the default rather than raising — a hand-edited
+        ``config.json`` shouldn't take retrieval down. The default reproduces
+        the previously-hardcoded weight, so leaving it unset is a
+        byte-identical blend (#2298).
+        """
+        return self._resolve_float_setting(
+            "MEMPALACE_HYBRID_VECTOR_WEIGHT",
+            "hybrid_rank_vector_weight",
+            DEFAULT_HYBRID_VECTOR_WEIGHT,
+        )
+
+    @property
+    def hybrid_rank_bm25_weight(self) -> float:
+        """Weight of the BM25 (lexical) signal in the hybrid re-rank
+        (``searcher._hybrid_rank``).
+
+        Read from env ``MEMPALACE_HYBRID_BM25_WEIGHT`` first, then
+        ``hybrid_rank_bm25_weight`` in ``config.json``, then the built-in
+        default (``0.4``). Unset, non-numeric, infinite, or negative values
+        fall back to the default rather than raising (#2298).
+        """
+        return self._resolve_float_setting(
+            "MEMPALACE_HYBRID_BM25_WEIGHT",
+            "hybrid_rank_bm25_weight",
+            DEFAULT_HYBRID_BM25_WEIGHT,
+        )
+
     def set_embedding_model(self, model: str) -> None:
         """Persist the embedding-model choice to ``config.json``.
 
@@ -1286,6 +1329,29 @@ class MempalaceConfig:
         if isinstance(cfg_val, str) and cfg_val.strip():
             return cfg_val.strip()
         return None
+
+    def _resolve_float_setting(self, env_var: str, config_key: str, default: float) -> float:
+        """Resolve a float setting: env var > ``config.json`` > ``default``.
+
+        Whitespace-only values are treated as unset, so a blank env var or a
+        hand-edited empty config key doesn't mask the value below it. A set
+        value that is not a finite, non-negative number falls back to
+        ``default`` rather than raising — a stray type or non-numeric string
+        in ``config.json`` shouldn't take retrieval down (mirrors
+        ``embedding_threads`` / ``embeddinggemma_batch_size``).
+        """
+        raw = os.environ.get(env_var)
+        if raw is None or not str(raw).strip():
+            raw = self._file_config.get(config_key)
+        if raw is None:
+            return default
+        try:
+            val = float(str(raw).strip())
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(val) or val < 0:
+            return default
+        return val
 
     @property
     def embedding_api_url(self):
