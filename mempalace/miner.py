@@ -641,19 +641,43 @@ def chunk_text(
     chunk_size: int = None,
     chunk_overlap: int = None,
     min_chunk_size: int = None,
+    *,
+    symbol_header_prefix=None,
 ) -> list:
     """
     Split content into drawer-sized chunks.
     Tries to split on paragraph/line boundaries.
-    Returns list of {"content": str, "chunk_index": int, "line_start": int, "line_end": int}
 
-    ``line_start`` / ``line_end`` are 1-indexed line numbers in the stripped
-    source, giving an approximate locator for where the chunk came from.
-    Closet pointers (Tier 6a) use this to emit ``YYYY-MM-DD:L42-L78`` segments
-    so retrieval can jump straight to the right span without opening the
-    whole drawer.
+    Args:
+        content: text to chunk.
+        source_file: file path used for room/topic inference and (when
+            ``symbol_header_prefix`` is supplied) chunk enrichment.
+        chunk_size, chunk_overlap, min_chunk_size: optional overrides for
+            the module-level defaults. When ``None`` (default), the
+            module constants ``CHUNK_SIZE`` / ``CHUNK_OVERLAP`` /
+            ``MIN_CHUNK_SIZE`` are used. Validated as positive ints; an
+            overlap >= size is rejected to avoid an infinite loop.
+        symbol_header_prefix: optional callable
+            ``(chunk, source_file, chunk_index) -> str``. When
+            supplied, the returned header is prepended to each chunk
+            with a blank line separator before storage. Lets AST-lite
+            symbol enrichment (function names, class paths, imports)
+            and similar representation-axis experiments stack on this
+            code path without forking it. Default ``None`` preserves
+            original behavior exactly. Discussed in
+            MemPalace/mempalace#1384.
 
-    Optional params override module-level defaults when provided.
+            Caveat: ``file_already_mined`` keys only on ``source_mtime``
+            and ``NORMALIZE_VERSION``, so changing the callback (or the
+            header it returns) does NOT invalidate files already mined
+            with a different prefix. Re-mine those files with ``--force``
+            or bump ``NORMALIZE_VERSION`` to pick up the new headers.
+
+    Returns:
+        list of ``{"content": str, "chunk_index": int, "line_start": int,
+        "line_end": int}``.  ``line_start`` / ``line_end`` are 1-indexed
+        line numbers in the stripped source, giving an approximate locator
+        for where the chunk came from.
     """
     if chunk_size is None:
         chunk_size = CHUNK_SIZE
@@ -735,6 +759,10 @@ def chunk_text(
 
         chunk = content[start:end].strip()
         if len(chunk) >= min_chunk_size:
+            if symbol_header_prefix is not None:
+                header = symbol_header_prefix(chunk, source_file, chunk_index)
+                if header:
+                    chunk = f"{header}\n\n{chunk}"
             # Tier 6a — 1-indexed line range in the stripped source.
             # Approximate locator (±1 at boundaries is fine for "jump to
             # roughly here"); exact-quote positioning is a future tier.
@@ -1502,6 +1530,7 @@ def process_file(
     chunk_overlap: int = None,
     min_chunk_size: int = None,
     max_chunks_per_file: Optional[int] = None,
+    symbol_header_prefix=None,
 ) -> tuple:
     """Read, chunk, route, and file one file.
 
@@ -1511,6 +1540,14 @@ def process_file(
     too-short content (below ``min_chunk_size``). It is ``"chunk_cap"``
     when the per-file chunk cap aborted the file. Callers use the tag to
     surface a separate counter in the mine summary (see #1455).
+
+    ``symbol_header_prefix`` is an optional callable forwarded to
+    :func:`chunk_text` for per-chunk header enrichment; ``None`` (default)
+    preserves current behavior exactly. Caveat: ``file_already_mined``
+    keys only on ``source_mtime`` and ``NORMALIZE_VERSION``, so changing
+    the callback (or the header it returns) does NOT trigger a re-mine of
+    files already filed under a different prefix — use ``--force`` or bump
+    ``NORMALIZE_VERSION`` to pick up the new headers.
     """
     effective_min = min_chunk_size if min_chunk_size is not None else MIN_CHUNK_SIZE
 
@@ -1535,6 +1572,7 @@ def process_file(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         min_chunk_size=min_chunk_size,
+        symbol_header_prefix=symbol_header_prefix,
     )
 
     effective_cap = _resolve_max_chunks_per_file(max_chunks_per_file)
@@ -1852,6 +1890,7 @@ def mine(
     include_ignored: list = None,
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
+    symbol_header_prefix=None,
 ):
     """Mine a project directory into the palace.
 
@@ -1865,6 +1904,12 @@ def mine(
     :func:`_resolve_max_chunks_per_file`). ``None`` defers to
     ``MEMPALACE_MAX_CHUNKS_PER_FILE`` or ``MAX_CHUNKS_PER_FILE``; ``0``
     disables the cap entirely (#1455).
+
+    ``symbol_header_prefix`` is an optional per-chunk header callable
+    forwarded to :func:`chunk_text` via :func:`process_file`; ``None``
+    (default) preserves current behavior exactly. See :func:`chunk_text`
+    for the signature and the re-mine caveat (changing it does not
+    invalidate already-mined files).
     """
     if dry_run:
         return _mine_impl(
@@ -1878,6 +1923,7 @@ def mine(
             include_ignored=include_ignored,
             files=files,
             max_chunks_per_file=max_chunks_per_file,
+            symbol_header_prefix=symbol_header_prefix,
         )
 
     # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
@@ -1895,6 +1941,7 @@ def mine(
             include_ignored=include_ignored,
             files=files,
             max_chunks_per_file=max_chunks_per_file,
+            symbol_header_prefix=symbol_header_prefix,
         )
 
 
@@ -1909,6 +1956,7 @@ def _mine_impl(
     include_ignored: list = None,
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
+    symbol_header_prefix=None,
 ):
     from .config import MempalaceConfig
 
@@ -1991,6 +2039,7 @@ def _mine_impl(
                     # otherwise a malformed env var would emit its warning
                     # per file.
                     max_chunks_per_file=effective_chunk_cap,
+                    symbol_header_prefix=symbol_header_prefix,
                 )
             except KeyboardInterrupt:
                 # Re-raise so the outer handler prints the summary; we
