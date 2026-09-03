@@ -67,7 +67,8 @@ jobs:
       # This drifted once (CI on 0.15.14 against pyproject's 0.15.20) and the
       # drift was invisible: the lint job never installs from pyproject, so a
       # dependabot bump to the pin there passes CI without the new version
-      # ever running. test_ruff_pins_match asserts the two stay equal.
+      # ever running. test_ruff_pins_match asserts the two stay equal, and
+      # also covers the pre-commit config's ruff rev (all three must agree).
       - run: pip install "ruff==0.16.1"
       - run: ruff check .
       - run: ruff format --check .

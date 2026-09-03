@@ -208,6 +208,7 @@ def event_matches_watch(
     *,
     streams=None,
     rooms=None,
+    topics=None,
     types=None,
     statuses=None,
     to_agents=None,
@@ -234,6 +235,7 @@ def event_matches_watch(
     return (
         _ok(streams, event.get("stream"))
         and _ok(rooms, event.get("room"))
+        and _ok(topics, event.get("topic"))
         and _ok(types, event.get("type"))
         and _ok(statuses, event.get("status"))
         and _ok(correlation_ids, event.get("correlation_id"))
@@ -263,6 +265,7 @@ def sanitize_watch_spec(spec: dict) -> dict:
     for key, field in (
         ("streams", "stream"),
         ("rooms", "room"),
+        ("topics", "topic"),
         ("to_agents", "to_agent"),
         ("from_agents", "from_agent"),
         ("exclude_from_agents", "exclude_from_agent"),
@@ -288,6 +291,7 @@ def pushdown_watch_filters(spec: dict) -> dict:
     for key, column in (
         ("streams", "stream"),
         ("rooms", "room"),
+        ("topics", "topic"),
         ("types", "type"),
         ("statuses", "status"),
         ("correlation_ids", "correlation_id"),
@@ -451,6 +455,7 @@ class Logstream:
                 type TEXT NOT NULL,
                 stream TEXT NOT NULL,
                 room TEXT NOT NULL,
+                topic TEXT,
                 from_agent TEXT NOT NULL,
                 to_agent TEXT,
                 correlation_id TEXT,
@@ -494,23 +499,27 @@ class Logstream:
                 PRIMARY KEY (event_id, artifact_id)
             );
         """)
-        self._migrate_replication_schema(conn)
+        self._migrate_schema(conn)
         conn.commit()
         # Seed the HLC from the newest stamp in the log so monotonicity
         # survives restarts (RFC 004 op envelope).
         row = conn.execute("SELECT max(hlc) AS last FROM events").fetchone()
         self._clock = HybridLogicalClock(self.replica_id, last=row["last"] if row else None)
 
-    def _migrate_replication_schema(self, conn):
-        """RFC 004 step 0: add provenance columns to pre-replication logs.
+    def _migrate_schema(self, conn):
+        """RFC 004 / RFC 003 migration: add provenance and topic columns to pre-existing logs.
 
         Fresh databases get the columns from the canonical CREATE TABLE; this
-        path upgrades logs created before step 0. Backfill stamps existing
-        rows as authored by THIS replica (they were: pre-replication, only
-        one copy existed) with origin_seq = rowid and an HLC derived from
-        created_at + rowid, preserving their original total order.
+        path upgrades logs created before provenance or topic fields were added.
+        Backfill stamps existing rows as authored by THIS replica with origin_seq = rowid
+        and an HLC derived from created_at + rowid.
         """
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(events)")}
+        if "topic" not in existing:
+            conn.execute("ALTER TABLE events ADD COLUMN topic TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS events_topic_created_idx ON events(topic, created_at)"
+        )
         if "origin_replica" not in existing:
             conn.execute("ALTER TABLE events ADD COLUMN origin_replica TEXT")
         if "origin_seq" not in existing:
@@ -594,6 +603,7 @@ class Logstream:
             "type": row["type"],
             "stream": row["stream"],
             "room": row["room"],
+            "topic": row["topic"],
             "from_agent": row["from_agent"],
             "to_agent": row["to_agent"],
             "correlation_id": row["correlation_id"],
@@ -636,6 +646,7 @@ class Logstream:
         body: str = "",
         metadata: dict = None,
         artifact_ids: list = None,
+        topic: str = None,
     ) -> dict:
         """Append one immutable event. Returns the stored event dict.
 
@@ -645,6 +656,7 @@ class Logstream:
         type = _sanitize_event_type(type)
         stream = _sanitize_routing(stream, "stream")
         room = _sanitize_routing(room, "room")
+        topic = _sanitize_routing(topic, "topic", required=False)
         from_agent = _sanitize_routing(from_agent, "from_agent")
         to_agent = _sanitize_routing(to_agent, "to_agent", required=False)
         correlation_id = _sanitize_routing(correlation_id, "correlation_id", required=False)
@@ -678,15 +690,16 @@ class Logstream:
                             f"artifact_ids references unknown artifact {artifact_id!r}"
                         )
                 cursor = conn.execute(
-                    "INSERT INTO events (id, type, stream, room, from_agent, to_agent,"
+                    "INSERT INTO events (id, type, stream, room, topic, from_agent, to_agent,"
                     " correlation_id, branch, base_commit, status, body, created_at,"
                     " metadata_json, origin_replica, hlc)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         event_id,
                         type,
                         stream,
                         room,
+                        topic,
                         from_agent,
                         to_agent,
                         correlation_id,
@@ -815,11 +828,12 @@ class Logstream:
         from_agent: str,
         status: str = None,
         body: str = "",
+        topic: str = None,
     ) -> dict:
         """Append an ``event.ack`` referencing a prior event.
 
         The target event is never mutated. The ack copies the target's
-        stream/room, copies its ``correlation_id`` (falling back to the
+        stream/room/topic, copies its ``correlation_id`` (falling back to the
         target's id so request/ack stay tied together), and routes back
         to the target's ``from_agent``.
         """
@@ -832,10 +846,13 @@ class Logstream:
         if target is None:
             raise ValueError(f"event {event_id!r} not found")
 
+        resolved_topic = topic if topic is not None else target["topic"]
+
         return self.append_event(
             type=ACK_EVENT_TYPE,
             stream=target["stream"],
             room=target["room"],
+            topic=resolved_topic,
             from_agent=from_agent,
             to_agent=target["from_agent"],
             correlation_id=target["correlation_id"] or target["id"],
@@ -856,6 +873,7 @@ class Logstream:
         base_commit: str = None,
         body: str = "",
         metadata: dict = None,
+        topic: str = None,
     ) -> dict:
         """Convenience wrapper: store a patch artifact + ``patch.ready`` event.
 
@@ -873,6 +891,7 @@ class Logstream:
             type="patch.ready",
             stream=stream,
             room=room,
+            topic=topic,
             from_agent=from_agent,
             to_agent=to_agent,
             correlation_id=correlation_id,
@@ -915,27 +934,35 @@ class Logstream:
         self,
         stream: str = None,
         room: str = None,
+        topic: str = None,
         type: str = None,
         to_agent: str = None,
         from_agent: str = None,
         correlation_id: str = None,
         status: str = None,
         since_event_id: str = None,
+        before_event_id: str = None,
         since_created_at: str = None,
         limit: int = DEFAULT_LIST_LIMIT,
+        order: str = "asc",
     ) -> list[dict]:
-        """List events matching structured filters, oldest first.
+        """List events matching structured filters.
 
-        Cursor semantics:
+        Cursor and ordering semantics:
 
-        - ``since_event_id`` is the precise cursor: strictly after that
-          event in append order (rowid), regardless of timestamp ties.
+        - ``since_event_id`` is the precise cursor: strictly AFTER that
+          event in append order (``rowid > anchor``), regardless of timestamp ties
+          or output ordering.
+        - ``before_event_id`` filters strictly BEFORE that event in append
+          order (``rowid < anchor``) for reverse / historical paging.
+        - ``order`` is ``'asc'`` (oldest first, default) or ``'desc'`` (newest first).
         - ``since_created_at`` is inclusive (``>=``) so second-granularity
           timestamps never skip events; callers dedup by ``id``.
         - ``to_agent`` also matches broadcast events (``to_agent='*'``).
         """
         stream = _sanitize_routing(stream, "stream", required=False)
         room = _sanitize_routing(room, "room", required=False)
+        topic = _sanitize_routing(topic, "topic", required=False)
         if type not in (None, ""):
             type = _sanitize_event_type(type)
         else:
@@ -945,7 +972,10 @@ class Logstream:
         correlation_id = _sanitize_routing(correlation_id, "correlation_id", required=False)
         status = _sanitize_status(status)
         since_event_id = _sanitize_routing(since_event_id, "since_event_id", required=False)
+        before_event_id = _sanitize_routing(before_event_id, "before_event_id", required=False)
         since_created_at = sanitize_iso_temporal(since_created_at, "since_created_at") or None
+        if order not in ("asc", "desc"):
+            raise ValueError(f"order={order!r} must be 'asc' or 'desc'")
         if not isinstance(limit, int) or limit < 1:
             raise ValueError("limit must be a positive integer")
         limit = min(limit, MAX_LIST_LIMIT)
@@ -955,6 +985,7 @@ class Logstream:
         for column, value in (
             ("stream", stream),
             ("room", room),
+            ("topic", topic),
             ("type", type),
             ("from_agent", from_agent),
             ("correlation_id", correlation_id),
@@ -980,11 +1011,20 @@ class Logstream:
                     raise ValueError(f"since_event_id {since_event_id!r} not found")
                 where.append("rowid > ?")
                 params.append(anchor["rowid"])
+            if before_event_id is not None:
+                before_anchor = conn.execute(
+                    "SELECT rowid FROM events WHERE id = ?", (before_event_id,)
+                ).fetchone()
+                if before_anchor is None:
+                    raise ValueError(f"before_event_id {before_event_id!r} not found")
+                where.append("rowid < ?")
+                params.append(before_anchor["rowid"])
 
+            order_clause = "DESC" if order == "desc" else "ASC"
             sql = "SELECT rowid, * FROM events"
             if where:
                 sql += " WHERE " + " AND ".join(where)
-            sql += " ORDER BY rowid ASC LIMIT ?"
+            sql += f" ORDER BY rowid {order_clause} LIMIT ?"
             params.append(limit)
             rows = conn.execute(sql, params).fetchall()
             events = [self._event_dict(row) for row in rows]
@@ -1156,6 +1196,7 @@ class Logstream:
             return False  # our own op echoed back — by definition already present
         artifact_ids = list(dict.fromkeys(event.get("artifact_ids") or []))
         metadata_json = _sanitize_metadata(event.get("metadata"))
+        topic = _sanitize_routing(event.get("topic"), "topic", required=False)
 
         with self._lock:
             conn = self._conn()
@@ -1176,15 +1217,16 @@ class Logstream:
                             f"{artifact_id!r} not yet applied locally"
                         )
                 conn.execute(
-                    "INSERT INTO events (id, type, stream, room, from_agent, to_agent,"
+                    "INSERT INTO events (id, type, stream, room, topic, from_agent, to_agent,"
                     " correlation_id, branch, base_commit, status, body, created_at,"
                     " metadata_json, origin_replica, origin_seq, hlc)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         event["id"],
                         event["type"],
                         event["stream"],
                         event["room"],
+                        topic,
                         event["from_agent"],
                         event.get("to_agent"),
                         event.get("correlation_id"),

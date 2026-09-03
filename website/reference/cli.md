@@ -4,6 +4,20 @@ All commands accept `--palace <path>` to override the default palace location.
 The top-level command also accepts `--backend <name>` to select a storage
 backend such as `sqlite_exact`, `milvus`, `qdrant`, or `pgvector`.
 
+## `mempalace update`
+
+Release checks are disabled by default. Enable weekly checks explicitly with
+`mempalace update configure --enable --installer uv-tool` (using `pipx` or
+`pip` when that is how the runtime was installed), or disable them with `--disable`.
+`mempalace update check` performs an explicit check regardless of that setting.
+`mempalace update plan` prints the runtime, skill, restart, and tool-refresh
+actions but never executes them. Command actions use structured `argv`; for a
+`pip` installation the first argument is the exact interpreter running
+MemPalace, not whichever `python` happens to be on `PATH`. For an explicit check made without saved setup
+state, pass the matching installer to `plan --installer`. Cached state appears in `mempalace_status` so
+agents can ask the user to authorize an upgrade without blocking on a network
+request.
+
 ## `mempalace init`
 
 Scan a project directory for people, projects, and rooms, and set up the palace.

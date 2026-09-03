@@ -14,6 +14,7 @@ import sqlite3
 from types import SimpleNamespace
 import subprocess
 import sys
+import warnings
 from unittest.mock import MagicMock
 
 import pytest
@@ -1911,6 +1912,197 @@ class TestSearchTool:
 
         assert "error" not in result
         assert seen["candidate_strategy"] == "union"
+
+    def test_search_preserves_default_max_distance(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        seen = {}
+
+        def fake_search(*args, **kwargs):
+            seen["max_distance"] = kwargs.get("max_distance")
+            return {"results": []}
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+
+        result = mcp_server.tool_search(query="needle")
+
+        assert "error" not in result
+        assert seen["max_distance"] == 1.5
+
+    def test_search_cli_compatible_reuses_hub_collection(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        collection = object()
+        seen = {}
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+        monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: collection)
+
+        def fake_cli_search(**kwargs):
+            seen.update(kwargs)
+
+        monkeypatch.setattr(mcp_server, "cli_search", fake_cli_search)
+        monkeypatch.setattr(mcp_server, "_capture_fd_stdout", lambda fn: (fn(), "exact CLI\n"))
+
+        result = mcp_server.tool_search(query="needle", limit=7, cli_compatible=True)
+
+        assert result == {"query": "needle", "cli_output": "exact CLI\n"}
+        assert seen["collection"] is collection
+        assert seen["n_results"] == 7
+
+    def test_search_cli_compatible_rejects_embedder_identity_mismatch(
+        self, monkeypatch, config, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import embedding, mcp_server, palace
+        from mempalace.backends.base import EmbedderIdentity
+
+        collection = MagicMock()
+        collection.effective_embedder_identity.return_value = None
+        collection.get_stored_embedder_identity.return_value = EmbedderIdentity("minilm", 384)
+        monkeypatch.setattr(embedding, "current_model_name", lambda: "embeddinggemma")
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+        monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: collection)
+        monkeypatch.setattr(mcp_server, "cli_search", lambda **_kwargs: pytest.fail())
+        palace._VALIDATED_IDENTITY.clear()
+
+        result = mcp_server.tool_search(query="needle", cli_compatible=True)
+
+        assert result["error"] == "Embedder identity mismatch"
+        assert "minilm" in result["details"]
+        assert "embeddinggemma" in result["details"]
+
+    def test_search_cli_compatible_repeats_unknown_embedder_warning(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import embedding, mcp_server, palace
+
+        collection = MagicMock()
+        collection.effective_embedder_identity.return_value = None
+        collection.get_stored_embedder_identity.return_value = None
+        collection.count.return_value = 1
+        monkeypatch.setattr(embedding, "current_model_name", lambda: "minilm")
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+        monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: collection)
+        monkeypatch.setattr(mcp_server, "cli_search", lambda **_kwargs: None)
+        monkeypatch.setattr(mcp_server, "_capture_fd_stdout", lambda fn: (fn(), "output\n"))
+        palace._VALIDATED_IDENTITY.clear()
+
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("always")
+                warnings.showwarning = lambda message, *_args, **_kwargs: print(
+                    message, file=sys.stderr
+                )
+                results = [
+                    mcp_server.tool_search(query="needle", cli_compatible=True) for _ in range(2)
+                ]
+        finally:
+            palace._VALIDATED_IDENTITY.clear()
+
+        for result in results:
+            assert result["cli_output"] == "output\n"
+            assert "no recorded embedder identity" in result["cli_error_output"]
+            assert "mempalace palace set-embedder" in result["cli_error_output"]
+
+    def test_search_cli_compatible_serializes_output_capture(self, monkeypatch, config, kg):
+        import threading
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server, palace
+
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+        monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: object())
+        monkeypatch.setattr(palace, "_enforce_embedder_identity", lambda *_a, **_kw: None)
+        monkeypatch.setattr(mcp_server, "cli_search", lambda **_kwargs: None)
+
+        state_lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def capture(fn):
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.1)
+                return fn(), "output\n"
+            finally:
+                with state_lock:
+                    active -= 1
+
+        monkeypatch.setattr(mcp_server, "_capture_fd_stdout", capture)
+        start = threading.Barrier(3)
+
+        def invoke():
+            start.wait()
+            return mcp_server.tool_search(query="needle", cli_compatible=True)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(invoke) for _ in range(2)]
+            start.wait()
+            results = [future.result(timeout=5) for future in futures]
+
+        assert [result["cli_output"] for result in results] == ["output\n", "output\n"]
+        assert max_active == 1
+
+    def test_search_cli_compatible_rejects_source_file(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: pytest.fail())
+        result = mcp_server.tool_search(query="needle", source_file="notes.md", cli_compatible=True)
+
+        assert "source_file" in result["error"]
+
+    @pytest.mark.parametrize(
+        ("arguments", "control"),
+        [
+            ({"candidate_strategy": "union"}, "candidate_strategy"),
+            ({"min_similarity": 0.5}, "min_similarity"),
+            ({"max_distance": 0.5}, "max_distance"),
+            ({"context": "background"}, "context"),
+        ],
+    )
+    def test_search_cli_compatible_rejects_ignored_controls(
+        self, monkeypatch, config, kg, arguments, control
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: pytest.fail())
+        result = mcp_server.tool_search(query="needle", cli_compatible=True, **arguments)
+
+        assert control in result["error"]
+
+    def test_search_cli_compatible_returns_stderr(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+        monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: object())
+
+        def fake_cli_search(**_kwargs):
+            print("legacy metric warning", file=sys.stderr)
+
+        monkeypatch.setattr(mcp_server, "cli_search", fake_cli_search)
+        monkeypatch.setattr(mcp_server, "_capture_fd_stdout", lambda fn: (fn(), "CLI output\n"))
+
+        result = mcp_server.tool_search(query="needle", cli_compatible=True)
+
+        assert result == {
+            "query": "needle",
+            "cli_output": "CLI output\n",
+            "cli_error_output": "legacy metric warning\n",
+        }
 
     def test_search_rejects_invalid_candidate_strategy(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -3950,6 +4142,66 @@ class TestKGTools:
         assert result["as_of"] == "2026-05-06T14:23:00Z"
         assert result["count"] == 1
         assert result["facts"][0]["object"] == "Acme"
+
+    def test_kg_query_as_of_does_not_duplicate_ended_facts(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        kg.add_triple(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-01-01",
+            valid_to="2026-06-01",
+        )
+        result = mcp_server.tool_kg_query("Alice", as_of="2026-04-01", direction="outgoing")
+        assert result["count"] == 1
+        assert len(result["active_facts"]) == 1
+        assert result["historical_facts"] == []
+
+    def test_kg_query_excludes_future_valid_from_from_active(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        kg.add_triple("Alice", "starts", "school", valid_from="2099-01-01")
+        kg.add_triple("Alice", "lives_in", "Town", valid_from="2020-01-01")
+        result = mcp_server.tool_kg_query("Alice", direction="outgoing")
+        active_preds = {r["predicate"] for r in result["active_facts"]}
+        future_preds = {r["predicate"] for r in result["future_facts"]}
+        assert "lives_in" in active_preds
+        assert "starts" not in active_preds
+        assert "starts" in future_preds
+
+    def test_kg_query_keeps_bounded_future_end_as_active(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        kg.add_triple(
+            "Alice",
+            "on_med",
+            "Empagliflozin",
+            valid_from="2025-01-01",
+            valid_to="2099-12-31",
+        )
+        kg.add_triple(
+            "Alice",
+            "on_med",
+            "Metformin",
+            valid_from="2020-01-01",
+            valid_to="2025-01-01",
+        )
+        result = mcp_server.tool_kg_query("Alice", direction="outgoing")
+        active_objs = {r["object"] for r in result["active_facts"]}
+        historical_objs = {r["object"] for r in result["historical_facts"]}
+        assert "Empagliflozin" in active_objs
+        assert "Empagliflozin" not in historical_objs
+        assert "Metformin" in historical_objs
 
     def test_kg_invalidate_accepts_datetime_ended(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -7152,6 +7404,11 @@ class TestStaleLibraryGate:
 
         self._reset(monkeypatch)
         self._versions(monkeypatch, {"mempalace": "3.6.0"}, {"mempalace": "3.7.0"})
+        monkeypatch.setattr(
+            "mempalace.update_awareness.cached_update_status",
+            lambda: {"enabled": True, "installed": "3.6.0", "available": True},
+        )
+        monkeypatch.setattr("mempalace.update_awareness.schedule_update_check", lambda: False)
 
         decorated = mcp_server._decorate_mcp_tool_result("mempalace_status", {"total_drawers": 0})
 
@@ -7159,6 +7416,13 @@ class TestStaleLibraryGate:
         assert decorated["library_versions"]["packages"] == [
             {"package": "mempalace", "serving": "3.6.0", "installed": "3.7.0"}
         ]
+        assert decorated["updates"] == {
+            "server": {
+                "enabled": True,
+                "installed": "3.6.0",
+                "available": True,
+            }
+        }
 
     def test_unreadable_metadata_fails_open_but_says_so(self, monkeypatch):
         """An unreadable metadata directory must not take the server down, but

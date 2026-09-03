@@ -53,10 +53,10 @@ class TestSharedBrainRulesTemplate:
 
     def test_watcher_instruction_is_imperative_not_conditional(self):
         """A capability-conditional watcher rule ('if your harness can...')
-        reads as optional and agents skip it; the template must open the
-        monitoring rule as a startup imperative."""
+        reads as optional and agents skip it; the template must make watcher
+        discipline imperative."""
         content = SHARED_BRAIN_RULES_FILE.read_text(encoding="utf-8")
-        assert "at the start of every session" in content.lower()
+        assert "you must watch the stream actively" in " ".join(content.lower().split())
         assert "if your harness can run a background process, start" not in content.lower()
 
 
