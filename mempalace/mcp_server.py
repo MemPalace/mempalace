@@ -23,6 +23,7 @@ Tools (maintenance):
 
 import os
 import sys
+from mempalace.importance import score_importance
 
 # --- MCP stdio protection (issue #225) -----------------------------------
 # The MCP protocol multiplexes JSON-RPC over stdio: stdout MUST carry only
@@ -3228,7 +3229,7 @@ def tool_add_drawer(
             col.upsert(
                 ids=[drawer_id],
                 documents=[content],
-                metadatas=[{**base_meta, "chunk_index": 0}],
+                metadatas=[{**base_meta, "chunk_index": 0, "importance": score_importance(content)}],
             )
             inserted = col.get(ids=[drawer_id], include=[])
             if not _get_result_ids(inserted):
@@ -3259,7 +3260,7 @@ def tool_add_drawer(
             chunk_ids.append(f"{drawer_id}_chunk_{chunk_idx:06d}")
             chunk_docs.append(content[i : i + chunk_size])
             chunk_metas.append(
-                {**base_meta, "chunk_index": chunk_idx, "parent_drawer_id": drawer_id}
+                {**base_meta, "chunk_index": chunk_idx, "parent_drawer_id": drawer_id, "importance": score_importance(content[i : i + chunk_size])}
             )
         assert_no_collisions(list(zip(chunk_ids, chunk_metas)), col)
         col.upsert(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
@@ -4315,7 +4316,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             col.add(
                 ids=[entry_id],
                 documents=[entry],
-                metadatas=[{**base_metadata, "chunk_index": 0}],
+                metadatas=[{**base_metadata, "chunk_index": 0, "importance": score_importance(entry)}],
             )
             logger.info(f"Diary entry: {entry_id} -> {wing}/diary/{topic}")
             return {
@@ -4362,6 +4363,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
                     "chunk_index": chunk_idx,
                     "parent_entry_id": entry_id,
                     "parent_drawer_id": entry_id,
+                    "importance": score_importance(entry[i : i + chunk_size]),
                 }
             )
         col.add(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
