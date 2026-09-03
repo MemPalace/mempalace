@@ -2776,13 +2776,53 @@ def tool_delete_tunnel(tunnel_id: str):
     return delete_tunnel(tunnel_id)
 
 
-def tool_list_hallways(wing: str = None):
-    """List within-wing hallway records, optionally filtered by wing."""
+# ``tool_list_hallways`` bounds its rows so a dense wing (hallway count grows
+# super-linearly with entity density) can't overflow the client tool budget.
+# The strongest-first slice is returned and the full-match count + a
+# truncation flag are surfaced to the caller (#2327).
+_LIST_HALLWAYS_DEFAULT_LIMIT = 200
+_LIST_HALLWAYS_MAX_LIMIT = 10000
+
+
+def tool_list_hallways(wing: str = None, limit: int | None = None):
+    """List within-wing hallway records, optionally filtered by wing.
+
+    Returns a ``{rows, total, truncated}`` envelope so a large graph can be
+    served without overflowing the client tool budget (#2327): ``rows`` are
+    the strongest-first, bounded records (default ``_LIST_HALLWAYS_DEFAULT_LIMIT``,
+    overridable via the optional ``limit`` argument, capped at
+    ``_LIST_HALLWAYS_MAX_LIMIT``), ``total`` is the full matching count
+    (ignoring any cap), and ``truncated`` is true when more records exist
+    than were returned.
+    """
     try:
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
-    return list_hallways(wing)
+
+    if limit is None:
+        limit = _LIST_HALLWAYS_DEFAULT_LIMIT
+    # bool is a subclass of int and ``int(True)`` would silently coerce it to
+    # ``1`` — reject it *before* the ``int()`` coercion below can hide it.
+    if isinstance(limit, bool):
+        return {"error": "limit must be a non-negative integer"}
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        return {"error": "limit must be a non-negative integer"}
+    if limit < 0:
+        return {"error": "limit must be a non-negative integer"}
+    if limit > _LIST_HALLWAYS_MAX_LIMIT:
+        return {"error": f"limit must be at most {_LIST_HALLWAYS_MAX_LIMIT}"}
+
+    all_rows = list_hallways(wing)
+    total = len(all_rows)
+    rows = all_rows[:limit]
+    return {
+        "rows": rows,
+        "total": total,
+        "truncated": total > len(rows),
+    }
 
 
 def tool_delete_hallway(hallway_id: str):
@@ -5329,6 +5369,15 @@ TOOLS = {
                 "wing": {
                     "type": "string",
                     "description": "Filter hallways by wing",
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": _LIST_HALLWAYS_DEFAULT_LIMIT,
+                    "maximum": _LIST_HALLWAYS_MAX_LIMIT,
+                    "description": "Max hallways to return, strongest-first. "
+                    "Bounded to keep dense wings within the client tool "
+                    "budget; the response also carries `total` (full match "
+                    "count) and `truncated` (true when the answer was capped).",
                 },
             },
         },

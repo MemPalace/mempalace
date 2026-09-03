@@ -3272,15 +3272,95 @@ class TestWriteTools:
         hallways._save_hallways(seeded)
         return seeded
 
+    def _seed_dense_hallways(self, monkeypatch, tmp_path, n):
+        """Seed ``n`` hallways in ONE dense wing with distinct co-occurrence
+        counts (1..n), so strongest-first ordering + truncation are checkable."""
+        from mempalace import hallways
+
+        hallway_file = tmp_path / "hallways.json"
+        monkeypatch.setattr(hallways, "_get_hallway_file", lambda *a, **kw: str(hallway_file))
+        monkeypatch.setattr(hallways, "_legacy_hallway_file", lambda: str(tmp_path / "legacy-hallways.json"))
+        seeded = [
+            {
+                "id": f"hallway_dense_E{i}_Hub_{i:04d}",
+                "wing": "wing_dense",
+                "entity_a": f"E{i}",
+                "entity_b": "Hub",
+                "co_occurrence_count": i,
+                "rooms": ["room1"],
+            }
+            for i in range(1, n + 1)
+        ]
+        hallways._save_hallways(seeded)
+        return seeded
+
+    def test_tool_list_hallways_truncates_dense_wing_strongest_first(self, monkeypatch, tmp_path):
+        """A wing with more hallways than the default limit returns the
+        strongest-first slice with a truncation signal, not a ~31 MB payload
+        that overflows the client tool budget (#2327)."""
+        from mempalace import mcp_server
+
+        n = 250
+        self._seed_dense_hallways(monkeypatch, tmp_path, n)
+        result = mcp_server.tool_list_hallways(wing="wing_dense")
+        assert isinstance(result, dict)
+        assert result["total"] == n
+        assert result["truncated"] is True
+        rows = result["rows"]
+        assert len(rows) == 200  # default limit
+        counts = [h["co_occurrence_count"] for h in rows]
+        assert counts == sorted(counts, reverse=True), "rows must be strongest-first"
+        assert counts[0] == n, "the most-connected hallway must lead the slice"
+        assert counts[-1] == n - (len(rows) - 1)
+
+    def test_tool_list_hallways_honors_explicit_limit(self, monkeypatch, tmp_path):
+        """An explicit ``limit`` caps rows to the strongest-first slice while
+        ``total`` / ``truncated`` reflect the full matching set (#2327)."""
+        from mempalace import mcp_server
+
+        n = 30
+        self._seed_dense_hallways(monkeypatch, tmp_path, n)
+        result = mcp_server.tool_list_hallways(wing="wing_dense", limit=7)
+        assert result["total"] == n
+        assert result["truncated"] is True
+        rows = result["rows"]
+        assert len(rows) == 7
+        assert [h["co_occurrence_count"] for h in rows] == [n, n - 1, n - 2, n - 3, n - 4, n - 5, n - 6]
+
+    def test_tool_list_hallways_small_corpus_not_truncated(self, monkeypatch, tmp_path):
+        """A corpus smaller than the limit returns the whole set and
+        ``truncated=False`` (#2327)."""
+        from mempalace import mcp_server
+
+        seeded = self._seed_hallways(monkeypatch, tmp_path)
+        result = mcp_server.tool_list_hallways()
+        assert result["total"] == len(seeded)
+        assert result["truncated"] is False
+        assert len(result["rows"]) == len(seeded)
+
+    def test_tool_list_hallways_rejects_malformed_limit(self, monkeypatch, tmp_path):
+        """Bad ``limit`` values (bool / negative / non-numeric / over max)
+        yield a structured error, not a crash (#2327)."""
+        from mempalace import mcp_server
+
+        self._seed_hallways(monkeypatch, tmp_path)
+        for bad in (True, -1, "ten", 10_000_000):
+            result = mcp_server.tool_list_hallways(limit=bad)
+            assert isinstance(result, dict)
+            assert "error" in result, f"expected error for limit={bad!r}, got {result}"
+
     def test_tool_list_hallways_returns_all_without_filter(self, monkeypatch, tmp_path):
         """tool_list_hallways with no wing returns every record."""
         from mempalace import mcp_server
 
         seeded = self._seed_hallways(monkeypatch, tmp_path)
         result = mcp_server.tool_list_hallways()
-        assert isinstance(result, list)
-        assert len(result) == len(seeded)
-        ids = {h["id"] for h in result}
+        assert isinstance(result, dict)
+        assert set(result.keys()) == {"rows", "total", "truncated"}
+        assert result["total"] == len(seeded)
+        assert result["truncated"] is False
+        rows = result["rows"]
+        ids = {h["id"] for h in rows}
         assert ids == {h["id"] for h in seeded}
 
     def test_tool_list_hallways_filters_by_wing(self, monkeypatch, tmp_path):
@@ -3289,8 +3369,10 @@ class TestWriteTools:
 
         self._seed_hallways(monkeypatch, tmp_path)
         result = mcp_server.tool_list_hallways(wing="wing_a")
-        assert len(result) == 1
-        assert result[0]["wing"] == "wing_a"
+        assert result["total"] == 1
+        assert result["truncated"] is False
+        assert len(result["rows"]) == 1
+        assert result["rows"][0]["wing"] == "wing_a"
 
     def test_tool_list_hallways_rejects_invalid_wing_name(self, monkeypatch, tmp_path):
         """Invalid wing names go through _sanitize_optional_name and return a
@@ -3312,7 +3394,7 @@ class TestWriteTools:
         result = mcp_server.tool_delete_hallway(hallway_id=target_id)
         assert result == {"deleted": True}
         remaining = mcp_server.tool_list_hallways()
-        assert target_id not in {h["id"] for h in remaining}
+        assert target_id not in {h["id"] for h in remaining["rows"]}
 
     def test_tool_delete_hallway_unknown_id_returns_false(self, monkeypatch, tmp_path):
         """Deleting an ID that doesn't exist returns {deleted: False} without error."""
