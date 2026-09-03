@@ -627,6 +627,124 @@ def test_writable_http_releases_writer_lease_after_bind_failure(monkeypatch):
     assert mcp._MCP_WRITER_LOCK_CM is None
 
 
+def test_two_sequential_writable_mutations_over_http_both_succeed(http_server, monkeypatch, tmp_path):
+    """Regression for #2413: two sequential mutating tools/call over HTTP.
+
+    The original bug (v3.5.0): the writer-lease re-entrance credit was
+    thread-local (``_palace_lock_holders = threading.local()``). ThreadingHTTPServer
+    serves each request on a fresh thread, so the FIRST mutating call acquired the
+    per-palace lock and held it for process lifetime; the SECOND call — landing on
+    a different handler thread — was not credited as holder, re-opened the lock
+    file, and hit the server's OWN flock → ``MineAlreadyRunning`` naming the
+    server's own PID.
+
+    The fix (PR #1859, landed in 3.9.0): the re-entrance credit is
+    PROCESS-scoped (module-global ``_MCP_WRITER_LOCK_CM`` checked at the top of
+    ``_acquire_mcp_writer_lock``), so handler thread identity is irrelevant.
+
+    This test drives two real ``tools/call`` POSTs to the production
+    ``_build_http_server`` server in writable mode and asserts BOTH succeed.
+    It exercises the full dispatch path:
+        _http_dispatch → (exclusive lock) → handle_request
+          → _mcp_peer_writer_refusal → _acquire_mcp_writer_lock
+              1st call: lease acquired, _MCP_WRITER_LOCK_CM set (process-scoped)
+              2nd call: _MCP_WRITER_LOCK_CM present → (True, "") short-circuit
+          → tool_diary_write → _get_collection → col.add(...)
+    """
+    port, _ = http_server
+
+    # --- writable mode, no peer conflict ---
+    monkeypatch.setattr(mcp, "_READ_ONLY", False)
+    monkeypatch.setattr(
+        mcp, "_MCP_WRITER_READ_ONLY", False
+    )
+    monkeypatch.setattr(
+        mcp, "_MCP_WRITER_LOCK_FAILED", False
+    )
+    monkeypatch.setattr(
+        mcp, "_MCP_WRITER_LOCK_ERROR", ""
+    )
+
+    # --- point config at tmp_path so mine_palace_lock has a real path ---
+    monkeypatch.setattr(
+        type(mcp._config), "palace_path", property(lambda self: str(tmp_path / "palace"))
+    )
+    (tmp_path / "palace").mkdir(parents=True, exist_ok=True)
+
+    # --- record writes via a mock collection ---
+    # Mirror ChromaCollection._write_lock (backends/chroma.py:1881-1907): every
+    # write method re-enters mine_palace_lock(palace_path) for the duration of
+    # the write. This is Site B of the re-entrance chain — the write happens on
+    # a ThreadingHTTPServer worker thread while the process-wide writer lease
+    # (Site A, held from _acquire_mcp_writer_lock) is already in hand. Under the
+    # old thread-local credit (v3.5.0) that worker thread had no re-entrant
+    # credit here, re-acquired the flock, and collided with the server's own
+    # PID -> MineAlreadyRunning. The process-scoped fix short-circuits it.
+    from mempalace.palace import mine_palace_lock
+
+    writes = []
+
+    class _RecordingCollection:
+        def add(self, **kwargs):
+            with mine_palace_lock(str(tmp_path / "palace")):  # Site B re-entrance
+                writes.append(kwargs)
+
+        def count(self):
+            return len(writes)
+
+    monkeypatch.setattr(mcp, "_get_collection", lambda create=False: _RecordingCollection())
+    monkeypatch.setattr(mcp, "_wal_log", lambda *a, **kw: None)
+
+    # --- reset the writer-lease cache so call #1 does a real acquire ---
+    monkeypatch.setattr(mcp, "_MCP_WRITER_LOCK_CM", None)
+    monkeypatch.setattr(mcp, "_MCP_WRITER_ATEXIT_REGISTERED", True)  # skip atexit re-register
+    monkeypatch.setattr(mcp, "_discard_mcp_storage_handles", lambda: None)
+
+    # --- two sequential real HTTP POSTs ---
+    def _diary_call(call_id, entry):
+        return {
+            "jsonrpc": "2.0",
+            "id": call_id,
+            "method": "tools/call",
+            "params": {
+                "name": "mempalace_diary_write",
+                "arguments": {"agent_name": "test-agent", "entry": entry, "topic": "regression"},
+            },
+        }
+
+    # First call: acquires the real writer lease (mine_palace_lock → flock).
+    status, body = _post(port, "/mcp", _diary_call(1, "first write entry"))
+    assert status == 200, f"first call: status={status} body={body[:200]}"
+    first = json.loads(body)
+    assert "error" not in first, f"first call got JSON-RPC error: {first}"
+    first_result = json.loads(first["result"]["content"][0]["text"])
+    assert first_result["success"] is True, f"first call not successful: {first_result}"
+
+    # Second call: lands on a DIFFERENT thread (ThreadingHTTPServer).
+    # With the old thread-local bug, THIS call would see no credit,
+    # re-acquire, and get MineAlreadyRunning naming the server's own PID.
+    # Process-scoped fix: _MCP_WRITER_LOCK_CM is set → short-circuits.
+    status, body = _post(port, "/mcp", _diary_call(2, "second write entry"))
+    assert status == 200, f"second call: status={status} body={body[:200]}"
+    second = json.loads(body)
+    assert "error" not in second, f"second call got JSON-RPC error (self-conflict?): {second}"
+    second_result = json.loads(second["result"]["content"][0]["text"])
+    assert second_result["success"] is True, (
+        f"second call not successful (thread-local re-entrance bug?): {second_result}"
+    )
+
+    # --- both writes landed in the collection ---
+    assert len(writes) == 2, f"expected 2 recorded writes, got {len(writes)}"
+
+    # --- lease held by this process (process-scoped, not thread-local) ---
+    assert mcp._MCP_WRITER_LOCK_CM is not None, (
+        "writer lease should be held after mutations (process-scoped credit)"
+    )
+    # Release it cleanly for teardown (canonical order: discard handles,
+    # clear globals, then __exit__ the context manager).
+    mcp._release_mcp_writer_lock()
+
+
 def _hook_settings_call(req_id):
     return {
         "jsonrpc": "2.0",
