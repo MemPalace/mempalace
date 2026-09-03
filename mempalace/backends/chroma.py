@@ -261,6 +261,34 @@ def _hnsw_creation_metadata(options: Optional[dict]) -> dict:
 # (don't attempt recovery on segments with negligible data).
 _HNSW_MISSING_METADATA_DATA_FLOOR = 1024
 
+# Lower bound on the bytes one HNSW element can occupy in data_level0.bin,
+# used to derive a capacity CEILING from payload size when
+# index_metadata.pickle is absent. A real element costs dim*4 bytes for the
+# vector alone (1,536 at dim=384) plus link and label overhead, so 256 sits
+# far below any real configuration: it over-estimates capacity, which means
+# the stub check below only fires on unambiguous cases and never on a
+# segment that is merely lagging.
+_HNSW_MIN_BYTES_PER_ELEMENT = 256
+
+
+def _hnsw_capacity_ceiling_from_payload(palace_path: str, segment_id: str) -> Optional[int]:
+    """Upper bound on the elements a segment's payload could hold, or None.
+
+    Returns None when ``data_level0.bin`` does not exist: a segment that has
+    never written payload is genuinely fresh, and its missing pickle says
+    nothing about whether vector search is usable. When payload IS present,
+    its size caps how many elements the segment can possibly hold, which is
+    enough to recognise a replacement stub standing in for a lost index
+    without loading the segment.
+    """
+    data_path = os.path.join(palace_path, segment_id, "data_level0.bin")
+    try:
+        if not os.path.isfile(data_path):
+            return None
+        return os.path.getsize(data_path) // _HNSW_MIN_BYTES_PER_ELEMENT
+    except OSError:
+        return None
+
 
 def _validate_where(where: Optional[dict]) -> None:
     """Scan a where-clause for unknown operators and raise ``UnsupportedFilterError``.
@@ -991,6 +1019,7 @@ def _hnsw_capacity_status_uncached(
         "hnsw_count": None,
         "divergence": None,
         "diverged": False,
+        "flush_unreachable": False,
         "status": "unknown",
         "message": "",
     }
@@ -1026,6 +1055,50 @@ def _hnsw_capacity_status_uncached(
             # so MCP does not globally disable vectors on an inconclusive
             # signal. Corrupt/invalid metadata, when present, is handled by
             # quarantine_invalid_hnsw_metadata before Chroma opens.
+            # Cause 1: the collection can never reach its own flush
+            # threshold. Chroma compacts its write buffer into HNSW - and
+            # only then writes index_metadata.pickle - once the buffer
+            # reaches hnsw:sync_threshold. Collections created before the
+            # threshold default dropped still carry the old large value, so
+            # one that never grows past it never builds an index at all.
+            # This is not flush-lag and will not resolve on its own.
+            if sqlite_count >= _HNSW_DIVERGENCE_FALLBACK_FLOOR and sqlite_count < sync_threshold:
+                out["flush_unreachable"] = True
+                out["message"] = (
+                    f"hnsw:sync_threshold is {sync_threshold:,} but the collection holds "
+                    f"only {sqlite_count:,} records, so Chroma's write buffer can never "
+                    "reach the compaction threshold: no HNSW index is built and no "
+                    "metadata is written. It will not resolve on its own. Lower "
+                    "sync_threshold below the collection size via collection.modify() "
+                    "and re-upsert to force a flush."
+                )
+                return out
+
+            # Cause 2: payload size caps how many elements the segment can
+            # hold. After a quarantine Chroma creates a replacement sized for
+            # ~100 elements; that stub has no pickle either, so treating "no
+            # pickle" as unconditionally inconclusive leaves the #1222
+            # fallback disarmed against an index holding 100 slots while
+            # sqlite holds six figures.
+            ceiling = _hnsw_capacity_ceiling_from_payload(palace_path, seg_id)
+            if ceiling is not None:
+                shortfall = sqlite_count - ceiling
+                stub_threshold = max(
+                    _HNSW_DIVERGENCE_FALLBACK_FLOOR,
+                    int(sqlite_count * _HNSW_DIVERGENCE_FRACTION),
+                )
+                if shortfall > stub_threshold:
+                    out["divergence"] = shortfall
+                    out["status"] = "diverged"
+                    out["diverged"] = True
+                    out["message"] = (
+                        f"HNSW payload can hold at most ~{ceiling:,} elements but sqlite "
+                        f"has {sqlite_count:,} embeddings, and no metadata pickle was "
+                        "written - this is a replacement stub, not flush-lag. "
+                        "Run `mempalace repair` to rebuild."
+                    )
+                    return out
+
             out["message"] = (
                 "HNSW capacity unavailable: metadata has not been flushed; "
                 "leaving vector search enabled"
