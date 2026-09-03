@@ -1,6 +1,7 @@
 """Unit tests for convo_miner pure functions (no chromadb needed)."""
 
 import contextlib
+import os
 import sys
 
 import pytest
@@ -818,6 +819,268 @@ class TestFileChunksLocked:
             "next mine would skip this incomplete file forever (#2183)"
         )
         assert col.deleted_ids, "cleanup did not delete the partial drawer ids"
+
+
+class TestFileChunksLockedIncremental:
+    """#2336: re-mining a grown conversation must upsert only the new/changed
+    chunks, delete only the orphans an append past its tail (or a /compact
+    re-chunk) left behind, and re-stamp ``source_mtime`` / ``chunk_total`` on
+    the unchanged rows — not rebuild-and-embed every exchange."""
+
+    def _setup(self, monkeypatch, tmp_path):
+        """Install monkeypatches only — does NOT write the source file."""
+        import mempalace.convo_miner as convo_miner
+
+        monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 50)
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+    def test_unchanged_file_is_noop_no_delete(self, monkeypatch, tmp_path):
+        import mempalace.convo_miner as convo_miner
+        from mempalace.ids import make_convo_drawer_id
+
+        source = tmp_path / "chat.jsonl"
+        contents = [f"exchange {i} about memory " * 20 for i in range(3)]
+        source.write_text("".join(contents), encoding="utf-8")
+        src = str(source)
+        self._setup(monkeypatch, tmp_path)  # install monkeypatches (no file write)
+        stored_ids = [make_convo_drawer_id("wing", "general", src, "exchange", i) for i in range(3)]
+        source_mtime = os.path.getmtime(src)
+        rows = {
+            drawer_id: (content, {
+                "source_file": src,
+                "extract_mode": "exchange",
+                "ingest_mode": "convos",
+                "normalize_version": convo_miner.NORMALIZE_VERSION,
+                "source_mtime": source_mtime,
+                "chunk_total": 3,
+            })
+            for drawer_id, content in zip(stored_ids, contents)
+        }
+
+        class StoredCol:
+            def __init__(self):
+                self.rows = rows
+                self.deleted = []
+                self.upserted = 0
+                self.upsert_docs = []
+                self.update_calls = 0
+                self.updated_refresh = {}
+
+            def get(self, ids=None, include=None, where=None, limit=None, offset=0, **kw):
+                if ids is not None:
+                    got = [self.rows[drawer_id] for drawer_id in ids if drawer_id in self.rows]
+                    return {
+                        "ids": [drawer_id for drawer_id, _v in got],
+                        "metadatas": [meta for _doc, meta in got],
+                    }
+                page = {
+                    drawer_id: (doc, meta)
+                    for drawer_id, (doc, meta) in self.rows.items()
+                }
+                ordered_ids = list(page)
+                ordered = [page[d] for d in ordered_ids]
+                end = offset + (limit or len(ordered))
+                return {
+                    "ids": ordered_ids[offset:end],
+                    "metadatas": [meta for _doc, meta in ordered[offset:end]],
+                    "documents": [doc for doc, _meta in ordered[offset:end]],
+                }
+
+            def delete(self, ids=None, **kw):
+                self.deleted.extend(ids)
+                for drawer_id in ids:
+                    self.rows.pop(drawer_id, None)
+
+            def upsert(self, documents, ids, metadatas):
+                self.upserted += len(documents)
+                self.upsert_docs.extend(documents)
+                self.rows.update(zip(ids, zip(documents, metadatas)))
+
+            def update(self, ids=None, metadatas=None, **kw):
+                self.update_calls += 1
+                for drawer_id, meta in zip(ids, metadatas):
+                    self.updated_refresh[drawer_id] = dict(meta)
+
+        col = StoredCol()
+        drawers, room_counts, skipped = _file_chunks_locked(
+            col, str(source), [{"content": c, "chunk_index": i} for i, c in enumerate(contents)],
+            "wing", "general", "agent", "exchange",
+        )
+
+        assert skipped is False
+        assert drawers == 0
+        assert col.deleted == [], (
+            f"unchanged rows must not be deleted, got {col.deleted}"
+        )
+        assert col.upserted == 0, (
+            f"unchanged rows must not be re-upserted, got {col.upserted}"
+        )
+        assert col.update_calls >= 1, "skipped rows need a metadata refresh"
+        assert all(
+            meta["source_mtime"] == source_mtime and meta["chunk_total"] == 3
+            for meta in col.updated_refresh.values()
+        ), "refresh must carry this pass's source_mtime and chunk_total"
+
+    def test_grown_file_upserts_only_changed(self, monkeypatch, tmp_path):
+        import mempalace.convo_miner as convo_miner
+        from mempalace.ids import make_convo_drawer_id
+
+        source = tmp_path / "chat.jsonl"
+        old_contents = [f"exchange {i} about memory " * 20 for i in range(2)]
+        # chunk 0 is byte-identical, chunk 1 gains content, chunk 2 is new.
+        contents = [old_contents[0], old_contents[1] + " and a new detail", "exchange 2 brand-new"]
+        source.write_text("".join(contents), encoding="utf-8")
+        src = str(source)
+        self._setup(monkeypatch, tmp_path)
+        stored_ids = [make_convo_drawer_id("wing", "general", src, "exchange", i) for i in range(2)]
+        source_mtime = os.path.getmtime(src)
+        rows = {
+            drawer_id: (content, {
+                "source_file": src,
+                "extract_mode": "exchange",
+                "ingest_mode": "convos",
+                "normalize_version": convo_miner.NORMALIZE_VERSION,
+                "source_mtime": source_mtime,
+                "chunk_total": 2,
+            })
+            for drawer_id, content in zip(stored_ids, old_contents)
+        }
+
+        class StoredCol:
+            def __init__(self):
+                self.rows = dict(rows)
+                self.deleted = []
+                self.upserted_ids = []
+                self.updated_refresh = {}
+
+            def get(self, ids=None, include=None, where=None, limit=None, offset=0, **kw):
+                if ids is not None:
+                    got = [self.rows[drawer_id] for drawer_id in ids if drawer_id in self.rows]
+                    return {"ids": [d for d, _v in got], "metadatas": [m for _d, m in got]}
+                ordered_ids = list(self.rows)
+                ordered = [self.rows[d] for d in ordered_ids]
+                end = offset + (limit or len(ordered))
+                return {
+                    "ids": ordered_ids[offset:end],
+                    "metadatas": [m for _d, m in ordered[offset:end]],
+                    "documents": [d for d, _m in ordered[offset:end]],
+                }
+
+            def delete(self, ids=None, **kw):
+                self.deleted.extend(ids)
+                for drawer_id in ids:
+                    self.rows.pop(drawer_id, None)
+
+            def upsert(self, documents, ids, metadatas):
+                self.upserted_ids.extend(ids)
+                self.rows.update(zip(ids, zip(documents, metadatas)))
+
+            def update(self, ids=None, metadatas=None, **kw):
+                for drawer_id, meta in zip(ids, metadatas):
+                    self.updated_refresh[drawer_id] = dict(meta)
+
+        col = StoredCol()
+        new_id = make_convo_drawer_id("wing", "general", src, "exchange", 2)
+
+        drawers, _room_counts, skipped = _file_chunks_locked(
+            col, src,
+            [{"content": c, "chunk_index": i} for i, c in enumerate(contents)],
+            "wing", "general", "agent", "exchange",
+        )
+
+        assert skipped is False
+        assert drawers == 2, f"expected 2 re-ups (chunk 1 changed + chunk 2 new), got {drawers}"
+        upserted = set(col.upserted_ids)
+        assert new_id in upserted, "the brand-new chunk must be upserted"
+        assert stored_ids[0] not in upserted, "unchanged chunk must be left alone"
+        assert stored_ids[1] in upserted, "the changed chunk must be re-upserted"
+        assert col.deleted == [], "no orphans were produced by a pure append"
+        assert stored_ids[0] in col.updated_refresh
+        assert col.updated_refresh[stored_ids[0]]["chunk_total"] == 3
+        assert col.updated_refresh[stored_ids[0]]["source_mtime"] == source_mtime
+
+    def test_orphans_are_deleted_after_shrink(self, monkeypatch, tmp_path):
+        import mempalace.convo_miner as convo_miner
+        from mempalace.ids import make_convo_drawer_id
+
+        source = tmp_path / "chat.jsonl"
+        contents = [f"exchange {i} about memory " * 20 for i in range(2)]
+        source.write_text("".join(contents), encoding="utf-8")
+        src = str(source)
+        self._setup(monkeypatch, tmp_path)
+        # Stored has chunk 0,1,2 — this pass drops chunk 2 (file shrank /
+        # /compact re-chunked), so chunk 2 is an orphan.
+        stored_ids = [make_convo_drawer_id("wing", "general", src, "exchange", i) for i in range(3)]
+        old_contents = [f"exchange {i} about memory " * 20 for i in range(3)]
+        source_mtime = os.path.getmtime(src)
+        rows = {
+            drawer_id: (content, {
+                "source_file": src,
+                "extract_mode": "exchange",
+                "ingest_mode": "convos",
+                "normalize_version": convo_miner.NORMALIZE_VERSION,
+                "source_mtime": source_mtime,
+                "chunk_total": 3,
+            })
+            for drawer_id, content in zip(stored_ids, old_contents)
+        }
+
+        class StoredCol:
+            def __init__(self):
+                self.rows = dict(rows)
+                self.deleted = []
+                self.upserted_ids = []
+                self.updated_refresh = {}
+
+            def get(self, ids=None, include=None, where=None, limit=None, offset=0, **kw):
+                if ids is not None:
+                    got = [self.rows[drawer_id] for drawer_id in ids if drawer_id in self.rows]
+                    return {"ids": [d for d, _v in got], "metadatas": [m for _d, m in got]}
+                ordered_ids = list(self.rows)
+                ordered = [self.rows[d] for d in ordered_ids]
+                end = offset + (limit or len(ordered))
+                return {
+                    "ids": ordered_ids[offset:end],
+                    "metadatas": [m for _d, m in ordered[offset:end]],
+                    "documents": [d for d, _m in ordered[offset:end]],
+                }
+
+            def delete(self, ids=None, **kw):
+                self.deleted.extend(ids)
+                for drawer_id in ids:
+                    self.rows.pop(drawer_id, None)
+
+            def upsert(self, documents, ids, metadatas):
+                self.upserted_ids.extend(ids)
+                self.rows.update(zip(ids, zip(documents, metadatas)))
+
+            def update(self, ids=None, metadatas=None, **kw):
+                for drawer_id, meta in zip(ids, metadatas):
+                    self.updated_refresh[drawer_id] = dict(meta)
+
+        col = StoredCol()
+        orphan_id = stored_ids[2]
+
+        drawers, _room_counts, skipped = _file_chunks_locked(
+            col, src,
+            [{"content": c, "chunk_index": i} for i, c in enumerate(contents)],
+            "wing", "general", "agent", "exchange",
+        )
+
+        assert skipped is False
+        assert orphan_id in col.deleted, (
+            f"the orphan (chunk 2 no longer in this pass) must be deleted, got {col.deleted}"
+        )
+        assert stored_ids[0] not in col.deleted, "a kept row must not be deleted"
+        assert stored_ids[1] not in col.deleted, "a kept row must not be deleted"
+        # chunk 0 identical → skipped; chunk 1 identical → skipped. No upserts.
+        assert col.upserted_ids == []
+        assert stored_ids[0] in col.updated_refresh
+        assert col.updated_refresh[stored_ids[0]]["chunk_total"] == 2
 
 
 class TestSourceFileDeleteIds:
