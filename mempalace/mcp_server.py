@@ -6740,6 +6740,65 @@ def _mcp_tool_preflight_refusal(req_id, tool_name: str):
     return _mcp_peer_writer_refusal(req_id, tool_name)
 
 
+def _mcp_envelope_error_if_malformed(request):
+    """Return (error_dict | None, stop) for one request's envelope shape.
+
+    ``stop == True`` means the caller must short-circuit (either with the
+    error dict, or with ``None`` for a notification-shaped request that
+    must elicit no response).  ``stop == False`` means the envelope is
+    absent / null / correctly-typed and the caller continues on to
+    method dispatch.
+
+    JSON-RPC 2.0 / MCP expect ``method`` to be a ``str`` and ``params``
+    to be an ``object`` (or absent / ``null``).  The pre-fix code used
+    ``or `` rescaffolding (``request.get("method") or ""``) to absorb
+    ``None`` / ``False`` / ``[]`` / ``0`` values, which let wrong-typed
+    truthy values (``123``, ``True``, ``[1, 2]``, ``"oops"``) through to
+    ``.startswith()`` / ``.get()`` / ``**`` / ``in`` calls where both
+    the stdio and HTTP transports swallowed the resulting ``TypeError`` /
+    ``AttributeError`` (stdio's ``except Exception: continue`` and the
+    HTTP ``do_POST`` socket drop) — the client hangs forever on that
+    request id while the server stays alive (issue #2231).
+
+    ``method: null`` / ``params: null`` keep their previous meaning —
+    "no method" → -32601 unknown-method; "no params" → {} → the method's
+    own handling (e.g. tools/call reports "'name' is required").  Only
+    non-null wrong-type values are rejected here, so existing valid /
+    null-valued requests are not touched.
+
+    Notifications (no id) never elicit a response — JSON-RPC semantics.
+    For those we return ``(None, True)``: the caller treats it as
+    "stop, reply with None".
+    """
+    raw_method = request.get("method")
+    raw_params = request.get("params")
+    req_id = request.get("id")
+    if raw_method is not None and not isinstance(raw_method, str):
+        return (
+            None if req_id is None
+            else _envelope_invalid_request_error(
+                req_id, '"method" must be a string'),
+            True,
+        )
+    if raw_params is not None and not isinstance(raw_params, dict):
+        return (
+            None if req_id is None
+            else _envelope_invalid_request_error(
+                req_id, '"params" must be an object'),
+            True,
+        )
+    return (None, False)
+
+
+def _envelope_invalid_request_error(req_id, field):
+    """Shared -32600 Invalid Request payload."""
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {"code": -32600, "message": f'Invalid Request: {field}'},
+    }
+
+
 def _decorate_mcp_tool_result(tool_name: str, result):
     """Attach MCP transport-only diagnostics outside handle_request complexity."""
 
@@ -6754,7 +6813,7 @@ def _decorate_mcp_tool_result(tool_name: str, result):
     return result
 
 
-def handle_request(request):
+def handle_request(request):  # noqa: C901
     global _last_request_time
     if not isinstance(request, dict):
         return {
@@ -6763,6 +6822,19 @@ def handle_request(request):
             "error": {"code": -32600, "message": "Invalid Request"},
         }
     _last_request_time = time.monotonic()
+    # Envelope shape guards (issue #2231): a *truthy-but-wrong-typed*
+    # method (123, true, {...}) or params ("oops", [1], 5) used to sail
+    # past the ``or ""`` / ``or {}`` rescue and reach .startswith() /
+    # .get() / ** / in, where both transports then swallowed the raise
+    # (stdio's except/continue, the HTTP socket drop) and the client hung
+    # on that id while the server stayed alive.  _mcp_envelope_error_if_malformed
+    # returns a -32600 Invalid Request that still carries the request id
+    # (or None for a notification-shaped request) so both transports emit
+    # a response.  method:null / params:null keep their previous meaning
+    # (absent → {} → method-specific handling) — see the helper.
+    envelope_error, stop = _mcp_envelope_error_if_malformed(request)
+    if stop:
+        return envelope_error
     method = request.get("method") or ""
     params = request.get("params") or {}
     req_id = request.get("id")
@@ -6814,7 +6886,31 @@ def handle_request(request):
                 },
             }
         tool_name = params.get("name")
+        # Guard on name type — a bool, list, dict, or other non-string
+        # reached `in TOOLS` (→ unhashable → TypeError) or was later
+        # formatted as "Unknown tool: {}" without a response.
+        if not isinstance(tool_name, str):
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {
+                    "code": -32602,
+                    "message": "Invalid params: 'name' must be a string",
+                },
+            }
         tool_args = params.get("arguments") or {}
+        # Guard on arguments type — a truthy non-mapping (e.g. 5, [], "x")
+        # caused `for k in tool_args` / `dict(**tool_args)` / iteration
+        # to raise TypeError.
+        if not isinstance(tool_args, dict):
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {
+                    "code": -32602,
+                    "message": "Invalid params: 'arguments' must be an object",
+                },
+            }
         if tool_name not in TOOLS:
             return {
                 "jsonrpc": "2.0",
@@ -7646,12 +7742,31 @@ def _http_dispatch(request):
     the lock; palace writes take it exclusively. Unclassified tools fail
     closed onto the exclusive side.
     """
-    method = request.get("method") or "" if isinstance(request, dict) else ""
+    # Non-dict request (including None — a ``null`` body): do_JSON
+    # already json.loads()'d it; handle_request owns the -32600 "Invalid
+    # Request" guard for those shapes.
+    if not isinstance(request, dict):
+        return handle_request(request)
+    # Issue #2231: a *truthy-but-wrong-typed* method (123, [1, 2], True)
+    # previously hit the .startswith() call below without a surrounding
+    # try/except, and the socket was dropped mid-request (client hangs).
+    # The module-level _mcp_envelope_error_if_malformed helper (also used
+    # by handle_request) is the single source of truth for the -32600
+    # Invalid Request payload.
+    envelope_error, stop = _mcp_envelope_error_if_malformed(request)
+    if stop:
+        return envelope_error
+    method = request.get("method") or ""
     if method in _HTTP_PROTOCOL_METHODS or method.startswith("notifications/"):
         return handle_request(request)
     tool_name = None
     if method == "tools/call" and isinstance(request.get("params"), dict):
         tool_name = request["params"].get("name")
+    if not isinstance(tool_name, str):
+        # `in` set lookups below would raise TypeError for unhashable
+        # values (e.g. params.name = {}); and handle_request already
+        # rejects non-string name, so short-circuit through it.
+        return handle_request(request)
     if tool_name in _HTTP_LOCK_FREE_TOOLS:
         return handle_request(request)
     # service.classify_tool is the authoritative read/write registry. The
@@ -8509,7 +8624,12 @@ def _forward_request_to_hub(base_url: str, headers: dict, request: dict, palace_
 def _request_is_mutating(request: dict) -> bool:
     if request.get("method") != "tools/call":
         return False
-    name = ((request.get("params") or {}).get("name")) or ""
+    params = request.get("params")
+    if not isinstance(params, dict):
+        return False
+    name = params.get("name")
+    if not isinstance(name, str):
+        return False
     return name in _MUTATING_TOOLS
 
 
