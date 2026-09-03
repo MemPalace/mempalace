@@ -672,6 +672,25 @@ def test_wing_from_transcript_path_strips_parent_dir_with_hyphenated_project():
     assert _wing_from_transcript_path(path) == "wing_react_native"
 
 
+def test_wing_from_transcript_path_fallback_collapses_claude_worktree():
+    """The encoded-path fallback must not create one wing per worktree."""
+    path = (
+        "/Users/me/.claude/projects/"
+        "-Users-me-projects-gsd-core--claude-worktrees-hardcore-wilbur-48691a/"
+        "session.jsonl"
+    )
+    assert _wing_from_transcript_path(path) == "wing_gsd_core"
+
+
+def test_wing_from_transcript_path_preserves_similar_hyphenated_project():
+    """Only the double-dash worktree marker is structural."""
+    path = (
+        "/Users/me/.claude/projects/"
+        "-Users-me-projects-gsd-core-claude-worktrees-tools/session.jsonl"
+    )
+    assert _wing_from_transcript_path(path) == "wing_gsd_core_claude_worktrees_tools"
+
+
 # --- _wing_from_transcript_path: cwd-from-JSONL primary path ---
 
 

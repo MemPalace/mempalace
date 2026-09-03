@@ -1284,6 +1284,10 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
         m = re.match(r"(?:Users|home)-[^-]+-(.+)", encoded)
         if m:
             encoded = m.group(1)
+        # Match the cwd path's worktree handling above. Without cwd, Claude
+        # encodes ``/.claude/worktrees/<name>`` into the project directory,
+        # which otherwise creates a separate wing for every worktree.
+        encoded = encoded.split("--claude-worktrees-", 1)[0]
         # Strip one common parent-dir token if present, keeping the rest as
         # the project path. Hyphens become underscores to preserve
         # uniqueness for hyphenated project folder names.
