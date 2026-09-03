@@ -67,6 +67,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             "agent": agent_name,
             "filed_at": now.isoformat(),
             "date": now.strftime("%Y-%m-%d"),
+            "importance": score_importance(entry),
         }
         chunk_size = _config.chunk_size
         if len(entry) <= chunk_size:

@@ -413,6 +413,7 @@ def tool_add_drawer(
         "added_by": added_by,
         "filed_at": datetime.now().isoformat(),
         "id_recipe": ID_RECIPE,
+        "importance": score_importance(content),
     }
 
     base_meta["last_modified"] = base_meta["filed_at"]
