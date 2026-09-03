@@ -304,6 +304,98 @@ class TestQdrantGetAllMetadataSingleScroll:
 
 
 # ---------------------------------------------------------------------------
+# 2b. QdrantCollection.get() bounded scroll (issue #2363)
+# ---------------------------------------------------------------------------
+
+
+class TestQdrantGetBoundedScroll:
+    def test_get_with_limit_stops_after_first_sufficient_page(self, monkeypatch):
+        """
+        Three pages of 3 rows each (9 total, cursor-chained) all match a
+        plain, push-down-able filter. get(where=..., limit=1) only needs
+        the first page to satisfy limit=1, so it must not touch page 2/3.
+        """
+        page1 = ([_fake_point(f"d{i}", "wing_a") for i in range(3)], "cursor-1")
+        page2 = ([_fake_point(f"d{i}", "wing_a") for i in range(3, 6)], "cursor-2")
+        page3 = ([_fake_point(f"d{i}", "wing_a") for i in range(6, 9)], None)
+        col, call_log = _make_qdrant_collection(monkeypatch, [page1, page2, page3])
+
+        result = col.get(where={"wing": "wing_a"}, limit=1)
+
+        assert result.ids == ["d0"]
+        assert len(call_log) == 1, (
+            f"limit=1 must be satisfied by the first page alone, got {len(call_log)} scroll calls"
+        )
+
+    def test_get_with_limit_and_offset_walks_only_up_to_requested_range(self, monkeypatch):
+        """offset=3, limit=1 needs rows [3:4], which is page 2, not page 3."""
+        page1 = ([_fake_point(f"d{i}", "wing_a") for i in range(3)], "cursor-1")
+        page2 = ([_fake_point(f"d{i}", "wing_a") for i in range(3, 6)], "cursor-2")
+        page3 = ([_fake_point(f"d{i}", "wing_a") for i in range(6, 9)], None)
+        col, call_log = _make_qdrant_collection(monkeypatch, [page1, page2, page3])
+
+        result = col.get(where={"wing": "wing_a"}, limit=1, offset=3)
+
+        assert result.ids == ["d3"]
+        assert len(call_log) == 2, (
+            f"offset=3/limit=1 needs rows through index 4, not page 3, got {len(call_log)} calls"
+        )
+
+    def test_get_requests_bounded_page_limit_not_full_page_size(self, monkeypatch):
+        """The per-call `limit` sent to scroll_points() must shrink to what's
+        still needed (offset+limit), not stay pinned at _SCROLL_PAGE_SIZE."""
+        page1 = ([_fake_point("d0", "wing_a")], None)
+        col, call_log = _make_qdrant_collection(monkeypatch, [page1])
+
+        col.get(where={"wing": "wing_a"}, limit=1)
+
+        assert call_log[0]["limit"] == 1
+
+    def test_get_with_local_filter_still_walks_full_collection(self, monkeypatch):
+        """
+        An $or clause requires the local Python re-check
+        (_requires_local_filter() == True), so qdrant's own filter cannot be
+        trusted to have selected exactly the right rows, so bounding the
+        scroll here could return fewer than `limit` genuine matches. Must
+        still walk every page.
+        """
+        page1 = ([_fake_point("d0", "wing_a"), _fake_point("d1", "wing_b")], "cursor-1")
+        page2 = ([_fake_point("d2", "wing_c")], None)
+        col, call_log = _make_qdrant_collection(monkeypatch, [page1, page2])
+
+        result = col.get(where={"$or": [{"wing": "wing_a"}, {"wing": "wing_b"}]}, limit=1)
+
+        assert result.ids == ["d0"]
+        assert len(call_log) == 2, "an $or filter must not shortcut the scroll"
+
+    def test_get_with_ids_still_walks_full_collection(self, monkeypatch):
+        """An id lookup must scan every matching point regardless of scroll
+        order: offset/limit slicing happens after id resolution, so
+        bounding the scroll here could miss a requested id."""
+        page1 = ([_fake_point("d0", "wing_a")], "cursor-1")
+        page2 = ([_fake_point("d1", "wing_a")], None)
+        col, call_log = _make_qdrant_collection(monkeypatch, [page1, page2])
+
+        result = col.get(ids=["d1"], limit=1)
+
+        assert result.ids == ["d1"]
+        assert len(call_log) == 2, "an id lookup must not shortcut the scroll"
+
+    def test_get_all_metadata_remains_unbounded(self, monkeypatch):
+        """Regression guard: get_all_metadata() must keep walking the whole
+        matching set even though _rows()/_scroll_all() now accept a
+        max_rows bound, since it has no limit/offset concept at all."""
+        page1 = ([_fake_point(f"d{i}", "wing_a") for i in range(3)], "cursor-1")
+        page2 = ([_fake_point(f"d{i}", "wing_a") for i in range(3, 6)], None)
+        col, call_log = _make_qdrant_collection(monkeypatch, [page1, page2])
+
+        result = col.get_all_metadata()
+
+        assert len(result) == 6
+        assert len(call_log) == 2
+
+
+# ---------------------------------------------------------------------------
 # 3. Scroll page-size constant
 # ---------------------------------------------------------------------------
 

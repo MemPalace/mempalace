@@ -24,6 +24,7 @@ def _append_args(palace, **overrides):
         type="task.request",
         stream="project/mempalace",
         room="delegation",
+        topic=None,
         from_agent="mac-fable",
         to_agent="windows-codex",
         correlation_id="task_cli",
@@ -46,14 +47,17 @@ def _list_args(palace, **overrides):
         logstream_action="list",
         stream=None,
         room=None,
+        topic=None,
         type=None,
         to_agent=None,
         from_agent=None,
         correlation_id=None,
         status=None,
         since_event_id=None,
+        before_event_id=None,
         since_created_at=None,
         limit=50,
+        order="asc",
         json=True,
     )
     fields.update(overrides)
@@ -687,6 +691,7 @@ def _watch_args(palace, **overrides):
         agent=None,
         stream=None,
         room=None,
+        topic=None,
         type=None,
         status=None,
         to_agent=None,
@@ -1194,3 +1199,80 @@ class TestLogstreamWatch:
             cmd_logstream(_watch_args(palace_path, agent="mac-claude", limit=0))
         assert exc.value.code == 1
         assert "limit" in json.loads(capsys.readouterr().out)["error"]
+
+
+class TestTopicAndOrderCli:
+    def test_human_output_includes_topic(self, palace_path, capsys):
+        cmd_logstream(
+            _append_args(
+                palace_path,
+                topic="security",
+                body="Review auth boundary",
+                json=False,
+            )
+        )
+
+        output = capsys.readouterr().out
+        assert "topic=security" in output
+
+    def test_append_and_list_topic(self, palace_path, capsys):
+        cmd_logstream(_append_args(palace_path, topic="infra", body="Infra task"))
+        e1 = json.loads(capsys.readouterr().out)
+        assert e1["topic"] == "infra"
+
+        cmd_logstream(_append_args(palace_path, topic="billing", body="Billing task"))
+        e2 = json.loads(capsys.readouterr().out)
+        assert e2["topic"] == "billing"
+
+        cmd_logstream(_list_args(palace_path, topic="infra"))
+        res = json.loads(capsys.readouterr().out)
+        assert res["count"] == 1
+        assert res["events"][0]["id"] == e1["id"]
+
+    def test_list_order_and_before_event_id(self, palace_path, capsys):
+        cmd_logstream(_append_args(palace_path, body="1"))
+        e1 = json.loads(capsys.readouterr().out)
+        cmd_logstream(_append_args(palace_path, body="2"))
+        e2 = json.loads(capsys.readouterr().out)
+        cmd_logstream(_append_args(palace_path, body="3"))
+        e3 = json.loads(capsys.readouterr().out)
+
+        cmd_logstream(_list_args(palace_path, order="desc"))
+        desc_res = json.loads(capsys.readouterr().out)
+        assert [e["id"] for e in desc_res["events"]] == [e3["id"], e2["id"], e1["id"]]
+
+        cmd_logstream(_list_args(palace_path, before_event_id=e3["id"], order="desc"))
+        before_res = json.loads(capsys.readouterr().out)
+        assert [e["id"] for e in before_res["events"]] == [e2["id"], e1["id"]]
+
+    def test_watch_topic_filtering(self, palace_path, capsys):
+        cmd_logstream(_append_args(palace_path, topic="security", to_agent="mac-claude"))
+        capsys.readouterr()
+
+        cmd_logstream(
+            _watch_args(
+                palace_path,
+                agent="mac-claude",
+                topic=["security", "compliance"],
+                from_start=True,
+            )
+        )
+        assert _watch_payload(capsys)["count"] == 1
+
+    def test_ack_topic_override_cli(self, palace_path, capsys):
+        cmd_logstream(_append_args(palace_path, topic="orig-topic", from_agent="target-agent"))
+        target = json.loads(capsys.readouterr().out)
+
+        ack_args = SimpleNamespace(
+            palace=palace_path,
+            logstream_action="ack",
+            event_id=target["id"],
+            from_agent="ack-agent",
+            status="claimed",
+            body="ack body",
+            topic="new-topic",
+            json=True,
+        )
+        cmd_logstream(ack_args)
+        ack_res = json.loads(capsys.readouterr().out)
+        assert ack_res["topic"] == "new-topic"

@@ -120,6 +120,19 @@ Summarize the installed version, palace location or hub URL (without secrets),
 MCP connection, stable agent identity, watcher mode, and the first safe next
 action. For active delegation, hand off to the `mempalace-task` skill.
 
+Ask whether the user wants weekly stable-release checks. The default is no.
+Explain that enabling them contacts PyPI but sends no palace content, identity,
+or telemetry. When enabling, record the installer actually used with
+`mempalace update configure --enable --installer uv-tool` (or `pipx` / `pip`);
+use `--disable` to opt out. Checks never install anything. In
+`mempalace_status`, treat `updates.server` as the palace-serving runtime and
+`updates.client` (when present) as the local proxy runtime; do not conflate
+their versions or installers. For a client update, use the local `mempalace
+update plan`. A remote server update is informational on the client: surface it
+naturally and ask the hub operator to prepare and authorize the plan on the
+palace-serving machine. Never use a client-generated plan to upgrade the
+server, and never execute any plan without explicit approval.
+
 ## Recalling past work
 
 This skill covers setup, mining, and status. For questions about past

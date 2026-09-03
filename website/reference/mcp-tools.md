@@ -10,9 +10,19 @@ Palace overview: total drawers, wing and room counts, AAAK spec, and memory prot
 
 **Parameters:** None
 
-**Returns:** `{ total_drawers, wings, rooms, protocol, aaak_dialect, sqlite_integrity, library_versions }`
+**Returns:** `{ total_drawers, wings, rooms, protocol, aaak_dialect, sqlite_integrity, library_versions, updates }`
 
 `library_versions` reports the versions this server loaded and whether they still match what is installed on disk. `stale: true` means they no longer match, which happens when the package is upgraded or removed while the server is running; write tools are then refused with error `-32005` until the server is restarted, unless `MEMPALACE_MCP_ALLOW_STALE_LIBRARY=1` is set in its environment, in which case `gate_disabled_by` names that variable. An `unreadable` key lists the distributions the check is not covering — either their installed metadata could not be read, or they could not be resolved at all when the server started — so `stale: false` is never mistaken for "checked and fine" when nothing was checked.
+
+`updates.server` is cached release state for the runtime serving the palace.
+When a local stdio process proxies to a hub, it also adds `updates.client` for
+that proxy's locally installed runtime; a direct HTTP client receives only the
+server scope because it has no local MemPalace process to inspect. Checks are
+disabled by default and refresh in a background thread, so this tool never
+waits on PyPI. An available release is informational only and must be authorized
+by the user before any upgrade commands run. A remote `updates.server` release
+must be planned on the hub host; a client's local plan applies only to
+`updates.client`.
 
 ---
 
@@ -517,13 +527,14 @@ task with the user before invoking this immutable append.
 
 ### `mempalace_event_append`
 
-Append an immutable coordination event.
+Append an immutable agent-coordination event to the logstream (RFC 003).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `type` | string | **Yes** | Event type, e.g. `task.request`, `task.reply`, `patch.ready` |
 | `stream` | string | **Yes** | Logical stream, e.g. `project/myapp` or `shared_agent_brain` |
 | `room` | string | **Yes** | Sub-channel: `delegation`, `patches`, `reviews`, `status` |
+| `topic` | string | No | Topic to group related work/sub-team, e.g. `auth-v2` |
 | `from_agent` | string | **Yes** | Writer agent identity |
 | `to_agent` | string | No | Target agent, or `*` for broadcast |
 | `correlation_id` | string | No | Task id tying request and reply events together |
@@ -540,19 +551,22 @@ Append an immutable coordination event.
 
 ### `mempalace_event_list`
 
-List events with structured filters, oldest first.
+List events with structured filters.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `stream` | string | No | Filter by stream |
 | `room` | string | No | Filter by room |
+| `topic` | string | No | Filter by topic |
 | `type` | string | No | Filter by event type |
 | `to_agent` | string | No | Filter by target; also matches `*` broadcasts |
 | `from_agent` | string | No | Filter by writer |
 | `correlation_id` | string | No | Filter by correlation id |
 | `status` | string | No | Filter by status |
-| `since_event_id` | string | No | Only events strictly after this id (precise cursor) |
+| `since_event_id` | string | No | Only events strictly after this id in append order (precise forward cursor) |
+| `before_event_id` | string | No | Only events strictly before this id in append order (reverse/historical paging) |
 | `since_created_at` | string | No | Only events at/after this time (inclusive) |
+| `order` | string | No | `asc` (oldest first, default) or `desc` (newest first) |
 | `limit` | integer | No | Max events (default 50, cap 500) |
 
 **Returns:** `{ events: [...], count }`
@@ -561,7 +575,7 @@ List events with structured filters, oldest first.
 
 ### `mempalace_event_wait`
 
-Block until a matching event exists or the timeout expires (long-poll; max 5 minutes). Accepts the same filters as `event_list` plus:
+Block until a matching event exists or the timeout expires (long-poll; max 5 minutes). Accepts the forward filters `stream`, `room`, `topic`, `type`, `to_agent`, `from_agent`, `correlation_id`, `status`, `since_event_id`, and `since_created_at`, plus:
 
 For live-tail clients that can keep an HTTP connection open, use
 `GET /logstream/stream` SSE instead; `event_wait` is the polling MCP surface.
@@ -577,7 +591,7 @@ For live-tail clients that can keep an HTTP connection open, use
 
 ### `mempalace_event_ack`
 
-Acknowledge an event: appends a new `event.ack` routed back to the original writer, with `correlation_id` copied from the target (falling back to the target's id). Never mutates the target event.
+Acknowledge an event: appends a new `event.ack` routed back to the original writer. It copies `topic` from the target unless overridden, and copies `correlation_id` with the target id as its fallback. It never mutates the target event.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -585,6 +599,7 @@ Acknowledge an event: appends a new `event.ack` routed back to the original writ
 | `from_agent` | string | **Yes** | Acknowledging agent identity |
 | `status` | string | No | e.g. `applied`, `failed` |
 | `body` | string | No | Verbatim ack notes |
+| `topic` | string | No | Topic override (defaults to target event's topic) |
 
 **Returns:** `{ success, event }` — the new ack event.
 
@@ -627,6 +642,7 @@ Convenience: store a patch artifact and append its `patch.ready` event in one ca
 | `from_agent` | string | **Yes** | Submitting agent identity |
 | `stream` | string | **Yes** | Logical stream |
 | `room` | string | No | Sub-channel (default `patches`) |
+| `topic` | string | No | Topic name, e.g. `auth-v2` |
 | `to_agent` | string | No | Target agent or `*` |
 | `correlation_id` | string | No | Task id tying the patch to its request |
 | `branch` | string | No | Git branch |

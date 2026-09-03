@@ -299,6 +299,7 @@ class TestSyncPrimitives:
             "type",
             "stream",
             "room",
+            "topic",
             "from_agent",
             "body",
             "created_at",
@@ -310,6 +311,29 @@ class TestSyncPrimitives:
         ):
             assert copy[key] == event[key], key
         assert ls_b.get_artifact(artifact["id"])["content"] == "payload"
+
+    def test_remote_event_with_and_without_topic(self, ls_a, ls_b):
+        event_topic = _append(ls_a, topic="security-track", body="with topic")
+        event_none = _append(ls_a, topic=None, body="without topic")
+
+        assert ls_b.apply_remote_event(event_topic) is True
+        assert ls_b.apply_remote_event(event_none) is True
+
+        b_topic = ls_b.list_events(topic="security-track")
+        assert len(b_topic) == 1
+        assert b_topic[0]["id"] == event_topic["id"]
+        assert b_topic[0]["topic"] == "security-track"
+
+        all_b = ls_b.list_events(limit=10)
+        by_id = {e["id"]: e for e in all_b}
+        assert by_id[event_none["id"]]["topic"] is None
+
+    def test_remote_event_rejects_invalid_topic(self, ls_a, ls_b):
+        event = _append(ls_a, topic="security")
+        event["topic"] = "security\nforged"
+
+        with pytest.raises(ValueError, match="topic"):
+            ls_b.apply_remote_event(event)
 
 
 # ── Convergence (engine over simulated wire) ─────────────────────────────

@@ -1376,7 +1376,11 @@ def test_sqlite_exact_equality_where_uses_locus_column(tmp_path):
 
 def test_sqlite_exact_migrates_locus_columns_on_existing_palace(tmp_path):
     import numpy as np
-    from mempalace.backends.sqlite_exact import _LOCUS_FIELDS, _LOCUS_INDEX
+    from mempalace.backends.sqlite_exact import (
+        _LOCUS_FIELDS,
+        _LOCUS_INDEX,
+        _SOURCE_FILE_INDEX,
+    )
 
     db = tmp_path / "sqlite_exact.sqlite3"
     conn = sqlite3.connect(str(db))
@@ -1423,6 +1427,13 @@ def test_sqlite_exact_migrates_locus_columns_on_existing_palace(tmp_path):
     assert set(_LOCUS_FIELDS) <= cols
     indexes = {row[1] for row in handle.execute("PRAGMA index_list(documents)").fetchall()}
     assert _LOCUS_INDEX in indexes
+    assert _SOURCE_FILE_INDEX in indexes
+    plan = handle.execute(
+        "EXPLAIN QUERY PLAN SELECT document FROM documents "
+        "WHERE collection_id = 1 AND json_extract(metadata_json, '$.source_file') = ?",
+        ("C:/convo/keep.jsonl",),
+    ).fetchall()
+    assert _SOURCE_FILE_INDEX in " ".join(str(row[-1]) for row in plan)
     assert tuple(
         handle.execute("SELECT wing, room, hall FROM documents WHERE id='a'").fetchone()
     ) == (
@@ -1435,3 +1446,37 @@ def test_sqlite_exact_migrates_locus_columns_on_existing_palace(tmp_path):
     total, wings = sqlite_wing_room_counts(str(tmp_path), "mempalace_drawers")
     assert total == 1
     assert wings["alpha"]["notes"] == 1
+
+
+def test_sqlite_exact_source_file_index_used_for_equality_get(tmp_path):
+    """The closet-enrichment source filter must use its expression index."""
+    from mempalace.backends.sqlite_exact import _SOURCE_FILE_INDEX
+
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["keep", "drop"],
+        documents=["keep me", "drop me"],
+        metadatas=[
+            {"source_file": "C:/convo/keep.jsonl", "wing": "w", "chunk_index": 0},
+            {"source_file": "C:/convo/drop.jsonl", "wing": "w", "chunk_index": 0},
+        ],
+        embeddings=[[1.0, 0.0], [1.0, 0.0]],
+    )
+    conn = col._handle.conn
+    indexes = {row[1] for row in conn.execute("PRAGMA index_list(documents)").fetchall()}
+    assert _SOURCE_FILE_INDEX in indexes
+
+    result, selects = _doc_select_sql(
+        col,
+        lambda: col.get(where={"source_file": "C:/convo/keep.jsonl"}, include=["documents"]),
+    )
+    assert result.ids == ["keep"]
+    assert selects
+    plan = conn.execute(
+        "EXPLAIN QUERY PLAN SELECT document FROM documents "
+        "WHERE collection_id = 1 AND json_extract(metadata_json, '$.source_file') = ?",
+        ("C:/convo/keep.jsonl",),
+    ).fetchall()
+    plan_text = " ".join(str(row[-1]) for row in plan)
+    assert _SOURCE_FILE_INDEX in plan_text, plan_text
+    assert "idx_documents_collection" not in plan_text

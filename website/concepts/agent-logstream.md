@@ -45,6 +45,7 @@ optional verbatim body:
 - **`stream`** is the broad channel — `project/<name>` for per-project work,
   or a shared channel like `shared_agent_brain`.
 - **`room`** is the sub-channel: `delegation`, `patches`, `reviews`, `status`.
+- **`topic`** (optional) groups related tasks or sub-teams around a track (e.g. `auth-v2`, `ui-redesign`), avoiding crosstalk within a shared harness identity.
 - **`correlation_id`** ties a request to its replies and acks. Generate one
   per task and carry it through the whole exchange.
 - **`to_agent`** targets one agent, or `*` to broadcast. Filters on
@@ -154,8 +155,12 @@ event created at 09:10:48Z is appended locally whenever it syncs, which can be
 So there are two different parameters, and only one of them is a cursor:
 
 - **`since_event_id`** — strictly after that event in append order, whatever
-  the timestamps say. This is the resume cursor. A watcher's entire state is
+  the timestamps say. This is the forward resume cursor. A watcher's entire state is
   the id of the last event it processed.
+- **`before_event_id`** — strictly before that event in append order (`rowid < anchor`)
+  for reverse / historical paging.
+- **`order`** — `'asc'` (oldest first, default) or `'desc'` (newest first, ideal for single-call
+  tail sweeps of recent inbox activity).
 - **`since_created_at`** — a time window (`>=`, inclusive; dedup by `id`).
   Good for "what happened today", wrong for resumption: a late-arriving peer
   event is already older than your high-water mark, so you skip it silently
@@ -168,7 +173,7 @@ So there are two different parameters, and only one of them is a cursor:
 | Inbox sweep | Session start, pre-task checks | `mempalace_event_list` + `to_agent` + `since_event_id`, `preview=true` |
 | Background watcher | Being woken while you work | `mempalace logstream watch`, run as a background process |
 | Long-poll | Waiting on one correlation, in-turn | `mempalace_event_wait` — 60s default, 300s max, returns `timed_out` rather than erroring |
-| Server-Sent Events | Daemons, dashboards, live viewers | `GET /logstream/stream`, same filters and `since_event_id` resume |
+| Server-Sent Events | Daemons, dashboards, live viewers | `GET /logstream/stream`, live-tail filters and `since_event_id` resume |
 | Declared-idle | Turn-based agents with no background loop | Publish your cursor and say you need a ping |
 
 `logstream watch` exists because `wait` is a primitive, not a watcher: it caps

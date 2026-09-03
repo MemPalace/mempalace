@@ -667,6 +667,7 @@ def search(
     n_results: int = 5,
     since: str = None,
     before: str = None,
+    collection=None,
 ):
     """
     Search the palace. Returns verbatim drawer content.
@@ -693,32 +694,34 @@ def search(
     # collection.count(); both happen before the old query-only guard and can
     # hit the same native crash. Non-Chroma backends never use Chroma's HNSW
     # files or sqlite-specific fallback and proceed normally.
-    try:
-        backend_name = resolve_backend_name(palace_path)
-    except (BackendMismatchError, KeyError):
-        # Preserve _open_collection_or_explain's state-specific diagnostics
-        # for mixed artifacts and unknown backend selections. This probe is
-        # only an early Chroma safety fence; it must not become a second,
-        # less-helpful backend validation path.
-        backend_name = None
-
-    if backend_name == "chroma" and _hnsw_capacity_diverged(palace_path):
-        return _print_search_results_bm25_only(
-            query,
-            palace_path,
-            wing,
-            room,
-            n_results,
-            stop_words=stop_words,
-            since_dt=since_dt,
-            before_dt=before_dt,
-        )
-
-    col = _open_collection_or_explain(palace_path, opener=get_collection)
+    col = collection
     if col is None:
-        if not os.path.isdir(palace_path):
-            raise SearchError(f"No palace found at {palace_path}")
-        raise SearchError(f"No palace database at {palace_path}")
+        try:
+            backend_name = resolve_backend_name(palace_path)
+        except (BackendMismatchError, KeyError):
+            # Preserve _open_collection_or_explain's state-specific diagnostics
+            # for mixed artifacts and unknown backend selections. This probe is
+            # only an early Chroma safety fence; it must not become a second,
+            # less-helpful backend validation path.
+            backend_name = None
+
+        if backend_name == "chroma" and _hnsw_capacity_diverged(palace_path):
+            return _print_search_results_bm25_only(
+                query,
+                palace_path,
+                wing,
+                room,
+                n_results,
+                stop_words=stop_words,
+                since_dt=since_dt,
+                before_dt=before_dt,
+            )
+
+        col = _open_collection_or_explain(palace_path, opener=get_collection)
+        if col is None:
+            if not os.path.isdir(palace_path):
+                raise SearchError(f"No palace found at {palace_path}")
+            raise SearchError(f"No palace database at {palace_path}")
 
     # Alert the user if this palace predates hnsw:space=cosine being set on
     # creation — their similarity scores will be junk until they run repair.
@@ -2140,7 +2143,9 @@ def search_memories(
             "source_path": source,
             "created_at": meta.get("filed_at", "unknown"),
             "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
-            "similarity": round(_distance_to_similarity(effective_dist, metric), 3),
+            # Similarity is the raw vector score. Closet boost ranks via
+            # effective_distance but must not inflate the advertised score.
+            "similarity": round(_distance_to_similarity(dist, metric), 3),
             "distance": round(dist, 4),
             "effective_distance": round(effective_dist, 4),
             "closet_boost": round(boost, 3),

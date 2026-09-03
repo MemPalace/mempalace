@@ -589,10 +589,240 @@ _HUB_HEALTH_TIMEOUT_S = 0.75
 # minutes inside the hub; the forwarder is a background/CLI process, not a
 # hook-budgeted one, so it waits.
 _HUB_MINE_TIMEOUT_S = 3600.0
+_HUB_SEARCH_TIMEOUT_S = 600.0
+_HUB_SEARCH_MAX_RESULTS = 100
+_SEARCH_OVERRIDE_ENV_VARS = (
+    "MEMPALACE_BACKEND",
+    "MEMPALACE_BACKEND_EXPLICIT",
+    "MEMPALACE_EMBEDDING_API_KEY",
+    "MEMPALACE_EMBEDDING_API_MODEL",
+    "MEMPALACE_EMBEDDING_API_URL",
+    "MEMPALACE_EMBEDDING_DEVICE",
+    "MEMPALACE_EMBEDDING_MODEL",
+    "MEMPALACE_EMBEDDING_THREADS",
+    "MEMPALACE_LANG",
+    "MEMPAL_LANG",
+    "MEMPALACE_MILVUS_CONSISTENCY_LEVEL",
+    "MEMPALACE_MILVUS_DB_NAME",
+    "MEMPALACE_MILVUS_NAMESPACE",
+    "MEMPALACE_MILVUS_TOKEN",
+    "MEMPALACE_MILVUS_URI",
+    "MEMPALACE_PGVECTOR_DSN",
+    "MEMPALACE_PGVECTOR_NAMESPACE",
+    "MEMPALACE_QDRANT_API_KEY",
+    "MEMPALACE_QDRANT_NAMESPACE",
+    "MEMPALACE_QDRANT_TIMEOUT",
+    "MEMPALACE_QDRANT_URL",
+)
 
 
 def _hub_forward_disabled() -> bool:
     return os.environ.get(_HUB_FORWARD_ENV, "").strip().lower() in {"0", "false", "no", "off"}
+
+
+def _search_args_forwardable(args) -> bool:
+    """Return whether ``mempalace_search`` preserves this CLI search exactly."""
+    if _backend_arg(args) or not 1 <= args.results <= _HUB_SEARCH_MAX_RESULTS:
+        return False
+    if any(os.environ.get(name, "").strip() for name in _SEARCH_OVERRIDE_ENV_VARS):
+        return False
+
+    # The MCP tool sanitizes queries longer than its safe passthrough window.
+    # Keep any query it would rewrite on the direct CLI path so forwarding
+    # never changes the user's search text silently.
+    from .config import sanitize_name, strip_lone_surrogates
+    from .query_sanitizer import SAFE_QUERY_LENGTH
+
+    cleaned = strip_lone_surrogates(args.query.strip())
+    if cleaned != args.query or len(cleaned) > SAFE_QUERY_LENGTH:
+        return False
+
+    for field_name in ("wing", "room"):
+        value = getattr(args, field_name, None)
+        if value is None:
+            continue
+        try:
+            if sanitize_name(value, field_name) != value:
+                return False
+        except ValueError:
+            return False
+    return True
+
+
+def _print_hub_search_result(args, result: dict) -> bool:
+    """Render an MCP search result using the CLI's human-readable shape."""
+    if not isinstance(result, dict):
+        return False
+
+    error = result.get("error")
+    if error:
+        details = result.get("details")
+        message = f"{error}: {details}" if details else str(error)
+        print(f"mempalace: hub search failed: {message}", file=sys.stderr)
+        return False
+
+    cli_output = result.get("cli_output")
+    if isinstance(cli_output, str):
+        cli_error_output = result.get("cli_error_output")
+        if isinstance(cli_error_output, str):
+            print(cli_error_output, end="", file=sys.stderr)
+        print(cli_output, end="")
+        return True
+
+    hits = result.get("results")
+    if not isinstance(hits, list):
+        return False
+
+    if result.get("vector_disabled") or result.get("fallback") == "bm25_only_via_sqlite":
+        print(
+            "\n  NOTICE: vector search disabled — showing BM25-only results.\n"
+            "          Run `mempalace repair` to restore vector search.\n"
+        )
+
+    if not hits:
+        print(f'\n  No results found for: "{args.query}"')
+        return True
+
+    print(f"\n{'=' * 60}")
+    print(f'  Results for: "{args.query}"')
+    if args.wing:
+        print(f"  Wing: {args.wing}")
+    if args.room:
+        print(f"  Room: {args.room}")
+    if args.since:
+        print(f"  Since: {args.since}")
+    if args.before:
+        print(f"  Before: {args.before}")
+    print(f"{'=' * 60}\n")
+
+    for index, hit in enumerate(hits, 1):
+        wing = hit.get("wing", "?")
+        room = hit.get("room", "?")
+        source = hit.get("source_file", "?")
+        similarity = hit.get("similarity")
+        bm25 = hit.get("bm25_score", 0.0)
+
+        print(f"  [{index}] {wing} / {room}")
+        print(f"      Source: {source}")
+        if similarity is None:
+            print(f"      Match:  bm25={bm25}  (vector disabled)")
+        else:
+            print(f"      Match:  similarity={similarity}  bm25={bm25}")
+        print()
+        for line in (hit.get("text") or "").strip().split("\n"):
+            print(f"      {line}")
+        print()
+        print(f"  {'-' * 56}")
+
+    print()
+    return True
+
+
+def _forward_search_to_hub(args, palace_path: str) -> bool:
+    """Run a CLI search in the palace's HTTP hub, if one is alive.
+
+    A local Chroma search cold-loads the palace's full HNSW index. Reusing the
+    long-lived hub prevents every shell command or agent worker from holding a
+    private copy. If the hub accepts the request but fails mid-flight, do not
+    fall back locally: that would recreate the memory spike this path avoids.
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    from . import server_registry
+
+    if _hub_forward_disabled():
+        return False
+    info = server_registry.read_live_serverinfo(palace_path)
+    if not info:
+        return False
+    if "search_cli_compatible" not in info.get("capabilities", []):
+        return False
+    current_config = MempalaceConfig(palace_path=palace_path)
+    if info.get("search_config_fingerprint") != current_config.search_config_fingerprint:
+        return False
+
+    base_url = server_registry.client_base_url(info)
+    headers = {"Content-Type": "application/json"}
+
+    try:
+        health = urllib.request.Request(f"{base_url}/healthz", headers=headers)
+        with urllib.request.urlopen(health, timeout=_HUB_HEALTH_TIMEOUT_S) as resp:
+            if resp.status != 200:
+                return False
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+    arguments = {
+        "query": args.query,
+        "limit": args.results,
+        "cli_compatible": True,
+    }
+    for name in ("wing", "room", "since", "before"):
+        value = getattr(args, name, None)
+        if value:
+            arguments[name] = value
+
+    body = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "mempalace_search", "arguments": arguments},
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    try:
+        with server_registry.urlopen_with_server_tokens(
+            palace_path,
+            f"{base_url}/mcp",
+            data=body,
+            headers=headers,
+            timeout=_HUB_SEARCH_TIMEOUT_S,
+        ) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            # Authentication failed before the Hub accepted the search, so
+            # direct execution is still safe. This covers Hubs started with
+            # an explicit/env token that is intentionally not persisted in
+            # the per-palace token file, as well as a stale local token.
+            return False
+        print(f"mempalace: hub rejected search ({exc.code} {exc.reason})", file=sys.stderr)
+        sys.exit(1)
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        print(
+            f"mempalace: hub at {base_url} did not complete the search ({exc}); "
+            "not retrying directly because that would load another full index. "
+            f"Set {_HUB_FORWARD_ENV}=0 to force a direct search.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(
+        f"mempalace: forwarding search to palace hub {base_url} (pid {info.get('pid')})",
+        file=sys.stderr,
+    )
+
+    if payload.get("error"):
+        err = payload["error"]
+        print(
+            f"mempalace: hub refused search: {err.get('message', 'unknown error')}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        result = json.loads(payload["result"]["content"][0]["text"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        print("mempalace: hub returned an unrecognized search response", file=sys.stderr)
+        sys.exit(1)
+
+    if not _print_hub_search_result(args, result):
+        sys.exit(1)
+    return True
 
 
 def _mine_args_forwardable(args, include_ignored) -> bool:
@@ -644,9 +874,6 @@ def _forward_mine_to_hub(args, palace_path: str) -> bool:
 
     base_url = server_registry.client_base_url(info)
     headers = {"Content-Type": "application/json"}
-    token = server_registry.load_server_token(palace_path)
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
 
     try:
         health = urllib.request.Request(f"{base_url}/healthz", headers=headers)
@@ -677,8 +904,13 @@ def _forward_mine_to_hub(args, palace_path: str) -> bool:
 
     print(f"mempalace: forwarding mine to palace hub {base_url} (pid {info.get('pid')})")
     try:
-        request = urllib.request.Request(f"{base_url}/mcp", data=body, headers=headers)
-        with urllib.request.urlopen(request, timeout=_HUB_MINE_TIMEOUT_S) as resp:
+        with server_registry.urlopen_with_server_tokens(
+            palace_path,
+            f"{base_url}/mcp",
+            data=body,
+            headers=headers,
+            timeout=_HUB_MINE_TIMEOUT_S,
+        ) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         # The hub answered — the request reached it, so no direct fallback.
@@ -1328,9 +1560,12 @@ def cmd_daemon(args):
 
 
 def cmd_search(args):
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    if _search_args_forwardable(args) and _forward_search_to_hub(args, palace_path):
+        return
+
     from .searcher import search, SearchError
 
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     try:
         search(
             query=args.query,
@@ -1438,6 +1673,31 @@ def cmd_status(args):
     status(palace_path=palace_path)
 
 
+def cmd_update(args):
+    """Configure, check, or prepare updates without installing automatically."""
+    import json
+
+    from .update_awareness import check_updates, configure_updates, prepare_upgrade
+
+    try:
+        if args.update_action == "configure":
+            result = configure_updates(
+                enabled=args.enabled,
+                interval_days=args.interval_days,
+                installer=args.installer,
+            )
+        elif args.update_action == "check":
+            result = check_updates(force=True)
+        elif args.update_action == "plan":
+            result = prepare_upgrade(installer=args.installer)
+        else:
+            raise ValueError("choose update configure, check, or plan")
+    except (OSError, ValueError) as exc:
+        print(f"mempalace update: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
 # ── Logstream (RFC 003 agent coordination) ────────────────────────────────
 
 
@@ -1532,6 +1792,7 @@ def _parse_metadata_arg(raw):
 def _print_event_line(event):
     target = event["to_agent"] or "*"
     corr = f" corr={event['correlation_id']}" if event["correlation_id"] else ""
+    topic = f" topic={event['topic']}" if event.get("topic") else ""
     status = f" [{event['status']}]" if event["status"] else ""
     arts = f" artifacts={len(event['artifact_ids'])}" if event["artifact_ids"] else ""
     body = event["body"].replace("\n", " ")
@@ -1541,7 +1802,7 @@ def _print_event_line(event):
     print(
         f"  {event['id']}  {event['created_at']}  {event['type']}  "
         f"{event['stream']}/{event['room']}  {event['from_agent']}->{target}"
-        f"{status}{corr}{arts}{body}"
+        f"{status}{topic}{corr}{arts}{body}"
     )
 
 
@@ -1604,6 +1865,7 @@ def _watch_spec(args, as_json) -> dict:
     spec = {
         "streams": normalize_watch_values(args.stream),
         "rooms": normalize_watch_values(args.room),
+        "topics": normalize_watch_values(getattr(args, "topic", None)),
         "types": normalize_watch_values(args.type),
         "statuses": normalize_watch_values(args.status),
         "to_agents": normalize_watch_values(to_agents),
@@ -1811,6 +2073,7 @@ def cmd_logstream(args):
                     type=args.type,
                     stream=args.stream,
                     room=args.room,
+                    topic=getattr(args, "topic", None),
                     from_agent=args.from_agent,
                     to_agent=args.to_agent,
                     correlation_id=args.correlation_id,
@@ -1832,6 +2095,7 @@ def cmd_logstream(args):
             filters = {
                 "stream": args.stream,
                 "room": args.room,
+                "topic": getattr(args, "topic", None),
                 "type": args.type,
                 "to_agent": args.to_agent,
                 "from_agent": args.from_agent,
@@ -1842,7 +2106,12 @@ def cmd_logstream(args):
             }
             try:
                 if args.logstream_action == "list":
-                    events = ls.list_events(limit=args.limit, **filters)
+                    events = ls.list_events(
+                        limit=args.limit,
+                        order=getattr(args, "order", "asc"),
+                        before_event_id=getattr(args, "before_event_id", None),
+                        **filters,
+                    )
                     result = {"events": events, "count": len(events)}
                 else:
                     result = ls.wait_events(timeout_ms=args.timeout_ms, limit=args.limit, **filters)
@@ -1905,6 +2174,7 @@ def cmd_logstream(args):
                     from_agent=args.from_agent,
                     status=args.status,
                     body=args.body or "",
+                    topic=getattr(args, "topic", None),
                 )
             except ValueError as exc:
                 _logstream_fail(str(exc), as_json)
@@ -2529,9 +2799,19 @@ def cmd_mcp(args):
         cmd_parts.extend(["--backend", shlex.quote(str(backend).strip().lower())])
     server_cmd = " ".join(cmd_parts)
 
+    light_parts = ["mempalace-light-mcp"]
+    if args.palace:
+        light_parts.extend(["--palace", shlex.quote(resolved_palace)])
+    if backend:
+        light_parts.extend(["--backend", shlex.quote(str(backend).strip().lower())])
+    light_cmd = " ".join(light_parts)
+
     print("MemPalace MCP quick setup:")
     print(f"  claude mcp add mempalace -- {server_cmd}")
     print(f"  codex mcp add mempalace -- {server_cmd}")
+    print("\nLightweight MCP setup (3 consolidated tools, ~92% fewer schema tokens):")
+    print(f"  claude mcp add mempalace-light -- {light_cmd}")
+    print(f"  codex mcp add mempalace-light -- {light_cmd}")
     print("\nRun the server directly:")
     print(f"  {server_cmd}")
 
@@ -2539,6 +2819,7 @@ def cmd_mcp(args):
         print("\nOptional custom palace:")
         print(f"  claude mcp add mempalace -- {base_server_cmd} --palace /path/to/palace")
         print(f"  codex mcp add mempalace -- {base_server_cmd} --palace /path/to/palace")
+        print("  claude mcp add mempalace-light -- mempalace-light-mcp --palace /path/to/palace")
         print(f"  {base_server_cmd} --palace /path/to/palace")
 
 
@@ -3423,6 +3704,19 @@ def main():
         default=None,
         help="Storage backend to use for status (default: config/env/detected/chroma)",
     )
+    p_update = sub.add_parser("update", help="Opt-in release checks and upgrade planning")
+    update_sub = p_update.add_subparsers(dest="update_action")
+    p_update_configure = update_sub.add_parser("configure", help="Configure periodic checks")
+    update_consent = p_update_configure.add_mutually_exclusive_group(required=True)
+    update_consent.add_argument("--enable", dest="enabled", action="store_true")
+    update_consent.add_argument("--disable", dest="enabled", action="store_false")
+    p_update_configure.add_argument("--interval-days", type=int, default=7)
+    p_update_configure.add_argument("--installer", choices=("uv-tool", "pipx", "pip"))
+    update_sub.add_parser("check", help="Explicitly check the latest stable release")
+    p_update_plan = update_sub.add_parser(
+        "plan", help="Show the exact upgrade plan without applying it"
+    )
+    p_update_plan.add_argument("--installer", choices=("uv-tool", "pipx", "pip"))
 
     # logstream (RFC 003 agent coordination)
     p_logstream = sub.add_parser(
@@ -3434,6 +3728,7 @@ def main():
     def _add_logstream_filters(p):
         p.add_argument("--stream", default=None, help="Stream, e.g. project/mempalace")
         p.add_argument("--room", default=None, help="Room, e.g. delegation, patches")
+        p.add_argument("--topic", default=None, help="Topic, e.g. auth-v2")
         p.add_argument("--type", default=None, help="Event type, e.g. task.request")
         p.add_argument("--to-agent", default=None, help="Target agent (also matches '*')")
         p.add_argument("--from-agent", default=None, help="Writer agent")
@@ -3454,6 +3749,7 @@ def main():
     p_ls_append.add_argument("--type", required=True, help="Event type, e.g. task.request")
     p_ls_append.add_argument("--stream", required=True, help="Stream, e.g. project/mempalace")
     p_ls_append.add_argument("--room", required=True, help="Room, e.g. delegation")
+    p_ls_append.add_argument("--topic", default=None, help="Topic name, e.g. auth-v2")
     p_ls_append.add_argument("--from-agent", required=True, help="Writer agent identity")
     p_ls_append.add_argument("--to-agent", default=None, help="Target agent or '*'")
     p_ls_append.add_argument("--correlation-id", default=None, help="Task/conversation id")
@@ -3477,8 +3773,19 @@ def main():
     )
     p_ls_append.add_argument("--json", action="store_true", help="Machine-readable output")
 
-    p_ls_list = logstream_sub.add_parser("list", help="List events, oldest first")
+    p_ls_list = logstream_sub.add_parser("list", help="List events")
     _add_logstream_filters(p_ls_list)
+    p_ls_list.add_argument(
+        "--before-event-id",
+        default=None,
+        help="Only events strictly before this id in append order",
+    )
+    p_ls_list.add_argument(
+        "--order",
+        choices=["asc", "desc"],
+        default="asc",
+        help="asc (oldest first, default) or desc (newest first)",
+    )
     p_ls_list.add_argument("--limit", type=int, default=50, help="Max events (default 50)")
     p_ls_list.add_argument("--json", action="store_true", help="Machine-readable output")
 
@@ -3515,6 +3822,9 @@ def main():
     )
     p_ls_watch.add_argument(
         "--room", action="append", default=None, help="Room (repeatable; matches any)"
+    )
+    p_ls_watch.add_argument(
+        "--topic", action="append", default=None, help="Topic (repeatable; matches any)"
     )
     p_ls_watch.add_argument(
         "--type", action="append", default=None, help="Event type (repeatable; matches any)"
@@ -3586,6 +3896,9 @@ def main():
         "--status",
         default=None,
         help="open|claimed|ready|applied|blocked|failed|superseded",
+    )
+    p_ls_ack.add_argument(
+        "--topic", default=None, help="Topic override (defaults to target event's topic)"
     )
     p_ls_ack.add_argument("--body", default=None, help="Verbatim ack notes")
     p_ls_ack.add_argument("--json", action="store_true", help="Machine-readable output")
@@ -3780,6 +4093,7 @@ def main():
         "migrate-wings": cmd_migrate_wings,
         "hallways": cmd_hallways,
         "status": cmd_status,
+        "update": cmd_update,
     }
     dispatch[args.command](args)
 

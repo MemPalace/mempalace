@@ -53,7 +53,7 @@ import hmac  # noqa: E402
 import sqlite3  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
-from datetime import date, datetime  # noqa: E402
+from datetime import date, datetime, timezone  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Optional  # noqa: E402
 from urllib.parse import urlparse  # noqa: E402
@@ -82,8 +82,10 @@ from .backends import BackendMismatchError, PalaceRef, detect_backend_for_path  
 from .date_window import filed_at_in_window, parse_date_bound  # noqa: E402
 from .query_sanitizer import sanitize_query  # noqa: E402
 from .searcher import (  # noqa: E402
+    SearchError,
     _distance_to_similarity,
     _metric_for_collection,
+    search as cli_search,
     search_memories,
 )
 from .palace_graph import (  # noqa: E402
@@ -333,6 +335,10 @@ _kg_cache_lock = threading.Lock()
 
 _logstream_by_path: dict[str, Logstream] = {}
 _logstream_cache_lock = threading.Lock()
+# CLI-compatible search temporarily redirects process-wide stderr and fd 1.
+# Keep that entire scope single-threaded even when tool_search is invoked
+# outside the HTTP dispatch lock (tests, embedded hosts, future transports).
+_cli_search_capture_lock = threading.Lock()
 _palace_flag_given: bool = bool(_args.palace)
 
 # MCP server idle auto-exit (#1552).  Stale MCP servers from ended Claude
@@ -2456,10 +2462,11 @@ def tool_search(
     source_file: str = None,
     since: str = None,
     before: str = None,
-    max_distance: float = 1.5,
+    max_distance: float = None,
     min_similarity: float = None,
     context: str = None,
     candidate_strategy: str = "vector",
+    cli_compatible: bool = False,
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
@@ -2473,12 +2480,78 @@ def tool_search(
     candidate_strategy = candidate_strategy or "vector"
     if not isinstance(candidate_strategy, str) or candidate_strategy not in {"vector", "union"}:
         return {"error": "candidate_strategy must be one of ('vector', 'union')"}
-    # Backwards compat: accept old name
+    # Mitigate system prompt contamination (Issue #333)
+    sanitized = sanitize_query(query)
+    if cli_compatible:
+        import contextlib
+        import io
+
+        if source_file is not None:
+            return {"error": "cli-compatible search does not support source_file"}
+        unsupported_controls = []
+        if candidate_strategy != "vector":
+            unsupported_controls.append("candidate_strategy")
+        if min_similarity is not None:
+            unsupported_controls.append("min_similarity")
+        if max_distance is not None:
+            unsupported_controls.append("max_distance")
+        if context is not None:
+            unsupported_controls.append("context")
+        if unsupported_controls:
+            return {
+                "error": "cli-compatible search does not support " + ", ".join(unsupported_controls)
+            }
+        if sanitized["clean_query"] != query or sanitized["was_sanitized"]:
+            return {"error": "cli-compatible search requires an unchanged query"}
+        error_output = io.StringIO()
+        try:
+            with _cli_search_capture_lock, contextlib.redirect_stderr(error_output):
+                _refresh_vector_disabled_flag()
+                collection = None if _vector_disabled else _get_collection()
+                if collection is None and not _vector_disabled:
+                    return _collection_error_or_no_palace()
+                if collection is not None:
+                    from .backends.base import (
+                        DimensionMismatchError,
+                        EmbedderIdentityMismatchError,
+                    )
+                    from .palace import _enforce_embedder_identity
+
+                    try:
+                        _enforce_embedder_identity(
+                            collection,
+                            _config.palace_path,
+                            _config.collection_name,
+                            create=False,
+                            repeat_unknown_warning=True,
+                        )
+                    except (EmbedderIdentityMismatchError, DimensionMismatchError) as exc:
+                        return {"error": "Embedder identity mismatch", "details": str(exc)}
+                _, output = _capture_fd_stdout(
+                    lambda: cli_search(
+                        query=query,
+                        palace_path=_config.palace_path,
+                        wing=wing,
+                        room=room,
+                        n_results=limit,
+                        since=since,
+                        before=before,
+                        collection=collection,
+                    )
+                )
+        except SearchError as exc:
+            return {"error": str(exc)}
+        result = {"query": query, "cli_output": output}
+        if error_output.getvalue():
+            result["cli_error_output"] = error_output.getvalue()
+        return result
+
     # Backwards compat: convert old similarity scale (higher=stricter) to
     # distance scale (lower=stricter). Similarity 0.8 → distance 0.2.
     dist = (1.0 - min_similarity) if min_similarity is not None else max_distance
-    # Mitigate system prompt contamination (Issue #333)
-    sanitized = sanitize_query(query)
+    if dist is None:
+        dist = 1.5
+
     # Ensure the vector-disabled probe has been run via the safe
     # sqlite/pickle path before we touch chromadb. Calling _get_client()
     # here would defeat the fallback — it constructs a PersistentClient
@@ -3935,6 +4008,25 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 # ==================== KNOWLEDGE GRAPH ====================
 
 
+def _temporal_bound_key(value, *, end: bool = False) -> Optional[str]:
+    if not value:
+        return None
+    text = str(value)
+    if "T" in text:
+        return text
+    return f"{text}T23:59:59Z" if end else f"{text}T00:00:00Z"
+
+
+def _fact_interval_bucket(row: dict, now_key: str) -> str:
+    start_key = _temporal_bound_key(row.get("valid_from"), end=False)
+    end_key = _temporal_bound_key(row.get("valid_to"), end=True)
+    if start_key and start_key > now_key:
+        return "future"
+    if end_key and end_key < now_key:
+        return "historical"
+    return "active"
+
+
 def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
     """Query the knowledge graph for an entity's relationships."""
     try:
@@ -3947,7 +4039,48 @@ def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
         return {"error": "direction must be 'outgoing', 'incoming', or 'both'"}
 
     results = _call_kg(lambda kg: kg.query_entity(entity, as_of=as_of, direction=direction))
-    return {"entity": entity, "as_of": as_of, "facts": results, "count": len(results)}
+    if as_of is None:
+        now_key = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        active = []
+        historical = []
+        future = []
+        for row in results:
+            bucket = _fact_interval_bucket(row, now_key)
+            if bucket == "future":
+                future.append(row)
+            elif bucket == "historical":
+                historical.append(row)
+            else:
+                active.append(row)
+    else:
+        active = results
+        historical = []
+        future = []
+    payload = {
+        "entity": entity,
+        "as_of": as_of,
+        "active_facts": active,
+        "historical_facts": historical,
+        "future_facts": future,
+        "facts": results,
+        "count": len(results),
+    }
+    if results:
+        resolved_names = {
+            r.get("subject") if r.get("direction") == "outgoing" else r.get("object")
+            for r in results
+        }
+        resolved_names.discard(None)
+        if len(resolved_names) == 1:
+            resolved = next(iter(resolved_names))
+            if resolved != entity:
+                payload["resolved_from"] = entity
+                payload["entity"] = resolved
+    else:
+        candidates = _call_kg(lambda kg: kg.find_entity_candidates(entity))
+        if candidates:
+            payload["candidates"] = candidates
+    return payload
 
 
 def tool_kg_add(
@@ -4706,6 +4839,7 @@ def tool_event_append(
     body: str = "",
     metadata: dict = None,
     artifact_ids: list = None,
+    topic: str = None,
 ):
     """Append one immutable coordination event."""
     try:
@@ -4723,6 +4857,7 @@ def tool_event_append(
                 body=body,
                 metadata=metadata,
                 artifact_ids=artifact_ids,
+                topic=topic,
             )
         )
     except ValueError as e:
@@ -4786,37 +4921,43 @@ def _preview_event(event: dict) -> dict:
 def tool_event_list(
     stream: str = None,
     room: str = None,
+    topic: str = None,
     type: str = None,
     to_agent: str = None,
     from_agent: str = None,
     correlation_id: str = None,
     status: str = None,
     since_event_id: str = None,
+    before_event_id: str = None,
     since_created_at: str = None,
     limit: int = 50,
+    order: str = "asc",
     preview: bool = False,
 ):
-    """List coordination events with structured filters, oldest first.
+    """List coordination events with structured filters.
 
+    ``order='desc'`` returns newest events first (e.g. for sweeping recent inbox
+    or checking recent project history in a single call). Default is ``'asc'``.
     ``preview=True`` truncates each event's verbatim body to a short excerpt
     (marking ``body_truncated`` + ``body_length``) so scanning many events
-    stays cheap. ``since_event_id`` is strictly after that id, so do not
-    pass the truncated event's own id to re-fetch it — repeat the original
-    filters with ``preview=false``.
+    stays cheap.
     """
     try:
         events = _call_logstream(
             lambda ls: ls.list_events(
                 stream=stream,
                 room=room,
+                topic=topic,
                 type=type,
                 to_agent=to_agent,
                 from_agent=from_agent,
                 correlation_id=correlation_id,
                 status=status,
                 since_event_id=since_event_id,
+                before_event_id=before_event_id,
                 since_created_at=since_created_at,
                 limit=limit,
+                order=order,
             )
         )
     except ValueError as e:
@@ -4829,6 +4970,7 @@ def tool_event_list(
 def tool_event_wait(
     stream: str = None,
     room: str = None,
+    topic: str = None,
     type: str = None,
     to_agent: str = None,
     from_agent: str = None,
@@ -4851,6 +4993,7 @@ def tool_event_wait(
                 timeout_ms=timeout_ms,
                 stream=stream,
                 room=room,
+                topic=topic,
                 type=type,
                 to_agent=to_agent,
                 from_agent=from_agent,
@@ -4867,11 +5010,19 @@ def tool_event_wait(
     return result
 
 
-def tool_event_ack(event_id: str, from_agent: str, status: str = None, body: str = ""):
+def tool_event_ack(
+    event_id: str,
+    from_agent: str,
+    status: str = None,
+    body: str = "",
+    topic: str = None,
+):
     """Append an event.ack referencing a prior event (never mutates it)."""
     try:
         event = _call_logstream(
-            lambda ls: ls.ack_event(event_id, from_agent=from_agent, status=status, body=body)
+            lambda ls: ls.ack_event(
+                event_id, from_agent=from_agent, status=status, body=body, topic=topic
+            )
         )
     except ValueError as e:
         return {"success": False, "error": str(e)}
@@ -4913,6 +5064,7 @@ def tool_patch_submit(
     base_commit: str = None,
     body: str = "",
     metadata: dict = None,
+    topic: str = None,
 ):
     """Store a patch artifact and append its patch.ready event in one call."""
     try:
@@ -4928,6 +5080,7 @@ def tool_patch_submit(
                 base_commit=base_commit,
                 body=body,
                 metadata=metadata,
+                topic=topic,
             )
         )
     except ValueError as e:
@@ -5255,6 +5408,10 @@ TOOLS = {
                     "type": "string",
                     "enum": ["vector", "union"],
                     "description": "Candidate source strategy. 'vector' preserves default semantic search; 'union' also merges backend BM25 lexical candidates before reranking.",
+                },
+                "cli_compatible": {
+                    "type": "boolean",
+                    "description": "Preserve standalone CLI candidate selection, ranking, and output. Used by the CLI Hub forwarder.",
                 },
                 "context": {
                     "type": "string",
@@ -5630,6 +5787,10 @@ TOOLS = {
                     "type": "string",
                     "description": "Sub-channel, e.g. 'delegation', 'patches', 'reviews', 'status'",
                 },
+                "topic": {
+                    "type": "string",
+                    "description": "Topic to group related work/sub-team, e.g. 'auth-v2', 'ui-redesign' (optional)",
+                },
                 "from_agent": {"type": "string", "description": "Writer agent identity"},
                 "to_agent": {
                     "type": "string",
@@ -5710,22 +5871,24 @@ TOOLS = {
     },
     "mempalace_event_list": {
         "description": (
-            "List agent-coordination events with structured filters, oldest first (append"
-            " order, not timestamp order). Use since_event_id as the resume cursor: it means"
-            " strictly after that event in append order, so it cannot skip anything. Do NOT"
-            " resume with since_created_at — a peer's event syncs in whenever it arrives, so"
-            " it can already be older than a timestamp cursor and be missed permanently;"
-            " since_created_at is a time window ('what happened today'), not a cursor. Store"
-            " the id of the last event you processed — that is your whole watcher state. Pass"
-            " preview=true when sweeping a busy stream. to_agent=<you> also matches '*'"
-            " broadcasts, so no second call is needed. To wait for something that has not"
-            " happened yet, use mempalace_event_wait instead of polling this."
+            "List agent-coordination events with structured filters. Use order='desc' to return"
+            " newest events first (e.g. for sweeping recent inbox or inspecting project tail in"
+            " a single call); default order is 'asc' (oldest first, append order). Use"
+            " since_event_id as the resume cursor: it means strictly AFTER that event in append"
+            " order (rowid > anchor), so it cannot skip anything. For reverse/historical paging,"
+            " use before_event_id (rowid < anchor). Do NOT resume with since_created_at — a"
+            " peer's event syncs in whenever it arrives, so it can already be older than a"
+            " timestamp cursor and be missed permanently; since_created_at is a time window"
+            " ('what happened today'), not a cursor. Pass preview=true when sweeping a busy"
+            " stream. to_agent=<you> also matches '*' broadcasts. To wait for future events, use"
+            " mempalace_event_wait."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "stream": {"type": "string", "description": "Filter by stream (optional)"},
                 "room": {"type": "string", "description": "Filter by room (optional)"},
+                "topic": {"type": "string", "description": "Filter by topic (optional)"},
                 "type": {"type": "string", "description": "Filter by event type (optional)"},
                 "to_agent": {
                     "type": "string",
@@ -5739,7 +5902,11 @@ TOOLS = {
                 "status": {"type": "string", "description": "Filter by status (optional)"},
                 "since_event_id": {
                     "type": "string",
-                    "description": "Return only events strictly after this event id (optional)",
+                    "description": "Return only events strictly after this event id in append order (optional)",
+                },
+                "before_event_id": {
+                    "type": "string",
+                    "description": "Return only events strictly before this event id in append order (optional)",
                 },
                 "since_created_at": {
                     "type": "string",
@@ -5751,6 +5918,10 @@ TOOLS = {
                     ),
                 },
                 "limit": {"type": "integer", "description": "Max events to return (default 50)"},
+                "order": {
+                    "type": "string",
+                    "description": "'asc' (oldest first, default) or 'desc' (newest first, optional)",
+                },
                 "preview": {
                     "type": "boolean",
                     "description": (
@@ -5774,13 +5945,14 @@ TOOLS = {
             " not wrap it in a tight retry loop: on timeout just call it again with"
             " since_event_id updated to the last event you processed. For long-lived consumers"
             " (daemons, dashboards) prefer the push stream at GET /logstream/stream, which"
-            " takes the same filters and the same since_event_id resume."
+            " takes the live-tail filter subset and the same since_event_id resume."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "stream": {"type": "string", "description": "Filter by stream (optional)"},
                 "room": {"type": "string", "description": "Filter by room (optional)"},
+                "topic": {"type": "string", "description": "Filter by topic (optional)"},
                 "type": {"type": "string", "description": "Filter by event type (optional)"},
                 "to_agent": {
                     "type": "string",
@@ -5833,6 +6005,10 @@ TOOLS = {
                     ),
                 },
                 "body": {"type": "string", "description": "Verbatim ack notes (optional)"},
+                "topic": {
+                    "type": "string",
+                    "description": "Topic override (defaults to target event's topic, optional)",
+                },
             },
             "required": ["event_id", "from_agent"],
         },
@@ -5889,6 +6065,7 @@ TOOLS = {
                     "description": "Logical stream, e.g. 'project/mempalace'",
                 },
                 "room": {"type": "string", "description": "Sub-channel (default 'patches')"},
+                "topic": {"type": "string", "description": "Topic name (optional)"},
                 "to_agent": {"type": "string", "description": "Target agent or '*' (optional)"},
                 "correlation_id": {
                     "type": "string",
@@ -6567,8 +6744,12 @@ def _decorate_mcp_tool_result(tool_name: str, result):
     """Attach MCP transport-only diagnostics outside handle_request complexity."""
 
     if tool_name == "mempalace_status" and isinstance(result, dict):
+        from .update_awareness import cached_update_status, schedule_update_check
+
         result.setdefault("sqlite_integrity", _sqlite_integrity_payload())
         result.setdefault("library_versions", _stale_library_payload())
+        result.setdefault("updates", {"server": cached_update_status()})
+        schedule_update_check()
 
     return result
 
@@ -7106,15 +7287,83 @@ def _json_rpc_parse_error(req_id=None):
 # Module-level constants for the HTTP transport.
 # Defined here (not inside main()) so _serve_http() / _build_http_server()
 # can reference them as free names without a NameError.
-_HTTP_REQUEST_LOCK = threading.Lock()
+#
+# ThreadingHTTPServer can run requests in parallel, but an exclusive lock
+# around every JSON-RPC method made a slow palace search stall handshakes and
+# every other reader. Protocol methods and independent stores bypass this
+# lock; palace reads share it; palace writes take it exclusively.
+class _RWLock:
+    """Writer-preferring readers-writer lock."""
+
+    def __init__(self):
+        self._cond = threading.Condition(threading.Lock())
+        self._readers = 0
+        self._writer = False
+        self._waiting_writers = 0
+
+    def acquire_read(self) -> None:
+        with self._cond:
+            while self._writer or self._waiting_writers:
+                self._cond.wait()
+            self._readers += 1
+
+    def release_read(self) -> None:
+        with self._cond:
+            self._readers -= 1
+            if self._readers == 0:
+                self._cond.notify_all()
+
+    def acquire_write(self) -> None:
+        with self._cond:
+            self._waiting_writers += 1
+            try:
+                while self._writer or self._readers:
+                    self._cond.wait()
+                self._writer = True
+            finally:
+                self._waiting_writers -= 1
+
+    def release_write(self) -> None:
+        with self._cond:
+            self._writer = False
+            self._cond.notify_all()
+
+    def read_lock(self):
+        lock = self
+
+        class _Read:
+            def __enter__(self):
+                lock.acquire_read()
+                return lock
+
+            def __exit__(self, exc_type, exc, tb):
+                lock.release_read()
+                return False
+
+        return _Read()
+
+    def __enter__(self):
+        self.acquire_write()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release_write()
+        return False
+
+
+_HTTP_REQUEST_LOCK = _RWLock()
 _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 _HTTP_ACTIVE_CLIENT_WINDOW_S = 120.0
+
+_HTTP_PROTOCOL_METHODS = frozenset({"initialize", "ping", "tools/list"})
 
 # RFC 003 phase 5: logstream tools touch only logstream.sqlite3 (its own WAL
 # database with internal locking) — never Chroma or the KG. Dispatching them
 # outside _HTTP_REQUEST_LOCK keeps a five-minute mempalace_event_wait
 # long-poll from stalling every other agent on a shared hub, and lets the
 # SSE stream coexist with normal tool traffic.
+# Knowledge-graph tools use their own SQLite database and lock. Mesh peers
+# and the AAAK spec are process-local reads.
 _HTTP_LOCK_FREE_TOOLS = frozenset(
     {
         "mempalace_event_append",
@@ -7125,6 +7374,14 @@ _HTTP_LOCK_FREE_TOOLS = frozenset(
         "mempalace_artifact_put",
         "mempalace_artifact_get",
         "mempalace_patch_submit",
+        "mempalace_kg_query",
+        "mempalace_kg_add",
+        "mempalace_kg_invalidate",
+        "mempalace_kg_supersede",
+        "mempalace_kg_timeline",
+        "mempalace_kg_stats",
+        "mempalace_mesh_peers",
+        "mempalace_get_aaak_spec",
     }
 )
 
@@ -7385,19 +7642,25 @@ def _sse_max_clients() -> int:
 def _http_dispatch(request):
     """Dispatch one JSON-RPC request with the transport's locking policy.
 
-    The global request lock preserves the single-process / single-palace-
-    handle behavior stdio deployments rely on. Logstream tools are the one
-    exception: they never touch Chroma/KG state and carry their own database
-    lock, and serializing them would let one agent's event_wait long-poll
-    (up to 5 minutes) starve the whole hub.
+    Protocol methods and independent stores are lock-free. Palace reads share
+    the lock; palace writes take it exclusively. Unclassified tools fail
+    closed onto the exclusive side.
     """
-    if (
-        isinstance(request, dict)
-        and request.get("method") == "tools/call"
-        and isinstance(request.get("params"), dict)
-        and request["params"].get("name") in _HTTP_LOCK_FREE_TOOLS
-    ):
+    method = request.get("method") or "" if isinstance(request, dict) else ""
+    if method in _HTTP_PROTOCOL_METHODS or method.startswith("notifications/"):
         return handle_request(request)
+    tool_name = None
+    if method == "tools/call" and isinstance(request.get("params"), dict):
+        tool_name = request["params"].get("name")
+    if tool_name in _HTTP_LOCK_FREE_TOOLS:
+        return handle_request(request)
+    # service.classify_tool is the authoritative read/write registry. The
+    # lock-free set above is a storage-boundary override for independent DBs.
+    from .service import classify_tool
+
+    if classify_tool(tool_name) == "read":
+        with _HTTP_REQUEST_LOCK.read_lock():
+            return handle_request(request)
     with _HTTP_REQUEST_LOCK:
         return handle_request(request)
 
@@ -7802,7 +8065,8 @@ def _sse_release_slot(httpd) -> None:
 def _http_serve_logstream_stream(handler) -> None:
     """RFC 003 phase 5: live logstream tail over Server-Sent Events.
 
-    Query params are exactly the ``event_list`` filters plus
+    Query params are the live-tail subset of ``event_list`` filters (stream,
+    room, topic, type, to/from agent, correlation id, and status), plus
     ``since_event_id`` (or the standard ``Last-Event-ID`` header): with a
     cursor the server replays everything after it, then tails live; without
     one it tails only post-connect events. Each event is one SSE frame
@@ -7824,6 +8088,7 @@ def _http_serve_logstream_stream(handler) -> None:
         for key in (
             "stream",
             "room",
+            "topic",
             "type",
             "to_agent",
             "from_agent",
@@ -8100,6 +8365,8 @@ def _serve_http(host: str, port: int) -> None:
                 port=bound_port,
                 scheme=getattr(httpd, "scheme", "http"),
                 read_only=_READ_ONLY,
+                capabilities=["search_cli_compatible"],
+                search_config_fingerprint=_config.search_config_fingerprint,
             )
             import atexit
 
@@ -8208,12 +8475,9 @@ def _hub_proxy_target():
             return None
         base_url = server_registry.client_base_url(info)
         headers = {"Content-Type": "application/json"}
-        token = server_registry.load_server_token(_config.palace_path)
     except Exception:
         logger.debug("hub discovery failed; serving locally", exc_info=True)
         return None
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
     if not _hub_proxy_announced:
         _hub_proxy_announced = True
         logger.info("Live palace hub detected at %s; proxying stdio requests to it", base_url)
@@ -8224,13 +8488,18 @@ def _truthy_env_off(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"0", "false", "no", "off"}
 
 
-def _forward_request_to_hub(base_url: str, headers: dict, request: dict):
+def _forward_request_to_hub(base_url: str, headers: dict, request: dict, palace_path: str):
     """POST one JSON-RPC request to the hub; None for notifications (202)."""
-    import urllib.request
+    from . import server_registry
 
     body = json.dumps(request, ensure_ascii=False).encode("utf-8")
-    http_request = urllib.request.Request(f"{base_url}/mcp", data=body, headers=headers)
-    with urllib.request.urlopen(http_request, timeout=_HUB_PROXY_TIMEOUT_S) as resp:
+    with server_registry.urlopen_with_server_tokens(
+        palace_path,
+        f"{base_url}/mcp",
+        data=body,
+        headers=headers,
+        timeout=_HUB_PROXY_TIMEOUT_S,
+    ) as resp:
         raw = resp.read()
     if not raw:
         return None
@@ -8261,7 +8530,12 @@ def _dispatch_stdio_request(request: dict):
         return handle_request(request)
     base_url, headers = target
     try:
-        return _forward_request_to_hub(base_url, headers, request)
+        from .mcp_proxy import _annotate_forwarded_update_status
+
+        return _annotate_forwarded_update_status(
+            request,
+            _forward_request_to_hub(base_url, headers, request, _config.palace_path),
+        )
     except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
         reached_hub = isinstance(exc, urllib.error.HTTPError)
         if not reached_hub and not _request_is_mutating(request):
@@ -8484,6 +8758,13 @@ def main():
     os.environ.pop("PYTHONPATH", None)
 
     _install_shutdown_signal_handlers()
+
+    # Consent is persisted locally and defaults off. When enabled, refresh the
+    # release cache in the background so the first agent status call never
+    # waits on PyPI and can naturally surface a newly available version.
+    from .update_awareness import schedule_update_check
+
+    schedule_update_check()
 
     if _args.transport == "http":
         _run_http_loop()

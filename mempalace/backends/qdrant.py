@@ -771,6 +771,7 @@ class QdrantCollection(BaseCollection):
         *,
         qdrant_filter: Optional[dict] = None,
         with_vector: bool = False,
+        max_rows: Optional[int] = None,
     ) -> list[dict]:
         self._ensure_open()
         if not self._remote_exists():
@@ -780,14 +781,19 @@ class QdrantCollection(BaseCollection):
         rows = []
         offset = None
         while True:
+            page_limit = _SCROLL_PAGE_SIZE
+            if max_rows is not None:
+                page_limit = min(page_limit, max_rows - len(rows))
             points, offset = self._client.scroll_points(
                 self._remote_collection,
                 qdrant_filter=qdrant_filter,
-                limit=_SCROLL_PAGE_SIZE,
+                limit=page_limit,
                 offset=offset,
                 with_vector=with_vector,
             )
             rows.extend(_payload_row(point) for point in points)
+            if max_rows is not None and len(rows) >= max_rows:
+                return rows[:max_rows]
             if offset is None:
                 return rows
 
@@ -798,14 +804,21 @@ class QdrantCollection(BaseCollection):
         where: Optional[dict] = None,
         where_document: Optional[dict] = None,
         with_vector: bool = False,
+        max_rows: Optional[int] = None,
     ) -> list[dict]:
         _validate_where(where)
         _validate_where(where_document)
-        q_filter = None if _requires_local_filter(where, where_document) else _qdrant_filter(where)
+        local_filter_required = _requires_local_filter(where, where_document)
+        q_filter = None if local_filter_required else _qdrant_filter(where)
         if ids is not None:
             id_filter = {"must": [{"has_id": [_point_id(doc_id) for doc_id in ids]}]}
             q_filter = _combine_filters(q_filter, id_filter)
-        rows = self._scroll_all(qdrant_filter=q_filter, with_vector=with_vector)
+        # Bounding needs qdrant's filter alone to fully decide membership,
+        # and no id lookup (order-independent, needs every match).
+        bounded_rows = None if (ids is not None or local_filter_required) else max_rows
+        rows = self._scroll_all(
+            qdrant_filter=q_filter, with_vector=with_vector, max_rows=bounded_rows
+        )
         rows = [
             row
             for row in rows
@@ -1031,11 +1044,13 @@ class QdrantCollection(BaseCollection):
         include=None,
     ) -> GetResult:
         spec = _IncludeSpec.resolve(include, default_distances=False)
+        max_rows = (offset or 0) + limit if limit is not None and ids is None else None
         rows = self._rows(
             ids=ids,
             where=where,
             where_document=where_document,
             with_vector=spec.embeddings,
+            max_rows=max_rows,
         )
         if ids is not None:
             by_id = {row["id"]: row for row in rows}

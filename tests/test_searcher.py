@@ -314,6 +314,86 @@ class TestSearchMemories:
         # the boost still wins, but it no longer flips the ranking.
         assert hits[0]["source_file"] == "a.md"
         assert hits[0]["matched_via"] == "drawer+closet"
+        # Closet boost ranks; it must not inflate the advertised similarity.
+        assert hits[0]["distance"] == pytest.approx(0.08)
+        assert hits[0]["closet_boost"] == pytest.approx(0.4)
+        assert hits[0]["similarity"] == pytest.approx(0.92)
+
+    def test_closet_boosted_hits_deduped_by_source_before_hydration(self):
+        jsonl = "C:/convo/big.jsonl"
+        other = "notes.md"
+        extra = "extra.md"
+        drawers_col = MagicMock()
+        drawers_col.query.return_value = {
+            "documents": [["j0", "j1", "j2", "j3", "other-doc", "extra-doc"]],
+            "metadatas": [
+                [
+                    *[
+                        {
+                            "source_file": jsonl,
+                            "wing": "claude_conversations_windows",
+                            "room": "technical",
+                            "chunk_index": i,
+                        }
+                        for i in range(4)
+                    ],
+                    {
+                        "source_file": other,
+                        "wing": "bentokit",
+                        "room": "decisions",
+                        "chunk_index": 0,
+                    },
+                    {"source_file": extra, "wing": "bentokit", "room": "backend", "chunk_index": 0},
+                ]
+            ],
+            "distances": [[0.40, 0.41, 0.42, 0.43, 0.44, 0.45]],
+            "ids": [["d0", "d1", "d2", "d3", "d-other", "d-extra"]],
+        }
+        get_sources = []
+
+        def fake_get(*, where=None, include=None, **_kwargs):
+            src = (where or {}).get("source_file")
+            if where and "$and" in where:
+                src = next(
+                    (clause["source_file"] for clause in where["$and"] if "source_file" in clause),
+                    None,
+                )
+            get_sources.append(src)
+            result = MagicMock()
+            result.documents = [f"chunk-{i} query term here" for i in range(4)]
+            result.metadatas = [
+                {
+                    "source_file": jsonl,
+                    "wing": "claude_conversations_windows",
+                    "room": "technical",
+                    "chunk_index": i,
+                }
+                for i in range(4)
+            ]
+            return result
+
+        drawers_col.get.side_effect = fake_get
+        closets_col = MagicMock()
+        closets_col.query.return_value = {
+            "documents": [["closet-jsonl"]],
+            "metadatas": [[{"source_file": jsonl}]],
+            "distances": [[0.2]],
+            "ids": [["c-jsonl"]],
+        }
+
+        with (
+            patch("mempalace.searcher.get_collection", return_value=drawers_col),
+            patch("mempalace.searcher.get_closets_collection", return_value=closets_col),
+        ):
+            result = search_memories("query term", "/fake/path", n_results=3)
+
+        sources = [hit["source_path"] for hit in result["results"]]
+        assert sources.count(jsonl) == 1, sources
+        assert other in sources
+        assert extra in sources
+        assert get_sources.count(jsonl) == 1, get_sources
+        jsonl_hit = next(hit for hit in result["results"] if hit["source_path"] == jsonl)
+        assert jsonl_hit["similarity"] == pytest.approx(0.6)
 
 
 # ── BM25 internals: None / empty document safety ─────────────────────
