@@ -643,16 +643,16 @@ class _SafePersistentDataUnpickler:
             return _Restricted(f).load()
 
 
-def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
-    """Return the element count chromadb thinks the HNSW segment holds.
+def _hnsw_id_to_label_keys(palace_path: str, segment_id: str) -> Optional[set[str]]:
+    """Return the set of embedding IDs the HNSW segment's pickle knows about.
 
     Reads ``index_metadata.pickle`` via a tight-allowlist unpickler and
-    counts ``id_to_label`` entries. This is the count chromadb consults
-    when sizing/loading the HNSW index on next open — distinct from
-    hnswlib's internal ``cur_element_count`` in the binary files. For
-    #1222's divergence check this is the number that matters, because it
-    is what gets compared against ``count() * resize_factor`` when
-    chromadb decides whether to resize HNSW on load.
+    returns the KEYS of its ``id_to_label`` map — the chroma embedding IDs
+    (string UUIDs) currently present in the flushed HNSW index. This is the
+    authoritative "what is indexed" set: :func:`_hnsw_element_count` counts
+    it for #1222's divergence check, and :mod:`mempalace.repair`'s reconcile
+    mode diffs it against the sqlite embedding IDs to find exactly which
+    drawers are missing from the index.
 
     Uses :class:`_SafePersistentDataUnpickler` rather than chromadb's own
     ``PersistentData.load_from_file`` so the probe works even when
@@ -680,11 +680,29 @@ def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
         else:
             id_to_label = getattr(pd, "id_to_label", None)
         if isinstance(id_to_label, dict):
-            return len(id_to_label)
+            return set(id_to_label.keys())
         return None
     except Exception:
-        logger.debug("_hnsw_element_count failed for %s", pickle_path, exc_info=True)
+        logger.debug("_hnsw_id_to_label_keys failed for %s", pickle_path, exc_info=True)
         return None
+
+
+def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
+    """Return the element count chromadb thinks the HNSW segment holds.
+
+    Thin wrapper over :func:`_hnsw_id_to_label_keys` — counts the
+    ``id_to_label`` entries in ``index_metadata.pickle``. This is the count
+    chromadb consults when sizing/loading the HNSW index on next open —
+    distinct from hnswlib's internal ``cur_element_count`` in the binary
+    files. For #1222's divergence check this is the number that matters,
+    because it is what gets compared against ``count() * resize_factor``
+    when chromadb decides whether to resize HNSW on load.
+
+    Returns ``None`` when the pickle is absent (fresh / never-flushed
+    segment) or unreadable. Callers treat ``None`` as "unknown".
+    """
+    keys = _hnsw_id_to_label_keys(palace_path, segment_id)
+    return len(keys) if keys is not None else None
 
 
 # Divergence threshold: chromadb's HNSW flushes asynchronously, so HNSW

@@ -2472,6 +2472,23 @@ def cmd_repair_status(args):
     repair_status(palace_path=palace_path)
 
 
+def _run_reconcile_mode(palace_path: str, collection_name: str, dry_run: bool) -> None:
+    """Dispatch ``repair --mode reconcile``: surgical HNSW re-index of only the
+    drawers missing from the index, with clean non-zero exits for the
+    too-large-gap and mine-in-progress cases."""
+    from .palace import MineAlreadyRunning
+    from .repair import ReconcileNotSafe, reconcile_index
+
+    try:
+        reconcile_index(palace_path, collection_name, dry_run=dry_run)
+    except ReconcileNotSafe as exc:
+        print(f"\n  {exc}")
+        sys.exit(1)
+    except MineAlreadyRunning as exc:
+        print(f"\n  {exc}\n  A mine is holding the palace; retry reconcile once it finishes.")
+        sys.exit(1)
+
+
 def cmd_repair(args):
     """Rebuild palace vector index from SQLite metadata.
 
@@ -2523,6 +2540,10 @@ def cmd_repair(args):
             dry_run=getattr(args, "dry_run", False),
             assume_yes=getattr(args, "yes", False),
         )
+        return
+
+    if getattr(args, "mode", "legacy") == "reconcile":
+        _run_reconcile_mode(palace_path, collection_name, getattr(args, "dry_run", False))
         return
 
     if getattr(args, "mode", "legacy") == "from-sqlite":
@@ -3536,14 +3557,17 @@ def main():
     )
     p_repair.add_argument(
         "--mode",
-        choices=["legacy", "max-seq-id", "from-sqlite"],
+        choices=["legacy", "max-seq-id", "from-sqlite", "reconcile"],
         default="legacy",
         help=(
             "legacy: full-palace rebuild via the chromadb client (default). "
             "max-seq-id: un-poison max_seq_id rows corrupted by the legacy 0.6.x shim. "
             "from-sqlite: rebuild by reading rows directly from chroma.sqlite3, "
             "bypassing the chromadb client. Use when legacy mode bails because the "
-            "chromadb client cannot open the collection."
+            "chromadb client cannot open the collection. "
+            "reconcile: re-index ONLY the drawers missing from the HNSW index "
+            "(re-embeds just the gap, not the whole palace) — the fast fix for a "
+            "small flush-lag divergence. Refuses a large gap; use from-sqlite then."
         ),
     )
     p_repair.add_argument(

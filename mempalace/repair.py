@@ -45,12 +45,27 @@ from typing import Callable, Iterator, Optional
 
 from chromadb.errors import NotFoundError as ChromaNotFoundError
 
-from .backends.chroma import ChromaBackend, hnsw_capacity_status
+from .backends.chroma import ChromaBackend, _hnsw_id_to_label_keys, hnsw_capacity_status
 from .config import sqlite_read_uri
 
 
 COLLECTION_NAME = "mempalace_drawers"
 REPAIR_TEMP_COLLECTION = f"{COLLECTION_NAME}__repair_tmp"
+
+# Reconcile mode caps — refuse the surgical reconcile path when the HNSW gap
+# is too large and fall back to a full ``--mode from-sqlite`` rebuild. Both an
+# absolute and a relative ceiling: reconcile opens the LIVE vector segment
+# (unlike from-sqlite, which only reads chroma.sqlite3), so a #1222-scale gap
+# could trigger an uncatchable native resize on open. The relative cap stops a
+# small palace being reconciled through a gap that is tiny in absolute terms
+# but a large fraction of its contents.
+RECONCILE_MAX_MISSING = 5000
+RECONCILE_MAX_MISSING_FRACTION = 0.02
+
+# Chunk size for the ``embedding_id IN (...)`` filter in extract_via_sqlite's
+# only_ids path — keeps each SQL statement's parameter count well under
+# SQLite's default 999 host-parameter limit.
+_EXTRACT_ID_CHUNK = 500
 
 # The closets collection (AAAK index layer) is intentionally fixed —
 # closets reference drawer IDs by string and live alongside drawers in the
@@ -335,6 +350,22 @@ class RebuildCollectionError(RuntimeError):
     def __init__(self, message: str, *, live_replaced: bool):
         super().__init__(message)
         self.live_replaced = live_replaced
+
+
+class ReconcileNotSafe(RuntimeError):
+    """Raised when the HNSW gap is too large for the surgical reconcile path.
+
+    Reconcile opens the LIVE vector segment (unlike ``from-sqlite``, which
+    reads only ``chroma.sqlite3``), so a catastrophic gap (#1222: max_elements
+    frozen far below the true count) can trigger an uncatchable native resize
+    on open. The caps refuse *before* ``get_collection`` is ever called and
+    point the operator at ``--mode from-sqlite --archive-existing`` instead.
+    """
+
+    def __init__(self, message: str, *, n_missing: int, sqlite_count: "int | None"):
+        super().__init__(message)
+        self.n_missing = n_missing
+        self.sqlite_count = sqlite_count
 
 
 def _rebuild_collection_via_temp(
@@ -1744,7 +1775,65 @@ def _rebuild_one_collection(
     return upserted
 
 
-def extract_via_sqlite(palace_path: str, collection_name: str) -> Iterator[tuple[str, str, dict]]:
+def _emit_extracted_rows(
+    conn: sqlite3.Connection,
+    segment_id: str,
+    id_chunk: "Optional[list[str]]",
+) -> Iterator[tuple[str, str, dict]]:
+    """Run one metadata-segment scan and yield ``(embedding_id, document,
+    metadata)``, optionally filtered to the ``embedding_id`` values in
+    ``id_chunk``.
+
+    Shared by :func:`extract_via_sqlite`'s full-scan and only_ids paths so the
+    typed-column resolution lives in exactly one place. Grouping is per call:
+    every ``embedding_metadata`` row for a given ``embedding_id`` is fetched in
+    the same scan (the filter, when present, matches by ``embedding_id``), so a
+    drawer's metadata never straddles two chunks.
+    """
+    params: list = [segment_id]
+    id_filter = ""
+    if id_chunk is not None:
+        placeholders = ",".join("?" for _ in id_chunk)
+        id_filter = f" AND e.embedding_id IN ({placeholders})"
+        params.extend(id_chunk)
+
+    per_id: dict[str, dict] = defaultdict(dict)
+    order: list[str] = []
+    for emb_id, key, sv, iv, fv, bv in conn.execute(
+        f"""
+        SELECT e.embedding_id, em.key, em.string_value, em.int_value,
+               em.float_value, em.bool_value
+        FROM embeddings e
+        LEFT JOIN embedding_metadata em ON em.id = e.id
+        WHERE e.segment_id = ?{id_filter}
+        ORDER BY e.id
+        """,
+        params,
+    ):
+        if emb_id not in per_id:
+            order.append(emb_id)
+        if key is None:
+            continue
+        if sv is not None:
+            per_id[emb_id][key] = sv
+        elif iv is not None:
+            per_id[emb_id][key] = iv
+        elif fv is not None:
+            per_id[emb_id][key] = fv
+        elif bv is not None:
+            per_id[emb_id][key] = bool(bv)
+
+    for emb_id in order:
+        kv = per_id[emb_id]
+        doc = kv.pop("chroma:document", "")
+        yield emb_id, doc, kv
+
+
+def extract_via_sqlite(
+    palace_path: str,
+    collection_name: str,
+    only_ids: "Optional[set[str]]" = None,
+) -> Iterator[tuple[str, str, dict]]:
     """Yield ``(embedding_id, document, metadata)`` for every row in
     ``collection_name``'s metadata segment by reading ``chroma.sqlite3``
     directly.
@@ -1767,18 +1856,26 @@ def extract_via_sqlite(palace_path: str, collection_name: str) -> Iterator[tuple
     returned as the document; this matches how chromadb itself stores
     ``add(documents=...)``.
 
-    Driven from ``embeddings`` (LEFT JOIN ``embedding_metadata``), not
-    the other way around: an embedding with zero ``embedding_metadata``
-    rows — a sparse historical write with no ``chroma:document`` and no
-    other key, the same condition ``_extract_drawers`` already sanitizes
+    Driven from `embeddings` (LEFT JOIN `embedding_metadata`), not
+    the other way around: an embedding with zero `embedding_metadata`
+    rows — a sparse historical write with no `chroma:document` and no
+    other key, the same condition `_extract_drawers` already sanitizes
     for the collection-layer path, see #1458 — must still be yielded
     with an empty metadata dict, not silently excluded by the join.
+
+    When `only_ids` is provided, only rows whose `embedding_id` is in the
+    set are yielded, fetched in chunks of `_EXTRACT_ID_CHUNK` via
+    `IN (...)` so the reconcile path can pull just the drawers missing from
+    the HNSW index without scanning the whole metadata segment. An empty
+    `only_ids` set yields nothing.
 
     Silent on missing palace, missing ``chroma.sqlite3``, or unknown
     collection name — yields nothing. Callers that need to distinguish
     "empty collection" from "collection not present" should query
     :func:`sqlite_drawer_count` first.
     """
+    if only_ids is not None and not only_ids:
+        return
     sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.isfile(sqlite_path):
         return
@@ -1797,40 +1894,14 @@ def extract_via_sqlite(palace_path: str, collection_name: str) -> Iterator[tuple
             return
         segment_id = seg_row[0]
 
-        per_id: dict[str, dict] = defaultdict(dict)
-        order: list[str] = []
-        for emb_id, key, sv, iv, fv, bv in conn.execute(
-            """
-            SELECT e.embedding_id, em.key, em.string_value, em.int_value,
-                   em.float_value, em.bool_value
-            FROM embeddings e
-            LEFT JOIN embedding_metadata em ON em.id = e.id
-            WHERE e.segment_id = ?
-            ORDER BY e.id
-            """,
-            (segment_id,),
-        ):
-            if emb_id not in per_id:
-                order.append(emb_id)
-            if key is None:
-                # LEFT JOIN unmatched row: this embedding has zero
-                # embedding_metadata rows. `order`/`per_id` already
-                # account for it via the defaultdict below; nothing to
-                # merge for this row.
-                continue
-            if sv is not None:
-                per_id[emb_id][key] = sv
-            elif iv is not None:
-                per_id[emb_id][key] = iv
-            elif fv is not None:
-                per_id[emb_id][key] = fv
-            elif bv is not None:
-                per_id[emb_id][key] = bool(bv)
-
-        for emb_id in order:
-            kv = per_id[emb_id]
-            doc = kv.pop("chroma:document", "")
-            yield emb_id, doc, kv
+        if only_ids is None:
+            yield from _emit_extracted_rows(conn, segment_id, None)
+        else:
+            id_list = list(only_ids)
+            for i in range(0, len(id_list), _EXTRACT_ID_CHUNK):
+                yield from _emit_extracted_rows(
+                    conn, segment_id, id_list[i : i + _EXTRACT_ID_CHUNK]
+                )
     finally:
         conn.close()
 
@@ -2404,6 +2475,307 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
         )
     print()
     return {"drawers": drawers, "closets": closets}
+
+
+# ---------------------------------------------------------------------------
+# reconcile mode: re-index only the drawers missing from the HNSW index
+# ---------------------------------------------------------------------------
+
+
+def _sqlite_embedding_ids(palace_path: str, collection_name: str) -> "Optional[set[str]]":
+    """Return the set of embedding IDs stored in ``chroma.sqlite3`` for the
+    collection — every drawer that *should* be present in the HNSW index.
+
+    Mirrors :func:`mempalace.backends.chroma._sqlite_embedding_count` (same
+    collection-scoped join) but returns the IDs instead of a count, so
+    :func:`compute_missing_ids` can diff them against the HNSW ``id_to_label``
+    keys. Deliberately does NOT join ``embedding_metadata``: a drawer with zero
+    metadata rows still has an ``embeddings`` row and must not be dropped from
+    the "should be indexed" set.
+
+    Returns ``None`` when the ids cannot be read (missing DB, or a sqlite error
+    such as a sustained writer lock) so the caller never mistakes an unreadable
+    palace for an empty one — returning an empty set there would let reconcile
+    silently report "nothing missing" while a mine simply held the lock. A
+    ``busy_timeout`` (same grace period as :func:`sqlite_integrity_errors`) lets
+    a transient writer lock resolve before we give up. Returns a (possibly
+    empty) set only on a successful read.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        conn = sqlite3.connect(
+            sqlite_read_uri(db_path),
+            uri=True,
+            timeout=_SQLITE_INTEGRITY_BUSY_TIMEOUT_SECONDS,
+        )
+    except sqlite3.Error:
+        return None
+    try:
+        ids: set[str] = set()
+        for (emb_id,) in conn.execute(
+            """
+            SELECT e.embedding_id
+            FROM embeddings e
+            JOIN segments s ON e.segment_id = s.id
+            JOIN collections c ON s.collection = c.id
+            WHERE c.name = ?
+            """,
+            (collection_name,),
+        ):
+            ids.add(emb_id)
+        return ids
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
+def compute_missing_ids(
+    palace_path: str, collection_name: str = COLLECTION_NAME
+) -> "tuple[Optional[set[str]], dict]":
+    """Return ``(missing_ids, status)`` — the embedding IDs present in sqlite
+    but absent from the flushed HNSW index, plus the raw
+    :func:`hnsw_capacity_status` dict.
+
+    ``missing_ids`` is ``None`` when the diff cannot be computed reliably (no
+    vector segment, or the HNSW metadata pickle is absent/unreadable) — the
+    caller must NOT treat that as "nothing missing". A negative divergence
+    (HNSW holds more than sqlite) yields an empty set: reconcile is a no-op,
+    never a delete.
+    """
+    status = hnsw_capacity_status(palace_path, collection_name)
+    seg_id = status.get("segment_id")
+    if seg_id is None:
+        return None, status
+    hnsw_keys = _hnsw_id_to_label_keys(palace_path, seg_id)
+    if hnsw_keys is None:
+        return None, status
+    sqlite_ids = _sqlite_embedding_ids(palace_path, collection_name)
+    if sqlite_ids is None:
+        return None, status
+    # Override with the authoritative count from the SAME read that produced
+    # ``missing``, so the cap's fraction denominator and ``missing`` can never
+    # disagree — and so ``sqlite_count`` is always an int for callers that
+    # format it (hnsw_capacity_status's own count read can be None under a
+    # transient lock, which would otherwise crash an f"{sqlite_count:,}").
+    status["sqlite_count"] = len(sqlite_ids)
+    missing = sqlite_ids - hnsw_keys
+    return missing, status
+
+
+def reconcile_index(
+    palace_path: str,
+    collection_name: str = COLLECTION_NAME,
+    *,
+    dry_run: bool = False,
+    batch_size: int = 500,
+) -> dict:
+    """Re-index only the drawers missing from the HNSW index.
+
+    The surgical alternative to a full ``--mode from-sqlite`` rebuild for the
+    common small-divergence case (a flush-lag or crash-truncated pickle that
+    left a few hundred drawers out of the index while chroma.sqlite3 stayed
+    intact). Diffs the sqlite embedding IDs against the HNSW ``id_to_label``
+    keys and re-upserts just the missing drawers through the same
+    ``ChromaCollection.upsert`` primitive the live MCP write path uses —
+    re-embedding those documents and letting chromadb fold them into the
+    existing index, with no delete-and-recreate.
+
+    Scope: reconcile is for a *flush-lag* gap — the HNSW binary is sound and
+    only the metadata pickle lags (or a crash truncated it). It opens the live
+    segment, so a genuinely corrupt / undersized HNSW (the #1222 / #1308 class,
+    where ``count`` / ``upsert`` fault natively) can still crash on open even at
+    a small divergence that clears the caps — a native access violation the
+    caps cannot predict and Python cannot catch. That is a
+    ``--mode from-sqlite --archive-existing`` rebuild case (from-sqlite reads
+    chroma.sqlite3 directly and never opens the failing segment), not a
+    reconcile case.
+
+    Returns a result dict::
+
+        {"missing", "reconciled", "fetched",
+         "divergence_before", "divergence_after", "flushed"}
+
+    Concurrency: the complete transaction — integrity preflight, missing-ID
+    diff, sqlite extraction, every upsert batch, and the final verification —
+    runs under ONE per-palace writer lease (``mine_palace_lock``), so no
+    concurrent writer can move sqlite or the HNSW segment between phases and
+    the reconcile set always describes the generation being modified. Nested
+    ``ChromaCollection.upsert`` lock acquisitions pass through via the lock's
+    process-wide re-entrancy.
+
+    Raises :class:`ReconcileNotSafe` when the gap exceeds the caps (opening the
+    live segment on a #1222-scale gap can crash natively). Raises
+    :class:`~mempalace.palace.MineAlreadyRunning` at entry when another writer
+    holds the palace — the caller should retry once it finishes.
+    """
+    palace_path = os.path.abspath(os.path.expanduser(palace_path))
+
+    print(f"\n{'=' * 55}")
+    print("  MemPalace Repair — Reconcile HNSW index")
+    print(f"{'=' * 55}\n")
+    print(f"  Palace: {palace_path}")
+
+    # ONE palace writer lease for the COMPLETE transaction. Any phase running
+    # outside it lets a concurrent writer move sqlite/HNSW between phases: the
+    # missing-ID snapshot then describes an older generation than the state
+    # being modified — the safety cap no longer applies to the current state,
+    # already-repaired IDs get processed again, and stale extracted rows can
+    # overwrite a newer concurrent update. Nested ChromaCollection.upsert
+    # acquisitions pass through via the lock's process-wide re-entrancy; a
+    # foreign holder raises MineAlreadyRunning here, before any read. Lazy
+    # import for the same reason as maybe_autoheal_fts5_index's: keep
+    # repair.py's import graph light for callers that never hit this path.
+    from .palace import mine_palace_lock
+
+    with mine_palace_lock(palace_path):
+        return _reconcile_under_lease(
+            palace_path, collection_name, dry_run=dry_run, batch_size=batch_size
+        )
+
+
+def _reconcile_under_lease(
+    palace_path: str,
+    collection_name: str,
+    *,
+    dry_run: bool,
+    batch_size: int,
+) -> dict:
+    """Body of :func:`reconcile_index`; the caller holds the palace writer lease."""
+    # Preflight: the same sqlite integrity gate the rebuild paths use. A
+    # malformed DB must never be the source of a re-embed.
+    sqlite_errors = sqlite_integrity_errors(palace_path)
+    if sqlite_errors:
+        print_sqlite_integrity_abort(palace_path, sqlite_errors)
+        return {"missing": 0, "reconciled": 0, "aborted": "sqlite_integrity"}
+
+    missing, status = compute_missing_ids(palace_path, collection_name)
+    divergence_before = status.get("divergence")
+    if missing is None:
+        print(
+            "\n  Cannot compute the missing-drawer set: "
+            f"{status.get('message', 'no vector segment / HNSW metadata')}.\n"
+            "  Nothing reconciled. If vectors are disabled by a corrupt index, "
+            "use --mode from-sqlite --archive-existing."
+        )
+        return {
+            "missing": 0,
+            "reconciled": 0,
+            "divergence_before": divergence_before,
+        }
+
+    sqlite_count = status.get("sqlite_count")
+    n_missing = len(missing)
+
+    if n_missing == 0:
+        print("\n  HNSW index already covers every sqlite drawer — nothing to reconcile.")
+        return {
+            "missing": 0,
+            "reconciled": 0,
+            "divergence_before": divergence_before,
+            "divergence_after": divergence_before,
+            "flushed": True,
+        }
+
+    # Caps — refuse a large gap BEFORE opening the live segment (see
+    # ReconcileNotSafe). Absolute AND relative.
+    frac = n_missing / max(sqlite_count or 0, 1)
+    if n_missing > RECONCILE_MAX_MISSING or frac > RECONCILE_MAX_MISSING_FRACTION:
+        raise ReconcileNotSafe(
+            f"HNSW gap too large for reconcile: {n_missing:,} drawers missing "
+            f"({frac * 100:.1f}% of {sqlite_count:,}). Caps: "
+            f"{RECONCILE_MAX_MISSING:,} absolute / "
+            f"{RECONCILE_MAX_MISSING_FRACTION * 100:.0f}% relative. "
+            "Use --mode from-sqlite --archive-existing for a full rebuild.",
+            n_missing=n_missing,
+            sqlite_count=sqlite_count,
+        )
+
+    print(
+        f"\n  {n_missing:,} drawers missing from the HNSW index "
+        f"(sqlite {sqlite_count:,} / divergence {divergence_before})."
+    )
+
+    if dry_run:
+        print("  --dry-run: no changes made.")
+        return {
+            "missing": n_missing,
+            "reconciled": 0,
+            "divergence_before": divergence_before,
+            "dry_run": True,
+        }
+
+    # Fetch documents + metadata for exactly the missing IDs (chunked IN()).
+    ids: list[str] = []
+    docs: list[str] = []
+    metas: list[dict] = []
+    for emb_id, doc, meta in extract_via_sqlite(palace_path, collection_name, only_ids=missing):
+        ids.append(emb_id)
+        docs.append(doc)
+        metas.append(meta)
+    fetched = len(ids)
+    if fetched < n_missing:
+        # extract_via_sqlite drops rows whose every typed metadata column is
+        # NULL (chromadb never writes that shape); surface it, don't hide it.
+        print(
+            f"  Note: fetched {fetched:,} of {n_missing:,} missing drawers from "
+            "sqlite; the rest have no metadata rows and are skipped."
+        )
+    if fetched == 0:
+        print("  Nothing to upsert after fetch — no reconcilable rows.")
+        return {
+            "missing": n_missing,
+            "reconciled": 0,
+            "fetched": 0,
+            "divergence_before": divergence_before,
+        }
+
+    # Open the LIVE collection and re-upsert the missing drawers through the
+    # same locked primitive the MCP write path uses. Re-embeds at upsert time
+    # (the stored vectors are not reused — same rationale as
+    # rebuild_from_sqlite; the embedding model is deterministic). A running
+    # mine makes ``upsert`` raise MineAlreadyRunning, which propagates.
+    backend = ChromaBackend()
+    col = backend.get_collection(palace_path, collection_name)
+    reconciled = 0
+    for i in range(0, fetched, batch_size):
+        batch_ids = ids[i : i + batch_size]
+        col.upsert(
+            ids=batch_ids,
+            documents=docs[i : i + batch_size],
+            metadatas=metas[i : i + batch_size],
+        )
+        reconciled += len(batch_ids)
+    print(f"  Upserted {reconciled:,} drawers.")
+
+    # Post-verify from the pickle. On a legacy palace with a large
+    # ``hnsw:sync_threshold`` the pickle may not have re-flushed yet (the index
+    # binary has the vectors, but the metadata pickle MCP reads for its
+    # divergence check lags) — never claim the divergence is closed on a stale
+    # pickle, and do NOT lower the threshold to force a flush (scope creep).
+    post = hnsw_capacity_status(palace_path, collection_name)
+    divergence_after = post.get("divergence")
+    flushed = divergence_after is not None and divergence_after <= 0
+    if flushed:
+        print("  HNSW index reconciled — divergence closed, vector search re-enabled.")
+    else:
+        print(
+            f"  Upserts applied, but the HNSW metadata pickle still reports "
+            f"divergence {divergence_after} (collection sync_threshold not yet "
+            "reached). The index binary holds the new vectors; the pickle will "
+            "reflect them on the next persist. Vector search may stay disabled "
+            "until then."
+        )
+    return {
+        "missing": n_missing,
+        "reconciled": reconciled,
+        "fetched": fetched,
+        "divergence_before": divergence_before,
+        "divergence_after": divergence_after,
+        "flushed": flushed,
+    }
 
 
 # ---------------------------------------------------------------------------
