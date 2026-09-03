@@ -2454,11 +2454,21 @@ def cmd_palace_set_embedder(args):
     # set-embedder records the palace's identity; it does not change the
     # configured model. If they differ, the next normal open would mismatch —
     # tell the user how to align them.
-    configured = config.embedding_model
+    from .embedding import current_model_name
+
+    configured = current_model_name()
     if new.model_name and configured and new.model_name != configured:
+        if new.model_name.startswith("embeddinggemma:"):
+            _, variant = new.model_name.split(":", 1)
+            settings = (
+                "MEMPALACE_EMBEDDING_MODEL=embeddinggemma and "
+                f"MEMPALACE_EMBEDDINGGEMMA_VARIANT={variant}"
+            )
+        else:
+            settings = f"MEMPALACE_EMBEDDING_MODEL={new.model_name}"
         print(
-            f"  ⚠ configured model is {configured!r}; set MEMPALACE_EMBEDDING_MODEL="
-            f"{new.model_name} (or run onboarding) so normal opens of this palace match."
+            f"  ⚠ configured model is {configured!r}; set {settings} (or run onboarding) "
+            "so normal opens of this palace match."
         )
 
 
