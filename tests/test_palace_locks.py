@@ -1,4 +1,4 @@
-"""Tests for mine_palace_lock — the per-palace non-blocking mine guard.
+"""Tests for mine_palace_lock â€” the per-palace non-blocking mine guard.
 
 Covers the fix for the runaway mine fan-out described alongside issues
 #974 and #965: if N copies of `mempalace mine` are spawned concurrently
@@ -10,6 +10,7 @@ against *different* palaces must still be free to run in parallel.
 from __future__ import annotations
 
 import multiprocessing
+import errno
 import os
 import threading
 import time
@@ -29,15 +30,15 @@ from mempalace.palace import (
 
 
 def _get_mp_context():
-    """Always use ``spawn`` — ``fork`` deadlocks under modern Python.
+    """Always use ``spawn`` â€” ``fork`` deadlocks under modern Python.
 
     The parent (pytest + chromadb + onnxruntime) is multi-threaded by the time
     these tests run. ``fork`` snapshots that state into the child without the
     threads that hold the locks, which Python 3.13 explicitly warns about and
     which deadlocks the CI runners. macOS additionally forbids
     fork-without-exec via CoreFoundation. ``spawn`` re-imports the package in
-    the child (slower, but safe) and inherits ``os.environ`` — including the
-    monkeypatched ``HOME`` — which is all these lock-file tests need.
+    the child (slower, but safe) and inherits ``os.environ`` â€” including the
+    monkeypatched ``HOME`` â€” which is all these lock-file tests need.
     """
     return multiprocessing.get_context("spawn")
 
@@ -179,7 +180,7 @@ def test_different_palaces_dont_conflict(tmp_path, monkeypatch):
             time.sleep(0.01)
         assert os.path.exists(ready), "holder failed to acquire lock in time"
 
-        # Different palace — must succeed even while palace_a is held
+        # Different palace â€” must succeed even while palace_a is held
         with mine_palace_lock(palace_b):
             pass  # no exception expected
     finally:
@@ -193,8 +194,8 @@ def test_palace_path_is_normalized(tmp_path, monkeypatch):
     Cross-process variant: a child holds the absolute form, a relative form
     in the parent must hash to the same lock key and raise
     ``MineAlreadyRunning``. (The same-thread case is now a re-entrant
-    pass-through by design — see ``test_reentrant_same_thread_passes_through``
-    — so we exercise the normalization invariant across a process boundary
+    pass-through by design â€” see ``test_reentrant_same_thread_passes_through``
+    â€” so we exercise the normalization invariant across a process boundary
     where re-entrance does not apply.)
     """
     _isolate_home(monkeypatch, tmp_path)
@@ -237,7 +238,7 @@ def test_reentrant_same_thread_passes_through(tmp_path, monkeypatch):
     _isolate_home(monkeypatch, tmp_path)
     palace = str(tmp_path / "palace")
     with mine_palace_lock(palace):
-        # Re-enter from the same thread — must yield without raising or hanging.
+        # Re-enter from the same thread â€” must yield without raising or hanging.
         with mine_palace_lock(palace):
             pass
         # After the inner exits, the outer is still held. Use spawn so the
@@ -333,7 +334,7 @@ def test_write_lock_holder_writes_utf8_bytes_for_non_ascii_argv(tmp_path, monkey
     monkeypatch.setattr(
         sys,
         "argv",
-        ["mempalace", "mine", "café/北"],
+        ["mempalace", "mine", "cafÃ©/åŒ—"],
     )
 
     lock_path = tmp_path / "holder.lock"
@@ -357,12 +358,12 @@ def test_write_lock_holder_is_best_effort_on_unicode_error(monkeypatch):
             pass
 
         def write(self, _data):
-            raise UnicodeEncodeError("cp1252", "北", 0, 1, "not representable")
+            raise UnicodeEncodeError("cp1252", "åŒ—", 0, 1, "not representable")
 
         def flush(self):
             pass
 
-    monkeypatch.setattr(sys, "argv", ["mempalace", "mine", "北"])
+    monkeypatch.setattr(sys, "argv", ["mempalace", "mine", "åŒ—"])
     _write_lock_holder(UnicodeFailingLock())
 
 
@@ -449,14 +450,14 @@ def test_holder_set_not_orphaned_by_interrupt_after_mark_held(tmp_path, monkeypa
 
 
 # ---------------------------------------------------------------------------
-# reap_stale_mine_locks — orphaned per-source-file lock garbage collection
+# reap_stale_mine_locks â€” orphaned per-source-file lock garbage collection
 # ---------------------------------------------------------------------------
 #
 # mine_lock's own finally-block cleanup (_cleanup_mine_lock_file) only runs
 # for the specific lock a process just released, and only if that process
 # reaches its own finally block at all. A process killed abruptly (SIGKILL,
 # force-quit, host crash) never runs it, and nothing else in the codebase
-# later revisits that lock file — it orphans permanently. One long-lived
+# later revisits that lock file â€” it orphans permanently. One long-lived
 # installation was found with 5,636 such orphaned lock files, the oldest
 # several months old, none held by any live process. These tests cover the
 # reaper added to reclaim them safely.
@@ -506,7 +507,7 @@ def test_reap_leaves_recently_touched_lock_alone(tmp_path, monkeypatch):
     lock_dir = tmp_path / ".mempalace" / "locks"
     lock_dir.mkdir(parents=True)
     fresh = lock_dir / "1111111111111111.lock"
-    fresh.write_bytes(b"")  # mtime is "now" — well under the threshold
+    fresh.write_bytes(b"")  # mtime is "now" â€” well under the threshold
 
     reaped, skipped = reap_stale_mine_locks(min_age_seconds=3600)
 
@@ -516,7 +517,7 @@ def test_reap_leaves_recently_touched_lock_alone(tmp_path, monkeypatch):
 
 def test_reap_never_removes_a_lock_held_by_another_process(tmp_path, monkeypatch):
     """The core safety property: a lock genuinely held by a live process,
-    however old it looks by mtime, is never removed — the age threshold is
+    however old it looks by mtime, is never removed â€” the age threshold is
     a courtesy throttle, the flock check is the actual safety mechanism."""
     _isolate_home(monkeypatch, tmp_path)
     source_file = str(tmp_path / "some_source.py")
@@ -536,7 +537,7 @@ def test_reap_never_removes_a_lock_held_by_another_process(tmp_path, monkeypatch
         lock_dir = tmp_path / ".mempalace" / "locks"
         lock_files = list(lock_dir.glob("*.lock"))
         assert lock_files, "expected the held lock file to exist"
-        # Backdate mtime so it would be a reap candidate by age alone —
+        # Backdate mtime so it would be a reap candidate by age alone â€”
         # the flock held by the child process must still protect it.
         old_time = time.time() - 7200
         os.utime(lock_files[0], (old_time, old_time))
@@ -554,7 +555,7 @@ def test_reap_never_removes_a_lock_held_by_another_process(tmp_path, monkeypatch
 
 def test_reap_skips_mine_palace_prefixed_locks(tmp_path, monkeypatch):
     """mine_palace_*.lock belongs to the newer per-palace lock (mine_palace_lock)
-    with its own lifecycle and holder tracking — this reaper targets only the
+    with its own lifecycle and holder tracking â€” this reaper targets only the
     per-source-file locks mine_lock creates, and must not touch those."""
     _isolate_home(monkeypatch, tmp_path)
     lock_dir = tmp_path / ".mempalace" / "locks"
@@ -578,7 +579,7 @@ def test_reap_missing_lock_dir_is_a_noop(tmp_path, monkeypatch):
 
 
 def test_maybe_reap_is_throttled(tmp_path, monkeypatch):
-    """The opportunistic call site runs at most once per interval — a stale
+    """The opportunistic call site runs at most once per interval â€” a stale
     lock created between two rapid-fire mine_lock calls must survive the
     second call because the reap itself was skipped, not because reaping
     failed."""
@@ -598,3 +599,77 @@ def test_maybe_reap_is_throttled(tmp_path, monkeypatch):
         pass  # second call: marker is fresh, reap should be skipped this time
 
     assert stale.exists(), "reap should have been throttled on the second mine_lock call"
+
+
+class _FakeMsvcrt:
+    """Stand-in for the ``msvcrt`` module exercising the Windows lock path.
+
+    ``locking`` raises ``OSError(EDEADLOCK)`` for the first ``fail_times``
+    calls (mimicking ``LK_LOCK``'s ~10s-timeout-then-raise on a contended
+    region) and then succeeds, so the blocking-retry loop can be verified on
+    any host without real Windows contention.
+    """
+
+    LK_LOCK = 1
+    LK_NBLCK = 2
+    LK_UNLCK = 0
+
+    def __init__(self, fail_times: int):
+        self.fail_times = fail_times
+        self.calls = 0
+
+    def locking(self, fileno, mode, nbytes):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            deadlock_errno = getattr(errno, "EDEADLOCK", errno.EDEADLK)
+            raise OSError(deadlock_errno, "Resource deadlock avoided")
+
+
+def test_windows_blocking_lock_retries_past_lk_lock_timeout(tmp_path, monkeypatch):
+    """Blocking acquire on Windows must retry LK_LOCK instead of crashing.
+
+    Regression for the per-file ``mine_lock`` contract: ``msvcrt.locking`` with
+    ``LK_LOCK`` gives up after ~10s and raises ``OSError(EDEADLOCK)``. A large
+    per-file mine outlasts that, so the waiter must re-issue the lock rather
+    than propagate the error (which POSIX ``flock`` would never do).
+    """
+    from mempalace import palace
+
+    monkeypatch.setattr(os, "name", "nt")
+    fake = _FakeMsvcrt(fail_times=2)
+    monkeypatch.setitem(sys.modules, "msvcrt", fake)
+
+    lock_path = tmp_path / "contended.lock"
+    with open(lock_path, "w+b") as lf:
+        # Must return True (acquired) after two simulated timeouts, not raise.
+        assert palace._lock_mine_lock_file(lf, blocking=True) is True
+    assert fake.calls == 3, "expected two failed LK_LOCK attempts then success"
+
+
+def test_windows_blocking_lock_reraises_non_contention_error(tmp_path, monkeypatch):
+    """A non-contention OSError (e.g. EBADF) must propagate, not loop forever."""
+    from mempalace import palace
+
+    monkeypatch.setattr(os, "name", "nt")
+
+    class _BadFdMsvcrt(_FakeMsvcrt):
+        def locking(self, fileno, mode, nbytes):
+            self.calls += 1
+            raise OSError(errno.EBADF, "Bad file descriptor")
+
+    monkeypatch.setitem(sys.modules, "msvcrt", _BadFdMsvcrt(fail_times=0))
+    lock_path = tmp_path / "badfd.lock"
+    with open(lock_path, "w+b") as lf:
+        with pytest.raises(OSError):
+            palace._lock_mine_lock_file(lf, blocking=True)
+
+
+def test_windows_nonblocking_lock_returns_false_on_contention(tmp_path, monkeypatch):
+    """Non-blocking acquire must report failure (False), never raise."""
+    from mempalace import palace
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setitem(sys.modules, "msvcrt", _FakeMsvcrt(fail_times=1))
+    lock_path = tmp_path / "nb.lock"
+    with open(lock_path, "w+b") as lf:
+        assert palace._lock_mine_lock_file(lf, blocking=False) is False

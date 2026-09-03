@@ -873,16 +873,42 @@ def _open_mine_lock_file(lock_path: str, *, create: bool):
 def _lock_mine_lock_file(lock_file, *, blocking: bool) -> bool:
     lock_file.seek(0)
     if os.name == "nt":
+        import errno
         import msvcrt
 
-        mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
-        try:
-            msvcrt.locking(lock_file.fileno(), mode, 1)
-        except OSError:
-            if not blocking:
+        if not blocking:
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
                 return False
-            raise
-        return True
+            return True
+
+        # Blocking acquire. Unlike POSIX ``fcntl.flock(LOCK_EX)``, which waits
+        # indefinitely, Windows ``msvcrt.locking(LK_LOCK, ...)`` retries
+        # internally only ~10 times at 1s intervals and then raises OSError
+        # (EDEADLOCK). A per-file mine of a large transcript routinely runs far
+        # longer than 10s, so a contending waiter would crash instead of
+        # waiting. Re-issue LK_LOCK on the contention errno so a blocking
+        # acquire truly blocks, matching the POSIX contract. Each LK_LOCK call
+        # sleeps ~10s before raising, so this loop is not a busy-spin. Non-
+        # contention errors (e.g. EBADF) propagate immediately.
+        # EDEADLK/EDEADLOCK are the same value (36) on Windows; EACCES (13) can
+        # surface via the ERROR_LOCK_VIOLATION mapping. Build the retry set
+        # defensively since not every name is defined on every build.
+        _contention_errnos = {
+            getattr(errno, name)
+            for name in ("EDEADLOCK", "EDEADLK", "EACCES")
+            if hasattr(errno, name)
+        }
+        while True:
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            except OSError as exc:
+                if exc.errno in _contention_errnos:
+                    lock_file.seek(0)
+                    continue
+                raise
+            return True
 
     import fcntl
 
