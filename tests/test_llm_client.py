@@ -15,6 +15,7 @@ from mempalace.llm_client import (
     LLMError,
     OllamaProvider,
     OpenAICompatProvider,
+    OrcaRouterProvider,
     _http_post_json,
     get_provider,
 )
@@ -39,6 +40,13 @@ def test_get_provider_anthropic():
     p = get_provider("anthropic", "claude-haiku", api_key="sk-xxx")
     assert isinstance(p, AnthropicProvider)
     assert p.api_key == "sk-xxx"
+
+
+def test_get_provider_orcarouter():
+    p = get_provider("orcarouter", "orcarouter/fusion-mini", api_key="sk-orca-xxx")
+    assert isinstance(p, OrcaRouterProvider)
+    assert p.api_key == "sk-orca-xxx"
+    assert p.endpoint == OrcaRouterProvider.DEFAULT_ENDPOINT
 
 
 def test_get_provider_unknown_raises():
@@ -325,6 +333,137 @@ def test_anthropic_no_key_raises_on_classify(monkeypatch):
     p = AnthropicProvider(model="claude-haiku")
     with pytest.raises(LLMError, match="requires ANTHROPIC_API_KEY"):
         p.classify("s", "u")
+
+
+# ── OrcaRouterProvider ──────────────────────────────────────────────────
+
+
+def _mock_orcarouter_response(content: str):
+    mock = MagicMock()
+    payload = {"choices": [{"message": {"content": content}}]}
+    mock.read.return_value = json.dumps(payload).encode()
+    mock.__enter__.return_value = mock
+    mock.__exit__.return_value = False
+    return mock
+
+
+def test_orcarouter_resolves_default_url():
+    captured = {}
+
+    def fake_urlopen(req, *, timeout):
+        captured["url"] = req.full_url
+        return _mock_orcarouter_response('{"ok": true}')
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        p = OrcaRouterProvider(model="orcarouter/fusion-mini", api_key="sk-orca-abc")
+        p.classify("s", "u")
+    assert captured["url"] == "https://api.orcarouter.ai/v1/chat/completions"
+
+
+def test_orcarouter_resolves_url_with_existing_v1():
+    captured = {}
+
+    def fake_urlopen(req, *, timeout):
+        captured["url"] = req.full_url
+        return _mock_orcarouter_response('{"ok": true}')
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        p = OrcaRouterProvider(
+            model="orcarouter/fusion-mini", endpoint="http://h:1234/v1", api_key="sk-orca"
+        )
+        p.classify("s", "u")
+    assert captured["url"] == "http://h:1234/v1/chat/completions"
+
+
+def test_orcarouter_sends_authorization_when_key_present():
+    captured = {}
+
+    def fake_urlopen(req, *, timeout):
+        captured["auth"] = req.get_header("Authorization")
+        return _mock_orcarouter_response('{"ok": true}')
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        p = OrcaRouterProvider(model="orcarouter/fusion-mini", api_key="sk-orca-abc")
+        p.classify("s", "u")
+    assert captured["auth"] == "Bearer sk-orca-abc"
+
+
+def test_orcarouter_sends_response_format_json():
+    captured = {}
+
+    def fake_urlopen(req, *, timeout):
+        captured["body"] = json.loads(req.data.decode())
+        return _mock_orcarouter_response('{"ok": true}')
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        p = OrcaRouterProvider(model="orcarouter/fusion-mini", api_key="sk-orca")
+        p.classify("s", "u", json_mode=True)
+    assert captured["body"]["response_format"] == {"type": "json_object"}
+
+
+def test_orcarouter_uses_env_var_fallback(monkeypatch):
+    monkeypatch.setenv("ORCAROUTER_API_KEY", "sk-orca-env")
+    p = OrcaRouterProvider(model="orcarouter/fusion-mini")
+    assert p.api_key == "sk-orca-env"
+
+
+def test_orcarouter_requires_api_key(monkeypatch):
+    monkeypatch.delenv("ORCAROUTER_API_KEY", raising=False)
+    p = OrcaRouterProvider(model="orcarouter/fusion-mini")
+    ok, msg = p.check_available()
+    assert not ok
+    assert "ORCAROUTER_API_KEY" in msg
+    with pytest.raises(LLMError, match="requires ORCAROUTER_API_KEY"):
+        p.classify("s", "u")
+
+
+def test_orcarouter_check_available_probes_models(monkeypatch):
+    monkeypatch.setenv("ORCAROUTER_API_KEY", "sk-orca")
+    mock = MagicMock()
+    mock.__enter__.return_value = mock
+    with patch("mempalace.llm_client.urlopen", return_value=mock):
+        p = OrcaRouterProvider(model="orcarouter/fusion-mini")
+        ok, msg = p.check_available()
+    assert ok
+    assert msg == "ok"
+
+
+def test_orcarouter_default_endpoint_is_external():
+    """OrcaRouterProvider's default endpoint is the hosted gateway, which
+    must be classified as external so the privacy warning fires by default
+    for users who pass --llm-provider orcarouter."""
+    p = OrcaRouterProvider(model="orcarouter/fusion-mini", api_key="sk-orca")
+    assert p.is_external_service is True, (
+        f"Default OrcaRouterProvider endpoint must be external; got "
+        f"is_external_service={p.is_external_service} for endpoint={p.endpoint}"
+    )
+
+
+def test_orcarouter_api_key_source_tracking(monkeypatch):
+    """OrcaRouterProvider tracks api_key_source the same way as the other
+    cloud providers: 'flag' when passed explicitly, 'env' when resolved
+    from ORCAROUTER_API_KEY env."""
+    monkeypatch.setenv("ORCAROUTER_API_KEY", "sk-orca-env")
+    p_flag = OrcaRouterProvider(model="orcarouter/fusion-mini", api_key="sk-orca-flag")
+    assert p_flag.api_key_source == "flag", (
+        f"Explicit api_key must produce 'flag'; got {p_flag.api_key_source!r}"
+    )
+    p_env = OrcaRouterProvider(model="orcarouter/fusion-mini")
+    assert p_env.api_key == "sk-orca-env"
+    assert p_env.api_key_source == "env", (
+        f"Env-fallback must produce 'env'; got {p_env.api_key_source!r}"
+    )
+
+
+def test_orcarouter_unexpected_shape_raises():
+    mock = MagicMock()
+    mock.read.return_value = b'{"nothing": "here"}'
+    mock.__enter__.return_value = mock
+    mock.__exit__.return_value = False
+    with patch("mempalace.llm_client.urlopen", return_value=mock):
+        p = OrcaRouterProvider(model="orcarouter/fusion-mini", api_key="sk-orca")
+        with pytest.raises(LLMError, match="Unexpected response shape"):
+            p.classify("s", "u")
 
 
 # ── is_external_service property (issue #24 — privacy warning support) ──
