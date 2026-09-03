@@ -3109,6 +3109,15 @@ def _reconfigure_stdio_utf8_on_windows():
     reconfigure_stdio_utf8_on_windows(stdout_errors="replace", stderr_errors="replace")
 
 
+# Harness names accepted by ``hook run --harness``. Duplicated from
+# ``hooks_cli.SUPPORTED_HARNESSES`` on purpose: the parser is rebuilt on every
+# CLI invocation and ``hooks_cli`` is a deliberate lazy import (see ``run_hook``)
+# to hold the startup budget, so importing it here to derive the list would put
+# the hook module on the critical path of every unrelated command.
+# ``test_cli_harness_choices_match_supported_harnesses`` asserts the two stay equal.
+HOOK_HARNESS_CHOICES = ("claude-code", "codex", "hermes")
+
+
 def main():
     """CLI entry point for the ``mempalace`` console script.
 
@@ -3477,7 +3486,7 @@ def main():
     p_hook_run.add_argument(
         "--harness",
         required=True,
-        choices=["claude-code", "codex"],
+        choices=list(HOOK_HARNESS_CHOICES),
         help="Harness type (determines stdin JSON format)",
     )
 

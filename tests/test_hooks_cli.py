@@ -15,6 +15,7 @@ import mempalace.hooks_cli as hooks_cli_mod
 from mempalace.config import sanitize_name
 from mempalace.hooks_cli import (
     SAVE_INTERVAL,
+    SUPPORTED_HARNESSES,
     _count_human_messages,
     _diary_agent_for_harness,
     _extract_recent_messages,
@@ -401,6 +402,27 @@ def test_stop_hook_tracks_save_point(tmp_path):
 def test_diary_agent_for_harness_maps_known_harnesses():
     assert _diary_agent_for_harness("claude-code") == "claude"
     assert _diary_agent_for_harness("codex") == "codex"
+    assert _diary_agent_for_harness("hermes") == "hermes"
+
+
+def test_every_supported_harness_has_its_own_diary_identity():
+    """No supported harness may borrow another one's diary name.
+
+    A harness absent from SUPPORTED_HARNESSES has to be invoked under a
+    different one, and _diary_agent_for_harness then files its checkpoints
+    into that agent's diary — the session's own diary_read finds nothing,
+    which is #1693 in a new shape.
+    """
+    agents = {h: _diary_agent_for_harness(h) for h in SUPPORTED_HARNESSES}
+    assert len(set(agents.values())) == len(agents), agents
+
+
+def test_cli_harness_choices_match_supported_harnesses():
+    """cli.py repeats the harness list so hooks_cli can stay a lazy import
+    (CLI startup budget). Guard the duplication against drift."""
+    from mempalace.cli import HOOK_HARNESS_CHOICES
+
+    assert set(HOOK_HARNESS_CHOICES) == SUPPORTED_HARNESSES
 
 
 def test_diary_agent_for_harness_unknown_falls_back_to_name():
@@ -413,7 +435,7 @@ def test_diary_agent_for_harness_unknown_falls_back_to_name():
 
 @pytest.mark.parametrize(
     "harness,expected_agent",
-    [("claude-code", "claude"), ("codex", "codex")],
+    [("claude-code", "claude"), ("codex", "codex"), ("hermes", "hermes")],
 )
 def test_stop_hook_files_checkpoint_under_harness_agent(tmp_path, harness, expected_agent):
     """The Stop hook must file checkpoints under the agent identity that the
