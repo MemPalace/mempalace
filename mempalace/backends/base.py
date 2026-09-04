@@ -710,3 +710,18 @@ class _IncludeSpec:
             distances="distances" in keys,
             embeddings="embeddings" in keys,
         )
+
+
+def collection_supports_facets(col) -> bool:
+    """True if ``col``'s backend implements server-side metadata facets.
+
+    Backends advertising ``supports_metadata_facets`` (qdrant/pgvector/milvus)
+    can answer ``facet_counts`` and keyword-indexed ``where`` filters remotely,
+    so callers may skip the client-side full-collection scan they otherwise
+    need on local backends. Tolerant of anything passed in — a collection with
+    no ``_backend``, or a backend with no ``capabilities``, is simply not
+    facet-capable.
+    """
+    backend = getattr(col, "_backend", None)
+    caps = getattr(backend, "capabilities", None)
+    return isinstance(caps, (set, frozenset)) and "supports_metadata_facets" in caps

@@ -21,6 +21,7 @@ from datetime import datetime
 from collections import defaultdict
 from typing import Optional
 
+from .backends import collection_supports_facets
 from .entity_detector import _apply_known_systems_prepass, _get_coca_filter
 from .palace import (
     NORMALIZE_VERSION,
@@ -2266,10 +2267,26 @@ def status(palace_path: str):
         print("  Run `mempalace repair --mode from-sqlite --archive-existing` first.")
         return
 
+    total = col.count()
+
+    # On backends with server-side metadata facets (qdrant/pgvector/milvus),
+    # count wing/room remotely instead of streaming every drawer's metadata
+    # over the wire — a full scan that costs minutes on a large shared
+    # collection. Mirrors the MCP status tool. Falls back to the paginated
+    # scan below on any facet error, and for local backends (chroma).
+    if collection_supports_facets(col):
+        try:
+            wing_rooms: dict = {}
+            for wing in col.facet_counts("wing"):
+                wing_rooms[wing] = dict(col.facet_counts("room", where={"wing": wing}))
+            _print_status(total, wing_rooms)
+            return
+        except Exception:
+            logger.debug("status: facet counting failed, falling back to scan", exc_info=True)
+
     # Count by wing and room — paginate to avoid SQLite "too many SQL
     # variables" error on large palaces (see #802, #850).
-    total = col.count()
-    wing_rooms: dict = defaultdict(lambda: defaultdict(int))
+    wing_rooms = defaultdict(lambda: defaultdict(int))
     batch_size = 5000
     offset = 0
     while offset < total:
