@@ -2100,9 +2100,10 @@ def search_memories(
     CLOSET_RANK_BOOSTS = [0.40, 0.25, 0.15, 0.08, 0.04]
     CLOSET_DISTANCE_CAP = 1.5  # cosine dist > 1.5 = too weak to use as signal
 
-    scored: list = []
     drawer_docs = _first_or_empty(drawer_results, "documents")
     stored_drawer_ids = _aligned_query_ids(drawer_results, len(drawer_docs))
+
+    scored: list = []
     for stored_drawer_id, doc, meta, dist in zip(
         stored_drawer_ids,
         drawer_docs,
@@ -2158,6 +2159,11 @@ def search_memories(
             "_source_file_full": source,
             "_chunk_index": meta.get("chunk_index"),
             "_parent_drawer_id": meta.get("parent_drawer_id"),
+            # Internal: logical (parent) drawer id for this hit, falling back to
+            # the row id for non-chunked drawers. Retained past the strip below
+            # so tool_search can increment per-drawer retrieval counters; it is
+            # popped there before the response reaches the caller.
+            "_logical_drawer_id": meta.get("parent_drawer_id") or stored_drawer_id,
         }
         if closet_preview:
             entry["closet_preview"] = closet_preview
