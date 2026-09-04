@@ -10,6 +10,7 @@ import pickle
 import re
 import shlex
 import sqlite3
+import struct
 import time
 from collections import defaultdict
 from numbers import Integral
@@ -53,6 +54,57 @@ _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 # Treat only >10x as corruption so normal flush lag or small segments do not get
 # quarantined.
 _HNSW_LINK_TO_DATA_MAX_RATIO = 10.0
+_HNSW_PERSISTENCE_VERSION = 1
+_HNSW_SANE_ELEMENT_CAP = 50_000_000
+# Current chroma-hnswlib header.bin prefix: native-endian int version,
+# followed by 64-bit size_t offsetLevel0, max_elements, and current_count.
+_HNSW_HEADER_PREFIX = struct.Struct("=iQQQ")
+
+
+def _read_hnsw_binary_header(
+    segment_dir: str,
+) -> Optional[dict[str, int]]:
+    """Read the version and count prefix from chroma-hnswlib header.bin."""
+    if struct.calcsize("P") != 8:
+        return None
+
+    header_path = os.path.join(segment_dir, "header.bin")
+    try:
+        with open(header_path, "rb") as handle:
+            raw = handle.read(_HNSW_HEADER_PREFIX.size)
+    except OSError:
+        return None
+
+    if len(raw) != _HNSW_HEADER_PREFIX.size:
+        return None
+
+    try:
+        version, offset_level0, max_elements, current_count = _HNSW_HEADER_PREFIX.unpack(raw)
+    except struct.error:
+        return None
+
+    return {
+        "persistence_version": int(version),
+        "offset_level0": int(offset_level0),
+        "max_elements": int(max_elements),
+        "cur_element_count": int(current_count),
+    }
+
+
+def _hnsw_binary_header_has_impossible_counts(
+    header: dict[str, int],
+) -> bool:
+    """Return True only for impossible counts in the known v1 layout."""
+    if header.get("persistence_version") != _HNSW_PERSISTENCE_VERSION:
+        return False
+
+    max_elements = int(header["max_elements"])
+    current_count = int(header["cur_element_count"])
+    return (
+        current_count > max_elements
+        or max_elements > _HNSW_SANE_ELEMENT_CAP
+        or current_count > _HNSW_SANE_ELEMENT_CAP
+    )
 
 
 def _hnsw_link_to_data_ratio(seg_dir: str) -> Optional[float]:
@@ -434,6 +486,10 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     files and quarantine_stale_hnsw would conservatively rename them
     out of the way.
     """
+    binary_header = _read_hnsw_binary_header(seg_dir)
+    if binary_header is not None and _hnsw_binary_header_has_impossible_counts(binary_header):
+        return False
+
     meta_path = os.path.join(seg_dir, "index_metadata.pickle")
 
     if not os.path.isfile(meta_path):
@@ -455,7 +511,7 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
 def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> list[str]:
     """Rename HNSW segment dirs that look unsafe to open.
 
-    This catches two classes of HNSW corruption before ChromaDB opens the
+    This catches three classes of HNSW corruption before ChromaDB opens the
     native segment reader:
 
     1. stale-by-mtime segments whose ``index_metadata.pickle`` fails the
@@ -506,14 +562,18 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
 
         payload_ratio = _hnsw_link_to_data_ratio(seg_dir)
         payload_corrupt = payload_ratio is not None and payload_ratio > _HNSW_LINK_TO_DATA_MAX_RATIO
+        binary_header = _read_hnsw_binary_header(seg_dir)
+        header_corrupt = binary_header is not None and _hnsw_binary_header_has_impossible_counts(
+            binary_header
+        )
 
-        if not payload_corrupt and sqlite_mtime - hnsw_mtime < stale_seconds:
+        if not payload_corrupt and not header_corrupt and sqlite_mtime - hnsw_mtime < stale_seconds:
             continue
 
         # Stage 2: integrity gate. Mtime drift alone is not corruption because
         # Chroma flushes HNSW asynchronously. A healthy metadata file proves the
         # ordinary stale-by-mtime case is just flush lag.
-        if not payload_corrupt and _segment_appears_healthy(seg_dir):
+        if not payload_corrupt and not header_corrupt and _segment_appears_healthy(seg_dir):
             logger.info(
                 "HNSW mtime gap %.0fs on %s exceeds threshold but segment "
                 "metadata and payload size are intact — flush-lag, not "
@@ -526,7 +586,13 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
         stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         target = f"{seg_dir}.drift-{stamp}"
 
-        if payload_corrupt:
+        if header_corrupt:
+            reason = (
+                "header.bin contains impossible HNSW element counts "
+                f"(max={binary_header['max_elements']:,}, "
+                f"current={binary_header['cur_element_count']:,})"
+            )
+        elif payload_corrupt:
             reason = (
                 f"link_lists.bin/data_level0.bin ratio {payload_ratio:.1f}x "
                 f"exceeds {_HNSW_LINK_TO_DATA_MAX_RATIO:.1f}x"
@@ -867,6 +933,22 @@ def _pickle_signature(palace_path: str, segment_id: Optional[str]) -> tuple[int,
     return _stat_signature(os.path.join(palace_path, segment_id, "index_metadata.pickle"))
 
 
+def _header_signature(
+    palace_path: str,
+    segment_id: Optional[str],
+) -> tuple[int, int, int]:
+    """Signature of the segment's header.bin."""
+    if not segment_id:
+        return (0, 0, 0)
+    return _stat_signature(
+        os.path.join(
+            palace_path,
+            segment_id,
+            "header.bin",
+        )
+    )
+
+
 def _segment_id_safe(palace_path: str, collection_name: str) -> Optional[str]:
     """``_vector_segment_id`` that never raises, for the pre-probe signature."""
     try:
@@ -876,15 +958,19 @@ def _segment_id_safe(palace_path: str, collection_name: str) -> Optional[str]:
 
 
 def _capacity_fingerprint(palace_path: str, segment_id: Optional[str]) -> tuple:
-    """Signature over every file the probe reads: the sqlite family + the pickle.
+    """Signature over every file the probe reads: sqlite, pickle, and header.
 
-    Both halves must be captured for the same ``segment_id`` so a rewrite of
+    All parts must be captured for the same ``segment_id`` so a rewrite of
     ``index_metadata.pickle`` is caught. The probe reads that pickle partway
     through, then makes two more sqlite calls, so a signature taken only after
     the probe returned would record a mid-probe pickle rewrite as "unchanged"
     while the verdict still reflected the pre-write file (#1471 review).
     """
-    return (_db_family_signature(palace_path), _pickle_signature(palace_path, segment_id))
+    return (
+        _db_family_signature(palace_path),
+        _pickle_signature(palace_path, segment_id),
+        _header_signature(palace_path, segment_id),
+    )
 
 
 def reset_hnsw_capacity_cache() -> None:
@@ -956,7 +1042,7 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
     # Snapshot the files the probe is about to read, before it reads them, and
     # again after — using the segment id the probe itself resolved. Caching
     # only when both snapshots agree makes an external write during the probe
-    # (sqlite OR the pickle) fall through uncached rather than pin a verdict
+    # (sqlite, pickle, OR header) fall through uncached rather than pin a verdict
     # the disk no longer supports.
     before = _capacity_fingerprint(palace_path, _segment_id_safe(palace_path, collection_name))
     out = _hnsw_capacity_status_uncached(palace_path, collection_name)
@@ -1004,6 +1090,31 @@ def _hnsw_capacity_status_uncached(
 
         if seg_id is None or sqlite_count is None:
             out["message"] = "palace state unreadable; skipping HNSW capacity check"
+            return out
+
+        binary_header = _read_hnsw_binary_header(
+            os.path.join(
+                palace_path,
+                seg_id,
+            )
+        )
+        if binary_header is not None and _hnsw_binary_header_has_impossible_counts(binary_header):
+            out.update(
+                {
+                    "status": "diverged",
+                    "diverged": True,
+                    "hnsw_binary_persistence_version": binary_header["persistence_version"],
+                    "hnsw_binary_max_elements": binary_header["max_elements"],
+                    "hnsw_binary_cur_element_count": binary_header["cur_element_count"],
+                    "message": (
+                        "HNSW header.bin contains impossible element counts "
+                        f"(max={binary_header['max_elements']:,}, "
+                        f"current={binary_header['cur_element_count']:,}). "
+                        "Vector reads are disabled until `mempalace repair` "
+                        "rebuilds the index."
+                    ),
+                }
+            )
             return out
 
         hnsw_count = _hnsw_element_count(palace_path, seg_id)
