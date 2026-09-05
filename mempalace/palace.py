@@ -12,7 +12,7 @@ import re
 import sys
 import threading
 import time
-from typing import Optional
+from typing import List, Optional
 
 from .backends import (
     BackendClosedError,
@@ -211,6 +211,71 @@ def _enforce_embedder_identity(
     _VALIDATED_IDENTITY.add(key)
 
 
+# The closets collection name is fixed (not user-configurable) — it is the
+# searchable index layer and MemPalace never opens a differently-named closets
+# store. Mirrored independently in repair.py as ``CLOSETS_COLLECTION_NAME``.
+CLOSETS_COLLECTION_NAME = "mempalace_closets"
+
+
+def _allowed_wrapper_collection_names() -> List[str]:
+    """The collection names the ``get_collection`` wrapper routes through.
+
+    Only two stores are first-class to MemPalace: the configured drawers
+    collection (default ``mempalace_drawers``, overridable in config) and the
+    closets collection. Every other name points at a store the search/CLI/MCP
+    layer never reads — the exact silent-miss failure of issue ``#2347``.
+    """
+    from .config import get_configured_collection_name
+
+    allowed = [get_configured_collection_name(), CLOSETS_COLLECTION_NAME]
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in allowed:
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+class CollectionNameMismatchError(ValueError):
+    """Raised when ``get_collection(collection_name=...)`` names a collection the
+    palace wrapper does not own.
+
+    The wrapper (``mempalace.palace.get_collection``) front-loads exactly two
+    collections: the configured drawers collection (default
+    ``mempalace_drawers``, overridable in config) and ``mempalace_closets`` (the
+    searchable index layer). Opening any other name would create or touch a
+    store the rest of MemPalace never reads — so data upserted through it would
+    be invisible to search, MCP, and repair — instead of the caller discovering
+    the miss once their reads come back empty.
+
+    Subclass of :class:`ValueError` so callers that already catch the generic
+    type for a bad string keep working, while ``except
+    CollectionNameMismatchError`` gives the specific signal. This is a distinct
+    failure from :class:`mempalace.backends.CollectionNotInitializedError`
+    (palace + DB present, collection simply not bootstrapped yet): this one means
+    the *name* is not one MemPalace routes reads/writes through.
+    """
+
+    def __init__(self, requested: str, allowed: List[str], palace_path: Optional[str] = None):
+        self.requested = requested
+        self.allowed = list(allowed)
+        self.palace_path = palace_path
+        where = f" in {palace_path}" if palace_path else ""
+        allowed_str = ", ".join(repr(n) for n in allowed)
+        super().__init__(
+            f"collection {requested!r} is not a MemPalace collection{where}: "
+            f"get_collection routes reads and writes through {allowed_str} only. "
+            f"Opening {requested!r} would create or touch a store the rest of "
+            f"MemPalace never reads, so data upserted through it would be "
+            f"invisible to search, MCP, and repair. Use one of the configured "
+            f"names — the drawers collection name (default "
+            f"'mempalace_drawers', overridable in config; expose it with "
+            f"``get_configured_collection_name()``) or the closets collection "
+            f"``get_closets_collection()`` — not an ad-hoc string."
+        )
+
+
 def get_collection(
     palace_path: str,
     collection_name: Optional[str] = None,
@@ -218,8 +283,27 @@ def get_collection(
     backend: Optional[str] = None,
     read_only: bool = False,
     _skip_identity_check: bool = False,
+    _skip_name_check: bool = False,
 ):
-    """Get the palace collection through the backend layer.
+    """Get a first-class MemPalace collection (drawers or closets).
+
+    The wrapper front-loads exactly two collections and is the public surface
+    MCP, miners, the search layer, and the CLI use to open a palace:
+
+    * the **drawers** collection — the verbatim document store. Its name is
+      configurable (default ``mempalace_drawers``); read it via
+      :func:`mempalace.config.get_configured_collection_name` rather than
+      hard-coding the string.
+    * the **closets** collection — the searchable index layer. Always named
+      :data:`mempalace.palace.CLOSETS_COLLECTION_NAME`` ("mempalace_closets");
+      open it through :func:`mempalace.palace.get_closets_collection`.
+
+    Any other name points to a store the rest of MemPalace never reads, so data
+    upserted through it stays invisible to search/CLI/MCP. ``get_collection``
+    therefore raises :class:`CollectionNameMismatchError` (a ``ValueError``)
+    naming both the offending and allowed strings, instead of silently creating
+    that orphan collection (issue ``#2347``). Passing ``collection_name=None``
+    resolves to the configured drawers name and always succeeds.
 
     ``read_only=True`` asks local backends to open storage without schema
     initialization, migrations, or metadata writes. Backends that support a
@@ -228,11 +312,22 @@ def get_collection(
     ``_skip_identity_check`` bypasses the embedder-identity enforcement so the
     ``set-embedder`` override path can open a palace whose recorded model
     differs from the current one (the very state it exists to repair).
+
+    ``_skip_name_check`` is the maintenance escape hatch for tools like
+    ``mempalace_repair_encoding --collection NAME`` that must be able to open a
+    legacy ad-hoc collection name deliberately created before this check
+    existed. Callers on this path take the risk of a mismatched-name orphan;
+    they are explicit and self-aware. The common programmatic-API misuse this
+    check exists to prevent never uses this flag and still fails loudly.
     """
     if collection_name is None:
         from .config import get_configured_collection_name
 
         collection_name = get_configured_collection_name()
+    if not _skip_name_check:
+        allowed = _allowed_wrapper_collection_names()
+        if collection_name not in allowed:
+            raise CollectionNameMismatchError(collection_name, allowed, palace_path)
     backend_obj = get_backend_for_palace(palace_path, explicit=backend)
     palace_ref = PalaceRef(id=palace_path, local_path=palace_path)
     backend_options = {"read_only": True} if read_only else None
