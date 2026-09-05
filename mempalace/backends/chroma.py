@@ -2604,20 +2604,6 @@ class ChromaBackend(BaseBackend):
             # path); an mtime/appearance change means an external in-place
             # write (closet_llm, mine, compress) that may have drifted the
             # HNSW index while this process was running.
-            if (
-                inode_changed
-                or mtime_changed
-                or (mtime_appeared and palace_path in self._freshness)
-            ):
-                ChromaBackend._quarantined_paths.discard(palace_path)
-                # #2028: the same external change means chromadb's path-keyed
-                # System cache is now stale. Reconstructing PersistentClient
-                # below would reuse the cached System (and its in-memory HNSW
-                # segment), so drop the shared cache first -- otherwise the
-                # rebuilt client persists an outdated index over the on-disk
-                # change. Gated on genuine external change (not first open) so
-                # cold opens never pay the global-evict cost.
-                _clear_chroma_system_cache()
             # Release the client we are about to displace. Each live
             # PersistentClient pins its own copy of every HNSW segment it has
             # opened (``max_elements * size_data_per_element`` bytes -- ~440 MB
@@ -2629,7 +2615,32 @@ class ChromaBackend(BaseBackend):
             # point is invalidated -- which is the intent: the rebuild only
             # fires when the palace changed underneath us, and serving the
             # pre-change segment is the stale-index class of #2002/#2028.
+            #
+            # This must run BEFORE _clear_chroma_system_cache(): PersistentClient
+            # releases its native index memory via ``System.stop()`` -- but it
+            # does so through the shared registry (``SharedSystemClient
+            # ._release_system(self._identifier)`` ), so the registry must still
+            # hold this client's identifier. Clearing the cache first empties
+            # it, so ``close()`` becomes a silent no-op and every external-change
+            # rebuild orphans one HNSW segment set. Closing first lets
+            # ``System.stop()`` actually fire, then we drop the (now empty for
+            # this path) shared System cache so the PersistentClient below is
+            # rebuilt fresh.
             _close_client(self._clients.pop(palace_path, None))
+            # #2028: the same external change means chromadb's path-keyed
+            # System cache is now stale. Reconstructing PersistentClient below
+            # would reuse the cached System (and its in-memory HNSW segment),
+            # so drop the shared cache -- otherwise the rebuilt client persists
+            # an outdated index over the on-disk change. Gated on genuine
+            # external change (not first open) so cold opens never pay the
+            # global-evict cost.
+            if (
+                inode_changed
+                or mtime_changed
+                or (mtime_appeared and palace_path in self._freshness)
+            ):
+                ChromaBackend._quarantined_paths.discard(palace_path)
+                _clear_chroma_system_cache()
             ChromaBackend._prepare_palace_for_open(palace_path)
             cached = chromadb.PersistentClient(path=palace_path)
             self._clients[palace_path] = cached

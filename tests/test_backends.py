@@ -2090,6 +2090,116 @@ def test_chroma_backend_resets_system_cache_on_inode_change(tmp_path, monkeypatc
     ], events
 
 
+def test_chroma_backend_closes_displaced_client_before_clearing_cache(tmp_path, monkeypatch):
+    """#2375: on the rebuild branch ``_client`` must ``close()`` the displaced
+    client BEFORE evicting chromadb's shared ``System`` cache.
+
+    ``PersistentClient.close()`` releases native HNSW segment memory via
+    ``System.stop()``, but it does so through the shared registry, keyed by the
+    client's identifier. ``clear_system_cache()`` empties that registry, so if
+    it runs first the ``close()`` that follows can no longer find the
+    identifier -- ``System.stop()`` is silently skipped and every
+    external-change rebuild orphans one HNSW segment set (the native-index leak
+    in the #2002/#2028 stale-data class). Closing first keeps a long-lived
+    server flat across rebuilds.
+
+    This is the same surface as ``test_chroma_backend_resets_system_cache_on_inode_change``
+    (which pins that a clear fires on a genuine external change) but asserts the
+    *relative* order of close vs clear. Under the pre-fix ordering (clear then
+    close) the rebuild branch emits ``[..., "clear", "close", "open"]`` and this
+    test FAILS; with the fix it emits ``[..., "close", "clear", "open"]``.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("")
+
+    events = []
+
+    # Neutralize the on-disk HNSW pre-checks so only cache/close ordering is
+    # exercised (mirrors the sibling #2028 test).
+    for _name in (
+        "_fix_missing_collection_type",
+        "_fix_blob_seq_ids",
+        "quarantine_invalid_hnsw_metadata",
+        "quarantine_stale_hnsw",
+    ):
+        monkeypatch.setattr(f"mempalace.backends.chroma.{_name}", lambda *a, **k: [])
+    monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
+
+    monkeypatch.setattr(
+        "mempalace.backends.chroma._close_client", lambda client: events.append("close")
+    )
+
+    from chromadb.api.client import SharedSystemClient
+
+    def _record_clear(*args, **kwargs):
+        events.append("clear")
+
+    monkeypatch.setattr(SharedSystemClient, "clear_system_cache", _record_clear)
+
+    def _record_open(path):
+        events.append("open")
+        return object()
+
+    monkeypatch.setattr("mempalace.backends.chroma.chromadb.PersistentClient", _record_open)
+
+    backend = ChromaBackend()
+    # Same stat pattern as the sibling #2028 test: first open (no prior
+    # freshness -> no external change -> no clear), then an inode change.
+    stats = iter([(1, 1.0), (1, 1.0), (2, 2.0), (2, 2.0)])
+    monkeypatch.setattr(backend, "_db_stat", lambda path: next(stats))
+
+    backend._client(str(palace))  # cold open: close(no-op, first), no clear, open
+    backend._client(str(palace))  # inode 1 -> 2: close(displaced) -> clear -> open
+
+    # Rebuild branch (last three events): close FIRST, then clear, then reopen.
+    # A pre-fix (clear-then-close) ordering would read [..., "clear", "close", "open"].
+    assert events[-3:] == ["close", "clear", "open"], events
+    # And the cold (first) open still pays no clear -- the global-evict cost is
+    # gated to genuine external change, as in the sibling #2028 test.
+    assert events[:2] == ["close", "open"], events
+
+
+def test_chroma_displaced_client_close_stops_system_before_cache_clear(monkeypatch):
+    """#2375 mechanism: closing a ``PersistentClient`` only stops its ``System``
+    (releasing native HNSW memory) if the shared registry still holds the
+    client's identifier. Proves the load-bearing reason close must precede
+    ``clear_system_cache()``: registry clear first -> ``System.stop()`` never
+    called; close first -> ``System.stop()`` fires.
+    """
+    from chromadb.api.client import SharedSystemClient
+
+    stops = []
+
+    class _FakeSystem:
+        def stop(self):
+            stops.append("stopped")
+
+    # Restore the class-level registries after the test regardless of outcome.
+    saved_system = SharedSystemClient._identifier_to_system
+    saved_refcount = SharedSystemClient._identifier_to_refcount
+    ident = "#2375-mechanism"
+    try:
+        # Case A: clear the cache FIRST (the pre-fix ordering), then close.
+        # The identifier is already gone, so close() cannot stop the System.
+        SharedSystemClient._identifier_to_system[ident] = _FakeSystem()
+        SharedSystemClient._identifier_to_refcount[ident] = 1
+        SharedSystemClient.clear_system_cache()
+        SharedSystemClient._release_system(ident)  # what PersistentClient.close() calls
+        assert stops == [], stops  # silent no-op: HNSW set orphaned (the bug)
+
+        # Case B: close FIRST (the fix), then clear the cache.
+        # The identifier is still registered, so close() stops the System.
+        SharedSystemClient._identifier_to_system[ident] = _FakeSystem()
+        SharedSystemClient._identifier_to_refcount[ident] = 1
+        SharedSystemClient._release_system(ident)  # PersistentClient.close()
+        SharedSystemClient.clear_system_cache()
+        assert stops == ["stopped"], stops  # System.stop() fired: native memory released
+    finally:
+        SharedSystemClient._identifier_to_system = saved_system
+        SharedSystemClient._identifier_to_refcount = saved_refcount
+
+
 def test_explain_ef_mismatch_recognizes_chromadb_conflict():
     """When ChromaDB rejects a collection read due to an EF-name mismatch
     (user changed MEMPALACE_EMBEDDING_MODEL on an existing palace), the
