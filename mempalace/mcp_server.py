@@ -4125,8 +4125,20 @@ def tool_kg_add(
         },
     )
 
-    triple_id = _call_kg(
-        lambda kg: kg.add_triple(
+    def _add_with_status(kg):
+        # KG identities are normalized case-insensitively and collapse
+        # spaces/apostrophes. Mirror that key here so the MCP response
+        # reports reuse even when callers spell the same entity differently.
+        normalized_predicate = predicate.lower().replace(" ", "_")
+        normalized_object = object.lower().replace(" ", "_").replace("'", "")
+        already_exists = any(
+            fact.get("current") is True
+            and fact.get("predicate") == normalized_predicate
+            and str(fact.get("object") or "").lower().replace(" ", "_").replace("'", "")
+            == normalized_object
+            for fact in kg.query_entity(subject, direction="outgoing")
+        )
+        triple_id = kg.add_triple(
             subject,
             predicate,
             object,
@@ -4136,8 +4148,17 @@ def tool_kg_add(
             source_file=source_file,
             source_drawer_id=source_drawer_id,
         )
-    )
-    return {"success": True, "triple_id": triple_id, "fact": f"{subject} → {predicate} → {object}"}
+        return triple_id, already_exists
+
+    triple_id, already_exists = _call_kg(_add_with_status)
+    result = {
+        "success": True,
+        "triple_id": triple_id,
+        "fact": f"{subject} → {predicate} → {object}",
+    }
+    if already_exists:
+        result["reason"] = "already_exists"
+    return result
 
 
 def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
