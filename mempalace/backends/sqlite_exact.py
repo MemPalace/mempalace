@@ -297,13 +297,16 @@ def _equality_where_sql(where: Optional[dict]) -> Optional[tuple[str, list]]:
     return (" AND ".join(clauses) if clauses else "1=1"), params
 
 
-def _cosine_distances(mat: np.ndarray, query: np.ndarray) -> np.ndarray:
+def _cosine_distances(
+    mat: np.ndarray, query: np.ndarray, norms: Optional[np.ndarray] = None
+) -> np.ndarray:
     """Exact cosine distance (1 - cos) for every row of ``mat`` vs ``query``."""
     q = np.asarray(query, dtype=np.float32)
     if mat.size == 0:
         return np.zeros((0,), dtype=np.float32)
     q_norm = float(np.linalg.norm(q))
-    norms = np.linalg.norm(mat, axis=1)
+    if norms is None:
+        norms = np.linalg.norm(mat, axis=1)
     denom = norms * q_norm
     dots = mat @ q
     cos = np.zeros(dots.shape, dtype=np.float32)
@@ -468,9 +471,8 @@ class _SQLiteExactHandle:
         # collection_id -> (ids, float32 matrix, mini-metadata). Filled lazily
         # by query() so a long-lived hub does not re-read every embedding blob
         # on the next search. Mini-metadata is wing/room/source_file for
-        # in-memory equality filters. Cleared on any write through this handle;
         # ``_vector_cache_data_version`` detects commits from other handles.
-        self._vector_cache: dict[int, tuple[list[str], np.ndarray, list[dict]]] = {}
+        self._vector_cache: dict[int, tuple[list[str], np.ndarray, np.ndarray, list[dict]]] = {}
         self._vector_cache_data_version: Optional[int] = None
 
 
@@ -894,7 +896,8 @@ class SQLiteExactCollection(BaseCollection):
         with self._cursor() as cur:
             collection_id = self._collection_id(cur)
             expected_dim = self._collection_dimension(cur, collection_id)
-            ids, mat = self._rank_vectors(
+
+            ids, mat, norms = self._rank_vectors(
                 cur, collection_id, where=where, where_document=where_document
             )
 
@@ -918,9 +921,14 @@ class SQLiteExactCollection(BaseCollection):
                         f"sqlite_exact collection {self._collection_name!r} expects "
                         f"embedding dimension {int(mat.shape[1])}, got {int(q.size)}"
                     )
-                dist = _cosine_distances(mat, q)
+                dist = _cosine_distances(mat, q, norms)
                 k = min(n_results, int(dist.size))
-                order = np.argsort(dist, kind="mergesort")[:k]
+                if k < int(dist.size):
+                    partition = np.argpartition(dist, k)[:k]
+                    sub_order = np.argsort(dist[partition], kind="mergesort")
+                    order = partition[sub_order]
+                else:
+                    order = np.argsort(dist, kind="mergesort")
                 top_ids = [ids[int(i)] for i in order]
                 docs_by_id: dict[str, str] = {}
                 metas_by_id: dict[str, dict] = {}
@@ -952,11 +960,12 @@ class SQLiteExactCollection(BaseCollection):
         *,
         where,
         where_document,
-    ) -> tuple[list[str], np.ndarray]:
-        """Load (ids, embedding matrix) for exact cosine ranking.
+    ) -> tuple[list[str], np.ndarray, np.ndarray]:
+        """Load (ids, embedding matrix, norms) for exact cosine ranking.
 
-        The full embedding matrix is cached on the handle after the first
-        scan so later searches — filtered or not — do not re-read blobs.
+        The full embedding matrix and precomputed norms are cached on the
+        handle after the first scan so later searches — filtered or not —
+        do not re-read blobs or recompute vector norms.
         Equality filters then restrict by id; other filters fall back to
         ``_rows`` only to decide membership.
         """
@@ -964,6 +973,7 @@ class SQLiteExactCollection(BaseCollection):
         _validate_where(where_document)
         expected = self._collection_dimension(cur, collection_id)
         empty = np.zeros((0, expected or 0), dtype=np.float32)
+        empty_norms = np.zeros((0,), dtype=np.float32)
         data_version = int(cur.execute("PRAGMA data_version").fetchone()[0])
         if self._handle._vector_cache_data_version != data_version:
             self._handle._vector_cache.clear()
@@ -972,11 +982,11 @@ class SQLiteExactCollection(BaseCollection):
         if cached is None:
             cached = self._load_all_vectors(cur, collection_id, expected)
             self._handle._vector_cache[collection_id] = cached
-        ids, mat, metas = cached
+        ids, mat, norms, metas = cached
         if not where and not where_document:
-            return ids, mat
+            return ids, mat, norms
         if mat.size == 0:
-            return ids, mat
+            return ids, mat, norms
         if where_document or not _where_uses_only_cached_keys(where):
             wanted = {
                 row["id"] for row in self._rows(cur, where=where, where_document=where_document)
@@ -985,13 +995,17 @@ class SQLiteExactCollection(BaseCollection):
         else:
             keep = [i for i, meta in enumerate(metas) if _matches_where(meta, where)]
         if not keep:
-            return [], empty if mat.size == 0 else np.zeros((0, mat.shape[1]), dtype=np.float32)
+            return (
+                [],
+                empty if mat.size == 0 else np.zeros((0, mat.shape[1]), dtype=np.float32),
+                empty_norms,
+            )
         idx = np.array(keep, dtype=np.intp)
-        return [ids[i] for i in keep], mat[idx]
+        return [ids[i] for i in keep], mat[idx], norms[idx]
 
     def _load_all_vectors(
         self, cur, collection_id: int, expected: Optional[int]
-    ) -> tuple[list[str], np.ndarray, list[dict]]:
+    ) -> tuple[list[str], np.ndarray, np.ndarray, list[dict]]:
         rows = cur.execute(
             """
             SELECT id, embedding, wing, room,
@@ -1022,8 +1036,15 @@ class SQLiteExactCollection(BaseCollection):
                 meta["source_file"] = source_file
             metas.append(meta)
         if not vecs:
-            return ids, np.zeros((0, expected or 0), dtype=np.float32), metas
-        return ids, np.stack(vecs), metas
+            return (
+                ids,
+                np.zeros((0, expected or 0), dtype=np.float32),
+                np.zeros((0,), dtype=np.float32),
+                metas,
+            )
+        mat = np.stack(vecs)
+        norms = np.linalg.norm(mat, axis=1)
+        return ids, mat, norms, metas
 
     def _hydrate(self, cur, collection_id: int, ids: list[str], spec) -> tuple[dict, dict]:
         docs: dict[str, str] = {}
