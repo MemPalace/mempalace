@@ -254,15 +254,20 @@ Query entity relationships with time filtering. Defaults to one-hop; set `recurs
 
 ### `mempalace_kg_add`
 
-Add a fact to the knowledge graph.
+Add a fact to the knowledge graph. Subject → predicate → object with optional time window. Pass `valid_to` to backfill an already-ended historical fact in a single call.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `subject` | string | **Yes** | The entity doing/being something |
 | `predicate` | string | **Yes** | Relationship type (e.g. "loves", "works_on") |
 | `object` | string | **Yes** | The entity being connected to |
-| `valid_from` | string | No | When this became true (YYYY-MM-DD) |
+| `valid_from` | string | No | When this became true (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ) |
+| `valid_to` | string | No | When this stopped being true (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ). Use for backfilling already-ended historical facts |
 | `source_closet` | string | No | Closet ID where this fact appears |
+| `source_file` | string | No | Source file path the fact was extracted from |
+| `source_drawer_id` | string | No | Drawer ID the fact was extracted from (RFC 002 provenance) |
+
+> Parameters are strict-validated: passing a key not listed above fails the whole call with JSON-RPC `-32602 Unknown parameter`, it is not ignored.
 
 **Returns:** `{ success, triple_id, fact }`
 
