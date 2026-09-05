@@ -2419,38 +2419,51 @@ def cmd_palace_set_embedder(args):
     """Record (or force-override) a palace's embedder identity (RFC 001).
 
     Resolves the ``unknown`` state for a legacy palace, or records a specific
-    model with ``--model``. It records identity on the palace only; it does not
-    change the configured model — when the two differ it prints how to align
+    model with ``--model``. Both the drawers and the closets collection are
+    recorded — a palace whose closets keep an unknown identity never gets the
+    fail-fast model-swap check that ``_enforce_embedder_identity`` provides.
+    It records identity on the palace only; it does not change the configured
+    model — when the two differ it prints how to align
     ``MEMPALACE_EMBEDDING_MODEL``. ``--force`` overwrites an existing,
     differently-named identity.
     """
     from .backends.base import EmbedderIdentityMismatchError
     from .palace import set_palace_embedder_identity
+    from .repair import RECOVERABLE_COLLECTIONS
 
     config = MempalaceConfig()
     palace_path = os.path.abspath(
         os.path.expanduser(args.palace) if args.palace else config.palace_path
     )
     model = getattr(args, "model", None)
-    try:
-        old, new = set_palace_embedder_identity(
-            palace_path,
-            model=model,
-            force=getattr(args, "force", False),
-            backend=_backend_arg(args),
-        )
-    except EmbedderIdentityMismatchError as exc:
-        print(f"  ✗ {exc}")
-        raise SystemExit(2) from exc
-    if old is None:
-        print(f"  ✓ recorded embedder identity: {new.model_name} (dim={new.dimension})")
-    elif old.model_name == new.model_name:
-        print(f"  ✓ embedder identity unchanged: {new.model_name} (dim={new.dimension})")
-    else:
-        print(
-            f"  ✓ embedder identity changed: {old.model_name} → {new.model_name} "
-            f"(dim={new.dimension})"
-        )
+    new = None
+    for collection_name in RECOVERABLE_COLLECTIONS:
+        try:
+            old, new = set_palace_embedder_identity(
+                palace_path,
+                model=model,
+                force=getattr(args, "force", False),
+                backend=_backend_arg(args),
+                collection_name=collection_name,
+            )
+        except EmbedderIdentityMismatchError as exc:
+            print(f"  ✗ {collection_name}: {exc}")
+            raise SystemExit(2) from exc
+        if old is None:
+            print(
+                f"  ✓ recorded embedder identity on {collection_name}: "
+                f"{new.model_name} (dim={new.dimension})"
+            )
+        elif old.model_name == new.model_name:
+            print(
+                f"  ✓ embedder identity unchanged on {collection_name}: "
+                f"{new.model_name} (dim={new.dimension})"
+            )
+        else:
+            print(
+                f"  ✓ embedder identity changed on {collection_name}: "
+                f"{old.model_name} → {new.model_name} (dim={new.dimension})"
+            )
     # set-embedder records the palace's identity; it does not change the
     # configured model. If they differ, the next normal open would mismatch —
     # tell the user how to align them.
