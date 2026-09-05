@@ -3157,6 +3157,12 @@ def main():
     p_init = sub.add_parser("init", help="Detect rooms from your folder structure")
     p_init.add_argument("dir", help="Project directory to set up")
     p_init.add_argument(
+        "--palace",
+        default=argparse.SUPPRESS,
+        help="Where the palace lives (default: from ~/.mempalace/config.json or ~/.mempalace/palace); "
+        "may be passed before or after the subcommand — both positions are accepted (#2366)",
+    )
+    p_init.add_argument(
         "--backend",
         default=None,
         help="Storage backend to persist for this palace (default: chroma)",

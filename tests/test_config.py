@@ -309,6 +309,59 @@ def test_env_path_legacy_alias_normalized():
         del os.environ["MEMPAL_PALACE_PATH"]
 
 
+def test_env_path_mempalace_palace_alias():
+    """#2366: ``MEMPALACE_PALACE`` (the short form the reporter used) is
+    honored for ``palace_path`` with the same abspath+expanduser normalization
+    as ``MEMPALACE_PALACE_PATH`` and legacy ``MEMPAL_PALACE_PATH``. The issue
+    body's exact failing step is ``MEMPALACE_PALACE=/custom/path/palace
+    mempalace status`` — pre-fix this resolved to the hardcoded default.
+    """
+    os.environ.pop("MEMPALACE_PALACE_PATH", None)
+    os.environ.pop("MEMPAL_PALACE_PATH", None)
+    raw = os.path.join("~", "custom", "path", "palace")
+    os.environ["MEMPALACE_PALACE"] = raw
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert ".." not in cfg.palace_path
+        assert cfg.palace_path == os.path.abspath(os.path.expanduser(raw))
+        assert cfg.palace_path.endswith("custom" + os.sep + "path" + os.sep + "palace")
+    finally:
+        del os.environ["MEMPALACE_PALACE"]
+
+
+def test_env_path_primary_wins_over_alias():
+    """Precedence contract: ``MEMPALACE_PALACE_PATH`` (the documented primary)
+    must win over the ``MEMPALACE_PALACE`` alias, which must win over legacy
+    ``MEMPAL_PALACE_PATH``. Guards against the new alias being inserted ahead
+    of the primary and silently overriding it.
+    """
+    os.environ["MEMPALACE_PALACE_PATH"] = "/primary/should/wins"
+    os.environ["MEMPALACE_PALACE"] = "/alias/should/lose"
+    os.environ["MEMPAL_PALACE_PATH"] = "/legacy/should/lose"
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert cfg.palace_path == os.path.abspath("/primary/should/wins")
+    finally:
+        del os.environ["MEMPALACE_PALACE_PATH"]
+        del os.environ["MEMPALACE_PALACE"]
+        del os.environ["MEMPAL_PALACE_PATH"]
+
+
+def test_env_alias_wins_over_legacy():
+    """The ``MEMPALACE_PALACE`` alias outranks legacy ``MEMPAL_PALACE_PATH``
+    (both are newer than the legacy name), even when the legacy name is set.
+    """
+    os.environ.pop("MEMPALACE_PALACE_PATH", None)
+    os.environ["MEMPALACE_PALACE"] = "/alias/wins"
+    os.environ["MEMPAL_PALACE_PATH"] = "/legacy/loses"
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert cfg.palace_path == os.path.abspath("/alias/wins")
+    finally:
+        del os.environ["MEMPALACE_PALACE"]
+        del os.environ["MEMPAL_PALACE_PATH"]
+
+
 def test_init():
     tmpdir = tempfile.mkdtemp()
     cfg = MempalaceConfig(config_dir=tmpdir)

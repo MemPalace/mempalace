@@ -926,6 +926,46 @@ def test_main_init_dispatches():
         mock_cmd.assert_called_once()
 
 
+def test_main_init_accepts_palace_after_subcommand():
+    """Regression for #2366: ``mempalace init <dir> --palace <path>`` must
+    parse, not raise ``unrecognized arguments: --palace``.
+
+    Pre-fix, ``--palace`` was registered only on the *global* parser, so the
+    natural (human-readable) invocation order the reporter used in the issue
+    body — flag after the subcommand/positional — was rejected. Mirroring the
+    existing ``p_serve`` ``--palace`` (#1877) added a subcommand-level
+    ``--palace`` on ``p_init`` with ``default=argparse.SUPPRESS`` so it cannot
+    clobber the global value on Python <3.12, yet both positions work.
+
+    We assert on the *parsed* ``args.palace`` rather than the env-stamp in
+    ``cmd_init`` (covered by ``test_cmd_init_honors_palace_flag``) — the parser
+    is the layer that was actually broken.
+    """
+    captured = {}
+    with (
+        patch("sys.argv", ["mempalace", "init", "/some/project", "--palace", "/custom/palace"]),
+        patch("mempalace.cli.cmd_init", side_effect=lambda args: captured.update(args.__dict__)),
+    ):
+        main()  # pre-fix would have raised SystemExit("unrecognized arguments") here
+    assert captured["palace"] == "/custom/palace", captured
+    assert captured["dir"] == "/some/project", captured
+
+
+def test_main_init_accepts_palace_before_subcommand():
+    """The global-order invocation (``--palace <path> init <dir>``) — the form
+    ``#1313``'s fix added — must keep working alongside the new natural order.
+    Together the two tests pin the full "either position is accepted" contract.
+    """
+    captured = {}
+    with (
+        patch("sys.argv", ["mempalace", "--palace", "/custom/palace", "init", "/some/project"]),
+        patch("mempalace.cli.cmd_init", side_effect=lambda args: captured.update(args.__dict__)),
+    ):
+        main()
+    assert captured["palace"] == "/custom/palace", captured
+    assert captured["dir"] == "/some/project", captured
+
+
 def test_main_mine_dispatches():
     with (
         patch("sys.argv", ["mempalace", "mine", "/some/dir"]),
