@@ -1,0 +1,11 @@
+import { Database } from "bun:sqlite";
+const db = new Database("C:/Users/igorl/.mempalace/palace/sqlite_exact.sqlite3", { readonly: true });
+const row = db.query("SELECT id, embedding FROM documents WHERE id = 'drawer_44fb808c93188a039e5ce4ef712ebe0a'").get() as any;
+console.log("ID:", row.id);
+console.log("Embedding type:", row.embedding.constructor.name, "byteLength:", row.embedding.byteLength);
+const f32 = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, 384);
+console.log("First 5 floats:", f32.slice(0, 5));
+let normSq = 0;
+for (let i = 0; i < 384; i++) normSq += f32[i] * f32[i];
+console.log("Vector norm:", Math.sqrt(normSq));
+db.close();

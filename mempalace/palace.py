@@ -413,10 +413,12 @@ def resolve_backend_name(palace_path: str, explicit: Optional[str] = None) -> st
         )
     detected = detected_backends[0] if detected_backends else None
     if detected and detected != selected:
-        raise BackendMismatchError(
-            f"palace at {palace_path!r} contains {detected!r} backend artifacts, "
-            f"but {selected!r} was selected"
-        )
+        exact_family = {"sqlite_exact", "rust_exact"}
+        if not (detected in exact_family and selected in exact_family):
+            raise BackendMismatchError(
+                f"palace at {palace_path!r} contains {detected!r} backend artifacts, "
+                f"but {selected!r} was selected"
+            )
     return selected
 
 
@@ -466,6 +468,7 @@ def _open_collection_or_explain(
     collection_name: Optional[str] = None,
     out=None,
     opener=None,
+    read_only: bool = False,
 ):
     """Open the palace collection or print a state-specific message and return ``None``.
 
@@ -526,12 +529,22 @@ def _open_collection_or_explain(
         emit("  Run: mempalace mine <dir>")
         return None
     try:
-        return open_collection(
-            palace_path,
-            collection_name=collection_name,
-            create=False,
-            backend=backend_name,
-        )
+        open_fn = opener or open_collection
+        try:
+            return open_fn(
+                palace_path,
+                collection_name=collection_name,
+                create=False,
+                backend=backend_name,
+                read_only=read_only,
+            )
+        except TypeError:
+            return open_fn(
+                palace_path,
+                collection_name=collection_name,
+                create=False,
+                backend=backend_name,
+            )
     except CollectionNotInitializedError:
         emit(f"\n  Palace at {palace_path} is initialized but empty (no drawers yet).")
         emit("  Run: mempalace mine <dir>")

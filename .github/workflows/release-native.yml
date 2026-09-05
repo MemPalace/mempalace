@@ -1,0 +1,72 @@
+name: Build Native Wheels & Binaries
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  wheels:
+    name: Build wheels on ${{ matrix.os }} (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -m crates/mempalace-py/Cargo.toml
+          sccache: 'true'
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist
+
+  binaries:
+    name: Build standalone CLI on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: mempalace-native-linux-amd64
+            binary_path: target/release/mempalace-native
+          - os: windows-latest
+            artifact_name: mempalace-native-windows-amd64.exe
+            binary_path: target/release/mempalace-native.exe
+          - os: macos-latest
+            artifact_name: mempalace-native-macos
+            binary_path: target/release/mempalace-native
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build binary
+        run: cargo build --release --bin mempalace-native
+      - name: Stage binary
+        run: |
+          mkdir -p dist-bin
+          cp ${{ matrix.binary_path }} dist-bin/${{ matrix.artifact_name }}
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist-bin/${{ matrix.artifact_name }}

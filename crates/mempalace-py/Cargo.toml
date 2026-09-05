@@ -1,0 +1,19 @@
+[package]
+name = "mempalace-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "mempalace_core_rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+mempalace-core = { path = "../mempalace-core" }
+pyo3 = { version = "0.22", features = ["abi3-py39"] }
+

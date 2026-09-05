@@ -72,3 +72,17 @@ jobs:
       - run: pip install "ruff==0.16.1"
       - run: ruff check .
       - run: ruff format --check .
+
+  test-rust:
+    name: Test Rust Core & CLI
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --workspace
+      - run: cargo test -p mempalace-core -p mempalace-cli
+
+
