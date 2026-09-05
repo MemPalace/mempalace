@@ -9,6 +9,11 @@ authors.workspace = true
 name = "mempalace_core_rs"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+
 [dependencies]
 mempalace-core = { path = "../mempalace-core" }
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+pyo3 = { version = "0.22", features = ["abi3-py39"] }
+

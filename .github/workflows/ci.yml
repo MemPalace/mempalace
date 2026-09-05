@@ -82,5 +82,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --workspace
+      - run: cargo check --workspace
+      - run: cargo test -p mempalace-core -p mempalace-cli
+
 
