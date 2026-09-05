@@ -59,6 +59,7 @@ SKIP_DIRS = {
     ".eggs",
     "htmlcov",
     "target",
+    ".pnpm-store",
 }
 
 _DEFAULT_BACKEND = get_backend("chroma")
