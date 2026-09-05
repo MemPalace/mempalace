@@ -952,6 +952,7 @@ def cmd_mine(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     mode = getattr(args, "mode", None) or "projects"
     source_adapter = getattr(args, "source", None)
+    config_dir = os.path.expanduser(args.config) if getattr(args, "config", None) else args.dir
     include_ignored = []
     for raw in args.include_ignored or []:
         include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
@@ -1046,6 +1047,7 @@ def cmd_mine(args):
 
             mine(
                 project_dir=args.dir,
+                config_dir=config_dir,
                 palace_path=palace_path,
                 wing_override=args.wing,
                 agent=args.agent,
@@ -3311,6 +3313,11 @@ def main():
         "--background",
         action="store_true",
         help="With --daemon, return a job id immediately instead of waiting",
+    )
+    p_mine.add_argument(
+        "--config",
+        default=None,
+        help="Directory containing mempalace.yaml (default: same as mined directory)",
     )
     p_mine.add_argument(
         "--extract",
