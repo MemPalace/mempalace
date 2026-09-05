@@ -805,7 +805,13 @@ class MempalaceConfig:
         """Path to the memory palace data directory."""
         if self._palace_path_override is not None:
             return self._palace_path_override
-        env_val = os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALACE_PATH")
+        # Precedence: MEMPALACE_PALACE_PATH (documented, primary) >
+        # MEMPALACE_PALACE (short alias accepted per #2366) > MEMPAL_PALACE_PATH (legacy).
+        env_val = (
+            os.environ.get("MEMPALACE_PALACE_PATH")
+            or os.environ.get("MEMPALACE_PALACE")
+            or os.environ.get("MEMPAL_PALACE_PATH")
+        )
         if env_val:
             # Normalize: expand ~ and collapse .. to match the CLI --palace
             # code path (mcp_server.py:62) and prevent surprise redirection

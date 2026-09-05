@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **`init` accepts `--palace` in the natural invocation order (#2366).** `mempalace init <dir> --palace <path>` previously failed with `unrecognized arguments: --palace` because the flag was registered only on the global parser. `--palace` now mirrors the existing `serve` subcommand pattern (#1877), so both `--palace <path> init <dir>` and `init <dir> --palace <path>` work. The global form takes precedence on Python <3.12 where subparser defaults can otherwise clobber it.
+- **`MEMPALACE_PALACE` environment variable is honored (#2366).** The short var name from the issue body now resolves through `MempalaceConfig.palace_path`, so `MEMPALACE_PALACE=<dir> mempalace status` (and every other command reading `palace_path`) targets the intended palace. Precedence: `MEMPALACE_PALACE_PATH` > `MEMPALACE_PALACE` > legacy `MEMPAL_PALACE_PATH`.
+
 ---
 
 ## [3.9.0] — 2026-08-31
