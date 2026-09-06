@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+from unittest import mock
 from mempalace.config import MempalaceConfig, canonical_palace_path
 
 
@@ -151,3 +152,121 @@ def test_init_persists_env_var_palace_path():
     # to the persisted custom path, not silently fall back to the default.
     later_cfg = MempalaceConfig(config_dir=config_dir)
     assert later_cfg.palace_path == custom_palace
+
+
+# --- Instance-level canonicalisation cache (#2418) --------------------------
+
+
+def test_palace_path_file_branch_cached_exactly_once(tmp_path, monkeypatch):
+    """Acceptance (a) — file-config branch: helper runs ONCE across N reads.
+
+    The per-access ``isfile``/``listdir`` probe is the hot path behind 147
+    call sites; this asserts memoization removes the repeated I/O while the
+    #2404 invariant (reader opens the store-owning leaf) is preserved.
+    """
+    leaf = _make_leaf(str(tmp_path), name="palace")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    cfg._file_config["palace_path"] = str(tmp_path)  # file-config branch
+    assert cfg._palace_path_override is None
+
+    with mock.patch(
+        "mempalace.config.canonical_palace_path", side_effect=canonical_palace_path
+    ) as sp:
+        results = [cfg.palace_path for _ in range(50)]
+        assert sp.call_count == 1, f"expected 1 resolve, got {sp.call_count}"
+    assert all(r == leaf for r in results)
+
+
+def test_palace_path_override_branch_cached_once_and_stable(tmp_path):
+    """Acceptance — constructor-override branch also memoizes.
+
+    A stable-instance override (``--palace <x>`` on the CLI) is a constant
+    for the process lifetime, so it is cached too: one resolve, then hits.
+    """
+    leaf = _make_leaf(str(tmp_path), name="palace")
+    cfg = MempalaceConfig(config_dir=str(tmp_path), palace_path=str(tmp_path))
+
+    with mock.patch(
+        "mempalace.config.canonical_palace_path", side_effect=canonical_palace_path
+    ) as sp:
+        for _ in range(50):
+            assert cfg.palace_path == leaf
+        assert sp.call_count == 1
+
+
+def test_palace_path_set_backend_invalidates_file_cache(tmp_path):
+    """Acceptance (b) — a setter that rewrites config.json clears the cache.
+
+    ``set_backend`` persists ``_file_config`` via ``_atomic_write_json``;
+    after that the file may disagree with the cached value, so the next
+    ``palace_path`` access must re-resolve (a second helper call).
+    """
+    leaf = _make_leaf(str(tmp_path), name="palace")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    cfg._file_config["palace_path"] = str(tmp_path)
+    assert cfg.palace_path == leaf  # prime the cache (file branch)
+
+    with mock.patch(
+        "mempalace.config.canonical_palace_path", side_effect=canonical_palace_path
+    ) as sp:
+        cfg.set_backend("chroma")  # writes config.json -> clears cache
+        cfg._file_config["palace_path"] = leaf  # a value a real edit might persist
+        assert cfg.palace_path == leaf
+        assert sp.call_count == 1  # the post-rewrite re-resolve
+
+
+def test_palace_path_env_branch_re_resolves_across_env_mutation(tmp_path, monkeypatch):
+    """Acceptance — env branch is NOT cached across live env mutation.
+
+    The CLI sets ``MEMPALACE_PALACE_PATH`` per invocation, so a same-instance
+    env change must still be honored: two reads with a mutation between them
+    reflect both values (no stale cache hides the environment).
+    """
+    leaf_a = _make_leaf(str(tmp_path / "a"), name="palace-a")
+    leaf_b = _make_leaf(str(tmp_path / "b"), name="palace-b")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg._palace_path_override is None
+
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", leaf_a)
+    first = cfg.palace_path
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", leaf_b)
+    second = cfg.palace_path
+
+    assert first == leaf_a
+    assert second == leaf_b
+
+
+def test_palace_path_init_roundtrip_leaf_stable(tmp_path):
+    """Acceptance (c) — init() roundtrip keeps leaf unchanged, no double-read.
+
+    ``init()`` persists ``self.palace_path`` (a no-op rewrite of the same
+    value); it must not re-resolve a stale value, and a fresh reader reading
+    the same config dir afterward must land on the identical leaf.
+    """
+    leaf = _make_leaf(str(tmp_path / "src"), name="palace")
+    config_dir = str(tmp_path / "config-dir")
+    os.makedirs(config_dir, exist_ok=True)
+
+    cfg = MempalaceConfig(config_dir=config_dir)
+    cfg._file_config["palace_path"] = str(tmp_path / "src")  # parent dir
+    before = cfg.palace_path
+    assert before == leaf
+
+    cfg.init()  # writes config.json with the resolved value
+
+    with open(os.path.join(config_dir, "config.json")) as f:
+        saved = json.load(f)
+    assert saved["palace_path"] == leaf
+
+    after = cfg.palace_path  # must be unchanged, not re-guessed
+    assert after == leaf
+
+    later = MempalaceConfig(config_dir=config_dir)
+    assert later.palace_path == leaf
+
+
+def test_palace_path_cache_slot_seeded_none(tmp_path):
+    """Acceptance — cache slot exists and starts empty (not pre-populated)."""
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert hasattr(cfg, "_palace_path_cache")
+    assert cfg._palace_path_cache is None

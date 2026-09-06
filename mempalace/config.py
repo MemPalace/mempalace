@@ -676,6 +676,12 @@ class MempalaceConfig:
             else None
         )
         self._file_config = {}
+        # Instance cache for the canonicalised ``palace_path`` resolution
+        # (#2418 follow-up). ``None`` = not yet resolved; otherwise the
+        # (source_path, canonical_leaf) pair. Seeded here, cleared by
+        # ``_persist_file_config``. See the ``palace_path`` property for the
+        # full caching / invalidation contract.
+        self._palace_path_cache = None
         # What this process established about the file on disk, which decides
         # what the first setter is allowed to do with it. The defaults below
         # apply either way, as they always did, but they stop being written
@@ -847,6 +853,12 @@ class MempalaceConfig:
                 )
         try:
             _atomic_write_json(self._config_file, self._file_config)
+            # A setter just rewrote config.json. If the resolved
+            # ``palace_path`` came from the file-config branch it may now
+            # disagree with disk, so drop the instance cache and let the next
+            # access re-resolve (#2418). A failed write leaves disk unchanged,
+            # so the cache is intentionally retained on the OSError path.
+            self._palace_path_cache = None
         except OSError as exc:
             print(f"  ! Could not write {self._config_file}: {exc}", file=sys.stderr)
 
@@ -859,19 +871,53 @@ class MempalaceConfig:
         always opens the leaf that actually holds the ChromaDB store, even
         when the caller named a parent directory (#2404). See the helper for
         the full invariant.
+
+        Caching / invalidation contract (#2418, follow-up to AmirF194's
+        strace — the per-access ``isfile``/``listdir`` probe ran behind 147
+        call sites on every MCP tool invocation):
+
+        - The *override* and *file-config* resolutions are memoised per
+          instance on ``self._palace_path_cache`` — ``canonical_palace_path``
+          runs at most once per resolved *source path*.
+        - The *env-var* branch is intentionally NOT cached: a live mutation
+          of ``MEMPALACE_PALACE_PATH`` / ``MEMPAL_PALACE_PATH`` between
+          accesses on the same instance is still honored (the CLI sets this
+          per-invocation), so its per-access cost stays one probe.
+        - The cache is cleared by ``_persist_file_config`` — every ``set_*``
+          setter that rewrites ``config.json`` (``set_entity_languages``,
+          ``set_embedding_model``, ``set_backend``, ``set_hook_setting``) —
+          so a later ``_file_config["palace_path"]`` change is re-resolved
+          against the new disk state.
+        - ``init()`` is exempt on purpose: it persists ``self.palace_path``
+          it just read (a no-op rewrite), and clearing the cache there would
+          double-read the very value it writes.
+        - ``search_config_fingerprint`` is orthogonal (own ``@lru_cache``)
+          and does not touch the cache either way.
+
+        Invariant preserved: the reader still opens the same leaf that owns
+        the ChromaDB store (#2404) — only the repeated I/O goes away.
         """
         if self._palace_path_override is not None:
-            return canonical_palace_path(self._palace_path_override)
+            cached = self._palace_path_cache
+            if cached is not None and cached[0] == self._palace_path_override:
+                return cached[1]
+            resolved = canonical_palace_path(self._palace_path_override)
+            self._palace_path_cache = (self._palace_path_override, resolved)
+            return resolved
         env_val = os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALACE_PATH")
         if env_val:
             # Normalize: expand ~ and collapse .. to match the CLI --palace
             # code path (mcp_server.py:62) and prevent surprise redirection
-            # when the env var contains unresolved components. Then
-            # canonicalise to the leaf store directory (#2404).
+            # when the env var contains unresolved components. Canonicalised
+            # per access (uncached on purpose — see docstring).
             return canonical_palace_path(os.path.abspath(os.path.expanduser(env_val)))
-        return canonical_palace_path(
-            os.path.expanduser(self._file_config.get("palace_path", DEFAULT_PALACE_PATH))
-        )
+        source = os.path.expanduser(self._file_config.get("palace_path", DEFAULT_PALACE_PATH))
+        cached = self._palace_path_cache
+        if cached is not None and cached[0] == source:
+            return cached[1]
+        resolved = canonical_palace_path(source)
+        self._palace_path_cache = (source, resolved)
+        return resolved
 
     @property
     def tunnel_file(self):
