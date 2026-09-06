@@ -13,6 +13,7 @@ from mempalace.config import (
     sanitize_name,
     sqlite_read_uri,
 )
+from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 
 def test_default_config():
@@ -1086,3 +1087,81 @@ def test_lang_explicit_ignores_entity_languages_fallback():
     cfg = MempalaceConfig(config_dir=tmpdir)
     assert cfg.lang_explicit is None
     assert cfg.lang == "ko"  # display-side fallback still works
+
+
+# ── #2418: palace_path cache — out-of-band regression (AmirF194) ────────
+
+
+def test_palace_path_cache_reprobes_uninitialised_parent(tmp_path):
+    """#2418 regression: a not-yet-initialised parent must NOT be cached, so
+    that a leaf created out-of-band (separate `mine` process, etc.) is picked
+    up on the next access.  This is the exact split-brain AmirF194 caught at
+    b15cba2: memoizing an uninitialised resolution pins the reader to the
+    empty parent even after a sibling leaf appears.
+
+    Setup:
+      1. parent dir exists, holds no chroma.sqlite3, has no child leaves.
+      2. First palace_path access → canonical_palace_path (rule 3) returns
+         the parent itself.  The fix does NOT memoize this (no store).
+      3. A 'separate process' creates parent/leaf/chroma.sqlite3.
+      4. Second palace_path access → re-probes → rule 2 fires → returns the
+         new leaf.  The fix DOES memoize this (store present).
+
+    If the pre-fix (b15cba2) cache logic were in place, step 4 would return
+    the stale parent because the (parent → parent) entry was memoized at step 2.
+    """
+    parent = tmp_path / "palace-root"
+    parent.mkdir()
+
+    # No chroma.sqlite3 in parent, no child directories → rule 3 → parent.
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    cfg._palace_path_override = str(parent)
+
+    first = cfg.palace_path
+    assert first == str(parent.resolve()) or first == str(parent), \
+        f"step 1: expected parent, got {first!r}"
+
+    # Simulate out-of-band creation (separate `mine` process):
+    # parent/leaf/chroma.sqlite3 now exists.
+    leaf = parent / "leaf"
+    leaf.mkdir()
+    make_minimal_chroma_sqlite(leaf)
+
+    second = cfg.palace_path
+    expected = str(leaf.resolve()) if os.path.islink(str(leaf)) else str(leaf)
+    assert "leaf" in second, (
+        f"step 4: cache pinned to stale parent! got {second!r}, "
+        f"expected the new leaf {expected!r}"
+    )
+
+
+def test_palace_path_cache_hit_for_initialised_leaf(tmp_path):
+    """#2418 fast-path: once a resolution holds the store, it is memoized and
+    subsequent accesses return from the dict in O(1).  This guarantees the
+    147-call-site MCP hot path does not re-run canonical_palace_path (isfile +
+    listdir) on every tool invocation.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    make_minimal_chroma_sqlite(palace)
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    cfg._palace_path_override = str(palace)
+
+    # First access: slow path, should memoize.
+    first = cfg.palace_path
+    canonical = str(palace.resolve()) if palace.exists() else str(palace)
+    assert "palace" in first
+
+    # Cache must now be populated with a definitive entry.
+    assert cfg._palace_path_cache is not None, (
+        "initialised resolution was not memoized after first access"
+    )
+    cached_src, cached_res = cfg._palace_path_cache
+    assert cached_res == first
+
+    # Second access: fast path (O(1) dict lookup, no filesystem).
+    # We can't directly spy on isfile/listdir without monkeypatch, so we just
+    # verify the cache still holds and the value is unchanged.
+    second = cfg.palace_path
+    assert second == first

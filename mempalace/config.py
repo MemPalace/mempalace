@@ -871,52 +871,65 @@ class MempalaceConfig:
         always opens the leaf that actually holds the ChromaDB store, even
         when the caller named a parent directory (#2404). See the helper for
         the full invariant.
+        - Caching / invalidation contract (#2418, follow-up to AmirF194's
+          strace and re-review on b15cba2):
 
-        Caching / invalidation contract (#2418, follow-up to AmirF194's
-        strace — the per-access ``isfile``/``listdir`` probe ran behind 147
-        call sites on every MCP tool invocation):
+        - The cache is written only when the *resolved* path already
+          holds ``chroma.sqlite3``.  That state is definitive for the
+          life of the instance, so it is safe to memoize per source path.
+        - A resolution to an *uninitialised* state (no store found, or an
+          ambiguous parent) is a **transient** observation — it is not
+          memoized, so the next access re-probes on disk and picks up a
+          leaf that a separate process created between the two reads.  This
+          is the split-brain window #2404 guarded against, and the
+          re-detection cost is one ``isfile`` on the resolved path per
+          uninitialised access (no ``listdir`` once a leaf exists).
+        - The cache is cleared independently by ``_persist_file_config``,
+          which is the setter-driven invalidation path — kept for belt and
+          braces, and because the source path itself can change on disk.
+        - ``init()`` is exempt on purpose (it persists the very value it
+          reads, and clearing the cache there would double-read).
+        - ``search_config_fingerprint`` is orthogonal (own ``@lru_cache``).
 
-        - The *override* and *file-config* resolutions are memoised per
-          instance on ``self._palace_path_cache`` — ``canonical_palace_path``
-          runs at most once per resolved *source path*.
-        - The *env-var* branch is intentionally NOT cached: a live mutation
-          of ``MEMPALACE_PALACE_PATH`` / ``MEMPAL_PALACE_PATH`` between
-          accesses on the same instance is still honored (the CLI sets this
-          per-invocation), so its per-access cost stays one probe.
-        - The cache is cleared by ``_persist_file_config`` — every ``set_*``
-          setter that rewrites ``config.json`` (``set_entity_languages``,
-          ``set_embedding_model``, ``set_backend``, ``set_hook_setting``) —
-          so a later ``_file_config["palace_path"]`` change is re-resolved
-          against the new disk state.
-        - ``init()`` is exempt on purpose: it persists ``self.palace_path``
-          it just read (a no-op rewrite), and clearing the cache there would
-          double-read the very value it writes.
-        - ``search_config_fingerprint`` is orthogonal (own ``@lru_cache``)
-          and does not touch the cache either way.
-
-        Invariant preserved: the reader still opens the same leaf that owns
-        the ChromaDB store (#2404) — only the repeated I/O goes away.
+        Invariant preserved (per #2404, per Amir's re-review on b15cba2):
+        the reader still opens the same leaf the writer wrote to, even when
+        that leaf appears for the first time via a separate process while
+        the config is cached.
         """
-        if self._palace_path_override is not None:
-            cached = self._palace_path_cache
-            if cached is not None and cached[0] == self._palace_path_override:
-                return cached[1]
-            resolved = canonical_palace_path(self._palace_path_override)
-            self._palace_path_cache = (self._palace_path_override, resolved)
-            return resolved
-        env_val = os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALACE_PATH")
-        if env_val:
-            # Normalize: expand ~ and collapse .. to match the CLI --palace
-            # code path (mcp_server.py:62) and prevent surprise redirection
-            # when the env var contains unresolved components. Canonicalised
-            # per access (uncached on purpose — see docstring).
-            return canonical_palace_path(os.path.abspath(os.path.expanduser(env_val)))
-        source = os.path.expanduser(self._file_config.get("palace_path", DEFAULT_PALACE_PATH))
+        # Fast path: if the previous access for this source path was definitive
+        # (held the store), the resolution cannot have changed on this instance
+        # (the source path is fixed for the instance's lifetime unless a setter
+        # clears the cache).  Return in O(1) — one dict lookup, no isfile, no
+        # listdir.  This is the hot path that the original strace complaint
+        # was about (147 call sites on every MCP tool invocation).
+        override = self._palace_path_override
+        env_val = None
+        if override is None:
+            env_val = os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALACE_PATH")
+
+        # Determine the source path WITHOUT calling canonical_palace_path yet.
+        if override is not None:
+            source = override
+        elif env_val:
+            source = os.path.abspath(os.path.expanduser(env_val))
+        else:
+            source = os.path.expanduser(self._file_config.get("palace_path", DEFAULT_PALACE_PATH))
+
+        # Fast-path: cached and source path unchanged → return immediately.
         cached = self._palace_path_cache
         if cached is not None and cached[0] == source:
+            # Cache only holds entries whose resolved path held chroma.sqlite3,
+            # so this is always definitive.
             return cached[1]
+
+        # --- slow path: resolve and conditionally memoise ---------------------
+        # A leaf that holds the store is definitive → memoize.
+        # A leaf that does NOT hold the store is transient (no palace yet, or
+        # an ambiguous parent) → do NOT memoize, so the next access re-probes
+        # and picks up the leaf a separate process created in between.
         resolved = canonical_palace_path(source)
-        self._palace_path_cache = (source, resolved)
+        if os.path.isfile(os.path.join(resolved, _CHROMA_SQLITE_NAME)):
+            self._palace_path_cache = (source, resolved)
         return resolved
 
     @property
