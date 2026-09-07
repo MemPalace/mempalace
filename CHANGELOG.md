@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **The transcript-path fallback no longer gives every git worktree its own wing.** `_wing_from_transcript_path`'s primary path (reading `cwd` from the JSONL) already collapsed a `<project>/.claude/worktrees/<wt>` segment before deriving the wing; the fallback path, used whenever `cwd` is absent, had no equivalent strip, so the flattened `--claude-worktrees-<wt>` segment survived into the wing name. Applied the same collapse there. (#2388)
+
 ---
 
 ## [3.9.0] — 2026-08-31
