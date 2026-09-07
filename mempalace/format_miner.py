@@ -608,13 +608,19 @@ def _file_chunks_locked(
     """
     # Lazy imports to avoid a module-load cycle (miner.py imports from this
     # module's package, so we defer these helpers until call time).
-    from .miner import _extract_content_date, _extract_entities_for_metadata, detect_hall
+    from .miner import (
+        _extract_content_date_with_source,
+        _extract_entities_for_metadata,
+        detect_hall,
+    )
 
     # Tier 6a content-date: extract once per file (not per chunk). Format-mined
     # files often have date-rich content (RTF/PDF dates in body text, mtimes on
     # the binary source). Caller may pass ``content`` (full extracted text) for
     # the body-scan branch; if absent, the helper still uses filename + mtime.
-    file_content_date = _extract_content_date(source_file, content or "")
+    file_content_date, file_content_date_source = _extract_content_date_with_source(
+        source_file, content or ""
+    )
 
     drawers_added = 0
     with mine_lock(source_file):
@@ -670,6 +676,7 @@ def _file_chunks_locked(
                 # Tier 6a content-date: shared across all chunks of the file.
                 if file_content_date:
                     meta["content_date"] = file_content_date
+                    meta["content_date_source"] = file_content_date_source
                 entities = _extract_entities_for_metadata(content)
                 if entities:
                     meta["entities"] = entities
