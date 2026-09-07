@@ -68,8 +68,22 @@ Semantic search. Returns verbatim drawer content with similarity scores.
 | `limit` | integer | No | Max results (default: 5) |
 | `wing` | string | No | Filter by wing |
 | `room` | string | No | Filter by room |
+| `since` | string | No | Include drawers filed on or after this ISO date/datetime |
+| `before` | string | No | Include drawers filed strictly before this ISO date/datetime |
 
 **Returns:** `{ query, filters, results: [{ text, wing, room, source_file, similarity }] }`
+
+Each hit also includes date provenance: `filed_at` (equal to legacy `created_at`),
+legacy `authored_at`, `authored_at_source`, `content_date`, and
+`content_date_source`. `authored_at_source` identifies stored authorship metadata
+(`authored_at`), the historical ingestion-time fallback (`filed_at`), or missing
+evidence (`unknown`). An inferred `content_date` is kept separate; its source is
+`filename`, `frontmatter`, `body`, `mtime`, or `unknown` for unrecorded provenance.
+Missing content dates are `null`. These fields do not change ranking or the
+filing-date semantics of `since`/`before`.
+
+See [date provenance](https://github.com/MemPalace/mempalace/blob/develop/docs/authored-at.md)
+for interpretation and compatibility details.
 
 ---
 

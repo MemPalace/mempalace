@@ -1372,28 +1372,37 @@ def _extract_content_date(source_file: str, content: str) -> Optional[str]:
     Returns ISO 'YYYY-MM-DD' string, or None if no date can be determined.
     See module-level comment block for the full hierarchy + design rationale.
     """
+    return _extract_content_date_with_source(source_file, content)[0]
+
+
+def _extract_content_date_with_source(source_file: str, content: str) -> tuple[Optional[str], str]:
+    """Return the inferred date and its evidence source, not verified authorship.
+
+    Preserve the existing extraction precedence. ``unknown`` means no date
+    was found; callers must not treat filing time as an extracted date.
+    """
     # 1. Filename
     result = _try_filename_date(source_file)
     if result:
-        return result
+        return result, "filename"
 
     # 2. YAML frontmatter
     result = _try_frontmatter_date(content)
     if result:
-        return result
+        return result, "frontmatter"
 
     # 3. Content body
     result = _try_content_body_date(content)
     if result:
-        return result
+        return result, "body"
 
     # 4. Filesystem mtime
     result = _try_mtime_date(source_file)
     if result:
-        return result
+        return result, "mtime"
 
     # 5. Nothing found — caller falls back to filed_at.
-    return None
+    return None, "unknown"
 
 
 def _build_drawer_metadata(
@@ -1408,6 +1417,7 @@ def _build_drawer_metadata(
     line_end: Optional[int] = None,
     content_date: Optional[str] = None,
     chunk_total: Optional[int] = None,
+    content_date_source: Optional[str] = None,
 ) -> dict:
     """Build the metadata dict for one drawer without upserting.
 
@@ -1423,6 +1433,10 @@ def _build_drawer_metadata(
     (legacy callers, pre-Tier-6a drawers), the keys are absent from the
     returned dict and downstream code falls back to ``filed_at`` for the
     date and the 3-segment closet pointer format.
+
+    ``content_date_source`` records which extraction tier supplied the
+    date: filename, frontmatter, body, or mtime. A supplied date with no
+    recorded source is marked ``unknown``, never inferred retroactively.
 
     ``chunk_total`` — the total number of chunks this mining pass expects
     to write for ``source_file`` (see #21). Every chunk of the same pass
@@ -1450,6 +1464,7 @@ def _build_drawer_metadata(
         metadata["line_end"] = line_end
     if content_date:
         metadata["content_date"] = content_date
+        metadata["content_date_source"] = content_date_source or "unknown"
     if chunk_total is not None:
         metadata["chunk_total"] = chunk_total
     metadata["hall"] = detect_hall(content)
@@ -1602,7 +1617,9 @@ def process_file(
         # share across all chunks. Reads filename / frontmatter / content /
         # mtime hierarchy. Returns None when nothing usable found → caller
         # falls back to filed_at downstream.
-        file_content_date = _extract_content_date(source_file, content)
+        file_content_date, file_content_date_source = _extract_content_date_with_source(
+            source_file, content
+        )
 
         drawers_added = 0
         # Accumulate drawer metadata across batches so the closet emitter
@@ -1635,6 +1652,7 @@ def process_file(
                             line_end=chunk.get("line_end"),
                             content_date=file_content_date,
                             chunk_total=len(chunks),
+                            content_date_source=file_content_date_source,
                         )
                     )
                 assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)

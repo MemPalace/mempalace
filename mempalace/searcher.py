@@ -822,6 +822,33 @@ def search(
     print()
 
 
+def _result_date_fields(meta: dict) -> dict:
+    """Expose stored dates and disclose the legacy authored-at fallback.
+
+    ``created_at`` and ``authored_at`` retain their historical values;
+    the source identifies the field supplying ``authored_at``, not a
+    guarantee of authorship. Content-date provenance is only reported
+    when stored, never reconstructed from a legacy drawer's path or text.
+    """
+    filed_at = meta.get("filed_at", "unknown")
+    authored_at = meta.get("authored_at", filed_at)
+    authored_at_source = "authored_at" if "authored_at" in meta else "filed_at"
+    if not authored_at or authored_at == "unknown":
+        authored_at_source = "unknown"
+    content_date = meta.get("content_date")
+    content_date_source = meta.get("content_date_source") or "unknown"
+    if not content_date or content_date == "unknown":
+        content_date_source = "unknown"
+    return {
+        "created_at": filed_at,
+        "filed_at": filed_at,
+        "authored_at": authored_at,
+        "authored_at_source": authored_at_source,
+        "content_date": content_date,
+        "content_date_source": content_date_source,
+    }
+
+
 def _window_sql_prefilters(since_dt, before_dt) -> list:
     """(operator, bound-string) pairs for the SQL date-window narrowing.
 
@@ -1087,8 +1114,7 @@ def _bm25_only_via_sqlite(
                 "room": meta.get("room", "unknown"),
                 "source_file": Path(full_source).name if full_source else "?",
                 "source_path": full_source,
-                "created_at": meta.get("filed_at", "unknown"),
-                "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
+                **_result_date_fields(meta),
                 # No vector distance available in BM25-only mode.
                 "similarity": None,
                 "distance": None,
@@ -1210,8 +1236,7 @@ def _merge_bm25_union_candidates(
                 "room": meta.get("room", "unknown"),
                 "source_file": Path(full_source).name if full_source else "?",
                 "source_path": full_source,
-                "created_at": meta.get("filed_at", "unknown"),
-                "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
+                **_result_date_fields(meta),
                 "similarity": (
                     None
                     if distance is None
@@ -1975,6 +2000,13 @@ def search_memories(
 
     Used by the MCP server and other callers that need data.
 
+    Each hit exposes ``filed_at`` (also retained as ``created_at``), plus
+    the legacy ``authored_at`` value and ``authored_at_source`` indicating
+    whether it came from stored ``authored_at``, the ``filed_at`` fallback,
+    or is ``unknown``. ``content_date`` is a separate inferred date with
+    ``content_date_source`` (filename/frontmatter/body/mtime when recorded,
+    otherwise ``unknown``). Neither inference nor filing proves authorship.
+
     Args:
         query: Natural language search query.
         palace_path: Path to the ChromaDB palace directory.
@@ -2141,8 +2173,7 @@ def search_memories(
             # stored value, the round-trippable key for the source_file filter.
             "source_file": Path(source).name if source else "?",
             "source_path": source,
-            "created_at": meta.get("filed_at", "unknown"),
-            "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
+            **_result_date_fields(meta),
             # Similarity is the raw vector score. Closet boost ranks via
             # effective_distance but must not inflate the advertised score.
             "similarity": round(_distance_to_similarity(dist, metric), 3),
