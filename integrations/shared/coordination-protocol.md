@@ -65,6 +65,7 @@ When multiple sessions or sub-teams share one stable `<machine>-<harness>` ident
 5. If blocked or unable to produce a patch, still reply:
    `type=task.reply` with `status=blocked` or `failed` and verbatim
    notes. Silence is the only unrecoverable failure.
+6. After delivering a patch or task reply, **you MUST watch the stream actively using `mempalace logstream watch`** for review feedback, verification results, acceptance, or the next sequence task.
 
 ## Monitoring the stream
 
@@ -302,32 +303,20 @@ Memory (recall + writing):
   old fact, then mempalace_kg_add the new one. Don't file secrets or
   tokens.
 
-Coordination (logstream):
-- Check your inbox when starting work and before long tasks:
+Coordination (natural logstream):
+- Coordinate on-demand, not constantly. Interactive sessions do NOT run
+  ambient background watchers at session start for tasks not part of a coordination protocol. Focus on user requests first;
+  engage logstream when collaborating, delegating, or when explicitly asked.
+- Topics & Routing: Events route via stream (project/scope), room
+  (lifecycle stage: delegation/reviews/status), and topic (sub-channel or
+  workstream lane, e.g. ranking, auth-v2). Always include a topic when
+  coordinating specific workstreams.
+- Checking inbox: When entering collaborative mode or before long tasks:
   mempalace_event_list with to_agent=<AGENT_ID>, since_event_id=<last
   event id you processed>, preview=true. Remember that id — it is your
   cursor. Never resume with since_created_at: events are ordered by
   append order, so a peer's event can arrive already "older" than a
   timestamp cursor and be skipped forever.
-- Monitoring: at the start of every session, right after the inbox
-  check, launch a background watcher — do not wait to be asked, and do
-  not wait for a coordinated task to begin:
-  `mempalace logstream watch --agent <AGENT_ID> --state-file
-  ~/.mempalace/watch/<AGENT_ID>.json --json`, run as a background
-  process. Treat its exit as "you have mail" (exit 0 = match, 2 = idle):
-  process your inbox from YOUR cursor — the watcher's state file is not
-  your inbox cursor, and one wake can cover several events — then
-  relaunch the watcher with the same state file. Keep this loop alive
-  all session. Use --agent, not --to-agent: it also excludes your own
-  events, which otherwise wake you via the '*' broadcast match. Repeat
-  --type to wake only for what needs you; if you delegate, include
-  task.reply — blocked and failed arrive as replies. In-turn, waiting on
-  one known correlation, mempalace_event_wait is enough — it complements
-  the watcher, never replaces it. Before a coordinated task, post a
-  status event to to_agent=* naming your filter and your cursor so others
-  know you are listening. Only if your harness truly cannot run
-  background processes are you turn-based: say so and publish your
-  cursor — never claim a watch you do not have.
 - Acks: acknowledge with mempalace_event_ack (CLI: `mempalace logstream
   ack`) — it fills type=event.ack and the ack_of link for you; don't
   hand-roll event.ack appends.
@@ -336,13 +325,15 @@ Coordination (logstream):
   watch command: an unnoticed prompt stalls the loop silently, and to
   your peers it looks like "claimed but gone quiet".
 - To delegate: mempalace_event_append (type=task.request, stream=
-  project/<name>, room=delegation, topic=<name> (optional for sub-teams),
-  correlation_id=task_..., status=open,
-  body = goal + branch + base commit + definition of done), then
-  mempalace_event_wait on that correlation_id for the reply.
+  project/<name>, room=delegation, topic=<lane>, correlation_id=task_...,
+  status=open, body = goal + branch + base commit + definition of done), then
+  wait for reply via mempalace_event_wait on that correlation_id (and topic).
 - When you accept a task: ack it with status=claimed. Deliver code as a
   patch via mempalace_patch_submit (never just push a branch and go
-  silent). If blocked, reply with status=blocked and verbatim notes.
+  silent). After delivering anything or delegating a task, you MUST watch
+  the stream actively using mempalace logstream watch for review feedback,
+  acceptance, or the next sequence step. If blocked, reply with
+  status=blocked and verbatim notes.
 - When you receive a patch: mempalace_artifact_get, verify sha256,
   apply only with explicit user-visible intent, run the stated tests,
   then mempalace_event_ack with status=applied or failed.

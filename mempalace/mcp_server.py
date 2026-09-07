@@ -53,7 +53,7 @@ import hmac  # noqa: E402
 import sqlite3  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
-from datetime import date, datetime  # noqa: E402
+from datetime import date, datetime, timezone  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Optional  # noqa: E402
 from urllib.parse import urlparse  # noqa: E402
@@ -4008,6 +4008,25 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 # ==================== KNOWLEDGE GRAPH ====================
 
 
+def _temporal_bound_key(value, *, end: bool = False) -> Optional[str]:
+    if not value:
+        return None
+    text = str(value)
+    if "T" in text:
+        return text
+    return f"{text}T23:59:59Z" if end else f"{text}T00:00:00Z"
+
+
+def _fact_interval_bucket(row: dict, now_key: str) -> str:
+    start_key = _temporal_bound_key(row.get("valid_from"), end=False)
+    end_key = _temporal_bound_key(row.get("valid_to"), end=True)
+    if start_key and start_key > now_key:
+        return "future"
+    if end_key and end_key < now_key:
+        return "historical"
+    return "active"
+
+
 def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
     """Query the knowledge graph for an entity's relationships."""
     try:
@@ -4020,7 +4039,48 @@ def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
         return {"error": "direction must be 'outgoing', 'incoming', or 'both'"}
 
     results = _call_kg(lambda kg: kg.query_entity(entity, as_of=as_of, direction=direction))
-    return {"entity": entity, "as_of": as_of, "facts": results, "count": len(results)}
+    if as_of is None:
+        now_key = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        active = []
+        historical = []
+        future = []
+        for row in results:
+            bucket = _fact_interval_bucket(row, now_key)
+            if bucket == "future":
+                future.append(row)
+            elif bucket == "historical":
+                historical.append(row)
+            else:
+                active.append(row)
+    else:
+        active = results
+        historical = []
+        future = []
+    payload = {
+        "entity": entity,
+        "as_of": as_of,
+        "active_facts": active,
+        "historical_facts": historical,
+        "future_facts": future,
+        "facts": results,
+        "count": len(results),
+    }
+    if results:
+        resolved_names = {
+            r.get("subject") if r.get("direction") == "outgoing" else r.get("object")
+            for r in results
+        }
+        resolved_names.discard(None)
+        if len(resolved_names) == 1:
+            resolved = next(iter(resolved_names))
+            if resolved != entity:
+                payload["resolved_from"] = entity
+                payload["entity"] = resolved
+    else:
+        candidates = _call_kg(lambda kg: kg.find_entity_candidates(entity))
+        if candidates:
+            payload["candidates"] = candidates
+    return payload
 
 
 def tool_kg_add(

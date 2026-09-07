@@ -4143,6 +4143,66 @@ class TestKGTools:
         assert result["count"] == 1
         assert result["facts"][0]["object"] == "Acme"
 
+    def test_kg_query_as_of_does_not_duplicate_ended_facts(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        kg.add_triple(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-01-01",
+            valid_to="2026-06-01",
+        )
+        result = mcp_server.tool_kg_query("Alice", as_of="2026-04-01", direction="outgoing")
+        assert result["count"] == 1
+        assert len(result["active_facts"]) == 1
+        assert result["historical_facts"] == []
+
+    def test_kg_query_excludes_future_valid_from_from_active(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        kg.add_triple("Alice", "starts", "school", valid_from="2099-01-01")
+        kg.add_triple("Alice", "lives_in", "Town", valid_from="2020-01-01")
+        result = mcp_server.tool_kg_query("Alice", direction="outgoing")
+        active_preds = {r["predicate"] for r in result["active_facts"]}
+        future_preds = {r["predicate"] for r in result["future_facts"]}
+        assert "lives_in" in active_preds
+        assert "starts" not in active_preds
+        assert "starts" in future_preds
+
+    def test_kg_query_keeps_bounded_future_end_as_active(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        kg.add_triple(
+            "Alice",
+            "on_med",
+            "Empagliflozin",
+            valid_from="2025-01-01",
+            valid_to="2099-12-31",
+        )
+        kg.add_triple(
+            "Alice",
+            "on_med",
+            "Metformin",
+            valid_from="2020-01-01",
+            valid_to="2025-01-01",
+        )
+        result = mcp_server.tool_kg_query("Alice", direction="outgoing")
+        active_objs = {r["object"] for r in result["active_facts"]}
+        historical_objs = {r["object"] for r in result["historical_facts"]}
+        assert "Empagliflozin" in active_objs
+        assert "Empagliflozin" not in historical_objs
+        assert "Metformin" in historical_objs
+
     def test_kg_invalidate_accepts_datetime_ended(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
 
