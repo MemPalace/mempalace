@@ -1609,8 +1609,9 @@ def test_palace_path_cache_reprobes_uninitialised_parent(tmp_path):
     cfg._palace_path_override = str(parent)
 
     first = cfg.palace_path
-    assert first == str(parent.resolve()) or first == str(parent), \
+    assert first == str(parent.resolve()) or first == str(parent), (
         f"step 1: expected parent, got {first!r}"
+    )
 
     # Simulate out-of-band creation (separate `mine` process):
     # parent/leaf/chroma.sqlite3 now exists.
@@ -1621,8 +1622,7 @@ def test_palace_path_cache_reprobes_uninitialised_parent(tmp_path):
     second = cfg.palace_path
     expected = str(leaf.resolve()) if os.path.islink(str(leaf)) else str(leaf)
     assert "leaf" in second, (
-        f"step 4: cache pinned to stale parent! got {second!r}, "
-        f"expected the new leaf {expected!r}"
+        f"step 4: cache pinned to stale parent! got {second!r}, expected the new leaf {expected!r}"
     )
 
 
@@ -1641,7 +1641,6 @@ def test_palace_path_cache_hit_for_initialised_leaf(tmp_path):
 
     # First access: slow path, should memoize.
     first = cfg.palace_path
-    canonical = str(palace.resolve()) if palace.exists() else str(palace)
     assert "palace" in first
 
     # Cache must now be populated with a definitive entry.
