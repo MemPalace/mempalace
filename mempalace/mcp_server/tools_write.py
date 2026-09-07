@@ -447,10 +447,14 @@ def tool_add_drawer(
     try:
         existing = col.get(ids=idempotency_probe_ids, include=[])
         if _get_result_ids(existing):
-            return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
+            outcome = {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
+            _wal_result("add_drawer", outcome)
+            return outcome
     except Exception as e:
         logger.warning("Idempotency pre-check failed for %s", idempotency_probe_ids, exc_info=True)
-        return {"success": False, "error": f"Idempotency check failed before write: {e}"}
+        outcome = {"success": False, "error": f"Idempotency check failed before write: {e}"}
+        _wal_result("add_drawer", outcome)
+        return outcome
 
     try:
         if len(content) <= chunk_size:
@@ -467,13 +471,15 @@ def tool_add_drawer(
                 )
             _invalidate_overview_caches()
             logger.info(f"Filed drawer: {drawer_id} -> {wing}/{room}")
-            return {
+            outcome = {
                 "success": True,
                 "drawer_id": drawer_id,
                 "wing": wing,
                 "room": room,
                 "chunks": 1,
             }
+            _wal_result("add_drawer", outcome)
+            return outcome
 
         # Oversized content: split into bounded per-chunk drawers so the
         # embedding model never sees a document above ``chunk_size``.
@@ -502,7 +508,7 @@ def tool_add_drawer(
             )
         _invalidate_overview_caches()
         logger.info(f"Filed drawer: {drawer_id} -> {wing}/{room} ({len(chunk_ids)} chunks)")
-        return {
+        outcome = {
             "success": True,
             "drawer_id": drawer_id,
             "wing": wing,
@@ -510,8 +516,12 @@ def tool_add_drawer(
             "chunks": len(chunk_ids),
             "chunk_ids": chunk_ids,
         }
+        _wal_result("add_drawer", outcome)
+        return outcome
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        outcome = {"success": False, "error": str(e)}
+        _wal_result("add_drawer", outcome)
+        return outcome
 
 
 def tool_delete_drawer(drawer_id: str):
