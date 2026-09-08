@@ -573,10 +573,18 @@ class KnowledgeGraph:
         conn.execute("BEGIN IMMEDIATE")
         try:
             yield conn
+            conn.commit()
         except BaseException:
+            # COMMIT is inside the try on purpose. It can fail in its own
+            # right -- SQLITE_BUSY during a WAL checkpoint -- and a commit
+            # that raises leaves the transaction open. The next _sqlite_retry
+            # attempt would then hit "cannot start a transaction within a
+            # transaction", which is not a lock error, so the retry gives up
+            # and reports that instead of the contention it exists to absorb.
+            # rollback() is a no-op when nothing is open, so this is safe on
+            # every path.
             conn.rollback()
             raise
-        conn.commit()
 
     def _resolve_entity_id(self, conn, name: str) -> str:
         """Id for ``name``: its own id, else a legacy row it used to map to.
