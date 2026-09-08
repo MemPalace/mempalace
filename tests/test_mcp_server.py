@@ -1169,8 +1169,6 @@ with mine_palace_lock(sys.argv[1]):
             palace._VALIDATED_IDENTITY.clear()
 
     def test_status_qdrant_backend_has_no_hnsw_fields(self, monkeypatch, config, palace_path, kg):
-        from mempalace.backends import GetResult
-
         monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "qdrant")
         monkeypatch.setenv("MEMPALACE_BACKEND", "qdrant")
         with open(os.path.join(palace_path, "qdrant_backend.json"), "w", encoding="utf-8") as f:
@@ -1183,14 +1181,12 @@ with mine_palace_lock(sys.argv[1]):
             def count(self):
                 return 2
 
-            def get(self, **_kwargs):
-                return GetResult(
-                    ids=["q1", "q2"],
-                    documents=[],
-                    metadatas=[
+            def iter_metadata(self):
+                return iter(
+                    [
                         {"wing": "project", "room": "backend"},
                         {"wing": "project", "room": "api"},
-                    ],
+                    ]
                 )
 
         monkeypatch.setattr(mcp_server, "_collection_cache", None)
@@ -1210,8 +1206,8 @@ with mine_palace_lock(sys.argv[1]):
     def test_status_handles_none_metadata_without_partial(
         self, monkeypatch, config, palace_path, kg
     ):
-        """tool_status must not crash or go partial when the metadata cache
-        returns a ``None`` entry — palaces can contain drawers with no
+        """tool_status must not crash or go partial when the metadata iterator
+        yields a ``None`` entry — palaces can contain drawers with no
         metadata (older mining paths, third-party writes). Before the guard,
         ``m.get("wing")`` raised AttributeError mid-tally and the result
         carried ``"error"`` + ``"partial": True`` even though the data was
@@ -1221,15 +1217,18 @@ with mine_palace_lock(sys.argv[1]):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_status
 
-        # Inject a metadata cache where one entry is None
+        # Inject a metadata iterator where one entry is None
         with _patch("mempalace.mcp_server._get_collection") as mock_get_col:
-            fake_col = type("C", (), {"count": lambda self: 2})()
+            fake_col = type(
+                "C",
+                (),
+                {
+                    "count": lambda self: 2,
+                    "iter_metadata": lambda self: iter([{"wing": "proj", "room": "r"}, None]),
+                },
+            )()
             mock_get_col.return_value = fake_col
-            with _patch(
-                "mempalace.mcp_server._get_cached_metadata",
-                return_value=[{"wing": "proj", "room": "r"}, None],
-            ):
-                result = tool_status()
+            result = tool_status()
 
         # The None-metadata drawer falls under 'unknown/unknown' — no crash,
         # no partial flag.

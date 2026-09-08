@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Iterator, Optional
 
 from .base import BaseCollection
 
@@ -177,6 +177,11 @@ class EmbeddingCollection(BaseCollection):
         # (qdrant, pgvector, sqlite_exact) raises and silently degrades to
         # client-side counting in mcp_server's try/except.
         return self._inner.facet_counts(field, where=where, limit=limit)
+
+    def iter_metadata(self) -> Iterator[Optional[dict]]:
+        # Forward explicitly: the concrete base default would otherwise hide
+        # the backend's native cursor and route through offset-based get().
+        return self._inner.iter_metadata()
 
     def get_all_metadata(self, where: Optional[dict] = None) -> list[dict]:
         # ``BaseCollection.get_all_metadata`` ships a concrete default that

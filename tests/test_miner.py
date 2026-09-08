@@ -1046,7 +1046,7 @@ def test_status_aborts_on_hnsw_divergence(tmp_path, capsys):
 
 
 def test_status_handles_none_metadata_without_crash(tmp_path, capsys):
-    """status must not crash when col.get returns a None entry in metadatas.
+    """status must not crash when the iterator yields a None metadata entry.
 
     Palaces can contain drawers whose metadata was never set (older mining
     paths, drawers written by third-party tools). Before the guard, status
@@ -1058,12 +1058,8 @@ def test_status_handles_none_metadata_without_crash(tmp_path, capsys):
         def count(self):
             return 2
 
-        def get(self, *args, **kwargs):
-            return {
-                "ids": ["a", "b"],
-                "documents": ["doc a", "doc b"],
-                "metadatas": [{"wing": "proj", "room": "r"}, None],
-            }
+        def iter_metadata(self):
+            return iter([{"wing": "proj", "room": "r"}, None])
 
     with patch("mempalace.miner._open_collection_or_explain", return_value=FakeCol()):
         status(str(tmp_path))

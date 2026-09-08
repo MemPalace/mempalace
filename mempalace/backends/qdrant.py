@@ -17,7 +17,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
@@ -502,10 +502,11 @@ class _QdrantRESTClient:
         limit: int = _SCROLL_PAGE_SIZE,
         offset: Any = None,
         with_vector: bool = False,
+        payload_fields: Optional[list[str]] = None,
     ) -> tuple[list[dict], Any]:
         body: dict[str, Any] = {
             "limit": int(limit),
-            "with_payload": True,
+            "with_payload": True if payload_fields is None else payload_fields,
             "with_vector": bool(with_vector),
         }
         if qdrant_filter:
@@ -1065,6 +1066,32 @@ class QdrantCollection(BaseCollection):
             metadatas=[row["metadata"] for row in rows] if spec.metadatas else [],
             embeddings=[row["embedding"] or [] for row in rows] if spec.embeddings else None,
         )
+
+    def iter_metadata(self) -> Iterator[dict]:
+        """Walk the native cursor once, retaining only one metadata page.
+
+        In particular, do not use get(offset=) or _rows(): both accumulate a
+        prefix of full documents before returning a metadata-only projection.
+        """
+        self._ensure_open()
+        if not self._remote_exists():
+            if self._marker_exists():
+                raise CollectionNotInitializedError(self._collection_name)
+            return
+        offset = None
+        while True:
+            points, offset = self._client.scroll_points(
+                self._remote_collection,
+                limit=_SCROLL_PAGE_SIZE,
+                offset=offset,
+                with_vector=False,
+                payload_fields=[_PAYLOAD_METADATA],
+            )
+            for point in points:
+                metadata = (point.get("payload") or {}).get(_PAYLOAD_METADATA)
+                yield metadata if isinstance(metadata, dict) else {}
+            if offset is None:
+                return
 
     def get_all_metadata(self, where: Optional[dict] = None) -> list[dict]:
         """Return every matching record's metadata in one cursor pass (#1796).

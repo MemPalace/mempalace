@@ -2239,8 +2239,8 @@ def status(palace_path: str):
     Tallies drawers by wing/room directly from ``chroma.sqlite3`` so a routine
     status check never cold-loads the HNSW vector index — a load that costs
     tens of seconds of CPU per call on large palaces (#1681). Falls back to the
-    ChromaDB client path when the sqlite read is unavailable (missing DB,
-    un-bootstrapped collection, or an unexpected schema); the fallback also
+    backend metadata iterator when the sqlite read is unavailable (a different
+    backend, missing DB, un-bootstrapped collection, or an unexpected schema); the fallback also
     emits the state-specific guidance for absent/empty palaces.
     """
     from .backends.chroma import _sqlite_wing_room_counts, hnsw_capacity_status
@@ -2266,21 +2266,13 @@ def status(palace_path: str):
         print("  Run `mempalace repair --mode from-sqlite --archive-existing` first.")
         return
 
-    # Count by wing and room — paginate to avoid SQLite "too many SQL
-    # variables" error on large palaces (see #802, #850).
+    # Let the backend page natively: offset-based get() restarts Qdrant's
+    # cursor on each page, repeatedly transferring all preceding documents.
     total = col.count()
     wing_rooms: dict = defaultdict(lambda: defaultdict(int))
-    batch_size = 5000
-    offset = 0
-    while offset < total:
-        r = col.get(limit=batch_size, offset=offset, include=["metadatas"])
-        batch = r["metadatas"]
-        if not batch:
-            break
-        for m in batch:
-            m = m or {}
-            wing_rooms[m.get("wing", "?")][m.get("room", "?")] += 1
-        offset += len(batch)
+    for m in col.iter_metadata():
+        m = m or {}
+        wing_rooms[m.get("wing", "?")][m.get("room", "?")] += 1
 
     _print_status(total, wing_rooms)
 
