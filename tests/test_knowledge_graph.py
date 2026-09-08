@@ -231,6 +231,40 @@ class TestWALMode:
         facts = kg.query_entity("Max")
         assert [f["current"] for f in facts] == [True]
 
+    def test_failed_commit_does_not_leave_the_transaction_open(self, kg):
+        """A COMMIT that raises must still close the transaction.
+
+        COMMIT can fail in its own right — SQLITE_BUSY during a WAL
+        checkpoint — and a raising commit leaves the transaction open. The
+        next ``_sqlite_retry`` attempt then hits "cannot start a transaction
+        within a transaction", which is not a lock error, so the retry gives
+        up and reports that instead of the contention it exists to absorb.
+        Assert on ``in_transaction`` rather than on a message, so the guard
+        survives a reworded error.
+        """
+        real = kg._conn()
+
+        class CommitFails:
+            """Delegating proxy — ``sqlite3.Connection.commit`` is read-only."""
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def commit(self):
+                raise sqlite3.OperationalError("database is locked")
+
+        kg._connection = CommitFails()
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                kg.add_entity("Alice", entity_type="person")
+        finally:
+            kg._connection = real
+
+        assert not real.in_transaction, "a failed commit left the transaction open"
+        # The connection must still be usable: a retry has to be able to BEGIN.
+        kg.add_entity("Bob", entity_type="person")
+        assert kg.stats()["entities"] >= 1
+
 
 class TestStats:
     def test_stats_empty(self, kg):
