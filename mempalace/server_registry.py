@@ -1,13 +1,13 @@
 """Per-palace discovery registry for the MemPalace HTTP MCP hub.
 
 ``mempalace serve`` (and ``mempalace-mcp --transport http``) is meant to be
-the single long-lived writer for a shared palace: once it performs its first
-mutating tool call it holds the per-palace MCP writer lease (#1818) for its
-whole lifetime, and every other process is refused palace writes. That is
-correct for agents — they talk to the hub — but the background save hooks
-and the plain CLI still spawn short-lived ``mempalace mine`` processes,
-which would be refused while a hub is up and silently stop transcript
-capture on the hub machine.
+the single long-lived writer for a shared palace. It acquires the per-palace
+MCP writer lease (#1818), may release it after a configured write-idle gap,
+and reacquires it on the next mutating call. Agents talk to the hub, but the
+background save hooks and the plain CLI still spawn short-lived
+``mempalace mine`` processes. Without forwarding, those processes are refused
+while the hub owns the lease or may take an idle lease and force the hub to
+reacquire later.
 
 This module gives those local processes a way to find the hub instead of
 fighting it: the HTTP transport records ``{pid, host, port, scheme,
