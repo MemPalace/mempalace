@@ -2247,16 +2247,14 @@ def tool_status():
                 )
                 rooms.clear()
                 wings.clear()
-                all_meta = _get_cached_metadata(col)
-                for m in all_meta:
+                for m in col.iter_metadata():
                     m = m or {}
                     w = m.get("wing", "unknown")
                     r = m.get("room", "unknown")
                     wings[w] = wings.get(w, 0) + 1
                     rooms[r] = rooms.get(r, 0) + 1
         else:
-            all_meta = _get_cached_metadata(col)
-            for m in all_meta:
+            for m in col.iter_metadata():
                 m = m or {}
                 w = m.get("wing", "unknown")
                 r = m.get("room", "unknown")

@@ -15,7 +15,7 @@ conformance suite land in follow-up PRs.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import ClassVar, Optional, Protocol, runtime_checkable
+from typing import ClassVar, Iterator, Optional, Protocol, runtime_checkable
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +470,24 @@ class BaseCollection(ABC):
         injected/core embedder, and the caller supplies the current identity.
         """
         return None
+
+    def iter_metadata(self) -> Iterator[Optional[dict]]:
+        """Yield every record's metadata without retaining earlier pages.
+
+        The default uses bounded offset reads. Backends that implement offsets
+        by rereading a prefix must override this with their native cursor.
+        Consumers may stop early; failures propagate instead of yielding a
+        successful partial result. No documents or embeddings are requested.
+        """
+        offset = 0
+        page_size = 1000
+        while True:
+            batch = self.get(include=["metadatas"], limit=page_size, offset=offset)
+            metadata = batch.metadatas
+            yield from metadata
+            if len(metadata) < page_size:
+                return
+            offset += len(metadata)
 
     def get_all_metadata(self, where: Optional[dict] = None) -> list[dict]:
         """Return every matching record's metadata in one logical pass (#1796).
