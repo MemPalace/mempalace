@@ -23,6 +23,7 @@ from typing import Any, Optional
 
 import numpy as np
 
+from ._magic import has_sqlite_magic, read_header_fields
 from .base import (
     BackendClosedError,
     BackendError,
@@ -1497,13 +1498,20 @@ class SQLiteExactBackend(BaseBackend):
     def _database_signature(db_path: str) -> tuple:
         """Detect completed writer/checkpoint cycles, even with unchanged size.
 
-        The SQLite header includes the change counter; stat identity and times
-        also detect replacement and updates between checkpoints. Never return a
-        cached snapshot after a failed filesystem read.
+        Stat identity and times detect replacement and updates between
+        checkpoints; the header fields SQLite exposes through pragmas
+        (schema cookie, page count, freelist count, user version, application
+        id) cover the page-1 changes a checkpoint can land without touching the
+        size. Never return a cached snapshot after a failed filesystem read.
+
+        The header is read through a throwaway ``immutable=1`` connection, not
+        a plain ``open()``: closing a non-SQLite descriptor on the database
+        drops every POSIX lock this process holds on it, including the SHARED
+        lock a sibling writer keeps for the life of its WAL connection. See
+        :mod:`mempalace.backends._magic`.
         """
         stat = os.stat(db_path)
-        with open(db_path, "rb") as database:
-            header = database.read(100)
+        header = read_header_fields(db_path)
         return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, header)
 
     @staticmethod
@@ -1872,15 +1880,16 @@ class SQLiteExactBackend(BaseBackend):
         behind because the SQLite header is written on the first statement,
         not on connection. The 16-byte ``SQLite format 3\\x00`` magic prefix
         accepts every real palace while rejecting empty / garbage files. See #1893.
+
+        The probe goes through :func:`mempalace.backends._magic.has_sqlite_magic`
+        and never opens a plain descriptor on the file: ``detect()`` runs on
+        nearly every MCP tool call, and closing a non-SQLite descriptor on the
+        database this backend already holds a WAL connection to drops every
+        POSIX lock the process owns on that inode -- including the SHARED lock
+        that stops an external ``close()`` from checkpointing and unlinking the
+        live ``-wal`` / ``-shm`` sidecars.
         """
-        db_path = os.path.join(path, _DB_FILENAME)
-        if not os.path.isfile(db_path):
-            return False
-        try:
-            with open(db_path, "rb") as f:
-                return f.read(16) == b"SQLite format 3\x00"
-        except OSError:
-            return False
+        return has_sqlite_magic(os.path.join(path, _DB_FILENAME))
 
     def create_collection(self, palace_path: str, collection_name: str) -> SQLiteExactCollection:
         return self.get_collection(palace_path, collection_name, create=True)
