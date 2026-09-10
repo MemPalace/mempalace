@@ -36,6 +36,8 @@ Environment variables (all have sensible defaults):
   LOG_LEVEL          DEBUG/INFO/WARNING/ERROR (default: INFO)
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
