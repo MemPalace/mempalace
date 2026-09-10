@@ -383,15 +383,17 @@ def test_preprocess_directory_respects_batch_snapshot(tmp_path):
     (staging / "late.py").write_text("a = 1\nb = 2\nc = 3\n", encoding="utf-8")
 
     content = "x = 1\ny = 2\nz = 3\n"
-    (staging / "claimed.py").write_text(content, encoding="utf-8")
-    (staging / "late.py").write_text("a = 1\nb = 2\nc = 3\n", encoding="utf-8")
+    # Use binary mode to avoid Windows \n -> \r\n conversion which would
+    # change the sha256 hash.
+    (staging / "claimed.py").write_bytes(content.encode("utf-8"))
+    (staging / "late.py").write_bytes("a = 1\nb = 2\nc = 3\n".encode("utf-8"))
 
     sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
     size = len(content.encode("utf-8"))
 
     snapshot = staging / ".batch_snapshot"
     # Unit-separator-delimited: rel\x1fsize\x1fmtime\x1fsha256
-    snapshot.write_text(f"claimed.py\x1f{size}\x1f0\x1f{sha256}\n", encoding="utf-8")
+    snapshot.write_bytes(f"claimed.py\x1f{size}\x1f0\x1f{sha256}\n".encode("utf-8"))
 
     stats = pp.preprocess_directory(str(staging), max_lines=4000, batch_snapshot=snapshot)
 
@@ -406,15 +408,16 @@ def test_batch_snapshot_rejects_modified_source(tmp_path):
     staging.mkdir()
 
     original_content = "x = 1\ny = 2\nz = 3\n"
-    (staging / "claimed.py").write_text(original_content, encoding="utf-8")
+    # Use binary mode to avoid Windows \n -> \r\n conversion.
+    (staging / "claimed.py").write_bytes(original_content.encode("utf-8"))
 
     sha256 = hashlib.sha256(original_content.encode("utf-8")).hexdigest()
     size = len(original_content.encode("utf-8"))
     snapshot = staging / ".batch_snapshot"
-    snapshot.write_text(f"claimed.py\x1f{size}\x1f0\x1f{sha256}\n", encoding="utf-8")
+    snapshot.write_bytes(f"claimed.py\x1f{size}\x1f0\x1f{sha256}\n".encode("utf-8"))
 
     # Simulate a producer modifying the file after the batch was claimed.
-    (staging / "claimed.py").write_text("x = 999\n", encoding="utf-8")
+    (staging / "claimed.py").write_bytes("x = 999\n".encode("utf-8"))
 
     stats = pp.preprocess_directory(str(staging), max_lines=4000, batch_snapshot=snapshot)
 
