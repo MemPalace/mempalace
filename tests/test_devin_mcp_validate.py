@@ -79,8 +79,10 @@ class TestConfigDiscovery:
         )
 
         monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
         # Force Path.home() to re-evaluate the env var.
         os.environ["HOME"] = str(home)
+        os.environ["USERPROFILE"] = str(home)
 
         cfg = module.load_server_config("mempalace")
         assert cfg == {"url": "http://localhost:8766/mcp"}
