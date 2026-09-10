@@ -444,6 +444,7 @@ def preprocess_directory(
     max_lines: int,
     dry_run: bool = False,
     batch_snapshot: Path | None = None,
+    work_dir: Path | None = None,
 ) -> dict[str, int]:
     """Preprocess files in *staging_dir*.
 
@@ -482,37 +483,47 @@ def preprocess_directory(
             logger.warning("gossip: could not read batch snapshot %s", batch_snapshot)
             return stats
 
-        work_dir = staging / ".batch_work"
-        if work_dir.exists():
-            shutil.rmtree(work_dir)
-        work_dir.mkdir(parents=True, exist_ok=True)
+        # Work directory is OUTSIDE the watched staging tree to prevent the
+        # watcher from treating work copies as a new batch.  When the caller
+        # provides a work_dir (e.g. the watcher's BATCH_WORK), use it so
+        # archive_files() can read the same claimed copies.
+        import tempfile
+
+        if work_dir is not None:
+            work_dir = Path(work_dir)
+            work_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            work_dir = Path(tempfile.mkdtemp(prefix="mempalace-batch-"))
 
         for record in records:
             rel = record.rel
-            src = staging / rel
-            if not src.is_file():
-                continue
             if "processed" in rel.parts or ".batch_work" in rel.parts:
                 continue
             if rel.name == "mempalace.yaml":
                 continue
 
-            # Copy to a private work directory and verify it matches the claim.
+            # When claim_batch has already populated work_dir, read from the
+            # immutable work copy.  Otherwise (direct call / test), copy from
+            # the live staging tree and verify sha256 against the snapshot.
             work_path = work_dir / rel
-            work_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, work_path)
-
-            if _sha256_file(work_path) != record.sha256:
-                # The file changed after it was claimed. Do not mine the new
-                # content as part of this batch.
-                stats["skipped"] += 1
-                continue
+            if work_path.is_file():
+                src_path = work_path
+            else:
+                src = staging / rel
+                if not src.is_file():
+                    continue
+                work_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, work_path)
+                if _sha256_file(work_path) != record.sha256:
+                    stats["skipped"] += 1
+                    continue
+                src_path = work_path
 
             stats["total_files"] += 1
 
             try:
                 outputs = preprocess_file(
-                    work_path, staging, processed_dir, max_lines, dry_run, rel=rel
+                    src_path, staging, processed_dir, max_lines, dry_run, rel=rel
                 )
                 if outputs:
                     stats["processed"] += 1
@@ -574,6 +585,12 @@ if __name__ == "__main__":
         default=None,
         help="Only preprocess files listed in this snapshot file",
     )
+    parser.add_argument(
+        "--work-dir",
+        type=Path,
+        default=None,
+        help="Private work directory outside the watched tree for claimed file copies",
+    )
     args = parser.parse_args()
 
     stats = preprocess_directory(
@@ -581,6 +598,7 @@ if __name__ == "__main__":
         args.max_lines,
         args.dry_run,
         batch_snapshot=args.batch_snapshot,
+        work_dir=args.work_dir,
     )
 
     print("\nPreprocessing complete:")

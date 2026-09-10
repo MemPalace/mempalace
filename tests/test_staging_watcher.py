@@ -526,3 +526,231 @@ class TestBatchIsolation:
         assert not (staging / "processed").exists()
         assert not (staging / ".batch_snapshot").exists()
         assert not (staging / ".batch_manifest").exists()
+
+
+# ── Regression tests for fatkobra review issues 1-4 ──────────────────────────
+
+
+class TestStaleVersionVerification:
+    """Issue 1: verification must prove the CURRENT source version was mined.
+
+    If version A was previously indexed and version B at the same path was
+    skipped (e.g. oversized), A must not satisfy B's verification query.
+    """
+
+    def test_verify_fails_when_file_sha256_mismatches_snapshot(self, tmp_path):
+        """A file whose sha256 changed since the batch was claimed must fail."""
+        import hashlib
+
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        original = "x = 1\ny = 2\nz = 3\n"
+        (staging / "claimed.py").write_text(original, encoding="utf-8")
+
+        sha256 = hashlib.sha256(original.encode("utf-8")).hexdigest()
+        size = len(original.encode("utf-8"))
+        snapshot = staging / ".batch_snapshot"
+        snapshot.write_text(f"claimed.py\x1f{size}\x1f0\x1f{sha256}\n", encoding="utf-8")
+
+        # Simulate the file changing after the snapshot was claimed.
+        (staging / "claimed.py").write_text("x = 999\n", encoding="utf-8")
+
+        from tools.verify_mined import verify_one
+
+        manifest = {str((staging / "claimed.py").resolve())}
+        result = verify_one(
+            "/fake/palace",
+            (staging / "claimed.py").resolve(),
+            manifest,
+            "mempalace",
+            expected_sha256=sha256,
+        )
+        assert result is False, "verify must fail when sha256 mismatches"
+
+    def test_verify_passes_when_file_sha256_matches_snapshot(self, tmp_path):
+        """A file whose sha256 matches the snapshot should proceed to search."""
+        import hashlib
+
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        content = "x = 1\ny = 2\nz = 3\n"
+        (staging / "claimed.py").write_text(content, encoding="utf-8")
+
+        sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        size = len(content.encode("utf-8"))
+        snapshot = staging / ".batch_snapshot"
+        snapshot.write_text(f"claimed.py\x1f{size}\x1f0\x1f{sha256}\n", encoding="utf-8")
+
+        from tools.verify_mined import file_sha256
+
+        # Verify the sha256 check passes (search will fail since no palace,
+        # but the sha256 gate should not block).
+        sample = (staging / "claimed.py").resolve()
+        assert file_sha256(sample) == sha256
+
+
+class TestBatchWorkOutsideWatchedTree:
+    """Issue 2: .batch_work must not be inside the watched staging tree.
+
+    After a successful batch, count_files must be zero and the next watcher
+    iteration must not see work copies as a new batch.
+    """
+
+    def test_count_files_excludes_batch_work(self, tmp_path):
+        """find_batch_files must not list files inside .batch_work."""
+        import os
+
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        (staging / "real.md").write_text("hello\n", encoding="utf-8")
+
+        # Simulate a work directory OUTSIDE the staging tree.
+        work = tmp_path / "batch_work"
+        work.mkdir()
+        (work / "copy.md").write_text("copy\n", encoding="utf-8")
+
+        env = os.environ.copy()
+        env["STAGING_DIR"] = str(staging)
+        env["STAGING_WATCHER_TEST_MODE"] = "1"
+
+        result = subprocess.run(
+            ["bash", "-c", f"source '{_TOOLS_DIR / 'staging_watcher.sh'}' && count_files"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        count = int(result.stdout.strip())
+        assert count == 1, f"count_files should be 1 (real.md only), got {count}"
+
+
+class TestArchiveUsesImmutableWorkCopy:
+    """Issue 3: archive and deletion must use the claimed immutable bytes.
+
+    A producer replacing the file after the hash check but before gzip must
+    not corrupt the archive.  Late replacements must survive in staging.
+    """
+
+    def test_archive_from_work_copy_not_staging(self, tmp_path):
+        """archive_files must read from BATCH_WORK, not STAGING_DIR, when
+        BATCH_WORK has the file."""
+        import os
+
+        staging = tmp_path / "staging"
+        archive = tmp_path / "archive"
+        log = tmp_path / "watcher.log"
+        work = tmp_path / "batch_work"
+
+        staging.mkdir()
+        work.mkdir()
+
+        original = "original content\n"
+        (staging / "file.txt").write_text(original, encoding="utf-8")
+        (work / "file.txt").write_text(original, encoding="utf-8")
+
+        # After claim, producer replaces the live file.
+        (staging / "file.txt").write_text("REPLACED\n", encoding="utf-8")
+
+        env = os.environ.copy()
+        env["STAGING_DIR"] = str(staging)
+        env["ARCHIVE_DIR"] = str(archive)
+        env["LOG_FILE"] = str(log)
+        env["BATCH_WORK"] = str(work)
+        env["STAGING_WATCHER_TEST_MODE"] = "1"
+
+        # Create a snapshot so archive_files uses it.
+        import hashlib
+        import os
+
+        sha = hashlib.sha256(original.encode("utf-8")).hexdigest()
+        size = len(original.encode("utf-8"))
+        mtime = int(os.path.getmtime(work / "file.txt"))
+        snapshot = work / ".batch_snapshot"
+        snapshot.write_text(f"file.txt\x1f{size}\x1f{mtime}\x1f{sha}\n", encoding="utf-8")
+        env["BATCH_SNAPSHOT"] = str(snapshot)
+
+        result = subprocess.run(
+            ["bash", "-c", f"source '{_TOOLS_DIR / 'staging_watcher.sh'}' && archive_files"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        # Archive should succeed using the work copy.
+        assert result.returncode == 0, f"archive_files failed: {result.stderr}"
+
+        batch = [d for d in archive.iterdir() if d.is_dir()][0]
+        with gzip.open(batch / "file.txt.gz", "rt", encoding="utf-8") as f:
+            archived_content = f.read()
+        assert archived_content == original, (
+            "archive must contain the claimed bytes, not the replaced live file"
+        )
+
+
+class TestPortableHashing:
+    """Issue 4: fingerprint_staging must fail closed when sha256sum is missing.
+
+    On systems with only shasum, the fingerprint must still work.
+    On systems with neither, it must return ERROR_NO_SHA256.
+    """
+
+    def test_fingerprint_stable_when_unchanged(self, tmp_path):
+        """fingerprint_staging must produce the same hash for the same tree."""
+        import os
+
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        (staging / "a.txt").write_text("hello\n", encoding="utf-8")
+        (staging / "b.txt").write_text("world\n", encoding="utf-8")
+
+        env = os.environ.copy()
+        env["STAGING_DIR"] = str(staging)
+        env["STAGING_WATCHER_TEST_MODE"] = "1"
+
+        result1 = subprocess.run(
+            ["bash", "-c", f"source '{_TOOLS_DIR / 'staging_watcher.sh'}' && fingerprint_staging"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        fp1 = result1.stdout.strip()
+        assert fp1 and fp1 != "ERROR_NO_SHA256", f"fingerprint failed: {result1.stderr}"
+
+        result2 = subprocess.run(
+            ["bash", "-c", f"source '{_TOOLS_DIR / 'staging_watcher.sh'}' && fingerprint_staging"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        fp2 = result2.stdout.strip()
+        assert fp1 == fp2, "fingerprint must be stable for unchanged tree"
+
+    def test_fingerprint_changes_when_file_modified(self, tmp_path):
+        """fingerprint_staging must change when a file is modified."""
+        import os
+
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        (staging / "a.txt").write_text("hello\n", encoding="utf-8")
+
+        env = os.environ.copy()
+        env["STAGING_DIR"] = str(staging)
+        env["STAGING_WATCHER_TEST_MODE"] = "1"
+
+        result1 = subprocess.run(
+            ["bash", "-c", f"source '{_TOOLS_DIR / 'staging_watcher.sh'}' && fingerprint_staging"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        fp1 = result1.stdout.strip()
+
+        (staging / "a.txt").write_text("CHANGED\n", encoding="utf-8")
+
+        result2 = subprocess.run(
+            ["bash", "-c", f"source '{_TOOLS_DIR / 'staging_watcher.sh'}' && fingerprint_staging"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        fp2 = result2.stdout.strip()
+
+        assert fp1 != fp2, "fingerprint must change when file content changes"

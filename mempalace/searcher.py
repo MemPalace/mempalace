@@ -731,27 +731,6 @@ def search(
         try:
             backend_name = resolve_backend_name(palace_path)
         except (BackendMismatchError, KeyError):
-            backend_name = None
-
-        if backend_name == "chroma" and _hnsw_capacity_diverged(palace_path):
-            return _print_search_results_bm25_only(
-                query,
-                palace_path,
-                wing,
-                room,
-                n_results,
-                stop_words=stop_words,
-                source_file=source_file,
-                since_dt=since_dt,
-                before_dt=before_dt,
-                json_output=json_output,
-            )
-
-        col = _open_collection_or_explain(palace_path, opener=get_collection)
-    if col is None:
-        try:
-            backend_name = resolve_backend_name(palace_path)
-        except (BackendMismatchError, KeyError):
             # Preserve _open_collection_or_explain's state-specific diagnostics
             # for mixed artifacts and unknown backend selections. This probe is
             # only an early Chroma safety fence; it must not become a second,
@@ -766,8 +745,10 @@ def search(
                 room,
                 n_results,
                 stop_words=stop_words,
+                source_file=source_file,
                 since_dt=since_dt,
                 before_dt=before_dt,
+                json_output=json_output,
             )
 
         col = _open_collection_or_explain(palace_path, opener=get_collection, read_only=True)
