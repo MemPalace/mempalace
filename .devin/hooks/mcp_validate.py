@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 """Validate mcp_call_tool input against the server's declared JSON schema.
 
 This script is invoked by a Devin PreToolUse hook. It reads the pending
@@ -18,6 +19,8 @@ If the arguments are invalid, it prints a JSON decision with a block reason
 and exits non-zero. If valid or validation cannot be performed, it prints
 {"decision": "approve"}.
 """
+
+from __future__ import annotations
 
 import json
 import os
