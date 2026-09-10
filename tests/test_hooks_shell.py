@@ -230,7 +230,7 @@ class TestSessionEndWrapper:
             "worker finished before the foreground returned — wrapper is not backgrounding"
         )
         assert _wait_for(done_file), "detached worker never completed"
-        assert args_file.read_text() == "hook run --hook session-end --harness claude-code"
+        assert args_file.read_text() == "hook run --hook session-end --harness auto"
 
     def test_dispatches_via_mempal_python_override(self, tmp_path):
         args_file = tmp_path / "args.log"
@@ -262,7 +262,7 @@ exit 1
         assert result.returncode == 0, f"stderr={result.stderr!r}"
         assert result.stdout == "{}"
         assert _wait_for(args_file), "backgrounded worker never ran"
-        assert args_file.read_text() == "hook run --hook session-end --harness claude-code"
+        assert args_file.read_text() == "hook run --hook session-end --harness auto"
 
     def test_harness_override_is_forwarded(self, tmp_path):
         args_file = tmp_path / "args.log"
@@ -298,4 +298,4 @@ class TestPluginSessionEndWrapper:
         assert elapsed < 1.5, f"plugin foreground blocked {elapsed:.2f}s"
         assert not done_file.exists()
         assert _wait_for(done_file), "detached plugin worker never completed"
-        assert args_file.read_text() == "hook run --hook session-end --harness claude-code"
+        assert args_file.read_text() == "hook run --hook session-end --harness auto"

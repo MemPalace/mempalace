@@ -1647,10 +1647,10 @@ def test_get_mine_targets_empty():
 
 
 def test_parse_harness_input_unknown():
-    """Unknown harness should sys.exit(1)."""
-    with pytest.raises(SystemExit) as exc_info:
-        _parse_harness_input({"session_id": "test"}, "unknown-harness")
-    assert exc_info.value.code == 1
+    """Unknown harness tokens parse with generic aliases instead of exiting."""
+    result = _parse_harness_input({"session_id": "test"}, "unknown-harness")
+    assert result["session_id"] == "test"
+    assert result["harness"] == "unknown-harness"
 
 
 def test_parse_harness_input_valid():

@@ -3,7 +3,11 @@ Hook logic for MemPalace — Python implementation of session-start, stop, sessi
 
 Reads JSON from stdin, outputs JSON to stdout.
 Supported hooks: session-start, stop, session-end, precompact
-Supported harnesses: claude-code, codex (extensible to cursor, gemini, etc.)
+Supported harnesses: claude-code, codex, grok, copilot, auto, or any other token.
+Payload parsing is alias-based (session_id/sessionId, transcript_path, cwd,
+stopReason). Grok locates ~/.grok/sessions/<urlencoded-cwd>/<id>/chat_history.jsonl
+when the payload has no transcript_path. Copilot locates
+~/.copilot/session-state/<id>/events.jsonl (COPILOT_HOME overrides the root).
 """
 
 import hashlib
@@ -18,7 +22,8 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
+from urllib.parse import quote
 
 from mempalace.config import MempalaceConfig
 from mempalace.write_routing import (
@@ -32,6 +37,7 @@ from mempalace.write_routing import (
 SAVE_INTERVAL = 15
 STATE_DIR = Path.home() / ".mempalace" / "hook_state"
 PALACE_ROOT = Path.home() / ".mempalace"
+_USER_QUERY_RE = re.compile(r"<user_query>\s*(.*?)\s*</user_query>", re.DOTALL)
 
 
 def _detached_popen_kwargs() -> dict:
@@ -150,6 +156,50 @@ def _validate_transcript_path(transcript_path: str) -> Path:
     return path
 
 
+def _record_text(entry: dict) -> str:
+    """Flatten a transcript record's text from string or typed content blocks."""
+    content = entry.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(parts)
+    return ""
+
+
+def _is_grok_user_turn(entry: dict) -> bool:
+    """Grok chat_history.jsonl: real prompts carry prompt_index; synthetics do not."""
+    if entry.get("type") != "user":
+        return False
+    if entry.get("synthetic_reason"):
+        return False
+    return "prompt_index" in entry
+
+
+def _copilot_user_text(entry: dict) -> str:
+    """Copilot session-state events.jsonl: type=user.message, text in data.content."""
+    if entry.get("type") != "user.message":
+        return ""
+    payload = entry.get("data") or {}
+    if not isinstance(payload, dict):
+        return ""
+    content = payload.get("content")
+    return content.strip() if isinstance(content, str) else ""
+
+
+def _normalize_user_text(text: str) -> str:
+    if not text or not isinstance(text, str):
+        return ""
+    match = _USER_QUERY_RE.search(text)
+    body = (match.group(1) if match else text).strip()
+    return re.sub(r"\s+", " ", body)
+
+
 def _count_human_messages(transcript_path: str) -> int:
     """Count human messages in a JSONL transcript, skipping command-messages."""
     path = _validate_transcript_path(transcript_path)
@@ -165,6 +215,14 @@ def _count_human_messages(transcript_path: str) -> int:
             for line in f:
                 try:
                     entry = json.loads(line)
+                    if not isinstance(entry, dict):
+                        continue
+                    if _is_grok_user_turn(entry):
+                        count += 1
+                        continue
+                    if _copilot_user_text(entry):
+                        count += 1
+                        continue
                     msg = entry.get("message", {})
                     if isinstance(msg, dict) and msg.get("role") == "user":
                         content = msg.get("content", "")
@@ -890,6 +948,17 @@ def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUN
             for line in f:
                 try:
                     entry = json.loads(line)
+                    if not isinstance(entry, dict):
+                        continue
+                    if _is_grok_user_turn(entry):
+                        text = _normalize_user_text(_record_text(entry))
+                        if text:
+                            messages.append(text[:200])
+                        continue
+                    copilot_text = _copilot_user_text(entry)
+                    if copilot_text:
+                        messages.append(copilot_text[:200])
+                        continue
                     # Claude Code format
                     msg = entry.get("message") or entry.get("event_message") or {}
                     if isinstance(msg, dict) and msg.get("role") == "user":
@@ -1130,7 +1199,7 @@ def _ingest_transcript(transcript_path: str):
         _log(f"transcript ingest hook failed: {exc}")
 
 
-SUPPORTED_HARNESSES = {"claude-code", "codex"}
+SUPPORTED_HARNESSES = {"claude-code", "codex", "grok", "cursor", "copilot", "auto"}
 
 
 def _diary_agent_for_harness(harness: str) -> str:
@@ -1144,19 +1213,206 @@ def _diary_agent_for_harness(harness: str) -> str:
     returning the harness name keeps a newly supported harness discoverable
     instead of silently invisible again.
     """
-    return "claude" if harness == "claude-code" else harness
+    resolved = harness if harness and harness != "auto" else "claude-code"
+    return "claude" if resolved == "claude-code" else resolved
 
 
-def _parse_harness_input(data: dict, harness: str) -> dict:
-    """Parse stdin JSON according to the harness type."""
-    if harness not in SUPPORTED_HARNESSES:
-        print(f"Unknown harness: {harness}", file=sys.stderr)
-        sys.exit(1)
+def _first_payload_str(
+    data: dict,
+    *keys: str,
+    env: Optional[Mapping[str, str]] = None,
+    env_keys: tuple = (),
+) -> str:
+    """Return the first non-empty string from payload keys, then env keys."""
+    for key in keys:
+        value = data.get(key)
+        if value is None or value == "":
+            continue
+        if isinstance(value, list):
+            if not value:
+                continue
+            value = value[0]
+        return str(value).strip()
+    if env:
+        for key in env_keys:
+            value = env.get(key)
+            if value:
+                return str(value).strip()
+    return ""
+
+
+def _detect_harness(data: dict, env: Optional[Mapping[str, str]] = None) -> str:
+    """Infer harness from env and payload when ``--harness auto`` is used."""
+    env = env or {}
+    explicit = str(env.get("MEMPALACE_HOOK_HARNESS") or "").strip()
+    if explicit and explicit != "auto":
+        return explicit
+    if env.get("GROK_SESSION_ID") or env.get("GROK_HOOK_EVENT") or env.get("GROK_WORKSPACE_ROOT"):
+        return "grok"
+    if env.get("CURSOR_TRANSCRIPT_PATH") or (
+        data.get("conversation_id") and data.get("workspace_roots")
+    ):
+        return "cursor"
+    if env.get("COPILOT_HOME"):
+        return "copilot"
+    transcript = str(data.get("transcriptPath") or data.get("transcript_path") or "")
+    transcript_norm = transcript.replace("\\", "/")
+    if "session-state" in transcript_norm or transcript_norm.endswith("events.jsonl"):
+        return "copilot"
+    if data.get("stopReason") is not None:
+        return "copilot"
+    return "claude-code"
+
+
+def _resolve_harness_name(harness: str, data: dict, env: Optional[Mapping[str, str]] = None) -> str:
+    if harness and harness != "auto":
+        return harness
+    return _detect_harness(data, env)
+
+
+def _parse_harness_input(
+    data: dict,
+    harness: str,
+    env: Optional[Mapping[str, str]] = None,
+) -> dict:
+    """Parse stdin JSON using camelCase/snake_case aliases shared across harnesses."""
+    if env is None:
+        env = os.environ
+    harness = _resolve_harness_name(harness, data, env)
+    session_id = _first_payload_str(
+        data,
+        "session_id",
+        "sessionId",
+        "conversation_id",
+        env=env,
+        env_keys=("GROK_SESSION_ID",),
+    )
+    cwd = _first_payload_str(
+        data,
+        "cwd",
+        "workspaceRoot",
+        "workspace_root",
+        "workspace_roots",
+        env=env,
+        env_keys=("GROK_WORKSPACE_ROOT", "CURSOR_PROJECT_DIR", "CLAUDE_PROJECT_DIR"),
+    )
+    transcript_path = _first_payload_str(
+        data,
+        "transcript_path",
+        "transcriptPath",
+        env=env,
+        env_keys=("CURSOR_TRANSCRIPT_PATH",),
+    )
+    stop_hook_active = data.get("stop_hook_active", data.get("stopHookActive", False))
+    loop_count = data.get("loop_count", data.get("loopCount"))
+    if loop_count not in (None, "", False) and not stop_hook_active:
+        try:
+            stop_hook_active = int(loop_count) > 0
+        except (TypeError, ValueError):
+            pass
+    subagent = (
+        data.get("subagentType")
+        or data.get("subagent_type")
+        or data.get("agentType")
+        or data.get("agent_type")
+    )
+    subagent_s = str(subagent).strip() if subagent else ""
+    reason = data.get("stopReason") or data.get("stop_reason") or data.get("reason")
     return {
-        "session_id": _sanitize_session_id(str(data.get("session_id", "unknown"))),
-        "stop_hook_active": data.get("stop_hook_active", False),
-        "transcript_path": str(data.get("transcript_path", "")),
+        "session_id": _sanitize_session_id(session_id or "unknown"),
+        "stop_hook_active": stop_hook_active,
+        "transcript_path": transcript_path,
+        "cwd": cwd,
+        "stop_reason": str(reason) if reason else "",
+        "subagent_type": subagent_s,
+        "harness": harness,
     }
+
+
+def _wing_from_cwd(cwd: str) -> str:
+    """Derive ``wing_<slug>`` from a workspace path leaf."""
+    name = Path(str(cwd).rstrip("/\\")).name if cwd else "sessions"
+    return f"wing_{_safe_wing_slug(name)}"
+
+
+def _project_wing(parsed: dict, transcript_path: str) -> str:
+    cwd = str(parsed.get("cwd") or "")
+    if cwd:
+        return _wing_from_cwd(cwd)
+    return _wing_from_transcript_path(transcript_path)
+
+
+def _grok_sessions_root() -> Path:
+    home = os.environ.get("GROK_HOME") or str(Path.home() / ".grok")
+    return Path(home).expanduser() / "sessions"
+
+
+def _find_grok_chat_history(
+    session_id: str, cwd: str, sessions_root: Optional[Path] = None
+) -> Optional[Path]:
+    if not session_id:
+        return None
+    root = sessions_root or _grok_sessions_root()
+    if cwd:
+        candidate = root / quote(cwd, safe="") / session_id / "chat_history.jsonl"
+        if candidate.is_file():
+            return candidate
+    matches = sorted(root.glob(f"*/{session_id}/chat_history.jsonl"))
+    return matches[0] if matches else None
+
+
+def _copilot_sessions_root() -> Path:
+    home = os.environ.get("COPILOT_HOME") or str(Path.home() / ".copilot")
+    return Path(home).expanduser() / "session-state"
+
+
+def _find_copilot_events(session_id: str, sessions_root: Optional[Path] = None) -> Optional[Path]:
+    if not session_id:
+        return None
+    root = sessions_root or _copilot_sessions_root()
+    candidate = root / session_id / "events.jsonl"
+    if candidate.is_file():
+        return candidate
+    matches = sorted(root.glob(f"*/{session_id}/events.jsonl"))
+    return matches[0] if matches else None
+
+
+def _locate_transcript(
+    harness: str,
+    parsed: dict,
+    *,
+    sessions_root: Optional[Path] = None,
+) -> str:
+    """Return a readable transcript path, locating Grok sessions when omitted."""
+    explicit = str(parsed.get("transcript_path") or "")
+    validated = _validate_transcript_path(explicit)
+    if validated is not None and validated.is_file():
+        return str(validated)
+    resolved = parsed.get("harness") or harness
+    if resolved == "auto":
+        resolved = _detect_harness(parsed, os.environ)
+    if resolved == "grok":
+        found = _find_grok_chat_history(
+            str(parsed.get("session_id") or ""),
+            str(parsed.get("cwd") or ""),
+            sessions_root=sessions_root,
+        )
+        return str(found) if found else ""
+    if resolved == "copilot":
+        found = _find_copilot_events(
+            str(parsed.get("session_id") or ""),
+            sessions_root=sessions_root,
+        )
+        return str(found) if found else ""
+    return explicit
+
+
+def _should_skip_stop(parsed: dict) -> bool:
+    """Skip nested/teardown Stop fires that would double-save or count as turns."""
+    if parsed.get("subagent_type"):
+        return True
+    reason = parsed.get("stop_reason") or ""
+    return bool(reason) and reason != "end_turn"
 
 
 # Common parent-dir tokens stripped from the encoded folder when no
@@ -1310,7 +1566,11 @@ def hook_stop(data: dict, harness: str):
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
     stop_hook_active = parsed["stop_hook_active"]
-    transcript_path = parsed["transcript_path"]
+    harness = parsed.get("harness") or harness
+    if _should_skip_stop(parsed):
+        _output({})
+        return
+    transcript_path = _locate_transcript(harness, parsed)
 
     # Respect auto_save config toggle (clean opt-out)
     if not MempalaceConfig().hooks_auto_save:
@@ -1369,7 +1629,7 @@ def hook_stop(data: dict, harness: str):
                 silent = True
                 toast = False
 
-            project_wing = _wing_from_transcript_path(transcript_path)
+            project_wing = _project_wing(parsed, transcript_path)
 
             if silent:
                 # Save directly via Python API — systemMessage renders in terminal
@@ -1494,7 +1754,8 @@ def hook_session_end(data: dict, harness: str):
     try:
         parsed = _parse_harness_input(data, harness)
         session_id = parsed["session_id"]
-        transcript_path = parsed["transcript_path"]
+        harness = parsed.get("harness") or harness
+        transcript_path = _locate_transcript(harness, parsed)
 
         # Read config defensively (mirror hook_stop): a corrupt or unreadable
         # config must not lose the final save, so default to auto-save on and
@@ -1549,7 +1810,7 @@ def hook_session_end(data: dict, harness: str):
                 _save_diary_direct(
                     valid_transcript,
                     session_id,
-                    wing=_wing_from_transcript_path(valid_transcript),
+                    wing=_project_wing(parsed, valid_transcript),
                     toast=toast,
                     agent_name=_diary_agent_for_harness(harness),
                 )
@@ -1572,7 +1833,8 @@ def hook_precompact(data: dict, harness: str):
         return
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
-    transcript_path = parsed["transcript_path"]
+    harness = parsed.get("harness") or harness
+    transcript_path = _locate_transcript(harness, parsed)
 
     # Respect auto_save config toggle (clean opt-out)
     if not MempalaceConfig().hooks_auto_save:
@@ -1619,4 +1881,5 @@ def run_hook(hook_name: str, harness: str):
         print(f"Unknown hook: {hook_name}", file=sys.stderr)
         sys.exit(1)
 
+    harness = _resolve_harness_name(harness, data, os.environ)
     handler(data, harness)

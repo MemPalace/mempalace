@@ -95,10 +95,7 @@ def test_plugin_hook_wrapper_prefers_mempalace_cli(
 
     assert result.returncode == 0
     assert result.stdout == "{}\n"
-    assert (
-        args_file.read_text(encoding="utf-8")
-        == f"hook run --hook {hook_name} --harness claude-code"
-    )
+    assert args_file.read_text(encoding="utf-8") == f"hook run --hook {hook_name} --harness auto"
     assert stdin_file.read_text(encoding="utf-8") == payload
 
 
@@ -128,7 +125,7 @@ def test_plugin_hook_wrapper_falls_back_to_importable_python(
     assert result.stdout == "{}\n"
     assert (
         args_file.read_text(encoding="utf-8")
-        == f"-m mempalace hook run --hook {hook_name} --harness claude-code"
+        == f"-m mempalace hook run --hook {hook_name} --harness auto"
     )
     assert stdin_file.read_text(encoding="utf-8") == payload
 
@@ -186,7 +183,39 @@ def test_plugin_hook_wrapper_falls_back_to_python_when_python3_cannot_import(
     assert result.stdout == "{}\n"
     assert (
         args_file.read_text(encoding="utf-8")
-        == f"-m mempalace hook run --hook {hook_name} --harness claude-code"
+        == f"-m mempalace hook run --hook {hook_name} --harness auto"
     )
     assert stdin_file.read_text(encoding="utf-8") == payload
     assert not bad_python3_used.exists()
+
+
+@pytest.mark.parametrize(("script_name", "hook_name"), SCRIPT_CASES)
+def test_plugin_hook_wrapper_forwards_harness_override(
+    tmp_path: Path, script_name: str, hook_name: str
+) -> None:
+    args_file = tmp_path / "args.txt"
+    stdin_file = tmp_path / "stdin.json"
+    bin_dir = _make_bin_dir(
+        tmp_path,
+        {
+            "mempalace": (
+                "#!/bin/sh\n"
+                f'printf \'%s\' "$*" > "{_shell_path(args_file)}"\n'
+                f"{_capture_stdin_to(stdin_file)}"
+                "printf '{}\\n'\n"
+            ),
+        },
+    )
+    env = os.environ.copy()
+    env["PATH"] = str(bin_dir)
+    env["MEMPALACE_HOOK_HARNESS"] = "grok"
+    result = subprocess.run(
+        [BASH, _shell_path(PLUGIN_HOOKS_DIR / script_name)],
+        input='{"sessionId":"g1"}',
+        text=True,
+        capture_output=True,
+        cwd=REPO_ROOT,
+        env=env,
+    )
+    assert result.returncode == 0
+    assert args_file.read_text(encoding="utf-8") == (f"hook run --hook {hook_name} --harness grok")
