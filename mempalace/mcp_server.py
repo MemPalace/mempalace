@@ -1467,6 +1467,17 @@ def _get_client():
     return _client_cache
 
 
+def _backend_open_failure_hint(backend_name: str) -> str:
+    """Return a recovery hint that the selected backend can actually use."""
+    if backend_name == "qdrant":
+        return "Run: mempalace status and ensure the configured Qdrant service is running."
+    if backend_name == "pgvector":
+        return "Run: mempalace status and ensure the configured PostgreSQL service is running."
+    if backend_name == "chroma":
+        return "Run: mempalace status or mempalace repair-status for diagnostics."
+    return "Run: mempalace status for diagnostics."
+
+
 def _get_collection(create=False):
     """Return the configured backend collection, caching handles between calls.
 
@@ -1578,7 +1589,7 @@ def _get_collection(create=False):
                 _collection_open_error = {
                     "error": "Backend open failed",
                     "details": "Could not open the selected backend collection.",
-                    "hint": "Run: mempalace status or mempalace repair-status for diagnostics.",
+                    "hint": _backend_open_failure_hint(backend_name),
                 }
         return None
 
@@ -6381,7 +6392,8 @@ def _read_installed_dist_versions(search_path: list[str]) -> tuple[dict[str, str
         try:
             context = DistributionFinder.Context(name=dist, path=list(search_path))
             found = next(iter(finder.find_distributions(context)), None)
-            raw = "" if found is None else str(found.version or "")
+            raw_version = None if found is None else found.metadata.get("Version")
+            raw = "" if raw_version is None else str(raw_version)
         except Exception:
             # Fail open — an unreadable metadata directory must not take the
             # server down — but never silently: with the version unknown this

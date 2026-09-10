@@ -4596,6 +4596,25 @@ class TestCacheInvalidation:
         assert "No palace found" in result["message"]
         assert result["drawers"] == 0
 
+    def test_qdrant_open_failure_reports_service_health_not_chroma_repair(
+        self, monkeypatch, config, kg
+    ):
+        """The MCP failure hint must name a diagnostic valid for Qdrant."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server, palace
+
+        monkeypatch.setattr(mcp_server, "_selected_backend_name", lambda: "qdrant")
+
+        def connection_refused(*args, **kwargs):
+            raise ConnectionRefusedError("Qdrant is not listening")
+
+        monkeypatch.setattr(palace, "get_collection", connection_refused)
+        mcp_server._collection_cache = None
+
+        assert mcp_server._get_collection() is None
+        assert "Qdrant service is running" in mcp_server._collection_open_error["hint"]
+        assert "repair-status" not in mcp_server._collection_open_error["hint"]
+
     def test_reconnect_reports_success(self, monkeypatch, config, palace_path, kg):
         """tool_reconnect should report success with drawer count."""
         _patch_mcp_server(monkeypatch, config, kg)
@@ -7433,7 +7452,9 @@ class TestStaleLibraryGate:
         )
         break_it(metadata)
         try:
-            versions, errors = mcp_server._read_installed_dist_versions([str(tmp_path)])
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", DeprecationWarning)
+                versions, errors = mcp_server._read_installed_dist_versions([str(tmp_path)])
         finally:
             if metadata.exists():
                 metadata.chmod(0o644)
@@ -7462,7 +7483,9 @@ class TestStaleLibraryGate:
         )
         metadata.chmod(0o000)
         try:
-            versions, errors = mcp_server._installed_dist_state()
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", DeprecationWarning)
+                versions, errors = mcp_server._installed_dist_state()
             assert versions == {} and "mempalace" in errors
             # repaired: neither the directory listing nor the file's stat
             # changed, only its readability
