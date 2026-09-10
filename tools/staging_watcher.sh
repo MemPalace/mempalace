@@ -47,7 +47,11 @@ LOG_FILE="$LOG_DIR/staging-watcher.log"
 DEBOUNCE_SECONDS="${DEBOUNCE_SECONDS:-30}"
 MIN_FILES="${MIN_FILES:-1}"
 MAX_LINES="${MAX_LINES:-4000}"
-BATCH_SNAPSHOT="${BATCH_SNAPSHOT:-$STAGING_DIR/.batch_snapshot}"
+# Work directory and snapshot live OUTSIDE the watched staging tree so the
+# watcher never sees its own private files as a new batch.
+WORK_ROOT="${WORK_ROOT:-$(mktemp -d -t mempalace-batch-XXXXXX)}"
+BATCH_SNAPSHOT="${BATCH_SNAPSHOT:-$WORK_ROOT/.batch_snapshot}"
+BATCH_WORK="${BATCH_WORK:-$WORK_ROOT/.batch_work}"
 
 mkdir -p "$LOG_DIR" "$ARCHIVE_DIR" "$STAGING_DIR"
 
@@ -119,9 +123,28 @@ snapshot_staging() {
 
 # Return a single hash that represents the current state of the staging tree.
 # Any change to file count, paths, sizes, or mtimes produces a different hash.
+# Hash stdin with sha256.  Tries sha256sum then shasum -a 256.
+# Fails closed (returns empty) if neither is available.
+hash_stdin() {
+    local hash
+    hash=$(sha256sum 2>/dev/null | awk '{print $1}')
+    if [[ -z "$hash" ]]; then
+        hash=$(shasum -a 256 2>/dev/null | awk '{print $1}')
+    fi
+    printf '%s' "$hash"
+}
+
 fingerprint_staging() {
     local target="${1:-$STAGING_DIR}"
-    snapshot_staging "$target" | sha256sum | awk '{print $1}'
+    local fp
+    fp=$(snapshot_staging "$target" | hash_stdin)
+    if [[ -z "$fp" ]]; then
+        # No SHA-256 command available — fail closed so a changing tree
+        # is never treated as stable.
+        printf 'ERROR_NO_SHA256'
+        return 1
+    fi
+    printf '%s' "$fp"
 }
 
 wait_for_stable() {
@@ -152,6 +175,32 @@ claim_batch() {
         return 1
     fi
     printf '%s\n' "$snapshot" > "$BATCH_SNAPSHOT"
+    # Create the private work directory outside the watched tree.
+    rm -rf "$BATCH_WORK" 2>/dev/null || true
+    mkdir -p "$BATCH_WORK"
+    # Copy ALL claimed files into BATCH_WORK with sha256 verification.
+    # This gives archive_files an immutable copy that cannot be raced by
+    # a producer replacing the live staging file.
+    local line
+    while IFS= read -r line; do
+        parse_snapshot_line "$line"
+        local rel_path="$_rel"
+        local expected_hash="$_hash"
+        [[ -z "$rel_path" ]] && continue
+        [[ "$rel_path" == .DS_Store || "$rel_path" == mempalace.yaml ]] && continue
+        [[ "$rel_path" == .batch_snapshot || "$rel_path" == .batch_manifest ]] && continue
+        local src="$STAGING_DIR/$rel_path"
+        [[ ! -e "$src" ]] && continue
+        local dst="$BATCH_WORK/$rel_path"
+        mkdir -p "$(dirname "$dst")"
+        cp -p "$src" "$dst"
+        local copied_hash
+        copied_hash=$(file_sha256 "$dst")
+        if [[ "$copied_hash" != "$expected_hash" ]]; then
+            log "Claim SKIP: $rel_path changed during claim (hash mismatch)"
+            rm -f "$dst"
+        fi
+    done < "$BATCH_SNAPSHOT"
     log "Claimed batch: $(grep -c '^' "$BATCH_SNAPSHOT" 2>/dev/null || wc -l < "$BATCH_SNAPSHOT") files -> $BATCH_SNAPSHOT"
     return 0
 }
@@ -173,7 +222,7 @@ preprocess_staging() {
 
     local extra_args=()
     if [[ -s "$BATCH_SNAPSHOT" ]]; then
-        extra_args=(--batch-snapshot "$BATCH_SNAPSHOT")
+        extra_args=(--batch-snapshot "$BATCH_SNAPSHOT" --work-dir "$BATCH_WORK")
     fi
 
     if "$PYTHON_BIN" "$PREPROCESS_SCRIPT" "$STAGING_DIR" --max-lines "$MAX_LINES" "${extra_args[@]}" >> "$LOG_FILE" 2>&1; then
@@ -249,7 +298,12 @@ verify_mined() {
 
     log "Verify: checking searchability of all processed files against $manifest"
 
-    if ! "$PYTHON_BIN" "$VERIFY_SCRIPT" "$PALACE_PATH" "$manifest" "$manifest" "$MEMPALACE_BIN" \
+    local snapshot_arg=()
+    if [[ -s "$BATCH_SNAPSHOT" ]]; then
+        snapshot_arg=(--snapshot "$BATCH_SNAPSHOT")
+    fi
+
+    if ! "$PYTHON_BIN" "$VERIFY_SCRIPT" "$PALACE_PATH" "$manifest" "$manifest" "$MEMPALACE_BIN" "${snapshot_arg[@]}" \
         >> "$LOG_FILE" 2>&1; then
         log "Verify FAILED: one or more processed files are not searchable"
         return 1
@@ -313,7 +367,13 @@ archive_files() {
         [[ "$rel_path" == .DS_Store || "$rel_path" == mempalace.yaml ]] && continue
         [[ "$rel_path" == .batch_snapshot || "$rel_path" == .batch_manifest ]] && continue
 
-        local file="$STAGING_DIR/$rel_path"
+        # Use the immutable work copy from claim_batch when available;
+        # fall back to the live staging tree for direct function testing
+        # and legacy callers that bypass claim_batch.
+        local file="$BATCH_WORK/$rel_path"
+        if [[ ! -e "$file" ]]; then
+            file="$STAGING_DIR/$rel_path"
+        fi
 
         if [[ ! -e "$file" ]]; then
             log "Archive SKIP: $rel_path no longer exists"
@@ -427,6 +487,9 @@ clear_staging() {
     rm -f "$STAGING_DIR/.batch_snapshot" 2>/dev/null || true
     rm -f "$STAGING_DIR/.batch_manifest" 2>/dev/null || true
     find "$STAGING_DIR" -mindepth 1 -type d -empty -not -path "*/processed" -delete 2>/dev/null || true
+    # Clean up the private work directory outside the watched tree.
+    rm -rf "$BATCH_WORK" 2>/dev/null || true
+    rm -f "$BATCH_SNAPSHOT" 2>/dev/null || true
     log "Staging cleared (ready for next batch)"
 }
 
@@ -440,11 +503,15 @@ process_batch() {
 
     if ! preprocess_staging; then
         log "ABORT: preprocess failed — files left for retry"
+        rm -rf "$BATCH_WORK" 2>/dev/null || true
+        rm -f "$BATCH_SNAPSHOT" 2>/dev/null || true
         return 1
     fi
 
     if ! mine_processed; then
         log "ABORT: mine failed — files left for retry"
+        rm -rf "$BATCH_WORK" 2>/dev/null || true
+        rm -f "$BATCH_SNAPSHOT" 2>/dev/null || true
         return 1
     fi
 
@@ -452,6 +519,8 @@ process_batch() {
 
     if ! verify_mined; then
         log "ABORT: verify failed — files left for inspection"
+        rm -rf "$BATCH_WORK" 2>/dev/null || true
+        rm -f "$BATCH_SNAPSHOT" 2>/dev/null || true
         return 1
     fi
 
@@ -459,11 +528,15 @@ process_batch() {
 
     if ! archive_files; then
         log "ABORT: archive failed — files left for inspection"
+        rm -rf "$BATCH_WORK" 2>/dev/null || true
+        rm -f "$BATCH_SNAPSHOT" 2>/dev/null || true
         return 1
     fi
 
     if ! clear_staging; then
         log "ABORT: clear_staging failed — archive is at $ARCHIVE_DIR but staging may be dirty"
+        rm -rf "$BATCH_WORK" 2>/dev/null || true
+        rm -f "$BATCH_SNAPSHOT" 2>/dev/null || true
         return 1
     fi
 
