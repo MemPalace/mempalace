@@ -8,6 +8,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Performance & Architecture (Dual-Track Rust Engine)
+
+- **Optional native Rust exact-vector acceleration (`rust_exact`).**
+  Reads the existing SQLite format into a contiguous float buffer, uses Rayon
+  for large scans, and releases the Python GIL. Local and external writes
+  invalidate the native cache. Loading is collection-scoped and decodes blobs
+  safely; serial and parallel scans preserve deterministic tie ordering.
+  The initial Windows benchmark reported 557 MB RSS versus 2,430 MB for the
+  Python baseline, with 7.2-11.8 ms native warm latency across 168k/334k-row
+  workloads. These historical numbers have not been rerun after hardening.
+  Complex filters and absent native extensions fall back to Python.
+
+- **Standalone native vector CLI and optional wheels.**
+  GitHub releases include native wheels and platform executables. The CLI
+  accepts JSON embedding vectors via `--vector` or stdin; it does not embed
+  text or require Python. Platform runtime libraries may still be required.
+
+- **NumPy top-k optimization.**
+  Cache vector norms and partition distances before sorting the selected
+  results, preserving row-order ties at the cutoff.
+
+- **Read-only search operations stop contending with palace writer leases.**
+  `searcher.py` and `_open_search_collection` now explicitly open collections with `read_only=True`. Read-only queries connect in SQLite WAL reader mode without attempting schema initialization or writer lease locks, allowing CLI and agent searches to run concurrently with an active background MCP server or writer process without raising `MineAlreadyRunning`.
+
+### Features
+
+- **Shared-brain rules are `host:harness:project`, declared-idle, and MCP-shape aware.** `mempalace rules` takes `--host --harness --project` (stable lowercase tokens) and optional `--mcp full|light` (default `full`, matching the 45-tool server). The packaged snippet is the only coordination text: compose the identity from the current workspace, arm `logstream watch` only on listen / claim / delegate, write topics on named lanes without filtering the default inbox on them, claim with a lowest-HLC mutex, and use `kg_supersede` for single-valued fact changes. `--mcp light` swaps tool tokens onto the 3-tool triad; prose is identical. `logstream watch --agent` now defaults a sanitized `--state-file` (`:` → `_` under `~/.mempalace/watch/`) so Windows tuple identities do not need a private path overlay.
+
 ---
 
 ## [3.9.0] — 2026-08-31

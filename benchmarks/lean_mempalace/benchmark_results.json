@@ -1,0 +1,518 @@
+{
+  "drawers": {
+    "Python 3.14.5 (numpy)": {
+      "language": "Python 3.14.5 (numpy)",
+      "mode": "drawers",
+      "rows_indexed": 168050,
+      "embedding_dim": 384,
+      "rss_start_mb": 32.95,
+      "rss_after_load_mb": 618.23,
+      "rss_end_mb": 1237.41,
+      "load_time_ms": 947.86,
+      "cold_first_query_ms": 90.7,
+      "total_cold_start_ms": 1598.12,
+      "warm_p50_ms": 96.8,
+      "warm_p95_ms": 109.22,
+      "warm_p99_ms": 122.81,
+      "warm_min_ms": 87.8,
+      "warm_max_ms": 126.76,
+      "python_opt_warm_p50_ms": 7.13,
+      "python_opt_warm_p95_ms": 7.63,
+      "filtered_p50_ms": 92.71,
+      "filtered_p95_ms": 97.9,
+      "top_10": [
+        {
+          "id": "drawer_44fb808c93188a039e5ce4ef712ebe0a",
+          "distance": 0.0
+        },
+        {
+          "id": "drawer_512abeb0021880da8251e5bde1508d4f",
+          "distance": 0.247153
+        },
+        {
+          "id": "drawer_62f2af23710cf616a1be769b358e67b0",
+          "distance": 0.26147
+        },
+        {
+          "id": "drawer_c39d3eb481edaf74f0416323461ec0ae",
+          "distance": 0.274269
+        },
+        {
+          "id": "drawer_b105dc45b5fb098f2d11a9ae351e3d0b",
+          "distance": 0.277083
+        },
+        {
+          "id": "drawer_9f60fe151dd2a714add1074c26b45880",
+          "distance": 0.32609
+        },
+        {
+          "id": "drawer_74e9ff6049c5b51b66894169a4b64f79",
+          "distance": 0.326677
+        },
+        {
+          "id": "drawer_bb4ef093ad575e6743f68df15209b9c0",
+          "distance": 0.346777
+        },
+        {
+          "id": "drawer_89b3758a01d49113f5e0b129ad5f9500",
+          "distance": 0.348718
+        },
+        {
+          "id": "drawer_be3f0c0e5d9f83ede3192757ad7d1812",
+          "distance": 0.352402
+        }
+      ],
+      "process_wall_time_ms": 7390.4
+    },
+    "TypeScript (Bun 1.4.1)": {
+      "language": "TypeScript (Bun 1.4.1 + bun:sqlite)",
+      "mode": "drawers",
+      "rows_indexed": 168050,
+      "embedding_dim": 384,
+      "rss_start_mb": 50.73,
+      "rss_after_load_mb": 630.43,
+      "rss_end_mb": 402.43,
+      "load_time_ms": 857.52,
+      "cold_first_query_ms": 23.94,
+      "total_cold_start_ms": 1780.54,
+      "warm_p50_ms": 19.24,
+      "warm_p95_ms": 26.03,
+      "warm_p99_ms": 27.98,
+      "warm_min_ms": 18.82,
+      "warm_max_ms": 27.98,
+      "warm_parallel_p50_ms": 39.4,
+      "warm_parallel_p95_ms": 45.66,
+      "filtered_p50_ms": 14.44,
+      "filtered_p95_ms": 14.66,
+      "top_10": [
+        {
+          "id": "drawer_44fb808c93188a039e5ce4ef712ebe0a",
+          "distance": 0
+        },
+        {
+          "id": "drawer_512abeb0021880da8251e5bde1508d4f",
+          "distance": 0.247153
+        },
+        {
+          "id": "drawer_62f2af23710cf616a1be769b358e67b0",
+          "distance": 0.26147
+        },
+        {
+          "id": "drawer_c39d3eb481edaf74f0416323461ec0ae",
+          "distance": 0.274269
+        },
+        {
+          "id": "drawer_b105dc45b5fb098f2d11a9ae351e3d0b",
+          "distance": 0.277083
+        },
+        {
+          "id": "drawer_9f60fe151dd2a714add1074c26b45880",
+          "distance": 0.32609
+        },
+        {
+          "id": "drawer_74e9ff6049c5b51b66894169a4b64f79",
+          "distance": 0.326677
+        },
+        {
+          "id": "drawer_bb4ef093ad575e6743f68df15209b9c0",
+          "distance": 0.346777
+        },
+        {
+          "id": "drawer_89b3758a01d49113f5e0b129ad5f9500",
+          "distance": 0.348718
+        },
+        {
+          "id": "drawer_be3f0c0e5d9f83ede3192757ad7d1812",
+          "distance": 0.352402
+        }
+      ],
+      "process_wall_time_ms": 3847.36
+    },
+    "Rust 1.97.0-nightly": {
+      "language": "Rust (1.97.0-nightly + rusqlite + Rayon)",
+      "mode": "drawers",
+      "rows_indexed": 168050,
+      "embedding_dim": 384,
+      "rss_start_mb": 4.78,
+      "rss_after_load_mb": 268.13,
+      "rss_end_mb": 269.34,
+      "load_time_ms": 681.44,
+      "cold_first_query_ms": 23.62,
+      "total_cold_start_ms": 706.16,
+      "warm_p50_ms": 23.42,
+      "warm_p95_ms": 24.22,
+      "warm_p99_ms": 24.24,
+      "warm_min_ms": 22.07,
+      "warm_max_ms": 24.24,
+      "warm_parallel_p50_ms": 5.03,
+      "warm_parallel_p95_ms": 5.98,
+      "filtered_p50_ms": 17.42,
+      "filtered_p95_ms": 18.19,
+      "top_10": [
+        {
+          "id": "drawer_44fb808c93188a039e5ce4ef712ebe0a",
+          "distance": 0.0
+        },
+        {
+          "id": "drawer_512abeb0021880da8251e5bde1508d4f",
+          "distance": 0.247154
+        },
+        {
+          "id": "drawer_62f2af23710cf616a1be769b358e67b0",
+          "distance": 0.261471
+        },
+        {
+          "id": "drawer_c39d3eb481edaf74f0416323461ec0ae",
+          "distance": 0.274269
+        },
+        {
+          "id": "drawer_b105dc45b5fb098f2d11a9ae351e3d0b",
+          "distance": 0.277083
+        },
+        {
+          "id": "drawer_9f60fe151dd2a714add1074c26b45880",
+          "distance": 0.32609
+        },
+        {
+          "id": "drawer_74e9ff6049c5b51b66894169a4b64f79",
+          "distance": 0.326677
+        },
+        {
+          "id": "drawer_bb4ef093ad575e6743f68df15209b9c0",
+          "distance": 0.346777
+        },
+        {
+          "id": "drawer_89b3758a01d49113f5e0b129ad5f9500",
+          "distance": 0.348718
+        },
+        {
+          "id": "drawer_be3f0c0e5d9f83ede3192757ad7d1812",
+          "distance": 0.352402
+        }
+      ],
+      "process_wall_time_ms": 2027.67
+    },
+    "Go 1.27.1": {
+      "language": "Go (go1.27.1 + modernc.org/sqlite)",
+      "mode": "drawers",
+      "rows_indexed": 168050,
+      "embedding_dim": 384,
+      "rss_start_mb": 8.31,
+      "rss_after_load_mb": 289.55,
+      "rss_end_mb": 295.05,
+      "load_time_ms": 1125.41,
+      "cold_first_query_ms": 19.56,
+      "total_cold_start_ms": 1169.73,
+      "warm_p50_ms": 18.54,
+      "warm_p95_ms": 19.68,
+      "warm_p99_ms": 20.14,
+      "warm_min_ms": 17.27,
+      "warm_max_ms": 20.14,
+      "warm_parallel_p50_ms": 5.43,
+      "warm_parallel_p95_ms": 6.39,
+      "filtered_p50_ms": 13.97,
+      "filtered_p95_ms": 15.96,
+      "top_10": [
+        {
+          "id": "drawer_44fb808c93188a039e5ce4ef712ebe0a",
+          "distance": 0
+        },
+        {
+          "id": "drawer_512abeb0021880da8251e5bde1508d4f",
+          "distance": 0.247153
+        },
+        {
+          "id": "drawer_62f2af23710cf616a1be769b358e67b0",
+          "distance": 0.26147
+        },
+        {
+          "id": "drawer_c39d3eb481edaf74f0416323461ec0ae",
+          "distance": 0.274269
+        },
+        {
+          "id": "drawer_b105dc45b5fb098f2d11a9ae351e3d0b",
+          "distance": 0.277083
+        },
+        {
+          "id": "drawer_9f60fe151dd2a714add1074c26b45880",
+          "distance": 0.32609
+        },
+        {
+          "id": "drawer_74e9ff6049c5b51b66894169a4b64f79",
+          "distance": 0.326676
+        },
+        {
+          "id": "drawer_bb4ef093ad575e6743f68df15209b9c0",
+          "distance": 0.346777
+        },
+        {
+          "id": "drawer_89b3758a01d49113f5e0b129ad5f9500",
+          "distance": 0.348718
+        },
+        {
+          "id": "drawer_be3f0c0e5d9f83ede3192757ad7d1812",
+          "distance": 0.352402
+        }
+      ],
+      "process_wall_time_ms": 2300.26
+    }
+  },
+  "all": {
+    "Python 3.14.5 (numpy)": {
+      "language": "Python 3.14.5 (numpy)",
+      "mode": "all",
+      "rows_indexed": 334224,
+      "embedding_dim": 384,
+      "rss_start_mb": 32.89,
+      "rss_after_load_mb": 1191.3,
+      "rss_end_mb": 2430.85,
+      "load_time_ms": 1855.32,
+      "cold_first_query_ms": 265.14,
+      "total_cold_start_ms": 2796.01,
+      "warm_p50_ms": 191.56,
+      "warm_p95_ms": 241.32,
+      "warm_p99_ms": 248.09,
+      "warm_min_ms": 172.76,
+      "warm_max_ms": 248.2,
+      "python_opt_warm_p50_ms": 14.66,
+      "python_opt_warm_p95_ms": 15.61,
+      "filtered_p50_ms": 194.09,
+      "filtered_p95_ms": 267.77,
+      "top_10": [
+        {
+          "id": "drawer_44fb808c93188a039e5ce4ef712ebe0a",
+          "distance": 0.0
+        },
+        {
+          "id": "drawer_512abeb0021880da8251e5bde1508d4f",
+          "distance": 0.247153
+        },
+        {
+          "id": "drawer_62f2af23710cf616a1be769b358e67b0",
+          "distance": 0.26147
+        },
+        {
+          "id": "drawer_c39d3eb481edaf74f0416323461ec0ae",
+          "distance": 0.274269
+        },
+        {
+          "id": "drawer_b105dc45b5fb098f2d11a9ae351e3d0b",
+          "distance": 0.277083
+        },
+        {
+          "id": "drawer_9f60fe151dd2a714add1074c26b45880",
+          "distance": 0.32609
+        },
+        {
+          "id": "drawer_74e9ff6049c5b51b66894169a4b64f79",
+          "distance": 0.326677
+        },
+        {
+          "id": "drawer_bb4ef093ad575e6743f68df15209b9c0",
+          "distance": 0.346777
+        },
+        {
+          "id": "drawer_89b3758a01d49113f5e0b129ad5f9500",
+          "distance": 0.348718
+        },
+        {
+          "id": "drawer_be3f0c0e5d9f83ede3192757ad7d1812",
+          "distance": 0.352402
+        }
+      ],
+      "process_wall_time_ms": 14735.55
+    },
+    "TypeScript (Bun 1.4.1)": {
+      "language": "TypeScript (Bun 1.4.1 + bun:sqlite)",
+      "mode": "all",
+      "rows_indexed": 334224,
+      "embedding_dim": 384,
+      "rss_start_mb": 50.8,
+      "rss_after_load_mb": 769.54,
+      "rss_end_mb": 663.26,
+      "load_time_ms": 1603.21,
+      "cold_first_query_ms": 42.61,
+      "total_cold_start_ms": 2586.09,
+      "warm_p50_ms": 37.67,
+      "warm_p95_ms": 39.63,
+      "warm_p99_ms": 41.95,
+      "warm_min_ms": 37.13,
+      "warm_max_ms": 41.95,
+      "warm_parallel_p50_ms": 78.6,
+      "warm_parallel_p95_ms": 84.66,
+      "filtered_p50_ms": 28.26,
+      "filtered_p95_ms": 29.92,
+      "top_10": [
+        {
+          "id": "drawer_44fb808c93188a039e5ce4ef712ebe0a",
+          "distance": 0
+        },
+        {
+          "id": "drawer_512abeb0021880da8251e5bde1508d4f",
+          "distance": 0.247153
+        },
+        {
+          "id": "drawer_62f2af23710cf616a1be769b358e67b0",
+          "distance": 0.26147
+        },
+        {
+          "id": "drawer_c39d3eb481edaf74f0416323461ec0ae",
+          "distance": 0.274269
+        },
+        {
+          "id": "drawer_b105dc45b5fb098f2d11a9ae351e3d0b",
+          "distance": 0.277083
+        },
+        {
+          "id": "drawer_9f60fe151dd2a714add1074c26b45880",
+          "distance": 0.32609
+        },
+        {
+          "id": "drawer_74e9ff6049c5b51b66894169a4b64f79",
+          "distance": 0.326677
+        },
+        {
+          "id": "drawer_bb4ef093ad575e6743f68df15209b9c0",
+          "distance": 0.346777
+        },
+        {
+          "id": "drawer_89b3758a01d49113f5e0b129ad5f9500",
+          "distance": 0.348718
+        },
+        {
+          "id": "drawer_be3f0c0e5d9f83ede3192757ad7d1812",
+          "distance": 0.352402
+        }
+      ],
+      "process_wall_time_ms": 6475.28
+    },
+    "Rust 1.97.0-nightly": {
+      "language": "Rust (1.97.0-nightly + rusqlite + Rayon)",
+      "mode": "all",
+      "rows_indexed": 334224,
+      "embedding_dim": 384,
+      "rss_start_mb": 4.76,
+      "rss_after_load_mb": 526.0,
+      "rss_end_mb": 526.38,
+      "load_time_ms": 1399.32,
+      "cold_first_query_ms": 49.54,
+      "total_cold_start_ms": 1449.93,
+      "warm_p50_ms": 48.82,
+      "warm_p95_ms": 51.15,
+      "warm_p99_ms": 51.32,
+      "warm_min_ms": 46.21,
+      "warm_max_ms": 51.32,
+      "warm_parallel_p50_ms": 11.15,
+      "warm_parallel_p95_ms": 11.5,
+      "filtered_p50_ms": 34.76,
+      "filtered_p95_ms": 36.18,
+      "top_10": [
+        {
+          "id": "drawer_44fb808c93188a039e5ce4ef712ebe0a",
+          "distance": 0.0
+        },
+        {
+          "id": "drawer_512abeb0021880da8251e5bde1508d4f",
+          "distance": 0.247154
+        },
+        {
+          "id": "drawer_62f2af23710cf616a1be769b358e67b0",
+          "distance": 0.261471
+        },
+        {
+          "id": "drawer_c39d3eb481edaf74f0416323461ec0ae",
+          "distance": 0.274269
+        },
+        {
+          "id": "drawer_b105dc45b5fb098f2d11a9ae351e3d0b",
+          "distance": 0.277083
+        },
+        {
+          "id": "drawer_9f60fe151dd2a714add1074c26b45880",
+          "distance": 0.32609
+        },
+        {
+          "id": "drawer_74e9ff6049c5b51b66894169a4b64f79",
+          "distance": 0.326677
+        },
+        {
+          "id": "drawer_bb4ef093ad575e6743f68df15209b9c0",
+          "distance": 0.346777
+        },
+        {
+          "id": "drawer_89b3758a01d49113f5e0b129ad5f9500",
+          "distance": 0.348718
+        },
+        {
+          "id": "drawer_be3f0c0e5d9f83ede3192757ad7d1812",
+          "distance": 0.352402
+        }
+      ],
+      "process_wall_time_ms": 4145.49
+    },
+    "Go 1.27.1": {
+      "language": "Go (go1.27.1 + modernc.org/sqlite)",
+      "mode": "all",
+      "rows_indexed": 334224,
+      "embedding_dim": 384,
+      "rss_start_mb": 8.1,
+      "rss_after_load_mb": 556.33,
+      "rss_end_mb": 561.84,
+      "load_time_ms": 1984.15,
+      "cold_first_query_ms": 34.02,
+      "total_cold_start_ms": 2059.07,
+      "warm_p50_ms": 34.66,
+      "warm_p95_ms": 35.83,
+      "warm_p99_ms": 37.42,
+      "warm_min_ms": 33.17,
+      "warm_max_ms": 37.42,
+      "warm_parallel_p50_ms": 11.44,
+      "warm_parallel_p95_ms": 13.05,
+      "filtered_p50_ms": 25.87,
+      "filtered_p95_ms": 27.17,
+      "top_10": [
+        {
+          "id": "drawer_44fb808c93188a039e5ce4ef712ebe0a",
+          "distance": 0
+        },
+        {
+          "id": "drawer_512abeb0021880da8251e5bde1508d4f",
+          "distance": 0.247153
+        },
+        {
+          "id": "drawer_62f2af23710cf616a1be769b358e67b0",
+          "distance": 0.26147
+        },
+        {
+          "id": "drawer_c39d3eb481edaf74f0416323461ec0ae",
+          "distance": 0.274269
+        },
+        {
+          "id": "drawer_b105dc45b5fb098f2d11a9ae351e3d0b",
+          "distance": 0.277083
+        },
+        {
+          "id": "drawer_9f60fe151dd2a714add1074c26b45880",
+          "distance": 0.32609
+        },
+        {
+          "id": "drawer_74e9ff6049c5b51b66894169a4b64f79",
+          "distance": 0.326676
+        },
+        {
+          "id": "drawer_bb4ef093ad575e6743f68df15209b9c0",
+          "distance": 0.346777
+        },
+        {
+          "id": "drawer_89b3758a01d49113f5e0b129ad5f9500",
+          "distance": 0.348718
+        },
+        {
+          "id": "drawer_be3f0c0e5d9f83ede3192757ad7d1812",
+          "distance": 0.352402
+        }
+      ],
+      "process_wall_time_ms": 4142.05
+    }
+  }
+}
