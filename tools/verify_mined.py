@@ -18,6 +18,8 @@ previously-indexed version cannot satisfy verification for a new version
 that was never mined.
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
 import re
