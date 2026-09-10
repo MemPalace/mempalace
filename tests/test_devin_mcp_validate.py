@@ -100,7 +100,9 @@ class TestConfigDiscovery:
         )
 
         monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
         os.environ["HOME"] = str(home)
+        os.environ["USERPROFILE"] = str(home)
 
         cfg = module.load_server_config("mempalace")
         assert cfg == {"url": "http://new:8766/mcp"}
@@ -204,7 +206,9 @@ class TestHttpToolList:
             )
 
             monkeypatch.setenv("HOME", str(home))
+            monkeypatch.setenv("USERPROFILE", str(home))
             os.environ["HOME"] = str(home)
+            os.environ["USERPROFILE"] = str(home)
 
             # Clear any existing cache so the hook has to talk to the HTTP server.
             cache_dir = home / ".devin" / "cache" / "mcp_schemas"
