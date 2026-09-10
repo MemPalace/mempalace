@@ -9,6 +9,16 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
+# The staging watcher is a bash script. Tests that source it cannot run on
+# Windows without WSL.  Skip them on Windows rather than reporting false
+# failures.
+skip_on_windows = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="staging_watcher.sh requires bash (not available on Windows without WSL)",
+)
+
 
 def _write_snapshot(staging: Path, rels: list[str]) -> Path:
     """Create a unit-separator batch snapshot for the given relative paths."""
@@ -74,6 +84,7 @@ def _make_fake_mempalace(tmp_path: Path, body: str) -> Path:
     return script
 
 
+@skip_on_windows
 class TestVerifyMined:
     """Regressions for staging_watcher verification (fatkobra review)."""
 
@@ -206,6 +217,7 @@ class TestVerifyMined:
         assert _run_verify(manifest, manifest, fake) == 0
 
 
+@skip_on_windows
 class TestArchiveFiles:
     """Regressions for archive name collisions (mvalentsev review)."""
 
@@ -309,6 +321,7 @@ class TestArchiveFiles:
         assert len(final_batches) == 0
 
 
+@skip_on_windows
 class TestPreprocessSubdirectories:
     """Ensure preprocessing does not flatten subdirectories (root cause of archive collisions)."""
 
@@ -333,6 +346,7 @@ class TestPreprocessSubdirectories:
             sys.path.pop(0)
 
 
+@skip_on_windows
 class TestProcessBatch:
     """End-to-end batch regressions (fatkobra review)."""
 
@@ -399,6 +413,7 @@ class TestProcessBatch:
         assert len(final_batches) == 0
 
 
+@skip_on_windows
 class TestBatchStability:
     """Regressions for content-based debounce (fatkobra review)."""
 
@@ -463,6 +478,7 @@ class TestBatchStability:
         assert first.stdout.strip() == second.stdout.strip()
 
 
+@skip_on_windows
 class TestBatchIsolation:
     """Regressions for immutable batch claim (fatkobra review)."""
 
@@ -531,6 +547,7 @@ class TestBatchIsolation:
 # ── Regression tests for fatkobra review issues 1-4 ──────────────────────────
 
 
+@skip_on_windows
 class TestStaleVersionVerification:
     """Issue 1: verification must prove the CURRENT source version was mined.
 
@@ -589,6 +606,7 @@ class TestStaleVersionVerification:
         assert file_sha256(sample) == sha256
 
 
+@skip_on_windows
 class TestBatchWorkOutsideWatchedTree:
     """Issue 2: .batch_work must not be inside the watched staging tree.
 
@@ -623,6 +641,7 @@ class TestBatchWorkOutsideWatchedTree:
         assert count == 1, f"count_files should be 1 (real.md only), got {count}"
 
 
+@skip_on_windows
 class TestArchiveUsesImmutableWorkCopy:
     """Issue 3: archive and deletion must use the claimed immutable bytes.
 
@@ -685,6 +704,7 @@ class TestArchiveUsesImmutableWorkCopy:
         )
 
 
+@skip_on_windows
 class TestPortableHashing:
     """Issue 4: fingerprint_staging must fail closed when sha256sum is missing.
 
