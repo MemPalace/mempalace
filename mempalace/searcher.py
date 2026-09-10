@@ -395,7 +395,7 @@ def _maybe_expand_wings(
     wing: str = None,
     room: str = None,
     source_file: str = None,
-) -> list[str] | None:
+) -> Optional[list[str]]:
     """Compute which wings to search when no explicit filter is given.
 
     Returns ``None`` if expansion is disabled, the caller specified a
@@ -1693,7 +1693,7 @@ def _search_result_envelope(
     candidates_fetched: int,
     pool_size: int,
     date_window_active: bool,
-    expanded_wings: list[str] | None = None,
+    expanded_wings: Optional[list[str]] = None,
 ) -> dict:
     """Assemble the ``search_memories`` response dict.
 
