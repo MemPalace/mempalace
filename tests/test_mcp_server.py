@@ -984,8 +984,9 @@ class TestReadTools:
         assert db_path.read_bytes() == before_bytes
         assert db_path.stat().st_mtime_ns == before_mtime_ns
 
+    @pytest.mark.parametrize("backend_name", ["sqlite_exact", "rust_exact"])
     def test_stdio_sqlite_exact_reads_with_peer_writer_then_reopens_on_promotion(
-        self, monkeypatch, config, palace_path, kg
+        self, monkeypatch, config, palace_path, kg, backend_name
     ):
         """A writable-capable stdio server must recall through a read-only
         handle while a peer owns the palace, then discard that handle when it
@@ -994,7 +995,7 @@ class TestReadTools:
         from mempalace import mcp_server, palace
         from mempalace.backends import PalaceRef
 
-        monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
+        monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", backend_name)
         monkeypatch.setattr(
             embedding_wrapper,
             "_embed_texts",
@@ -1053,6 +1054,19 @@ with mine_palace_lock(sys.argv[1]):
             holder.stdin.close()
             holder.wait(timeout=10)
             assert holder.returncode == 0
+
+            # Complete a writer/checkpoint cycle while MCP retains its wrapper.
+            from mempalace.backends.sqlite_exact import SQLiteExactBackend
+
+            peer = SQLiteExactBackend()
+            try:
+                peer_col = peer.get_collection(
+                    palace=palace_ref, collection_name=config.collection_name
+                )
+                peer_col.add(ids=["new_drawer"], documents=["new memory"], embeddings=[[1.0, 0.0]])
+            finally:
+                peer.close()
+            assert mcp_server.tool_list_drawers()["count"] == 2
 
             writer_ok, writer_reason = mcp_server._acquire_mcp_writer_lock()
             assert writer_ok is True
@@ -4141,6 +4155,66 @@ class TestKGTools:
         assert result["as_of"] == "2026-05-06T14:23:00Z"
         assert result["count"] == 1
         assert result["facts"][0]["object"] == "Acme"
+
+    def test_kg_query_as_of_does_not_duplicate_ended_facts(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        kg.add_triple(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-01-01",
+            valid_to="2026-06-01",
+        )
+        result = mcp_server.tool_kg_query("Alice", as_of="2026-04-01", direction="outgoing")
+        assert result["count"] == 1
+        assert len(result["active_facts"]) == 1
+        assert result["historical_facts"] == []
+
+    def test_kg_query_excludes_future_valid_from_from_active(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        kg.add_triple("Alice", "starts", "school", valid_from="2099-01-01")
+        kg.add_triple("Alice", "lives_in", "Town", valid_from="2020-01-01")
+        result = mcp_server.tool_kg_query("Alice", direction="outgoing")
+        active_preds = {r["predicate"] for r in result["active_facts"]}
+        future_preds = {r["predicate"] for r in result["future_facts"]}
+        assert "lives_in" in active_preds
+        assert "starts" not in active_preds
+        assert "starts" in future_preds
+
+    def test_kg_query_keeps_bounded_future_end_as_active(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        kg.add_triple(
+            "Alice",
+            "on_med",
+            "Empagliflozin",
+            valid_from="2025-01-01",
+            valid_to="2099-12-31",
+        )
+        kg.add_triple(
+            "Alice",
+            "on_med",
+            "Metformin",
+            valid_from="2020-01-01",
+            valid_to="2025-01-01",
+        )
+        result = mcp_server.tool_kg_query("Alice", direction="outgoing")
+        active_objs = {r["object"] for r in result["active_facts"]}
+        historical_objs = {r["object"] for r in result["historical_facts"]}
+        assert "Empagliflozin" in active_objs
+        assert "Empagliflozin" not in historical_objs
+        assert "Metformin" in historical_objs
 
     def test_kg_invalidate_accepts_datetime_ended(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)

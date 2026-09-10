@@ -1,0 +1,878 @@
+{
+  "model": "qwen3.8-27b-nvfp4",
+  "endpoint": "http://x870e-9950x3d:8010/v1/chat/completions",
+  "timestamp": "2026-09-01 12:18:09",
+  "routine_benchmark": {
+    "lightweight": {
+      "total": 20,
+      "pass_count": 18,
+      "pass_rate_pct": 90.0,
+      "avg_latency_sec": 30.68,
+      "results": [
+        {
+          "test_id": "recall_jwt_auth",
+          "category": "Recall & Search",
+          "mode": "lightweight",
+          "tool_called": true,
+          "tool_name": "palace_query",
+          "tool_args": {
+            "query": "FIND \"JWT expiration refresh token storage\" IN backend LIMIT 10"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 36.93,
+          "multi_turn_success": true,
+          "final_response_preview": "Here's what's recorded in the palace (backend/auth, from `auth.py`):  **JWT & Refresh Token Decision:** - **Session mana"
+        },
+        {
+          "test_id": "recall_db_pooling",
+          "category": "Recall & Search",
+          "mode": "lightweight",
+          "tool_called": true,
+          "tool_name": "palace_query",
+          "tool_args": {
+            "query": "FIND \"production database connection pooler\" LIMIT 10"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 23.02,
+          "multi_turn_success": true,
+          "final_response_preview": "In production you're running **PostgreSQL 15** with **PgBouncer** as the connection pooler, configured with a max pool s"
+        },
+        {
+          "test_id": "recall_frontend_state",
+          "category": "Recall & Search",
+          "mode": "lightweight",
+          "tool_called": true,
+          "tool_name": "palace_query",
+          "tool_args": {
+            "query": "FIND \"server state management React frontend\" LIMIT 10"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 24.76,
+          "multi_turn_success": true,
+          "final_response_preview": "**TanStack Query** is used for server state management in the React frontend.  Per the architecture notes (project_front"
+        },
+        {
+          "test_id": "taxonomy_overview",
+          "category": "Recall & Search",
+          "mode": "lightweight",
+          "tool_called": true,
+          "tool_name": "palace_query",
+          "tool_args": {
+            "target": "taxonomy"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 35.05,
+          "multi_turn_success": true,
+          "final_response_preview": "{\"total_drawers\": 6, \"wings\": {\"project_backend\": 2, \"project_frontend\": 1, \"security\": 1, \"team\": 1, \"wing_antigravity\""
+        },
+        {
+          "test_id": "palace_status_health",
+          "category": "Recall & Search",
+          "mode": "lightweight",
+          "tool_called": true,
+          "tool_name": "palace_query",
+          "tool_args": {
+            "query": "STATUS",
+            "target": "status"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 27.19,
+          "multi_turn_success": true,
+          "final_response_preview": "Here's the full status report for your memory palace:  ## \ud83c\udfdb\ufe0f Palace Status  **Total drawers: 6**  ### Wings (5) | Wing |"
+        },
+        {
+          "test_id": "check_duplicate_content",
+          "category": "Recall & Search",
+          "mode": "lightweight",
+          "tool_called": true,
+          "tool_name": "palace_query",
+          "tool_args": {
+            "content": "Database migrations are handled by Alembic with PostgreSQL 15.",
+            "target": "check_duplicate"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 41.7,
+          "multi_turn_success": true,
+          "final_response_preview": "**Short answer: effectively yes \u2014 the core fact is already stored, though not verbatim.**  - **Exact duplicate check:** "
+        },
+        {
+          "test_id": "kg_query_entity",
+          "category": "Knowledge Graph",
+          "mode": "lightweight",
+          "tool_called": true,
+          "tool_name": "palace_query",
+          "tool_args": {
+            "direction": "both",
+            "entity": "Alice",
+            "target": "kg_query"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 24.77,
+          "multi_turn_success": true,
+          "final_response_preview": "Here's what the knowledge graph knows about **Alice** \u2014 2 active facts, no historical or future ones:  | Fact | Details "
+        },
+        {
+          "test_id": "kg_timeline_entity",
+          "category": "Knowledge Graph",
+          "mode": "lightweight",
+          "tool_called": true,
+          "tool_name": "palace_query",
+          "tool_args": {
+            "entity": "Bob",
+            "target": "kg_timeline"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 37.31,
+          "multi_turn_success": true,
+          "final_response_preview": "Here's the chronological history of facts for **Bob** from the knowledge graph:  ## \ud83d\udcc5 Bob \u2014 Fact Timeline  | Date | Fact"
+        },
+        {
+          "test_id": "kg_stats_overview",
+          "category": "Knowledge Graph",
+          "mode": "lightweight",
+          "tool_called": true,
+          "tool_name": "palace_query",
+          "tool_args": {
+            "target": "kg_stats"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 22.71,
+          "multi_turn_success": true,
+          "final_response_preview": "Here are the overall knowledge graph stats:  - **Entities:** 8 - **Triples:** 5 - **Current facts:** 5 - **Expired facts"
+        },
+        {
+          "test_id": "graph_traverse_room",
+          "category": "Graph & Navigation",
+          "mode": "lightweight",
+          "tool_called": true,
+          "tool_name": "palace_query",
+          "tool_args": {
+            "query": "STATUS",
+            "target": "status"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 51.09,
+          "multi_turn_success": false,
+          "final_response_preview": "[]"
+        },
+        {
+          "test_id": "list_cross_wing_tunnels",
+          "category": "Graph & Navigation",
+          "mode": "lightweight",
+          "tool_called": true,
+          "tool_name": "palace_query",
+          "tool_args": {
+            "target": "find_tunnels",
+            "wing_a": "project_backend",
+            "wing_b": "project_frontend"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 39.1,
+          "multi_turn_success": true,
+          "final_response_preview": "There are **2 cross-wing tunnels** connecting `project_backend` to `project_frontend`:  | # | Tunnel | Source | Target |"
+        },
+        {
+          "test_id": "diary_read_recent",
+          "category": "Agent Diary",
+          "mode": "lightweight",
+          "tool_called": true,
+          "tool_name": "palace_query",
+          "tool_args": {
+            "agent_name": "antigravity",
+            "last_n": 3,
+            "target": "diary_read"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 24.82,
+          "multi_turn_success": true,
+          "final_response_preview": "Agent **antigravity** has only **1** diary entry recorded (not 3). Here it is:  | Timestamp | Topic | Content | |---|---"
+        },
+        {
+          "test_id": "diary_write_session",
+          "category": "Agent Diary",
+          "mode": "lightweight",
+          "tool_called": true,
+          "tool_name": "palace_exec",
+          "tool_args": {
+            "action": "diary_write",
+            "command": "DIARY antigravity topic:auth \"SESSION:2026-09-01|migrated JWT tokens to passkeys|done\""
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 45.61,
+          "multi_turn_success": true,
+          "final_response_preview": "Diary entry written successfully for agent **antigravity**:  - **Entry ID:** `diary_wing_antigravity_20260901_1202206598"
+        },
+        {
+          "test_id": "add_new_drawer",
+          "category": "Memory Mutations",
+          "mode": "lightweight",
+          "tool_called": true,
+          "tool_name": "palace_exec",
+          "tool_args": {
+            "action": "add_drawer",
+            "content": "All internal microservices must communicate via gRPC with Protocol Buffers.",
+            "room": "architecture",
+            "wing": "project_backend"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 24.8,
+          "multi_turn_success": true,
+          "final_response_preview": "Filed successfully. \u2705  - **Drawer ID:** `drawer_project_backend_architecture_516e1269087c5933d5da4ba2` - **Wing:** `proj"
+        },
+        {
+          "test_id": "kg_add_fact",
+          "category": "Memory Mutations",
+          "mode": "lightweight",
+          "tool_called": true,
+          "tool_name": "palace_exec",
+          "tool_args": {
+            "action": "kg_add",
+            "object": "Technical Advisory Board",
+            "predicate": "appointed_to",
+            "subject": "Alice",
+            "valid_from": "2026-09-01"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 22.85,
+          "multi_turn_success": true,
+          "final_response_preview": "Done! The fact has been added to the knowledge graph:  - **Triple:** Alice \u2192 appointed_to \u2192 Technical Advisory Board - *"
+        },
+        {
+          "test_id": "kg_supersede_fact",
+          "category": "Memory Mutations",
+          "mode": "lightweight",
+          "tool_called": true,
+          "tool_name": "palace_query",
+          "tool_args": {
+            "direction": "both",
+            "entity": "Alice",
+            "target": "kg_query"
+          },
+          "selection_correct": true,
+          "execution_success": false,
+          "execution_error": "tool_kg_supersede() missing 1 required positional argument: 'old_object'",
+          "latency_sec": 34.37,
+          "multi_turn_success": true,
+          "final_response_preview": "{\"success\": true, \"triple_id\": \"t_alice_role_vp_of_engineering_0fc14a91a736\", \"fact\": \"Alice \u2192 role \u2192 VP of Engineering\""
+        },
+        {
+          "test_id": "create_cross_wing_tunnel",
+          "category": "Memory Mutations",
+          "mode": "lightweight",
+          "tool_called": true,
+          "tool_name": "palace_query",
+          "tool_args": {
+            "target": "list_tunnels"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 26.79,
+          "multi_turn_success": true,
+          "final_response_preview": "Good news \u2014 that tunnel already exists, so I didn't create a duplicate. Here's the existing one:  **Tunnel `671e4b5282a7"
+        },
+        {
+          "test_id": "coord_task_create",
+          "category": "Multi-Agent Flow",
+          "mode": "lightweight",
+          "tool_called": true,
+          "tool_name": "palace_coordinate",
+          "tool_args": {
+            "action": "task_create",
+            "base_commit": "a1b2c3d4e5f6",
+            "branch": "feat/passkeys",
+            "done": "All WebAuthn integration tests pass",
+            "from_agent": "windows:antigravity:mempalace",
+            "goal": "Implement Passkey WebAuthn endpoints",
+            "project": "mempalace",
+            "to_agent": "windows:claude:mempalace"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 24.05,
+          "multi_turn_success": true,
+          "final_response_preview": "Task delegated successfully. Here's the summary:  **Task: Implement Passkey WebAuthn endpoints**  | Field | Value | |---"
+        },
+        {
+          "test_id": "coord_event_list",
+          "category": "Multi-Agent Flow",
+          "mode": "lightweight",
+          "tool_called": true,
+          "tool_name": "palace_coordinate",
+          "tool_args": {
+            "action": "event_list",
+            "stream": "project/mempalace",
+            "to_agent": "windows:antigravity:mempalace"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 23.45,
+          "multi_turn_success": true,
+          "final_response_preview": "There is **1 coordination event** in stream `project/mempalace` sent to agent `windows:antigravity:mempalace`:  | Field "
+        },
+        {
+          "test_id": "coord_mesh_peers",
+          "category": "Multi-Agent Flow",
+          "mode": "lightweight",
+          "tool_called": true,
+          "tool_name": "palace_coordinate",
+          "tool_args": {
+            "action": "mesh_peers"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 23.18,
+          "multi_turn_success": true,
+          "final_response_preview": "Here's the current coordination mesh estate snapshot:  ## Mesh Status  | Field | Value | |---|---| | **Sync interval** |"
+        }
+      ]
+    },
+    "legacy": {
+      "total": 20,
+      "pass_count": 20,
+      "pass_rate_pct": 100.0,
+      "avg_latency_sec": 25.19,
+      "results": [
+        {
+          "test_id": "recall_jwt_auth",
+          "category": "Recall & Search",
+          "mode": "legacy",
+          "tool_called": true,
+          "tool_name": "mempalace_search",
+          "tool_args": {
+            "limit": 8,
+            "query": "JWT expiration refresh token storage backend decision"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 34.09,
+          "multi_turn_success": true,
+          "final_response_preview": "Found it \u2014 from the `project_backend` / `auth` drawer (sourced from `auth.py`):  **The decision:** - **JWT expiration:**"
+        },
+        {
+          "test_id": "recall_db_pooling",
+          "category": "Recall & Search",
+          "mode": "legacy",
+          "tool_called": true,
+          "tool_name": "mempalace_search",
+          "tool_args": {
+            "limit": 5,
+            "query": "production database connection pooler"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 22.76,
+          "multi_turn_success": true,
+          "final_response_preview": "In production you're running **PostgreSQL 15** with **PgBouncer** as the connection pooler, configured with a max pool s"
+        },
+        {
+          "test_id": "recall_frontend_state",
+          "category": "Recall & Search",
+          "mode": "legacy",
+          "tool_called": true,
+          "tool_name": "mempalace_search",
+          "tool_args": {
+            "limit": 5,
+            "query": "React frontend server state management library"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 21.5,
+          "multi_turn_success": true,
+          "final_response_preview": "**TanStack Query** is used for server state management in the React frontend. (Zustand handles global UI state, and all "
+        },
+        {
+          "test_id": "taxonomy_overview",
+          "category": "Recall & Search",
+          "mode": "legacy",
+          "tool_called": true,
+          "tool_name": "mempalace_get_taxonomy",
+          "tool_args": {},
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 22.72,
+          "multi_turn_success": true,
+          "final_response_preview": "Here's the full breakdown of your memory palace:  ## \ud83c\udfdb\ufe0f Palace Overview  | Wing | Rooms | Drawers | |------|-------|----"
+        },
+        {
+          "test_id": "palace_status_health",
+          "category": "Recall & Search",
+          "mode": "legacy",
+          "tool_called": true,
+          "tool_name": "mempalace_status",
+          "tool_args": {},
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 32.86,
+          "multi_turn_success": true,
+          "final_response_preview": "{\"entities\": 8, \"triples\": 5, \"current_facts\": 5, \"expired_facts\": 0, \"relationship_types\": [\"founded\", \"leads\", \"mainta"
+        },
+        {
+          "test_id": "check_duplicate_content",
+          "category": "Recall & Search",
+          "mode": "legacy",
+          "tool_called": true,
+          "tool_name": "mempalace_check_duplicate",
+          "tool_args": {
+            "content": "Database migrations are handled by Alembic with PostgreSQL 15."
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 21.67,
+          "multi_turn_success": true,
+          "final_response_preview": "No \u2014 that note isn't stored in the palace yet. The duplicate check found no matches for \"Database migrations are handled"
+        },
+        {
+          "test_id": "kg_query_entity",
+          "category": "Knowledge Graph",
+          "mode": "legacy",
+          "tool_called": true,
+          "tool_name": "mempalace_kg_query",
+          "tool_args": {
+            "entity": "Alice"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 21.93,
+          "multi_turn_success": true,
+          "final_response_preview": "Here's what the knowledge graph knows about **Alice** \u2014 2 active facts, no historical or future ones:  | Fact | Details "
+        },
+        {
+          "test_id": "kg_timeline_entity",
+          "category": "Knowledge Graph",
+          "mode": "legacy",
+          "tool_called": true,
+          "tool_name": "mempalace_kg_timeline",
+          "tool_args": {
+            "entity": "Bob"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 22.29,
+          "multi_turn_success": true,
+          "final_response_preview": "Here's Bob's chronological timeline of facts:  | Date | Fact | Status | |------|------|--------| | **2025-02-01** | Bob "
+        },
+        {
+          "test_id": "kg_stats_overview",
+          "category": "Knowledge Graph",
+          "mode": "legacy",
+          "tool_called": true,
+          "tool_name": "mempalace_kg_stats",
+          "tool_args": {},
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 21.54,
+          "multi_turn_success": true,
+          "final_response_preview": "Here's the current state of your knowledge graph:  - **Entities:** 8 - **Triples (facts):** 5 - **Current facts:** 5 - *"
+        },
+        {
+          "test_id": "graph_traverse_room",
+          "category": "Graph & Navigation",
+          "mode": "legacy",
+          "tool_called": true,
+          "tool_name": "mempalace_list_rooms",
+          "tool_args": {},
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 33.3,
+          "multi_turn_success": true,
+          "final_response_preview": "{\"total_rooms\": 6, \"total_room_instances\": 6, \"tunnel_rooms\": 0, \"passive_tunnel_rooms\": 0, \"explicit_tunnels\": 0, \"tota"
+        },
+        {
+          "test_id": "list_cross_wing_tunnels",
+          "category": "Graph & Navigation",
+          "mode": "legacy",
+          "tool_called": true,
+          "tool_name": "mempalace_find_tunnels",
+          "tool_args": {
+            "wing_a": "project_backend",
+            "wing_b": "project_frontend"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 32.54,
+          "multi_turn_success": true,
+          "final_response_preview": "[{\"id\": \"a30daa020c4a6f4f\", \"source\": {\"wing\": \"project_backend\", \"room\": \"auth\", \"drawer_id\": \"C:\\\\Users\\\\igorl\\\\AppDat"
+        },
+        {
+          "test_id": "diary_read_recent",
+          "category": "Agent Diary",
+          "mode": "legacy",
+          "tool_called": true,
+          "tool_name": "mempalace_diary_read",
+          "tool_args": {
+            "agent_name": "antigravity",
+            "last_n": 3
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 22.33,
+          "multi_turn_success": true,
+          "final_response_preview": "Agent **antigravity** has only **1** diary entry on record (not 3):  **2026-08-28 12:00** \u2014 topic: `general` > `SESSION:"
+        },
+        {
+          "test_id": "diary_write_session",
+          "category": "Agent Diary",
+          "mode": "legacy",
+          "tool_called": true,
+          "tool_name": "mempalace_diary_write",
+          "tool_args": {
+            "agent_name": "antigravity",
+            "entry": "SESSION:2026-09-01|migrated JWT tokens to passkeys|done",
+            "topic": "auth"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 22.07,
+          "multi_turn_success": true,
+          "final_response_preview": "Diary entry filed for **antigravity** (topic: `auth`):  - **Entry:** `SESSION:2026-09-01|migrated JWT tokens to passkeys"
+        },
+        {
+          "test_id": "add_new_drawer",
+          "category": "Memory Mutations",
+          "mode": "legacy",
+          "tool_called": true,
+          "tool_name": "mempalace_add_drawer",
+          "tool_args": {
+            "content": "All internal microservices must communicate via gRPC with Protocol Buffers.",
+            "room": "architecture",
+            "wing": "project_backend"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 22.0,
+          "multi_turn_success": true,
+          "final_response_preview": "Filed. The decision is now stored in the palace:  - **Wing:** `project_backend` - **Room:** `architecture` - **Drawer ID"
+        },
+        {
+          "test_id": "kg_add_fact",
+          "category": "Memory Mutations",
+          "mode": "legacy",
+          "tool_called": true,
+          "tool_name": "mempalace_kg_add",
+          "tool_args": {
+            "object": "Technical Advisory Board",
+            "predicate": "appointed_to",
+            "subject": "Alice",
+            "valid_from": "2026-09-01"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 21.95,
+          "multi_turn_success": true,
+          "final_response_preview": "Done! The fact has been added to the knowledge graph:  - **Fact:** Alice \u2192 appointed_to \u2192 Technical Advisory Board - **V"
+        },
+        {
+          "test_id": "kg_supersede_fact",
+          "category": "Memory Mutations",
+          "mode": "legacy",
+          "tool_called": true,
+          "tool_name": "mempalace_kg_query",
+          "tool_args": {
+            "entity": "Alice"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 34.1,
+          "multi_turn_success": true,
+          "final_response_preview": "{\"entity\": \"Alice\", \"as_of\": \"2026-09-01\", \"active_facts\": [{\"direction\": \"outgoing\", \"subject\": \"Alice\", \"predicate\": \""
+        },
+        {
+          "test_id": "create_cross_wing_tunnel",
+          "category": "Memory Mutations",
+          "mode": "legacy",
+          "tool_called": true,
+          "tool_name": "mempalace_create_tunnel",
+          "tool_args": {
+            "label": "Auth token integration",
+            "source_room": "auth",
+            "source_wing": "project_backend",
+            "target_room": "login",
+            "target_wing": "project_frontend"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 22.13,
+          "multi_turn_success": true,
+          "final_response_preview": "Tunnel created successfully:  - **ID:** `671e4b5282a72a93` - **Source:** `project_backend` / `auth` - **Target:** `proje"
+        },
+        {
+          "test_id": "coord_task_create",
+          "category": "Multi-Agent Flow",
+          "mode": "legacy",
+          "tool_called": true,
+          "tool_name": "mempalace_task_create",
+          "tool_args": {
+            "base_commit": "a1b2c3d4e5f6",
+            "branch": "feat/passkeys",
+            "done": "All WebAuthn integration tests pass",
+            "from_agent": "windows:antigravity:mempalace",
+            "goal": "Implement Passkey WebAuthn endpoints",
+            "project": "mempalace",
+            "to_agent": "windows:claude:mempalace"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 25.22,
+          "multi_turn_success": true,
+          "final_response_preview": "Task delegated successfully. \u2705  **Task details:** - **ID:** `evt_20260901T151258_343efc6821d1` - **Correlation ID:** `ta"
+        },
+        {
+          "test_id": "coord_event_list",
+          "category": "Multi-Agent Flow",
+          "mode": "legacy",
+          "tool_called": true,
+          "tool_name": "mempalace_event_list",
+          "tool_args": {
+            "limit": 100,
+            "stream": "project/mempalace",
+            "to_agent": "windows:antigravity:mempalace"
+          },
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 22.74,
+          "multi_turn_success": true,
+          "final_response_preview": "Found **1 coordination event** in stream `project/mempalace` addressed to `windows:antigravity:mempalace`:  | Field | Va"
+        },
+        {
+          "test_id": "coord_mesh_peers",
+          "category": "Multi-Agent Flow",
+          "mode": "legacy",
+          "tool_called": true,
+          "tool_name": "mempalace_mesh_peers",
+          "tool_args": {},
+          "selection_correct": true,
+          "execution_success": true,
+          "execution_error": null,
+          "latency_sec": 24.12,
+          "multi_turn_success": true,
+          "final_response_preview": "Here's the current mesh estate snapshot:  ## Self (this replica) | Field | Value | |---|---| | **Replica ID** | `rep_2cb"
+        }
+      ]
+    }
+  },
+  "stress_benchmark": {
+    "model": "qwen3.8-27b-nvfp4",
+    "total_stress_tests": 7,
+    "sensitivity_pass_rate_pct": 42.857142857142854,
+    "mean_reasoning_score_pct": 66.7,
+    "avg_latency_sec": 35.82,
+    "results": [
+      {
+        "test_id": "stress_temporal_active_meds",
+        "dimension": "Temporal Reasoning & Obsolete Filtering",
+        "model": "qwen3.8-27b-nvfp4",
+        "tool_called": true,
+        "tool_name": "palace_query",
+        "tool_args": {
+          "query": "FIND \"patient 1042 metformin diabetes medication\" LIMIT 10",
+          "target": "search"
+        },
+        "execution_success": true,
+        "reasoning_accuracy_score": 0.6,
+        "assertions_passed": [
+          "Empagliflozin",
+          "25mg",
+          "eGFR"
+        ],
+        "assertions_failed": [
+          "discontinued",
+          "kidney"
+        ],
+        "negative_violations": [],
+        "latency_sec": 42.04,
+        "final_answer": "{\"query\": \"1042 empagliflozin 25mg 2026\", \"filters\": {\"wing\": null, \"room\": null, \"source_file\": null, \"since\": null, \"before\": null}, \"total_before_filter\": 20, \"results\": [{\"drawer_id\": \"drw_1042_enc_2026\", \"text\": \"Encounter 2026-01-15: Renal func"
+      },
+      {
+        "test_id": "stress_multihop_allergy_contraindication",
+        "dimension": "Cross-Wing Multi-Hop Inference",
+        "model": "qwen3.8-27b-nvfp4",
+        "tool_called": true,
+        "tool_name": "palace_query",
+        "tool_args": {
+          "query": "FIND \"patient 1042\" LIMIT 10",
+          "target": "search"
+        },
+        "execution_success": true,
+        "reasoning_accuracy_score": 0.4,
+        "assertions_passed": [
+          "allergy",
+          "Penicillin"
+        ],
+        "assertions_failed": [
+          "unsafe",
+          "contraindicated",
+          "Doxycycline"
+        ],
+        "negative_violations": [],
+        "latency_sec": 35.42,
+        "final_answer": "{\"query\": \"\", \"filters\": {\"wing\": \"patient_1042\", \"room\": null, \"source_file\": null, \"since\": null, \"before\": null}, \"total_before_filter\": 6, \"results\": [{\"drawer_id\": \"drw_1042_enc_2024\", \"text\": \"Encounter 2024-06-15: HbA1c elevated to 8.5%. Escal"
+      },
+      {
+        "test_id": "stress_needle_haystack_distractor",
+        "dimension": "Distractor Resilience (50 Patients)",
+        "model": "qwen3.8-27b-nvfp4",
+        "tool_called": true,
+        "tool_name": "palace_query",
+        "tool_args": {
+          "query": "FIND \"Patient 1067 baseline renal panel eGFR fasting glucose\" LIMIT 10",
+          "target": "search"
+        },
+        "execution_success": true,
+        "reasoning_accuracy_score": 1.0,
+        "assertions_passed": [
+          "104",
+          "96"
+        ],
+        "assertions_failed": [],
+        "negative_violations": [],
+        "latency_sec": 34.91,
+        "final_answer": "Retrieved and verified from Patient 1067's baseline renal panel (wing: `patient_1067`, room: `labs`, source: `patient_1067_panel.md`):  - **eGFR:** 104 mL/min/1.73m\u00b2 - **Fasting Glucose:** 96 mg/dL  Additional context from the same panel: HbA1c 8.6%,"
+      },
+      {
+        "test_id": "stress_hallucination_unstored_fact",
+        "dimension": "Hallucination Resistance",
+        "model": "qwen3.8-27b-nvfp4",
+        "tool_called": true,
+        "tool_name": "palace_query",
+        "tool_args": {
+          "query": "FIND \"patient 1042 CAC coronary artery calcium cardiac CT\" LIMIT 10"
+        },
+        "execution_success": true,
+        "reasoning_accuracy_score": 0.0,
+        "assertions_passed": [],
+        "assertions_failed": [
+          "no record",
+          "not found",
+          "no cardiac CT",
+          "no Atorvastatin"
+        ],
+        "negative_violations": [],
+        "latency_sec": 37.49,
+        "final_answer": "{\"query\": \"coronary artery calcium score cardiac CT scan\", \"filters\": {\"wing\": null, \"room\": null, \"source_file\": null, \"since\": null, \"before\": null}, \"total_before_filter\": 40, \"results\": [{\"drawer_id\": \"drw_guide_metformin_renal\", \"text\": \"ADA/KDI"
+      },
+      {
+        "test_id": "stress_implicit_symptom_search",
+        "dimension": "Implicit Semantic Search",
+        "model": "qwen3.8-27b-nvfp4",
+        "tool_called": true,
+        "tool_name": "palace_query",
+        "tool_args": {
+          "query": "FIND \"anaphylaxis hives bronchospasm facial swelling antibiotic\" LIMIT 10",
+          "target": "search"
+        },
+        "execution_success": true,
+        "reasoning_accuracy_score": 1.0,
+        "assertions_passed": [
+          "Penicillin",
+          "beta-lactam"
+        ],
+        "assertions_failed": [],
+        "negative_violations": [],
+        "latency_sec": 39.57,
+        "final_answer": "## Result: **Penicillin / Beta-lactam antibiotic class**  The palace search identified the trigger with high confidence. Here's the evidence:  ### Matching Record **Drawer:** `drw_1042_allergy` (wing: `patient_1042`, room: `allergies`) > *\"Critical A"
+      },
+      {
+        "test_id": "stress_pql_multi_constraint_query",
+        "dimension": "Complex PQL Construction",
+        "model": "qwen3.8-27b-nvfp4",
+        "tool_called": true,
+        "tool_name": "palace_query",
+        "tool_args": {
+          "limit": 3,
+          "query": "FIND \"elevated glucose\" IN patient_1042/labs LIMIT 3",
+          "room": "labs",
+          "target": "search",
+          "wing": "patient_1042"
+        },
+        "execution_success": true,
+        "reasoning_accuracy_score": 0.67,
+        "assertions_passed": [
+          "165",
+          "HbA1c"
+        ],
+        "assertions_failed": [
+          "8.2%"
+        ],
+        "negative_violations": [],
+        "latency_sec": 25.07,
+        "final_answer": "I searched wing `patient_1042` / room `labs` for elevated glucose lab records (limit 3). **1 matching record** was found:  ## Lab Record | Field | Value | |---|---| | **Drawer ID** | `drw_1042_lab_2026` | | **Date** | 2026-01-15 (08:30) | | **Source*"
+      },
+      {
+        "test_id": "stress_mutation_allergy_update",
+        "dimension": "Mutation & KG Consistency",
+        "model": "qwen3.8-27b-nvfp4",
+        "tool_called": true,
+        "tool_name": "palace_query",
+        "tool_args": {
+          "direction": "outgoing",
+          "entity": "Patient_1042",
+          "target": "kg_query"
+        },
+        "execution_success": true,
+        "reasoning_accuracy_score": 1.0,
+        "assertions_passed": [
+          "added",
+          "Sulfonamides",
+          "Patient_1042"
+        ],
+        "assertions_failed": [],
+        "negative_violations": [],
+        "latency_sec": 36.27,
+        "final_answer": "\u2705 Done. The new allergy has been added to the knowledge graph:  - **Fact:** `Patient_1042 \u2192 has_allergy \u2192 Sulfonamides` - **Valid from:** 2026-09-01 - **Triple ID:** `t_patient_1042_has_allergy_sulfonamides_ee0051ecee7e`  **Current allergy profile fo"
+      }
+    ]
+  }
+}

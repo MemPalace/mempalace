@@ -717,7 +717,7 @@ def search(
                 before_dt=before_dt,
             )
 
-        col = _open_collection_or_explain(palace_path, opener=get_collection)
+        col = _open_collection_or_explain(palace_path, opener=get_collection, read_only=True)
         if col is None:
             if not os.path.isdir(palace_path):
                 raise SearchError(f"No palace found at {palace_path}")
@@ -1823,7 +1823,9 @@ def _vector_disabled_search(
 
 def _open_search_collection(palace_path: str, collection_name: str):
     try:
-        return get_collection(palace_path, collection_name=collection_name, create=False), None
+        return get_collection(
+            palace_path, collection_name=collection_name, create=False, read_only=True
+        ), None
     except BackendMismatchError as e:
         return None, _backend_mismatch_result(e)
     except KeyError as e:
@@ -2086,7 +2088,7 @@ def search_memories(
     # Gather closet hits (best-per-source) to build a boost lookup.
     closet_boost_by_source: dict = {}  # source_file -> (rank, closet_dist, preview)
     try:
-        closets_col = get_closets_collection(palace_path, create=False)
+        closets_col = get_closets_collection(palace_path, create=False, read_only=True)
         closet_boost_by_source = _closet_boosts(
             closets_col, query=query, n_results=n_results, where=where
         )

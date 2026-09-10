@@ -2789,9 +2789,19 @@ def cmd_mcp(args):
         cmd_parts.extend(["--backend", shlex.quote(str(backend).strip().lower())])
     server_cmd = " ".join(cmd_parts)
 
+    light_parts = ["mempalace-light-mcp"]
+    if args.palace:
+        light_parts.extend(["--palace", shlex.quote(resolved_palace)])
+    if backend:
+        light_parts.extend(["--backend", shlex.quote(str(backend).strip().lower())])
+    light_cmd = " ".join(light_parts)
+
     print("MemPalace MCP quick setup:")
     print(f"  claude mcp add mempalace -- {server_cmd}")
     print(f"  codex mcp add mempalace -- {server_cmd}")
+    print("\nLightweight MCP setup (3 consolidated tools, ~92% fewer schema tokens):")
+    print(f"  claude mcp add mempalace-light -- {light_cmd}")
+    print(f"  codex mcp add mempalace-light -- {light_cmd}")
     print("\nRun the server directly:")
     print(f"  {server_cmd}")
 
@@ -2799,6 +2809,7 @@ def cmd_mcp(args):
         print("\nOptional custom palace:")
         print(f"  claude mcp add mempalace -- {base_server_cmd} --palace /path/to/palace")
         print(f"  codex mcp add mempalace -- {base_server_cmd} --palace /path/to/palace")
+        print("  claude mcp add mempalace-light -- mempalace-light-mcp --palace /path/to/palace")
         print(f"  {base_server_cmd} --palace /path/to/palace")
 
 

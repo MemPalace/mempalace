@@ -351,6 +351,8 @@ def get_closets_collection(
     palace_path: str,
     create: bool = True,
     backend: Optional[str] = None,
+    *,
+    read_only: bool = False,
 ):
     """Get the closets collection — the searchable index layer."""
     return get_collection(
@@ -358,6 +360,7 @@ def get_closets_collection(
         collection_name="mempalace_closets",
         create=create,
         backend=backend,
+        **({"read_only": True} if read_only else {}),
     )
 
 
@@ -413,10 +416,12 @@ def resolve_backend_name(palace_path: str, explicit: Optional[str] = None) -> st
         )
     detected = detected_backends[0] if detected_backends else None
     if detected and detected != selected:
-        raise BackendMismatchError(
-            f"palace at {palace_path!r} contains {detected!r} backend artifacts, "
-            f"but {selected!r} was selected"
-        )
+        exact_family = {"sqlite_exact", "rust_exact"}
+        if not (detected in exact_family and selected in exact_family):
+            raise BackendMismatchError(
+                f"palace at {palace_path!r} contains {detected!r} backend artifacts, "
+                f"but {selected!r} was selected"
+            )
     return selected
 
 
@@ -455,7 +460,7 @@ def _backend_artifact_label(backend_name: Optional[str]) -> str:
         return "qdrant_backend.json"
     if backend_name == "pgvector":
         return "pgvector_backend.json"
-    if backend_name == "sqlite_exact":
+    if backend_name in {"sqlite_exact", "rust_exact"}:
         return "sqlite_exact.sqlite3"
     return "backend database"
 
@@ -466,6 +471,7 @@ def _open_collection_or_explain(
     collection_name: Optional[str] = None,
     out=None,
     opener=None,
+    read_only: bool = False,
 ):
     """Open the palace collection or print a state-specific message and return ``None``.
 
@@ -526,11 +532,13 @@ def _open_collection_or_explain(
         emit("  Run: mempalace mine <dir>")
         return None
     try:
+        options = {"read_only": True} if read_only else {}
         return open_collection(
             palace_path,
             collection_name=collection_name,
             create=False,
             backend=backend_name,
+            **options,
         )
     except CollectionNotInitializedError:
         emit(f"\n  Palace at {palace_path} is initialized but empty (no drawers yet).")

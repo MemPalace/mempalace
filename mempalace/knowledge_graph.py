@@ -47,6 +47,11 @@ from .ids import make_triple_id
 
 
 DEFAULT_KG_PATH = os.path.expanduser("~/.mempalace/knowledge_graph.sqlite3")
+_MIN_ENTITY_CANDIDATE_LEN = 3
+
+
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _is_date_only_temporal(value: str) -> bool:
@@ -551,6 +556,108 @@ class KnowledgeGraph:
                         }
                     )
 
+            if not results:
+                exact_exists = (
+                    conn.execute("SELECT 1 FROM entities WHERE id = ?", (eid,)).fetchone()
+                    is not None
+                )
+                if not exact_exists:
+                    candidates = self._lookup_entity_candidates(conn, name, eid)
+                    if len(candidates) == 1:
+                        cand_id = candidates[0]["id"]
+                        cand_name = candidates[0]["name"]
+                        results.extend(
+                            self._triples_for_entity(
+                                conn,
+                                cand_id,
+                                cand_name,
+                                direction,
+                                temporal_sql,
+                                temporal_params,
+                            )
+                        )
+
+        return results
+
+    def find_entity_candidates(self, name: str) -> list:
+        """Return token/prefix entity matches for disambiguation (never substring)."""
+        if not name or len(name.strip()) < _MIN_ENTITY_CANDIDATE_LEN:
+            return []
+        eid = self._entity_id(name)
+        with self._lock:
+            return self._lookup_entity_candidates(self._conn(), name, eid)
+
+    def _lookup_entity_candidates(self, conn, name: str, eid: str) -> list:
+        if not name or len(name.strip()) < _MIN_ENTITY_CANDIDATE_LEN:
+            return []
+        name_esc = _escape_like(name.strip())
+        id_esc = _escape_like(eid)
+        rows = conn.execute(
+            "SELECT id, name FROM entities WHERE "
+            "id = ? OR name = ? OR "
+            "name LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\' OR "
+            "id LIKE ? ESCAPE '\\' OR id LIKE ? ESCAPE '\\' OR id LIKE ? ESCAPE '\\' "
+            "LIMIT 5",
+            (
+                eid,
+                name,
+                f"{name_esc} %",
+                f"% {name_esc}",
+                f"% {name_esc} %",
+                f"{id_esc}\\_%",
+                f"%\\_{id_esc}",
+                f"%\\_{id_esc}\\_%",
+            ),
+        ).fetchall()
+        out = []
+        for row in rows:
+            if row["id"] == eid:
+                continue
+            out.append({"id": row["id"], "name": row["name"]})
+        return out
+
+    def _triples_for_entity(
+        self, conn, eid: str, name: str, direction: str, temporal_sql: str, temporal_params: list
+    ) -> list:
+        results = []
+        if direction in ("outgoing", "both"):
+            query = (
+                "SELECT t.*, e.name as obj_name FROM triples t "
+                "JOIN entities e ON t.object = e.id WHERE t.subject = ?" + temporal_sql
+            )
+            for row in conn.execute(query, [eid] + temporal_params).fetchall():
+                results.append(
+                    {
+                        "direction": "outgoing",
+                        "subject": name,
+                        "predicate": row["predicate"],
+                        "object": row["obj_name"],
+                        "valid_from": row["valid_from"],
+                        "valid_to": row["valid_to"],
+                        "confidence": row["confidence"],
+                        "source_closet": row["source_closet"],
+                        "current": row["valid_to"] is None,
+                    }
+                )
+        if direction in ("incoming", "both"):
+            query = (
+                "SELECT t.*, e.name as sub_name FROM triples t "
+                "JOIN entities e ON t.subject = e.id WHERE t.object = ?" + temporal_sql
+            )
+            for row in conn.execute(query, [eid] + temporal_params).fetchall():
+                results.append(
+                    {
+                        "direction": "incoming",
+                        "subject": row["sub_name"],
+                        "predicate": row["predicate"],
+                        "object": name,
+                        "valid_from": row["valid_from"],
+                        "valid_to": row["valid_to"],
+                        "confidence": row["confidence"],
+                        "source_closet": row["source_closet"],
+                        "current": row["valid_to"] is None,
+                    }
+                )
         return results
 
     def query_relationship(self, predicate: str, as_of: str = None):
