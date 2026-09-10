@@ -392,9 +392,9 @@ def _maybe_expand_wings(
     query: str,
     palace_path: str,
     expand_wings: bool,
-    wing: str | None,
-    room: str | None,
-    source_file: str | None,
+    wing: str = None,
+    room: str = None,
+    source_file: str = None,
 ) -> list[str] | None:
     """Compute which wings to search when no explicit filter is given.
 
