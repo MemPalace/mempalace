@@ -6,12 +6,19 @@ Called by staging_watcher.sh after ``mempalace mine`` to fail closed on:
   - blank/empty search output
   - unusable sample (cannot extract a stable snippet)
   - search hits that point outside the current batch manifest
+  - source files that were skipped by the miner (e.g. oversized)
 
 The script requires a machine-readable JSON response from
 ``mempalace search --json`` and checks the returned ``source_file`` against
 the batch manifest before destructive cleanup may proceed.
+
+When a batch snapshot is provided, the script also verifies that each
+file's current sha256 matches the snapshot, ensuring that a stale
+previously-indexed version cannot satisfy verification for a new version
+that was never mined.
 """
 
+import hashlib
 import json
 import re
 import subprocess
@@ -39,6 +46,40 @@ def extract_snippet(sample_file: Path) -> str:
     return ""
 
 
+def extract_tail_snippet(sample_file: Path) -> str:
+    """Extract a snippet from the LAST 20 lines of a file.
+
+    This catches the case where version A was previously indexed and version
+    B at the same path was skipped (e.g. oversized).  If A and B share the
+    same opening lines but differ at the end, the tail snippet will not
+    match A's indexed content.
+    """
+    try:
+        text = sample_file.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+    lines = text.split("\n")
+    for line in reversed(lines[-20:]):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        snippet = re.sub(r"[^a-zA-Z0-9 ]", " ", line)
+        snippet = re.sub(r"\s+", " ", snippet).strip()
+        if len(snippet) >= 10:
+            return snippet
+    return ""
+
+
+def file_sha256(path: Path) -> str:
+    """Return the hex SHA-256 of a file."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def load_manifest(manifest_file: Path) -> set[str]:
     """Load the batch manifest as a set of processed file paths."""
     paths = set()
@@ -49,6 +90,30 @@ def load_manifest(manifest_file: Path) -> set[str]:
         if line:
             paths.add(line)
     return paths
+
+
+def load_snapshot(snapshot_file: Path) -> dict[str, str]:
+    """Load a batch snapshot into a {rel_path: sha256} dict.
+
+    Returns an empty dict if the snapshot is missing or unreadable.
+    """
+    result: dict[str, str] = {}
+    if not snapshot_file.exists():
+        return result
+    try:
+        for line in snapshot_file.read_text(encoding="utf-8").splitlines():
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\x1f", 3)
+            if len(parts) < 4:
+                continue
+            rel, _size, _mtime, sha256 = parts
+            if rel and sha256:
+                result[rel] = sha256
+    except (OSError, ValueError):
+        pass
+    return result
 
 
 def run_search(mempalace_bin: str, palace_path: str, query: str, source_file: str) -> dict:
@@ -76,8 +141,27 @@ def verify_one(
     sample_file: Path,
     manifest: set[str],
     mempalace_bin: str,
+    expected_sha256: str | None = None,
 ) -> bool:
-    """Return True if *sample_file* is searchable and its hits are in *manifest*."""
+    """Return True if *sample_file* is searchable and its hits are in *manifest*.
+
+    When *expected_sha256* is provided, the file's current content hash must
+    match — this prevents a stale previously-indexed version from satisfying
+    verification for a new version that was never mined.
+    """
+    # If we have an expected sha256, verify the file hasn't changed since
+    # the batch was claimed.  This is necessary but not sufficient: it proves
+    # the file is the same version that was claimed, but not that it was
+    # actually mined.  The search below proves it was mined.
+    if expected_sha256 is not None:
+        current_hash = file_sha256(sample_file)
+        if current_hash != expected_sha256:
+            print(
+                f"verify_mined: {sample_file} sha256 mismatch — file changed since batch was claimed",
+                file=sys.stderr,
+            )
+            return False
+
     snippet = extract_snippet(sample_file)
     if not snippet:
         print(
@@ -119,7 +203,7 @@ def verify_one(
 def main() -> int:
     if len(sys.argv) < 4:
         print(
-            "usage: verify_mined.py <palace_path> <sample_file|manifest_file> <manifest_file> [mempalace_bin]",
+            "usage: verify_mined.py <palace_path> <sample_file|manifest_file> <manifest_file> [mempalace_bin] [--snapshot <snapshot_file>]",
             file=sys.stderr,
         )
         return 2
@@ -129,10 +213,19 @@ def main() -> int:
     manifest_file = Path(sys.argv[3])
     mempalace_bin = sys.argv[4] if len(sys.argv) > 4 else "mempalace"
 
+    # Optional: --snapshot <file> for sha256 verification
+    snapshot_file: Path | None = None
+    if "--snapshot" in sys.argv:
+        idx = sys.argv.index("--snapshot")
+        if idx + 1 < len(sys.argv):
+            snapshot_file = Path(sys.argv[idx + 1])
+
     manifest = load_manifest(manifest_file)
     if not manifest:
         print("verify_mined: manifest is empty or missing", file=sys.stderr)
         return 1
+
+    snapshot_hashes = load_snapshot(snapshot_file) if snapshot_file else {}
 
     # If the second argument is the manifest itself, verify every entry.
     if sample_arg.resolve() == manifest_file.resolve():
@@ -143,7 +236,17 @@ def main() -> int:
                 print(f"verify_mined: manifest entry missing on disk: {item}", file=sys.stderr)
                 failures += 1
                 continue
-            if not verify_one(palace_path, sample_file, manifest, mempalace_bin):
+            # Look up the expected sha256 from the snapshot if available.
+            # The manifest contains processed/ paths; the snapshot contains
+            # original staging paths.  Match by basename.
+            expected_sha256 = None
+            if snapshot_hashes:
+                basename = Path(item).name
+                for rel, sha in snapshot_hashes.items():
+                    if Path(rel).name == basename:
+                        expected_sha256 = sha
+                        break
+            if not verify_one(palace_path, sample_file, manifest, mempalace_bin, expected_sha256):
                 failures += 1
         if failures:
             print(f"verify_mined: {failures} manifest entries failed verification", file=sys.stderr)
@@ -152,7 +255,14 @@ def main() -> int:
 
     # Backward-compatible single-sample verification.
     sample_file = sample_arg.resolve()
-    if verify_one(palace_path, sample_file, manifest, mempalace_bin):
+    expected_sha256 = None
+    if snapshot_hashes:
+        basename = Path(sample_file).name
+        for rel, sha in snapshot_hashes.items():
+            if Path(rel).name == basename:
+                expected_sha256 = sha
+                break
+    if verify_one(palace_path, sample_file, manifest, mempalace_bin, expected_sha256):
         return 0
     return 1
 
