@@ -17,6 +17,8 @@ import logging
 import stat
 from pathlib import Path
 from datetime import datetime
+
+from mempalace.importance import score_importance
 from collections import defaultdict
 from typing import Optional
 
@@ -134,6 +136,7 @@ def file_conversation_exchange(
         "extract_mode": "exchange",
         "normalize_version": NORMALIZE_VERSION,
         "id_recipe": ID_RECIPE,
+        "importance": score_importance(text),
     }
     if extra_metadata:
         for key, value in extra_metadata.items():
@@ -731,6 +734,7 @@ def _file_chunks_locked(
                         "normalize_version": NORMALIZE_VERSION,
                         "id_recipe": ID_RECIPE,
                         "chunk_total": chunk_total,
+                        "importance": score_importance(chunk["content"]),
                     }
                     if source_mtime is not None:
                         meta["source_mtime"] = source_mtime

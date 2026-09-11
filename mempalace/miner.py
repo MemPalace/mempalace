@@ -18,6 +18,8 @@ import logging
 import stat
 from pathlib import Path
 from datetime import datetime
+
+from mempalace.importance import score_importance
 from collections import defaultdict
 from typing import Optional
 
@@ -1453,6 +1455,7 @@ def _build_drawer_metadata(
     if chunk_total is not None:
         metadata["chunk_total"] = chunk_total
     metadata["hall"] = detect_hall(content)
+    metadata["importance"] = score_importance(content)
     entities = _extract_entities_for_metadata(content)
     if entities:
         metadata["entities"] = entities
@@ -1476,6 +1479,7 @@ def add_drawer(
     metadata = _build_drawer_metadata(
         wing, room, source_file, chunk_index, agent, content, source_mtime
     )
+    metadata["importance"] = score_importance(content)
     collection.upsert(
         documents=[content],
         ids=[drawer_id],
