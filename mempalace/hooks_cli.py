@@ -3,7 +3,7 @@ Hook logic for MemPalace — Python implementation of session-start, stop, sessi
 
 Reads JSON from stdin, outputs JSON to stdout.
 Supported hooks: session-start, stop, session-end, precompact
-Supported harnesses: claude-code, codex (extensible to cursor, gemini, etc.)
+Supported harnesses: claude-code, codex, hermes (extensible to cursor, gemini, etc.)
 """
 
 import hashlib
@@ -1130,7 +1130,16 @@ def _ingest_transcript(transcript_path: str):
         _log(f"transcript ingest hook failed: {exc}")
 
 
-SUPPORTED_HARNESSES = {"claude-code", "codex"}
+# Harness names accepted by ``hook run --harness``. The name is not just a
+# validation token: ``_diary_agent_for_harness`` derives the diary identity from
+# it, so a harness missing from this set has to borrow another one's name and
+# files its checkpoints into that agent's diary — the #1693 invisibility bug in
+# a new shape. ``_parse_harness_input`` is harness-agnostic (session_id,
+# transcript_path, stop_hook_active), so adding a name here is all a new harness
+# needs once it can produce a transcript in a format ``normalize`` recognises.
+# Keep in sync with the ``--harness`` choices in ``cli.py``
+# (``test_cli_harness_choices_match_supported_harnesses`` guards the pair).
+SUPPORTED_HARNESSES = {"claude-code", "codex", "hermes"}
 
 
 def _diary_agent_for_harness(harness: str) -> str:
