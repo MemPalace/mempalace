@@ -2766,6 +2766,7 @@ def tool_create_tunnel(
             label=label,
             source_drawer_id=source_drawer_id,
             target_drawer_id=target_drawer_id,
+            config=_config,
         )
     except ValueError as e:
         return {"error": str(e)}
@@ -2777,14 +2778,14 @@ def tool_list_tunnels(wing: str = None):
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
-    return list_tunnels(wing)
+    return list_tunnels(wing, config=_config)
 
 
 def tool_delete_tunnel(tunnel_id: str):
     """Delete an explicit tunnel by its ID."""
     if not tunnel_id or not isinstance(tunnel_id, str):
         return {"error": "tunnel_id is required"}
-    return delete_tunnel(tunnel_id)
+    return delete_tunnel(tunnel_id, config=_config)
 
 
 def tool_list_hallways(wing: str = None):
@@ -2793,14 +2794,14 @@ def tool_list_hallways(wing: str = None):
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
-    return list_hallways(wing)
+    return list_hallways(wing, config=_config)
 
 
 def tool_delete_hallway(hallway_id: str):
     """Delete a hallway record by its ID."""
     if not hallway_id or not isinstance(hallway_id, str):
         return {"error": "hallway_id is required"}
-    return {"deleted": delete_hallway(hallway_id)}
+    return {"deleted": delete_hallway(hallway_id, config=_config)}
 
 
 def tool_follow_tunnels(wing: str, room: str):
@@ -2813,7 +2814,7 @@ def tool_follow_tunnels(wing: str, room: str):
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
-    return follow_tunnels(wing, room, col=col)
+    return follow_tunnels(wing, room, col=col, config=_config)
 
 
 # ==================== WRITE TOOLS ====================

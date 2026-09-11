@@ -586,6 +586,62 @@ class TestTunnelFileFollowsConfig:
 
         assert "Legacy tunnels file" not in caplog.text
 
+    @staticmethod
+    def _seed_two_palaces(tmp_path, monkeypatch):
+        """Create the same tunnel ID in two isolated sidecars.
+
+        Palace B is the ambient fallback. Explicit ``config=A`` calls must
+        never read or mutate B, even though both files contain the same ID.
+        """
+        from mempalace.config import MempalaceConfig
+
+        config_a = MempalaceConfig(palace_path=tmp_path / "palace-a" / "palace")
+        config_b = MempalaceConfig(palace_path=tmp_path / "palace-b" / "palace")
+        tunnel_a = palace_graph.create_tunnel(
+            "wing_alpha",
+            "topic:shared",
+            "wing_beta",
+            "topic:shared",
+            label="A-only",
+            kind="topic",
+            config=config_a,
+        )
+        tunnel_b = palace_graph.create_tunnel(
+            "wing_alpha",
+            "topic:shared",
+            "wing_beta",
+            "topic:shared",
+            label="B-only",
+            kind="topic",
+            config=config_b,
+        )
+        assert tunnel_a["id"] == tunnel_b["id"]
+
+        monkeypatch.setattr(palace_graph, "MempalaceConfig", lambda: config_b)
+        return config_a, config_b, tunnel_a["id"]
+
+    def test_list_tunnels_reads_only_selected_palace(self, tmp_path, monkeypatch):
+        config_a, config_b, _ = self._seed_two_palaces(tmp_path, monkeypatch)
+
+        assert [t["label"] for t in palace_graph.list_tunnels(config=config_a)] == ["A-only"]
+        assert [t["label"] for t in palace_graph.list_tunnels(config=config_b)] == ["B-only"]
+
+    def test_follow_tunnels_reads_only_selected_palace(self, tmp_path, monkeypatch):
+        config_a, config_b, _ = self._seed_two_palaces(tmp_path, monkeypatch)
+
+        followed_a = palace_graph.follow_tunnels("wing_alpha", "topic:shared", config=config_a)
+        followed_b = palace_graph.follow_tunnels("wing_alpha", "topic:shared", config=config_b)
+
+        assert [t["label"] for t in followed_a] == ["A-only"]
+        assert [t["label"] for t in followed_b] == ["B-only"]
+
+    def test_delete_tunnel_mutates_only_selected_palace(self, tmp_path, monkeypatch):
+        config_a, config_b, tunnel_id = self._seed_two_palaces(tmp_path, monkeypatch)
+
+        assert palace_graph.delete_tunnel(tunnel_id, config=config_a) == {"deleted": tunnel_id}
+        assert palace_graph._load_tunnels(config_a) == []
+        assert [t["label"] for t in palace_graph._load_tunnels(config_b)] == ["B-only"]
+
 
 # =============================================================================
 # Regression: create_tunnel validates explicit-tunnel endpoints (#1468)
