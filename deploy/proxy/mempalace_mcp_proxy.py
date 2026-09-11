@@ -456,6 +456,12 @@ def _is_inbound_request_allowed(request: web.Request) -> tuple[bool, int, str]:
     origin = request.headers.get("Origin")
     host = request.headers.get("Host", "").lower()
 
+    # Host must ALWAYS be validated independently of Origin to prevent
+    # DNS-rebinding attacks where an attacker-controlled page sets both
+    # Host and Origin to attacker.example:8766 to bypass ALLOWED_HOSTS.
+    if host not in ALLOWED_HOSTS:
+        return False, 403, f"Forbidden — Host {host!r} not allowed"
+
     if origin:
         # Browser / cross-origin client: Origin must match Host or the allowlist.
         if origin in ALLOWED_ORIGINS:
@@ -463,10 +469,6 @@ def _is_inbound_request_allowed(request: web.Request) -> tuple[bool, int, str]:
         if origin == f"http://{host}" or origin == f"https://{host}":
             return True, 200, ""
         return False, 403, f"Forbidden — Origin {origin!r} not allowed"
-
-    # Non-browser client with no Origin header: restrict by Host.
-    if host not in ALLOWED_HOSTS:
-        return False, 403, f"Forbidden — Host {host!r} not allowed"
 
     return True, 200, ""
 
@@ -771,12 +773,23 @@ def main():
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
 
-    loop = asyncio.get_event_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(_shutdown(app, s)))
-        except NotImplementedError:
-            pass  # Windows
+    # Python 3.14 removed the implicit event loop creation in
+    # asyncio.get_event_loop(); use the modern lifecycle to register
+    # signal handlers so the entry point does not crash on startup.
+    async def _setup_signals(runner: web.AppRunner) -> None:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(_shutdown(app, s)))
+            except NotImplementedError:
+                pass  # Windows
+
+    async def _on_startup_with_signals(app: web.Application) -> None:
+        await on_startup(app)
+        await _setup_signals(app._runner)  # type: ignore[attr-defined]
+
+    app.on_startup[:] = []  # replace default
+    app.on_startup.append(_on_startup_with_signals)
 
     log.info(f"MCP streamable-http proxy: {HOST}:{PORT} -> {UPSTREAM_URL}")
     web.run_app(app, host=HOST, port=PORT, print=None)
