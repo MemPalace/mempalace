@@ -30,6 +30,7 @@ from .ids import (
 )
 from .normalize import normalize_conversations
 from .entities import entities_metadata
+from .config import validate_memory_kind
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
@@ -146,6 +147,7 @@ def file_conversation_exchange(
 CONVO_EXTENSIONS = {
     ".txt",
     ".md",
+    ".org",
     ".json",
     ".jsonl",
 }
@@ -219,6 +221,7 @@ def _register_file(
     agent: str,
     extract_mode: str,
     content_hash: Optional[str] = None,
+    memory_kind: str = "archive",
 ):
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
 
@@ -247,6 +250,7 @@ def _register_file(
         "source_file": source_file,
         "added_by": agent,
         "filed_at": datetime.now().isoformat(),
+        "memory_kind": validate_memory_kind(memory_kind),
         "ingest_mode": "registry",
         "extract_mode": extract_mode,
         "normalize_version": NORMALIZE_VERSION,
@@ -635,6 +639,7 @@ def _file_chunks_locked(
     extract_mode,
     authored_at=None,
     content_hash=None,
+    memory_kind="archive",
 ):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
@@ -654,7 +659,13 @@ def _file_chunks_locked(
         # Re-check after lock — another agent may have just finished this file
         # at the current schema/mtime. A stale hit here returns False, so we
         # still fall through to the purge+rebuild path below.
-        if file_already_mined(collection, source_file, check_mtime=True, extract_mode=extract_mode):
+        if file_already_mined(
+            collection,
+            source_file,
+            check_mtime=True,
+            extract_mode=extract_mode,
+            memory_kind=memory_kind,
+        ):
             return 0, room_counts_delta, True
 
         # Purge stale drawers first. Fires both on a normalize-schema bump
@@ -728,6 +739,7 @@ def _file_chunks_locked(
                         "authored_at": authored_at if authored_at is not None else filed_at,
                         "ingest_mode": "convos",
                         "extract_mode": extract_mode,
+                        "memory_kind": memory_kind,
                         "normalize_version": NORMALIZE_VERSION,
                         "id_recipe": ID_RECIPE,
                         "chunk_total": chunk_total,
@@ -881,6 +893,7 @@ def mine_convos(
     dry_run: bool = False,
     extract_mode: str = "exchange",
     include_subagents: bool = False,
+    memory_kind: str = "archive",
 ):
     """Mine a directory of conversation files into the palace.
 
@@ -917,6 +930,7 @@ def mine_convos(
             dry_run=dry_run,
             extract_mode=extract_mode,
             include_subagents=include_subagents,
+            memory_kind=memory_kind,
         )
 
     with mine_palace_lock(palace_path):
@@ -929,6 +943,7 @@ def mine_convos(
             dry_run=dry_run,
             extract_mode=extract_mode,
             include_subagents=include_subagents,
+            memory_kind=memory_kind,
         )
 
 
@@ -957,6 +972,7 @@ def _normalize_convo_conversations(
     agent: str,
     extract_mode: str,
     dry_run: bool,
+    memory_kind: str,
 ) -> Optional[list]:
     """Normalize a transcript file into its individual conversations,
     registering it as filed when there's nothing worth mining. Returns None
@@ -973,13 +989,17 @@ def _normalize_convo_conversations(
         conversations = [c for c in normalize_conversations(str(filepath)) if c]
     except (OSError, ValueError):
         if not dry_run:
-            _register_file(collection, source_file, wing, agent, extract_mode)
+            _register_file(
+                collection, source_file, wing, agent, extract_mode, memory_kind=memory_kind
+            )
         return None
 
     total_len = sum(len(c.strip()) for c in conversations)
     if not conversations or total_len < cfg_min_chunk_size:
         if not dry_run:
-            _register_file(collection, source_file, wing, agent, extract_mode)
+            _register_file(
+                collection, source_file, wing, agent, extract_mode, memory_kind=memory_kind
+            )
         return None
 
     return conversations
@@ -1015,6 +1035,7 @@ def _mine_convos_impl(
     dry_run: bool = False,
     extract_mode: str = "exchange",
     include_subagents: bool = False,
+    memory_kind: str = "archive",
 ):
     from .config import MempalaceConfig
 
@@ -1033,6 +1054,7 @@ def _mine_convos_impl(
 
     convo_path = Path(convo_dir).expanduser().resolve()
     wing = _resolve_wing(convo_path, wing)
+    memory_kind = validate_memory_kind(memory_kind, default="archive")
 
     files = scan_convos(convo_dir, include_subagents=include_subagents)
 
@@ -1040,6 +1062,7 @@ def _mine_convos_impl(
     print("  MemPalace Mine -- Conversations")
     print(f"{'=' * 55}")
     print(f"  Wing:    {wing}")
+    print(f"  Kind:    {memory_kind}")
     print(f"  Source:  {convo_path}")
     limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
     print(f"  Files:   {len(files)}{limit_suffix}")
@@ -1060,7 +1083,9 @@ def _mine_convos_impl(
     # prefetch_mined_set() does the same decisions in a single scan; loop
     # body becomes an O(1) dict lookup + a cheap local mtime comparison.
     mined_mtimes: dict = (
-        prefetch_mined_set(collection, extract_mode=extract_mode) if collection is not None else {}
+        prefetch_mined_set(collection, extract_mode=extract_mode, memory_kind=memory_kind)
+        if collection is not None
+        else {}
     )
     # content_hash -> source_file for transcripts already filed. Repeated
     # exports from Claude/ChatGPT commonly land under a new filename each
@@ -1068,7 +1093,7 @@ def _mine_convos_impl(
     # source_file-keyed skip above ("mined_mtimes") never recognizes them —
     # this catches the same conversation reappearing at a new path.
     mined_content_hashes: dict = (
-        prefetch_content_hashes(collection, extract_mode=extract_mode)
+        prefetch_content_hashes(collection, extract_mode=extract_mode, memory_kind=memory_kind)
         if collection is not None
         else {}
     )
@@ -1108,6 +1133,7 @@ def _mine_convos_impl(
             agent,
             extract_mode,
             dry_run,
+            memory_kind,
         )
         if conversations is None:
             continue
@@ -1124,7 +1150,9 @@ def _mine_convos_impl(
         )
         if not new_items:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _register_file(
+                    collection, source_file, wing, agent, extract_mode, memory_kind=memory_kind
+                )
             dup_source = duplicates[0][1]
             print(
                 f"  = [{i:4}/{len(files)}] {filepath.name[:50]:50} "
@@ -1151,7 +1179,7 @@ def _mine_convos_impl(
 
         if not chunks:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _register_file(collection, source_file, wing, agent, extract_mode, memory_kind)
             continue
 
         # Detect room from content (general mode uses memory_type instead)
@@ -1194,6 +1222,7 @@ def _mine_convos_impl(
             room,
             agent,
             extract_mode,
+            memory_kind=memory_kind,
             authored_at=_extract_authored_at(filepath),
             content_hash=content_hash,
         )

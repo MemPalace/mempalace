@@ -71,12 +71,19 @@ def test_layer0_default_path():
 
 
 def _mock_chromadb_for_layer(docs, metas, monkeypatch=None):
-    """Return a mock collection whose get() returns docs/metas."""
+    """Return a mock collection whose get() returns explicitly curated rows."""
+    curated_metas = [
+        ({**meta, "memory_kind": meta.get("memory_kind", "curated")} if meta else meta)
+        for meta in metas
+    ]
     mock_col = MagicMock()
-    # First batch returns data, second batch returns empty (end of pagination)
     mock_col.get.side_effect = [
-        {"documents": docs, "metadatas": metas},
-        {"documents": [], "metadatas": []},
+        {
+            "ids": [f"id-{i}" for i in range(len(docs))],
+            "documents": docs,
+            "metadatas": curated_metas,
+        },
+        {"ids": [], "documents": [], "metadatas": []},
     ]
     return mock_col
 
@@ -124,7 +131,7 @@ def test_layer1_empty_palace():
         layer = Layer1(palace_path="/fake")
         result = layer.generate()
 
-    assert "No memories" in result
+    assert "No curated memories" in result
 
 
 def test_layer1_with_wing_filter():
@@ -143,11 +150,11 @@ def test_layer1_with_wing_filter():
     assert "ESSENTIAL STORY" in result
     # Verify wing filter was passed
     call_kwargs = mock_col.get.call_args_list[0][1]
-    assert call_kwargs.get("where") == {"wing": "project_x"}
+    assert call_kwargs.get("where") == {"$and": [{"memory_kind": "curated"}, {"wing": "project_x"}]}
 
 
 def test_layer1_truncates_long_snippets():
-    docs = ["A" * 300]
+    docs = ["A" * 500]
     metas = [{"room": "general", "source_file": "long.txt"}]
     mock_col = _mock_chromadb_for_layer(docs, metas)
 
@@ -159,7 +166,8 @@ def test_layer1_truncates_long_snippets():
         layer = Layer1(palace_path="/fake")
         result = layer.generate()
 
-    assert "..." in result
+    assert "A" * layer.MAX_SNIPPET_CHARS in result
+    assert "A" * (layer.MAX_SNIPPET_CHARS + 1) not in result
 
 
 def test_layer1_respects_max_chars():
@@ -177,7 +185,7 @@ def test_layer1_respects_max_chars():
         layer.MAX_CHARS = 200  # Very low cap to trigger truncation
         result = layer.generate()
 
-    assert "more in L3 search" in result
+    assert len(result) <= layer.MAX_CHARS
 
 
 def test_layer1_importance_from_various_keys():
@@ -226,7 +234,11 @@ def test_layer1_batch_exception_breaks():
     """If col.get raises on a batch, loop breaks gracefully."""
     mock_col = MagicMock()
     mock_col.get.side_effect = [
-        {"documents": ["doc1"], "metadatas": [{"room": "r"}]},
+        {
+            "ids": ["id-1"],
+            "documents": ["doc1"],
+            "metadatas": [{"room": "r", "memory_kind": "curated"}],
+        },
         RuntimeError("batch error"),
     ]
     with (
@@ -238,6 +250,88 @@ def test_layer1_batch_exception_breaks():
         result = layer.generate()
 
     assert "ESSENTIAL STORY" in result
+
+
+def test_layer1_max_scan_caps_rows_even_when_all_are_excluded():
+    first_page_size = 500
+    mock_col = MagicMock()
+    mock_col.get.side_effect = [
+        {
+            "ids": [f"sentinel-{index}" for index in range(first_page_size)],
+            "documents": ["[empty]"] * first_page_size,
+            "metadatas": [
+                {"memory_kind": "curated", "is_sentinel": True} for _ in range(first_page_size)
+            ],
+        },
+        {
+            "ids": [f"registry-{index}" for index in range(100)],
+            "documents": ["registry"] * 100,
+            "metadatas": [
+                {"memory_kind": "curated", "ingest_mode": "registry"} for _ in range(100)
+            ],
+        },
+    ]
+    with patch("mempalace.layers._get_collection", return_value=mock_col):
+        layer = Layer1(palace_path="/fake")
+        layer.MAX_SCAN = 600
+        result = layer.generate()
+
+    assert result == "## L1 — No curated memories."
+    assert mock_col.get.call_count == 2
+    assert mock_col.get.call_args_list[0].kwargs["limit"] == 500
+    assert mock_col.get.call_args_list[1].kwargs["limit"] == 100
+
+
+def test_layer1_excludes_archive_reference_and_legacy_drawers():
+    docs = ["archive", "reference", "legacy"]
+    metas = [
+        {"memory_kind": "archive", "source_file": "a"},
+        {"memory_kind": "reference", "source_file": "b"},
+        {"memory_kind": None, "source_file": "c"},
+    ]
+    mock_col = _mock_chromadb_for_layer(docs, metas)
+    with patch("mempalace.layers._get_collection", return_value=mock_col):
+        result = Layer1(palace_path="/fake").generate()
+    assert result == "## L1 — No curated memories."
+
+
+def test_layer1_source_diversity_and_provenance_are_deterministic():
+    docs = ["a0", "a1", "a2", "b0"]
+    metas = [
+        {
+            "memory_kind": "curated",
+            "wing": "w",
+            "room": "r",
+            "source_file": "/notes/a.org",
+            "chunk_index": i,
+            "importance": 5,
+            "authored_at": "2026-07-01",
+        }
+        for i in range(3)
+    ] + [
+        {
+            "memory_kind": "curated",
+            "wing": "w",
+            "room": "r",
+            "source_file": "/notes/b.org",
+            "chunk_index": 0,
+            "importance": 4,
+            "content_date": "2026-06-01",
+        }
+    ]
+    first = _mock_chromadb_for_layer(docs, metas)
+    second = _mock_chromadb_for_layer(list(reversed(docs)), list(reversed(metas)))
+    with patch("mempalace.layers._get_collection", return_value=first):
+        result1 = Layer1(palace_path="/fake").generate()
+    with patch("mempalace.layers._get_collection", return_value=second):
+        result2 = Layer1(palace_path="/fake").generate()
+    assert result1 == result2
+    assert "a0" in result1 and "a1" in result1 and "a2" not in result1
+    assert "b0" in result1
+    assert "source=/notes/a.org" in result1
+    assert "chunk=0" in result1
+    assert "authored_at=2026-07-01" in result1
+    assert "content_date=2026-06-01" in result1
 
 
 # ── Layer2 — mocked chromadb ────────────────────────────────────────────
@@ -589,6 +683,15 @@ def test_memory_stack_wake_up(tmp_path):
     assert "Atlas" in result
     # L1 will say no palace found
     assert "No palace" in result or "No memories" in result
+
+
+def test_memory_stack_wake_up_identity_only_skips_l1(tmp_path):
+    identity_file = tmp_path / "identity.txt"
+    identity_file.write_text("I am Atlas.")
+    stack = MemoryStack(palace_path="/nonexistent", identity_path=str(identity_file))
+    stack.l1.generate = MagicMock(side_effect=AssertionError("L1 should not run"))
+    assert stack.wake_up(identity_only=True) == "I am Atlas."
+    stack.l1.generate.assert_not_called()
 
 
 def test_memory_stack_wake_up_with_wing(tmp_path):

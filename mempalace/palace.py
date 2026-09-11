@@ -1447,11 +1447,16 @@ def _metadata_matches_extract_mode(meta: dict, extract_mode: Optional[str]) -> b
     return extract_mode == "exchange" and meta.get("ingest_mode") in (None, "convos")
 
 
+def _metadata_matches_memory_kind(meta: dict, memory_kind: Optional[str]) -> bool:
+    return memory_kind is None or meta.get("memory_kind") == memory_kind
+
+
 def file_already_mined(
     collection,
     source_file: str,
     check_mtime: bool = False,
     extract_mode: Optional[str] = None,
+    memory_kind: Optional[str] = None,
 ) -> bool:
     """Check if a file has already been filed in the palace.
 
@@ -1460,6 +1465,7 @@ def file_already_mined(
       - the stored `normalize_version` is missing or older than the current
         schema (triggers silent rebuild after a normalization upgrade)
       - `check_mtime=True` and the file's mtime differs from the stored one
+      - ``memory_kind`` is set and the stored provenance classification differs
 
     When check_mtime=True (used by the project miner, and by the convo
     miner's in-lock recheck), also re-mines on content change. Conversation
@@ -1519,6 +1525,8 @@ def file_already_mined(
                     meta, extract_mode
                 ):
                     continue
+                if not _metadata_matches_memory_kind(meta, memory_kind):
+                    continue
                 # Pre-v2 drawers have no version field — treat them as stale.
                 stored_version = meta.get("normalize_version", 1)
                 if stored_version < NORMALIZE_VERSION:
@@ -1548,7 +1556,9 @@ def file_already_mined(
 
 
 def prefetch_mined_set(
-    collection, extract_mode: Optional[str] = None
+    collection,
+    extract_mode: Optional[str] = None,
+    memory_kind: Optional[str] = None,
 ) -> dict[str, Optional[float]]:
     """Pre-fetch source_file -> stored source_mtime for files already mined
     at the current NORMALIZE_VERSION, in one bulk pass instead of one
@@ -1569,6 +1579,8 @@ def prefetch_mined_set(
 
     When extract_mode is set, mirrors file_already_mined(..., extract_mode=...)
     so conversation mines skip per extraction mode rather than per source file.
+    When ``memory_kind`` is set, legacy or differently classified rows are
+    omitted so the caller re-mines them with the requested provenance.
 
     Completeness mirrors :func:`file_already_mined`'s ``chunk_total`` rule
     (#2183): a source that only has a mid-file partial (surviving drawers
@@ -1596,6 +1608,8 @@ def prefetch_mined_set(
                 if not src:
                     continue
                 if not _metadata_matches_extract_mode(meta, extract_mode):
+                    continue
+                if not _metadata_matches_memory_kind(meta, memory_kind):
                     continue
                 # Same default as file_already_mined: missing version == 1
                 version = meta.get("normalize_version", 1)
@@ -1634,7 +1648,9 @@ def prefetch_mined_set(
 
 
 def prefetch_content_hashes(
-    collection, extract_mode: Optional[str] = None
+    collection,
+    extract_mode: Optional[str] = None,
+    memory_kind: Optional[str] = None,
 ) -> dict[tuple[str, str], str]:
     """Pre-fetch (wing, content_hash) -> source_file for drawers already
     filed at the current NORMALIZE_VERSION, in one bulk pass.
@@ -1675,6 +1691,8 @@ def prefetch_content_hashes(
                 if not content_hash_field or not src or not wing:
                     continue
                 if not _metadata_matches_extract_mode(meta, extract_mode):
+                    continue
+                if not _metadata_matches_memory_kind(meta, memory_kind):
                     continue
                 version = meta.get("normalize_version", 1)
                 if version < NORMALIZE_VERSION:

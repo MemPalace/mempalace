@@ -761,6 +761,61 @@ def test_mine_formats_files_drawers_for_ok_extractions(_mine_formats_mocks):
     assert _mine_formats_mocks["collection"].upsert.called
 
 
+def test_mine_formats_records_explicit_memory_kind(_mine_formats_mocks):
+    """Format drawers carry an explicit provenance classification."""
+    from unittest.mock import patch
+    from mempalace.format_miner import mine_formats
+
+    tmp = _mine_formats_mocks["tmp_path"]
+    source = tmp / "curated.pdf"
+    source.write_bytes(b"%PDF-1.4 stub")
+    with (
+        patch("mempalace.format_miner.scan_formats", return_value=[source]),
+        patch(
+            "mempalace.format_miner._extract_via_markitdown",
+            return_value="Curated source material. " * 30,
+        ),
+    ):
+        mine_formats(
+            format_dir=str(tmp),
+            palace_path=str(tmp / "palace"),
+            memory_kind="curated",
+        )
+
+    metadatas = _mine_formats_mocks["collection"].upsert.call_args.kwargs["metadatas"]
+    assert metadatas
+    assert {metadata["memory_kind"] for metadata in metadatas} == {"curated"}
+    for call in _mine_formats_mocks["file_already_mined"].call_args_list:
+        assert call.kwargs["memory_kind"] == "curated"
+
+
+def test_mine_formats_uses_configured_memory_kind(_mine_formats_mocks):
+    """Format extraction uses mempalace.yaml when no CLI override is given."""
+    from unittest.mock import patch
+    from mempalace.format_miner import mine_formats
+
+    tmp = _mine_formats_mocks["tmp_path"]
+    source = tmp / "configured.pdf"
+    source.write_bytes(b"%PDF-1.4 stub")
+    config = {
+        "wing": "configured",
+        "memory_kind": "curated",
+        "rooms": [{"name": "documents", "keywords": ["documents"]}],
+    }
+    with (
+        patch("mempalace.format_miner.scan_formats", return_value=[source]),
+        patch("mempalace.format_miner.load_config", return_value=config),
+        patch(
+            "mempalace.format_miner._extract_via_markitdown",
+            return_value="Configured source material. " * 30,
+        ),
+    ):
+        mine_formats(format_dir=str(tmp), palace_path=str(tmp / "palace"))
+
+    metadatas = _mine_formats_mocks["collection"].upsert.call_args.kwargs["metadatas"]
+    assert {metadata["memory_kind"] for metadata in metadatas} == {"curated"}
+
+
 def test_mine_formats_dry_run_does_not_open_collection(_mine_formats_mocks):
     """dry_run=True must not call get_collection or upsert any drawers."""
     from unittest.mock import patch
@@ -1315,12 +1370,19 @@ def test_mine_formats_passes_extract_mode_format_to_file_already_mined(monkeypat
 
     calls: list = []
 
-    def fake_check(collection, source_file, check_mtime=False, extract_mode=None):
+    def fake_check(
+        collection,
+        source_file,
+        check_mtime=False,
+        extract_mode=None,
+        memory_kind=None,
+    ):
         calls.append(
             {
                 "source_file": source_file,
                 "check_mtime": check_mtime,
                 "extract_mode": extract_mode,
+                "memory_kind": memory_kind,
             }
         )
         return False  # never already mined — let the mine proceed
@@ -1350,6 +1412,7 @@ def test_mine_formats_passes_extract_mode_format_to_file_already_mined(monkeypat
         assert call["extract_mode"] == "format", (
             f"file_already_mined call missing extract_mode='format': {call}"
         )
+        assert call["memory_kind"] == "reference"
 
 
 def test_mine_formats_does_not_write_sentinel_for_skip_no_markitdown(monkeypatch, tmp_path: Path):
