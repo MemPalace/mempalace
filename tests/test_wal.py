@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 
@@ -168,3 +169,49 @@ def test_wal_log_redacts_non_string_values(tmp_path, monkeypatch):
     entry = json.loads(wal_file.read_text().strip())
     assert entry["params"]["document"] == "[REDACTED]"
     assert entry["params"]["safe"] == "ok"
+
+
+class TestAuditLogSink:
+    """MEMPALACE_AUDIT_LOG mirrors every WAL entry to a second, consumer-owned path."""
+
+    def test_audit_sink_mirrors_redacted_entry(self, tmp_path, monkeypatch):
+        from mempalace import wal
+
+        wal_file = tmp_path / "write_log.jsonl"
+        audit_file = tmp_path / "external" / "audit.jsonl"
+        monkeypatch.setattr(wal, "_WAL_FILE", wal_file)
+        monkeypatch.setenv("MEMPALACE_AUDIT_LOG", str(audit_file))
+
+        wal._wal_log("test", {"content": "secret note", "safe": "ok"})
+
+        entry = json.loads(audit_file.read_text().strip())
+        assert entry["operation"] == "test"
+        assert entry["params"]["safe"] == "ok"
+        assert "secret note" not in audit_file.read_text()
+        # the primary WAL append is unchanged
+        assert json.loads(wal_file.read_text().strip())["operation"] == "test"
+
+    def test_audit_sink_absent_env_is_noop(self, tmp_path, monkeypatch):
+        from mempalace import wal
+
+        wal_file = tmp_path / "write_log.jsonl"
+        monkeypatch.setattr(wal, "_WAL_FILE", wal_file)
+        monkeypatch.delenv("MEMPALACE_AUDIT_LOG", raising=False)
+
+        wal._wal_log("test", {"safe": "ok"})
+
+        assert json.loads(wal_file.read_text().strip())["operation"] == "test"
+        assert not (tmp_path / "external").exists()
+
+    def test_audit_sink_failure_never_crashes_the_write(self, tmp_path, monkeypatch):
+        from mempalace import wal
+
+        wal_file = tmp_path / "write_log.jsonl"
+        monkeypatch.setattr(wal, "_WAL_FILE", wal_file)
+        blocker = tmp_path / "blocker"
+        blocker.write_text("x")
+        monkeypatch.setenv("MEMPALACE_AUDIT_LOG", str(blocker / "audit.jsonl"))
+
+        wal._wal_log("test", {"safe": "ok"})  # must not raise
+
+        assert json.loads(wal_file.read_text().strip())["operation"] == "test"

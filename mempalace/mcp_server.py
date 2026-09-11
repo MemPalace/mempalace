@@ -2758,6 +2758,16 @@ def tool_create_tunnel(
         source_room = sanitize_name(source_room, "source_room")
         target_wing = sanitize_name(target_wing, "target_wing")
         target_room = sanitize_name(target_room, "target_room")
+        _wal_log(
+            "create_tunnel",
+            {
+                "source_wing": source_wing,
+                "source_room": source_room,
+                "target_wing": target_wing,
+                "target_room": target_room,
+                "label": label,
+            },
+        )
         return create_tunnel(
             source_wing,
             source_room,
@@ -2784,6 +2794,7 @@ def tool_delete_tunnel(tunnel_id: str):
     """Delete an explicit tunnel by its ID."""
     if not tunnel_id or not isinstance(tunnel_id, str):
         return {"error": "tunnel_id is required"}
+    _wal_log("delete_tunnel", {"tunnel_id": tunnel_id})
     return delete_tunnel(tunnel_id)
 
 
@@ -2800,6 +2811,7 @@ def tool_delete_hallway(hallway_id: str):
     """Delete a hallway record by its ID."""
     if not hallway_id or not isinstance(hallway_id, str):
         return {"error": "hallway_id is required"}
+    _wal_log("delete_hallway", {"hallway_id": hallway_id})
     return {"deleted": delete_hallway(hallway_id)}
 
 
@@ -3502,6 +3514,8 @@ def tool_mine(
     # tree, so they keep the directory requirement.
     if not src or not (os.path.isdir(src) or (mode == "convos" and os.path.isfile(src))):
         return {"success": False, "error": f"source not found: {source!r}"}
+
+    _wal_log("mine", {"source": src, "mode": mode, "wing": wing, "dry_run": dry_run})
 
     def _run():
         if mode == "convos":
@@ -4605,6 +4619,7 @@ def tool_reconnect():
     or replace ``knowledge_graph.sqlite3`` directly, which can leave the
     in-memory HNSW index stale or pin a closed-on-disk SQLite connection.
     """
+    _wal_log("reconnect", {})
     global \
         _client_cache, \
         _collection_cache, \
