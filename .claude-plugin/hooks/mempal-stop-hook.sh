@@ -21,4 +21,4 @@ run_mempalace_hook() {
   return 1
 }
 
-run_mempalace_hook --hook stop --harness "${MEMPALACE_HOOK_HARNESS:-auto}"
+run_mempalace_hook --hook stop --harness "${MEMPALACE_HOOK_HARNESS:-claude-code}"

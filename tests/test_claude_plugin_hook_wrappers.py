@@ -95,7 +95,7 @@ def test_plugin_hook_wrapper_prefers_mempalace_cli(
 
     assert result.returncode == 0
     assert result.stdout == "{}\n"
-    assert args_file.read_text(encoding="utf-8") == f"hook run --hook {hook_name} --harness auto"
+    assert args_file.read_text(encoding="utf-8") == f"hook run --hook {hook_name} --harness claude-code"
     assert stdin_file.read_text(encoding="utf-8") == payload
 
 
@@ -125,7 +125,7 @@ def test_plugin_hook_wrapper_falls_back_to_importable_python(
     assert result.stdout == "{}\n"
     assert (
         args_file.read_text(encoding="utf-8")
-        == f"-m mempalace hook run --hook {hook_name} --harness auto"
+        == f"-m mempalace hook run --hook {hook_name} --harness claude-code"
     )
     assert stdin_file.read_text(encoding="utf-8") == payload
 
@@ -183,7 +183,7 @@ def test_plugin_hook_wrapper_falls_back_to_python_when_python3_cannot_import(
     assert result.stdout == "{}\n"
     assert (
         args_file.read_text(encoding="utf-8")
-        == f"-m mempalace hook run --hook {hook_name} --harness auto"
+        == f"-m mempalace hook run --hook {hook_name} --harness claude-code"
     )
     assert stdin_file.read_text(encoding="utf-8") == payload
     assert not bad_python3_used.exists()
