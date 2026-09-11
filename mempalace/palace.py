@@ -497,7 +497,7 @@ def _open_collection_or_explain(
         never been bootstrapped (``init`` ran, ``mine`` has not).
     State D: healthy — returns the opened collection.
     State E: an unexpected error opens the backend — message points the
-        user at ``repair-status`` for further diagnosis.
+        user at a diagnostic that applies to the selected backend.
 
     ``out`` is the message sink; defaults to the builtin ``print``. Pass a
     callable (e.g. a repair progress emitter) to route messages through it.
@@ -559,7 +559,14 @@ def _open_collection_or_explain(
         raise
     except Exception as e:  # noqa: BLE001 — backend exceptions vary (chromadb, OSError, lock errors)
         emit(f"\n  Error opening palace at {palace_path}: {e!r}")
-        emit("  Try: mempalace repair-status --palace <path>")
+        if backend_name == "chroma":
+            emit("  Try: mempalace --palace <path> repair-status")
+        elif backend_name == "qdrant":
+            emit("  Run: mempalace status and ensure the configured Qdrant service is running.")
+        elif backend_name == "pgvector":
+            emit("  Run: mempalace status and ensure the configured PostgreSQL service is running.")
+        else:
+            emit("  Run: mempalace status for diagnostics.")
         return None
 
 

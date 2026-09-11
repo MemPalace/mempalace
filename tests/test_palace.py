@@ -177,7 +177,27 @@ def test_open_collection_or_explain_state_e_unexpected_error(tmp_path, monkeypat
 
     assert result is None
     assert any("Error opening palace" in line for line in lines)
-    assert any("repair-status" in line for line in lines)
+    assert any("mempalace --palace <path> repair-status" in line for line in lines)
+
+
+def test_open_collection_or_explain_qdrant_error_routes_to_service_health(tmp_path, monkeypatch):
+    """A remote Qdrant outage must not recommend the Chroma-only repair tool."""
+    emit, lines = _capture()
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    monkeypatch.setattr("mempalace.palace.resolve_backend_name", lambda _path: "qdrant")
+    monkeypatch.setattr("mempalace.palace.detect_backend_for_path", lambda _path: "qdrant")
+
+    def connection_refused(*args, **kwargs):
+        raise ConnectionRefusedError("Qdrant is not listening")
+
+    result = _open_collection_or_explain(str(palace), out=emit, opener=connection_refused)
+
+    assert result is None
+    assert any("mempalace status" in line for line in lines)
+    assert any("Qdrant service is running" in line for line in lines)
+    assert not any("repair-status" in line for line in lines)
 
 
 def test_open_collection_or_explain_default_sink_is_print(tmp_path, capsys):

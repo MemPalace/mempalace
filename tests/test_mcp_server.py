@@ -1183,8 +1183,6 @@ with mine_palace_lock(sys.argv[1]):
             palace._VALIDATED_IDENTITY.clear()
 
     def test_status_qdrant_backend_has_no_hnsw_fields(self, monkeypatch, config, palace_path, kg):
-        from mempalace.backends import GetResult
-
         monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "qdrant")
         monkeypatch.setenv("MEMPALACE_BACKEND", "qdrant")
         with open(os.path.join(palace_path, "qdrant_backend.json"), "w", encoding="utf-8") as f:
@@ -1197,14 +1195,12 @@ with mine_palace_lock(sys.argv[1]):
             def count(self):
                 return 2
 
-            def get(self, **_kwargs):
-                return GetResult(
-                    ids=["q1", "q2"],
-                    documents=[],
-                    metadatas=[
+            def iter_metadata(self):
+                return iter(
+                    [
                         {"wing": "project", "room": "backend"},
                         {"wing": "project", "room": "api"},
-                    ],
+                    ]
                 )
 
         monkeypatch.setattr(mcp_server, "_collection_cache", None)
@@ -1224,8 +1220,8 @@ with mine_palace_lock(sys.argv[1]):
     def test_status_handles_none_metadata_without_partial(
         self, monkeypatch, config, palace_path, kg
     ):
-        """tool_status must not crash or go partial when the metadata cache
-        returns a ``None`` entry — palaces can contain drawers with no
+        """tool_status must not crash or go partial when the metadata iterator
+        yields a ``None`` entry — palaces can contain drawers with no
         metadata (older mining paths, third-party writes). Before the guard,
         ``m.get("wing")`` raised AttributeError mid-tally and the result
         carried ``"error"`` + ``"partial": True`` even though the data was
@@ -1235,15 +1231,18 @@ with mine_palace_lock(sys.argv[1]):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_status
 
-        # Inject a metadata cache where one entry is None
+        # Inject a metadata iterator where one entry is None
         with _patch("mempalace.mcp_server._get_collection") as mock_get_col:
-            fake_col = type("C", (), {"count": lambda self: 2})()
+            fake_col = type(
+                "C",
+                (),
+                {
+                    "count": lambda self: 2,
+                    "iter_metadata": lambda self: iter([{"wing": "proj", "room": "r"}, None]),
+                },
+            )()
             mock_get_col.return_value = fake_col
-            with _patch(
-                "mempalace.mcp_server._get_cached_metadata",
-                return_value=[{"wing": "proj", "room": "r"}, None],
-            ):
-                result = tool_status()
+            result = tool_status()
 
         # The None-metadata drawer falls under 'unknown/unknown' — no crash,
         # no partial flag.
@@ -4719,6 +4718,25 @@ class TestCacheInvalidation:
         assert "No palace found" in result["message"]
         assert result["drawers"] == 0
 
+    def test_qdrant_open_failure_reports_service_health_not_chroma_repair(
+        self, monkeypatch, config, kg
+    ):
+        """The MCP failure hint must name a diagnostic valid for Qdrant."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server, palace
+
+        monkeypatch.setattr(mcp_server, "_selected_backend_name", lambda: "qdrant")
+
+        def connection_refused(*args, **kwargs):
+            raise ConnectionRefusedError("Qdrant is not listening")
+
+        monkeypatch.setattr(palace, "get_collection", connection_refused)
+        mcp_server._collection_cache = None
+
+        assert mcp_server._get_collection() is None
+        assert "Qdrant service is running" in mcp_server._collection_open_error["hint"]
+        assert "repair-status" not in mcp_server._collection_open_error["hint"]
+
     def test_reconnect_reports_success(self, monkeypatch, config, palace_path, kg):
         """tool_reconnect should report success with drawer count."""
         _patch_mcp_server(monkeypatch, config, kg)
@@ -7556,7 +7574,9 @@ class TestStaleLibraryGate:
         )
         break_it(metadata)
         try:
-            versions, errors = mcp_server._read_installed_dist_versions([str(tmp_path)])
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", DeprecationWarning)
+                versions, errors = mcp_server._read_installed_dist_versions([str(tmp_path)])
         finally:
             if metadata.exists():
                 metadata.chmod(0o644)
@@ -7585,7 +7605,9 @@ class TestStaleLibraryGate:
         )
         metadata.chmod(0o000)
         try:
-            versions, errors = mcp_server._installed_dist_state()
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", DeprecationWarning)
+                versions, errors = mcp_server._installed_dist_state()
             assert versions == {} and "mempalace" in errors
             # repaired: neither the directory listing nor the file's stat
             # changed, only its readability
