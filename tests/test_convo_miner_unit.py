@@ -1,6 +1,7 @@
 """Unit tests for convo_miner pure functions (no chromadb needed)."""
 
 import contextlib
+import stat
 import sys
 
 import pytest
@@ -15,6 +16,43 @@ from mempalace.convo_miner import (
     detect_convo_room,
     scan_convos,
 )
+
+
+def test_normalize_failure_is_not_registered_as_mined(tmp_path, monkeypatch, capsys):
+    import mempalace.convo_miner as convo_mod
+    import mempalace.normalize as normalize_mod
+
+    source = tmp_path / "unknown.jsonl"
+    source.write_text('{"type":"future_format"}\n', encoding="utf-8")
+
+    class OversizedRegularFile:
+        st_mode = stat.S_IFREG | 0o644
+        st_size = normalize_mod.MAX_IN_MEMORY_FILE_SIZE + 1
+
+    monkeypatch.setattr(normalize_mod.os, "fstat", lambda _fd: OversizedRegularFile())
+
+    class Collection:
+        def __init__(self):
+            self.upserts = []
+
+        def upsert(self, **kwargs):
+            self.upserts.append(kwargs)
+
+    collection = Collection()
+    result = convo_mod._normalize_convo_conversations(
+        source,
+        str(source),
+        30,
+        collection,
+        "sessions",
+        "codex",
+        "exchange",
+        False,
+    )
+
+    assert result is None
+    assert collection.upserts == []
+    assert "normalize error" in capsys.readouterr().err
 
 
 class TestChunkExchanges:
