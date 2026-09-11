@@ -5,13 +5,57 @@ import chromadb
 from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 from mempalace.backends import CollectionNotInitializedError, PalaceNotFoundError
+from mempalace.backends.base import GetResult
 from mempalace.palace import (
+    _VisibleDrawersCollection,
     _candidate_entity_words,
     _metadata_matches_extract_mode,
     _open_collection_or_explain,
     backend_requires_single_writer,
     get_collection,
 )
+from mempalace.sources.lifecycle import SourceLifecycleStore
+
+
+class _OrderedGetCollection:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def get(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.result
+
+
+def test_visible_collection_applies_limit_after_hiding_generations(tmp_path):
+    store = SourceLifecycleStore(str(tmp_path / "knowledge_graph.sqlite3"))
+    active = store.begin(adapter_name="fixture", source_file="fixture://one", version="v2")
+    store.activate(active)
+    raw = _OrderedGetCollection(
+        GetResult(
+            ids=["hidden", "active"],
+            documents=["old", "new"],
+            metadatas=[
+                {
+                    "adapter_name": "fixture",
+                    "source_file": "fixture://one",
+                    "source_generation": "old",
+                },
+                {
+                    "adapter_name": "fixture",
+                    "source_file": "fixture://one",
+                    "source_generation": active.generation,
+                },
+            ],
+        )
+    )
+    collection = _VisibleDrawersCollection(raw, str(tmp_path))
+
+    result = collection.get(where={"source_file": "fixture://one"}, limit=1)
+
+    assert result.ids == ["active"]
+    assert raw.calls[0]["limit"] == 1
+    assert "limit" not in raw.calls[1]
 
 
 def test_backend_writer_ownership_distinguishes_milvus_lite_from_server(tmp_path, monkeypatch):
