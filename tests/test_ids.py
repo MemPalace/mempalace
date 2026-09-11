@@ -186,3 +186,28 @@ def test_private_delimited_sha256_truncation_honoured():
     """Truncation argument actually shortens the hex output."""
     result = ids._delimited_sha256(("a", "b"), 8)
     assert len(result) == 8
+
+
+# ── make_turn_fingerprint ────────────────────────────────────────────
+
+
+def test_make_turn_fingerprint_is_stable():
+    assert ids.make_turn_fingerprint("hello world") == ids.make_turn_fingerprint("hello world")
+
+
+def test_make_turn_fingerprint_distinct_content_distinct_fp():
+    assert ids.make_turn_fingerprint("hello") != ids.make_turn_fingerprint("hello ")
+
+
+def test_make_turn_fingerprint_is_short_hex():
+    fp = ids.make_turn_fingerprint("some user message")
+    assert len(fp) == 16
+    assert all(c in "0123456789abcdef" for c in fp)
+
+
+def test_make_turn_fingerprint_pins_recipe():
+    # The fingerprint must match across independently computed call
+    # sites (sync_turn vs session_end). Pin the exact recipe output so
+    # an accidental recipe change fails loudly here.
+    expected = hashlib.sha256(b"11:hello world").hexdigest()[:16]
+    assert ids.make_turn_fingerprint("hello world") == expected
