@@ -1844,6 +1844,7 @@ def scan_project(
 def mine(
     project_dir: str,
     palace_path: str,
+    config_dir: str = None,
     wing_override: str = None,
     agent: str = "mempalace",
     limit: int = 0,
@@ -1870,6 +1871,7 @@ def mine(
         return _mine_impl(
             project_dir,
             palace_path,
+            config_dir=config_dir,
             wing_override=wing_override,
             agent=agent,
             limit=limit,
@@ -1887,6 +1889,7 @@ def mine(
         return _mine_impl(
             project_dir,
             palace_path,
+            config_dir=config_dir,
             wing_override=wing_override,
             agent=agent,
             limit=limit,
@@ -1901,6 +1904,7 @@ def mine(
 def _mine_impl(
     project_dir: str,
     palace_path: str,
+    config_dir: str = None,
     wing_override: str = None,
     agent: str = "mempalace",
     limit: int = 0,
@@ -1913,7 +1917,7 @@ def _mine_impl(
     from .config import MempalaceConfig
 
     project_path = Path(project_dir).expanduser().resolve()
-    config = load_config(project_dir)
+    config = load_config(config_dir or project_dir)
     palace_config = MempalaceConfig()
 
     cfg_chunk_size = palace_config.chunk_size
