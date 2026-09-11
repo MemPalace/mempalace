@@ -222,6 +222,34 @@ It is a transparent forwarding layer. All data stays between your MCP
 client and your MemPalace server, consistent with MemPalace's
 "local-first, zero external API" design principle.
 
+## Light MCP Compatibility
+
+MemPalace has two MCP surfaces:
+
+1. **Light MCP** (stdio only) — three consolidated tools
+   (`palace_query`, `palace_exec`, `palace_coordinate`) for resource-
+   constrained clients. This is the existing path:
+   `client → light MCP over stdio → full HTTP hub`.
+
+2. **Full MCP** (HTTP or stdio) — the complete tool catalog
+   (`mempalace_search`, `mempalace_add_drawer`, `mempalace_kg_query`,
+   etc.). This is what the proxy exposes over streamable-HTTP.
+
+**This proxy forwards `tools/list` unchanged**, so clients connecting
+through it receive the **full hub catalog**, not the three consolidated
+light tools. The light MCP server currently only supports stdio and
+cannot be used directly as this proxy's HTTP upstream.
+
+If the intended feature is light MCP over HTTP, that requires
+integration with the light dispatcher and an end-to-end test asserting
+the three-tool catalog and correct dispatch. That is out of scope for
+this PR.
+
+**Deploying the watchdog can affect the light MCP path** because the
+watchdog manages the same upstream hub process. If you use both paths,
+ensure the watchdog's `MEMPALACE_START_CMD` matches your server's
+launch configuration.
+
 ## License
 
 MIT (same as MemPalace)
