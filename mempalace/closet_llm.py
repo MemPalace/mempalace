@@ -47,7 +47,6 @@ import urllib.error
 from datetime import datetime
 from typing import Optional
 
-from .llm_client import USER_AGENT
 from .palace import (
     NORMALIZE_VERSION,
     get_closets_collection,
@@ -57,6 +56,7 @@ from .palace import (
     purge_file_closets,
     upsert_closet_lines,
 )
+from .user_agent import USER_AGENT
 
 MAX_CONTENT_CHARS = 30000
 MAX_OUTPUT_TOKENS = 1500
