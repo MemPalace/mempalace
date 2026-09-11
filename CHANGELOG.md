@@ -36,6 +36,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **Shared-brain rules are `host:harness:project`, declared-idle, and MCP-shape aware.** `mempalace rules` takes `--host --harness --project` (stable lowercase tokens) and optional `--mcp full|light` (default `full`, matching the 45-tool server). The packaged snippet is the only coordination text: compose the identity from the current workspace, arm `logstream watch` only on listen / claim / delegate, write topics on named lanes without filtering the default inbox on them, claim with a lowest-HLC mutex, and use `kg_supersede` for single-valued fact changes. `--mcp light` swaps tool tokens onto the 3-tool triad; prose is identical. `logstream watch --agent` now defaults a sanitized `--state-file` (`:` → `_` under `~/.mempalace/watch/`) so Windows tuple identities do not need a private path overlay.
 
+- **Cross-device sync: `mempalace export` / `mempalace import`.** `export` (default `--format jsonl`)
+  writes a deterministic, git-friendly JSONL tree organized by wing/room — sorted ids, sorted keys, no
+  timestamps, so re-exporting an unchanged palace is a zero git diff — and `import <dir>` merges an
+  export into another machine's palace by drawer id: adds new drawers, skips existing ones, idempotent
+  on re-import, and re-embeds locally since exports deliberately carry no vectors. `--format markdown`
+  exposes the existing browsable markdown exporter on the CLI for the first time. (#452)
+
 ---
 
 ## [3.9.0] — 2026-08-31
