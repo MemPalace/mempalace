@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.request import Request, urlopen
 
+from .user_agent import USER_AGENT
 from .version import __version__
 
 
@@ -86,7 +87,7 @@ def fetch_latest_stable() -> str:
     """Return the latest stable version advertised by the official PyPI project."""
     request = Request(
         "https://pypi.org/pypi/mempalace/json",
-        headers={"Accept": "application/json", "User-Agent": "mempalace-update-check"},
+        headers={"Accept": "application/json", "User-Agent": f"{USER_AGENT} (update-check)"},
     )
     with urlopen(request, timeout=2.0) as response:  # noqa: S310 -- fixed HTTPS origin
         payload = json.load(response)

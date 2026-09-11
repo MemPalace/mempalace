@@ -34,7 +34,7 @@ from datetime import datetime
 
 import chromadb
 
-from mempalace.llm_client import USER_AGENT
+from mempalace.user_agent import USER_AGENT
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
