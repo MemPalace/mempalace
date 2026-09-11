@@ -11,7 +11,6 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 from mempalace.llm_client import (
-    USER_AGENT,
     AnthropicProvider,
     LLMError,
     OllamaProvider,
@@ -19,6 +18,7 @@ from mempalace.llm_client import (
     _http_post_json,
     get_provider,
 )
+from mempalace.user_agent import USER_AGENT
 
 
 # ── factory ─────────────────────────────────────────────────────────────
@@ -311,18 +311,6 @@ def test_openai_compat_check_available_malformed_endpoint_returns_false_not_rais
     ok, msg = p.check_available()
     assert ok is False
     assert "Cannot reach" in msg
-
-
-def test_user_agent_constant_format():
-    """Format-pin: WAF allowlists and operator log greps key off the full
-    ``mempalace/<semver> (+repo URL)`` shape. A future ``__version__`` refactor
-    that drops the version segment OR the URL suffix must fail loudly here."""
-    import re
-
-    assert re.fullmatch(
-        r"mempalace/\d+\.\d+\.\d+[^()]*\(\+https://github\.com/MemPalace/mempalace\)",
-        USER_AGENT,
-    ), f"USER_AGENT format mismatch: {USER_AGENT!r}"
 
 
 def test_http_post_json_malformed_url_raises_llm_error_not_value_error():

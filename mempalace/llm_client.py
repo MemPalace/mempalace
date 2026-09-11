@@ -31,14 +31,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from .version import __version__
-
-# Cloudflare-fronted endpoints (Workers AI, AI Gateway, Together, ...) often
-# run a WAF "User Agent Blocking" rule against the stdlib default
-# ``Python-urllib/<py-version>`` and return a bare 403 before auth (#1570).
-# Sending an explicit identifier passes those checks and gives operators
-# something searchable in their WAF logs.
-USER_AGENT = f"mempalace/{__version__} (+https://github.com/MemPalace/mempalace)"
+from .user_agent import USER_AGENT
 
 
 # ── External-service heuristic (issue #24 — privacy warning support) ─────
