@@ -3164,7 +3164,7 @@ def main():
     p_init.add_argument(
         "--yes",
         action="store_true",
-        help="Auto-accept all detected entities (non-interactive)",
+        help="Auto-accept all detected entities and rooms (non-interactive)",
     )
     p_init.add_argument(
         "--auto-mine",
