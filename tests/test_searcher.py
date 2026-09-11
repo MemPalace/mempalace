@@ -17,6 +17,7 @@ from mempalace.backends import BackendMismatchError
 from mempalace.searcher import (
     SearchError,
     _result_drawer_id,
+    brief,
     build_where_filter,
     get_collection,
     search,
@@ -189,6 +190,36 @@ class TestSearchMemories:
             result = search_memories("test", "/fake/path")
         hit = result["results"][0]
         assert hit["created_at"] == "unknown"
+
+    def test_brief(self, palace_path, seeded_collection):
+        """Brief returns a deduplicated overview."""
+        result = brief(palace_path=palace_path)
+        assert "Brief" in result
+        assert "topics" in result
+
+    def test_brief_empty_palace(self, palace_path, collection):
+        """Brief surfaces the L2 'no drawers' message instead of crashing."""
+        result = brief(palace_path=palace_path)
+        assert result.startswith("No ")
+
+    def test_brief_dedupes_near_identical_drawers(self, palace_path, collection):
+        """Brief collapses drawers whose summary lines overlap heavily."""
+        collection.add(
+            ids=["dup_a", "dup_b", "distinct_c"],
+            documents=[
+                "The authentication module uses JWT tokens for session management.",
+                "The authentication module uses JWT tokens for session management.",
+                "Database migrations are handled by Alembic with PostgreSQL 15.",
+            ],
+            metadatas=[
+                {"wing": "project", "room": "backend", "source_file": "auth_a.py"},
+                {"wing": "project", "room": "backend", "source_file": "auth_b.py"},
+                {"wing": "project", "room": "backend", "source_file": "db.py"},
+            ],
+        )
+        result = brief(palace_path=palace_path, wing="project")
+        assert result.count("authentication module uses JWT") == 1
+        assert "Database migrations" in result
 
     def test_search_memories_query_error(self):
         """search_memories returns error dict when query raises."""
