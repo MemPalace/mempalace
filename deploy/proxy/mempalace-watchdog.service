@@ -27,7 +27,7 @@ Environment=MEMPALACE_PORT=8765
 Environment=WATCHDOG_INTERVAL=30
 Environment=MAX_RESTARTS_PER_HOUR=5
 Environment=RESTART_COOLDOWN=60
-Environment=MEMPALACE_START_CMD=mempalace serve --host 0.0.0.0 --port 8765
+Environment="MEMPALACE_START_CMD=mempalace serve --host 0.0.0.0 --port 8765"
 ExecStart=/usr/local/bin/mempalace-watchdog.sh
 Restart=always
 RestartSec=5
@@ -36,6 +36,10 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+# Preserve writable palace storage for the replacement server.
+# Without these, ProtectSystem=strict blocks all writes under /var/lib/mempalace.
+StateDirectory=mempalace
+ReadWritePaths=/var/lib/mempalace /var/log/mempalace
 
 [Install]
 WantedBy=multi-user.target

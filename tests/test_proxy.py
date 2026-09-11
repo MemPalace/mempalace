@@ -671,6 +671,33 @@ class TestOriginValidation:
         assert allowed is False
         assert status == 403
 
+    def test_dns_rebinding_attacker_host_and_origin_rejected(self):
+        """Both Host and Origin are attacker-controlled — Host must be
+        validated independently of Origin to prevent DNS rebinding."""
+        import mempalace_mcp_proxy as proxy
+
+        request = self._mock_request(
+            Origin="http://attacker.example:8766",
+            Host="attacker.example:8766",
+        )
+        allowed, status, msg = proxy._is_inbound_request_allowed(request)
+        assert allowed is False
+        assert status == 403
+        # The rejection must mention Host, not just Origin
+        assert "Host" in msg
+
+    def test_valid_origin_with_disallowed_host_rejected(self):
+        """Even with a valid Origin, a disallowed Host must be rejected."""
+        import mempalace_mcp_proxy as proxy
+
+        request = self._mock_request(
+            Origin="http://localhost:8766",
+            Host="attacker.example:8766",
+        )
+        allowed, status, msg = proxy._is_inbound_request_allowed(request)
+        assert allowed is False
+        assert status == 403
+
     def test_inbound_token_required(self, monkeypatch):
         import mempalace_mcp_proxy as proxy
 
