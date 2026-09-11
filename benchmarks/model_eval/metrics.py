@@ -13,7 +13,7 @@ from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from mempalace.llm_client import USER_AGENT
+from mempalace.user_agent import USER_AGENT
 
 
 # ── Thinking-token stripping ─────────────────────────────────────────────

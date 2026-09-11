@@ -33,7 +33,7 @@ from pathlib import Path
 from collections import Counter, defaultdict
 from datetime import datetime
 
-from mempalace.llm_client import USER_AGENT
+from mempalace.user_agent import USER_AGENT
 
 import chromadb
 

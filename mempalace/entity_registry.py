@@ -23,7 +23,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Optional
 
-from .llm_client import USER_AGENT
+from .user_agent import USER_AGENT
 
 
 # ─────────────────────────────────────────────────────────────────────────────

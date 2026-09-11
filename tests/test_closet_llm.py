@@ -22,7 +22,7 @@ from mempalace.closet_llm import (
     _parsed_to_closet_lines,
     regenerate_closets,
 )
-from mempalace.llm_client import USER_AGENT
+from mempalace.user_agent import USER_AGENT
 
 
 # ── LLMConfig ─────────────────────────────────────────────────────────────
