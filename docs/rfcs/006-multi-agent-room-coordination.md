@@ -1,184 +1,398 @@
-# RFC 006: Multi-Agent Room Coordination Protocol
+# RFC 006: Rooms — Open Discussion Between Agents and People
 
-Status: Draft — for Milla's review  
-Owner: Igor Lins e Silva & Antigravity (`windows:antigravity:mempalace`)  
-Created: 2026-09-05  
-Branch: `feat/multi-agent-room-coordination`  
-Prior art: RFC 003 (Agent Logstream Coordination), RFC 004 (Replicated Palace), RFC 005 (Agent Identity & Routing)
+Status: Draft v2 — complete rewrite, for Milla's review
+Owner: Igor Lins e Silva (`windows:claude:mempalace`)
+Created: 2026-09-05 (v1), rewritten 2026-09-11 (v2)
+Branch: `feat/multi-agent-room-coordination`
+Prior art: RFC 003 (logstream), RFC 005 (identity), `integrations/shared/coordination-protocol.md`
+Supersedes: the v1 draft of this RFC and its `examples/multi_agent_room/` simulation
 
 ---
 
 ## Summary
 
-RFC 003 established the MemPalace Logstream as an append-only coordination substrate for explicit, task-directed handoffs:
-$$\text{task.request} \longrightarrow \text{status=claimed} \longrightarrow \text{patch.ready} \longrightarrow \text{event.ack}$$
+RFC 003 gives agents a way to hand work to each other: `task.request` →
+`claimed` → `patch.ready` → `event.ack`. It is deliberately rigid — every
+event has one addressee and one obligation.
 
-While effective for deterministic work delegation, this model is too rigid for open-ended brainstorming, architectural design, exploratory research, and peer critique. In conversational spaces, agents should be able to share a common **Room**, listen continuously, and speak freely.
+Rooms are for the other kind of collaboration: a design review, a
+brainstorm, a critique, a "what should we do about X" where several agents
+and one or more humans think together and nobody owes anybody a patch.
 
-However, unconstrained multi-agent rooms in LLM systems face two pathological failure modes:
-1. **The Mechanical Chatter / Infinite Echo Storm**: Agents mechanically respond to every broadcast message (*"Understood"*, *"I agree"*, *"Here is my summary"*), triggering exponential message cascades and runaway token consumption.
-2. **The Bystander Effect / Dead Air**: When gating thresholds are too strict or ambiguously defined, all agents wait indefinitely and conversation dies.
+A room is **a conversation held on the logstream** that any participant can
+join *from the session it is already running in* — a Claude Code terminal, a
+Codex CLI, a ChatGPT/Claude/Codex desktop app, Antigravity, Astra, or a human
+with a shell. Nothing is spawned. There is no room server, no room process,
+no simulation. Participation is three operations every agent already has:
 
-This RFC proposes **Multi-Agent Room Coordination**: a protocol layer on top of RFC 003 logstream that enables decentralized, natural turn-taking in open rooms through two complementary mechanisms:
-1. **Autonomous Participation Gating**: An explicit decision heuristic evaluated on incoming events ($\text{Decision} \in \{\text{SPEAK}, \text{PASS}\}$), suppressing turns that lack substantive novelty or domain relevance.
-2. **Urgency-Weighted Jitter Backoff & Pre-Flight Cancellation**: A decentralized floor control algorithm where high-urgency points take the floor first, while lower-urgency thoughts pause; if a peer speaks during the pause and resolves the point, the pending speech is cleanly aborted (`PREEMPTED_PASS`) with zero wire traffic.
+1. **Catch up** — read what was said since you last looked.
+2. **Speak, or stay quiet.**
+3. **Find out when it is your turn** — in the way *your* harness can.
 
----
+Everything else in this RFC is convention: how the floor is handed around,
+how to keep a room from turning into an echo chamber, and how a finished
+discussion becomes memory.
 
-## Motivation & Empirical Findings
+One sentence: **a room is a `room` on the project stream; the floor is an
+event; your turn arrives the way your harness can receive it; silence costs
+nothing.**
 
-During our dogfood experiments, three agents with distinct perspectives—`rust-architect`, `python-pragmatist`, and `coordination-mesh`—brainstormed on expanding Rust across the MemPalace codebase over an isolated logstream room (`stream="room/architecture"`, `room="salon"`).
+## What the first draft got wrong
 
-### Naive Broadcast vs. Autonomous Gating
+The v1 draft modelled a room as a Python program: three scripted personas in
+daemon threads, each running a four-factor gating heuristic
+(relevance × novelty × anti-echo × urgency), an urgency-weighted jitter
+backoff to "win the floor", and pre-flight cancellation to avoid "append
+collisions". Reviewer feedback (Milla, PR #2447):
 
-When agents were prompted without gating, every broadcast message produced $N-1$ replies, leading to quadratic message growth:
-$$M_{k+1} = M_k \times (N - 1)$$
+> Complicated and doesn't account for agents that don't argue and when you
+> just need to have one person at a time speak. Doesn't work with the agent
+> that needs to speak on the desktop app — it connects to the app and then
+> spawns a brand new window so the instance there has no clue what he's
+> doing there.
 
-When running under the **Participation Gating & Pre-Flight Cancellation Protocol**, empirical telemetry on an isolated sandbox database revealed:
-- **Total Turn Evaluations**: 9
-- **Speeches Emitted**: 4
-- **Silent Passes**: 3 (0 wire traffic)
-- **Pre-empted Cancellations**: 2 (posts aborted during backoff because a peer spoke first)
-- **Chatter Suppression Rate**: **55.6%**
-- **Collision Rate**: **0%** (zero simultaneous append races)
-- **Supervisor / Conductor Overhead**: **0%** (completely decentralized, self-scheduling agents)
+All three points are correct, and they share a root cause: v1 designed the
+*agents* instead of the *room*. Concretely:
 
-The conversation naturally progressed through thesis $\rightarrow$ antithesis $\rightarrow$ synthesis $\rightarrow$ quiet consensus, falling completely silent once all constraints were resolved.
+- **Collisions are not a problem to solve.** The logstream is append-only
+  and totally ordered (HLC, RFC 004). Two agents posting "at the same time"
+  produce two events in a definite order. Backoff and cancellation were
+  solving a race that cannot corrupt anything.
+- **Chatter is a prompt problem, not a protocol problem.** An agent that
+  replies "Understood" to every broadcast is following bad instructions.
+  The fix is a four-line rule in its instructions (§5), not a scoring
+  function in a subprocess.
+- **The only real constraint v1 ignored is how each participant wakes up.**
+  A Claude Code session with a background watcher can be woken by an event.
+  A desktop chat app cannot — it acts only when its human (or its host app)
+  gives it a turn. `coordination-protocol.md` already says this plainly:
+  *"A pasted handoff can wake a turn-based agent; a logstream event alone
+  cannot."* A room protocol that assumes every participant is a long-running
+  Python loop excludes exactly the agents Milla uses.
+- **"Agents that don't argue"** — most agents in a room are there to answer
+  when asked, not to compete for the floor. v1 had no place for them; the
+  default mode here (§3, *moderated*) is built for them.
 
----
+v1 is superseded in full. Its simulation is removed from the tree; nothing
+in it was reusable by a real agent.
 
-## Design Principles
+## Design principles
 
-1. **Decentralized Floor Control**: No central room manager, queue server, or token-passing orchestrator. Agents arbitrate turn-taking autonomously using local backoff heuristics.
-2. **Silence as a First-Class Action**: Choosing not to speak (`PASS`) is an active, correct response. A pass advances the agent's local cursor (`since_event_id`) and writes zero bytes to the logstream.
-3. **Pre-Flight Verification**: An agent must never commit a write without checking if the room state changed while it was thinking or waiting.
-4. **Verbatim Durability**: Room messages are standard logstream events, preserved verbatim with causal HLC ordering, origin replica tagging, and SHA256 integrity.
-5. **Zero-Config Local Degradation**: Pure stdio or single-agent workflows must not require a daemon or room broker to operate.
+- **Zero-spawn.** Joining a room never starts a process, opens a window, or
+  requires code beyond the MCP tools / CLI the agent already has.
+- **Wake-model aware.** The protocol works for participants that can be
+  woken by events *and* for participants that can only be woken by a human.
+  Both are first-class; neither is degraded.
+- **One speaker at a time is the default.** Open, free-for-all discussion
+  is available but opt-in.
+- **Silence is free.** Choosing not to speak writes zero bytes. Nobody has
+  to say "I have nothing to add" unless they hold the floor.
+- **Verbatim, then memory.** Every turn is a verbatim logstream event. When
+  the room closes, the transcript is filed as drawers so it is recallable.
+  Nothing is summarized in place of the original words.
+- **Convention over mechanism.** Phase 1 of this RFC ships with no code
+  change at all. CLI sugar and a skill come after the convention has been
+  dogfooded.
 
----
+## 1. What a room is
 
-## Protocol Specification
+A room is a `room` sub-channel on an existing RFC 003 stream — the same
+field the fleet already uses for `delegation`, `patches`, `reviews`,
+`status`. A brainstorm about MemPalace search lives at
+`stream=project/mempalace, room=search-brainstorm`. No new namespace,
+no new matcher, and the events sit next to the project's task traffic where
+the participants are already looking.
 
-### 1. Room Envelope & Naming Conventions
+| Field | Value |
+|---|---|
+| `stream` | `project/<project>` (or any stream the participants share) |
+| `room` | the room's name: short, kebab-case, e.g. `search-brainstorm` |
+| `correlation_id` | one **session** of the room: `room_<name>_<yyyymmdd>`. A room can be reopened; each opening is a new session. |
+| `topic` | optional lane inside a session, as in RFC 003 |
+| `from_agent` | RFC 005 identity, or a human handle (`igor`, `milla`) |
+| `to_agent` | `*` for the room, or a specific participant when addressing them |
 
-Rooms are addressed using RFC 003 streams and broadcast addressing:
-* `stream`: `room/<room-name>` (e.g. `room/architecture`, `room/brainstorm`)
-* `room`: Lifecycle sub-channel, default `discussion` (or `salon`, `critique`, `synthesis`)
-* `topic`: Focus lane (e.g. `hybrid-engine`, `auth-v2`)
-* `to_agent`: `*` (broadcast to all listeners)
-* `type`: `room.message` (standard conversational turns) or `room.reaction` (lightweight signals)
+Humans are participants. A human posts from the CLI (`mempalace logstream
+append`) or, later, from PalaceMind. There is no distinction on the wire
+between a human turn and an agent turn.
 
-Example Event:
+## 2. Event vocabulary
+
+Six event types, all valid under the existing `_EVENT_TYPE_RE` — no schema
+change. `body` is always verbatim.
+
+| Type | Who | Meaning |
+|---|---|---|
+| `room.open` | the opener | Starts a session. `body` = the question or agenda. `metadata.mode` = `moderated` (default) or `open`. `metadata.moderator` = identity (defaults to the opener). |
+| `room.join` | each participant | Presence. `metadata.wake` = `self` or `turn-based` (§4). Optional `body` = what perspective you bring. |
+| `room.floor` | the moderator | Gives the floor. `to_agent` = the participant whose turn it is. Optional `body` = the specific question for them. |
+| `room.message` | whoever has the floor (moderated) / anyone (open) | A turn. `to_agent` = `*`, or a specific participant when the message is *for* them. |
+| `room.pass` | a participant who was given the floor | "Nothing to add." Only meaningful in moderated mode; in open mode, silence is the pass. |
+| `room.close` | the moderator | Ends the session. `body` = the outcome in the moderator's own words. |
+
+`status` is left empty on room events. The RFC 003 status vocabulary
+(`open`, `claimed`, `applied`, …) describes work, and a room is not work.
+
+Example — a moderator handing the floor:
+
 ```json
 {
-  "id": "evt_20260905T145246_c669ae0e6de8",
-  "seq": 104,
-  "type": "room.message",
-  "stream": "room/architecture",
-  "room": "discussion",
-  "topic": "hybrid-engine",
-  "from_agent": "windows:antigravity:rust-architect",
-  "to_agent": "*",
-  "correlation_id": "room_session_001",
-  "status": "open",
-  "body": "For the in-core inverted index in mempalace-core, we should store posting lists in a single contiguous Vec<u32> buffer...",
-  "metadata": {
-    "urgency": 4,
-    "phase": "divergence"
-  },
-  "created_at": "2026-09-05T14:52:46Z"
+  "type": "room.floor",
+  "stream": "project/mempalace",
+  "room": "search-brainstorm",
+  "correlation_id": "room_search-brainstorm_20260911",
+  "from_agent": "igor",
+  "to_agent": "mac:codex:mempalace",
+  "body": "You own the sqlite_exact backend — does the fused index proposal break the read-only snapshot guarantee?"
 }
 ```
 
----
+## 3. Floor control: two modes
 
-### 2. Autonomous Participation Gate
+### Moderated (default)
 
-Upon receiving new events since its local cursor, an agent evaluates:
+One participant is the **moderator** — usually the human who opened the
+room, sometimes an agent. The moderator decides who speaks next by
+appending `room.floor to_agent=<X>`. `X` replies with exactly one
+`room.message` (or `room.pass`), and the floor returns to the moderator.
 
-```text
-GATING EVALUATION:
-1. Domain Relevance: Does this message intersect my assigned expertise/concerns? (Score: 0.0 - 1.0)
-2. Substantive Novelty: Has this point, critique, or proposal already been stated? (Score: 0.0 - 1.0)
-3. Anti-Echo Check: Would speaking now merely agree, rephrase, or acknowledge? (Boolean)
-4. Urgency Assessment:
-   - Level 5: Fatal flaw, breaking bug, or explicit direct question to me.
-   - Level 4: Strong architectural counterpoint or hard constraint violation.
-   - Level 3: Substantive new proposal or novel design alternative.
-   - Level 2: Secondary refinement, color, or optimization.
-   - Level 1: Minor observation or peripheral remark.
+That is the whole mechanism. It gives:
 
-DECISION RULE:
-- If Relevance < 0.4 OR Novelty < 0.5 OR AntiEcho == True OR Urgency < 2:
-    -> Action: PASS (Advance cursor, emit 0 events, log rationale).
-- Else:
-    -> Action: QUEUED_TO_SPEAK (Formulate concise body, enter Floor Controller).
-```
+- **One speaker at a time**, by construction.
+- **A home for agents that don't argue.** They never have to decide whether
+  to speak; they answer when asked and are otherwise silent.
+- **Round-robin, standup, panel, cross-examination** — these are moderator
+  *policies*, not modes. A moderator that hands the floor in join order is
+  running a round-robin. The protocol does not need to know.
+- **Compatibility with turn-based participants.** A `room.floor` addressed
+  to `X` is precisely the ping `X` needs (§4). The moderator hands the floor
+  and, if `X` declared `wake=turn-based`, hands its human the paste line.
 
----
+Anyone who is not holding the floor may still post a `room.message` with
+`to_agent=<moderator>` to *request* the floor ("I have a constraint on
+this"). The moderator decides. This keeps the floor strict without making
+participants mute.
 
-### 3. Decentralized Floor Controller
+### Open
 
-To eliminate race collisions and reflect human conversational dynamics, agents do not append immediately upon deciding to speak. Instead, they enter an **Urgency-Weighted Jitter Window**:
+`metadata.mode=open`. Anyone may post a `room.message` at any time. The
+floor is not managed; the anti-chatter rule (§5) is the only brake. Use it
+for a short burst of divergent thinking among self-waking agents, when the
+moderator's serialization would slow the room down more than it helps.
 
-$$\Delta t = \frac{T_{\text{base}}}{\text{Urgency}} + \text{Uniform}(0, J_{\text{max}})$$
+The moderator can switch modes mid-session by posting a new `room.open`
+with the same `correlation_id` and a different `metadata.mode`; the latest
+one wins.
 
-* $T_{\text{base}} = 0.8\text{s}$ (configurable per room)
-* $J_{\text{max}} = 0.25\text{s}$
+## 4. Wake models — how your turn reaches you
 
-#### Backoff Tiers
-* **Urgency 5**: $\Delta t \approx 0.16\text{s} - 0.35\text{s}$ (instant interjection for critical corrections)
-* **Urgency 4**: $\Delta t \approx 0.20\text{s} - 0.45\text{s}$
-* **Urgency 3**: $\Delta t \approx 0.27\text{s} - 0.52\text{s}$
-* **Urgency 2**: $\Delta t \approx 0.40\text{s} - 0.65\text{s}$
+Every participant declares, in `room.join`, how it can be reached:
 
-#### Pre-Flight Collision Cancellation
-During $\Delta t$, the agent's worker listens to the logstream. If a peer event arrives:
-1. The agent inspects the newly arrived peer event.
-2. It executes a **pre-flight re-evaluation**: *"Did the peer's message answer the question, alter the premise, or voice my intended point?"*
-3. If yes: the agent triggers `PREEMPTED_PASS`, aborts its pending write, advances its cursor, and releases the floor.
-4. If no: upon timer expiry, the agent commits its event to SQLite.
+| `metadata.wake` | Who | How the room reaches you |
+|---|---|---|
+| `self` | Headless / CLI harnesses with a background watcher (Claude Code, Codex CLI, daemons) | You arm `mempalace logstream watch` on the room (below) and are woken by `room.floor` / `room.message` events directly. |
+| `turn-based` | Chat harnesses that act only when prompted (desktop apps, web chats) | You cannot be woken by an event. Your human pastes the floor line into your chat; you then catch up, speak or pass, and report your cursor. |
 
----
+Declaring the wrong model is the one way to break a room: a moderator who
+hands the floor to a "self-waking" participant that is actually deaf will
+wait forever. This is the same rule as coordination-protocol.md's
+*"Never fake a watch."*
 
-### 4. Conversational Lifecycle & Natural Silence
+### Self-waking participants
 
-A room session naturally terminates when all listening participants return `PASS` consecutively for an idle threshold $T_{\text{idle}}$ (typically $3.0\text{s} - 5.0\text{s}$).
-
-When silence is reached:
-1. No synthetic "close" messages are required.
-2. A designated scribe agent (or the meeting initiator) may optionally append a summary event (`type="status"`, `room="summary"`) and file durable decisions into MemPalace drawers via `palace_exec ADD`.
-
----
-
-## Planned CLI Affordances
-
-We propose three high-level CLI commands under `mempalace room`:
+Arm a watcher scoped to the room, re-arm after every wake, and process
+each wake by catching up from **your own cursor** (not the watcher's state
+file — the watcher's cursor advances past events it examined and rejected):
 
 ```bash
-# 1. Join and declare presence in an open room
-mempalace room join --room architecture --persona "systems, low-level memory, SIMD"
-
-# 2. Listen continuously with autonomous gating and pre-flight cancellation
-mempalace room listen --room architecture --auto-gate --idle-timeout 30s
-
-# 3. Post a direct thought to the room with an explicit urgency tier
-mempalace room post --room architecture --topic hybrid-engine --urgency 4 --body "..."
+mempalace logstream watch --agent <me> \
+  --stream project/mempalace --room search-brainstorm \
+  --type room.floor --type room.message --type room.close --json
 ```
 
----
+In moderated mode a self-waking participant may narrow to `--type
+room.floor --type room.close` and never wake for other people's turns; it
+reads the whole session when the floor reaches it.
 
-## Non-Goals
+### Turn-based participants
 
-1. **Not a General Chat Application**: This protocol is designed for LLM agents and human-agent hybrid brainstorms, not a human IRC/Slack replacement.
-2. **No Central Lock Coordinator**: Does not introduce Redis, distributed locks, or Raft clusters. SQLite WAL ordering + HLC provides all required causal consistency.
-3. **No Forced Handoffs**: Unlike `task.request`, a `room.message` carries no obligation for any specific peer to reply.
+The moderator's `room.floor` produces a one-line handoff, in the same
+shape as `mempalace task create`'s *Ready to paste* line:
 
----
+```text
+You have the floor in MemPalace room project/mempalace/search-brainstorm
+(session room_search-brainstorm_20260911) as mac:codex:mempalace.
+Catch up from your last cursor, then post one room.message or a room.pass.
+```
 
-## Verification & Conformance
+The participant's human pastes that into the chat. The agent then, within
+that single turn:
 
-The prototype implementation has been validated in `examples/multi_agent_room/room_prototype.py` against a dedicated SQLite sandbox:
-- Multi-threaded concurrent worker execution.
-- Deterministic pre-emption trigger tests.
-- Zero-leakage verification against the primary user palace.
+1. `event_list stream=project/mempalace room=search-brainstorm
+   correlation_id=<session> since_event_id=<its cursor> order=asc` — reads
+   every turn it has not seen, verbatim.
+2. Appends one `room.message` or `room.pass`.
+3. Tells its human the new cursor (the id of the last event it read or
+   wrote), so the next paste resumes exactly there.
+
+Nothing is spawned, no second window opens, and the agent has full context
+because the context *is the room*, read at the moment it is needed.
+
+A turn-based participant may also be handed the floor pre-emptively: the
+moderator can give the floor to three turn-based agents in a row, and their
+humans paste when they get to it. Turns land in the order they are posted;
+the moderator reads them as they arrive.
+
+## 5. The anti-chatter rule
+
+This replaces v1's gating heuristic. It goes into a participant's
+instructions, not into code:
+
+> **Before posting, read everything since your cursor.** Post only if you
+> add a fact, a constraint, a concrete proposal, a specific objection, or an
+> answer to something addressed to you. **Never post agreement,
+> acknowledgement, or a restatement** — if it has been said, it has been
+> said. **At most one message per wake** unless a message is addressed to
+> you by name. Silence is the default; it costs nothing and nobody is
+> waiting for it.
+
+In moderated mode the moderator enforces this by not handing the floor to
+someone who has nothing new. In open mode the "one message per wake" bound
+is what makes the room converge: a room of N agents produces at most N
+messages per round of wakes, and a round in which everyone stays silent
+ends the discussion with no closing ceremony.
+
+## 6. Closing a room, and what becomes memory
+
+The moderator posts `room.close` with the outcome in their own words.
+Then the moderator — or a participant the moderator names as scribe —
+files the session:
+
+1. **The transcript, verbatim**, as drawers: one drawer per `room.message`,
+   wing = the project, room = the room name, `source_file` = the session's
+   `correlation_id`. This is what makes the discussion searchable next
+   month. It is the original words, not a digest.
+2. **The decision**, as one additional drawer quoting the `room.close`
+   body, and as KG facts via `mempalace_kg_add` where a single-valued fact
+   was settled (`mempalace-core → uses → fused BM25 index`, valid from
+   today).
+
+Filing is the same *"File the outcome"* rule coordination-protocol.md
+already imposes on delegations. A room that closes without being filed was
+a chat, not a memory.
+
+## 7. A complete moderated session
+
+Igor opens a room from the shell, with two agents — one self-waking, one
+turn-based — and Milla.
+
+```bash
+# 1. Open
+mempalace logstream append --type room.open --stream project/mempalace \
+  --room search-brainstorm --correlation-id room_search-brainstorm_20260911 \
+  --from-agent igor --to-agent '*' \
+  --metadata '{"mode":"moderated","moderator":"igor"}' \
+  --body "Should the Rust exact engine own BM25, or should BM25 stay in Python?"
+```
+
+Participants join (each from their own session, with their own tools):
+
+```text
+windows:claude:mempalace  → room.join  metadata.wake=self
+                            arms: logstream watch ... --type room.floor --type room.close
+mac:codex:mempalace       → room.join  metadata.wake=turn-based
+milla                     → room.join  (human, posts from CLI)
+```
+
+Igor hands the floor, in turn:
+
+```bash
+mempalace logstream append --type room.floor ... --to-agent windows:claude:mempalace \
+  --body "You wrote the sqlite_exact backend. What does BM25-in-Rust cost us?"
+# → the watcher on the windows box exits 0; that session catches up and posts one room.message.
+
+mempalace logstream append --type room.floor ... --to-agent mac:codex:mempalace \
+  --body "Same question from the packaging side."
+# → prints the paste line; Igor pastes it into the Codex desktop app; it reads the room and posts.
+
+mempalace logstream append --type room.floor ... --to-agent milla
+# → Milla reads the transcript and replies from her shell.
+```
+
+Igor closes and files:
+
+```bash
+mempalace logstream append --type room.close ... \
+  --body "Decision: BM25 moves into mempalace-core behind the existing tokenizer seam; Python keeps the tokenizer. Windows Claude to draft the task."
+# → transcript filed as drawers under wing=mempalace room=search-brainstorm;
+#   KG: mempalace-core → owns → bm25 (valid_from 2026-09-11)
+```
+
+Every line above is an existing command. Phase 1 needs nothing built.
+
+## 8. Implementation plan
+
+### Phase 1 — Convention (this PR; docs only)
+
+- This RFC.
+- A `## Rooms` section in `integrations/shared/coordination-protocol.md`
+  carrying §2–§6 in the same voice as the delegation protocol, so every
+  harness's system-prompt block inherits it.
+- The v1 simulation under `examples/multi_agent_room/` is removed.
+
+### Phase 2 — Sugar (follow-up PR, after dogfood)
+
+Thin wrappers over `logstream`, each printing `--json` and the paste line
+where relevant. None of them are required to participate:
+
+```bash
+mempalace room open   <room> --stream project/x --mode moderated --body-file agenda.md
+mempalace room join   <room> --wake self|turn-based
+mempalace room floor  <room> --to <agent> [--body "..."]      # prints the paste line
+mempalace room say    <room> --body-file turn.md [--to <agent>]
+mempalace room pass   <room>
+mempalace room catchup <room> [--since <event-id>]              # verbatim transcript + new cursor
+mempalace room close  <room> --body-file outcome.md --file      # --file: file transcript + decision drawers
+```
+
+Plus a `mempalace-room` skill mirroring `mempalace-task`: verify the seam,
+declare your wake model honestly, catch up from *your* cursor, one message
+per wake, report the cursor back.
+
+### Phase 3 — Viewer
+
+A room view in PalaceMind: the session transcript, who holds the floor, each
+participant's declared wake model, and a "hand floor to…" button that
+appends `room.floor` and copies the paste line. This is where turn-based
+participation becomes one click instead of one paste.
+
+## Non-goals
+
+- **No room server, scheduler, or floor lock.** The floor is an event;
+  ordering is the logstream's.
+- **No in-process multi-agent simulation.** A room's participants are real
+  sessions. Anything that "demonstrates" a room by spawning fake ones
+  demonstrates the wrong thing.
+- **No summarization of turns.** The transcript is filed verbatim. A
+  moderator's `room.close` body is their own words about the outcome, not a
+  digest of others'.
+- **No new routing.** `to_agent` exact-match plus `*` (RFC 005, Decision 1)
+  is sufficient: the floor is addressed to one identity, everything else is
+  broadcast.
+- **No general chat product.** Rooms are for agents and the people working
+  with them, on the project streams they already share.
+
+## Open questions
+
+- **Should `room.floor` carry a deadline?** A moderator might want "you have
+  the floor for the next ten minutes, then I move on." Leaning towards
+  leaving it to the moderator's `body` in v1 and adding `metadata.until` only
+  if dogfood shows moderators actually re-handing the floor on timeouts.
+- **Cursor storage for turn-based participants.** Today the agent reports
+  the cursor to its human, who carries it between pastes. A per-identity
+  server-side cursor (RFC 003 "future work") would remove that chore; it is
+  useful well beyond rooms and should be its own change.
+- **Filing granularity.** One drawer per message keeps recall precise and
+  verbatim; one drawer per session keeps the palace tidy. Starting with
+  per-message because it is the faithful choice; revisit if it floods the
+  taxonomy.

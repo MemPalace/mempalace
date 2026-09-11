@@ -252,6 +252,47 @@ Ping the operator to wake me; I sweep to_agent=<AGENT_ID> on every start.
 Never claim to be monitoring when you are not. A false watcher is worse than
 a declared-absent one: the requester stops looking for a human to nudge.
 
+## Rooms — discussion, not delegation
+
+A delegation has one addressee and one obligation. A **room** is where
+several agents and people think together — a design review, a brainstorm,
+a critique — and nobody owes anybody a patch. Full design: RFC 006
+(`docs/rfcs/006-multi-agent-room-coordination.md`). The rules that matter
+when you are a participant:
+
+- **A room is a `room` on the project stream** (`stream=project/<x>,
+  room=<name>`), one session per `correlation_id=room_<name>_<yyyymmdd>`.
+  Event types: `room.open`, `room.join`, `room.floor`, `room.message`,
+  `room.pass`, `room.close`. Leave `status` empty — a room is not work.
+- **Join from the session you are already in.** Post `room.join` with
+  `metadata.wake=self` if you have a background watcher, or
+  `metadata.wake=turn-based` if you act only when a human prompts you.
+  Declare it honestly: a moderator who hands the floor to a "self-waking"
+  agent that is actually deaf waits forever (same rule as *Never fake a
+  watch*). Never spawn a process or open a window to participate.
+- **Moderated mode is the default: one speaker at a time.** The moderator
+  gives the floor with `room.floor to_agent=<you>`; you reply with exactly
+  one `room.message` (or `room.pass`) and the floor returns. If you are
+  turn-based, your human pastes the floor line into your chat; you then
+  catch up from your cursor, post once, and report the new cursor back.
+  To request the floor, post a `room.message` addressed `to_agent=<moderator>`.
+- **Open mode** (`metadata.mode=open` on `room.open`): anyone may post at
+  any time. The only brake is the anti-chatter rule below.
+- **Anti-chatter.** Before posting, read everything since your cursor.
+  Post only if you add a fact, a constraint, a concrete proposal, a
+  specific objection, or an answer to something addressed to you. Never
+  post agreement, acknowledgement, or a restatement. At most one message
+  per wake unless addressed by name. Silence writes zero bytes and is the
+  default.
+- **Catch up from your own cursor**, with `event_list` on the room's
+  stream/room/correlation, `since_event_id=<cursor>`, `order=asc` — never
+  from the watcher's state file and never by timestamp.
+- **File the outcome.** When the moderator posts `room.close`, the
+  transcript is filed verbatim as drawers (wing = project, room = room
+  name, one drawer per message) plus one drawer for the decision and any
+  settled single-valued facts via `mempalace_kg_add`. A room that closes
+  without being filed was a chat, not a memory.
+
 ## Hard rules
 
 - **Never apply a patch silently.** Fetching an artifact is free;
@@ -349,3 +390,5 @@ Coordination (natural logstream):
   event/artifact model and the full tool reference.
 - RFC 003 (`docs/rfcs/003-agent-logstream-coordination.md`) — design
   rationale and storage model.
+- RFC 006 (`docs/rfcs/006-multi-agent-room-coordination.md`) — rooms:
+  moderated and open discussion on the logstream, wake models, filing.
