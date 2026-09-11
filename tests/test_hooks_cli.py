@@ -401,19 +401,20 @@ def test_stop_hook_tracks_save_point(tmp_path):
 def test_diary_agent_for_harness_maps_known_harnesses():
     assert _diary_agent_for_harness("claude-code") == "claude"
     assert _diary_agent_for_harness("codex") == "codex"
+    assert _diary_agent_for_harness("grok") == "grok"
 
 
 def test_diary_agent_for_harness_unknown_falls_back_to_name():
     """A future harness must never collapse to the legacy 'session-hook'
     identity, which no diary_read(agent_name=...) call ever matches (#1693)."""
     assert _diary_agent_for_harness("cursor") == "cursor"
-    for harness in ("claude-code", "codex", "cursor", "gemini"):
+    for harness in ("claude-code", "codex", "cursor", "gemini", "grok"):
         assert _diary_agent_for_harness(harness) != "session-hook"
 
 
 @pytest.mark.parametrize(
     "harness,expected_agent",
-    [("claude-code", "claude"), ("codex", "codex")],
+    [("claude-code", "claude"), ("codex", "codex"), ("grok", "grok")],
 )
 def test_stop_hook_files_checkpoint_under_harness_agent(tmp_path, harness, expected_agent):
     """The Stop hook must file checkpoints under the agent identity that the
