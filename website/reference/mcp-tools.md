@@ -405,8 +405,9 @@ List within-wing hallway records (entity-to-entity co-occurrence links built at 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `wing` | string | No | Filter hallways by wing |
+| `limit` | integer | No | Max hallways to return, strongest-first. Default **200**, hard cap **10000**. Bounded to keep dense wings (hallway count grows super-linearly with entity density) within the client tool budget; the response also carries `total` (full match count) and `truncated` |
 
-**Returns:** `[ { id, wing, entity_a, entity_b, co_occurrence_count, rooms, ... }, ... ]`
+**Returns:** `{ rows: [ { id, wing, entity_a, entity_b, co_occurrence_count, rooms, ... } ], total: <int>, truncated: <bool> }` — `rows` are the strongest-first (highest `co_occurrence_count` first) bounded records, `total` is the full matching count ignoring the cap, and `truncated` is `true` when `total > len(rows)`.
 
 ---
 
