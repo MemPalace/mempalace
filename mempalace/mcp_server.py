@@ -2478,6 +2478,7 @@ def tool_search(
     context: str = None,
     candidate_strategy: str = "vector",
     cli_compatible: bool = False,
+    expand_wings: bool = True,
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
@@ -2581,6 +2582,7 @@ def tool_search(
         vector_disabled=_vector_disabled,
         candidate_strategy=candidate_strategy,
         collection_name=_config.collection_name,
+        expand_wings=expand_wings,
     )
     if _is_transient_index_error(result):
         # Post-bulk-write HNSW flush window (#1315): drop caches, give
@@ -2602,6 +2604,7 @@ def tool_search(
             vector_disabled=_vector_disabled,
             candidate_strategy=candidate_strategy,
             collection_name=_config.collection_name,
+            expand_wings=expand_wings,
         )
         if not _is_transient_index_error(result):
             result["index_recovered"] = True
@@ -5388,12 +5391,11 @@ TOOLS = {
         "handler": tool_follow_tunnels,
     },
     "mempalace_search": {
-        "description": "Semantic search. Returns verbatim drawer content with similarity scores. IMPORTANT: 'query' must contain ONLY search keywords. Use 'context' for background. Results with cosine distance > max_distance are filtered out.",
+        "description": "Semantic search. When no wing is given, automatically expands to the most relevant wings via graph tunnels and hallways (set expand_wings=false to disable). Returns verbatim drawer content with similarity scores. IMPORTANT: 'query' must contain ONLY search keywords. Use 'context' for background. Results with cosine distance > max_distance are filtered out.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "query": {
-                    "type": "string",
                     "description": "Short search query ONLY — keywords or a question. Max 250 chars.",
                     "maxLength": 250,
                 },
@@ -5446,6 +5448,10 @@ TOOLS = {
                 "context": {
                     "type": "string",
                     "description": "Background context for the search (optional). NOT used for embedding — only for future re-ranking.",
+                },
+                "expand_wings": {
+                    "type": "boolean",
+                    "description": "When true (default) and no wing is specified, automatically search the most relevant wings based on palace graph structure.",
                 },
             },
             "required": ["query"],
