@@ -6,10 +6,10 @@ spacing effect: stability grows when reinforcement is spaced rather than
 massed.
 
 This module is pure. No I/O, no DB, no chromadb. It operates on plain
-dicts (hall records, tunnel records) and mutates them in place. Callers
-in ``hallways.py`` and ``palace_graph.py`` invoke these functions; the
-math lives here in one place so both connection kinds share identical
-semantics.
+dicts (hall records, tunnel records, drawer metadata records) and mutates
+them in place. Callers in ``hallways.py`` and ``palace_graph.py`` invoke
+these functions; the math lives here in one place so both connection kinds
+and drawer salience share identical semantics.
 
 Schema fields added to hall + tunnel records (all default-safe — existing
 records without them work via ``initialize_dynamics_fields``):
@@ -100,6 +100,44 @@ def initialize_dynamics_fields(connection: dict, *, now: Optional[datetime] = No
     connection.setdefault("last_activated", created_at)
     connection.setdefault("access_count", 0)
     return connection
+
+
+def initialize_drawer_dynamics_fields(
+    drawer_metadata: dict, *, now: Optional[datetime] = None
+) -> dict:
+    """Populate dynamics fields on drawer metadata, using ``filed_at`` as creation time.
+
+    Drawer metadata historically has ``filed_at`` rather than connection-style
+    ``created_at``. This adapter keeps the shared dynamics math unchanged while
+    preserving the drawer metadata shape: ``created_at`` is only supplied as a
+    temporary fallback and is not left behind when absent from the input.
+    """
+
+    missing_created_at = "created_at" not in drawer_metadata
+    if missing_created_at and drawer_metadata.get("filed_at"):
+        drawer_metadata["created_at"] = drawer_metadata["filed_at"]
+
+    initialize_dynamics_fields(drawer_metadata, now=now)
+
+    if missing_created_at:
+        drawer_metadata.pop("created_at", None)
+
+    return drawer_metadata
+
+
+def drawer_salience(drawer_metadata: dict, *, now: Optional[datetime] = None) -> dict:
+    """Return lazy-decayed salience for drawer metadata without mutating input."""
+
+    record = dict(drawer_metadata or {})
+    initialize_drawer_dynamics_fields(record, now=now)
+    if _parse_iso(record.get("last_activated")) is not None:
+        apply_decay(record, now=now)
+    return {
+        "strength": float(record.get("strength", DEFAULT_STRENGTH)),
+        "stability": float(record.get("stability", DEFAULT_STABILITY)),
+        "last_activated": record.get("last_activated"),
+        "access_count": int(record.get("access_count", 0)),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
