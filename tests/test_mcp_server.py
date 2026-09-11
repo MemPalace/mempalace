@@ -2315,10 +2315,98 @@ class TestSearchTool:
         assert entry["params"]["safe"] == "ok"
 
 
-# ── Write Tools ─────────────────────────────────────────────────────────
-
-
 class TestWriteTools:
+    def test_wal_result_entries_match_tool_outcome_issue_538_regression(
+        self, monkeypatch, config, palace_path, kg, tmp_path
+    ):
+        """Regression #538: successful add_drawer / kg_add must leave a WAL
+        entry that carries the tool's actual outcome (``result`` not None).
+
+        Before this fix, every WAL entry in write_log.jsonl read ``result:
+        null`` regardless of whether the backend write succeeded, which the
+        #538 reporter used as evidence of data loss. Their replay workaround
+        script keys off ``entry["result"] is None`` to decide which entries to
+        re-execute, so a structurally null result defeats both the audit trail
+        and the replay heuristic in the same stroke.
+
+        The fix appends an outcome entry *after* the mutation (the pre-mutation
+        intent entry from ``_wal_log`` is preserved for crash-recovery — a
+        crash during the mutation itself still leaves an intent with
+        ``result: null``). The last entry for the operation after a successful
+        write must be the outcome entry and its ``result`` must match what
+        the tool returned to the caller.
+        """
+        import json
+
+        from mempalace import mcp_server
+        from mempalace import wal
+
+        # Redirect the WAL to a per-test file so we can read the exact entries
+        # produced by this test, independent of any prior test.
+        wal_file = tmp_path / "write_log.jsonl"
+        monkeypatch.setattr(wal, "_WAL_FILE", wal_file)
+        monkeypatch.setattr(wal, "_WAL_INITIALIZED_DIR", None)
+
+        # Wire the full MCP-server fixture so real Chroma+KG backends are used
+        # (matches the convention used by every other add_drawer/kg_add test
+        # in this module — no stubs of the collection, no hand-rolled KG).
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        # --- add_drawer success path -----------------------------------------
+        result = mcp_server.tool_add_drawer(
+            wing="w538",
+            room="r538",
+            content="issue 538 regression drawer",
+        )
+        assert result["success"] is True
+        assert result.get("drawer_id")
+
+        entries = [json.loads(line) for line in wal_file.read_text().splitlines()]
+        add_drawer_entries = [e for e in entries if e.get("operation") == "add_drawer"]
+        # One pre-mutation intent (result: null) + one post-mutation outcome.
+        assert len(add_drawer_entries) >= 2
+        assert add_drawer_entries[0]["result"] is None
+        assert add_drawer_entries[-1]["result"] == result
+
+        # --- kg_add success path ---------------------------------------------
+        kg_result = mcp_server.tool_kg_add(
+            subject="Alice",
+            predicate="wrote",
+            object="fix for issue 538",
+            valid_from="2026-04-01",
+        )
+        assert kg_result["success"] is True
+        assert kg_result.get("triple_id")
+
+        entries = [json.loads(line) for line in wal_file.read_text().splitlines()]
+        kg_add_entries = [e for e in entries if e.get("operation") == "kg_add"]
+        assert len(kg_add_entries) >= 2
+        assert kg_add_entries[0]["result"] is None
+        assert kg_add_entries[-1]["result"] == kg_result
+
+        # --- kg_add failure path ---------------------------------------------
+        # The except-and-raise branch in tool_kg_add records a failure outcome
+        # in the WAL before the dispatcher catches the exception, so the audit
+        # trail shows the error instead of a bare ``result: null``.
+        import pytest as _pytest
+
+        def _raise_err(*args, **kwargs):
+            raise RuntimeError("KG backend unavailable")
+
+        monkeypatch.setattr(mcp_server, "_call_kg", _raise_err)
+        with _pytest.raises(RuntimeError, match="KG backend unavailable"):
+            mcp_server.tool_kg_add(
+                subject="Alice",
+                predicate="wrote",
+                object="failure-path probe",
+                valid_from="2026-04-01",
+            )
+        entries = [json.loads(line) for line in wal_file.read_text().splitlines()]
+        kg_add_entries = [e for e in entries if e.get("operation") == "kg_add"]
+        last = kg_add_entries[-1]
+        assert last["result"]["success"] is False
+        assert "KG backend unavailable" in last["result"]["error"]
+
     def test_add_drawer(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         _client, _col = _get_collection(palace_path, create=True)

@@ -72,7 +72,22 @@ def _ensure_wal() -> None:
 
 
 def _wal_log(operation: str, params: dict, result: dict = None):
-    """Append a write operation to the write-ahead log."""
+    """Append a write operation to the write-ahead log.
+
+    Preserves the existing contract: callers write *before* the backend
+    mutation so the intent entry survives a crash in the mutation itself. The
+    ``result`` argument is kept for back-compat but is not expected to be
+    supplied at the call site — tools that want to record the write outcome
+    should follow up with :func:`_wal_result`, which appends a second entry
+    carrying the actual outcome for that operation (success/error and any ids
+    it produced). A WAL for a successful write therefore reads as two lines:
+    the pre-mutation intent (``result: null``) and the post-mutation outcome
+    (``result: {...success...}``). Consumers that select by
+    ``result is None`` naturally pick up the intent entry; consumers that
+    select by ``result == {"success": True, ...}`` pick up the outcome. This
+    keeps the existing 8 call sites unchanged and adds the observation the
+    issue #538 reporter was missing.
+    """
     # Redact sensitive content from params before logging
     safe_params = {}
     for k, v in params.items():
@@ -95,3 +110,34 @@ def _wal_log(operation: str, params: dict, result: dict = None):
             f.write(json.dumps(entry, default=str) + "\n")
     except Exception as e:
         logger.error(f"WAL write failed: {e}")
+
+
+def _wal_result(operation: str, result: dict):
+    """Append an outcome entry to the write-ahead log for a prior intent.
+
+    Called by write tools after the backend mutation completes — either on
+    success or on the failure paths they catch. The resulting WAL line for a
+    single logical write is then two entries: the pre-mutation intent from
+    :func:`_wal_log` (``result: null``) followed by this outcome (``result``
+    populated). This is the "result is structurally always null" gap closed by
+    issue #538 — the WAL now answers "did this land?" with the tool's actual
+    return value, so a replay script can distinguish completed writes (skip
+    them) from pending ones (redo them) using the intent entry as the key.
+
+    The entry deliberately carries no ``params`` (the intent line owns those);
+    this line is outcome-only: timestamp, operation, result. Same file, same
+    append-only discipline, same redaction of sensitive keys, same non-fatal
+    error contract.
+    """
+    entry = {
+        "timestamp": datetime.now().isoformat(),
+        "operation": operation,
+        "result": result,
+    }
+    try:
+        _ensure_wal()
+        fd = os.open(str(_WAL_FILE), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, default=str) + "\n")
+    except Exception as e:
+        logger.error(f"WAL result write failed: {e}")

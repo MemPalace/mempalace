@@ -148,6 +148,56 @@ def test_wal_ensure_swallows_mkdir_failure(tmp_path, monkeypatch):
     assert wal._WAL_INITIALIZED_DIR == wal_dir
 
 
+def test_wal_result_appends_outcome_line(tmp_path, monkeypatch):
+    """_wal_result appends a single outcome-only entry (operation + result)
+    to the WAL file, preserving the timestamp and using the same non-fatal
+    error contract as _wal_log.
+
+    This is the helper that closes the #538 observation gap: after a tool
+    reports a successful mutation, the WAL now carries the tool's actual
+    return value rather than the bare ``result: null`` it used to.
+    """
+    import json
+
+    from mempalace import wal
+
+    wal_file = tmp_path / "wal" / "write_log.jsonl"
+    monkeypatch.setattr(wal, "_WAL_FILE", wal_file)
+    monkeypatch.setattr(wal, "_WAL_INITIALIZED_DIR", None)
+
+    outcome = {"success": True, "triple_id": "triple_42", "fact": "Alice → wrote → this"}
+    wal._wal_result("kg_add", outcome)
+
+    entry = json.loads(wal_file.read_text().strip())
+    assert entry["operation"] == "kg_add"
+    assert entry["result"] == outcome
+    assert "timestamp" in entry
+    # Outcome entries deliberately carry no ``params`` — the intent line owns
+    # those; this line is outcome-only by design.
+    assert "params" not in entry
+
+
+def test_wal_result_never_raises_when_write_fails(tmp_path, monkeypatch, caplog):
+    """A _wal_result write failure is logged and swallowed, never crashing the
+    tool call that just finished a real mutation (parity with _wal_log)."""
+    import logging
+
+    from mempalace import wal
+
+    monkeypatch.setattr(wal, "_WAL_FILE", tmp_path / "wal" / "write_log.jsonl")
+    monkeypatch.setattr(wal, "_WAL_INITIALIZED_DIR", None)
+
+    def _boom(*args, **kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(wal.os, "open", _boom)
+
+    with caplog.at_level(logging.ERROR, logger="mempalace.wal"):
+        wal._wal_result("add_drawer", {"success": True, "drawer_id": "d1"})  # not raise
+
+    assert any("WAL result write failed" in r.getMessage() for r in caplog.records)
+
+
 def test_wal_log_redacts_non_string_values(tmp_path, monkeypatch):
     """Non-string values under a redact key use the plain [REDACTED] marker.
 

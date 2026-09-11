@@ -1398,7 +1398,7 @@ def _refresh_vector_disabled_flag() -> None:
 # CLI sync path and the daemon service layer can audit writes without importing
 # this module, whose import installs MCP stdio protection (os.dup2(2, 1) and
 # sys.stdout = sys.stderr) that would misroute their output.
-from .wal import _wal_log  # noqa: E402
+from .wal import _wal_log, _wal_result  # noqa: E402
 
 
 def _get_client():
@@ -3229,10 +3229,14 @@ def tool_add_drawer(
     try:
         existing = col.get(ids=idempotency_probe_ids, include=[])
         if _get_result_ids(existing):
-            return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
+            outcome = {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
+            _wal_result("add_drawer", outcome)
+            return outcome
     except Exception as e:
         logger.warning("Idempotency pre-check failed for %s", idempotency_probe_ids, exc_info=True)
-        return {"success": False, "error": f"Idempotency check failed before write: {e}"}
+        outcome = {"success": False, "error": f"Idempotency check failed before write: {e}"}
+        _wal_result("add_drawer", outcome)
+        return outcome
 
     try:
         if len(content) <= chunk_size:
@@ -3249,13 +3253,15 @@ def tool_add_drawer(
                 )
             _invalidate_overview_caches()
             logger.info(f"Filed drawer: {drawer_id} -> {wing}/{room}")
-            return {
+            outcome = {
                 "success": True,
                 "drawer_id": drawer_id,
                 "wing": wing,
                 "room": room,
                 "chunks": 1,
             }
+            _wal_result("add_drawer", outcome)
+            return outcome
 
         # Oversized content: split into bounded per-chunk drawers so the
         # embedding model never sees a document above ``chunk_size``.
@@ -3284,7 +3290,7 @@ def tool_add_drawer(
             )
         _invalidate_overview_caches()
         logger.info(f"Filed drawer: {drawer_id} -> {wing}/{room} ({len(chunk_ids)} chunks)")
-        return {
+        outcome = {
             "success": True,
             "drawer_id": drawer_id,
             "wing": wing,
@@ -3292,8 +3298,12 @@ def tool_add_drawer(
             "chunks": len(chunk_ids),
             "chunk_ids": chunk_ids,
         }
+        _wal_result("add_drawer", outcome)
+        return outcome
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        outcome = {"success": False, "error": str(e)}
+        _wal_result("add_drawer", outcome)
+        return outcome
 
 
 def tool_delete_drawer(drawer_id: str):
@@ -4136,19 +4146,34 @@ def tool_kg_add(
         },
     )
 
-    triple_id = _call_kg(
-        lambda kg: kg.add_triple(
-            subject,
-            predicate,
-            object,
-            valid_from=valid_from,
-            valid_to=valid_to,
-            source_closet=source_closet,
-            source_file=source_file,
-            source_drawer_id=source_drawer_id,
+    try:
+        triple_id = _call_kg(
+            lambda kg: kg.add_triple(
+                subject,
+                predicate,
+                object,
+                valid_from=valid_from,
+                valid_to=valid_to,
+                source_closet=source_closet,
+                source_file=source_file,
+                source_drawer_id=source_drawer_id,
+            )
         )
-    )
-    return {"success": True, "triple_id": triple_id, "fact": f"{subject} → {predicate} → {object}"}
+    except Exception as e:
+        # Preserve the dispatcher-visible exception contract (tool_kg_add lets
+        # KG write errors bubble through _call_kg, which the MCP dispatcher
+        # turns into a -32000 response with context). Record the intent's
+        # outcome in the WAL before re-raising so the audit trail shows the
+        # error instead of a bare ``result: null``.
+        _wal_result("kg_add", {"success": False, "error": str(e)})
+        raise
+    outcome = {
+        "success": True,
+        "triple_id": triple_id,
+        "fact": f"{subject} → {predicate} → {object}",
+    }
+    _wal_result("kg_add", outcome)
+    return outcome
 
 
 def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
