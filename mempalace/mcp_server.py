@@ -44,6 +44,7 @@ except (OSError, AttributeError):
 sys.stdout = sys.stderr
 
 import argparse  # noqa: E402  (deferred until after stdio protection above)
+import atexit  # noqa: E402
 import contextlib  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
@@ -1191,6 +1192,28 @@ def _call_kg(op):
                         _kg_by_path.pop(path, None)
                 continue
             raise
+
+
+def _close_cached_kgs() -> None:
+    """Close and drop every cached KnowledgeGraph handle.
+
+    Registered with ``atexit`` below so a shutting-down server checkpoints its
+    WAL instead of leaving a hot ``-wal`` file for the next process to
+    recover. Registration is module level, on the server-owned cache only:
+    registering ``close`` per instance in ``KnowledgeGraph.__init__`` would
+    make the atexit registry a strong reference to every short-lived KG in the
+    process and pin its SQLite handle open until exit.
+    """
+    with _kg_cache_lock:
+        for kg in _kg_by_path.values():
+            try:
+                kg.close()
+            except Exception:
+                pass
+        _kg_by_path.clear()
+
+
+atexit.register(_close_cached_kgs)
 
 
 def _resolve_logstream_path() -> str:
@@ -4685,13 +4708,7 @@ def tool_reconnect():
     _vector_disabled_reason = ""
     # Drain the per-path KnowledgeGraph cache so a replaced sqlite file is
     # reopened on the next tool call rather than served from a stale handle.
-    with _kg_cache_lock:
-        for kg in _kg_by_path.values():
-            try:
-                kg.close()
-            except Exception:
-                pass
-        _kg_by_path.clear()
+    _close_cached_kgs()
     with _logstream_cache_lock:
         for ls in _logstream_by_path.values():
             try:

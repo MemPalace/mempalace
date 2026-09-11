@@ -35,10 +35,15 @@ Usage:
     kg.invalidate("Max", "has_issue", "sports_injury", ended="2026-02-15")
 """
 
+import contextlib
+import functools
 import json
+import logging
 import os
+import random
 import sqlite3
 import threading
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -46,8 +51,54 @@ from .config import sanitize_iso_temporal
 from .ids import make_triple_id
 
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_KG_PATH = os.path.expanduser("~/.mempalace/knowledge_graph.sqlite3")
 _MIN_ENTITY_CANDIDATE_LEN = 3
+
+
+def _sqlite_retry(max_retries=5, base_delay=0.1, max_delay=5.0):
+    """Retry on ``sqlite3.OperationalError`` caused by database locking.
+
+    When multiple processes (separate mcp-proxy connections, or a CLI mine
+    running alongside the MCP server) share one SQLite file, the connection's
+    ``busy_timeout`` absorbs most contention. This decorator is the safety net
+    for the rare case where ``busy_timeout`` itself expires — typically during
+    a long WAL checkpoint.
+
+    Only errors whose message mentions "locked" or "busy" are retried. Other
+    ``OperationalError`` variants (corrupt database, disk full, missing table)
+    propagate immediately so real faults are not masked by a retry loop.
+    """
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exc = None
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except sqlite3.OperationalError as exc:
+                    msg = str(exc).lower()
+                    if "locked" not in msg and "busy" not in msg:
+                        raise
+                    last_exc = exc
+                    if attempt < max_retries:
+                        delay = min(base_delay * (2**attempt), max_delay)
+                        sleep_time = delay + delay * 0.5 * random.random()
+                        logger.warning(
+                            "SQLite locked in %s (attempt %d/%d), retrying in %.2fs",
+                            func.__name__,
+                            attempt + 1,
+                            max_retries,
+                            sleep_time,
+                        )
+                        time.sleep(sleep_time)
+            raise last_exc
+
+        return wrapper
+
+    return decorator
 
 
 def _escape_like(value: str) -> str:
@@ -152,6 +203,7 @@ class KnowledgeGraph:
         self._lock = threading.Lock()
         self._init_db()
 
+    @_sqlite_retry()
     def _init_db(self):
         conn = self._conn()
         conn.executescript("""
@@ -208,8 +260,23 @@ class KnowledgeGraph:
 
     def _conn(self):
         if self._connection is None:
-            self._connection = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False)
+            # timeout= sets SQLite's busy_timeout: how long a writer waits for
+            # a peer process to release the write lock before raising
+            # "database is locked". 10s is not enough under a concurrent CLI
+            # mine; 60s absorbs a long WAL checkpoint.
+            self._connection = sqlite3.connect(self.db_path, timeout=60, check_same_thread=False)
+            # Take transaction control away from sqlite3: it opens a
+            # transaction only on the first DML statement, which leaves a
+            # read-then-write block (invalidate, supersede) reading OUTSIDE the
+            # write lock. ``_write_txn`` issues BEGIN IMMEDIATE explicitly so
+            # the whole read-modify-write is serialized against peer processes.
+            self._connection.isolation_level = None
             self._connection.execute("PRAGMA journal_mode=WAL")
+            # Bound WAL growth so readers in other processes never have to walk
+            # an unbounded WAL, and so the -wal file is truncated back down
+            # after a checkpoint instead of staying at its high-water mark.
+            self._connection.execute("PRAGMA wal_autocheckpoint=1000")
+            self._connection.execute("PRAGMA journal_size_limit=67108864")
             self._connection.row_factory = sqlite3.Row
         return self._connection
 
@@ -220,6 +287,20 @@ class KnowledgeGraph:
                 self._connection.close()
                 self._connection = None
 
+    def __del__(self):
+        """Best-effort close for instances dropped without ``close()``.
+
+        Deliberately not an ``atexit`` registration: that would keep a strong
+        reference to every instance until interpreter exit, which is how
+        short-lived callers (fact_checker) used to pin a SQLite handle open
+        for the life of the process.
+        """
+        try:
+            if self._connection is not None:
+                self._connection.close()
+        except Exception:
+            pass
+
     def __enter__(self):
         """Allow KnowledgeGraph to be used as a context manager."""
         return self
@@ -229,24 +310,58 @@ class KnowledgeGraph:
         self.close()
         return False
 
+    @contextlib.contextmanager
+    def _write_txn(self):
+        """Run a block inside a ``BEGIN IMMEDIATE`` transaction.
+
+        IMMEDIATE, not DEFERRED, and explicit rather than left to sqlite3's
+        implicit BEGIN, for two reasons:
+
+        * A DEFERRED transaction acquires its write lock on the first write.
+          Any validating SELECT before that write therefore reads outside the
+          lock, so a peer process can insert or close a row between the check
+          and the UPDATE — which is how a concurrent ``invalidate`` could write
+          a ``valid_to`` earlier than a row's ``valid_from`` and produce an
+          interval invisible to every KG query.
+        * SQLite raises SQLITE_BUSY immediately, without consulting
+          busy_timeout, when a read transaction fails to upgrade to a write.
+          Taking the write lock up front is the case busy_timeout covers.
+        """
+        conn = self._conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+            conn.commit()
+        except BaseException:
+            # COMMIT is inside the try on purpose. It can fail in its own
+            # right -- SQLITE_BUSY during a WAL checkpoint -- and a commit
+            # that raises leaves the transaction open. The next _sqlite_retry
+            # attempt would then hit "cannot start a transaction within a
+            # transaction", which is not a lock error, so the retry gives up
+            # and reports that instead of the contention it exists to absorb.
+            # rollback() is a no-op when nothing is open, so this is safe on
+            # every path.
+            conn.rollback()
+            raise
+
     def _entity_id(self, name: str) -> str:
         return name.lower().replace(" ", "_").replace("'", "")
 
     # ── Write operations ──────────────────────────────────────────────────
 
+    @_sqlite_retry()
     def add_entity(self, name: str, entity_type: str = "unknown", properties: dict = None):
         """Add or update an entity node."""
         eid = self._entity_id(name)
         props = json.dumps(properties or {})
-        with self._lock:
-            conn = self._conn()
-            with conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO entities (id, name, type, properties) VALUES (?, ?, ?, ?)",
-                    (eid, name, entity_type, props),
-                )
+        with self._lock, self._write_txn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO entities (id, name, type, properties) VALUES (?, ?, ?, ?)",
+                (eid, name, entity_type, props),
+            )
         return eid
 
+    @_sqlite_retry()
     def add_triple(
         self,
         subject: str,
@@ -295,51 +410,48 @@ class KnowledgeGraph:
         pred = predicate.lower().replace(" ", "_")
 
         # Auto-create entities if they don't exist
-        with self._lock:
-            conn = self._conn()
-            with conn:
-                conn.execute(
-                    "INSERT OR IGNORE INTO entities (id, name) VALUES (?, ?)",
-                    (sub_id, subject),
-                )
-                conn.execute(
-                    "INSERT OR IGNORE INTO entities (id, name) VALUES (?, ?)",
-                    (obj_id, obj),
-                )
+        with self._lock, self._write_txn() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO entities (id, name) VALUES (?, ?)",
+                (sub_id, subject),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO entities (id, name) VALUES (?, ?)",
+                (obj_id, obj),
+            )
 
-                # Check for existing identical triple
-                existing = conn.execute(
-                    "SELECT id FROM triples WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
-                    (sub_id, pred, obj_id),
-                ).fetchone()
-                if existing:
-                    return existing["id"]  # Already exists and still valid
+            # Check for existing identical triple
+            existing = conn.execute(
+                "SELECT id FROM triples WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
+                (sub_id, pred, obj_id),
+            ).fetchone()
+            if existing:
+                return existing["id"]  # Already exists and still valid
 
-                triple_id = make_triple_id(
-                    sub_id, pred, obj_id, valid_from, datetime.now().isoformat()
-                )
-                conn.execute(
-                    """INSERT INTO triples (
+            triple_id = make_triple_id(sub_id, pred, obj_id, valid_from, datetime.now().isoformat())
+            conn.execute(
+                """INSERT INTO triples (
                         id, subject, predicate, object, valid_from, valid_to,
                         confidence, source_closet, source_file,
                         source_drawer_id, adapter_name
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        triple_id,
-                        sub_id,
-                        pred,
-                        obj_id,
-                        valid_from,
-                        valid_to,
-                        confidence,
-                        source_closet,
-                        source_file,
-                        source_drawer_id,
-                        adapter_name,
-                    ),
-                )
-                return triple_id
+                (
+                    triple_id,
+                    sub_id,
+                    pred,
+                    obj_id,
+                    valid_from,
+                    valid_to,
+                    confidence,
+                    source_closet,
+                    source_file,
+                    source_drawer_id,
+                    adapter_name,
+                ),
+            )
+            return triple_id
 
+    @_sqlite_retry()
     def invalidate(self, subject: str, predicate: str, obj: str, ended: str = None):
         """Mark a relationship as no longer valid (set valid_to date/time)."""
         sub_id = self._entity_id(subject)
@@ -347,31 +459,30 @@ class KnowledgeGraph:
         pred = predicate.lower().replace(" ", "_")
         ended = sanitize_iso_temporal(ended or date.today().isoformat(), "ended")
 
-        with self._lock:
-            conn = self._conn()
-            with conn:
-                rows = conn.execute(
-                    "SELECT id, valid_from FROM triples "
-                    "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
-                    (sub_id, pred, obj_id),
-                ).fetchall()
+        with self._lock, self._write_txn() as conn:
+            rows = conn.execute(
+                "SELECT id, valid_from FROM triples "
+                "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
+                (sub_id, pred, obj_id),
+            ).fetchall()
 
-                for row in rows:
-                    valid_from = row["valid_from"]
-                    if valid_from is not None and _temporal_end_key(ended) < _temporal_start_key(
-                        valid_from
-                    ):
-                        raise ValueError(
-                            f"valid_to={ended!r} is before valid_from={valid_from!r}; "
-                            "an inverted interval would be invisible to every KG query"
-                        )
+            for row in rows:
+                valid_from = row["valid_from"]
+                if valid_from is not None and _temporal_end_key(ended) < _temporal_start_key(
+                    valid_from
+                ):
+                    raise ValueError(
+                        f"valid_to={ended!r} is before valid_from={valid_from!r}; "
+                        "an inverted interval would be invisible to every KG query"
+                    )
 
-                conn.execute(
-                    "UPDATE triples SET valid_to=? "
-                    "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
-                    (ended, sub_id, pred, obj_id),
-                )
+            conn.execute(
+                "UPDATE triples SET valid_to=? "
+                "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
+                (ended, sub_id, pred, obj_id),
+            )
 
+    @_sqlite_retry()
     def supersede(
         self,
         subject: str,
@@ -420,79 +531,76 @@ class KnowledgeGraph:
         new_id = self._entity_id(new_obj)
         pred = predicate.lower().replace(" ", "_")
 
-        with self._lock:
-            conn = self._conn()
-            with conn:
-                # Only create entities we actually open a fact for. old_obj is
-                # matched by id in the UPDATE below whether or not its row
-                # exists, so inserting it would just orphan an entity when no
-                # open old fact is present (the degrade-to-add path).
-                for name, eid in ((subject, sub_id), (new_obj, new_id)):
-                    conn.execute(
-                        "INSERT OR IGNORE INTO entities (id, name) VALUES (?, ?)",
-                        (eid, name),
+        with self._lock, self._write_txn() as conn:
+            # Only create entities we actually open a fact for. old_obj is
+            # matched by id in the UPDATE below whether or not its row
+            # exists, so inserting it would just orphan an entity when no
+            # open old fact is present (the degrade-to-add path).
+            for name, eid in ((subject, sub_id), (new_obj, new_id)):
+                conn.execute(
+                    "INSERT OR IGNORE INTO entities (id, name) VALUES (?, ?)",
+                    (eid, name),
+                )
+
+            # Reject a boundary that precedes the old fact's start — an
+            # inverted interval would be invisible to every KG query.
+            rows = conn.execute(
+                "SELECT valid_from FROM triples "
+                "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
+                (sub_id, pred, old_id),
+            ).fetchall()
+            for row in rows:
+                valid_from = row["valid_from"]
+                if valid_from is not None and _temporal_end_key(boundary) < _temporal_start_key(
+                    valid_from
+                ):
+                    raise ValueError(
+                        f"at={boundary!r} is before valid_from={valid_from!r}; "
+                        "an inverted interval would be invisible to every KG query"
                     )
 
-                # Reject a boundary that precedes the old fact's start — an
-                # inverted interval would be invisible to every KG query.
-                rows = conn.execute(
-                    "SELECT valid_from FROM triples "
-                    "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
-                    (sub_id, pred, old_id),
-                ).fetchall()
-                for row in rows:
-                    valid_from = row["valid_from"]
-                    if valid_from is not None and _temporal_end_key(boundary) < _temporal_start_key(
-                        valid_from
-                    ):
-                        raise ValueError(
-                            f"at={boundary!r} is before valid_from={valid_from!r}; "
-                            "an inverted interval would be invisible to every KG query"
-                        )
+            # Close the open old fact at the shared boundary.
+            conn.execute(
+                "UPDATE triples SET valid_to=? "
+                "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
+                (boundary, sub_id, pred, old_id),
+            )
 
-                # Close the open old fact at the shared boundary.
-                conn.execute(
-                    "UPDATE triples SET valid_to=? "
-                    "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
-                    (boundary, sub_id, pred, old_id),
-                )
+            # Open the successor at the same instant (idempotent if already open).
+            existing = conn.execute(
+                "SELECT id FROM triples "
+                "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
+                (sub_id, pred, new_id),
+            ).fetchone()
+            if existing:
+                return existing["id"]
 
-                # Open the successor at the same instant (idempotent if already open).
-                existing = conn.execute(
-                    "SELECT id FROM triples "
-                    "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
-                    (sub_id, pred, new_id),
-                ).fetchone()
-                if existing:
-                    return existing["id"]
-
-                triple_id = make_triple_id(
-                    sub_id, pred, new_id, boundary, datetime.now().isoformat()
-                )
-                conn.execute(
-                    """INSERT INTO triples (
+            triple_id = make_triple_id(sub_id, pred, new_id, boundary, datetime.now().isoformat())
+            conn.execute(
+                """INSERT INTO triples (
                         id, subject, predicate, object, valid_from, valid_to,
                         confidence, source_closet, source_file,
                         source_drawer_id, adapter_name
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        triple_id,
-                        sub_id,
-                        pred,
-                        new_id,
-                        boundary,
-                        None,
-                        confidence,
-                        source_closet,
-                        source_file,
-                        source_drawer_id,
-                        adapter_name,
-                    ),
-                )
-                return triple_id
+                (
+                    triple_id,
+                    sub_id,
+                    pred,
+                    new_id,
+                    boundary,
+                    None,
+                    confidence,
+                    source_closet,
+                    source_file,
+                    source_drawer_id,
+                    adapter_name,
+                ),
+            )
+            return triple_id
 
     # ── Query operations ──────────────────────────────────────────────────
 
+    @_sqlite_retry()
     def query_entity(self, name: str, as_of: str = None, direction: str = "outgoing"):
         """
         Get all relationships for an entity.
@@ -579,6 +687,7 @@ class KnowledgeGraph:
 
         return results
 
+    @_sqlite_retry()
     def find_entity_candidates(self, name: str) -> list:
         """Return token/prefix entity matches for disambiguation (never substring)."""
         if not name or len(name.strip()) < _MIN_ENTITY_CANDIDATE_LEN:
@@ -660,6 +769,7 @@ class KnowledgeGraph:
                 )
         return results
 
+    @_sqlite_retry()
     def query_relationship(self, predicate: str, as_of: str = None):
         """Get all triples with a given relationship type."""
         as_of = sanitize_iso_temporal(as_of, "as_of")
@@ -695,6 +805,7 @@ class KnowledgeGraph:
                 )
         return results
 
+    @_sqlite_retry()
     def timeline(self, entity_name: str = None):
         """Get all facts in chronological order, optionally filtered by entity."""
         with self._lock:
@@ -757,6 +868,7 @@ class KnowledgeGraph:
         ),
     }
 
+    @_sqlite_retry()
     def dump_rows(self, table: str, after_rowid: int = 0, limit: int = 500) -> list:
         """Page KG rows in rowid order for snapshot replication.
 
@@ -776,6 +888,7 @@ class KnowledgeGraph:
             ).fetchall()
         return [dict(row) | {"_rowid": row["rowid"]} for row in rows]
 
+    @_sqlite_retry()
     def apply_row(self, table: str, row: dict) -> None:
         """Fold one replicated KG row in, keyed by id (INSERT OR REPLACE).
 
@@ -788,15 +901,14 @@ class KnowledgeGraph:
         if not row.get("id"):
             raise ValueError("replicated row is missing 'id'")
         values = [row.get(col) for col in columns]
-        with self._lock:
-            conn = self._conn()
-            with conn:
-                conn.execute(
-                    f"INSERT OR REPLACE INTO {table} ({', '.join(columns)}) "
-                    f"VALUES ({', '.join('?' for _ in columns)})",
-                    values,
-                )
+        with self._lock, self._write_txn() as conn:
+            conn.execute(
+                f"INSERT OR REPLACE INTO {table} ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)})",
+                values,
+            )
 
+    @_sqlite_retry()
     def stats(self):
         with self._lock:
             conn = self._conn()
