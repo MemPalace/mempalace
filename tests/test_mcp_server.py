@@ -984,8 +984,9 @@ class TestReadTools:
         assert db_path.read_bytes() == before_bytes
         assert db_path.stat().st_mtime_ns == before_mtime_ns
 
+    @pytest.mark.parametrize("backend_name", ["sqlite_exact", "rust_exact"])
     def test_stdio_sqlite_exact_reads_with_peer_writer_then_reopens_on_promotion(
-        self, monkeypatch, config, palace_path, kg
+        self, monkeypatch, config, palace_path, kg, backend_name
     ):
         """A writable-capable stdio server must recall through a read-only
         handle while a peer owns the palace, then discard that handle when it
@@ -994,7 +995,7 @@ class TestReadTools:
         from mempalace import mcp_server, palace
         from mempalace.backends import PalaceRef
 
-        monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
+        monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", backend_name)
         monkeypatch.setattr(
             embedding_wrapper,
             "_embed_texts",
@@ -1053,6 +1054,19 @@ with mine_palace_lock(sys.argv[1]):
             holder.stdin.close()
             holder.wait(timeout=10)
             assert holder.returncode == 0
+
+            # Complete a writer/checkpoint cycle while MCP retains its wrapper.
+            from mempalace.backends.sqlite_exact import SQLiteExactBackend
+
+            peer = SQLiteExactBackend()
+            try:
+                peer_col = peer.get_collection(
+                    palace=palace_ref, collection_name=config.collection_name
+                )
+                peer_col.add(ids=["new_drawer"], documents=["new memory"], embeddings=[[1.0, 0.0]])
+            finally:
+                peer.close()
+            assert mcp_server.tool_list_drawers()["count"] == 2
 
             writer_ok, writer_reason = mcp_server._acquire_mcp_writer_lock()
             assert writer_ok is True

@@ -721,7 +721,7 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     """Acquire this process's per-palace MCP writer lease.
 
     Returns (True, "") when this process may write. Returns (False, reason)
-    when another live writer already owns the per-palace lease.
+    when another writer owns the lease or writer initialization fails.
 
     Self-healing: a server that came up read-only (a peer held the lease at
     startup) RE-ATTEMPTS the non-blocking flock on every subsequent call.
@@ -745,6 +745,10 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     # backend mismatch can be corrected, and lock-directory permissions can be
     # repaired while this long-lived stdio host remains alive. Each mutating
     # request therefore gets a fresh ownership attempt.
+
+    _MCP_WRITER_READ_ONLY = False
+    _MCP_WRITER_LOCK_FAILED = False
+    _MCP_WRITER_LOCK_ERROR = ""
 
     try:
         from .palace import (
@@ -813,12 +817,18 @@ def _mcp_peer_writer_refusal(req_id, tool_name: str):
         "id": req_id,
         "error": {
             "code": -32001,
-            "message": "Peer MCP writer active; this server is read-only for mutating tools",
+            "message": (
+                "MCP writer initialization failed; this server is read-only for mutating tools"
+                if _MCP_WRITER_LOCK_FAILED
+                else "Peer MCP writer active; this server is read-only for mutating tools"
+            ),
             "data": {
                 "tool": tool_name,
                 "palace": _config.palace_path,
                 "reason": reason,
-                "override_env": _MCP_ALLOW_PEER_WRITER_ENV,
+                "failure_kind": (
+                    "initialization_failed" if _MCP_WRITER_LOCK_FAILED else "peer_contention"
+                ),
             },
         },
     }
@@ -1517,7 +1527,7 @@ def _get_collection(create=False):
         # with a daemon/HTTP writer. _acquire_mcp_writer_lock() discards this
         # cached read-only collection before a promoted mutation is handled.
         collection_read_only = _READ_ONLY or (
-            backend_name == "sqlite_exact"
+            backend_name in {"sqlite_exact", "rust_exact"}
             and getattr(_args, "transport", "stdio") == "stdio"
             and _MCP_WRITER_LOCK_CM is None
         )
@@ -2012,7 +2022,7 @@ def _sqlite_taxonomy():
             from .backends.chroma import _sqlite_wing_room_counts
 
             counts = _sqlite_wing_room_counts(_config.palace_path, _config.collection_name)
-        elif _selected_backend_name() == "sqlite_exact":
+        elif _selected_backend_name() in {"sqlite_exact", "rust_exact"}:
             from .backends.sqlite_exact import sqlite_wing_room_counts
 
             counts = sqlite_wing_room_counts(_config.palace_path, _config.collection_name)
@@ -2065,7 +2075,7 @@ def _sqlite_graph_stats():
     try:
         if _is_chroma_backend():
             rows = _chroma_room_wing_hall_counts()
-        elif _selected_backend_name() == "sqlite_exact":
+        elif _selected_backend_name() in {"sqlite_exact", "rust_exact"}:
             from .backends.sqlite_exact import sqlite_room_wing_hall_counts
 
             rows = sqlite_room_wing_hall_counts(_config.palace_path, _config.collection_name)
@@ -6708,7 +6718,7 @@ def _mcp_stale_library_refusal(req_id, tool_name: str):
     }
 
 
-def _mcp_tool_preflight_refusal(req_id, tool_name: str):
+def _mcp_tool_preflight_refusal(req_id, tool_name: str, *, check_writer: bool = True):
     """Run MCP request preflight gates outside handle_request complexity."""
 
     read_only_error = _mcp_read_only_refusal(req_id, tool_name)
@@ -6737,7 +6747,7 @@ def _mcp_tool_preflight_refusal(req_id, tool_name: str):
     if diverged_index_error is not None:
         return diverged_index_error
 
-    return _mcp_peer_writer_refusal(req_id, tool_name)
+    return _mcp_peer_writer_refusal(req_id, tool_name) if check_writer else None
 
 
 def _decorate_mcp_tool_result(tool_name: str, result):
