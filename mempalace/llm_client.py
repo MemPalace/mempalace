@@ -1,7 +1,7 @@
 """
 llm_client.py — Minimal provider abstraction for LLM-assisted entity refinement.
 
-Three providers cover the useful space:
+Four providers cover the useful space:
 
 - ``ollama`` (default): local models via http://localhost:11434. Works fully
   offline. Honors MemPalace's "zero-API required" principle.
@@ -10,6 +10,10 @@ Three providers cover the useful space:
   Together, and most self-hosted setups.
 - ``anthropic``: the official Messages API. Opt-in for users who want Haiku
   quality without setting up a local model.
+- ``orcarouter``: the OrcaRouter OpenAI-compatible gateway at
+  https://api.orcarouter.ai. A named provider so the ``orcarouter/`` model
+  namespace is a first-class choice, with its own ``ORCAROUTER_API_KEY`` env
+  var, instead of requiring an anonymous openai-compat base URL.
 
 All providers expose the same ``classify(system, user, json_mode)`` method and
 the same ``check_available()`` probe. No external SDK dependencies — stdlib
@@ -170,8 +174,8 @@ class LLMProvider:
         warning before first use (issue #24). URL-based heuristic only —
         the endpoint determines, regardless of which provider class.
         Subclasses that resolve their endpoint dynamically should override
-        if needed; the default works for the three in-tree providers
-        (Ollama / OpenAI-compat / Anthropic).
+        if needed; the default works for the in-tree providers
+        (Ollama / OpenAI-compat / Anthropic / OrcaRouter).
         """
         return not _endpoint_is_local(self.endpoint)
 
@@ -436,6 +440,99 @@ class AnthropicProvider(LLMProvider):
         return LLMResponse(text=text, model=self.model, provider=self.name, raw=data)
 
 
+# ==================== ORCAROUTER ====================
+
+
+class OrcaRouterProvider(LLMProvider):
+    """The OrcaRouter OpenAI-compatible gateway at ``https://api.orcarouter.ai``.
+
+    A named provider for OrcaRouter's model namespace (``orcarouter/...``)
+    so users can select it with ``--llm-provider orcarouter`` instead of
+    treating it as an anonymous openai-compat base URL. Talks the same
+    ``/v1/chat/completions`` wire format as ``OpenAICompatProvider``, but
+    ships a default endpoint and reads its own ``ORCAROUTER_API_KEY`` env
+    var. API key via ``--llm-api-key`` or ``ORCAROUTER_API_KEY``.
+    """
+
+    name = "orcarouter"
+    DEFAULT_ENDPOINT = "https://api.orcarouter.ai"
+
+    def __init__(
+        self,
+        model: str,
+        api_key: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        timeout: int = 120,
+        **_: object,
+    ):
+        if api_key:
+            resolved_key = api_key
+            source: Optional[str] = "flag"
+        else:
+            env_key = os.environ.get("ORCAROUTER_API_KEY")
+            resolved_key = env_key or None
+            source = "env" if env_key else None
+        super().__init__(
+            model=model,
+            endpoint=endpoint or self.DEFAULT_ENDPOINT,
+            api_key=resolved_key,
+            timeout=timeout,
+            api_key_source=source,
+        )
+
+    def _resolve_url(self) -> str:
+        url = self.endpoint.rstrip("/")
+        if url.endswith("/chat/completions"):
+            return url
+        if not url.endswith("/v1"):
+            url = f"{url}/v1"
+        return f"{url}/chat/completions"
+
+    def check_available(self) -> tuple[bool, str]:
+        if not self.api_key:
+            return False, "ORCAROUTER_API_KEY not set (use --llm-api-key or env)"
+        base = self.endpoint.rstrip("/")
+        base = base.removesuffix("/chat/completions").removesuffix("/v1")
+        try:
+            req = Request(f"{base}/v1/models")
+            if self.api_key and (self.api_key_source != "env" or not self.is_external_service):
+                req.add_header("Authorization", f"Bearer {self.api_key}")
+            with urlopen(req, timeout=5):
+                pass
+        except (URLError, HTTPError, OSError) as e:
+            return False, f"Cannot reach {self.endpoint}: {e}"
+        return True, "ok"
+
+    def classify(
+        self,
+        system: str,
+        user: str,
+        json_mode: bool = True,
+        think: Optional[bool] = None,  # noqa: ARG002 — accepted for interface compat; OpenAI-compat has no thinking toggle
+    ) -> LLMResponse:
+        if not self.api_key:
+            raise LLMError("OrcaRouter provider requires ORCAROUTER_API_KEY env or --llm-api-key")
+        body: dict = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0.1,
+        }
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        data = _http_post_json(self._resolve_url(), body, headers=headers, timeout=self.timeout)
+        try:
+            text = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as e:
+            raise LLMError(f"Unexpected response shape: {e}") from e
+        if not text:
+            raise LLMError(f"Empty response from {self.name} (model={self.model})")
+        return LLMResponse(text=text, model=self.model, provider=self.name, raw=data)
+
+
 # ==================== FACTORY ====================
 
 
@@ -443,6 +540,7 @@ PROVIDERS: dict[str, type[LLMProvider]] = {
     "ollama": OllamaProvider,
     "openai-compat": OpenAICompatProvider,
     "anthropic": AnthropicProvider,
+    "orcarouter": OrcaRouterProvider,
 }
 
 
