@@ -52,6 +52,10 @@ def cmd_palace_set_embedder(args):
                 "MEMPALACE_EMBEDDING_MODEL=embeddinggemma and "
                 f"MEMPALACE_EMBEDDINGGEMMA_VARIANT={variant}"
             )
+        elif new.model_name == "embeddinggemma":
+            settings = (
+                "MEMPALACE_EMBEDDING_MODEL=embeddinggemma and MEMPALACE_EMBEDDINGGEMMA_VARIANT=q8"
+            )
         else:
             settings = f"MEMPALACE_EMBEDDING_MODEL={new.model_name}"
         print(

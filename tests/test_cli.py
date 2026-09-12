@@ -75,6 +75,28 @@ def test_cmd_palace_set_embedder_explains_how_to_configure_fp16(tmp_path, monkey
     assert "MEMPALACE_EMBEDDING_MODEL=embeddinggemma:fp16" not in output
 
 
+def test_cmd_palace_set_embedder_explains_how_to_configure_q8(tmp_path, monkeypatch, capsys):
+    from mempalace.backends.base import EmbedderIdentity
+
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "embeddinggemma")
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", "fp16")
+    args = argparse.Namespace(
+        palace=str(tmp_path),
+        model="embeddinggemma",
+        force=True,
+        backend="sqlite_exact",
+    )
+    with patch(
+        "mempalace.palace.set_palace_embedder_identity",
+        return_value=(None, EmbedderIdentity("embeddinggemma", 384)),
+    ):
+        cmd_palace_set_embedder(args)
+
+    output = capsys.readouterr().out
+    assert "MEMPALACE_EMBEDDING_MODEL=embeddinggemma" in output
+    assert "MEMPALACE_EMBEDDINGGEMMA_VARIANT=q8" in output
+
+
 # ── CLI entry point: PYTHONPATH stripping ────────────────────────────────
 
 
