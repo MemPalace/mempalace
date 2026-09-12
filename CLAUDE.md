@@ -67,7 +67,7 @@ mempalace/
 ├── config.py            # Configuration + input validation
 ├── miner.py             # Project file miner
 ├── convo_miner.py       # Conversation transcript miner
-├── searcher.py          # Semantic search (hybrid BM25 + vector)
+├── searcher/            # Hybrid search package; public import is still mempalace.searcher
 ├── knowledge_graph.py   # Temporal entity-relationship graph (SQLite)
 ├── palace.py            # Shared palace operations
 ├── palace_graph.py      # Room traversal + cross-wing tunnels
@@ -127,7 +127,7 @@ Knowledge Graph:
 
 - **Adding an MCP tool**: handler in `mempalace/mcp_server/tools_*.py` + `TOOLS` entry in `mempalace/mcp_server/schemas.py` (public import path is still `mempalace.mcp_server`)
 - **Adding a CLI command**: handler in `mempalace/cli/cmd_*.py` + argparse in `mempalace/cli/parser.py` (public import path is still `mempalace.cli`)
-- **Changing search**: `mempalace/searcher.py`
+- **Changing search**: `mempalace/searcher/` (ranking, sqlite BM25, pipeline, CLI); public import is still `mempalace.searcher`
 - **Modifying mining**: `mempalace/miner.py` (project files) or `mempalace/convo_miner.py` (transcripts)
 - **Adding a storage backend**: subclass `mempalace/backends/base.py`, register in `backends/__init__.py`
 - **Input validation**: `mempalace/config.py` — `sanitize_name()` / `sanitize_content()`
