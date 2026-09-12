@@ -613,7 +613,8 @@ def _extract_authored_at(filepath):
                 if not line:
                     continue
                 try:
-                    ts = json.loads(line).get("timestamp")
+                    obj = json.loads(line)
+                    ts = obj.get("timestamp") or obj.get("created_at")
                 except (ValueError, TypeError, AttributeError):
                     continue
                 # ISO-8601 timestamps are strings; guard against a non-string

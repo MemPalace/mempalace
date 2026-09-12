@@ -8,6 +8,7 @@ from mempalace.normalize import (
     _format_tool_result,
     _format_tool_use,
     _messages_to_transcript,
+    _try_antigravity_jsonl,
     _try_chatgpt_export_json_split,
     _try_chatgpt_json,
     _try_claude_ai_json,
@@ -2166,3 +2167,144 @@ def test_pi_jsonl_invalid_lines_skipped():
     ]
     result = _try_pi_jsonl("\n".join(lines))
     assert result is not None
+
+
+# ── Google Antigravity / Gemini IDE JSONL ─────────────────────────────────
+
+
+def test_antigravity_jsonl_basic():
+    """Extracts <USER_REQUEST> from user step and content from planner response."""
+    lines = [
+        json.dumps({
+            "step_index": 0,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "content": "<USER_REQUEST>\nHow do I configure Supabase auth?\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nActive Document: app.py\n</ADDITIONAL_METADATA>"
+        }),
+        json.dumps({
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "content": "You can configure Supabase auth using createClient in utils/supabase/server.ts."
+        })
+    ]
+    result = _try_antigravity_jsonl("\n".join(lines))
+    assert result is not None
+    assert "> How do I configure Supabase auth?" in result
+    assert "You can configure Supabase auth using createClient" in result
+    assert "ADDITIONAL_METADATA" not in result
+    assert "Active Document" not in result
+
+
+def test_antigravity_jsonl_metadata_and_settings_stripped():
+    """Strips <ADDITIONAL_METADATA> and <USER_SETTINGS_CHANGE> tags without user request tags."""
+    lines = [
+        json.dumps({
+            "step_index": 0,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "content": "Add dark mode toggle\n<ADDITIONAL_METADATA>\nCursor is on line: 1\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nModel changed to Flash\n</USER_SETTINGS_CHANGE>"
+        }),
+        json.dumps({
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "content": "Dark mode toggle has been added."
+        })
+    ]
+    result = _try_antigravity_jsonl("\n".join(lines))
+    assert result is not None
+    assert "> Add dark mode toggle" in result
+    assert "Cursor is on line" not in result
+    assert "USER_SETTINGS_CHANGE" not in result
+    assert "Dark mode toggle has been added." in result
+
+
+def test_antigravity_jsonl_tool_calls_summary():
+    """When planner response content is empty but tool_calls exist, action names are summarized."""
+    lines = [
+        json.dumps({
+            "step_index": 0,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "content": "<USER_REQUEST>\nCheck git status\n</USER_REQUEST>"
+        }),
+        json.dumps({
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "content": "",
+            "tool_calls": [{"name": "run_command", "args": {}}, {"name": "view_file", "args": {}}]
+        })
+    ]
+    result = _try_antigravity_jsonl("\n".join(lines))
+    assert result is not None
+    assert "> Check git status" in result
+    assert "[Action: run_command, view_file]" in result
+
+
+def test_antigravity_jsonl_multi_turn_assistant_merge():
+    """Consecutive planner responses in a single turn cycle are merged into one assistant block."""
+    lines = [
+        json.dumps({
+            "step_index": 0,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "content": "<USER_REQUEST>Run analysis</USER_REQUEST>"
+        }),
+        json.dumps({
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "content": "Starting analysis..."
+        }),
+        json.dumps({
+            "step_index": 2,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "content": "Analysis complete with 0 errors."
+        })
+    ]
+    result = _try_antigravity_jsonl("\n".join(lines))
+    assert result is not None
+    assert "> Run analysis" in result
+    assert "Starting analysis...\nAnalysis complete with 0 errors." in result
+
+
+def test_antigravity_jsonl_under_two_turns_returns_none():
+    """Sessions with fewer than 2 turns return None."""
+    lines = [
+        json.dumps({
+            "step_index": 0,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "content": "<USER_REQUEST>Hello</USER_REQUEST>"
+        })
+    ]
+    result = _try_antigravity_jsonl("\n".join(lines))
+    assert result is None
+
+
+def test_antigravity_jsonl_dispatch_integration(tmp_path):
+    """normalize_conversations recognizes Antigravity JSONL files end-to-end."""
+    lines = [
+        json.dumps({
+            "step_index": 0,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "content": "<USER_REQUEST>\nFix bug in auth flow\n</USER_REQUEST>"
+        }),
+        json.dumps({
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "content": "Bug fixed in lib/auth.ts."
+        })
+    ]
+    f = tmp_path / "transcript.jsonl"
+    f.write_text("\n".join(lines), encoding="utf-8")
+    res = normalize_conversations(str(f))
+    assert len(res) == 1
+    assert "> Fix bug in auth flow" in res[0]
+    assert "Bug fixed in lib/auth.ts." in res[0]
+
