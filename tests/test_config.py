@@ -6,6 +6,7 @@ import tempfile
 import pytest
 from mempalace.config import (
     MempalaceConfig,
+    connect_sqlite_read,
     normalize_wing_name,
     sanitize_iso_date,
     sanitize_iso_temporal,
@@ -223,6 +224,86 @@ def test_embeddinggemma_batch_size_invalid_falls_back_to_default(tmp_path, monke
     monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE", "not-a-number")
     cfg = MempalaceConfig(config_dir=str(tmp_path))
     assert cfg.embeddinggemma_batch_size == _EMBEDDINGGEMMA_BATCH_SIZE
+
+
+def _wal_db(tmp_path, name="chroma.sqlite3"):
+    """A WAL database with its sidecars removed, as chroma leaves one behind."""
+    db_path = tmp_path / name
+    setup = sqlite3.connect(str(db_path))
+    setup.execute("PRAGMA journal_mode=WAL")
+    setup.execute("CREATE TABLE t (x INTEGER)")
+    setup.execute("INSERT INTO t VALUES (42)")
+    setup.commit()
+    setup.close()
+    for sidecar in (f"{db_path}-wal", f"{db_path}-shm"):
+        if os.path.exists(sidecar):
+            os.unlink(sidecar)
+    return db_path
+
+
+def test_connect_sqlite_read_reads_a_wal_database_without_sidecars(tmp_path):
+    """A read-only open cannot create the WAL index, so that case takes a normal open.
+
+    Apple's SQLite, which CPython links on macOS, fails the first statement of
+    such a connection with "unable to open database file", and the integrity
+    gate then refused every tool for a healthy palace (#2489).
+    """
+    db_path = _wal_db(tmp_path)
+
+    conn = connect_sqlite_read(str(db_path))
+    try:
+        assert conn.execute("SELECT x FROM t").fetchone()[0] == 42
+        assert conn.execute("PRAGMA quick_check").fetchall() == [("ok",)]
+    finally:
+        conn.close()
+
+
+def test_connect_sqlite_read_takes_a_normal_open_when_the_wal_index_is_missing(tmp_path):
+    """The fallback is a normal open, which is the whole point: it may create the index.
+
+    Asserting the open mode rather than a side effect keeps this meaningful on
+    SQLite builds whose read-only open happens to succeed here.
+    """
+    db_path = _wal_db(tmp_path)
+
+    conn = connect_sqlite_read(str(db_path))
+    try:
+        conn.execute("INSERT INTO t VALUES (1)")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def test_connect_sqlite_read_stays_read_only_for_a_rollback_journal_database(tmp_path):
+    db_path = tmp_path / "chroma.sqlite3"
+    setup = sqlite3.connect(str(db_path))
+    setup.execute("CREATE TABLE t (x INTEGER)")
+    setup.commit()
+    setup.close()
+
+    conn = connect_sqlite_read(str(db_path))
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("INSERT INTO t VALUES (1)")
+    finally:
+        conn.close()
+
+
+def test_connect_sqlite_read_stays_read_only_while_the_sidecars_are_there(tmp_path):
+    """A WAL palace that something else holds open keeps the read-only connection."""
+    db_path = _wal_db(tmp_path)
+    holder = sqlite3.connect(str(db_path))
+    holder.execute("SELECT x FROM t").fetchone()
+    try:
+        assert os.path.exists(f"{db_path}-shm")
+        conn = connect_sqlite_read(str(db_path))
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                conn.execute("INSERT INTO t VALUES (1)")
+        finally:
+            conn.close()
+    finally:
+        holder.close()
 
 
 def test_sqlite_read_uri_opens_path_with_spaces(tmp_path):
