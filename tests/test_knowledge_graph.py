@@ -81,6 +81,69 @@ class TestTripleOperations:
         tid2 = kg.add_triple("Alice", "knew", "Bob", valid_to="2026-03-01")
         assert tid2.startswith("t_alice_knew_bob_")
 
+    def test_duplicate_add_backfills_null_valid_from(self, kg):
+        """Re-adding an existing triple with a new valid_from must populate it.
+
+        Common adapter pattern: a bare ingest establishes the relationship,
+        a later adapter discovers the start date. The second call previously
+        returned the existing id and silently dropped the new valid_from.
+        """
+        kg.add_triple("Max", "child_of", "Alice")
+        kg.add_triple("Max", "child_of", "Alice", valid_from="2015-04-01")
+        facts = [
+            f for f in kg.query_entity("Max", direction="outgoing") if f["predicate"] == "child_of"
+        ]
+        assert len(facts) == 1
+        assert facts[0]["valid_from"] == "2015-04-01"
+
+    def test_duplicate_add_backfills_null_provenance(self, kg):
+        """corpus-origin provenance fields backfill when supplied on a later add_triple call."""
+        tid = kg.add_triple("Alice", "works_at", "Acme")
+        kg.add_triple(
+            "Alice",
+            "works_at",
+            "Acme",
+            source_closet="projects/acme.md",
+            source_file="projects/acme.md",
+            source_drawer_id="d_abc123",
+            adapter_name="project-miner",
+        )
+        conn = kg._conn()
+        row = conn.execute(
+            "SELECT source_closet, source_file, source_drawer_id, adapter_name "
+            "FROM triples WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert row["source_closet"] == "projects/acme.md"
+        assert row["source_file"] == "projects/acme.md"
+        assert row["source_drawer_id"] == "d_abc123"
+        assert row["adapter_name"] == "project-miner"
+
+    def test_duplicate_add_does_not_overwrite_existing_metadata(self, kg):
+        """Backfill must never clobber data that is already populated.
+
+        If the first write set valid_from=2015 and a later call passes
+        valid_from=2020, we keep 2015 — explicit invalidation is the only
+        path to change an existing start date.
+        """
+        tid = kg.add_triple("Max", "child_of", "Alice", valid_from="2015-04-01")
+        kg.add_triple("Max", "child_of", "Alice", valid_from="2020-01-01")
+        conn = kg._conn()
+        row = conn.execute("SELECT valid_from FROM triples WHERE id = ?", (tid,)).fetchone()
+        assert row["valid_from"] == "2015-04-01"
+
+    def test_duplicate_add_upgrades_confidence_only_when_higher(self, kg):
+        """Confidence is monotonically non-decreasing — later evidence that
+        is at least as strong wins, weaker evidence never downgrades."""
+        tid = kg.add_triple("Max", "does", "swimming", confidence=0.6)
+        kg.add_triple("Max", "does", "swimming", confidence=0.4)  # weaker, ignored
+        conn = kg._conn()
+        row = conn.execute("SELECT confidence FROM triples WHERE id = ?", (tid,)).fetchone()
+        assert row["confidence"] == 0.6
+        kg.add_triple("Max", "does", "swimming", confidence=0.9)  # stronger, wins
+        row = conn.execute("SELECT confidence FROM triples WHERE id = ?", (tid,)).fetchone()
+        assert row["confidence"] == 0.9
+
 
 class TestQueries:
     def test_query_outgoing(self, seeded_kg):
