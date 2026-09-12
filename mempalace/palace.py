@@ -72,7 +72,11 @@ _EXPLICIT_BACKEND_ENV = "MEMPALACE_BACKEND_EXPLICIT"
 #
 # v2 (2026-04): introduced strip_noise() for Claude Code JSONL; previous
 #               drawers stored system tags / hook chrome verbatim.
-NORMALIZE_VERSION = 2
+# v3 (2026-05): strip_noise() now also removes the rest of the Claude Code
+#               slash-command envelope (<command-args>, <local-command-caveat>,
+#               <local-command-stdout>) and ANSI CSI/OSC escape sequences
+#               captured from Bash tool output.
+NORMALIZE_VERSION = 3
 
 
 # (palace_id, collection_name, model_name) tuples already validated this
