@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mempalace.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <!-- Replace with your actual Python path: `which python` in the mempalace venv -->
+        <string>/path/to/mempalace/venv/bin/python</string>
+        <string>/path/to/mempalace-daemon.py</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/.mempalace/daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/.mempalace/daemon.log</string>
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USERNAME</string>
+</dict>
+</plist>
