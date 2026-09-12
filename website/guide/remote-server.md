@@ -95,7 +95,12 @@ The backend can also be set with `--backend milvus` (or `qdrant` /
 
 Prefer Postgres? Install `pip install mempalace[pgvector]`, point
 `MEMPALACE_BACKEND=pgvector` at a database with the `vector` extension, and
-the rest of this guide applies unchanged.
+the rest of this guide applies unchanged. If more than one machine talks to
+that database and they are meant to share one palace, set the same
+`MEMPALACE_PGVECTOR_SHARED_NAMESPACE` on each — without it, pgvector table
+names include each node's local palace path and the nodes silently end up with
+separate tables. See
+[Sharing one palace across machines](/guide/configuration#sharing-one-palace-across-machines).
 
 ## 2. GPU embedding (optional)
 
