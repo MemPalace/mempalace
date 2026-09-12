@@ -19,7 +19,7 @@ from typing import Any, Optional
 import chromadb
 from chromadb.errors import NotFoundError as _ChromaNotFoundError
 
-from ..config import sqlite_read_uri
+from ..config import connect_sqlite_read
 from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
     BaseBackend,
@@ -562,7 +562,7 @@ def _vector_segment_id(palace_path: str, collection_name: str) -> Optional[str]:
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             row = conn.execute(
                 """
@@ -733,7 +733,7 @@ def _read_sync_threshold(palace_path: str, collection_name: str) -> int:
     if not os.path.isfile(db_path):
         return 1000
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             cur = conn.cursor()
             cur.execute(
@@ -764,7 +764,7 @@ def _collection_has_sync_threshold_metadata(palace_path: str, collection_name: s
         return False
 
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             row = conn.execute(
                 """
@@ -1097,7 +1097,7 @@ def _sqlite_embedding_count(palace_path: str, collection_name: str) -> Optional[
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             row = conn.execute(
                 """
@@ -1158,7 +1158,7 @@ def _sqlite_wing_room_counts(
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             # Wait out a transient writer/checkpoint lock rather than falling
             # straight back to the expensive vector-index path (#1681).
@@ -1215,7 +1215,7 @@ def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Opti
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             conn.execute("PRAGMA busy_timeout = 3000")
             if (
@@ -1317,7 +1317,7 @@ def sqlite_list_id_metadata(
     if filters is None:
         return None
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             conn.execute("PRAGMA busy_timeout = 3000")
             if (
@@ -1430,7 +1430,7 @@ def sqlite_documents_for_ids(
     wanted = [str(i) for i in ids]
     docs: dict[str, str] = {}
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             conn.execute("PRAGMA busy_timeout = 3000")
             segments = [
@@ -2250,7 +2250,7 @@ class ChromaCollection(BaseCollection):
         # rowid, embedding_id is the user-facing drawer id.
         public_ids: dict[int, str] = {}
         try:
-            conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+            conn = connect_sqlite_read(db_path)
             conn.row_factory = sqlite3.Row
         except sqlite3.Error:
             logger.debug("Chroma lexical sqlite open failed", exc_info=True)

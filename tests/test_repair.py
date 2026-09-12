@@ -1756,6 +1756,30 @@ def test_sqlite_integrity_errors_returns_empty_for_healthy_db(tmp_path):
     assert repair.sqlite_integrity_errors(str(palace)) == []
 
 
+def test_sqlite_integrity_errors_reads_a_wal_palace_without_sidecars(tmp_path):
+    """A healthy WAL palace nothing holds open must not read as corrupt (#2489).
+
+    chroma removes the ``-wal``/``-shm`` sidecars when its last connection
+    closes cleanly, and a read-only connection may not recreate the index they
+    hold. On SQLite builds that enforce this, the probe failed with "unable to
+    open database file" and the gate then refused every tool.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    db_path = palace / "chroma.sqlite3"
+    setup = sqlite3.connect(str(db_path))
+    setup.execute("PRAGMA journal_mode=WAL")
+    setup.execute("CREATE TABLE t (x INTEGER)")
+    setup.execute("INSERT INTO t VALUES (1)")
+    setup.commit()
+    setup.close()
+    for sidecar in (f"{db_path}-wal", f"{db_path}-shm"):
+        if os.path.exists(sidecar):
+            os.unlink(sidecar)
+
+    assert repair.sqlite_integrity_errors(str(palace)) == []
+
+
 def test_sqlite_integrity_errors_uses_bounded_contention_timeout(tmp_path, monkeypatch):
     """Integrity checks wait out routine writers without a real-time sleep.
 

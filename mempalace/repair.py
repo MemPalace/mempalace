@@ -46,7 +46,11 @@ from typing import Callable, Iterator, Optional
 from chromadb.errors import NotFoundError as ChromaNotFoundError
 
 from .backends.chroma import ChromaBackend, hnsw_capacity_status
-from .config import sqlite_read_uri
+
+# sqlite_read_uri stays in this module's namespace: callers and tests reach the
+# read-only URI through repair, while the connections themselves now go through
+# connect_sqlite_read.
+from .config import connect_sqlite_read, sqlite_read_uri  # noqa: F401
 
 
 COLLECTION_NAME = "mempalace_drawers"
@@ -706,9 +710,7 @@ def sqlite_drawer_count(palace_path: str, collection_name: Optional[str] = None)
     if not os.path.exists(sqlite_path):
         return None
     try:
-        import sqlite3
-
-        conn = sqlite3.connect(sqlite_read_uri(sqlite_path), uri=True)
+        conn = connect_sqlite_read(sqlite_path)
         try:
             row = conn.execute(
                 """
@@ -799,8 +801,8 @@ def _quick_check_errors(sqlite_path: str) -> list[str]:
     would come back as an empty error list, which reads as a clean verdict for
     a database nobody opened.
 
-    ``ValueError`` is reported rather than raised. ``sqlite_read_uri`` builds a
-    URI before SQLite is reached, and up to Python 3.12 that raises for a
+    ``ValueError`` is reported rather than raised. ``connect_sqlite_read`` builds
+    a URI before SQLite is reached, and up to Python 3.12 that raises for a
     directory name holding a byte that came back through ``surrogateescape``;
     3.13 percent-encodes it instead. Such a path reaches here because absence
     was not proven for it, the same reason every unreadable path reaches here,
@@ -818,11 +820,7 @@ def _quick_check_errors(sqlite_path: str) -> list[str]:
         # open, so the descriptor would sit there until the cyclic collector
         # ran.
         with closing(
-            sqlite3.connect(
-                sqlite_read_uri(sqlite_path),
-                uri=True,
-                timeout=_SQLITE_INTEGRITY_BUSY_TIMEOUT_SECONDS,
-            )
+            connect_sqlite_read(sqlite_path, timeout=_SQLITE_INTEGRITY_BUSY_TIMEOUT_SECONDS)
         ) as conn:
             rows = conn.execute("PRAGMA quick_check").fetchall()
     except (sqlite3.Error, ValueError) as e:
@@ -1783,7 +1781,7 @@ def extract_via_sqlite(palace_path: str, collection_name: str) -> Iterator[tuple
     if not os.path.isfile(sqlite_path):
         return
 
-    conn = sqlite3.connect(sqlite_read_uri(sqlite_path), uri=True)
+    conn = connect_sqlite_read(sqlite_path)
     try:
         seg_row = conn.execute(
             """

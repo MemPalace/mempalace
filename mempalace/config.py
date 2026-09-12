@@ -265,6 +265,50 @@ def sqlite_read_uri(db_path: str) -> str:
     return f"file:{pathname2url(db_path)}?mode=ro"
 
 
+def _is_wal_without_sidecars(db_path: str) -> bool:
+    """True for a WAL database whose ``-wal``/``-shm`` sidecars are both absent.
+
+    Byte 18 of the SQLite header is the file format write version: 1 for a
+    rollback journal, 2 for WAL. Reading it costs one open and answers the
+    question a connection cannot answer without already being usable.
+    """
+    if os.path.exists(f"{db_path}-shm") or os.path.exists(f"{db_path}-wal"):
+        return False
+    try:
+        with open(db_path, "rb") as handle:
+            header = handle.read(19)
+    except OSError:
+        # Unreadable for another reason; let the normal open report it.
+        return False
+    return len(header) == 19 and header[:16] == b"SQLite format 3\x00" and header[18] == 2
+
+
+def connect_sqlite_read(db_path: str, *, timeout: float | None = None):
+    """Open ``db_path`` for reading, and keep reading when ``mode=ro`` cannot.
+
+    A WAL database whose ``-wal`` and ``-shm`` sidecars are absent cannot be
+    read through a read-only connection on every SQLite build: Apple's system
+    library, which CPython links on macOS, accepts the connect and then fails
+    the first statement with ``SQLITE_CANTOPEN``, because a read-only
+    connection may not create the shared-memory index that WAL needs. The
+    sidecars are absent exactly when nothing holds the palace open, which is
+    the ordinary state before this process opens chroma, so a healthy palace
+    came back as unreadable and the integrity gate refused every tool (#2489).
+
+    Only that case takes a normal open, which creates the sidecars the
+    read-only connection may not and takes SQLite's usual locks. ``immutable=1``
+    would also open, but it disables locking and can read a torn page set from
+    under a live writer, so it is not a substitute. Everything else keeps the
+    read-only connection it had.
+    """
+    import sqlite3
+
+    kwargs = {} if timeout is None else {"timeout": timeout}
+    if _is_wal_without_sidecars(db_path):
+        return sqlite3.connect(os.fspath(db_path), **kwargs)
+    return sqlite3.connect(sqlite_read_uri(db_path), uri=True, **kwargs)
+
+
 @lru_cache(maxsize=1)
 def get_configured_collection_name() -> str:
     """Return the configured drawer collection name without repeated config-file reads."""

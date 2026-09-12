@@ -26,7 +26,7 @@ from .backends import (
     PalaceNotFoundError,
     UnsupportedCapabilityError,
 )
-from .config import MempalaceConfig, sqlite_read_uri
+from .config import MempalaceConfig, connect_sqlite_read
 from .date_window import filed_at_in_window, parse_window
 from .i18n import _canonical_lang, get_stopwords
 from .palace import (
@@ -933,7 +933,7 @@ def _bm25_only_via_sqlite(
         return "".join(clauses), params
 
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
     except sqlite3.Error as e:
         return _search_error_result(f"sqlite open failed: {e}")
 
