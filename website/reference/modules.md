@@ -15,7 +15,7 @@ mempalace/
 │   ├── dialect.py             ← AAAK compression
 │   ├── miner.py               ← project file ingest
 │   ├── convo_miner.py         ← conversation ingest
-│   ├── searcher.py            ← semantic search
+│   ├── searcher/              ← hybrid BM25 + vector search package
 │   ├── layers.py              ← 4-layer memory stack
 │   ├── onboarding.py          ← guided setup
 │   ├── config.py              ← configuration loading
@@ -58,7 +58,7 @@ Argparse-based CLI with subcommands: `init`, `mine`, `split`, `search`, `compres
 
 JSON-RPC over stdin/stdout. Implements the MCP protocol with 36 tools covering palace read/write, drawer CRUD, knowledge graph, navigation, tunnels, agent diary, and system operations. Includes the Memory Protocol and AAAK Spec in status responses.
 
-### `searcher.py` — Semantic Search
+### `searcher/` — Semantic Search
 
 Two functions: `search()` for CLI output and `search_memories()` for programmatic use. Both query ChromaDB with optional wing/room filters and return verbatim drawer content with similarity scores.
 
