@@ -1,0 +1,106 @@
+name: Build Native Wheels & Binaries
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'crates/**'
+      - 'Cargo.*'
+      - '.github/workflows/release-native.yml'
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: Build wheels on ${{ matrix.os }} (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+      - name: Build wheels
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --locked --out dist -m crates/mempalace-py/Cargo.toml
+          sccache: 'true'
+      - name: Smoke-test wheel on matching host architecture
+        if: (runner.arch == 'X64' && startsWith(matrix.target, 'x86_64')) || (runner.arch == 'ARM64' && startsWith(matrix.target, 'aarch64'))
+        run: |
+          python -c "import glob, subprocess, sys; subprocess.check_call([sys.executable, '-m', 'pip', 'install', *glob.glob('dist/*.whl')])"
+          python -c "from mempalace_core_rs import NativeVectorIndex"
+      - name: Upload wheels
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist
+
+  binaries:
+    name: Build standalone CLI on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: mempalace-native-linux-amd64
+            binary_path: target/release/mempalace-native
+          - os: windows-latest
+            artifact_name: mempalace-native-windows-amd64.exe
+            binary_path: target/release/mempalace-native.exe
+          - os: macos-latest
+            artifact_name: mempalace-native-macos
+            binary_path: target/release/mempalace-native
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Build binary
+        run: cargo build --release --locked --bin mempalace-native
+      - name: Smoke-test executable
+        run: ${{ matrix.binary_path }} --help
+      - name: Stage binary
+        run: |
+          mkdir -p dist-bin
+          cp ${{ matrix.binary_path }} dist-bin/${{ matrix.artifact_name }}
+        shell: bash
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist-bin/${{ matrix.artifact_name }}
+
+  publish-assets:
+    if: github.event_name == 'release'
+    needs: [wheels, binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: native-assets
+          merge-multiple: true
+      - name: Attach native wheels and executables to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" native-assets/*

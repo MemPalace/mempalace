@@ -11,6 +11,7 @@ Subject → Predicate → Object [valid_from → valid_to]
 ```
 
 Facts have time windows. When something stops being true, you invalidate it — and historical queries still find it.
+When a single-valued fact changes, supersede it so the old and new values meet at one precise boundary.
 
 ## Usage
 
@@ -49,6 +50,28 @@ kg.invalidate("Kai", "works_on", "Orion", ended="2026-03-01")
 
 Now queries for Kai's current work won't return Orion. Historical queries still will.
 
+### Superseding Facts
+
+When a single-valued fact changes, use `supersede()` instead of hand-rolling `invalidate()` plus `add_triple()`:
+
+```python
+kg.add_triple("Kai", "uses_model", "gpt-4.1", valid_from="2026-01-01")
+
+kg.supersede(
+    "Kai",
+    "uses_model",
+    old_obj="gpt-4.1",
+    new_obj="gpt-5.6",
+    at="2026-07-20",
+)
+```
+
+`supersede()` closes the old fact and opens the new one in a single transaction with the same precise boundary.
+A query at the handoff returns only the successor, not both values.
+
+Use it for relationships that should have one current value, such as `uses_model`, `works_at`, or `lives_at`.
+Keep `invalidate()` for facts that simply ended, and use `add_triple()` for facts that can coexist.
+
 ### MCP Tools
 
 Through the MCP server, the knowledge graph is available as tools:
@@ -58,6 +81,7 @@ Through the MCP server, the knowledge graph is available as tools:
 | `mempalace_kg_query` | Query entity relationships with time filtering |
 | `mempalace_kg_add` | Add facts |
 | `mempalace_kg_invalidate` | Mark facts as ended |
+| `mempalace_kg_supersede` | Atomically replace one current fact with another |
 | `mempalace_kg_timeline` | Chronological entity story |
 | `mempalace_kg_stats` | Graph overview |
 

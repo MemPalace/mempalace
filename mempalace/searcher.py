@@ -15,6 +15,7 @@ import math
 import os
 import re
 import sqlite3
+from datetime import timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -26,6 +27,7 @@ from .backends import (
     UnsupportedCapabilityError,
 )
 from .config import MempalaceConfig, sqlite_read_uri
+from .date_window import filed_at_in_window, parse_window
 from .i18n import _canonical_lang, get_stopwords
 from .palace import (
     _open_collection_or_explain,
@@ -77,8 +79,16 @@ def _aligned_query_ids(results, document_count: int) -> list:
 
 
 def _result_drawer_id(meta, stored_drawer_id):
-    """Return the ID that round-trips through ``mempalace_get_drawer``."""
-    return (meta or {}).get("parent_drawer_id") or stored_drawer_id
+    """Return the ID that round-trips through ``mempalace_get_drawer``.
+
+    Chunk metadata carries the logical-group id under ``parent_drawer_id``
+    (``tool_add_drawer``) or ``parent_entry_id`` (``tool_diary_write``);
+    resolving both means a hit on a chunked diary entry reports the id that
+    fetches the WHOLE entry rather than the one chunk that matched (#2185).
+    Kept in sync with ``mcp_server._PARENT_ID_KEYS``.
+    """
+    meta = meta or {}
+    return meta.get("parent_drawer_id") or meta.get("parent_entry_id") or stored_drawer_id
 
 
 def _tokenize(text: str, stop_words: frozenset = frozenset()) -> list:
@@ -261,6 +271,64 @@ def _metric_for_collection(col) -> str:
         return "cosine"
     metric = str(metric or "cosine").lower()
     return metric if metric in ("cosine", "l2", "ip") else "cosine"
+
+
+def _vector_distance(
+    query_vector: list[float], candidate_vector: list[float], metric: str
+) -> float:
+    """Return a backend-style distance between two already-normalized vectors."""
+    if not query_vector or not candidate_vector or len(query_vector) != len(candidate_vector):
+        raise ValueError("embedding dimensions do not match")
+
+    if metric == "l2":
+        return math.sqrt(sum((a - b) ** 2 for a, b in zip(query_vector, candidate_vector)))
+
+    dot = sum(a * b for a, b in zip(query_vector, candidate_vector))
+    if metric == "ip":
+        return -dot
+
+    q_norm = math.sqrt(sum(a * a for a in query_vector))
+    c_norm = math.sqrt(sum(b * b for b in candidate_vector))
+    if q_norm == 0.0 or c_norm == 0.0:
+        raise ValueError("zero-norm embedding")
+    return 1.0 - (dot / (q_norm * c_norm))
+
+
+def _lexical_hit_vector_distances(drawers_col, query: str, lexical_hits: list, metric: str) -> dict:
+    """Compute vector distances for lexical hits when stored embeddings are available."""
+    ids = [hit.id for hit in lexical_hits if getattr(hit, "id", None)]
+    if not ids:
+        return {}
+
+    try:
+        from .backends.embedding_wrapper import _embed_texts
+
+        query_vector = _embed_texts([query])[0]
+        stored = drawers_col.get(ids=ids, include=["embeddings"])
+    except Exception:
+        logger.debug(
+            "candidate_strategy=union: failed to load lexical hit embeddings", exc_info=True
+        )
+        return {}
+
+    stored_ids = getattr(stored, "ids", None) if not isinstance(stored, dict) else stored.get("ids")
+    embeddings = (
+        getattr(stored, "embeddings", None)
+        if not isinstance(stored, dict)
+        else stored.get("embeddings")
+    )
+    if not stored_ids or not embeddings:
+        return {}
+
+    distances = {}
+    for doc_id, candidate_vector in zip(stored_ids, embeddings):
+        try:
+            distances[doc_id] = _vector_distance(query_vector, candidate_vector, metric)
+        except Exception:
+            logger.debug(
+                "candidate_strategy=union: failed to score lexical hit %s", doc_id, exc_info=True
+            )
+    return distances
 
 
 def _hybrid_rank(
@@ -524,6 +592,8 @@ def _print_search_results_bm25_only(
     room: str,
     n_results: int,
     stop_words: frozenset = frozenset(),
+    since_dt=None,
+    before_dt=None,
 ) -> None:
     """CLI fallback printer for when HNSW divergence fences off vector search.
 
@@ -536,6 +606,11 @@ def _print_search_results_bm25_only(
     :func:`_vector_disabled_search` forwards it on the MCP side: this path
     still ranks by BM25, so dropping the filter would rank a diverged
     palace by different rules than a healthy one.
+
+    An active ``[since_dt, before_dt)`` window is forwarded to the BM25
+    reader, which post-filters on it. A diverged index degrades the
+    ranking; it must never widen the result set past the window the
+    caller asked for.
     """
     result = _bm25_only_via_sqlite(
         query=query,
@@ -544,6 +619,8 @@ def _print_search_results_bm25_only(
         room=room,
         n_results=n_results,
         stop_words=stop_words,
+        since_dt=since_dt,
+        before_dt=before_dt,
     )
     hits = result.get("results", [])
 
@@ -577,44 +654,74 @@ def _print_search_results_bm25_only(
         for line in (hit.get("text", "") or "").strip().split("\n"):
             print(f"      {line}")
         print()
-        print(f"  {'─' * 56}")
+        print(f"  {'-' * 56}")
 
     print()
 
 
-def search(query: str, palace_path: str, wing: str = None, room: str = None, n_results: int = 5):
+def search(
+    query: str,
+    palace_path: str,
+    wing: str = None,
+    room: str = None,
+    n_results: int = 5,
+    since: str = None,
+    before: str = None,
+    collection=None,
+):
     """
     Search the palace. Returns verbatim drawer content.
-    Optionally filter by wing (project) or room (aspect).
+    Optionally filter by wing (project) or room (aspect), and/or narrow to
+    drawers whose ``filed_at`` falls in the ``[since, before)`` window —
+    same semantics as ``search_memories``/``list_drawers`` (#1128/#463).
     """
     # Resolved before the fence below: both exits from this function rank by
     # BM25, so the filter has to be in hand on either branch.
     stop_words = _resolve_stop_words(None)
+
+    # Parse the window before probing the palace: an inverted or malformed
+    # bound is a caller error and must raise identically whether or not the
+    # index turns out to be diverged.
+    try:
+        since_dt, before_dt = parse_window(since, before)
+    except ValueError as e:
+        print(f"\n  {e}")
+        raise SearchError(str(e)) from e
+    date_window_active = since_dt is not None or before_dt is not None
 
     # Probe a Chroma palace before get_collection(). Opening the client can
     # load native index state, and embedder-identity enforcement may call
     # collection.count(); both happen before the old query-only guard and can
     # hit the same native crash. Non-Chroma backends never use Chroma's HNSW
     # files or sqlite-specific fallback and proceed normally.
-    try:
-        backend_name = resolve_backend_name(palace_path)
-    except (BackendMismatchError, KeyError):
-        # Preserve _open_collection_or_explain's state-specific diagnostics
-        # for mixed artifacts and unknown backend selections. This probe is
-        # only an early Chroma safety fence; it must not become a second,
-        # less-helpful backend validation path.
-        backend_name = None
-
-    if backend_name == "chroma" and _hnsw_capacity_diverged(palace_path):
-        return _print_search_results_bm25_only(
-            query, palace_path, wing, room, n_results, stop_words=stop_words
-        )
-
-    col = _open_collection_or_explain(palace_path, opener=get_collection)
+    col = collection
     if col is None:
-        if not os.path.isdir(palace_path):
-            raise SearchError(f"No palace found at {palace_path}")
-        raise SearchError(f"No palace database at {palace_path}")
+        try:
+            backend_name = resolve_backend_name(palace_path)
+        except (BackendMismatchError, KeyError):
+            # Preserve _open_collection_or_explain's state-specific diagnostics
+            # for mixed artifacts and unknown backend selections. This probe is
+            # only an early Chroma safety fence; it must not become a second,
+            # less-helpful backend validation path.
+            backend_name = None
+
+        if backend_name == "chroma" and _hnsw_capacity_diverged(palace_path):
+            return _print_search_results_bm25_only(
+                query,
+                palace_path,
+                wing,
+                room,
+                n_results,
+                stop_words=stop_words,
+                since_dt=since_dt,
+                before_dt=before_dt,
+            )
+
+        col = _open_collection_or_explain(palace_path, opener=get_collection, read_only=True)
+        if col is None:
+            if not os.path.isdir(palace_path):
+                raise SearchError(f"No palace found at {palace_path}")
+            raise SearchError(f"No palace database at {palace_path}")
 
     # Alert the user if this palace predates hnsw:space=cosine being set on
     # creation — their similarity scores will be junk until they run repair.
@@ -625,13 +732,18 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     try:
         kwargs = {
             "query_texts": [query],
-            "n_results": n_results,
+            # The window is a post-filter (ChromaDB can't range-compare
+            # string metadata), so widen the fetch the same way the
+            # programmatic path does and trim back after filtering.
+            "n_results": _candidate_pool_size(n_results, date_window_active)
+            if date_window_active
+            else n_results,
             "include": ["documents", "metadatas", "distances"],
         }
         if where:
             kwargs["where"] = where
 
-        results = col.query(**kwargs)
+        results = _query_drawers_with_filter_fallback(col, kwargs, query, n_results, wing, room)
 
     except Exception as e:
         print(f"\n  Search error: {e}")
@@ -640,6 +752,19 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     docs = _first_or_empty(results, "documents")
     metas = _first_or_empty(results, "metadatas")
     dists = _first_or_empty(results, "distances")
+
+    if date_window_active:
+        kept = [
+            (doc, meta, dist)
+            for doc, meta, dist in zip(docs, metas, dists)
+            if filed_at_in_window((meta or {}).get("filed_at"), since_dt, before_dt)
+        ]
+        # Keep the whole in-window pool here; the hybrid re-rank below must
+        # see every survivor before the display cut to n_results, or a
+        # BM25-strong drawer deep in the pool could never surface.
+        docs = [k[0] for k in kept]
+        metas = [k[1] for k in kept]
+        dists = [k[2] for k in kept]
 
     if not docs:
         print(f'\n  No results found for: "{query}"')
@@ -659,6 +784,10 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         for doc, meta, dist in zip(docs, metas, dists)
     ]
     hits = _hybrid_rank(hits, query, metric=metric, stop_words=stop_words)
+    if date_window_active:
+        # The widened fetch exists only to survive the window filter; the
+        # display contract stays "top n_results", now cut AFTER the re-rank.
+        hits = hits[:n_results]
 
     print(f"\n{'=' * 60}")
     print(f'  Results for: "{query}"')
@@ -666,6 +795,10 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         print(f"  Wing: {wing}")
     if room:
         print(f"  Room: {room}")
+    if since:
+        print(f"  Since: {since}")
+    if before:
+        print(f"  Before: {before}")
     print(f"{'=' * 60}\n")
 
     for i, hit in enumerate(hits, 1):
@@ -684,9 +817,40 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         for line in hit["text"].strip().split("\n"):
             print(f"      {line}")
         print()
-        print(f"  {'─' * 56}")
+        print(f"  {'-' * 56}")
 
     print()
+
+
+def _window_sql_prefilters(since_dt, before_dt) -> list:
+    """(operator, bound-string) pairs for the SQL date-window narrowing.
+
+    A SQL-side *narrowing* on the ISO ``filed_at`` string, kept at
+    whole-DAY granularity so it is provably wider than the window for
+    every ISO-8601 spelling that shares the YYYY-MM-DD prefix (bare date,
+    space separator, minute precision, Z/offset suffixes) — a
+    full-isoformat bound would sort after some of those on the boundary
+    day and drop an in-window row at the SQL layer, where the
+    authoritative Python re-filter (offset drop, unparseable exclusion —
+    mirroring the wing/room double-check) can't recover it. Day
+    granularity costs at most one extra day of candidates per bound;
+    Python decides the exact window.
+    """
+    prefilters = []
+    if since_dt is not None:
+        prefilters.append((">=", since_dt.date().isoformat()))
+    if before_dt is not None:
+        try:
+            upper = (before_dt + timedelta(days=1)).date().isoformat()
+        except OverflowError:
+            # before at the calendar ceiling ("9999-12-31" as an open-ended
+            # sentinel): there is no next day to bound by, so skip the SQL
+            # narrowing entirely — the Python re-filter stays authoritative
+            # and such a window is effectively unbounded above anyway.
+            upper = None
+        if upper is not None:
+            prefilters.append(("<", upper))
+    return prefilters
 
 
 def _bm25_only_via_sqlite(
@@ -700,6 +864,8 @@ def _bm25_only_via_sqlite(
     _include_internal: bool = False,
     collection_name: str = None,
     stop_words: frozenset = frozenset(),
+    since_dt=None,
+    before_dt=None,
 ) -> dict:
     """BM25-only search reading drawers directly from chroma.sqlite3.
 
@@ -751,6 +917,19 @@ def _bm25_only_via_sqlite(
                 """
             )
             params.extend([key, value])
+        for op, sql_bound in _window_sql_prefilters(since_dt, before_dt):
+            clauses.append(
+                f"""
+                AND EXISTS (
+                    SELECT 1
+                    FROM embedding_metadata mf
+                    WHERE mf.id = {row_id_expr}
+                      AND mf.key = 'filed_at'
+                      AND mf.string_value {op} ?
+                )
+                """
+            )
+            params.append(sql_bound)
         return "".join(clauses), params
 
     try:
@@ -758,6 +937,7 @@ def _bm25_only_via_sqlite(
     except sqlite3.Error as e:
         return _search_error_result(f"sqlite open failed: {e}")
 
+    window_active = since_dt is not None or before_dt is not None
     try:
         # FTS5 MATCH expects whitespace-separated tokens. Drop tokens
         # shorter than 3 chars (trigram tokenizer can't match them).
@@ -841,6 +1021,11 @@ def _bm25_only_via_sqlite(
                     logger.debug("id-ordered fallback also failed", exc_info=True)
                     candidate_ids = []
 
+        # A full candidate page means rows beyond it never got a chance to
+        # match the window — mirror the vector path's truncation honesty
+        # (``date_filter_pool_truncated``) instead of a silently thin result.
+        window_pool_truncated = window_active and len(candidate_ids) >= max_candidates
+
         if not candidate_ids:
             return {
                 "query": query,
@@ -891,6 +1076,8 @@ def _bm25_only_via_sqlite(
             continue
         if source_file and meta.get("source_file") != source_file:
             continue
+        if window_active and not filed_at_in_window(meta.get("filed_at"), since_dt, before_dt):
+            continue
         full_source = meta.get("source_file", "") or ""
         candidates.append(
             {
@@ -934,7 +1121,7 @@ def _bm25_only_via_sqlite(
             h.pop("_source_file_full", None)
             h.pop("_chunk_index", None)
 
-    return {
+    result = {
         "query": query,
         "filters": {"wing": wing, "room": room, "source_file": source_file},
         "total_before_filter": len(candidates),
@@ -942,6 +1129,9 @@ def _bm25_only_via_sqlite(
         "fallback": "bm25_only_via_sqlite",
         "fallback_reason": "vector_search_disabled",
     }
+    if window_pool_truncated:
+        result["date_filter_pool_truncated"] = True
+    return result
 
 
 def _merge_bm25_union_candidates(
@@ -954,6 +1144,8 @@ def _merge_bm25_union_candidates(
     max_distance: float = 0.0,
     source_file: str = None,
     stop_words: frozenset = frozenset(),
+    since_dt=None,
+    before_dt=None,
 ) -> None:
     """Append top-K backend lexical candidates into ``hits`` in place.
 
@@ -968,18 +1160,12 @@ def _merge_bm25_union_candidates(
     contributing chunk M of the same file. Falls back to ``source_file``
     only when full-path/chunk metadata is absent.
 
-    BM25-only additions carry ``distance=None`` so ``_hybrid_rank`` scores
-    them on BM25 contribution alone.
-
-    When ``max_distance > 0.0`` (a strict vector-distance threshold is
-    set), BM25-only candidates are skipped entirely — they have no vector
-    distance to satisfy the threshold, and silently injecting them would
-    break the existing ``max_distance`` guarantee that hybrid results lie
-    within the requested vector-distance bound.
+    BM25-only additions carry ``distance=None`` unless a strict
+    ``max_distance`` threshold is set. Under a threshold, union mode loads
+    stored embeddings for lexical hits and computes their vector distance
+    before admitting them, preserving the same distance guarantee as the
+    vector-only path.
     """
-    if max_distance > 0.0:
-        return
-
     where = build_where_filter(wing, room, source_file)
     try:
         lexical = drawers_col.lexical_search(
@@ -993,10 +1179,29 @@ def _merge_bm25_union_candidates(
         logger.debug("candidate_strategy=union: lexical fetch failed", exc_info=True)
         return
 
+    metric = _metric_for_collection(drawers_col)
+    lexical_distances = (
+        _lexical_hit_vector_distances(drawers_col, query, lexical.hits, metric)
+        if max_distance > 0.0
+        else {}
+    )
+
     bm25_extra = []
     for hit in lexical.hits:
         meta = hit.metadata or {}
+        # The window applies to every candidate source; a lexically strong
+        # drawer outside [since, before) must not enter through this side
+        # door (the vector-path candidates are filtered upstream).
+        if (since_dt is not None or before_dt is not None) and not filed_at_in_window(
+            meta.get("filed_at"), since_dt, before_dt
+        ):
+            continue
         full_source = meta.get("source_file", "") or ""
+        distance = lexical_distances.get(hit.id)
+        if max_distance > 0.0:
+            if distance is None or distance > max_distance:
+                continue
+            distance = round(distance, 4)
         bm25_extra.append(
             {
                 "drawer_id": _result_drawer_id(meta, hit.id),
@@ -1007,9 +1212,13 @@ def _merge_bm25_union_candidates(
                 "source_path": full_source,
                 "created_at": meta.get("filed_at", "unknown"),
                 "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
-                "similarity": None,
-                "distance": None,
-                "effective_distance": None,
+                "similarity": (
+                    None
+                    if distance is None
+                    else round(_distance_to_similarity(distance, metric), 3)
+                ),
+                "distance": distance,
+                "effective_distance": distance,
                 "closet_boost": 0.0,
                 "matched_via": "bm25_backend",
                 "bm25_score": round(float(hit.score), 3),
@@ -1033,11 +1242,261 @@ def _merge_bm25_union_candidates(
         key = _dedup_key(bh)
         if not key or key == "?" or key in seen:
             continue
-        bh["distance"] = None
-        bh["effective_distance"] = None
         bh["closet_boost"] = 0.0
         hits.append(bh)
         seen.add(key)
+
+
+def _candidate_pool_size(n_results: int, date_window_active: bool) -> int:
+    """Rerank-pool size for the drawer vector query.
+
+    Without a date window this is the historical ``n_results * 3``
+    over-fetch. With one, the window filters the pool AFTER retrieval
+    (ChromaDB rejects string operands for ``$gte``/``$lt``, so ``filed_at``
+    can't be range-filtered server-side), and a narrow window over a large
+    palace would starve a 3x pool even though matching drawers exist —
+    recall is the design requirement. Widen to ``n_results * 15``, capped
+    at 500 (the ceiling the filter-fallback path already uses) — except
+    the pool never drops below ``n_results`` itself, or an oversized
+    request could return fewer rows than an unfiltered query would.
+    ``date_filter_pool_truncated`` in the response flags a full pool so a
+    capped result is never silent.
+    """
+    if not date_window_active:
+        return n_results * 3
+    return max(min(n_results * 15, 500), n_results)
+
+
+_CLOSET_RESULT_POOL_MULTIPLIER = 4
+_MAX_HYDRATION_CHARS = 10000
+
+
+def _candidate_pool_limits(
+    candidate_strategy: str,
+    n_results: int,
+    date_window_active: bool = False,
+) -> tuple[int, int]:
+    """Return vector-query and pre-enrichment candidate limits.
+
+    Date-window searches retain the wider current-develop pool because the
+    timestamp constraint is applied after retrieval. The normal vector path
+    also remains at least four times wide through closet enrichment. Union
+    mode keeps only the requested top vector candidates before lexical merge.
+    """
+    base_query_limit = _candidate_pool_size(
+        n_results,
+        date_window_active,
+    )
+
+    if candidate_strategy == "union":
+        return base_query_limit, n_results
+
+    widened = max(
+        base_query_limit,
+        n_results * _CLOSET_RESULT_POOL_MULTIPLIER,
+    )
+    return widened, widened
+
+
+def _enrich_closet_hits(
+    hits: list,
+    drawers_col,
+    query: str,
+    stop_words: frozenset = frozenset(),
+) -> list:
+    """Hydrate closet-boosted hits and memoise each source/group fetch."""
+    query_terms = set(
+        _tokenize(
+            query,
+            stop_words,
+        )
+    )
+    source_cache: dict = {}
+
+    for hit in hits:
+        if hit.get("matched_via") == "drawer":
+            continue
+
+        full_source = hit.get("_source_file_full") or ""
+
+        if not full_source:
+            continue
+
+        parent_drawer_id = hit.get("_parent_drawer_id") or None
+        cache_key = (
+            full_source,
+            parent_drawer_id,
+        )
+
+        if cache_key not in source_cache:
+            try:
+                source_drawers = drawers_col.get(
+                    where=(
+                        _scoped_source_filter(
+                            full_source,
+                            parent_drawer_id,
+                        )
+                    ),
+                    include=[
+                        "documents",
+                        "metadatas",
+                    ],
+                )
+            except Exception:
+                logger.debug(
+                    "Neighbor fetch failed for %s",
+                    full_source,
+                    exc_info=True,
+                )
+                source_cache[cache_key] = None
+            else:
+                source_cache[cache_key] = (
+                    list(
+                        getattr(
+                            source_drawers,
+                            "documents",
+                            None,
+                        )
+                        or []
+                    ),
+                    list(
+                        getattr(
+                            source_drawers,
+                            "metadatas",
+                            None,
+                        )
+                        or []
+                    ),
+                )
+
+        cached = source_cache[cache_key]
+
+        if cached is None:
+            continue
+
+        docs, metadatas = cached
+
+        if len(docs) <= 1:
+            continue
+
+        indexed = []
+
+        for index, (
+            document,
+            metadata,
+        ) in enumerate(
+            zip(
+                docs,
+                metadatas,
+            )
+        ):
+            chunk_index = (
+                metadata.get(
+                    "chunk_index",
+                    index,
+                )
+                if isinstance(
+                    metadata,
+                    dict,
+                )
+                else index
+            )
+
+            if not isinstance(
+                chunk_index,
+                int,
+            ):
+                chunk_index = index
+
+            indexed.append(
+                (
+                    chunk_index,
+                    document or "",
+                )
+            )
+
+        indexed.sort(key=lambda pair: pair[0])
+        ordered_docs = [document for _, document in indexed]
+
+        best_index = 0
+        best_score = -1
+
+        for index, document in enumerate(ordered_docs):
+            lowered = document.lower()
+            score = sum(1 for term in query_terms if term in lowered)
+
+            if score > best_score:
+                best_score = score
+                best_index = index
+
+        start = max(
+            0,
+            best_index - 1,
+        )
+        end = min(
+            len(ordered_docs),
+            best_index + 2,
+        )
+        expanded = "\n\n".join(ordered_docs[start:end])
+
+        if len(expanded) > _MAX_HYDRATION_CHARS:
+            expanded = expanded[:_MAX_HYDRATION_CHARS] + (
+                f"\n\n[...truncated. "
+                f"{len(ordered_docs)} total drawers. "
+                "Use mempalace_get_drawer "
+                "for full content.]"
+            )
+
+        hit["text"] = expanded
+        hit["drawer_index"] = best_index
+        hit["total_drawers"] = len(ordered_docs)
+
+    return hits
+
+
+def _dedupe_rendered_hits(
+    hits: list,
+) -> list:
+    """Drop repeated closet-rendered passages while preserving rank order.
+
+    Plain drawer hits retain their historical behavior, including legitimate
+    exact repeats at different source positions. A duplicate is removed only
+    when either occurrence came through closet enrichment.
+    """
+    unique = []
+    first_by_key: dict = {}
+
+    for hit in hits:
+        source = hit.get("_source_file_full") or hit.get("source_path") or hit.get("source_file")
+        text = hit.get("text")
+
+        if not source or not isinstance(
+            text,
+            str,
+        ):
+            unique.append(hit)
+            continue
+
+        key = (
+            source,
+            text,
+        )
+        previous = first_by_key.get(key)
+
+        if previous is None:
+            first_by_key[key] = hit
+            unique.append(hit)
+            continue
+
+        previous_is_closet = previous.get("matched_via") == "drawer+closet"
+        current_is_closet = hit.get("matched_via") == "drawer+closet"
+
+        if previous_is_closet or current_is_closet:
+            continue
+
+        unique.append(hit)
+
+    return unique
 
 
 # Strategy dispatch — keeps search_memories' branch count under the
@@ -1072,6 +1531,8 @@ def _apply_candidate_strategy(
     n_results: int,
     max_distance: float = 0.0,
     source_file: str = None,
+    since_dt=None,
+    before_dt=None,
 ) -> None:
     """Dispatch to the registered merger for ``strategy``.
 
@@ -1089,6 +1550,8 @@ def _apply_candidate_strategy(
             n_results,
             max_distance=max_distance,
             source_file=source_file,
+            since_dt=since_dt,
+            before_dt=before_dt,
         )
 
 
@@ -1104,6 +1567,8 @@ def _finalize_candidate_hits(
     max_distance: float,
     source_file: str = None,
     stop_words: frozenset = frozenset(),
+    since_dt=None,
+    before_dt=None,
 ) -> tuple:
     try:
         _apply_candidate_strategy(
@@ -1116,6 +1581,8 @@ def _finalize_candidate_hits(
             n_results,
             max_distance=max_distance,
             source_file=source_file,
+            since_dt=since_dt,
+            before_dt=before_dt,
         )
     except UnsupportedCapabilityError:
         return [], _search_error_result(
@@ -1126,14 +1593,20 @@ def _finalize_candidate_hits(
             ),
         )
 
-    hits = _hybrid_rank(
-        hits, query, metric=_metric_for_collection(drawers_col), stop_words=stop_words
-    )[:n_results]
-    for h in hits:
-        h.pop("_sort_key", None)
-        h.pop("_source_file_full", None)
-        h.pop("_chunk_index", None)
-        h.pop("_parent_drawer_id", None)
+    ranked = _hybrid_rank(
+        hits,
+        query,
+        metric=_metric_for_collection(drawers_col),
+        stop_words=stop_words,
+    )
+    hits = _dedupe_rendered_hits(ranked)[:n_results]
+
+    for hit in hits:
+        hit.pop("_sort_key", None)
+        hit.pop("_source_file_full", None)
+        hit.pop("_chunk_index", None)
+        hit.pop("_parent_drawer_id", None)
+
     return hits, None
 
 
@@ -1165,6 +1638,149 @@ def _unknown_backend_result(error: KeyError) -> dict:
     )
 
 
+def _search_result_envelope(
+    *,
+    query: str,
+    wing,
+    room,
+    source_file,
+    since,
+    before,
+    hits: list,
+    candidates_fetched: int,
+    pool_size: int,
+    date_window_active: bool,
+) -> dict:
+    """Assemble the ``search_memories`` response dict.
+
+    When a date window is active and the widened candidate pool came back
+    full, drawers beyond the pool never got a chance to match the window —
+    ``date_filter_pool_truncated`` flags it so a thin result under a date
+    filter is never mistaken for "that's all there was".
+    """
+    result = {
+        "query": query,
+        "filters": {
+            "wing": wing,
+            "room": room,
+            "source_file": source_file,
+            "since": since,
+            "before": before,
+        },
+        "total_before_filter": candidates_fetched,
+        "results": hits,
+    }
+    if date_window_active and candidates_fetched >= pool_size:
+        result["date_filter_pool_truncated"] = True
+    return result
+
+
+def _window_and_fallback_gate(
+    since,
+    before,
+    vector_disabled: bool,
+    *,
+    query: str,
+    palace_path: str,
+    wing,
+    room,
+    n_results: int,
+    collection_name,
+    source_file,
+    stop_words: frozenset = frozenset(),
+):
+    """Front gate for ``search_memories``: parse the window, route the fallback.
+
+    Returns ``(since_dt, before_dt, active, short_circuit)``.
+    ``short_circuit`` is a complete response to return verbatim — the
+    ``{"error": ...}`` payload for an invalid/inverted window, or the
+    BM25-only fallback result when ``vector_disabled`` is set — and ``None``
+    when the vector path should proceed. Extracted so the window plumbing
+    doesn't push ``search_memories`` over the C901 complexity ceiling.
+    """
+    try:
+        since_dt, before_dt = parse_window(since, before)
+    except ValueError as e:
+        return None, None, False, {"error": str(e)}
+    active = since_dt is not None or before_dt is not None
+    if vector_disabled:
+        return (
+            since_dt,
+            before_dt,
+            active,
+            _vector_disabled_with_window(
+                query=query,
+                palace_path=palace_path,
+                wing=wing,
+                room=room,
+                n_results=n_results,
+                collection_name=collection_name,
+                source_file=source_file,
+                since=since,
+                before=before,
+                since_dt=since_dt,
+                before_dt=before_dt,
+                stop_words=stop_words,
+            ),
+        )
+    return since_dt, before_dt, active, None
+
+
+def _candidate_out_of_scope(dist, meta, max_distance, since_dt, before_dt) -> bool:
+    """True when a drawer candidate fails the distance or date-window gate.
+
+    Distance is checked on the raw value before rounding to avoid precision
+    loss (pre-existing behavior); the date window applies whenever a bound
+    is set, with the shared ``[since, before)`` semantics.
+    """
+    if max_distance > 0.0 and dist > max_distance:
+        return True
+    if (since_dt is not None or before_dt is not None) and not filed_at_in_window(
+        meta.get("filed_at"), since_dt, before_dt
+    ):
+        return True
+    return False
+
+
+def _vector_disabled_with_window(
+    *,
+    query: str,
+    palace_path: str,
+    wing: str,
+    room: str,
+    n_results: int,
+    collection_name: str,
+    source_file: str,
+    since: str,
+    before: str,
+    since_dt,
+    before_dt,
+    stop_words: frozenset = frozenset(),
+) -> dict:
+    """Run the BM25-only route and echo the raw window strings.
+
+    The fallback helper takes parsed bounds; the caller's raw ``since``/
+    ``before`` strings are stitched into the ``filters`` envelope here so
+    both search paths report the same shape.
+    """
+    result = _vector_disabled_search(
+        query=query,
+        palace_path=palace_path,
+        wing=wing,
+        room=room,
+        n_results=n_results,
+        collection_name=collection_name,
+        source_file=source_file,
+        since_dt=since_dt,
+        before_dt=before_dt,
+        stop_words=stop_words,
+    )
+    if "filters" in result:
+        result["filters"]["since"] = since
+        result["filters"]["before"] = before
+    return result
+
+
 def _vector_disabled_search(
     *,
     query: str,
@@ -1175,6 +1791,8 @@ def _vector_disabled_search(
     collection_name: str,
     source_file: str = None,
     stop_words: frozenset = frozenset(),
+    since_dt=None,
+    before_dt=None,
 ) -> dict:
     try:
         backend_name = resolve_backend_name(palace_path)
@@ -1198,12 +1816,16 @@ def _vector_disabled_search(
         n_results=n_results,
         collection_name=collection_name,
         stop_words=stop_words,
+        since_dt=since_dt,
+        before_dt=before_dt,
     )
 
 
 def _open_search_collection(palace_path: str, collection_name: str):
     try:
-        return get_collection(palace_path, collection_name=collection_name, create=False), None
+        return get_collection(
+            palace_path, collection_name=collection_name, create=False, read_only=True
+        ), None
     except BackendMismatchError as e:
         return None, _backend_mismatch_result(e)
     except KeyError as e:
@@ -1285,12 +1907,65 @@ def _query_drawers_with_filter_fallback(
         }
 
 
+def _backend_capabilities(col) -> frozenset:
+    backend = getattr(col, "_backend", None)
+    if backend is None:
+        inner = getattr(col, "_inner", None)
+        backend = getattr(inner, "_backend", None) if inner is not None else None
+    caps = getattr(backend, "capabilities", None) if backend is not None else None
+    return caps if isinstance(caps, (set, frozenset)) else frozenset()
+
+
+def _closet_boosts(closets_col, *, query: str, n_results: int, where: dict) -> dict:
+    """Best-per-source closet hits used as a rank boost, never a gate.
+
+    sqlite_exact (and any lexical backend) uses FTS instead of a second
+    exact-cosine scan over the closet collection — closets are pointer
+    lines, so BM25 is the better signal anyway.
+    """
+    boosts: dict = {}
+    n_hits = max(1, n_results * 2)
+    if "supports_lexical_search" in _backend_capabilities(closets_col):
+        result = closets_col.lexical_search(query=query, n_results=n_hits, where=where or None)
+        hits = getattr(result, "hits", None) or []
+        for rank, hit in enumerate(hits):
+            meta = hit.metadata or {}
+            source = meta.get("source_file", "")
+            if source and source not in boosts:
+                preview = (hit.document or "")[:200]
+                boosts[source] = (rank, 0.0, preview)
+        return boosts
+
+    ckwargs = {
+        "query_texts": [query],
+        "n_results": n_hits,
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if where:
+        ckwargs["where"] = where
+    closet_results = closets_col.query(**ckwargs)
+    for rank, (cdoc, cmeta, cdist) in enumerate(
+        zip(
+            _first_or_empty(closet_results, "documents"),
+            _first_or_empty(closet_results, "metadatas"),
+            _first_or_empty(closet_results, "distances"),
+        )
+    ):
+        cmeta = cmeta or {}
+        source = cmeta.get("source_file", "")
+        if source and source not in boosts:
+            boosts[source] = (rank, cdist, (cdoc or "")[:200])
+    return boosts
+
+
 def search_memories(
     query: str,
     palace_path: str,
     wing: str = None,
     room: str = None,
     source_file: str = None,
+    since: str = None,
+    before: str = None,
     n_results: int = 5,
     max_distance: float = 0.0,
     vector_disabled: bool = False,
@@ -1309,6 +1984,16 @@ def search_memories(
         room: Optional room filter.
         source_file: Optional exact source_file filter. Matches the full
             stored source_file value verbatim (#1815).
+        since: Optional inclusive ISO date/datetime lower bound on a
+            drawer's ``filed_at`` (ingest time, the ``created_at`` shown in
+            results) — ``[since, before)`` window semantics shared with
+            ``list_drawers`` (#1128): wall-clock naive comparison, drawers
+            with missing/unparseable ``filed_at`` excluded while a bound is
+            active. Filtering happens after retrieval (ChromaDB rejects
+            string operands for ``$gte``/``$lt``), so the candidate pool is
+            widened via ``_candidate_pool_size`` — see
+            ``date_filter_pool_truncated`` in the response.
+        before: Optional exclusive ISO upper bound; see ``since``.
         n_results: Max results to return.
         max_distance: Max cosine distance threshold. The palace collection uses
             cosine distance (hnsw:space=cosine) — 0 = identical, 2 = opposite.
@@ -1321,7 +2006,7 @@ def search_memories(
         candidate_strategy: How candidates for the hybrid re-rank are gathered.
 
             * ``"vector"`` (default) — preserves historical behavior: top
-              ``n_results * 3`` rows from the vector index are the rerank pool.
+              ``n_results * 4`` rows from the vector index are the rerank pool.
               Cheap; works well when query and target docs agree in the
               embedding space.
             * ``"union"`` — also pull top ``n_results * 3`` lexical candidates
@@ -1332,8 +2017,8 @@ def search_memories(
               characterized.
 
               When ``max_distance > 0.0`` is also set, BM25-only candidates
-              are skipped — they have no vector distance and would silently
-              violate the requested distance threshold.
+              are admitted only if their stored embeddings can be loaded and
+              their computed vector distance satisfies that threshold.
         lang: Locale code for BM25 stop-word filtering (opt-in). When
             omitted, reads ``MempalaceConfig().lang_explicit`` — returns an
             empty set unless the user has set ``MEMPALACE_LANG`` /
@@ -1351,17 +2036,21 @@ def search_memories(
     # candidate gather) tokenizes against the same locale.
     stop_words = _resolve_stop_words(lang)
 
-    if vector_disabled:
-        return _vector_disabled_search(
-            query=query,
-            palace_path=palace_path,
-            wing=wing,
-            room=room,
-            n_results=n_results,
-            collection_name=collection_name,
-            source_file=source_file,
-            stop_words=stop_words,
-        )
+    since_dt, before_dt, date_window_active, short_circuit = _window_and_fallback_gate(
+        since,
+        before,
+        vector_disabled,
+        query=query,
+        palace_path=palace_path,
+        wing=wing,
+        room=room,
+        n_results=n_results,
+        collection_name=collection_name,
+        source_file=source_file,
+        stop_words=stop_words,
+    )
+    if short_circuit is not None:
+        return short_circuit
 
     drawers_col, open_error = _open_search_collection(palace_path, collection_name)
     if open_error:
@@ -1377,10 +2066,15 @@ def search_memories(
     # This avoids the "weak-closets regression" where narrative content
     # produces low-signal closets (regex extraction matches few topics)
     # and closet-first routing hides drawers that direct search would find.
+    pool_size, pre_enrichment_limit = _candidate_pool_limits(
+        candidate_strategy,
+        n_results,
+        date_window_active,
+    )
     try:
         dkwargs = {
             "query_texts": [query],
-            "n_results": n_results * 3,  # over-fetch for re-ranking
+            "n_results": pool_size,  # over-fetch for re-ranking
             "include": ["documents", "metadatas", "distances"],
         }
         if where:
@@ -1394,26 +2088,10 @@ def search_memories(
     # Gather closet hits (best-per-source) to build a boost lookup.
     closet_boost_by_source: dict = {}  # source_file -> (rank, closet_dist, preview)
     try:
-        closets_col = get_closets_collection(palace_path, create=False)
-        ckwargs = {
-            "query_texts": [query],
-            "n_results": n_results * 2,
-            "include": ["documents", "metadatas", "distances"],
-        }
-        if where:
-            ckwargs["where"] = where
-        closet_results = closets_col.query(**ckwargs)
-        for rank, (cdoc, cmeta, cdist) in enumerate(
-            zip(
-                _first_or_empty(closet_results, "documents"),
-                _first_or_empty(closet_results, "metadatas"),
-                _first_or_empty(closet_results, "distances"),
-            )
-        ):
-            cmeta = cmeta or {}
-            source = cmeta.get("source_file", "")
-            if source and source not in closet_boost_by_source:
-                closet_boost_by_source[source] = (rank, cdist, cdoc[:200])
+        closets_col = get_closets_collection(palace_path, create=False, read_only=True)
+        closet_boost_by_source = _closet_boosts(
+            closets_col, query=query, n_results=n_results, where=where
+        )
     except Exception:
         # No closets yet — hybrid degrades to pure drawer search.
         logger.debug("Closet collection unavailable; using drawer-only search", exc_info=True)
@@ -1435,8 +2113,7 @@ def search_memories(
     ):
         meta = meta or {}
         doc = doc or ""
-        # Filter on raw distance before rounding to avoid precision loss.
-        if max_distance > 0.0 and dist > max_distance:
+        if _candidate_out_of_scope(dist, meta, max_distance, since_dt, before_dt):
             continue
 
         meta = meta or {}
@@ -1468,7 +2145,9 @@ def search_memories(
             "source_path": source,
             "created_at": meta.get("filed_at", "unknown"),
             "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
-            "similarity": round(_distance_to_similarity(effective_dist, metric), 3),
+            # Similarity is the raw vector score. Closet boost ranks via
+            # effective_distance but must not inflate the advertised score.
+            "similarity": round(_distance_to_similarity(dist, metric), 3),
             "distance": round(dist, 4),
             "effective_distance": round(effective_dist, 4),
             "closet_boost": round(boost, 3),
@@ -1487,65 +2166,16 @@ def search_memories(
         scored.append(entry)
 
     scored.sort(key=lambda h: h["_sort_key"])
-    hits = scored[:n_results]
+    hits = scored[:pre_enrichment_limit]
 
-    # Drawer-grep enrichment: for closet-boosted hits whose source has
-    # multiple drawers, return the keyword-best chunk + its immediate
-    # neighbors instead of just the drawer vector search landed on. The
-    # closet said "this source is relevant"; vector may have picked the
-    # wrong chunk within it; grep picks the right one.
-    MAX_HYDRATION_CHARS = 10000
-    for h in hits:
-        if h["matched_via"] == "drawer":
-            continue
-        full_source = h.get("_source_file_full") or ""
-        if not full_source:
-            continue
-        # Narrow by ``parent_drawer_id`` when present so unrelated
-        # chunked drawers sharing ``source_file`` do not stitch (#1580).
-        try:
-            source_drawers = drawers_col.get(
-                where=_scoped_source_filter(full_source, h.get("_parent_drawer_id")),
-                include=["documents", "metadatas"],
-            )
-        except Exception:
-            logger.debug("Neighbor fetch failed for %s", full_source, exc_info=True)
-            continue
-        docs = source_drawers.documents
-        metas_ = source_drawers.metadatas
-        if len(docs) <= 1:
-            continue
-
-        # Sort by chunk_index so best_idx + neighbors are positional.
-        indexed = []
-        for idx, (d, m) in enumerate(zip(docs, metas_)):
-            ci = m.get("chunk_index", idx) if isinstance(m, dict) else idx
-            if not isinstance(ci, int):
-                ci = idx
-            indexed.append((ci, d))
-        indexed.sort(key=lambda p: p[0])
-        ordered_docs = [d for _, d in indexed]
-
-        query_terms = set(_tokenize(query, stop_words))
-        best_idx, best_score = 0, -1
-        for idx, d in enumerate(ordered_docs):
-            d_lower = d.lower()
-            s = sum(1 for t in query_terms if t in d_lower)
-            if s > best_score:
-                best_score, best_idx = s, idx
-
-        start = max(0, best_idx - 1)
-        end = min(len(ordered_docs), best_idx + 2)
-        expanded = "\n\n".join(ordered_docs[start:end])
-        if len(expanded) > MAX_HYDRATION_CHARS:
-            expanded = (
-                expanded[:MAX_HYDRATION_CHARS]
-                + f"\n\n[...truncated. {len(ordered_docs)} total drawers. "
-                "Use mempalace_get_drawer for full content.]"
-            )
-        h["text"] = expanded
-        h["drawer_index"] = best_idx
-        h["total_drawers"] = len(ordered_docs)
+    # Drawer-grep enrichment: retain the wider pool until repeated
+    # closet-rendered passages can be replaced by distinct candidates.
+    _enrich_closet_hits(
+        hits,
+        drawers_col,
+        query,
+        stop_words=stop_words,
+    )
 
     # Candidate strategy hook: optionally widen the rerank pool's *source*
     # before ranking. Default ("vector") is a no-op; "union" merges top-K
@@ -1566,16 +2196,24 @@ def search_memories(
         max_distance=max_distance,
         source_file=source_file,
         stop_words=stop_words,
+        since_dt=since_dt,
+        before_dt=before_dt,
     )
     if strategy_error:
         return strategy_error
 
-    return {
-        "query": query,
-        "filters": {"wing": wing, "room": room, "source_file": source_file},
-        "total_before_filter": len(_first_or_empty(drawer_results, "documents")),
-        "results": hits,
-    }
+    return _search_result_envelope(
+        query=query,
+        wing=wing,
+        room=room,
+        source_file=source_file,
+        since=since,
+        before=before,
+        hits=hits,
+        candidates_fetched=len(_first_or_empty(drawer_results, "documents")),
+        pool_size=pool_size,
+        date_window_active=date_window_active,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

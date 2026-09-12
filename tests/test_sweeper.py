@@ -316,3 +316,104 @@ class TestSweeperDrawerMetadata:
                 "user",
                 "assistant",
             ), f"Drawer missing or wrong role metadata: {m}"
+
+
+class TestSweeperDuplicateMessageIds:
+    def test_sweep_collapses_repeated_uuid_last_record_wins(
+        self,
+        tmp_path,
+    ):
+        from mempalace.palace import get_collection
+        from mempalace.sweeper import _drawer_id_for_message, sweep
+
+        session_id = "00000000-0000-0000-0000-00000000aaaa"
+        repeated_uuid = "11111111-1111-1111-1111-111111111111"
+        assistant_uuid = "22222222-2222-2222-2222-222222222222"
+
+        records = [
+            {
+                "type": "user",
+                "uuid": repeated_uuid,
+                "sessionId": session_id,
+                "timestamp": "2020-01-01T00:00:01.000Z",
+                "message": {
+                    "role": "user",
+                    "content": "first copy",
+                },
+            },
+            {
+                "type": "user",
+                "uuid": repeated_uuid,
+                "sessionId": session_id,
+                "timestamp": "2020-01-01T00:00:02.000Z",
+                "message": {
+                    "role": "user",
+                    "content": "second copy, same uuid",
+                },
+            },
+            {
+                "type": "assistant",
+                "uuid": assistant_uuid,
+                "sessionId": session_id,
+                "timestamp": "2020-01-01T00:00:03.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": "ok",
+                },
+            },
+        ]
+
+        jsonl_path = tmp_path / "session.jsonl"
+        jsonl_path.write_text(
+            "".join(json.dumps(record) + "\n" for record in records),
+            encoding="utf-8",
+        )
+        palace_path = str(tmp_path / "palace")
+
+        result = sweep(
+            str(jsonl_path),
+            palace_path,
+        )
+
+        assert result["drawers_added"] == 2
+        assert result["drawers_already_present"] == 0
+        assert result["drawers_upserted"] == 2
+        assert result["drawers_skipped"] == 0
+
+        collection = get_collection(
+            palace_path,
+            create=False,
+        )
+        repeated_id = _drawer_id_for_message(
+            session_id,
+            repeated_uuid,
+        )
+        assistant_id = _drawer_id_for_message(
+            session_id,
+            assistant_uuid,
+        )
+
+        rows = collection.get(
+            ids=[repeated_id, assistant_id],
+            include=["documents", "metadatas"],
+        )
+
+        by_id = {
+            drawer_id: (document, metadata)
+            for drawer_id, document, metadata in zip(
+                rows["ids"],
+                rows["documents"],
+                rows["metadatas"],
+            )
+        }
+
+        assert set(by_id) == {
+            repeated_id,
+            assistant_id,
+        }
+
+        repeated_document, repeated_metadata = by_id[repeated_id]
+
+        assert repeated_document == "USER: second copy, same uuid"
+        assert repeated_metadata["timestamp"] == "2020-01-01T00:00:02.000Z"
+        assert by_id[assistant_id][0] == "ASSISTANT: ok"

@@ -141,11 +141,10 @@ class TestCandidateUnion:
             f"union must trim to n_results=2; got {len(result['results'])} results"
         )
 
-    def test_union_skipped_when_max_distance_set(self, tmp_path):
-        """``max_distance`` is a vector-distance threshold; BM25-only
-        candidates have ``distance=None`` and cannot satisfy it. Union
-        must not silently inject them when a strict threshold is set,
-        otherwise the existing ``max_distance`` guarantee regresses."""
+    def test_union_respects_max_distance_set(self, tmp_path):
+        """``max_distance`` remains a vector-distance threshold in union mode:
+        lexical candidates may join only when they have a real distance that
+        satisfies it."""
         palace = str(tmp_path / "palace")
         _seed_drawers(palace)
         # Sanity: without max_distance, union surfaces the BM25-strong doc.
@@ -154,8 +153,8 @@ class TestCandidateUnion:
         )
         assert "brand_voice_D4.md" in {h["source_file"] for h in unfiltered["results"]}
 
-        # With a tight max_distance, union must NOT inject BM25-only hits —
-        # every returned hit must have a real (non-None) distance.
+        # With a tight max_distance, every returned hit must have a real
+        # (non-None) distance that satisfies the threshold.
         filtered = search_memories(
             _NARRATIVE_QUERY,
             palace,
@@ -165,8 +164,7 @@ class TestCandidateUnion:
         )
         for h in filtered["results"]:
             assert h.get("distance") is not None, (
-                f"union under max_distance must not inject BM25-only "
-                f"(distance=None) candidates; offending hit: {h}"
+                f"union under max_distance must not inject unscored candidates; offending hit: {h}"
             )
             assert h["distance"] <= 0.5, f"hit violates max_distance=0.5: distance={h['distance']}"
 

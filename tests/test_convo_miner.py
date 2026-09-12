@@ -14,7 +14,12 @@ from mempalace.convo_miner import (
     _resolve_wing,
     mine_convos,
 )
-from mempalace.palace import MineAlreadyRunning, file_already_mined, prefetch_mined_set
+from mempalace.palace import (
+    NORMALIZE_VERSION,
+    MineAlreadyRunning,
+    file_already_mined,
+    prefetch_mined_set,
+)
 
 
 def test_convo_mining():
@@ -767,6 +772,71 @@ def test_prefetch_mined_set_none_for_drawer_without_stored_mtime():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_prefetch_mined_set_omits_incomplete_chunk_total_group():
+    """Mid-file partials with chunk_total must not bulk-skip the source (#2183)."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+        mtime = 1_700_000_000.0
+        source = "/fake/session.jsonl"
+        # Only 2 of 3 expected chunks landed before a crash.
+        col.upsert(
+            ids=["d0", "d1"],
+            documents=["chunk 0", "chunk 1"],
+            metadatas=[
+                {
+                    "wing": "test",
+                    "room": "general",
+                    "source_file": source,
+                    "chunk_index": 0,
+                    "extract_mode": "exchange",
+                    "normalize_version": NORMALIZE_VERSION,
+                    "source_mtime": mtime,
+                    "chunk_total": 3,
+                },
+                {
+                    "wing": "test",
+                    "room": "general",
+                    "source_file": source,
+                    "chunk_index": 1,
+                    "extract_mode": "exchange",
+                    "normalize_version": NORMALIZE_VERSION,
+                    "source_mtime": mtime,
+                    "chunk_total": 3,
+                },
+            ],
+        )
+        mined = prefetch_mined_set(col, extract_mode="exchange")
+        assert source not in mined, (
+            "prefetch_mined_set treated 2/3 chunks as fully filed — the bulk "
+            "skip path would permanently strand the missing exchange (#2183)"
+        )
+
+        col.upsert(
+            ids=["d2"],
+            documents=["chunk 2"],
+            metadatas=[
+                {
+                    "wing": "test",
+                    "room": "general",
+                    "source_file": source,
+                    "chunk_index": 2,
+                    "extract_mode": "exchange",
+                    "normalize_version": NORMALIZE_VERSION,
+                    "source_mtime": mtime,
+                    "chunk_total": 3,
+                }
+            ],
+        )
+        mined = prefetch_mined_set(col, extract_mode="exchange")
+        assert source in mined
+        assert abs(mined[source] - mtime) < 0.001
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_mine_convos_reprocesses_legacy_drawer_without_stored_mtime(capsys):
     """A file mined before source_mtime was tracked (simulated: drawer
     written directly, no source_mtime field) must be re-mined on the next
@@ -834,6 +904,79 @@ def test_register_file_sentinel_includes_source_mtime():
         assert abs(mined[str(tiny_file)] - os.path.getmtime(tiny_file)) < 0.001
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# file_conversation_exchange — canonical single-exchange write path
+# ---------------------------------------------------------------------------
+
+
+class _RecordingCollection:
+    """Captures upsert kwargs without a real ChromaDB behind it."""
+
+    def __init__(self):
+        self.upserts = []
+
+    def upsert(self, *, ids, documents, metadatas):
+        self.upserts.append({"ids": ids, "documents": documents, "metadatas": metadatas})
+
+
+def _exchange_kwargs(**overrides):
+    kwargs = {
+        "wing": "wing_dev",
+        "room": "conversations",
+        "text": "User: hi\n\nAssistant: hello",
+        "source_file": "hermes-session:s1",
+        "agent": "hermes",
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_file_conversation_exchange_extra_metadata_cannot_clobber_canonical():
+    """The docstring promises extras are append-only — colliding keys lose.
+
+    PR #1915 review: ``metadata.update(extra_metadata)`` let a caller
+    silently overwrite ``wing`` / ``filed_at`` / etc.
+    """
+    from mempalace.convo_miner import file_conversation_exchange
+
+    col = _RecordingCollection()
+    file_conversation_exchange(
+        col,
+        **_exchange_kwargs(),
+        extra_metadata={"wing": "wing_evil", "filed_at": "1970-01-01", "source": "hermes"},
+    )
+    meta = col.upserts[0]["metadatas"][0]
+    assert meta["wing"] == "wing_dev"
+    assert meta["filed_at"] != "1970-01-01"
+    # Non-colliding extras still land.
+    assert meta["source"] == "hermes"
+
+
+def test_file_conversation_exchange_invalid_wing_falls_back_to_wing_general():
+    """A bad configured wing must not drop the turn — verbatim first.
+
+    Same validation the MCP write tools apply (sanitize_name), but with a
+    wing_general fallback instead of an error: live filing losing turns
+    over a config typo would violate the 100%-recall promise.
+    """
+    from mempalace.convo_miner import file_conversation_exchange
+
+    col = _RecordingCollection()
+    file_conversation_exchange(col, **_exchange_kwargs(wing="../escape"))
+    meta = col.upserts[0]["metadatas"][0]
+    assert meta["wing"] == "wing_general"
+    assert col.upserts[0]["documents"] == ["User: hi\n\nAssistant: hello"]
+
+
+def test_file_conversation_exchange_invalid_room_falls_back_to_conversations():
+    from mempalace.convo_miner import file_conversation_exchange
+
+    col = _RecordingCollection()
+    file_conversation_exchange(col, **_exchange_kwargs(room="a/b"))
+    meta = col.upserts[0]["metadatas"][0]
+    assert meta["room"] == "conversations"
 
 
 def _write_dry_run_transcript(path: Path) -> None:

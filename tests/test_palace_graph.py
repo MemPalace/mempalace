@@ -3,6 +3,8 @@
 All ChromaDB access is mocked — no real database needed.
 """
 
+import json
+import os
 from unittest.mock import MagicMock, patch
 
 
@@ -111,14 +113,15 @@ class TestBuildGraph:
         assert edges[0]["wing_b"] == "wing_project"
         assert edges[0]["hall"] == "databases"
 
-    def test_general_room_excluded(self):
+    def test_general_room_included(self):
         col = _make_fake_collection(
             [
                 {"room": "general", "wing": "wing_code", "hall": "misc", "date": ""},
             ]
         )
         nodes, edges = build_graph(col=col)
-        assert "general" not in nodes
+        assert "general" in nodes
+        assert nodes["general"]["wings"] == ["wing_code"]
 
     def test_missing_wing_excluded(self):
         col = _make_fake_collection(
@@ -305,3 +308,103 @@ class TestFuzzyMatch:
         nodes = {f"room-{i}": {} for i in range(20)}
         result = _fuzzy_match("room", nodes, n=3)
         assert len(result) <= 3
+
+
+# --- sqlite fast path backend gating ---
+
+
+class TestSqliteGroupedCountsReader:
+    """The sqlite graph path must follow configuration, not the filesystem."""
+
+    MAGIC = b"SQLite format 3\x00"
+
+    def _config(self, palace_path):
+        from mempalace.config import MempalaceConfig
+
+        cfg_dir = os.path.join(os.path.dirname(palace_path), "config")
+        os.makedirs(cfg_dir, exist_ok=True)
+        with open(os.path.join(cfg_dir, "config.json"), "w") as f:
+            json.dump({"palace_path": palace_path}, f)
+        return MempalaceConfig(config_dir=cfg_dir)
+
+    def test_chroma_palace_resolves_a_reader(self, tmp_path):
+        from mempalace.backends.chroma import sqlite_room_wing_hall_counts
+        from mempalace.palace_graph import sqlite_grouped_counts_reader
+
+        palace = tmp_path / "palace"
+        palace.mkdir()
+        (palace / "chroma.sqlite3").write_bytes(self.MAGIC)
+        assert (
+            sqlite_grouped_counts_reader(self._config(str(palace))) is sqlite_room_wing_hall_counts
+        )
+
+    def test_missing_database_falls_back_to_the_client(self, tmp_path):
+        """No db file means no fast path — that is how a broken palace still
+        reports a diagnostic instead of an empty graph."""
+        from mempalace.palace_graph import sqlite_grouped_counts_reader
+
+        palace = tmp_path / "palace"
+        palace.mkdir()
+        assert sqlite_grouped_counts_reader(self._config(str(palace))) is None
+
+    def test_mixed_backend_artifacts_do_not_get_sniffed(self, tmp_path):
+        """Two backends' files in one directory is a ``BackendMismatchError``
+        on every normal path; picking one by file order would hide that."""
+        from mempalace.palace_graph import sqlite_grouped_counts_reader
+
+        palace = tmp_path / "palace"
+        palace.mkdir()
+        (palace / "chroma.sqlite3").write_bytes(self.MAGIC)
+        (palace / "sqlite_exact.sqlite3").write_bytes(self.MAGIC)
+        assert sqlite_grouped_counts_reader(self._config(str(palace))) is None
+
+
+def test_2288_grouped_general_room_is_not_filtered():
+    from mempalace.palace_graph import _nodes_edges_from_grouped_rows
+
+    nodes, edges = _nodes_edges_from_grouped_rows(
+        [
+            ("general", "wing_a", "hall_one", 2, "2026-01-01"),
+            ("general", "wing_a", "hall_two", 3, "2026-01-02"),
+            ("general", "wing_b", "hall_one", 1, "2026-01-03"),
+        ]
+    )
+    assert nodes["general"]["wings"] == ["wing_a", "wing_b"]
+    assert nodes["general"]["halls"] == ["hall_one", "hall_two"]
+    assert nodes["general"]["count"] == 6
+    assert len(edges) == 2
+
+
+def test_2288_graph_stats_preserve_room_names_and_count_room_instances():
+    invalidate_graph_cache()
+    col = _make_fake_collection(
+        [
+            {"room": "fact", "wing": "desercion"},
+            {"room": "general", "wing": "desercion-pascual"},
+            {"room": "general", "wing": "desertion"},
+            {"room": "heatstgnn-model-selection", "wing": "desertion"},
+            {"room": "diary", "wing": "desertion"},
+            {"room": "general", "wing": "matlab-drive"},
+            {"room": "documentation", "wing": "octopus"},
+            {"room": "plans", "wing": "octopus"},
+            {"room": "controller", "wing": "octopus"},
+        ]
+    )
+    with patch.dict(
+        graph_stats.__globals__,
+        {"_load_tunnels": lambda config=None: [{"id": "t1"}, {"id": "t2"}]},
+    ):
+        stats = graph_stats(col=col)
+
+    assert stats["total_rooms"] == 7
+    assert stats["total_room_instances"] == 9
+    assert stats["tunnel_rooms"] == stats["passive_tunnel_rooms"] == 1
+    assert stats["explicit_tunnels"] == 2
+    assert stats["total_connections"] == stats["total_edges"] + 2
+    assert set(stats["rooms_per_wing"]) == {
+        "desercion",
+        "desercion-pascual",
+        "desertion",
+        "matlab-drive",
+        "octopus",
+    }

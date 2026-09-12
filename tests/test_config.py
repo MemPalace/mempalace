@@ -185,6 +185,46 @@ def test_embedding_threads_invalid_falls_back_to_auto(tmp_path, monkeypatch):
     assert cfg.embedding_threads == 2
 
 
+def test_embeddinggemma_batch_size_defaults_to_module_constant(monkeypatch):
+    from mempalace.embedding import _EMBEDDINGGEMMA_BATCH_SIZE
+
+    monkeypatch.delenv("MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE", raising=False)
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.embeddinggemma_batch_size == _EMBEDDINGGEMMA_BATCH_SIZE
+
+
+def test_embeddinggemma_batch_size_positive_value_from_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embeddinggemma_batch_size": 8}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embeddinggemma_batch_size == 8
+
+
+def test_embeddinggemma_batch_size_env_overrides_config(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embeddinggemma_batch_size": 8}, f)
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE", "4")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embeddinggemma_batch_size == 4
+
+
+def test_embeddinggemma_batch_size_non_positive_falls_back_to_default(tmp_path, monkeypatch):
+    from mempalace.embedding import _EMBEDDINGGEMMA_BATCH_SIZE
+
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE", "0")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embeddinggemma_batch_size == _EMBEDDINGGEMMA_BATCH_SIZE
+
+
+def test_embeddinggemma_batch_size_invalid_falls_back_to_default(tmp_path, monkeypatch):
+    from mempalace.embedding import _EMBEDDINGGEMMA_BATCH_SIZE
+
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE", "not-a-number")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embeddinggemma_batch_size == _EMBEDDINGGEMMA_BATCH_SIZE
+
+
 def test_sqlite_read_uri_opens_path_with_spaces(tmp_path):
     """sqlite_read_uri must open a read-only DB whose path contains spaces,
     which a bare f"file:{path}?mode=ro" mis-parses (especially on Windows)."""

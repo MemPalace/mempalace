@@ -91,6 +91,7 @@ This protocol is what turns storage into memory — the AI knows to verify befor
 | `mempalace_kg_query` | Entity relationships with time filtering |
 | `mempalace_kg_add` | Add facts |
 | `mempalace_kg_invalidate` | Mark facts as ended |
+| `mempalace_kg_supersede` | Atomically replace one current fact with another |
 | `mempalace_kg_timeline` | Chronological entity story |
 | `mempalace_kg_stats` | Graph overview |
 
