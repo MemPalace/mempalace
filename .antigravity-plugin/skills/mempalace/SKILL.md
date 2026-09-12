@@ -90,3 +90,14 @@ The MCP server is auto-registered when this plugin is installed at `~/.gemini/co
 - **Background everything** — filing, indexing, and timestamps happen via hooks in the background; zero tokens spent on bookkeeping in the chat window.
 
 If a request would violate any of these principles, refuse and explain — even if it would be technically convenient.
+
+## Release awareness
+
+Release checks are opt-in. Ask before enabling weekly checks with
+`mempalace update configure --enable --installer uv-tool` (or `pipx` / `pip`,
+matching the installation); the default is disabled. Enabling checks
+contacts PyPI but sends no palace content, identity, or telemetry. When
+`mempalace_status` reports an available release, distinguish `updates.server`
+from a local proxy's `updates.client`. Use the local update plan only for the
+client scope; a remote server update must be planned and authorized on the hub
+host by its operator. Never install an update without explicit user authorization.

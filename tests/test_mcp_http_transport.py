@@ -24,6 +24,7 @@ import os
 import socketserver
 import ssl
 import threading
+import time
 
 import pytest
 
@@ -97,6 +98,152 @@ def test_initialize_reports_server_info(http_server):
     status, body = _post(port, "/mcp", {"jsonrpc": "2.0", "id": 7, "method": "initialize"})
     assert status == 200
     assert json.loads(body)["result"]["serverInfo"]["name"] == "mempalace"
+
+
+class TestPalaceReadsDoNotStarveTheHub:
+    """Slow palace reads must not block protocol traffic or other reads."""
+
+    @staticmethod
+    def _request(port, body, timeout=10):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+        try:
+            conn.request(
+                "POST",
+                "/mcp",
+                json.dumps(body),
+                headers={"Content-Type": "application/json"},
+            )
+            response = conn.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            conn.close()
+
+    def _call(self, port, name, arguments, req_id=1, timeout=10):
+        status, payload = self._request(
+            port,
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            },
+            timeout=timeout,
+        )
+        assert status == 200, payload
+        text = payload["result"]["content"][0]["text"]
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return payload["result"]
+
+    @staticmethod
+    def _patch_slow_search(monkeypatch, hold_s=0.7):
+        started = threading.Event()
+
+        def slow_search(**_kwargs):
+            started.set()
+            time.sleep(hold_s)
+            return {"query": "x", "results": []}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", slow_search)
+        return started
+
+    @pytest.mark.parametrize("method", ["initialize", "tools/list"])
+    def test_protocol_method_completes_while_search_holds(self, http_server, monkeypatch, method):
+        port, _ = http_server
+        started = self._patch_slow_search(monkeypatch, hold_s=0.8)
+        errors = []
+
+        def searcher():
+            try:
+                self._call(port, "mempalace_search", {"query": "x"}, req_id=11)
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=searcher)
+        thread.start()
+        assert started.wait(timeout=2)
+        started_at = time.perf_counter()
+        status, payload = self._request(port, {"jsonrpc": "2.0", "id": 1, "method": method})
+        elapsed = time.perf_counter() - started_at
+        thread.join(timeout=5)
+
+        assert not errors, errors
+        assert status == 200
+        if method == "initialize":
+            assert payload["result"]["serverInfo"]["name"] == "mempalace"
+        else:
+            assert "mempalace_search" in {tool["name"] for tool in payload["result"]["tools"]}
+        assert elapsed < 0.4, f"{method} waited on search: {elapsed:.3f}s"
+
+    def test_two_searches_overlap(self, http_server, monkeypatch):
+        port, _ = http_server
+        in_flight = threading.Barrier(2, timeout=3)
+        max_in_flight = {"n": 0}
+        current = {"n": 0}
+        lock = threading.Lock()
+        errors = []
+
+        def slow_search(**_kwargs):
+            with lock:
+                current["n"] += 1
+                max_in_flight["n"] = max(max_in_flight["n"], current["n"])
+            try:
+                in_flight.wait()
+                time.sleep(0.5)
+            finally:
+                with lock:
+                    current["n"] -= 1
+            return {"query": "x", "results": []}
+
+        def run_search(req_id):
+            try:
+                self._call(port, "mempalace_search", {"query": "x"}, req_id=req_id)
+            except Exception as exc:
+                errors.append(exc)
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", slow_search)
+        threads = [threading.Thread(target=run_search, args=(req_id,)) for req_id in (21, 22)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+        assert not errors, errors
+        assert max_in_flight["n"] == 2, "searches stayed serialized on the HTTP lock"
+
+    @pytest.mark.parametrize("tool_name", ["mempalace_add_drawer", "mempalace_memories_filed_away"])
+    def test_state_changes_wait_for_in_flight_search(self, http_server, monkeypatch, tool_name):
+        port, _ = http_server
+        search_started = threading.Event()
+        search_release = threading.Event()
+        write_started = threading.Event()
+
+        def slow_search(**_kwargs):
+            search_started.set()
+            search_release.wait(timeout=5)
+            return {"query": "x", "results": []}
+
+        def state_change(**_kwargs):
+            write_started.set()
+            return {"success": True}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", slow_search)
+        monkeypatch.setitem(mcp.TOOLS[tool_name], "handler", state_change)
+        search_thread = threading.Thread(
+            target=lambda: self._call(port, "mempalace_search", {"query": "x"}, req_id=31)
+        )
+        search_thread.start()
+        assert search_started.wait(timeout=2)
+        write_thread = threading.Thread(target=lambda: self._call(port, tool_name, {}, req_id=32))
+        write_thread.start()
+        time.sleep(0.25)
+        assert not write_started.is_set(), f"{tool_name} ran while a palace read was in flight"
+        search_release.set()
+        search_thread.join(timeout=5)
+        write_thread.join(timeout=5)
+        assert write_started.is_set()
 
 
 def test_healthz_ok(http_server):

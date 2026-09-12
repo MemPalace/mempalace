@@ -75,7 +75,6 @@ READ_TOOLS = frozenset(
         "mempalace_get_drawer",
         "mempalace_list_drawers",
         "mempalace_diary_read",
-        "mempalace_memories_filed_away",
         "mempalace_kg_query",
         "mempalace_kg_stats",
         "mempalace_kg_timeline",
@@ -96,6 +95,7 @@ WRITE_TOOLS = frozenset(
         "mempalace_delete_tunnel",
         "mempalace_delete_hallway",
         "mempalace_hook_settings",
+        "mempalace_memories_filed_away",
     }
 )
 

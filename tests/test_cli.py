@@ -261,6 +261,38 @@ def test_cmd_init_normalizes_wing_name_for_topics_registry(mock_config_cls, tmp_
         assert mock_register.call_args.kwargs["wing"] == "my_cool_app"
 
 
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_init_does_not_report_a_registry_update_that_did_not_happen(
+    mock_config_cls, tmp_path, capsys
+):
+    """``add_to_known_entities`` answers ``None`` when it left the registry
+    alone and printed why. Printing "Registry updated" over that would tell
+    the user the opposite of what stderr just said."""
+    project = tmp_path / "app"
+    project.mkdir()
+    detected = {
+        "people": [{"name": "Alice"}],
+        "projects": [],
+        "topics": [],
+        "uncertain": [],
+    }
+    confirmed = {"people": ["Alice"], "projects": [], "topics": []}
+    args = argparse.Namespace(dir=str(project), yes=True)
+    with (
+        patch("mempalace.entity_detector.scan_for_detection", return_value=[project / "a.txt"]),
+        patch("mempalace.entity_detector.detect_entities", return_value=detected),
+        patch("mempalace.entity_detector.confirm_entities", return_value=confirmed),
+        patch("mempalace.miner.add_to_known_entities", return_value=None),
+        patch("mempalace.room_detector_local.detect_rooms_local"),
+        patch("builtins.open", MagicMock()),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
+        patch("mempalace.cli._run_pass_zero", return_value=None),
+    ):
+        cmd_init(args)
+
+    assert "Registry updated" not in capsys.readouterr().out
+
+
 def test_cmd_init_honors_palace_flag(tmp_path, monkeypatch):
     """Regression for #1313: ``cmd_init`` must honor ``--palace`` instead of
     silently writing to ``~/.mempalace``. Mirrors the env-var pattern used
@@ -282,6 +314,16 @@ def test_cmd_init_honors_palace_flag(tmp_path, monkeypatch):
     monkeypatch.setenv("MEMPAL_PALACE_PATH", "")
     monkeypatch.delenv("MEMPALACE_PALACE_PATH")
     monkeypatch.delenv("MEMPAL_PALACE_PATH")
+
+    # cmd_init's MempalaceConfig() has no config_dir, so an unpatched call
+    # here now persists this test's tmp_path into the shared ~/.mempalace
+    # (#2366's fix made init() write what actually resolved, not a constant).
+    from mempalace.config import MempalaceConfig
+
+    monkeypatch.setattr(
+        "mempalace.cli.MempalaceConfig",
+        lambda *a, **kw: MempalaceConfig(*a, config_dir=str(tmp_path / ".mempalace"), **kw),
+    )
 
     args = argparse.Namespace(
         dir=str(project),
@@ -952,6 +994,9 @@ def test_mcp_command_prints_setup_guidance(monkeypatch, capsys):
     assert "MemPalace MCP quick setup:" in captured.out
     assert "claude mcp add mempalace -- mempalace-mcp" in captured.out
     assert "codex mcp add mempalace -- mempalace-mcp" in captured.out
+    assert "claude mcp add mempalace-light -- mempalace-light-mcp" in captured.out
+    assert "codex mcp add mempalace-light -- mempalace-light-mcp" in captured.out
+    assert "claude mcp add mempalace -- mempalace-light-mcp" not in captured.out
     assert "\nOptional custom palace:\n" in captured.out
     assert "mempalace-mcp --palace /path/to/palace" in captured.out
     assert "[--palace /path/to/palace]" not in captured.out
@@ -970,6 +1015,7 @@ def test_mcp_command_uses_custom_palace_path_when_provided(monkeypatch, capsys):
     assert expanded in captured.out
     assert "claude mcp add mempalace -- mempalace-mcp --palace" in captured.out
     assert "codex mcp add mempalace -- mempalace-mcp --palace" in captured.out
+    assert "claude mcp add mempalace-light -- mempalace-light-mcp --palace" in captured.out
     assert "Optional custom palace:" not in captured.out
     assert "[--palace /path/to/palace]" not in captured.out
     assert captured.err == ""
@@ -984,6 +1030,7 @@ def test_mcp_command_includes_backend_when_provided(monkeypatch, capsys):
 
     captured = capsys.readouterr()
     assert "mempalace-mcp --backend sqlite_exact" in captured.out
+    assert "mempalace-light-mcp --backend sqlite_exact" in captured.out
     assert captured.err == ""
     os.environ.pop("MEMPALACE_BACKEND_EXPLICIT", None)
     os.environ.pop("MEMPALACE_BACKEND", None)

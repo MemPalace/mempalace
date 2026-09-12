@@ -42,11 +42,12 @@ def http_server(patched_palace):
         thread.join(timeout=5)
 
 
-def _append(body="hello", correlation_id="task_sse", type="task.request"):
+def _append(body="hello", correlation_id="task_sse", type="task.request", topic=None):
     result = mcp.tool_event_append(
         type=type,
         stream="project/mempalace",
         room="delegation",
+        topic=topic,
         from_agent="mac-claude",
         to_agent="windows-codex",
         correlation_id=correlation_id,
@@ -135,6 +136,18 @@ class TestSSEStream:
             wanted = _append(body="signal", correlation_id="task_wanted")
             frames = _read_frames(resp, 1)
             assert [f["id"] for f in frames] == [wanted["id"]]
+        finally:
+            conn.close()
+
+    def test_topic_filter_scopes_the_stream(self, http_server):
+        port, _ = http_server
+        conn, resp = _open_stream(port, query="?topic=topic_wanted")
+        try:
+            _append(body="noise", topic="topic_noise")
+            wanted = _append(body="signal", topic="topic_wanted")
+            frames = _read_frames(resp, 1)
+            assert [f["id"] for f in frames] == [wanted["id"]]
+            assert frames[0]["data"]["topic"] == "topic_wanted"
         finally:
             conn.close()
 

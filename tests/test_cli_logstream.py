@@ -1,18 +1,20 @@
-"""Tests for the RFC 003 logstream/artifact CLI commands.
+"""Tests for the RFC 003 logstream/task/artifact CLI commands.
 
-Covers cmd_logstream (append/list/wait/ack) and cmd_artifact (put/get):
-JSON and human output, exact-content stdout piping, timeout exit code,
-and error exits. Uses SimpleNamespace args like the rest of test_cli.py.
+Covers cmd_logstream (append/list/wait/ack), cmd_task (create/launch), and
+cmd_artifact (put/get): JSON and human output, exact-content stdout piping,
+timeout exit code, and error exits. Uses SimpleNamespace args like the rest
+of test_cli.py.
 """
 
 import json
+import subprocess
 import sys
 import time
 from types import SimpleNamespace
 
 import pytest
 
-from mempalace.cli import cmd_artifact, cmd_logstream, main
+from mempalace.cli import cmd_artifact, cmd_logstream, cmd_task, main
 
 
 def _append_args(palace, **overrides):
@@ -22,6 +24,7 @@ def _append_args(palace, **overrides):
         type="task.request",
         stream="project/mempalace",
         room="delegation",
+        topic=None,
         from_agent="mac-fable",
         to_agent="windows-codex",
         correlation_id="task_cli",
@@ -44,14 +47,17 @@ def _list_args(palace, **overrides):
         logstream_action="list",
         stream=None,
         room=None,
+        topic=None,
         type=None,
         to_agent=None,
         from_agent=None,
         correlation_id=None,
         status=None,
         since_event_id=None,
+        before_event_id=None,
         since_created_at=None,
         limit=50,
+        order="asc",
         json=True,
     )
     fields.update(overrides)
@@ -79,6 +85,42 @@ def _put_args(palace, content, **overrides):
     )
     fields.update(overrides)
     return SimpleNamespace(**fields)
+
+
+def _task_create_args(palace, **overrides):
+    fields = dict(
+        palace=palace,
+        task_action="create",
+        project="mempalace",
+        from_agent="mac-claude",
+        to_agent="windows-codex",
+        goal="Fix search starvation without changing ranking semantics.",
+        goal_file=None,
+        branch="fix/search-starvation",
+        base_commit="abc1234",
+        done="Focused tests pass and a patch is submitted.",
+        done_file=None,
+        json=False,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def _task_workspace(path, branch="fix/search-starvation"):
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "Task Test"], check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "config", "user.email", "task-test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(path), "commit", "--allow-empty", "-qm", "base"], check=True)
+    subprocess.run(["git", "-C", str(path), "checkout", "-qb", branch], check=True)
+    return subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
 
 class TestLogstreamCli:
@@ -154,6 +196,256 @@ class TestLogstreamCli:
         assert ack["correlation_id"] == "task_cli"
 
 
+class TestTaskCli:
+    def test_create_posts_canonical_request_and_prints_pasteable_handoff(self, palace_path, capsys):
+        cmd_task(_task_create_args(palace_path))
+
+        out = capsys.readouterr().out
+        assert "Task created: task_fix_search_starvation_" in out
+        assert "Ready to paste:" in out
+        assert (
+            "Open MemPalace task task_fix_search_starvation_" in out and "as windows-codex." in out
+        )
+
+        cmd_logstream(_list_args(palace_path, type="task.request"))
+        event = json.loads(capsys.readouterr().out)["events"][0]
+        assert event["stream"] == "project/mempalace"
+        assert event["room"] == "delegation"
+        assert event["from_agent"] == "mac-claude"
+        assert event["to_agent"] == "windows-codex"
+        assert event["status"] == "open"
+        assert event["branch"] == "fix/search-starvation"
+        assert event["base_commit"] == "abc1234"
+        assert event["correlation_id"].startswith("task_fix_search_starvation_")
+        assert event["body"] == (
+            "Goal:\n"
+            "Fix search starvation without changing ranking semantics.\n\n"
+            "Definition of done:\n"
+            "Focused tests pass and a patch is submitted.\n\n"
+            "Delivery:\n"
+            "Close the loop through MemPalace: claim the request, then submit a patch "
+            "with mempalace_patch_submit or reply with blocked/failed evidence."
+        )
+
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            ("branch", "", "branch must not be empty"),
+            ("base_commit", "", "base commit must not be empty"),
+            ("base_commit", "main", "not a branch or tag"),
+        ],
+    )
+    def test_create_rejects_incomplete_or_mutable_git_coordinates(
+        self, palace_path, capsys, field, value, message
+    ):
+        with pytest.raises(SystemExit) as exc:
+            cmd_task(_task_create_args(palace_path, json=True, **{field: value}))
+
+        assert exc.value.code == 1
+        assert message in json.loads(capsys.readouterr().out)["error"]
+
+        cmd_logstream(_list_args(palace_path, type="task.request"))
+        assert json.loads(capsys.readouterr().out)["events"] == []
+
+    def test_launch_resolves_task_and_runs_codex_headlessly(
+        self, palace_path, tmp_path, capsys, monkeypatch
+    ):
+        base_commit = _task_workspace(tmp_path)
+        cmd_task(_task_create_args(palace_path, base_commit=base_commit, json=True))
+        created = json.loads(capsys.readouterr().out)
+        correlation_id = created["task"]["correlation_id"]
+        calls = []
+        real_run = subprocess.run
+
+        def fake_run(command, **kwargs):
+            if command[0] == "git":
+                return real_run(command, **kwargs)
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        cmd_task(
+            SimpleNamespace(
+                palace=palace_path,
+                task_action="launch",
+                correlation_id=correlation_id,
+                runner="codex",
+                workspace=str(tmp_path),
+                agent=None,
+                json=False,
+            )
+        )
+
+        prompt = created["handoff"]
+        assert calls == [
+            (
+                ["codex", "exec", "--cd", str(tmp_path.resolve()), prompt],
+                {"check": False},
+            )
+        ]
+        assert f"Launching {correlation_id} with codex as windows-codex" in capsys.readouterr().out
+
+    def test_launch_refuses_a_workspace_at_the_wrong_base_commit(
+        self, palace_path, tmp_path, capsys, monkeypatch
+    ):
+        from mempalace import cli
+
+        _task_workspace(tmp_path)
+        cmd_task(_task_create_args(palace_path, base_commit="deadbeef", json=True))
+        correlation_id = json.loads(capsys.readouterr().out)["task"]["correlation_id"]
+        monkeypatch.setitem(
+            cli._TASK_RUNNER_ADAPTERS,
+            "codex",
+            ("-codex", lambda _workspace, _prompt: ([sys.executable, "-c", "pass"], {})),
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            cmd_task(
+                SimpleNamespace(
+                    palace=palace_path,
+                    task_action="launch",
+                    correlation_id=correlation_id,
+                    runner="codex",
+                    workspace=str(tmp_path),
+                    agent=None,
+                    json=True,
+                )
+            )
+
+        assert exc.value.code == 1
+        assert "base commit" in json.loads(capsys.readouterr().out)["error"]
+
+    def test_launch_refuses_a_workspace_on_the_wrong_branch(self, palace_path, tmp_path, capsys):
+        base_commit = _task_workspace(tmp_path, branch="fix/other-branch")
+        cmd_task(_task_create_args(palace_path, base_commit=base_commit, json=True))
+        correlation_id = json.loads(capsys.readouterr().out)["task"]["correlation_id"]
+
+        with pytest.raises(SystemExit) as exc:
+            cmd_task(
+                SimpleNamespace(
+                    palace=palace_path,
+                    task_action="launch",
+                    correlation_id=correlation_id,
+                    runner="codex",
+                    workspace=str(tmp_path),
+                    agent=None,
+                    json=True,
+                )
+            )
+
+        assert exc.value.code == 1
+        assert "branch" in json.loads(capsys.readouterr().out)["error"]
+
+    def test_launch_refuses_to_impersonate_the_addressed_agent(self, palace_path, tmp_path, capsys):
+        cmd_task(_task_create_args(palace_path, json=True))
+        correlation_id = json.loads(capsys.readouterr().out)["task"]["correlation_id"]
+
+        with pytest.raises(SystemExit) as exc:
+            cmd_task(
+                SimpleNamespace(
+                    palace=palace_path,
+                    task_action="launch",
+                    correlation_id=correlation_id,
+                    runner="codex",
+                    workspace=str(tmp_path),
+                    agent="linux-claude",
+                    json=True,
+                )
+            )
+
+        assert exc.value.code == 1
+        assert "windows-codex" in json.loads(capsys.readouterr().out)["error"]
+
+    def test_launch_refuses_a_runner_that_does_not_match_the_agent_identity(
+        self, palace_path, tmp_path, capsys
+    ):
+        cmd_task(_task_create_args(palace_path, to_agent="linux-claude", json=True))
+        correlation_id = json.loads(capsys.readouterr().out)["task"]["correlation_id"]
+
+        with pytest.raises(SystemExit) as exc:
+            cmd_task(
+                SimpleNamespace(
+                    palace=palace_path,
+                    task_action="launch",
+                    correlation_id=correlation_id,
+                    runner="codex",
+                    workspace=str(tmp_path),
+                    agent=None,
+                    json=True,
+                )
+            )
+
+        assert exc.value.code == 1
+        assert "runner codex does not match" in json.loads(capsys.readouterr().out)["error"]
+
+    def test_launch_accepts_an_exact_task_fetched_through_remote_mcp(
+        self, palace_path, tmp_path, capsys, monkeypatch
+    ):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        base_commit = _task_workspace(workspace)
+        cmd_task(_task_create_args(palace_path, base_commit=base_commit, json=True))
+        created = json.loads(capsys.readouterr().out)
+        task_file = tmp_path / "task-request.json"
+        task_file.write_text(json.dumps(created["task"]), encoding="utf-8")
+        calls = []
+        real_run = subprocess.run
+
+        def fake_run(command, **kwargs):
+            if command[0] == "git":
+                return real_run(command, **kwargs)
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        cmd_task(
+            SimpleNamespace(
+                palace=str(tmp_path / "no-local-palace"),
+                task_action="launch",
+                correlation_id=None,
+                task_file=str(task_file),
+                runner="codex",
+                workspace=str(workspace),
+                agent=None,
+                json=False,
+            )
+        )
+
+        assert calls[0][0][:3] == ["codex", "exec", "--cd"]
+        assert created["task"]["correlation_id"] in calls[0][0][-1]
+
+    def test_launch_rejects_incomplete_remote_task_with_a_controlled_error(self, tmp_path, capsys):
+        task_file = tmp_path / "task-request.json"
+        task_file.write_text(
+            json.dumps(
+                {
+                    "type": "task.request",
+                    "correlation_id": "task_incomplete",
+                    "to_agent": "windows-codex",
+                    "base_commit": "abc1234",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            cmd_task(
+                SimpleNamespace(
+                    task_action="launch",
+                    correlation_id=None,
+                    task_file=str(task_file),
+                    runner="codex",
+                    workspace=str(tmp_path),
+                    agent=None,
+                    json=True,
+                )
+            )
+
+        assert exc.value.code == 1
+        error = json.loads(capsys.readouterr().out)["error"]
+        assert "missing required field(s): branch" in error
+
+
 class TestArtifactCli:
     PATCH = "diff --git a/x b/x\n+cli\n"
 
@@ -221,6 +513,40 @@ class TestArtifactCli:
 
 
 class TestMainDispatch:
+    def test_main_dispatches_task_create(self, palace_path, capsys, monkeypatch):
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "mempalace",
+                "--palace",
+                palace_path,
+                "task",
+                "create",
+                "--project",
+                "mempalace",
+                "--from-agent",
+                "mac-claude",
+                "--to-agent",
+                "windows-codex",
+                "--goal",
+                "Fix task dispatch.",
+                "--branch",
+                "feat/task-dispatch",
+                "--base-commit",
+                "abc1234",
+                "--done",
+                "Focused test passes.",
+                "--json",
+            ],
+        )
+
+        main()
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["task"]["type"] == "task.request"
+        assert payload["handoff"].startswith("Open MemPalace task task_fix_task_dispatch_")
+
     def test_main_dispatches_logstream_list(self, palace_path, capsys, monkeypatch):
         monkeypatch.setattr(
             sys,
@@ -365,6 +691,7 @@ def _watch_args(palace, **overrides):
         agent=None,
         stream=None,
         room=None,
+        topic=None,
         type=None,
         status=None,
         to_agent=None,
@@ -872,3 +1199,80 @@ class TestLogstreamWatch:
             cmd_logstream(_watch_args(palace_path, agent="mac-claude", limit=0))
         assert exc.value.code == 1
         assert "limit" in json.loads(capsys.readouterr().out)["error"]
+
+
+class TestTopicAndOrderCli:
+    def test_human_output_includes_topic(self, palace_path, capsys):
+        cmd_logstream(
+            _append_args(
+                palace_path,
+                topic="security",
+                body="Review auth boundary",
+                json=False,
+            )
+        )
+
+        output = capsys.readouterr().out
+        assert "topic=security" in output
+
+    def test_append_and_list_topic(self, palace_path, capsys):
+        cmd_logstream(_append_args(palace_path, topic="infra", body="Infra task"))
+        e1 = json.loads(capsys.readouterr().out)
+        assert e1["topic"] == "infra"
+
+        cmd_logstream(_append_args(palace_path, topic="billing", body="Billing task"))
+        e2 = json.loads(capsys.readouterr().out)
+        assert e2["topic"] == "billing"
+
+        cmd_logstream(_list_args(palace_path, topic="infra"))
+        res = json.loads(capsys.readouterr().out)
+        assert res["count"] == 1
+        assert res["events"][0]["id"] == e1["id"]
+
+    def test_list_order_and_before_event_id(self, palace_path, capsys):
+        cmd_logstream(_append_args(palace_path, body="1"))
+        e1 = json.loads(capsys.readouterr().out)
+        cmd_logstream(_append_args(palace_path, body="2"))
+        e2 = json.loads(capsys.readouterr().out)
+        cmd_logstream(_append_args(palace_path, body="3"))
+        e3 = json.loads(capsys.readouterr().out)
+
+        cmd_logstream(_list_args(palace_path, order="desc"))
+        desc_res = json.loads(capsys.readouterr().out)
+        assert [e["id"] for e in desc_res["events"]] == [e3["id"], e2["id"], e1["id"]]
+
+        cmd_logstream(_list_args(palace_path, before_event_id=e3["id"], order="desc"))
+        before_res = json.loads(capsys.readouterr().out)
+        assert [e["id"] for e in before_res["events"]] == [e2["id"], e1["id"]]
+
+    def test_watch_topic_filtering(self, palace_path, capsys):
+        cmd_logstream(_append_args(palace_path, topic="security", to_agent="mac-claude"))
+        capsys.readouterr()
+
+        cmd_logstream(
+            _watch_args(
+                palace_path,
+                agent="mac-claude",
+                topic=["security", "compliance"],
+                from_start=True,
+            )
+        )
+        assert _watch_payload(capsys)["count"] == 1
+
+    def test_ack_topic_override_cli(self, palace_path, capsys):
+        cmd_logstream(_append_args(palace_path, topic="orig-topic", from_agent="target-agent"))
+        target = json.loads(capsys.readouterr().out)
+
+        ack_args = SimpleNamespace(
+            palace=palace_path,
+            logstream_action="ack",
+            event_id=target["id"],
+            from_agent="ack-agent",
+            status="claimed",
+            body="ack body",
+            topic="new-topic",
+            json=True,
+        )
+        cmd_logstream(ack_args)
+        ack_res = json.loads(capsys.readouterr().out)
+        assert ack_res["topic"] == "new-topic"

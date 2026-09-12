@@ -98,7 +98,14 @@ def clear_validated_embedder_identity(palace_path: Optional[str] = None) -> None
         _VALIDATED_IDENTITY.discard(key)
 
 
-def _enforce_embedder_identity(collection, palace_path, collection_name, *, create) -> None:
+def _enforce_embedder_identity(
+    collection,
+    palace_path,
+    collection_name,
+    *,
+    create,
+    repeat_unknown_warning=False,
+) -> None:
     """Check (and, for a brand-new collection, record) embedder identity (RFC 001).
 
     Check at open so a model swap fails fast — before any query silently
@@ -107,6 +114,9 @@ def _enforce_embedder_identity(collection, palace_path, collection_name, *, crea
     vectors from an unknown model would mislabel it, so populated-but-unrecorded
     collections warn instead and are resolved with
     ``mempalace palace set-embedder``.
+
+    ``repeat_unknown_warning`` bypasses the process cache so a long-lived Hub
+    can reproduce the warning a standalone CLI process emits on every search.
 
     Bookkeeping must never break memory operations: only the deliberate
     identity/dimension mismatch propagates; every other error is swallowed.
@@ -144,7 +154,7 @@ def _enforce_embedder_identity(collection, palace_path, collection_name, *, crea
 
     model_name = current.model_name
     key = (str(palace_path), str(collection_name), model_name)
-    if key in _VALIDATED_IDENTITY:
+    if key in _VALIDATED_IDENTITY and not repeat_unknown_warning:
         return
 
     try:
@@ -341,6 +351,8 @@ def get_closets_collection(
     palace_path: str,
     create: bool = True,
     backend: Optional[str] = None,
+    *,
+    read_only: bool = False,
 ):
     """Get the closets collection — the searchable index layer."""
     return get_collection(
@@ -348,6 +360,7 @@ def get_closets_collection(
         collection_name="mempalace_closets",
         create=create,
         backend=backend,
+        **({"read_only": True} if read_only else {}),
     )
 
 
@@ -403,10 +416,12 @@ def resolve_backend_name(palace_path: str, explicit: Optional[str] = None) -> st
         )
     detected = detected_backends[0] if detected_backends else None
     if detected and detected != selected:
-        raise BackendMismatchError(
-            f"palace at {palace_path!r} contains {detected!r} backend artifacts, "
-            f"but {selected!r} was selected"
-        )
+        exact_family = {"sqlite_exact", "rust_exact"}
+        if not (detected in exact_family and selected in exact_family):
+            raise BackendMismatchError(
+                f"palace at {palace_path!r} contains {detected!r} backend artifacts, "
+                f"but {selected!r} was selected"
+            )
     return selected
 
 
@@ -445,7 +460,7 @@ def _backend_artifact_label(backend_name: Optional[str]) -> str:
         return "qdrant_backend.json"
     if backend_name == "pgvector":
         return "pgvector_backend.json"
-    if backend_name == "sqlite_exact":
+    if backend_name in {"sqlite_exact", "rust_exact"}:
         return "sqlite_exact.sqlite3"
     return "backend database"
 
@@ -456,6 +471,7 @@ def _open_collection_or_explain(
     collection_name: Optional[str] = None,
     out=None,
     opener=None,
+    read_only: bool = False,
 ):
     """Open the palace collection or print a state-specific message and return ``None``.
 
@@ -516,11 +532,13 @@ def _open_collection_or_explain(
         emit("  Run: mempalace mine <dir>")
         return None
     try:
+        options = {"read_only": True} if read_only else {}
         return open_collection(
             palace_path,
             collection_name=collection_name,
             create=False,
             backend=backend_name,
+            **options,
         )
     except CollectionNotInitializedError:
         emit(f"\n  Palace at {palace_path} is initialized but empty (no drawers yet).")
@@ -1167,8 +1185,8 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
 # different worker thread. A thread-local guard makes those handlers fail to see
 # the process-held lease, re-acquire the flock, and self-conflict
 # ("palace ... is held by PID <self>"). flock is per-process and HTTP writes are
-# serialized by `_HTTP_REQUEST_LOCK`, so the process is the correct re-entrancy
-# boundary.
+# serialized by ``_HTTP_REQUEST_LOCK``'s exclusive side, so the process is the
+# correct re-entrancy boundary even though palace reads may overlap.
 #
 # The holder set is tagged with ``pid`` so that a forked child does NOT inherit
 # re-entrant credit from its parent: the OS-level flock IS NOT inherited as a

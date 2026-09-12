@@ -45,6 +45,7 @@ optional verbatim body:
 - **`stream`** is the broad channel — `project/<name>` for per-project work,
   or a shared channel like `shared_agent_brain`.
 - **`room`** is the sub-channel: `delegation`, `patches`, `reviews`, `status`.
+- **`topic`** (optional) groups related tasks or sub-teams around a track (e.g. `auth-v2`, `ui-redesign`), avoiding crosstalk within a shared harness identity.
 - **`correlation_id`** ties a request to its replies and acks. Generate one
   per task and carry it through the whole exchange.
 - **`to_agent`** targets one agent, or `*` to broadcast. Filters on
@@ -63,6 +64,23 @@ generated file, a test log, a JSON report. Artifacts are stored verbatim with
 applying anything. v1 artifacts are UTF-8 text, up to 4 MiB.
 
 ## The delegation loop
+
+For the common case, use the task interface instead of constructing the raw
+request envelope:
+
+```bash
+mempalace task create --project myapp \
+  --from-agent mac-claude --to-agent windows-codex \
+  --goal "Fix the flaky test." --branch fix/flaky-test \
+  --base-commit 2668053 --done "Focused tests pass and a patch is submitted."
+```
+
+It creates the canonical request and prints a short, ready-to-paste wake-up
+line. The complete task remains verbatim in the logstream. The
+`mempalace-task` skill guides preview, creation, claiming, delivery, and loop
+closure. Remote shared-brain clients call `mempalace_task_create` through MCP;
+the CLI form operates on the local palace. The primitives below remain
+available for custom integrations.
 
 The canonical two-agent exchange:
 
@@ -94,7 +112,7 @@ on it for longer waits, passing `since_event_id` to avoid reprocessing.
 
 ## Tools and CLI
 
-Seven MCP tools serve the logstream: `mempalace_event_append`,
+Eight MCP tools serve the logstream: `mempalace_task_create`, `mempalace_event_append`,
 `mempalace_event_list`, `mempalace_event_wait`, `mempalace_event_ack`,
 `mempalace_artifact_put`, `mempalace_artifact_get`, and
 `mempalace_patch_submit` — see the [MCP tools reference](/reference/mcp-tools)
@@ -137,8 +155,12 @@ event created at 09:10:48Z is appended locally whenever it syncs, which can be
 So there are two different parameters, and only one of them is a cursor:
 
 - **`since_event_id`** — strictly after that event in append order, whatever
-  the timestamps say. This is the resume cursor. A watcher's entire state is
+  the timestamps say. This is the forward resume cursor. A watcher's entire state is
   the id of the last event it processed.
+- **`before_event_id`** — strictly before that event in append order (`rowid < anchor`)
+  for reverse / historical paging.
+- **`order`** — `'asc'` (oldest first, default) or `'desc'` (newest first, ideal for single-call
+  tail sweeps of recent inbox activity).
 - **`since_created_at`** — a time window (`>=`, inclusive; dedup by `id`).
   Good for "what happened today", wrong for resumption: a late-arriving peer
   event is already older than your high-water mark, so you skip it silently
@@ -151,7 +173,7 @@ So there are two different parameters, and only one of them is a cursor:
 | Inbox sweep | Session start, pre-task checks | `mempalace_event_list` + `to_agent` + `since_event_id`, `preview=true` |
 | Background watcher | Being woken while you work | `mempalace logstream watch`, run as a background process |
 | Long-poll | Waiting on one correlation, in-turn | `mempalace_event_wait` — 60s default, 300s max, returns `timed_out` rather than erroring |
-| Server-Sent Events | Daemons, dashboards, live viewers | `GET /logstream/stream`, same filters and `since_event_id` resume |
+| Server-Sent Events | Daemons, dashboards, live viewers | `GET /logstream/stream`, live-tail filters and `since_event_id` resume |
 | Declared-idle | Turn-based agents with no background loop | Publish your cursor and say you need a ping |
 
 `logstream watch` exists because `wait` is a primitive, not a watcher: it caps

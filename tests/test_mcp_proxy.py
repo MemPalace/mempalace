@@ -124,6 +124,42 @@ class TestRouting:
         assert mcp_proxy._handle(dict(self._REQUEST), "/p", local) is forwarded
         assert local.load_count == 0
 
+    def test_proxied_status_distinguishes_hub_and_local_update_state(self, monkeypatch):
+        request = {
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {"name": "mempalace_status", "arguments": {}},
+        }
+        hub_payload = {
+            "total_drawers": 10,
+            "updates": {"server": {"enabled": True, "installed": "3.9.0"}},
+        }
+        forwarded = {
+            "jsonrpc": "2.0",
+            "id": 8,
+            "result": {"content": [{"type": "text", "text": json.dumps(hub_payload)}]},
+        }
+        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: ("http://hub", {}))
+        monkeypatch.setattr(mcp_proxy, "_forward", lambda *a: forwarded)
+        monkeypatch.setattr(
+            mcp_proxy,
+            "cached_update_status",
+            lambda: {"enabled": True, "installed": "3.8.0"},
+            raising=False,
+        )
+        monkeypatch.setattr(mcp_proxy, "schedule_update_check", lambda: False, raising=False)
+        local = _LoadedLocal(_FakeServer())
+
+        out = mcp_proxy._handle(request, "/p", local)
+
+        payload = json.loads(out["result"]["content"][0]["text"])
+        assert payload["updates"] == {
+            "server": {"enabled": True, "installed": "3.9.0"},
+            "client": {"enabled": True, "installed": "3.8.0"},
+        }
+        assert local.load_count == 0
+
     def test_no_hub_falls_back_locally_and_warns(self, monkeypatch):
         monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: None)
         server = _FakeServer()

@@ -1,7 +1,7 @@
 ---
 name: mempalace
 description: "MemPalace — Local AI memory with 96.6% recall. Semantic search, temporal knowledge graph, palace architecture (wings/rooms/drawers). Free, no cloud, no API keys."
-version: 3.8.0
+version: 3.9.0
 homepage: https://github.com/MemPalace/mempalace
 user-invocable: true
 metadata:
@@ -129,8 +129,8 @@ tool-specific workflow below says to.
   - `drawer_id` (required)
 
 ### Ingest & Cleanup
-- `mempalace_mine` — Mine a directory into the palace. Host-level ingest; call only when the user asks to import files.
-  - `source` (required): directory to mine
+- `mempalace_mine` — Mine a directory into the palace, or one conversation file with `mode='convos'`. Host-level ingest; call only when the user asks to import files.
+  - `source` (required): directory to mine, or one conversation file with `mode='convos'`
   - `mode`: `projects` (default), `convos`, or `extract`
   - `wing`: target wing (default: source directory name)
   - `agent`: recorded on every drawer (default `mempalace`)

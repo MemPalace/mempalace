@@ -16,7 +16,11 @@ Three embedding-model options are available, selected via
   non-English use; onboarding offers it as the default. The ~300 MB ONNX
   model is lazy-downloaded from HuggingFace on first use. Switching models
   on an existing palace requires ``mempalace repair rebuild-index``
-  (different vector space).
+  (different vector space). Its ``session.run()`` sub-batch size (32 docs by
+  default, #1770) is overridable via ``MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE``
+  or ``embeddinggemma_batch_size`` in ``config.json`` for palaces whose
+  drawers are long enough that the default sub-batch exceeds available
+  memory (#2330).
 * ``openai-compat`` — embeddings served by any OpenAI-compatible
   ``/v1/embeddings`` endpoint (LM Studio, llama.cpp, vLLM, Ollama's OpenAI
   shim, or a self-hosted server) instead of a local ONNX model. Useful for
@@ -182,6 +186,21 @@ def _resolve_intra_op_threads() -> int:
     except Exception:
         logger.debug("embedding_threads resolution failed; leaving ORT default", exc_info=True)
         return 0
+
+
+def _resolve_embeddinggemma_batch_size() -> int:
+    """Read the configured EmbeddingGemma sub-batch size (#2330)."""
+    try:
+        from .config import MempalaceConfig
+
+        return MempalaceConfig().embeddinggemma_batch_size
+    except Exception:
+        logger.debug(
+            "embeddinggemma_batch_size resolution failed; using the %d default",
+            _EMBEDDINGGEMMA_BATCH_SIZE,
+            exc_info=True,
+        )
+        return _EMBEDDINGGEMMA_BATCH_SIZE
 
 
 def _build_ef_class():
@@ -781,7 +800,11 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
 
         threads = _resolve_intra_op_threads()
         if model == "embeddinggemma":
-            ef = EmbeddinggemmaONNX(preferred_providers=providers, intra_op_num_threads=threads)
+            ef = EmbeddinggemmaONNX(
+                preferred_providers=providers,
+                intra_op_num_threads=threads,
+                batch_size=_resolve_embeddinggemma_batch_size(),
+            )
         else:
             # Default: minilm (or anything we don't recognize — back-compat win).
             ef_cls = _build_ef_class()

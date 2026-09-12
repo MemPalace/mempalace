@@ -66,6 +66,7 @@ Required fields:
 
 Common optional fields:
 
+- `topic`: topic name grouping related tasks or sub-teams (e.g. `auth-v2`, `ui-redesign`).
 - `to_agent`: target agent or `*`.
 - `correlation_id`: task or conversation id tying request/reply events together.
 - `branch`: Git branch, when relevant.
@@ -111,6 +112,7 @@ Example event:
   "type": "patch.ready",
   "stream": "project/mempalace",
   "room": "patches",
+  "topic": "ranking",
   "from_agent": "windows-codex",
   "to_agent": "mac-codex",
   "correlation_id": "task_01J...",
@@ -151,6 +153,7 @@ CREATE TABLE events (
   type TEXT NOT NULL,
   stream TEXT NOT NULL,
   room TEXT NOT NULL,
+  topic TEXT,
   from_agent TEXT NOT NULL,
   to_agent TEXT,
   correlation_id TEXT,
@@ -163,6 +166,7 @@ CREATE TABLE events (
 );
 
 CREATE INDEX events_stream_created_idx ON events(stream, created_at);
+CREATE INDEX events_topic_created_idx ON events(topic, created_at);
 CREATE INDEX events_correlation_idx ON events(correlation_id, created_at);
 CREATE INDEX events_to_agent_idx ON events(to_agent, created_at);
 CREATE INDEX events_type_idx ON events(type, created_at);
@@ -235,12 +239,16 @@ Filters:
 
 - `stream`
 - `room`
+- `topic`
 - `type`
 - `to_agent`
 - `from_agent`
 - `correlation_id`
+- `status`
 - `since_event_id`
+- `before_event_id`
 - `since_created_at`
+- `order` (`asc` or `desc`)
 - `limit`
 
 Default limit: 50.
