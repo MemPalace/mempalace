@@ -257,12 +257,12 @@ Palace mode is a structural upgrade that uses the full MemPal hall/wing/closet/d
 
 ### The Palace Structure
 
-```
-PALACE
-  └── HALL (content type: preferences / facts / events / assistant_advice / general)
-        └── CLOSET (user turns per session — the primary index)
-              └── DRAWER (assistant turns — opened on demand for assistant-reference questions)
-  └── PREFERENCE WING (synthetic docs extracted from user expressions — separate from halls)
+```mermaid
+flowchart TD
+    PA[PALACE] --> HA["HALL<br/>(preferences · facts · events · assistant_advice · general)"]
+    PA --> PW["PREFERENCE WING<br/>(synthetic docs — separate from halls)"]
+    HA --> CL["CLOSET<br/>(user turns per session — primary index)"]
+    CL --> DR["DRAWER<br/>(assistant turns — opened on demand)"]
 ```
 
 ### Hall Classification
