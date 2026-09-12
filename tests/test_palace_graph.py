@@ -50,6 +50,47 @@ class TestBuildGraph:
         assert nodes == {}
         assert edges == []
 
+    def test_backend_collection_walks_metadata_once(self):
+        """A BaseCollection is read through get_all_metadata() (one cursor
+        pass on qdrant, #2452) instead of the limit/offset loop."""
+        # The module-level ``patch.dict(sys.modules, ...)`` above drops the
+        # modules imported while it was active, so a fresh import here would
+        # yield a different BaseCollection class than the one palace_graph
+        # holds; use palace_graph's own reference.
+        BaseCollection = build_graph.__globals__["BaseCollection"]
+
+        class _Col(BaseCollection):
+            def add(self, **kwargs):
+                raise NotImplementedError
+
+            def upsert(self, **kwargs):
+                raise NotImplementedError
+
+            def query(self, **kwargs):
+                raise NotImplementedError
+
+            def delete(self, **kwargs):
+                raise NotImplementedError
+
+            def count(self):
+                return 2
+
+            def get(self, **kwargs):
+                raise AssertionError(
+                    "build_graph must not page through get() on a backend collection"
+                )
+
+            def get_all_metadata(self, where=None):
+                return [
+                    {"room": "auth", "wing": "wing_a", "hall": "h"},
+                    {"room": "auth", "wing": "wing_b", "hall": "h"},
+                ]
+
+        nodes, edges = build_graph(col=_Col())
+
+        assert nodes["auth"]["count"] == 2
+        assert len(edges) == 1
+
     def test_falsy_collection(self):
         """When col is explicitly falsy, build_graph returns empty."""
         nodes, edges = build_graph(col=0)
