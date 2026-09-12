@@ -217,15 +217,18 @@ def compute_hallways_for_wing(
 
     Args:
         wing: wing name to scan.
-        col: ChromaDB collection — must support ``.count()`` and paginated
-            ``.get(limit=..., offset=..., include=...)``. The fetch is filtered
-            to ``wing`` client-side rather than via ``.get(where={"wing": ...})``,
-            which binds one SQL variable per matched id and overflows SQLite's
-            ``SQLITE_MAX_VARIABLE_NUMBER`` on large wings (#1619). Fake
-            collections and alternate backends must implement this shape.
-            If ``None``, returns ``[]`` (caller didn't supply a backing
-            store, so nothing to compute against). Tests pass a controlled
-            MagicMock.
+        col: ChromaDB collection — must support paginated
+            ``.get(where={"wing": ...}, limit=..., offset=..., include=...)``.
+            The fetch is scoped to ``wing`` server-side AND paginated: an
+            unbounded ``.get(where=...)`` binds one SQL variable per matched
+            id and overflows SQLite's ``SQLITE_MAX_VARIABLE_NUMBER`` on wings
+            above ~32k drawers (#1619), while an unscoped page walk costs
+            O(total palace drawers) on every mine, pegging the CPU for
+            minutes on large palaces (#2466). A bounded page never binds more
+            than ``batch_size`` ids. Fake collections and alternate backends
+            must implement this shape. If ``None``, returns ``[]`` (caller
+            didn't supply a backing store, so nothing to compute against).
+            Tests pass a controlled MagicMock.
         min_count: minimum co-occurrence count required to materialize a
             hallway between two entities. Default 2 — single co-occurrences
             are noise (entities mentioned together once in one drawer);
@@ -245,19 +248,28 @@ def compute_hallways_for_wing(
 
     min_count = max(1, int(min_count))
 
-    # 1. Query drawers for this wing. Paginate the fetch and filter to the
-    #    wing client-side: a single get(where={"wing": wing}) binds one SQL
+    # 1. Query drawers for this wing: scoped to the wing server-side AND
+    #    paginated. An unbounded get(where={"wing": wing}) binds one SQL
     #    variable per matched id and overflows SQLite's
-    #    SQLITE_MAX_VARIABLE_NUMBER (32766) on wings > ~32k drawers (#1619).
-    #    Mirrors the established pagination in miner.status / palace /
-    #    palace_graph.
+    #    SQLITE_MAX_VARIABLE_NUMBER (32766) on wings > ~32k drawers (#1619);
+    #    a bounded page binds at most batch_size ids. Walking the WHOLE
+    #    collection instead and filtering client-side cost O(total palace
+    #    drawers) on every mine, so filing one small session into an 800k-
+    #    drawer palace pegged the CPU for minutes (#2466). The client-side
+    #    wing check stays as a guard for stores that ignore ``where``. The
+    #    loop ends on a short page: count() counts every wing, so it cannot
+    #    bound a scoped walk.
     metadatas: list = []
     try:
-        total = col.count()
         batch_size = 5000
         offset = 0
-        while offset < total:
-            batch = col.get(limit=batch_size, offset=offset, include=["metadatas"])
+        while True:
+            batch = col.get(
+                where={"wing": wing},
+                limit=batch_size,
+                offset=offset,
+                include=["metadatas"],
+            )
             batch_metas = (batch or {}).get("metadatas") or []
             if not batch_metas:
                 break
@@ -265,6 +277,8 @@ def compute_hallways_for_wing(
                 m for m in batch_metas if isinstance(m, dict) and m.get("wing") == wing
             )
             offset += len(batch_metas)
+            if len(batch_metas) < batch_size:
+                break
     except Exception:
         logger.warning(
             "compute_hallways_for_wing: collection fetch failed for %s", wing, exc_info=True
