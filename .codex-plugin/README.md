@@ -10,63 +10,44 @@ Give your AI a persistent memory -- mine projects and conversations into a searc
 
 ## Installation
 
-### Local Install
-
-1. Copy or symlink the `.codex-plugin` directory into your project root:
+1. Add the repo to the Codex marketplaces:
 
 ```bash
-cp -r .codex-plugin /path/to/your/project/.codex-plugin
+codex plugin marketplace add MemPalace/mempalace
 ```
 
-2. Verify the plugin is detected:
+2. Install the plugin:
 
 ```bash
-codex --plugins
+codex plugin add mempalace@mempalace
 ```
 
-3. Initialize your palace:
+3. Initialize your palace in the Codex TUI:
 
 ```bash
-codex /init
-```
-
-### Git Install
-
-1. Clone the MemPalace repository:
-
-```bash
-git clone https://github.com/MemPalace/mempalace.git
-cd mempalace
-```
-
-2. Install the Python package so the `mempalace-mcp` script lands on
-   your PATH (the bundled `plugin.json` invokes it by bare name):
-
-```bash
-uv tool install --editable .   # or: pip install -e .
-```
-
-   Plain `uv sync` is **not** enough here — it installs the scripts into
-   `.venv/bin/`, which Codex will not find unless you activate the venv
-   before launching Codex.
-
-3. The `.codex-plugin` directory is already in the repo root. Codex CLI will detect it automatically when you run Codex from inside the repository.
-
-4. Initialize your palace:
-
-```bash
-codex /init
+codex
+> $mempalace:mempalace init
 ```
 
 ## Available Skills
 
 | Skill | Description |
 |-------|-------------|
-| `/help` | Show available commands and usage tips |
-| `/init` | Initialize a new memory palace |
-| `/search` | Semantic search across all mined memories |
-| `/mine` | Mine a project or conversation into your palace |
-| `/status` | Show palace status, room counts, and health |
+| `$mempalace:mempalace` | Install, configure, and operate MemPalace, including a private local palace, a shared-brain hub, or a client joining an existing hub |
+| `$mempalace:mempalace-recall` | Recall protocol for MemPalace — search the palace before answering about past work, people, projects, or prior decisions |
+| `$mempalace:mempalace-task` | Create, hand off, claim, execute, and close agent tasks through the MemPalace logstream |
+
+### Skill Commands
+
+The main `$mempalace:mempalace` skill can be invoked with five different subcommands. `$mempalace <command>` can be used as a short form invocation. 
+
+| Command | Description |
+|---------| ------------|
+| `$mempalace help` | Show available commands and usage tips |
+| `$mempalace init` | Initialize a new memory palace |
+| `$mempalace search` | Semantic search across all mined memories |
+| `$mempalace mine` | Mine a project or conversation into your palace |
+| `$mempalace status` | Show palace status, room counts, and health |
 
 ## Hooks
 
