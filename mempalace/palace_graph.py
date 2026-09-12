@@ -91,7 +91,7 @@ def sqlite_grouped_counts_reader(config=None):
             from .backends.chroma import sqlite_room_wing_hall_counts
 
             db_name = "chroma.sqlite3"
-        elif backend == "sqlite_exact":
+        elif backend in {"sqlite_exact", "rust_exact"}:
             from .backends.sqlite_exact import _DB_FILENAME as db_name
             from .backends.sqlite_exact import sqlite_room_wing_hall_counts
         else:
