@@ -19,7 +19,7 @@ from typing import Any, Optional
 import chromadb
 from chromadb.errors import NotFoundError as _ChromaNotFoundError
 
-from ..config import sqlite_read_uri
+from ..config import connect_sqlite_read
 from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
     BaseBackend,
@@ -34,6 +34,7 @@ from .base import (
     QueryResult,
     UnsupportedFilterError,
     _IncludeSpec,
+    initialize_last_modified_metadata,
 )
 
 logger = logging.getLogger(__name__)
@@ -742,7 +743,7 @@ def _vector_segment_id(palace_path: str, collection_name: str) -> Optional[str]:
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             row = conn.execute(
                 """
@@ -909,11 +910,7 @@ def _read_sync_threshold(
         return 1000
 
     try:
-        connection = sqlite3.connect(
-            sqlite_read_uri(db_path),
-            uri=True,
-        )
-
+        connection = connect_sqlite_read(db_path)
         try:
             try:
                 row = connection.execute(
@@ -968,11 +965,7 @@ def _collection_has_sync_threshold_metadata(
         return False
 
     try:
-        connection = sqlite3.connect(
-            sqlite_read_uri(db_path),
-            uri=True,
-        )
-
+        connection = connect_sqlite_read(db_path)
         try:
             try:
                 row = connection.execute(
@@ -1323,7 +1316,7 @@ def _sqlite_embedding_count(palace_path: str, collection_name: str) -> Optional[
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             row = conn.execute(
                 """
@@ -1384,7 +1377,7 @@ def _sqlite_wing_room_counts(
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             # Wait out a transient writer/checkpoint lock rather than falling
             # straight back to the expensive vector-index path (#1681).
@@ -1441,7 +1434,7 @@ def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Opti
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             conn.execute("PRAGMA busy_timeout = 3000")
             if (
@@ -1543,7 +1536,7 @@ def sqlite_list_id_metadata(
     if filters is None:
         return None
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             conn.execute("PRAGMA busy_timeout = 3000")
             if (
@@ -1656,7 +1649,7 @@ def sqlite_documents_for_ids(
     wanted = [str(i) for i in ids]
     docs: dict[str, str] = {}
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             conn.execute("PRAGMA busy_timeout = 3000")
             segments = [
@@ -2050,21 +2043,23 @@ def _close_client(client) -> None:
 
 
 def _clear_chroma_system_cache() -> None:
-    """Drop chromadb's process-global ``SharedSystemClient`` cache.
+    """Drop Chroma's process-global ``SharedSystemClient`` cache.
 
-    chromadb caches its ``System`` (and the live HNSW segment) keyed by path.
-    A bare ``chromadb.PersistentClient(path=...)`` reopen reuses that cached
-    System, so after a peer/rebuild has changed ``chroma.sqlite3`` on disk we
-    would rebuild against the stale in-memory segment and persist an outdated
+    ``clear_system_cache()`` replaces Chroma's system and refcount maps without
+    calling ``System.stop()``. Callers must close every client they own before
+    invoking this helper, while Chroma can still resolve those maps.
+
+    Chroma caches its ``System`` (and the live HNSW segment) keyed by path. A
+    bare ``chromadb.PersistentClient(path=...)`` reopen reuses that cached
+    System, so after a peer or rebuild changes ``chroma.sqlite3`` on disk we
+    would rebuild against stale in-memory state and could persist an outdated
     index over the on-disk changes -- the same data-loss class as #2002,
-    reached via :meth:`ChromaBackend._client` instead of
-    ``mcp_server._get_client``. This mirrors the reset already performed by
-    ``mcp_server._force_chroma_cache_reset`` and ``repair._close_chroma_handles``.
+    reached through :meth:`ChromaBackend._client` instead of
+    ``mcp_server._get_client``.
 
-    The clear is process-global (it evicts every palace's cached System, not
-    just this path); chromadb exposes no per-path eviction. It only fires on the
-    inode/mtime-change branch of ``_client``, never the steady-state hot path,
-    so the redundant rebuild cost is bounded to genuine external-change reopens.
+    The clear is process-global because Chroma exposes no public per-path
+    eviction primitive. It runs only on the external inode/mtime-change branch,
+    never on the steady-state hot path.
     """
     try:
         from chromadb.api.client import SharedSystemClient
@@ -2073,7 +2068,10 @@ def _clear_chroma_system_cache() -> None:
         if callable(clear):
             clear()
     except Exception:
-        logger.debug("Failed to clear chromadb SharedSystemClient cache", exc_info=True)
+        logger.debug(
+            "Failed to clear chromadb SharedSystemClient cache",
+            exc_info=True,
+        )
 
 
 class ChromaCollection(BaseCollection):
@@ -2147,6 +2145,7 @@ class ChromaCollection(BaseCollection):
         misses a case (or skips for performance), reaching the chromadb
         client always goes through here first.
         """
+        metadatas = initialize_last_modified_metadata(metadatas)
         if metadatas is None:
             return None
         return [
@@ -2492,7 +2491,7 @@ class ChromaCollection(BaseCollection):
         # rowid, embedding_id is the user-facing drawer id.
         public_ids: dict[int, str] = {}
         try:
-            conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+            conn = connect_sqlite_read(db_path)
             conn.row_factory = sqlite3.Row
         except sqlite3.Error:
             logger.debug("Chroma lexical sqlite open failed", exc_info=True)
@@ -2815,6 +2814,23 @@ class ChromaBackend(BaseBackend):
         except OSError:
             return (0, 0.0)
 
+    def _drain_clients(self) -> None:
+        """Close and forget every client owned by this backend.
+
+        Chroma's cache reset is process-global. Draining only the palace that
+        changed would leave this backend's other clients untracked after the
+        reset, so their later ``close()`` calls could not stop their Systems.
+
+        Draining invalidates every ``ChromaCollection`` previously returned by
+        those clients, including collections for unchanged palaces. Callers
+        must reacquire them through :meth:`get_collection`.
+        """
+        clients = list(self._clients.values())
+        self._clients.clear()
+        self._freshness.clear()
+        for client in clients:
+            _close_client(client)
+
     def _client(self, palace_path: str):
         """Return a cached ``PersistentClient``, rebuilding on inode/mtime change.
 
@@ -2861,37 +2877,28 @@ class ChromaBackend(BaseBackend):
 
         if cached is None or inode_changed or mtime_changed or mtime_appeared:
             # Drop the per-process quarantine gate so the HNSW pre-checks
-            # run again against the new disk state.  An inode swap means a
-            # different physical DB (post-restore, fresh palace at the same
-            # path); an mtime/appearance change means an external in-place
-            # write (closet_llm, mine, compress) that may have drifted the
-            # HNSW index while this process was running.
-            if (
+            # run again against the new disk state. An inode swap means a
+            # different physical DB; an mtime/appearance change means an
+            # external writer may have drifted the in-memory HNSW state.
+            external_change = (
                 inode_changed
                 or mtime_changed
                 or (mtime_appeared and palace_path in self._freshness)
-            ):
+            )
+            if external_change:
                 ChromaBackend._quarantined_paths.discard(palace_path)
-                # #2028: the same external change means chromadb's path-keyed
-                # System cache is now stale. Reconstructing PersistentClient
-                # below would reuse the cached System (and its in-memory HNSW
-                # segment), so drop the shared cache first -- otherwise the
-                # rebuilt client persists an outdated index over the on-disk
-                # change. Gated on genuine external change (not first open) so
-                # cold opens never pay the global-evict cost.
+
+                # #2028/#2375: Chroma's cache reset is process-global and only
+                # forgets its maps. Close all clients owned by this backend
+                # first, while their close() calls can still decrement the
+                # refcounts and stop the corresponding Systems.
+                self._drain_clients()
                 _clear_chroma_system_cache()
-            # Release the client we are about to displace. Each live
-            # PersistentClient pins its own copy of every HNSW segment it has
-            # opened (``max_elements * size_data_per_element`` bytes -- ~440 MB
-            # per collection on a 165k-drawer palace), and neither dict
-            # eviction nor _clear_chroma_system_cache() returns that native
-            # memory. Dropping it here keeps a long-lived server flat across
-            # rebuilds instead of accumulating one orphaned index set per
-            # external change. Any ChromaCollection handed out before this
-            # point is invalidated -- which is the intent: the rebuild only
-            # fires when the palace changed underneath us, and serving the
-            # pre-change segment is the stale-index class of #2002/#2028.
-            _close_client(self._clients.pop(palace_path, None))
+            else:
+                # Cold open or a missing-DB invalidation does not require a
+                # global reset; release only the requested path.
+                _close_client(self._clients.pop(palace_path, None))
+
             ChromaBackend._prepare_palace_for_open(palace_path)
             cached = chromadb.PersistentClient(path=palace_path)
             self._clients[palace_path] = cached
@@ -3125,10 +3132,7 @@ class ChromaBackend(BaseBackend):
         self._freshness.pop(path, None)
 
     def close(self) -> None:
-        for client in self._clients.values():
-            _close_client(client)
-        self._clients.clear()
-        self._freshness.clear()
+        self._drain_clients()
         self._closed = True
 
     def health(self, palace: Optional[PalaceRef] = None) -> HealthStatus:
