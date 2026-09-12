@@ -770,6 +770,67 @@ def delete_tunnel(tunnel_id: str):
     return {"deleted": tunnel_id}
 
 
+def _merge_tunnels(dst: dict, src: dict) -> None:
+    """Fold ``src`` into ``dst`` in place when two tunnels collapse onto the same
+    canonical id after a re-key. Dynamics keep the stronger and more-recent
+    signal so learned weights are not reset."""
+    dst["strength"] = max(float(dst.get("strength", 1.0)), float(src.get("strength", 1.0)))
+    dst["stability"] = max(float(dst.get("stability", 1.0)), float(src.get("stability", 1.0)))
+    if str(src.get("last_activated", "")) > str(dst.get("last_activated", "")):
+        dst["last_activated"] = src.get("last_activated")
+    dst["access_count"] = int(dst.get("access_count", 0)) + int(src.get("access_count", 0))
+    dst["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def rekey_tunnel_wings(rename_map: dict, config=None) -> int:
+    """Re-key tunnel endpoint wings after a wing rename.
+
+    ``rename_map`` maps ``{old_wing: new_wing}``. Each endpoint whose wing is a
+    key is rewritten and the canonical id regenerated. A tunnel whose two
+    endpoints collapse to the same ``wing/room`` after the rename is dropped (it
+    is no longer a cross-endpoint link); tunnels that collide on the regenerated
+    id are merged via ``_merge_tunnels``. Covers both entity and topic tunnels
+    since they share ``tunnels.json``. Returns the number of tunnels whose
+    endpoints moved or were dropped.
+    """
+    if not rename_map:
+        return 0
+    with mine_lock(_get_tunnel_file(config)):
+        tunnels = _load_tunnels(config)
+        index: dict = {}
+        order: list = []
+        changed = 0
+        for t in tunnels:
+            src = dict(t.get("source") or {})
+            tgt = dict(t.get("target") or {})
+            moved = src.get("wing") in rename_map or tgt.get("wing") in rename_map
+            if moved:
+                changed += 1
+                if src.get("wing") in rename_map:
+                    src["wing"] = rename_map[src["wing"]]
+                if tgt.get("wing") in rename_map:
+                    tgt["wing"] = rename_map[tgt["wing"]]
+                t["source"] = src
+                t["target"] = tgt
+                if _endpoint_key(src.get("wing"), src.get("room")) == _endpoint_key(
+                    tgt.get("wing"), tgt.get("room")
+                ):
+                    # endpoints coincide — no longer a tunnel; drop it
+                    continue
+                t["id"] = _canonical_tunnel_id(
+                    src.get("wing"), src.get("room"), tgt.get("wing"), tgt.get("room")
+                )
+            tid = t.get("id")
+            if tid in index:
+                _merge_tunnels(index[tid], t)
+            else:
+                index[tid] = t
+                order.append(tid)
+        if changed:
+            _save_tunnels([index[k] for k in order], config)
+    return changed
+
+
 def follow_tunnels(wing: str, room: str, col=None, config=None):
     """Follow explicit tunnels from a room — returns connected drawers.
 

@@ -944,3 +944,61 @@ class TestTunnelDynamicsIntegration:
         assert recreated["stability"] == DEFAULT_STABILITY
         assert recreated["access_count"] == 0
         assert "last_activated" in recreated
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# rekey_tunnel_wings — follow drawers after a wing rename (#1938)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _tunnel(sw, sr, tw, tr, **dyn):
+    rec = {
+        "id": palace_graph._canonical_tunnel_id(sw, sr, tw, tr),
+        "source": {"wing": sw, "room": sr},
+        "target": {"wing": tw, "room": tr},
+        "label": f"link {sw}->{tw}",
+        "kind": "entity",
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    rec.update(dyn)
+    return rec
+
+
+class TestRekeyTunnelWings:
+    def test_noop_when_map_empty(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        palace_graph._save_tunnels([_tunnel("_alpha", "entity:Alice", "beta", "entity:Alice")])
+        assert palace_graph.rekey_tunnel_wings({}) == 0
+
+    def test_rekeys_endpoint_and_regenerates_id(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        palace_graph._save_tunnels(
+            [
+                _tunnel(
+                    "_alpha", "entity:Alice", "beta", "entity:Alice", strength=4.0, access_count=8
+                )
+            ]
+        )
+        assert palace_graph.rekey_tunnel_wings({"_alpha": "alpha"}) == 1
+        tuns = palace_graph.list_tunnels()
+        assert len(tuns) == 1
+        wings = sorted([tuns[0]["source"]["wing"], tuns[0]["target"]["wing"]])
+        assert wings == ["alpha", "beta"]
+        assert tuns[0]["id"] == palace_graph._canonical_tunnel_id(
+            "alpha", "entity:Alice", "beta", "entity:Alice"
+        )
+        assert tuns[0]["strength"] == 4.0  # dynamics preserved
+
+    def test_drops_self_referential_tunnel(self, tmp_path, monkeypatch):
+        # a tunnel between two wings that normalize to the SAME target is no
+        # longer a cross-endpoint link and must be dropped
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        palace_graph._save_tunnels([_tunnel("_alpha", "entity:Alice", "alpha_", "entity:Alice")])
+        assert palace_graph.rekey_tunnel_wings({"_alpha": "alpha", "alpha_": "alpha"}) == 1
+        assert palace_graph.list_tunnels() == []
+
+    def test_untouched_tunnel_left_alone(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        palace_graph._save_tunnels([_tunnel("beta", "entity:X", "delta", "entity:X")])
+        palace_graph.rekey_tunnel_wings({"_alpha": "alpha"})
+        assert len(palace_graph.list_tunnels()) == 1
