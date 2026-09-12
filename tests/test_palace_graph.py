@@ -60,11 +60,10 @@ class TestBuildGraph:
         """ChromaDB can return None for drawers without metadata (legacy
         data, partial writes — upstream #1020 territory). build_graph
         must skip None entries silently rather than crash the whole
-        graph build with AttributeError. Caught 2026-04-25 by
-        palace-daemon's verify-routes.sh smoke test against the
-        canonical 151K palace; /stats was 500-ing on a single None
-        drawer and taking out every consumer of build_graph for the
-        whole call path."""
+        graph build with AttributeError. Caught 2026-04-25 during
+        smoke testing against a canonical 151K palace; /stats was
+        500-ing on a single None drawer and taking out every consumer
+        of build_graph for the whole call path."""
         col = _make_fake_collection(
             [
                 {"room": "auth", "wing": "wing_code", "hall": "security", "date": "2026-01-01"},
