@@ -283,7 +283,7 @@ def _is_wal_without_sidecars(db_path: str) -> bool:
     return len(header) == 19 and header[:16] == b"SQLite format 3\x00" and header[18] == 2
 
 
-def connect_sqlite_read(db_path: str, *, timeout: float | None = None):
+def connect_sqlite_read(db_path: str, *, timeout: "float | None" = None):
     """Open ``db_path`` for reading, and keep reading when ``mode=ro`` cannot.
 
     A WAL database whose ``-wal`` and ``-shm`` sidecars are absent cannot be
