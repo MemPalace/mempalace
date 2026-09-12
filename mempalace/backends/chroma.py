@@ -20,6 +20,7 @@ import chromadb
 from chromadb.errors import NotFoundError as _ChromaNotFoundError
 
 from ..config import sqlite_read_uri
+from ._magic import has_sqlite_magic
 from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
     BaseBackend,
@@ -2858,15 +2859,13 @@ class ChromaBackend(BaseBackend):
         as chromadb's ``PersistentClient`` does any work, so this check
         accepts every real chroma palace while rejecting empty / garbage
         files. See #1893.
+
+        Probed through :func:`mempalace.backends._magic.has_sqlite_magic`,
+        which never opens a plain descriptor on the file -- see that module for
+        why a plain open+close of a live database drops the process's POSIX
+        locks on it.
         """
-        db_path = os.path.join(path, "chroma.sqlite3")
-        if not os.path.isfile(db_path):
-            return False
-        try:
-            with open(db_path, "rb") as f:
-                return f.read(16) == b"SQLite format 3\x00"
-        except OSError:
-            return False
+        return has_sqlite_magic(os.path.join(path, "chroma.sqlite3"))
 
     # ------------------------------------------------------------------
     # Legacy (pre-RFC 001) surface — retained while callers migrate.
