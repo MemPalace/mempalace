@@ -1862,7 +1862,10 @@ def _query_drawers_with_filter_fallback(
     drawers are ingested via two different paths (e.g. bulk import vs MCP tool
     calls), leaving the vector index inconsistent with the metadata store. We
     retry unfiltered (over-fetching) and re-apply the wing/room/source_file filter in Python.
-    See #1245 / #1035.
+    The unfiltered retry is progressive — wide recall width first, then ``n_results`` —
+    because on convos-mined wings the wide pool can re-hit the same stale pointer
+    (#1082). The last-resort narrow width is the exact one the CLI path uses.
+    See #1245 / #1035 / #1082.
     """
     where = dkwargs.get("where")
     try:
@@ -1874,37 +1877,53 @@ def _query_drawers_with_filter_fallback(
             "Filtered search failed (%s); falling back to unfiltered + post-filter",
             filter_err,
         )
-        raw = drawers_col.query(
-            query_texts=[query],
-            n_results=min(n_results * 15, 500),
-            include=["documents", "metadatas", "distances"],
-        )
-        raw_docs = _first_or_empty(raw, "documents")
-        raw_ids = _aligned_query_ids(raw, len(raw_docs))
-        fids, fdocs, fmetas, fdists = [], [], [], []
-        for stored_drawer_id, doc, meta, dist in zip(
-            raw_ids,
-            raw_docs,
-            _first_or_empty(raw, "metadatas"),
-            _first_or_empty(raw, "distances"),
-        ):
-            meta = meta or {}
-            if wing and meta.get("wing") != wing:
+        # The filtered query tripped a stale HNSW pointer. Retry unfiltered,
+        # but progressively: first at the wide recall width (broadest), then
+        # narrow back to ``n_results`` — the exact width the CLI path uses
+        # and which demonstrably stays out of the stale region a convos-mined
+        # wing's cluster sits in (#1082). The wide width alone was not enough:
+        # at ``n_results * 15`` breadth the convos cluster IS in the top pool,
+        # so the unfiltered retry re-hit the same pointer and surfaced the
+        # raw "Error finding id" to the caller. Re-raising the last failure
+        # keeps the give-up path identical for a genuinely broken index.
+        last_err = filter_err
+        for candidate_n in (min(n_results * 15, 500), n_results):
+            try:
+                raw = drawers_col.query(
+                    query_texts=[query],
+                    n_results=candidate_n,
+                    include=["documents", "metadatas", "distances"],
+                )
+            except Exception as candidate_err:
+                last_err = candidate_err
                 continue
-            if room and meta.get("room") != room:
-                continue
-            if source_file and meta.get("source_file") != source_file:
-                continue
-            fids.append(stored_drawer_id)
-            fdocs.append(doc)
-            fmetas.append(meta)
-            fdists.append(dist)
-        return {
-            "ids": [fids],
-            "documents": [fdocs],
-            "metadatas": [fmetas],
-            "distances": [fdists],
-        }
+            raw_docs = _first_or_empty(raw, "documents")
+            raw_ids = _aligned_query_ids(raw, len(raw_docs))
+            fids, fdocs, fmetas, fdists = [], [], [], []
+            for stored_drawer_id, doc, meta, dist in zip(
+                raw_ids,
+                raw_docs,
+                _first_or_empty(raw, "metadatas"),
+                _first_or_empty(raw, "distances"),
+            ):
+                meta = meta or {}
+                if wing and meta.get("wing") != wing:
+                    continue
+                if room and meta.get("room") != room:
+                    continue
+                if source_file and meta.get("source_file") != source_file:
+                    continue
+                fids.append(stored_drawer_id)
+                fdocs.append(doc)
+                fmetas.append(meta)
+                fdists.append(dist)
+            return {
+                "ids": [fids],
+                "documents": [fdocs],
+                "metadatas": [fmetas],
+                "distances": [fdists],
+            }
+        raise last_err
 
 
 def _backend_capabilities(col) -> frozenset:
