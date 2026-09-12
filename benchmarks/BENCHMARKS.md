@@ -755,4 +755,43 @@ python benchmarks/locomo_bench.py /tmp/locomo/data/locomo10.json \
 
 ---
 
-*Results verified March 2026. Scripts and raw data committed to this repo.*
+---
+
+## Distilled Knowledge (new — April 2026)
+
+Tests retrieval of **distilled operational knowledge** — engineering constraints,
+architectural decisions, and system invariants written as prose documents.
+
+All existing benchmarks test episodic memory ("what did the user say in session
+3?"). This benchmark tests semantic memory ("what is the correct behaviour for
+X?") — the kind of knowledge engineers capture in runbooks, ADRs, and wikis.
+
+**Corpus:** 30 documents covering cross-cutting engineering constraints
+(concurrency, database gotchas, security gates, process isolation, lifecycle
+management, error handling). No external download required — corpus is embedded
+in the script.
+
+**QA pairs:** 30 paraphrased queries. Question wording deliberately avoids the
+exact vocabulary in the target document to test semantic similarity, not keyword
+matching.
+
+| Mode | Recall@1 | Recall@5 | LLM | Notes |
+|---|---|---|---|---|
+| **Raw ChromaDB baseline** | **76.7%** | **100%** | None | all-MiniLM-L6-v2, n=30 |
+
+Recall@5 is perfect — every correct document appears in the top-5 for all 30
+queries. The 23pp gap to R@1 is consistent with the pattern seen on LongMemEval
+and LoCoMo — correct documents are present but not always ranked first. Hybrid
+retrieval or reranking would likely push R@1 into the 90s.
+
+```bash
+# No data download needed — corpus is self-contained
+python benchmarks/distilled_knowledge_bench.py
+python benchmarks/distilled_knowledge_bench.py --top-k 1 --verbose
+```
+
+See `benchmarks/distilled_knowledge/README.md` for full methodology notes.
+
+---
+
+*Results verified March–April 2026. Scripts and raw data committed to this repo.*
