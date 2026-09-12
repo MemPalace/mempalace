@@ -13,6 +13,8 @@ import os
 import re
 import sys
 
+from .config import MempalaceConfig, wing_from_path
+
 
 _SESSION_ID_RE = re.compile(r"[^a-zA-Z0-9_-]")
 _CONTROL_CHARS_RE = re.compile(r"[\x00\r\n]")
@@ -51,19 +53,44 @@ def _stop_hook_active(value: object) -> str:
     return "False"
 
 
-def parse_stop_payload(payload: dict) -> tuple[str, str, str]:
+def parse_stop_payload(payload: dict) -> tuple[str, str, str, str]:
     return (
         sanitize_session_id(payload.get("session_id", "")),
         _stop_hook_active(payload.get("stop_hook_active", False)),
         normalize_transcript_path(payload.get("transcript_path", "")),
+        normalize_transcript_path(payload.get("cwd", "")),
     )
 
 
-def parse_precompact_payload(payload: dict) -> tuple[str, str]:
+def parse_precompact_payload(payload: dict) -> tuple[str, str, str]:
     return (
         sanitize_session_id(payload.get("session_id", "")),
         normalize_transcript_path(payload.get("transcript_path", "")),
+        normalize_transcript_path(payload.get("cwd", "")),
     )
+
+
+def wing_line(cwd: object) -> str:
+    """The wing the hooks should mine into, or ``""`` when opted out.
+
+    Claude Code's Stop / PreCompact payloads carry the directory the user was
+    working in. When ``hooks.wing_from_cwd`` is enabled, the hooks pass the
+    slug derived from it to ``mempalace mine --wing``, which is priority 1 in
+    ``convo_miner._resolve_wing`` and so overrides the ``wing_api`` default
+    that AI-tool transcript paths otherwise get.
+
+    The decision lives here, not in the shell, so the hooks stay free of slug
+    rules and config parsing. Failures resolve to ``""`` — a misconfigured
+    ``config.json`` must degrade to the default wing, never break the hook.
+    """
+    if not cwd:
+        return ""
+    try:
+        if not MempalaceConfig().hooks_wing_from_cwd:
+            return ""
+        return wing_from_path(str(cwd))
+    except Exception:
+        return ""
 
 
 def count_human_messages(path: str) -> int:
@@ -137,18 +164,22 @@ def main(argv: list[str] | None = None) -> int:
     command = argv[0]
 
     if command == "parse-stop":
-        session_id, stop_hook_active, transcript_path = parse_stop_payload(_load_stdin_json())
+        session_id, stop_hook_active, transcript_path, cwd = parse_stop_payload(_load_stdin_json())
         print("__MEMPAL_PARSE_OK__")
         print(session_id)
         print(stop_hook_active)
         print(transcript_path)
+        # Appended LAST: the hooks read fields by fixed `sed -n 'Np'`
+        # offsets, so a new field may only go on the end.
+        print(wing_line(cwd))
         return 0
 
     if command == "parse-precompact":
-        session_id, transcript_path = parse_precompact_payload(_load_stdin_json())
+        session_id, transcript_path, cwd = parse_precompact_payload(_load_stdin_json())
         print("__MEMPAL_PARSE_OK__")
         print(session_id)
         print(transcript_path)
+        print(wing_line(cwd))
         return 0
 
     if command == "count-human-messages":
