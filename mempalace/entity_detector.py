@@ -235,6 +235,13 @@ READABLE_EXTENSIONS = {
     ".rb",
     ".go",
     ".rs",
+    # C / C++
+    ".c",
+    ".h",
+    ".cpp",
+    ".hpp",
+    ".cc",
+    ".hh",
 }
 
 SKIP_DIRS = {
