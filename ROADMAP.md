@@ -1,74 +1,74 @@
 # MemPalace Roadmap
 
-## v3.1.1 — Stability Patch (this week)
+## Current Status - 2026-06-02
 
-Bug fixes and hardening merged to `develop`, releasing soon.
+This roadmap is a dated planning guide, not a live PR queue. Refresh live state
+before sequencing work:
 
-**Merged:**
-- Security hardening: input validation, KG threading locks, WAL permission fixes (#647)
-- MCP tools: drawer CRUD, paginated export, hook settings (#667)
-- Backend storage seam: ChromaDB abstraction layer enabling swappable backends (#413)
-- MCP ping health check for AnythingLLM compatibility (#600)
-- Windows reparse point crash fix (#558)
-- `mempalace compress` KeyError crash fix (#569)
-- Token count estimate fix (#609)
-- Mtime float precision fix preventing unnecessary re-mines (#610)
+```bash
+gh pr list --repo MemPalace/mempalace --state open --limit 100
+git fetch --prune --tags
+git describe --tags --always
+```
 
-**In review (merging this week):**
-- Auto-repair BLOB seq_ids from chromadb 0.6→1.5 migration (#664)
-- Graph cache with write-invalidation (#661)
-- L1 importance pre-filter for large palaces (#660)
-- Windows Chinese/Unicode encoding fix (#631)
-- HNSW index bloat prevention — 441GB→433KB on large palaces (#346, pending rebase)
-- ~25 additional small bug fixes and platform compatibility patches
+Evidence from the 2026-06-02 refresh:
 
-## v4.0.0-alpha — Next Generation (this week)
+- `develop` is the default remote branch and the active development target.
+- `pyproject.toml` reports version `3.3.6`.
+- `git describe --tags --always` on `develop` returned
+  `v3.3.6-17-g9b7cfc9`.
+- `git tag --list 'v*' --sort=-v:refname` includes `v3.3.6`.
+- `gh release list --repo MemPalace/mempalace --limit 10` still listed
+  `v3.3.5` as the latest GitHub release, so do not claim v3.3.6 has a current
+  GitHub release without rechecking releases.
 
-The v4 alpha introduces three major capabilities: pluggable storage backends, local NLP processing, and improved retrieval quality.
+## Active PR Queue - 2026-06-02
 
-### Swappable Storage
+`gh pr list --repo MemPalace/mempalace --state open --limit 100` returned a
+large open queue. The most recently updated PRs at this refresh were:
 
-ChromaDB remains the default, but v4 introduces a backend abstraction (shipped in #413) that enables drop-in replacements:
+- #1675 `fix/wing-normalize-strip-sep`
+- #1673 `fix/sanitize-documents-chromadb-chokepoint`
+- #1671 `feat/openai-compat-embeddings`
+- #1670 `fix/repair-rebuild-index-alias`
+- #1667 `fix/embeddinggemma-external-data`
+- #1666 `fix/80-drawer-id-collision-delimiter`
+- #1664 `perf/1657-read-path-o1`
+- #1661 `fix/windows-hooks-bash-path-mangling`
+- #1658 `fix/persist-directory-config`
+- #1655 `claude/stoic-zhukovsky-98db3a`
 
-- **PostgreSQL backend** with pg_sorted_heap support (#665) — for production deployments needing ACID guarantees, concurrent access, and standard backup/restore
-- **LanceDB backend** (#574) — for local-first deployments wanting multi-device sync without a database server
-- **PalaceStore** (#643) — bespoke storage layer purpose-built for MemPalace's access patterns (draft, evaluating)
+## Current Themes
 
-Users choose their backend at init time. Existing ChromaDB palaces continue to work unchanged.
+- **Release hygiene:** reconcile the v3.3.6 tag/repo version with GitHub release
+  status before publishing or announcing it.
+- **Backend correctness:** ChromaDB chokepoints, HNSW repair/quarantine,
+  SQLite/FTS5 repair, and persistent directory handling remain active review
+  themes.
+- **Embedding and retrieval:** OpenAI-compatible embeddings, embeddinggemma
+  external data, candidate strategies, recency ordering, and read-path
+  performance are active review themes.
+- **Platform compatibility:** Windows path/encoding fixes and hook launcher
+  hardening remain active review themes.
 
-### Local NLP
+## Historical Snapshot
 
-On-device natural language processing via local models (#507):
-
-- Entity extraction, relationship detection, and topic classification without external API calls
-- Feature-flagged and optional — falls back to existing heuristic extractors
-- Runs on consumer hardware (no GPU required, GPU-accelerated when available)
-
-### Improved Retrieval
-
-- **Hybrid search**: keyword text-match fallback when vector similarity misses exact terms (#662)
-- **Stale index detection**: automatic reconnection when the HNSW index changes on disk (#663)
-- **Time-decay scoring**: recent memories surface before older ones (#337)
-- **Query sanitization**: system prompt contamination mitigation already shipped in v3.1 (#385)
-
-### What's Not in v4 Alpha
-
-These are under consideration for v4 stable or later:
-
-- Synapse advanced retrieval — MMR, pinned memory, query expansion (#596)
-- Multi-device sync (#575) — depends on LanceDB backend
-- Multilingual embedding support (#488, #442)
-- Qdrant vector search backend (#381)
+The old v3.1.1 and v4.0.0-alpha "this week" plan has been superseded by the
+v3.3.x release line. Keep those references in old changelog or issue context
+only; do not use them as current schedule language.
 
 ## Branch Model
 
 ```
-main            ← tagged production releases
-develop         ← active development (PRs merge here)
-release/3.1     ← hotfixes for current stable (v3.1.x)
-release/3.0     ← hotfixes for prior stable
+main            <- tagged production releases
+develop         <- active development; PRs normally target here
+release/3.3.6   <- current 3.3.6 release branch evidence
+release/v4-prep <- v4 preparation branch evidence
+older release/* <- historical maintenance branches
 ```
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines. PRs should target `develop`. We review all contributions for correctness, security, and compatibility before merging.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines. PRs should target
+`develop` unless a maintainer explicitly names a release branch. Review all
+contributions for correctness, security, and compatibility before merging.
