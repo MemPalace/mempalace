@@ -4377,6 +4377,54 @@ class TestDiaryTools:
         r = tool_diary_read(agent_name="Nobody")
         assert r["entries"] == []
 
+    def test_diary_read_pages_past_10000_and_returns_true_latest(self, monkeypatch, config, kg):
+        """Entries beyond the old 10k cap must affect both recency and total."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        class PagedDiaryCollection:
+            total = 10001
+
+            def __init__(self):
+                self.calls = []
+
+            def get(self, *, where, include, limit, offset):
+                self.calls.append(
+                    {"where": where, "include": include, "limit": limit, "offset": offset}
+                )
+                stop = min(offset + limit, self.total)
+                indices = range(offset, stop)
+                return {
+                    "ids": [f"diary-{index}" for index in indices],
+                    "documents": [f"entry-{index}" for index in indices],
+                    "metadatas": [
+                        {
+                            "filed_at": f"2026-01-01T00:00:00.{index:06d}Z",
+                            "date": "2026-01-01",
+                            "topic": "pagination",
+                        }
+                        for index in indices
+                    ],
+                }
+
+        collection = PagedDiaryCollection()
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: collection)
+
+        result = mcp_server.tool_diary_read(agent_name="TestAgent", last_n=10)
+
+        assert result["total"] == 10001
+        assert result["showing"] == 10
+        assert [entry["content"] for entry in result["entries"]] == [
+            f"entry-{index}" for index in range(10000, 9990, -1)
+        ]
+        assert len(collection.calls) == 11
+        assert all(call["limit"] == 1000 for call in collection.calls)
+        assert [call["offset"] for call in collection.calls] == list(range(0, 11000, 1000))
+        assert all(
+            call["where"] == {"$and": [{"room": "diary"}, {"agent": "testagent"}]}
+            for call in collection.calls
+        )
+
     def test_diary_write_same_second_shared_prefix_no_collision(
         self, monkeypatch, config, palace_path, kg
     ):

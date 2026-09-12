@@ -49,7 +49,7 @@ jobs:
           python -c "import glob, subprocess, sys; subprocess.check_call([sys.executable, '-m', 'pip', 'install', *glob.glob('dist/*.whl')])"
           python -c "from mempalace_core_rs import NativeVectorIndex"
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.target }}
           path: dist
@@ -82,7 +82,7 @@ jobs:
           mkdir -p dist-bin
           cp ${{ matrix.binary_path }} dist-bin/${{ matrix.artifact_name }}
         shell: bash
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
           path: dist-bin/${{ matrix.artifact_name }}
@@ -94,7 +94,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: native-assets
           merge-multiple: true
