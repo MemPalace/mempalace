@@ -41,6 +41,7 @@ from .milvus import MilvusBackend, MilvusCollection
 from .pgvector import PgVectorBackend, PgVectorCollection
 from .qdrant import QdrantBackend, QdrantCollection
 from .sqlite_exact import SQLiteExactBackend, SQLiteExactCollection
+from .rust_exact import RustExactBackend, RustExactCollection
 from .registry import (
     available_backends,
     detect_backend_for_path,
@@ -52,6 +53,8 @@ from .registry import (
     resolve_backend_for_palace,
     unregister,
 )
+
+register("rust_exact", RustExactBackend)
 
 __all__ = [
     "BackendClosedError",
@@ -78,6 +81,8 @@ __all__ = [
     "QdrantBackend",
     "QdrantCollection",
     "QueryResult",
+    "RustExactBackend",
+    "RustExactCollection",
     "SQLiteExactBackend",
     "SQLiteExactCollection",
     "UnsupportedCapabilityError",

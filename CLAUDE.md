@@ -62,8 +62,8 @@ uv run ruff format --check .
 
 ```
 mempalace/
-├── mcp_server.py        # MCP server — all read/write tools
-├── cli.py               # CLI dispatcher
+├── mcp_server/          # MCP server package — tools, schemas, protocol, transports
+├── cli/                 # CLI package — commands, parser; public import is still mempalace.cli
 ├── config.py            # Configuration + input validation
 ├── miner.py             # Project file miner
 ├── convo_miner.py       # Conversation transcript miner
@@ -125,7 +125,8 @@ Knowledge Graph:
 
 ## Key Files for Common Tasks
 
-- **Adding an MCP tool**: `mempalace/mcp_server.py` — add handler function + TOOLS dict entry
+- **Adding an MCP tool**: handler in `mempalace/mcp_server/tools_*.py` + `TOOLS` entry in `mempalace/mcp_server/schemas.py` (public import path is still `mempalace.mcp_server`)
+- **Adding a CLI command**: handler in `mempalace/cli/cmd_*.py` + argparse in `mempalace/cli/parser.py` (public import path is still `mempalace.cli`)
 - **Changing search**: `mempalace/searcher.py`
 - **Modifying mining**: `mempalace/miner.py` (project files) or `mempalace/convo_miner.py` (transcripts)
 - **Adding a storage backend**: subclass `mempalace/backends/base.py`, register in `backends/__init__.py`

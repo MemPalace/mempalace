@@ -13,8 +13,8 @@ jobs:
       matrix:
         python-version: ["3.9", "3.11", "3.13"]
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
@@ -24,8 +24,8 @@ jobs:
   test-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.13"
           cache: 'pip'
@@ -46,8 +46,8 @@ jobs:
   test-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.13"
           cache: 'pip'
@@ -56,8 +56,8 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.11"
           cache: 'pip'
@@ -69,6 +69,33 @@ jobs:
       # dependabot bump to the pin there passes CI without the new version
       # ever running. test_ruff_pins_match asserts the two stay equal, and
       # also covers the pre-commit config's ruff rev (all three must agree).
-      - run: pip install "ruff==0.16.1"
+      - run: pip install "ruff==0.16.6"
       - run: ruff check .
       - run: ruff format --check .
+
+  test-rust:
+    name: Test Rust Core & CLI
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - run: cargo fmt --all --check
+      - run: cargo check --workspace --locked
+      - run: cargo test -p mempalace-core -p mempalace-cli --locked
+      - run: pip install -e ".[dev]" "maturin>=1.7,<2"
+      - name: Build and install native wheel
+        run: pip install ./crates/mempalace-py
+      - name: Verify native adapter (fallback cannot satisfy this job)
+        env:
+          MEMPALACE_REQUIRE_NATIVE: "1"
+        run: >-
+          python -m pytest tests/test_rust_exact_backend.py
+          tests/test_backend_conformance.py tests/test_sqlite_exact_backend.py -v
+
+

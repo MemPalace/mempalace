@@ -65,6 +65,7 @@ milvus = "mempalace.backends.milvus:MilvusBackend"
 pgvector = "mempalace.backends.pgvector:PgVectorBackend"
 qdrant = "mempalace.backends.qdrant:QdrantBackend"
 sqlite_exact = "mempalace.backends.sqlite_exact:SQLiteExactBackend"
+rust_exact = "mempalace.backends.rust_exact:RustExactBackend"
 
 # RFC 002 source-adapter entry-point group. Core publishes no first-party
 # adapters under this group yet; ``miner.py`` and ``convo_miner.py`` migrate
@@ -80,7 +81,7 @@ dev = [
     # (wired only into the test-windows job in ci.yml, scoped to the specific
     # error). Local/Linux/macOS runs never rerun, so real failures stay loud.
     "pytest-rerunfailures>=12.0",
-    "ruff==0.16.1",
+    "ruff==0.16.6",
     "psutil>=5.9",
     # Property-based testing — generates hundreds of random inputs per
     # test to find counterexamples the hand-written positive tests miss.
@@ -148,7 +149,7 @@ dev = [
     # (wired only into the test-windows job in ci.yml, scoped to the specific
     # error). Local/Linux/macOS runs never rerun, so real failures stay loud.
     "pytest-rerunfailures>=12.0",
-    "ruff==0.16.1",
+    "ruff==0.16.6",
     "psutil>=5.9",
     "hypothesis>=6.0",
     "pre-commit>=3.0",
@@ -174,6 +175,25 @@ extend-exclude = ["benchmarks", "*.md"]
 [tool.ruff.lint]
 select = ["E", "F", "W", "C901"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# mcp_server fragments exec into the package namespace. Names they use live
+# in __init__.py and earlier fragments, so F821 is expected; __init__.py
+# imports those names for the fragments, so F401 is expected there too.
+"mempalace/mcp_server/__init__.py" = ["F401"]
+"mempalace/mcp_server/_*.py" = ["F821"]
+"mempalace/mcp_server/tools_*.py" = ["F821"]
+"mempalace/mcp_server/schemas.py" = ["F821"]
+"mempalace/mcp_server/protocol.py" = ["F821"]
+"mempalace/mcp_server/http.py" = ["F821"]
+"mempalace/mcp_server/runtime.py" = ["F821"]
+# cli fragments exec into the package namespace. Names they use live in
+# __init__.py and earlier fragments, so F821 is expected; __init__.py
+# imports those names for the fragments, so F401 is expected there too.
+"mempalace/cli/__init__.py" = ["F401"]
+"mempalace/cli/_*.py" = ["F821"]
+"mempalace/cli/cmd_*.py" = ["F821"]
+"mempalace/cli/parser.py" = ["F821"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 25
