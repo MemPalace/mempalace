@@ -34,12 +34,17 @@ def _readme() -> str:
     return _read(README_PATH)
 
 
+def _mcp_server_source() -> str:
+    """Concatenate mcp_server package sources without importing chromadb."""
+    pkg = MEMPALACE_PKG / "mcp_server"
+    return "\n".join(_read(path) for path in sorted(pkg.glob("*.py")))
+
+
 def _tools_dict_keys() -> list:
     """Return the list of tool names registered in the TOOLS dict."""
     # Import the module-level TOOLS dict.  We can't just import mcp_server
     # because it calls chromadb on import, so we parse the source instead.
-    src = _read(MEMPALACE_PKG / "mcp_server.py")
-    return re.findall(r'"(mempalace_\w+)":\s*\{', src)
+    return re.findall(r'"(mempalace_\w+)":\s*\{', _mcp_server_source())
 
 
 def _doc_tool_names() -> list:
@@ -752,7 +757,7 @@ class TestAAAKSpecToolHandler:
 
     def test_aaak_spec_handler_exists(self):
         """The handler function for get_aaak_spec must be defined."""
-        src = _read(MEMPALACE_PKG / "mcp_server.py")
+        src = _mcp_server_source()
         tools = _tools_dict_keys()
         if "mempalace_get_aaak_spec" in tools:
             assert "def tool_get_aaak_spec(" in src, (

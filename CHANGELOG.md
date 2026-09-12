@@ -8,8 +8,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Performance & Architecture (Dual-Track Rust Engine)
+
+- **Optional native Rust exact-vector acceleration (`rust_exact`).**
+  Reads the existing SQLite format into a contiguous float buffer, uses Rayon
+  for large scans, and releases the Python GIL. Local and external writes
+  invalidate the native cache. Loading is collection-scoped and decodes blobs
+  safely; serial and parallel scans preserve deterministic tie ordering.
+  The initial Windows benchmark reported 557 MB RSS versus 2,430 MB for the
+  Python baseline, with 7.2-11.8 ms native warm latency across 168k/334k-row
+  workloads. These historical numbers have not been rerun after hardening.
+  Complex filters and absent native extensions fall back to Python.
+
+- **Standalone native vector CLI and optional wheels.**
+  GitHub releases include native wheels and platform executables. The CLI
+  accepts JSON embedding vectors via `--vector` or stdin; it does not embed
+  text or require Python. Platform runtime libraries may still be required.
+
+- **NumPy top-k optimization.**
+  Cache vector norms and partition distances before sorting the selected
+  results, preserving row-order ties at the cutoff.
+
+- **Read-only search operations stop contending with palace writer leases.**
+  `searcher.py` and `_open_search_collection` now explicitly open collections with `read_only=True`. Read-only queries connect in SQLite WAL reader mode without attempting schema initialization or writer lease locks, allowing CLI and agent searches to run concurrently with an active background MCP server or writer process without raising `MineAlreadyRunning`.
+
+### Refactors
+
+- **MCP server is a package, not an 8 000-line module.** `mempalace.mcp_server` stays the public import path (`TOOLS`, `handle_request`, `main`, every `tool_*` handler, and the process-global names tests monkeypatch). Implementation lives in domain files under `mempalace/mcp_server/` so PRs can target drawers, KG, coordination, protocol, or HTTP without colliding on one god-file. Fragments exec into the package namespace — a physical split, not a behaviour change.
+- **CLI is a package, not a 4 000-line module.** `mempalace.cli` stays the public import path (`main`, every `cmd_*` handler, and the names tests monkeypatch). Implementation lives in domain files under `mempalace/cli/` so PRs can target init, mine, search, repair, logstream, or argparse without colliding on one god-file. Fragments exec into the package namespace — a physical split, not a behaviour change.
+- **MCP server tests are split by domain.** `tests/test_mcp_server.py` is now `tests/mcp/` (protocol, read, search, write, diary, KG, guards, stale-library) so community MCP PRs do not collide on one 8 600-line test file. Shared helpers live in `tests/_mcp_server_helpers.py`.
+
+### Features
+
+- **Shared-brain rules are `host:harness:project`, declared-idle, and MCP-shape aware.** `mempalace rules` takes `--host --harness --project` (stable lowercase tokens) and optional `--mcp full|light` (default `full`, matching the 45-tool server). The packaged snippet is the only coordination text: compose the identity from the current workspace, arm `logstream watch` only on listen / claim / delegate, write topics on named lanes without filtering the default inbox on them, claim with a lowest-HLC mutex, and use `kg_supersede` for single-valued fact changes. `--mcp light` swaps tool tokens onto the 3-tool triad; prose is identical. `logstream watch --agent` now defaults a sanitized `--state-file` (`:` → `_` under `~/.mempalace/watch/`) so Windows tuple identities do not need a private path overlay.
+
 ### Bug Fixes
 
+- **The transcript-path fallback no longer gives every git worktree its own wing.** `_wing_from_transcript_path`'s primary path (reading `cwd` from the JSONL) already collapsed a `<project>/.claude/worktrees/<wt>` segment before deriving the wing; the fallback path, used whenever `cwd` is absent, had no equivalent strip, so the flattened `--claude-worktrees-<wt>` segment survived into the wing name. Applied the same collapse there. (#2388)
 - **A convo mine no longer re-walks the whole collection once per thousand drawers.** `prefetch_content_hashes` builds the `(wing, content_hash) -> source_file` map every `mempalace mine --mode convos` consults before filing, and it paged the collection with `get(limit=1000, offset=N)`. That shape assumes `limit`/`offset` reach the store, which is true of Chroma's SQL cursor and false of Qdrant, where `get()` goes through `_rows() -> _scroll_all()` to materialize every matching row and slices the result in Python afterwards: each page walked the entire collection to keep a thousandth of it, so the scan cost grew with the square of palace size. On a 260,415-drawer Qdrant palace that was 261 passes over 260,415 rows -- roughly 68 million payloads fetched and JSON-decoded, 17+ minutes of a pegged core and 800 MB resident -- to build a map the miner then consulted for a single transcript. The hook-driven mine that runs every few exchanges meant one core stayed pegged for the length of a working session. It now takes the single-cursor `get_all_metadata()` path added for exactly this in #1832, the same one `mcp_server._fetch_all_metadata()` already uses, which brings that palace to 4.1 s and the whole dry-run mine to 4.5 s. `BaseCollection.get_all_metadata` defaults to the identical offset loop, so backends with a real server-side cursor are behaviorally unchanged. (#1796)
 
 ---
