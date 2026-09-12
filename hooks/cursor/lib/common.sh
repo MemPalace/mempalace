@@ -444,12 +444,14 @@ mempal_infer_wing() {
     case "$base" in
         *\\*) base="${base##*\\}" ;;
     esac
-    # Lowercase + replace anything outside [a-z0-9_-] with underscore.
-    # Collapse runs of underscores so "foo  bar" doesn't become
-    # "foo__bar".
+    # Lowercase + collapse anything outside [a-z0-9_] (spaces, hyphens,
+    # other punctuation) to underscore, then squeeze runs so "foo  bar"
+    # doesn't become "foo__bar". Hyphens collapse too, matching
+    # config.normalize_wing_name, so the hook-derived wing equals the
+    # miner's canonical wing for a hyphenated repo dir (#1936).
     base="$(printf '%s' "$base" \
         | tr '[:upper:]' '[:lower:]' \
-        | tr -c 'a-z0-9_-' '_' \
+        | tr -c 'a-z0-9_' '_' \
         | tr -s '_' \
         | sed 's/^_//; s/_$//')"
     if [ -z "$base" ]; then
