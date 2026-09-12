@@ -6,6 +6,7 @@ import tempfile
 import pytest
 from mempalace.config import (
     MempalaceConfig,
+    connect_sqlite_read,
     normalize_wing_name,
     sanitize_iso_date,
     sanitize_iso_temporal,
@@ -95,6 +96,38 @@ def test_milvus_config_from_env_and_file(tmp_path, monkeypatch):
     assert cfg.milvus_db_name == "env-db"
     assert cfg.milvus_namespace == "env-ns"
     assert cfg.milvus_consistency_level == "Eventually"
+
+
+def test_pgvector_config_from_env_and_file(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump(
+            {
+                "pgvector_dsn": "postgresql://config.example:5432/memdb",
+                "pgvector_namespace": "config-ns",
+                "pgvector_shared_namespace": "config-fleet",
+            },
+            f,
+        )
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.pgvector_dsn == "postgresql://config.example:5432/memdb"
+    assert cfg.pgvector_namespace == "config-ns"
+    assert cfg.pgvector_shared_namespace == "config-fleet"
+
+    monkeypatch.setenv("MEMPALACE_PGVECTOR_DSN", "postgresql://env.example:5432/memdb")
+    monkeypatch.setenv("MEMPALACE_PGVECTOR_NAMESPACE", "env-ns")
+    monkeypatch.setenv("MEMPALACE_PGVECTOR_SHARED_NAMESPACE", "env-fleet")
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    assert cfg.pgvector_dsn == "postgresql://env.example:5432/memdb"
+    assert cfg.pgvector_namespace == "env-ns"
+    assert cfg.pgvector_shared_namespace == "env-fleet"
+
+
+def test_pgvector_shared_namespace_unset_by_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_PGVECTOR_SHARED_NAMESPACE", raising=False)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.pgvector_shared_namespace is None
 
 
 def test_milvus_config_rejects_invalid_consistency_level(tmp_path, monkeypatch):
@@ -223,6 +256,86 @@ def test_embeddinggemma_batch_size_invalid_falls_back_to_default(tmp_path, monke
     monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE", "not-a-number")
     cfg = MempalaceConfig(config_dir=str(tmp_path))
     assert cfg.embeddinggemma_batch_size == _EMBEDDINGGEMMA_BATCH_SIZE
+
+
+def _wal_db(tmp_path, name="chroma.sqlite3"):
+    """A WAL database with its sidecars removed, as chroma leaves one behind."""
+    db_path = tmp_path / name
+    setup = sqlite3.connect(str(db_path))
+    setup.execute("PRAGMA journal_mode=WAL")
+    setup.execute("CREATE TABLE t (x INTEGER)")
+    setup.execute("INSERT INTO t VALUES (42)")
+    setup.commit()
+    setup.close()
+    for sidecar in (f"{db_path}-wal", f"{db_path}-shm"):
+        if os.path.exists(sidecar):
+            os.unlink(sidecar)
+    return db_path
+
+
+def test_connect_sqlite_read_reads_a_wal_database_without_sidecars(tmp_path):
+    """A read-only open cannot create the WAL index, so that case takes a normal open.
+
+    Apple's SQLite, which CPython links on macOS, fails the first statement of
+    such a connection with "unable to open database file", and the integrity
+    gate then refused every tool for a healthy palace (#2489).
+    """
+    db_path = _wal_db(tmp_path)
+
+    conn = connect_sqlite_read(str(db_path))
+    try:
+        assert conn.execute("SELECT x FROM t").fetchone()[0] == 42
+        assert conn.execute("PRAGMA quick_check").fetchall() == [("ok",)]
+    finally:
+        conn.close()
+
+
+def test_connect_sqlite_read_takes_a_normal_open_when_the_wal_index_is_missing(tmp_path):
+    """The fallback is a normal open, which is the whole point: it may create the index.
+
+    Asserting the open mode rather than a side effect keeps this meaningful on
+    SQLite builds whose read-only open happens to succeed here.
+    """
+    db_path = _wal_db(tmp_path)
+
+    conn = connect_sqlite_read(str(db_path))
+    try:
+        conn.execute("INSERT INTO t VALUES (1)")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def test_connect_sqlite_read_stays_read_only_for_a_rollback_journal_database(tmp_path):
+    db_path = tmp_path / "chroma.sqlite3"
+    setup = sqlite3.connect(str(db_path))
+    setup.execute("CREATE TABLE t (x INTEGER)")
+    setup.commit()
+    setup.close()
+
+    conn = connect_sqlite_read(str(db_path))
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("INSERT INTO t VALUES (1)")
+    finally:
+        conn.close()
+
+
+def test_connect_sqlite_read_stays_read_only_while_the_sidecars_are_there(tmp_path):
+    """A WAL palace that something else holds open keeps the read-only connection."""
+    db_path = _wal_db(tmp_path)
+    holder = sqlite3.connect(str(db_path))
+    holder.execute("SELECT x FROM t").fetchone()
+    try:
+        assert os.path.exists(f"{db_path}-shm")
+        conn = connect_sqlite_read(str(db_path))
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                conn.execute("INSERT INTO t VALUES (1)")
+        finally:
+            conn.close()
+    finally:
+        holder.close()
 
 
 def test_sqlite_read_uri_opens_path_with_spaces(tmp_path):
@@ -1086,3 +1199,77 @@ def test_lang_explicit_ignores_entity_languages_fallback():
     cfg = MempalaceConfig(config_dir=tmpdir)
     assert cfg.lang_explicit is None
     assert cfg.lang == "ko"  # display-side fallback still works
+
+
+# ── hybrid re-rank blend weights (#2298) ─────────────────────────────────
+# searcher._hybrid_rank used to hardcode 0.6 (vector) / 0.4 (BM25). Those are
+# now configurable via env var > config.json > built-in default, with malformed
+# values silently falling back so a hand-edited config can't take retrieval down.
+
+_HYBRID_VECTOR_ENV = "MEMPALACE_HYBRID_VECTOR_WEIGHT"
+_HYBRID_BM25_ENV = "MEMPALACE_HYBRID_BM25_WEIGHT"
+
+
+def _clear_hybrid_env(monkeypatch) -> None:
+    monkeypatch.delenv(_HYBRID_VECTOR_ENV, raising=False)
+    monkeypatch.delenv(_HYBRID_BM25_ENV, raising=False)
+
+
+def test_hybrid_rank_weights_default_when_unset(tmp_path, monkeypatch):
+    _clear_hybrid_env(monkeypatch)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hybrid_rank_vector_weight == 0.6
+    assert cfg.hybrid_rank_bm25_weight == 0.4
+
+
+def test_hybrid_rank_weights_from_config_file(tmp_path, monkeypatch):
+    _clear_hybrid_env(monkeypatch)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"hybrid_rank_vector_weight": 0.8, "hybrid_rank_bm25_weight": 0.2}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hybrid_rank_vector_weight == 0.8
+    assert cfg.hybrid_rank_bm25_weight == 0.2
+
+
+def test_hybrid_rank_weights_env_overrides_config_file(tmp_path, monkeypatch):
+    # config.json holds 0.8/0.2; env holds 0.9/0.1, which must win for both.
+    # (Leaving one unset would resolve it from config, not env, so both are set
+    # to isolate the env > config precedence for each weight.)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"hybrid_rank_vector_weight": 0.8, "hybrid_rank_bm25_weight": 0.2}, f)
+    monkeypatch.setenv(_HYBRID_VECTOR_ENV, "0.9")
+    monkeypatch.setenv(_HYBRID_BM25_ENV, "0.1")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hybrid_rank_vector_weight == 0.9
+    assert cfg.hybrid_rank_bm25_weight == 0.1
+
+
+@pytest.mark.parametrize("value", ["0.8", "0.2", "  0.5  ", "1e-3", "2"])
+def test_hybrid_rank_weights_accept_numeric_env_values(tmp_path, monkeypatch, value):
+    _clear_hybrid_env(monkeypatch)
+    monkeypatch.setenv(_HYBRID_VECTOR_ENV, value)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hybrid_rank_vector_weight == float(value)
+
+
+@pytest.mark.parametrize("bad", ["not-a-number", "", "nan", "inf", "-0.5"])
+def test_hybrid_rank_weights_malformed_env_falls_back_to_default(tmp_path, monkeypatch, bad):
+    _clear_hybrid_env(monkeypatch)
+    monkeypatch.setenv(_HYBRID_VECTOR_ENV, bad)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hybrid_rank_vector_weight == 0.6
+    assert cfg.hybrid_rank_bm25_weight == 0.4
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [[0.8, 0.2], {"v": 1}, "banana", None, -0.5, 1e400],
+    ids=["list", "dict", "string", "null", "negative", "inf"],
+)
+def test_hybrid_rank_weights_malformed_config_falls_back_to_default(tmp_path, monkeypatch, bad):
+    _clear_hybrid_env(monkeypatch)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"hybrid_rank_vector_weight": bad, "hybrid_rank_bm25_weight": bad}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hybrid_rank_vector_weight == 0.6
+    assert cfg.hybrid_rank_bm25_weight == 0.4
