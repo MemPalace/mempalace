@@ -286,16 +286,19 @@ def build_palace_and_retrieve_aaak(entry, granularity="session", n_results=50):
 
     collection = _fresh_collection()
 
-    # Ingest AAAK compressed text
+    # Ingest raw text for retrieval; store AAAK in metadata for display.
+    # Fix C: MiniLM was trained on natural language, not AAAK format.
+    # Storing raw text lets the embedding model do what it was trained to do.
     collection.add(
-        documents=corpus_compressed,
-        ids=[f"doc_{i}" for i in range(len(corpus_compressed))],
+        documents=corpus,
+        ids=[f"doc_{i}" for i in range(len(corpus))],
         metadatas=[
-            {"corpus_id": cid, "timestamp": ts} for cid, ts in zip(corpus_ids, corpus_timestamps)
+            {"corpus_id": cid, "timestamp": ts, "aaak": aaak_doc}
+            for cid, ts, aaak_doc in zip(corpus_ids, corpus_timestamps, corpus_compressed)
         ],
     )
 
-    # Query with raw question (not compressed)
+    # Query with raw natural language — matches the raw documents in the index.
     query = entry["question"]
     results = collection.query(
         query_texts=[query],
