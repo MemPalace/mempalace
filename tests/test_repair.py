@@ -1967,8 +1967,19 @@ def test_sqlite_integrity_errors_reports_a_path_python_cannot_encode(tmp_path):
 
     assert all("quick_check failed" in error for error in errors)
     assert repair.sqlite_integrity_status(palace).checked is True
-    if sys.version_info < (3, 13):
-        assert errors, "pathname2url raises here, and the probe has to report that"
+
+    # ``pathname2url`` changed behavior across Python implementations and
+    # versions: some raise on the surrogateescape byte while others
+    # percent-encode it. Test the actual runtime behavior rather than assuming
+    # a particular Python version implies one outcome.
+    from urllib.request import pathname2url
+
+    try:
+        pathname2url(os.path.join(palace, "chroma.sqlite3"))
+    except ValueError:
+        assert errors, "a pathname2url failure must be reported by the probe"
+    else:
+        assert errors == [], "an encodable path should reach SQLite normally"
 
 
 @needs_posix_path_errno
