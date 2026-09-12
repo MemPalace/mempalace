@@ -203,6 +203,19 @@ def test_locate_keeps_explicit_transcript_path(tmp_path):
     assert Path(located).resolve() == transcript.resolve()
 
 
+def test_locate_transcript_claude_code_does_not_search_grok_sessions(tmp_path):
+    cwd = "/Users/vijay/Projects/Engram"
+    sid = "grok-sess"
+    dest = tmp_path / "sessions" / quote(cwd, safe="") / sid
+    _write_grok_history(dest / "chat_history.jsonl", [_grok_user("q", prompt_index=0)])
+    located = hooks_cli_mod._locate_transcript(
+        "claude-code",
+        {"session_id": sid, "cwd": cwd, "transcript_path": "", "harness": "claude-code"},
+        sessions_root=tmp_path / "sessions",
+    )
+    assert located == ""
+
+
 # --- count / extract ---
 
 

@@ -1423,6 +1423,8 @@ def _should_skip_stop(parsed: dict) -> bool:
     """Skip nested/teardown Stop fires that would double-save or count as turns."""
     if parsed.get("subagent_type"):
         return True
+    if parsed.get("harness") not in ("grok", "copilot"):
+        return False
     reason = parsed.get("stop_reason") or ""
     return bool(reason) and reason != "end_turn"
 
