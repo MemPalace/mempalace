@@ -71,6 +71,20 @@ def _ensure_wal() -> None:
     _WAL_INITIALIZED_DIR = wal_dir
 
 
+def _harden_existing_wal_file() -> None:
+    """Re-apply the intended mode before appending to an existing WAL.
+
+    ``os.open(..., mode=0o600)`` constrains only a newly created file. If an
+    existing WAL has drifted to broader permissions, restore 0o600 before the
+    append. This is one best-effort file chmod per write; directory hardening
+    remains cached in :func:`_ensure_wal`.
+    """
+    try:
+        _WAL_FILE.chmod(0o600)
+    except (OSError, NotImplementedError):
+        pass
+
+
 def _wal_log(operation: str, params: dict, result: dict = None):
     """Append a write operation to the write-ahead log."""
     # Redact sensitive content from params before logging
@@ -90,6 +104,7 @@ def _wal_log(operation: str, params: dict, result: dict = None):
         # Dir setup shares the append's exception handler below: any WAL
         # failure is logged and non-fatal, never crashing the tool call.
         _ensure_wal()
+        _harden_existing_wal_file()
         fd = os.open(str(_WAL_FILE), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, default=str) + "\n")
