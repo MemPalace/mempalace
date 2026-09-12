@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 from .palace import get_collection
+from .source_identity import source_directory_identity
 
 logger = logging.getLogger(__name__)
 
@@ -289,6 +290,12 @@ def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None)
         batch_docs.clear()
         batch_metas.clear()
 
+    # Established once per transcript, before any drawer is built, and taken
+    # from the directory of the path that goes into ``source_file`` below.
+    # ``sync`` looks the drawer up by that path, so an identity read from any
+    # other directory would answer for something the drawer never names.
+    source_dir_ino = source_directory_identity(source_label or jsonl_path)
+
     for rec in parse_claude_jsonl(jsonl_path):
         sid = rec["session_id"]
         if sid not in cursors:
@@ -310,6 +317,10 @@ def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None)
             "filed_at": datetime.now().isoformat(),
             "ingest_mode": "sweep",
         }
+        # The directory this drawer's ``source_file`` sits in, so ``sync``
+        # decides a swept drawer by the same reading as a mined one (#2320).
+        if source_dir_ino:
+            metadata["source_dir_ino"] = source_dir_ino
 
         batch_ids.append(drawer_id)
         batch_docs.append(document)

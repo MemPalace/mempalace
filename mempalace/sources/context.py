@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Protocol
 
+from ..source_identity import source_directory_identity
 from .base import DrawerRecord
 
 
@@ -92,11 +93,36 @@ class PalaceContext:
         """Persist a ``DrawerRecord`` to the drawer collection.
 
         Applies the spec-mandated ``adapter_name`` and ``adapter_version``
-        metadata stamps (§5.1) so adapters never need to populate them.
+        metadata stamps (§5.1), which an adapter may set for itself, and the
+        ``source_dir_ino`` stamp core records for every drawer that names a
+        source file (§5.1, #2320), which it may not: that one is a reading of
+        this machine's filesystem, and a value from anywhere else would be a
+        number ``sync`` weighs a removal against.
         """
         meta = dict(record.metadata)
         meta.setdefault("source_file", record.source_file)
         meta.setdefault("chunk_index", record.chunk_index)
+        # A drawer an adapter files names a source the same way a mined one
+        # does, and ``sync`` decides both by the same rule (#2320). A source
+        # that is not a path on this machine stats to nothing and records
+        # nothing, which is what a drawer with no identity already means.
+        #
+        # Read from ``meta`` after the ``setdefault`` above, since that leaves
+        # an adapter's own ``source_file`` in place where it set one, and from
+        # ``meta`` again on the way in rather than defaulted: the key means
+        # "the inode core read from the directory this row names", and neither
+        # a different path nor a value an adapter supplied would be that.
+        #
+        # Read per drawer rather than held for the run. An adapter can file
+        # for as long as it likes, and a directory replaced while it does
+        # would go on being described by the answer its first drawer got.
+        # ``file_conversation_exchange`` and ``miner.add_drawer`` read it per
+        # drawer for the same reason.
+        identity = source_directory_identity(meta["source_file"])
+        if identity:
+            meta["source_dir_ino"] = identity
+        else:
+            meta.pop("source_dir_ino", None)
         if self.adapter_name:
             meta.setdefault("adapter_name", self.adapter_name)
         if self.adapter_version:

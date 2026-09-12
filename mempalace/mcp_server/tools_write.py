@@ -27,6 +27,14 @@ def _response_safe_meta(meta):
         safe_meta["last_modified"] = safe_meta["filed_at"]
     if safe_meta.get("source_file"):
         safe_meta["source_file"] = Path(safe_meta["source_file"]).name
+    # ``source_dir_ino`` is bookkeeping for ``sync``, which reads the metadata
+    # directly. It says nothing a caller can use and it describes the host's
+    # filesystem, which is the same reason the path above is cut to its name.
+    # It comes off the copy made above, never the record: ``_safe_meta`` hands
+    # back the caller's own dict, and popping the field from a record a writer
+    # still holds would drop it from whatever that writer filed next. No caller
+    # passes a record it goes on to write through here today.
+    safe_meta.pop("source_dir_ino", None)
     return safe_meta
 
 
@@ -399,6 +407,12 @@ def tool_add_drawer(
         "filed_at": datetime.now().isoformat(),
         "id_recipe": ID_RECIPE,
     }
+    if source_file:
+        # A drawer filed here names a source file the same way a mined one
+        # does, and ``sync`` decides both by the same rule, so it records the
+        # same directory identity (#2320). Without it this tool would file the
+        # one kind of drawer in a palace that sync cannot protect.
+        base_meta.update(identity_metadata(source_file))
 
     base_meta["last_modified"] = base_meta["filed_at"]
     # Idempotency. Three cases to detect a prior committed write:

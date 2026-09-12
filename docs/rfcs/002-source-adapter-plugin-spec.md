@@ -470,6 +470,7 @@ Existing drawer metadata fields are preserved — the spec adds the following:
 | `adapter_name` | `str` | core, from `BaseSourceAdapter.name` | Which registered source produced this drawer. |
 | `adapter_version` | `str` | adapter | Adapter's own version (distinct from palace `normalize_version`). Enables re-extract workflows targeted at drawers from a known-buggy adapter version. |
 | `privacy_class` | `str` | adapter default, config override | Per §6. |
+| `source_dir_ino` | `str` | core, from `source_identity.directory_identity` | The inode of the directory `source_file` was read from, when `source_file` is a path on this machine and that directory answers with a non-zero one. `sync` compares it against the inode answering when it forms a removal verdict, so a volume mounted over that directory, or in place of it, cannot corroborate the removal of a drawer it never knew (#2320, #2367). Absent when the source is not a local path, or the filesystem reports no inode of its own. |
 
 Existing fields retain their current semantics (verified against `miner.py:542-561` and `convo_miner.py:338-350`):
 
