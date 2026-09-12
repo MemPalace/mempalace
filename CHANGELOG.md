@@ -32,6 +32,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Read-only search operations stop contending with palace writer leases.**
   `searcher.py` and `_open_search_collection` now explicitly open collections with `read_only=True`. Read-only queries connect in SQLite WAL reader mode without attempting schema initialization or writer lease locks, allowing CLI and agent searches to run concurrently with an active background MCP server or writer process without raising `MineAlreadyRunning`.
 
+### Refactors
+
+- **MCP server is a package, not an 8 000-line module.** `mempalace.mcp_server` stays the public import path (`TOOLS`, `handle_request`, `main`, every `tool_*` handler, and the process-global names tests monkeypatch). Implementation lives in domain files under `mempalace/mcp_server/` so PRs can target drawers, KG, coordination, protocol, or HTTP without colliding on one god-file. Fragments exec into the package namespace — a physical split, not a behaviour change.
+- **CLI is a package, not a 4 000-line module.** `mempalace.cli` stays the public import path (`main`, every `cmd_*` handler, and the names tests monkeypatch). Implementation lives in domain files under `mempalace/cli/` so PRs can target init, mine, search, repair, logstream, or argparse without colliding on one god-file. Fragments exec into the package namespace — a physical split, not a behaviour change.
+
 ### Features
 
 - **Shared-brain rules are `host:harness:project`, declared-idle, and MCP-shape aware.** `mempalace rules` takes `--host --harness --project` (stable lowercase tokens) and optional `--mcp full|light` (default `full`, matching the 45-tool server). The packaged snippet is the only coordination text: compose the identity from the current workspace, arm `logstream watch` only on listen / claim / delegate, write topics on named lanes without filtering the default inbox on them, claim with a lowest-HLC mutex, and use `kg_supersede` for single-valued fact changes. `--mcp light` swaps tool tokens onto the 3-tool triad; prose is identical. `logstream watch --agent` now defaults a sanitized `--state-file` (`:` → `_` under `~/.mempalace/watch/`) so Windows tuple identities do not need a private path overlay.

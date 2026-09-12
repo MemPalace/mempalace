@@ -8,8 +8,8 @@ Complete source file reference for the MemPalace codebase.
 mempalace/
 ├── README.md                  ← project documentation
 ├── mempalace/                 ← core package
-│   ├── cli.py                 ← CLI entry point
-│   ├── mcp_server.py          ← MCP server (36 tools)
+│   ├── cli/                   ← CLI package (commands, parser)
+│   ├── mcp_server/            ← MCP server package (tools, protocol, HTTP)
 │   ├── knowledge_graph.py     ← temporal entity graph
 │   ├── palace_graph.py        ← room navigation graph
 │   ├── dialect.py             ← AAAK compression
@@ -50,11 +50,11 @@ mempalace/
 
 ## Core Modules
 
-### `cli.py` — CLI Entry Point
+### `cli/` — CLI Entry Point
 
 Argparse-based CLI with subcommands: `init`, `mine`, `split`, `search`, `compress`, `wake-up`, `repair`, `status`, `hook`, `instructions`. Dispatches to the corresponding module.
 
-### `mcp_server.py` — MCP Server
+### `mcp_server/` — MCP Server
 
 JSON-RPC over stdin/stdout. Implements the MCP protocol with 36 tools covering palace read/write, drawer CRUD, knowledge graph, navigation, tunnels, agent diary, and system operations. Includes the Memory Protocol and AAAK Spec in status responses.
 
