@@ -69,10 +69,6 @@ def _json_loads(text: str | None) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _encode_vector(vector: list[float]) -> bytes:
-    return _as_vector_array(vector).tobytes()
-
-
 def _as_vector_array(vector: list[float]) -> np.ndarray:
     arr = np.asarray(vector, dtype=np.float32)
     if arr.ndim != 1 or arr.size == 0:
