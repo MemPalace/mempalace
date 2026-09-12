@@ -54,6 +54,7 @@ from .base import (
     PalaceNotFoundError,
     PalaceRef,
     QueryResult,
+    UnsupportedCapabilityError,
     UnsupportedFilterError,
     _IncludeSpec,
 )
@@ -727,6 +728,29 @@ class _PgVectorClient:
         rows = self._execute(f"SELECT count(*) FROM {_quote_identifier(table)}", fetch=True)
         return int(rows[0][0]) if rows and rows[0] else 0
 
+    def facet_counts(
+        self,
+        table: str,
+        *,
+        field: str,
+        where: Optional[dict] = None,
+        limit: int = 1000,
+    ) -> dict[str, int]:
+        qi = _quote_identifier(table)
+        params: list = [field]
+        where_sql = _where_to_sql(where, params) if where else "TRUE"
+        sql = (
+            f"SELECT metadata->>%s AS k, count(*) AS c "
+            f"FROM {qi} WHERE {where_sql} "
+            f"GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT %s"
+        )
+        params.append(int(limit))
+        rows = self._execute(sql, params, fetch=True)
+        # Exclude NULL bucket: matches Qdrant's facet semantics; mcp_server
+        # reconciles missing values into "unknown" via the count diff
+        # (count(*) - sum(facet_values)).
+        return {str(row[0]): int(row[1]) for row in rows if row[0] is not None}
+
     def drop_table(self, table: str) -> None:
         self._execute(f"DROP TABLE IF EXISTS {_quote_identifier(table)}")
 
@@ -1194,6 +1218,26 @@ class PgVectorCollection(BaseCollection):
             return 0
         return self._client.count_rows(self._table)
 
+    def facet_counts(
+        self,
+        field: str,
+        where: Optional[dict] = None,
+        limit: int = 1000,
+    ) -> dict[str, int]:
+        self._ensure_open()
+        # Validate the filter before the existence short-circuit so an
+        # unsupported local-only filter raises even on an unmaterialized
+        # collection — matches the order used by get()/lexical_search() and
+        # qdrant.facet_counts (PR #1868 review).
+        _validate_where(where)
+        if _requires_local_filter(where):
+            raise UnsupportedCapabilityError("facet_counts does not support local-only filters")
+        if not self._table_exists():
+            if self._marker_exists():
+                raise CollectionNotInitializedError(self._collection_name)
+            return {}
+        return self._client.facet_counts(self._table, field=field, where=where, limit=limit)
+
     def lexical_search(self, *, query: str, n_results: int = 10, where: Optional[dict] = None):
         _validate_where(where)
         pushdown = None if _requires_local_filter(where) else where
@@ -1291,6 +1335,7 @@ class PgVectorBackend(BaseBackend):
             "supports_embeddings_out",
             "supports_metadata_filters",
             "supports_lexical_search",
+            "supports_metadata_facets",
             "supports_namespace_isolation",
             "supports_server_side_indexes",
             "server_mode",

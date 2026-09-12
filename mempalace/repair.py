@@ -30,13 +30,15 @@ Usage (from CLI):
 """
 
 import argparse
+import errno
 import os
 import shutil
 import sqlite3
 import stat
 import time
 from collections import defaultdict
-from contextlib import closing
+from contextlib import closing, suppress
+from dataclasses import dataclass
 from datetime import datetime
 import re
 from typing import Callable, Iterator, Optional
@@ -62,10 +64,29 @@ def _no_follow_flag() -> int:
     return getattr(os, "O_NOFOLLOW", 0)
 
 
+def _non_blocking_flag() -> int:
+    """Return O_NONBLOCK, or 0 where the platform has no such flag (Windows).
+
+    Without it the ``S_ISREG`` refusal in ``_open_regular_file_no_follow``
+    is unreachable for a FIFO: opening one for reading blocks in the kernel
+    until a writer appears, so ``repair`` would wedge instead of refusing.
+    """
+    return getattr(os, "O_NONBLOCK", 0)
+
+
 def _open_regular_file_no_follow(path: str) -> int:
     if os.path.islink(path):
         raise RuntimeError(f"Refusing symlinked file: {path}")
-    fd = os.open(path, os.O_RDONLY | _no_follow_flag())
+    flags = os.O_RDONLY | _no_follow_flag() | _non_blocking_flag()
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        # EAGAIN here is a write-lease break, which the kernel grants on
+        # regular files only, so re-check the type and open the way this
+        # helper did before the flag existed. Anything else propagates.
+        if exc.errno != errno.EAGAIN or not stat.S_ISREG(os.lstat(path).st_mode):
+            raise
+        fd = os.open(path, flags & ~_non_blocking_flag())
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
@@ -531,7 +552,7 @@ def prune_corrupt(palace_path=None, confirm=False, collection_name: Optional[str
     bad_file = os.path.join(palace_path, "corrupt_ids.txt")
 
     if not os.path.exists(bad_file):
-        print("  No corrupt_ids.txt found — run scan first.")
+        print("  No corrupt_ids.txt found -- run scan first.")
         return
 
     with open(bad_file) as f:
@@ -539,7 +560,7 @@ def prune_corrupt(palace_path=None, confirm=False, collection_name: Optional[str
     print(f"  {len(bad_ids):,} corrupt IDs queued for deletion")
 
     if not confirm:
-        print("\n  DRY RUN — no deletions performed.")
+        print("\n  DRY RUN -- no deletions performed.")
         print("  Re-run with --confirm to actually delete.")
         return
 
@@ -577,7 +598,7 @@ def prune_corrupt(palace_path=None, confirm=False, collection_name: Optional[str
     after = col.count()
     print(f"\n  Deleted: {deleted:,}")
     print(f"  Failed:  {failed:,}")
-    print(f"  Collection size: {before:,} → {after:,}")
+    print(f"  Collection size: {before:,} -> {after:,}")
 
 
 # ChromaDB's ``collection.get()`` enforces an internal default ``limit``
@@ -677,12 +698,23 @@ def sqlite_drawer_count(palace_path: str, collection_name: Optional[str] = None)
     stale and repair would destroy the difference.
 
     Returns ``None`` when the schema isn't readable (chromadb version
-    drift, missing tables, locked file). Callers treat ``None`` as
-    "unknown" and fall back to the cap-detection check.
+    drift, missing tables, locked file), and without opening anything when
+    nothing resolves under the path or when the path names a FIFO. Callers
+    treat ``None`` as "unknown" and fall back to the cap-detection check.
     """
     collection_name = collection_name or _drawers_collection_name()
     sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
-    if not os.path.exists(sqlite_path):
+    # os.path.exists lets a FIFO through, and the connect below opens read-only,
+    # which parks in the kernel until a writer arrives. The type check belongs
+    # here rather than only at the caller: one made further up can be answered
+    # while the path is unreachable, and a permission change between the two
+    # calls then hands this one the pipe anyway (#2293). Checking here narrows
+    # that window to the lines below; only handing sqlite3 a descriptor would
+    # close it. os.path.exists folds errors the way os.path.isfile did in
+    # status(), and that is right here: None means "could not count", not
+    # "there is no database", so a folded error and a real absence want the
+    # same answer.
+    if _is_a_named_pipe(sqlite_path) or not os.path.exists(sqlite_path):
         return None
     try:
         import sqlite3
@@ -712,36 +744,133 @@ def sqlite_drawer_count(palace_path: str, collection_name: Optional[str] = None)
 _SQLITE_INTEGRITY_BUSY_TIMEOUT_SECONDS = 15.0
 
 
-def sqlite_integrity_errors(palace_path: str) -> list[str]:
-    """Return SQLite quick_check errors for chroma.sqlite3.
+@dataclass(frozen=True)
+class SqliteIntegrityStatus:
+    """Whether a quick_check verdict exists for a palace, and what it says.
 
-    The repair rebuild path eventually calls Chroma's delete_collection().
-    If the SQLite layer has corrupt secondary indexes or FTS5 shadow pages,
-    Chroma can raise an opaque SQLITE_CORRUPT_INDEX / code 779 error before
-    repair reaches the HNSW rebuild.
+    ``checked`` False means no probe ran, so an empty ``errors`` says nothing
+    about the database. That is the distinction :func:`sqlite_integrity_errors`
+    cannot express: it answers ``[]`` both for a database quick_check found
+    intact and for a palace that has none to open.
 
-    Run a direct SQLite quick_check first so repair can fail with a clear,
-    actionable message before invoking Chroma's destructive collection-delete
-    path.
+    ``errors`` is a tuple rather than a list so ``frozen=True`` means what it
+    says: a list field would leave the generated ``__hash__`` raising
+    ``TypeError`` on every call, and would let a caller append to a verdict it
+    was handed.
     """
 
-    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
-    if not os.path.exists(sqlite_path):
-        return []
+    checked: bool
+    errors: tuple[str, ...]
+    reason: str
 
+
+def _integrity_target_is_absent(sqlite_path: str) -> bool:
+    """Return True only when nothing resolves under ``sqlite_path``.
+
+    ``ENOENT`` is the one errno this accepts as proof, because it cannot mean
+    anything else: no file answered to that path. It does not say which
+    component was missing, so it is proof about the path and not about the
+    palace. A palace directory that is itself a dangling symlink, and a mount
+    point with nothing mounted on it, both reach here as ``ENOENT`` and are
+    reported as no verdict. That is the same answer ``develop`` gives, only
+    without ``develop``'s claim that the check passed.
+
+    ``ENOTDIR`` would be proof too and is deliberately left to the open
+    attempt, which reports it rather than silently treating it as nothing to
+    do. Windows raises ``ENOENT`` for that case, so it is proven absent there;
+    both answers are safe. Every other failure, a parent directory this process
+    may not enter for one, leaves the question open and takes the same route.
+    False therefore means "not proven absent", not "the file is there".
+
+    ``os.path.exists`` cannot draw that line: it follows symlinks and folds
+    every ``OSError`` into False, so a dangling link and an unreadable
+    directory both read as "no database here". ``ValueError`` (an embedded NUL
+    in the path) is caught for the same reason as any ``OSError``: it does not
+    prove absence either, and callers that never handled it still never see
+    it. What they do see changes, as it does for the other unreadable paths:
+    the open attempt reports the failure instead of returning nothing.
+    """
+    try:
+        os.lstat(sqlite_path)
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError):
+        return False
+    return False
+
+
+def _is_a_named_pipe(sqlite_path: str) -> bool:
+    """Return True only when ``sqlite_path`` provably names a FIFO.
+
+    A read that fails is an answer; a read that never returns is not. Opening a
+    FIFO for reading parks in the kernel until a writer arrives, so it has to
+    be decided about before reading rather than by reading.
+    ``miner._read_text_no_follow`` meets the same hazard and answers it with
+    ``O_NONBLOCK``; there is no open to pass flags to here, because the open
+    happens inside sqlite3.
+
+    The other types this palace could hold need no special case: measured
+    against ``sqlite3.connect(..., mode=ro)``, a directory, a socket, a block
+    device and a character device each answered with an ``OperationalError`` in
+    well under a second, and landed in the same "unreadable" report as a
+    database behind a permission. Which error each answers with is not worth
+    recording here — it varies with the device and with the permissions on it.
+    The FIFO is the only one that does not answer at all.
+
+    ``os.stat`` follows symlinks on purpose, so a link pointing at a FIFO is
+    refused too — unlike :func:`_integrity_target_is_absent`, which uses
+    ``lstat`` because there the question is whether the NAME resolves at all.
+    A ``stat`` that fails leaves the question open and answers False, which
+    lets the path go on; that is the same fail-toward-the-probe rule, and it is
+    what keeps an unreadable directory or a broken link described rather than
+    swallowed. It is also why :func:`sqlite_drawer_count` makes this check
+    itself rather than trusting one made further up: answered while the path is
+    unreachable, it cannot speak for the moment of the open.
+    """
+    try:
+        return stat.S_ISFIFO(os.stat(sqlite_path).st_mode)
+    except (OSError, ValueError):
+        return False
+
+
+def _quick_check_errors(sqlite_path: str) -> list[str]:
+    """Run ``PRAGMA quick_check`` against ``sqlite_path`` and report what it says.
+
+    There is no absence gate here on purpose. A caller that has already asked
+    whether the path is provably absent passes it straight through, so the
+    answer comes from the attempt to read it rather than from a second guess
+    about whether it is there. Re-testing for absence would reopen the hole
+    this module exists to close: a file that vanishes between the two tests
+    would come back as an empty error list, which reads as a clean verdict for
+    a database nobody opened.
+
+    ``ValueError`` is reported rather than raised. ``sqlite_read_uri`` builds a
+    URI before SQLite is reached, and up to Python 3.12 that raises for a
+    directory name holding a byte that came back through ``surrogateescape``;
+    3.13 percent-encodes it instead. Such a path reaches here because absence
+    was not proven for it, the same reason every unreadable path reaches here,
+    so it gets the same answer rather than a traceback out of ``mempalace
+    mine`` and ``mempalace repair``, neither of which guards this call.
+    """
     try:
         # A writer holding SQLite's lock is contention, not corruption. The
         # sqlite3 module defaults to five seconds, which is shorter than
         # routine batch mines and curator writes on rollback-journal palaces.
         # Give those writers a bounded grace period before surfacing BUSY to
         # callers; genuine corruption still comes from PRAGMA quick_check.
-        with sqlite3.connect(
-            sqlite_read_uri(sqlite_path),
-            uri=True,
-            timeout=_SQLITE_INTEGRITY_BUSY_TIMEOUT_SECONDS,
+        # closing(), as at the other two quick_check sites in this module: the
+        # sqlite3 context manager ends the transaction and leaves the handle
+        # open, so the descriptor would sit there until the cyclic collector
+        # ran.
+        with closing(
+            sqlite3.connect(
+                sqlite_read_uri(sqlite_path),
+                uri=True,
+                timeout=_SQLITE_INTEGRITY_BUSY_TIMEOUT_SECONDS,
+            )
         ) as conn:
             rows = conn.execute("PRAGMA quick_check").fetchall()
-    except sqlite3.Error as e:
+    except (sqlite3.Error, ValueError) as e:
         return [f"PRAGMA quick_check failed: {e}"]
 
     errors: list[str] = []
@@ -753,6 +882,65 @@ def sqlite_integrity_errors(palace_path: str) -> list[str]:
             errors.append(message)
 
     return errors
+
+
+def sqlite_integrity_status(palace_path: str) -> SqliteIntegrityStatus:
+    """Run the quick_check probe and report whether it produced a verdict.
+
+    Callers that state an integrity result to an operator want this rather
+    than :func:`sqlite_integrity_errors`, whose empty list cannot separate a
+    clean database from one that was never opened.
+    """
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    if _integrity_target_is_absent(sqlite_path):
+        return SqliteIntegrityStatus(
+            checked=False,
+            errors=(),
+            reason=(
+                f"no quick_check ran: {sqlite_path} does not exist, so there "
+                "was no SQLite database to open"
+            ),
+        )
+    # _quick_check_errors, not sqlite_integrity_errors: that one gates on
+    # absence again, and a file unlinked between the two gates would come back
+    # as an empty list, which is the clean verdict this function exists to
+    # withhold. Past the gate above, only an open attempt may answer.
+    return SqliteIntegrityStatus(
+        checked=True,
+        errors=tuple(_quick_check_errors(sqlite_path)),
+        reason="",
+    )
+
+
+def sqlite_integrity_errors(palace_path: str) -> list[str]:
+    """Return SQLite quick_check errors for chroma.sqlite3.
+
+    The repair rebuild path eventually calls Chroma's delete_collection().
+    If the SQLite layer has corrupt secondary indexes or FTS5 shadow pages,
+    Chroma can raise an opaque SQLITE_CORRUPT_INDEX / code 779 error before
+    repair reaches the HNSW rebuild.
+
+    Run a direct SQLite quick_check first so repair can fail with a clear,
+    actionable message before invoking Chroma's destructive collection-delete
+    path.
+
+    An empty list means one of two things and cannot tell them apart: the
+    check ran and found nothing, or the palace provably has no database to
+    check. Callers stating a result to an operator want
+    :func:`sqlite_integrity_status` instead. A path that resolves to a
+    directory entry but cannot be opened — a dangling symlink, a database
+    under a directory this process may not enter — is reported here as an
+    error, since the probe did fail.
+    """
+
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    # Absence is the one state with nothing to report; anything else that
+    # cannot be read is reported by the open attempt below. Callers that need
+    # to tell an absent database from a clean one use sqlite_integrity_status.
+    if _integrity_target_is_absent(sqlite_path):
+        return []
+
+    return _quick_check_errors(sqlite_path)
 
 
 def print_sqlite_integrity_abort(palace_path: str, errors: list[str]) -> None:
@@ -793,9 +981,8 @@ def print_sqlite_integrity_abort(palace_path: str, errors: list[str]) -> None:
 #   "fts5: corruption found reading blob N from table \"embedding_fulltext_search\""
 #     (SQLite >= ~3.5x, confirmed on 3.53.2 / Python 3.13.7 — the exact
 #     message this repo's own test fixture produces on that build)
-# Either failure is recoverable in place: the index is derived from the
-# intact ``embedding_fulltext_search_content`` shadow table, so rebuilding it
-# restores full-text search without touching any drawer rows. Concurrent
+# Either failure says the index and the ``embedding_fulltext_search_content``
+# shadow table disagree; neither names the side that is damaged. Concurrent
 # killed-mid-write mines are the usual cause (#1596). A regex matching only
 # the older phrasing would silently decline to auto-heal on newer SQLite —
 # the exact failure this repo's own test suite caught (test_repair.py's two
@@ -805,16 +992,96 @@ _FTS5_MALFORMED_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ``embedding_fulltext_search`` is derived data twice over: chroma writes each
+# document into ``embedding_metadata`` under ``chroma:document`` and into the
+# FTS5 table at ``rowid = embeddings.id``, and every read path returns the
+# metadata copy (checked against chromadb 1.5.7). So the content shadow table
+# has an authority to be checked against, and a rebuild that reads it is only
+# as good as that check.
+#
+# Both queries scan the metadata table: ``(id, key)`` is its primary key, so a
+# lookup by ``key`` alone cannot use it. An index for the heal alone would be
+# paid on every write instead, which is the worse trade.
+#
+# ``typeof(m.id) = 'integer'`` is not decoration. ``id`` is nullable — a NULL
+# is storable in that composite key — and feeding NULL into the content table's
+# ``INTEGER PRIMARY KEY`` makes SQLite assign a fresh rowid rather than conflict,
+# so such a row would never reconcile and the heal would decline on every run.
+_FTS5_CONTENT_TO_RESTORE_SQL = """
+    SELECT count(*)
+      FROM embedding_metadata AS m
+      LEFT JOIN embedding_fulltext_search_content AS c ON c.id = m.id
+     WHERE m.key = 'chroma:document'
+       AND typeof(m.id) = 'integer'
+       AND m.string_value IS NOT NULL
+       AND c.c0 IS NOT m.string_value
+"""
+
+# How much of the content table the authority can speak for. A row it cannot —
+# chroma's own update path stores ``{'chroma:document': None}`` by deleting the
+# metadata row while still writing the FTS row — keeps its content untouched,
+# because for those rows the shadow table may be the only copy. If the authority
+# can speak for none of them there is nothing to rebuild on, and a row at an id
+# no ``embeddings`` row uses says the table is not keyed the way this code reads
+# it: chroma's ``00003-full-text-tokenize`` migration populated the FTS table
+# from ``embedding_metadata.rowid`` over every string value, not from
+# ``embeddings.id`` over documents.
+_FTS5_CONTENT_CENSUS_SQL = """
+    SELECT coalesce(sum(CASE WHEN m.id IS NULL THEN 0 ELSE 1 END), 0),
+           coalesce(sum(CASE WHEN m.id IS NULL THEN 1 ELSE 0 END), 0),
+           coalesce(sum(CASE WHEN e.id IS NULL THEN 1 ELSE 0 END), 0)
+      FROM embedding_fulltext_search_content AS c
+      LEFT JOIN embedding_metadata AS m
+        ON m.id = c.id
+       AND m.key = 'chroma:document'
+       AND m.string_value IS NOT NULL
+      LEFT JOIN embeddings AS e ON e.id = c.id
+"""
+
+# Written to the shadow table directly, not through the virtual table: an
+# INSERT or DELETE on ``embedding_fulltext_search`` goes through the inverted
+# index, which is the structure quick_check has just called malformed. Writing
+# the content rows and then rebuilding is the one order that does not depend on
+# the damaged side. ``c0`` is FTS5's own column-naming convention for the first
+# indexed column, and the SELECT needs its WHERE clause for ``ON CONFLICT`` to
+# parse at all — dropping that predicate turns this into a syntax error.
+_FTS5_CONTENT_RESTORE_SQL = """
+    INSERT INTO embedding_fulltext_search_content(id, c0)
+    SELECT m.id, m.string_value
+      FROM embedding_metadata AS m
+     WHERE m.key = 'chroma:document'
+       AND typeof(m.id) = 'integer'
+       AND m.string_value IS NOT NULL
+        ON CONFLICT(id) DO UPDATE SET c0 = excluded.c0
+     WHERE embedding_fulltext_search_content.c0 IS NOT excluded.c0
+"""
+
+_FTS5_REBUILD_SQL = (
+    "INSERT INTO embedding_fulltext_search(embedding_fulltext_search) VALUES('rebuild')"  # noqa: E501
+)
+
 
 def _errors_are_isolated_fts5(errors: list[str]) -> bool:
     """True when every quick_check error is a malformed FTS5 inverted index.
 
-    Only an isolated FTS5 failure is safe to auto-heal: the inverted index is
-    derived data that ``rebuild`` regenerates from the content shadow table. If
-    quick_check also reports page/row corruption, the data itself may be damaged
-    and rebuilding the index over it would mask real loss — that still aborts.
+    Isolation is necessary but not sufficient for an auto-heal: it rules out
+    page/row corruption elsewhere in the file, and nothing more. Which of the
+    two FTS5 tables is damaged is still open — see
+    :func:`maybe_autoheal_fts5_index`, which settles that before writing.
     """
     return bool(errors) and all(_FTS5_MALFORMED_RE.search(e) for e in errors)
+
+
+def _fts5_content_rows_to_restore(conn: sqlite3.Connection) -> int:
+    """Count documents whose shadow copy is missing or says something else."""
+    return int(conn.execute(_FTS5_CONTENT_TO_RESTORE_SQL).fetchone()[0])
+
+
+def _fts5_content_census(conn: sqlite3.Connection) -> tuple[int, int, int]:
+    """Content rows a ``chroma:document`` can speak for, rows it cannot, rows
+    sitting at an id no ``embeddings`` row uses."""
+    checked, unverifiable, unkeyed = conn.execute(_FTS5_CONTENT_CENSUS_SQL).fetchone()
+    return int(checked), int(unverifiable), int(unkeyed)
 
 
 def maybe_autoheal_fts5_index(palace_path: str, errors: list[str], *, progress=print) -> list[str]:
@@ -822,15 +1089,26 @@ def maybe_autoheal_fts5_index(palace_path: str, errors: list[str], *, progress=p
 
     The repair preflight aborts when ``PRAGMA quick_check`` reports SQLite-layer
     corruption. After concurrent killed-mid-write mines (#1596) the common
-    failure is an isolated ``malformed inverted index for FTS5 table``, which is
-    fully recoverable: the index rebuilds from the intact
-    ``embedding_fulltext_search_content`` table without touching drawer rows.
+    failure is an isolated ``malformed inverted index for FTS5 table``, and
+    ``rebuild`` recovers it by regenerating the index from
+    ``embedding_fulltext_search_content``.
 
-    When the errors are isolated to FTS5, rebuild the index under the palace
-    write lock (so a live mine cannot race the rebuild) and re-run quick_check.
-    Returns the remaining quick_check errors — empty when the heal succeeded.
-    Broader corruption, a lock held by another writer, or a rebuild failure
-    leaves ``errors`` unchanged so the caller still aborts with the banner.
+    That error says the index and the content table disagree; it does not say
+    which of them is wrong. So the content table is checked against
+    ``embedding_metadata`` first, and any row that disagrees is restored from it
+    before the rebuild reads it — otherwise a rebuild over a damaged content
+    table would overwrite an index that still held the drawer's own words and
+    leave quick_check clean, reporting success for a palace that lost full-text
+    reach. Both writes are derived from ``embedding_metadata``; rows that
+    table cannot speak for are left untouched.
+
+    Everything happens under the palace write lock (so a live mine cannot race
+    it) and in one transaction, which is why a restored row cannot outlive a
+    rebuild that then fails. Returns the remaining quick_check errors — empty
+    when the heal succeeded. Broader corruption, a lock held by another writer,
+    a content table that cannot be checked or cannot be brought into agreement,
+    a rebuild failure, or a quick_check still dirty afterwards leaves ``errors``
+    unchanged so the caller still aborts with the banner.
     """
     if not _errors_are_isolated_fts5(errors):
         return errors
@@ -844,17 +1122,73 @@ def maybe_autoheal_fts5_index(palace_path: str, errors: list[str], *, progress=p
     from .palace import MineAlreadyRunning, mine_palace_lock
 
     progress(
-        "\n  Isolated FTS5 inverted-index corruption detected; attempting an\n"
-        "  in-place rebuild from the intact content table before aborting."
+        "\n  Isolated FTS5 inverted-index corruption detected; checking the content\n"
+        "  table against embedding_metadata before rebuilding the index from it."
     )
+    declined = False
+    to_restore = checked = unverifiable = unkeyed = 0
     try:
         with mine_palace_lock(palace_path):
             with closing(sqlite3.connect(sqlite_path, isolation_level=None)) as conn:
-                conn.execute(
-                    "INSERT INTO embedding_fulltext_search"
-                    "(embedding_fulltext_search) VALUES('rebuild')"
-                )
-                conn.commit()
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    to_restore = _fts5_content_rows_to_restore(conn)
+                    checked, unverifiable, unkeyed = _fts5_content_census(conn)
+                except sqlite3.Error as exc:
+                    # Suppressed: a failing ROLLBACK would replace the message
+                    # that says why the heal declined. Closing the connection
+                    # rolls the transaction back either way.
+                    with suppress(sqlite3.Error):
+                        conn.execute("ROLLBACK")
+                    declined = True
+                    progress(
+                        "  Skipped FTS5 rebuild: the content table cannot be checked against "
+                        f"embedding_metadata ({exc}). The index still holds the terms it was "
+                        "built from."
+                    )
+                if not declined and unverifiable and not checked and not to_restore:
+                    with suppress(sqlite3.Error):
+                        conn.execute("ROLLBACK")
+                    declined = True
+                    progress(
+                        "  Skipped FTS5 rebuild: no content row has an embedding_metadata "
+                        "document to check it against. The index still holds the terms it "
+                        "was built from."
+                    )
+                if not declined and to_restore:
+                    # Present tense on purpose: this prints before COMMIT, so it
+                    # is also what an operator sees on a run that then rolls back.
+                    progress(
+                        f"  Restoring {to_restore} content row(s) from embedding_metadata "
+                        "before rebuilding."
+                    )
+                    conn.execute(_FTS5_CONTENT_RESTORE_SQL)
+                    if _fts5_content_rows_to_restore(conn):
+                        with suppress(sqlite3.Error):
+                            conn.execute("ROLLBACK")
+                        declined = True
+                        progress(
+                            "  Skipped FTS5 rebuild: the content table still disagrees with "
+                            "embedding_metadata after restoring it. Nothing was written."
+                        )
+                    else:
+                        # Re-taken: a restore can add content rows the authority
+                        # has and the shadow table had lost, so the census from
+                        # before it would under-report what the rebuild reads.
+                        checked, unverifiable, unkeyed = _fts5_content_census(conn)
+                if not declined:
+                    if unverifiable:
+                        progress(
+                            f"  {unverifiable} content row(s) have no embedding_metadata document "
+                            "to check against; the rebuild indexes them as they stand."
+                        )
+                    if unkeyed:
+                        progress(
+                            f"  {unkeyed} content row(s) sit at an id no embeddings row uses; "
+                            "this table was not written by the current chromadb schema."
+                        )
+                    conn.execute(_FTS5_REBUILD_SQL)
+                    conn.execute("COMMIT")
     except MineAlreadyRunning as exc:
         progress(
             f"  Skipped FTS5 rebuild: palace is being written by another process ({exc}). "
@@ -862,14 +1196,23 @@ def maybe_autoheal_fts5_index(palace_path: str, errors: list[str], *, progress=p
         )
         return errors
     except Exception as exc:
-        progress(f"  FTS5 rebuild failed (leaving palace untouched): {exc}")
+        # Deliberately broad and deliberately not naming the rebuild: this now
+        # covers the lock, the transaction, both counts and the restore, and a
+        # heal that raises must never be what fails a mine.
+        progress(f"  FTS5 heal failed (leaving palace untouched): {exc}")
+        return errors
+
+    if declined:
         return errors
 
     remaining = sqlite_integrity_errors(palace_path)
     if remaining:
         progress("  FTS5 rebuild did not clear quick_check; aborting for safety.")
     else:
-        progress("  FTS5 index rebuilt from intact content; quick_check is clean.")
+        progress(
+            f"  FTS5 index rebuilt from content checked against embedding_metadata "
+            f"({checked} row(s)); quick_check is clean."
+        )
     return remaining
 
 
@@ -1130,7 +1473,7 @@ def rebuild_index(
         return
 
     progress(f"\n{'=' * 55}")
-    progress("  MemPalace Repair — Index Rebuild")
+    progress("  MemPalace Repair -- Index Rebuild")
     progress(f"{'=' * 55}\n")
     progress(f" Palace: {palace_path}")
 
@@ -1167,7 +1510,31 @@ def rebuild_index(
         progress(index_read_recovery_guidance())
         return
 
-    backend = ChromaBackend()
+    # Hold the palace writer lease for the complete snapshot -> rebuild/swap
+    # -> cleanup cycle. A writer landing after the snapshot but before the
+    # rebuilt collection becomes authoritative would otherwise be lost from
+    # the rebuilt index and recreate SQLite/HNSW divergence.
+    from .palace import mine_palace_lock
+
+    with mine_palace_lock(palace_path):
+        _rebuild_index_under_lease(
+            backend=ChromaBackend(),
+            palace_path=palace_path,
+            collection_name=collection_name,
+            confirm_truncation_ok=confirm_truncation_ok,
+            progress=progress,
+        )
+
+
+def _rebuild_index_under_lease(
+    *,
+    backend,
+    palace_path: str,
+    collection_name: str,
+    confirm_truncation_ok: bool,
+    progress: Callable[[str], None],
+):
+    """Run rebuild_index's snapshot/rebuild body under its writer lease."""
     try:
         col = backend.get_collection(palace_path, collection_name)
         total = col.count()
@@ -1646,7 +2013,7 @@ def rebuild_from_sqlite(
     in_place = source_palace == dest_palace
 
     print(f"\n{'=' * 55}")
-    print("  MemPalace Repair — Rebuild from SQLite")
+    print("  MemPalace Repair -- Rebuild from SQLite")
     print(f"{'=' * 55}\n")
     print(f"  Source: {source_palace}")
     print(f"  Dest:   {dest_palace}")
@@ -1715,6 +2082,21 @@ def rebuild_from_sqlite(
         )
 
 
+def _print_unreadable_count_refusal(*, collection_name: str, palace_path: str) -> None:
+    """Refuse to preview a collection whose SQLite row count cannot be read.
+
+    Fail closed: inventing 0 would hide an unreadable source and make the
+    operator believe a real run would upsert nothing (review note on #1654 /
+    #2095). Shared by both previews so the wording cannot drift apart.
+    """
+    print(
+        f"\n  Cannot preview [{collection_name}]: SQLite row count is unreadable "
+        f"at {os.path.join(palace_path, 'chroma.sqlite3')}.\n"
+        "  Fix source readability (schema, lock, permissions) and re-run "
+        "--dry-run; refusing to invent zero counts."
+    )
+
+
 def _preview_rebuild_from_sqlite(
     *,
     source_palace: str,
@@ -1726,7 +2108,7 @@ def _preview_rebuild_from_sqlite(
     Never archives, locks, or writes. Returns ``{}`` if SQLite counts are
     unreadable so a broken preview cannot look like a successful zero-row plan.
     """
-    print("\n  DRY RUN — no changes will be made.")
+    print("\n  DRY RUN -- no changes will be made.")
     if in_place:
         print(
             f"  Would archive {dest_palace} → "
@@ -1739,15 +2121,7 @@ def _preview_rebuild_from_sqlite(
     for cname in _recoverable_collections():
         n = sqlite_drawer_count(source_palace, cname)
         if n is None:
-            # Fail closed: inventing 0 would hide an unreadable source and
-            # make the operator believe a real rebuild would upsert nothing
-            # (review note on #1654 / #2095).
-            print(
-                f"\n  Cannot preview [{cname}]: SQLite row count is unreadable "
-                f"at {os.path.join(source_palace, 'chroma.sqlite3')}.\n"
-                "  Fix source readability (schema, lock, permissions) and re-run "
-                "--dry-run; refusing to invent zero counts."
-            )
+            _print_unreadable_count_refusal(collection_name=cname, palace_path=source_palace)
             return {}
         counts[cname] = n
         print(f"  [{cname}] would re-embed and upsert {n} rows")
@@ -1756,6 +2130,119 @@ def _preview_rebuild_from_sqlite(
     )
     print(f"{'=' * 55}\n")
     return counts
+
+
+def _preview_legacy_repair(
+    *,
+    palace_path: str,
+    collection_name: str,
+    confirm_truncation_ok: bool = False,
+) -> dict[str, int]:
+    """Read-only preview for the default (legacy) ``repair`` path (``dry_run=True``).
+
+    Never opens a chromadb client, takes a lock, or writes. Opening a client is
+    itself a write to ``chroma.sqlite3``, so the row count comes from the
+    read-only SQLite ground truth :func:`check_extraction_safety` already
+    trusts. That is a different source than the real run rebuilds from (it
+    re-files what the chromadb collection layer returns), so the plan below
+    states the ``#1208`` contingency rather than promising the number.
+
+    ``confirm_truncation_ok`` mirrors the real run's flag: it switches that
+    contingency off, so the preview has to say the guard is disabled rather
+    than promise an abort that would not happen.
+
+    Returns ``{}`` when the count is unreadable so a broken preview cannot look
+    like a valid plan (#1654, #2095, #2133).
+    """
+    print("\n  DRY RUN -- no changes will be made.")
+    n = sqlite_drawer_count(palace_path, collection_name)
+    if n is None:
+        _print_unreadable_count_refusal(collection_name=collection_name, palace_path=palace_path)
+        print(f"{'=' * 55}\n")
+        return {}
+
+    if n == 0:
+        # The real run stops at ``total == 0`` with "Nothing to repair.", or —
+        # when the collection is absent altogether — at the index-read error
+        # that points to --mode from-sqlite. Neither backs up nor rebuilds, so
+        # promising a backup and a VACUUM here would describe a run that does
+        # not happen.
+        print(
+            f"  [{collection_name}] chroma.sqlite3 holds no rows. A real run would report\n"
+            "  nothing to repair, or an index read error, and change nothing."
+        )
+        print(f"{'=' * 55}\n")
+        return {collection_name: 0}
+
+    backup_path = os.path.normpath(palace_path) + ".backup"
+    if confirm_truncation_ok:
+        print(
+            f"  [{collection_name}] chroma.sqlite3 holds {n} rows, and --confirm-truncation-ok\n"
+            "  is set, so the #1208 truncation guard is DISABLED. A real run would re-file\n"
+            f"  whatever the chromadb collection layer returns, even if that is fewer than {n}\n"
+            "  rows, and the difference would be destroyed. It would, in order:"
+        )
+    else:
+        print(
+            f"  [{collection_name}] chroma.sqlite3 holds {n} rows. A real run would extract them\n"
+            "  through the chromadb collection layer first and abort without changes if that\n"
+            f"  returns fewer than {n} (#1208 truncation guard). It would then, in order:"
+        )
+    if os.path.exists(backup_path):
+        print(f"    1. DELETE the existing backup at {backup_path} -- or refuse outright")
+        print("       if it is not a palace -- and copy the live palace in its place")
+    else:
+        print(f"    1. copy the palace directory to {backup_path}")
+    print(f"    2. DELETE the live '{collection_name}' collection and re-file the extracted rows")
+    print("       into a fresh one, staged and verified in a temp collection first")
+    print("    3. rebuild the FTS5 index and VACUUM chroma.sqlite3")
+    print("\n  Without --yes it would ask for confirmation before step 1.")
+    print("  Re-run without --dry-run to execute.")
+    print(f"{'=' * 55}\n")
+    return {collection_name: n}
+
+
+def resolve_repair_preflight_errors(
+    palace_path: str,
+    errors: list[str],
+    *,
+    dry_run: bool,
+    progress=print,
+) -> list[str]:
+    """Return the quick_check errors that still block a repair.
+
+    A real run heals an isolated malformed FTS5 inverted index in place and
+    carries on (#1596). ``--dry-run`` must not perform that write, so it
+    classifies the errors with the same :func:`_errors_are_isolated_fts5`
+    predicate the real path gates on: an isolated FTS5 error is reported and
+    cleared, anything broader still aborts. Without this a preview would print
+    the ABORT banner — offline ``sqlite3 .recover``, recreate the FTS5 table —
+    for a palace the tool repairs by itself.
+
+    The prediction is deliberately the optimistic branch, and it is stated as
+    an attempt rather than a promise: the real heal still returns the errors
+    unchanged when another process holds the mine lock, when the content table
+    cannot be checked against ``embedding_metadata`` or cannot be brought into
+    agreement with it, when the rebuild raises, or when ``quick_check`` is still
+    dirty afterwards. A dry run cannot tell those apart without taking the lock
+    and writing, which is exactly what it must not do, so the wording names them
+    instead.
+    """
+    if not errors:
+        return errors
+    if not dry_run:
+        return maybe_autoheal_fts5_index(palace_path, errors, progress=progress)
+    if _errors_are_isolated_fts5(errors):
+        progress(
+            "\n  DRY RUN — quick_check reports an isolated FTS5 inverted-index error.\n"
+            "  A real run would check the content table against embedding_metadata,\n"
+            "  restore any row that disagrees, rebuild the index from it and continue\n"
+            "  if that succeeds; it aborts instead if another process holds the mine\n"
+            "  lock, if the content table cannot be checked or restored, or if the\n"
+            "  rebuild leaves quick_check dirty. This preview leaves the index untouched."
+        )
+        return []
+    return errors
 
 
 def _rebuild_from_sqlite_locked(
@@ -1778,7 +2265,7 @@ def _rebuild_from_sqlite_locked(
     if in_place:
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         archive_path = f"{dest_palace}.pre-rebuild-{ts}"
-        print(f"  Archiving {dest_palace} → {archive_path}")
+        print(f"  Archiving {dest_palace} -> {archive_path}")
         # os.rename, NOT shutil.move. When any file inside the palace is
         # held open by another process (MCP server, a running mine, another
         # harness), renaming the directory fails atomically UP FRONT on
@@ -1901,13 +2388,26 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
     hnswlib — it reads ``chroma.sqlite3`` and ``index_metadata.pickle``
     directly via :func:`mempalace.backends.chroma.hnsw_capacity_status`.
 
-    Returns the capacity-status dict (also printed). Returns a dict with
-    ``status="unknown"`` when no palace exists at the given path.
+    Returns the capacity-status dict (also printed), or a one-key dict in its
+    place: ``status="unknown"`` when no palace directory is reachable at the
+    given path or when ``chroma.sqlite3`` resolves to a named pipe,
+    ``status="uninitialized"`` when the palace directory is there but nothing
+    resolves under ``chroma.sqlite3``, and ``status="empty"`` when the
+    database is readable and holds no drawers.
+
+    A state this gate cannot settle takes neither early return: the capacity
+    report below answers for it instead, returning the ``{"drawers": …,
+    "closets": …}`` shape a healthy palace returns with both counts printed as
+    unreadable. That report reaches its verdict through its own probes, not by
+    opening the file: with ``sqlite3.connect`` instrumented, an unreadable
+    directory, a broken link and a symlink loop each produce zero opens of
+    ``chroma.sqlite3``, while the same instrumentation counts opens on a
+    healthy palace.
     """
     palace_path = palace_path or _get_palace_path()
     collection_name = collection_name or _drawers_collection_name()
     print(f"\n{'=' * 55}")
-    print("  MemPalace Repair — Status")
+    print("  MemPalace Repair -- Status")
     print(f"{'=' * 55}\n")
     print(f"  Palace: {palace_path}")
 
@@ -1916,9 +2416,28 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
         return {"status": "unknown", "message": "no palace at path"}
 
     db_path = os.path.join(palace_path, "chroma.sqlite3")
-    if not os.path.isfile(db_path):
+    # "uninitialized" is a statement about the palace, so it needs proof that
+    # nothing is there. os.path.isfile folds OSError and ValueError alike into
+    # False, which reports a database behind an unreadable directory, or one
+    # whose name is now a broken symlink, as one that was never created
+    # (#2293). _integrity_target_is_absent accepts only ENOENT as proof;
+    # everything it cannot settle skips this early return and is described by
+    # the capacity report below.
+    if _integrity_target_is_absent(db_path):
         print(f"  Palace dir at {palace_path} exists but has no chroma.sqlite3 yet.\n")
         return {"status": "uninitialized", "message": "palace has no chroma.sqlite3 yet"}
+
+    # This is not what keeps the read from parking: sqlite_drawer_count refuses
+    # a FIFO next to its own open, and measured, that check alone already
+    # answers this state in well under a second. What this one buys is the
+    # name. Without it the operator is told "(unreadable)", the same answer a
+    # database behind a permission gets, for a palace whose actual problem is
+    # that chroma.sqlite3 is not a database at all.
+    if _is_a_named_pipe(db_path):
+        # "resolves to", not "is": the name may be a symlink, and an operator
+        # told to delete a pipe should not be pointed at the link instead.
+        print(f"  chroma.sqlite3 at {palace_path} resolves to a named pipe, not a database.\n")
+        return {"status": "unknown", "message": "chroma.sqlite3 resolves to a named pipe"}
 
     # Cheap collection-existence check via sqlite. By design this function
     # never opens a chromadb client (see the docstring); sqlite_drawer_count
@@ -2124,7 +2643,7 @@ def repair_max_seq_id(
     }
 
     print(f"\n{'=' * 55}")
-    print("  MemPalace Repair — max_seq_id Un-poison")
+    print("  MemPalace Repair -- max_seq_id Un-poison")
     print(f"{'=' * 55}\n")
     print(f"  Palace:  {palace_path}")
     if segment:
@@ -2175,10 +2694,10 @@ def repair_max_seq_id(
     source = "sidecar" if from_sidecar else "heuristic (collection MAX)"
     print(f"    clean-value source   {source}")
     for seg_id, old_val, new_val in plan:
-        print(f"    {seg_id}  {old_val}  →  {new_val}")
+        print(f"    {seg_id}  {old_val}  ->  {new_val}")
 
     if dry_run:
-        print("\n  DRY RUN — no rows modified.\n" + "=" * 55 + "\n")
+        print("\n  DRY RUN -- no rows modified.\n" + "=" * 55 + "\n")
         return result
 
     if not plan:

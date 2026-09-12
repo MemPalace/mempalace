@@ -7,6 +7,7 @@ Routes each file to the right room based on content.
 Stores verbatim chunks as drawers. No summaries. Ever.
 """
 
+import errno
 import os
 import re
 import sys
@@ -15,6 +16,7 @@ import hashlib
 import fnmatch
 import logging
 import stat
+import tempfile
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -57,19 +59,45 @@ def _path_within_root(path: Path, root: Path) -> bool:
         return False
 
 
-def _read_text_no_follow(filepath: Path, root: Path) -> Optional[str]:
+def _read_text_no_follow(filepath: Path, root: Path) -> Optional[tuple[str, float]]:
+    """Read ``filepath`` and return ``(content, mtime)`` from the SAME
+    ``fstat()`` call that validated the file, so callers never need a
+    separate, later ``os.path.getmtime()`` that could observe a file
+    modified in between (see #22: a stale re-stat lets appended content
+    be silently and permanently skipped)."""
     if not _path_within_root(filepath, root):
         return None
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # O_NONBLOCK is what makes the S_ISREG check below reachable. Opening a
+    # FIFO for reading parks in the kernel until a writer shows up, so
+    # without it the fstat never runs and a named pipe carrying a
+    # READABLE_EXTENSIONS suffix wedges the mine forever. With it the open
+    # returns immediately and the *file type* decides — no errno guesswork,
+    # and a FIFO that does have a live writer is rejected just the same.
+    # Linux open(2): "this flag has no effect for regular files and block
+    # devices". POSIX leaves it unspecified outside FIFOs and special files,
+    # and one Linux case is not a no-op — see the EAGAIN branch below.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     fd = -1
     try:
-        fd = os.open(filepath, flags)
+        try:
+            fd = os.open(filepath, flags)
+        except OSError as exc:
+            # A reader that breaks a write lease gets EAGAIN when it passes
+            # O_NONBLOCK, where a blocking open waits out lease-break-time
+            # and succeeds. The kernel grants leases on regular files only
+            # (F_SETLEASE on a pipe fails EINVAL), so re-check the type and
+            # then read it the way this code did before the flag existed;
+            # dropping it would silently lose a file that used to be mined.
+            if exc.errno != errno.EAGAIN or not stat.S_ISREG(os.lstat(filepath).st_mode):
+                raise
+            fd = os.open(filepath, flags & ~getattr(os, "O_NONBLOCK", 0))
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_FILE_SIZE:
             return None
+        mtime = st.st_mtime
         with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
             fd = -1
-            return f.read()
+            return f.read(), mtime
     except OSError:
         return None
     finally:
@@ -135,6 +163,14 @@ READABLE_EXTENSIONS = {
     ".toml",
     ".tex",
     ".bib",
+    # C / C++
+    ".c",
+    ".h",
+    ".cpp",
+    ".hpp",
+    ".cc",
+    ".cxx",
+    ".inl",
     # C# / .NET
     ".cs",
     ".csproj",
@@ -486,10 +522,14 @@ def load_config(project_dir: str) -> dict:
 
     resolved_project_dir = Path(project_dir).expanduser().resolve()
     config_path = resolved_project_dir / "mempalace.yaml"
-    if not config_path.exists():
+    # ``is_file()`` rather than ``exists()``: the latter is true for a FIFO,
+    # and the ``open`` at the end of this function would then block in the
+    # kernel until a writer appears. A config that is not a regular file is
+    # treated as absent, which lands on the auto-detected defaults below.
+    if not config_path.is_file():
         # Fallback to legacy name
         legacy_path = resolved_project_dir / "mempal.yaml"
-        if legacy_path.exists():
+        if legacy_path.is_file():
             config_path = legacy_path
         else:
             from .config import normalize_wing_name
@@ -518,7 +558,7 @@ def load_config(project_dir: str) -> dict:
                     }
                 ],
             }
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -848,7 +888,301 @@ def _set_wing_topics(existing: dict, wing_key: str, topics_for_wing: list, coerc
         existing.pop("topics_by_wing", None)
 
 
-def add_to_known_entities(entities_by_category: dict, wing: str = None) -> str:
+def _registry_write_target(registry_path):
+    """The file a registry write should replace, following a symlink to it.
+
+    A registry kept in a dotfiles checkout is reached through a link, and
+    ``write_text`` wrote through it. Replacing the link itself would leave the
+    real file holding what it held and send this merge, and every later one,
+    somewhere the user is not looking, so the temporary file and the rename
+    both happen at the target instead. ``realpath`` follows the whole chain
+    rather than one link, which is the file the reader would have got.
+
+    A link this call cannot ``lstat`` is not reported as "not a link": that
+    reading would send the write through ``os.replace`` and put a regular file
+    where the link was. The error is raised instead, since the caller has to
+    write somewhere and there is no safe guess about where.
+    """
+    try:
+        is_link = stat.S_ISLNK(os.lstat(str(registry_path)).st_mode)
+    except FileNotFoundError:
+        return registry_path
+    if is_link:
+        return Path(os.path.realpath(str(registry_path)))
+    return registry_path
+
+
+def _keep_unmergeable_registry(registry_path) -> Optional[str]:
+    """Move a registry this call could not merge aside, keeping its bytes.
+
+    Renaming needs the directory rather than the file, so a registry whose
+    contents did not parse is preserved whole, and the caller is left with a
+    free name to write. ``FileNotFoundError`` from the rename is the one
+    outcome that establishes there was nothing to keep; every other failure
+    leaves the file where it is and is raised, because a registry that could
+    not be moved is not one to write over. A directory that will not take a
+    new name raises here for the same reason.
+
+    Returns the path the old registry now lives at, or ``None`` when there
+    was no file there.
+    """
+
+    registry_path = _registry_write_target(registry_path)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    fd, target = tempfile.mkstemp(
+        dir=str(registry_path.parent),
+        prefix=f"{registry_path.name}.unreadable-{stamp}-",
+    )
+    os.close(fd)
+    try:
+        os.replace(str(registry_path), target)
+    except FileNotFoundError:
+        _unlink_quietly(target)
+        return None
+    except OSError:
+        _unlink_quietly(target)
+        raise
+    return target
+
+
+def _unlink_quietly(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _fsync_directory(directory) -> None:
+    """Make the rename itself durable.
+
+    ``EntityRegistry.save`` spells out why: on ext4 the kernel can acknowledge
+    a rename and, after a crash, come back to the temporary file present and
+    the target still holding the old bytes. Windows cannot open a directory
+    this way at all, and answering nothing there is the same as answering
+    nothing on a filesystem that does not implement it.
+    """
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _write_registry_in_place(registry_path, payload: dict) -> None:
+    """Write the registry without the rename, for a directory that refuses one.
+
+    This is ``develop``'s write. It is kept for the one case where the atomic
+    write cannot run at all, since a merge that is lost outright is worse than
+    a merge that is not crash-safe.
+    """
+    import json as _json
+
+    with open(registry_path, "w", encoding="utf-8") as f:
+        _json.dump(payload, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        os.chmod(registry_path, 0o600)
+    except (OSError, NotImplementedError):
+        pass
+
+
+def _publish_registry(registry_path, payload: dict) -> None:
+    """Write ``payload`` to ``registry_path`` through a temporary file.
+
+    The rename is what publishes it, so an interrupted write cannot leave the
+    registry empty or half-serialized, which is where the unreadable files
+    this module now preserves came from. ``EntityRegistry.save`` writes its own
+    registry this way, down to the directory ``fsync`` that makes the rename
+    survive a crash; ``migrate._apply_topics_by_wing_renames`` writes this same
+    file through a temporary file and a rename as well.
+
+    The temporary file carries this process's pid rather than a random suffix,
+    so two concurrent ``mempalace init`` runs never share one. A run killed
+    between the write and the rename leaves that file behind, and nothing here
+    removes it. ``O_NOFOLLOW`` keeps a symlink dropped at that name from being
+    written through, and anything else in the way of that name sends the write
+    to a name the directory picks rather than to a write without the rename.
+
+    A directory that will not take a name it chose itself is the one case that
+    falls back to writing in place: a read-only ``~/.mempalace`` whose registry
+    is still writable is what reaches it, and ``develop`` merged into it
+    without complaint.
+    """
+    import json as _json
+
+    registry_path = _registry_write_target(registry_path)
+    tmp = str(registry_path.with_name(f"{registry_path.name}.tmp-{os.getpid()}"))
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(tmp, flags, 0o600)
+        if os.fstat(fd).st_nlink > 1:
+            # A hard link at that name is not a symlink, so ``O_NOFOLLOW`` lets
+            # it through, and truncating through it would empty a file nobody
+            # named here. The truncate happens below, after this has ruled that
+            # out, and the write goes to a name the directory chose instead.
+            os.close(fd)
+            raise OSError(errno.EMLINK, "temporary name has another link", tmp)
+    except OSError:
+        # This errno belongs to the name, not to the directory. An orphan
+        # another user's run left at that name, a directory dropped there, and
+        # a symlink planted there all answer the way a directory that takes no
+        # new names answers, and giving up the rename on that reading is how
+        # the atomic write turns itself off where it was needed. Ask the
+        # directory for a name of its own instead: what it says about a name
+        # it chooses is about the directory.
+        try:
+            fd, tmp = tempfile.mkstemp(
+                dir=str(registry_path.parent),
+                prefix=f".{registry_path.name}.",
+                suffix=".tmp",
+            )
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
+                raise
+            _write_registry_in_place(registry_path, payload)
+            print(
+                f"  ! {registry_path.parent} would not take a temporary file, so "
+                f"{registry_path.name} was written in place and an interrupted write "
+                "can truncate it",
+                file=sys.stderr,
+            )
+            return
+    try:
+        # The mode is set before anything is written rather than after: under a
+        # umask that clears the owner's write bit, ``O_CREAT`` leaves the file
+        # at 0400, and one left behind by a killed run is then a name its own
+        # owner cannot open next time.
+        try:
+            os.chmod(tmp, 0o600)
+        except (OSError, NotImplementedError):
+            pass
+        os.ftruncate(fd, 0)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            _json.dump(payload, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        _unlink_quietly(tmp)
+        raise
+    try:
+        os.replace(tmp, str(registry_path))
+    except BaseException as exc:
+        if not isinstance(exc, OSError):
+            # A signal between the write and the rename leaves the temporary
+            # file behind for no reason: nothing has been published yet.
+            _unlink_quietly(tmp)
+            raise
+        # Opening a temporary file that already exists needs the file, not the
+        # directory, so a run that reused an orphan at the pid name never asked
+        # the directory anything. The rename is where the directory answers,
+        # and a read-only one answers here rather than above.
+        if exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
+            _unlink_quietly(tmp)
+            raise
+        # The temporary file holds this merge, complete and fsynced. Removing
+        # it before writing in place would trade a finished copy for a write
+        # that truncates first, so it is removed after that write returns, and
+        # named if it could not be.
+        try:
+            _write_registry_in_place(registry_path, payload)
+        except BaseException:
+            # That write truncates before it serializes, so what was there is
+            # gone whether or not this one finished.
+            print(
+                f"  ! {registry_path.name} was not written and may have been "
+                f"truncated; {tmp} holds what this call was asked to save",
+                file=sys.stderr,
+            )
+            raise
+        _unlink_quietly(tmp)
+        if os.path.exists(tmp):
+            # Removing it needs the directory too, which is what just refused.
+            print(
+                f"  ! {tmp} holds a copy of what was written and could not be "
+                "removed; nothing here removes it later either",
+                file=sys.stderr,
+            )
+        print(
+            f"  ! {registry_path.parent} would not take the rename, so "
+            f"{registry_path.name} was written in place and an interrupted write "
+            "can truncate it",
+            file=sys.stderr,
+        )
+        return
+    _fsync_directory(registry_path.parent)
+
+
+def _registry_to_merge_into(registry_path) -> Optional[dict]:
+    """The registry to merge into, or ``None`` when nothing may be written.
+
+    The merge rewrites the file whole, so folding a read that did not conclude
+    into an empty dict is what erased every category the registry held. Only
+    ``FileNotFoundError`` establishes that there is no registry here. A
+    truncated write, a byte that is not UTF-8, a hand-edit that lost a brace
+    and a file this process may not read are four different answers, and none
+    of them says the registry was empty.
+
+    A registry that reads but is not a JSON object is renamed aside first, and
+    the empty dict returned then starts a fresh one beside its bytes. A
+    registry that could not be read at all, or could not be moved aside,
+    answers ``None``: what is in memory at that point is one call's entities,
+    and writing those over a registry nobody read is how a permission bit
+    turns into a lost registry.
+
+    Printed rather than logged: the one caller is ``mempalace init``, which
+    configures no logging handler.
+    """
+    import json as _json
+
+    try:
+        raw = registry_path.read_bytes()
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        print(
+            f"  ! Not writing {registry_path}: it exists and could not be read "
+            f"({exc}), so it is not overwritten",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        # ``utf-8-sig`` rather than ``utf-8``: a BOM is what a Windows editor
+        # leaves on an otherwise valid registry, and ``json.loads`` on bytes
+        # accepts one, so decoding by hand has to accept it too.
+        loaded = _json.loads(raw.decode("utf-8-sig"))
+    except ValueError:
+        # Both failures this catches are ValueErrors: JSONDecodeError for
+        # text that is not JSON, UnicodeDecodeError for bytes that are not
+        # UTF-8. Catching only the first is what let the second out of this
+        # call and into ``mempalace init`` as a traceback.
+        loaded = None
+    if isinstance(loaded, dict):
+        return loaded
+    try:
+        kept_at = _keep_unmergeable_registry(registry_path)
+    except OSError as exc:
+        print(
+            f"  ! Not writing {registry_path}: it does not parse and could not be "
+            f"moved aside ({exc}), so it is not overwritten",
+            file=sys.stderr,
+        )
+        return None
+    if kept_at is not None:
+        print(
+            f"  ! Registry at {registry_path} does not parse; "
+            f"kept it as {kept_at} and started a new one",
+            file=sys.stderr,
+        )
+    return {}
+
+
+def add_to_known_entities(entities_by_category: dict, wing: str = None) -> Optional[str]:
     """Union ``entities_by_category`` into ``~/.mempalace/known_entities.json``.
 
     Accepts ``{category: [names]}`` shape as produced by ``mempalace init``
@@ -875,22 +1209,20 @@ def add_to_known_entities(entities_by_category: dict, wing: str = None) -> str:
     (notably ``cmd_init`` → ``cmd_mine`` in sequence) see the update
     immediately instead of waiting for a mtime re-check.
 
-    Returns the registry path as a string for logging.
+    Returns the registry path as a string for logging, or ``None`` when the
+    registry was left alone and nothing was written, so a caller does not
+    report an update that did not happen.
     """
-    import json as _json
     from pathlib import Path as _Path
 
     registry_path = _Path(_ENTITY_REGISTRY_PATH)
     registry_path.parent.mkdir(parents=True, exist_ok=True)
 
-    existing: dict = {}
-    if registry_path.exists():
-        try:
-            loaded = _json.loads(registry_path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                existing = loaded
-        except (_json.JSONDecodeError, OSError):
-            existing = {}
+    # A registry this call cannot merge into is kept rather than written over,
+    # and ``None`` here means nothing was written at all.
+    existing = _registry_to_merge_into(registry_path)
+    if existing is None:
+        return None
 
     def _coerce_name(value):
         if not value:
@@ -946,11 +1278,7 @@ def add_to_known_entities(entities_by_category: dict, wing: str = None) -> str:
     if topics_for_wing is not None:
         _set_wing_topics(existing, wing.strip(), topics_for_wing, _coerce_name)
 
-    registry_path.write_text(_json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
-    try:
-        registry_path.chmod(0o600)
-    except (OSError, NotImplementedError):
-        pass
+    _publish_registry(registry_path, existing)
 
     # Invalidate in-process cache so later calls in the same run see the write.
     _ENTITY_REGISTRY_CACHE["mtime"] = None
@@ -1368,6 +1696,7 @@ def _build_drawer_metadata(
     line_start: Optional[int] = None,
     line_end: Optional[int] = None,
     content_date: Optional[str] = None,
+    chunk_total: Optional[int] = None,
 ) -> dict:
     """Build the metadata dict for one drawer without upserting.
 
@@ -1383,6 +1712,14 @@ def _build_drawer_metadata(
     (legacy callers, pre-Tier-6a drawers), the keys are absent from the
     returned dict and downstream code falls back to ``filed_at`` for the
     date and the 3-segment closet pointer format.
+
+    ``chunk_total`` — the total number of chunks this mining pass expects
+    to write for ``source_file`` (see #21). Every chunk of the same pass
+    carries the same value so ``file_already_mined`` can tell "N of N
+    batches committed" from "crashed after batch 1 of N", instead of
+    treating any surviving drawer with a matching mtime as proof the file
+    is fully mined. ``None`` for legacy callers (e.g. ``add_drawer``,
+    which is inherently a single atomic write with no partial-batch risk).
     """
     metadata = {
         "wing": wing,
@@ -1402,6 +1739,8 @@ def _build_drawer_metadata(
         metadata["line_end"] = line_end
     if content_date:
         metadata["content_date"] = content_date
+    if chunk_total is not None:
+        metadata["chunk_total"] = chunk_total
     metadata["hall"] = detect_hall(content)
     entities = _extract_entities_for_metadata(content)
     if entities:
@@ -1469,9 +1808,10 @@ def process_file(
     if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
         return 0, "general", None
 
-    content = _read_text_no_follow(filepath, project_path)
-    if content is None:
+    read_result = _read_text_no_follow(filepath, project_path)
+    if read_result is None:
         return 0, "general", None
+    content, read_mtime = read_result
 
     content = content.strip()
     if len(content) < effective_min:
@@ -1518,19 +1858,34 @@ def process_file(
         # hnswlib's thread-unsafe updatePoint path and can segfault on macOS ARM
         # with chromadb 0.6.3) into a clean delete+insert, bypassing the update
         # path entirely.
+        #
+        # A failed purge must abort this file's mine attempt rather than fall
+        # through to upsert: proceeding would either leave stale tail entries
+        # as permanent orphans (old chunk count > new) or silently overwrite
+        # only the overlapping chunk_index positions (not a real re-mine) --
+        # see #23. Returning here (without touching source_mtime/chunk_total)
+        # leaves the old drawers' stored mtime untouched, so the next mine
+        # still sees a mismatch against the current on-disk mtime and retries.
         try:
             collection.delete(where={"source_file": source_file})
-        except Exception:
+        except Exception as exc:
+            print(
+                f"  ! [skip] {filepath.name[:50]:50} stale-drawer purge failed "
+                f"({exc!r}); leaving existing drawers untouched, will retry "
+                f"on the next mine",
+                file=sys.stderr,
+            )
             logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
+            return 0, room, None
 
-        # Batch chunks into bounded upserts so the embedding model sees many
-        # chunks per forward pass without building one huge Chroma/SQLite
-        # request for pathological files. A bad chunk can fail its sub-batch;
-        # that is the deliberate trade-off for amortizing embedding overhead.
-        try:
-            source_mtime = os.path.getmtime(source_file)
-        except OSError:
-            source_mtime = None
+        # source_mtime is the mtime paired with the content actually read
+        # above (from _read_text_no_follow's own fstat), not a fresh re-stat
+        # here -- see #22. Re-statting separately can observe a file that was
+        # appended to between the read and this point, stamping drawers with
+        # an mtime that doesn't match what was actually chunked; the next
+        # mine's freshness check then sees stored-mtime == current-disk-mtime
+        # and silently, permanently skips the appended tail.
+        source_mtime = read_mtime
 
         # Tier 6a content-date: extract once per file (not per chunk) and
         # share across all chunks. Reads filename / frontmatter / content /
@@ -1545,40 +1900,68 @@ def process_file(
         # in production and the 4-segment pointer form lives only in tests.
         # Per PR #1584 review (Igor, 2026-05-22).
         all_metas: list = []
-        for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
-            batch_docs: list = []
-            batch_ids: list = []
-            batch_metas: list = []
-            for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                drawer_id = make_drawer_id_from_chunk(wing, room, source_file, chunk["chunk_index"])
-                batch_docs.append(chunk["content"])
-                batch_ids.append(drawer_id)
-                batch_metas.append(
-                    _build_drawer_metadata(
-                        wing,
-                        room,
-                        source_file,
-                        chunk["chunk_index"],
-                        agent,
-                        chunk["content"],
-                        source_mtime,
-                        line_start=chunk.get("line_start"),
-                        line_end=chunk.get("line_end"),
-                        content_date=file_content_date,
+        try:
+            for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
+                batch_docs: list = []
+                batch_ids: list = []
+                batch_metas: list = []
+                for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
+                    drawer_id = make_drawer_id_from_chunk(
+                        wing, room, source_file, chunk["chunk_index"]
                     )
+                    batch_docs.append(chunk["content"])
+                    batch_ids.append(drawer_id)
+                    batch_metas.append(
+                        _build_drawer_metadata(
+                            wing,
+                            room,
+                            source_file,
+                            chunk["chunk_index"],
+                            agent,
+                            chunk["content"],
+                            source_mtime,
+                            line_start=chunk.get("line_start"),
+                            line_end=chunk.get("line_end"),
+                            content_date=file_content_date,
+                            chunk_total=len(chunks),
+                        )
+                    )
+                assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
+                collection.upsert(
+                    documents=batch_docs,
+                    ids=batch_ids,
+                    metadatas=batch_metas,
                 )
-            assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
-            collection.upsert(
-                documents=batch_docs,
-                ids=batch_ids,
-                metadatas=batch_metas,
-            )
-            drawers_added += len(batch_docs)
-            all_metas.extend(batch_metas)
+                drawers_added += len(batch_docs)
+                all_metas.extend(batch_metas)
+        except Exception:
+            # A successful earlier batch has the source's current mtime (and
+            # often chunk_total). Leaving those drawers behind would make the
+            # next run skip this incomplete rebuild when chunk_total is absent
+            # on legacy rows, and would leave partial content searchable until
+            # the next mine. The source lock prevents this cleanup from
+            # deleting another miner's work for the same file. (#2122)
+            try:
+                collection.delete(where={"source_file": source_file})
+            except Exception:
+                logger.warning(
+                    "Failed to clean partial drawers after upsert error for %s",
+                    source_file,
+                    exc_info=True,
+                )
+            if closets_col:
+                purge_file_closets(closets_col, source_file)
+            raise
 
         # Build closet — the searchable index pointing to these drawers.
-        # Purge first: a re-mine (mtime change or normalize_version bump) must
-        # fully replace the prior closets, not append to them.
+        # Purge unconditionally: the old drawers this closet pointed at were
+        # already deleted above regardless of how many chunks survived this
+        # pass's own length filter, so a re-mine that ends up with zero filed
+        # drawers must still end up with zero closets, not stale ones
+        # dangling on deleted drawer IDs (see #24). Only the closet
+        # rebuild itself is conditional on there being new drawers to point at.
+        if closets_col:
+            purge_file_closets(closets_col, source_file)
         if closets_col and drawers_added > 0:
             drawer_ids = [
                 make_drawer_id_from_chunk(wing, room, source_file, c["chunk_index"]) for c in chunks
@@ -1609,7 +1992,6 @@ def process_file(
             }
             if entities:
                 closet_meta["entities"] = entities
-            purge_file_closets(closets_col, source_file)
             upsert_closet_lines(closets_col, closet_id_base, closet_lines, closet_meta)
 
     return drawers_added, room, None
@@ -1708,7 +2090,19 @@ def scan_project(
             # match the SKIP: (symlink) line above; silent drops at this
             # gate were the original #923 complaint.
             try:
-                file_size = filepath.stat().st_size
+                file_stat = filepath.stat()
+                # Reject anything that is not a regular file before it can
+                # reach a reader. os.walk lists FIFOs, sockets and device
+                # nodes as plain filenames and the extension filter above
+                # decides by name, so ``notes.md`` can be a named pipe.
+                # stat() itself never blocks on one; opening it can.
+                if not stat.S_ISREG(file_stat.st_mode):
+                    print(
+                        f"  SKIP: {filepath.name} (not a regular file)",
+                        file=sys.stderr,
+                    )
+                    continue
+                file_size = file_stat.st_size
                 if file_size > MAX_FILE_SIZE:
                     print(
                         f"  SKIP: {filepath.name} ({file_size / (1024 * 1024):.1f} MB)"
@@ -1843,7 +2237,7 @@ def _mine_impl(
     print(f"  Palace:  {palace_path}")
     print(f"  Device:  {describe_device()}")
     if dry_run:
-        print("  DRY RUN — nothing will be filed")
+        print("  DRY RUN -- nothing will be filed")
     if not respect_gitignore:
         print("  .gitignore: DISABLED")
     if include_ignored:
@@ -2195,7 +2589,7 @@ def status(palace_path: str):
 def _print_status(total: int, wing_rooms: dict[str, dict[str, int]]) -> None:
     """Render the wing/room histogram shared by both status code paths."""
     print(f"\n{'=' * 55}")
-    print(f"  MemPalace Status — {total} drawers")
+    print(f"  MemPalace Status -- {total} drawers")
     print(f"{'=' * 55}\n")
     for wing, rooms in sorted(wing_rooms.items()):
         print(f"  WING: {wing}")

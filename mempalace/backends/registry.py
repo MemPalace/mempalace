@@ -32,6 +32,21 @@ _discovered = False
 _lock = Lock()
 
 
+class BackendUnavailableError(KeyError):
+    """A selected backend is not registered in this Python process."""
+
+    def __init__(self, name: str, available: list[str]):
+        self.name = name
+        self.available = available
+        super().__init__(
+            f"unknown backend {name!r}; available: {available}. "
+            "Check --backend, ~/.mempalace/config.json backend, and "
+            "MEMPALACE_BACKEND. Select the backend matching the existing storage "
+            "or install its backend package into the MCP server's Python environment "
+            "and restart the MCP server to discover it. No fallback was selected."
+        )
+
+
 def register(name: str, backend_cls: Type[BaseBackend]) -> None:
     """Register ``backend_cls`` under ``name``.
 
@@ -103,7 +118,7 @@ def get_backend_class(name: str) -> Type[BaseBackend]:
     try:
         return _registry[name]
     except KeyError as e:
-        raise KeyError(f"unknown backend {name!r}; available: {available_backends()}") from e
+        raise BackendUnavailableError(name, available_backends()) from e
 
 
 def get_backend(name: str) -> BaseBackend:
@@ -119,7 +134,7 @@ def get_backend(name: str) -> BaseBackend:
             return inst
         cls = _registry.get(name)
         if cls is None:
-            raise KeyError(f"unknown backend {name!r}; available: {sorted(_registry.keys())}")
+            raise BackendUnavailableError(name, sorted(_registry.keys()))
         inst = cls()
         _instances[name] = inst
         return inst

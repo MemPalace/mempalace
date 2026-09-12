@@ -24,7 +24,10 @@ User=mempalace
 Group=mempalace
 EnvironmentFile=/etc/mempalace/server.env
 ExecStart=mempalace serve --host 0.0.0.0 --port 8765
-Restart=on-failure
+# The idle watchdog exits with status 0, which on-failure reads as an
+# intentional stop, so the server would stay down. server.env disables the
+# watchdog; Restart=always covers a deployment that has not set it.
+Restart=always
 RestartSec=2
 
 # --- Hardening ---------------------------------------------------------------

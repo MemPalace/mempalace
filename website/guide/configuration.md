@@ -172,3 +172,4 @@ python -m mempalace.mcp_server --palace /custom/palace
 | `MEMPAL_DIR` | Directory for auto-mining in hooks |
 | `MEMPALACE_MAX_BACKUPS` | Override `max_backups` retention count (`0` disables pruning) |
 | `MEMPALACE_BACKEND` | Select the storage backend (default `chroma`) — see [Storage backends](#storage-backends) for each backend's connection variables |
+| `MEMPALACE_MCP_IDLE_HOURS` | Hours with no MCP request before the server exits by itself (default `8`; `0` disables). See [Remote server](/guide/remote-server#operating-notes) |

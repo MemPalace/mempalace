@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import subprocess
@@ -210,6 +211,7 @@ def test_submit_job_uses_client_and_waits(monkeypatch, tmp_path):
 def test_service_tool_classification():
     assert service.classify_tool("mempalace_search") == "read"
     assert service.classify_tool("mempalace_add_drawer") == "write"
+    assert service.classify_tool("mempalace_memories_filed_away") == "write"
     assert service.classify_tool("mempalace_checkpoint") == "write"
     assert service.classify_tool("mempalace_delete_by_source") == "write"
     assert service.classify_tool("mempalace_mine") == "maintenance"
@@ -1182,6 +1184,42 @@ def test_run_mine_invalid_mode_returns_structured_error(tmp_path):
     assert out["exit_code"] == 2
 
 
+def test_run_mine_source_adapter_dispatches_through_adapter_runner(tmp_path, monkeypatch):
+    """Daemon mine jobs preserve the CLI's explicit source-adapter dispatch."""
+    from mempalace import cli, service
+
+    received = {}
+
+    def fake_mine_source_adapter(**kwargs):
+        received.update(kwargs)
+        return 3
+
+    monkeypatch.setattr(cli, "mine_source_adapter", fake_mine_source_adapter)
+    palace = tmp_path / "palace"
+    out = service.run_mine(
+        {
+            "palace_path": str(palace),
+            "source": "/source",
+            "source_adapter": "fixture",
+            "dry_run": True,
+        }
+    )
+
+    assert received == {
+        "source_name": "fixture",
+        "source_path": "/source",
+        "palace_path": str(palace.resolve()),
+        "dry_run": True,
+    }
+    assert out == {
+        "success": True,
+        "kind": "mine",
+        "mode": "source",
+        "dry_run": True,
+        "exit_code": 0,
+    }
+
+
 def test_run_mcp_tool_rejects_non_dict_arguments():
     from mempalace import service
 
@@ -1494,3 +1532,57 @@ def test_detached_kwargs_windows(tmp_path, monkeypatch):
         assert "start_new_session" not in kwargs
     finally:
         fh.close()
+
+
+# --- #2442: start_daemon must not deregister a live daemon ---
+
+
+def _fake_registration(tmp_path, monkeypatch, pid):
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    daemon.ensure_token(str(palace))
+    sd = daemon.state_dir(str(palace))
+    sd.mkdir(parents=True, exist_ok=True)
+    daemon.endpoint_path(str(palace)).write_text(
+        json.dumps({"host": "127.0.0.1", "port": 1, "pid": pid}), encoding="utf-8"
+    )
+    daemon.pid_path(str(palace)).write_text(f"{pid}\n", encoding="utf-8")
+    # The registered daemon is busy: the health probe times out.
+    monkeypatch.setattr(daemon, "get_client_if_running", lambda *a, **kw: None)
+    return palace
+
+
+def test_start_daemon_refuses_to_replace_a_live_but_busy_daemon(tmp_path, monkeypatch):
+    palace = _fake_registration(tmp_path, monkeypatch, os.getpid())
+
+    def fail_popen(*a, **kw):
+        raise AssertionError("must not spawn a replacement while the registered pid is alive")
+
+    monkeypatch.setattr(daemon.subprocess, "Popen", fail_popen)
+
+    with pytest.raises(daemon.DaemonError, match="busy or wedged"):
+        daemon.start_daemon(str(palace), timeout=0.05)
+
+    # Registration is intact, so the live owner stays reachable once it answers again.
+    assert daemon.endpoint_path(str(palace)).exists()
+    assert daemon.pid_path(str(palace)).exists()
+
+
+def test_start_daemon_replaces_a_dead_registration(tmp_path, monkeypatch):
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    palace = _fake_registration(tmp_path, monkeypatch, dead.pid)
+    spawned = []
+
+    def fake_popen(*a, **kw):
+        spawned.append(a)
+        assert not daemon.endpoint_path(str(palace)).exists()
+        assert not daemon.pid_path(str(palace)).exists()
+        raise OSError("stop here")
+
+    monkeypatch.setattr(daemon.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(OSError, match="stop here"):
+        daemon.start_daemon(str(palace), timeout=0.05)
+    assert spawned

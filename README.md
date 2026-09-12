@@ -45,6 +45,33 @@ Architecture, concepts, and mining flows:
 
 ## Install
 
+### Agent-guided setup
+
+Install the MemPalace skills first, then ask your coding agent to set up
+MemPalace. The setup skill detects your system, installs the Python package,
+configures MCP, and asks whether you want a private local palace, a shared-brain
+hub, or a client connected to an existing hub:
+
+```bash
+npx skills add MemPalace/mempalace
+```
+
+The repository exposes three skills: `mempalace` for guided installation and
+operations, `mempalace-recall` for search-before-answer recall, and
+`mempalace-task` for logstream delegation. Installing a skill does not by
+itself install the MemPalace CLI or MCP server; the setup skill guides the
+agent through those system changes and verifies the live connection.
+
+During guided setup the agent can offer weekly stable-release checks. They are
+disabled by default, contact only PyPI when enabled, and never install updates
+automatically. Cached availability appears in scoped `mempalace_status` fields
+for the serving runtime and, when a local proxy is present, its client runtime,
+allowing the agent to explain the release and request authorization before showing an exact
+upgrade plan. Setup records whether the runtime came from `uv tool`, `pipx`, or
+`pip` so the plan never proposes an upgrade command for the wrong installation.
+
+### Direct CLI setup
+
 MemPalace ships a CLI, so install it in an isolated environment to avoid
 PEP 668 errors on Debian/Ubuntu/Homebrew Pythons and to keep mempalace's
 deps (`chromadb`, `numpy`, `grpcio`, …) from conflicting with anything
@@ -69,42 +96,95 @@ python -m venv .venv && source .venv/bin/activate
 pip install mempalace
 ```
 
+### Android / Termux
+
+Native Termux installation is not currently supported because compiled
+dependencies such as ChromaDB and ONNX Runtime publish Linux wheels, not
+Android wheels. Android ARM64 users can run the regular Linux packages in an
+isolated Debian PRoot container instead. See the
+[Termux installation guide](website/guide/termux.md) for the tested setup and
+an argv-preserving launcher.
+
 ### Docker
 
 A container image is also available for running the MCP server or the CLI
-without a local Python toolchain. Everything persists under `/data` (palace,
-config, and the cached embedding model), so mount a volume there.
+without a local Python toolchain. Multi-arch (amd64 + arm64), so it runs
+natively on Apple Silicon:
 
 ```bash
-# Build the image (CPU; bundles the `extract` + `spellcheck` extras)
-docker build -t mempalace .
-
-# MCP server over stdio — note the `-i` flag (JSON-RPC needs stdin)
-docker run -i --rm -v mempalace-data:/data mempalace
-
-# Run any CLI command instead (mount the host directory you want to mine)
-docker run --rm -v mempalace-data:/data -v /path/to/project:/work mempalace mine /work
-docker run --rm -v mempalace-data:/data mempalace search "why GraphQL"
+docker pull ghcr.io/mempalace/mempalace:latest
 ```
 
-Wire it into an MCP client (e.g. Claude Code) as a stdio server:
+Everything persists under `/data` — palace, config, and the cached embedding
+model — so mount a volume there and reuse it across runs:
+
+```bash
+# MCP server over stdio — note the `-i` flag (JSON-RPC needs stdin)
+docker run -i --rm -v mempalace-data:/data ghcr.io/mempalace/mempalace
+
+# Run any CLI command instead. The container only sees what you mount, so
+# mount the directory you want to mine — read-only is enough, mining never
+# writes to the source.
+docker run --rm -v mempalace-data:/data -v /path/to/project:/work:ro \
+  ghcr.io/mempalace/mempalace mine /work
+docker run --rm -v mempalace-data:/data ghcr.io/mempalace/mempalace search "why GraphQL"
+```
+
+The first command that needs embeddings downloads the model into `/data`
+(~80 MB for the default `minilm`, ~300 MB for `embeddinggemma`). It is a
+one-off as long as the volume persists, but it does mean the first call is
+slow and needs network — worth knowing before assuming a hung container.
+
+Wire it into an MCP client (e.g. Claude Code) as a stdio server. Mount
+anything you want the server to be able to mine — it cannot reach your
+transcripts otherwise:
 
 ```json
 {
   "mcpServers": {
     "mempalace": {
       "command": "docker",
-      "args": ["run", "-i", "--rm", "-v", "mempalace-data:/data", "mempalace"]
+      "args": [
+        "run", "-i", "--rm",
+        "-v", "mempalace-data:/data",
+        "-v", "/absolute/path/to/.claude/projects:/transcripts:ro",
+        "ghcr.io/mempalace/mempalace"
+      ]
     }
   }
 }
 ```
 
-`docker compose run --rm mcp` works too (see `docker-compose.yml`). For
-CUDA-accelerated embeddings, build the GPU variant with
-`docker build -f Dockerfile.gpu -t mempalace:gpu .` and run it with
-`--gpus all`. Customise the bundled extras at build time, e.g.
-`docker build --build-arg EXTRAS="extract,spellcheck" -t mempalace .`.
+Use a real absolute path there — `~` and `$HOME` are not expanded by every
+MCP client. Paths are container paths from then on: mine `/transcripts`, not
+`~/.claude/projects`.
+
+**Mount permissions on Linux.** The image runs as uid 1000 and bind mounts
+keep their host ownership, so a mounted directory has to be readable by that
+uid — an ordinary `0755` checkout is fine, a `0700` directory is not, and the
+failure surfaces as `PermissionError: [Errno 13]` rather than anything about
+Docker. Docker Desktop maps uids on macOS and Windows, so this only bites on
+Linux. Do **not** work around it with `--user`: `/data` is owned by uid 1000
+inside the image, so another uid cannot write the palace at all.
+
+`docker compose run --rm mcp` works too (see `docker-compose.yml`), and
+`deploy/docker-compose.server.yml` stands up the team server. To build the
+image yourself instead of pulling — required for the GPU variant, which is not
+published:
+
+```bash
+docker build -t mempalace .                                  # CPU
+docker build --build-arg EXTRAS="extract,spellcheck" -t mempalace .
+docker build -f Dockerfile.gpu -t mempalace:gpu .            # CUDA; run with --gpus all
+```
+
+The GPU image is x86_64-only: `onnxruntime-gpu` publishes no aarch64 Linux
+wheels, so that last build fails on an ARM host (including Apple Silicon) with
+a dependency-resolution error rather than an obvious one.
+
+Note that a build from a clone uses whatever branch you checked out; `develop`
+is the default branch, so pull the published image if you want the released
+version.
 
 ## Storage backends
 
@@ -116,15 +196,26 @@ non-default backend is opt-in.
 | Backend | Mode | Install | Namespaces | Lexical | Configure with |
 | ------- | ---- | ------- | :--------: | :-----: | -------------- |
 | `chroma` _(default)_ | Local (embedded) | bundled | – | ✓ | – |
-| `sqlite_exact` | Local (exact) | bundled | – | ✓ | – |
+| `sqlite_exact` | Local (exact NumPy) | bundled | – | ✓ | – |
+| `rust_exact` | Local (native vectors) | wheel / compiled | – | ✓ | – |
 | `milvus` | Local (Lite) · Server opt-in | `mempalace[milvus]` | ✓ | ✓ | `MEMPALACE_MILVUS_URI` |
 | `qdrant` | Server (REST) | bundled | ✓ | ✓ | `MEMPALACE_QDRANT_URL` |
 | `pgvector` | Server (Postgres) | `mempalace[pgvector]` | ✓ | ✓ | `MEMPALACE_PGVECTOR_DSN` |
 
 Select with `--backend <name>`, `MEMPALACE_BACKEND=<name>`, or
-`"backend": "<name>"` in `config.json`. See
-[Storage backends](/guide/configuration#storage-backends) for connection
-variables, namespace behavior, and deployment notes.
+`"backend": "<name>"` in `config.json`. `rust_exact` uses the exact same `sqlite_exact.sqlite3` file on disk as `sqlite_exact` with zero data migration. See [native installation and vector CLI usage](crates/README.md) for the separately distributed wheel and executables.
+
+### Vector Search Engine Performance
+
+Initial Windows benchmarks of `rust_exact` and `mempalace-native` showed reduced memory usage and faster vector scans. These historical measurements span 168k and 334k-row workloads in a 1.75 GB database; they have not been rerun after the correctness fixes:
+
+| Engine / Runtime | RSS Memory (334k items) | Query Latency (Warm p50) | Dependencies / Footprint |
+| ---------------- | ----------------------- | ------------------------ | ------------------------ |
+| `sqlite_exact` (Python + NumPy) | 2,430 MB | 14.7 ms | Python virtualenv |
+| `rust_exact` (PyO3 + Rust engine) | **557 MB (-77%)** | **7.2 ms – 11.8 ms** | Python + native extension |
+| `mempalace-native` (Standalone CLI) | **526 MB (-78%)** | **6.1 ms – 11.6 ms** | **Standalone executable (no Python)** |
+
+See [`crates/`](crates/) for the core workspace, PyO3 bindings, and native CLI.
 
 ## Quickstart
 
@@ -209,8 +300,9 @@ Usage and tool reference:
 
 ## MCP server
 
-36 MCP tools cover palace reads/writes, knowledge-graph operations,
-cross-wing navigation, drawer management, and agent diaries. Installation
+45 MCP tools cover palace reads/writes, knowledge-graph operations,
+cross-wing navigation, drawer management, agent diaries, and agent
+coordination (logstream events + artifact handoffs). Installation
 and the full tool list:
 [mempalaceofficial.com/reference/mcp-tools](https://mempalaceofficial.com/reference/mcp-tools.html).
 
@@ -248,6 +340,7 @@ verbatim drawer per user/assistant message, idempotent and resume-safe.
 - Python 3.9+
 - A vector-store backend (ChromaDB by default)
 - ~300 MB disk for the embedding model. Onboarding (`python -m mempalace.onboarding`) offers `embeddinggemma-300m` (multilingual, 100+ languages, recommended) or `all-MiniLM-L6-v2` (English-only, ~30 MB). See the docstring at [`mempalace/embedding.py`](mempalace/embedding.py) for details and migration notes.
+- Optional — compute embeddings on a server instead of locally. Set `embedding_model: "openai-compat"` in `~/.mempalace/config.json` together with `embedding_api_url` / `embedding_api_model` (and `embedding_api_key` if the server needs auth) to use any OpenAI-compatible `/v1/embeddings` endpoint — LM Studio, llama.cpp, vLLM, Ollama's OpenAI shim, or a self-hosted server (e.g. a larger multilingual or GPU-served embedder). Each key is overridable via the matching `MEMPALACE_EMBEDDING_API_*` env var. When the endpoint is on your machine or LAN, no content leaves your network. Switching to it requires `mempalace repair rebuild-index` (different vector space).
 
 No API key is required for the core benchmark path.
 
@@ -269,7 +362,7 @@ PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 MIT — see [LICENSE](LICENSE).
 
 <!-- Link Definitions -->
-[version-shield]: https://img.shields.io/badge/version-3.7.0-4dc9f6?style=flat-square&labelColor=0a0e14
+[version-shield]: https://img.shields.io/badge/version-3.9.0-4dc9f6?style=flat-square&labelColor=0a0e14
 [release-link]: https://github.com/MemPalace/mempalace/releases
 [python-shield]: https://img.shields.io/badge/python-3.9+-7dd8f8?style=flat-square&labelColor=0a0e14&logo=python&logoColor=7dd8f8
 [python-link]: https://www.python.org/

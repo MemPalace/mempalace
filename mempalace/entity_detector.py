@@ -628,6 +628,13 @@ def detect_entities(
         if files_read >= max_files:
             break
         try:
+            # Decide by file type before opening: ``scan_for_detection``
+            # picks candidates by extension, so a FIFO named ``notes.md``
+            # reaches this loop and a blocking open of one waits in the
+            # kernel for a writer that may never come. ``is_file()`` stats
+            # instead of opening and never blocks.
+            if not Path(filepath).is_file():
+                continue
             with open(filepath, encoding="utf-8", errors="replace") as f:
                 content = f.read(MAX_BYTES_PER_FILE)
             all_text.append(content)
@@ -748,7 +755,7 @@ def _print_entity_list(entities: list, label: str):
         print("    (none detected)")
         return
     for i, e in enumerate(entities):
-        confidence_bar = "●" * int(e["confidence"] * 5) + "○" * (5 - int(e["confidence"] * 5))
+        confidence_bar = "#" * int(e["confidence"] * 5) + "." * (5 - int(e["confidence"] * 5))
         signals_str = ", ".join(e["signals"][:2]) if e["signals"] else ""
         print(f"    {i + 1:2}. {e['name']:20} [{confidence_bar}] {signals_str}")
 
@@ -768,7 +775,7 @@ def confirm_entities(detected: dict, yes: bool = False) -> dict:
     Pass yes=True to auto-accept all detected entities without prompting.
     """
     print(f"\n{'=' * 58}")
-    print("  MemPalace — Entity Detection")
+    print("  MemPalace -- Entity Detection")
     print(f"{'=' * 58}")
     print("\n  Scanned your files. Here's what we found:\n")
 
@@ -798,7 +805,7 @@ def confirm_entities(detected: dict, yes: bool = False) -> dict:
             "topics": confirmed_topics,
         }
 
-    print(f"\n{'─' * 58}")
+    print(f"\n{'-' * 58}")
     print("  Options:")
     print("    [enter]  Accept all")
     print("    [edit]   Remove wrong entries or reclassify uncertain")
@@ -813,9 +820,9 @@ def confirm_entities(detected: dict, yes: bool = False) -> dict:
     if choice == "edit":
         # Handle uncertain first
         if detected["uncertain"]:
-            print("\n  Uncertain entities — classify each:")
+            print("\n  Uncertain entities -- classify each:")
             for e in detected["uncertain"]:
-                ans = input(f"    {e['name']} — (p)erson, (r)project, or (s)kip? ").strip().lower()
+                ans = input(f"    {e['name']} -- (p)erson, (r)project, or (s)kip? ").strip().lower()
                 if ans == "p":
                     confirmed_people.append(e["name"])
                 elif ans == "r":

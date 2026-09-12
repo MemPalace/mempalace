@@ -134,7 +134,24 @@ def _print_change(
     )
 
 
+def _reconfigure_stdio_utf8_on_windows() -> None:
+    """Decode stdio as UTF-8 on Windows for the encoding-repair CLI.
+
+    Thin wrapper around the shared helper in ``mempalace._stdio``, matching
+    ``cli.py`` and ``fact_checker.py``. stdout/stderr override to ``replace``
+    because every proposed change prints a before/after preview of verbatim
+    drawer text -- under the legacy console codepage this tool is written for,
+    ``strict`` raises on the mojibake lead bytes themselves and aborts the run
+    before a single drawer is repaired.
+    """
+    from mempalace._stdio import reconfigure_stdio_utf8_on_windows
+
+    reconfigure_stdio_utf8_on_windows(stdout_errors="replace", stderr_errors="replace")
+
+
 def main() -> int:
+    _reconfigure_stdio_utf8_on_windows()
+
     parser = build_parser()
     args = parser.parse_args()
 

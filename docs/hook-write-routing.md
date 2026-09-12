@@ -1,5 +1,11 @@
 # Hook write routing
 
+> [!IMPORTANT]
+> This page documents unreleased hook write-routing behavior on `develop`.
+> MemPalace v3.6.0 does not consume `write_routing.hooks`; see the
+> [v3.6.0 write-routing policy](https://github.com/MemPalace/mempalace/blob/v3.6.0/docs/write-routing-policy.md#backward-compatibility)
+> for behavior available in that release.
+
 Hook-triggered writes use the shared write-routing policy introduced for the
 Tier 3 rollout tracked in #1963.
 
