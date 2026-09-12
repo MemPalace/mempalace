@@ -426,3 +426,34 @@ def test_import_rejects_non_directory():
             pass
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_cli_export_then_import_round_trips(monkeypatch):
+    """`mempalace export` / `mempalace import` reach their handlers through the CLI package."""
+    import sys
+
+    from mempalace.cli import main
+
+    tmpdir = tempfile.mkdtemp()
+    monkeypatch.setenv("HOME", tmpdir)
+    monkeypatch.setenv("USERPROFILE", tmpdir)
+    # main() pops PYTHONPATH from the process env; registering it here restores it on teardown.
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    try:
+        palace_path = _setup_palace(tmpdir)
+        export_dir = os.path.join(tmpdir, "export")
+        monkeypatch.setattr(
+            sys, "argv", ["mempalace", "--palace", palace_path, "export", "--output", export_dir]
+        )
+        main()
+        exported = _read_all_lines(export_dir)
+        assert exported, "export wrote no drawers"
+
+        target_palace = os.path.join(tmpdir, "palace_b")
+        monkeypatch.setattr(
+            sys, "argv", ["mempalace", "--palace", target_palace, "import", export_dir]
+        )
+        main()
+        assert get_collection(target_palace).count() == len(exported)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
