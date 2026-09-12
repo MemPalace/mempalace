@@ -263,6 +263,17 @@ def main():
         "target",
         help="A .jsonl transcript file, or a directory to scan recursively",
     )
+    p_sweep.add_argument(
+        "--wing",
+        default=None,
+        help="Classify swept drawers under this wing (like `mine --wing`); "
+        "default leaves them unclassified as ?/?",
+    )
+    p_sweep.add_argument(
+        "--room",
+        default=None,
+        help="Room for swept drawers when --wing is set (default: general)",
+    )
 
     # sync
     p_sync = sub.add_parser(
