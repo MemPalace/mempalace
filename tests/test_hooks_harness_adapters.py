@@ -287,10 +287,26 @@ def test_stop_hook_grok_saves_at_interval(tmp_path):
                 harness="grok",
                 state_dir=tmp_path,
             )
-    assert "systemMessage" in result
+    assert result == {}
+    assert "systemMessage" not in result
+    mock_save.assert_called_once()
     kwargs = mock_save.call_args.kwargs
     assert kwargs["agent_name"] == "grok"
     assert kwargs["wing"] == "wing_engram"
+
+
+def test_harness_notice_output_grok_is_empty():
+    assert hooks_cli_mod._harness_notice_output("grok", "✦ 15 memories woven") == {}
+
+
+def test_harness_notice_output_claude_keeps_system_message():
+    notice = "✦ 15 memories woven into the palace"
+    assert hooks_cli_mod._harness_notice_output("claude-code", notice) == {"systemMessage": notice}
+
+
+def test_harness_notice_output_copilot_keeps_system_message():
+    notice = "✦ 15 memories woven into the palace"
+    assert hooks_cli_mod._harness_notice_output("copilot", notice) == {"systemMessage": notice}
 
 
 def test_stop_hook_grok_skips_subagent(tmp_path):

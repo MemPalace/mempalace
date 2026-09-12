@@ -748,8 +748,20 @@ def _log_hook_write_blocked(routing: HookWriteRouting, operation: str) -> None:
     _log(f"{routing.notice} Operation skipped: {operation}.")
 
 
-def _blocked_hook_output(routing: HookWriteRouting) -> dict:
-    return {"systemMessage": routing.notice}
+def _harness_notice_output(harness: str, notice: str) -> dict:
+    """Return a user-visible hook notice for harnesses that render it.
+
+    Claude Code shows ``systemMessage``. Grok Stop ignores that key, and
+    Grok ``additionalContext`` on Stop keeps the agent working, so Grok
+    silent-save must emit empty JSON.
+    """
+    if (harness or "") == "grok":
+        return {}
+    return {"systemMessage": notice}
+
+
+def _blocked_hook_output(routing: HookWriteRouting, harness: str = "") -> dict:
+    return _harness_notice_output(harness, routing.notice)
 
 
 def _submit_daemon_job(
@@ -1615,7 +1627,7 @@ def hook_stop(data: dict, harness: str):
         with _hook_write_routing_context() as routing:
             if routing.blocked:
                 _log_hook_write_blocked(routing, "stop-hook checkpoint")
-                _output(_blocked_hook_output(routing))
+                _output(_blocked_hook_output(routing, harness))
                 return
 
             _log(f"TRIGGERING SAVE at exchange {exchange_count}")
@@ -1656,11 +1668,8 @@ def hook_stop(data: dict, harness: str):
                         tag = " \u2014 " + ", ".join(themes)
                     else:
                         tag = ""
-                    _output(
-                        {
-                            "systemMessage": f"\u2726 {count} memories woven into the palace{tag}",
-                        }
-                    )
+                    notice = f"\u2726 {count} memories woven into the palace{tag}"
+                    _output(_harness_notice_output(harness, notice))
                 else:
                     _output({})
             else:
@@ -1698,7 +1707,7 @@ def hook_session_start(data: dict, harness: str):
     with _hook_write_routing_context() as routing:
         if routing.blocked:
             _log_hook_write_blocked(routing, "session-start readiness check")
-            _output(_blocked_hook_output(routing))
+            _output(_blocked_hook_output(routing, harness))
             return
 
     # Pass through — no blocking on session start
@@ -1803,7 +1812,7 @@ def hook_session_end(data: dict, harness: str):
         with _hook_write_routing_context() as routing:
             if routing.blocked:
                 _log_hook_write_blocked(routing, "session-end flush")
-                _output(_blocked_hook_output(routing))
+                _output(_blocked_hook_output(routing, harness))
                 return
 
             if valid_transcript:
@@ -1846,7 +1855,7 @@ def hook_precompact(data: dict, harness: str):
     with _hook_write_routing_context() as routing:
         if routing.blocked:
             _log_hook_write_blocked(routing, "precompact flush")
-            _output(_blocked_hook_output(routing))
+            _output(_blocked_hook_output(routing, harness))
             return
 
         # Capture tool output via our normalize path before compaction loses it
