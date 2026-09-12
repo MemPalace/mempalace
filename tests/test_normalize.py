@@ -1,6 +1,11 @@
 import json
 import stat
+import time
 from unittest.mock import patch
+
+import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from mempalace.normalize import (
     _SLACK_PROVENANCE_FOOTER,
@@ -2038,6 +2043,10 @@ class TestStripNoiseRemovesSystemChrome:
             "system-reminder",
             "command-message",
             "command-name",
+            "command-args",
+            "local-command-caveat",
+            "local-command-stdout",
+            "local-command-stderr",
             "task-notification",
             "user-prompt-submit-hook",
             "hook_output",
@@ -2054,6 +2063,514 @@ class TestStripNoiseRemovesSystemChrome:
         assert "line two" in out
         # Should collapse to no more than 3 newlines
         assert "\n\n\n\n" not in out
+
+
+class TestStripNoiseClaudeCodeEnvelopeAndAnsi:
+    """#1333: strip the rest of the slash-command envelope and ANSI escapes
+    from Bash-tool output, while prose that merely *names* them survives
+    (verbatim is sacred)."""
+
+    def test_strips_multiparagraph_local_command_stdout(self):
+        # The old blank-line-halt regex stopped at the first blank line and
+        # left the tail + closing tag behind. Real slash-command stdout is
+        # often multi-paragraph -- the whole envelope must go.
+        text = (
+            "> User:\n"
+            "> <local-command-stdout>Set defaultPermissionMode to default\n"
+            "\n"
+            "Disabled auto-compact for all sessions</local-command-stdout>\n"
+            "> Real message."
+        )
+        out = strip_noise(text)
+        assert "local-command-stdout" not in out
+        assert "defaultPermissionMode" not in out
+        assert "Disabled auto-compact" not in out
+        assert "Real message." in out
+
+    def test_strips_local_command_stderr(self):
+        text = "> <local-command-stderr>command failed: boom</local-command-stderr>\n> Real."
+        out = strip_noise(text)
+        assert "local-command-stderr" not in out
+        assert "boom" not in out
+        assert "Real." in out
+
+    def test_strips_empty_command_args_remnant(self):
+        text = "> User:\n> <command-args></command-args>\n> Real."
+        out = strip_noise(text)
+        assert "command-args" not in out
+        assert "Real." in out
+
+    def test_strips_local_command_caveat(self):
+        text = "> <local-command-caveat>caveat text</local-command-caveat>\n> Real."
+        out = strip_noise(text)
+        assert "local-command-caveat" not in out
+        assert "caveat text" not in out
+        assert "Real." in out
+
+    def test_long_tag_name_prefix_is_not_falsely_closed(self):
+        """A `[\\s>]` lookahead, not a bare `\\b`, distinguishes <command-args>
+        from a longer tag name it prefixes. `\\b` alone fires between "s" and
+        "-" (a word/non-word pair), which would make the lazy body stop
+        early inside <command-args-extended>, treating its content as if the
+        <command-args> tag had already closed."""
+        text = (
+            "> User:\n> <command-args-extended>keep this content</command-args-extended>\n> Real."
+        )
+        out = strip_noise(text)
+        assert "keep this content" in out
+        assert "Real." in out
+
+    def test_prose_naming_ansi_survives(self):
+        # No literal ESC byte -- text that merely *documents* an escape
+        # sequence must survive verbatim.
+        text = "> User: the SGR reset code is written ESC[0m in the docs."
+        assert strip_noise(text) == text.strip()
+
+
+# ── ANSI escape stripping (#1333) ───────────────────────────────────────
+#
+# Split into several focused classes rather than one grab-bag, since this
+# code ships to an external repo (mempalace) and each failure mode found
+# during review deserves its own regression test, not a shared one that
+# obscures which shape actually broke.
+
+
+class TestAnsiCsiRealWorldShapes:
+    """CSI (Control Sequence Introducer) sequences actually seen in Bash
+    tool output: SGR color/style codes (the dominant case) plus cursor
+    movement and erase."""
+
+    def test_strips_truecolor_sgr(self):
+        text = "> Assistant: \x1b[38;2;153;153;153m├\x1b[39m mempalace_add_drawer done"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert "[38;2;153" not in out
+        assert "mempalace_add_drawer done" in out
+
+    def test_strips_256_color_sgr(self):
+        text = "before \x1b[38;5;208morange text\x1b[0m after"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert out == "before orange text after"
+
+    def test_strips_basic_16_color_sgr(self):
+        for code in ("30", "31", "32", "33", "34", "35", "36", "37", "90", "97"):
+            text = f"before \x1b[{code}mcolored\x1b[0m after"
+            out = strip_noise(text)
+            assert "\x1b" not in out
+            assert out == "before colored after"
+
+    def test_strips_bold_and_reset(self):
+        text = "before \x1b[1mbold\x1b[22m after"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert out == "before bold after"
+
+    def test_strips_multi_param_sgr(self):
+        # Bold + red in one sequence -- a common real shape.
+        text = "\x1b[1;31mbold red\x1b[0m"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert out == "bold red"
+
+    def test_strips_cursor_movement_with_param(self):
+        text = "\x1b[2Aup two lines"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert out == "up two lines"
+
+    def test_strips_cursor_position_with_params(self):
+        text = "\x1b[10;20Hmoved"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert out == "moved"
+
+    def test_strips_erase_in_line(self):
+        text = "progress: 50%\x1b[2Kprogress: 100%"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert out == "progress: 50%progress: 100%"
+
+    def test_strips_adjacent_sgr_codes_with_no_text_between(self):
+        # e.g. a color change immediately followed by a style change --
+        # two escapes back-to-back, no real content between them.
+        text = "\x1b[1m\x1b[31mbold red\x1b[0m\x1b[0m"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert out == "bold red"
+
+    def test_strips_progress_bar_style_output(self):
+        # A realistic composite: multiple colored segments in one line,
+        # like npm/eslint/test-runner progress output.
+        text = "\x1b[32m✓\x1b[0m 12 passed \x1b[31m✗\x1b[0m 1 failed \x1b[2m(0.3s)\x1b[0m"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert out == "✓ 12 passed ✗ 1 failed (0.3s)"
+
+
+class TestAnsiOscRealWorldShapes:
+    """OSC (Operating System Command) sequences: hyperlinks and window
+    titles, in both terminator styles (BEL and ST)."""
+
+    def test_strips_hyperlink_bel_terminated(self):
+        text = "> Assistant: see \x1b]8;;https://example.com\x07link\x1b]8;;\x07 here"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert "link here" in out
+
+    def test_strips_hyperlink_st_terminated(self):
+        text = "see \x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ here"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert out == "see link here"
+
+    def test_strips_window_title_bel(self):
+        text = "\x1b]0;my-window-title\x07real content follows"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert out == "real content follows"
+
+    def test_strips_window_title_st(self):
+        text = "\x1b]2;my-window-title\x1b\\real content follows"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert out == "real content follows"
+
+    def test_strips_multiple_hyperlinks_in_one_line(self):
+        text = (
+            "see \x1b]8;;https://a.example\x07first\x1b]8;;\x07 and "
+            "\x1b]8;;https://b.example\x07second\x1b]8;;\x07 links"
+        )
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert out == "see first and second links"
+
+
+class TestAnsiSimpleEscapeRealWorldShapes:
+    """Simple (single-byte-terminated) escape sequences: the VT100 nF range,
+    Fe (minus CSI/OSC), and Fs (independent control functions)."""
+
+    def test_strips_ris_full_reset(self):
+        """ESC c (RIS, full terminal reset) -- emitted by watch-mode dev
+        tools (tsx watch, nodemon) before reprinting output on a
+        file-change restart. A backgrounded process's redirected
+        stdout/stderr can pick this up verbatim -- the case that motivated
+        adding this pattern in the first place."""
+        text = "> Assistant: All jobs stopped.\n\x1bc14:44:55.089 INF server ready"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert "All jobs stopped." in out
+        assert "14:44:55.089 INF server ready" in out
+
+    def test_strips_fe_set(self):
+        """IND, NEL, RI -- the Fe set (0x40-0x5F) minus CSI/OSC's own
+        introducers."""
+        for seq in ("\x1bD", "\x1bE", "\x1bM"):
+            text = f"before{seq}after"
+            out = strip_noise(text)
+            assert "\x1b" not in out
+            assert out == "beforeafter"
+
+    def test_strips_fs_set(self):
+        """RIS and a couple of neighbouring Fs (0x60-0x7E) codes."""
+        for seq in ("\x1bc", "\x1bn", "\x1bo"):
+            text = f"before{seq}after"
+            out = strip_noise(text)
+            assert "\x1b" not in out
+            assert out == "beforeafter"
+
+    def test_strips_nf_range_save_restore_cursor(self):
+        """ESC 7 / ESC 8 (DECSC/DECRC) -- VT100-common, in the 0x30-0x3F
+        range rather than Fe/Fs."""
+        for seq in ("\x1b7", "\x1b8"):
+            text = f"before{seq}after"
+            out = strip_noise(text)
+            assert "\x1b" not in out
+            assert out == "beforeafter"
+
+    def test_simple_pattern_does_not_eat_csi_or_osc_introducers(self):
+        """The simple-sequence pattern must not itself consume '[' or ']' --
+        those belong to CSI/OSC, which have their own payload-aware
+        patterns and run first (order doesn't matter here only because
+        the character class explicitly excludes both bytes)."""
+        text = "\x1b[1mbold\x1b[0m and \x1b]8;;url\x07link\x1b]8;;\x07"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert "bold and link" in out
+
+
+class TestAnsiTruncationSafety:
+    """Regression coverage for truncated/malformed escape sequences meeting
+    real prose. Real captured Bash tool output does get cut mid-write (a
+    background process's redirected stdout racing its reader) -- these
+    document what happens when an escape sequence never got its real
+    terminator, and confirm it doesn't corrupt the real text that follows.
+    """
+
+    def test_truncated_csi_with_no_params_does_not_eat_a_letter(self):
+        """The bug this class exists to catch: ESC[ with zero digits
+        immediately followed by a real word used to be indistinguishable
+        from a valid empty-param CSI, and the word's first letter got
+        silently eaten as the "final byte"."""
+        text = "before \x1b[this has words after"
+        out = strip_noise(text)
+        assert "this has words" in out, f"real content corrupted -- leading letter eaten: {out!r}"
+
+    def test_truncated_csi_with_punctuation_does_not_eat_a_letter(self):
+        """Same failure mode via the (now-removed) intermediate-byte class:
+        punctuation/space runs (0x20-0x2F) between the truncation point
+        and the next letter used to be silently consumed too."""
+        text = "before \x1b[!!! this has punctuation after"
+        out = strip_noise(text)
+        assert "this has punctuation" in out, (
+            f"real content corrupted -- leading letter eaten: {out!r}"
+        )
+
+    def test_truncated_csi_mid_digit_run_does_not_eat_a_letter(self):
+        text = "before \x1b[38;2;15 real words after"
+        out = strip_noise(text)
+        assert "real words" in out
+
+    def test_bare_no_param_csi_survives_unstripped(self):
+        """Known, accepted tradeoff: requiring >=1 param byte means a
+        genuinely bare CSI (no row/col) is no longer distinguishable from
+        truncation, so it's left as harmless unstripped noise rather than
+        risking real-word corruption. If this starts failing because a
+        `strip_ansi` upgrade adds this back, re-verify the truncation
+        cases above still pass before accepting the change."""
+        text = "\x1b[Hhome"
+        out = strip_noise(text)
+        assert out == "\x1b[Hhome"
+
+    def test_truncated_osc_eating_through_a_later_escape_is_blocked(self):
+        """A truncated OSC's payload scan excludes ESC itself, so it can
+        never jump *over* a later, unrelated escape sequence (e.g. a
+        second, complete hyperlink) to reach a distant terminator -- it
+        stops at the very next ESC byte no matter what follows."""
+        text = (
+            "before \x1b]0;window-title-truncated-no-terminator "
+            "This is a large block of real prose that must never be "
+            "touched by the OSC stripper. "
+            "see \x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ after"
+        )
+        out = strip_noise(text)
+        assert "large block of real prose" in out
+        assert "link" in out
+
+    def test_truncated_osc_with_later_bare_bel_is_a_known_residual_risk(self):
+        """Documented, accepted limitation: unlike the CSI case, this one
+        isn't closed. A truncated OSC's greedy payload scan still treats a
+        later, unrelated bare BEL (0x07) in real prose as a false
+        terminator, consuming everything in between. Accepted because BEL
+        essentially never appears in real captured text (unlike the
+        letters/punctuation that made the CSI case common) -- if this ever
+        needs closing, dropping legacy BEL-terminated OSC support (ST-only)
+        is the next step, at the cost of some older xterm title-setting
+        sequences surviving unstripped instead."""
+        text = "before \x1b]0;truncated real prose with a bell\x07 after"
+        out = strip_noise(text)
+        # Current, accepted behavior: everything up to and including the
+        # bare BEL is consumed. This test exists so a future change to
+        # this tradeoff is a deliberate, visible diff -- not silent.
+        assert out == "before  after"
+
+    def test_truncated_simple_escape_loses_at_most_one_character(self):
+        """A bare, truncated ESC immediately followed by a real character
+        in the simple-pattern's range loses exactly that one character --
+        bounded by construction (the pattern is ESC + exactly one byte,
+        no quantifier to run away with)."""
+        text = "before\x1bXafter"
+        out = strip_noise(text)
+        assert out in ("beforeafter", "beforeXafter")
+        # Whichever way it resolves, nothing beyond the single adjacent
+        # character can be lost.
+        assert out.startswith("before")
+        assert out.endswith("after")
+        assert len(out) >= len("beforeafter")
+
+
+class TestAnsiBoundaryConditions:
+    def test_escape_at_start_of_string(self):
+        text = "\x1b[1mbold\x1b[0m"
+        out = strip_noise(text)
+        assert out == "bold"
+
+    def test_escape_at_end_of_string_unterminated(self):
+        # An OSC that never gets its terminator because the string simply
+        # ends -- must not raise, and must not silently drop earlier
+        # unrelated real content before it.
+        text = "real content first \x1b]0;untermin"
+        out = strip_noise(text)
+        assert "real content first" in out
+
+    def test_empty_string(self):
+        assert strip_noise("") == ""
+
+    def test_only_escapes_no_real_text(self):
+        text = "\x1b[1m\x1b[31m\x1b[0m"
+        out = strip_noise(text)
+        assert out == ""
+
+    def test_single_escape_byte_alone(self):
+        # A lone ESC with nothing after it at all (string ends right
+        # there) -- none of the three patterns can match (each requires
+        # at least one more byte), so it survives. Documented, not a bug:
+        # a single stray control byte with no payload is not the
+        # multi-token-cost problem this code exists to solve.
+        text = "before\x1b"
+        out = strip_noise(text)
+        assert out == "before\x1b"
+
+
+class TestAnsiUnicodeInteraction:
+    """Escape sequences operate on Python str (code points), not raw bytes
+    -- multi-byte UTF-8 characters adjacent to an escape must survive
+    completely intact, never split."""
+
+    def test_box_drawing_character_between_escapes_survives(self):
+        # The exact real-world shape found in Claude Code / mempalace CLI
+        # output: a tree-branch character colored on both sides.
+        text = "\x1b[38;2;153;153;153m├\x1b[39m mempalace_add_drawer"
+        out = strip_noise(text)
+        assert out == "├ mempalace_add_drawer"
+
+    def test_emoji_immediately_after_sgr_code(self):
+        text = "\x1b[32m✓\x1b[0m done"
+        out = strip_noise(text)
+        assert out == "✓ done"
+
+    def test_cjk_text_wrapped_in_color(self):
+        text = "\x1b[31m你好世界\x1b[0m"
+        out = strip_noise(text)
+        assert out == "你好世界"
+
+    def test_combining_character_sequence_survives(self):
+        # e + combining acute accent (é as two code points) -- must not be
+        # split even if a CSI happens to be adjacent to it.
+        text = "\x1b[1mé\x1b[0m"
+        out = strip_noise(text)
+        assert out == "é"
+
+
+class TestAnsiIdempotency:
+    """Running strip_noise twice must equal running it once -- a sanity
+    check that stripped output can never itself look like a new match
+    (e.g. leftover partial byte sequences reassembling into something
+    that would match on a second pass)."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "\x1b[38;2;153;153;153m├\x1b[39m mempalace_add_drawer done",
+            "see \x1b]8;;https://example.com\x07link\x1b]8;;\x07 here",
+            "\x1bc14:44:55.089 INF server ready",
+            "before \x1b[this has words after",
+            "before \x1b]0;truncated real prose with a bell\x07 after",
+            "plain text with no escapes at all",
+        ],
+    )
+    def test_stable_under_repeated_application(self, text):
+        once = strip_noise(text)
+        twice = strip_noise(once)
+        assert once == twice
+
+
+class TestAnsiPerformance:
+    """The comment above these patterns claims ReDoS-safety by
+    construction (disjoint/negated character classes, no nested
+    overlapping quantifiers). Verify that holds under adversarial input
+    sized to expose catastrophic backtracking if it existed."""
+
+    def test_long_unterminated_digit_run_is_linear_not_exponential(self):
+        # Worst case for the CSI pattern's `[0-9;]+` greedy quantifier:
+        # a very long run of parameter-shaped characters that never
+        # reaches a valid final byte, forcing the engine to give up only
+        # after trying every possible backtrack point.
+        text = "\x1b[" + "1;" * 50_000 + "not a final byte, still digits after"
+        start = time.monotonic()
+        strip_noise(text)
+        elapsed = time.monotonic() - start
+        assert elapsed < 2.0, f"took {elapsed:.2f}s -- possible ReDoS regression"
+
+    def test_long_unterminated_osc_payload_is_linear(self):
+        text = "\x1b]0;" + ("x" * 200_000)
+        start = time.monotonic()
+        strip_noise(text)
+        elapsed = time.monotonic() - start
+        assert elapsed < 2.0, f"took {elapsed:.2f}s -- possible ReDoS regression"
+
+    def test_many_small_escapes_is_linear(self):
+        text = "\x1b[1mx\x1b[0m" * 20_000
+        start = time.monotonic()
+        out = strip_noise(text)
+        elapsed = time.monotonic() - start
+        assert elapsed < 2.0, f"took {elapsed:.2f}s -- possible ReDoS regression"
+        assert "\x1b" not in out
+
+
+class TestAnsiPropertyBased:
+    """Fuzz strip_noise with hypothesis rather than only hand-picked
+    examples -- this ships to an external repo, so the invariant that
+    matters most (real content, marked with a unique sentinel, is never
+    truncated or altered) gets checked against inputs no one thought to
+    write by hand."""
+
+    @given(st.text(alphabet=st.characters(blacklist_characters="\x1b"), max_size=200))
+    @settings(max_examples=200, deadline=None)
+    def test_text_without_escape_bytes_is_never_touched_by_ansi_stripping(self, text):
+        # No ESC byte anywhere -- none of the three ANSI patterns can
+        # match at all, so ANSI stripping must be a strict no-op. (Other
+        # strip_noise rules -- tag/hook/blank-line collapsing -- may still
+        # apply; isolate just the ANSI patterns to keep this test's
+        # invariant precise.)
+        from mempalace.normalize import _ANSI_CSI_RE, _ANSI_OSC_RE, _ANSI_SIMPLE_RE
+
+        assert _ANSI_CSI_RE.sub("", text) == text
+        assert _ANSI_OSC_RE.sub("", text) == text
+        assert _ANSI_SIMPLE_RE.sub("", text) == text
+
+    # Printable, non-whitespace alphabet for prefix/suffix: strip_noise()'s
+    # contract includes an overall leading/trailing .strip() and internal
+    # blank-line-run collapsing, both unrelated to ANSI stripping. Testing
+    # the ANSI invariant precisely means generating text that can't trip
+    # those other, already-covered behaviors -- otherwise a "failure" here
+    # would just be re-discovering .strip() existing, not an ANSI bug.
+    _PREFIX_SUFFIX_ALPHABET = st.characters(
+        blacklist_characters="\x1b<>", blacklist_categories=("Cc", "Zs", "Zl", "Zp")
+    )
+
+    @given(
+        prefix=st.text(alphabet=_PREFIX_SUFFIX_ALPHABET, max_size=50),
+        suffix=st.text(alphabet=_PREFIX_SUFFIX_ALPHABET, max_size=50),
+        sgr_code=st.integers(min_value=0, max_value=107),
+    )
+    @settings(max_examples=200, deadline=None)
+    def test_well_formed_sgr_pair_never_touches_surrounding_text(self, prefix, suffix, sgr_code):
+        # A complete, well-formed SGR open+reset pair wrapped around
+        # arbitrary escape-free prefix/suffix text: the prefix and suffix
+        # must reappear byte-for-byte, only the codes themselves removed.
+        text = f"{prefix}\x1b[{sgr_code}mMARKER\x1b[0m{suffix}"
+        out = strip_noise(text)
+        assert out == f"{prefix}MARKER{suffix}"
+
+    @given(
+        prefix=st.text(
+            alphabet=_PREFIX_SUFFIX_ALPHABET,
+            min_size=1,
+            max_size=30,
+        ).filter(lambda s: s[0].isalpha()),
+    )
+    @settings(max_examples=200, deadline=None)
+    def test_truncated_csi_never_shortens_real_word_by_more_than_the_escape(self, prefix):
+        # A truncated CSI (no digits, no final byte ever supplied)
+        # directly followed by real text starting with a letter: the
+        # regression this whole class exists to prevent. The real text
+        # must survive with its leading letter intact.
+        text = "\x1b[" + prefix
+        out = strip_noise(text)
+        assert out == text or prefix in out, (
+            f"leading letter of real content lost: input={text!r} output={out!r}"
+        )
 
 
 # ── _try_pi_jsonl ──────────────────────────────────────────────────────
@@ -2166,3 +2683,39 @@ def test_pi_jsonl_invalid_lines_skipped():
     ]
     result = _try_pi_jsonl("\n".join(lines))
     assert result is not None
+
+
+# ── promoted tool-chrome patterns ──────────────────────────────────────
+
+
+def test_bash_no_output_placeholder_stripped():
+    out = strip_noise("ran the migration\n(Bash completed with no output)\nall done")
+    assert "(Bash completed with no output)" not in out
+    assert "ran the migration" in out and "all done" in out
+
+
+def test_bash_no_output_stripped_inline_in_flattened_tool_result():
+    """Flattened tool_result forms embed the placeholder mid-line — the
+    pattern is deliberately unanchored so those are cleaned too."""
+    out = strip_noise('[tool_result: "(Bash completed with no output)"]')
+    assert "Bash completed" not in out
+
+
+def test_gh_run_log_prefix_stripped_keeps_log_text():
+    line = "Smoke API (crypto)\tUNKNOWN STEP\t2026-07-08T01:35:10.3582300Z real log text here"
+    out = strip_noise(line)
+    assert "UNKNOWN STEP" not in out
+    assert "Smoke API" not in out
+    assert "real log text here" in out
+
+
+def test_gh_run_log_prefix_keeps_arrow_marker():
+    line = "→ Gates\tUNKNOWN STEP\t2026-07-08T01:35:10.9457855Z ##[error]checklist missing"
+    out = strip_noise(line)
+    assert out.startswith("→ ")
+    assert "##[error]checklist missing" in out
+
+
+def test_tabbed_prose_without_gh_shape_untouched():
+    text = "col a\tcol b\tcol c\nplain prose line"
+    assert strip_noise(text) == text
