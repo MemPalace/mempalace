@@ -1203,6 +1203,281 @@ def _sqlite_wing_room_counts(
     return total, wing_rooms
 
 
+def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Optional[list[tuple]]:
+    """Grouped ``(room, wing, hall, n, last_date)`` from ``chroma.sqlite3``.
+
+    ``last_date`` is the newest ``date`` metadata value in the group, so
+    ``find_tunnels`` can still report ``recent`` without paging every drawer
+    (``build_graph`` only ever uses the maximum). Returns ``None`` when sqlite
+    cannot be trusted, so the caller falls back to the client path.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        try:
+            conn.execute("PRAGMA busy_timeout = 3000")
+            if (
+                conn.execute(
+                    "SELECT 1 FROM collections WHERE name = ?", (collection_name,)
+                ).fetchone()
+                is None
+            ):
+                return None
+            return conn.execute(
+                """
+                SELECT
+                    COALESCE(rm.string_value, CAST(rm.int_value AS TEXT),
+                             CAST(rm.float_value AS TEXT), '') AS room,
+                    COALESCE(wm.string_value, CAST(wm.int_value AS TEXT),
+                             CAST(wm.float_value AS TEXT), '') AS wing,
+                    COALESCE(hm.string_value, CAST(hm.int_value AS TEXT),
+                             CAST(hm.float_value AS TEXT), '') AS hall,
+                    COUNT(*) AS n,
+                    COALESCE(MAX(dm.string_value), '') AS last_date
+                FROM embeddings e
+                JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
+                JOIN collections c ON s.collection = c.id
+                LEFT JOIN embedding_metadata rm ON rm.id = e.id AND rm.key = 'room'
+                LEFT JOIN embedding_metadata wm ON wm.id = e.id AND wm.key = 'wing'
+                LEFT JOIN embedding_metadata hm ON hm.id = e.id AND hm.key = 'hall'
+                LEFT JOIN embedding_metadata dm ON dm.id = e.id AND dm.key = 'date'
+                WHERE c.name = ?
+                GROUP BY room, wing, hall
+                """,
+                (collection_name,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
+def _metadata_value_columns(conn) -> list[str]:
+    """Value columns actually present on ``embedding_metadata``.
+
+    Older chromadb builds predate ``bool_value``; probing keeps one reader
+    working across schema versions (same approach as the lexical path).
+    """
+    present = {row[1] for row in conn.execute("PRAGMA table_info(embedding_metadata)")}
+    return [c for c in ("string_value", "int_value", "float_value", "bool_value") if c in present]
+
+
+def _equality_filters(where: Optional[dict]) -> Optional[dict]:
+    """Flatten ``tool_list_drawers``-shaped ``where`` into ``{key: value}``.
+
+    Supports equality on ``wing``/``room`` and an ``$and`` of those. Returns
+    ``None`` for anything else so the caller falls back to ``col.get`` paging
+    rather than silently answering a filter it did not apply.
+    """
+    if not where:
+        return {}
+    if not isinstance(where, dict):
+        return None
+    clauses = []
+    if list(where.keys()) == ["$and"]:
+        for child in where["$and"] or []:
+            if not isinstance(child, dict) or len(child) != 1:
+                return None
+            clauses.append(next(iter(child.items())))
+    elif len(where) == 1 and not next(iter(where.keys())).startswith("$"):
+        clauses.append(next(iter(where.items())))
+    else:
+        return None
+    filters = {}
+    for key, val in clauses:
+        if key not in ("wing", "room"):
+            return None
+        filters[key] = val
+    return filters
+
+
+def sqlite_list_id_metadata(
+    palace_path: str,
+    collection_name: str,
+    where: Optional[dict] = None,
+) -> Optional[tuple[list[str], list[dict]]]:
+    """All matching drawer ids + metadata from sqlite, without opening HNSW.
+
+    Documents are deliberately excluded: ``chroma:document`` lives in the same
+    ``embedding_metadata`` table, and joining it in would materialize the whole
+    palace's verbatim text (hundreds of MB on a six-figure palace) just to
+    render one page of previews. Callers hydrate the page they display via
+    :func:`sqlite_documents_for_ids`.
+
+    ``where`` supports equality on ``wing``/``room`` and ``$and`` of those,
+    matching ``tool_list_drawers``; it is applied in SQL. Returns ``None`` when
+    sqlite cannot be trusted so the caller can fall back to ``col.get`` paging.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    filters = _equality_filters(where)
+    if filters is None:
+        return None
+    try:
+        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        try:
+            conn.execute("PRAGMA busy_timeout = 3000")
+            if (
+                conn.execute(
+                    "SELECT 1 FROM collections WHERE name = ?", (collection_name,)
+                ).fetchone()
+                is None
+            ):
+                return None
+            value_columns = _metadata_value_columns(conn)
+            if not value_columns:
+                return None
+            # Push the filter down as an inner join per key. Non-string operands
+            # cannot be matched against ``string_value``, so those stay in the
+            # Python pass below rather than silently matching nothing.
+            joins = []
+            params: list = []
+            for idx, (key, val) in enumerate(sorted(filters.items())):
+                if not isinstance(val, str):
+                    continue
+                alias = f"f{idx}"
+                joins.append(
+                    f"JOIN embedding_metadata {alias} ON {alias}.id = e.id "
+                    f"AND {alias}.key = ? AND {alias}.string_value = ?"
+                )
+                params.extend([key, val])
+            params.append(collection_name)
+            rows = conn.execute(
+                f"""
+                SELECT e.embedding_id, m.key, {", ".join("m." + c for c in value_columns)}
+                FROM embeddings e
+                JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
+                JOIN collections c ON s.collection = c.id
+                {" ".join(joins)}
+                LEFT JOIN embedding_metadata m
+                    ON m.id = e.id AND m.key != 'chroma:document'
+                WHERE c.name = ?
+                ORDER BY e.id
+                """,
+                params,
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+    # Column positions are resolved once: this loop runs per metadata row —
+    # millions of them on a large palace — so per-row dict building there is
+    # the difference between one second and several.
+    def _cell(name):
+        return value_columns.index(name) + 2 if name in value_columns else None
+
+    s_at, i_at, f_at, b_at = (
+        _cell(c) for c in ("string_value", "int_value", "float_value", "bool_value")
+    )
+    by_id: dict[str, dict] = {}
+    order: list[str] = []
+    for row in rows:
+        doc_id = row[0]
+        meta = by_id.get(doc_id)
+        if meta is None:
+            meta = by_id[doc_id] = {}
+            order.append(doc_id)
+        key = row[1]
+        if not key:
+            continue
+        value = _metadata_cell_value(
+            row[s_at] if s_at is not None else None,
+            row[i_at] if i_at is not None else None,
+            row[f_at] if f_at is not None else None,
+            row[b_at] if b_at is not None else None,
+        )
+        if value is None:
+            continue
+        meta[key] = value
+
+    ids: list[str] = []
+    metas: list[dict] = []
+    for doc_id in order:
+        meta = by_id[doc_id]
+        if any(meta.get(key) != val for key, val in filters.items()):
+            continue
+        ids.append(doc_id)
+        metas.append(meta)
+    return ids, metas
+
+
+def sqlite_documents_for_ids(
+    palace_path: str,
+    collection_name: str,
+    ids: list,
+) -> Optional[dict]:
+    """``{drawer_id: document}`` for ``ids`` only, straight from sqlite.
+
+    Hydrates previews for the page being displayed without opening HNSW and
+    without reading the rest of the palace's text.
+
+    Resolved in two indexed steps rather than one join: ``embedding_id`` is
+    only indexed as part of ``UNIQUE (segment_id, embedding_id)``, so a join
+    that filters on it alone degenerates into a full scan of
+    ``embedding_metadata`` — 5.7s for a 20-row page on a 165k-drawer palace.
+    Seeking the segment first, then ``embedding_metadata``'s ``(id, key)``
+    primary key, keeps both steps on an index.
+    """
+    if not ids:
+        return {}
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    wanted = [str(i) for i in ids]
+    docs: dict[str, str] = {}
+    try:
+        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        try:
+            conn.execute("PRAGMA busy_timeout = 3000")
+            segments = [
+                row[0]
+                for row in conn.execute(
+                    """
+                    SELECT s.id FROM segments s
+                    JOIN collections c ON s.collection = c.id
+                    WHERE c.name = ? AND s.scope = 'METADATA'
+                    """,
+                    (collection_name,),
+                )
+            ]
+            if not segments:
+                return None
+            seg_placeholders = ",".join("?" for _ in segments)
+            for start in range(0, len(wanted), 900):
+                chunk = wanted[start : start + 900]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT id, embedding_id FROM embeddings
+                    WHERE segment_id IN ({seg_placeholders})
+                      AND embedding_id IN ({placeholders})
+                    """,
+                    [*segments, *chunk],
+                ).fetchall()
+                if not rows:
+                    continue
+                public_by_internal = {int(row[0]): str(row[1]) for row in rows}
+                internal = list(public_by_internal)
+                internal_placeholders = ",".join("?" for _ in internal)
+                for internal_id, value in conn.execute(
+                    f"""
+                    SELECT id, string_value FROM embedding_metadata
+                    WHERE key = 'chroma:document' AND id IN ({internal_placeholders})
+                    """,
+                    internal,
+                ):
+                    docs[public_by_internal[int(internal_id)]] = str(value or "")
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    return docs
+
+
 def _pin_hnsw_threads(collection) -> None:
     """Best-effort retrofit: pin ``hnsw:num_threads=1`` on an existing collection.
 
@@ -1548,6 +1823,38 @@ def _close_client(client) -> None:
         logger.debug("client.close() unavailable or failed", exc_info=True)
 
 
+def _clear_chroma_system_cache() -> None:
+    """Drop Chroma's process-global ``SharedSystemClient`` cache.
+
+    ``clear_system_cache()`` replaces Chroma's system and refcount maps without
+    calling ``System.stop()``. Callers must close every client they own before
+    invoking this helper, while Chroma can still resolve those maps.
+
+    Chroma caches its ``System`` (and the live HNSW segment) keyed by path. A
+    bare ``chromadb.PersistentClient(path=...)`` reopen reuses that cached
+    System, so after a peer or rebuild changes ``chroma.sqlite3`` on disk we
+    would rebuild against stale in-memory state and could persist an outdated
+    index over the on-disk changes -- the same data-loss class as #2002,
+    reached through :meth:`ChromaBackend._client` instead of
+    ``mcp_server._get_client``.
+
+    The clear is process-global because Chroma exposes no public per-path
+    eviction primitive. It runs only on the external inode/mtime-change branch,
+    never on the steady-state hot path.
+    """
+    try:
+        from chromadb.api.client import SharedSystemClient
+
+        clear = getattr(SharedSystemClient, "clear_system_cache", None)
+        if callable(clear):
+            clear()
+    except Exception:
+        logger.debug(
+            "Failed to clear chromadb SharedSystemClient cache",
+            exc_info=True,
+        )
+
+
 class ChromaCollection(BaseCollection):
     """Thin adapter translating ChromaDB dict returns into typed results.
 
@@ -1568,15 +1875,27 @@ class ChromaCollection(BaseCollection):
     directly without going through ``ChromaBackend``.
     """
 
-    def __init__(self, collection, palace_path: Optional[str] = None):
+    def __init__(self, collection, palace_path: Optional[str] = None, backend=None):
         self._collection = collection
         self._palace_path = palace_path
+        # Owning ChromaBackend, when this collection came through one. Used
+        # only to re-baseline that backend's freshness stat after our writes
+        # (see _write_lock). None for directly-constructed test doubles.
+        self._backend = backend
 
     @contextlib.contextmanager
     def _write_lock(self):
         """Acquire ``mine_palace_lock`` for the configured palace, if any.
 
         No-op (yields immediately) when ``self._palace_path`` is None.
+
+        On exit, re-baselines the owning backend's client-cache freshness stat.
+        A write moves ``chroma.sqlite3``'s mtime, and that stat is how
+        :meth:`ChromaBackend._client` detects an *external* change; without the
+        re-baseline our own upsert looks like somebody else's write and the
+        next collection open rebuilds the client, reloading every HNSW segment
+        it had already paid for. That made the file-a-drawer-then-search cycle
+        reload the whole index each time.
         """
         if self._palace_path is None:
             yield
@@ -1585,7 +1904,11 @@ class ChromaCollection(BaseCollection):
         from ..palace import mine_palace_lock
 
         with mine_palace_lock(self._palace_path):
-            yield
+            try:
+                yield
+            finally:
+                if self._backend is not None:
+                    self._backend._restamp(self._palace_path)
 
     # ------------------------------------------------------------------
     # Writes
@@ -2235,6 +2558,23 @@ class ChromaBackend(BaseBackend):
         except OSError:
             return (0, 0.0)
 
+    def _drain_clients(self) -> None:
+        """Close and forget every client owned by this backend.
+
+        Chroma's cache reset is process-global. Draining only the palace that
+        changed would leave this backend's other clients untracked after the
+        reset, so their later ``close()`` calls could not stop their Systems.
+
+        Draining invalidates every ``ChromaCollection`` previously returned by
+        those clients, including collections for unchanged palaces. Callers
+        must reacquire them through :meth:`get_collection`.
+        """
+        clients = list(self._clients.values())
+        self._clients.clear()
+        self._freshness.clear()
+        for client in clients:
+            _close_client(client)
+
     def _client(self, palace_path: str):
         """Return a cached ``PersistentClient``, rebuilding on inode/mtime change.
 
@@ -2281,17 +2621,28 @@ class ChromaBackend(BaseBackend):
 
         if cached is None or inode_changed or mtime_changed or mtime_appeared:
             # Drop the per-process quarantine gate so the HNSW pre-checks
-            # run again against the new disk state.  An inode swap means a
-            # different physical DB (post-restore, fresh palace at the same
-            # path); an mtime/appearance change means an external in-place
-            # write (closet_llm, mine, compress) that may have drifted the
-            # HNSW index while this process was running.
-            if (
+            # run again against the new disk state. An inode swap means a
+            # different physical DB; an mtime/appearance change means an
+            # external writer may have drifted the in-memory HNSW state.
+            external_change = (
                 inode_changed
                 or mtime_changed
                 or (mtime_appeared and palace_path in self._freshness)
-            ):
+            )
+            if external_change:
                 ChromaBackend._quarantined_paths.discard(palace_path)
+
+                # #2028/#2375: Chroma's cache reset is process-global and only
+                # forgets its maps. Close all clients owned by this backend
+                # first, while their close() calls can still decrement the
+                # refcounts and stop the corresponding Systems.
+                self._drain_clients()
+                _clear_chroma_system_cache()
+            else:
+                # Cold open or a missing-DB invalidation does not require a
+                # global reset; release only the requested path.
+                _close_client(self._clients.pop(palace_path, None))
+
             ChromaBackend._prepare_palace_for_open(palace_path)
             cached = chromadb.PersistentClient(path=palace_path)
             self._clients[palace_path] = cached
@@ -2300,6 +2651,40 @@ class ChromaBackend(BaseBackend):
             # may still be (0, 0.0) on first open.
             self._freshness[palace_path] = self._db_stat(palace_path)
         return cached
+
+    def _restamp(self, palace_path: str) -> None:
+        """Re-baseline the freshness stat after this backend's own writes.
+
+        Opening a ``chromadb.PersistentClient`` writes to ``chroma.sqlite3``,
+        and so do the collection opens that follow it, so the mtime this cache
+        keys on moves *while we are using it*. Stamping only at
+        client-construction time (as :meth:`_client` does above) therefore left
+        the recorded value stale the moment the surrounding operation finished
+        its own writes, and the next ``_client()`` call read our own footprint
+        as an external change.
+
+        The effect was a cache that essentially never hit: a single search
+        opens ``mempalace_drawers`` and then ``mempalace_closets``, and the
+        first open bumped the mtime that the second one checked, so every
+        search rebuilt the client and reloaded both HNSW segments.
+
+        Stamping again once the operation is done makes the recorded value mean
+        "``chroma.sqlite3`` as this backend last left it", so a later
+        difference is genuinely somebody else's write.
+
+        Trade-off: an external write that lands *while* one of our operations
+        is in flight is absorbed into the new stamp and will not trigger a
+        rebuild until the next change. That window is one collection open wide.
+        It cannot be closed with mtime alone, and ``PRAGMA data_version`` does
+        not help -- it reports writes by any other *connection*, and chromadb's
+        own connection is foreign to a probe connection, so our own opens would
+        register as external there too.
+
+        No-ops when the path has no cached client, so an eviction that races
+        the operation (``close_palace``) is not resurrected as a stale stamp.
+        """
+        if palace_path in self._freshness:
+            self._freshness[palace_path] = self._db_stat(palace_path)
 
     # ------------------------------------------------------------------
     # Public static helpers (legacy; prefer :meth:`get_collection`)
@@ -2441,7 +2826,11 @@ class ChromaBackend(BaseBackend):
                     raise ValueError(explanation) from e
                 raise
         _pin_hnsw_threads(collection)
-        return ChromaCollection(collection, palace_path=palace_path)
+        # Our own client construction and collection open just wrote to
+        # chroma.sqlite3; re-baseline so the next _client() call does not read
+        # that as an external change and rebuild the client.
+        self._restamp(palace_path)
+        return ChromaCollection(collection, palace_path=palace_path, backend=self)
 
     def close_palace(self, palace) -> None:
         """Drop cached handles for ``palace`` and release its SQLite file lock.
@@ -2458,10 +2847,7 @@ class ChromaBackend(BaseBackend):
         self._freshness.pop(path, None)
 
     def close(self) -> None:
-        for client in self._clients.values():
-            _close_client(client)
-        self._clients.clear()
-        self._freshness.clear()
+        self._drain_clients()
         self._closed = True
 
     def health(self, palace: Optional[PalaceRef] = None) -> HealthStatus:
@@ -2503,6 +2889,7 @@ class ChromaBackend(BaseBackend):
     def delete_collection(self, palace_path: str, collection_name: str) -> None:
         """Delete ``collection_name`` from the palace at ``palace_path``."""
         self._client(palace_path).delete_collection(collection_name)
+        self._restamp(palace_path)
 
     def create_collection(
         self, palace_path: str, collection_name: str, hnsw_space: str = "cosine"
@@ -2515,7 +2902,8 @@ class ChromaBackend(BaseBackend):
             metadata=_hnsw_creation_metadata({"hnsw_space": hnsw_space}),
             **ef_kwargs,
         )
-        return ChromaCollection(collection, palace_path=palace_path)
+        self._restamp(palace_path)
+        return ChromaCollection(collection, palace_path=palace_path, backend=self)
 
 
 def _normalize_get_collection_args(args, kwargs):

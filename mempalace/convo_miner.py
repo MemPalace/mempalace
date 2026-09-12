@@ -8,6 +8,7 @@ Normalizes format, chunks by exchange pair (Q+A = one unit), files to palace.
 Same palace as project mining. Different ingest strategy.
 """
 
+import errno
 import os
 import sys
 import json
@@ -27,7 +28,7 @@ from .ids import (
     make_convo_sentinel_id,
     make_exchange_drawer_id,
 )
-from .normalize import normalize_conversations
+from .normalize import UnparsedCodexTranscriptError, normalize_conversations
 from .entities import entities_metadata
 from .palace import (
     NORMALIZE_VERSION,
@@ -185,10 +186,20 @@ def _path_within_root(path: Path, root: Path) -> bool:
 def _is_regular_source_file(filepath: Path, root: Path) -> bool:
     if not _path_within_root(filepath, root):
         return False
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # O_NONBLOCK keeps the S_ISREG verdict below reachable: a blocking open
+    # of a FIFO waits in the kernel for a writer, so a named pipe called
+    # ``session.jsonl`` would hang this check instead of failing it. See the
+    # matching comment in ``miner._read_text_no_follow``, including why the
+    # EAGAIN branch re-checks the type and then opens without the flag.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     fd = -1
     try:
-        fd = os.open(filepath, flags)
+        try:
+            fd = os.open(filepath, flags)
+        except OSError as exc:
+            if exc.errno != errno.EAGAIN or not stat.S_ISREG(os.lstat(filepath).st_mode):
+                raise
+            fd = os.open(filepath, flags & ~getattr(os, "O_NONBLOCK", 0))
         st = os.fstat(fd)
         return stat.S_ISREG(st.st_mode) and st.st_size <= MAX_FILE_SIZE
     except OSError:
@@ -543,7 +554,17 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
                 # to stderr to match the SKIP: (symlink) line above; silent
                 # drops at this gate were the original #923 complaint.
                 try:
-                    file_size = filepath.stat().st_size
+                    file_stat = filepath.stat()
+                    # Drop non-regular entries (FIFO, socket, device node)
+                    # before any reader touches them — see the matching
+                    # gate in ``miner.scan_project``.
+                    if not stat.S_ISREG(file_stat.st_mode):
+                        print(
+                            f"  SKIP: {filepath.name} (not a regular file)",
+                            file=sys.stderr,
+                        )
+                        continue
+                    file_size = file_stat.st_size
                     if file_size > MAX_FILE_SIZE:
                         print(
                             f"  SKIP: {filepath.name} ({file_size / (1024 * 1024):.1f} MB)"
@@ -667,59 +688,85 @@ def _file_chunks_locked(
         # the embedding speedup without one huge Chroma/SQLite request. Keep
         # one filed_at per source file so all transcript drawers share an
         # ingest timestamp.
+        #
+        # Every drawer of this pass carries ``chunk_total`` so
+        # ``file_already_mined`` / ``prefetch_mined_set`` can tell a complete
+        # multi-batch mine from one that crashed mid-file (#2183). Without it
+        # a stable mtime + any surviving drawer permanently skips the file
+        # and the missing exchanges never come back.
         filed_at = datetime.now().isoformat()
         try:
             source_mtime = os.path.getmtime(source_file)
         except OSError:
             source_mtime = None
-        for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
-            batch_docs: list = []
-            batch_ids: list = []
-            batch_metas: list = []
-            for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
-                if extract_mode == "general":
-                    room_counts_delta[chunk_room] += 1
-                drawer_id = make_convo_drawer_id(
-                    wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
-                )
-                batch_docs.append(chunk["content"])
-                batch_ids.append(drawer_id)
-                meta = {
-                    "wing": wing,
-                    "room": chunk_room,
-                    "hall": _detect_hall_cached(chunk["content"]),
-                    "source_file": source_file,
-                    "chunk_index": chunk["chunk_index"],
-                    "added_by": agent,
-                    "filed_at": filed_at,
-                    "entities": entities_metadata(chunk["content"]),
-                    "authored_at": authored_at if authored_at is not None else filed_at,
-                    "ingest_mode": "convos",
-                    "extract_mode": extract_mode,
-                    "normalize_version": NORMALIZE_VERSION,
-                    "id_recipe": ID_RECIPE,
-                }
-                if source_mtime is not None:
-                    meta["source_mtime"] = source_mtime
-                # Stamp content_hash only on chunk 0 so multi-conversation
-                # privacy-export hashes are not O(N²)-duplicated across every
-                # chunk row. ``prefetch_content_hashes`` still finds them —
-                # it scans all drawers and splits comma-joined hash fields.
-                if content_hash is not None and chunk.get("chunk_index", 0) == 0:
-                    meta["content_hash"] = content_hash
-                batch_metas.append(meta)
-            assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
+        chunk_total = len(chunks)
+        try:
+            for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
+                batch_docs: list = []
+                batch_ids: list = []
+                batch_metas: list = []
+                for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
+                    chunk_room = (
+                        chunk.get("memory_type", room) if extract_mode == "general" else room
+                    )
+                    if extract_mode == "general":
+                        room_counts_delta[chunk_room] += 1
+                    drawer_id = make_convo_drawer_id(
+                        wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
+                    )
+                    batch_docs.append(chunk["content"])
+                    batch_ids.append(drawer_id)
+                    meta = {
+                        "wing": wing,
+                        "room": chunk_room,
+                        "hall": _detect_hall_cached(chunk["content"]),
+                        "source_file": source_file,
+                        "chunk_index": chunk["chunk_index"],
+                        "added_by": agent,
+                        "filed_at": filed_at,
+                        "entities": entities_metadata(chunk["content"]),
+                        "authored_at": authored_at if authored_at is not None else filed_at,
+                        "ingest_mode": "convos",
+                        "extract_mode": extract_mode,
+                        "normalize_version": NORMALIZE_VERSION,
+                        "id_recipe": ID_RECIPE,
+                        "chunk_total": chunk_total,
+                    }
+                    if source_mtime is not None:
+                        meta["source_mtime"] = source_mtime
+                    # Stamp content_hash only on chunk 0 so multi-conversation
+                    # privacy-export hashes are not O(N²)-duplicated across every
+                    # chunk row. ``prefetch_content_hashes`` still finds them —
+                    # it scans all drawers and splits comma-joined hash fields.
+                    if content_hash is not None and chunk.get("chunk_index", 0) == 0:
+                        meta["content_hash"] = content_hash
+                    batch_metas.append(meta)
+                assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
+                try:
+                    collection.upsert(
+                        documents=batch_docs,
+                        ids=batch_ids,
+                        metadatas=batch_metas,
+                    )
+                    drawers_added += len(batch_docs)
+                except Exception as e:
+                    if "already exists" not in str(e).lower():
+                        raise
+        except Exception:
+            # A successful earlier batch has the source's current mtime and
+            # chunk_total. Leaving those drawers behind would make the next
+            # run treat the incomplete set as fully filed (#2183 / #2122).
             try:
-                collection.upsert(
-                    documents=batch_docs,
-                    ids=batch_ids,
-                    metadatas=batch_metas,
+                delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
+                if delete_ids:
+                    collection.delete(ids=delete_ids)
+            except Exception:
+                logger.warning(
+                    "Failed to clean partial convo drawers after upsert error for %s",
+                    source_file,
+                    exc_info=True,
                 )
-                drawers_added += len(batch_docs)
-            except Exception as e:
-                if "already exists" not in str(e).lower():
-                    raise
+            raise
     return drawers_added, room_counts_delta, False
 
 
@@ -924,6 +971,9 @@ def _normalize_convo_conversations(
     """
     try:
         conversations = [c for c in normalize_conversations(str(filepath)) if c]
+    except UnparsedCodexTranscriptError as exc:
+        logger.warning("Skipping %s: %s; source remains eligible for retry", filepath, exc)
+        return None
     except (OSError, ValueError):
         if not dry_run:
             _register_file(collection, source_file, wing, agent, extract_mode)

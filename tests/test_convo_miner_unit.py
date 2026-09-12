@@ -718,6 +718,107 @@ class TestFileChunksLocked:
         assert drawers == 0
         assert skipped is True
 
+    def test_stamps_chunk_total_for_completion_check(self, monkeypatch):
+        """Every convo drawer of one pass must carry chunk_total (#2183)."""
+        import mempalace.convo_miner as convo_miner
+
+        class FakeCol:
+            def __init__(self):
+                self.metas = []
+
+            def delete(self, *args, **kwargs):
+                pass
+
+            def get(self, ids=None, include=None, **kwargs):
+                return {"ids": [], "metadatas": []}
+
+            def upsert(self, documents, ids, metadatas):
+                self.metas.extend(metadatas)
+
+        chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(5)]
+        col = FakeCol()
+        monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        _file_chunks_locked(col, "chat.txt", chunks, "wing", "general", "agent", "exchange")
+
+        assert len(col.metas) == 5
+        assert all(m.get("chunk_total") == 5 for m in col.metas), (
+            "not every convo chunk carries the pass's chunk_total — a mid-file "
+            "crash would leave mtime-stamped partials that skip forever (#2183)"
+        )
+
+    def test_cleans_partial_drawers_after_batch_upsert_failure(self, monkeypatch, tmp_path):
+        """A failed later batch must not leave mtime-stamped partials (#2183)."""
+        import mempalace.convo_miner as convo_miner
+
+        class FailingCol:
+            def __init__(self):
+                self.records = []
+                self.upsert_calls = 0
+                self.deleted_ids = []
+
+            def get(self, where=None, limit=None, offset=0, include=None, ids=None, **kwargs):
+                if ids is not None:
+                    return {"ids": [], "metadatas": []}
+                records = self.records
+                if where and "source_file" in where:
+                    records = [
+                        r
+                        for r in records
+                        if r["metadata"].get("source_file") == where["source_file"]
+                    ]
+                page = records[offset : offset + (limit or len(records))]
+                return {
+                    "ids": [r["id"] for r in page],
+                    "metadatas": [r["metadata"] for r in page],
+                }
+
+            def delete(self, ids=None, where=None, **kwargs):
+                if ids:
+                    self.deleted_ids.extend(ids)
+                    id_set = set(ids)
+                    self.records = [r for r in self.records if r["id"] not in id_set]
+                    return
+                if where and "source_file" in where:
+                    src = where["source_file"]
+                    self.records = [
+                        r for r in self.records if r["metadata"].get("source_file") != src
+                    ]
+
+            def upsert(self, documents, ids, metadatas):
+                self.upsert_calls += 1
+                if self.upsert_calls == 2:
+                    raise RuntimeError("simulated second-batch failure")
+                self.records.extend(
+                    {"id": drawer_id, "metadata": metadata}
+                    for drawer_id, metadata in zip(ids, metadatas)
+                )
+
+        source = tmp_path / "chat.txt"
+        source.write_text("content\n", encoding="utf-8")
+        chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3)]
+        col = FailingCol()
+        monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        with pytest.raises(RuntimeError, match="second-batch failure"):
+            _file_chunks_locked(col, str(source), chunks, "wing", "general", "agent", "exchange")
+
+        assert col.records == [], (
+            "partial convo drawers survived a mid-file upsert failure — the "
+            "next mine would skip this incomplete file forever (#2183)"
+        )
+        assert col.deleted_ids, "cleanup did not delete the partial drawer ids"
+
 
 class TestSourceFileDeleteIds:
     """#104: the sweeper writes drawers with no extract_mode at all

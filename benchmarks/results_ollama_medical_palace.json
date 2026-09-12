@@ -1,0 +1,266 @@
+{
+  "medgemma1.5-tools": {
+    "stats": {
+      "model": "medgemma1.5-tools",
+      "total_tests": 15,
+      "tool_call_rate_pct": 93.33333333333333,
+      "selection_accuracy_pct": 86.66666666666667,
+      "execution_success_pct": 73.33333333333333,
+      "multi_turn_success_pct": 80.0,
+      "end_to_end_pass_pct": 66.66666666666666,
+      "avg_latency_sec": 2.3850162466662974
+    },
+    "results": [
+      {
+        "test_id": "med_recall_hba1c",
+        "category": "Clinical Recall",
+        "model": "medgemma1.5-tools",
+        "tool_called": true,
+        "tool_name": "palace_query",
+        "tool_args": {
+          "query": "FIND \"1042\" IN patient AND FIND \"HbA1c\" IN lab_result AND FIND \"fasting glucose\" IN lab_result ORDER BY date DESC LIMIT 1"
+        },
+        "selection_correct": true,
+        "execution_success": true,
+        "execution_error": null,
+        "latency_sec": 1.7748554999998305,
+        "multi_turn_success": true,
+        "final_response_preview": "<unused94>thought 1.  **Analyze the user's request:** The user wants the \"most recent\" HbA1c and fasting glucose levels "
+      },
+      {
+        "test_id": "med_recall_medications",
+        "category": "Clinical Recall",
+        "model": "medgemma1.5-tools",
+        "tool_called": true,
+        "tool_name": "palace_query",
+        "tool_args": {
+          "query": "FIND \"medications\" IN patient/1042"
+        },
+        "selection_correct": true,
+        "execution_success": true,
+        "execution_error": null,
+        "latency_sec": 1.5790329999981623,
+        "multi_turn_success": true,
+        "final_response_preview": "<unused94>thought The user is asking for a list of active prescribed medications and dosages for Patient 1042. The previ"
+      },
+      {
+        "test_id": "med_recall_allergy_safety",
+        "category": "Patient Safety",
+        "model": "medgemma1.5-tools",
+        "tool_called": true,
+        "tool_name": "palace_query",
+        "tool_args": {
+          "query": "FIND \"drug allergies\" IN patient/1042"
+        },
+        "selection_correct": true,
+        "execution_success": true,
+        "execution_error": null,
+        "latency_sec": 3.050147599999036,
+        "multi_turn_success": true,
+        "final_response_preview": "<unused94>thought 1.  **Analyze the user's request:** The user asks for \"drug allergies\" for \"Patient 1042\". 2.  **Ident"
+      },
+      {
+        "test_id": "med_recall_guideline_escalation",
+        "category": "Clinical Guidelines",
+        "model": "medgemma1.5-tools",
+        "tool_called": true,
+        "tool_name": "palace_query",
+        "tool_args": {
+          "query": "FIND HbA1c > 8.0% AND Metformin LIMIT 1"
+        },
+        "selection_correct": true,
+        "execution_success": true,
+        "execution_error": null,
+        "latency_sec": 3.5055317000005743,
+        "multi_turn_success": true,
+        "final_response_preview": "<unused94>thought 1.  **Analyze the user's request:** The user is asking for ADA guidelines specifically for HbA1c > 8.0"
+      },
+      {
+        "test_id": "med_palace_taxonomy",
+        "category": "Palace Structure",
+        "model": "medgemma1.5-tools",
+        "tool_called": true,
+        "tool_name": "palace_query",
+        "tool_args": {
+          "query": "TAXONOMY WING BREAKDOWN LIMIT 10 ORDER BY name ASC"
+        },
+        "selection_correct": true,
+        "execution_success": true,
+        "execution_error": null,
+        "latency_sec": 5.749303699998563,
+        "multi_turn_success": true,
+        "final_response_preview": "<unused94>thought The user wants to see the full taxonomy and wing breakdown of their private clinical memory palace. Th"
+      },
+      {
+        "test_id": "med_check_duplicate_lab",
+        "category": "Clinical Ingestion",
+        "model": "medgemma1.5-tools",
+        "tool_called": true,
+        "tool_name": "palace_query",
+        "tool_args": {
+          "query": "FIND \"Lab Panel 2026-01-15: HbA1c 8.2%, Fasting Glucose 165 mg/dL, eGFR 78 mL/min.\" IN lab_notes"
+        },
+        "selection_correct": true,
+        "execution_success": true,
+        "execution_error": null,
+        "latency_sec": 2.5186202000004414,
+        "multi_turn_success": true,
+        "final_response_preview": "<unused94>thought 1.  **Analyze the user's request:** The user is asking to check if a specific lab note exists in the s"
+      },
+      {
+        "test_id": "med_kg_patient_profile",
+        "category": "Medical Knowledge Graph",
+        "model": "medgemma1.5-tools",
+        "tool_called": true,
+        "tool_name": "palace_query",
+        "tool_args": {
+          "query": "FIND diagnoses IN patient_1042\nFIND relationships IN patient_1042"
+        },
+        "selection_correct": true,
+        "execution_success": true,
+        "execution_error": null,
+        "latency_sec": 1.0945141999982297,
+        "multi_turn_success": true,
+        "final_response_preview": "<unused94>thought The user wants to find diagnoses and relationships for Patient_1042. The provided tool response contai"
+      },
+      {
+        "test_id": "med_kg_timeline_disease",
+        "category": "Medical Knowledge Graph",
+        "model": "medgemma1.5-tools",
+        "tool_called": true,
+        "tool_name": "palace_query",
+        "tool_args": {
+          "query": "KG Max AS OF 2026-04-01"
+        },
+        "selection_correct": true,
+        "execution_success": true,
+        "execution_error": null,
+        "latency_sec": 1.0110945999986143,
+        "multi_turn_success": true,
+        "final_response_preview": "<unused94>thought The user wants a chronological timeline of medical facts and milestones for Patient_1042. The `palace_"
+      },
+      {
+        "test_id": "med_kg_stats_overview",
+        "category": "Medical Knowledge Graph",
+        "model": "medgemma1.5-tools",
+        "tool_called": false,
+        "tool_name": null,
+        "tool_args": null,
+        "selection_correct": false,
+        "execution_success": false,
+        "execution_error": "Ollama API error: timed out",
+        "latency_sec": 0.0,
+        "multi_turn_success": false,
+        "final_response_preview": ""
+      },
+      {
+        "test_id": "med_graph_traverse_clinical",
+        "category": "Clinical Navigation",
+        "model": "medgemma1.5-tools",
+        "tool_called": true,
+        "tool_name": "palace_query",
+        "tool_args": {
+          "query": "FIND \"patient_1042/labs\" IN room AND \"clinical guidelines\" IN wing/room"
+        },
+        "selection_correct": true,
+        "execution_success": true,
+        "execution_error": "Multi-turn error: timed out",
+        "latency_sec": 2.0571445999994467,
+        "multi_turn_success": false,
+        "final_response_preview": ""
+      },
+      {
+        "test_id": "med_diary_read_recent_handoff",
+        "category": "Clinician Journal",
+        "model": "medgemma1.5-tools",
+        "tool_called": true,
+        "tool_name": "palace_query",
+        "tool_args": {
+          "query": "FIND diary IN agent/antigravity",
+          "content": "diary"
+        },
+        "selection_correct": true,
+        "execution_success": true,
+        "execution_error": null,
+        "latency_sec": 3.251753500000632,
+        "multi_turn_success": true,
+        "final_response_preview": "<unused94>thought The user wants me to read the latest clinical handoff diary entries recorded by the agent named 'antig"
+      },
+      {
+        "test_id": "med_diary_write_rounds_note",
+        "category": "Clinician Journal",
+        "model": "medgemma1.5-tools",
+        "tool_called": true,
+        "tool_name": "palace_query",
+        "tool_args": {
+          "session": "2026-03-01",
+          "patient_id": "1042",
+          "topic": "follow-up",
+          "entry": "Patient 1042 presents for follow-up. Reports tolerating Metformin well. Notes improvement in glycemic control. Plan: Repeat HbA1c in 3 months. \u2605\u2605\u2605"
+        },
+        "selection_correct": false,
+        "execution_success": false,
+        "execution_error": "tool_search() missing 1 required positional argument: 'query'",
+        "latency_sec": 2.2803985999998986,
+        "multi_turn_success": true,
+        "final_response_preview": "<unused94>thought The user is asking for a clinical diary entry. The entry should contain specific information: - Sessio"
+      },
+      {
+        "test_id": "med_exec_file_encounter",
+        "category": "Clinical Mutation",
+        "model": "medgemma1.5-tools",
+        "tool_called": true,
+        "tool_name": "palace_exec",
+        "tool_args": {
+          "action": "diary_write",
+          "content": "Encounter 2026-03-01: Follow-up for T2D. HbA1c improved to 7.4%. Escalated Metformin to 1000mg BID with meals. Patient counseled on hypoglycemia symptoms.",
+          "wing": "patient_1042",
+          "room": "encounters",
+          "since": "2026-03-01"
+        },
+        "selection_correct": true,
+        "execution_success": false,
+        "execution_error": "Multi-turn error: timed out",
+        "latency_sec": 4.238350499999797,
+        "multi_turn_success": false,
+        "final_response_preview": ""
+      },
+      {
+        "test_id": "med_exec_kg_add_complication",
+        "category": "Clinical Mutation",
+        "model": "medgemma1.5-tools",
+        "tool_called": true,
+        "tool_name": "palace_exec",
+        "tool_args": {
+          "action": "kg_add",
+          "object": "Diabetic Peripheral Neuropathy",
+          "subject": "Patient_1042",
+          "predicate": "diagnosed_with",
+          "as_of": "2026-03-01"
+        },
+        "selection_correct": true,
+        "execution_success": true,
+        "execution_error": null,
+        "latency_sec": 1.9316977999988012,
+        "multi_turn_success": true,
+        "final_response_preview": "<unused94>thought The user wants to add a new diagnosis to the medical knowledge graph. The patient is \"Patient_1042\". T"
+      },
+      {
+        "test_id": "med_exec_kg_supersede_dose",
+        "category": "Clinical Mutation",
+        "model": "medgemma1.5-tools",
+        "tool_called": true,
+        "tool_name": "palace_exec",
+        "tool_args": {
+          "command": "KG SUPERSEDE Metformin dosage 500mg -> 1000mg BID valid_from 2026-03-01"
+        },
+        "selection_correct": true,
+        "execution_success": false,
+        "execution_error": "PQL exec parse error: KG SUPERSEDE requires 'old_val => new_val'",
+        "latency_sec": 1.732798200002435,
+        "multi_turn_success": true,
+        "final_response_preview": "<unused94>thought 1.  **Analyze the user request:** The user wants to update the medical knowledge graph (KG). Specifica"
+      }
+    ]
+  }
+}

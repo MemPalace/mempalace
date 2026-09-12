@@ -5,15 +5,22 @@ PRs welcome. MemPalace is open source and we welcome contributions of all sizes 
 ## Getting Started
 
 ```bash
-git clone https://github.com/MemPalace/mempalace.git
+# Fork the repo on GitHub first, then clone your fork
+git clone https://github.com/<your-username>/mempalace.git
 cd mempalace
+git remote add upstream https://github.com/MemPalace/mempalace.git
 
 # Recommended: uv (https://docs.astral.sh/uv/) manages the venv for you
 uv sync --extra dev
 
 # Or with pip in your own venv:
 # pip install -e ".[dev]"
+
+# Activate pre-commit hooks (one-time, per clone)
+pre-commit install
 ```
+
+The `pre-commit install` step matters: the repo pins ruff to the exact version CI uses, so without it you can commit code that passes your local lint but fails CI on push.
 
 ## Running Tests
 
@@ -46,7 +53,7 @@ See [Benchmarks](/reference/benchmarks) for data download instructions.
    - `fix: handle empty transcript files`
    - `docs: update MCP tool descriptions`
    - `bench: add LoCoMo turn-level metrics`
-6. Push to your fork and open a PR against `main`
+6. Push to your fork and open a PR against `develop`
 
 ## Code Style
 

@@ -13,22 +13,39 @@ config pointing at a binary that was never installed — exactly what broke
 v3.3.2 ([#1093](https://github.com/MemPalace/mempalace/issues/1093)).
 
 ```bash
-grep -r mempalace-mcp pyproject.toml .claude-plugin .codex-plugin
+grep -r mempalace-mcp pyproject.toml .mcp.json .claude-plugin .codex-plugin
 ```
 
-Expected on a healthy `develop` (post-[#340](https://github.com/MemPalace/mempalace/pull/340)) — one line per file:
+Expected on a healthy `develop`:
 
 ```
-pyproject.toml:mempalace-mcp = "mempalace.mcp_server:main"
-.claude-plugin/plugin.json:      "command": "mempalace-mcp"
-.codex-plugin/plugin.json:      "command": "mempalace-mcp"
+.mcp.json:      "command": "mempalace-mcp"
+pyproject.toml:mempalace-mcp = "mempalace.mcp_proxy:main"
 .claude-plugin/.mcp.json:    "command": "mempalace-mcp"
+.claude-plugin/plugin.json:      "command": "mempalace-mcp"
+.codex-plugin/README.md:2. Install the Python package so the `mempalace-mcp` script lands on
 ```
 
-If `pyproject.toml` has no match, **stop** — the entry point is missing and
-any fresh `pip install` will ship a broken plugin config. Investigate whether
-the release branch was cut before
-[#340](https://github.com/MemPalace/mempalace/pull/340) landed on `develop`.
+Two things about that list are easy to misread, and both have cost a
+releaser time:
+
+- **`pyproject.toml` points at `mcp_proxy`, not `mcp_server`.** A proxied
+  stdio session loads only the forwarding path and pulls in the full server
+  lazily ([#2312](https://github.com/MemPalace/mempalace/pull/2312)). A
+  `mempalace.mcp_server:main` here means the branch predates that change.
+- **`.codex-plugin/plugin.json` is *supposed* to have no match.** It carries
+  `"mcpServers": "./.mcp.json"`, a path resolved against the marketplace
+  entry's `source.path` of `./` — the repo root — so the Codex command lives
+  in the root `.mcp.json` above, not under `.codex-plugin/`. This is what
+  [#2178](https://github.com/MemPalace/mempalace/pull/2178) changed to make
+  the marketplace plugin installable, and `tests/test_codex_plugin_manifest.py`
+  pins it. A missing `.codex-plugin/.mcp.json` is not a bug.
+
+If `pyproject.toml` has no match at all, **stop** — the entry point is
+missing and any fresh `pip install` will ship a plugin config pointing at a
+binary that was never installed. Investigate whether the release branch was
+cut before [#340](https://github.com/MemPalace/mempalace/pull/340) landed on
+`develop`.
 
 ## Publishing to PyPI
 
@@ -61,10 +78,11 @@ Done once per project; both steps require PyPI owner / GitHub admin rights.
 
 ### Cutting a release
 
-1. Bump the version in **all five** sources on `develop` so `version-guard.yml`
+1. Bump the version in **all six** sources on `develop` so `version-guard.yml`
    stays green (it is the single source of truth at `mempalace/version.py`,
    mirrored in `pyproject.toml`, `.claude-plugin/marketplace.json`,
-   `.claude-plugin/plugin.json`, and `.codex-plugin/plugin.json`).
+   `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, and
+   `integrations/openclaw/SKILL.md`).
 2. Land everything for the release on `develop`, then merge `develop → main`.
    Releases publish **only from `main`** — the workflow refuses any tag whose
    commit is not an ancestor of `main`. Don't commit the bump directly to

@@ -14,7 +14,12 @@ from mempalace.convo_miner import (
     _resolve_wing,
     mine_convos,
 )
-from mempalace.palace import MineAlreadyRunning, file_already_mined, prefetch_mined_set
+from mempalace.palace import (
+    NORMALIZE_VERSION,
+    MineAlreadyRunning,
+    file_already_mined,
+    prefetch_mined_set,
+)
 
 
 def test_convo_mining():
@@ -763,6 +768,71 @@ def test_prefetch_mined_set_none_for_drawer_without_stored_mtime():
         mined = prefetch_mined_set(col, extract_mode="exchange")
         assert "/fake/legacy/file.txt" in mined
         assert mined["/fake/legacy/file.txt"] is None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_prefetch_mined_set_omits_incomplete_chunk_total_group():
+    """Mid-file partials with chunk_total must not bulk-skip the source (#2183)."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+        mtime = 1_700_000_000.0
+        source = "/fake/session.jsonl"
+        # Only 2 of 3 expected chunks landed before a crash.
+        col.upsert(
+            ids=["d0", "d1"],
+            documents=["chunk 0", "chunk 1"],
+            metadatas=[
+                {
+                    "wing": "test",
+                    "room": "general",
+                    "source_file": source,
+                    "chunk_index": 0,
+                    "extract_mode": "exchange",
+                    "normalize_version": NORMALIZE_VERSION,
+                    "source_mtime": mtime,
+                    "chunk_total": 3,
+                },
+                {
+                    "wing": "test",
+                    "room": "general",
+                    "source_file": source,
+                    "chunk_index": 1,
+                    "extract_mode": "exchange",
+                    "normalize_version": NORMALIZE_VERSION,
+                    "source_mtime": mtime,
+                    "chunk_total": 3,
+                },
+            ],
+        )
+        mined = prefetch_mined_set(col, extract_mode="exchange")
+        assert source not in mined, (
+            "prefetch_mined_set treated 2/3 chunks as fully filed — the bulk "
+            "skip path would permanently strand the missing exchange (#2183)"
+        )
+
+        col.upsert(
+            ids=["d2"],
+            documents=["chunk 2"],
+            metadatas=[
+                {
+                    "wing": "test",
+                    "room": "general",
+                    "source_file": source,
+                    "chunk_index": 2,
+                    "extract_mode": "exchange",
+                    "normalize_version": NORMALIZE_VERSION,
+                    "source_mtime": mtime,
+                    "chunk_total": 3,
+                }
+            ],
+        )
+        mined = prefetch_mined_set(col, extract_mode="exchange")
+        assert source in mined
+        assert abs(mined[source] - mtime) < 0.001
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 

@@ -491,3 +491,453 @@ class TestSizeLimits:
             assert evt["body"] == "x" * 10
         finally:
             ls.close()
+
+
+# ── Watch (background watchers) ───────────────────────────────────────────
+
+
+class TestWatchFilters:
+    """The multi-valued and negative filters ``list_events`` cannot express."""
+
+    def _event(self, **overrides):
+        base = {
+            "stream": "project/mempalace",
+            "room": "delegation",
+            "type": "task.request",
+            "status": "open",
+            "to_agent": "mac-claude",
+            "from_agent": "windows-grok",
+            "correlation_id": "task_1",
+        }
+        base.update(overrides)
+        return base
+
+    def test_normalize_treats_blank_as_absent_not_impossible(self):
+        from mempalace.logstream import normalize_watch_values
+
+        assert normalize_watch_values(None) is None
+        assert normalize_watch_values("a") == {"a"}
+        assert normalize_watch_values(["a", "b"]) == {"a", "b"}
+        # A blank filter must mean "any", never "match nothing" — otherwise a
+        # stray empty flag silently deafens the watcher forever.
+        assert normalize_watch_values(["", None]) is None
+
+    def test_own_broadcast_is_excluded(self):
+        """The bug that motivated --agent.
+
+        ``to_agent=<me>`` also matches '*' broadcasts, and an agent's own
+        broadcasts are broadcasts — so without the exclusion a watcher wakes
+        itself every time it posts a status.
+        """
+        from mempalace.logstream import event_matches_watch
+
+        own = self._event(from_agent="mac-claude", to_agent="*")
+        assert not event_matches_watch(
+            own, to_agents={"mac-claude"}, exclude_from_agents={"mac-claude"}
+        )
+        # The same broadcast from anyone else still reaches us.
+        other = self._event(from_agent="windows-grok", to_agent="*")
+        assert event_matches_watch(
+            other, to_agents={"mac-claude"}, exclude_from_agents={"mac-claude"}
+        )
+
+    def test_exclusion_beats_a_direct_address(self):
+        from mempalace.logstream import event_matches_watch
+
+        addressed = self._event(from_agent="noisy", to_agent="mac-claude")
+        assert not event_matches_watch(
+            addressed, to_agents={"mac-claude"}, exclude_from_agents={"noisy"}
+        )
+
+    def test_multi_valued_field_is_an_or(self):
+        from mempalace.logstream import event_matches_watch
+
+        evt = self._event(type="patch.ready")
+        assert event_matches_watch(evt, types={"task.request", "patch.ready"})
+        assert not event_matches_watch(evt, types={"task.request", "status.update"})
+
+    def test_absent_filter_matches_anything(self):
+        from mempalace.logstream import event_matches_watch
+
+        assert event_matches_watch(self._event(), types=None, streams=None)
+
+    def test_pushdown_only_takes_single_valued_filters(self):
+        from mempalace.logstream import pushdown_watch_filters
+
+        spec = {"types": {"task.request"}, "streams": {"a", "b"}, "rooms": None}
+        pushed = pushdown_watch_filters(spec)
+        # Multi-valued filters must stay client-side; pushing one arbitrary
+        # value would silently drop the others.
+        assert pushed == {"type": "task.request"}
+
+
+class TestWatchEvents:
+    def test_wakes_only_on_a_match_and_advances_cursor(self, logstream):
+        noise = _append(logstream, type="status.update", from_agent="windows-grok")
+        wanted = _append(logstream, type="patch.ready", from_agent="windows-grok")
+        watcher = logstream.watch_events(
+            poll_timeout_ms=200,
+            poll_interval_s=0.01,
+            types={"patch.ready"},
+        )
+        matched, cursor = next(watcher)
+        assert [e["id"] for e in matched] == [wanted["id"]]
+        # The cursor passes the rejected event too — re-judging it after a
+        # restart would be pure waste.
+        assert cursor == wanted["id"]
+        assert noise["id"] != cursor
+        watcher.close()
+
+    def test_idle_poll_yields_so_callers_can_time_out(self, logstream):
+        watcher = logstream.watch_events(
+            poll_timeout_ms=50, poll_interval_s=0.01, correlation_id=None, types={"nothing"}
+        )
+        matched, cursor = next(watcher)
+        assert matched == []
+        assert cursor is None
+        watcher.close()
+
+    def test_cursor_resumes_without_replaying(self, logstream):
+        first = _append(logstream)
+        watcher = logstream.watch_events(poll_timeout_ms=100, poll_interval_s=0.01)
+        matched, cursor = next(watcher)
+        assert [e["id"] for e in matched] == [first["id"]]
+        watcher.close()
+
+        second = _append(logstream)
+        resumed = logstream.watch_events(cursor=cursor, poll_timeout_ms=100, poll_interval_s=0.01)
+        matched, _ = next(resumed)
+        assert [e["id"] for e in matched] == [second["id"]]
+        resumed.close()
+
+    def test_self_broadcast_does_not_wake_the_author(self, logstream):
+        """End-to-end version of the --agent bug, through the real store."""
+        _append(logstream, from_agent="mac-claude", to_agent="*", type="status.update")
+        watcher = logstream.watch_events(
+            poll_timeout_ms=50,
+            poll_interval_s=0.01,
+            to_agents={"mac-claude"},
+            exclude_from_agents={"mac-claude"},
+        )
+        matched, cursor = next(watcher)
+        assert matched == []
+        # Still examined, so the cursor moved past it.
+        assert cursor is not None
+        watcher.close()
+
+
+class TestWatchCursorFile:
+    def test_roundtrip(self, tmp_path):
+        from mempalace.logstream import read_watch_cursor, write_watch_cursor
+
+        path = str(tmp_path / "nested" / "cursor.json")
+        write_watch_cursor(path, "evt_abc", agent="mac-claude")
+        assert read_watch_cursor(path) == "evt_abc"
+
+    def test_missing_or_corrupt_file_is_not_fatal(self, tmp_path):
+        """A truncated state file costs a replay; refusing to start costs
+        every event after it."""
+        from mempalace.logstream import read_watch_cursor
+
+        assert read_watch_cursor(str(tmp_path / "absent.json")) is None
+        corrupt = tmp_path / "corrupt.json"
+        corrupt.write_text("{not json", encoding="utf-8")
+        assert read_watch_cursor(str(corrupt)) is None
+        assert read_watch_cursor(None) is None
+
+    def test_write_leaves_no_temp_file_behind(self, tmp_path):
+        from mempalace.logstream import write_watch_cursor
+
+        path = str(tmp_path / "cursor.json")
+        write_watch_cursor(path, "evt_abc")
+        assert [p.name for p in tmp_path.iterdir()] == ["cursor.json"]
+
+    def test_non_object_json_is_treated_as_corrupt(self, tmp_path):
+        """Valid JSON that is not an object must degrade, not raise.
+
+        ``json.load(...).get()`` on ``null`` / ``[]`` / a bare string raises
+        AttributeError, which would stop the watcher from starting — the
+        exact opposite of the recovery contract.
+        """
+        from mempalace.logstream import read_watch_cursor
+
+        for payload in ("null", "[]", '"evt_abc"', "42"):
+            path = tmp_path / f"cursor_{abs(hash(payload))}.json"
+            path.write_text(payload, encoding="utf-8")
+            assert read_watch_cursor(str(path)) is None
+
+    def test_conditions_distinguish_absent_empty_and_corrupt(self, tmp_path):
+        """ "No cursor" is four facts; only ``absent`` may start at the tip."""
+        from mempalace.logstream import (
+            WATCH_STATE_ABSENT,
+            WATCH_STATE_CORRUPT,
+            WATCH_STATE_EMPTY,
+            WATCH_STATE_OK,
+            read_watch_state,
+            write_watch_cursor,
+        )
+
+        assert read_watch_state(str(tmp_path / "nope.json")) == (None, WATCH_STATE_ABSENT)
+        assert read_watch_state(None) == (None, WATCH_STATE_ABSENT)
+
+        good = tmp_path / "good.json"
+        write_watch_cursor(str(good), "evt_abc")
+        assert read_watch_state(str(good)) == ("evt_abc", WATCH_STATE_OK)
+
+        # Empty-log sentinel: the file exists and says so explicitly.
+        empty = tmp_path / "empty.json"
+        write_watch_cursor(str(empty), None)
+        assert read_watch_state(str(empty)) == (None, WATCH_STATE_EMPTY)
+
+        broken = tmp_path / "broken.json"
+        broken.write_text("{not json", encoding="utf-8")
+        assert read_watch_state(str(broken)) == (None, WATCH_STATE_CORRUPT)
+        broken.write_text("null", encoding="utf-8")
+        assert read_watch_state(str(broken)) == (None, WATCH_STATE_CORRUPT)
+        broken.write_text('{"other": 1}', encoding="utf-8")
+        assert read_watch_state(str(broken)) == (None, WATCH_STATE_CORRUPT)
+
+    def test_unreachable_file_is_corrupt_not_absent(self, tmp_path, monkeypatch):
+        """A checkpoint we cannot open must replay, never restart at the tip.
+
+        ``os.path.exists`` answers False both for "no such file" and for
+        "cannot traverse the parent directory", so a preflight check turns a
+        momentarily unreachable checkpoint into a fake first run and skips
+        every event since the stored cursor.
+        """
+        from mempalace.logstream import (
+            WATCH_STATE_ABSENT,
+            WATCH_STATE_CORRUPT,
+            read_watch_state,
+        )
+
+        # A directory where a file is expected: open() raises OSError on
+        # every platform (IsADirectoryError on POSIX, PermissionError on NT).
+        as_dir = tmp_path / "cursor.json"
+        as_dir.mkdir()
+        assert read_watch_state(str(as_dir)) == (None, WATCH_STATE_CORRUPT)
+
+        # Permission denied, simulated so the test is platform-independent.
+        real_open = open
+
+        def denied(path, *a, **k):
+            if str(path).endswith("locked.json"):
+                raise PermissionError(13, "Permission denied")
+            return real_open(path, *a, **k)
+
+        monkeypatch.setattr("builtins.open", denied)
+        assert read_watch_state(str(tmp_path / "locked.json")) == (None, WATCH_STATE_CORRUPT)
+
+        # A genuinely missing file is still absent, i.e. a real first run.
+        monkeypatch.undo()
+        assert read_watch_state(str(tmp_path / "gone.json")) == (None, WATCH_STATE_ABSENT)
+
+    def test_required_checkpoint_raises_instead_of_swallowing(self, tmp_path, monkeypatch):
+        """Best effort is safe only when a lost checkpoint costs a replay.
+
+        For the first checkpoint of a fresh watch it costs a skip instead, so
+        that one must surface the failure.
+        """
+        from mempalace.logstream import write_watch_cursor
+
+        target = str(tmp_path / "sub" / "cursor.json")
+
+        def denied(path, *a, **k):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr("builtins.open", denied)
+        # Ordinary checkpoint: swallowed, the watcher keeps running.
+        write_watch_cursor(target, "evt_abc")
+        # Initial checkpoint: raised, so the caller can refuse to start.
+        with pytest.raises(OSError):
+            write_watch_cursor(target, "evt_abc", required=True)
+
+
+# ── Topic routing, query ordering, and migration ──────────────────────────
+
+
+class TestTopicAndOrder:
+    def test_migration_pre_topic_db(self, palace_path):
+        """Pre-topic database upgrades idempotently and preserves existing rows."""
+        db_path = os.path.join(palace_path, "logstream.sqlite3")
+        conn = sqlite3.connect(db_path)
+        conn.executescript("""
+            CREATE TABLE events (
+                id TEXT PRIMARY KEY,
+                type TEXT NOT NULL,
+                stream TEXT NOT NULL,
+                room TEXT NOT NULL,
+                from_agent TEXT NOT NULL,
+                to_agent TEXT,
+                correlation_id TEXT,
+                branch TEXT,
+                base_commit TEXT,
+                status TEXT,
+                body TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE artifacts (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE event_artifacts (
+                event_id TEXT NOT NULL,
+                artifact_id TEXT NOT NULL,
+                PRIMARY KEY (event_id, artifact_id)
+            );
+            INSERT INTO events (id, type, stream, room, from_agent, created_at)
+            VALUES ('evt_pre_migration', 'task.request', 'project/legacy', 'delegation', 'agent-old', '2026-08-01T12:00:00Z');
+        """)
+        conn.commit()
+        conn.close()
+
+        ls = Logstream(db_path=db_path)
+        try:
+            events = ls.list_events(stream="project/legacy")
+            assert len(events) == 1
+            assert events[0]["id"] == "evt_pre_migration"
+            assert events[0]["topic"] is None
+
+            # Topic column and index exist
+            raw_conn = sqlite3.connect(db_path)
+            cols = {r[1] for r in raw_conn.execute("PRAGMA table_info(events)").fetchall()}
+            assert "topic" in cols
+            indices = {
+                r[1]
+                for r in raw_conn.execute(
+                    "SELECT * FROM sqlite_master WHERE type='index'"
+                ).fetchall()
+            }
+            assert "events_topic_created_idx" in indices
+            raw_conn.close()
+
+            # Appending topic-bearing event works
+            new_evt = _append(ls, topic="auth-upgrade")
+            assert new_evt["topic"] == "auth-upgrade"
+            filtered = ls.list_events(topic="auth-upgrade")
+            assert len(filtered) == 1
+            assert filtered[0]["id"] == new_evt["id"]
+        finally:
+            ls.close()
+
+        # Reopen is idempotent
+        reopened = Logstream(db_path=db_path)
+        try:
+            all_events = reopened.list_events(limit=10)
+            assert len(all_events) == 2
+        finally:
+            reopened.close()
+
+    def test_topic_append_and_list_filtering(self, logstream):
+        e1 = _append(logstream, topic="auth-v2", body="Auth work")
+        e2 = _append(logstream, topic="ui-v2", body="UI work")
+        e3 = _append(logstream, topic=None, body="General work")
+
+        assert e1["topic"] == "auth-v2"
+        assert e2["topic"] == "ui-v2"
+        assert e3["topic"] is None
+
+        auth_events = logstream.list_events(topic="auth-v2")
+        assert [e["id"] for e in auth_events] == [e1["id"]]
+
+        ui_events = logstream.list_events(topic="ui-v2")
+        assert [e["id"] for e in ui_events] == [e2["id"]]
+
+        none_events = logstream.list_events(topic="nonexistent")
+        assert none_events == []
+
+    def test_ack_topic_inheritance_and_override(self, logstream):
+        e = _append(logstream, topic="compiler-team")
+        ack1 = logstream.ack_event(e["id"], from_agent="windows-codex", status="claimed")
+        assert ack1["topic"] == "compiler-team"
+
+        ack2 = logstream.ack_event(
+            e["id"], from_agent="windows-codex", status="claimed", topic="custom-override"
+        )
+        assert ack2["topic"] == "custom-override"
+
+    def test_submit_patch_with_topic(self, logstream):
+        res = logstream.submit_patch(
+            content="diff --git a/a b/b\n",
+            from_agent="agent-a",
+            stream="project/mempalace",
+            topic="fast-path",
+        )
+        assert res["event"]["topic"] == "fast-path"
+        assert logstream.list_events(topic="fast-path")[0]["id"] == res["event"]["id"]
+
+    def test_order_asc_and_desc(self, logstream):
+        e1 = _append(logstream, body="First")
+        e2 = _append(logstream, body="Second")
+        e3 = _append(logstream, body="Third")
+
+        asc = logstream.list_events(order="asc")
+        assert [e["id"] for e in asc] == [e1["id"], e2["id"], e3["id"]]
+
+        desc = logstream.list_events(order="desc")
+        assert [e["id"] for e in desc] == [e3["id"], e2["id"], e1["id"]]
+
+        tail = logstream.list_events(order="desc", limit=2)
+        assert [e["id"] for e in tail] == [e3["id"], e2["id"]]
+
+        with pytest.raises(ValueError, match="order='sideways'"):
+            logstream.list_events(order="sideways")
+
+    def test_since_event_id_cursor_invariance_with_order(self, logstream):
+        e1 = _append(logstream, body="1")
+        e2 = _append(logstream, body="2")
+        e3 = _append(logstream, body="3")
+
+        # since_event_id is strictly after e1 (rowid > e1["rowid"])
+        asc = logstream.list_events(since_event_id=e1["id"], order="asc")
+        assert [e["id"] for e in asc] == [e2["id"], e3["id"]]
+
+        desc = logstream.list_events(since_event_id=e1["id"], order="desc")
+        assert [e["id"] for e in desc] == [e3["id"], e2["id"]]
+
+    def test_before_event_id_filtering(self, logstream):
+        e1 = _append(logstream, body="1")
+        e2 = _append(logstream, body="2")
+        e3 = _append(logstream, body="3")
+
+        before_asc = logstream.list_events(before_event_id=e3["id"], order="asc")
+        assert [e["id"] for e in before_asc] == [e1["id"], e2["id"]]
+
+        before_desc = logstream.list_events(before_event_id=e3["id"], order="desc")
+        assert [e["id"] for e in before_desc] == [e2["id"], e1["id"]]
+
+        with pytest.raises(ValueError, match="before_event_id 'evt_nope' not found"):
+            logstream.list_events(before_event_id="evt_nope")
+
+    def test_watch_topic_spec_and_matching(self):
+        from mempalace.logstream import (
+            event_matches_watch,
+            pushdown_watch_filters,
+            sanitize_watch_spec,
+        )
+
+        spec = sanitize_watch_spec({"topics": {" auth ", "ui "}})
+        assert spec["topics"] == {"auth", "ui"}
+
+        pushdown_single = pushdown_watch_filters({"topics": {"auth"}})
+        assert pushdown_single == {"topic": "auth"}
+
+        pushdown_multi = pushdown_watch_filters({"topics": {"auth", "ui"}})
+        assert "topic" not in pushdown_multi
+
+        event_auth = {"stream": "p", "room": "r", "topic": "auth", "from_agent": "a"}
+        event_ui = {"stream": "p", "room": "r", "topic": "ui", "from_agent": "a"}
+        event_other = {"stream": "p", "room": "r", "topic": "other", "from_agent": "a"}
+        event_none = {"stream": "p", "room": "r", "topic": None, "from_agent": "a"}
+
+        assert event_matches_watch(event_auth, topics={"auth", "ui"}) is True
+        assert event_matches_watch(event_ui, topics={"auth", "ui"}) is True
+        assert event_matches_watch(event_other, topics={"auth", "ui"}) is False
+        assert event_matches_watch(event_none, topics={"auth", "ui"}) is False

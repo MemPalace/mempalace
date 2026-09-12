@@ -45,6 +45,7 @@ optional verbatim body:
 - **`stream`** is the broad channel — `project/<name>` for per-project work,
   or a shared channel like `shared_agent_brain`.
 - **`room`** is the sub-channel: `delegation`, `patches`, `reviews`, `status`.
+- **`topic`** (optional) groups related tasks or sub-teams around a track (e.g. `auth-v2`, `ui-redesign`), avoiding crosstalk within a shared harness identity.
 - **`correlation_id`** ties a request to its replies and acks. Generate one
   per task and carry it through the whole exchange.
 - **`to_agent`** targets one agent, or `*` to broadcast. Filters on
@@ -63,6 +64,23 @@ generated file, a test log, a JSON report. Artifacts are stored verbatim with
 applying anything. v1 artifacts are UTF-8 text, up to 4 MiB.
 
 ## The delegation loop
+
+For the common case, use the task interface instead of constructing the raw
+request envelope:
+
+```bash
+mempalace task create --project myapp \
+  --from-agent mac-claude --to-agent windows-codex \
+  --goal "Fix the flaky test." --branch fix/flaky-test \
+  --base-commit 2668053 --done "Focused tests pass and a patch is submitted."
+```
+
+It creates the canonical request and prints a short, ready-to-paste wake-up
+line. The complete task remains verbatim in the logstream. The
+`mempalace-task` skill guides preview, creation, claiming, delivery, and loop
+closure. Remote shared-brain clients call `mempalace_task_create` through MCP;
+the CLI form operates on the local palace. The primitives below remain
+available for custom integrations.
 
 The canonical two-agent exchange:
 
@@ -94,7 +112,7 @@ on it for longer waits, passing `since_event_id` to avoid reprocessing.
 
 ## Tools and CLI
 
-Seven MCP tools serve the logstream: `mempalace_event_append`,
+Eight MCP tools serve the logstream: `mempalace_task_create`, `mempalace_event_append`,
 `mempalace_event_list`, `mempalace_event_wait`, `mempalace_event_ack`,
 `mempalace_artifact_put`, `mempalace_artifact_get`, and
 `mempalace_patch_submit` — see the [MCP tools reference](/reference/mcp-tools)
@@ -120,6 +138,98 @@ For push-based consumers (dashboards, live viewers), the hub also serves
 the stream over Server-Sent Events at `GET /logstream/stream` — same
 filters, same JSON envelope, `since_event_id` resume — see
 [Shared Brain](/guide/shared-brain#operating-the-shared-brain).
+
+## Monitoring
+
+Reading the stream efficiently is its own skill, and getting it wrong is the
+usual reason a coordinated task stalls: the event was written correctly, but
+nobody was listening.
+
+### Cursors
+
+Events are returned in **append order** (`ORDER BY rowid`), not timestamp
+order. That distinction matters as soon as a second replica exists — a peer's
+event created at 09:10:48Z is appended locally whenever it syncs, which can be
+*after* a local event created at 09:13:21Z.
+
+So there are two different parameters, and only one of them is a cursor:
+
+- **`since_event_id`** — strictly after that event in append order, whatever
+  the timestamps say. This is the forward resume cursor. A watcher's entire state is
+  the id of the last event it processed.
+- **`before_event_id`** — strictly before that event in append order (`rowid < anchor`)
+  for reverse / historical paging.
+- **`order`** — `'asc'` (oldest first, default) or `'desc'` (newest first, ideal for single-call
+  tail sweeps of recent inbox activity).
+- **`since_created_at`** — a time window (`>=`, inclusive; dedup by `id`).
+  Good for "what happened today", wrong for resumption: a late-arriving peer
+  event is already older than your high-water mark, so you skip it silently
+  and permanently.
+
+### Choosing a mode
+
+| Mode | Best for | Mechanism |
+|---|---|---|
+| Inbox sweep | Session start, pre-task checks | `mempalace_event_list` + `to_agent` + `since_event_id`, `preview=true` |
+| Background watcher | Being woken while you work | `mempalace logstream watch`, run as a background process |
+| Long-poll | Waiting on one correlation, in-turn | `mempalace_event_wait` — 60s default, 300s max, returns `timed_out` rather than erroring |
+| Server-Sent Events | Daemons, dashboards, live viewers | `GET /logstream/stream`, live-tail filters and `since_event_id` resume |
+| Declared-idle | Turn-based agents with no background loop | Publish your cursor and say you need a ping |
+
+`logstream watch` exists because `wait` is a primitive, not a watcher: it caps
+at five minutes and reports a timeout, so every caller ends up writing the same
+re-arm loop and each one has to remember to carry the cursor forward. `watch`
+owns both, adds the filters a watcher needs, and exits on a match so a harness
+can treat process exit as "you have mail":
+
+```bash
+mempalace logstream watch \
+  --agent mac-claude \
+  --type task.request --type task.reply --type patch.ready \
+  --state-file ~/.mempalace/watch/mac-claude.json --json
+```
+
+`--agent` is shorthand for `--to-agent <id> --exclude-from-agent <id>`. That
+exclusion matters more than it looks: `to_agent=<you>` also matches `*`
+broadcasts, and your own broadcasts are broadcasts, so a watcher without it
+wakes itself on every status it posts. Repeating a filter means "or", which is
+how you narrow to the events that genuinely require you and stop being woken by
+routine traffic — but keep `task.reply` in the set if you ever delegate:
+`blocked` and `failed` arrive as replies, and a watcher that rejects one
+advances its cursor past it silently. Exit is `0` on a match and `2` on `--idle-exit-ms`, matching
+`wait`'s timeout convention; `--follow` keeps the process alive past the first
+match for daemons. A cursorless first run starts at the tip, like the SSE
+live-tail, and says so on stderr — replaying a long fleet log would wake a new
+watcher holding weeks of history it cannot tell is stale. `--from-start` opts
+into the replay.
+
+`mempalace_event_wait` backs off internally (0.25s → 1s), so a tight retry
+loop around it buys nothing. Filter server-side — `to_agent`, `type`,
+`status` and `correlation_id` are all indexed, and `to_agent=<you>` matches
+`*` broadcasts without a second query. Use `preview=true` when scanning a
+busy stream: bodies come back truncated with `body_truncated` and
+`body_length` set, so you spend tokens only on the event you actually want.
+
+### Make the watch visible
+
+A watcher nobody can see is nearly as bad as no watcher. The convention is to
+post a `status` event to `to_agent=*` when you begin monitoring a correlation,
+naming four things: the filter you are watching, the cursor you have reached,
+the work that must not be duplicated, and — implicitly — the fact that someone
+is home. Agents deciding whether to delegate can then check instead of
+guessing. Announce in a `status` type the fleet's watchers sleep
+through, once per session and again when your filter changes — an
+announcement typed as something watchers wake
+on wakes every window, every time anyone re-arms.
+
+The inverse is equally important. If your harness is turn-based and stops
+existing between prompts, declare that rather than staying quiet: publish your
+last-seen event id and say a ping is needed. Never advertise a watch you do
+not have — a requester who believes an agent is listening stops looking for a
+human to nudge.
+
+For the full protocol, see the
+[coordination protocol](https://github.com/MemPalace/mempalace/blob/develop/integrations/shared/coordination-protocol.md).
 
 ## Coordination vs. memory
 

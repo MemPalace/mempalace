@@ -27,6 +27,66 @@ def test_auto_falls_to_cpu(monkeypatch):
     assert embedding._resolve_providers("auto") == (["CPUExecutionProvider"], "cpu")
 
 
+def test_auto_skips_coreml_for_embeddinggemma(monkeypatch):
+    """auto must not hand EmbeddingGemma to CoreML.
+
+    CoreML supports only a fraction of that model's quantized graph and
+    returns an all-NaN hidden state without erroring, so a Mac user with no
+    explicit embedding_device would silently embed (and, under `repair
+    rebuild-index`, persist) degenerate vectors.
+    """
+    monkeypatch.setattr(
+        "onnxruntime.get_available_providers",
+        lambda: ["CoreMLExecutionProvider", "CPUExecutionProvider"],
+    )
+
+    assert embedding._resolve_providers("auto", "embeddinggemma") == (
+        ["CPUExecutionProvider"],
+        "cpu",
+    )
+
+
+def test_auto_still_picks_coreml_for_other_models(monkeypatch):
+    """The denylist is per-model — it must not disable CoreML globally."""
+    monkeypatch.setattr(
+        "onnxruntime.get_available_providers",
+        lambda: ["CoreMLExecutionProvider", "CPUExecutionProvider"],
+    )
+
+    assert embedding._resolve_providers("auto", "minilm") == (
+        ["CoreMLExecutionProvider", "CPUExecutionProvider"],
+        "coreml",
+    )
+
+
+def test_auto_still_picks_cuda_for_embeddinggemma(monkeypatch):
+    """Only CoreML is implicated; CUDA stays the preferred accelerator."""
+    monkeypatch.setattr(
+        "onnxruntime.get_available_providers",
+        lambda: ["CUDAExecutionProvider", "CoreMLExecutionProvider", "CPUExecutionProvider"],
+    )
+
+    assert embedding._resolve_providers("auto", "embeddinggemma") == (
+        ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        "cuda",
+    )
+
+
+def test_explicit_coreml_is_still_honored_for_embeddinggemma(monkeypatch):
+    """An explicit embedding_device=coreml is a deliberate choice, so the
+    denylist (which only guards *automatic* selection) leaves it alone. The
+    witness probe in EmbeddinggemmaONNX._lazy_load is what keeps it safe."""
+    monkeypatch.setattr(
+        "onnxruntime.get_available_providers",
+        lambda: ["CoreMLExecutionProvider", "CPUExecutionProvider"],
+    )
+
+    assert embedding._resolve_providers("coreml", "embeddinggemma") == (
+        ["CoreMLExecutionProvider", "CPUExecutionProvider"],
+        "coreml",
+    )
+
+
 def test_cuda_missing_warns_with_gpu_extra(monkeypatch, caplog):
     monkeypatch.setattr("onnxruntime.get_available_providers", lambda: ["CPUExecutionProvider"])
 
@@ -78,7 +138,9 @@ def test_get_embedding_function_caches_by_resolved_provider_tuple(monkeypatch):
 
     monkeypatch.setattr(embedding, "_build_ef_class", lambda: DummyEF)
     monkeypatch.setattr(
-        embedding, "_resolve_providers", lambda device: (["CPUExecutionProvider"], "cpu")
+        embedding,
+        "_resolve_providers",
+        lambda device, model=None: (["CPUExecutionProvider"], "cpu"),
     )
 
     first = embedding.get_embedding_function("cpu", "minilm")
@@ -108,7 +170,9 @@ def test_get_embedding_function_threads_cap_passed_to_minilm_ef(monkeypatch):
 
     monkeypatch.setattr(embedding, "_build_ef_class", lambda: DummyEF)
     monkeypatch.setattr(
-        embedding, "_resolve_providers", lambda device: (["CPUExecutionProvider"], "cpu")
+        embedding,
+        "_resolve_providers",
+        lambda device, model=None: (["CPUExecutionProvider"], "cpu"),
     )
     monkeypatch.setattr(embedding, "_resolve_intra_op_threads", lambda: 2)
 
@@ -121,18 +185,57 @@ def test_get_embedding_function_threads_cap_passed_to_embeddinggemma(monkeypatch
     captured = {}
 
     class DummyGemma:
-        def __init__(self, preferred_providers=None, intra_op_num_threads=0):
+        def __init__(self, preferred_providers=None, intra_op_num_threads=0, batch_size=32):
             captured["threads"] = intra_op_num_threads
 
     monkeypatch.setattr(embedding, "EmbeddinggemmaONNX", DummyGemma)
     monkeypatch.setattr(
-        embedding, "_resolve_providers", lambda device: (["CPUExecutionProvider"], "cpu")
+        embedding,
+        "_resolve_providers",
+        lambda device, model=None: (["CPUExecutionProvider"], "cpu"),
     )
     monkeypatch.setattr(embedding, "_resolve_intra_op_threads", lambda: 4)
 
     embedding.get_embedding_function("cpu", "embeddinggemma")
 
     assert captured["threads"] == 4
+
+
+def test_get_embedding_function_batch_size_passed_to_embeddinggemma(monkeypatch):
+    """#2330: the configured sub-batch size must reach EmbeddinggemmaONNX, not
+    just its constructor's default, or an override is silently inert."""
+    captured = {}
+
+    class DummyGemma:
+        def __init__(self, preferred_providers=None, intra_op_num_threads=0, batch_size=32):
+            captured["batch_size"] = batch_size
+
+    monkeypatch.setattr(embedding, "EmbeddinggemmaONNX", DummyGemma)
+    monkeypatch.setattr(
+        embedding,
+        "_resolve_providers",
+        lambda device, model=None: (["CPUExecutionProvider"], "cpu"),
+    )
+    monkeypatch.setattr(embedding, "_resolve_embeddinggemma_batch_size", lambda: 8)
+
+    embedding.get_embedding_function("cpu", "embeddinggemma")
+
+    assert captured["batch_size"] == 8
+
+
+def test_resolve_embeddinggemma_batch_size_reads_config(monkeypatch):
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE", "6")
+    assert embedding._resolve_embeddinggemma_batch_size() == 6
+
+
+def test_resolve_embeddinggemma_batch_size_falls_back_on_config_error(monkeypatch):
+    class ExplodingConfig:
+        def __init__(self, *a, **kw):
+            raise RuntimeError("config load failed")
+
+    monkeypatch.setattr("mempalace.config.MempalaceConfig", ExplodingConfig)
+
+    assert embedding._resolve_embeddinggemma_batch_size() == embedding._EMBEDDINGGEMMA_BATCH_SIZE
 
 
 def test_minilm_ef_model_override_applies_thread_cap(monkeypatch):
@@ -188,10 +291,23 @@ def test_describe_device_uses_resolved_effective_device(monkeypatch):
     monkeypatch.setattr(
         embedding,
         "_resolve_providers",
-        lambda device: (["CUDAExecutionProvider", "CPUExecutionProvider"], "cuda"),
+        lambda device, model=None: (["CUDAExecutionProvider", "CPUExecutionProvider"], "cuda"),
     )
 
     assert embedding.describe_device("auto") == "cuda"
+
+
+def test_describe_device_reports_the_model_aware_resolution(monkeypatch):
+    """The status header must show the device that will actually be used —
+    which now depends on the model, since CoreML is off the table for
+    embeddinggemma."""
+    monkeypatch.setattr(
+        "onnxruntime.get_available_providers",
+        lambda: ["CoreMLExecutionProvider", "CPUExecutionProvider"],
+    )
+
+    assert embedding.describe_device("auto", "minilm") == "coreml"
+    assert embedding.describe_device("auto", "embeddinggemma") == "cpu"
 
 
 # ---------------------------------------------------------------------------

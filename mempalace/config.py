@@ -4,9 +4,14 @@ MemPalace configuration system.
 Priority: env vars > config file (~/.mempalace/config.json) > defaults
 """
 
+import errno
+import hashlib
 import json
 import os
+import stat
 import re
+import sys
+import tempfile
 from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
@@ -344,6 +349,256 @@ DEFAULT_HALL_KEYWORDS = {
 }
 
 
+def _write_target(path: Path) -> Path:
+    """The file a write should replace, following a symlink to it.
+
+    A config kept in a dotfiles checkout is reached through a link, and the
+    setters wrote through it. Replacing the link itself would leave the real
+    file holding what it held and send this setting, and every later one,
+    somewhere the user is not looking, so the temporary file, the rename and
+    the quarantine all happen at the target instead. ``realpath`` follows the
+    whole chain rather than one link, which is the file the reader would have
+    got.
+
+    A link this call cannot ``lstat`` is not reported as "not a link": that
+    reading would send the write through ``os.replace`` and put a regular file
+    where the link was. The error is raised instead, since the caller has to
+    write somewhere and there is no safe guess about where.
+    """
+    try:
+        is_link = stat.S_ISLNK(os.lstat(str(path)).st_mode)
+    except FileNotFoundError:
+        return path
+    if is_link:
+        return Path(os.path.realpath(str(path)))
+    return path
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Make the rename itself durable.
+
+    ``EntityRegistry.save`` spells out why: on ext4 the kernel can acknowledge
+    a rename and, after a crash, come back to the temporary file present and
+    the target still holding the old bytes. Windows cannot open a directory
+    this way at all, and answering nothing there is the same as answering
+    nothing on a filesystem that does not implement it.
+    """
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _keep_unreadable_file(path: Path):
+    """Move a file whose contents did not parse aside, keeping its bytes.
+
+    Renaming needs write permission on the directory rather than on the file,
+    and the caller is left with a free name to write. ``FileNotFoundError``
+    from the rename is the one outcome that establishes there was nothing to
+    keep; every other failure leaves the file where it is and is raised,
+    because a file that could not be moved is not one to write over.
+
+    A file this process could not read at all never reaches here: that state
+    declines the write outright rather than renaming anything.
+
+    Returns the path the old file now lives at, or ``None`` when there was
+    nothing there.
+    """
+    path = _write_target(path)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    fd, target = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f"{path.name}.unreadable-{stamp}-",
+    )
+    os.close(fd)
+    try:
+        os.replace(str(path), target)
+    except FileNotFoundError:
+        _unlink_quietly(target)
+        return None
+    except OSError:
+        _unlink_quietly(target)
+        raise
+    return target
+
+
+def _make_config_dir(directory: Path) -> None:
+    """Create the config directory, restricted to the owner when this call makes it.
+
+    ``mkdir(mode=...)`` is masked by the umask, so the mode is set afterwards,
+    and only on a directory this call created: the config written here holds
+    the user's ``people_map``, while a directory that was already there has
+    whatever the user gave it and is not this function's to change. That is
+    narrower than ``init()``, which sets the mode on an existing directory too.
+
+    Raises whatever stopped it, which is what ``develop`` did: three setters
+    and ``save_people_map`` created the directory outside any ``try``, so a
+    directory they could not make came out as ``PermissionError``. Only
+    ``set_hook_setting`` did not create it at all and returned instead, which
+    is what ``tool_hook_settings`` relies on, and that one still returns: it
+    reaches this through the writer, where the error becomes a message.
+    """
+    existed = directory.is_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    if not existed:
+        try:
+            directory.chmod(0o700)
+        except (OSError, NotImplementedError):
+            pass  # Windows has no Unix permission bits; init() tolerates this too.
+
+
+def _unlink_quietly(path) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _write_json_in_place(path: Path, payload) -> None:
+    """Write without the rename, for a directory that refuses a new name.
+
+    This is what the setters did before this module wrote atomically. It is
+    kept for the one case where the atomic write cannot run at all, since a
+    setting that is lost outright is worse than one written without
+    crash-safety.
+    """
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        os.chmod(path, 0o600)
+    except (OSError, NotImplementedError):
+        pass
+
+
+def _atomic_write_json(path: Path, payload) -> None:
+    """Serialize ``payload`` into ``path`` through a temporary file.
+
+    The rename is what publishes the new contents, so an interrupted write
+    leaves the previous file exactly where it was rather than emptied or half
+    serialized, and the directory is synced afterwards so the rename itself
+    survives a crash, the way ``EntityRegistry.save`` does.
+
+    The temporary file carries this process's pid, so two processes writing
+    the same config never share one. A run killed between the write and the
+    rename leaves that file behind, and nothing here removes it. It is opened
+    ``O_NOFOLLOW``, so a symlink dropped at that name is not written through,
+    and anything else in the way of that name sends the write to a name the
+    directory picks rather than to a write without the rename.
+
+    A directory that will not take a name it chose itself is the one case that
+    falls back to writing in place: a read-only config directory whose config
+    is still writable is what reaches it, and the setters wrote into it
+    without complaint before this.
+    """
+    path = _write_target(path)
+    tmp = str(path.with_name(f"{path.name}.tmp-{os.getpid()}"))
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(tmp, flags, 0o600)
+        if os.fstat(fd).st_nlink > 1:
+            # A hard link at that name is not a symlink, so ``O_NOFOLLOW`` lets
+            # it through, and truncating through it would empty a file nobody
+            # named here. The truncate happens below, after this has ruled that
+            # out, and the write goes to a name the directory chose instead.
+            os.close(fd)
+            raise OSError(errno.EMLINK, "temporary name has another link", tmp)
+    except OSError:
+        # This errno belongs to the name, not to the directory. An orphan
+        # another user's run left at that name, a directory dropped there, and
+        # a symlink planted there all answer the way a directory that takes no
+        # new names answers, and giving up the rename on that reading is how
+        # the atomic write turns itself off where it was needed. Ask the
+        # directory for a name of its own instead: what it says about a name
+        # it chooses is about the directory.
+        try:
+            fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
+                raise
+            # The message follows the write rather than announcing it: a
+            # directory that refuses the temporary file often refuses the
+            # write too, and saying the file was written in place before
+            # finding that out is how the caller's failure message ends up
+            # contradicted.
+            _write_json_in_place(path, payload)
+            print(
+                f"  ! {path.parent} would not take a temporary file, so {path.name} was "
+                "written in place and an interrupted write can truncate it",
+                file=sys.stderr,
+            )
+            return
+    try:
+        # The mode is set before anything is written rather than after: under a
+        # umask that clears the owner's write bit, ``O_CREAT`` leaves the file
+        # at 0400, and one left behind by a killed run is then a name its own
+        # owner cannot open next time.
+        try:
+            os.chmod(tmp, 0o600)
+        except (OSError, NotImplementedError):
+            pass
+        os.ftruncate(fd, 0)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        _unlink_quietly(tmp)
+        raise
+    try:
+        os.replace(tmp, str(path))
+    except BaseException as exc:
+        if not isinstance(exc, OSError):
+            # A signal between the write and the rename leaves the temporary
+            # file behind for no reason: nothing has been published yet.
+            _unlink_quietly(tmp)
+            raise
+        # Opening a temporary file that already exists needs the file, not the
+        # directory, so a run that reused an orphan at the pid name never asked
+        # the directory anything. The rename is where the directory answers,
+        # and a read-only one answers here rather than above.
+        if exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
+            _unlink_quietly(tmp)
+            raise
+        # The temporary file holds this write, complete and fsynced. Removing
+        # it before writing in place would trade a finished copy for a write
+        # that truncates first, so it is removed after that write returns, and
+        # named if it could not be.
+        try:
+            _write_json_in_place(path, payload)
+        except BaseException:
+            # That write truncates before it serializes, so what was there is
+            # gone whether or not this one finished.
+            print(
+                f"  ! {path.name} was not written and may have been truncated; "
+                f"{tmp} holds what this call was asked to save",
+                file=sys.stderr,
+            )
+            raise
+        _unlink_quietly(tmp)
+        if os.path.exists(tmp):
+            # Removing it needs the directory too, which is what just refused.
+            print(
+                f"  ! {tmp} holds a copy of what was written and could not be "
+                "removed; nothing here removes it later either",
+                file=sys.stderr,
+            )
+        print(
+            f"  ! {path.parent} would not take the rename, so {path.name} was "
+            "written in place and an interrupted write can truncate it",
+            file=sys.stderr,
+        )
+        return
+    _fsync_directory(path.parent)
+
+
 class MempalaceConfig:
     """Configuration manager for MemPalace.
 
@@ -371,13 +626,179 @@ class MempalaceConfig:
             else None
         )
         self._file_config = {}
-
-        if self._config_file.exists():
+        # What this process established about the file on disk, which decides
+        # what the first setter is allowed to do with it. The defaults below
+        # apply either way, as they always did, but they stop being written
+        # over a file nobody read.
+        #   "absent"   nothing resolved under that name
+        #   "read"     this is its content
+        #   "unparsed" it was read and is not a JSON object: a truncated write
+        #              or a hand-edit that lost a brace lands here, and the
+        #              first setter renames it aside before writing
+        #   "unread"   it is there and could not be read at all, a permission
+        #              bit or a directory at that name, and the first setter
+        #              declines rather than writing defaults into it
+        self._file_config_state = "absent"
+        self._file_config_error = None
+        try:
+            raw = self._config_file.read_bytes()
+        except FileNotFoundError:
+            raw = None
+        except OSError as exc:
+            # Present, or unreachable: not proven absent, so not ours to lose.
+            # A permission bit, a directory at that name, a symlink loop and a
+            # share that stopped answering all arrive here, and the setter's
+            # message names which one rather than guessing at permissions.
+            raw = None
+            self._file_config_state = "unread"
+            self._file_config_error = exc
+        if raw is not None:
             try:
-                with open(self._config_file, "r", encoding="utf-8") as f:
-                    self._file_config = json.load(f)
-            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
-                self._file_config = {}
+                # ``utf-8-sig`` rather than ``utf-8``: a BOM is what a
+                # Windows editor leaves on an otherwise valid config, and
+                # ``json.loads`` on bytes accepts one, so decoding by hand has
+                # to accept it too.
+                loaded = json.loads(raw.decode("utf-8-sig"))
+            except ValueError:
+                # JSONDecodeError and UnicodeDecodeError are both ValueErrors:
+                # text that is not JSON, and bytes that are not UTF-8.
+                loaded = None
+            if isinstance(loaded, dict):
+                self._file_config = loaded
+                self._file_config_state = "read"
+            else:
+                self._file_config_state = "unparsed"
+
+    @property
+    def search_config_fingerprint(self) -> str:
+        """Stable digest of the effective search configuration for this process.
+
+        A long-running Hub keeps this configuration snapshot and may also keep
+        a collection opened from it.  CLI search forwarding compares this
+        digest with a freshly loaded config so a changed ``config.json`` falls
+        back to the direct path instead of querying stale Hub state.
+
+        Hash only resolved settings that affect the currently selected search
+        backend.  This detects relevant file edits and Hub-start environment
+        overrides without treating hook/UI settings or inactive-backend values
+        as stale search state.  The digest keeps secrets out of the registry.
+        """
+        try:
+            # Match the backend selection used by palace.get_collection(),
+            # including artifact auto-detection for an existing palace.
+            from .palace import resolve_backend_name
+
+            backend = resolve_backend_name(self.palace_path)
+            backend_resolution_error = None
+        except Exception as exc:  # noqa: BLE001 - fingerprint must remain total
+            # A mismatched or otherwise invalid palace still needs a stable
+            # digest so the Hub gate can fall back to the direct path, where
+            # normal backend opening reports the actionable error.
+            backend = self.backend
+            backend_resolution_error = f"{type(exc).__name__}: {exc}"
+        embedding_model = self.embedding_model
+        effective = {
+            "backend": backend,
+            "collection_name": self.collection_name,
+            "embedding_model": embedding_model,
+            "lang_explicit": self.lang_explicit,
+        }
+        if backend_resolution_error is not None:
+            effective["backend_resolution_error"] = backend_resolution_error
+        if embedding_model == "openai-compat":
+            effective.update(
+                embedding_api_key=self.embedding_api_key,
+                embedding_api_model=self.embedding_api_model,
+                embedding_api_url=self.embedding_api_url,
+            )
+        else:
+            effective.update(
+                embedding_device=self.embedding_device,
+                embedding_threads=self.embedding_threads,
+            )
+        try:
+            if backend == "qdrant":
+                effective.update(
+                    qdrant_api_key=self.qdrant_api_key,
+                    qdrant_namespace=self.qdrant_namespace,
+                    qdrant_timeout=self.qdrant_timeout,
+                    qdrant_url=self.qdrant_url,
+                )
+            elif backend == "milvus":
+                effective.update(
+                    milvus_consistency_level=self.milvus_consistency_level,
+                    milvus_db_name=self.milvus_db_name,
+                    milvus_namespace=self.milvus_namespace,
+                    milvus_token=self.milvus_token,
+                    milvus_uri=self.milvus_uri,
+                )
+            elif backend == "pgvector":
+                effective.update(
+                    pgvector_dsn=self.pgvector_dsn,
+                    pgvector_namespace=self.pgvector_namespace,
+                )
+        except (TypeError, ValueError) as exc:
+            # Invalid active-backend settings still need a stable digest. The
+            # backend will report their validation error if search reaches it;
+            # fingerprinting must never turn an unrelated config edit into a
+            # CLI crash before the direct-path fallback can be selected.
+            effective["backend_config_error"] = f"{type(exc).__name__}: {exc}"
+        payload = json.dumps(
+            effective, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _persist_file_config(self):
+        """Write ``_file_config`` to ``config.json``, keeping what it replaces.
+
+        A file this process never read is renamed aside first, so a setter
+        called on defaults cannot be the last word on settings nobody could
+        read. The write itself goes through a temporary file, because
+        truncating the config and serializing into it afterwards is what
+        produced the unreadable files in the first place.
+        """
+        if self._file_config_state == "unread":
+            # The file is there and this process could not open it. Its
+            # contents are still whatever they are; the settings in memory are
+            # this session's defaults, and writing them here is how a
+            # permission bit or an absent volume turns into a lost config.
+            print(
+                f"  ! Not writing {self._config_file}: it exists and could not be read "
+                f"({self._file_config_error}), so it is not overwritten. Move it aside "
+                "or fix what is in its way.",
+                file=sys.stderr,
+            )
+            return
+        try:
+            _make_config_dir(self._config_dir)
+        except OSError as exc:
+            print(
+                f"  ! Could not create {self._config_dir} ({exc}), so "
+                f"{self._config_file.name} was not written",
+                file=sys.stderr,
+            )
+            return
+        if self._file_config_state == "unparsed":
+            try:
+                kept = _keep_unreadable_file(self._config_file)
+            except OSError as exc:
+                print(
+                    f"  ! Not writing {self._config_file}: it does not parse "
+                    f"and could not be moved aside ({exc})",
+                    file=sys.stderr,
+                )
+                return
+            self._file_config_state = "read"
+            if kept is not None:
+                print(
+                    f"  ! {self._config_file} does not parse; kept it as {kept} "
+                    "and started a new one",
+                    file=sys.stderr,
+                )
+        try:
+            _atomic_write_json(self._config_file, self._file_config)
+        except OSError as exc:
+            print(f"  ! Could not write {self._config_file}: {exc}", file=sys.stderr)
 
     @property
     def palace_path(self):
@@ -713,16 +1134,12 @@ class MempalaceConfig:
         if not normalized:
             normalized = ["en"]
         self._file_config["entity_languages"] = normalized
-        self._config_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            with open(self._config_file, "w", encoding="utf-8") as f:
-                json.dump(self._file_config, f, indent=2, ensure_ascii=False)
-        except OSError:
-            pass
-        try:
-            self._config_file.chmod(0o600)
-        except (OSError, NotImplementedError):
-            pass
+        # ``develop`` created the directory here, outside any ``try``, so this
+        # setter raised when it could not be made. ``set_hook_setting`` did not
+        # create it at all and returned instead, and that difference is kept:
+        # ``tool_hook_settings`` does not wrap its call.
+        _make_config_dir(self._config_dir)
+        self._persist_file_config()
         return normalized
 
     @property
@@ -797,6 +1214,33 @@ class MempalaceConfig:
             return max(1, (os.cpu_count() or 2) // 2)
         return val if val > 0 else 0
 
+    @property
+    def embeddinggemma_batch_size(self) -> int:
+        """Documents per ``session.run()`` for the EmbeddingGemma ONNX model (#2330).
+
+        The sub-batching added for #1770 bounds a run by document COUNT, not
+        allocation: attention buffers scale with ``batch * padded_len ** 2``, so
+        a batch of long documents can still exceed available memory at the
+        module default (``mempalace.embedding._EMBEDDINGGEMMA_BATCH_SIZE``, 32).
+        Read from env ``MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE`` first, then
+        ``embeddinggemma_batch_size`` in ``config.json``, then the module
+        default. Unset, non-numeric, or non-positive values fall back to the
+        default rather than raising; ``EmbeddinggemmaONNX.__init__`` still
+        raises on an explicitly-passed non-positive ``batch_size``.
+        """
+        from .embedding import _EMBEDDINGGEMMA_BATCH_SIZE
+
+        raw = os.environ.get("MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE")
+        if raw is None:
+            raw = self._file_config.get("embeddinggemma_batch_size")
+        if raw is None:
+            return _EMBEDDINGGEMMA_BATCH_SIZE
+        try:
+            val = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return _EMBEDDINGGEMMA_BATCH_SIZE
+        return val if val > 0 else _EMBEDDINGGEMMA_BATCH_SIZE
+
     def set_embedding_model(self, model: str) -> None:
         """Persist the embedding-model choice to ``config.json``.
 
@@ -806,16 +1250,12 @@ class MempalaceConfig:
         minilm for unrecognized values).
         """
         self._file_config["embedding_model"] = str(model).strip().lower()
-        self._config_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            with open(self._config_file, "w", encoding="utf-8") as f:
-                json.dump(self._file_config, f, indent=2, ensure_ascii=False)
-        except OSError:
-            pass
-        try:
-            self._config_file.chmod(0o600)
-        except (OSError, NotImplementedError):
-            pass
+        # ``develop`` created the directory here, outside any ``try``, so this
+        # setter raised when it could not be made. ``set_hook_setting`` did not
+        # create it at all and returned instead, and that difference is kept:
+        # ``tool_hook_settings`` does not wrap its call.
+        _make_config_dir(self._config_dir)
+        self._persist_file_config()
 
     def set_backend(self, backend: str) -> None:
         """Persist the storage backend choice to ``config.json``."""
@@ -824,16 +1264,12 @@ class MempalaceConfig:
 
         get_backend_class(backend)
         self._file_config["backend"] = backend
-        self._config_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            with open(self._config_file, "w", encoding="utf-8") as f:
-                json.dump(self._file_config, f, indent=2, ensure_ascii=False)
-        except OSError:
-            pass
-        try:
-            self._config_file.chmod(0o600)
-        except (OSError, NotImplementedError):
-            pass
+        # ``develop`` created the directory here, outside any ``try``, so this
+        # setter raised when it could not be made. ``set_hook_setting`` did not
+        # create it at all and returned instead, and that difference is kept:
+        # ``tool_hook_settings`` does not wrap its call.
+        _make_config_dir(self._config_dir)
+        self._persist_file_config()
 
     def _resolve_str_setting(self, env_var: str, config_key: str):
         """Resolve a string setting: env var > ``config.json`` > ``None``.
@@ -1098,11 +1534,7 @@ class MempalaceConfig:
         if "hooks" not in self._file_config:
             self._file_config["hooks"] = {}
         self._file_config["hooks"][key] = value
-        try:
-            with open(self._config_file, "w", encoding="utf-8") as f:
-                json.dump(self._file_config, f, indent=2, ensure_ascii=False)
-        except OSError:
-            pass
+        self._persist_file_config()
 
     def init(self):
         """Create config directory and write default config.json if it doesn't exist."""
@@ -1122,7 +1554,7 @@ class MempalaceConfig:
             # dropping legitimate short conversation exchanges. Module-level
             # defaults already apply correctly when these keys are absent.
             default_config = {
-                "palace_path": DEFAULT_PALACE_PATH,
+                "palace_path": self.palace_path,
                 "collection_name": DEFAULT_COLLECTION_NAME,
                 "topic_wings": DEFAULT_TOPIC_WINGS,
                 "hall_keywords": DEFAULT_HALL_KEYWORDS,
@@ -1142,11 +1574,6 @@ class MempalaceConfig:
         Args:
             people_map: Dict mapping name variants to canonical names.
         """
-        self._config_dir.mkdir(parents=True, exist_ok=True)
-        with open(self._people_map_file, "w", encoding="utf-8") as f:
-            json.dump(people_map, f, indent=2)
-        try:
-            self._people_map_file.chmod(0o600)
-        except (OSError, NotImplementedError):
-            pass
+        _make_config_dir(self._config_dir)
+        _atomic_write_json(self._people_map_file, people_map)
         return self._people_map_file

@@ -98,7 +98,14 @@ def clear_validated_embedder_identity(palace_path: Optional[str] = None) -> None
         _VALIDATED_IDENTITY.discard(key)
 
 
-def _enforce_embedder_identity(collection, palace_path, collection_name, *, create) -> None:
+def _enforce_embedder_identity(
+    collection,
+    palace_path,
+    collection_name,
+    *,
+    create,
+    repeat_unknown_warning=False,
+) -> None:
     """Check (and, for a brand-new collection, record) embedder identity (RFC 001).
 
     Check at open so a model swap fails fast — before any query silently
@@ -107,6 +114,9 @@ def _enforce_embedder_identity(collection, palace_path, collection_name, *, crea
     vectors from an unknown model would mislabel it, so populated-but-unrecorded
     collections warn instead and are resolved with
     ``mempalace palace set-embedder``.
+
+    ``repeat_unknown_warning`` bypasses the process cache so a long-lived Hub
+    can reproduce the warning a standalone CLI process emits on every search.
 
     Bookkeeping must never break memory operations: only the deliberate
     identity/dimension mismatch propagates; every other error is swallowed.
@@ -144,7 +154,7 @@ def _enforce_embedder_identity(collection, palace_path, collection_name, *, crea
 
     model_name = current.model_name
     key = (str(palace_path), str(collection_name), model_name)
-    if key in _VALIDATED_IDENTITY:
+    if key in _VALIDATED_IDENTITY and not repeat_unknown_warning:
         return
 
     try:
@@ -341,6 +351,8 @@ def get_closets_collection(
     palace_path: str,
     create: bool = True,
     backend: Optional[str] = None,
+    *,
+    read_only: bool = False,
 ):
     """Get the closets collection — the searchable index layer."""
     return get_collection(
@@ -348,6 +360,7 @@ def get_closets_collection(
         collection_name="mempalace_closets",
         create=create,
         backend=backend,
+        **({"read_only": True} if read_only else {}),
     )
 
 
@@ -403,10 +416,12 @@ def resolve_backend_name(palace_path: str, explicit: Optional[str] = None) -> st
         )
     detected = detected_backends[0] if detected_backends else None
     if detected and detected != selected:
-        raise BackendMismatchError(
-            f"palace at {palace_path!r} contains {detected!r} backend artifacts, "
-            f"but {selected!r} was selected"
-        )
+        exact_family = {"sqlite_exact", "rust_exact"}
+        if not (detected in exact_family and selected in exact_family):
+            raise BackendMismatchError(
+                f"palace at {palace_path!r} contains {detected!r} backend artifacts, "
+                f"but {selected!r} was selected"
+            )
     return selected
 
 
@@ -445,7 +460,7 @@ def _backend_artifact_label(backend_name: Optional[str]) -> str:
         return "qdrant_backend.json"
     if backend_name == "pgvector":
         return "pgvector_backend.json"
-    if backend_name == "sqlite_exact":
+    if backend_name in {"sqlite_exact", "rust_exact"}:
         return "sqlite_exact.sqlite3"
     return "backend database"
 
@@ -456,6 +471,7 @@ def _open_collection_or_explain(
     collection_name: Optional[str] = None,
     out=None,
     opener=None,
+    read_only: bool = False,
 ):
     """Open the palace collection or print a state-specific message and return ``None``.
 
@@ -516,11 +532,13 @@ def _open_collection_or_explain(
         emit("  Run: mempalace mine <dir>")
         return None
     try:
+        options = {"read_only": True} if read_only else {}
         return open_collection(
             palace_path,
             collection_name=collection_name,
             create=False,
             backend=backend_name,
+            **options,
         )
     except CollectionNotInitializedError:
         emit(f"\n  Palace at {palace_path} is initialized but empty (no drawers yet).")
@@ -1125,7 +1143,9 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
     `maybe_autoheal_fts5_index` rebuild `cmd_repair` already runs as its own
     preflight step — so a normal `mine` self-heals the recoverable case
     instead of forcing the operator to run `mempalace repair` by hand for a
-    derived index that regenerates from intact content.
+    derived index. Nothing re-files afterwards on this path, so the heal is the
+    last word here: it checks the content table against `embedding_metadata`
+    before rebuilding from it, and declines when it cannot.
     """
     if resolve_backend_name(palace_path) != "chroma":
         return
@@ -1165,8 +1185,8 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
 # different worker thread. A thread-local guard makes those handlers fail to see
 # the process-held lease, re-acquire the flock, and self-conflict
 # ("palace ... is held by PID <self>"). flock is per-process and HTTP writes are
-# serialized by `_HTTP_REQUEST_LOCK`, so the process is the correct re-entrancy
-# boundary.
+# serialized by ``_HTTP_REQUEST_LOCK``'s exclusive side, so the process is the
+# correct re-entrancy boundary even though palace reads may overlap.
 #
 # The holder set is tagged with ``pid`` so that a forked child does NOT inherit
 # re-entrant credit from its parent: the OS-level flock IS NOT inherited as a
@@ -1455,6 +1475,15 @@ def file_already_mined(
     that extraction mode so exchange-mode and general-mode drawers can coexist
     for the same source transcript. Legacy drawers without extract_mode are
     treated as exchange-mode drawers.
+
+    A drawer whose metadata carries ``chunk_total`` (see #21) is only
+    counted toward a match once its stored_mtime group has accumulated at
+    least that many drawers -- guarding against a mid-file crash between
+    upsert batches, where the surviving drawers share the current mtime
+    (the file itself was never touched) but are short of the full set. A
+    drawer with no ``chunk_total`` (legacy rows, or a single-shot
+    ``add_drawer()`` call with no partial-batch risk) is trusted on its own,
+    exactly as before.
     """
     try:
         # Under the additive-mining model, a single ``source_file`` can have
@@ -1471,6 +1500,9 @@ def file_already_mined(
         # first matching group regardless of ordering.
         current_mtime = os.path.getmtime(source_file) if check_mtime else None
         offset = 0
+        # Tracks, per matching stored_mtime group, how many drawers have
+        # been seen so far toward that group's own chunk_total (#21).
+        group_counts: dict = {}
         while True:
             results = collection.get(
                 where={"source_file": source_file},
@@ -1496,7 +1528,16 @@ def file_already_mined(
                 stored_mtime = meta.get("source_mtime")
                 if stored_mtime is None:
                     continue
-                if abs(float(stored_mtime) - current_mtime) < 0.001:
+                if abs(float(stored_mtime) - current_mtime) >= 0.001:
+                    continue
+                chunk_total = meta.get("chunk_total")
+                if chunk_total is None:
+                    # No completion marker on this drawer — can't verify
+                    # completeness for its group, trust the match as before.
+                    return True
+                seen = group_counts.get(stored_mtime, 0) + 1
+                group_counts[stored_mtime] = seen
+                if seen >= chunk_total:
                     return True
             if not ids:
                 break
@@ -1529,12 +1570,21 @@ def prefetch_mined_set(
     When extract_mode is set, mirrors file_already_mined(..., extract_mode=...)
     so conversation mines skip per extraction mode rather than per source file.
 
+    Completeness mirrors :func:`file_already_mined`'s ``chunk_total`` rule
+    (#2183): a source that only has a mid-file partial (surviving drawers
+    share the current mtime but are short of ``chunk_total``) is **omitted**
+    from the result so the bulk skip path re-mines instead of permanently
+    stranding the missing exchanges. Drawers with no ``chunk_total``
+    (legacy rows, registry sentinels) are trusted on their own, as before.
+
     The convo miner walks thousands of transcript files; per-file
     `collection.get(where={"source_file": X})` costs ~2s on a 150k-drawer
     palace, making a 2000-file sweep take >1h of pure skip-checking. This
     helper drops that to a single paginated scan plus O(1) lookups.
     """
-    mined: dict[str, Optional[float]] = {}
+    # Per source_file: per stored_mtime group → count + optional chunk_total.
+    # A source is only "mined" once some group is complete.
+    groups: dict[str, dict] = {}
     try:
         total = collection.count()
         offset = 0
@@ -1549,14 +1599,37 @@ def prefetch_mined_set(
                     continue
                 # Same default as file_already_mined: missing version == 1
                 version = meta.get("normalize_version", 1)
-                if version >= NORMALIZE_VERSION:
-                    stored_mtime = meta.get("source_mtime")
-                    mined[src] = float(stored_mtime) if stored_mtime is not None else None
+                if version < NORMALIZE_VERSION:
+                    continue
+                stored_mtime = meta.get("source_mtime")
+                mtime_key = float(stored_mtime) if stored_mtime is not None else None
+                entry = groups.setdefault(src, {}).setdefault(
+                    mtime_key, {"count": 0, "chunk_total": None}
+                )
+                entry["count"] += 1
+                chunk_total = meta.get("chunk_total")
+                if chunk_total is not None:
+                    try:
+                        entry["chunk_total"] = int(chunk_total)
+                    except (TypeError, ValueError):
+                        pass
             if not batch["ids"]:
                 break
             offset += len(batch["ids"])
     except Exception:
-        logger.warning("prefetch_mined_set: partial fetch, %d files loaded", len(mined))
+        logger.warning("prefetch_mined_set: partial fetch, %d source groups loaded", len(groups))
+
+    mined: dict[str, Optional[float]] = {}
+    for src, by_mtime in groups.items():
+        for mtime_key, entry in by_mtime.items():
+            chunk_total = entry["chunk_total"]
+            if chunk_total is None:
+                # Legacy / registry: no completion marker — trust membership.
+                mined[src] = mtime_key
+                break
+            if entry["count"] >= chunk_total:
+                mined[src] = mtime_key
+                break
     return mined
 
 
