@@ -95,7 +95,10 @@ def test_plugin_hook_wrapper_prefers_mempalace_cli(
 
     assert result.returncode == 0
     assert result.stdout == "{}\n"
-    assert args_file.read_text(encoding="utf-8") == f"hook run --hook {hook_name} --harness claude-code"
+    assert (
+        args_file.read_text(encoding="utf-8")
+        == f"hook run --hook {hook_name} --harness claude-code"
+    )
     assert stdin_file.read_text(encoding="utf-8") == payload
 
 

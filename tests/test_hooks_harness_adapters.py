@@ -522,3 +522,22 @@ def test_stop_hook_copilot_skips_non_end_turn_reason(tmp_path):
         )
     assert result == {}
     mock_save.assert_not_called()
+
+
+def test_grok_example_hooks_json_is_installable():
+    path = Path(__file__).resolve().parents[1] / "examples" / "grok" / "hooks.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    hooks = data["hooks"]
+    expected = {
+        "Stop": (30, "stop"),
+        "SessionEnd": (60, "session-end"),
+        "PreCompact": (90, "precompact"),
+    }
+    for event, (timeout, hook_name) in expected.items():
+        handler = hooks[event][0]["hooks"][0]
+        assert handler["type"] == "command"
+        assert handler["timeout"] == timeout
+        command = handler["command"]
+        assert f"--hook {hook_name}" in command
+        assert "--harness grok" in command
+        assert "auto" not in command
