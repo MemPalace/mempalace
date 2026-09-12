@@ -167,6 +167,21 @@ class EmbeddingCollection(BaseCollection):
     def lexical_search(self, *, query: str, n_results: int = 10, where: Optional[dict] = None):
         return self._inner.lexical_search(query=query, n_results=n_results, where=where)
 
+    def get_recent(
+        self,
+        *,
+        limit: int,
+        where: Optional[dict] = None,
+        order_field: str = "filed_at",
+        include: Optional[list[str]] = None,
+    ):
+        # Concrete on ``BaseCollection`` (the scan-and-sort default), so MRO
+        # would resolve it here and shadow a backend that pushes the ordering
+        # into storage. Forward explicitly.
+        return self._inner.get_recent(
+            limit=limit, where=where, order_field=order_field, include=include
+        )
+
     def facet_counts(
         self, field: str, where: Optional[dict] = None, limit: int = 1000
     ) -> dict[str, int]:
