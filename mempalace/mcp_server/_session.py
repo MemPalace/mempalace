@@ -430,12 +430,12 @@ def _fetch_all_metadata(col, where=None):
 
 
 def _supports_metadata_facets(col) -> bool:
-    """Return True if the collection's backend implements metadata facets."""
-    backend = getattr(col, "_backend", None)
-    if backend is None:
-        return False
-    capabilities = getattr(backend, "capabilities", None)
-    return isinstance(capabilities, (set, frozenset)) and "supports_metadata_facets" in capabilities
+    """Return True if the collection's backend implements metadata facets.
+
+    Kept as a module-level name (rather than importing the shared helper under
+    its own name) so the call sites below stay monkeypatchable per-module.
+    """
+    return collection_supports_facets(col)
 
 
 _metadata_cache = None

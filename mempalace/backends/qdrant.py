@@ -53,6 +53,10 @@ _MARKER_FILENAME = "qdrant_backend.json"
 _PAYLOAD_ID = "mempalace_id"
 _PAYLOAD_DOCUMENT = "document"
 _PAYLOAD_METADATA = "metadata"
+# Metadata fields we facet on (status/taxonomy) and filter on (dedup/skip
+# checks). qdrant needs a keyword payload index on each, or facet_counts()
+# raises "No appropriate index for faceting" and filtered reads full-scan.
+_INDEXED_METADATA_FIELDS = ("wing", "room", "source_file")
 _POINT_NAMESPACE = uuid.UUID("c06c3fc7-5c14-4dc4-84c2-24a5f72d8dc1")
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 # Page size for Qdrant's /points/scroll cursor. 4096 (up from the original
@@ -756,6 +760,7 @@ class QdrantCollection(BaseCollection):
                 self._client.create_payload_index(
                     self._remote_collection, _PAYLOAD_DOCUMENT, "text"
                 )
+                self._ensure_metadata_indexes()
                 self._known_dimension = dimension
                 return
             remote_dim = self._remote_dimension()
@@ -765,6 +770,27 @@ class QdrantCollection(BaseCollection):
                     f"embedding dimension {remote_dim}, got {dimension}"
                 )
             self._known_dimension = remote_dim or dimension
+            # Backfill for collections created before these indexes existed.
+            self._ensure_metadata_indexes()
+
+    def _ensure_metadata_indexes(self) -> None:
+        """Create keyword payload indexes for the metadata fields we facet and
+        filter on. Idempotent — ``create_payload_index`` ignores an index that
+        already exists — and best-effort: a failure here only means the
+        dependent op falls back to a slower scan, so it must never break a
+        write."""
+        for field in _INDEXED_METADATA_FIELDS:
+            try:
+                self._client.create_payload_index(
+                    self._remote_collection, f"{_PAYLOAD_METADATA}.{field}", "keyword"
+                )
+            except Exception:  # pragma: no cover - non-fatal best effort
+                logger.debug(
+                    "create_payload_index(metadata.%s) failed; facet/filter ops "
+                    "may fall back to a scan",
+                    field,
+                    exc_info=True,
+                )
 
     def _scroll_all(
         self,
@@ -1391,6 +1417,18 @@ class QdrantBackend(BaseBackend):
             collection_name=collection_name,
             remote_collection=remote_collection,
         )
+        # Write the local marker as soon as a populated remote collection is
+        # opened for write, not only on the first upsert. Otherwise CLI
+        # search/status (which gate on the marker's presence) refuse to touch a
+        # fully-populated shared collection until *this* host happens to write
+        # to it — a read-first client can't search a perfectly good palace.
+        if (
+            create
+            and palace.local_path
+            and not os.path.isfile(self._marker_path(palace.local_path))
+            and client.collection_exists(remote_collection)
+        ):
+            self._write_marker(palace, config)
         with self._lock:
             self._collections_by_palace.setdefault(palace.id, []).append(collection)
         return collection

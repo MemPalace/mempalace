@@ -34,6 +34,7 @@ from .base import (
     UnsupportedCapabilityError,
     UnsupportedFilterError,
     UnsupportedMaintenanceKindError,
+    collection_supports_facets,
 )
 from .chroma import ChromaBackend, ChromaCollection
 from .milvus import MilvusBackend, MilvusCollection
@@ -88,6 +89,7 @@ __all__ = [
     "UnsupportedFilterError",
     "UnsupportedMaintenanceKindError",
     "available_backends",
+    "collection_supports_facets",
     "detect_backend_for_path",
     "detect_backends_for_path",
     "get_backend",
