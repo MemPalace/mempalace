@@ -50,6 +50,7 @@ def test_dialect_compress_samples():
     samples = {
         "en": "We decided to migrate from SQLite to PostgreSQL for better concurrent writes. Ben approved the PR yesterday.",
         "fr": "Nous avons décidé de migrer de SQLite vers PostgreSQL pour une meilleure écriture concurrente. Ben a approuvé le PR hier.",
+        "uk": "Вирішили мігрувати з SQLite на PostgreSQL для кращого паралельного запису. Бен схвалив PR вчора.",
         "ko": "더 나은 동시 쓰기를 위해 SQLite에서 PostgreSQL로 마이그레이션하기로 했습니다. 벤이 어제 PR을 승인했습니다.",
         "ja": "同時書き込みの改善のため、SQLiteからPostgreSQLに移行することを決定しました。ベンが昨日PRを承認しました。",
         "es": "Decidimos migrar de SQLite a PostgreSQL para mejor escritura concurrente. Ben aprobó el PR ayer.",
