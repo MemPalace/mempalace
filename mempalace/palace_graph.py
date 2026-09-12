@@ -234,9 +234,36 @@ def build_graph(col=None, config=None):
     total = col.count()
     room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0, "dates": set()})
 
+    # Fast path: single-pass get_all_metadata() when the backend provides
+    # it (qdrant, #1796). The get(limit/offset) loop below re-walks the
+    # ENTIRE collection from the start on every page for remote backends
+    # (each get() is a full _scroll_all() materialization), turning the
+    # graph build into O(n^2) scroll traffic — minutes of hang on a 91K
+    # palace, which also blocks the single-threaded stdio MCP queue.
+    meta_iter = None
+    get_all_metadata = getattr(col, "get_all_metadata", None)
+    if callable(get_all_metadata):
+        try:
+            all_meta = get_all_metadata()
+            # list-check guards against auto-attrs (MagicMock) and
+            # half-implemented backends: fall back to the loop, not crash
+            if isinstance(all_meta, list):
+                meta_iter = iter(all_meta)
+        except Exception:
+            meta_iter = None
+
     offset = 0
     while offset < total:
-        batch = col.get(limit=1000, offset=offset, include=["metadatas"])
+        if meta_iter is not None:
+            metas = []
+            for _ in range(1000):
+                try:
+                    metas.append(next(meta_iter))
+                except StopIteration:
+                    break
+            batch = {"ids": metas, "metadatas": metas}
+        else:
+            batch = col.get(limit=1000, offset=offset, include=["metadatas"])
         for meta in batch["metadatas"]:
             # ChromaDB can return ``None`` for drawers without metadata
             # (legacy data, partial writes — upstream #1020 territory).

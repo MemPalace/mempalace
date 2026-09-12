@@ -408,3 +408,44 @@ def test_2288_graph_stats_preserve_room_names_and_count_room_instances():
         "matlab-drive",
         "octopus",
     }
+
+
+# --- build_graph: get_all_metadata fast path (qdrant, #1796) ---
+
+def test_build_graph_uses_single_pass_metadata_when_available():
+    """Backends exposing get_all_metadata must not be read via the
+    offset-paginated get() loop: on remote backends each get() re-walks
+    the whole collection (O(n^2)). Regression test for the 91K-palace
+    graph hang (2026-09-03)."""
+    invalidate_graph_cache()
+    metas = [
+        {"wing": f"wing_{i % 3}", "room": f"room_{i % 5}", "date": "2026-09-03"}
+        for i in range(10)
+    ] + [None]  # None-metadata rows must be skipped silently
+    col = _make_fake_collection(metas)
+    # Backend contract: get_all_metadata returns bare metadata list
+    provided = [m for m in metas if m is not None]
+    col.get_all_metadata.return_value = provided
+
+    nodes, edges = build_graph(col)
+
+    assert col.get.call_count == 0, "fast path must not touch get()"
+    assert col.get_all_metadata.call_count == 1
+    assert set(nodes) == {f"room_{i % 5}" for i in range(10)}
+    invalidate_graph_cache()
+
+
+def test_build_graph_falls_back_to_get_loop_without_get_all_metadata():
+    """Chroma-style collections (no get_all_metadata) keep the legacy
+    offset-paginated path."""
+    invalidate_graph_cache()
+    metas = [{"wing": "w", "room": "r", "date": "2026-09-03"}] * 3
+    col = _make_fake_collection(metas)
+    # MagicMock exposes get_all_metadata by default — remove it
+    delattr(col, "get_all_metadata")
+
+    nodes, edges = build_graph(col)
+
+    assert col.get.called
+    assert "r" in nodes
+    invalidate_graph_cache()
