@@ -114,6 +114,16 @@ class PalaceContext:
         advancing past the item."""
         self._skip_requested = True
 
+    def is_skip_requested(self) -> bool:
+        """Return whether :meth:`skip_current_item` was called since the last
+        time core advanced past an item. Adapters check this between the
+        ``SourceItemMetadata`` yield and the cost of processing the item — if
+        core has signaled skip (because :meth:`is_current` returned True), the
+        adapter can bail out of expensive work (SQL queries, chunking, etc.)
+        rather than waiting for core to drop drawers downstream. Core resets
+        the flag on its own; adapters MUST NOT clear it."""
+        return self._skip_requested
+
     def emit(self, event: str, **details: Any) -> None:
         """Invoke each registered progress hook with ``(event, **details)``."""
         for hook in self.progress_hooks:
