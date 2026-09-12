@@ -746,6 +746,10 @@ def test_read_text_no_follow_retries_when_a_lease_break_returns_eagain(tmp_path,
     calls = {"n": 0}
 
     def _fake_open(path, flags, *args, **kwargs):
+        # os is a process-wide module, so background library activity also
+        # reaches this mock. Inject/count only opens of this fixture.
+        if os.fspath(path) != os.fspath(target):
+            return real_open(path, flags, *args, **kwargs)
         calls["n"] += 1
         if calls["n"] == 1:
             assert flags & os.O_NONBLOCK, "first attempt should carry the flag"
@@ -760,6 +764,9 @@ def test_read_text_no_follow_retries_when_a_lease_break_returns_eagain(tmp_path,
     content, mtime = result
     assert content == payload
     assert mtime == os.path.getmtime(target)
+    # An unrelated open must not affect the retry count (CI runs other workers).
+    unrelated = os.open(tmp_path, os.O_RDONLY)
+    os.close(unrelated)
     assert calls["n"] == 2
 
 
