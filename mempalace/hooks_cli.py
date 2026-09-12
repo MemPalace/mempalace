@@ -1279,6 +1279,12 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
     match = re.search(r"/\.claude/projects/-([^/]+)", normalized)
     if match:
         encoded = match.group(1)
+        # "<project>/.claude/worktrees/<wt>" flattens to "-<project>--claude-worktrees-<wt>"
+        # here; collapse it to <project> like _wing_from_jsonl_cwd already does for cwd,
+        # or every worktree spawns its own wing.
+        _wt_marker = "-claude-worktrees-"
+        if _wt_marker in encoded:
+            encoded = encoded.split(_wt_marker, 1)[0]
         # Strip platform user-home prefix so the wing isn't dominated by
         # /Users/<user>/ or /home/<user>/.
         m = re.match(r"(?:Users|home)-[^-]+-(.+)", encoded)

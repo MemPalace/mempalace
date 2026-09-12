@@ -942,7 +942,12 @@ def dispatch_light_stdio_request(request: Dict[str, Any]) -> Optional[Dict[str, 
         if rewritten is not None:
             forwarded = {k: v for k, v in rewritten.items() if not k.startswith("_")}
             underlying = ((forwarded.get("params") or {}).get("name")) or ""
-            refusal = mcp_server._mcp_tool_preflight_refusal(request.get("id"), underlying)
+            # The destination owns the lease: hub forwarding must not first
+            # compete for the hub's local writer lock. Local dispatch still
+            # runs the full gate inside handle_request, as does the hub.
+            refusal = mcp_server._mcp_tool_preflight_refusal(
+                request.get("id"), underlying, check_writer=False
+            )
             if refusal is not None:
                 return refusal
             try:

@@ -1271,6 +1271,29 @@ def _detached_kwargs(log_path: Path) -> dict[str, Any]:
     return kwargs
 
 
+def _registered_pid(palace_path: str) -> int | None:
+    """Pid recorded by the last daemon that registered for ``palace_path``.
+
+    Reads ``endpoint.json`` first (written together with the pid file by
+    ``run_server``), then the bare pid file, so a partially written
+    registration still yields the pid. Returns None when nothing is registered
+    or the value is not an int.
+    """
+    try:
+        pid = _read_endpoint(palace_path).get("pid")
+    except DaemonError:
+        pid = None
+    if pid is None:
+        try:
+            pid = pid_path(palace_path).read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+    try:
+        return int(pid)
+    except (TypeError, ValueError):
+        return None
+
+
 def start_daemon(
     palace_path: str,
     *,
@@ -1310,6 +1333,19 @@ def start_daemon(
                 return existing
             # The other starter failed without bringing the daemon up; fall
             # through and spawn ourselves (we now hold the lock).
+
+    # The health probe above can fail while the registered daemon is alive but
+    # busy (a long mine) or wedged. Its process still owns the palace lock, so
+    # a replacement would die at startup -- and unlinking the registration
+    # first would leave the live owner unreachable (#2442). Refuse instead of
+    # spawning; ``daemon stop`` is the explicit way to replace it.
+    registered_pid = _registered_pid(palace_path)
+    if registered_pid is not None and _pid_alive(registered_pid):
+        raise DaemonError(
+            f"daemon pid {registered_pid} is running but did not answer the "
+            "health probe (busy or wedged); not starting a second one. "
+            "Retry later or run `mempalace daemon stop` first."
+        )
 
     for stale in (endpoint_path(palace_path), pid_path(palace_path)):
         try:

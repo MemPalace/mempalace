@@ -219,6 +219,7 @@ class TestSearchMemories:
             "/fake/path",
             collection_name="custom_drawers",
             create=False,
+            read_only=True,
         )
 
     def test_search_memories_filters_in_result(self, palace_path, seeded_collection):
@@ -239,7 +240,7 @@ class TestSearchMemories:
             "ids": [["d1", "d2"]],
         }
 
-        def mock_get_collection(path, collection_name=None, create=False):
+        def mock_get_collection(path, collection_name=None, create=False, read_only=False):
             # First call: drawers. Second call: closets — raise so hybrid
             # degrades to pure drawer search (the catch block covers it).
             if not hasattr(mock_get_collection, "_called"):
@@ -802,7 +803,7 @@ class TestSearchCLI:
                 search("anything", fake_palace_path)
 
         mock_probe.assert_not_called()
-        mock_open.assert_called_once_with(fake_palace_path, opener=get_collection)
+        mock_open.assert_called_once_with(fake_palace_path, opener=get_collection, read_only=True)
 
 
 # ── _tokenize stop-word filter ─────────────────────────────────────────
