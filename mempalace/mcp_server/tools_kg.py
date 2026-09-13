@@ -227,15 +227,35 @@ def tool_kg_supersede(
     }
 
 
-def tool_kg_timeline(entity: str = None):
-    """Get chronological timeline of facts, optionally for one entity."""
+def tool_kg_timeline(entity: str = None, limit: int = 100, offset: int = 0):
+    """Get chronological timeline of facts, optionally for one entity.
+
+    Paginated with ``limit``/``offset`` following the ``tool_list_drawers``
+    convention; defaults match the historical behavior (first 100 facts).
+    """
+    limit = max(1, min(limit, _MAX_RESULTS))
+    offset = max(0, offset)
     if entity is not None:
         try:
             entity = sanitize_kg_value(entity, "entity")
         except ValueError as e:
             return {"error": str(e)}
-    results = _call_kg(lambda kg: kg.timeline(entity))
-    return {"entity": entity or "all", "timeline": results, "count": len(results)}
+
+    def _query(kg):
+        return {
+            "timeline": kg.timeline(entity, limit=limit, offset=offset),
+            "total": kg.timeline_total(entity),
+        }
+
+    result = _call_kg(_query)
+    return {
+        "entity": entity or "all",
+        "timeline": result["timeline"],
+        "count": len(result["timeline"]),
+        "total": result["total"],
+        "offset": offset,
+        "limit": limit,
+    }
 
 
 def tool_kg_stats():
