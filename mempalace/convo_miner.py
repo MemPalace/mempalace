@@ -720,8 +720,36 @@ def _active_drawer_generation_token(existing: dict) -> Optional[str]:
     return token if isinstance(token, str) else None
 
 
-def _is_append_only_growth(planned_chunks, existing) -> bool:
-    """True when this pass only adds new logical drawers to an existing set."""
+def _is_committed_active_drawer(meta: dict, active_token: Optional[str]) -> bool:
+    """True when a stored drawer belongs to the currently committed generation.
+
+    Tokenless leftover rows from a failed A→B cleanup are not active once a
+    later generation carries a token. Append-only token reuse needs a real
+    committed row so a B→A reversion cannot retag retired A with B's token.
+    """
+    if not isinstance(meta, dict):
+        return False
+    token = meta.get("mine_generation_token")
+    if active_token:
+        return token == active_token
+    if meta.get("mine_staged") is True:
+        return False
+    return not token
+
+
+def _committed_active_matches(matches, active_token: Optional[str]):
+    return [match for match in matches if _is_committed_active_drawer(match[1], active_token)]
+
+
+def _is_append_only_growth(planned_chunks, existing, active_token: Optional[str] = None) -> bool:
+    """True when this pass only adds new logical drawers to the committed set.
+
+    Matching leftover content is not enough. A failed A→B cleanup can leave
+    tokenless A beside committed B; a later B→A reversion plus append would
+    otherwise look like append-only growth and retag retired A with B's token.
+    Reused matches must be committed active rows so repeated appends stay
+    incremental without reviving obsolete text.
+    """
     if not existing or not planned_chunks:
         return False
     planned_logical = {item["logical_drawer_id"] for item in planned_chunks}
@@ -730,9 +758,14 @@ def _is_append_only_growth(planned_chunks, existing) -> bool:
             continue
         if _drawer_logical_id(physical_id, meta) not in planned_logical:
             return False
-    if any(item["candidates"] and not item["matches"] for item in planned_chunks):
+    if any(
+        item["candidates"] and not _committed_active_matches(item["matches"], active_token)
+        for item in planned_chunks
+    ):
         return False
-    return any(not item["matches"] for item in planned_chunks)
+    return any(
+        not _committed_active_matches(item["matches"], active_token) for item in planned_chunks
+    )
 
 
 def _reused_generation_copy_id(logical_drawer_id: str, generation_token: str) -> str:
@@ -1016,8 +1049,10 @@ def _plan_convo_generation_writes(
     # Repeated appends must not mint a new content-set token: that would clone
     # every unchanged active row onto new physical ids and delete the old
     # ones. Reuse the committed token so vectors stay in place; new rows still
-    # inherit it so a later failed shrink cleanup can hide them.
-    if _is_append_only_growth(planned_chunks, existing) and active_token:
+    # inherit it so a later failed shrink cleanup can hide them. Matching
+    # leftover content is not enough — the reused rows must already belong
+    # to that committed generation.
+    if _is_append_only_growth(planned_chunks, existing, active_token) and active_token:
         generation_token = active_token
     else:
         generation_token = content_set_token
@@ -1045,10 +1080,11 @@ def _plan_convo_generation_writes(
     # The first complete mine stays tokenless so those rows remain genuine
     # legacy. The first growth publishes a content-set token so appended rows
     # are not tokenless legacy if a later shrink's stale delete fails. Later
-    # append-only growth reuses that active token instead of cloning. A
-    # rewrite/shrink that publishes a new content-set token must clone reused
-    # rows that still carry the previous token; updating those ids in place
-    # would hide them for the duration of the switch.
+    # append-only growth reuses that active token instead of cloning, but
+    # only when the matching rows already belong to it. A rewrite/shrink that
+    # publishes a new content-set token must clone reused rows that still
+    # carry the previous token; updating those ids in place would hide them
+    # for the duration of the switch.
     has_new_rows = any(kind == "upsert" for kind, *_ in tentative)
     will_publish = (
         pending_cleanup

@@ -598,6 +598,133 @@ def test_plan_reuses_active_token_for_append_only_growth(monkeypatch):
     assert content_set_token != active
 
 
+def test_plan_does_not_reuse_token_when_append_matches_retired_tokenless(monkeypatch):
+    """Failed A→B cleanup leaves tokenless A beside committed B.
+
+    A later B→A reversion plus append must not treat leftover A as an
+    append-only match; that would retag A with B's token.
+    """
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    active = "b-token"
+    leftover_a = {
+        "logical_drawer_id": "drawer-a",
+        "chunk_hash": "hash-a",
+        "mine_staged": False,
+        "chunk_index": 0,
+    }
+    committed_b = {
+        "logical_drawer_id": "drawer-a",
+        "chunk_hash": "hash-b",
+        "mine_generation_token": active,
+        "mine_staged": False,
+        "chunk_index": 0,
+    }
+    existing = {"drawer-a": leftover_a, "drawer-a-b": committed_b}
+    planned = [
+        {
+            "chunk": {"content": "A", "chunk_index": 0},
+            "chunk_room": "general",
+            "logical_drawer_id": "drawer-a",
+            "chunk_hash": "hash-a",
+            "candidates": [("drawer-a", leftover_a), ("drawer-a-b", committed_b)],
+            "matches": [("drawer-a", leftover_a)],
+        },
+        _plan_chunk("drawer-c", "hash-c", "C", 1),
+    ]
+    assert convo_miner._is_append_only_growth(planned, existing, active) is False
+    to_upsert, to_touch, to_copy, new_ids, token, will_publish = _plan_writes(
+        planned, existing, pending_cleanup=True
+    )
+
+    assert token != active
+    assert will_publish is True
+    assert "drawer-a-b" not in new_ids
+    assert [row_id for row_id, _, _ in to_upsert] == ["drawer-c"]
+    assert {row_id for row_id, _ in to_touch} == {"drawer-a"}
+    assert to_copy == []
+    content_set_token = convo_miner._content_set_generation_token(
+        [(item["logical_drawer_id"], item["chunk_hash"]) for item in planned]
+    )
+    assert token == content_set_token
+
+
+def test_plan_reuses_active_token_when_leftover_tokenless_is_not_the_match(monkeypatch):
+    """True B appends stay incremental even if tokenless A was left behind."""
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    active = "b-token"
+    leftover_a = {
+        "logical_drawer_id": "drawer-a",
+        "chunk_hash": "hash-a",
+        "mine_staged": False,
+        "chunk_index": 0,
+    }
+    committed_b = {
+        "logical_drawer_id": "drawer-a",
+        "chunk_hash": "hash-b",
+        "mine_generation_token": active,
+        "mine_staged": False,
+        "chunk_index": 0,
+    }
+    existing = {"drawer-a": leftover_a, "drawer-a-b": committed_b}
+    planned = [
+        {
+            "chunk": {"content": "B", "chunk_index": 0},
+            "chunk_room": "general",
+            "logical_drawer_id": "drawer-a",
+            "chunk_hash": "hash-b",
+            "candidates": [("drawer-a", leftover_a), ("drawer-a-b", committed_b)],
+            "matches": [("drawer-a-b", committed_b)],
+        },
+        _plan_chunk("drawer-c", "hash-c", "C", 1),
+    ]
+    assert convo_miner._is_append_only_growth(planned, existing, active) is True
+    to_upsert, to_touch, to_copy, new_ids, token, will_publish = _plan_writes(planned, existing)
+
+    assert token == active
+    assert will_publish is True
+    assert to_copy == []
+    assert {row_id for row_id, _ in to_touch} == {"drawer-a-b"}
+    assert [row_id for row_id, _, _ in to_upsert] == ["drawer-c"]
+    assert new_ids == {"drawer-a-b", "drawer-c"}
+    assert "drawer-a" not in new_ids
+
+
+def test_plan_reuses_active_token_when_pending_append_rows_are_still_staged(monkeypatch):
+    """A crash after staging the tail must still reuse the active token."""
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    active = "active-token"
+    existing = {
+        "drawer-a": {
+            "logical_drawer_id": "drawer-a",
+            "chunk_hash": "hash-a",
+            "mine_generation_token": active,
+            "mine_staged": False,
+        },
+        "drawer-b": {
+            "logical_drawer_id": "drawer-b",
+            "chunk_hash": "hash-b",
+            "mine_generation_token": active,
+            "mine_staged": True,
+        },
+    }
+    planned = [
+        _plan_chunk("drawer-a", "hash-a", "A", 0, existing["drawer-a"]),
+        _plan_chunk("drawer-b", "hash-b", "B", 1, existing["drawer-b"]),
+        _plan_chunk("drawer-c", "hash-c", "C", 2),
+    ]
+    assert convo_miner._is_append_only_growth(planned, existing, active) is True
+    to_upsert, to_touch, to_copy, new_ids, token, will_publish = _plan_writes(
+        planned, existing, pending_cleanup=True
+    )
+
+    assert token == active
+    assert will_publish is True
+    assert to_copy == []
+    assert {row_id for row_id, _ in to_touch} == {"drawer-a", "drawer-b"}
+    assert [row_id for row_id, _, _ in to_upsert] == ["drawer-c"]
+    assert new_ids == {"drawer-a", "drawer-b", "drawer-c"}
+
+
 def test_plan_reuses_active_token_when_append_retry_has_pending_cleanup(monkeypatch):
     monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
     active = "active-token"
@@ -811,3 +938,78 @@ def test_repeated_appends_keep_active_rows_in_place_and_hide_on_failed_shrink(
     assert mine(collection, initial)[2] is False
     _assert_all_read_paths(collection, source, hidden_after_shrink)
     assert collection.embedded_documents == []
+
+
+def test_failed_rewrite_cleanup_then_revert_append_exposes_newest_text(tmp_path, monkeypatch):
+    """Legacy A → B cleanup fail, then A+append cleanup fail, must show A+append.
+
+    If append-only reuse retags tokenless A with B's token and the B delete
+    fails again, logical reads would prefer newer-filed B and expose obsolete
+    text. Newest wanted text must be visible immediately and after retry.
+    """
+    source = str(tmp_path / "session.txt")
+    (tmp_path / "session.txt").write_text("transcript", encoding="utf-8")
+    monkeypatch.setattr(convo_miner, "mine_lock", lambda *_: contextlib.nullcontext())
+    monkeypatch.setattr(convo_miner, "file_already_mined", lambda *_a, **_k: False)
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 1)
+
+    def mine(collection, documents):
+        chunks = [{"content": text, "chunk_index": index} for index, text in enumerate(documents)]
+        return convo_miner._file_chunks_locked(
+            collection, source, chunks, "wing", "general", "agent", "exchange"
+        )
+
+    class DeleteFailingCollection(GenerationCollection):
+        def __init__(self):
+            super().__init__()
+            self.fail_delete = False
+
+        def delete(self, ids):
+            if self.fail_delete:
+                raise InjectedWriteFailure("stale delete failed")
+            super().delete(ids)
+
+    legacy_a = ["alpha first chunk", "alpha second chunk", "alpha third chunk"]
+    rewritten_b = ["beta first chunk", "beta second chunk", "beta third chunk"]
+    wanted = [*legacy_a, "alpha appended chunk"]
+    collection = DeleteFailingCollection()
+    assert mine(collection, legacy_a)[2] is False
+    _assert_all_read_paths(collection, source, legacy_a)
+    tokenless_a_ids = [
+        key
+        for key, row in _non_marker_rows(collection).items()
+        if not row["metadata"].get("mine_generation_token")
+    ]
+    assert tokenless_a_ids
+
+    collection.fail_delete = True
+    skipped = mine(collection, rewritten_b)[2]
+    assert skipped is True
+    assert all(key in collection.rows for key in tokenless_a_ids)
+    _assert_all_read_paths(collection, source, rewritten_b)
+    commit_id = make_convo_commit_id(source, "exchange")
+    b_token = collection.rows[commit_id]["metadata"]["mine_generation_commit"]
+    assert b_token
+    assert all(
+        not collection.rows[key]["metadata"].get("mine_generation_token") for key in tokenless_a_ids
+    )
+    b_ids = [
+        key
+        for key, row in _non_marker_rows(collection).items()
+        if row["metadata"].get("mine_generation_token") == b_token
+    ]
+    assert b_ids
+
+    collection.fail_delete = True
+    skipped = mine(collection, wanted)[2]
+    assert skipped is True
+    assert all(key in collection.rows for key in b_ids)
+    for key in tokenless_a_ids:
+        assert collection.rows[key]["metadata"].get("mine_generation_token") != b_token
+    _assert_all_read_paths(collection, source, wanted)
+
+    collection.fail_delete = False
+    assert mine(collection, wanted)[2] is False
+    _assert_all_read_paths(collection, source, wanted)
+    assert all(key not in collection.rows for key in b_ids)
