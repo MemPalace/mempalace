@@ -173,12 +173,18 @@ def _record_text(entry: dict) -> str:
 
 
 def _is_grok_user_turn(entry: dict) -> bool:
-    """Grok chat_history.jsonl: real prompts carry prompt_index; synthetics do not."""
+    """Grok chat_history.jsonl: real prompts, not synthetics or user_info.
+
+    Fresh turns carry ``prompt_index``. Compacted resumes often omit it but
+    still wrap the typed prompt in ``<user_query>``.
+    """
     if entry.get("type") != "user":
         return False
     if entry.get("synthetic_reason"):
         return False
-    return "prompt_index" in entry
+    if "prompt_index" in entry:
+        return True
+    return "<user_query>" in _record_text(entry)
 
 
 def _copilot_user_text(entry: dict) -> str:
@@ -1359,18 +1365,134 @@ def _grok_sessions_root() -> Path:
     return Path(home).expanduser() / "sessions"
 
 
-def _find_grok_chat_history(
+def _find_grok_session_dir(
     session_id: str, cwd: str, sessions_root: Optional[Path] = None
 ) -> Optional[Path]:
     if not session_id:
         return None
     root = sessions_root or _grok_sessions_root()
     if cwd:
-        candidate = root / quote(cwd, safe="") / session_id / "chat_history.jsonl"
-        if candidate.is_file():
+        candidate = root / quote(cwd, safe="") / session_id
+        if candidate.is_dir():
             return candidate
-    matches = sorted(root.glob(f"*/{session_id}/chat_history.jsonl"))
-    return matches[0] if matches else None
+    for name in ("events.jsonl", "chat_history.jsonl"):
+        matches = sorted(p.parent for p in root.glob(f"*/{session_id}/{name}"))
+        if matches:
+            return matches[0]
+    return None
+
+
+def _find_grok_chat_history(
+    session_id: str, cwd: str, sessions_root: Optional[Path] = None
+) -> Optional[Path]:
+    session_dir = _find_grok_session_dir(session_id, cwd, sessions_root=sessions_root)
+    if session_dir is None:
+        return None
+    history = session_dir / "chat_history.jsonl"
+    return history if history.is_file() else None
+
+
+def _find_grok_events(
+    session_id: str, cwd: str, sessions_root: Optional[Path] = None
+) -> Optional[Path]:
+    session_dir = _find_grok_session_dir(session_id, cwd, sessions_root=sessions_root)
+    if session_dir is None:
+        return None
+    events = session_dir / "events.jsonl"
+    return events if events.is_file() else None
+
+
+def _count_grok_event_turns(events_path: str) -> int:
+    """Count ``turn_started`` events. Written at turn start, before Stop."""
+    path = Path(events_path)
+    if not path.is_file():
+        return 0
+    count = 0
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(entry, dict) and entry.get("type") == "turn_started":
+                    count += 1
+    except OSError:
+        return 0
+    return count
+
+
+def _grok_turn_count(parsed: dict, sessions_root: Optional[Path] = None) -> int:
+    """Turn count that does not depend on chat_history.jsonl being flushed.
+
+    Live Grok Stop runs at turn_ended while chat_history.jsonl is still
+    unflushed, so a history-only count is always 0. events.jsonl already
+    has turn_started for the current turn.
+    """
+    sid = str(parsed.get("session_id") or "")
+    cwd = str(parsed.get("cwd") or "")
+    history = _find_grok_chat_history(sid, cwd, sessions_root=sessions_root)
+    events = _find_grok_events(sid, cwd, sessions_root=sessions_root)
+    hist = _count_human_messages(str(history)) if history else 0
+    ev = _count_grok_event_turns(str(events)) if events else 0
+    return max(hist, ev)
+
+
+_GROK_DEFERRED_SAVE_ENV = "MEMPALACE_GROK_DEFERRED_SAVE"
+_GROK_HISTORY_WAIT_S = 5.0
+
+
+def _wait_for_grok_chat_history(
+    parsed: dict,
+    sessions_root: Optional[Path] = None,
+    timeout_s: float = _GROK_HISTORY_WAIT_S,
+) -> Optional[Path]:
+    sid = str(parsed.get("session_id") or "")
+    cwd = str(parsed.get("cwd") or "")
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    found = None
+    while True:
+        found = _find_grok_chat_history(sid, cwd, sessions_root=sessions_root)
+        if found and _count_human_messages(str(found)) > 0:
+            return found
+        if time.monotonic() >= deadline:
+            return found
+        time.sleep(0.05)
+
+
+def _spawn_deferred_grok_save(data: dict) -> bool:
+    """Rerun Stop after chat_history.jsonl is flushed. Must not block this Stop."""
+    if os.environ.get(_GROK_DEFERRED_SAVE_ENV):
+        return False
+    env = os.environ.copy()
+    env[_GROK_DEFERRED_SAVE_ENV] = "1"
+    kwargs = _detached_popen_kwargs()
+    kwargs["stdin"] = subprocess.PIPE
+    kwargs["stdout"] = subprocess.DEVNULL
+    kwargs["stderr"] = subprocess.DEVNULL
+    try:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "mempalace",
+                "hook",
+                "run",
+                "--hook",
+                "stop",
+                "--harness",
+                "grok",
+            ],
+            env=env,
+            **kwargs,
+        )
+        if proc.stdin is not None:
+            proc.stdin.write(json.dumps(data).encode("utf-8"))
+            proc.stdin.close()
+    except OSError as exc:
+        _log(f"WARNING: could not spawn deferred Grok save: {exc}")
+        return False
+    return True
 
 
 def _copilot_sessions_root() -> Path:
@@ -1585,6 +1707,10 @@ def hook_stop(data: dict, harness: str):
         _output({})
         return
     transcript_path = _locate_transcript(harness, parsed)
+    if harness == "grok" and os.environ.get(_GROK_DEFERRED_SAVE_ENV):
+        waited = _wait_for_grok_chat_history(parsed)
+        if waited:
+            transcript_path = str(waited)
 
     # Respect auto_save config toggle (clean opt-out)
     if not MempalaceConfig().hooks_auto_save:
@@ -1608,8 +1734,12 @@ def hook_stop(data: dict, harness: str):
             _output({})
             return
 
-    # Count human messages
-    exchange_count = _count_human_messages(transcript_path)
+    # Count human messages. Grok Stop runs before chat_history.jsonl is
+    # flushed; events.jsonl turn_started is already on disk.
+    if harness == "grok":
+        exchange_count = _grok_turn_count(parsed)
+    else:
+        exchange_count = _count_human_messages(transcript_path)
 
     # Track last save point
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1646,6 +1776,15 @@ def hook_stop(data: dict, harness: str):
             project_wing = _project_wing(parsed, transcript_path)
 
             if silent:
+                if harness == "grok" and (
+                    not transcript_path or _count_human_messages(transcript_path) == 0
+                ):
+                    if _spawn_deferred_grok_save(data):
+                        _log(
+                            f"Deferred Grok save; chat_history unflushed at exchange {exchange_count}"
+                        )
+                        _output({})
+                        return
                 # Save directly via Python API — systemMessage renders in terminal
                 result = {"count": 0}
                 if transcript_path:

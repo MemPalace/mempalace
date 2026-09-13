@@ -234,6 +234,57 @@ def test_count_grok_prompt_index_turns_skips_synthetic(tmp_path):
     assert _count_human_messages(str(transcript)) == 2
 
 
+def test_count_grok_user_query_without_prompt_index(tmp_path):
+    """Compacted Grok resumes omit prompt_index on the real user_query."""
+    transcript = tmp_path / "chat_history.jsonl"
+    _write_grok_history(
+        transcript,
+        [
+            _grok_user("<user_info>\nWorkspace Path: /tmp/proj\n</user_info>"),
+            _grok_user("<user_query>\nIs it ok to use tailscale?\n</user_query>"),
+            _grok_user("<system-reminder>skills</system-reminder>", synthetic="system_reminder"),
+        ],
+    )
+    assert _count_human_messages(str(transcript)) == 1
+
+
+def _write_grok_events(path: Path, turn_count: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        json.dumps({"type": "turn_started", "turn_number": i, "session_id": "s"}) + "\n"
+        for i in range(turn_count)
+    ]
+    path.write_text("".join(lines), encoding="utf-8")
+
+
+def test_grok_turn_count_uses_events_when_chat_history_unflushed(tmp_path):
+    cwd = "/Users/vijay/Projects/mempalace"
+    sid = "unflushed"
+    dest = tmp_path / quote(cwd, safe="") / sid
+    _write_grok_events(dest / "events.jsonl", 15)
+    count = hooks_cli_mod._grok_turn_count(
+        {"session_id": sid, "cwd": cwd, "harness": "grok"},
+        sessions_root=tmp_path,
+    )
+    assert count == 15
+
+
+def test_grok_turn_count_prefers_max_of_history_and_events(tmp_path):
+    cwd = "/Users/vijay/Projects/mempalace"
+    sid = "mixed"
+    dest = tmp_path / quote(cwd, safe="") / sid
+    _write_grok_history(
+        dest / "chat_history.jsonl",
+        [_grok_user("<user_query>\nq\n</user_query>", prompt_index=0)],
+    )
+    _write_grok_events(dest / "events.jsonl", 4)
+    count = hooks_cli_mod._grok_turn_count(
+        {"session_id": sid, "cwd": cwd, "harness": "grok"},
+        sessions_root=tmp_path,
+    )
+    assert count == 4
+
+
 def test_extract_grok_strips_user_query_tags(tmp_path):
     transcript = tmp_path / "chat_history.jsonl"
     _write_grok_history(
@@ -306,6 +357,36 @@ def test_stop_hook_grok_saves_at_interval(tmp_path):
     kwargs = mock_save.call_args.kwargs
     assert kwargs["agent_name"] == "grok"
     assert kwargs["wing"] == "wing_engram"
+
+
+def test_stop_hook_grok_defers_save_when_history_unflushed(tmp_path):
+    """Live Grok Stop fires before chat_history.jsonl is flushed.
+
+    events.jsonl already has turn_started; counting that must reach the
+    interval and spawn a deferred save instead of logging 0 exchanges.
+    """
+    cwd = "/Users/vijay/Projects/mempalace"
+    sid = "unflushed-stop"
+    dest = tmp_path / "sessions" / quote(cwd, safe="") / sid
+    _write_grok_events(dest / "events.jsonl", SAVE_INTERVAL)
+    with patch("mempalace.hooks_cli._save_diary_direct") as mock_save:
+        with patch.object(hooks_cli_mod, "_grok_sessions_root", return_value=tmp_path / "sessions"):
+            with patch.object(
+                hooks_cli_mod, "_spawn_deferred_grok_save", return_value=True
+            ) as mock_defer:
+                result = _capture_hook_output(
+                    hook_stop,
+                    {
+                        "sessionId": sid,
+                        "cwd": cwd,
+                        "reason": "end_turn",
+                    },
+                    harness="grok",
+                    state_dir=tmp_path,
+                )
+    assert result == {}
+    mock_save.assert_not_called()
+    mock_defer.assert_called_once()
 
 
 def test_harness_notice_output_grok_is_empty():
