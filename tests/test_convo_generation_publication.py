@@ -1574,6 +1574,58 @@ def test_plan_reuses_active_token_when_pending_append_tail_is_unpublished(monkey
     assert new_ids == {"drawer-a", "drawer-b", "drawer-c"}
 
 
+def test_plan_restages_recovered_pending_tail_when_transcript_grows(monkeypatch):
+    """Unchanged first-round pending rows stay in to_touch and restage in place."""
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    active = "active-token"
+    tail = "tail-token"
+    existing = {
+        "drawer-a": {
+            "logical_drawer_id": "drawer-a",
+            "chunk_hash": "hash-a",
+            "mine_generation_token": active,
+            "mine_staged": False,
+        },
+        "drawer-b": {
+            "logical_drawer_id": "drawer-b",
+            "chunk_hash": "hash-b",
+            "mine_generation_token": tail,
+            "mine_staged": True,
+        },
+    }
+    planned = [
+        _plan_chunk("drawer-a", "hash-a", "A", 0, existing["drawer-a"]),
+        _plan_chunk("drawer-b", "hash-b", "B", 1, existing["drawer-b"]),
+        _plan_chunk("drawer-c", "hash-c", "C", 2),
+        _plan_chunk("drawer-d", "hash-d", "D", 3),
+    ]
+    to_upsert, to_touch, to_copy, new_ids, token, will_publish = _plan_writes(
+        planned, existing, pending_cleanup=True, active_token=active
+    )
+    staging = convo_miner._append_staging_token(token, active, planned)
+
+    assert token == active
+    assert will_publish is True
+    assert to_copy == []
+    assert {row_id for row_id, _ in to_touch} == {"drawer-a", "drawer-b"}
+    assert [row_id for row_id, _, _ in to_upsert] == ["drawer-c", "drawer-d"]
+    assert new_ids == {"drawer-a", "drawer-b", "drawer-c", "drawer-d"}
+    assert staging not in {active, tail}
+
+    restage = convo_miner._pending_append_rows_to_restage(
+        to_touch, existing=existing, staging_token=staging
+    )
+    assert [row_id for row_id, _ in restage] == ["drawer-b"]
+    restaged_meta = restage[0][1]
+    assert restaged_meta["mine_staged"] is True
+    assert restaged_meta["mine_generation_token"] == staging
+    assert restaged_meta.get("source_mtime") is None
+    assert (
+        convo_miner._pending_append_rows_to_restage(to_touch, existing=existing, staging_token=tail)
+        == []
+    )
+
+
 def _append_visibility_case(tmp_path, monkeypatch):
     source = str(tmp_path / "session.txt")
     (tmp_path / "session.txt").write_text("transcript", encoding="utf-8")
@@ -1582,10 +1634,17 @@ def _append_visibility_case(tmp_path, monkeypatch):
     monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
     monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 1)
 
-    def mine(collection, documents):
+    def mine(collection, documents, access_gate=None):
         chunks = [{"content": text, "chunk_index": index} for index, text in enumerate(documents)]
         return convo_miner._file_chunks_locked(
-            collection, source, chunks, "wing", "general", "agent", "exchange"
+            collection,
+            source,
+            chunks,
+            "wing",
+            "general",
+            "agent",
+            "exchange",
+            access_gate=access_gate,
         )
 
     tokenless = ["original first chunk", "unchanged middle chunk", "unchanged last chunk"]
@@ -1723,3 +1782,254 @@ def test_reappend_after_shrink_hides_batches_until_the_new_tail_is_complete(tmp_
     assert grown in snapshots
     assert set(map(tuple, snapshots)) <= {tuple(hidden), tuple(grown)}
     _assert_all_read_paths(collection, source, grown)
+
+
+def _padded_generation(documents, length):
+    return tuple([*documents, *[None] * (length - len(documents))])
+
+
+def _visible_logical_contents(collection, source, length):
+    current = []
+    for index in range(length):
+        logical_id = make_convo_drawer_id("wing", "general", source, "exchange", index)
+        row = mcp_server._logical_generation_record(collection, logical_id)
+        current.append(row["content"] if row else None)
+    return current
+
+
+def _assert_visible_complete_generations(collection, source, *generations):
+    length = max(len(item) for item in generations)
+    current = _visible_logical_contents(collection, source, length)
+    allowed = {_padded_generation(item, length) for item in generations}
+    assert tuple(current) in allowed
+    _assert_all_read_paths(collection, source, current)
+    commit_id = make_convo_commit_id(source, "exchange")
+    commit_token = collection.rows[commit_id]["metadata"]["mine_generation_commit"]
+    for row in _non_marker_rows(collection).values():
+        if row["metadata"].get("mine_staged") is True:
+            assert row["metadata"].get("mine_generation_token") != commit_token
+    return current
+
+
+def _assert_prefix_rows_preserved(collection, previous_active):
+    for key, (embedding, document, token) in previous_active.items():
+        row = collection.rows[key]
+        assert list(row["embedding"]) == embedding
+        assert row["document"] == document
+        assert row["metadata"].get("mine_generation_token") == token
+
+
+def _assert_embeddings_reused(collection, before):
+    for key, embedding in before.items():
+        if (
+            key in collection.rows
+            and collection.rows[key]["metadata"].get("mine_commit_marker") is not True
+        ):
+            assert list(collection.rows[key]["embedding"]) == embedding
+
+
+def _unpublished_pending_row_ids(collection):
+    tokens = _committed_tokens(collection)
+    return [
+        key
+        for key, row in _non_marker_rows(collection).items()
+        if row["metadata"].get("mine_staged") is True
+        and row["metadata"].get("mine_generation_token")
+        and row["metadata"].get("mine_generation_token") not in tokens
+    ]
+
+
+def _interrupt_append(mine, original, documents, write_index, fail_before):
+    collection = copy.deepcopy(original)
+    collection.write_count = 0
+    collection.fail_before = fail_before
+    collection.fail_at = write_index
+    try:
+        mine(collection, documents)
+    except InjectedWriteFailure:
+        pass
+    collection.fail_at = None
+    collection.fail_before = False
+    return collection
+
+
+def _assert_retired_or_absent_tail_marker(collection, source):
+    tail_id = make_convo_tail_commit_id(source, "exchange")
+    if tail_id in collection.rows:
+        assert collection.rows[tail_id]["metadata"].get("mine_commit_marker") is True
+        assert collection.rows[tail_id]["metadata"].get("mine_cleanup_pending") is not True
+        assert not collection.rows[tail_id]["metadata"].get("mine_generation_commit")
+
+
+@pytest.mark.parametrize("fail_before", [True, False])
+def test_interrupted_append_then_growth_retry_never_exposes_a_gapped_tail(
+    tmp_path, monkeypatch, fail_before
+):
+    original, mine, source, committed, first_growth = _append_visibility_case(tmp_path, monkeypatch)
+    second_growth = [*first_growth, "appended seventh chunk", "appended eighth chunk"]
+    previous_active = _snapshot_active_rows(original)
+    completed_first = copy.deepcopy(original)
+    assert mine(completed_first, first_growth)[2] is False
+    recovered = None
+
+    for write_index in range(1, completed_first.write_count + 1):
+        collection = _interrupt_append(mine, original, first_growth, write_index, fail_before)
+        _assert_visible_complete_generations(collection, source, committed, first_growth)
+        _assert_prefix_rows_preserved(collection, previous_active)
+        if recovered is None and _unpublished_pending_row_ids(collection):
+            recovered = copy.deepcopy(collection)
+
+        snapshots = []
+
+        def observe(current=collection):
+            snapshots.append(
+                _assert_visible_complete_generations(
+                    current, source, committed, first_growth, second_growth
+                )
+            )
+
+        collection.observe = observe
+        before_embeddings = {
+            key: list(row["embedding"]) for key, row in _non_marker_rows(collection).items()
+        }
+        collection.embedded_documents.clear()
+        assert mine(collection, second_growth)[2] is False
+        assert snapshots
+        _assert_all_read_paths(collection, source, second_growth)
+        _assert_prefix_rows_preserved(collection, previous_active)
+        _assert_embeddings_reused(collection, before_embeddings)
+        _assert_retired_or_absent_tail_marker(collection, source)
+        assert all(doc not in committed for doc in collection.embedded_documents)
+
+    assert recovered is not None
+    completed_second = copy.deepcopy(recovered)
+    completed_second.write_count = 0
+    completed_second.observe = lambda: None
+    assert mine(completed_second, second_growth)[2] is False
+    for write_index in range(1, completed_second.write_count + 1):
+        collection = _interrupt_append(mine, recovered, second_growth, write_index, fail_before)
+        _assert_visible_complete_generations(
+            collection, source, committed, first_growth, second_growth
+        )
+        _assert_prefix_rows_preserved(collection, previous_active)
+        collection.embedded_documents.clear()
+        assert mine(collection, second_growth)[2] is False
+        _assert_all_read_paths(collection, source, second_growth)
+        _assert_prefix_rows_preserved(collection, previous_active)
+        _assert_retired_or_absent_tail_marker(collection, source)
+
+
+def test_interrupted_append_pending_tail_content_change_stays_complete(tmp_path, monkeypatch):
+    original, mine, source, committed, first_growth = _append_visibility_case(tmp_path, monkeypatch)
+    previous_active = _snapshot_active_rows(original)
+    completed_first = copy.deepcopy(original)
+    assert mine(completed_first, first_growth)[2] is False
+    interrupted = None
+    for write_index in range(1, completed_first.write_count + 1):
+        collection = _interrupt_append(mine, original, first_growth, write_index, False)
+        if _unpublished_pending_row_ids(collection):
+            interrupted = collection
+            break
+    assert interrupted is not None
+    changed = [
+        *committed,
+        "changed fifth chunk",
+        *first_growth[len(committed) + 1 :],
+        "appended seventh chunk",
+    ]
+    snapshots = []
+
+    def observe():
+        snapshots.append(
+            _assert_visible_complete_generations(
+                interrupted, source, committed, first_growth, changed
+            )
+        )
+
+    interrupted.observe = observe
+    before_embeddings = {
+        key: list(row["embedding"]) for key, row in _non_marker_rows(interrupted).items()
+    }
+    interrupted.embedded_documents.clear()
+    assert mine(interrupted, changed)[2] is False
+    assert snapshots
+    _assert_all_read_paths(interrupted, source, changed)
+    _assert_prefix_rows_preserved(interrupted, previous_active)
+    _assert_embeddings_reused(interrupted, before_embeddings)
+    _assert_retired_or_absent_tail_marker(interrupted, source)
+    assert "changed fifth chunk" in interrupted.embedded_documents
+    assert all(doc not in committed for doc in interrupted.embedded_documents)
+
+
+def test_interrupted_append_pending_tail_shrink_stays_complete(tmp_path, monkeypatch):
+    original, mine, source, committed, first_growth = _append_visibility_case(tmp_path, monkeypatch)
+    previous_active = _snapshot_active_rows(original)
+    completed_first = copy.deepcopy(original)
+    assert mine(completed_first, first_growth)[2] is False
+    interrupted = None
+    for write_index in range(1, completed_first.write_count + 1):
+        collection = _interrupt_append(mine, original, first_growth, write_index, False)
+        if len(_unpublished_pending_row_ids(collection)) >= 1:
+            interrupted = collection
+            break
+    assert interrupted is not None
+    shrunk = first_growth[:-1]
+    snapshots = []
+
+    def observe():
+        snapshots.append(
+            _assert_visible_complete_generations(
+                interrupted, source, committed, first_growth, shrunk
+            )
+        )
+
+    interrupted.observe = observe
+    before_embeddings = {
+        key: list(row["embedding"]) for key, row in _non_marker_rows(interrupted).items()
+    }
+    interrupted.embedded_documents.clear()
+    assert mine(interrupted, shrunk)[2] is False
+    assert snapshots
+    _assert_all_read_paths(
+        interrupted, source, [*shrunk, *[None] * (len(first_growth) - len(shrunk))]
+    )
+    _assert_prefix_rows_preserved(interrupted, previous_active)
+    _assert_embeddings_reused(interrupted, before_embeddings)
+    _assert_retired_or_absent_tail_marker(interrupted, source)
+    assert all(doc not in committed for doc in interrupted.embedded_documents)
+
+
+def test_grown_retry_after_interrupted_append_hands_off_complete_views(tmp_path, monkeypatch):
+    original, mine, source, committed, first_growth = _append_visibility_case(tmp_path, monkeypatch)
+    second_growth = [*first_growth, "appended seventh chunk", "appended eighth chunk"]
+    previous_active = _snapshot_active_rows(original)
+    completed_first = copy.deepcopy(original)
+    assert mine(completed_first, first_growth)[2] is False
+    interrupted = None
+    for write_index in range(1, completed_first.write_count + 1):
+        collection = _interrupt_append(mine, original, first_growth, write_index, False)
+        if _unpublished_pending_row_ids(collection):
+            interrupted = collection
+            break
+    assert interrupted is not None
+    snapshots = []
+    gate = RecordingAccessGate()
+
+    def on_release():
+        snapshots.append(
+            _assert_visible_complete_generations(
+                gated, source, committed, first_growth, second_growth
+            )
+        )
+
+    gate.on_release = on_release
+    gated = GatedGenerationCollection(gate)
+    gated.rows = copy.deepcopy(interrupted.rows)
+    assert mine(gated, second_growth, access_gate=gate)[2] is False
+    assert gate.write_sessions > 1
+    assert gate.max_ops_in_session == 1
+    assert gate.max_ids_in_session <= 1
+    assert snapshots
+    _assert_all_read_paths(gated, source, second_growth)
+    _assert_prefix_rows_preserved(gated, previous_active)
+    _assert_retired_or_absent_tail_marker(gated, source)

@@ -953,6 +953,143 @@ def _stage_reused_generation_copies(
             )
 
 
+def _append_tail_marker_commit_token(collection, tail_commit_id, access_gate) -> Optional[str]:
+    """Return the extra tail marker's committed token, if one is published."""
+    if not isinstance(tail_commit_id, str) or not tail_commit_id:
+        return None
+    try:
+        with _access_read(access_gate):
+            result = collection.get(ids=[tail_commit_id], include=["metadatas"])
+    except Exception:
+        logger.debug("Could not read append tail commit marker", exc_info=True)
+        return None
+    return _committed_marker_generation_token(result.get("metadatas") or [])
+
+
+def _pending_append_rows_to_restage(to_touch, *, existing, staging_token):
+    """In-place metadata updates that move recovered pending rows onto ``staging_token``.
+
+    The planner keeps unchanged pending-tail matches in ``to_touch`` instead of
+    cloning them under the active token. Those rows still carry the previous
+    unpublished identity until publication retags them, so they must be
+    restaged first.
+    """
+    if not isinstance(staging_token, str) or not staging_token or not to_touch:
+        return []
+    restage = []
+    for drawer_id, touch_meta in to_touch:
+        prev = existing.get(drawer_id)
+        if not isinstance(prev, dict) or prev.get("mine_staged") is not True:
+            continue
+        token = prev.get("mine_generation_token")
+        if not isinstance(token, str) or not token or token == staging_token:
+            continue
+        restaged = dict(touch_meta)
+        restaged.pop("source_mtime", None)
+        restaged["mine_staged"] = True
+        restaged["mine_generation_token"] = staging_token
+        restage.append((drawer_id, restaged))
+    return restage
+
+
+def _restage_recovered_pending_append_rows(collection, rows, *, access_gate) -> None:
+    """Apply recovered pending-tail restages without re-embedding."""
+    if not rows:
+        return
+    for batch_start in range(0, len(rows), DRAWER_UPSERT_BATCH_SIZE):
+        batch = rows[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+        with _access_write(access_gate):
+            collection.update(
+                ids=[drawer_id for drawer_id, _ in batch],
+                metadatas=[meta for _, meta in batch],
+            )
+
+
+def _clone_recovered_pending_append_rows(
+    collection, rows, *, staging_token, access_gate
+) -> list[tuple[str, str]]:
+    """Clone currently visible pending-tail rows onto the unpublished token.
+
+    In-place restage would hide a committed extra-marker tail one row at a
+    time. Copying onto the new unpublished identity leaves the old rows
+    readable until the extra marker switches.
+    """
+    if not rows:
+        return []
+    source_ids = [drawer_id for drawer_id, _ in rows]
+    documents = {}
+    try:
+        with _access_read(access_gate):
+            result = collection.get(ids=source_ids, include=["documents"])
+        for drawer_id, document in zip(result.get("ids") or [], result.get("documents") or []):
+            if document is not None:
+                documents[drawer_id] = document
+    except Exception:
+        logger.debug("Could not read pending append rows to clone", exc_info=True)
+    copies = []
+    replacements = []
+    leftover = []
+    for drawer_id, touch_meta in rows:
+        content = documents.get(drawer_id)
+        logical_id = touch_meta.get("logical_drawer_id") or drawer_id
+        if not isinstance(logical_id, str) or not logical_id or content is None:
+            leftover.append((drawer_id, touch_meta))
+            continue
+        copy_id = _reused_generation_copy_id(logical_id, staging_token)
+        copies.append((copy_id, drawer_id, content, touch_meta))
+        replacements.append((drawer_id, copy_id))
+    _stage_reused_generation_copies(
+        collection,
+        copies,
+        generation_token=staging_token,
+        access_gate=access_gate,
+    )
+    _restage_recovered_pending_append_rows(collection, leftover, access_gate=access_gate)
+    return replacements
+
+
+def _restage_pending_append_tail_before_publish(
+    collection,
+    *,
+    to_touch,
+    existing,
+    staging_token,
+    generation_token,
+    tail_commit_id,
+    access_gate,
+) -> list[tuple[str, str]]:
+    """Move recovered pending-tail rows onto the unpublished token before exposing it.
+
+    Unpublished recovered rows restage in place. Rows already visible under a
+    committed extra-marker token are cloned so readers keep the previous
+    complete tail until the new token is published.
+    """
+    if not (isinstance(staging_token, str) and staging_token and staging_token != generation_token):
+        return []
+    extra_token = _append_tail_marker_commit_token(collection, tail_commit_id, access_gate)
+    committed = {
+        token for token in (generation_token, extra_token) if isinstance(token, str) and token
+    }
+    in_place = []
+    to_clone = []
+    for drawer_id, restaged in _pending_append_rows_to_restage(
+        to_touch, existing=existing, staging_token=staging_token
+    ):
+        prev = existing.get(drawer_id) or {}
+        token = prev.get("mine_generation_token")
+        if token in committed:
+            to_clone.append((drawer_id, restaged))
+        else:
+            in_place.append((drawer_id, restaged))
+    _restage_recovered_pending_append_rows(collection, in_place, access_gate=access_gate)
+    return _clone_recovered_pending_append_rows(
+        collection,
+        to_clone,
+        staging_token=staging_token,
+        access_gate=access_gate,
+    )
+
+
 def _publish_changed_generations(
     collection,
     *,
@@ -969,16 +1106,17 @@ def _publish_changed_generations(
 
     Callers must already have written every new-generation row — including
     generation-specific copies of reused unchanged chunks — under
-    ``mine_generation_token``. Switching the marker is then the crash-atomic
-    visibility flip: before it, the previous committed generation stays
-    complete; after it, the new token is complete even if metadata
-    finalization or stale-row cleanup fails. Append-only tails stage under a
-    distinct unpublished token; a temporary extra marker commits that token
-    beside the still-active generation so the complete tail becomes visible
-    without hiding unchanged rows. The extra marker is overwritten on the
-    next append rather than deleted, so repeated appends stay delete-free
-    for active drawers. ``cleanup_pending`` keeps the source retryable
-    until every follow-up write succeeds.
+    ``mine_generation_token``, and restaged recovered pending-tail rows onto
+    the unpublished append token. Switching the marker is then the
+    crash-atomic visibility flip: before it, the previous committed
+    generation stays complete; after it, the new token is complete even if
+    metadata finalization or stale-row cleanup fails. Append-only tails
+    stage under a distinct unpublished token; a temporary extra marker
+    commits that token beside the still-active generation so the complete
+    tail becomes visible without hiding unchanged rows. The extra marker is
+    overwritten on the next append rather than deleted, so repeated appends
+    stay delete-free for active drawers. ``cleanup_pending`` keeps the source
+    retryable until every follow-up write succeeds.
 
     Writer serialization comes from the caller's mutation lock (HTTP mine)
     or per-file ``mine_lock``. The access gate is acquired only around each
@@ -1221,6 +1359,10 @@ def _plan_convo_generation_writes(
             continue
         physical_id, prev = current
         reused_token = prev.get("mine_generation_token")
+        # Staged pending-tail matches stay on their physical ids (to_touch)
+        # instead of cloning under the active token, which Hub would treat
+        # as visible. The write path restages those rows onto the current
+        # unpublished token before that token is exposed.
         if (
             will_publish
             and reused_token
@@ -1294,7 +1436,10 @@ def _file_chunks_locked(
     stay on their existing physical ids. New tail rows stage under a distinct
     unpublished content-set token until the whole tail is written; a
     temporary extra marker then exposes that complete tail without hiding
-    the prior generation. A rewrite or shrink that publishes a new token
+    the prior generation. Recovered pending-tail rows from an interrupted
+    append are restaged onto that unpublished token before the extra
+    marker is published, so a later growth cannot expose a new suffix
+    while still hiding the middle. A rewrite or shrink that publishes a new token
     clones unchanged rows that already belong to another committed
     generation under a generation-specific physical id with the stored
     embedding, so the old token stays complete until the new token is fully
@@ -1437,8 +1582,10 @@ def _file_chunks_locked(
         # marker's active token so unchanged rows are only
         # metadata-refreshed, while new tail rows stage under an
         # unpublished content-set token until the extra tail marker makes
-        # the complete append visible. Only after orphan cleanup succeeds
-        # do we stamp the whole target set current. A transient delete
+        # the complete append visible. Recovered pending rows still carrying
+        # an older staging token are restaged onto the current unpublished
+        # identity before that extra marker is written. Only after orphan
+        # cleanup succeeds do we stamp the whole target set current. A transient delete
         # failure then remains visibly incomplete and retries even if the
         # source never changes again.
         stale_ids = [drawer_id for drawer_id in existing if drawer_id not in new_ids]
@@ -1515,6 +1662,23 @@ def _file_chunks_locked(
         # retries even when the source itself stays unchanged. Growth with
         # no orphans still publishes so appended rows carry a token.
         if publish_generation:
+            tail_commit_id = make_convo_tail_commit_id(source_file, extract_mode)
+            replacements = _restage_pending_append_tail_before_publish(
+                collection,
+                to_touch=to_touch,
+                existing=existing,
+                staging_token=staging_token,
+                generation_token=generation_token,
+                tail_commit_id=tail_commit_id,
+                access_gate=access_gate,
+            )
+            if replacements:
+                remap = dict(replacements)
+                to_touch = [(remap.get(drawer_id, drawer_id), meta) for drawer_id, meta in to_touch]
+                stale_ids = [
+                    *stale_ids,
+                    *[old_id for old_id, new_id in replacements if old_id != new_id],
+                ]
             final_metadata = []
             for drawer_id, meta in (
                 to_touch
@@ -1534,7 +1698,7 @@ def _file_chunks_locked(
                 source_file=source_file,
                 access_gate=access_gate,
                 staging_token=staging_token,
-                tail_commit_id=make_convo_tail_commit_id(source_file, extract_mode),
+                tail_commit_id=tail_commit_id,
             ):
                 return drawers_added, room_counts_delta, True
     return drawers_added, room_counts_delta, False
