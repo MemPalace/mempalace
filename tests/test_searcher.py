@@ -67,6 +67,106 @@ class TestBuildWhereFilter:
         }
 
 
+def _where_node_count(where) -> int:
+    """Count nested dict/list nodes in a Chroma-style where clause."""
+    if isinstance(where, dict):
+        return 1 + sum(_where_node_count(value) for value in where.values())
+    if isinstance(where, list) and where and isinstance(where[0], dict):
+        return 1 + sum(_where_node_count(item) for item in where)
+    return 0
+
+
+def _where_source_ne_count(where) -> int:
+    """Count ``source_file: {$ne: ...}`` leaves — the old per-source guards."""
+    if not isinstance(where, dict):
+        return 0
+    count = 0
+    for key, value in where.items():
+        if key in ("$and", "$or") and isinstance(value, list):
+            count += sum(_where_source_ne_count(item) for item in value)
+        elif key == "source_file" and isinstance(value, dict) and "$ne" in value:
+            count += 1
+    return count
+
+
+class TestVisibleDrawerWhereBounds:
+    def test_many_tokened_sources_do_not_expand_query_guards(self):
+        from mempalace.searcher import _is_visible_generation_metadata, _visible_drawer_where
+
+        n_sources = 3000
+        tokens = {f"token-{index}" for index in range(n_sources)}
+        modes = {(f"/tmp/session-{index}.jsonl", "exchange") for index in range(n_sources)}
+        where = _visible_drawer_where({}, tokens, modes)
+
+        assert _where_source_ne_count(where) == 0
+        assert _where_node_count(where) <= 8
+        leftover = {
+            "source_file": "/tmp/session-0.jsonl",
+            "extract_mode": "exchange",
+            "ingest_mode": "convos",
+        }
+        current = {**leftover, "mine_generation_token": "token-0"}
+        assert _is_visible_generation_metadata(leftover, tokens, modes) is False
+        assert _is_visible_generation_metadata(current, tokens, modes) is True
+
+    def test_chroma_hides_tokenless_predecessor_among_many_tokened_sources(
+        self, palace_path, collection
+    ):
+        query = "bounded-generation-chroma-phrase"
+        n_sources = 80
+        collection.upsert(
+            ids=[f"marker-{index}" for index in range(n_sources)] + ["leftover", "current"],
+            documents=["marker"] * n_sources + [query, query],
+            metadatas=[
+                *[
+                    {
+                        "mine_staged": True,
+                        "mine_commit_marker": True,
+                        "mine_generation_commit": f"token-{index}",
+                        "source_file": f"/tmp/session-{index}.jsonl",
+                        "extract_mode": "exchange",
+                        "wing": "sessions",
+                        "room": "general",
+                    }
+                    for index in range(n_sources)
+                ],
+                {
+                    "wing": "sessions",
+                    "room": "general",
+                    "source_file": "/tmp/session-0.jsonl",
+                    "extract_mode": "exchange",
+                    "ingest_mode": "convos",
+                    "filed_at": "2026-09-01T00:00:00",
+                },
+                {
+                    "wing": "sessions",
+                    "room": "general",
+                    "source_file": "/tmp/session-0.jsonl",
+                    "extract_mode": "exchange",
+                    "ingest_mode": "convos",
+                    "mine_generation_token": "token-0",
+                    "logical_drawer_id": "kept-logical",
+                    "filed_at": "2026-09-02T00:00:00",
+                },
+            ],
+        )
+
+        from mempalace.searcher import _visible_drawer_where
+
+        tokens = {f"token-{index}" for index in range(n_sources)}
+        modes = {(f"/tmp/session-{index}.jsonl", "exchange") for index in range(n_sources)}
+        where = _visible_drawer_where({}, tokens, modes)
+        assert _where_source_ne_count(where) == 0
+        assert _where_node_count(where) <= 8
+
+        result = search_memories(query, palace_path, n_results=1)
+        assert "error" not in result, result
+        assert result["results"]
+        ids = [hit["drawer_id"] for hit in result["results"]]
+        assert "leftover" not in ids
+        assert ids[0] in {"current", "kept-logical"}
+
+
 # ── search_memories (API) ──────────────────────────────────────────────
 
 
@@ -245,6 +345,77 @@ class TestSearchMemories:
 
         assert collection.query_limits == [1, 2]
         assert result["ids"] == [["current"]]
+
+    def test_filtered_query_refills_past_tokenless_predecessors_before_limit(self):
+        from mempalace.searcher import _query_drawers_with_filter_fallback
+
+        leftover_meta = {
+            "source_file": "/tmp/session.jsonl",
+            "extract_mode": "exchange",
+            "ingest_mode": "convos",
+        }
+        current_meta = {
+            **leftover_meta,
+            "logical_drawer_id": "kept-logical",
+            "mine_generation_token": "active-token",
+        }
+
+        class Collection:
+            def __init__(self):
+                self.query_limits = []
+
+            @staticmethod
+            def count():
+                return 8
+
+            @staticmethod
+            def get(where=None, include=None, **_kwargs):
+                if isinstance(where, dict) and where.get("mine_commit_marker") is True:
+                    return {
+                        "ids": ["marker"],
+                        "metadatas": [
+                            {
+                                "mine_commit_marker": True,
+                                "mine_generation_commit": "active-token",
+                                "source_file": leftover_meta["source_file"],
+                                "extract_mode": "exchange",
+                                "ingest_mode": "convos",
+                            }
+                        ],
+                    }
+                return {"ids": ["current"], "metadatas": [current_meta]}
+
+            def query(self, **kwargs):
+                limit = kwargs["n_results"]
+                self.query_limits.append(limit)
+                leftover_count = min(limit, 7)
+                ids = [f"leftover-{index}" for index in range(leftover_count)]
+                metas = [leftover_meta] * leftover_count
+                docs = ["retired leftover text"] * leftover_count
+                if limit >= 8:
+                    ids.append("current")
+                    metas.append(current_meta)
+                    docs.append("current committed text")
+                return {
+                    "ids": [ids],
+                    "documents": [docs],
+                    "metadatas": [metas],
+                    "distances": [[0.1] * len(ids)],
+                }
+
+        collection = Collection()
+        result = _query_drawers_with_filter_fallback(
+            collection,
+            {"where": {"mine_staged": {"$ne": True}}, "n_results": 1},
+            "query",
+            1,
+            None,
+            None,
+        )
+
+        assert collection.query_limits[-1] >= 8
+        assert result["ids"] == [["current"]]
+        assert result["documents"] == [["current committed text"]]
 
     def test_lexical_union_replaces_old_hit_with_current_generation(self):
         from mempalace.searcher import _resolve_lexical_generation_hits

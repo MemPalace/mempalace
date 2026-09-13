@@ -65,14 +65,25 @@ def test_rendered_dedup_preserves_first_ranked_closet_hit_and_plain_repeats():
     ]
 
 
+def _is_commit_marker_where(where) -> bool:
+    return isinstance(where, dict) and where.get("mine_commit_marker") is True
+
+
+def _content_get_calls(collection):
+    """Collection.get calls that hydrate source text, not generation markers."""
+    return [
+        call
+        for call in collection.get.call_args_list
+        if not _is_commit_marker_where(call.kwargs.get("where"))
+    ]
+
+
 def test_closet_enrichment_memoises_by_source_and_parent_group():
     drawers_col = MagicMock()
 
-    def get_group(
-        *,
-        where,
-        include,
-    ):
+    def get_group(*, where, include, **_kwargs):
+        if _is_commit_marker_where(where):
+            return {"ids": [], "metadatas": []}
         assert include == [
             "documents",
             "metadatas",
@@ -128,7 +139,8 @@ def test_closet_enrichment_memoises_by_source_and_parent_group():
         committed_tokens=frozenset(),
     )
 
-    assert drawers_col.get.call_count == 2
+    content_gets = _content_get_calls(drawers_col)
+    assert len(content_gets) == 2
     assert hits[0]["text"] == hits[1]["text"]
     assert "parent-a" in hits[0]["text"]
     assert "parent-b" in hits[2]["text"]
@@ -190,8 +202,8 @@ def test_search_promotes_distinct_results_from_wider_pool_and_fetches_source_onc
         ],
     }
 
-    def get_drawers(*, where, include):
-        if where == {"mine_commit_marker": True}:
+    def get_drawers(*, where, include, **_kwargs):
+        if _is_commit_marker_where(where):
             return {"ids": [], "metadatas": []}
         return SimpleNamespace(
             documents=[
@@ -267,12 +279,7 @@ def test_search_promotes_distinct_results_from_wider_pool_and_fetches_source_onc
     assert len(rendered_keys) == 5
     assert hits[0]["drawer_id"] == "same-0"
     assert drawers_col.query.call_args.kwargs["n_results"] == 20
-    assert drawers_col.get.call_count == 2
-    source_gets = [
-        call
-        for call in drawers_col.get.call_args_list
-        if call.kwargs["where"] != {"mine_commit_marker": True}
-    ]
+    source_gets = _content_get_calls(drawers_col)
     assert len(source_gets) == 1
     assert sum(hit["source_path"] == repeated_source for hit in hits) == 1
 

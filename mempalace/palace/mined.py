@@ -55,12 +55,24 @@ def _record_generation_commit_marker(meta, committed_tokens, tokened_source_mode
         tokened_source_modes.add(source_mode)
 
 
+def _ingest_generation_commit_marker_batch(batch, committed_tokens, tokened_source_modes) -> int:
+    """Record one marker page and return its id count."""
+    marker_ids = batch.get("ids") or []
+    for meta in batch.get("metadatas") or []:
+        _record_generation_commit_marker(meta, committed_tokens, tokened_source_modes)
+    return len(marker_ids)
+
+
 def _generation_commit_marker_state(collection) -> tuple[set, set, bool]:
     """Load published generation markers as ``(tokens, source_modes, complete)``.
 
     ``complete`` is False when any marker page fails. Hash dedup must not use
     partial source/mode state: a missing later page would treat leftover
     tokenless rows as live and permanently skip another file of that text.
+
+    Compatibility backends may accept ``offset=0`` and raise ``TypeError`` for
+    later pages. That truncated scan is not complete: retry unpaginated, or
+    fail closed if the full fetch also fails.
     """
     committed_tokens: set = set()
     tokened_source_modes: set = set()
@@ -79,18 +91,24 @@ def _generation_commit_marker_state(collection) -> tuple[set, set, bool]:
             try:
                 marker_batch = collection.get(**kwargs)
             except TypeError:
-                if marker_offset:
-                    break
+                if not paginated:
+                    raise
+                logger.warning(
+                    "generation commit marker pagination rejected at offset %d; "
+                    "retrying unpaginated fetch",
+                    marker_offset,
+                )
                 paginated = False
+                committed_tokens.clear()
+                tokened_source_modes.clear()
                 marker_batch = collection.get(
                     where={"mine_commit_marker": True},
                     include=["metadatas"],
                 )
-            marker_ids = marker_batch.get("ids") or []
-            for meta in marker_batch.get("metadatas") or []:
-                _record_generation_commit_marker(meta, committed_tokens, tokened_source_modes)
-            page_len = len(marker_ids)
-            del marker_batch, marker_ids
+            page_len = _ingest_generation_commit_marker_batch(
+                marker_batch, committed_tokens, tokened_source_modes
+            )
+            del marker_batch
             if not paginated or not page_len:
                 break
             marker_offset += page_len

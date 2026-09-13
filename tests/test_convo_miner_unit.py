@@ -1643,6 +1643,162 @@ def test_content_hash_prefetch_disables_dedup_when_marker_page_fails(fail_offset
     assert [text for _content_hash, text in new_items] == ["leftover transcript"]
 
 
+def _marker_page_fail_rows(page_size: int = 1000):
+    from mempalace.palace import NORMALIZE_VERSION
+
+    leftover_hash = "leftover-hash"
+    rows = []
+    for index in range(page_size):
+        src = f"paged-{index}.jsonl"
+        rows.append(
+            (
+                f"active-{index}",
+                {
+                    "wing": "wing",
+                    "source_file": src,
+                    "extract_mode": "exchange",
+                    "normalize_version": NORMALIZE_VERSION,
+                    "content_hash": f"active-hash-{index}",
+                    "mine_generation_token": f"token-{index}",
+                },
+            )
+        )
+        rows.append(
+            (
+                f"marker-{index}",
+                {
+                    "mine_staged": True,
+                    "mine_commit_marker": True,
+                    "mine_generation_commit": f"token-{index}",
+                    "source_file": src,
+                    "extract_mode": "exchange",
+                },
+            )
+        )
+    rows.extend(
+        [
+            (
+                "later-active",
+                {
+                    "wing": "wing",
+                    "source_file": "later.jsonl",
+                    "extract_mode": "exchange",
+                    "normalize_version": NORMALIZE_VERSION,
+                    "content_hash": "later-hash",
+                    "mine_generation_token": "later-token",
+                },
+            ),
+            (
+                "later-marker",
+                {
+                    "mine_staged": True,
+                    "mine_commit_marker": True,
+                    "mine_generation_commit": "later-token",
+                    "source_file": "later.jsonl",
+                    "extract_mode": "exchange",
+                },
+            ),
+            (
+                "leftover",
+                {
+                    "wing": "wing",
+                    "source_file": "later.jsonl",
+                    "extract_mode": "exchange",
+                    "normalize_version": NORMALIZE_VERSION,
+                    "content_hash": leftover_hash,
+                },
+            ),
+        ]
+    )
+    return leftover_hash, rows
+
+
+def test_content_hash_prefetch_later_page_typeerror_retries_unpaginated():
+    """A first page of 1000 markers plus a later-page TypeError must not
+    publish complete=True on the truncated set. Unpaginated retry recovers
+    the omitted later marker so the leftover tokenless hash is not used.
+    """
+    from mempalace.palace import prefetch_content_hashes
+
+    leftover_hash, rows = _marker_page_fail_rows()
+    calls = []
+
+    class Collection:
+        @staticmethod
+        def count():
+            return len(rows)
+
+        @staticmethod
+        def get(*_args, **kwargs):
+            calls.append(dict(kwargs))
+            where = kwargs.get("where")
+            offset = kwargs.get("offset", 0)
+            limit = kwargs.get("limit")
+            if where == {"mine_commit_marker": True} and kwargs.get("offset"):
+                raise TypeError("offset not supported after the first page")
+            selected = rows
+            if where == {"mine_commit_marker": True}:
+                selected = [
+                    (key, meta) for key, meta in rows if meta.get("mine_commit_marker") is True
+                ]
+            selected = selected[offset : offset + limit if limit is not None else None]
+            return {
+                "ids": [key for key, _ in selected],
+                "metadatas": [dict(meta) for _, meta in selected],
+            }
+
+    hashes = prefetch_content_hashes(Collection(), extract_mode="exchange")
+    assert any(call.get("offset") == 1000 for call in calls)
+    assert any(
+        call.get("where") == {"mine_commit_marker": True} and "limit" not in call for call in calls
+    )
+    assert ("wing", leftover_hash) not in hashes
+    assert hashes[("wing", "later-hash")] == "later.jsonl"
+    assert hashes[("wing", "active-hash-0")] == "paged-0.jsonl"
+
+
+def test_content_hash_prefetch_later_page_typeerror_without_unpaginated_is_incomplete():
+    """If later-page TypeError cannot fall back to a complete fetch, disable dedup."""
+    from mempalace import convo_miner
+    from mempalace.palace import prefetch_content_hashes
+
+    _, rows = _marker_page_fail_rows()
+
+    class Collection:
+        @staticmethod
+        def count():
+            return len(rows)
+
+        @staticmethod
+        def get(*_args, **kwargs):
+            where = kwargs.get("where")
+            if where == {"mine_commit_marker": True}:
+                if kwargs.get("offset"):
+                    raise TypeError("later offset rejected")
+                if "limit" not in kwargs:
+                    raise TypeError("unpaginated get rejected")
+            selected = rows
+            if where == {"mine_commit_marker": True}:
+                selected = [
+                    (key, meta) for key, meta in rows if meta.get("mine_commit_marker") is True
+                ]
+            offset = kwargs.get("offset", 0)
+            limit = kwargs.get("limit")
+            selected = selected[offset : offset + limit if limit is not None else None]
+            return {
+                "ids": [key for key, _ in selected],
+                "metadatas": [dict(meta) for _, meta in selected],
+            }
+
+    hashes = prefetch_content_hashes(Collection(), extract_mode="exchange")
+    assert hashes == {}
+    new_items, duplicates = convo_miner._split_new_and_duplicate_conversations(
+        ["leftover transcript"], "wing", "reexport.jsonl", hashes
+    )
+    assert duplicates == []
+    assert [text for _content_hash, text in new_items] == ["leftover transcript"]
+
+
 def test_pending_commit_finishes_when_stale_rows_are_already_gone():
     import mempalace.convo_miner as convo_miner
 

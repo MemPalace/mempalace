@@ -77,41 +77,21 @@ def _committed_generation_tokens(collection) -> frozenset[str]:
     return tokens
 
 
-def _tokenless_predecessor_where_guards(tokened_source_modes) -> list:
-    """Chroma clauses that drop tokenless rows of a tokened source/mode."""
-    guards = []
-    for src, mode in sorted(tokened_source_modes):
-        if not src:
-            continue
-        if mode is None:
-            guards.append({"source_file": {"$ne": src}})
-            continue
-        guards.append(
-            {
-                "$or": [
-                    {"source_file": {"$ne": src}},
-                    {"extract_mode": {"$ne": mode}},
-                ]
-            }
-        )
-    return guards
-
-
 def _visible_drawer_where(
     where: dict, committed_tokens=frozenset(), tokened_source_modes=frozenset()
 ) -> dict:
-    """Exclude unpublished and superseded rows before the backend top-K limit.
+    """Exclude unpublished staged rows before the backend top-K limit.
 
-    The unstaged branch would otherwise admit tokenless predecessors left
-    behind when the first complete mine is shrunk or rechunked and stale
-    deletion fails. Pair-exclude those source/modes the same way hash
-    prefetch does. Callers still post-filter: missing ``extract_mode`` on a
-    leftover exchange row may not match ``$ne``.
+    Tokenless predecessors of a tokened source/mode are *not* encoded as one
+    nested ``$and`` guard per source: that AST is O(sources) and turns
+    sqlite_exact FTS into O(matches × sources) ``_matches_where`` work, and
+    it can exceed Chroma filter limits. ``tokened_source_modes`` stays a
+    Python set used by :func:`_is_visible_generation_metadata` (O(1) lookup).
+    Callers refill after that post-filter so retired rows cannot consume the
+    user-visible limit. ``tokened_source_modes`` is kept in the signature so
+    existing call sites stay unchanged.
     """
     committed = {"mine_staged": {"$ne": True}}
-    predecessor_guards = _tokenless_predecessor_where_guards(tokened_source_modes)
-    if predecessor_guards:
-        committed = {"$and": [committed, *predecessor_guards]}
     visibility = committed
     if committed_tokens:
         visibility = {
