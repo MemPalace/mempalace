@@ -149,3 +149,34 @@ def test_light_hub_forward_does_not_acquire_local_writer(isolated_writer, monkey
         }
     )
     assert "result" in result
+
+
+def test_peer_sync_thread_does_not_pollute_unrelated_palace(tmp_path, monkeypatch):
+    """Issue #2493: peer sync thread must not create or mutate other palaces."""
+    import time
+    from mempalace.config import MempalaceConfig
+
+    palace1 = tmp_path / "sync_palace"
+    palace1.mkdir()
+    monkeypatch.setenv("MEMPALACE_SYNC_INTERVAL", "0.05")
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(palace1))
+    monkeypatch.setattr(mcp, "_config", MempalaceConfig(palace_path=palace1))
+
+    thread = mcp._start_peer_sync_thread()
+    assert thread is not None
+
+    unrelated_palace = tmp_path / "unrelated_palace"
+    assert not unrelated_palace.exists()
+
+    # Repoint _config to unrelated_palace
+    monkeypatch.setattr(mcp, "_config", MempalaceConfig(palace_path=unrelated_palace))
+
+    # Wait for multiple sync loop ticks
+    time.sleep(0.15)
+
+    # Unrelated palace must remain absent!
+    assert not unrelated_palace.exists()
+
+    # Clean up thread
+    mcp._stop_peer_sync_thread()
+    assert not thread.is_alive()
