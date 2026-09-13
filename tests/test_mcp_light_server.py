@@ -40,6 +40,10 @@ class TestLightMcpProtocol:
         tools = res["result"]["tools"]
         tool_names = [t["name"] for t in tools]
         assert tool_names == ["palace_query", "palace_exec", "palace_coordinate"]
+        coord_tool = next(t for t in tools if t["name"] == "palace_coordinate")
+        props = coord_tool["inputSchema"]["properties"]
+        for expected_prop in ("order", "limit", "preview", "since_created_at"):
+            assert expected_prop in props, f"Missing {expected_prop} in palace_coordinate schema"
 
     def test_tools_list_read_only(self, monkeypatch, config, kg):
         _patch_light_server(monkeypatch, config, kg)
@@ -230,10 +234,27 @@ class TestPalaceCoordinate:
         task_event = payload.get("task", {})
         assert task_event.get("type") == "task.request"
 
-        # List events
+        # Append a second event
+        second_cmd = (
+            "EVENT APPEND type:status stream:project/mempalace room:status "
+            'from:windows:claude:mempalace to:windows:antigravity:mempalace body:"Task acknowledged"'
+        )
+        second_res = mcp_light_server.handle_light_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 51,
+                "method": "tools/call",
+                "params": {"name": "palace_coordinate", "arguments": second_cmd},
+            }
+        )
+        second_payload = json.loads(second_res["result"]["content"][0]["text"])
+        assert second_payload.get("success") is True
+        second_event = second_payload["event"]
+
+        # 1. Default without cursor returns newest first
         list_req = {
             "jsonrpc": "2.0",
-            "id": 51,
+            "id": 52,
             "method": "tools/call",
             "params": {
                 "name": "palace_coordinate",
@@ -243,7 +264,55 @@ class TestPalaceCoordinate:
         list_res = mcp_light_server.handle_light_request(list_req)
         list_payload = json.loads(list_res["result"]["content"][0]["text"])
         events = list_payload.get("events", [])
-        assert len(events) >= 1
+        assert len(events) == 2
+        assert events[0]["id"] == second_event["id"]
+        assert events[1]["id"] == task_event["id"]
+
+        # 2. EVENT INBOX defaults to newest first and preview=True
+        inbox_req = {
+            "jsonrpc": "2.0",
+            "id": 53,
+            "method": "tools/call",
+            "params": {
+                "name": "palace_coordinate",
+                "arguments": "EVENT INBOX to:windows:claude:mempalace",
+            },
+        }
+        inbox_res = mcp_light_server.handle_light_request(inbox_req)
+        inbox_payload = json.loads(inbox_res["result"]["content"][0]["text"])
+        inbox_events = inbox_payload.get("events", [])
+        assert len(inbox_events) == 1
+        assert inbox_events[0]["id"] == task_event["id"]
+
+        # 3. Resuming with since_event_id returns forward chronological order
+        resume_req = {
+            "jsonrpc": "2.0",
+            "id": 54,
+            "method": "tools/call",
+            "params": {
+                "name": "palace_coordinate",
+                "arguments": f"EVENT LIST stream:project/mempalace since_id:{task_event['id']}",
+            },
+        }
+        resume_res = mcp_light_server.handle_light_request(resume_req)
+        resume_payload = json.loads(resume_res["result"]["content"][0]["text"])
+        assert len(resume_payload.get("events", [])) == 1
+        assert resume_payload["events"][0]["id"] == second_event["id"]
+
+        # 4. Uppercase ORDER DESC works cleanly
+        desc_req = {
+            "jsonrpc": "2.0",
+            "id": 55,
+            "method": "tools/call",
+            "params": {
+                "name": "palace_coordinate",
+                "arguments": f"EVENT LIST stream:project/mempalace ORDER DESC since_id:{task_event['id']}",
+            },
+        }
+        desc_res = mcp_light_server.handle_light_request(desc_req)
+        desc_payload = json.loads(desc_res["result"]["content"][0]["text"])
+        assert len(desc_payload.get("events", [])) == 1
+        assert desc_payload["events"][0]["id"] == second_event["id"]
 
     def test_artifact_put_and_get(self, monkeypatch, config, kg):
         _patch_light_server(monkeypatch, config, kg)

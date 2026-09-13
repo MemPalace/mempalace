@@ -502,3 +502,56 @@ class TestPalaceCoordinateParser:
         assert action == "patch_submit"
         assert params["content"] == "diff --git a/b"
         assert "diff" not in params
+
+    def test_inbox_dsl_and_shorthand_ordering(self):
+        action, params = parse_coordinate_input("INBOX to:agent1")
+        assert action == "event_list"
+        assert params["to_agent"] == "agent1"
+        assert params["order"] == "desc"
+        assert params["preview"] is True
+
+        action, params = parse_coordinate_input("EVENT INBOX stream:project/x")
+        assert action == "event_list"
+        assert params["stream"] == "project/x"
+        assert params["order"] == "desc"
+        assert params["preview"] is True
+
+        action, params = parse_coordinate_input("EVENT LIST to:agent1 DESC PREVIEW")
+        assert action == "event_list"
+        assert params["to_agent"] == "agent1"
+        assert params["order"] == "desc"
+        assert params["preview"] is True
+
+        for flag in ("LATEST", "RECENT", "TAIL"):
+            action, params = parse_coordinate_input(f"EVENT LIST to:agent1 {flag}")
+            assert action == "event_list"
+            assert params["order"] == "desc"
+
+        for flag in ("ASC", "HEAD", "OLDEST", "FROM_START"):
+            action, params = parse_coordinate_input(f"EVENT LIST to:agent1 {flag}")
+            assert action == "event_list"
+            assert params["order"] == "asc"
+
+    def test_order_case_insensitivity_and_structured_inbox(self):
+        action, params = parse_coordinate_input("EVENT LIST to:agent1 ORDER DESC")
+        assert action == "event_list"
+        assert params["order"] == "desc"
+
+        action, params = parse_coordinate_input("EVENT LIST to:agent1 ORDER ASC")
+        assert action == "event_list"
+        assert params["order"] == "asc"
+
+        action, params = parse_coordinate_input(
+            {"action": "event_list", "order": "DESC", "to_agent": "agent1"}
+        )
+        assert action == "event_list"
+        assert params["order"] == "desc"
+
+        action, params = parse_coordinate_input(
+            {"action": "inbox", "to_agent": "agent1"}
+        )
+        assert action == "event_list"
+        assert params["to_agent"] == "agent1"
+        assert params["order"] == "desc"
+        assert params["preview"] is True
+

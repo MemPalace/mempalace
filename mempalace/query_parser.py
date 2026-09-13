@@ -23,7 +23,22 @@ class QuotedToken(str):
     """A DSL token that was written in quotes; never treated as a keyword flag."""
 
 
-_BARE_FLAGS = frozenset({"APPLY", "COMMIT", "PREVIEW", "DRY_RUN"})
+_BARE_FLAGS = frozenset(
+    {
+        "APPLY",
+        "COMMIT",
+        "PREVIEW",
+        "DRY_RUN",
+        "DESC",
+        "ASC",
+        "LATEST",
+        "RECENT",
+        "TAIL",
+        "HEAD",
+        "OLDEST",
+        "FROM_START",
+    }
+)
 _KG_ADD_FLAGS = frozenset({"FROM", "TO", "VALID_FROM", "VALID_TO", "CLOSET", "DRAWER"})
 _KG_INVALIDATE_FLAGS = frozenset({"ENDED", "AT", "DATE"})
 _KG_SUPERSEDE_FLAGS = frozenset({"AT", "DATE"})
@@ -160,9 +175,14 @@ def _parse_key_value_tokens(tokens: List[str]) -> Dict[str, Any]:
 
         # Case 4: tok is key keyword, next is value (including uppercase values
         # like CONTENT NASA). Bare flags never consume the following token.
-        if i + 1 < n and tok.isupper() and tokens[i + 1] != ":":
+        if (
+            i + 1 < n
+            and tok.isupper()
+            and tok.upper() not in _BARE_FLAGS
+            and tokens[i + 1] != ":"
+        ):
             nxt = tokens[i + 1]
-            if nxt.upper() not in _BARE_FLAGS:
+            if tok.upper() == "ORDER" or nxt.upper() not in _BARE_FLAGS:
                 k = tok.lower().strip()
                 if k:
                     result[k] = _parse_val(nxt)
@@ -1130,6 +1150,7 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
                     "EVENT",
                     "EVENTS",
                     "LOGSTREAM",
+                    "INBOX",
                     "ARTIFACT",
                     "PATCH",
                     "PEERS",
@@ -1164,7 +1185,12 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
             action = "task_create"
         elif action in ("event", "append_event", "event_append", "emit"):
             action = "event_append"
-        elif action in ("events", "list_events", "event_list", "logstream"):
+        elif action in ("events", "list_events", "event_list", "logstream", "inbox", "event_inbox"):
+            if action in ("inbox", "event_inbox"):
+                if "order" not in params:
+                    params["order"] = "desc"
+                if "preview" not in params:
+                    params["preview"] = True
             action = "event_list"
         elif action in ("ack", "event_ack"):
             action = "event_ack"
@@ -1178,6 +1204,8 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
             params["to_agent"] = params.pop("to")
         elif "to" in params:
             params.pop("to")
+        if "order" in params and params["order"] is not None:
+            params["order"] = str(params["order"]).lower().strip()
         if "base" in params and "base_commit" not in params:
             params["base_commit"] = params.pop("base")
         elif "base" in params:
@@ -1264,12 +1292,40 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
                 raise QueryParseError(f"EVENT APPEND missing required field: '{req}'")
         return "event_append", kv
 
-    # --- Event List ---
-    if first_tok in ("LOGSTREAM", "EVENTS") or (
+    # --- Event List / Inbox ---
+    is_inbox = first_tok == "INBOX" or (
+        first_tok == "EVENT" and len(tokens) > 1 and tokens[1].upper() == "INBOX"
+    )
+    if is_inbox or first_tok in ("LOGSTREAM", "EVENTS") or (
         first_tok == "EVENT" and len(tokens) > 1 and tokens[1].upper() in ("LIST", "FIND")
     ):
-        start_idx = 2 if first_tok == "EVENT" else 1
+        start_idx = 1 if first_tok in ("INBOX", "LOGSTREAM", "EVENTS") else 2
         kv = _parse_key_value_tokens(tokens[start_idx:])
+        if is_inbox:
+            if "order" not in kv:
+                kv["order"] = "desc"
+            if "preview" not in kv:
+                kv["preview"] = True
+
+        # Shorthand flags for ordering and preview
+        for desc_flag in ("desc", "latest", "recent", "tail"):
+            if desc_flag in kv:
+                kv.pop(desc_flag)
+                if "order" not in kv:
+                    kv["order"] = "desc"
+        for asc_flag in ("asc", "head", "oldest", "from_start"):
+            if asc_flag in kv:
+                kv.pop(asc_flag)
+                if "order" not in kv:
+                    kv["order"] = "asc"
+        if "preview" in kv:
+            kv["preview"] = bool(kv["preview"])
+
+        if "order" in kv and kv["order"] is not None:
+            kv["order"] = str(kv["order"]).lower().strip()
+            if kv["order"] not in ("asc", "desc"):
+                raise QueryParseError(f"Invalid order '{kv['order']}'; must be 'asc' or 'desc'")
+
         if "from" in kv and "from_agent" not in kv:
             kv["from_agent"] = kv.pop("from")
         elif "from" in kv:

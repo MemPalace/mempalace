@@ -23,7 +23,7 @@ Coordination (natural logstream):
   coordinating specific workstreams.
 - Checking inbox: When entering collaborative mode or before long tasks:
   mempalace_event_list with to_agent=<AGENT_ID>, since_event_id=<last
-  event id you processed>, preview=true. Remember that id — it is your
+  event id you processed>, preview=true (defaults to newest-first without cursor). Remember that id — it is your
   cursor. Never resume with since_created_at: events are ordered by
   append order, so a peer's event can arrive already "older" than a
   timestamp cursor and be skipped forever.

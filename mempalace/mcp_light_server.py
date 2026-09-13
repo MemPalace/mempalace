@@ -75,6 +75,7 @@ _PQL_KEYWORDS = {
     "EVENT",
     "EVENTS",
     "LOGSTREAM",
+    "INBOX",
     "ARTIFACT",
     "PATCH",
     "PEERS",
@@ -554,22 +555,23 @@ LIGHT_TOOLS = {
             "logstream event append/list/wait/ack, artifact put/get, patch submission, and mesh estate snapshot. "
             "Accepts a concise coordination DSL string (e.g. 'TASK CREATE project:mempalace from:agent1 "
             'to:agent2 goal:"fix" branch:b base:c done:"done"\', \'EVENT APPEND type:task.request ...\', '
-            "'EVENT LIST stream:project/x ...', 'EVENT WAIT correlation:task_1', 'EVENT ACK id:evt_1 "
-            "from:agent1 status:applied', 'ARTIFACT PUT kind:patch ...', 'PATCH SUBMIT ...', 'MESH PEERS') "
-            "or a structured dict payload."
+            "'EVENT INBOX to:agent', 'EVENT LIST stream:project/x [DESC|ASC] [LIMIT n] [PREVIEW]', "
+            "'EVENT WAIT correlation:task_1', 'EVENT ACK id:evt_1 from:agent1 status:applied', "
+            "'ARTIFACT PUT kind:patch ...', 'PATCH SUBMIT ...', 'MESH PEERS') "
+            "or a structured dict payload. EVENT LIST defaults to newest-first (order='desc') when no cursor is passed."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "Coordination DSL string (e.g. 'TASK CREATE project:x ...')",
+                    "description": "Coordination DSL string (e.g. 'TASK CREATE project:x ...', 'EVENT INBOX to:agent', 'EVENT LIST stream:project/x DESC')",
                 },
                 "action": {
                     "type": "string",
                     "description": (
                         "Action: task_create, event_append, event_list, event_wait, event_ack, "
-                        "artifact_put, artifact_get, patch_submit, mesh_peers"
+                        "artifact_put, artifact_get, patch_submit, mesh_peers, inbox"
                     ),
                 },
                 "project": {"type": "string", "description": "Project routing name (optional)"},
@@ -590,11 +592,27 @@ LIGHT_TOOLS = {
                 "event_id": {"type": "string", "description": "Event ID to ack (optional)"},
                 "since_event_id": {
                     "type": "string",
-                    "description": "Resume cursor: events after this id (optional)",
+                    "description": "Resume cursor: events strictly after this id in append order (optional)",
                 },
                 "before_event_id": {
                     "type": "string",
-                    "description": "Page backward: events before this id (optional)",
+                    "description": "Page backward: events strictly before this id in append order (optional)",
+                },
+                "since_created_at": {
+                    "type": "string",
+                    "description": "Time window filter, inclusive: events created at or after this timestamp (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional). NOT a resume cursor — use since_event_id for that.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max events to return (default 50, max 500, optional)",
+                },
+                "order": {
+                    "type": "string",
+                    "description": "'desc' (newest first, default without cursor) or 'asc' (forward chronological, default with since_event_id, optional)",
+                },
+                "preview": {
+                    "type": "boolean",
+                    "description": "Truncate each event body to short excerpt (marks body_truncated + body_length) so scanning stays cheap (default false)",
                 },
                 "timeout_ms": {
                     "type": "integer",

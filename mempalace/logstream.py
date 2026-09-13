@@ -974,6 +974,10 @@ class Logstream:
         since_event_id = _sanitize_routing(since_event_id, "since_event_id", required=False)
         before_event_id = _sanitize_routing(before_event_id, "before_event_id", required=False)
         since_created_at = sanitize_iso_temporal(since_created_at, "since_created_at") or None
+        if order is None:
+            order = "asc"
+        elif isinstance(order, str):
+            order = order.lower().strip()
         if order not in ("asc", "desc"):
             raise ValueError(f"order={order!r} must be 'asc' or 'desc'")
         if not isinstance(limit, int) or limit < 1:
