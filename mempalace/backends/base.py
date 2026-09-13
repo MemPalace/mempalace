@@ -562,6 +562,54 @@ class BaseCollection(ABC):
             offset += len(batch_meta)
         return all_meta
 
+    def get_all_rows(
+        self, where: Optional[dict] = None, include: Optional[list[str]] = None
+    ) -> GetResult:
+        """Return every matching record -- ids plus the ``include``d fields --
+        in one logical pass (#2452).
+
+        The ids-carrying sibling of :meth:`get_all_metadata`, for callers that
+        need to know *which* rows they got (``list_drawers`` collapses chunk
+        rows into logical drawers by id). ``include`` defaults to
+        ``["metadatas"]``; ``documents``/``metadatas`` come back aligned with
+        ``ids`` when requested and empty otherwise. Same contract as
+        ``get_all_metadata``: the default pages through :meth:`get` with
+        ``limit``/``offset``, and backends without a real server-side cursor
+        MUST override it with a single native walk, or every page re-scans
+        the whole collection (O(n^2)).
+        """
+        include = list(include) if include else ["metadatas"]
+        want_docs = "documents" in include
+        want_meta = "metadatas" in include
+        ids: list[str] = []
+        documents: list = []
+        metadatas: list = []
+        offset = 0
+        page_size = 1000
+        while True:
+            kwargs: dict = {"include": include, "limit": page_size, "offset": offset}
+            if where:
+                kwargs["where"] = where
+            batch = self.get(**kwargs)
+            batch_ids = batch.ids if hasattr(batch, "ids") else batch.get("ids")
+            if not batch_ids:
+                break
+            ids.extend(batch_ids)
+            if want_docs:
+                batch_docs = (
+                    batch.documents if hasattr(batch, "documents") else batch.get("documents")
+                )
+                documents.extend(batch_docs or [])
+            if want_meta:
+                batch_meta = (
+                    batch.metadatas if hasattr(batch, "metadatas") else batch.get("metadatas")
+                )
+                metadatas.extend(batch_meta or [])
+            if len(batch_ids) < page_size:
+                break
+            offset += len(batch_ids)
+        return GetResult(ids=ids, documents=documents, metadatas=metadatas, embeddings=None)
+
     def get_recent(
         self,
         *,

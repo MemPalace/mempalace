@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .base import BaseCollection, initialize_last_modified_metadata
+from .base import BaseCollection, GetResult, initialize_last_modified_metadata
 
 
 def _embed_texts(texts: list[str]) -> list[list[float]]:
@@ -205,6 +205,15 @@ class EmbeddingCollection(BaseCollection):
         # over the wire. Same MRO-shadow pattern as ``facet_counts`` /
         # ``lexical_search`` above.
         return self._inner.get_all_metadata(where=where)
+
+    def get_all_rows(
+        self, where: Optional[dict] = None, include: Optional[list[str]] = None
+    ) -> GetResult:
+        # Same MRO shadow as ``get_all_metadata`` right above: the concrete
+        # default on ``BaseCollection`` pages through ``self.get()``, so without
+        # this forwarder a backend's single-pass implementation (qdrant scrolls
+        # its own cursor) is never reached and the O(n^2) offset walk comes back.
+        return self._inner.get_all_rows(where=where, include=include)
 
     def update(self, *, ids, documents=None, metadatas=None, embeddings=None):
         ids = _as_list(ids)
