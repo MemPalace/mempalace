@@ -480,17 +480,20 @@ def search_memories(
         scored.append(entry)
 
     scored = _collapse_logical_generation_hits(scored)
-    scored = _include_matching_parent_siblings(
-        scored,
+    scored.sort(key=lambda h: h["_sort_key"])
+    hits = scored[:pre_enrichment_limit]
+    hits = _include_matching_parent_siblings(
+        hits,
         drawers_col,
         query,
         committed_tokens,
         tokened_source_modes,
         stop_words=stop_words,
         metric=metric,
+        wing=wing,
+        room=room,
+        source_file=source_file,
     )
-    scored.sort(key=lambda h: h["_sort_key"])
-    hits = scored[:pre_enrichment_limit]
 
     # Drawer-grep enrichment: retain the wider pool until repeated
     # closet-rendered passages can be replaced by distinct candidates.

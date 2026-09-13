@@ -1013,6 +1013,94 @@ class TestSearchMemories:
             [prefix], Boom(), "shrinkGamma", frozenset({"tok"}), frozenset()
         ) == [prefix]
 
+    def test_parent_sibling_refill_applies_request_filters_and_skips_uniform_groups(self):
+        from mempalace.searcher import _include_matching_parent_siblings
+
+        prefix = {
+            "text": "shrinkDelta prefix",
+            "_parent_drawer_id": "logical",
+            "_physical_drawer_id": "logical_chunk_000000",
+            "distance": 0.2,
+        }
+        tail = "shrinkGamma leftover verbatim"
+        leftover_meta = {
+            "logical_drawer_id": "logical",
+            "parent_drawer_id": "logical",
+            "wing": "sessions",
+            "room": "general",
+            "source_file": "/tmp/legacy-mined-session.jsonl",
+            "mine_generation_token": "tok",
+        }
+
+        class Mixed:
+            @staticmethod
+            def get(**_kwargs):
+                return {
+                    "ids": ["logical_chunk_000000", "logical_chunk_000002"],
+                    "documents": ["shrinkDelta prefix", tail],
+                    "metadatas": [
+                        {
+                            "parent_drawer_id": "logical",
+                            "wing": "moved",
+                            "room": "elsewhere",
+                            "mine_generation_token": "tok",
+                        },
+                        leftover_meta,
+                    ],
+                }
+
+        class Uniform:
+            @staticmethod
+            def get(**_kwargs):
+                return {
+                    "ids": ["logical_chunk_000000", "logical_chunk_000001"],
+                    "documents": ["common token alpha", "common token beta"],
+                    "metadatas": [
+                        {
+                            "logical_drawer_id": "logical",
+                            "parent_drawer_id": "logical",
+                            "mine_generation_token": "tok",
+                        },
+                        {
+                            "logical_drawer_id": "logical",
+                            "parent_drawer_id": "logical",
+                            "mine_generation_token": "tok",
+                        },
+                    ],
+                }
+
+        filtered = _include_matching_parent_siblings(
+            [prefix],
+            Mixed(),
+            "shrinkGamma",
+            frozenset({"tok"}),
+            frozenset(),
+            wing="moved",
+            room="elsewhere",
+        )
+        assert [hit["text"] for hit in filtered] == ["shrinkDelta prefix"]
+
+        same_scope = _include_matching_parent_siblings(
+            [prefix],
+            Mixed(),
+            "shrinkGamma",
+            frozenset({"tok"}),
+            frozenset(),
+            wing="sessions",
+            room="general",
+        )
+        assert any(hit["text"] == tail for hit in same_scope)
+
+        uniform_prefix = {
+            "text": "common token alpha",
+            "_parent_drawer_id": "logical",
+            "_physical_drawer_id": "logical_chunk_000000",
+            "distance": 0.1,
+        }
+        assert _include_matching_parent_siblings(
+            [uniform_prefix], Uniform(), "common token", frozenset({"tok"}), frozenset()
+        ) == [uniform_prefix]
+
     def test_wing_and_room_filter(self, palace_path, seeded_collection):
         result = search_memories("code", palace_path, wing="project", room="frontend")
         assert all(r["wing"] == "project" and r["room"] == "frontend" for r in result["results"])

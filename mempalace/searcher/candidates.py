@@ -323,6 +323,42 @@ def _sibling_search_hit(physical_id, doc, meta, distance, committed_tokens, metr
     }
 
 
+def _sibling_matches_request_filters(meta, wing=None, room=None, source_file=None) -> bool:
+    """True when a refilled sibling satisfies the caller's search filters."""
+    meta = meta or {}
+    if wing and meta.get("wing") != wing:
+        return False
+    if room and meta.get("room") != room:
+        return False
+    if source_file and meta.get("source_file") != source_file:
+        return False
+    return True
+
+
+def _mixed_generation_leftover_ids(ids, metas, parent_id, committed_tokens, tokened_source_modes):
+    """Physical IDs that still carry ``logical_drawer_id`` beside a stripped prefix.
+
+    A failed shrink leaves rewritten prefix chunks without generation identity
+    and the unread tail still carrying ``logical_drawer_id``. Ordinary parent
+    groups share one identity and must not be refilled wholesale.
+    """
+    stripped = False
+    leftovers = []
+    for index, physical_id in enumerate(ids):
+        meta = metas[index] if index < len(metas) else {}
+        if _logical_parent_id(meta) != parent_id:
+            continue
+        if not _is_visible_generation_metadata(meta, committed_tokens, tokened_source_modes):
+            continue
+        if meta.get("logical_drawer_id"):
+            leftovers.append(physical_id)
+        else:
+            stripped = True
+    if not stripped:
+        return set()
+    return set(leftovers)
+
+
 def _include_matching_parent_siblings(
     hits: list,
     drawers_col,
@@ -331,13 +367,17 @@ def _include_matching_parent_siblings(
     tokened_source_modes,
     stop_words=frozenset(),
     metric: str = "cosine",
+    wing=None,
+    room=None,
+    source_file=None,
 ) -> list:
     """Add leftover parent chunks that HNSW omitted but get() can still read.
 
     A failed shrink delete leaves the new prefix without ``logical_drawer_id``
     and the old tail still parent-linked. Vector query can drop that tail
     after the prefix upsert; logical drawer reads already recover it via
-    parent ``get()``. Search must return the same verbatim leftover chunk.
+    parent ``get()``. Search must return the same verbatim leftover chunk
+    without admitting every query-term sibling into the pre-rerank pool.
     """
     if not hits or not query:
         return hits
@@ -357,6 +397,11 @@ def _include_matching_parent_siblings(
             logger.debug("parent sibling refill failed for %s", parent_id, exc_info=True)
             continue
         ids, docs, metas = _collection_get_rows(result)
+        leftover_ids = _mixed_generation_leftover_ids(
+            ids, metas, parent_id, committed_tokens, tokened_source_modes
+        )
+        if not leftover_ids:
+            continue
         parent_distances = [
             hit.get("distance")
             for hit in hits
@@ -365,12 +410,12 @@ def _include_matching_parent_siblings(
         ]
         seed_dist = min(parent_distances) if parent_distances else 2.0
         for index, physical_id in enumerate(ids):
-            if not physical_id or physical_id in seen_ids:
+            if physical_id not in leftover_ids or physical_id in seen_ids:
                 continue
             meta = metas[index] if index < len(metas) else {}
-            if _logical_parent_id(meta) != parent_id:
-                continue
-            if not _is_visible_generation_metadata(meta, committed_tokens, tokened_source_modes):
+            if not _sibling_matches_request_filters(
+                meta, wing=wing, room=room, source_file=source_file
+            ):
                 continue
             doc = docs[index] if index < len(docs) else ""
             doc = doc or ""

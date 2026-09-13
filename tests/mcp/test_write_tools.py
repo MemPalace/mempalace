@@ -1828,6 +1828,47 @@ def test_update_shrink_delete_failure_leaves_prefix_readable(monkeypatch, config
     assert fetched["content"] == "".join([*new_parts, old_parts[2]])
 
 
+def test_interrupted_shrink_search_does_not_leak_old_wing_tail(
+    monkeypatch, config, palace_path, kg
+):
+    """A wing-scoped search must not refill a leftover tail from the old wing."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    logical_id = "logical-legacy-shrink-wing"
+    chunk_size = config.chunk_size
+    old_parts = [
+        _verbatim_chunk(label, chunk_size) for label in ("wingAlpha", "wingBeta", "wingGamma")
+    ]
+    new_parts = [_verbatim_chunk(label, chunk_size) for label in ("wingDelta", "wingEpsilon")]
+    _seed_legacy_mined_parent_chunks(palace_path, logical_id, old_parts)
+
+    from mempalace.backends.chroma import ChromaCollection
+    from mempalace.mcp_server import tool_search, tool_update_drawer
+
+    original_delete = ChromaCollection.delete
+
+    def failing_delete(self, *, ids=None, where=None):
+        id_list = list(ids or [])
+        if any(str(item).endswith("_chunk_000002") for item in id_list):
+            raise RuntimeError("stale tail delete failed")
+        return original_delete(self, ids=ids, where=where)
+
+    monkeypatch.setattr(ChromaCollection, "delete", failing_delete)
+    updated = tool_update_drawer(
+        logical_id,
+        content="".join(new_parts),
+        wing="moved",
+        room="elsewhere",
+    )
+    assert updated["success"] is False
+
+    moved = tool_search(query="wingGamma", wing="moved", room="elsewhere", limit=10)
+    assert not any("wingGamma" in hit["text"] for hit in moved["results"])
+    same_scope = tool_search(query="wingGamma", wing="sessions", room="general", limit=10)
+    matching = [hit for hit in same_scope["results"] if "wingGamma" in hit["text"]]
+    assert matching
+    assert any(hit["text"] == old_parts[2] for hit in matching)
+
+
 def test_parent_sibling_lookup_fails_closed_instead_of_returning_tail(
     monkeypatch, config, palace_path, kg
 ):
