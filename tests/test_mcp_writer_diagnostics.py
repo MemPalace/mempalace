@@ -149,3 +149,45 @@ def test_light_hub_forward_does_not_acquire_local_writer(isolated_writer, monkey
         }
     )
     assert "result" in result
+
+
+def test_peer_sync_thread_does_not_pollute_unrelated_palace(tmp_path, monkeypatch):
+    """Issue #2493: peer sync thread must not create or mutate other palaces."""
+    import threading
+    import mempalace.logsync as logsync_mod
+    from mempalace.config import MempalaceConfig
+
+    palace1 = tmp_path / "sync_palace"
+    palace1.mkdir()
+    monkeypatch.setenv("MEMPALACE_SYNC_INTERVAL", "0.01")
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(palace1))
+    monkeypatch.setattr(mcp, "_config", MempalaceConfig(palace_path=palace1))
+
+    sync_round_completed = threading.Event()
+    original_sync_all = logsync_mod.sync_all
+
+    def _sync_all_wrapper(*args, **kwargs):
+        res = original_sync_all(*args, **kwargs)
+        sync_round_completed.set()
+        return res
+
+    monkeypatch.setattr("mempalace.logsync.sync_all", _sync_all_wrapper)
+
+    unrelated_palace = tmp_path / "unrelated_palace"
+    assert not unrelated_palace.exists()
+
+    thread = mcp._start_peer_sync_thread()
+    assert thread is not None
+
+    # Repoint _config to unrelated_palace AFTER thread starts on palace1
+    monkeypatch.setattr(mcp, "_config", MempalaceConfig(palace_path=unrelated_palace))
+
+    # Wait for the sync round to definitely complete
+    assert sync_round_completed.wait(timeout=5.0), "sync round never executed within deadline"
+
+    # Unrelated palace must remain absent!
+    assert not unrelated_palace.exists()
+
+    # Clean up thread
+    assert mcp._stop_peer_sync_thread(timeout=5.0)
+    assert not thread.is_alive()

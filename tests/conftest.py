@@ -192,6 +192,13 @@ def _reset_mcp_cache(monkeypatch):
 
             mcp_server = sys.modules.get("mempalace.mcp_server")
             if mcp_server is not None:
+                stop_sync = getattr(mcp_server, "_stop_peer_sync_thread", None)
+                if callable(stop_sync):
+                    try:
+                        stop_sync()
+                    except Exception:
+                        pass
+
                 _reset_loaded_mcp_writer_state(mcp_server)
                 for kg in list(getattr(mcp_server, "_kg_by_path", {}).values()):
                     close = getattr(kg, "close", None)
@@ -203,6 +210,17 @@ def _reset_mcp_cache(monkeypatch):
 
                 if hasattr(mcp_server, "_kg_by_path"):
                     mcp_server._kg_by_path.clear()
+
+                for ls in list(getattr(mcp_server, "_logstream_by_path", {}).values()):
+                    close = getattr(ls, "close", None)
+                    if close is not None:
+                        try:
+                            close()
+                        except Exception:
+                            pass
+
+                if hasattr(mcp_server, "_logstream_by_path"):
+                    mcp_server._logstream_by_path.clear()
 
                 # Close (not just dereference) the cached chromadb client so its
                 # rust-side file handles are released; on Windows a bare deref

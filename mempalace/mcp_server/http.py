@@ -708,6 +708,10 @@ def _mesh_peers_payload() -> dict:
     }
 
 
+_peer_sync_thread: Optional[threading.Thread] = None
+_peer_sync_stop_event: Optional[threading.Event] = None
+
+
 def _peer_sync_interval_s() -> float:
     try:
         return float(os.environ.get("MEMPALACE_SYNC_INTERVAL", "") or 15)
@@ -715,7 +719,29 @@ def _peer_sync_interval_s() -> float:
         return 15.0
 
 
-def _start_peer_sync_thread() -> None:
+def _stop_peer_sync_thread(timeout: float = 5.0) -> bool:
+    """Signal shutdown to the peer sync thread and wait for it to exit.
+
+    Returns True if the thread stopped (or was not running), False if it timed out.
+    """
+    global _peer_sync_thread, _peer_sync_stop_event
+    if _peer_sync_stop_event is not None:
+        _peer_sync_stop_event.set()
+    stopped = True
+    if _peer_sync_thread is not None and _peer_sync_thread.is_alive():
+        _peer_sync_thread.join(timeout=timeout)
+        stopped = not _peer_sync_thread.is_alive()
+        if not stopped:
+            logger.warning("peer sync thread did not terminate within %.1fs", timeout)
+    if stopped:
+        _peer_sync_thread = None
+        _peer_sync_stop_event = None
+    return stopped
+
+
+def _start_peer_sync_thread(
+    stop_event: Optional[threading.Event] = None,
+) -> Optional[threading.Thread]:
     """Background anti-entropy loop for the logstream (RFC 004 step 0).
 
     Runs in the serving process so a hub with configured peers converges
@@ -732,20 +758,33 @@ def _start_peer_sync_thread() -> None:
     """
     from ..logsync import sync_all
 
+    global _peer_sync_thread, _peer_sync_stop_event
+    if not _stop_peer_sync_thread():
+        logger.warning("cannot start peer sync thread: previous thread is still alive")
+        return None
+
     palace_path = getattr(_config, "palace_path", None)
     if not palace_path:
-        return
+        return None
     interval = _peer_sync_interval_s()
     if interval <= 0:
-        return
+        return None
+
+    canonical_ls_path = _canonicalize_kg_path(
+        os.path.join(os.path.expanduser(palace_path), LOGSTREAM_DB_FILENAME)
+    )
+    stop = stop_event if stop_event is not None else threading.Event()
 
     def _loop():
         malformed_logged = False
-        while True:
-            time.sleep(interval)
+        while not stop.wait(interval):
+            if stop.is_set():
+                break
             try:
-                ls = _get_logstream()
+                ls = _get_logstream(canonical_ls_path)
                 for stats in sync_all(ls, palace_path):
+                    if stop.is_set():
+                        break
                     _record_peer_sync(stats)
                     if stats.get("error"):
                         logger.warning("peer sync %s: %s", stats.get("peer_name"), stats["error"])
@@ -756,6 +795,8 @@ def _start_peer_sync_thread() -> None:
                             stats["pulled_events"],
                             stats["pulled_artifacts"],
                         )
+                if stop.is_set():
+                    break
                 # Publish once per round, not per peer: the estate is only
                 # coherent after every configured peer has been attempted.
                 _publish_mesh_state(palace_path)
@@ -768,8 +809,11 @@ def _start_peer_sync_thread() -> None:
                 logger.warning("peer sync round failed", exc_info=True)
 
     thread = threading.Thread(target=_loop, name="mempalace-logsync", daemon=True)
+    _peer_sync_thread = thread
+    _peer_sync_stop_event = stop
     thread.start()
     logger.info("peer sync thread started (interval %.0fs)", interval)
+    return thread
 
 
 def _sse_acquire_slot(httpd) -> bool:
@@ -1152,6 +1196,7 @@ def _serve_http(host: str, port: int) -> None:
         except KeyboardInterrupt:
             logger.info("MemPalace MCP HTTP server shutting down")
         finally:
+            _stop_peer_sync_thread()
             if _registered_palace:
                 try:
                     from .. import server_registry
