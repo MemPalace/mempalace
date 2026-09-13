@@ -387,8 +387,10 @@ def main():
     p_hook_run.add_argument(
         "--harness",
         required=True,
-        choices=["claude-code", "codex"],
-        help="Harness type (determines stdin JSON format)",
+        help=(
+            "Harness type: claude-code, codex, grok, copilot, auto "
+            "(detect from stdin/env), or any other token"
+        ),
     )
 
     # instructions

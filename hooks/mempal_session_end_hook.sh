@@ -33,7 +33,7 @@ run_mempalace_hook() {
 # the final mine on its own time and outlives this process.
 payload="$(cat)"
 (
-  printf '%s' "$payload" | run_mempalace_hook --hook session-end --harness "${MEMPALACE_HOOK_HARNESS:-claude-code}"
+  printf '%s' "$payload" | run_mempalace_hook --hook session-end --harness "${MEMPALACE_HOOK_HARNESS:-auto}"
 ) >/dev/null 2>&1 </dev/null &
 disown 2>/dev/null || true
 
