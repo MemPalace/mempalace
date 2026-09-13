@@ -719,15 +719,24 @@ def _peer_sync_interval_s() -> float:
         return 15.0
 
 
-def _stop_peer_sync_thread(timeout: float = 2.0) -> None:
-    """Signal shutdown to the peer sync thread and wait for it to exit."""
+def _stop_peer_sync_thread(timeout: float = 5.0) -> bool:
+    """Signal shutdown to the peer sync thread and wait for it to exit.
+
+    Returns True if the thread stopped (or was not running), False if it timed out.
+    """
     global _peer_sync_thread, _peer_sync_stop_event
     if _peer_sync_stop_event is not None:
         _peer_sync_stop_event.set()
+    stopped = True
     if _peer_sync_thread is not None and _peer_sync_thread.is_alive():
         _peer_sync_thread.join(timeout=timeout)
-    _peer_sync_thread = None
-    _peer_sync_stop_event = None
+        stopped = not _peer_sync_thread.is_alive()
+        if not stopped:
+            logger.warning("peer sync thread did not terminate within %.1fs", timeout)
+    if stopped:
+        _peer_sync_thread = None
+        _peer_sync_stop_event = None
+    return stopped
 
 
 def _start_peer_sync_thread(
@@ -750,7 +759,9 @@ def _start_peer_sync_thread(
     from ..logsync import sync_all
 
     global _peer_sync_thread, _peer_sync_stop_event
-    _stop_peer_sync_thread()
+    if not _stop_peer_sync_thread():
+        logger.warning("cannot start peer sync thread: previous thread is still alive")
+        return None
 
     palace_path = getattr(_config, "palace_path", None)
     if not palace_path:
@@ -767,12 +778,13 @@ def _start_peer_sync_thread(
     def _loop():
         malformed_logged = False
         while not stop.wait(interval):
+            if stop.is_set():
+                break
             try:
-                try:
-                    ls = _get_logstream(canonical_ls_path)
-                except TypeError:
-                    ls = _get_logstream()
+                ls = _get_logstream(canonical_ls_path)
                 for stats in sync_all(ls, palace_path):
+                    if stop.is_set():
+                        break
                     _record_peer_sync(stats)
                     if stats.get("error"):
                         logger.warning("peer sync %s: %s", stats.get("peer_name"), stats["error"])
@@ -783,6 +795,8 @@ def _start_peer_sync_thread(
                             stats["pulled_events"],
                             stats["pulled_artifacts"],
                         )
+                if stop.is_set():
+                    break
                 # Publish once per round, not per peer: the estate is only
                 # coherent after every configured peer has been attempted.
                 _publish_mesh_state(palace_path)
