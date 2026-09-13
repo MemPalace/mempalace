@@ -137,7 +137,7 @@ def prefetch_mined_set(
     awareness "for free": conversation transcripts are not immutable once
     mined (a Claude Code session keeps appending to the same file while
     active, and /compact or /clear can rewrite one in place), so "we've
-    seen this source_file before" is not suffient to skip it -- the caller
+    seen this source_file before" is not sufficient to skip it -- the caller
     must also confirm its current on-disk mtime still matches what was
     stored. `if src in mined_set` still means the same thing as the old
     set-based return (dict `in` checks keys); a caller that wants staleness

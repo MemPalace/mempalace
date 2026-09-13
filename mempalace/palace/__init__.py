@@ -1,7 +1,8 @@
 """
-palace.py — Shared palace operations.
+mempalace.palace — Shared palace operations.
 
-Consolidates collection access patterns used by both miners and the MCP server.
+Collection access, closets, mine locks, and mined-set checks used by both
+miners and the MCP server. Public import path is ``mempalace.palace``.
 """
 
 # The public import path remains ``mempalace.palace``. Implementation is
