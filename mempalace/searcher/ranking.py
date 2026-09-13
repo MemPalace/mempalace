@@ -62,6 +62,14 @@ def _logical_parent_id(meta):
     return None
 
 
+def _logical_parent_where(drawer_id: str) -> dict:
+    """Chroma ``where`` matching every chunk of ``drawer_id`` under either key.
+
+    Kept in sync with ``mcp_server._logical_parent_where``.
+    """
+    return {"$or": [{"parent_drawer_id": drawer_id}, {"parent_entry_id": drawer_id}]}
+
+
 def _logical_generation_id(meta):
     """Conversation generation id, excluding physical parent-chunk rows."""
     meta = meta or {}

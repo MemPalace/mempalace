@@ -936,6 +936,83 @@ class TestSearchMemories:
         assert filtered["ids"][0] == chunk_ids
         assert filtered["documents"][0] == ["alpha chunk", "beta chunk"]
 
+    def test_parent_sibling_refill_restores_hnsw_omitted_leftover(self):
+        from mempalace.searcher import _include_matching_parent_siblings
+
+        prefix = {
+            "text": "shrinkDelta prefix",
+            "drawer_id": "logical",
+            "_parent_drawer_id": "logical",
+            "_physical_drawer_id": "logical_chunk_000000",
+            "distance": 0.2,
+        }
+        tail = "shrinkGamma leftover verbatim"
+
+        class Collection:
+            @staticmethod
+            def get(**_kwargs):
+                return {
+                    "ids": ["logical_chunk_000000", "logical_chunk_000002"],
+                    "documents": ["shrinkDelta prefix", tail],
+                    "metadatas": [
+                        {
+                            "parent_drawer_id": "logical",
+                            "wing": "sessions",
+                            "room": "general",
+                            "mine_generation_token": "tok",
+                            "filed_at": "2026-09-01T00:00:00",
+                        },
+                        {
+                            "logical_drawer_id": "logical",
+                            "parent_drawer_id": "logical",
+                            "wing": "sessions",
+                            "room": "general",
+                            "mine_generation_token": "tok",
+                            "filed_at": "2026-09-01T00:00:00",
+                        },
+                    ],
+                }
+
+        filled = _include_matching_parent_siblings(
+            [prefix], Collection(), "shrinkGamma", frozenset({"tok"}), frozenset()
+        )
+        matching = [hit for hit in filled if hit["text"] == tail]
+        assert matching
+        assert matching[0]["drawer_id"] == "logical"
+        assert matching[0]["_physical_drawer_id"] == "logical_chunk_000002"
+        assert filled[0]["text"] == "shrinkDelta prefix"
+
+    def test_parent_sibling_refill_skips_nonmatching_and_failed_get(self):
+        from mempalace.searcher import _include_matching_parent_siblings
+
+        prefix = {
+            "text": "shrinkDelta prefix",
+            "_parent_drawer_id": "logical",
+            "_physical_drawer_id": "logical_chunk_000000",
+            "distance": 0.2,
+        }
+
+        class NoMatch:
+            @staticmethod
+            def get(**_kwargs):
+                return {
+                    "ids": ["logical_chunk_000002"],
+                    "documents": ["unrelated leftover"],
+                    "metadatas": [{"parent_drawer_id": "logical", "mine_generation_token": "tok"}],
+                }
+
+        class Boom:
+            @staticmethod
+            def get(**_kwargs):
+                raise RuntimeError("sibling get failed")
+
+        assert _include_matching_parent_siblings(
+            [prefix], NoMatch(), "shrinkGamma", frozenset({"tok"}), frozenset()
+        ) == [prefix]
+        assert _include_matching_parent_siblings(
+            [prefix], Boom(), "shrinkGamma", frozenset({"tok"}), frozenset()
+        ) == [prefix]
+
     def test_wing_and_room_filter(self, palace_path, seeded_collection):
         result = search_memories("code", palace_path, wing="project", room="frontend")
         assert all(r["wing"] == "project" and r["room"] == "frontend" for r in result["results"])

@@ -269,6 +269,128 @@ def _dedupe_rendered_hits(
     return unique
 
 
+def _collection_get_rows(result) -> tuple[list, list, list]:
+    """Normalize a collection.get() payload to (ids, documents, metadatas)."""
+    if isinstance(result, dict):
+        ids = result.get("ids") or []
+        docs = result.get("documents") or []
+        metas = result.get("metadatas") or []
+    else:
+        ids = getattr(result, "ids", None) or []
+        docs = getattr(result, "documents", None) or []
+        metas = getattr(result, "metadatas", None) or []
+    return list(ids), list(docs), list(metas)
+
+
+def _parent_ids_from_hits(hits: list) -> list:
+    parent_ids = []
+    seen = set()
+    for hit in hits:
+        parent_id = hit.get("_parent_drawer_id") or hit.get("_parent_entry_id")
+        if not parent_id:
+            parent_id = _logical_parent_id(hit.get("metadata"))
+        if parent_id and parent_id not in seen:
+            seen.add(parent_id)
+            parent_ids.append(parent_id)
+    return parent_ids
+
+
+def _sibling_search_hit(physical_id, doc, meta, distance, committed_tokens, metric="cosine"):
+    """Build a drawer hit from a parent-linked sibling loaded via get()."""
+    source = (meta or {}).get("source_file", "") or ""
+    bounded = max(0.0, min(2.0, distance))
+    return {
+        "drawer_id": _result_drawer_id(meta, physical_id),
+        "text": doc,
+        "wing": (meta or {}).get("wing", "unknown"),
+        "room": (meta or {}).get("room", "unknown"),
+        "source_file": Path(source).name if source else "?",
+        "source_path": source,
+        **_result_date_fields(meta or {}),
+        "similarity": round(_distance_to_similarity(distance, metric), 3),
+        "distance": round(distance, 4),
+        "effective_distance": round(bounded, 4),
+        "closet_boost": 0.0,
+        "matched_via": "drawer",
+        "_sort_key": distance,
+        "_source_file_full": source,
+        "_chunk_index": (meta or {}).get("chunk_index"),
+        "_parent_drawer_id": (meta or {}).get("parent_drawer_id"),
+        "_parent_entry_id": (meta or {}).get("parent_entry_id"),
+        "_logical_generation_id": _logical_generation_id(meta),
+        "_physical_drawer_id": physical_id,
+        "_active_generation": (meta or {}).get("mine_generation_token") in committed_tokens,
+    }
+
+
+def _include_matching_parent_siblings(
+    hits: list,
+    drawers_col,
+    query: str,
+    committed_tokens,
+    tokened_source_modes,
+    stop_words=frozenset(),
+    metric: str = "cosine",
+) -> list:
+    """Add leftover parent chunks that HNSW omitted but get() can still read.
+
+    A failed shrink delete leaves the new prefix without ``logical_drawer_id``
+    and the old tail still parent-linked. Vector query can drop that tail
+    after the prefix upsert; logical drawer reads already recover it via
+    parent ``get()``. Search must return the same verbatim leftover chunk.
+    """
+    if not hits or not query:
+        return hits
+    query_terms = set(_tokenize(query, stop_words))
+    if not query_terms:
+        return hits
+
+    seen_ids = {hit.get("_physical_drawer_id") for hit in hits if hit.get("_physical_drawer_id")}
+    added = []
+    for parent_id in _parent_ids_from_hits(hits):
+        try:
+            result = drawers_col.get(
+                where=_logical_parent_where(parent_id),
+                include=["documents", "metadatas"],
+            )
+        except Exception:
+            logger.debug("parent sibling refill failed for %s", parent_id, exc_info=True)
+            continue
+        ids, docs, metas = _collection_get_rows(result)
+        parent_distances = [
+            hit.get("distance")
+            for hit in hits
+            if (hit.get("_parent_drawer_id") or hit.get("_parent_entry_id")) == parent_id
+            and hit.get("distance") is not None
+        ]
+        seed_dist = min(parent_distances) if parent_distances else 2.0
+        for index, physical_id in enumerate(ids):
+            if not physical_id or physical_id in seen_ids:
+                continue
+            meta = metas[index] if index < len(metas) else {}
+            if _logical_parent_id(meta) != parent_id:
+                continue
+            if not _is_visible_generation_metadata(meta, committed_tokens, tokened_source_modes):
+                continue
+            doc = docs[index] if index < len(docs) else ""
+            doc = doc or ""
+            lowered = doc.lower()
+            if not any(term in lowered for term in query_terms):
+                continue
+            seen_ids.add(physical_id)
+            added.append(
+                _sibling_search_hit(
+                    physical_id,
+                    doc,
+                    meta,
+                    seed_dist,
+                    committed_tokens,
+                    metric=metric,
+                )
+            )
+    return hits + added
+
+
 # Strategy dispatch — keeps search_memories' branch count under the
 # project's complexity ceiling (C901 max-complexity=25). New strategies
 # register here.
