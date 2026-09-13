@@ -116,6 +116,19 @@ def make_convo_commit_id(source_file: str, extract_mode: str) -> str:
     return f"_reg_commit_{digest}"
 
 
+def make_convo_tail_commit_id(source_file: str, extract_mode: str) -> str:
+    """Temporary registry ID that publishes an append tail's staging token.
+
+    Append-only growth keeps unchanged rows on the committed marker token.
+    New tail rows therefore stage under a distinct unpublished token; this
+    extra marker is the crash-atomic switch that makes the complete tail
+    visible without hiding the prior generation. Publication then
+    overwrites it so the tail token does not stay committed.
+    """
+    digest = _delimited_sha256(("convo-commit-tail", source_file, extract_mode), _HASH_TRUNC_DRAWER)
+    return f"_reg_commit_tail_{digest}"
+
+
 def make_convo_sentinel_id(source_file: str, extract_mode: str) -> str:
     """Sentinel registry ID for the conversation miner zero-chunk-file path.
 

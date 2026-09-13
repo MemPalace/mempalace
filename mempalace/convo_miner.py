@@ -30,6 +30,7 @@ from .ids import (
     make_convo_drawer_id,
     make_convo_generation_id,
     make_convo_sentinel_id,
+    make_convo_tail_commit_id,
     make_exchange_drawer_id,
 )
 from .normalize import UnparsedCodexTranscriptError, normalize_conversations
@@ -694,6 +695,27 @@ def _content_set_generation_token(members: list[tuple[str, str]]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _append_staging_token(generation_token, active_token, planned_chunks) -> Optional[str]:
+    """Unpublished identity for a pending append tail.
+
+    Append-only growth reuses the committed marker token so unchanged rows
+    keep their physical ids and vectors. Hub read filters treat staged rows
+    that already carry a committed token as visible, so new tail rows must
+    stage under a distinct content-set token until the entire append is
+    written. Publication then commits that token beside the active marker.
+    """
+    if not (
+        isinstance(generation_token, str)
+        and generation_token
+        and generation_token == active_token
+        and planned_chunks
+    ):
+        return generation_token
+    return _content_set_generation_token(
+        [(item["logical_drawer_id"], item["chunk_hash"]) for item in planned_chunks]
+    )
+
+
 def _drawer_logical_id(physical_id: str, meta: dict) -> str:
     logical_id = meta.get("logical_drawer_id")
     if isinstance(logical_id, str) and logical_id:
@@ -744,17 +766,17 @@ def _is_committed_active_drawer(meta: dict, active_token: Optional[str]) -> bool
     generation are not active either. Append-only subset and candidate checks
     share this predicate so a failed T1→T2 shrink cannot treat a dropped
     logical id as part of T2, and a B→A reversion cannot retag retired A
-    with B's token. Rows that already carry the active token, including a
-    staged tail from an interrupted append, still count so retries stay
-    incremental.
+    with B's token. A pending append tail stages under an unpublished
+    identity, so it is not active even if a crash left it carrying the
+    marker token; retries still match it by content hash.
     """
     if not isinstance(meta, dict) or _is_convo_registry_meta(meta):
+        return False
+    if meta.get("mine_staged") is True:
         return False
     token = meta.get("mine_generation_token")
     if active_token:
         return token == active_token
-    if meta.get("mine_staged") is True:
-        return False
     return not token
 
 
@@ -773,7 +795,8 @@ def _is_append_only_growth(planned_chunks, existing, active_token: Optional[str]
     leave retired A beside committed B, and a later B→A reversion plus append
     must not retag A with B's token. Reused matches must be committed active
     rows so repeated appends and a later cleanup retry stay incremental
-    without reviving obsolete text.
+    without reviving obsolete text. A pending append tail is unpublished and
+    does not participate as an active row; retries resume it by content hash.
     """
     if not existing or not planned_chunks:
         return False
@@ -939,6 +962,8 @@ def _publish_changed_generations(
     commit_metadata,
     source_file,
     access_gate=None,
+    staging_token=None,
+    tail_commit_id=None,
 ) -> bool:
     """Publish a fully staged generation, finalize rows, and retire old ones.
 
@@ -947,14 +972,40 @@ def _publish_changed_generations(
     ``mine_generation_token``. Switching the marker is then the crash-atomic
     visibility flip: before it, the previous committed generation stays
     complete; after it, the new token is complete even if metadata
-    finalization or stale-row cleanup fails. ``cleanup_pending`` keeps the
-    source retryable until every follow-up write succeeds.
+    finalization or stale-row cleanup fails. Append-only tails stage under a
+    distinct unpublished token; a temporary extra marker commits that token
+    beside the still-active generation so the complete tail becomes visible
+    without hiding unchanged rows. The extra marker is overwritten on the
+    next append rather than deleted, so repeated appends stay delete-free
+    for active drawers. ``cleanup_pending`` keeps the source retryable
+    until every follow-up write succeeds.
 
     Writer serialization comes from the caller's mutation lock (HTTP mine)
     or per-file ``mine_lock``. The access gate is acquired only around each
     bounded upsert/update/delete so waiting readers can run between bursts.
     """
+    publish_token = commit_metadata.get("mine_generation_commit")
+    expose_tail = (
+        isinstance(staging_token, str)
+        and staging_token
+        and staging_token != publish_token
+        and isinstance(tail_commit_id, str)
+        and tail_commit_id
+    )
+    ids_to_delete = list(stale_ids)
     try:
+        if expose_tail:
+            tail_metadata = dict(commit_metadata)
+            tail_metadata["mine_generation_commit"] = staging_token
+            # Leftover extra markers must not pin the source as pending;
+            # retryability lives on the primary marker.
+            tail_metadata["mine_cleanup_pending"] = False
+            with _access_write(access_gate):
+                collection.upsert(
+                    ids=[tail_commit_id],
+                    documents=[f"[conversation generation commit] {source_file}"],
+                    metadatas=[tail_metadata],
+                )
         with _access_write(access_gate):
             collection.upsert(
                 ids=[commit_id],
@@ -968,8 +1019,23 @@ def _publish_changed_generations(
                     ids=[drawer_id for drawer_id, _ in batch],
                     metadatas=[meta for _, meta in batch],
                 )
-        for batch_start in range(0, len(stale_ids), DRAWER_UPSERT_BATCH_SIZE):
-            batch_ids = stale_ids[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+        if expose_tail:
+            # Retag is complete, so the extra token must not stay committed.
+            # A later shrink-and-reappend of the same content set would
+            # otherwise find this leftover token already published and
+            # expose a partial tail. Overwrite in place; do not delete, so
+            # repeated appends keep active-row delete lists empty.
+            retired_tail = dict(commit_metadata)
+            retired_tail["mine_generation_commit"] = ""
+            retired_tail["mine_cleanup_pending"] = False
+            with _access_write(access_gate):
+                collection.upsert(
+                    ids=[tail_commit_id],
+                    documents=[f"[conversation generation commit] {source_file}"],
+                    metadatas=[retired_tail],
+                )
+        for batch_start in range(0, len(ids_to_delete), DRAWER_UPSERT_BATCH_SIZE):
+            batch_ids = ids_to_delete[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
             with _access_write(access_gate):
                 collection.delete(ids=batch_ids)
         completed_marker = dict(commit_metadata)
@@ -1112,10 +1178,17 @@ def _plan_convo_generation_writes(
     # carry the previous token; updating those ids in place would hide them
     # for the duration of the switch.
     has_new_rows = any(kind == "upsert" for kind, *_ in tentative)
+    has_pending_tail = any(
+        current[1] is not None
+        and current[1].get("mine_staged") is True
+        and current[1].get("mine_generation_token")
+        and current[1].get("mine_generation_token") != generation_token
+        for _kind, _item, _copy_id, current in tentative
+    )
     will_publish = (
         pending_cleanup
         or any(drawer_id not in tentative_ids for drawer_id in existing)
-        or (bool(existing) and has_new_rows)
+        or (bool(existing) and (has_new_rows or has_pending_tail))
     )
     new_ids: set = set()
     for kind, item, copy_id, current in tentative:
@@ -1153,6 +1226,7 @@ def _plan_convo_generation_writes(
             and reused_token
             and reused_token != generation_token
             and physical_id != copy_id
+            and prev.get("mine_staged") is not True
         ):
             source_id, source_meta = next(
                 (match for match in item["matches"] if match[1].get("mine_staged") is not True),
@@ -1216,9 +1290,12 @@ def _file_chunks_locked(
     content-addressed physical generation instead of overwriting its old
     logical position. Unchanged chunks that still have no generation token
     get a cheap metadata-only refresh (``source_mtime`` / ``chunk_total``).
-    Append-only growth reuses the active generation token so those rows stay
-    on their existing physical ids. A rewrite or shrink that publishes a new
-    token clones unchanged rows that already belong to another committed
+    Append-only growth reuses the active generation token so unchanged rows
+    stay on their existing physical ids. New tail rows stage under a distinct
+    unpublished content-set token until the whole tail is written; a
+    temporary extra marker then exposes that complete tail without hiding
+    the prior generation. A rewrite or shrink that publishes a new token
+    clones unchanged rows that already belong to another committed
     generation under a generation-specific physical id with the stored
     embedding, so the old token stays complete until the new token is fully
     staged.
@@ -1358,11 +1435,14 @@ def _file_chunks_locked(
         # mtime unless a rewrite/shrink publishes a new token, in which case
         # they are cloned first. Append-only growth reuses the commit
         # marker's active token so unchanged rows are only
-        # metadata-refreshed. Only after orphan cleanup succeeds do we
-        # stamp the whole target set current. A transient delete failure
-        # then remains visibly incomplete and retries even if the source
-        # never changes again.
+        # metadata-refreshed, while new tail rows stage under an
+        # unpublished content-set token until the extra tail marker makes
+        # the complete append visible. Only after orphan cleanup succeeds
+        # do we stamp the whole target set current. A transient delete
+        # failure then remains visibly incomplete and retries even if the
+        # source never changes again.
         stale_ids = [drawer_id for drawer_id in existing if drawer_id not in new_ids]
+        staging_token = _append_staging_token(generation_token, active_token, planned_chunks)
         commit_metadata = {
             "wing": wing,
             "room": "_registry",
@@ -1395,7 +1475,7 @@ def _file_chunks_locked(
                     incomplete_meta = dict(final_meta)
                     incomplete_meta.pop("source_mtime", None)
                     incomplete_meta["mine_staged"] = True
-                    incomplete_meta["mine_generation_token"] = generation_token
+                    incomplete_meta["mine_generation_token"] = staging_token
                     batch_metas.append(incomplete_meta)
             else:
                 batch_metas = [meta for _, _, meta in batch]
@@ -1453,6 +1533,8 @@ def _file_chunks_locked(
                 commit_metadata=commit_metadata,
                 source_file=source_file,
                 access_gate=access_gate,
+                staging_token=staging_token,
+                tail_commit_id=make_convo_tail_commit_id(source_file, extract_mode),
             ):
                 return drawers_added, room_counts_delta, True
     return drawers_added, room_counts_delta, False

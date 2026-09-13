@@ -6,7 +6,12 @@ import copy
 import pytest
 
 from mempalace import convo_miner, mcp_server, searcher
-from mempalace.ids import make_convo_commit_id, make_convo_drawer_id, make_convo_generation_id
+from mempalace.ids import (
+    make_convo_commit_id,
+    make_convo_drawer_id,
+    make_convo_generation_id,
+    make_convo_tail_commit_id,
+)
 
 
 class InjectedWriteFailure(RuntimeError):
@@ -1492,3 +1497,229 @@ def test_failed_shrink_cleanup_then_repeated_appends_keep_active_rows(tmp_path, 
     assert collection.rows[commit_id]["metadata"]["mine_generation_commit"] == t2
     assert collection.deleted_ids
     assert all(key not in collection.deleted_ids for key in t2_active)
+
+
+def test_committed_active_drawer_excludes_staged_append_tail():
+    active = "active-token"
+    assert (
+        convo_miner._is_committed_active_drawer(
+            {
+                "logical_drawer_id": "drawer-b",
+                "mine_generation_token": active,
+                "mine_staged": False,
+            },
+            active,
+        )
+        is True
+    )
+    assert (
+        convo_miner._is_committed_active_drawer(
+            {
+                "logical_drawer_id": "drawer-b",
+                "mine_generation_token": active,
+                "mine_staged": True,
+            },
+            active,
+        )
+        is False
+    )
+    assert (
+        convo_miner._is_committed_active_drawer(
+            {
+                "logical_drawer_id": "drawer-b",
+                "mine_generation_token": "tail-token",
+                "mine_staged": True,
+            },
+            active,
+        )
+        is False
+    )
+
+
+def test_plan_reuses_active_token_when_pending_append_tail_is_unpublished(monkeypatch):
+    """A crash after staging the tail under its unpublished identity retries in place."""
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    active = "active-token"
+    tail = "tail-token"
+    existing = {
+        "drawer-a": {
+            "logical_drawer_id": "drawer-a",
+            "chunk_hash": "hash-a",
+            "mine_generation_token": active,
+            "mine_staged": False,
+        },
+        "drawer-b": {
+            "logical_drawer_id": "drawer-b",
+            "chunk_hash": "hash-b",
+            "mine_generation_token": tail,
+            "mine_staged": True,
+        },
+    }
+    planned = [
+        _plan_chunk("drawer-a", "hash-a", "A", 0, existing["drawer-a"]),
+        _plan_chunk("drawer-b", "hash-b", "B", 1, existing["drawer-b"]),
+        _plan_chunk("drawer-c", "hash-c", "C", 2),
+    ]
+    assert convo_miner._is_append_only_growth(planned, existing, active) is True
+    assert convo_miner._append_staging_token(active, active, planned) != active
+    to_upsert, to_touch, to_copy, new_ids, token, will_publish = _plan_writes(
+        planned, existing, pending_cleanup=True, active_token=active
+    )
+
+    assert token == active
+    assert will_publish is True
+    assert to_copy == []
+    assert {row_id for row_id, _ in to_touch} == {"drawer-a", "drawer-b"}
+    assert [row_id for row_id, _, _ in to_upsert] == ["drawer-c"]
+    assert new_ids == {"drawer-a", "drawer-b", "drawer-c"}
+
+
+def _append_visibility_case(tmp_path, monkeypatch):
+    source = str(tmp_path / "session.txt")
+    (tmp_path / "session.txt").write_text("transcript", encoding="utf-8")
+    monkeypatch.setattr(convo_miner, "mine_lock", lambda *_: contextlib.nullcontext())
+    monkeypatch.setattr(convo_miner, "file_already_mined", lambda *_a, **_k: False)
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 1)
+
+    def mine(collection, documents):
+        chunks = [{"content": text, "chunk_index": index} for index, text in enumerate(documents)]
+        return convo_miner._file_chunks_locked(
+            collection, source, chunks, "wing", "general", "agent", "exchange"
+        )
+
+    tokenless = ["original first chunk", "unchanged middle chunk", "unchanged last chunk"]
+    previous = [*tokenless, "appended fourth chunk"]
+    grown = [*previous, "appended fifth chunk", "appended sixth chunk"]
+    collection = GenerationCollection()
+    assert mine(collection, tokenless)[2] is False
+    assert mine(collection, previous)[2] is False
+    _assert_all_read_paths(collection, source, previous)
+    commit_id = make_convo_commit_id(source, "exchange")
+    assert collection.rows[commit_id]["metadata"]["mine_generation_commit"]
+    collection.write_count = 0
+    collection.embedded_documents.clear()
+    return collection, mine, source, previous, grown
+
+
+def _assert_append_visible_complete(collection, source, previous, grown):
+    hidden = [*previous, *[None] * (len(grown) - len(previous))]
+    first_new = make_convo_drawer_id("wing", "general", source, "exchange", len(previous))
+    expected = grown
+    if mcp_server._logical_generation_record(collection, first_new) is None:
+        expected = hidden
+    current = []
+    for index in range(len(grown)):
+        logical_id = make_convo_drawer_id("wing", "general", source, "exchange", index)
+        row = mcp_server._logical_generation_record(collection, logical_id)
+        current.append(row["content"] if row else None)
+    assert current == expected
+    _assert_all_read_paths(collection, source, expected)
+    commit_id = make_convo_commit_id(source, "exchange")
+    commit_token = collection.rows[commit_id]["metadata"]["mine_generation_commit"]
+    for row in _non_marker_rows(collection).values():
+        if row["metadata"].get("mine_staged") is True:
+            assert row["metadata"].get("mine_generation_token") != commit_token
+    return expected
+
+
+def test_append_batches_are_hidden_until_the_tail_is_fully_staged(tmp_path, monkeypatch):
+    collection, mine, source, initial, grown = _append_visibility_case(tmp_path, monkeypatch)
+    commit_id = make_convo_commit_id(source, "exchange")
+    previous_active = _snapshot_active_rows(collection)
+    snapshots = []
+
+    def observe():
+        snapshots.append(_assert_append_visible_complete(collection, source, initial, grown))
+
+    collection.observe = observe
+    assert mine(collection, grown)[2] is False
+    assert snapshots
+    hidden = [*initial, None, None]
+    assert grown in snapshots
+    assert hidden in snapshots
+    assert set(map(tuple, snapshots)) <= {tuple(hidden), tuple(grown)}
+    _assert_all_read_paths(collection, source, grown)
+    current_active = _snapshot_active_rows(collection)
+    for key, (embedding, document, token) in previous_active.items():
+        assert key in current_active
+        assert current_active[key][0] == embedding
+        assert current_active[key][1] == document
+        assert current_active[key][2] == token
+    assert collection.embedded_documents == grown[len(initial) :]
+    tail_id = make_convo_tail_commit_id(source, "exchange")
+    if tail_id in collection.rows:
+        assert collection.rows[tail_id]["metadata"].get("mine_commit_marker") is True
+        assert collection.rows[tail_id]["metadata"].get("mine_cleanup_pending") is not True
+        assert not collection.rows[tail_id]["metadata"].get("mine_generation_commit")
+    assert collection.rows[commit_id]["metadata"]["mine_generation_commit"]
+    assert all(
+        collection.rows[key]["metadata"].get("mine_generation_token")
+        == collection.rows[commit_id]["metadata"]["mine_generation_commit"]
+        for key, row in _non_marker_rows(collection).items()
+    )
+
+
+@pytest.mark.parametrize("fail_before", [True, False])
+def test_interrupted_append_and_retry_never_exposes_a_partial_tail(
+    tmp_path, monkeypatch, fail_before
+):
+    original, mine, source, initial, grown = _append_visibility_case(tmp_path, monkeypatch)
+    previous_active = _snapshot_active_rows(original)
+    completed = copy.deepcopy(original)
+    assert mine(completed, grown)[2] is False
+    hidden = [*initial, None, None]
+
+    for write_index in range(1, completed.write_count + 1):
+        collection = copy.deepcopy(original)
+        collection.fail_before = fail_before
+        collection.fail_at = write_index
+        try:
+            mine(collection, grown)
+        except InjectedWriteFailure:
+            pass
+        expected = _assert_append_visible_complete(collection, source, initial, grown)
+        assert expected in (hidden, grown)
+        for key, (embedding, document, token) in previous_active.items():
+            row = collection.rows[key]
+            assert list(row["embedding"]) == embedding
+            assert row["document"] == document
+            assert row["metadata"].get("mine_generation_token") == token
+        collection.fail_at = None
+        assert mine(collection, grown)[2] is False
+        _assert_all_read_paths(collection, source, grown)
+        for key, (embedding, document, token) in previous_active.items():
+            row = collection.rows[key]
+            assert list(row["embedding"]) == embedding
+            assert row["document"] == document
+            assert row["metadata"].get("mine_generation_token") == token
+        tail_id = make_convo_tail_commit_id(source, "exchange")
+        if tail_id in collection.rows:
+            assert collection.rows[tail_id]["metadata"].get("mine_commit_marker") is True
+            assert collection.rows[tail_id]["metadata"].get("mine_cleanup_pending") is not True
+            assert not collection.rows[tail_id]["metadata"].get("mine_generation_commit")
+
+
+def test_reappend_after_shrink_hides_batches_until_the_new_tail_is_complete(tmp_path, monkeypatch):
+    """A neutralized leftover extra marker must not republish the next tail early."""
+    collection, mine, source, previous, grown = _append_visibility_case(tmp_path, monkeypatch)
+    assert mine(collection, grown)[2] is False
+    _assert_all_read_paths(collection, source, grown)
+    shrink = previous[:3]
+    assert mine(collection, shrink)[2] is False
+    _assert_all_read_paths(collection, source, [*shrink, None, None, None])
+    collection.write_count = 0
+    collection.embedded_documents.clear()
+    snapshots = []
+
+    def observe():
+        snapshots.append(_assert_append_visible_complete(collection, source, shrink, grown))
+
+    collection.observe = observe
+    assert mine(collection, grown)[2] is False
+    hidden = [*shrink, None, None, None]
+    assert snapshots
+    assert hidden in snapshots
+    assert grown in snapshots
+    assert set(map(tuple, snapshots)) <= {tuple(hidden), tuple(grown)}
+    _assert_all_read_paths(collection, source, grown)
