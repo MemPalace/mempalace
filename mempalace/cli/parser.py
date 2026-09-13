@@ -151,6 +151,11 @@ def main():
     )
 
     # mine
+    add_cli_write_routing_flags(
+        p_init,
+        allow_background=False,
+    )
+
     p_mine = sub.add_parser("mine", help="Mine files into the palace")
     p_mine.add_argument(
         "dir", help="Directory to mine, or one conversation file with --mode convos"
@@ -212,16 +217,7 @@ def main():
     p_mine.add_argument(
         "--dry-run", action="store_true", help="Show what would be filed without filing"
     )
-    p_mine.add_argument(
-        "--daemon",
-        action="store_true",
-        help="Submit this mine to the opt-in local daemon queue",
-    )
-    p_mine.add_argument(
-        "--background",
-        action="store_true",
-        help="With --daemon, return a job id immediately instead of waiting",
-    )
+    add_cli_write_routing_flags(p_mine)
     p_mine.add_argument(
         "--extract",
         choices=["exchange", "general"],
@@ -265,6 +261,7 @@ def main():
     )
 
     # sync
+    add_cli_write_routing_flags(p_sweep)
     p_sync = sub.add_parser(
         "sync",
         help="Prune drawers whose source files are gitignored, deleted, or moved (#1252)",
@@ -295,18 +292,9 @@ def main():
         action="store_false",
         help="Actually delete drawers (overrides --dry-run; requires --wing or a project root)",
     )
-    p_sync.add_argument(
-        "--daemon",
-        action="store_true",
-        help="Submit this sync to the opt-in local daemon queue",
-    )
-    p_sync.add_argument(
-        "--background",
-        action="store_true",
-        help="With --daemon, return a job id immediately instead of waiting",
-    )
 
     # search
+    add_cli_write_routing_flags(p_sync)
     p_search = sub.add_parser("search", help="Find anything, exact words")
     p_search.add_argument("query", help="What to search for")
     p_search.add_argument(

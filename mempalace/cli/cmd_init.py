@@ -278,6 +278,37 @@ def _maybe_run_mine_after_init(args, cfg) -> None:
             return
 
     palace_path = cfg.palace_path
+    routing = _resolve_cli_write_routing_or_exit(
+        args,
+        "init auto-mine",
+    )
+    if routing.use_daemon:
+        payload = {
+            "source": os.path.abspath(os.path.expanduser(project_dir)),
+            "mode": "projects",
+            "wing": None,
+            "agent": "mempalace",
+            "limit": 0,
+            "dry_run": False,
+            "extract": "exchange",
+            "no_gitignore": False,
+            "include_ignored": [],
+            "max_chunks_per_file": None,
+            "redetect_origin": False,
+            "files": (
+                [str(file_path) for file_path in scanned_files]
+                if scanned_files is not None
+                else None
+            ),
+        }
+        _submit_daemon_cli_job(
+            "mine",
+            payload,
+            args,
+            background=False,
+            auto_start=routing.decision.auto_start_daemon,
+        )
+        return
     try:
         mine(
             project_dir=project_dir,
