@@ -116,7 +116,14 @@ class TestVisibleDrawerWhereBounds:
         n_sources = 80
         collection.upsert(
             ids=[f"marker-{index}" for index in range(n_sources)] + ["leftover", "current"],
-            documents=["marker"] * n_sources + [query, query],
+            # Production commit markers are unique per source. Chroma 1.5.7
+            # HNSW omits rows from query() when one upsert is dominated by
+            # identical embeddings, even though get() still returns them.
+            documents=[
+                f"[conversation generation commit] /tmp/session-{index}.jsonl"
+                for index in range(n_sources)
+            ]
+            + [query, query],
             metadatas=[
                 *[
                     {
