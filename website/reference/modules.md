@@ -16,6 +16,7 @@ mempalace/
 │   ├── miner.py               ← project file ingest
 │   ├── convo_miner.py         ← conversation ingest
 │   ├── searcher/              ← hybrid BM25 + vector search package
+│   ├── palace/                ← collection access, closets, mine locks
 │   ├── layers.py              ← 4-layer memory stack
 │   ├── onboarding.py          ← guided setup
 │   ├── config.py              ← configuration loading

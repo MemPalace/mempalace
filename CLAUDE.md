@@ -69,7 +69,7 @@ mempalace/
 ├── convo_miner.py       # Conversation transcript miner
 ├── searcher/            # Hybrid search package; public import is still mempalace.searcher
 ├── knowledge_graph.py   # Temporal entity-relationship graph (SQLite)
-├── palace.py            # Shared palace operations
+├── palace/              # Palace ops package; public import is still mempalace.palace
 ├── palace_graph.py      # Room traversal + cross-wing tunnels
 ├── backends/            # Pluggable storage backends (ChromaDB default)
 │   ├── base.py          # Abstract interface — implement this for new backends

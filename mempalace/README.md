@@ -15,6 +15,7 @@ The Python package that powers MemPalace. All modules, all logic.
 | `layers.py` | 4-layer memory stack: L0 (identity), L1 (critical facts), L2 (room recall), L3 (deep search) |
 | `dialect.py` | AAAK compression — entity codes, emotion markers, 30x lossless ratio |
 | `knowledge_graph.py` | Temporal entity-relationship graph — SQLite, time-filtered queries, fact invalidation |
+| `palace/` | Collection access, closets, mine locks; public import is still `mempalace.palace` |
 | `palace_graph.py` | Room-based navigation graph — BFS traversal, tunnel detection across wings |
 | `mcp_server/` | MCP server package — tools, schemas, protocol, HTTP; public import is still `mempalace.mcp_server` |
 | `onboarding.py` | Guided first-run setup — asks about people/projects, generates AAAK bootstrap + wing config |
