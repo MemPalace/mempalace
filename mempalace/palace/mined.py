@@ -271,54 +271,54 @@ def prefetch_mined_set(
     `collection.get(where={"source_file": X})` costs ~2s on a 150k-drawer
     palace, making a 2000-file sweep take >1h of pure skip-checking. This
     helper drops that to a single paginated scan plus O(1) lookups.
+
+    A truncated scan is unusable, matching hash-dedup marker completeness:
+    later pages may hold ``mine_cleanup_pending`` markers. Returning the
+    groups seen so far would skip those sources and defer cleanup retry.
+    Compatibility backends that reject later ``offset`` with ``TypeError``
+    retry once unpaginated; any remaining fetch failure returns ``{}``.
     """
-    # Per source_file: per stored_mtime group → count + optional chunk_total.
-    # A source is only "mined" once some group is complete.
     groups: dict[str, dict] = {}
     pending_sources: set[str] = set()
+    page_size = 1000
+    paginated = True
+    offset = 0
     try:
-        total = collection.count()
-        offset = 0
-        while offset < total:
-            batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
-            for meta in batch["metadatas"]:
-                meta = meta or {}
-                if meta.get("mine_commit_marker") is True:
-                    if (
-                        meta.get("mine_cleanup_pending") is True
-                        and meta.get("source_file")
-                        and _metadata_matches_extract_mode(meta, extract_mode)
-                    ):
-                        pending_sources.add(meta["source_file"])
-                    continue
-                if meta.get("mine_staged") is True:
-                    continue
-                src = meta.get("source_file")
-                if not src:
-                    continue
-                if not _metadata_matches_extract_mode(meta, extract_mode):
-                    continue
-                # Same default as file_already_mined: missing version == 1
-                version = meta.get("normalize_version", 1)
-                if version < NORMALIZE_VERSION:
-                    continue
-                stored_mtime = meta.get("source_mtime")
-                mtime_key = float(stored_mtime) if stored_mtime is not None else None
-                entry = groups.setdefault(src, {}).setdefault(
-                    mtime_key, {"count": 0, "chunk_total": None}
+        while True:
+            kwargs = {"include": ["metadatas"]}
+            if paginated:
+                kwargs["limit"] = page_size
+                kwargs["offset"] = offset
+            try:
+                batch = collection.get(**kwargs)
+            except TypeError:
+                if not paginated:
+                    raise
+                logger.warning(
+                    "prefetch_mined_set pagination rejected at offset %d; "
+                    "retrying unpaginated fetch",
+                    offset,
                 )
-                entry["count"] += 1
-                chunk_total = meta.get("chunk_total")
-                if chunk_total is not None:
-                    try:
-                        entry["chunk_total"] = int(chunk_total)
-                    except (TypeError, ValueError):
-                        pass
-            if not batch["ids"]:
+                paginated = False
+                groups.clear()
+                pending_sources.clear()
+                batch = collection.get(include=["metadatas"])
+            ids = batch.get("ids") or []
+            for meta in batch.get("metadatas") or []:
+                _ingest_prefetch_mined_metadata(meta, extract_mode, groups, pending_sources)
+            page_len = len(ids)
+            del ids, batch
+            if not paginated or not page_len:
                 break
-            offset += len(batch["ids"])
+            offset += page_len
+            if page_len < page_size:
+                break
     except Exception:
-        logger.warning("prefetch_mined_set: partial fetch, %d source groups loaded", len(groups))
+        logger.warning(
+            "prefetch_mined_set: incomplete fetch, discarding %d source groups",
+            len(groups),
+        )
+        return {}
 
     mined: dict[str, Optional[float]] = {}
     for src, by_mtime in groups.items():
@@ -334,6 +334,39 @@ def prefetch_mined_set(
                 mined[src] = mtime_key
                 break
     return mined
+
+
+def _ingest_prefetch_mined_metadata(meta, extract_mode, groups, pending_sources) -> None:
+    """Fold one metadata row into mined-set groups and pending-source marks."""
+    meta = meta or {}
+    if meta.get("mine_commit_marker") is True:
+        if (
+            meta.get("mine_cleanup_pending") is True
+            and meta.get("source_file")
+            and _metadata_matches_extract_mode(meta, extract_mode)
+        ):
+            pending_sources.add(meta["source_file"])
+        return
+    if meta.get("mine_staged") is True:
+        return
+    src = meta.get("source_file")
+    if not src:
+        return
+    if not _metadata_matches_extract_mode(meta, extract_mode):
+        return
+    version = meta.get("normalize_version", 1)
+    if version < NORMALIZE_VERSION:
+        return
+    stored_mtime = meta.get("source_mtime")
+    mtime_key = float(stored_mtime) if stored_mtime is not None else None
+    entry = groups.setdefault(src, {}).setdefault(mtime_key, {"count": 0, "chunk_total": None})
+    entry["count"] += 1
+    chunk_total = meta.get("chunk_total")
+    if chunk_total is not None:
+        try:
+            entry["chunk_total"] = int(chunk_total)
+        except (TypeError, ValueError):
+            pass
 
 
 def prefetch_content_hashes(

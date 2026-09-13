@@ -1871,6 +1871,153 @@ def test_parent_sibling_lookup_fails_closed_instead_of_returning_tail(
     assert "current conversation generation" in fetched["error"]
 
 
+def test_non_parent_generation_sibling_probe_fails_closed(monkeypatch, config, palace_path, kg):
+    """A leftover singleton must not be returned when sibling lookup fails."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    from mempalace import mcp_server
+    from mempalace.mcp_server import tool_get_drawer
+
+    singleton_meta = {
+        "wing": "sessions",
+        "room": "general",
+        "logical_drawer_id": "kept-logical",
+        "mine_generation_token": "tok",
+        "filed_at": "2026-09-01T00:00:00",
+    }
+
+    class Collection:
+        @staticmethod
+        def get(ids=None, where=None, include=None, **_kwargs):
+            if isinstance(where, dict) and where.get("logical_drawer_id") == "kept-logical":
+                return {
+                    "ids": ["physical-singleton"],
+                    "documents": ["old singleton verbatim"],
+                    "metadatas": [singleton_meta],
+                }
+            if isinstance(where, dict) and "$or" in where:
+                raise RuntimeError("parent sibling get failed")
+            return {"ids": [], "documents": [], "metadatas": []}
+
+    monkeypatch.setattr(mcp_server, "_get_collection", lambda **_kwargs: Collection())
+    monkeypatch.setattr(
+        mcp_server,
+        "_committed_generation_state",
+        lambda _col: (frozenset({"tok"}), frozenset()),
+    )
+
+    fetched = tool_get_drawer("kept-logical")
+    assert "old singleton verbatim" not in fetched.get("content", "")
+    assert "drawer_id" not in fetched
+    assert "current conversation generation" in fetched["error"]
+
+
+def test_interrupted_singleton_to_group_readback_keeps_new_chunks(
+    monkeypatch, config, palace_path, kg
+):
+    """Failed singleton delete after a long-group upsert must keep the new chunks."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    logical_id = "logical-singleton-group"
+    physical_id = "physical-singleton-group"
+    chunk_size = config.chunk_size
+    original = "short singleton verbatim mined text"
+    labels = ("groupDelta", "groupEpsilon")
+    parts = [_verbatim_chunk(label, chunk_size) for label in labels]
+    _seed_mined_conversation_drawer(palace_path, logical_id, physical_id, original)
+    _overwrite_prefix_dropping_logical_id(palace_path, logical_id, parts)
+
+    from mempalace.mcp_server import (
+        tool_delete_drawer,
+        tool_get_drawer,
+        tool_search,
+        tool_update_drawer,
+    )
+    from mempalace.searcher import search_memories
+
+    fetched = tool_get_drawer(logical_id)
+    assert fetched["content"] == "".join(parts)
+    assert original not in fetched["content"]
+    assert physical_id in fetched["chunk_ids"]
+    assert all(f"{logical_id}_chunk_{index:06d}" in fetched["chunk_ids"] for index in range(2))
+
+    for label, part in zip(labels, parts):
+        mcp_hits = tool_search(query=label, limit=10)
+        matching = [hit for hit in mcp_hits["results"] if label in hit["text"]]
+        assert matching, f"MCP search missed new chunk {label}"
+        assert all(hit["drawer_id"] == logical_id for hit in matching)
+        assert any(hit["text"] == part for hit in matching)
+        api_hits = search_memories(label, palace_path, n_results=10)
+        matching = [hit for hit in api_hits["results"] if label in hit["text"]]
+        assert matching, f"generation-aware search missed new chunk {label}"
+
+    updated = tool_update_drawer(logical_id, content="".join(parts))
+    assert updated["success"] is True
+    fetched = tool_get_drawer(logical_id)
+    assert fetched["content"] == "".join(parts)
+    assert physical_id not in fetched.get("chunk_ids", [])
+    deleted = tool_delete_drawer(logical_id)
+    assert deleted["success"] is True
+    assert "error" in tool_get_drawer(logical_id)
+
+
+def test_interrupted_singleton_to_group_delete_removes_chunks_and_singleton(
+    monkeypatch, config, palace_path, kg
+):
+    """Delete after a failed singleton cleanup must remove leftover and new chunks."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    logical_id = "logical-singleton-delete"
+    physical_id = "physical-singleton-delete"
+    chunk_size = config.chunk_size
+    parts = [_verbatim_chunk(label, chunk_size) for label in ("dropDelta", "dropEpsilon")]
+    _seed_mined_conversation_drawer(palace_path, logical_id, physical_id, "old singleton to drop")
+    _overwrite_prefix_dropping_logical_id(palace_path, logical_id, parts)
+
+    from mempalace.mcp_server import tool_delete_drawer, tool_get_drawer, tool_search
+
+    fetched = tool_get_drawer(logical_id)
+    assert physical_id in fetched["chunk_ids"]
+    deleted = tool_delete_drawer(logical_id)
+    assert deleted["success"] is True
+    assert physical_id in deleted["deleted_ids"]
+    assert "error" in tool_get_drawer(logical_id)
+    for label in ("dropDelta", "dropEpsilon"):
+        hits = tool_search(query=label, limit=10)
+        assert not any(label in hit["text"] for hit in hits["results"])
+
+
+def test_singleton_to_group_delete_failure_leaves_new_chunks_readable(
+    monkeypatch, config, palace_path, kg
+):
+    """If the leftover singleton delete raises after upsert, get must return new chunks."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    logical_id = "logical-singleton-crash"
+    physical_id = "physical-singleton-crash"
+    chunk_size = config.chunk_size
+    original = "crash singleton original verbatim"
+    parts = [_verbatim_chunk(label, chunk_size) for label in ("crashDelta", "crashEpsilon")]
+    _seed_mined_conversation_drawer(palace_path, logical_id, physical_id, original)
+
+    from mempalace.backends.chroma import ChromaCollection
+    from mempalace.mcp_server import tool_get_drawer, tool_update_drawer
+
+    assert tool_get_drawer(logical_id)["content"] == original
+    original_delete = ChromaCollection.delete
+
+    def failing_delete(self, *, ids=None, where=None):
+        id_list = list(ids or [])
+        if physical_id in id_list:
+            raise RuntimeError("singleton delete failed")
+        return original_delete(self, ids=ids, where=where)
+
+    monkeypatch.setattr(ChromaCollection, "delete", failing_delete)
+    updated = tool_update_drawer(logical_id, content="".join(parts))
+    assert updated["success"] is False
+    assert "singleton delete failed" in updated["error"]
+    fetched = tool_get_drawer(logical_id)
+    assert fetched["content"] == "".join(parts)
+    assert original not in fetched["content"]
+    assert physical_id in fetched["chunk_ids"]
+
+
 class TestDeleteBySource:
     """``tool_delete_by_source`` — bulk cleanup of benchmark/test contamination (#1722)."""
 

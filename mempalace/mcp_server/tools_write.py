@@ -166,9 +166,11 @@ def _logical_generation_record(col, drawer_id: str):
 
     Parent chunks of this logical drawer share ``logical_drawer_id`` after an
     oversized ``update_drawer``, but they are one physical split, not
-    competing generations. Reassemble those rows by ``chunk_index``, merging
-    parent-linked siblings so a failed shrink-delete cannot hide the new
-    prefix that already dropped ``logical_drawer_id``.
+    competing generations. Reassemble those rows by ``chunk_index``.
+
+    Always probe parent-linked siblings before returning, including when the
+    generation match is a leftover non-parent singleton: a failed delete after
+    upserting a long group would otherwise hide the new chunks.
     """
     try:
         result = col.get(
@@ -199,11 +201,12 @@ def _logical_generation_record(col, drawer_id: str):
     if not rows:
         return None
     parent_rows = [row for row in rows if _logical_parent_id(row[4]) == drawer_id]
-    if parent_rows:
+    siblings = _visible_parent_chunk_rows(col, drawer_id, committed, tokened_source_modes)
+    if parent_rows or siblings:
         by_id = {
             row[2]: (_chunk_index(row[4]), row[2], row[3] or "", row[4]) for row in parent_rows
         }
-        for sibling in _visible_parent_chunk_rows(col, drawer_id, committed, tokened_source_modes):
+        for sibling in siblings:
             by_id[sibling[1]] = sibling
         merged = sorted(by_id.values(), key=lambda row: (row[0], row[1]))
         leftover_ids = [row[2] for row in rows if _logical_parent_id(row[4]) != drawer_id]

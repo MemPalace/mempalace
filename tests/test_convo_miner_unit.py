@@ -1892,6 +1892,146 @@ def test_pending_marker_only_blocks_its_own_extract_mode():
     assert general == {}
 
 
+def _mined_set_complete_rows(source="chat.jsonl", count=1000, mtime=42.0):
+    from mempalace.palace import NORMALIZE_VERSION
+
+    rows = [
+        (
+            f"drawer-{index}",
+            {
+                "source_file": source,
+                "extract_mode": "exchange",
+                "normalize_version": NORMALIZE_VERSION,
+                "source_mtime": mtime,
+                "chunk_total": count,
+            },
+        )
+        for index in range(count)
+    ]
+    rows.append(
+        (
+            "pending-marker",
+            {
+                "source_file": source,
+                "extract_mode": "exchange",
+                "mine_commit_marker": True,
+                "mine_cleanup_pending": True,
+            },
+        )
+    )
+    return rows
+
+
+def test_prefetch_mined_set_first_page_failure_is_unusable():
+    from mempalace.palace import prefetch_mined_set
+
+    class Collection:
+        @staticmethod
+        def get(**_kwargs):
+            raise RuntimeError("first page failed")
+
+    assert prefetch_mined_set(Collection(), extract_mode="exchange") == {}
+
+
+def test_prefetch_mined_set_later_page_failure_is_unusable():
+    """A complete first page of groups is still unusable if a later page fails.
+
+    The pending cleanup marker may live on that later page; returning the
+    groups already seen would skip the source and defer cleanup retry.
+    """
+    from mempalace.palace import prefetch_mined_set
+
+    rows = _mined_set_complete_rows()
+
+    class Collection:
+        @staticmethod
+        def get(**kwargs):
+            offset = kwargs.get("offset", 0)
+            if offset:
+                raise RuntimeError("later page failed")
+            limit = kwargs.get("limit")
+            selected = rows[offset : offset + limit if limit is not None else None]
+            return {
+                "ids": [key for key, _ in selected],
+                "metadatas": [dict(meta) for _, meta in selected],
+            }
+
+    assert prefetch_mined_set(Collection(), extract_mode="exchange") == {}
+
+
+def test_prefetch_mined_set_pending_marker_on_last_page_blocks_skip():
+    from mempalace.palace import prefetch_mined_set
+
+    rows = _mined_set_complete_rows()
+
+    class Collection:
+        def __init__(self, data):
+            self.data = data
+
+        def get(self, **kwargs):
+            offset = kwargs.get("offset", 0)
+            limit = kwargs.get("limit")
+            selected = self.data[offset : offset + limit if limit is not None else None]
+            return {
+                "ids": [key for key, _ in selected],
+                "metadatas": [dict(meta) for _, meta in selected],
+            }
+
+    assert prefetch_mined_set(Collection(rows), extract_mode="exchange") == {}
+    assert prefetch_mined_set(Collection(rows[:-1]), extract_mode="exchange") == {
+        "chat.jsonl": 42.0
+    }
+
+
+def test_prefetch_mined_set_later_page_typeerror_retries_unpaginated():
+    from mempalace.palace import prefetch_mined_set
+
+    rows = _mined_set_complete_rows()
+    calls = []
+
+    class Collection:
+        @staticmethod
+        def get(**kwargs):
+            calls.append(dict(kwargs))
+            if kwargs.get("offset"):
+                raise TypeError("offset not supported after the first page")
+            offset = kwargs.get("offset", 0)
+            limit = kwargs.get("limit")
+            selected = rows[offset : offset + limit if limit is not None else None]
+            return {
+                "ids": [key for key, _ in selected],
+                "metadatas": [dict(meta) for _, meta in selected],
+            }
+
+    mined = prefetch_mined_set(Collection(), extract_mode="exchange")
+    assert any(call.get("offset") == 1000 for call in calls)
+    assert any("limit" not in call and "offset" not in call for call in calls)
+    assert mined == {}
+
+
+def test_prefetch_mined_set_later_page_typeerror_without_unpaginated_is_incomplete():
+    from mempalace.palace import prefetch_mined_set
+
+    rows = _mined_set_complete_rows()
+
+    class Collection:
+        @staticmethod
+        def get(**kwargs):
+            if kwargs.get("offset"):
+                raise TypeError("later offset rejected")
+            if "limit" not in kwargs:
+                raise TypeError("unpaginated get rejected")
+            offset = kwargs.get("offset", 0)
+            limit = kwargs.get("limit")
+            selected = rows[offset : offset + limit if limit is not None else None]
+            return {
+                "ids": [key for key, _ in selected],
+                "metadatas": [dict(meta) for _, meta in selected],
+            }
+
+    assert prefetch_mined_set(Collection(), extract_mode="exchange") == {}
+
+
 class TestSourceFileDeleteIds:
     """#104: the sweeper writes drawers with no extract_mode at all
     (ingest_mode="sweep"). convo_miner's default exchange-mode purge
