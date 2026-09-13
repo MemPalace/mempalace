@@ -740,10 +740,15 @@ def _is_committed_active_drawer(meta: dict, active_token: Optional[str]) -> bool
     """True when a stored drawer belongs to the currently committed generation.
 
     Tokenless leftover rows from a failed A→B cleanup are not active once a
-    later generation carries a token. Append-only token reuse needs a real
-    committed row so a B→A reversion cannot retag retired A with B's token.
+    later generation carries a token. Staged or tokened rows from a retired
+    generation are not active either. Append-only subset and candidate checks
+    share this predicate so a failed T1→T2 shrink cannot treat a dropped
+    logical id as part of T2, and a B→A reversion cannot retag retired A
+    with B's token. Rows that already carry the active token, including a
+    staged tail from an interrupted append, still count so retries stay
+    incremental.
     """
-    if not isinstance(meta, dict):
+    if not isinstance(meta, dict) or _is_convo_registry_meta(meta):
         return False
     token = meta.get("mine_generation_token")
     if active_token:
@@ -760,22 +765,27 @@ def _committed_active_matches(matches, active_token: Optional[str]):
 def _is_append_only_growth(planned_chunks, existing, active_token: Optional[str] = None) -> bool:
     """True when this pass restates or extends the committed generation.
 
-    Shrink and rewrite still mint a new token. Matching leftover content is
-    not enough: a failed A→B cleanup can leave retired A beside committed B,
-    and a later B→A reversion plus append must not retag A with B's token.
-    Reused matches must be committed active rows so repeated appends and a
-    later cleanup retry stay incremental without reviving obsolete text.
+    Shrink and rewrite still mint a new token. Only drawers that belong to
+    the committed active generation participate: leftover rows from a failed
+    T1→T2 shrink cleanup can retain a logical id that T2 dropped, and a later
+    append must not treat that retired id as a shrink or rewrite of T2.
+    Matching leftover content is not enough either: a failed A→B cleanup can
+    leave retired A beside committed B, and a later B→A reversion plus append
+    must not retag A with B's token. Reused matches must be committed active
+    rows so repeated appends and a later cleanup retry stay incremental
+    without reviving obsolete text.
     """
     if not existing or not planned_chunks:
         return False
     planned_logical = {item["logical_drawer_id"] for item in planned_chunks}
     for physical_id, meta in existing.items():
-        if _is_convo_registry_meta(meta):
+        if not _is_committed_active_drawer(meta, active_token):
             continue
         if _drawer_logical_id(physical_id, meta) not in planned_logical:
             return False
     return not any(
-        item["candidates"] and not _committed_active_matches(item["matches"], active_token)
+        _committed_active_matches(item["candidates"], active_token)
+        and not _committed_active_matches(item["matches"], active_token)
         for item in planned_chunks
     )
 
@@ -1064,7 +1074,8 @@ def _plan_convo_generation_writes(
     # residual rows after a failed T1→T2 cleanup can still carry both tokens,
     # so inferring from them returns None and would re-clone the transcript.
     # Matching leftover content is not enough — the reused rows must already
-    # belong to that committed generation.
+    # belong to that committed generation, and retired logical ids dropped by
+    # a shrink must not veto append-only reuse of T2.
     if not isinstance(active_token, str) or not active_token:
         active_token = _active_drawer_generation_token(existing)
     if _is_append_only_growth(planned_chunks, existing, active_token) and active_token:

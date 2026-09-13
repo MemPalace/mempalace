@@ -852,6 +852,120 @@ def test_plan_reuses_marker_token_when_residual_rows_have_two_tokens(monkeypatch
     assert retry_ids == {"drawer-a-t2", "drawer-b-t2"}
 
 
+def test_plan_reuses_marker_token_when_shrink_left_retired_logical_ids(monkeypatch):
+    """Failed T1→T2 shrink cleanup leaves a logical id T2 dropped.
+
+    The append-only subset check must ignore that retired id. A later
+    append that reuses the dropped index with new content must also ignore
+    the leftover candidate, or every append would clone unchanged T2 rows.
+    """
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    t1, t2 = "t1-token", "t2-token"
+    leftover_a = {
+        "logical_drawer_id": "drawer-a",
+        "chunk_hash": "hash-a1",
+        "mine_generation_token": t1,
+        "mine_staged": False,
+        "chunk_index": 0,
+    }
+    leftover_b = {
+        "logical_drawer_id": "drawer-b",
+        "chunk_hash": "hash-b",
+        "mine_generation_token": t1,
+        "mine_staged": False,
+        "chunk_index": 1,
+    }
+    leftover_c = {
+        "logical_drawer_id": "drawer-c",
+        "chunk_hash": "hash-c1",
+        "mine_generation_token": t1,
+        "mine_staged": False,
+        "chunk_index": 2,
+    }
+    active_a = {
+        "logical_drawer_id": "drawer-a",
+        "chunk_hash": "hash-a2",
+        "mine_generation_token": t2,
+        "mine_staged": False,
+        "chunk_index": 0,
+    }
+    active_b = {
+        "logical_drawer_id": "drawer-b",
+        "chunk_hash": "hash-b",
+        "mine_generation_token": t2,
+        "mine_staged": False,
+        "chunk_index": 1,
+    }
+    existing = {
+        "drawer-a-t1": leftover_a,
+        "drawer-b-t1": leftover_b,
+        "drawer-c-t1": leftover_c,
+        "drawer-a-t2": active_a,
+        "drawer-b-t2": active_b,
+    }
+    planned_a = {
+        "chunk": {"content": "A2", "chunk_index": 0},
+        "chunk_room": "general",
+        "logical_drawer_id": "drawer-a",
+        "chunk_hash": "hash-a2",
+        "candidates": [("drawer-a-t1", leftover_a), ("drawer-a-t2", active_a)],
+        "matches": [("drawer-a-t2", active_a)],
+    }
+    planned_b = {
+        "chunk": {"content": "B", "chunk_index": 1},
+        "chunk_room": "general",
+        "logical_drawer_id": "drawer-b",
+        "chunk_hash": "hash-b",
+        "candidates": [("drawer-b-t1", leftover_b), ("drawer-b-t2", active_b)],
+        "matches": [("drawer-b-t1", leftover_b), ("drawer-b-t2", active_b)],
+    }
+
+    planned_partial = [planned_a, planned_b, _plan_chunk("drawer-d", "hash-d", "D", 2)]
+    assert convo_miner._active_drawer_generation_token(existing) is None
+    assert convo_miner._is_append_only_growth(planned_partial, existing, t2) is True
+    assert convo_miner._is_append_only_growth(planned_partial, existing, t1) is False
+
+    to_upsert, to_touch, to_copy, new_ids, token, will_publish = _plan_writes(
+        planned_partial, existing, pending_cleanup=True, active_token=t2
+    )
+    assert token == t2
+    assert will_publish is True
+    assert to_copy == []
+    assert {row_id for row_id, _ in to_touch} == {"drawer-a-t2", "drawer-b-t2"}
+    assert [row_id for row_id, _, _ in to_upsert] == ["drawer-d"]
+    assert new_ids == {"drawer-a-t2", "drawer-b-t2", "drawer-d"}
+    assert "drawer-c-t1" not in new_ids
+    assert "drawer-a-t1" not in new_ids
+    assert "drawer-b-t1" not in new_ids
+
+    planned_reused_index = [
+        planned_a,
+        planned_b,
+        {
+            "chunk": {"content": "C2", "chunk_index": 2},
+            "chunk_room": "general",
+            "logical_drawer_id": "drawer-c",
+            "chunk_hash": "hash-c2",
+            "candidates": [("drawer-c-t1", leftover_c)],
+            "matches": [],
+        },
+    ]
+    assert convo_miner._is_append_only_growth(planned_reused_index, existing, t2) is True
+    assert convo_miner._is_append_only_growth(planned_reused_index, existing, t1) is False
+    reused_upsert, reused_touch, reused_copy, reused_ids, reused_token, _ = _plan_writes(
+        planned_reused_index, existing, pending_cleanup=True, active_token=t2
+    )
+    assert reused_token == t2
+    assert reused_copy == []
+    assert {row_id for row_id, _ in reused_touch} == {"drawer-a-t2", "drawer-b-t2"}
+    assert [row_id for row_id, _, _ in reused_upsert] == [
+        make_convo_generation_id("drawer-c", "hash-c2")
+    ]
+    assert "drawer-c-t1" not in reused_ids
+    assert "drawer-a-t2" in reused_ids
+    assert "drawer-b-t2" in reused_ids
+
+
 def test_plan_clones_reused_rows_when_shrinking(monkeypatch):
     monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
     active = "active-token"
@@ -1243,3 +1357,138 @@ def test_failed_tokened_rewrite_cleanup_then_repeated_appends_keep_active_rows(
         assert row["metadata"].get("mine_generation_token") == token
     assert collection.embedded_documents == []
     assert collection.rows[commit_id]["metadata"]["mine_generation_commit"] == t2
+
+
+def test_failed_shrink_cleanup_then_repeated_appends_keep_active_rows(tmp_path, monkeypatch):
+    """Failed T1→T2 shrink cleanup leaves extra retired logical ids.
+
+    Later appends to T2 must not clone or delete unchanged T2 rows while
+    cleanup keeps failing. Visible text stays on T2 plus the new tails,
+    including when an append reuses a dropped T1 index with new content.
+    A later cleanup retry finally removes T1.
+    """
+    source = str(tmp_path / "session.txt")
+    (tmp_path / "session.txt").write_text("transcript", encoding="utf-8")
+    monkeypatch.setattr(convo_miner, "mine_lock", lambda *_: contextlib.nullcontext())
+    monkeypatch.setattr(convo_miner, "file_already_mined", lambda *_a, **_k: False)
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 1)
+
+    def mine(collection, documents):
+        chunks = [{"content": text, "chunk_index": index} for index, text in enumerate(documents)]
+        return convo_miner._file_chunks_locked(
+            collection, source, chunks, "wing", "general", "agent", "exchange"
+        )
+
+    class TrackingCollection(GenerationCollection):
+        def __init__(self):
+            super().__init__()
+            self.upserted_ids = []
+            self.deleted_ids = []
+            self.fail_delete = False
+
+        def upsert(self, ids, documents, metadatas, embeddings=None):
+            self.upserted_ids.extend(ids)
+            super().upsert(ids, documents, metadatas, embeddings)
+
+        def delete(self, ids):
+            self.deleted_ids.extend(ids)
+            if self.fail_delete:
+                raise InjectedWriteFailure("stale delete failed")
+            super().delete(ids)
+
+    initial = ["original first chunk", "unchanged middle chunk", "unchanged last chunk"]
+    t1_docs = [*initial, "t1 extra fourth chunk", "t1 extra fifth chunk"]
+    t2_docs = ["second revision", *initial[1:]]
+    grown = [
+        [*t2_docs, "appended fourth chunk"],
+        [*t2_docs, "appended fourth chunk", "appended fifth chunk"],
+        [
+            *t2_docs,
+            "appended fourth chunk",
+            "appended fifth chunk",
+            "appended sixth",
+        ],
+    ]
+    collection = TrackingCollection()
+    assert mine(collection, initial)[2] is False
+    _assert_all_read_paths(collection, source, initial)
+    assert mine(collection, t1_docs)[2] is False
+    _assert_all_read_paths(collection, source, t1_docs)
+    commit_id = make_convo_commit_id(source, "exchange")
+    t1 = collection.rows[commit_id]["metadata"]["mine_generation_commit"]
+    t1_ids = set(_snapshot_token_rows(collection, t1))
+    assert t1_ids
+    t1_extra_logical = [
+        make_convo_drawer_id("wing", "general", source, "exchange", index) for index in (3, 4)
+    ]
+    t1_extra_ids = [
+        key
+        for key, row in _non_marker_rows(collection).items()
+        if row["metadata"].get("logical_drawer_id") in t1_extra_logical
+    ]
+    assert len(t1_extra_ids) == 2
+
+    collection.embedded_documents.clear()
+    collection.upserted_ids.clear()
+    collection.deleted_ids.clear()
+    collection.fail_delete = True
+    skipped = mine(collection, t2_docs)[2]
+    assert skipped is True
+    assert all(key in collection.rows for key in t1_ids)
+    assert all(key in collection.rows for key in t1_extra_ids)
+    _assert_all_read_paths(collection, source, [*t2_docs, None, None])
+    t2 = collection.rows[commit_id]["metadata"]["mine_generation_commit"]
+    assert t2
+    assert t2 != t1
+    residual = {key: row["metadata"] for key, row in _non_marker_rows(collection).items()}
+    assert convo_miner._active_drawer_generation_token(residual) is None
+    assert (
+        convo_miner._committed_marker_generation_token([collection.rows[commit_id]["metadata"]])
+        == t2
+    )
+    t2_active = _snapshot_token_rows(collection, t2)
+    assert t2_active
+    assert t1_ids.isdisjoint(t2_active)
+    assert all(
+        collection.rows[key]["metadata"].get("mine_generation_token") == t1 for key in t1_extra_ids
+    )
+
+    previous_active = t2_active
+    for documents in grown:
+        collection.upserted_ids.clear()
+        collection.deleted_ids.clear()
+        collection.embedded_documents.clear()
+        skipped = mine(collection, documents)[2]
+        assert skipped is True
+        hidden = [None] * max(0, len(t1_docs) - len(documents))
+        _assert_all_read_paths(collection, source, [*documents, *hidden])
+        assert collection.rows[commit_id]["metadata"]["mine_generation_commit"] == t2
+        assert all(key in collection.rows for key in t1_ids)
+        current_active = _snapshot_token_rows(collection, t2)
+        for key, (embedding, document, token) in previous_active.items():
+            assert key in current_active
+            assert current_active[key][0] == embedding
+            assert current_active[key][1] == document
+            assert current_active[key][2] == token
+            assert key not in collection.upserted_ids
+            assert key not in collection.deleted_ids
+        assert collection.embedded_documents == documents[len(previous_active) :]
+        previous_active = current_active
+
+    collection.fail_delete = False
+    collection.embedded_documents.clear()
+    collection.upserted_ids.clear()
+    collection.deleted_ids.clear()
+    assert mine(collection, grown[-1])[2] is False
+    _assert_all_read_paths(collection, source, grown[-1])
+    assert all(key not in collection.rows for key in t1_ids)
+    for key, (embedding, document, token) in t2_active.items():
+        row = collection.rows[key]
+        assert list(row["embedding"]) == embedding
+        assert row["document"] == document
+        assert row["metadata"].get("mine_generation_token") == token
+    assert collection.embedded_documents == []
+    assert collection.rows[commit_id]["metadata"]["mine_generation_commit"] == t2
+    assert collection.deleted_ids
+    assert all(key not in collection.deleted_ids for key in t2_active)
