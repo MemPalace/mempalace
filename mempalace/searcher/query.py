@@ -159,6 +159,13 @@ def search_memories(
 
     Used by the MCP server and other callers that need data.
 
+    Each hit exposes ``filed_at`` (also retained as ``created_at``), plus
+    the legacy ``authored_at`` value and ``authored_at_source`` indicating
+    whether it came from stored ``authored_at``, the ``filed_at`` fallback,
+    or is ``unknown``. ``content_date`` is a separate inferred date with
+    ``content_date_source`` (filename/frontmatter/body/mtime when recorded,
+    otherwise ``unknown``). Neither inference nor filing proves authorship.
+
     Args:
         query: Natural language search query.
         palace_path: Path to the ChromaDB palace directory.
@@ -325,8 +332,7 @@ def search_memories(
             # stored value, the round-trippable key for the source_file filter.
             "source_file": Path(source).name if source else "?",
             "source_path": source,
-            "created_at": meta.get("filed_at", "unknown"),
-            "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
+            **_result_date_fields(meta),
             # Similarity is the raw vector score. Closet boost ranks via
             # effective_distance but must not inflate the advertised score.
             "similarity": round(_distance_to_similarity(dist, metric), 3),

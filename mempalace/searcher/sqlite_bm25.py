@@ -3,6 +3,33 @@ if __name__ != "mempalace.searcher":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.searcher")
 
 
+def _result_date_fields(meta: dict) -> dict:
+    """Expose stored dates and disclose the legacy authored-at fallback.
+
+    ``created_at`` and ``authored_at`` retain their historical values;
+    the source identifies the field supplying ``authored_at``, not a
+    guarantee of authorship. Content-date provenance is only reported
+    when stored, never reconstructed from a legacy drawer's path or text.
+    """
+    filed_at = meta.get("filed_at", "unknown")
+    authored_at = meta.get("authored_at", filed_at)
+    authored_at_source = "authored_at" if "authored_at" in meta else "filed_at"
+    if not authored_at or authored_at == "unknown":
+        authored_at_source = "unknown"
+    content_date = meta.get("content_date")
+    content_date_source = meta.get("content_date_source") or "unknown"
+    if not content_date or content_date == "unknown":
+        content_date_source = "unknown"
+    return {
+        "created_at": filed_at,
+        "filed_at": filed_at,
+        "authored_at": authored_at,
+        "authored_at_source": authored_at_source,
+        "content_date": content_date,
+        "content_date_source": content_date_source,
+    }
+
+
 def _window_sql_prefilters(since_dt, before_dt) -> list:
     """(operator, bound-string) pairs for the SQL date-window narrowing.
 
@@ -268,8 +295,7 @@ def _bm25_only_via_sqlite(
                 "room": meta.get("room", "unknown"),
                 "source_file": Path(full_source).name if full_source else "?",
                 "source_path": full_source,
-                "created_at": meta.get("filed_at", "unknown"),
-                "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
+                **_result_date_fields(meta),
                 # No vector distance available in BM25-only mode.
                 "similarity": None,
                 "distance": None,
@@ -391,8 +417,7 @@ def _merge_bm25_union_candidates(
                 "room": meta.get("room", "unknown"),
                 "source_file": Path(full_source).name if full_source else "?",
                 "source_path": full_source,
-                "created_at": meta.get("filed_at", "unknown"),
-                "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
+                **_result_date_fields(meta),
                 "similarity": (
                     None
                     if distance is None
