@@ -759,6 +759,75 @@ class TestWriteTools:
         assert "Incomplete" in result["error"]
         assert "drawers" not in result
 
+    def test_get_delete_update_fail_closed_when_logical_generation_query_raises(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import (
+            tool_delete_drawer,
+            tool_get_drawer,
+            tool_update_drawer,
+        )
+
+        class Collection:
+            @staticmethod
+            def get(ids=None, where=None, include=None, **_kwargs):
+                if isinstance(where, dict) and where.get("logical_drawer_id"):
+                    raise RuntimeError("transient logical_drawer_id get")
+                if isinstance(where, dict) and where.get("mine_commit_marker") is True:
+                    return {"ids": [], "metadatas": []}
+                return {"ids": [], "documents": [], "metadatas": []}
+
+        monkeypatch.setattr("mempalace.mcp_server._get_collection", lambda **_kwargs: Collection())
+
+        fetched = tool_get_drawer("kept-logical")
+        assert "Drawer not found" not in fetched.get("error", "")
+        assert "current conversation generation" in fetched["error"]
+        assert "drawer_id" not in fetched
+
+        deleted = tool_delete_drawer("kept-logical")
+        assert deleted["success"] is False
+        assert "Drawer not found" not in deleted["error"]
+        assert "current conversation generation" in deleted["error"]
+
+        updated = tool_update_drawer("kept-logical", content="new text")
+        assert updated["success"] is False
+        assert "Drawer not found" not in updated["error"]
+        assert "current conversation generation" in updated["error"]
+
+    def test_get_drawer_ordinary_id_when_logical_lookup_is_empty(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_get_drawer
+
+        class Collection:
+            @staticmethod
+            def get(ids=None, where=None, include=None, **_kwargs):
+                if isinstance(where, dict) and where.get("logical_drawer_id"):
+                    return {"ids": [], "documents": [], "metadatas": []}
+                if isinstance(where, dict) and where.get("mine_commit_marker") is True:
+                    return {"ids": [], "metadatas": []}
+                if ids == ["ordinary"]:
+                    return {
+                        "ids": ["ordinary"],
+                        "documents": ["plain note"],
+                        "metadatas": [
+                            {
+                                "wing": "w",
+                                "room": "r",
+                                "source_file": "notes.md",
+                            }
+                        ],
+                    }
+                return {"ids": [], "documents": [], "metadatas": []}
+
+        monkeypatch.setattr("mempalace.mcp_server._get_collection", lambda **_kwargs: Collection())
+        result = tool_get_drawer("ordinary")
+        assert "error" not in result
+        assert result["drawer_id"] == "ordinary"
+        assert result["content"] == "plain note"
+
     def test_list_drawers_with_wing_filter(
         self, monkeypatch, config, palace_path, seeded_collection, kg
     ):

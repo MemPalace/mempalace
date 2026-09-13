@@ -359,6 +359,66 @@ class TestGenerationStateFailClosed:
         assert "error" in result
         assert "current conversation generation" in result["error"]
 
+    def test_lexical_hydrate_fails_closed_when_current_row_get_raises(self):
+        from types import SimpleNamespace
+
+        from mempalace.searcher import _resolve_lexical_generation_hits
+
+        old = SimpleNamespace(
+            id="old",
+            document="old text",
+            metadata={
+                "logical_drawer_id": "logical",
+                "mine_generation_token": "token-0",
+            },
+            score=1.0,
+        )
+
+        class Collection:
+            @staticmethod
+            def get(**kwargs):
+                if kwargs.get("ids"):
+                    raise RuntimeError("hydrate failed")
+                return {
+                    "ids": ["current"],
+                    "metadatas": [
+                        {
+                            "logical_drawer_id": "logical",
+                            "mine_generation_token": "token-0",
+                            "filed_at": "2026-09-02T00:00:00",
+                        }
+                    ],
+                }
+
+        with pytest.raises(GenerationStateError, match="current conversation generation"):
+            _resolve_lexical_generation_hits(Collection(), [old], "query", frozenset({"token-0"}))
+
+    def test_sqlite_active_generation_query_error_does_not_drop_tokened_hits(self, monkeypatch):
+        import sqlite3
+
+        from mempalace.searcher import _resolve_sqlite_generation_candidates
+
+        candidates = [
+            {
+                "_logical_generation_id": "kept-logical",
+                "_generation_token": "token-0",
+                "text": "tokened session hit",
+            }
+        ]
+
+        def boom(*_args, **_kwargs):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr("mempalace.searcher._sqlite_active_generation_rows", boom)
+        with pytest.raises(GenerationStateError, match="current conversation generation"):
+            _resolve_sqlite_generation_candidates(
+                candidates,
+                "tokened session hit",
+                "/unused/chroma.sqlite3",
+                "mempalace_drawers",
+                frozenset({"token-0"}),
+            )
+
 
 # ── search_memories (API) ──────────────────────────────────────────────
 
@@ -1941,6 +2001,70 @@ def test_bm25_commit_marker_is_scoped_to_selected_collection(tmp_path):
         max_candidates=1,
     )
     assert [hit["drawer_id"] for hit in limited["results"]] == ["ordinary-match"]
+
+
+def test_bm25_only_via_sqlite_missing_db_is_no_palace(tmp_path):
+    from mempalace import searcher
+
+    result = searcher._bm25_only_via_sqlite("anything", str(tmp_path))
+    assert result["error"] == "No palace found"
+    assert result["results"] == []
+
+
+def test_bm25_only_via_sqlite_fails_closed_when_active_generation_query_fails(
+    monkeypatch, tmp_path
+):
+    import sqlite3
+
+    from mempalace import searcher
+
+    db = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE VIRTUAL TABLE embedding_fulltext_search USING fts5(string_value, tokenize='trigram');
+        CREATE TABLE embedding_metadata (
+            id INTEGER, key TEXT, string_value TEXT, int_value INTEGER,
+            float_value REAL, bool_value INTEGER
+        );
+        CREATE TABLE collections (id TEXT PRIMARY KEY, name TEXT);
+        CREATE TABLE segments (id TEXT PRIMARY KEY, collection TEXT);
+        CREATE TABLE embeddings (
+            id INTEGER PRIMARY KEY, segment_id TEXT, embedding_id TEXT, created_at TEXT
+        );
+        INSERT INTO collections VALUES ('target', 'target_drawers');
+        INSERT INTO segments VALUES ('target-seg', 'target');
+        INSERT INTO embeddings VALUES (1, 'target-seg', 'physical-current', '2026-09-02');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (1, 'tokened generation session phrase');
+        INSERT INTO embedding_metadata VALUES
+            (1, 'chroma:document', 'tokened generation session phrase', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (1, 'logical_drawer_id', 'kept-logical', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (1, 'mine_generation_token', 'token-0', NULL, NULL, NULL);
+        INSERT INTO embeddings VALUES (2, 'target-seg', 'marker-0', '2026-09-02');
+        INSERT INTO embedding_metadata VALUES
+            (2, 'mine_generation_commit', 'token-0', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (2, 'mine_commit_marker', NULL, NULL, NULL, 1);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    def boom(*_args, **_kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(searcher, "_sqlite_active_generation_rows", boom)
+    result = searcher._bm25_only_via_sqlite(
+        "tokened generation session",
+        str(tmp_path),
+        collection_name="target_drawers",
+    )
+    assert result["results"] == []
+    assert "error" in result
+    assert "current conversation generation" in result["error"]
 
 
 def test_finalize_candidate_hits_forwards_stop_words_to_hybrid_rank(monkeypatch):

@@ -80,7 +80,7 @@ def _sqlite_active_generation_rows(
     """Hydrate marker-selected physical rows for logical IDs from sqlite."""
     if not logical_ids:
         return {}
-    conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+    conn = connect_sqlite_read(db_path)
     try:
         placeholders = ",".join("?" for _ in logical_ids)
         active = conn.execute(
@@ -161,9 +161,9 @@ def _resolve_sqlite_generation_candidates(
     }
     try:
         active = _sqlite_active_generation_rows(db_path, collection_name, logical_ids)
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
         logger.warning("Could not resolve sqlite active generations", exc_info=True)
-        active = {}
+        raise GenerationStateError("Could not resolve current conversation generations") from exc
     resolved = []
     emitted = set()
     for candidate in candidates:
@@ -651,9 +651,12 @@ def _bm25_only_via_sqlite(
     )
 
     # Local BM25 over the candidate set.
-    candidates = _resolve_sqlite_generation_candidates(
-        candidates, query, db_path, collection_name, committed_tokens, tokened_source_modes
-    )
+    try:
+        candidates = _resolve_sqlite_generation_candidates(
+            candidates, query, db_path, collection_name, committed_tokens, tokened_source_modes
+        )
+    except GenerationStateError as e:
+        return _search_error_result(str(e))
     candidates = _collapse_logical_generation_hits(candidates)
     docs = [c["text"] for c in candidates]
     bm25_raw = _bm25_scores(query, docs, stop_words=stop_words)
@@ -726,8 +729,11 @@ def _resolve_lexical_generation_hits(
                         metadata=metadata or {},
                         score=score,
                     )
-        except Exception:
+        except Exception as exc:
             logger.warning("Could not hydrate current lexical generations", exc_info=True)
+            raise GenerationStateError(
+                "Could not resolve current conversation generations"
+            ) from exc
 
     resolved = []
     emitted_logical = set()

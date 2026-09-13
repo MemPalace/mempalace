@@ -138,9 +138,9 @@ def _logical_generation_record(col, drawer_id: str):
             where={"logical_drawer_id": drawer_id},
             include=["documents", "metadatas"],
         )
-    except Exception:
-        logger.debug("generation lookup failed for %s", drawer_id, exc_info=True)
-        return None
+    except Exception as exc:
+        logger.warning("generation lookup failed for %s", drawer_id, exc_info=True)
+        raise GenerationStateError("Could not resolve current conversation generations") from exc
     committed, tokened_source_modes = _committed_generation_state(col)
     rows = []
     ids = _chroma_field(result, "ids", []) or []
