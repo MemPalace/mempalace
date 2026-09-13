@@ -40,6 +40,12 @@ def _mcp_server_source() -> str:
     return "\n".join(_read(path) for path in sorted(pkg.glob("*.py")))
 
 
+def _searcher_source() -> str:
+    """Concatenate searcher package sources."""
+    pkg = MEMPALACE_PKG / "searcher"
+    return "\n".join(_read(path) for path in sorted(pkg.glob("*.py")))
+
+
 def _tools_dict_keys() -> list:
     """Return the list of tool names registered in the TOOLS dict."""
     # Import the module-level TOOLS dict.  We can't just import mcp_server
@@ -172,7 +178,7 @@ class TestClosetFirstSearch:
     def test_closet_boost_search_exists(self):
         """Claim: search uses closets as a boost signal.
         searcher.py must have CLOSET_RANK_BOOSTS and query closets_col."""
-        src = _read(MEMPALACE_PKG / "searcher.py")
+        src = _searcher_source()
         assert "CLOSET_RANK_BOOSTS" in src, (
             "searcher.py has no closet boost logic. "
             "README describes closet-based search but searcher.py has no closet ranking."
@@ -180,7 +186,7 @@ class TestClosetFirstSearch:
 
     def test_searcher_imports_closets(self):
         """searcher.py must import get_closets_collection to use closets."""
-        src = _read(MEMPALACE_PKG / "searcher.py")
+        src = _searcher_source()
         assert "get_closets_collection" in src, (
             "searcher.py does not reference get_closets_collection. "
             "Closet-first search can't work without the closets collection."
@@ -198,7 +204,7 @@ class TestBM25HybridSearch:
     def test_bm25_in_searcher(self):
         """Claim: BM25 hybrid search is shipped.
         searcher.py must have BM25 scoring or hybrid ranking logic."""
-        src = _read(MEMPALACE_PKG / "searcher.py")
+        src = _searcher_source()
         has_bm25 = any(
             term in src.lower()
             for term in [

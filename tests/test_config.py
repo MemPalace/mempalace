@@ -98,6 +98,38 @@ def test_milvus_config_from_env_and_file(tmp_path, monkeypatch):
     assert cfg.milvus_consistency_level == "Eventually"
 
 
+def test_pgvector_config_from_env_and_file(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump(
+            {
+                "pgvector_dsn": "postgresql://config.example:5432/memdb",
+                "pgvector_namespace": "config-ns",
+                "pgvector_shared_namespace": "config-fleet",
+            },
+            f,
+        )
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.pgvector_dsn == "postgresql://config.example:5432/memdb"
+    assert cfg.pgvector_namespace == "config-ns"
+    assert cfg.pgvector_shared_namespace == "config-fleet"
+
+    monkeypatch.setenv("MEMPALACE_PGVECTOR_DSN", "postgresql://env.example:5432/memdb")
+    monkeypatch.setenv("MEMPALACE_PGVECTOR_NAMESPACE", "env-ns")
+    monkeypatch.setenv("MEMPALACE_PGVECTOR_SHARED_NAMESPACE", "env-fleet")
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    assert cfg.pgvector_dsn == "postgresql://env.example:5432/memdb"
+    assert cfg.pgvector_namespace == "env-ns"
+    assert cfg.pgvector_shared_namespace == "env-fleet"
+
+
+def test_pgvector_shared_namespace_unset_by_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_PGVECTOR_SHARED_NAMESPACE", raising=False)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.pgvector_shared_namespace is None
+
+
 def test_milvus_config_rejects_invalid_consistency_level(tmp_path, monkeypatch):
     monkeypatch.setenv("MEMPALACE_MILVUS_CONSISTENCY_LEVEL", "linearizable")
     cfg = MempalaceConfig(config_dir=str(tmp_path))
@@ -1167,3 +1199,77 @@ def test_lang_explicit_ignores_entity_languages_fallback():
     cfg = MempalaceConfig(config_dir=tmpdir)
     assert cfg.lang_explicit is None
     assert cfg.lang == "ko"  # display-side fallback still works
+
+
+# ── hybrid re-rank blend weights (#2298) ─────────────────────────────────
+# searcher._hybrid_rank used to hardcode 0.6 (vector) / 0.4 (BM25). Those are
+# now configurable via env var > config.json > built-in default, with malformed
+# values silently falling back so a hand-edited config can't take retrieval down.
+
+_HYBRID_VECTOR_ENV = "MEMPALACE_HYBRID_VECTOR_WEIGHT"
+_HYBRID_BM25_ENV = "MEMPALACE_HYBRID_BM25_WEIGHT"
+
+
+def _clear_hybrid_env(monkeypatch) -> None:
+    monkeypatch.delenv(_HYBRID_VECTOR_ENV, raising=False)
+    monkeypatch.delenv(_HYBRID_BM25_ENV, raising=False)
+
+
+def test_hybrid_rank_weights_default_when_unset(tmp_path, monkeypatch):
+    _clear_hybrid_env(monkeypatch)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hybrid_rank_vector_weight == 0.6
+    assert cfg.hybrid_rank_bm25_weight == 0.4
+
+
+def test_hybrid_rank_weights_from_config_file(tmp_path, monkeypatch):
+    _clear_hybrid_env(monkeypatch)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"hybrid_rank_vector_weight": 0.8, "hybrid_rank_bm25_weight": 0.2}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hybrid_rank_vector_weight == 0.8
+    assert cfg.hybrid_rank_bm25_weight == 0.2
+
+
+def test_hybrid_rank_weights_env_overrides_config_file(tmp_path, monkeypatch):
+    # config.json holds 0.8/0.2; env holds 0.9/0.1, which must win for both.
+    # (Leaving one unset would resolve it from config, not env, so both are set
+    # to isolate the env > config precedence for each weight.)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"hybrid_rank_vector_weight": 0.8, "hybrid_rank_bm25_weight": 0.2}, f)
+    monkeypatch.setenv(_HYBRID_VECTOR_ENV, "0.9")
+    monkeypatch.setenv(_HYBRID_BM25_ENV, "0.1")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hybrid_rank_vector_weight == 0.9
+    assert cfg.hybrid_rank_bm25_weight == 0.1
+
+
+@pytest.mark.parametrize("value", ["0.8", "0.2", "  0.5  ", "1e-3", "2"])
+def test_hybrid_rank_weights_accept_numeric_env_values(tmp_path, monkeypatch, value):
+    _clear_hybrid_env(monkeypatch)
+    monkeypatch.setenv(_HYBRID_VECTOR_ENV, value)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hybrid_rank_vector_weight == float(value)
+
+
+@pytest.mark.parametrize("bad", ["not-a-number", "", "nan", "inf", "-0.5"])
+def test_hybrid_rank_weights_malformed_env_falls_back_to_default(tmp_path, monkeypatch, bad):
+    _clear_hybrid_env(monkeypatch)
+    monkeypatch.setenv(_HYBRID_VECTOR_ENV, bad)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hybrid_rank_vector_weight == 0.6
+    assert cfg.hybrid_rank_bm25_weight == 0.4
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [[0.8, 0.2], {"v": 1}, "banana", None, -0.5, 1e400],
+    ids=["list", "dict", "string", "null", "negative", "inf"],
+)
+def test_hybrid_rank_weights_malformed_config_falls_back_to_default(tmp_path, monkeypatch, bad):
+    _clear_hybrid_env(monkeypatch)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"hybrid_rank_vector_weight": bad, "hybrid_rank_bm25_weight": bad}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hybrid_rank_vector_weight == 0.6
+    assert cfg.hybrid_rank_bm25_weight == 0.4

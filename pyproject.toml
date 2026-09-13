@@ -194,6 +194,9 @@ ignore = ["E501"]
 "mempalace/cli/_*.py" = ["F821"]
 "mempalace/cli/cmd_*.py" = ["F821"]
 "mempalace/cli/parser.py" = ["F821"]
+# searcher fragments exec into the package namespace.
+"mempalace/searcher/__init__.py" = ["F401"]
+"mempalace/searcher/*.py" = ["F821"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 25
