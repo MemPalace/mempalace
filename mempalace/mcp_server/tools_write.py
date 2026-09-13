@@ -80,6 +80,12 @@ def _logical_parent_id(meta):
     return None
 
 
+def _is_chunk_of_drawer(meta, drawer_id: str) -> bool:
+    """True when any parent-link key points at ``drawer_id``."""
+    meta = meta or {}
+    return any(meta.get(key) == drawer_id for key in _PARENT_ID_KEYS)
+
+
 def _logical_parent_where(drawer_id: str) -> dict:
     """Chroma ``where`` matching every chunk of ``drawer_id`` under either key.
 
@@ -153,6 +159,8 @@ def _visible_parent_chunk_rows(col, drawer_id, committed, tokened_source_modes):
     rows = []
     for idx, chunk_id in enumerate(ids):
         meta = _safe_meta(metas[idx] if idx < len(metas) else {})
+        if not _is_chunk_of_drawer(meta, drawer_id):
+            continue
         if not _is_visible_generation_metadata(meta, committed, tokened_source_modes):
             continue
         doc = docs[idx] if idx < len(docs) else ""
@@ -200,7 +208,7 @@ def _logical_generation_record(col, drawer_id: str):
         )
     if not rows:
         return None
-    parent_rows = [row for row in rows if _logical_parent_id(row[4]) == drawer_id]
+    parent_rows = [row for row in rows if _is_chunk_of_drawer(row[4], drawer_id)]
     siblings = _visible_parent_chunk_rows(col, drawer_id, committed, tokened_source_modes)
     if parent_rows or siblings:
         by_id = {
@@ -209,13 +217,13 @@ def _logical_generation_record(col, drawer_id: str):
         for sibling in siblings:
             by_id[sibling[1]] = sibling
         merged = sorted(by_id.values(), key=lambda row: (row[0], row[1]))
-        leftover_ids = [row[2] for row in rows if _logical_parent_id(row[4]) != drawer_id]
+        leftover_ids = [row[2] for row in rows if not _is_chunk_of_drawer(row[4], drawer_id)]
         chunk_ids = [row[1] for row in merged]
         chunk_docs = [row[2] for row in merged]
         chunk_metas = [row[3] for row in merged]
         return {
             "drawer_id": drawer_id,
-            "ids": chunk_ids + leftover_ids,
+            "ids": list(dict.fromkeys([*chunk_ids, *leftover_ids])),
             "documents": chunk_docs,
             "metadatas": chunk_metas,
             "content": "".join(chunk_docs),

@@ -1871,6 +1871,35 @@ def test_parent_sibling_lookup_fails_closed_instead_of_returning_tail(
     assert "current conversation generation" in fetched["error"]
 
 
+def test_parent_probe_does_not_reclassify_unparented_singleton(
+    monkeypatch, config, palace_path, kg
+):
+    """A get() that ignores where must not treat an unparented row as a chunk group."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    from mempalace import mcp_server
+
+    stub_col = MagicMock()
+    stub_col.get.return_value = {
+        "ids": ["drawer-singleton"],
+        "documents": ["singleton body"],
+        "metadatas": [{"wing": "w", "room": "r", "logical_drawer_id": "drawer-singleton"}],
+    }
+    monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: stub_col)
+    monkeypatch.setattr(
+        mcp_server,
+        "_committed_generation_state",
+        lambda _col: (frozenset(), frozenset()),
+    )
+
+    result = mcp_server.tool_update_drawer("drawer-singleton", content="new singleton body")
+    assert result.get("success") is True
+    stub_col.update.assert_called_once()
+    stub_col.upsert.assert_not_called()
+    deleted = mcp_server.tool_delete_drawer("drawer-singleton")
+    assert deleted["success"] is True
+    stub_col.delete.assert_called_once_with(ids=["drawer-singleton"])
+
+
 def test_non_parent_generation_sibling_probe_fails_closed(monkeypatch, config, palace_path, kg):
     """A leftover singleton must not be returned when sibling lookup fails."""
     _patch_mcp_server(monkeypatch, config, kg)
