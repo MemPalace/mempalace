@@ -22,6 +22,7 @@ import re
 import sqlite3
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 from ..backends import (
@@ -31,11 +32,13 @@ from ..backends import (
     PalaceNotFoundError,
     UnsupportedCapabilityError,
 )
-from ..config import MempalaceConfig, connect_sqlite_read
+from ..config import MempalaceConfig, connect_sqlite_read, sqlite_read_uri
 from ..date_window import filed_at_in_window, parse_window
 from ..i18n import _canonical_lang, get_stopwords
 from ..palace import (
+    _generation_commit_marker_state,
     _open_collection_or_explain,
+    _source_mode_commit_key,
     get_closets_collection,
     get_collection,
     resolve_backend_name,

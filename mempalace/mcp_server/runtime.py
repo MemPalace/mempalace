@@ -310,12 +310,10 @@ def _run_http_loop() -> None:
         _serve_http(_args.host, _args.port)
     finally:
         if owns_writer_lease:
-            # _serve_http uses daemon request threads, so synchronize with the
-            # dispatch lock before closing storage and exposing the palace to
-            # another process. Response serialization happens after this lock
-            # and no longer touches the backend.
-            with _HTTP_REQUEST_LOCK:
-                _release_mcp_writer_lock()
+            # Match dispatch's mutation -> backend lock order. Otherwise an
+            # interleaved mine could still own the mutation lifecycle while
+            # shutdown closes storage and exposes the palace to another process.
+            _release_http_writer_lease()
 
 
 def _install_shutdown_signal_handlers() -> None:

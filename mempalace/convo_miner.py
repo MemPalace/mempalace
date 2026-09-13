@@ -9,12 +9,14 @@ Same palace as project mining. Different ingest strategy.
 """
 
 import errno
+import contextlib
 import os
 import sys
 import json
 import hashlib
 import logging
 import stat
+import threading
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -24,8 +26,11 @@ from .backends import PalaceNotFoundError
 from .collision_scan import assert_no_collisions
 from .ids import (
     ID_RECIPE,
+    make_convo_commit_id,
     make_convo_drawer_id,
+    make_convo_generation_id,
     make_convo_sentinel_id,
+    make_convo_tail_commit_id,
     make_exchange_drawer_id,
 )
 from .normalize import UnparsedCodexTranscriptError, normalize_conversations
@@ -44,6 +49,51 @@ from .palace import (
 )
 
 logger = logging.getLogger("mempalace_mcp")
+_mine_output_state = threading.local()
+
+
+@contextlib.contextmanager
+def mine_output_streams(stdout, stderr):
+    """Route convo-miner progress for this thread without replacing sys streams."""
+    missing = object()
+    previous_stdout = getattr(_mine_output_state, "stdout", missing)
+    previous_stderr = getattr(_mine_output_state, "stderr", missing)
+    _mine_output_state.stdout = stdout
+    _mine_output_state.stderr = stderr
+    try:
+        yield
+    finally:
+        if previous_stdout is missing:
+            del _mine_output_state.stdout
+        else:
+            _mine_output_state.stdout = previous_stdout
+        if previous_stderr is missing:
+            del _mine_output_state.stderr
+        else:
+            _mine_output_state.stderr = previous_stderr
+
+
+def _mine_print(*args, **kwargs):
+    target = kwargs.get("file")
+    if target is sys.stderr:
+        kwargs["file"] = getattr(_mine_output_state, "stderr", sys.stderr)
+    elif target is None:
+        kwargs["file"] = getattr(_mine_output_state, "stdout", sys.stdout)
+    print(*args, **kwargs)
+
+
+def _access_read(access_gate):
+    """Return the caller's shared backend gate, or a direct-mode no-op."""
+    if access_gate is None:
+        return contextlib.nullcontext()
+    return access_gate.read_lock()
+
+
+def _access_write(access_gate):
+    """Return the caller's exclusive backend gate, or a direct-mode no-op."""
+    if access_gate is None:
+        return contextlib.nullcontext()
+    return access_gate.write_lock()
 
 
 # Cached hall keywords — avoids re-reading config per drawer
@@ -219,6 +269,7 @@ def _register_file(
     agent: str,
     extract_mode: str,
     content_hash: Optional[str] = None,
+    access_gate=None,
 ):
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
 
@@ -256,21 +307,22 @@ def _register_file(
         meta["source_mtime"] = source_mtime
     if content_hash is not None:
         meta["content_hash"] = content_hash
-    collection.upsert(
-        documents=[f"[registry] {source_file}"],
-        ids=[sentinel_id],
-        metadatas=[meta],
-    )
+    with _access_write(access_gate):
+        collection.upsert(
+            documents=[f"[registry] {source_file}"],
+            ids=[sentinel_id],
+            metadatas=[meta],
+        )
 
 
-def _source_file_delete_ids(collection, source_file: str, extract_mode: str) -> list[str]:
-    """Collect drawer IDs for one source file and extraction mode.
+def _source_file_existing(collection, source_file: str, extract_mode: str) -> dict[str, dict]:
+    """Map drawer_id -> stored metadata for one source file and extraction mode.
 
     Legacy conversation drawers did not carry extract_mode; treat those as
     exchange-mode rows so schema rebuilds can still clean them up without
     deleting newer general-mode drawers for the same transcript.
     """
-    ids: list[str] = []
+    existing: dict[str, dict] = {}
     offset = 0
     while True:
         batch = collection.get(
@@ -282,12 +334,19 @@ def _source_file_delete_ids(collection, source_file: str, extract_mode: str) -> 
         batch_ids = batch.get("ids") or []
         metadatas = batch.get("metadatas") or []
         for drawer_id, meta in zip(batch_ids, metadatas):
+            if (meta or {}).get("mine_commit_marker") is True:
+                continue
             if _metadata_matches_extract_mode(meta or {}, extract_mode):
-                ids.append(drawer_id)
+                existing[drawer_id] = meta or {}
         if not batch_ids:
             break
         offset += len(batch_ids)
-    return ids
+    return existing
+
+
+def _source_file_delete_ids(collection, source_file: str, extract_mode: str) -> list[str]:
+    """Collect drawer IDs for one source file and extraction mode."""
+    return list(_source_file_existing(collection, source_file, extract_mode))
 
 
 # =============================================================================
@@ -544,7 +603,7 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
                 if filepath.is_symlink():
                     rel = filepath.relative_to(convo_path).as_posix()
                     try:
-                        print(f"  SKIP: {rel} (symlink)", file=sys.stderr)
+                        _mine_print(f"  SKIP: {rel} (symlink)", file=sys.stderr)
                     except OSError:
                         pass
                     continue
@@ -559,14 +618,14 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
                     # before any reader touches them — see the matching
                     # gate in ``miner.scan_project``.
                     if not stat.S_ISREG(file_stat.st_mode):
-                        print(
+                        _mine_print(
                             f"  SKIP: {filepath.name} (not a regular file)",
                             file=sys.stderr,
                         )
                         continue
                     file_size = file_stat.st_size
                     if file_size > MAX_FILE_SIZE:
-                        print(
+                        _mine_print(
                             f"  SKIP: {filepath.name} ({file_size / (1024 * 1024):.1f} MB)"
                             f" exceeds {MAX_FILE_SIZE // (1024 * 1024)} MB limit",
                             file=sys.stderr,
@@ -576,7 +635,7 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
                     # Prefer ``exc.strerror`` so the path isn't duplicated in
                     # the output (see the matching comment in
                     # ``miner.scan_project``).
-                    print(
+                    _mine_print(
                         f"  SKIP: {filepath.name} (stat error: {exc.strerror or exc})",
                         file=sys.stderr,
                     )
@@ -625,6 +684,774 @@ def _extract_authored_at(filepath):
     return latest
 
 
+def _content_set_generation_token(members: list[tuple[str, str]]) -> str:
+    """Hash the logical drawer ids and chunk hashes that make one visible set.
+
+    Physical ids change when a reused row is copied into a new generation, so
+    the commit token cannot be derived from those ids. A content-set token is
+    stable across retries and A→B→A transitions of the same verbatim chunks.
+    """
+    payload = "\0".join(f"{logical_id}\0{chunk_hash}" for logical_id, chunk_hash in sorted(members))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _append_staging_token(generation_token, active_token, planned_chunks) -> Optional[str]:
+    """Unpublished identity for a pending append tail.
+
+    Append-only growth reuses the committed marker token so unchanged rows
+    keep their physical ids and vectors. Hub read filters treat staged rows
+    that already carry a committed token as visible, so new tail rows must
+    stage under a distinct content-set token until the entire append is
+    written. Publication then commits that token beside the active marker.
+    """
+    if not (
+        isinstance(generation_token, str)
+        and generation_token
+        and generation_token == active_token
+        and planned_chunks
+    ):
+        return generation_token
+    return _content_set_generation_token(
+        [(item["logical_drawer_id"], item["chunk_hash"]) for item in planned_chunks]
+    )
+
+
+def _drawer_logical_id(physical_id: str, meta: dict) -> str:
+    logical_id = meta.get("logical_drawer_id")
+    if isinstance(logical_id, str) and logical_id:
+        return logical_id
+    return physical_id
+
+
+def _is_convo_registry_meta(meta: dict) -> bool:
+    return meta.get("ingest_mode") == "registry"
+
+
+def _committed_marker_generation_token(marker_metas) -> Optional[str]:
+    """Return the published generation token from a commit-marker get()."""
+    for meta in marker_metas or []:
+        if not isinstance(meta, dict):
+            continue
+        token = meta.get("mine_generation_commit")
+        if meta.get("mine_commit_marker") is True and isinstance(token, str) and token:
+            return token
+    return None
+
+
+def _active_drawer_generation_token(existing: dict) -> Optional[str]:
+    """Return the single non-staged drawer token, if the active set agrees.
+
+    Residual rows after a failed T1→T2 rewrite cleanup can still carry both
+    tokens, so this inference returns None even though the commit marker
+    names T2. Callers that have the marker must pass that token instead.
+    """
+    tokens = {
+        meta.get("mine_generation_token")
+        for meta in existing.values()
+        if not _is_convo_registry_meta(meta)
+        and meta.get("mine_staged") is not True
+        and meta.get("mine_generation_token")
+    }
+    if len(tokens) != 1:
+        return None
+    token = next(iter(tokens))
+    return token if isinstance(token, str) else None
+
+
+def _is_committed_active_drawer(meta: dict, active_token: Optional[str]) -> bool:
+    """True when a stored drawer belongs to the currently committed generation.
+
+    Tokenless leftover rows from a failed A→B cleanup are not active once a
+    later generation carries a token. Staged or tokened rows from a retired
+    generation are not active either. Append-only subset and candidate checks
+    share this predicate so a failed T1→T2 shrink cannot treat a dropped
+    logical id as part of T2, and a B→A reversion cannot retag retired A
+    with B's token. A pending append tail stages under an unpublished
+    identity, so it is not active even if a crash left it carrying the
+    marker token; retries still match it by content hash.
+    """
+    if not isinstance(meta, dict) or _is_convo_registry_meta(meta):
+        return False
+    if meta.get("mine_staged") is True:
+        return False
+    token = meta.get("mine_generation_token")
+    if active_token:
+        return token == active_token
+    return not token
+
+
+def _committed_active_matches(matches, active_token: Optional[str]):
+    return [match for match in matches if _is_committed_active_drawer(match[1], active_token)]
+
+
+def _is_append_only_growth(planned_chunks, existing, active_token: Optional[str] = None) -> bool:
+    """True when this pass restates or extends the committed generation.
+
+    Shrink and rewrite still mint a new token. Only drawers that belong to
+    the committed active generation participate: leftover rows from a failed
+    T1→T2 shrink cleanup can retain a logical id that T2 dropped, and a later
+    append must not treat that retired id as a shrink or rewrite of T2.
+    Matching leftover content is not enough either: a failed A→B cleanup can
+    leave retired A beside committed B, and a later B→A reversion plus append
+    must not retag A with B's token. Reused matches must be committed active
+    rows so repeated appends and a later cleanup retry stay incremental
+    without reviving obsolete text. A pending append tail is unpublished and
+    does not participate as an active row; retries resume it by content hash.
+    """
+    if not existing or not planned_chunks:
+        return False
+    planned_logical = {item["logical_drawer_id"] for item in planned_chunks}
+    for physical_id, meta in existing.items():
+        if not _is_committed_active_drawer(meta, active_token):
+            continue
+        if _drawer_logical_id(physical_id, meta) not in planned_logical:
+            return False
+    return not any(
+        _committed_active_matches(item["candidates"], active_token)
+        and not _committed_active_matches(item["matches"], active_token)
+        for item in planned_chunks
+    )
+
+
+def _reused_generation_copy_id(logical_drawer_id: str, generation_token: str) -> str:
+    """Physical id for a reused chunk cloned into ``generation_token``."""
+    return make_convo_generation_id(logical_drawer_id, f"set:{generation_token}")
+
+
+def _compatible_chunk_generations(
+    candidates: list[tuple[str, dict]], chunk_hash: str
+) -> list[tuple[str, dict]]:
+    return [
+        (physical_id, stored_meta)
+        for physical_id, stored_meta in candidates
+        if stored_meta.get("chunk_hash") == chunk_hash
+        and stored_meta.get("normalize_version", 1) >= NORMALIZE_VERSION
+    ]
+
+
+def _reused_drawer_touch_meta(
+    prev: dict,
+    *,
+    logical_drawer_id: str,
+    chunk_total: int,
+    source_mtime,
+    content_hash,
+    chunk_index,
+) -> dict:
+    touched = dict(prev)
+    touched["logical_drawer_id"] = logical_drawer_id
+    touched["mine_staged"] = False
+    touched["chunk_total"] = chunk_total
+    if source_mtime is not None:
+        touched["source_mtime"] = source_mtime
+    else:
+        # A stale stored mtime with no current one to replace it would let
+        # an old group satisfy a future completion check.
+        touched.pop("source_mtime", None)
+    if content_hash is not None and chunk_index == 0:
+        touched["content_hash"] = content_hash
+    return touched
+
+
+def _embedding_vector(value):
+    if value is None:
+        return None
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if not isinstance(value, list) or not value:
+        return None
+    return list(value)
+
+
+def _existing_embeddings(collection, ids, access_gate) -> dict:
+    """Map physical id → stored embedding for reused generation copies."""
+    embeddings: dict = {}
+    unique_ids = list(dict.fromkeys(ids))
+    for batch_start in range(0, len(unique_ids), DRAWER_UPSERT_BATCH_SIZE):
+        batch_ids = unique_ids[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+        with _access_read(access_gate):
+            result = collection.get(ids=batch_ids, include=["embeddings"])
+        got_ids = result.get("ids") or []
+        got_embs = result.get("embeddings")
+        if not got_ids or got_embs is None:
+            continue
+        for drawer_id, raw in zip(got_ids, got_embs):
+            vector = _embedding_vector(raw)
+            if vector is not None:
+                embeddings[drawer_id] = vector
+    return embeddings
+
+
+def _upsert_staged_convo_drawers(
+    collection,
+    *,
+    ids,
+    documents,
+    metadatas,
+    access_gate,
+    embeddings=None,
+) -> None:
+    try:
+        with _access_write(access_gate):
+            assert_no_collisions(list(zip(ids, metadatas)), collection)
+            kwargs = {
+                "documents": documents,
+                "ids": ids,
+                "metadatas": metadatas,
+            }
+            if embeddings is not None:
+                kwargs["embeddings"] = embeddings
+            collection.upsert(**kwargs)
+    except Exception as exc:
+        if "already exists" not in str(exc).lower():
+            raise
+
+
+def _stage_reused_generation_copies(
+    collection,
+    copies: list[tuple[str, str, str, dict]],
+    *,
+    generation_token: str,
+    access_gate,
+) -> None:
+    """Clone reused drawers under the new token, copying stored embeddings."""
+    if not copies:
+        return
+    embeddings = _existing_embeddings(
+        collection, [source_id for _, source_id, _, _ in copies], access_gate
+    )
+    for batch_start in range(0, len(copies), DRAWER_UPSERT_BATCH_SIZE):
+        batch = copies[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+        with_vectors: list[tuple[str, str, dict, list]] = []
+        without_vectors: list[tuple[str, str, dict]] = []
+        for physical_id, source_id, content, final_meta in batch:
+            staged = dict(final_meta)
+            staged.pop("source_mtime", None)
+            staged["mine_staged"] = True
+            staged["mine_generation_token"] = generation_token
+            vector = embeddings.get(source_id)
+            if vector is not None:
+                with_vectors.append((physical_id, content, staged, vector))
+            else:
+                without_vectors.append((physical_id, content, staged))
+        if with_vectors:
+            _upsert_staged_convo_drawers(
+                collection,
+                ids=[item[0] for item in with_vectors],
+                documents=[item[1] for item in with_vectors],
+                metadatas=[item[2] for item in with_vectors],
+                access_gate=access_gate,
+                embeddings=[item[3] for item in with_vectors],
+            )
+        if without_vectors:
+            _upsert_staged_convo_drawers(
+                collection,
+                ids=[item[0] for item in without_vectors],
+                documents=[item[1] for item in without_vectors],
+                metadatas=[item[2] for item in without_vectors],
+                access_gate=access_gate,
+            )
+
+
+_TAIL_MARKER_UNREADABLE = object()
+
+
+def _append_tail_marker_commit_token(collection, tail_commit_id, access_gate):
+    """Return the extra tail marker's committed token, if one is published.
+
+    ``None`` means no published extra token. The unread sentinel means the
+    lookup failed; callers must not treat a visible staged tail as unpublished.
+    """
+    if not isinstance(tail_commit_id, str) or not tail_commit_id:
+        return None
+    try:
+        with _access_read(access_gate):
+            result = collection.get(ids=[tail_commit_id], include=["metadatas"])
+    except Exception:
+        logger.debug("Could not read append tail commit marker", exc_info=True)
+        return _TAIL_MARKER_UNREADABLE
+    return _committed_marker_generation_token(result.get("metadatas") or [])
+
+
+def _neutralized_tail_commit_metadata(commit_metadata) -> dict:
+    """Overwrite an extra tail marker so its token is no longer committed."""
+    retired_tail = dict(commit_metadata)
+    retired_tail["mine_generation_commit"] = ""
+    retired_tail["mine_cleanup_pending"] = False
+    return retired_tail
+
+
+def _pending_append_rows_to_restage(to_touch, *, existing, staging_token):
+    """In-place metadata updates that move recovered pending rows onto ``staging_token``.
+
+    The planner keeps unchanged pending-tail matches in ``to_touch`` instead of
+    cloning them under the active token. Those rows still carry the previous
+    unpublished identity until publication retags them, so they must be
+    restaged first.
+    """
+    if not isinstance(staging_token, str) or not staging_token or not to_touch:
+        return []
+    restage = []
+    for drawer_id, touch_meta in to_touch:
+        prev = existing.get(drawer_id)
+        if not isinstance(prev, dict) or prev.get("mine_staged") is not True:
+            continue
+        token = prev.get("mine_generation_token")
+        if not isinstance(token, str) or not token or token == staging_token:
+            continue
+        restaged = dict(touch_meta)
+        restaged.pop("source_mtime", None)
+        restaged["mine_staged"] = True
+        restaged["mine_generation_token"] = staging_token
+        restage.append((drawer_id, restaged))
+    return restage
+
+
+def _restage_recovered_pending_append_rows(collection, rows, *, access_gate) -> None:
+    """Apply recovered pending-tail restages without re-embedding."""
+    if not rows:
+        return
+    for batch_start in range(0, len(rows), DRAWER_UPSERT_BATCH_SIZE):
+        batch = rows[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+        with _access_write(access_gate):
+            collection.update(
+                ids=[drawer_id for drawer_id, _ in batch],
+                metadatas=[meta for _, meta in batch],
+            )
+
+
+def _clone_recovered_pending_append_rows(
+    collection, rows, *, staging_token, access_gate, allow_in_place: bool = True
+) -> list[tuple[str, str]]:
+    """Clone currently visible pending-tail rows onto the unpublished token.
+
+    In-place restage would hide a committed extra-marker tail one row at a
+    time. Copying onto the new unpublished identity leaves the old rows
+    readable until the extra marker switches. When the extra-marker state is
+    unknown, in-place fallback is forbidden so a visible tail cannot vanish.
+    """
+    if not rows:
+        return []
+    source_ids = [drawer_id for drawer_id, _ in rows]
+    documents = {}
+    try:
+        with _access_read(access_gate):
+            result = collection.get(ids=source_ids, include=["documents"])
+        for drawer_id, document in zip(result.get("ids") or [], result.get("documents") or []):
+            if document is not None:
+                documents[drawer_id] = document
+    except Exception:
+        logger.debug("Could not read pending append rows to clone", exc_info=True)
+    copies = []
+    replacements = []
+    leftover = []
+    for drawer_id, touch_meta in rows:
+        content = documents.get(drawer_id)
+        logical_id = touch_meta.get("logical_drawer_id") or drawer_id
+        if not isinstance(logical_id, str) or not logical_id or content is None:
+            leftover.append((drawer_id, touch_meta))
+            continue
+        copy_id = _reused_generation_copy_id(logical_id, staging_token)
+        copies.append((copy_id, drawer_id, content, touch_meta))
+        replacements.append((drawer_id, copy_id))
+    if leftover and not allow_in_place:
+        raise RuntimeError("could not clone recovered append rows with unread tail marker")
+    _stage_reused_generation_copies(
+        collection,
+        copies,
+        generation_token=staging_token,
+        access_gate=access_gate,
+    )
+    _restage_recovered_pending_append_rows(collection, leftover, access_gate=access_gate)
+    return replacements
+
+
+def _restage_pending_append_tail_before_publish(
+    collection,
+    *,
+    to_touch,
+    existing,
+    staging_token,
+    generation_token,
+    tail_commit_id,
+    access_gate,
+) -> list[tuple[str, str]]:
+    """Move recovered pending-tail rows onto the unpublished token before exposing it.
+
+    Unpublished recovered rows restage in place. Rows already visible under a
+    committed extra-marker token are cloned so readers keep the previous
+    complete tail until the new token is published. If the extra marker cannot
+    be read, every recovered row is cloned: treating unknown state as
+    unpublished would retag a visible tail in place and hide it.
+    """
+    if not (isinstance(staging_token, str) and staging_token and staging_token != generation_token):
+        return []
+    extra_token = _append_tail_marker_commit_token(collection, tail_commit_id, access_gate)
+    restage = _pending_append_rows_to_restage(
+        to_touch, existing=existing, staging_token=staging_token
+    )
+    if extra_token is _TAIL_MARKER_UNREADABLE:
+        return _clone_recovered_pending_append_rows(
+            collection,
+            restage,
+            staging_token=staging_token,
+            access_gate=access_gate,
+            allow_in_place=False,
+        )
+    committed = {
+        token for token in (generation_token, extra_token) if isinstance(token, str) and token
+    }
+    in_place = []
+    to_clone = []
+    for drawer_id, restaged in restage:
+        prev = existing.get(drawer_id) or {}
+        token = prev.get("mine_generation_token")
+        if token in committed:
+            to_clone.append((drawer_id, restaged))
+        else:
+            in_place.append((drawer_id, restaged))
+    _restage_recovered_pending_append_rows(collection, in_place, access_gate=access_gate)
+    return _clone_recovered_pending_append_rows(
+        collection,
+        to_clone,
+        staging_token=staging_token,
+        access_gate=access_gate,
+    )
+
+
+def _publish_changed_generations(
+    collection,
+    *,
+    final_metadata,
+    stale_ids,
+    commit_id,
+    commit_metadata,
+    source_file,
+    access_gate=None,
+    staging_token=None,
+    tail_commit_id=None,
+) -> bool:
+    """Publish a fully staged generation, finalize rows, and retire old ones.
+
+    Callers must already have written every new-generation row — including
+    generation-specific copies of reused unchanged chunks — under
+    ``mine_generation_token``, and restaged recovered pending-tail rows onto
+    the unpublished append token. Switching the marker is then the
+    crash-atomic visibility flip: before it, the previous committed
+    generation stays complete; after it, the new token is complete even if
+    metadata finalization or stale-row cleanup fails. Append-only tails
+    stage under a distinct unpublished token; a temporary extra marker
+    commits that token beside the still-active generation so the complete
+    tail becomes visible without hiding unchanged rows. The extra marker is
+    overwritten on the next append rather than deleted, so repeated appends
+    stay delete-free for active drawers. ``cleanup_pending`` keeps the source
+    retryable until every follow-up write succeeds.
+
+    Writer serialization comes from the caller's mutation lock (HTTP mine)
+    or per-file ``mine_lock``. The access gate is acquired only around each
+    bounded upsert/update/delete so waiting readers can run between bursts.
+
+    A rewrite or shrink after an interrupted append can find
+    ``staging_token == publish_token``, so it does not expose a new tail.
+    Every non-tail publication overwrites the deterministic extra tail id
+    in the same upsert as the primary switch: earlier would hide the
+    previous complete tail, and skipping it — including when a tail-marker
+    get fails — would keep dropped rows visible if stale-row deletion then
+    fails. The overwrite does not depend on reading the extra marker first.
+    """
+    publish_token = commit_metadata.get("mine_generation_commit")
+    expose_tail = (
+        isinstance(staging_token, str)
+        and staging_token
+        and staging_token != publish_token
+        and isinstance(tail_commit_id, str)
+        and tail_commit_id
+    )
+    commit_document = f"[conversation generation commit] {source_file}"
+    ids_to_delete = list(stale_ids)
+    try:
+        if expose_tail:
+            tail_metadata = dict(commit_metadata)
+            tail_metadata["mine_generation_commit"] = staging_token
+            # Leftover extra markers must not pin the source as pending;
+            # retryability lives on the primary marker.
+            tail_metadata["mine_cleanup_pending"] = False
+            with _access_write(access_gate):
+                collection.upsert(
+                    ids=[tail_commit_id],
+                    documents=[commit_document],
+                    metadatas=[tail_metadata],
+                )
+        publish_ids = [commit_id]
+        publish_docs = [commit_document]
+        publish_metas = [commit_metadata]
+        if not expose_tail and isinstance(tail_commit_id, str) and tail_commit_id:
+            # Primary first so a partial upsert cannot uncommit the old
+            # tail while the previous generation is still the published view.
+            publish_ids.append(tail_commit_id)
+            publish_docs.append(commit_document)
+            publish_metas.append(_neutralized_tail_commit_metadata(commit_metadata))
+        with _access_write(access_gate):
+            collection.upsert(
+                ids=publish_ids,
+                documents=publish_docs,
+                metadatas=publish_metas,
+            )
+        for batch_start in range(0, len(final_metadata), DRAWER_UPSERT_BATCH_SIZE):
+            batch = final_metadata[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+            with _access_write(access_gate):
+                collection.update(
+                    ids=[drawer_id for drawer_id, _ in batch],
+                    metadatas=[meta for _, meta in batch],
+                )
+        if expose_tail:
+            # Retag is complete, so the extra token must not stay committed.
+            # A later shrink-and-reappend of the same content set would
+            # otherwise find this leftover token already published and
+            # expose a partial tail. Overwrite in place; do not delete, so
+            # repeated appends keep active-row delete lists empty.
+            with _access_write(access_gate):
+                collection.upsert(
+                    ids=[tail_commit_id],
+                    documents=[commit_document],
+                    metadatas=[_neutralized_tail_commit_metadata(commit_metadata)],
+                )
+        for batch_start in range(0, len(ids_to_delete), DRAWER_UPSERT_BATCH_SIZE):
+            batch_ids = ids_to_delete[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+            with _access_write(access_gate):
+                collection.delete(ids=batch_ids)
+        completed_marker = dict(commit_metadata)
+        completed_marker["mine_cleanup_pending"] = False
+        with _access_write(access_gate):
+            collection.update(ids=[commit_id], metadatas=[completed_marker])
+        return True
+    except Exception:
+        logger.warning(
+            "Failed to publish changed generations or delete %d orphaned "
+            "convo drawers for %s; leaving the source incomplete so the "
+            "next mine retries",
+            len(stale_ids),
+            source_file,
+            exc_info=True,
+        )
+    return False
+
+
+def _changed_convo_drawer_meta(
+    *,
+    wing,
+    chunk_room,
+    chunk,
+    source_file,
+    agent,
+    filed_at,
+    authored_at,
+    extract_mode,
+    logical_drawer_id,
+    chunk_total,
+    chunk_hash,
+    source_mtime,
+    content_hash,
+) -> dict:
+    meta = {
+        "wing": wing,
+        "room": chunk_room,
+        "hall": _detect_hall_cached(chunk["content"]),
+        "source_file": source_file,
+        "chunk_index": chunk["chunk_index"],
+        "added_by": agent,
+        "filed_at": filed_at,
+        "entities": entities_metadata(chunk["content"]),
+        "authored_at": authored_at if authored_at is not None else filed_at,
+        "ingest_mode": "convos",
+        "extract_mode": extract_mode,
+        "normalize_version": NORMALIZE_VERSION,
+        "id_recipe": ID_RECIPE,
+        "logical_drawer_id": logical_drawer_id,
+        "mine_staged": False,
+        "chunk_total": chunk_total,
+        "chunk_hash": chunk_hash,
+    }
+    if source_mtime is not None:
+        meta["source_mtime"] = source_mtime
+    # Stamp content_hash only on chunk 0 so multi-conversation privacy-export
+    # hashes are not O(N²)-duplicated across every chunk row.
+    # ``prefetch_content_hashes`` still finds them — it scans all drawers and
+    # splits comma-joined hash fields.
+    if content_hash is not None and chunk.get("chunk_index", 0) == 0:
+        meta["content_hash"] = content_hash
+    return meta
+
+
+def _select_reuse_candidate(matches, copy_id, generation_token):
+    for match in matches:
+        if match[1].get("mine_generation_token") == generation_token:
+            return match
+    for match in matches:
+        if match[0] == copy_id:
+            return match
+    for match in matches:
+        if not match[1].get("mine_generation_token"):
+            return match
+    return matches[0]
+
+
+def _plan_convo_generation_writes(
+    planned_chunks,
+    *,
+    existing,
+    pending_cleanup,
+    wing,
+    source_file,
+    agent,
+    filed_at,
+    authored_at,
+    extract_mode,
+    chunk_total,
+    source_mtime,
+    content_hash,
+    active_token: Optional[str] = None,
+):
+    """Decide upserts, in-place refreshes, and generation copies for one pass."""
+    content_set_token = _content_set_generation_token(
+        [(item["logical_drawer_id"], item["chunk_hash"]) for item in planned_chunks]
+    )
+    # Repeated appends must not mint a new content-set token: that would clone
+    # every unchanged active row onto new physical ids and delete the old
+    # ones. The commit marker is the authority for which token is live;
+    # residual rows after a failed T1→T2 cleanup can still carry both tokens,
+    # so inferring from them returns None and would re-clone the transcript.
+    # Matching leftover content is not enough — the reused rows must already
+    # belong to that committed generation, and retired logical ids dropped by
+    # a shrink must not veto append-only reuse of T2.
+    if not isinstance(active_token, str) or not active_token:
+        active_token = _active_drawer_generation_token(existing)
+    if _is_append_only_growth(planned_chunks, existing, active_token) and active_token:
+        generation_token = active_token
+    else:
+        generation_token = content_set_token
+    to_upsert: list = []
+    to_touch: list = []
+    to_copy: list = []
+    tentative: list[tuple] = []
+    tentative_ids: set = set()
+    for item in planned_chunks:
+        copy_id = _reused_generation_copy_id(item["logical_drawer_id"], generation_token)
+        matches = item["matches"]
+        if matches:
+            current = _select_reuse_candidate(matches, copy_id, generation_token)
+            tentative.append(("reuse", item, copy_id, current))
+            tentative_ids.add(current[0])
+            continue
+        physical_id = (
+            make_convo_generation_id(item["logical_drawer_id"], item["chunk_hash"])
+            if item["candidates"]
+            else item["logical_drawer_id"]
+        )
+        tentative.append(("upsert", item, copy_id, (physical_id, None)))
+        tentative_ids.add(physical_id)
+
+    # The first complete mine stays tokenless so those rows remain genuine
+    # legacy. The first growth publishes a content-set token so appended rows
+    # are not tokenless legacy if a later shrink's stale delete fails. Later
+    # append-only growth reuses that active token instead of cloning, but
+    # only when the matching rows already belong to it. A rewrite/shrink that
+    # publishes a new content-set token must clone reused rows that still
+    # carry the previous token; updating those ids in place would hide them
+    # for the duration of the switch.
+    has_new_rows = any(kind == "upsert" for kind, *_ in tentative)
+    has_pending_tail = any(
+        current[1] is not None
+        and current[1].get("mine_staged") is True
+        and current[1].get("mine_generation_token")
+        and current[1].get("mine_generation_token") != generation_token
+        for _kind, _item, _copy_id, current in tentative
+    )
+    will_publish = (
+        pending_cleanup
+        or any(drawer_id not in tentative_ids for drawer_id in existing)
+        or (bool(existing) and (has_new_rows or has_pending_tail))
+    )
+    new_ids: set = set()
+    for kind, item, copy_id, current in tentative:
+        chunk = item["chunk"]
+        logical_drawer_id = item["logical_drawer_id"]
+        if kind == "upsert":
+            physical_id = current[0]
+            new_ids.add(physical_id)
+            to_upsert.append(
+                (
+                    physical_id,
+                    chunk["content"],
+                    _changed_convo_drawer_meta(
+                        wing=wing,
+                        chunk_room=item["chunk_room"],
+                        chunk=chunk,
+                        source_file=source_file,
+                        agent=agent,
+                        filed_at=filed_at,
+                        authored_at=authored_at,
+                        extract_mode=extract_mode,
+                        logical_drawer_id=logical_drawer_id,
+                        chunk_total=chunk_total,
+                        chunk_hash=item["chunk_hash"],
+                        source_mtime=source_mtime,
+                        content_hash=content_hash,
+                    ),
+                )
+            )
+            continue
+        physical_id, prev = current
+        reused_token = prev.get("mine_generation_token")
+        # Staged pending-tail matches stay on their physical ids (to_touch)
+        # instead of cloning under the active token, which Hub would treat
+        # as visible. The write path restages those rows onto the current
+        # unpublished token before that token is exposed.
+        if (
+            will_publish
+            and reused_token
+            and reused_token != generation_token
+            and physical_id != copy_id
+            and prev.get("mine_staged") is not True
+        ):
+            source_id, source_meta = next(
+                (match for match in item["matches"] if match[1].get("mine_staged") is not True),
+                current,
+            )
+            new_ids.add(copy_id)
+            to_copy.append(
+                (
+                    copy_id,
+                    source_id,
+                    chunk["content"],
+                    _reused_drawer_touch_meta(
+                        source_meta,
+                        logical_drawer_id=logical_drawer_id,
+                        chunk_total=chunk_total,
+                        source_mtime=source_mtime,
+                        content_hash=content_hash,
+                        chunk_index=chunk.get("chunk_index", 0),
+                    ),
+                )
+            )
+            continue
+        new_ids.add(physical_id)
+        to_touch.append(
+            (
+                physical_id,
+                _reused_drawer_touch_meta(
+                    prev,
+                    logical_drawer_id=logical_drawer_id,
+                    chunk_total=chunk_total,
+                    source_mtime=source_mtime,
+                    content_hash=content_hash,
+                    chunk_index=chunk.get("chunk_index", 0),
+                ),
+            )
+        )
+    return to_upsert, to_touch, to_copy, new_ids, generation_token, will_publish
+
+
 def _file_chunks_locked(
     collection,
     source_file,
@@ -635,59 +1462,89 @@ def _file_chunks_locked(
     extract_mode,
     authored_at=None,
     content_hash=None,
+    access_gate=None,
 ):
-    """Lock the source file, purge stale drawers, and upsert fresh chunks.
+    """Lock the source file and file its chunks incrementally.
 
     Combines the per-file serialization that prevents concurrent agents from
-    duplicating work (via mine_lock) with the rebuild contract
-    (purge-before-insert so stale drawers never survive) that fires on
-    either a normalize-version bump OR a changed/grown source file (mtime
-    differs from what's stored) -- transcripts are not assumed immutable,
-    since a Claude Code session keeps appending to its own file while
-    active and /compact or /clear can rewrite one in place.
+    duplicating work (via mine_lock) with an incremental re-mine contract
+    (#2403): logical drawer ids are deterministic over
+    ``(source_file, extract_mode, chunk_index)``, so a re-mine of a changed
+    source — a Claude Code session appends to its own transcript every turn,
+    and /compact or /clear can rewrite one in place — only re-embeds the
+    chunks whose content actually changed. A changed chunk is staged under a
+    content-addressed physical generation instead of overwriting its old
+    logical position. Unchanged chunks that still have no generation token
+    get a cheap metadata-only refresh (``source_mtime`` / ``chunk_total``).
+    Append-only growth reuses the active generation token so unchanged rows
+    stay on their existing physical ids. New tail rows stage under a distinct
+    unpublished content-set token until the whole tail is written; a
+    temporary extra marker then exposes that complete tail without hiding
+    the prior generation. Recovered pending-tail rows from an interrupted
+    append are restaged onto that unpublished token before the extra
+    marker is published, so a later growth cannot expose a new suffix
+    while still hiding the middle. A rewrite or shrink that publishes a new token
+    clones unchanged rows that already belong to another committed
+    generation under a generation-specific physical id with the stored
+    embedding, so the old token stays complete until the new token is fully
+    staged.
+    Existing generations are deleted only after every new batch succeeds, so
+    a crash mid-operation leaves the prior verbatim set untouched; a crash
+    after staging leaves a retryable incomplete group that reuses the staged
+    embeddings (#2183).
 
-    Returns (drawers_added, room_counts_delta, skipped).
+    Returns (drawers_added, room_counts_delta, skipped) where drawers_added
+    counts only new/changed drawers actually upserted this pass.
     """
     room_counts_delta: dict = defaultdict(int)
     drawers_added = 0
     with mine_lock(source_file):
+        commit_id = make_convo_commit_id(source_file, extract_mode)
         # Re-check after lock — another agent may have just finished this file
         # at the current schema/mtime. A stale hit here returns False, so we
-        # still fall through to the purge+rebuild path below.
-        if file_already_mined(collection, source_file, check_mtime=True, extract_mode=extract_mode):
+        # still fall through to the incremental path below.
+        pending_cleanup = False
+        active_token = None
+        try:
+            with _access_read(access_gate):
+                marker_result = collection.get(ids=[commit_id], include=["metadatas"])
+                marker_metas = marker_result.get("metadatas") or []
+                pending_cleanup = any(
+                    (meta or {}).get("mine_cleanup_pending") is True for meta in marker_metas
+                )
+                active_token = _committed_marker_generation_token(marker_metas)
+                if not pending_cleanup and file_already_mined(
+                    collection, source_file, check_mtime=True, extract_mode=extract_mode
+                ):
+                    return 0, room_counts_delta, True
+        except Exception:
+            logger.warning("Conversation mine re-check failed for %s", source_file, exc_info=True)
             return 0, room_counts_delta, True
 
-        # Purge stale drawers first. Fires both on a normalize-schema bump
-        # (file_already_mined() returned False for pre-v2 drawers) and on a
-        # changed/grown transcript (mtime differs) — clean them out so the
-        # source doesn't end up with mixed old/new drawers.
-        #
-        # A failed purge must abort this file's mine attempt rather than
-        # fall through to upsert: proceeding on top of an unpurged (or
-        # partially purged) set produces duplicate/stale drawers under
-        # mixed schema versions, with no operator-visible signal beyond a
-        # debug log (#105 — convo_miner's own instance of the same swallow
-        # already fixed for miner.py at #23). Returning here leaves the old
-        # drawers' stored mtime untouched, so the next mine still sees a
-        # mismatch and retries.
+        # Snapshot what the palace already holds for this source+mode. A
+        # failed snapshot must abort this file's mine attempt rather than
+        # fall through to a blind full upsert: without the snapshot the pass
+        # cannot tell changed chunks from unchanged ones or find orphaned
+        # ids, and would degrade to the very purge/rebuild churn this path
+        # exists to avoid (#105 — convo_miner's own instance of the same
+        # swallow already fixed for miner.py at #23). Returning here leaves
+        # the old drawers' stored mtime untouched, so the next mine still
+        # sees a mismatch and retries.
         try:
-            delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
-            if delete_ids:
-                collection.delete(ids=delete_ids)
+            with _access_read(access_gate):
+                existing = _source_file_existing(collection, source_file, extract_mode)
         except Exception as exc:
-            print(
-                f"  ! [skip] stale-drawer purge failed for {source_file!r} "
+            _mine_print(
+                f"  ! [skip] existing-drawer snapshot failed for {source_file!r} "
                 f"({exc!r}); leaving existing drawers untouched, will retry "
                 f"on the next mine",
                 file=sys.stderr,
             )
-            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
+            logger.debug("Existing-drawer snapshot failed for %s", source_file, exc_info=True)
             return 0, room_counts_delta, True
 
-        # Batch chunks into bounded upserts so large transcripts keep most of
-        # the embedding speedup without one huge Chroma/SQLite request. Keep
-        # one filed_at per source file so all transcript drawers share an
-        # ingest timestamp.
+        # One filed_at per source file so all transcript drawers of a pass
+        # share an ingest timestamp.
         #
         # Every drawer of this pass carries ``chunk_total`` so
         # ``file_already_mined`` / ``prefetch_mined_set`` can tell a complete
@@ -700,73 +1557,194 @@ def _file_chunks_locked(
         except OSError:
             source_mtime = None
         chunk_total = len(chunks)
-        try:
-            for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
-                batch_docs: list = []
-                batch_ids: list = []
-                batch_metas: list = []
-                for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                    chunk_room = (
-                        chunk.get("memory_type", room) if extract_mode == "general" else room
-                    )
-                    if extract_mode == "general":
-                        room_counts_delta[chunk_room] += 1
-                    drawer_id = make_convo_drawer_id(
-                        wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
-                    )
-                    batch_docs.append(chunk["content"])
-                    batch_ids.append(drawer_id)
-                    meta = {
-                        "wing": wing,
-                        "room": chunk_room,
-                        "hall": _detect_hall_cached(chunk["content"]),
-                        "source_file": source_file,
-                        "chunk_index": chunk["chunk_index"],
-                        "added_by": agent,
-                        "filed_at": filed_at,
-                        "entities": entities_metadata(chunk["content"]),
-                        "authored_at": authored_at if authored_at is not None else filed_at,
-                        "ingest_mode": "convos",
-                        "extract_mode": extract_mode,
-                        "normalize_version": NORMALIZE_VERSION,
-                        "id_recipe": ID_RECIPE,
-                        "chunk_total": chunk_total,
-                    }
-                    if source_mtime is not None:
-                        meta["source_mtime"] = source_mtime
-                    # Stamp content_hash only on chunk 0 so multi-conversation
-                    # privacy-export hashes are not O(N²)-duplicated across every
-                    # chunk row. ``prefetch_content_hashes`` still finds them —
-                    # it scans all drawers and splits comma-joined hash fields.
-                    if content_hash is not None and chunk.get("chunk_index", 0) == 0:
-                        meta["content_hash"] = content_hash
-                    batch_metas.append(meta)
-                assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
-                try:
+
+        # Partition the target set: a chunk whose drawer already exists with
+        # the same content hash at the current schema keeps its embedding and
+        # only needs its completion metadata refreshed; everything else is
+        # (re-)upserted. Drawers written before ``chunk_hash`` existed have no
+        # hash to compare, count as changed once, and migrate themselves.
+        # Physical ids can differ from their stable logical ids after a
+        # changed-content re-mine. Group every existing generation by logical
+        # position so a crash-left staging generation can be resumed without
+        # re-embedding it, while legacy deterministic ids remain compatible.
+        existing_by_logical: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+        for physical_id, stored_meta in existing.items():
+            logical_id = stored_meta.get("logical_drawer_id")
+            if not isinstance(logical_id, str) or not logical_id:
+                logical_id = physical_id
+            existing_by_logical[logical_id].append((physical_id, stored_meta))
+
+        planned_chunks: list[dict] = []
+        for chunk in chunks:
+            chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
+            if extract_mode == "general":
+                room_counts_delta[chunk_room] += 1
+            logical_drawer_id = make_convo_drawer_id(
+                wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
+            )
+            chunk_hash = hashlib.sha256(chunk["content"].encode("utf-8")).hexdigest()
+            candidates = existing_by_logical.get(logical_drawer_id, [])
+            planned_chunks.append(
+                {
+                    "chunk": chunk,
+                    "chunk_room": chunk_room,
+                    "logical_drawer_id": logical_drawer_id,
+                    "chunk_hash": chunk_hash,
+                    "candidates": candidates,
+                    "matches": _compatible_chunk_generations(candidates, chunk_hash),
+                }
+            )
+
+        (
+            to_upsert,
+            to_touch,
+            to_copy,
+            new_ids,
+            generation_token,
+            publish_generation,
+        ) = _plan_convo_generation_writes(
+            planned_chunks,
+            existing=existing,
+            pending_cleanup=pending_cleanup,
+            wing=wing,
+            source_file=source_file,
+            agent=agent,
+            filed_at=filed_at,
+            authored_at=authored_at,
+            extract_mode=extract_mode,
+            chunk_total=chunk_total,
+            source_mtime=source_mtime,
+            content_hash=content_hash,
+            active_token=active_token,
+        )
+
+        # Shrink, rewrite, and the first growth after a tokenless mine use a
+        # two-phase completion marker. New/changed rows are first written
+        # without the current source mtime; unchanged rows keep their old
+        # mtime unless a rewrite/shrink publishes a new token, in which case
+        # they are cloned first. Append-only growth reuses the commit
+        # marker's active token so unchanged rows are only
+        # metadata-refreshed, while new tail rows stage under an
+        # unpublished content-set token until the extra tail marker makes
+        # the complete append visible. Recovered pending rows still carrying
+        # an older staging token are restaged onto the current unpublished
+        # identity before that extra marker is written. Only after orphan
+        # cleanup succeeds do we stamp the whole target set current. A transient delete
+        # failure then remains visibly incomplete and retries even if the
+        # source never changes again.
+        stale_ids = [drawer_id for drawer_id in existing if drawer_id not in new_ids]
+        staging_token = _append_staging_token(generation_token, active_token, planned_chunks)
+        commit_metadata = {
+            "wing": wing,
+            "room": "_registry",
+            "source_file": source_file,
+            "extract_mode": extract_mode,
+            "ingest_mode": "registry",
+            "normalize_version": NORMALIZE_VERSION,
+            "id_recipe": ID_RECIPE,
+            "mine_staged": True,
+            "mine_commit_marker": True,
+            "mine_generation_commit": generation_token,
+            "mine_cleanup_pending": True,
+        }
+
+        # Batch into bounded requests so large transcripts keep most of the
+        # embedding speedup without one huge Chroma/SQLite request.
+        #
+        # No cleanup on failure: nothing was purged, so everything the palace
+        # held before this pass is still there, and the partially written
+        # pass leaves mixed mtime groups that each fall short of their
+        # ``chunk_total`` — ``file_already_mined`` stays False and the next
+        # mine retries (#2183 / #2403).
+        for batch_start in range(0, len(to_upsert), DRAWER_UPSERT_BATCH_SIZE):
+            batch = to_upsert[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+            batch_ids = [drawer_id for drawer_id, _, _ in batch]
+            batch_docs = [content for _, content, _ in batch]
+            if publish_generation:
+                batch_metas = []
+                for _, _, final_meta in batch:
+                    incomplete_meta = dict(final_meta)
+                    incomplete_meta.pop("source_mtime", None)
+                    incomplete_meta["mine_staged"] = True
+                    incomplete_meta["mine_generation_token"] = staging_token
+                    batch_metas.append(incomplete_meta)
+            else:
+                batch_metas = [meta for _, _, meta in batch]
+            try:
+                with _access_write(access_gate):
+                    assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
                     collection.upsert(
                         documents=batch_docs,
                         ids=batch_ids,
                         metadatas=batch_metas,
                     )
-                    drawers_added += len(batch_docs)
-                except Exception as e:
-                    if "already exists" not in str(e).lower():
-                        raise
-        except Exception:
-            # A successful earlier batch has the source's current mtime and
-            # chunk_total. Leaving those drawers behind would make the next
-            # run treat the incomplete set as fully filed (#2183 / #2122).
-            try:
-                delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
-                if delete_ids:
-                    collection.delete(ids=delete_ids)
-            except Exception:
-                logger.warning(
-                    "Failed to clean partial convo drawers after upsert error for %s",
-                    source_file,
-                    exc_info=True,
-                )
-            raise
+                drawers_added += len(batch_docs)
+            except Exception as e:
+                if "already exists" not in str(e).lower():
+                    raise
+        _stage_reused_generation_copies(
+            collection,
+            to_copy,
+            generation_token=generation_token,
+            access_gate=access_gate,
+        )
+        if not publish_generation:
+            for batch_start in range(0, len(to_touch), DRAWER_UPSERT_BATCH_SIZE):
+                batch = to_touch[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+                with _access_write(access_gate):
+                    collection.update(
+                        ids=[drawer_id for drawer_id, _ in batch],
+                        metadatas=[meta for _, meta in batch],
+                    )
+
+        # Delete orphaned drawers LAST — ids the current source no longer
+        # produces (shrunk/rewritten file, id recipe migration). Deleting
+        # them only after the full new set is in place means an interrupted
+        # pass never leaves the palace with less than it had; the worst
+        # crash window leaves transient duplicates. The current-mtime marker
+        # is deliberately withheld until cleanup succeeds, so the next mine
+        # retries even when the source itself stays unchanged. Growth with
+        # no orphans still publishes so appended rows carry a token.
+        if publish_generation:
+            tail_commit_id = make_convo_tail_commit_id(source_file, extract_mode)
+            replacements = _restage_pending_append_tail_before_publish(
+                collection,
+                to_touch=to_touch,
+                existing=existing,
+                staging_token=staging_token,
+                generation_token=generation_token,
+                tail_commit_id=tail_commit_id,
+                access_gate=access_gate,
+            )
+            if replacements:
+                remap = dict(replacements)
+                to_touch = [(remap.get(drawer_id, drawer_id), meta) for drawer_id, meta in to_touch]
+                stale_ids = [
+                    *stale_ids,
+                    *[old_id for old_id, new_id in replacements if old_id != new_id],
+                ]
+            final_metadata = []
+            for drawer_id, meta in (
+                to_touch
+                + [(item_id, item_meta) for item_id, _, item_meta in to_upsert]
+                + [(item_id, item_meta) for item_id, _, _, item_meta in to_copy]
+            ):
+                published_meta = dict(meta)
+                published_meta["mine_staged"] = False
+                published_meta["mine_generation_token"] = generation_token
+                final_metadata.append((drawer_id, published_meta))
+            if not _publish_changed_generations(
+                collection,
+                final_metadata=final_metadata,
+                stale_ids=stale_ids,
+                commit_id=commit_id,
+                commit_metadata=commit_metadata,
+                source_file=source_file,
+                access_gate=access_gate,
+                staging_token=staging_token,
+                tail_commit_id=tail_commit_id,
+            ):
+                return drawers_added, room_counts_delta, True
     return drawers_added, room_counts_delta, False
 
 
@@ -881,6 +1859,7 @@ def mine_convos(
     dry_run: bool = False,
     extract_mode: str = "exchange",
     include_subagents: bool = False,
+    access_gate=None,
 ):
     """Mine a directory of conversation files into the palace.
 
@@ -903,6 +1882,12 @@ def mine_convos(
     corrupt anything, and skipping the lock lets dry-run probes coexist
     with a live mine.
 
+    ``access_gate`` is an optional Hub-supplied readers/writer gate. Direct
+    CLI/library calls leave it unset. The HTTP Hub uses it to share Chroma
+    reads with peer searches and to bound exclusive access to individual
+    upsert/update/delete batches while a separate mutation lock preserves the
+    one-writer lifecycle across the complete crash-safe re-mine (#2403).
+
     Chunking parameters (chunk_size, min_chunk_size) are read from
     MempalaceConfig inside :func:`_mine_convos_impl` so `config.json`
     governs both this path and the project-file miner in `miner.py`.
@@ -917,6 +1902,7 @@ def mine_convos(
             dry_run=dry_run,
             extract_mode=extract_mode,
             include_subagents=include_subagents,
+            access_gate=access_gate,
         )
 
     with mine_palace_lock(palace_path):
@@ -929,6 +1915,7 @@ def mine_convos(
             dry_run=dry_run,
             extract_mode=extract_mode,
             include_subagents=include_subagents,
+            access_gate=access_gate,
         )
 
 
@@ -945,7 +1932,7 @@ def _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=None
 
         compute_hallways_for_wing(wing, col=collection, config=config)
     except Exception as exc:
-        print(f"  (hallways skipped: {exc})")
+        _mine_print(f"  (hallways skipped: {exc})")
 
 
 def _normalize_convo_conversations(
@@ -957,6 +1944,7 @@ def _normalize_convo_conversations(
     agent: str,
     extract_mode: str,
     dry_run: bool,
+    access_gate=None,
 ) -> Optional[list]:
     """Normalize a transcript file into its individual conversations,
     registering it as filed when there's nothing worth mining. Returns None
@@ -976,13 +1964,27 @@ def _normalize_convo_conversations(
         return None
     except (OSError, ValueError):
         if not dry_run:
-            _register_file(collection, source_file, wing, agent, extract_mode)
+            _register_file(
+                collection,
+                source_file,
+                wing,
+                agent,
+                extract_mode,
+                access_gate=access_gate,
+            )
         return None
 
     total_len = sum(len(c.strip()) for c in conversations)
     if not conversations or total_len < cfg_min_chunk_size:
         if not dry_run:
-            _register_file(collection, source_file, wing, agent, extract_mode)
+            _register_file(
+                collection,
+                source_file,
+                wing,
+                agent,
+                extract_mode,
+                access_gate=access_gate,
+            )
         return None
 
     return conversations
@@ -992,17 +1994,20 @@ def _open_convo_collection(
     palace_path: str,
     *,
     dry_run: bool,
+    access_gate=None,
 ):
     """Open the conversation collection without creating it during dry-run."""
     if not dry_run:
-        return get_collection(palace_path)
+        with _access_write(access_gate):
+            return get_collection(palace_path)
 
     try:
-        return get_collection(
-            palace_path,
-            create=False,
-            read_only=True,
-        )
+        with _access_read(access_gate):
+            return get_collection(
+                palace_path,
+                create=False,
+                read_only=True,
+            )
     except PalaceNotFoundError:
         # A missing palace or uninitialized collection represents empty
         # prior state to a dry-run. Do not create either one.
@@ -1018,6 +2023,7 @@ def _mine_convos_impl(
     dry_run: bool = False,
     extract_mode: str = "exchange",
     include_subagents: bool = False,
+    access_gate=None,
 ):
     from .config import MempalaceConfig
 
@@ -1039,21 +2045,22 @@ def _mine_convos_impl(
 
     files = scan_convos(convo_dir, include_subagents=include_subagents)
 
-    print(f"\n{'=' * 55}")
-    print("  MemPalace Mine -- Conversations")
-    print(f"{'=' * 55}")
-    print(f"  Wing:    {wing}")
-    print(f"  Source:  {convo_path}")
+    _mine_print(f"\n{'=' * 55}")
+    _mine_print("  MemPalace Mine -- Conversations")
+    _mine_print(f"{'=' * 55}")
+    _mine_print(f"  Wing:    {wing}")
+    _mine_print(f"  Source:  {convo_path}")
     limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
-    print(f"  Files:   {len(files)}{limit_suffix}")
-    print(f"  Palace:  {palace_path}")
+    _mine_print(f"  Files:   {len(files)}{limit_suffix}")
+    _mine_print(f"  Palace:  {palace_path}")
     if dry_run:
-        print("  DRY RUN -- nothing will be filed")
-    print(f"{'-' * 55}\n")
+        _mine_print("  DRY RUN -- nothing will be filed")
+    _mine_print(f"{'-' * 55}\n")
 
     collection = _open_convo_collection(
         palace_path,
         dry_run=dry_run,
+        access_gate=access_gate,
     )
 
     # Bulk pre-fetch already-mined source_file -> stored mtime in one
@@ -1062,19 +2069,22 @@ def _mine_convos_impl(
     # 2000-file sweep used to spend >1h just deciding to skip.
     # prefetch_mined_set() does the same decisions in a single scan; loop
     # body becomes an O(1) dict lookup + a cheap local mtime comparison.
-    mined_mtimes: dict = (
-        prefetch_mined_set(collection, extract_mode=extract_mode) if collection is not None else {}
-    )
-    # content_hash -> source_file for transcripts already filed. Repeated
-    # exports from Claude/ChatGPT commonly land under a new filename each
-    # run even when the conversation itself is unchanged, so the
-    # source_file-keyed skip above ("mined_mtimes") never recognizes them —
-    # this catches the same conversation reappearing at a new path.
-    mined_content_hashes: dict = (
-        prefetch_content_hashes(collection, extract_mode=extract_mode)
-        if collection is not None
-        else {}
-    )
+    with _access_read(access_gate):
+        mined_mtimes: dict = (
+            prefetch_mined_set(collection, extract_mode=extract_mode)
+            if collection is not None
+            else {}
+        )
+        # content_hash -> source_file for transcripts already filed. Repeated
+        # exports from Claude/ChatGPT commonly land under a new filename each
+        # run even when the conversation itself is unchanged, so the
+        # source_file-keyed skip above ("mined_mtimes") never recognizes them —
+        # this catches the same conversation reappearing at a new path.
+        mined_content_hashes: dict = (
+            prefetch_content_hashes(collection, extract_mode=extract_mode)
+            if collection is not None
+            else {}
+        )
 
     total_drawers = 0
     files_mined = 0
@@ -1111,6 +2121,7 @@ def _mine_convos_impl(
             agent,
             extract_mode,
             dry_run,
+            access_gate=access_gate,
         )
         if conversations is None:
             continue
@@ -1127,9 +2138,16 @@ def _mine_convos_impl(
         )
         if not new_items:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _register_file(
+                    collection,
+                    source_file,
+                    wing,
+                    agent,
+                    extract_mode,
+                    access_gate=access_gate,
+                )
             dup_source = duplicates[0][1]
-            print(
+            _mine_print(
                 f"  = [{i:4}/{len(files)}] {filepath.name[:50]:50} "
                 f"duplicate of {Path(dup_source).name}"
             )
@@ -1154,7 +2172,14 @@ def _mine_convos_impl(
 
         if not chunks:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _register_file(
+                    collection,
+                    source_file,
+                    wing,
+                    agent,
+                    extract_mode,
+                    access_gate=access_gate,
+                )
             continue
 
         # Detect room from content (general mode uses memory_type instead)
@@ -1169,9 +2194,11 @@ def _mine_convos_impl(
 
                 type_counts = Counter(c.get("memory_type", "general") for c in chunks)
                 types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
-                print(f"    [DRY RUN] {filepath.name} -> {len(chunks)} memories ({types_str})")
+                _mine_print(
+                    f"    [DRY RUN] {filepath.name} -> {len(chunks)} memories ({types_str})"
+                )
             else:
-                print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
+                _mine_print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
             total_drawers += len(chunks)
             # Track room counts
             if extract_mode == "general":
@@ -1199,6 +2226,7 @@ def _mine_convos_impl(
             extract_mode,
             authored_at=_extract_authored_at(filepath),
             content_hash=content_hash,
+            access_gate=access_gate,
         )
         if skipped:
             files_skipped += 1
@@ -1210,7 +2238,7 @@ def _mine_convos_impl(
             mined_content_hashes[(wing, h)] = source_file
         total_drawers += drawers_added
         files_mined += 1
-        print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
+        _mine_print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
         if limit > 0 and files_mined >= limit:
             break
 
@@ -1218,25 +2246,32 @@ def _mine_convos_impl(
         # Compute hallways before the FTS5 validation: the latter opens a direct sqlite
         # connection to the Chroma DB, which can invalidate the live collection handle on
         # some Chroma builds and make the hallway fetch fail.
-        _compute_hallways_for_wing_safe(wing, collection, total_drawers, config=palace_config)
-        _validate_palace_fts5_after_mine(palace_path)
+        with _access_read(access_gate):
+            _compute_hallways_for_wing_safe(wing, collection, total_drawers, config=palace_config)
+        # Validation may close cached Chroma handles and rebuild the FTS index,
+        # so it is a mutation even when the common healthy path is read-only.
+        # Keep peer searches out until that maintenance work is complete.
+        with _access_write(access_gate):
+            _validate_palace_fts5_after_mine(palace_path)
 
-    print(f"\n{'=' * 55}")
-    print("  Done.")
-    print(f"  Files processed: {files_processed - files_skipped}")
-    print(f"  Files skipped (already filed): {files_skipped}")
-    print(f"  Drawers filed: {total_drawers}")
+    _mine_print(f"\n{'=' * 55}")
+    _mine_print("  Done.")
+    _mine_print(f"  Files processed: {files_processed - files_skipped}")
+    _mine_print(f"  Files skipped (already filed): {files_skipped}")
+    _mine_print(f"  Drawers filed: {total_drawers}")
     if room_counts:
-        print("\n  By room:")
+        _mine_print("\n  By room:")
         for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
-            print(f"    {room:20} {count} files")
-    print('\n  Next: mempalace search "what you\'re looking for"')
-    print(f"{'=' * 55}\n")
+            _mine_print(f"    {room:20} {count} files")
+    _mine_print('\n  Next: mempalace search "what you\'re looking for"')
+    _mine_print(f"{'=' * 55}\n")
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python convo_miner.py <convo_dir> [--palace PATH] [--limit N] [--dry-run]")
+        _mine_print(
+            "Usage: python convo_miner.py <convo_dir> [--palace PATH] [--limit N] [--dry-run]"
+        )
         sys.exit(1)
     from .config import MempalaceConfig
 

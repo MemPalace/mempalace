@@ -6,7 +6,27 @@ if __name__ != "mempalace.mcp_server":
 # ==================== AGENT DIARY ====================
 
 
-def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: str = ""):
+def _diary_entry_physical_ids(collection, entry_id: str) -> set[str]:
+    """Return direct and chunked physical rows for one logical diary entry."""
+    physical_ids: set[str] = set()
+    direct = collection.get(ids=[entry_id], include=["metadatas"])
+    physical_ids.update(direct.get("ids") or [])
+    for parent_key in _PARENT_ID_KEYS:
+        grouped = collection.get(
+            where={parent_key: entry_id},
+            include=["metadatas"],
+        )
+        physical_ids.update(grouped.get("ids") or [])
+    return physical_ids
+
+
+def tool_diary_write(
+    agent_name: str,
+    entry: str,
+    topic: str = "general",
+    wing: str = "",
+    idempotency_key: str = "",
+):
     """
     Write a diary entry for this agent. Entries are timestamped and
     accumulate over time in a diary room.
@@ -27,6 +47,13 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         topic = sanitize_name(topic, "topic")
     except ValueError as e:
         return {"success": False, "error": str(e)}
+    if idempotency_key is None:
+        idempotency_key = ""
+    if not isinstance(idempotency_key, str):
+        return {"success": False, "error": "idempotency_key must be a string"}
+    idempotency_key = idempotency_key.strip()
+    if len(idempotency_key) > 512:
+        return {"success": False, "error": "idempotency_key must be at most 512 characters"}
 
     if wing:
         wing = sanitize_name(wing)
@@ -38,10 +65,18 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         return _collection_error_or_no_palace()
 
     now = datetime.now()
-    entry_id = (
-        f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S%f')}_"
-        f"{hashlib.sha256(entry.encode()).hexdigest()[:12]}"
-    )
+    idempotency_hash = ""
+    if idempotency_key:
+        idempotency_hash = hashlib.sha256(
+            f"{agent_name}\0{wing}\0{topic}\0{idempotency_key}".encode()
+        ).hexdigest()
+        entry_id = f"diary_{wing}_idem_{idempotency_hash[:24]}"
+    else:
+        entry_id = (
+            f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S%f')}_"
+            f"{hashlib.sha256(entry.encode()).hexdigest()[:12]}"
+        )
+    prior_physical_ids = _diary_entry_physical_ids(col, entry_id) if idempotency_key else set()
 
     _wal_log(
         "diary_write",
@@ -68,13 +103,19 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             "filed_at": now.isoformat(),
             "date": now.strftime("%Y-%m-%d"),
         }
+        if idempotency_hash:
+            base_metadata["idempotency_key_hash"] = idempotency_hash
+        write_drawers = col.upsert if idempotency_key else col.add
         chunk_size = _config.chunk_size
         if len(entry) <= chunk_size:
-            col.add(
+            write_drawers(
                 ids=[entry_id],
                 documents=[entry],
                 metadatas=[{**base_metadata, "chunk_index": 0}],
             )
+            obsolete_ids = prior_physical_ids - {entry_id}
+            if obsolete_ids:
+                col.delete(ids=sorted(obsolete_ids))
             logger.info(f"Diary entry: {entry_id} -> {wing}/diary/{topic}")
             return {
                 "success": True,
@@ -98,15 +139,11 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         # ``mempalace_get_drawer`` / ``update_drawer`` / ``delete_drawer``
         # to the whole entry, exactly as an oversized ``add_drawer`` id
         # does. The physical drawer ids remain available in ``chunk_ids``.
-        # Use a single batched ``add`` so the embedding pass either
-        # commits all chunks or none — avoids a half-written palace
-        # if the embedding model fails mid-loop. ``col.add`` (not
-        # ``upsert``) is intentional here: ``entry_id`` is timestamp-
-        # based with microsecond precision, so every call generates a
-        # fresh id and a duplicate is by definition a same-microsecond
-        # clash that should surface as an error rather than silently
-        # overwrite the prior entry (cf. ``tool_add_drawer`` whose
-        # content-hash ids are deliberately idempotent and use upsert).
+        # Use one batched write so the embedding pass either commits all
+        # chunks or none. Ordinary diary calls retain ``add`` and their
+        # timestamp-unique IDs; callers supplying an idempotency key use
+        # ``upsert`` so an ambiguous transport retry heals the same logical
+        # entry instead of creating a duplicate.
         chunk_ids: list[str] = []
         chunk_docs: list[str] = []
         chunk_metas: list[dict] = []
@@ -122,7 +159,10 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
                     "parent_drawer_id": entry_id,
                 }
             )
-        col.add(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
+        write_drawers(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
+        obsolete_ids = prior_physical_ids - set(chunk_ids)
+        if obsolete_ids:
+            col.delete(ids=sorted(obsolete_ids))
         logger.info(f"Diary entry: {entry_id} -> {wing}/diary/{topic} ({len(chunk_ids)} chunks)")
         return {
             "success": True,
