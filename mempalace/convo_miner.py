@@ -966,6 +966,14 @@ def _append_tail_marker_commit_token(collection, tail_commit_id, access_gate) ->
     return _committed_marker_generation_token(result.get("metadatas") or [])
 
 
+def _neutralized_tail_commit_metadata(commit_metadata) -> dict:
+    """Overwrite an extra tail marker so its token is no longer committed."""
+    retired_tail = dict(commit_metadata)
+    retired_tail["mine_generation_commit"] = ""
+    retired_tail["mine_cleanup_pending"] = False
+    return retired_tail
+
+
 def _pending_append_rows_to_restage(to_touch, *, existing, staging_token):
     """In-place metadata updates that move recovered pending rows onto ``staging_token``.
 
@@ -1121,6 +1129,13 @@ def _publish_changed_generations(
     Writer serialization comes from the caller's mutation lock (HTTP mine)
     or per-file ``mine_lock``. The access gate is acquired only around each
     bounded upsert/update/delete so waiting readers can run between bursts.
+
+    A rewrite or shrink after an interrupted append can find
+    ``staging_token == publish_token``, so it does not expose a new tail.
+    Any leftover extra marker still committing the interrupted tail token
+    is retired in the same write burst as the primary switch: earlier
+    would hide the previous complete tail, and skipping it would keep
+    dropped rows visible if stale-row deletion then fails.
     """
     publish_token = commit_metadata.get("mine_generation_commit")
     expose_tail = (
@@ -1130,6 +1145,12 @@ def _publish_changed_generations(
         and isinstance(tail_commit_id, str)
         and tail_commit_id
     )
+    leftover_tail_token = None
+    if not expose_tail:
+        leftover_tail_token = _append_tail_marker_commit_token(
+            collection, tail_commit_id, access_gate
+        )
+    commit_document = f"[conversation generation commit] {source_file}"
     ids_to_delete = list(stale_ids)
     try:
         if expose_tail:
@@ -1141,14 +1162,23 @@ def _publish_changed_generations(
             with _access_write(access_gate):
                 collection.upsert(
                     ids=[tail_commit_id],
-                    documents=[f"[conversation generation commit] {source_file}"],
+                    documents=[commit_document],
                     metadatas=[tail_metadata],
                 )
+        publish_ids = [commit_id]
+        publish_docs = [commit_document]
+        publish_metas = [commit_metadata]
+        if leftover_tail_token:
+            # Primary first so a partial upsert cannot uncommit the old
+            # tail while the previous generation is still the published view.
+            publish_ids.append(tail_commit_id)
+            publish_docs.append(commit_document)
+            publish_metas.append(_neutralized_tail_commit_metadata(commit_metadata))
         with _access_write(access_gate):
             collection.upsert(
-                ids=[commit_id],
-                documents=[f"[conversation generation commit] {source_file}"],
-                metadatas=[commit_metadata],
+                ids=publish_ids,
+                documents=publish_docs,
+                metadatas=publish_metas,
             )
         for batch_start in range(0, len(final_metadata), DRAWER_UPSERT_BATCH_SIZE):
             batch = final_metadata[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
@@ -1163,14 +1193,11 @@ def _publish_changed_generations(
             # otherwise find this leftover token already published and
             # expose a partial tail. Overwrite in place; do not delete, so
             # repeated appends keep active-row delete lists empty.
-            retired_tail = dict(commit_metadata)
-            retired_tail["mine_generation_commit"] = ""
-            retired_tail["mine_cleanup_pending"] = False
             with _access_write(access_gate):
                 collection.upsert(
                     ids=[tail_commit_id],
-                    documents=[f"[conversation generation commit] {source_file}"],
-                    metadatas=[retired_tail],
+                    documents=[commit_document],
+                    metadatas=[_neutralized_tail_commit_metadata(commit_metadata)],
                 )
         for batch_start in range(0, len(ids_to_delete), DRAWER_UPSERT_BATCH_SIZE):
             batch_ids = ids_to_delete[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]

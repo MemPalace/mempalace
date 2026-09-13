@@ -1301,58 +1301,83 @@ def test_publication_rollback_uses_short_write_gates():
     assert collection.upserts[0][2][0]["mine_cleanup_pending"] is True
 
 
+def _content_hash_prefetch_rows(normalize_version):
+    return [
+        (
+            "staged",
+            {
+                "wing": "wing",
+                "source_file": "staged.jsonl",
+                "extract_mode": "exchange",
+                "normalize_version": normalize_version,
+                "content_hash": "staged-hash",
+                "mine_staged": True,
+            },
+        ),
+        (
+            "committed",
+            {
+                "wing": "wing",
+                "source_file": "committed.jsonl",
+                "extract_mode": "exchange",
+                "normalize_version": normalize_version,
+                "content_hash": "committed-hash",
+            },
+        ),
+        (
+            "retired",
+            {
+                "wing": "wing",
+                "source_file": "retired.jsonl",
+                "extract_mode": "exchange",
+                "normalize_version": normalize_version,
+                "content_hash": "retired-hash",
+                "mine_generation_token": "retired-token",
+            },
+        ),
+        (
+            "active",
+            {
+                "wing": "wing",
+                "source_file": "active.jsonl",
+                "extract_mode": "exchange",
+                "normalize_version": normalize_version,
+                "content_hash": "active-hash",
+                "mine_generation_token": "active-token",
+            },
+        ),
+        (
+            "marker",
+            {
+                "mine_staged": True,
+                "mine_commit_marker": True,
+                "mine_generation_commit": "active-token",
+            },
+        ),
+    ]
+
+
 def test_content_hash_prefetch_ignores_staged_generations():
     from mempalace.palace import NORMALIZE_VERSION, prefetch_content_hashes
+
+    rows = _content_hash_prefetch_rows(NORMALIZE_VERSION)
 
     class Collection:
         @staticmethod
         def count():
-            return 5
+            return len(rows)
 
         @staticmethod
-        def get(limit, offset, include):
-            if offset:
-                return {"ids": [], "metadatas": []}
+        def get(limit=None, offset=0, include=None, where=None, ids=None):
+            selected = rows
+            if where == {"mine_commit_marker": True}:
+                selected = [
+                    (key, meta) for key, meta in rows if meta.get("mine_commit_marker") is True
+                ]
+            selected = selected[offset : offset + limit if limit is not None else None]
             return {
-                "ids": ["staged", "committed", "retired", "active", "marker"],
-                "metadatas": [
-                    {
-                        "wing": "wing",
-                        "source_file": "staged.jsonl",
-                        "extract_mode": "exchange",
-                        "normalize_version": NORMALIZE_VERSION,
-                        "content_hash": "staged-hash",
-                        "mine_staged": True,
-                    },
-                    {
-                        "wing": "wing",
-                        "source_file": "committed.jsonl",
-                        "extract_mode": "exchange",
-                        "normalize_version": NORMALIZE_VERSION,
-                        "content_hash": "committed-hash",
-                    },
-                    {
-                        "wing": "wing",
-                        "source_file": "retired.jsonl",
-                        "extract_mode": "exchange",
-                        "normalize_version": NORMALIZE_VERSION,
-                        "content_hash": "retired-hash",
-                        "mine_generation_token": "retired-token",
-                    },
-                    {
-                        "wing": "wing",
-                        "source_file": "active.jsonl",
-                        "extract_mode": "exchange",
-                        "normalize_version": NORMALIZE_VERSION,
-                        "content_hash": "active-hash",
-                        "mine_generation_token": "active-token",
-                    },
-                    {
-                        "mine_staged": True,
-                        "mine_commit_marker": True,
-                        "mine_generation_commit": "active-token",
-                    },
-                ],
+                "ids": [key for key, _ in selected],
+                "metadatas": [dict(meta) for _, meta in selected],
             }
 
     hashes = prefetch_content_hashes(Collection(), extract_mode="exchange")
@@ -1360,6 +1385,134 @@ def test_content_hash_prefetch_ignores_staged_generations():
     assert ("wing", "staged-hash") not in hashes
     assert ("wing", "retired-hash") not in hashes
     assert hashes[("wing", "committed-hash")] == "committed.jsonl"
+    assert hashes[("wing", "active-hash")] == "active.jsonl"
+
+
+def test_content_hash_prefetch_pages_release_metadata_and_keeps_generation_filter():
+    import gc
+
+    from mempalace.palace import NORMALIZE_VERSION, prefetch_content_hashes
+
+    class LiveMeta(dict):
+        live = 0
+        peak = 0
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            LiveMeta.live += 1
+            LiveMeta.peak = max(LiveMeta.peak, LiveMeta.live)
+
+        def __del__(self):
+            LiveMeta.live -= 1
+
+    page_size = 1000
+    rows = []
+    for index in range(page_size * 2):
+        rows.append(
+            (
+                f"staged-{index}",
+                {
+                    "wing": "wing",
+                    "source_file": f"staged-{index}.jsonl",
+                    "extract_mode": "exchange",
+                    "normalize_version": NORMALIZE_VERSION,
+                    "content_hash": f"staged-hash-{index}",
+                    "mine_staged": True,
+                    "mine_generation_token": "unpublished-token",
+                },
+            )
+        )
+    rows.extend(
+        [
+            (
+                "retired",
+                {
+                    "wing": "wing",
+                    "source_file": "retired.jsonl",
+                    "extract_mode": "exchange",
+                    "normalize_version": NORMALIZE_VERSION,
+                    "content_hash": "retired-hash",
+                    "mine_generation_token": "retired-token",
+                },
+            ),
+            (
+                "tokenless",
+                {
+                    "wing": "wing",
+                    "source_file": "tokenless.jsonl",
+                    "extract_mode": "exchange",
+                    "normalize_version": NORMALIZE_VERSION,
+                    "content_hash": "tokenless-hash,tokenless-extra",
+                },
+            ),
+            (
+                "active",
+                {
+                    "wing": "wing",
+                    "source_file": "active.jsonl",
+                    "extract_mode": "exchange",
+                    "normalize_version": NORMALIZE_VERSION,
+                    "content_hash": "active-hash",
+                    "mine_generation_token": "active-token",
+                },
+            ),
+            (
+                "marker",
+                {
+                    "mine_staged": True,
+                    "mine_commit_marker": True,
+                    "mine_generation_commit": "active-token",
+                },
+            ),
+            (
+                "retired-marker",
+                {
+                    "mine_staged": True,
+                    "mine_commit_marker": True,
+                    "mine_generation_commit": "",
+                },
+            ),
+        ]
+    )
+    calls = []
+
+    class Collection:
+        @staticmethod
+        def count():
+            return len(rows)
+
+        @staticmethod
+        def get(limit=None, offset=0, include=None, where=None, ids=None):
+            calls.append({"where": where, "limit": limit, "offset": offset})
+            selected = rows
+            if where == {"mine_commit_marker": True}:
+                selected = [
+                    (key, meta) for key, meta in rows if meta.get("mine_commit_marker") is True
+                ]
+            selected = selected[offset : offset + limit if limit is not None else None]
+            return {
+                "ids": [key for key, _ in selected],
+                "metadatas": [LiveMeta(meta) for _, meta in selected],
+            }
+
+    LiveMeta.live = 0
+    LiveMeta.peak = 0
+    hashes = prefetch_content_hashes(Collection(), extract_mode="exchange")
+    gc.collect()
+
+    assert calls[0]["where"] == {"mine_commit_marker": True}
+    assert calls[0]["limit"] == 1000
+    drawer_pages = [call for call in calls[1:] if call["where"] is None]
+    assert [call["limit"] for call in drawer_pages] == [1000] * len(drawer_pages)
+    assert [call["offset"] for call in drawer_pages] == [0, 1000, 2000]
+    assert LiveMeta.peak <= page_size + 8
+    assert LiveMeta.peak < len(rows)
+    assert LiveMeta.live == 0
+    assert ("wing", "staged-hash-0") not in hashes
+    assert ("wing", "staged-hash-1999") not in hashes
+    assert ("wing", "retired-hash") not in hashes
+    assert hashes[("wing", "tokenless-hash")] == "tokenless.jsonl"
+    assert hashes[("wing", "tokenless-extra")] == "tokenless.jsonl"
     assert hashes[("wing", "active-hash")] == "active.jsonl"
 
 

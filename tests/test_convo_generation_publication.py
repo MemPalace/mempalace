@@ -2033,3 +2033,345 @@ def test_grown_retry_after_interrupted_append_hands_off_complete_views(tmp_path,
     _assert_all_read_paths(gated, source, second_growth)
     _assert_prefix_rows_preserved(gated, previous_active)
     _assert_retired_or_absent_tail_marker(gated, source)
+
+
+def _committed_tail_token(collection, source):
+    tail_id = make_convo_tail_commit_id(source, "exchange")
+    row = collection.rows.get(tail_id)
+    if row is None:
+        return None
+    token = row["metadata"].get("mine_generation_commit")
+    return token if isinstance(token, str) and token else None
+
+
+def _interrupt_states_with_unretired_tail(mine, original, documents, source, fail_before):
+    completed = copy.deepcopy(original)
+    completed.write_count = 0
+    assert mine(completed, documents)[2] is False
+    states = []
+    for write_index in range(1, completed.write_count + 1):
+        collection = _interrupt_append(mine, original, documents, write_index, fail_before)
+        if _committed_tail_token(collection, source):
+            states.append(collection)
+    return states
+
+
+def _assert_unretired_tail_or_new_generation(collection, source, leftover, grown, next_documents):
+    """Before the non-tail switch the leftover append stays complete; after it, extra is retired."""
+    commit_id = make_convo_commit_id(source, "exchange")
+    old_token = leftover.rows[commit_id]["metadata"]["mine_generation_commit"]
+    current_token = collection.rows[commit_id]["metadata"]["mine_generation_commit"]
+    current = _visible_logical_contents(collection, source, len(grown))
+    if current_token == old_token:
+        assert tuple(current) == _padded_generation(grown, len(grown))
+        assert _committed_tail_token(collection, source)
+    else:
+        assert tuple(current) == _padded_generation(next_documents, len(grown))
+        _assert_retired_or_absent_tail_marker(collection, source)
+    _assert_all_read_paths(collection, source, current)
+    return current
+
+
+class DeleteFailingGenerationCollection(GenerationCollection):
+    def __init__(self):
+        super().__init__()
+        self.fail_delete = False
+
+    def delete(self, ids):
+        if self.fail_delete:
+            raise InjectedWriteFailure("stale delete failed")
+        super().delete(ids)
+
+
+def test_non_tail_publication_retires_leftover_tail_when_delete_fails():
+    """Rewrite/shrink must uncommit an interrupted append tail even if deletes fail."""
+    collection = DeleteFailingGenerationCollection()
+    commit_id = "commit"
+    tail_id = "tail-commit"
+    collection.rows["keep-new"] = {
+        "document": "new generation",
+        "metadata": {
+            "logical_drawer_id": "keep",
+            "mine_staged": True,
+            "mine_generation_token": "new-token",
+            "source_file": "chat.jsonl",
+            "extract_mode": "exchange",
+            "wing": "wing",
+            "room": "general",
+        },
+        "embedding": [1.0],
+    }
+    collection.rows["stale-tail"] = {
+        "document": "old tail",
+        "metadata": {
+            "logical_drawer_id": "dropped",
+            "mine_staged": True,
+            "mine_generation_token": "tail-token",
+            "source_file": "chat.jsonl",
+            "extract_mode": "exchange",
+            "wing": "wing",
+            "room": "general",
+        },
+        "embedding": [1.0],
+    }
+    collection.rows[commit_id] = {
+        "document": "[commit]",
+        "metadata": {
+            "mine_staged": True,
+            "mine_commit_marker": True,
+            "mine_generation_commit": "old-token",
+            "mine_cleanup_pending": True,
+        },
+        "embedding": [0.0],
+    }
+    collection.rows[tail_id] = {
+        "document": "[tail]",
+        "metadata": {
+            "mine_staged": True,
+            "mine_commit_marker": True,
+            "mine_generation_commit": "tail-token",
+            "mine_cleanup_pending": False,
+        },
+        "embedding": [0.0],
+    }
+    snapshots = []
+
+    def observe():
+        snapshots.append(
+            (
+                collection.rows[commit_id]["metadata"].get("mine_generation_commit"),
+                collection.rows[tail_id]["metadata"].get("mine_generation_commit"),
+                {document for _key, document, _meta in _sqlite_visible_rows(collection)},
+            )
+        )
+
+    collection.observe = observe
+    collection.fail_delete = True
+    marker = {
+        "mine_staged": True,
+        "mine_commit_marker": True,
+        "mine_generation_commit": "new-token",
+        "mine_cleanup_pending": True,
+        "source_file": "chat.jsonl",
+        "extract_mode": "exchange",
+        "wing": "wing",
+        "room": "_registry",
+    }
+    result = convo_miner._publish_changed_generations(
+        collection,
+        final_metadata=[
+            (
+                "keep-new",
+                {
+                    "logical_drawer_id": "keep",
+                    "mine_staged": False,
+                    "mine_generation_token": "new-token",
+                    "source_file": "chat.jsonl",
+                    "extract_mode": "exchange",
+                    "wing": "wing",
+                    "room": "general",
+                },
+            )
+        ],
+        stale_ids=["stale-tail"],
+        commit_id=commit_id,
+        commit_metadata=marker,
+        source_file="chat.jsonl",
+        staging_token="new-token",
+        tail_commit_id=tail_id,
+    )
+    assert result is False
+    assert "stale-tail" in collection.rows
+    assert snapshots
+    for primary, extra, documents in snapshots:
+        if primary == "old-token":
+            assert extra == "tail-token"
+            assert "old tail" in documents
+            assert "new generation" not in documents
+        else:
+            assert not extra
+            assert "old tail" not in documents
+            assert "new generation" in documents
+    assert collection.rows[commit_id]["metadata"]["mine_generation_commit"] == "new-token"
+    assert not collection.rows[tail_id]["metadata"].get("mine_generation_commit")
+    assert "tail-token" not in _committed_tokens(collection)
+    assert {document for _key, document, _meta in _sqlite_visible_rows(collection)} == {
+        "new generation"
+    }
+
+
+def test_non_tail_publication_does_not_retire_leftover_tail_before_switch():
+    collection = GenerationCollection()
+    commit_id = "commit"
+    tail_id = "tail-commit"
+    collection.rows["keep-new"] = {
+        "document": "new generation",
+        "metadata": {
+            "logical_drawer_id": "keep",
+            "mine_staged": True,
+            "mine_generation_token": "new-token",
+        },
+        "embedding": [1.0],
+    }
+    collection.rows["stale-tail"] = {
+        "document": "old tail",
+        "metadata": {
+            "logical_drawer_id": "dropped",
+            "mine_staged": True,
+            "mine_generation_token": "tail-token",
+        },
+        "embedding": [1.0],
+    }
+    collection.rows[commit_id] = {
+        "document": "[commit]",
+        "metadata": {
+            "mine_staged": True,
+            "mine_commit_marker": True,
+            "mine_generation_commit": "old-token",
+            "mine_cleanup_pending": True,
+        },
+        "embedding": [0.0],
+    }
+    collection.rows[tail_id] = {
+        "document": "[tail]",
+        "metadata": {
+            "mine_staged": True,
+            "mine_commit_marker": True,
+            "mine_generation_commit": "tail-token",
+            "mine_cleanup_pending": False,
+        },
+        "embedding": [0.0],
+    }
+    collection.fail_before = True
+    collection.fail_at = 1
+    marker = {
+        "mine_staged": True,
+        "mine_commit_marker": True,
+        "mine_generation_commit": "new-token",
+        "mine_cleanup_pending": True,
+    }
+    assert (
+        convo_miner._publish_changed_generations(
+            collection,
+            final_metadata=[
+                (
+                    "keep-new",
+                    {
+                        "logical_drawer_id": "keep",
+                        "mine_staged": False,
+                        "mine_generation_token": "new-token",
+                    },
+                )
+            ],
+            stale_ids=["stale-tail"],
+            commit_id=commit_id,
+            commit_metadata=marker,
+            source_file="chat.jsonl",
+            staging_token="new-token",
+            tail_commit_id=tail_id,
+        )
+        is False
+    )
+    assert collection.rows[commit_id]["metadata"]["mine_generation_commit"] == "old-token"
+    assert collection.rows[tail_id]["metadata"]["mine_generation_commit"] == "tail-token"
+    assert {document for _key, document, _meta in _sqlite_visible_rows(collection)} == {"old tail"}
+
+
+@pytest.mark.parametrize("fail_before", [True, False])
+@pytest.mark.parametrize("mode", ["shrink", "rewrite"])
+def test_non_tail_after_unretired_tail_hides_dropped_rows_on_every_write(
+    tmp_path, monkeypatch, fail_before, mode
+):
+    original, mine, source, previous, grown = _append_visibility_case(tmp_path, monkeypatch)
+    leftovers = _interrupt_states_with_unretired_tail(mine, original, grown, source, fail_before)
+    assert leftovers
+    next_documents = ["rewritten first chunk", *previous[1:]] if mode == "rewrite" else previous[:3]
+    hidden = [*next_documents, *[None] * (len(grown) - len(next_documents))]
+    saw_tail_rows = False
+    for leftover in leftovers:
+        tail_token = _committed_tail_token(leftover, source)
+        assert tail_token
+        if any(
+            row["metadata"].get("mine_generation_token") == tail_token
+            for row in _non_marker_rows(leftover).values()
+        ):
+            saw_tail_rows = True
+        _assert_unretired_tail_or_new_generation(leftover, source, leftover, grown, next_documents)
+        completed = copy.deepcopy(leftover)
+        completed.write_count = 0
+        completed.observe = lambda: None
+        assert mine(completed, next_documents)[2] is False
+        for write_index in range(1, completed.write_count + 1):
+            collection = _interrupt_append(mine, leftover, next_documents, write_index, fail_before)
+            _assert_unretired_tail_or_new_generation(
+                collection, source, leftover, grown, next_documents
+            )
+            collection.fail_at = None
+            collection.fail_before = False
+            assert mine(collection, next_documents)[2] is False
+            _assert_all_read_paths(collection, source, hidden)
+            _assert_retired_or_absent_tail_marker(collection, source)
+        snapshots = []
+        baseline = copy.deepcopy(leftover)
+
+        def observe(current=leftover, before=baseline):
+            snapshots.append(
+                _assert_unretired_tail_or_new_generation(
+                    current, source, before, grown, next_documents
+                )
+            )
+
+        leftover.observe = observe
+        leftover.write_count = 0
+        assert mine(leftover, next_documents)[2] is False
+        assert snapshots
+        _assert_all_read_paths(leftover, source, hidden)
+        _assert_retired_or_absent_tail_marker(leftover, source)
+    assert saw_tail_rows
+
+
+@pytest.mark.parametrize("mode", ["shrink", "rewrite"])
+def test_non_tail_after_unretired_tail_hides_dropped_rows_when_delete_fails(
+    tmp_path, monkeypatch, mode
+):
+    original, mine, source, previous, grown = _append_visibility_case(tmp_path, monkeypatch)
+    leftovers = _interrupt_states_with_unretired_tail(mine, original, grown, source, False)
+    leftover = next(
+        collection
+        for collection in leftovers
+        if any(
+            row["metadata"].get("mine_generation_token")
+            == _committed_tail_token(collection, source)
+            for row in _non_marker_rows(collection).values()
+        )
+    )
+    next_documents = ["rewritten first chunk", *previous[1:]] if mode == "rewrite" else previous[:3]
+    hidden = [*next_documents, *[None] * (len(grown) - len(next_documents))]
+    gated = DeleteFailingGenerationCollection()
+    gated.rows = copy.deepcopy(leftover.rows)
+    snapshots = []
+
+    def observe():
+        snapshots.append(
+            _assert_unretired_tail_or_new_generation(gated, source, leftover, grown, next_documents)
+        )
+
+    gated.observe = observe
+    gated.fail_delete = True
+    skipped = mine(gated, next_documents)[2]
+    assert skipped is True
+    assert snapshots
+    _assert_unretired_tail_or_new_generation(gated, source, leftover, grown, next_documents)
+    _assert_all_read_paths(gated, source, hidden)
+    _assert_retired_or_absent_tail_marker(gated, source)
+    tail_token = leftover.rows[make_convo_tail_commit_id(source, "exchange")]["metadata"][
+        "mine_generation_commit"
+    ]
+    assert any(
+        row["metadata"].get("mine_generation_token") == tail_token
+        for row in _non_marker_rows(gated).values()
+    )
+    gated.fail_delete = False
+    assert mine(gated, next_documents)[2] is False
+    _assert_all_read_paths(gated, source, hidden)
+    _assert_retired_or_absent_tail_marker(gated, source)

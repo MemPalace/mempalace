@@ -266,42 +266,75 @@ def prefetch_content_hashes(
     the ones that didn't. Only the first source_file seen for a given
     (wing, hash) pair is kept — good enough to detect and skip a repeat,
     the point is not to track every alias.
+
+    Commit markers are loaded first as a small set so unpublished
+    generations can be filtered while drawer metadata is scanned in
+    bounded pages. Pages are released after each batch; the full palace
+    metadata is never retained.
     """
     hashes: dict[tuple[str, str], str] = {}
-    all_metadatas = []
+    committed_tokens = set()
+
+    def _consider(meta):
+        meta = meta or {}
+        generation_token = meta.get("mine_generation_token")
+        if meta.get("mine_staged") is True and generation_token not in committed_tokens:
+            return
+        if generation_token and generation_token not in committed_tokens:
+            return
+        content_hash_field = meta.get("content_hash")
+        src = meta.get("source_file")
+        wing = meta.get("wing")
+        if not content_hash_field or not src or not wing:
+            return
+        if not _metadata_matches_extract_mode(meta, extract_mode):
+            return
+        if meta.get("normalize_version", 1) < NORMALIZE_VERSION:
+            return
+        for content_hash in content_hash_field.split(","):
+            key = (wing, content_hash)
+            if content_hash and key not in hashes:
+                hashes[key] = src
+
+    try:
+        marker_offset = 0
+        while True:
+            marker_batch = collection.get(
+                where={"mine_commit_marker": True},
+                limit=1000,
+                offset=marker_offset,
+                include=["metadatas"],
+            )
+            marker_ids = marker_batch.get("ids") or []
+            for meta in marker_batch.get("metadatas") or []:
+                meta = meta or {}
+                token = meta.get("mine_generation_commit")
+                if meta.get("mine_commit_marker") is True and token:
+                    committed_tokens.add(token)
+            del marker_batch
+            if not marker_ids:
+                break
+            marker_offset += len(marker_ids)
+            del marker_ids
+    except Exception:
+        logger.warning(
+            "prefetch_content_hashes: marker fetch failed, %d commit tokens loaded",
+            len(committed_tokens),
+        )
+
     try:
         total = collection.count()
         offset = 0
         while offset < total:
             batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
-            all_metadatas.extend(meta or {} for meta in batch["metadatas"])
-            if not batch["ids"]:
+            ids = batch.get("ids") or []
+            for meta in batch.get("metadatas") or []:
+                _consider(meta)
+            page_len = len(ids)
+            del ids, batch
+            if not page_len:
                 break
-            offset += len(batch["ids"])
+            offset += page_len
     except Exception:
         logger.warning("prefetch_content_hashes: partial fetch, %d hashes loaded", len(hashes))
-    committed_tokens = {
-        meta.get("mine_generation_commit")
-        for meta in all_metadatas
-        if meta.get("mine_commit_marker") is True and meta.get("mine_generation_commit")
-    }
-    for meta in all_metadatas:
-        generation_token = meta.get("mine_generation_token")
-        if meta.get("mine_staged") is True and generation_token not in committed_tokens:
-            continue
-        if generation_token and generation_token not in committed_tokens:
-            continue
-        content_hash_field = meta.get("content_hash")
-        src = meta.get("source_file")
-        wing = meta.get("wing")
-        if not content_hash_field or not src or not wing:
-            continue
-        if not _metadata_matches_extract_mode(meta, extract_mode):
-            continue
-        if meta.get("normalize_version", 1) < NORMALIZE_VERSION:
-            continue
-        for content_hash in content_hash_field.split(","):
-            key = (wing, content_hash)
-            if content_hash and key not in hashes:
-                hashes[key] = src
     return hashes
