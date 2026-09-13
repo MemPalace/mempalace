@@ -301,8 +301,8 @@ def main():
     )
     p_export.add_argument(
         "--output",
-        default="~/.mempalace/export",
-        help="Directory to write the export tree into (default: ~/.mempalace/export)",
+        default=None,
+        help="Directory to write the export tree into (default: export/ in the config directory, resolved via XDG — see mempalace.config)",
     )
     p_export.add_argument(
         "--format",

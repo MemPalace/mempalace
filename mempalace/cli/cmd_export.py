@@ -13,7 +13,12 @@ def cmd_export(args):
         print(f"\n  No palace found at {palace_path}", file=sys.stderr)
         sys.exit(1)
 
-    output_dir = os.path.expanduser(args.output)
+    # The default follows the config directory rather than a fixed ~/.mempalace, so
+    # an XDG install keeps its export beside its palace instead of in a second root.
+    if args.output:
+        output_dir = os.path.expanduser(args.output)
+    else:
+        output_dir = os.path.join(MempalaceConfig().config_dir, "export")
     print(f"\n{'=' * 55}")
     print(f"  Exporting palace ({args.format})")
     print(f"{'=' * 55}\n")

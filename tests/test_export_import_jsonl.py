@@ -457,3 +457,25 @@ def test_cli_export_then_import_round_trips(monkeypatch):
         assert get_collection(target_palace).count() == len(exported)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_cli_export_default_output_follows_config_dir(monkeypatch):
+    """Without --output, export lands in the XDG-aware config dir, not a fixed ~/.mempalace."""
+    import sys
+
+    from mempalace.cli import main
+
+    tmpdir = tempfile.mkdtemp()
+    monkeypatch.setenv("HOME", tmpdir)
+    monkeypatch.setenv("USERPROFILE", tmpdir)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    config_dir = os.path.join(tmpdir, "xdg", "mempalace")
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", config_dir)
+    try:
+        palace_path = _setup_palace(tmpdir)
+        monkeypatch.setattr(sys, "argv", ["mempalace", "--palace", palace_path, "export"])
+        main()
+        assert _read_all_lines(os.path.join(config_dir, "export")), "export wrote no drawers"
+        assert not os.path.exists(os.path.join(tmpdir, ".mempalace", "export"))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
