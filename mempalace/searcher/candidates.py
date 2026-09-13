@@ -60,6 +60,7 @@ def _enrich_closet_hits(
     query: str,
     stop_words: frozenset = frozenset(),
     committed_tokens=None,
+    tokened_source_modes=None,
 ) -> list:
     """Hydrate closet-boosted hits and memoise each source/group fetch."""
     query_terms = set(
@@ -69,8 +70,9 @@ def _enrich_closet_hits(
         )
     )
     source_cache: dict = {}
-    if committed_tokens is None:
-        committed_tokens = _committed_generation_tokens(drawers_col)
+    if committed_tokens is None or tokened_source_modes is None:
+        committed_tokens, tokened_source_modes = _committed_generation_state(drawers_col)
+    tokened_source_modes = tokened_source_modes or frozenset()
 
     for hit in hits:
         if hit.get("matched_via") == "drawer":
@@ -153,7 +155,9 @@ def _enrich_closet_hits(
         indexed = []
 
         source_rows = _collapse_physical_generation_rows(
-            list(zip(physical_ids, docs, metadatas)), committed_tokens
+            list(zip(physical_ids, docs, metadatas)),
+            committed_tokens,
+            tokened_source_modes,
         )
         for index, (_, document, metadata) in enumerate(source_rows):
             chunk_index = (
@@ -500,7 +504,13 @@ def _window_and_fallback_gate(
 
 
 def _candidate_out_of_scope(
-    dist, meta, max_distance, since_dt, before_dt, committed_tokens=frozenset()
+    dist,
+    meta,
+    max_distance,
+    since_dt,
+    before_dt,
+    committed_tokens=frozenset(),
+    tokened_source_modes=frozenset(),
 ) -> bool:
     """True when a drawer candidate fails the distance or date-window gate.
 
@@ -508,7 +518,7 @@ def _candidate_out_of_scope(
     loss (pre-existing behavior); the date window applies whenever a bound
     is set, with the shared ``[since, before)`` semantics.
     """
-    if _is_staged_metadata(meta, committed_tokens):
+    if not _is_visible_generation_metadata(meta, committed_tokens, tokened_source_modes):
         return True
     if max_distance > 0.0 and dist > max_distance:
         return True

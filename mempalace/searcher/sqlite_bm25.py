@@ -146,7 +146,14 @@ def _sqlite_active_generation_rows(
         conn.close()
 
 
-def _resolve_sqlite_generation_candidates(candidates, query, db_path, collection_name):
+def _resolve_sqlite_generation_candidates(
+    candidates,
+    query,
+    db_path,
+    collection_name,
+    committed_tokens=frozenset(),
+    tokened_source_modes=frozenset(),
+):
     logical_ids = {
         candidate.get("_logical_generation_id")
         for candidate in candidates
@@ -169,7 +176,15 @@ def _resolve_sqlite_generation_candidates(candidates, query, db_path, collection
         emitted.add(logical_id)
         current = active.get(logical_id)
         if current is None:
-            if not candidate.get("_generation_token"):
+            if not candidate.get("_generation_token") and _is_visible_generation_metadata(
+                {
+                    "source_file": candidate.get("_source_file_full"),
+                    "extract_mode": candidate.get("_extract_mode"),
+                    "ingest_mode": candidate.get("_ingest_mode"),
+                },
+                committed_tokens,
+                tokened_source_modes,
+            ):
                 resolved.append(candidate)
             continue
         if _bm25_scores(query, [current["document"]])[0] <= 0:
@@ -195,6 +210,97 @@ def _resolve_sqlite_generation_candidates(candidates, query, db_path, collection
         )
         resolved.append(replacement)
     return resolved
+
+
+def _sqlite_generation_commit_state(conn, collection_name: str) -> tuple[set, set]:
+    """Published generation tokens and source/mode pairs from an open sqlite conn."""
+    committed_tokens: set = set()
+    tokened_source_modes: set = set()
+    for token, src, mode, ingest in conn.execute(
+        """
+            SELECT marker.string_value, src.string_value,
+                   mode.string_value, ingest.string_value
+            FROM embedding_metadata marker
+            JOIN embeddings e ON e.id = marker.id
+            JOIN segments s ON e.segment_id = s.id
+            JOIN collections c ON s.collection = c.id
+            LEFT JOIN embedding_metadata src
+              ON src.id = e.id AND src.key = 'source_file'
+            LEFT JOIN embedding_metadata mode
+              ON mode.id = e.id AND mode.key = 'extract_mode'
+            LEFT JOIN embedding_metadata ingest
+              ON ingest.id = e.id AND ingest.key = 'ingest_mode'
+            WHERE c.name = ?
+              AND marker.key = 'mine_generation_commit'
+              AND marker.string_value IS NOT NULL
+            """,
+        (collection_name,),
+    ):
+        if not token:
+            continue
+        committed_tokens.add(token)
+        source_mode = _source_mode_commit_key(
+            {
+                "source_file": src,
+                "extract_mode": mode,
+                "ingest_mode": ingest,
+            }
+        )
+        if source_mode is not None:
+            tokened_source_modes.add(source_mode)
+    return committed_tokens, tokened_source_modes
+
+
+def _sqlite_bm25_candidates_from_drawers(
+    drawers,
+    *,
+    wing,
+    room,
+    source_file,
+    window_active,
+    since_dt,
+    before_dt,
+    committed_tokens,
+    tokened_source_modes,
+):
+    """Apply wing/room/generation filters to sqlite drawer dicts."""
+    candidates = []
+    for d in drawers.values():
+        meta = d["metadata"]
+        if wing and meta.get("wing") != wing:
+            continue
+        if room and meta.get("room") != room:
+            continue
+        if source_file and meta.get("source_file") != source_file:
+            continue
+        if not _is_visible_generation_metadata(meta, committed_tokens, tokened_source_modes):
+            continue
+        if window_active and not filed_at_in_window(meta.get("filed_at"), since_dt, before_dt):
+            continue
+        full_source = meta.get("source_file", "") or ""
+        candidates.append(
+            {
+                "drawer_id": _result_drawer_id(meta, d["_stored_drawer_id"]),
+                "text": d["text"],
+                "wing": meta.get("wing", "unknown"),
+                "room": meta.get("room", "unknown"),
+                "source_file": Path(full_source).name if full_source else "?",
+                "source_path": full_source,
+                **_result_date_fields(meta),
+                "similarity": None,
+                "distance": None,
+                "matched_via": "bm25_sqlite",
+                "_source_file_full": full_source,
+                "_chunk_index": meta.get("chunk_index"),
+                "_logical_generation_id": meta.get("logical_drawer_id"),
+                "_physical_drawer_id": d["_stored_drawer_id"],
+                "_active_generation": meta.get("mine_generation_token") in committed_tokens,
+                "_generation_token": meta.get("mine_generation_token"),
+                "_extract_mode": meta.get("extract_mode"),
+                "_ingest_mode": meta.get("ingest_mode"),
+            }
+        )
+    return candidates
 
 
 def _bm25_only_via_sqlite(
@@ -294,8 +400,67 @@ def _bm25_only_via_sqlite(
                 )
             )
             """,
+            f"""
+            AND (
+                EXISTS (
+                    SELECT 1 FROM embedding_metadata tokened
+                    WHERE tokened.id = {row_id_expr}
+                      AND tokened.key = 'mine_generation_token'
+                )
+                OR NOT EXISTS (
+                    SELECT 1
+                    FROM embedding_metadata marker
+                    JOIN embeddings marker_embedding
+                      ON marker_embedding.id = marker.id
+                    JOIN segments marker_segment
+                      ON marker_segment.id = marker_embedding.segment_id
+                    JOIN collections marker_collection
+                      ON marker_collection.id = marker_segment.collection
+                    JOIN embedding_metadata marker_src
+                      ON marker_src.id = marker.id
+                     AND marker_src.key = 'source_file'
+                    JOIN embedding_metadata row_src
+                      ON row_src.id = {row_id_expr}
+                     AND row_src.key = 'source_file'
+                     AND row_src.string_value = marker_src.string_value
+                    LEFT JOIN embedding_metadata marker_mode
+                      ON marker_mode.id = marker.id
+                     AND marker_mode.key = 'extract_mode'
+                    LEFT JOIN embedding_metadata marker_ingest
+                      ON marker_ingest.id = marker.id
+                     AND marker_ingest.key = 'ingest_mode'
+                    LEFT JOIN embedding_metadata row_mode
+                      ON row_mode.id = {row_id_expr}
+                     AND row_mode.key = 'extract_mode'
+                    LEFT JOIN embedding_metadata row_ingest
+                      ON row_ingest.id = {row_id_expr}
+                     AND row_ingest.key = 'ingest_mode'
+                    WHERE marker.key = 'mine_generation_commit'
+                      AND marker.string_value IS NOT NULL
+                      AND marker.string_value != ''
+                      AND marker_collection.name = ?
+                      AND (
+                        CASE
+                          WHEN marker_mode.string_value IS NOT NULL
+                            THEN marker_mode.string_value
+                          WHEN marker_ingest.string_value IS NULL
+                            OR marker_ingest.string_value = 'convos'
+                            THEN 'exchange'
+                        END
+                      ) IS (
+                        CASE
+                          WHEN row_mode.string_value IS NOT NULL
+                            THEN row_mode.string_value
+                          WHEN row_ingest.string_value IS NULL
+                            OR row_ingest.string_value = 'convos'
+                            THEN 'exchange'
+                        END
+                      )
+                )
+            )
+            """,
         ]
-        params = [collection_name, collection_name]
+        params = [collection_name, collection_name, collection_name]
         for key, value in (("wing", wing), ("room", room), ("source_file", source_file)):
             if not value:
                 continue
@@ -340,6 +505,7 @@ def _bm25_only_via_sqlite(
 
     window_active = since_dt is not None or before_dt is not None
     committed_tokens = set()
+    tokened_source_modes = set()
     try:
         # FTS5 MATCH expects whitespace-separated tokens. Drop tokens
         # shorter than 3 chars (trigram tokenizer can't match them).
@@ -447,23 +613,9 @@ def _bm25_only_via_sqlite(
             """,
             candidate_ids,
         ).fetchall()
-        committed_tokens = {
-            row[0]
-            for row in conn.execute(
-                """
-                SELECT marker.string_value
-                FROM embedding_metadata marker
-                JOIN embeddings e ON e.id = marker.id
-                JOIN segments s ON e.segment_id = s.id
-                JOIN collections c ON s.collection = c.id
-                WHERE c.name = ?
-                  AND marker.key = 'mine_generation_commit'
-                  AND marker.string_value IS NOT NULL
-                """,
-                (collection_name,),
-            ).fetchall()
-            if row[0]
-        }
+        committed_tokens, tokened_source_modes = _sqlite_generation_commit_state(
+            conn, collection_name
+        )
     finally:
         conn.close()
 
@@ -486,47 +638,22 @@ def _bm25_only_via_sqlite(
 
     # Apply wing/room filters in Python (FTS5 candidates may include
     # entries from other wings).
-    candidates = []
-    for d in drawers.values():
-        meta = d["metadata"]
-        if wing and meta.get("wing") != wing:
-            continue
-        if room and meta.get("room") != room:
-            continue
-        if source_file and meta.get("source_file") != source_file:
-            continue
-        if window_active and not filed_at_in_window(meta.get("filed_at"), since_dt, before_dt):
-            continue
-        full_source = meta.get("source_file", "") or ""
-        candidates.append(
-            {
-                "drawer_id": _result_drawer_id(meta, d["_stored_drawer_id"]),
-                "text": d["text"],
-                "wing": meta.get("wing", "unknown"),
-                "room": meta.get("room", "unknown"),
-                "source_file": Path(full_source).name if full_source else "?",
-                "source_path": full_source,
-                **_result_date_fields(meta),
-                # No vector distance available in BM25-only mode.
-                "similarity": None,
-                "distance": None,
-                "matched_via": "bm25_sqlite",
-                # Internal: full path + chunk_index let callers (notably
-                # candidate_strategy="union") dedupe at chunk granularity
-                # rather than basename — two files in different directories
-                # may share a basename, and one source_file is split across
-                # multiple chunks. Stripped before this helper returns.
-                "_source_file_full": full_source,
-                "_chunk_index": meta.get("chunk_index"),
-                "_logical_generation_id": meta.get("logical_drawer_id"),
-                "_physical_drawer_id": d["_stored_drawer_id"],
-                "_active_generation": meta.get("mine_generation_token") in committed_tokens,
-                "_generation_token": meta.get("mine_generation_token"),
-            }
-        )
+    candidates = _sqlite_bm25_candidates_from_drawers(
+        drawers,
+        wing=wing,
+        room=room,
+        source_file=source_file,
+        window_active=window_active,
+        since_dt=since_dt,
+        before_dt=before_dt,
+        committed_tokens=committed_tokens,
+        tokened_source_modes=tokened_source_modes,
+    )
 
     # Local BM25 over the candidate set.
-    candidates = _resolve_sqlite_generation_candidates(candidates, query, db_path, collection_name)
+    candidates = _resolve_sqlite_generation_candidates(
+        candidates, query, db_path, collection_name, committed_tokens, tokened_source_modes
+    )
     candidates = _collapse_logical_generation_hits(candidates)
     docs = [c["text"] for c in candidates]
     bm25_raw = _bm25_scores(query, docs, stop_words=stop_words)
@@ -548,6 +675,8 @@ def _bm25_only_via_sqlite(
             h.pop("_physical_drawer_id", None)
             h.pop("_active_generation", None)
             h.pop("_generation_token", None)
+            h.pop("_extract_mode", None)
+            h.pop("_ingest_mode", None)
 
     result = {
         "query": query,
@@ -562,7 +691,9 @@ def _bm25_only_via_sqlite(
     return result
 
 
-def _resolve_lexical_generation_hits(drawers_col, hits, query, committed_tokens):
+def _resolve_lexical_generation_hits(
+    drawers_col, hits, query, committed_tokens, tokened_source_modes=frozenset()
+):
     """Replace stale lexical hits with their newest visible physical generation."""
     logical_metas = [
         hit.metadata or {} for hit in hits if (hit.metadata or {}).get("logical_drawer_id")
@@ -571,6 +702,7 @@ def _resolve_lexical_generation_hits(drawers_col, hits, query, committed_tokens)
         drawers_col,
         {"metadatas": [logical_metas]},
         committed_tokens,
+        tokened_source_modes,
     )
     by_physical = {hit.id: hit for hit in hits}
     missing_ids = sorted(set(current_ids.values()) - set(by_physical))
@@ -610,12 +742,16 @@ def _resolve_lexical_generation_hits(drawers_col, hits, query, committed_tokens)
         current = by_physical.get(current_ids.get(logical_id))
         if current is not None:
             resolved.append(current)
-        elif not (hit.metadata or {}).get("mine_generation_token"):
+        elif _is_visible_generation_metadata(
+            hit.metadata or {}, committed_tokens, tokened_source_modes
+        ):
             resolved.append(hit)
     return resolved
 
 
-def _fetch_resolved_lexical_hits(drawers_col, query, where, target_results, committed_tokens):
+def _fetch_resolved_lexical_hits(
+    drawers_col, query, where, target_results, committed_tokens, tokened_source_modes=frozenset()
+):
     limit = max(1, target_results)
     total = None
     while True:
@@ -625,7 +761,7 @@ def _fetch_resolved_lexical_hits(drawers_col, query, where, target_results, comm
             where=where or None,
         )
         resolved = _resolve_lexical_generation_hits(
-            drawers_col, result.hits, query, committed_tokens
+            drawers_col, result.hits, query, committed_tokens, tokened_source_modes
         )
         if len(resolved) >= target_results or len(result.hits) < limit:
             return resolved
@@ -671,8 +807,10 @@ def _merge_bm25_union_candidates(
     before admitting them, preserving the same distance guarantee as the
     vector-only path.
     """
-    committed_tokens = _committed_generation_tokens(drawers_col)
-    where = _visible_drawer_where(build_where_filter(wing, room, source_file), committed_tokens)
+    committed_tokens, tokened_source_modes = _committed_generation_state(drawers_col)
+    where = _visible_drawer_where(
+        build_where_filter(wing, room, source_file), committed_tokens, tokened_source_modes
+    )
     try:
         lexical_hits = _fetch_resolved_lexical_hits(
             drawers_col,
@@ -680,6 +818,7 @@ def _merge_bm25_union_candidates(
             where,
             n_results * 3,
             committed_tokens,
+            tokened_source_modes,
         )
     except UnsupportedCapabilityError:
         raise
@@ -697,7 +836,7 @@ def _merge_bm25_union_candidates(
     bm25_extra = []
     for hit in lexical_hits:
         meta = hit.metadata or {}
-        if _is_staged_metadata(meta, committed_tokens):
+        if not _is_visible_generation_metadata(meta, committed_tokens, tokened_source_modes):
             continue
         # The window applies to every candidate source; a lexically strong
         # drawer outside [since, before) must not enter through this side

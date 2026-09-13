@@ -69,20 +69,19 @@ def _collapse_logical_generation_hits(hits: list) -> list:
     return passthrough + [item[1] for item in chosen.values()]
 
 
-def _collapse_physical_generation_rows(rows, committed_tokens) -> list:
+def _collapse_physical_generation_rows(
+    rows, committed_tokens, tokened_source_modes=frozenset()
+) -> list:
     """Keep the active physical row per logical id; retain ordinary rows."""
     chosen = {}
     ordinary = []
     for physical_id, document, metadata in rows:
         metadata = metadata or {}
-        if _is_staged_metadata(metadata, committed_tokens):
+        if not _is_visible_generation_metadata(metadata, committed_tokens, tokened_source_modes):
             continue
         logical_id = metadata.get("logical_drawer_id")
         if not logical_id:
             ordinary.append((physical_id, document, metadata))
-            continue
-        generation_token = metadata.get("mine_generation_token")
-        if generation_token and generation_token not in committed_tokens:
             continue
         key = (
             metadata.get("mine_generation_token") in committed_tokens,

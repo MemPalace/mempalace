@@ -402,6 +402,39 @@ class TestSearchMemories:
 
         assert [(row[0], row[1]) for row in collapsed] == [("active-a", "current text")]
 
+    def test_tokenless_predecessor_of_tokened_source_is_not_collapsed_as_current(self):
+        from mempalace.searcher import _collapse_physical_generation_rows
+
+        rows = [
+            (
+                "dropped-tokenless",
+                "deleted text",
+                {
+                    "logical_drawer_id": "removed-logical",
+                    "source_file": "/tmp/session.jsonl",
+                    "extract_mode": "exchange",
+                    "ingest_mode": "convos",
+                },
+            ),
+            (
+                "active-tokened",
+                "current text",
+                {
+                    "logical_drawer_id": "kept-logical",
+                    "source_file": "/tmp/session.jsonl",
+                    "extract_mode": "exchange",
+                    "ingest_mode": "convos",
+                    "mine_generation_token": "active-token",
+                },
+            ),
+        ]
+
+        collapsed = _collapse_physical_generation_rows(
+            rows, {"active-token"}, {("/tmp/session.jsonl", "exchange")}
+        )
+
+        assert [(row[0], row[1]) for row in collapsed] == [("active-tokened", "current text")]
+
     def test_wing_and_room_filter(self, palace_path, seeded_collection):
         result = search_memories("code", palace_path, wing="project", room="frontend")
         assert all(r["wing"] == "project" and r["room"] == "frontend" for r in result["results"])
@@ -1493,6 +1526,37 @@ def test_bm25_commit_marker_is_scoped_to_selected_collection(tmp_path):
         collection_name="target_drawers",
     )
     assert removed["results"] == []
+
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        INSERT INTO embedding_metadata VALUES
+            (3, 'source_file', '/tmp/session.jsonl', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (3, 'extract_mode', 'exchange', NULL, NULL, NULL);
+        INSERT INTO embeddings VALUES (8, 'target-seg', 'tokenless-drop', '2026-09-06');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (8, 'deleted tokenless predecessor phrase');
+        INSERT INTO embedding_metadata VALUES
+            (8, 'chroma:document', 'deleted tokenless predecessor phrase', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (8, 'logical_drawer_id', 'tokenless-drop', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (8, 'source_file', '/tmp/session.jsonl', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (8, 'extract_mode', 'exchange', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (8, 'ingest_mode', 'convos', NULL, NULL, NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+    tokenless_drop = searcher._bm25_only_via_sqlite(
+        "deleted tokenless predecessor",
+        str(tmp_path),
+        collection_name="target_drawers",
+    )
+    assert tokenless_drop["results"] == []
 
     conn = sqlite3.connect(db)
     conn.executescript(

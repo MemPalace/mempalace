@@ -31,11 +31,20 @@ class GenerationCollection:
         self.observe = lambda: None
         self.embedded_documents = []
         self.upsert_id_batches = []
+        self.fail_tail_get = False
+        self.tail_get_id = None
 
     def count(self):
         return len(self.rows)
 
     def get(self, ids=None, where=None, include=None, offset=0, limit=None):
+        if (
+            self.fail_tail_get
+            and self.tail_get_id is not None
+            and ids is not None
+            and list(ids) == [self.tail_get_id]
+        ):
+            raise RuntimeError("tail marker get failed")
         rows = [
             (key, row)
             for key, row in self.rows.items()
@@ -199,37 +208,30 @@ def _committed_tokens(collection):
     return searcher._committed_generation_tokens(collection)
 
 
+def _committed_state(collection):
+    return searcher._committed_generation_state(collection)
+
+
 def _sqlite_visible_rows(collection):
     """Python equivalent of the sqlite BM25 generation visibility clauses."""
-    tokens = _committed_tokens(collection)
+    tokens, modes = _committed_state(collection)
     visible = []
     for key, row in collection.rows.items():
         meta = row["metadata"]
-        if meta.get("mine_commit_marker") is True:
-            continue
-        if searcher._is_staged_metadata(meta, tokens):
-            continue
-        token = meta.get("mine_generation_token")
-        if token and token not in tokens:
-            continue
-        visible.append((key, row["document"], meta))
+        if searcher._is_visible_generation_metadata(meta, tokens, modes):
+            visible.append((key, row["document"], meta))
     return visible
 
 
 def _list_visible_drawer_ids(collection):
-    tokens = _committed_tokens(collection)
+    tokens, modes = _committed_state(collection)
     ids, documents, metadatas = [], [], []
     for key, row in collection.rows.items():
         meta = row["metadata"]
-        if meta.get("mine_commit_marker") is True:
-            continue
-        if meta.get("mine_staged") is True and meta.get("mine_generation_token") not in tokens:
-            continue
-        if meta.get("mine_generation_token") and meta.get("mine_generation_token") not in tokens:
-            continue
-        ids.append(key)
-        documents.append(row["document"])
-        metadatas.append(meta)
+        if searcher._is_visible_generation_metadata(meta, tokens, modes):
+            ids.append(key)
+            documents.append(row["document"])
+            metadatas.append(meta)
     return {
         drawer["drawer_id"]
         for drawer in mcp_server._collapse_drawer_rows(ids, documents, metadatas, tokens)
@@ -237,13 +239,13 @@ def _list_visible_drawer_ids(collection):
 
 
 def _search_visible_contents(collection):
-    tokens = _committed_tokens(collection)
+    tokens, modes = _committed_state(collection)
     rows = [
         (key, row["document"], row["metadata"])
         for key, row in collection.rows.items()
         if row["metadata"].get("mine_commit_marker") is not True
     ]
-    collapsed = searcher._collapse_physical_generation_rows(rows, tokens)
+    collapsed = searcher._collapse_physical_generation_rows(rows, tokens, modes)
     by_logical = {}
     for _physical_id, document, meta in collapsed:
         logical_id = meta.get("logical_drawer_id") or _physical_id
@@ -272,7 +274,7 @@ def _assert_all_read_paths(collection, source, expected):
     sqlite_by_logical = {
         meta.get("logical_drawer_id") or key: document
         for key, document, meta in searcher._collapse_physical_generation_rows(
-            _sqlite_visible_rows(collection), _committed_tokens(collection)
+            _sqlite_visible_rows(collection), *_committed_state(collection)
         )
     }
     listed = _list_visible_drawer_ids(collection)
@@ -1334,6 +1336,63 @@ def test_tokenless_predecessor_is_not_a_visible_duplicate(tmp_path, monkeypatch)
     assert hashes_after[("wing", hash_b)] == source
 
 
+def test_tokenless_shrink_hides_removed_chunk_when_delete_fails(tmp_path, monkeypatch):
+    """Initial tokenless A shrunk to B must not keep A's dropped text readable."""
+    source = str(tmp_path / "session.txt")
+    (tmp_path / "session.txt").write_text("transcript", encoding="utf-8")
+    monkeypatch.setattr(convo_miner, "mine_lock", lambda *_: contextlib.nullcontext())
+    monkeypatch.setattr(convo_miner, "file_already_mined", lambda *_a, **_k: False)
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 1)
+
+    def mine(collection, documents):
+        chunks = [{"content": text, "chunk_index": index} for index, text in enumerate(documents)]
+        return convo_miner._file_chunks_locked(
+            collection, source, chunks, "wing", "general", "agent", "exchange"
+        )
+
+    class DeleteFailingCollection(GenerationCollection):
+        def __init__(self):
+            super().__init__()
+            self.fail_delete = False
+
+        def delete(self, ids):
+            if self.fail_delete:
+                raise InjectedWriteFailure("stale delete failed")
+            super().delete(ids)
+
+    tokenless = ["alpha first chunk", "alpha second chunk", "alpha dropped chunk"]
+    shrunk = ["beta first chunk", "beta second chunk"]
+    collection = DeleteFailingCollection()
+    assert mine(collection, tokenless)[2] is False
+    _assert_all_read_paths(collection, source, tokenless)
+    dropped_id = make_convo_drawer_id("wing", "general", source, "exchange", 2)
+    assert not collection.rows[dropped_id]["metadata"].get("mine_generation_token")
+
+    collection.fail_delete = True
+    skipped = mine(collection, shrunk)[2]
+    assert skipped is True
+    assert dropped_id in collection.rows
+    assert not collection.rows[dropped_id]["metadata"].get("mine_generation_token")
+    _assert_all_read_paths(collection, source, [*shrunk, None])
+    tokens, modes = _committed_state(collection)
+    assert (source, "exchange") in modes
+    assert (
+        searcher._is_visible_generation_metadata(
+            collection.rows[dropped_id]["metadata"], tokens, modes
+        )
+        is False
+    )
+    where = searcher._visible_drawer_where({}, tokens, modes)
+    assert "mine_generation_token" in str(where)
+    assert mcp_server._logical_generation_record(collection, dropped_id) is None
+
+    collection.fail_delete = False
+    assert mine(collection, shrunk)[2] is False
+    _assert_all_read_paths(collection, source, [*shrunk, None])
+    assert dropped_id not in collection.rows
+
+
 def test_failed_tokened_rewrite_cleanup_then_repeated_appends_keep_active_rows(
     tmp_path, monkeypatch
 ):
@@ -2176,18 +2235,6 @@ class DeleteFailingGenerationCollection(GenerationCollection):
     def __init__(self):
         super().__init__()
         self.fail_delete = False
-        self.fail_tail_get = False
-        self.tail_get_id = None
-
-    def get(self, ids=None, where=None, include=None, offset=0, limit=None):
-        if (
-            self.fail_tail_get
-            and self.tail_get_id is not None
-            and ids is not None
-            and list(ids) == [self.tail_get_id]
-        ):
-            raise RuntimeError("tail marker get failed")
-        return super().get(ids=ids, where=where, include=include, offset=offset, limit=limit)
 
     def delete(self, ids):
         if self.fail_delete:
@@ -2314,6 +2361,79 @@ def test_non_tail_publication_retires_leftover_tail_when_delete_fails(fail_tail_
     assert {document for _key, document, _meta in _sqlite_visible_rows(collection)} == {
         "new generation"
     }
+
+
+def test_unread_tail_marker_clones_visible_tail_and_survives_second_interrupt(
+    tmp_path, monkeypatch
+):
+    """A failed extra-marker read must not retag a visible staged tail in place."""
+    original, mine, source, committed, first_growth = _append_visibility_case(tmp_path, monkeypatch)
+    second_growth = [*first_growth, "appended seventh chunk"]
+    leftovers = _interrupt_states_with_unretired_tail(
+        mine, original, first_growth, source, fail_before=False
+    )
+    assert leftovers
+    leftover = leftovers[0]
+    _assert_all_read_paths(leftover, source, first_growth)
+    tail_id = make_convo_tail_commit_id(source, "exchange")
+    old_tail_token = leftover.rows[tail_id]["metadata"]["mine_generation_commit"]
+    assert old_tail_token
+    visible_tail_ids = [
+        key
+        for key, row in _non_marker_rows(leftover).items()
+        if row["metadata"].get("mine_generation_token") == old_tail_token
+        and row["metadata"].get("mine_staged") is True
+    ]
+    assert visible_tail_ids
+
+    leftover.fail_tail_get = True
+    leftover.tail_get_id = tail_id
+    completed = copy.deepcopy(leftover)
+    completed.write_count = 0
+    assert mine(completed, second_growth)[2] is False
+    _assert_all_read_paths(completed, source, second_growth)
+
+    recovered = None
+    for write_index in range(1, completed.write_count + 1):
+        collection = copy.deepcopy(leftover)
+        collection.fail_tail_get = True
+        collection.tail_get_id = tail_id
+        collection.write_count = 0
+        collection.fail_at = write_index
+        try:
+            mine(collection, second_growth)
+        except InjectedWriteFailure:
+            pass
+        collection.fail_at = None
+        _assert_visible_complete_generations(
+            collection, source, committed, first_growth, second_growth
+        )
+        for key in visible_tail_ids:
+            if key in collection.rows:
+                assert (
+                    collection.rows[key]["metadata"].get("mine_generation_token") == old_tail_token
+                )
+        if recovered is None and _unpublished_pending_row_ids(collection):
+            recovered = collection
+
+    assert recovered is not None
+    recovered.fail_at = None
+    recovered.fail_tail_get = True
+    recovered.tail_get_id = tail_id
+    recovered.write_count = 0
+    snapshots = []
+
+    def observe():
+        snapshots.append(
+            _assert_visible_complete_generations(
+                recovered, source, committed, first_growth, second_growth
+            )
+        )
+
+    recovered.observe = observe
+    assert mine(recovered, second_growth)[2] is False
+    assert snapshots
+    _assert_all_read_paths(recovered, source, second_growth)
 
 
 def test_non_tail_publication_does_not_retire_leftover_tail_before_switch():

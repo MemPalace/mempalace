@@ -36,26 +36,82 @@ def _is_staged_metadata(metadata, committed_tokens=frozenset()) -> bool:
     return not token or token not in committed_tokens
 
 
-def _committed_generation_tokens(collection) -> frozenset[str]:
-    """Read crash-atomic conversation generation markers from the drawer store."""
+def _is_visible_generation_metadata(
+    metadata, committed_tokens=frozenset(), tokened_source_modes=frozenset()
+) -> bool:
+    """True when a stored drawer belongs to the currently readable generation.
+
+    Tokenless leftover rows from a failed A→B cleanup are not visible once a
+    later generation for the same source/mode carries a token. Staged or
+    tokened rows from a retired generation are not visible either. Ordinary
+    project/diary rows without a generation token stay readable.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    if metadata.get("mine_commit_marker") is True:
+        return False
+    if _is_staged_metadata(metadata, committed_tokens):
+        return False
+    token = metadata.get("mine_generation_token")
+    if token:
+        return token in committed_tokens
+    source_mode = _source_mode_commit_key(metadata)
+    if source_mode is not None and source_mode in tokened_source_modes:
+        return False
+    return True
+
+
+def _committed_generation_state(collection) -> tuple[frozenset, frozenset]:
+    """Published generation tokens and the source/mode pairs that carry them."""
     try:
-        result = collection.get(
-            where={"mine_commit_marker": True},
-            include=["metadatas"],
-        )
-        return frozenset(
-            meta.get("mine_generation_commit")
-            for meta in (result.get("metadatas") or [])
-            if isinstance(meta, dict) and meta.get("mine_generation_commit")
-        )
+        tokens, modes, _complete = _generation_commit_marker_state(collection)
+        return frozenset(tokens), frozenset(modes)
     except Exception:
         logger.warning("Could not read conversation generation commit markers", exc_info=True)
-        return frozenset()
+        return frozenset(), frozenset()
 
 
-def _visible_drawer_where(where: dict, committed_tokens=frozenset()) -> dict:
-    """Exclude staged rows in the backend before its top-K limit is applied."""
+def _committed_generation_tokens(collection) -> frozenset[str]:
+    """Read crash-atomic conversation generation markers from the drawer store."""
+    tokens, _modes = _committed_generation_state(collection)
+    return tokens
+
+
+def _tokenless_predecessor_where_guards(tokened_source_modes) -> list:
+    """Chroma clauses that drop tokenless rows of a tokened source/mode."""
+    guards = []
+    for src, mode in sorted(tokened_source_modes):
+        if not src:
+            continue
+        if mode is None:
+            guards.append({"source_file": {"$ne": src}})
+            continue
+        guards.append(
+            {
+                "$or": [
+                    {"source_file": {"$ne": src}},
+                    {"extract_mode": {"$ne": mode}},
+                ]
+            }
+        )
+    return guards
+
+
+def _visible_drawer_where(
+    where: dict, committed_tokens=frozenset(), tokened_source_modes=frozenset()
+) -> dict:
+    """Exclude unpublished and superseded rows before the backend top-K limit.
+
+    The unstaged branch would otherwise admit tokenless predecessors left
+    behind when the first complete mine is shrunk or rechunked and stale
+    deletion fails. Pair-exclude those source/modes the same way hash
+    prefetch does. Callers still post-filter: missing ``extract_mode`` on a
+    leftover exchange row may not match ``$ne``.
+    """
     committed = {"mine_staged": {"$ne": True}}
+    predecessor_guards = _tokenless_predecessor_where_guards(tokened_source_modes)
+    if predecessor_guards:
+        committed = {"$and": [committed, *predecessor_guards]}
     visibility = committed
     if committed_tokens:
         visibility = {

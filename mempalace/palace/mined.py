@@ -43,6 +43,68 @@ def _source_mode_commit_key(meta: dict) -> Optional[tuple]:
     return (src, mode)
 
 
+def _record_generation_commit_marker(meta, committed_tokens, tokened_source_modes) -> None:
+    """Collect a published generation token and its source/mode, if present."""
+    meta = meta or {}
+    token = meta.get("mine_generation_commit")
+    if meta.get("mine_commit_marker") is not True or not token:
+        return
+    committed_tokens.add(token)
+    source_mode = _source_mode_commit_key(meta)
+    if source_mode is not None:
+        tokened_source_modes.add(source_mode)
+
+
+def _generation_commit_marker_state(collection) -> tuple[set, set, bool]:
+    """Load published generation markers as ``(tokens, source_modes, complete)``.
+
+    ``complete`` is False when any marker page fails. Hash dedup must not use
+    partial source/mode state: a missing later page would treat leftover
+    tokenless rows as live and permanently skip another file of that text.
+    """
+    committed_tokens: set = set()
+    tokened_source_modes: set = set()
+    marker_offset = 0
+    page_size = 1000
+    paginated = True
+    try:
+        while True:
+            kwargs = {
+                "where": {"mine_commit_marker": True},
+                "include": ["metadatas"],
+            }
+            if paginated:
+                kwargs["limit"] = page_size
+                kwargs["offset"] = marker_offset
+            try:
+                marker_batch = collection.get(**kwargs)
+            except TypeError:
+                if marker_offset:
+                    break
+                paginated = False
+                marker_batch = collection.get(
+                    where={"mine_commit_marker": True},
+                    include=["metadatas"],
+                )
+            marker_ids = marker_batch.get("ids") or []
+            for meta in marker_batch.get("metadatas") or []:
+                _record_generation_commit_marker(meta, committed_tokens, tokened_source_modes)
+            page_len = len(marker_ids)
+            del marker_batch, marker_ids
+            if not paginated or not page_len:
+                break
+            marker_offset += page_len
+            if page_len < page_size:
+                break
+        return committed_tokens, tokened_source_modes, True
+    except Exception:
+        logger.warning(
+            "generation commit marker fetch failed, %d commit tokens loaded",
+            len(committed_tokens),
+        )
+        return committed_tokens, tokened_source_modes, False
+
+
 def file_already_mined(
     collection,
     source_file: str,
@@ -295,8 +357,14 @@ def prefetch_content_hashes(
     their hashes must not suppress a later file of the same transcript.
     """
     hashes: dict[tuple[str, str], str] = {}
-    committed_tokens = set()
-    tokened_source_modes = set()
+    committed_tokens, tokened_source_modes, markers_complete = _generation_commit_marker_state(
+        collection
+    )
+    if not markers_complete:
+        logger.warning(
+            "prefetch_content_hashes: marker fetch incomplete, disabling cross-file hash dedup"
+        )
+        return hashes
 
     def _consider(meta):
         meta = meta or {}
@@ -322,35 +390,6 @@ def prefetch_content_hashes(
             key = (wing, content_hash)
             if content_hash and key not in hashes:
                 hashes[key] = src
-
-    try:
-        marker_offset = 0
-        while True:
-            marker_batch = collection.get(
-                where={"mine_commit_marker": True},
-                limit=1000,
-                offset=marker_offset,
-                include=["metadatas"],
-            )
-            marker_ids = marker_batch.get("ids") or []
-            for meta in marker_batch.get("metadatas") or []:
-                meta = meta or {}
-                token = meta.get("mine_generation_commit")
-                if meta.get("mine_commit_marker") is True and token:
-                    committed_tokens.add(token)
-                    source_mode = _source_mode_commit_key(meta)
-                    if source_mode is not None:
-                        tokened_source_modes.add(source_mode)
-            del marker_batch
-            if not marker_ids:
-                break
-            marker_offset += len(marker_ids)
-            del marker_ids
-    except Exception:
-        logger.warning(
-            "prefetch_content_hashes: marker fetch failed, %d commit tokens loaded",
-            len(committed_tokens),
-        )
 
     try:
         total = collection.count()

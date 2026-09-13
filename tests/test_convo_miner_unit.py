@@ -1542,6 +1542,107 @@ def test_content_hash_prefetch_pages_release_metadata_and_keeps_generation_filte
     assert hashes[("wing", "active-hash")] == "active.jsonl"
 
 
+@pytest.mark.parametrize("fail_offset", [0, 1000])
+def test_content_hash_prefetch_disables_dedup_when_marker_page_fails(fail_offset):
+    """Incomplete marker pagination must not treat leftover tokenless rows as live."""
+    from mempalace import convo_miner
+    from mempalace.palace import NORMALIZE_VERSION, prefetch_content_hashes
+
+    leftover_hash = "leftover-hash"
+    page_size = 1000
+    rows = []
+    for index in range(page_size):
+        src = f"paged-{index}.jsonl"
+        rows.append(
+            (
+                f"active-{index}",
+                {
+                    "wing": "wing",
+                    "source_file": src,
+                    "extract_mode": "exchange",
+                    "normalize_version": NORMALIZE_VERSION,
+                    "content_hash": f"active-hash-{index}",
+                    "mine_generation_token": f"token-{index}",
+                },
+            )
+        )
+        rows.append(
+            (
+                f"marker-{index}",
+                {
+                    "mine_staged": True,
+                    "mine_commit_marker": True,
+                    "mine_generation_commit": f"token-{index}",
+                    "source_file": src,
+                    "extract_mode": "exchange",
+                },
+            )
+        )
+    rows.extend(
+        [
+            (
+                "later-active",
+                {
+                    "wing": "wing",
+                    "source_file": "later.jsonl",
+                    "extract_mode": "exchange",
+                    "normalize_version": NORMALIZE_VERSION,
+                    "content_hash": "later-hash",
+                    "mine_generation_token": "later-token",
+                },
+            ),
+            (
+                "later-marker",
+                {
+                    "mine_staged": True,
+                    "mine_commit_marker": True,
+                    "mine_generation_commit": "later-token",
+                    "source_file": "later.jsonl",
+                    "extract_mode": "exchange",
+                },
+            ),
+            (
+                "leftover",
+                {
+                    "wing": "wing",
+                    "source_file": "later.jsonl",
+                    "extract_mode": "exchange",
+                    "normalize_version": NORMALIZE_VERSION,
+                    "content_hash": leftover_hash,
+                },
+            ),
+        ]
+    )
+
+    class Collection:
+        @staticmethod
+        def count():
+            return len(rows)
+
+        @staticmethod
+        def get(limit=None, offset=0, include=None, where=None, ids=None):
+            if where == {"mine_commit_marker": True} and offset == fail_offset:
+                raise RuntimeError("marker page failed")
+            selected = rows
+            if where == {"mine_commit_marker": True}:
+                selected = [
+                    (key, meta) for key, meta in rows if meta.get("mine_commit_marker") is True
+                ]
+            selected = selected[offset : offset + limit if limit is not None else None]
+            return {
+                "ids": [key for key, _ in selected],
+                "metadatas": [dict(meta) for _, meta in selected],
+            }
+
+    hashes = prefetch_content_hashes(Collection(), extract_mode="exchange")
+    assert hashes == {}
+    new_items, duplicates = convo_miner._split_new_and_duplicate_conversations(
+        ["leftover transcript"], "wing", "reexport.jsonl", hashes
+    )
+    assert duplicates == []
+    assert [text for _content_hash, text in new_items] == ["leftover transcript"]
+
+
 def test_pending_commit_finishes_when_stale_rows_are_already_gone():
     import mempalace.convo_miner as convo_miner
 

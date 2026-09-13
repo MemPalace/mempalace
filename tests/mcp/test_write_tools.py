@@ -643,8 +643,16 @@ class TestWriteTools:
     ):
         _patch_mcp_server(monkeypatch, config, kg)
         collection.add(
-            ids=["hidden", "old", "published", "removed", "marker", "ordinary"],
-            documents=["hidden", "old", "published", "removed", "[commit]", "ordinary"],
+            ids=["hidden", "old", "published", "removed", "marker", "ordinary", "tokenless-drop"],
+            documents=[
+                "hidden",
+                "old",
+                "published",
+                "removed",
+                "[commit]",
+                "ordinary",
+                "deleted tokenless text",
+            ],
             metadatas=[
                 {
                     "wing": "w",
@@ -678,8 +686,18 @@ class TestWriteTools:
                     "mine_staged": True,
                     "mine_commit_marker": True,
                     "mine_generation_commit": "published-token",
+                    "source_file": "/tmp/session.jsonl",
+                    "extract_mode": "exchange",
                 },
                 {"wing": "w", "room": "r"},
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "source_file": "/tmp/session.jsonl",
+                    "extract_mode": "exchange",
+                    "ingest_mode": "convos",
+                    "logical_drawer_id": "tokenless-drop",
+                },
             ],
         )
 
@@ -697,6 +715,7 @@ class TestWriteTools:
         fetched = tool_get_drawer("logical-published")
         assert fetched["drawer_id"] == "logical-published"
         assert fetched["content"] == "published"
+        assert "error" in tool_get_drawer("tokenless-drop")
         deleted = tool_delete_drawer("logical-published")
         assert set(deleted["deleted_ids"]) == {"old", "published"}
         assert "error" in tool_get_drawer("logical-published")

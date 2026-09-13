@@ -145,8 +145,10 @@ def search(
     # creation — their similarity scores will be junk until they run repair.
     _warn_if_legacy_metric(col)
 
-    committed_tokens = _committed_generation_tokens(col)
-    where = _visible_drawer_where(build_where_filter(wing, room), committed_tokens)
+    committed_tokens, tokened_source_modes = _committed_generation_state(col)
+    where = _visible_drawer_where(
+        build_where_filter(wing, room), committed_tokens, tokened_source_modes
+    )
 
     try:
         kwargs = {
@@ -170,6 +172,7 @@ def search(
             wing,
             room,
             committed_tokens=committed_tokens,
+            tokened_source_modes=tokened_source_modes,
         )
 
     except Exception as e:
@@ -184,7 +187,7 @@ def search(
     visible = [
         (stored_id, doc, meta, dist)
         for stored_id, doc, meta, dist in zip(stored_ids, docs, metas, dists)
-        if not _is_staged_metadata(meta, committed_tokens)
+        if _is_visible_generation_metadata(meta, committed_tokens, tokened_source_modes)
     ]
     stored_ids = [item[0] for item in visible]
     docs = [item[1] for item in visible]

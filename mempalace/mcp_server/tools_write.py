@@ -138,28 +138,17 @@ def _logical_generation_record(col, drawer_id: str):
             where={"logical_drawer_id": drawer_id},
             include=["documents", "metadatas"],
         )
-        markers = col.get(
-            where={"mine_commit_marker": True},
-            include=["metadatas"],
-        )
+        committed, tokened_source_modes = _committed_generation_state(col)
     except Exception:
         logger.debug("generation lookup failed for %s", drawer_id, exc_info=True)
         return None
-    committed = {
-        (meta or {}).get("mine_generation_commit")
-        for meta in (_chroma_field(markers, "metadatas", []) or [])
-        if (meta or {}).get("mine_generation_commit")
-    }
     rows = []
     ids = _chroma_field(result, "ids", []) or []
     docs = _chroma_field(result, "documents", []) or []
     metas = _chroma_field(result, "metadatas", []) or []
     for index, physical_id in enumerate(ids):
         meta = _safe_meta(metas[index] if index < len(metas) else {})
-        if meta.get("mine_staged") is True and meta.get("mine_generation_token") not in committed:
-            continue
-        generation_token = meta.get("mine_generation_token")
-        if generation_token and generation_token not in committed:
+        if not _is_visible_generation_metadata(meta, committed, tokened_source_modes):
             continue
         rows.append(
             (
@@ -189,10 +178,24 @@ def _logical_drawer_record(col, drawer_id: str):
     generation = _logical_generation_record(col, drawer_id)
     if generation is not None:
         return generation
+    try:
+        committed, tokened_source_modes = _committed_generation_state(col)
+    except Exception:
+        committed, tokened_source_modes = frozenset(), frozenset()
     direct = _single_drawer_record(col, drawer_id)
     if direct is not None:
-        return direct
-    return _logical_chunk_group(col, drawer_id)
+        if _is_visible_generation_metadata(direct["metadata"], committed, tokened_source_modes):
+            return direct
+        return None
+    chunked = _logical_chunk_group(col, drawer_id)
+    if chunked is None:
+        return None
+    if not any(
+        _is_visible_generation_metadata(meta, committed, tokened_source_modes)
+        for meta in chunked.get("metadatas") or []
+    ):
+        return None
+    return chunked
 
 
 def _drawer_payload(record):
@@ -1152,19 +1155,21 @@ def tool_list_drawers(
             where = {"$and": conditions}
 
         listed = None
-        committed_tokens = set()
+        committed_tokens = frozenset()
+        tokened_source_modes = frozenset()
         if _is_chroma_backend() and _config.palace_path:
             from ..backends.chroma import (
-                sqlite_generation_commit_tokens,
+                sqlite_generation_commit_state,
                 sqlite_list_id_metadata,
             )
 
-            marker_tokens = sqlite_generation_commit_tokens(
+            marker_state = sqlite_generation_commit_state(
                 _config.palace_path,
                 _config.collection_name,
             )
-            if marker_tokens is not None:
-                committed_tokens = marker_tokens
+            if marker_state is not None:
+                committed_tokens = frozenset(marker_state[0])
+                tokened_source_modes = frozenset(marker_state[1])
             listed = sqlite_list_id_metadata(
                 _config.palace_path, _config.collection_name, where=where
             )
@@ -1177,24 +1182,11 @@ def tool_list_drawers(
             if not col:
                 return _collection_error_or_no_palace()
             ids, documents, metadatas = _fetch_drawer_rows(col, where=where, include=["metadatas"])
-            marker_result = col.get(where={"mine_commit_marker": True}, include=["metadatas"])
-            committed_tokens = {
-                (meta or {}).get("mine_generation_commit")
-                for meta in (marker_result.get("metadatas") or [])
-                if (meta or {}).get("mine_generation_commit")
-            }
+            committed_tokens, tokened_source_modes = _committed_generation_state(col)
         visible_rows = [
             (drawer_id, documents[index] if index < len(documents) else "", meta or {})
             for index, (drawer_id, meta) in enumerate(zip(ids, metadatas))
-            if (meta or {}).get("mine_commit_marker") is not True
-            and (
-                (meta or {}).get("mine_staged") is not True
-                or (meta or {}).get("mine_generation_token") in committed_tokens
-            )
-            and (
-                not (meta or {}).get("mine_generation_token")
-                or (meta or {}).get("mine_generation_token") in committed_tokens
-            )
+            if _is_visible_generation_metadata(meta or {}, committed_tokens, tokened_source_modes)
         ]
         drawers = _collapse_drawer_rows(
             [row[0] for row in visible_rows],

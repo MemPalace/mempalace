@@ -953,8 +953,15 @@ def _stage_reused_generation_copies(
             )
 
 
-def _append_tail_marker_commit_token(collection, tail_commit_id, access_gate) -> Optional[str]:
-    """Return the extra tail marker's committed token, if one is published."""
+_TAIL_MARKER_UNREADABLE = object()
+
+
+def _append_tail_marker_commit_token(collection, tail_commit_id, access_gate):
+    """Return the extra tail marker's committed token, if one is published.
+
+    ``None`` means no published extra token. The unread sentinel means the
+    lookup failed; callers must not treat a visible staged tail as unpublished.
+    """
     if not isinstance(tail_commit_id, str) or not tail_commit_id:
         return None
     try:
@@ -962,7 +969,7 @@ def _append_tail_marker_commit_token(collection, tail_commit_id, access_gate) ->
             result = collection.get(ids=[tail_commit_id], include=["metadatas"])
     except Exception:
         logger.debug("Could not read append tail commit marker", exc_info=True)
-        return None
+        return _TAIL_MARKER_UNREADABLE
     return _committed_marker_generation_token(result.get("metadatas") or [])
 
 
@@ -1014,13 +1021,14 @@ def _restage_recovered_pending_append_rows(collection, rows, *, access_gate) -> 
 
 
 def _clone_recovered_pending_append_rows(
-    collection, rows, *, staging_token, access_gate
+    collection, rows, *, staging_token, access_gate, allow_in_place: bool = True
 ) -> list[tuple[str, str]]:
     """Clone currently visible pending-tail rows onto the unpublished token.
 
     In-place restage would hide a committed extra-marker tail one row at a
     time. Copying onto the new unpublished identity leaves the old rows
-    readable until the extra marker switches.
+    readable until the extra marker switches. When the extra-marker state is
+    unknown, in-place fallback is forbidden so a visible tail cannot vanish.
     """
     if not rows:
         return []
@@ -1046,6 +1054,8 @@ def _clone_recovered_pending_append_rows(
         copy_id = _reused_generation_copy_id(logical_id, staging_token)
         copies.append((copy_id, drawer_id, content, touch_meta))
         replacements.append((drawer_id, copy_id))
+    if leftover and not allow_in_place:
+        raise RuntimeError("could not clone recovered append rows with unread tail marker")
     _stage_reused_generation_copies(
         collection,
         copies,
@@ -1070,19 +1080,30 @@ def _restage_pending_append_tail_before_publish(
 
     Unpublished recovered rows restage in place. Rows already visible under a
     committed extra-marker token are cloned so readers keep the previous
-    complete tail until the new token is published.
+    complete tail until the new token is published. If the extra marker cannot
+    be read, every recovered row is cloned: treating unknown state as
+    unpublished would retag a visible tail in place and hide it.
     """
     if not (isinstance(staging_token, str) and staging_token and staging_token != generation_token):
         return []
     extra_token = _append_tail_marker_commit_token(collection, tail_commit_id, access_gate)
+    restage = _pending_append_rows_to_restage(
+        to_touch, existing=existing, staging_token=staging_token
+    )
+    if extra_token is _TAIL_MARKER_UNREADABLE:
+        return _clone_recovered_pending_append_rows(
+            collection,
+            restage,
+            staging_token=staging_token,
+            access_gate=access_gate,
+            allow_in_place=False,
+        )
     committed = {
         token for token in (generation_token, extra_token) if isinstance(token, str) and token
     }
     in_place = []
     to_clone = []
-    for drawer_id, restaged in _pending_append_rows_to_restage(
-        to_touch, existing=existing, staging_token=staging_token
-    ):
+    for drawer_id, restaged in restage:
         prev = existing.get(drawer_id) or {}
         token = prev.get("mine_generation_token")
         if token in committed:
