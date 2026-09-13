@@ -197,6 +197,9 @@ ignore = ["E501"]
 # searcher fragments exec into the package namespace.
 "mempalace/searcher/__init__.py" = ["F401"]
 "mempalace/searcher/*.py" = ["F821"]
+# palace fragments exec into the package namespace.
+"mempalace/palace/__init__.py" = ["F401"]
+"mempalace/palace/*.py" = ["F821"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 25
