@@ -705,8 +705,24 @@ def _is_convo_registry_meta(meta: dict) -> bool:
     return meta.get("ingest_mode") == "registry"
 
 
+def _committed_marker_generation_token(marker_metas) -> Optional[str]:
+    """Return the published generation token from a commit-marker get()."""
+    for meta in marker_metas or []:
+        if not isinstance(meta, dict):
+            continue
+        token = meta.get("mine_generation_commit")
+        if meta.get("mine_commit_marker") is True and isinstance(token, str) and token:
+            return token
+    return None
+
+
 def _active_drawer_generation_token(existing: dict) -> Optional[str]:
-    """Return the single non-staged drawer token, if the active set agrees."""
+    """Return the single non-staged drawer token, if the active set agrees.
+
+    Residual rows after a failed T1→T2 rewrite cleanup can still carry both
+    tokens, so this inference returns None even though the commit marker
+    names T2. Callers that have the marker must pass that token instead.
+    """
     tokens = {
         meta.get("mine_generation_token")
         for meta in existing.values()
@@ -742,13 +758,13 @@ def _committed_active_matches(matches, active_token: Optional[str]):
 
 
 def _is_append_only_growth(planned_chunks, existing, active_token: Optional[str] = None) -> bool:
-    """True when this pass only adds new logical drawers to the committed set.
+    """True when this pass restates or extends the committed generation.
 
-    Matching leftover content is not enough. A failed A→B cleanup can leave
-    tokenless A beside committed B; a later B→A reversion plus append would
-    otherwise look like append-only growth and retag retired A with B's token.
-    Reused matches must be committed active rows so repeated appends stay
-    incremental without reviving obsolete text.
+    Shrink and rewrite still mint a new token. Matching leftover content is
+    not enough: a failed A→B cleanup can leave retired A beside committed B,
+    and a later B→A reversion plus append must not retag A with B's token.
+    Reused matches must be committed active rows so repeated appends and a
+    later cleanup retry stay incremental without reviving obsolete text.
     """
     if not existing or not planned_chunks:
         return False
@@ -758,13 +774,9 @@ def _is_append_only_growth(planned_chunks, existing, active_token: Optional[str]
             continue
         if _drawer_logical_id(physical_id, meta) not in planned_logical:
             return False
-    if any(
+    return not any(
         item["candidates"] and not _committed_active_matches(item["matches"], active_token)
         for item in planned_chunks
-    ):
-        return False
-    return any(
-        not _committed_active_matches(item["matches"], active_token) for item in planned_chunks
     )
 
 
@@ -1040,18 +1052,21 @@ def _plan_convo_generation_writes(
     chunk_total,
     source_mtime,
     content_hash,
+    active_token: Optional[str] = None,
 ):
     """Decide upserts, in-place refreshes, and generation copies for one pass."""
     content_set_token = _content_set_generation_token(
         [(item["logical_drawer_id"], item["chunk_hash"]) for item in planned_chunks]
     )
-    active_token = _active_drawer_generation_token(existing)
     # Repeated appends must not mint a new content-set token: that would clone
     # every unchanged active row onto new physical ids and delete the old
-    # ones. Reuse the committed token so vectors stay in place; new rows still
-    # inherit it so a later failed shrink cleanup can hide them. Matching
-    # leftover content is not enough — the reused rows must already belong
-    # to that committed generation.
+    # ones. The commit marker is the authority for which token is live;
+    # residual rows after a failed T1→T2 cleanup can still carry both tokens,
+    # so inferring from them returns None and would re-clone the transcript.
+    # Matching leftover content is not enough — the reused rows must already
+    # belong to that committed generation.
+    if not isinstance(active_token, str) or not active_token:
+        active_token = _active_drawer_generation_token(existing)
     if _is_append_only_growth(planned_chunks, existing, active_token) and active_token:
         generation_token = active_token
     else:
@@ -1211,13 +1226,16 @@ def _file_chunks_locked(
         # Re-check after lock — another agent may have just finished this file
         # at the current schema/mtime. A stale hit here returns False, so we
         # still fall through to the incremental path below.
+        pending_cleanup = False
+        active_token = None
         try:
             with _access_read(access_gate):
                 marker_result = collection.get(ids=[commit_id], include=["metadatas"])
+                marker_metas = marker_result.get("metadatas") or []
                 pending_cleanup = any(
-                    (meta or {}).get("mine_cleanup_pending") is True
-                    for meta in (marker_result.get("metadatas") or [])
+                    (meta or {}).get("mine_cleanup_pending") is True for meta in marker_metas
                 )
+                active_token = _committed_marker_generation_token(marker_metas)
                 if not pending_cleanup and file_already_mined(
                     collection, source_file, check_mtime=True, extract_mode=extract_mode
                 ):
@@ -1320,17 +1338,19 @@ def _file_chunks_locked(
             chunk_total=chunk_total,
             source_mtime=source_mtime,
             content_hash=content_hash,
+            active_token=active_token,
         )
 
         # Shrink, rewrite, and the first growth after a tokenless mine use a
         # two-phase completion marker. New/changed rows are first written
         # without the current source mtime; unchanged rows keep their old
         # mtime unless a rewrite/shrink publishes a new token, in which case
-        # they are cloned first. Append-only growth reuses the active token
-        # so unchanged rows are only metadata-refreshed. Only after orphan
-        # cleanup succeeds do we stamp the whole target set current. A
-        # transient delete failure then remains visibly incomplete and
-        # retries even if the source never changes again.
+        # they are cloned first. Append-only growth reuses the commit
+        # marker's active token so unchanged rows are only
+        # metadata-refreshed. Only after orphan cleanup succeeds do we
+        # stamp the whole target set current. A transient delete failure
+        # then remains visibly incomplete and retries even if the source
+        # never changes again.
         stale_ids = [drawer_id for drawer_id in existing if drawer_id not in new_ids]
         commit_metadata = {
             "wing": wing,

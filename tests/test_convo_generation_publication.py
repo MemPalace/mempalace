@@ -521,6 +521,12 @@ def _snapshot_active_rows(collection):
     }
 
 
+def _snapshot_token_rows(collection, token):
+    return {
+        key: value for key, value in _snapshot_active_rows(collection).items() if value[2] == token
+    }
+
+
 def _plan_chunk(logical_id, chunk_hash, content, index, stored=None, rewritten=False):
     candidate = (logical_id, stored) if stored is not None else None
     if rewritten:
@@ -542,7 +548,7 @@ def _plan_chunk(logical_id, chunk_hash, content, index, stored=None, rewritten=F
     }
 
 
-def _plan_writes(planned, existing, pending_cleanup=False):
+def _plan_writes(planned, existing, pending_cleanup=False, active_token=None):
     return convo_miner._plan_convo_generation_writes(
         planned,
         existing=existing,
@@ -556,6 +562,7 @@ def _plan_writes(planned, existing, pending_cleanup=False):
         chunk_total=len(planned),
         source_mtime=1.0,
         content_hash=None,
+        active_token=active_token,
     )
 
 
@@ -750,6 +757,99 @@ def test_plan_reuses_active_token_when_append_retry_has_pending_cleanup(monkeypa
     assert {row_id for row_id, _ in to_touch} == {"drawer-a"}
     assert [row_id for row_id, _, _ in to_upsert] == ["drawer-b"]
     assert new_ids == {"drawer-a", "drawer-b"}
+
+
+def test_plan_reuses_marker_token_when_residual_rows_have_two_tokens(monkeypatch):
+    """Failed T1→T2 cleanup leaves both tokens; the marker still names T2."""
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    t1, t2 = "t1-token", "t2-token"
+    leftover_a = {
+        "logical_drawer_id": "drawer-a",
+        "chunk_hash": "hash-a1",
+        "mine_generation_token": t1,
+        "mine_staged": False,
+        "chunk_index": 0,
+    }
+    leftover_b = {
+        "logical_drawer_id": "drawer-b",
+        "chunk_hash": "hash-b",
+        "mine_generation_token": t1,
+        "mine_staged": False,
+        "chunk_index": 1,
+    }
+    active_a = {
+        "logical_drawer_id": "drawer-a",
+        "chunk_hash": "hash-a2",
+        "mine_generation_token": t2,
+        "mine_staged": False,
+        "chunk_index": 0,
+    }
+    active_b = {
+        "logical_drawer_id": "drawer-b",
+        "chunk_hash": "hash-b",
+        "mine_generation_token": t2,
+        "mine_staged": False,
+        "chunk_index": 1,
+    }
+    existing = {
+        "drawer-a-t1": leftover_a,
+        "drawer-b-t1": leftover_b,
+        "drawer-a-t2": active_a,
+        "drawer-b-t2": active_b,
+    }
+    planned = [
+        {
+            "chunk": {"content": "A2", "chunk_index": 0},
+            "chunk_room": "general",
+            "logical_drawer_id": "drawer-a",
+            "chunk_hash": "hash-a2",
+            "candidates": [("drawer-a-t1", leftover_a), ("drawer-a-t2", active_a)],
+            "matches": [("drawer-a-t2", active_a)],
+        },
+        {
+            "chunk": {"content": "B", "chunk_index": 1},
+            "chunk_room": "general",
+            "logical_drawer_id": "drawer-b",
+            "chunk_hash": "hash-b",
+            "candidates": [("drawer-b-t1", leftover_b), ("drawer-b-t2", active_b)],
+            "matches": [("drawer-b-t1", leftover_b), ("drawer-b-t2", active_b)],
+        },
+        _plan_chunk("drawer-c", "hash-c", "C", 2),
+    ]
+    assert convo_miner._active_drawer_generation_token(existing) is None
+    assert convo_miner._is_append_only_growth(planned, existing, t2) is True
+    assert convo_miner._is_append_only_growth(planned, existing, t1) is False
+
+    to_upsert, to_touch, to_copy, new_ids, token, will_publish = _plan_writes(
+        planned, existing, pending_cleanup=True, active_token=t2
+    )
+    assert token == t2
+    assert will_publish is True
+    assert to_copy == []
+    assert {row_id for row_id, _ in to_touch} == {"drawer-a-t2", "drawer-b-t2"}
+    assert [row_id for row_id, _, _ in to_upsert] == ["drawer-c"]
+    assert new_ids == {"drawer-a-t2", "drawer-b-t2", "drawer-c"}
+    assert "drawer-a-t1" not in new_ids
+    assert "drawer-b-t1" not in new_ids
+
+    _, _, inferred_copies, inferred_ids, inferred_token, _ = _plan_writes(
+        planned, existing, pending_cleanup=True
+    )
+    assert inferred_token != t2
+    assert inferred_copies
+    assert "drawer-a-t1" not in inferred_ids
+    assert "drawer-b-t1" not in inferred_ids
+
+    same_set = planned[:2]
+    assert convo_miner._is_append_only_growth(same_set, existing, t2) is True
+    retry_upsert, retry_touch, retry_copy, retry_ids, retry_token, _ = _plan_writes(
+        same_set, existing, pending_cleanup=True, active_token=t2
+    )
+    assert retry_token == t2
+    assert retry_copy == []
+    assert retry_upsert == []
+    assert {row_id for row_id, _ in retry_touch} == {"drawer-a-t2", "drawer-b-t2"}
+    assert retry_ids == {"drawer-a-t2", "drawer-b-t2"}
 
 
 def test_plan_clones_reused_rows_when_shrinking(monkeypatch):
@@ -1013,3 +1113,133 @@ def test_failed_rewrite_cleanup_then_revert_append_exposes_newest_text(tmp_path,
     assert mine(collection, wanted)[2] is False
     _assert_all_read_paths(collection, source, wanted)
     assert all(key not in collection.rows for key in b_ids)
+
+
+def test_failed_tokened_rewrite_cleanup_then_repeated_appends_keep_active_rows(
+    tmp_path, monkeypatch
+):
+    """Tokened T1→T2 rewrite delete failure must not re-clone on later appends.
+
+    Residual rows then carry both tokens, so inferring the active token from
+    them returns None even though the commit marker names T2. Subsequent
+    appends must keep T2's physical ids/embeddings and only insert new tails
+    until cleanup retry finally deletes T1.
+    """
+    source = str(tmp_path / "session.txt")
+    (tmp_path / "session.txt").write_text("transcript", encoding="utf-8")
+    monkeypatch.setattr(convo_miner, "mine_lock", lambda *_: contextlib.nullcontext())
+    monkeypatch.setattr(convo_miner, "file_already_mined", lambda *_a, **_k: False)
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 1)
+
+    def mine(collection, documents):
+        chunks = [{"content": text, "chunk_index": index} for index, text in enumerate(documents)]
+        return convo_miner._file_chunks_locked(
+            collection, source, chunks, "wing", "general", "agent", "exchange"
+        )
+
+    class TrackingCollection(GenerationCollection):
+        def __init__(self):
+            super().__init__()
+            self.upserted_ids = []
+            self.deleted_ids = []
+            self.fail_delete = False
+
+        def upsert(self, ids, documents, metadatas, embeddings=None):
+            self.upserted_ids.extend(ids)
+            super().upsert(ids, documents, metadatas, embeddings)
+
+        def delete(self, ids):
+            self.deleted_ids.extend(ids)
+            if self.fail_delete:
+                raise InjectedWriteFailure("stale delete failed")
+            super().delete(ids)
+
+    initial = ["original first chunk", "unchanged middle chunk", "unchanged last chunk"]
+    t1_docs = ["first revision", *initial[1:]]
+    t2_docs = ["second revision", *initial[1:]]
+    grown = [
+        [*t2_docs, "appended fourth chunk", "appended fifth chunk"],
+        [
+            *t2_docs,
+            "appended fourth chunk",
+            "appended fifth chunk",
+            "appended sixth",
+            "appended seventh",
+        ],
+        [
+            *t2_docs,
+            "appended fourth chunk",
+            "appended fifth chunk",
+            "appended sixth",
+            "appended seventh",
+            "appended eighth",
+            "appended ninth",
+        ],
+    ]
+    collection = TrackingCollection()
+    assert mine(collection, initial)[2] is False
+    _assert_all_read_paths(collection, source, initial)
+    assert mine(collection, t1_docs)[2] is False
+    _assert_all_read_paths(collection, source, t1_docs)
+    commit_id = make_convo_commit_id(source, "exchange")
+    t1 = collection.rows[commit_id]["metadata"]["mine_generation_commit"]
+    t1_ids = set(_snapshot_token_rows(collection, t1))
+    assert t1_ids
+
+    collection.embedded_documents.clear()
+    collection.upserted_ids.clear()
+    collection.deleted_ids.clear()
+    collection.fail_delete = True
+    skipped = mine(collection, t2_docs)[2]
+    assert skipped is True
+    assert all(key in collection.rows for key in t1_ids)
+    _assert_all_read_paths(collection, source, t2_docs)
+    t2 = collection.rows[commit_id]["metadata"]["mine_generation_commit"]
+    assert t2
+    assert t2 != t1
+    residual = {key: row["metadata"] for key, row in _non_marker_rows(collection).items()}
+    assert convo_miner._active_drawer_generation_token(residual) is None
+    assert (
+        convo_miner._committed_marker_generation_token([collection.rows[commit_id]["metadata"]])
+        == t2
+    )
+    t2_active = _snapshot_token_rows(collection, t2)
+    assert t2_active
+    assert t1_ids.isdisjoint(t2_active)
+
+    previous_active = t2_active
+    for documents in grown:
+        collection.upserted_ids.clear()
+        collection.deleted_ids.clear()
+        collection.embedded_documents.clear()
+        skipped = mine(collection, documents)[2]
+        assert skipped is True
+        _assert_all_read_paths(collection, source, documents)
+        assert collection.rows[commit_id]["metadata"]["mine_generation_commit"] == t2
+        assert all(key in collection.rows for key in t1_ids)
+        current_active = _snapshot_token_rows(collection, t2)
+        for key, (embedding, document, token) in previous_active.items():
+            assert key in current_active
+            assert current_active[key][0] == embedding
+            assert current_active[key][1] == document
+            assert current_active[key][2] == token
+            assert key not in collection.upserted_ids
+            assert key not in collection.deleted_ids
+        assert collection.embedded_documents == documents[len(previous_active) :]
+        previous_active = current_active
+
+    collection.fail_delete = False
+    collection.embedded_documents.clear()
+    collection.upserted_ids.clear()
+    collection.deleted_ids.clear()
+    assert mine(collection, grown[-1])[2] is False
+    _assert_all_read_paths(collection, source, grown[-1])
+    assert all(key not in collection.rows for key in t1_ids)
+    for key, (embedding, document, token) in t2_active.items():
+        row = collection.rows[key]
+        assert list(row["embedding"]) == embedding
+        assert row["document"] == document
+        assert row["metadata"].get("mine_generation_token") == token
+    assert collection.embedded_documents == []
+    assert collection.rows[commit_id]["metadata"]["mine_generation_commit"] == t2
