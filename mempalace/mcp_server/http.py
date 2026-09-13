@@ -708,8 +708,8 @@ def _mesh_peers_payload() -> dict:
     }
 
 
-_peer_sync_thread: threading.Thread | None = None
-_peer_sync_stop_event: threading.Event | None = None
+_peer_sync_thread: Optional[threading.Thread] = None
+_peer_sync_stop_event: Optional[threading.Event] = None
 
 
 def _peer_sync_interval_s() -> float:
@@ -740,8 +740,8 @@ def _stop_peer_sync_thread(timeout: float = 5.0) -> bool:
 
 
 def _start_peer_sync_thread(
-    stop_event: threading.Event | None = None,
-) -> threading.Thread | None:
+    stop_event: Optional[threading.Event] = None,
+) -> Optional[threading.Thread]:
     """Background anti-entropy loop for the logstream (RFC 004 step 0).
 
     Runs in the serving process so a hub with configured peers converges
