@@ -1447,6 +1447,213 @@ def test_update_drawer_chunked_logical_id_rewrites_group(monkeypatch, config, pa
     assert listed["drawers"][0]["drawer_id"] == logical_id
 
 
+def _verbatim_chunk(label: str, chunk_size: int) -> str:
+    seed = f"{label} "
+    return (seed * (chunk_size // len(seed) + 1))[:chunk_size]
+
+
+def _seed_mined_conversation_drawer(
+    palace_path, logical_id, physical_id, content, token="active-token"
+):
+    _client, col = _get_collection(palace_path, create=True)
+    source = "/tmp/mined-session.jsonl"
+    col.upsert(
+        ids=[physical_id, f"{physical_id}-marker"],
+        documents=[content, f"[commit {token} {physical_id}]"],
+        metadatas=[
+            {
+                "wing": "sessions",
+                "room": "general",
+                "logical_drawer_id": logical_id,
+                "mine_generation_token": token,
+                "source_file": source,
+                "extract_mode": "exchange",
+                "ingest_mode": "convos",
+                "filed_at": "2026-09-01T00:00:00",
+            },
+            {
+                "wing": "sessions",
+                "room": "_registry",
+                "mine_commit_marker": True,
+                "mine_generation_commit": token,
+                "mine_staged": True,
+                "source_file": source,
+                "extract_mode": "exchange",
+            },
+        ],
+    )
+    del _client
+
+
+def test_update_mined_conversation_drawer_past_chunk_size_preserves_verbatim(
+    monkeypatch, config, palace_path, kg
+):
+    """Oversized update of a mined drawer must keep every chunk reachable."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    logical_id = "logical-mined-convo"
+    physical_id = "physical-mined-convo"
+    original = "short original verbatim mined text"
+    _seed_mined_conversation_drawer(palace_path, logical_id, physical_id, original)
+
+    from mempalace.mcp_server import (
+        tool_delete_drawer,
+        tool_get_drawer,
+        tool_list_drawers,
+        tool_search,
+        tool_update_drawer,
+    )
+    from mempalace.searcher import search_memories
+
+    fetched = tool_get_drawer(logical_id)
+    assert fetched["content"] == original
+    assert "chunks" not in fetched
+
+    chunk_size = config.chunk_size
+    labels = ("alphaVERBATIM", "betaVERBATIM", "gammaVERBATIM")
+    parts = [_verbatim_chunk(label, chunk_size) for label in labels]
+    long_content = "".join(parts)
+    assert len(long_content) > chunk_size
+
+    updated = tool_update_drawer(logical_id, content=long_content)
+    assert updated["success"] is True
+    assert updated["drawer_id"] == logical_id
+    assert updated["chunks"] == 3
+    assert updated["chunk_ids"] == [f"{logical_id}_chunk_{index:06d}" for index in range(3)]
+
+    fetched = tool_get_drawer(logical_id)
+    assert fetched["content"] == long_content
+    assert fetched["chunks"] == 3
+    assert fetched["chunk_ids"] == updated["chunk_ids"]
+
+    _client, col = _get_collection(palace_path)
+    stored = col.get(ids=updated["chunk_ids"], include=["documents", "metadatas"])
+    del _client
+    assert stored["ids"]
+    ordered = sorted(
+        zip(stored["ids"], stored["documents"], stored["metadatas"]),
+        key=lambda row: row[2].get("chunk_index", 0),
+    )
+    assert "".join(doc for _id, doc, _meta in ordered) == long_content
+    for _id, _doc, meta in ordered:
+        assert meta.get("parent_drawer_id") == logical_id
+        assert not meta.get("logical_drawer_id")
+        assert meta.get("mine_generation_token") == "active-token"
+
+    listed = tool_list_drawers(wing="sessions", room="general")
+    assert listed["total"] == 1
+    assert listed["drawers"][0]["drawer_id"] == logical_id
+    assert listed["drawers"][0]["chunks"] == 3
+
+    for label, part in zip(labels, parts):
+        mcp_hits = tool_search(query=label, limit=10)
+        matching = [hit for hit in mcp_hits["results"] if label in hit["text"]]
+        assert matching, f"MCP search missed chunk {label}"
+        assert all(hit["drawer_id"] == logical_id for hit in matching)
+        assert any(hit["text"] == part for hit in matching)
+
+        api_hits = search_memories(label, palace_path, n_results=10)
+        matching = [hit for hit in api_hits["results"] if label in hit["text"]]
+        assert matching, f"generation-aware search missed chunk {label}"
+        assert all(hit["drawer_id"] == logical_id for hit in matching)
+        assert any(hit["text"] == part for hit in matching)
+
+    second_labels = ("deltaVERBATIM", "epsilonVERBATIM")
+    second_parts = [_verbatim_chunk(label, chunk_size) for label in second_labels]
+    second_content = "".join(second_parts)
+    updated = tool_update_drawer(logical_id, content=second_content)
+    assert updated["success"] is True
+    assert updated["chunks"] == 2
+
+    fetched = tool_get_drawer(logical_id)
+    assert fetched["content"] == second_content
+    assert fetched["chunks"] == 2
+    assert fetched["chunk_ids"] == [f"{logical_id}_chunk_{index:06d}" for index in range(2)]
+
+    gone = tool_search(query="gammaVERBATIM", limit=10)
+    assert not any("gammaVERBATIM" in hit["text"] for hit in gone["results"])
+    for label, part in zip(second_labels, second_parts):
+        hits = tool_search(query=label, limit=10)
+        matching = [hit for hit in hits["results"] if label in hit["text"]]
+        assert matching
+        assert any(hit["text"] == part for hit in matching)
+        assert all(hit["drawer_id"] == logical_id for hit in matching)
+
+    deleted = tool_delete_drawer(logical_id)
+    assert deleted["success"] is True
+    assert deleted["chunks_deleted"] == 2
+    assert "error" in tool_get_drawer(logical_id)
+    listed = tool_list_drawers(wing="sessions", room="general")
+    assert listed["total"] == 0
+
+
+def test_legacy_mined_parent_chunks_sharing_logical_id_reassemble_and_search(
+    monkeypatch, config, palace_path, kg
+):
+    """Already-written palaces that inherited logical_drawer_id onto parent chunks."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    logical_id = "logical-legacy-mined"
+    token = "active-token"
+    source = "/tmp/legacy-mined-session.jsonl"
+    chunk_size = config.chunk_size
+    labels = ("legacyAlpha", "legacyBeta", "legacyGamma")
+    parts = [_verbatim_chunk(label, chunk_size) for label in labels]
+    content = "".join(parts)
+    chunk_ids = [f"{logical_id}_chunk_{index:06d}" for index in range(len(parts))]
+
+    _client, col = _get_collection(palace_path, create=True)
+    col.upsert(
+        ids=[*chunk_ids, "legacy-mined-marker"],
+        documents=[*parts, "[commit active-token legacy-mined]"],
+        metadatas=[
+            *[
+                {
+                    "wing": "sessions",
+                    "room": "general",
+                    "logical_drawer_id": logical_id,
+                    "parent_drawer_id": logical_id,
+                    "chunk_index": index,
+                    "mine_generation_token": token,
+                    "source_file": source,
+                    "extract_mode": "exchange",
+                    "ingest_mode": "convos",
+                    "filed_at": "2026-09-01T00:00:00",
+                }
+                for index in range(len(parts))
+            ],
+            {
+                "wing": "sessions",
+                "room": "_registry",
+                "mine_commit_marker": True,
+                "mine_generation_commit": token,
+                "mine_staged": True,
+                "source_file": source,
+                "extract_mode": "exchange",
+            },
+        ],
+    )
+    del _client
+
+    from mempalace.mcp_server import tool_get_drawer, tool_search
+    from mempalace.searcher import search_memories
+
+    fetched = tool_get_drawer(logical_id)
+    assert fetched["content"] == content
+    assert fetched["chunks"] == 3
+    assert fetched["chunk_ids"] == chunk_ids
+
+    for label, part in zip(labels, parts):
+        mcp_hits = tool_search(query=label, limit=10)
+        matching = [hit for hit in mcp_hits["results"] if label in hit["text"]]
+        assert matching, f"MCP search missed legacy chunk {label}"
+        assert all(hit["drawer_id"] == logical_id for hit in matching)
+        assert any(hit["text"] == part for hit in matching)
+
+        api_hits = search_memories(label, palace_path, n_results=10)
+        matching = [hit for hit in api_hits["results"] if label in hit["text"]]
+        assert matching, f"generation-aware search missed legacy chunk {label}"
+        assert all(hit["drawer_id"] == logical_id for hit in matching)
+
+
 class TestDeleteBySource:
     """``tool_delete_by_source`` — bulk cleanup of benchmark/test contamination (#1722)."""
 

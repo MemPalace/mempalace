@@ -236,7 +236,9 @@ def search(
             "distance": float(dist),
             "metadata": meta or {},
             "created_at": (meta or {}).get("filed_at", ""),
-            "_logical_generation_id": (meta or {}).get("logical_drawer_id"),
+            "_parent_drawer_id": (meta or {}).get("parent_drawer_id"),
+            "_parent_entry_id": (meta or {}).get("parent_entry_id"),
+            "_logical_generation_id": _logical_generation_id(meta),
             "_physical_drawer_id": stored_id,
             "_active_generation": (meta or {}).get("mine_generation_token") in committed_tokens,
         }

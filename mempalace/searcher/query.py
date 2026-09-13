@@ -37,9 +37,9 @@ def _current_generation_ids_for_query(
     collection, raw, committed_tokens, tokened_source_modes=frozenset()
 ) -> dict:
     logical_ids = {
-        (meta or {}).get("logical_drawer_id")
+        _logical_generation_id(meta)
         for meta in _first_or_empty(raw, "metadatas")
-        if (meta or {}).get("logical_drawer_id")
+        if _logical_generation_id(meta)
     }
     if not logical_ids:
         return {}
@@ -58,7 +58,7 @@ def _current_generation_ids_for_query(
         meta = metas[index] if index < len(metas) else {}
         if not _is_visible_generation_metadata(meta, committed_tokens, tokened_source_modes):
             continue
-        logical_id = (meta or {}).get("logical_drawer_id")
+        logical_id = _logical_generation_id(meta)
         key = (
             (meta or {}).get("mine_generation_token") in committed_tokens,
             (meta or {}).get("filed_at", ""),
@@ -87,7 +87,7 @@ def _post_filter_drawer_query(
         meta = meta or {}
         if not _is_visible_generation_metadata(meta, committed_tokens, tokened_source_modes):
             continue
-        logical_id = meta.get("logical_drawer_id")
+        logical_id = _logical_generation_id(meta)
         if logical_id and current_generations.get(logical_id) != stored_drawer_id:
             continue
         if wing and meta.get("wing") != wing:
@@ -470,7 +470,8 @@ def search_memories(
             "_source_file_full": source,
             "_chunk_index": meta.get("chunk_index"),
             "_parent_drawer_id": meta.get("parent_drawer_id"),
-            "_logical_generation_id": meta.get("logical_drawer_id"),
+            "_parent_entry_id": meta.get("parent_entry_id"),
+            "_logical_generation_id": _logical_generation_id(meta),
             "_physical_drawer_id": stored_drawer_id,
             "_active_generation": meta.get("mine_generation_token") in committed_tokens,
         }

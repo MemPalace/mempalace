@@ -49,13 +49,42 @@ def _result_drawer_id(meta, stored_drawer_id):
     )
 
 
+def _logical_parent_id(meta):
+    """Return the logical-group id from chunk metadata, or None.
+
+    Kept in sync with ``mcp_server._PARENT_ID_KEYS``.
+    """
+    meta = meta or {}
+    for key in ("parent_drawer_id", "parent_entry_id"):
+        value = meta.get(key)
+        if value:
+            return value
+    return None
+
+
+def _logical_generation_id(meta):
+    """Conversation generation id, excluding physical parent-chunk rows."""
+    meta = meta or {}
+    if _logical_parent_id(meta):
+        return None
+    return meta.get("logical_drawer_id")
+
+
 def _collapse_logical_generation_hits(hits: list) -> list:
-    """Keep the newest visible physical generation for each stable logical id."""
+    """Keep the newest visible physical generation for each stable logical id.
+
+    Physical parent chunks pass through so every chunk stays searchable.
+    """
     chosen = {}
     passthrough = []
     for hit in hits:
         logical_id = hit.get("_logical_generation_id")
-        if not logical_id:
+        if (
+            not logical_id
+            or hit.get("_parent_drawer_id")
+            or hit.get("_parent_entry_id")
+            or _logical_parent_id(hit.get("metadata"))
+        ):
             passthrough.append(hit)
             continue
         key = (
@@ -72,14 +101,17 @@ def _collapse_logical_generation_hits(hits: list) -> list:
 def _collapse_physical_generation_rows(
     rows, committed_tokens, tokened_source_modes=frozenset()
 ) -> list:
-    """Keep the active physical row per logical id; retain ordinary rows."""
+    """Keep the active physical row per logical id; retain ordinary rows.
+
+    Parent chunks of one logical drawer are ordinary rows, not generations.
+    """
     chosen = {}
     ordinary = []
     for physical_id, document, metadata in rows:
         metadata = metadata or {}
         if not _is_visible_generation_metadata(metadata, committed_tokens, tokened_source_modes):
             continue
-        logical_id = metadata.get("logical_drawer_id")
+        logical_id = _logical_generation_id(metadata)
         if not logical_id:
             ordinary.append((physical_id, document, metadata))
             continue

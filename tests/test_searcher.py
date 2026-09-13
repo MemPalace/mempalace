@@ -859,6 +859,83 @@ class TestSearchMemories:
 
         assert [(row[0], row[1]) for row in collapsed] == [("active-tokened", "current text")]
 
+    def test_parent_chunks_sharing_logical_id_are_not_collapsed(self):
+        from mempalace.searcher import (
+            _collapse_logical_generation_hits,
+            _collapse_physical_generation_rows,
+        )
+
+        rows = [
+            (
+                f"logical_chunk_{index:06d}",
+                f"chunk-{index}-UNIQUE",
+                {
+                    "logical_drawer_id": "logical",
+                    "parent_drawer_id": "logical",
+                    "chunk_index": index,
+                    "mine_generation_token": "active-token",
+                    "filed_at": "2026-09-01T00:00:00",
+                },
+            )
+            for index in range(3)
+        ]
+
+        collapsed = _collapse_physical_generation_rows(rows, {"active-token"})
+        assert [(row[0], row[1]) for row in collapsed] == [
+            (f"logical_chunk_{index:06d}", f"chunk-{index}-UNIQUE") for index in range(3)
+        ]
+
+        hits = [
+            {
+                "text": f"chunk-{index}-UNIQUE",
+                "_logical_generation_id": "logical",
+                "_parent_drawer_id": "logical",
+                "_physical_drawer_id": f"logical_chunk_{index:06d}",
+                "_active_generation": True,
+                "created_at": "2026-09-01T00:00:00",
+            }
+            for index in range(3)
+        ]
+        assert [hit["text"] for hit in _collapse_logical_generation_hits(hits)] == [
+            f"chunk-{index}-UNIQUE" for index in range(3)
+        ]
+
+    def test_post_filter_keeps_all_parent_chunks_sharing_logical_id(self):
+        from mempalace.searcher import _post_filter_drawer_query
+
+        chunk_ids = ["logical_chunk_000000", "logical_chunk_000001"]
+        metas = [
+            {
+                "logical_drawer_id": "logical",
+                "parent_drawer_id": "logical",
+                "chunk_index": 0,
+                "mine_generation_token": "tok",
+            },
+            {
+                "logical_drawer_id": "logical",
+                "parent_drawer_id": "logical",
+                "chunk_index": 1,
+                "mine_generation_token": "tok",
+            },
+        ]
+
+        class Collection:
+            @staticmethod
+            def get(**_kwargs):
+                return {"ids": chunk_ids, "metadatas": metas}
+
+        raw = {
+            "ids": [chunk_ids],
+            "documents": [["alpha chunk", "beta chunk"]],
+            "metadatas": [metas],
+            "distances": [[0.1, 0.2]],
+        }
+        filtered = _post_filter_drawer_query(
+            Collection(), raw, None, None, None, frozenset({"tok"})
+        )
+        assert filtered["ids"][0] == chunk_ids
+        assert filtered["documents"][0] == ["alpha chunk", "beta chunk"]
+
     def test_wing_and_room_filter(self, palace_path, seeded_collection):
         result = search_memories("code", palace_path, wing="project", room="frontend")
         assert all(r["wing"] == "project" and r["room"] == "frontend" for r in result["results"])

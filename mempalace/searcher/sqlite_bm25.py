@@ -141,7 +141,11 @@ def _sqlite_active_generation_rows(
                 target["document"] = value or ""
             elif value is not None:
                 target["metadata"][row[1]] = value
-        return {item["logical_id"]: item for item in by_internal.values()}
+        return {
+            item["logical_id"]: item
+            for item in by_internal.values()
+            if not _logical_parent_id(item.get("metadata"))
+        }
     finally:
         conn.close()
 
@@ -168,7 +172,11 @@ def _resolve_sqlite_generation_candidates(
     emitted = set()
     for candidate in candidates:
         logical_id = candidate.get("_logical_generation_id")
-        if not logical_id:
+        if (
+            not logical_id
+            or candidate.get("_parent_drawer_id")
+            or candidate.get("_parent_entry_id")
+        ):
             resolved.append(candidate)
             continue
         if logical_id in emitted:
@@ -292,7 +300,9 @@ def _sqlite_bm25_candidates_from_drawers(
                 "matched_via": "bm25_sqlite",
                 "_source_file_full": full_source,
                 "_chunk_index": meta.get("chunk_index"),
-                "_logical_generation_id": meta.get("logical_drawer_id"),
+                "_parent_drawer_id": meta.get("parent_drawer_id"),
+                "_parent_entry_id": meta.get("parent_entry_id"),
+                "_logical_generation_id": _logical_generation_id(meta),
                 "_physical_drawer_id": d["_stored_drawer_id"],
                 "_active_generation": meta.get("mine_generation_token") in committed_tokens,
                 "_generation_token": meta.get("mine_generation_token"),
@@ -688,6 +698,8 @@ def _bm25_only_via_sqlite(
         if not _include_internal:
             h.pop("_source_file_full", None)
             h.pop("_chunk_index", None)
+            h.pop("_parent_drawer_id", None)
+            h.pop("_parent_entry_id", None)
             h.pop("_logical_generation_id", None)
             h.pop("_physical_drawer_id", None)
             h.pop("_active_generation", None)
@@ -713,7 +725,7 @@ def _resolve_lexical_generation_hits(
 ):
     """Replace stale lexical hits with their newest visible physical generation."""
     logical_metas = [
-        hit.metadata or {} for hit in hits if (hit.metadata or {}).get("logical_drawer_id")
+        hit.metadata or {} for hit in hits if _logical_generation_id(hit.metadata or {})
     ]
     current_ids = _current_generation_ids_for_query(
         drawers_col,
@@ -752,7 +764,7 @@ def _resolve_lexical_generation_hits(
     resolved = []
     emitted_logical = set()
     for hit in hits:
-        logical_id = (hit.metadata or {}).get("logical_drawer_id")
+        logical_id = _logical_generation_id(hit.metadata or {})
         if not logical_id:
             resolved.append(hit)
             continue
@@ -894,7 +906,9 @@ def _merge_bm25_union_candidates(
                 "bm25_score": round(float(hit.score), 3),
                 "_source_file_full": full_source,
                 "_chunk_index": meta.get("chunk_index"),
-                "_logical_generation_id": meta.get("logical_drawer_id"),
+                "_parent_drawer_id": meta.get("parent_drawer_id"),
+                "_parent_entry_id": meta.get("parent_entry_id"),
+                "_logical_generation_id": _logical_generation_id(meta),
                 "_physical_drawer_id": hit.id,
                 "_active_generation": meta.get("mine_generation_token") in committed_tokens,
             }

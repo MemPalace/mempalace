@@ -132,7 +132,12 @@ def _logical_chunk_group(col, drawer_id: str):
 
 
 def _logical_generation_record(col, drawer_id: str):
-    """Resolve a stable conversation logical id to its visible physical row."""
+    """Resolve a stable conversation logical id to its visible physical row.
+
+    Parent chunks of this logical drawer share ``logical_drawer_id`` after an
+    oversized ``update_drawer``, but they are one physical split, not
+    competing generations. Reassemble those rows by ``chunk_index``.
+    """
     try:
         result = col.get(
             where={"logical_drawer_id": drawer_id},
@@ -161,6 +166,22 @@ def _logical_generation_record(col, drawer_id: str):
         )
     if not rows:
         return None
+    parent_rows = [row for row in rows if _logical_parent_id(row[4]) == drawer_id]
+    if parent_rows:
+        parent_rows.sort(key=lambda row: (_chunk_index(row[4]), row[2]))
+        leftover_ids = [row[2] for row in rows if _logical_parent_id(row[4]) != drawer_id]
+        chunk_ids = [row[2] for row in parent_rows]
+        chunk_docs = [row[3] or "" for row in parent_rows]
+        chunk_metas = [row[4] for row in parent_rows]
+        return {
+            "drawer_id": drawer_id,
+            "ids": chunk_ids + leftover_ids,
+            "documents": chunk_docs,
+            "metadatas": chunk_metas,
+            "content": "".join(chunk_docs),
+            "metadata": chunk_metas[0] if chunk_metas else {},
+            "chunked": True,
+        }
     rows.sort(key=lambda row: (row[0], row[1], row[2]), reverse=True)
     _, _, physical_id, document, metadata = rows[0]
     return {
@@ -407,6 +428,8 @@ def _build_chunk_rows(drawer_id: str, content: str, meta: dict, chunk_size: int)
 
     base_meta = _safe_meta(meta)
     base_meta.pop("chunk_index", None)
+    # Physical children of one logical drawer, not competing generations.
+    base_meta.pop("logical_drawer_id", None)
     base_meta["parent_drawer_id"] = drawer_id
 
     spans = (
