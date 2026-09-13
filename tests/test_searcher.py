@@ -1437,6 +1437,71 @@ class TestSearchCLI:
         assert "mempalace repair" in captured.out
         assert "diary entry that matches" in captured.out
 
+    def test_search_bm25_fallback_raises_when_generation_lookup_fails(
+        self, fake_palace_path, capsys
+    ):
+        """CLI BM25 fallback must not print a successful empty result on error.
+
+        ``_bm25_only_via_sqlite`` returns ``{error, results: []}``. Checking
+        only ``results`` made ``mempalace search`` print "No results found"
+        and exit 0.
+        """
+        bm25_error = {
+            "error": "Could not resolve current conversation generations",
+            "results": [],
+        }
+        with (
+            patch("mempalace.searcher.resolve_backend_name", return_value="chroma"),
+            patch(
+                "mempalace.backends.chroma.hnsw_capacity_status",
+                return_value={"diverged": True, "message": "test divergence"},
+            ),
+            patch("mempalace.searcher._bm25_only_via_sqlite", return_value=bm25_error),
+            patch("mempalace.searcher.get_collection") as mock_get_collection,
+        ):
+            with pytest.raises(SearchError, match="current conversation generation"):
+                search("anything", fake_palace_path)
+        captured = capsys.readouterr()
+        mock_get_collection.assert_not_called()
+        assert "Search error" in captured.out
+        assert "No results found" not in captured.out
+
+    def test_cmd_search_exits_nonzero_when_bm25_generation_lookup_fails(
+        self, fake_palace_path, capsys
+    ):
+        import argparse
+
+        from mempalace.cli import cmd_search
+
+        bm25_error = {
+            "error": "Could not resolve current conversation generations",
+            "results": [],
+        }
+        args = argparse.Namespace(
+            palace=fake_palace_path,
+            query="anything",
+            wing=None,
+            room=None,
+            results=5,
+            since=None,
+            before=None,
+        )
+        with (
+            patch("mempalace.cli._forward_search_to_hub", return_value=False),
+            patch("mempalace.searcher.resolve_backend_name", return_value="chroma"),
+            patch(
+                "mempalace.backends.chroma.hnsw_capacity_status",
+                return_value={"diverged": True, "message": "test divergence"},
+            ),
+            patch("mempalace.searcher._bm25_only_via_sqlite", return_value=bm25_error),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_search(args)
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "Search error" in captured.out
+        assert "No results found" not in captured.out
+
     def test_search_proceeds_to_vector_when_hnsw_healthy(self, fake_palace_path, capsys):
         """Paired guard: when HNSW is healthy, the divergence probe must NOT
         short-circuit to BM25 — vector search proceeds normally.
@@ -2065,6 +2130,98 @@ def test_bm25_only_via_sqlite_fails_closed_when_active_generation_query_fails(
     assert result["results"] == []
     assert "error" in result
     assert "current conversation generation" in result["error"]
+
+
+def test_bm25_only_via_sqlite_fails_closed_when_commit_state_query_fails(monkeypatch, tmp_path):
+    import sqlite3
+
+    from mempalace import searcher
+
+    db = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE VIRTUAL TABLE embedding_fulltext_search USING fts5(string_value, tokenize='trigram');
+        CREATE TABLE embedding_metadata (
+            id INTEGER, key TEXT, string_value TEXT, int_value INTEGER,
+            float_value REAL, bool_value INTEGER
+        );
+        CREATE TABLE collections (id TEXT PRIMARY KEY, name TEXT);
+        CREATE TABLE segments (id TEXT PRIMARY KEY, collection TEXT);
+        CREATE TABLE embeddings (
+            id INTEGER PRIMARY KEY, segment_id TEXT, embedding_id TEXT, created_at TEXT
+        );
+        INSERT INTO collections VALUES ('target', 'target_drawers');
+        INSERT INTO segments VALUES ('target-seg', 'target');
+        INSERT INTO embeddings VALUES (1, 'target-seg', 'physical-current', '2026-09-02');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (1, 'tokened generation session phrase');
+        INSERT INTO embedding_metadata VALUES
+            (1, 'chroma:document', 'tokened generation session phrase', NULL, NULL, NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    def boom(*_args, **_kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(searcher, "_sqlite_generation_commit_state", boom)
+    result = searcher._bm25_only_via_sqlite(
+        "tokened generation session",
+        str(tmp_path),
+        collection_name="target_drawers",
+    )
+    assert result["results"] == []
+    assert "error" in result
+    assert "generation commit" in result["error"].lower()
+
+
+def test_search_memories_vector_disabled_commit_state_error_is_envelope(monkeypatch, tmp_path):
+    import sqlite3
+
+    from mempalace import searcher
+
+    db = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE VIRTUAL TABLE embedding_fulltext_search USING fts5(string_value, tokenize='trigram');
+        CREATE TABLE embedding_metadata (
+            id INTEGER, key TEXT, string_value TEXT, int_value INTEGER,
+            float_value REAL, bool_value INTEGER
+        );
+        CREATE TABLE collections (id TEXT PRIMARY KEY, name TEXT);
+        CREATE TABLE segments (id TEXT PRIMARY KEY, collection TEXT);
+        CREATE TABLE embeddings (
+            id INTEGER PRIMARY KEY, segment_id TEXT, embedding_id TEXT, created_at TEXT
+        );
+        INSERT INTO collections VALUES ('c1', 'mempalace_drawers');
+        INSERT INTO segments VALUES ('s1', 'c1');
+        INSERT INTO embeddings VALUES (1, 's1', 'physical-current', '2026-09-02');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (1, 'tokened generation session phrase');
+        INSERT INTO embedding_metadata VALUES
+            (1, 'chroma:document', 'tokened generation session phrase', NULL, NULL, NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    def boom(*_args, **_kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(searcher, "_sqlite_generation_commit_state", boom)
+    monkeypatch.setattr(searcher, "resolve_backend_name", lambda *_a, **_k: "chroma")
+    result = search_memories(
+        "tokened generation session",
+        str(tmp_path),
+        vector_disabled=True,
+    )
+    assert isinstance(result, dict)
+    assert result["results"] == []
+    assert "error" in result
+    assert "generation commit" in result["error"].lower()
 
 
 def test_finalize_candidate_hits_forwards_stop_words_to_hybrid_rank(monkeypatch):

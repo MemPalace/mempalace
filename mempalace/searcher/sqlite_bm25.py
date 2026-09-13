@@ -604,18 +604,32 @@ def _bm25_only_via_sqlite(
             }
 
         placeholders = ",".join(["?"] * len(candidate_ids))
-        meta_rows = conn.execute(
-            f"""
+        try:
+            meta_rows = conn.execute(
+                f"""
             SELECT m.id, e.embedding_id, m.key, m.string_value, m.int_value
             FROM embedding_metadata AS m
             JOIN embeddings AS e ON e.id = m.id
             WHERE m.id IN ({placeholders})
             """,
-            candidate_ids,
-        ).fetchall()
-        committed_tokens, tokened_source_modes = _sqlite_generation_commit_state(
-            conn, collection_name
-        )
+                candidate_ids,
+            ).fetchall()
+        except sqlite3.Error as e:
+            logger.warning(
+                "sqlite metadata fetch failed after BM25 candidate selection", exc_info=True
+            )
+            return _search_error_result(f"sqlite metadata fetch failed: {e}")
+        try:
+            committed_tokens, tokened_source_modes = _sqlite_generation_commit_state(
+                conn, collection_name
+            )
+        except sqlite3.Error as exc:
+            logger.warning("Could not read conversation generation commit markers", exc_info=True)
+            raise GenerationStateError(
+                "Could not read conversation generation commit markers"
+            ) from exc
+    except GenerationStateError as e:
+        return _search_error_result(str(e))
     finally:
         conn.close()
 

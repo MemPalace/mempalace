@@ -41,12 +41,17 @@ def _print_search_results_bm25_only(
         before_dt=before_dt,
     )
     hits = result.get("results", [])
+    error = result.get("error")
 
     print(
         "\n  NOTICE: vector search disabled — HNSW index has diverged from SQLite.\n"
         "          Showing BM25-only results. Run `mempalace repair` to restore "
         "vector search.\n"
     )
+    if error:
+        print(f"  Search error: {error}")
+        raise SearchError(error)
+
     print(f"{'=' * 60}")
     print(f'  Results for: "{query}"')
     if wing:
