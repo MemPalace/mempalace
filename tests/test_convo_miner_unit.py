@@ -1038,12 +1038,15 @@ class TestFileChunksLocked:
         assert set(col.upserted_ids).isdisjoint(first_pass_ids), (
             "a chunk that did not change was re-upserted"
         )
-        assert set(col.updated_ids) == set(first_pass_ids), (
+        assert set(first_pass_ids) <= set(col.updated_ids), (
             "unchanged chunks did not get their completion metadata refreshed"
         )
         assert col.deleted_ids == [], "a purely-grown file has no orphans to delete"
         # After the incremental pass the file must read as complete.
-        assert all(m.get("chunk_total") == 5 for m in col.records.values())
+        drawer_metas = [
+            meta for meta in col.records.values() if meta.get("mine_commit_marker") is not True
+        ]
+        assert all(m.get("chunk_total") == 5 for m in drawer_metas)
         assert file_already_mined(col, str(source), check_mtime=True, extract_mode="exchange")
 
         # A rewrite that drops the tail (e.g. /compact) orphans the extra
@@ -1070,9 +1073,15 @@ class TestFileChunksLocked:
         orphaned = {
             make_convo_drawer_id("wing", "general", str(source), "exchange", i) for i in (3, 4)
         }
-        assert set(col.deleted_ids) == orphaned, (
-            "a shrunk re-mine must delete exactly the orphaned ids, nothing else"
+        assert orphaned <= set(col.deleted_ids), (
+            "a shrunk re-mine must delete the grown tail, not leave it as legacy"
         )
+        remaining = {
+            meta.get("chunk_index")
+            for meta in col.records.values()
+            if meta.get("mine_commit_marker") is not True
+        }
+        assert remaining == {0, 1, 2}
         assert file_already_mined(col, str(source), check_mtime=True, extract_mode="exchange")
 
 
@@ -1127,7 +1136,7 @@ def test_end_of_mine_hallways_read_then_fts_validation_write(tmp_path, monkeypat
     assert gate.events[-4:] == ["read-enter", "read-exit", "write-enter", "write-exit"]
 
 
-def test_publication_rollback_stays_inside_one_write_gate():
+def test_publication_rollback_uses_short_write_gates():
     import mempalace.convo_miner as convo_miner
 
     class Gate:
@@ -1186,7 +1195,15 @@ def test_publication_rollback_stays_inside_one_write_gate():
     )
 
     assert result is False
-    assert gate.events == ["write-enter", "write-exit"]
+    # marker upsert + two metadata rows (batch size 1000, so one update) + delete
+    assert gate.events == [
+        "write-enter",
+        "write-exit",
+        "write-enter",
+        "write-exit",
+        "write-enter",
+        "write-exit",
+    ]
     assert collection.upserts[0][0] == ["commit"]
     assert collection.upserts[0][2][0]["mine_cleanup_pending"] is True
 

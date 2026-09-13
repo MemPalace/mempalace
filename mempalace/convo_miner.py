@@ -853,6 +853,10 @@ def _publish_changed_generations(
     complete; after it, the new token is complete even if metadata
     finalization or stale-row cleanup fails. ``cleanup_pending`` keeps the
     source retryable until every follow-up write succeeds.
+
+    Writer serialization comes from the caller's mutation lock (HTTP mine)
+    or per-file ``mine_lock``. The access gate is acquired only around each
+    bounded upsert/update/delete so waiting readers can run between bursts.
     """
     try:
         with _access_write(access_gate):
@@ -861,16 +865,20 @@ def _publish_changed_generations(
                 documents=[f"[conversation generation commit] {source_file}"],
                 metadatas=[commit_metadata],
             )
-            for batch_start in range(0, len(final_metadata), DRAWER_UPSERT_BATCH_SIZE):
-                batch = final_metadata[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+        for batch_start in range(0, len(final_metadata), DRAWER_UPSERT_BATCH_SIZE):
+            batch = final_metadata[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+            with _access_write(access_gate):
                 collection.update(
                     ids=[drawer_id for drawer_id, _ in batch],
                     metadatas=[meta for _, meta in batch],
                 )
-            if stale_ids:
-                collection.delete(ids=stale_ids)
-            completed_marker = dict(commit_metadata)
-            completed_marker["mine_cleanup_pending"] = False
+        for batch_start in range(0, len(stale_ids), DRAWER_UPSERT_BATCH_SIZE):
+            batch_ids = stale_ids[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+            with _access_write(access_gate):
+                collection.delete(ids=batch_ids)
+        completed_marker = dict(commit_metadata)
+        completed_marker["mine_cleanup_pending"] = False
+        with _access_write(access_gate):
             collection.update(ids=[commit_id], metadatas=[completed_marker])
         return True
     except Exception:
@@ -984,11 +992,19 @@ def _plan_convo_generation_writes(
         tentative.append(("upsert", item, copy_id, (physical_id, None)))
         tentative_ids.add(physical_id)
 
-    # Grow-only passes keep reused physical ids in place and never switch the
-    # commit marker. A rewrite/shrink that will publish a new token must clone
-    # reused rows that still carry the previous token; updating those ids in
-    # place would hide them for the duration of the switch.
-    will_publish = pending_cleanup or any(drawer_id not in tentative_ids for drawer_id in existing)
+    # The first complete mine stays tokenless so those rows remain genuine
+    # legacy. Any later pass that adds rows or retires old ones publishes a
+    # content-set token. Growth is included: tokenless appended rows would
+    # otherwise resurface as legacy if a later shrink's stale delete fails.
+    # A rewrite/shrink that publishes a new token must clone reused rows that
+    # still carry the previous token; updating those ids in place would hide
+    # them for the duration of the switch.
+    has_new_rows = any(kind == "upsert" for kind, *_ in tentative)
+    will_publish = (
+        pending_cleanup
+        or any(drawer_id not in tentative_ids for drawer_id in existing)
+        or (bool(existing) and has_new_rows)
+    )
     new_ids: set = set()
     for kind, item, copy_id, current in tentative:
         chunk = item["chunk"]
@@ -1061,7 +1077,7 @@ def _plan_convo_generation_writes(
                 ),
             )
         )
-    return to_upsert, to_touch, to_copy, new_ids, generation_token
+    return to_upsert, to_touch, to_copy, new_ids, generation_token, will_publish
 
 
 def _file_chunks_locked(
@@ -1195,7 +1211,14 @@ def _file_chunks_locked(
                 }
             )
 
-        to_upsert, to_touch, to_copy, new_ids, generation_token = _plan_convo_generation_writes(
+        (
+            to_upsert,
+            to_touch,
+            to_copy,
+            new_ids,
+            generation_token,
+            publish_generation,
+        ) = _plan_convo_generation_writes(
             planned_chunks,
             existing=existing,
             pending_cleanup=pending_cleanup,
@@ -1210,13 +1233,14 @@ def _file_chunks_locked(
             content_hash=content_hash,
         )
 
-        # A shrink/rewrite needs a two-phase completion marker. New/changed
-        # rows are first written without the current source mtime; unchanged
-        # rows keep their old mtime unless they already carry another
-        # generation token, in which case they are cloned first. Only after
-        # orphan cleanup succeeds do we stamp the whole target set current.
-        # A transient delete failure then remains visibly incomplete and
-        # retries even if the source never changes again.
+        # Shrink, rewrite, and growth after the first complete mine use a
+        # two-phase completion marker. New/changed rows are first written
+        # without the current source mtime; unchanged rows keep their old
+        # mtime unless they already carry another generation token, in which
+        # case they are cloned first. Only after orphan cleanup succeeds do
+        # we stamp the whole target set current. A transient delete failure
+        # then remains visibly incomplete and retries even if the source
+        # never changes again.
         stale_ids = [drawer_id for drawer_id in existing if drawer_id not in new_ids]
         commit_metadata = {
             "wing": wing,
@@ -1244,7 +1268,7 @@ def _file_chunks_locked(
             batch = to_upsert[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
             batch_ids = [drawer_id for drawer_id, _, _ in batch]
             batch_docs = [content for _, content, _ in batch]
-            if stale_ids:
+            if publish_generation:
                 batch_metas = []
                 for _, _, final_meta in batch:
                     incomplete_meta = dict(final_meta)
@@ -1272,7 +1296,7 @@ def _file_chunks_locked(
             generation_token=generation_token,
             access_gate=access_gate,
         )
-        if not stale_ids and not pending_cleanup:
+        if not publish_generation:
             for batch_start in range(0, len(to_touch), DRAWER_UPSERT_BATCH_SIZE):
                 batch = to_touch[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
                 with _access_write(access_gate):
@@ -1287,8 +1311,9 @@ def _file_chunks_locked(
         # pass never leaves the palace with less than it had; the worst
         # crash window leaves transient duplicates. The current-mtime marker
         # is deliberately withheld until cleanup succeeds, so the next mine
-        # retries even when the source itself stays unchanged.
-        if stale_ids or pending_cleanup:
+        # retries even when the source itself stays unchanged. Growth with
+        # no orphans still publishes so appended rows carry a token.
+        if publish_generation:
             final_metadata = []
             for drawer_id, meta in (
                 to_touch
