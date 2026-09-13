@@ -131,12 +131,44 @@ def _logical_chunk_group(col, drawer_id: str):
     }
 
 
+def _visible_parent_chunk_rows(col, drawer_id, committed, tokened_source_modes):
+    """Visible physical chunks parented to ``drawer_id``, including rewritten rows.
+
+    New prefix chunks from an oversized update drop ``logical_drawer_id``. A
+    failed stale-tail delete then leaves those rows invisible to a
+    ``logical_drawer_id`` lookup. Parent linkage still finds them.
+    """
+    try:
+        result = col.get(
+            where=_logical_parent_where(drawer_id),
+            include=["documents", "metadatas"],
+        )
+    except Exception as exc:
+        logger.warning("parent chunk sibling lookup failed for %s", drawer_id, exc_info=True)
+        raise GenerationStateError("Could not resolve current conversation generations") from exc
+
+    ids = _chroma_field(result, "ids", []) or []
+    docs = _chroma_field(result, "documents", []) or []
+    metas = _chroma_field(result, "metadatas", []) or []
+    rows = []
+    for idx, chunk_id in enumerate(ids):
+        meta = _safe_meta(metas[idx] if idx < len(metas) else {})
+        if not _is_visible_generation_metadata(meta, committed, tokened_source_modes):
+            continue
+        doc = docs[idx] if idx < len(docs) else ""
+        rows.append((_chunk_index(meta), chunk_id, doc or "", meta))
+    rows.sort(key=lambda row: (row[0], row[1]))
+    return rows
+
+
 def _logical_generation_record(col, drawer_id: str):
     """Resolve a stable conversation logical id to its visible physical row.
 
     Parent chunks of this logical drawer share ``logical_drawer_id`` after an
     oversized ``update_drawer``, but they are one physical split, not
-    competing generations. Reassemble those rows by ``chunk_index``.
+    competing generations. Reassemble those rows by ``chunk_index``, merging
+    parent-linked siblings so a failed shrink-delete cannot hide the new
+    prefix that already dropped ``logical_drawer_id``.
     """
     try:
         result = col.get(
@@ -168,11 +200,16 @@ def _logical_generation_record(col, drawer_id: str):
         return None
     parent_rows = [row for row in rows if _logical_parent_id(row[4]) == drawer_id]
     if parent_rows:
-        parent_rows.sort(key=lambda row: (_chunk_index(row[4]), row[2]))
+        by_id = {
+            row[2]: (_chunk_index(row[4]), row[2], row[3] or "", row[4]) for row in parent_rows
+        }
+        for sibling in _visible_parent_chunk_rows(col, drawer_id, committed, tokened_source_modes):
+            by_id[sibling[1]] = sibling
+        merged = sorted(by_id.values(), key=lambda row: (row[0], row[1]))
         leftover_ids = [row[2] for row in rows if _logical_parent_id(row[4]) != drawer_id]
-        chunk_ids = [row[2] for row in parent_rows]
-        chunk_docs = [row[3] or "" for row in parent_rows]
-        chunk_metas = [row[4] for row in parent_rows]
+        chunk_ids = [row[1] for row in merged]
+        chunk_docs = [row[2] for row in merged]
+        chunk_metas = [row[3] for row in merged]
         return {
             "drawer_id": drawer_id,
             "ids": chunk_ids + leftover_ids,

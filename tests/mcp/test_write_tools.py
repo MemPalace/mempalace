@@ -1452,6 +1452,77 @@ def _verbatim_chunk(label: str, chunk_size: int) -> str:
     return (seed * (chunk_size // len(seed) + 1))[:chunk_size]
 
 
+def _seed_legacy_mined_parent_chunks(
+    palace_path,
+    logical_id,
+    parts,
+    token="active-token",
+    source="/tmp/legacy-mined-session.jsonl",
+):
+    chunk_ids = [f"{logical_id}_chunk_{index:06d}" for index in range(len(parts))]
+    _client, col = _get_collection(palace_path, create=True)
+    col.upsert(
+        ids=[*chunk_ids, f"{logical_id}-marker"],
+        documents=[*parts, f"[commit {token} {logical_id}]"],
+        metadatas=[
+            *[
+                {
+                    "wing": "sessions",
+                    "room": "general",
+                    "logical_drawer_id": logical_id,
+                    "parent_drawer_id": logical_id,
+                    "chunk_index": index,
+                    "mine_generation_token": token,
+                    "source_file": source,
+                    "extract_mode": "exchange",
+                    "ingest_mode": "convos",
+                    "filed_at": "2026-09-01T00:00:00",
+                }
+                for index in range(len(parts))
+            ],
+            {
+                "wing": "sessions",
+                "room": "_registry",
+                "mine_commit_marker": True,
+                "mine_generation_commit": token,
+                "mine_staged": True,
+                "source_file": source,
+                "extract_mode": "exchange",
+            },
+        ],
+    )
+    del _client
+    return chunk_ids
+
+
+def _overwrite_prefix_dropping_logical_id(
+    palace_path, logical_id, parts, token="active-token", source="/tmp/legacy-mined-session.jsonl"
+):
+    """Rewrite the leading chunks as a successful shrink upsert that has not deleted the tail."""
+    chunk_ids = [f"{logical_id}_chunk_{index:06d}" for index in range(len(parts))]
+    _client, col = _get_collection(palace_path)
+    col.upsert(
+        ids=chunk_ids,
+        documents=parts,
+        metadatas=[
+            {
+                "wing": "sessions",
+                "room": "general",
+                "parent_drawer_id": logical_id,
+                "chunk_index": index,
+                "mine_generation_token": token,
+                "source_file": source,
+                "extract_mode": "exchange",
+                "ingest_mode": "convos",
+                "filed_at": "2026-09-01T00:00:00",
+            }
+            for index in range(len(parts))
+        ],
+    )
+    del _client
+    return chunk_ids
+
+
 def _seed_mined_conversation_drawer(
     palace_path, logical_id, physical_id, content, token="active-token"
 ):
@@ -1592,46 +1663,11 @@ def test_legacy_mined_parent_chunks_sharing_logical_id_reassemble_and_search(
     """Already-written palaces that inherited logical_drawer_id onto parent chunks."""
     _patch_mcp_server(monkeypatch, config, kg)
     logical_id = "logical-legacy-mined"
-    token = "active-token"
-    source = "/tmp/legacy-mined-session.jsonl"
     chunk_size = config.chunk_size
     labels = ("legacyAlpha", "legacyBeta", "legacyGamma")
     parts = [_verbatim_chunk(label, chunk_size) for label in labels]
     content = "".join(parts)
-    chunk_ids = [f"{logical_id}_chunk_{index:06d}" for index in range(len(parts))]
-
-    _client, col = _get_collection(palace_path, create=True)
-    col.upsert(
-        ids=[*chunk_ids, "legacy-mined-marker"],
-        documents=[*parts, "[commit active-token legacy-mined]"],
-        metadatas=[
-            *[
-                {
-                    "wing": "sessions",
-                    "room": "general",
-                    "logical_drawer_id": logical_id,
-                    "parent_drawer_id": logical_id,
-                    "chunk_index": index,
-                    "mine_generation_token": token,
-                    "source_file": source,
-                    "extract_mode": "exchange",
-                    "ingest_mode": "convos",
-                    "filed_at": "2026-09-01T00:00:00",
-                }
-                for index in range(len(parts))
-            ],
-            {
-                "wing": "sessions",
-                "room": "_registry",
-                "mine_commit_marker": True,
-                "mine_generation_commit": token,
-                "mine_staged": True,
-                "source_file": source,
-                "extract_mode": "exchange",
-            },
-        ],
-    )
-    del _client
+    chunk_ids = _seed_legacy_mined_parent_chunks(palace_path, logical_id, parts)
 
     from mempalace.mcp_server import tool_get_drawer, tool_search
     from mempalace.searcher import search_memories
@@ -1652,6 +1688,187 @@ def test_legacy_mined_parent_chunks_sharing_logical_id_reassemble_and_search(
         matching = [hit for hit in api_hits["results"] if label in hit["text"]]
         assert matching, f"generation-aware search missed legacy chunk {label}"
         assert all(hit["drawer_id"] == logical_id for hit in matching)
+
+
+def test_interrupted_legacy_shrink_readback_keeps_prefix_and_stale_tail(
+    monkeypatch, config, palace_path, kg
+):
+    """Failed stale-tail delete must not hide the rewritten prefix."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    logical_id = "logical-legacy-shrink"
+    chunk_size = config.chunk_size
+    old_labels = ("shrinkAlpha", "shrinkBeta", "shrinkGamma")
+    new_labels = ("shrinkDelta", "shrinkEpsilon")
+    old_parts = [_verbatim_chunk(label, chunk_size) for label in old_labels]
+    new_parts = [_verbatim_chunk(label, chunk_size) for label in new_labels]
+    _seed_legacy_mined_parent_chunks(palace_path, logical_id, old_parts)
+    _overwrite_prefix_dropping_logical_id(palace_path, logical_id, new_parts)
+
+    from mempalace.mcp_server import (
+        tool_delete_drawer,
+        tool_get_drawer,
+        tool_search,
+        tool_update_drawer,
+    )
+    from mempalace.searcher import search_memories
+
+    recovered = "".join([*new_parts, old_parts[2]])
+    fetched = tool_get_drawer(logical_id)
+    assert fetched["content"] == recovered
+    assert fetched["chunks"] == 3
+    assert fetched["chunk_ids"] == [f"{logical_id}_chunk_{index:06d}" for index in range(3)]
+    assert new_parts[0] in fetched["content"]
+    assert old_parts[2] in fetched["content"]
+
+    for label, part in zip((*new_labels, old_labels[2]), (*new_parts, old_parts[2])):
+        mcp_hits = tool_search(query=label, limit=10)
+        matching = [hit for hit in mcp_hits["results"] if label in hit["text"]]
+        assert matching, f"MCP search missed recovered chunk {label}"
+        assert all(hit["drawer_id"] == logical_id for hit in matching)
+        assert any(hit["text"] == part for hit in matching)
+
+        api_hits = search_memories(label, palace_path, n_results=10)
+        matching = [hit for hit in api_hits["results"] if label in hit["text"]]
+        assert matching, f"generation-aware search missed recovered chunk {label}"
+        assert all(hit["drawer_id"] == logical_id for hit in matching)
+
+    updated = tool_update_drawer(logical_id, content="".join(new_parts))
+    assert updated["success"] is True
+    assert updated["chunks"] == 2
+    fetched = tool_get_drawer(logical_id)
+    assert fetched["content"] == "".join(new_parts)
+    assert fetched["chunks"] == 2
+    gone = tool_search(query=old_labels[2], limit=10)
+    assert not any(old_labels[2] in hit["text"] for hit in gone["results"])
+
+    deleted = tool_delete_drawer(logical_id)
+    assert deleted["success"] is True
+    assert "error" in tool_get_drawer(logical_id)
+
+
+def test_interrupted_legacy_shrink_delete_removes_prefix_and_tail(
+    monkeypatch, config, palace_path, kg
+):
+    """Delete after a failed shrink must remove rewritten prefix and leftover tail."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    logical_id = "logical-legacy-shrink-delete"
+    chunk_size = config.chunk_size
+    old_parts = [
+        _verbatim_chunk(label, chunk_size) for label in ("deleteAlpha", "deleteBeta", "deleteGamma")
+    ]
+    new_parts = [_verbatim_chunk(label, chunk_size) for label in ("deleteDelta", "deleteEpsilon")]
+    _seed_legacy_mined_parent_chunks(palace_path, logical_id, old_parts)
+    _overwrite_prefix_dropping_logical_id(palace_path, logical_id, new_parts)
+
+    from mempalace.mcp_server import tool_delete_drawer, tool_get_drawer, tool_search
+
+    fetched = tool_get_drawer(logical_id)
+    assert fetched["chunks"] == 3
+    deleted = tool_delete_drawer(logical_id)
+    assert deleted["success"] is True
+    assert deleted["chunks_deleted"] == 3
+    assert "error" in tool_get_drawer(logical_id)
+    for label in ("deleteDelta", "deleteEpsilon", "deleteGamma"):
+        hits = tool_search(query=label, limit=10)
+        assert not any(label in hit["text"] for hit in hits["results"])
+
+
+def test_successful_legacy_parent_shrink_drops_stale_tail(monkeypatch, config, palace_path, kg):
+    """A completed shrink of a legacy parent group must keep only the new prefix."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    logical_id = "logical-legacy-shrink-ok"
+    chunk_size = config.chunk_size
+    old_parts = [_verbatim_chunk(label, chunk_size) for label in ("okAlpha", "okBeta", "okGamma")]
+    new_parts = [_verbatim_chunk(label, chunk_size) for label in ("okDelta", "okEpsilon")]
+    _seed_legacy_mined_parent_chunks(palace_path, logical_id, old_parts)
+
+    from mempalace.mcp_server import tool_get_drawer, tool_search, tool_update_drawer
+
+    updated = tool_update_drawer(logical_id, content="".join(new_parts))
+    assert updated["success"] is True
+    assert updated["chunks"] == 2
+    fetched = tool_get_drawer(logical_id)
+    assert fetched["content"] == "".join(new_parts)
+    assert fetched["chunks"] == 2
+    gone = tool_search(query="okGamma", limit=10)
+    assert not any("okGamma" in hit["text"] for hit in gone["results"])
+
+
+def test_update_shrink_delete_failure_leaves_prefix_readable(monkeypatch, config, palace_path, kg):
+    """If stale_ids delete raises after upsert, get must still reach the new prefix."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    logical_id = "logical-legacy-shrink-crash"
+    chunk_size = config.chunk_size
+    old_parts = [
+        _verbatim_chunk(label, chunk_size) for label in ("crashAlpha", "crashBeta", "crashGamma")
+    ]
+    new_parts = [_verbatim_chunk(label, chunk_size) for label in ("crashDelta", "crashEpsilon")]
+    _seed_legacy_mined_parent_chunks(palace_path, logical_id, old_parts)
+
+    from mempalace.backends.chroma import ChromaCollection
+    from mempalace.mcp_server import tool_get_drawer, tool_update_drawer
+
+    assert tool_get_drawer(logical_id)["chunks"] == 3
+    original_delete = ChromaCollection.delete
+
+    def failing_delete(self, *, ids=None, where=None):
+        id_list = list(ids or [])
+        if any(str(item).endswith("_chunk_000002") for item in id_list):
+            raise RuntimeError("stale tail delete failed")
+        return original_delete(self, ids=ids, where=where)
+
+    monkeypatch.setattr(ChromaCollection, "delete", failing_delete)
+    updated = tool_update_drawer(logical_id, content="".join(new_parts))
+
+    assert updated["success"] is False
+    assert "stale tail delete failed" in updated["error"]
+    fetched = tool_get_drawer(logical_id)
+    assert "".join(new_parts) in fetched["content"]
+    assert old_parts[2] in fetched["content"]
+    assert fetched["content"] == "".join([*new_parts, old_parts[2]])
+
+
+def test_parent_sibling_lookup_fails_closed_instead_of_returning_tail(
+    monkeypatch, config, palace_path, kg
+):
+    """Sibling merge errors must not surface the stale tail as the whole drawer."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    from mempalace import mcp_server
+    from mempalace.mcp_server import tool_get_drawer
+
+    tail_meta = {
+        "wing": "sessions",
+        "room": "general",
+        "logical_drawer_id": "logical",
+        "parent_drawer_id": "logical",
+        "chunk_index": 2,
+        "mine_generation_token": "tok",
+    }
+
+    class Collection:
+        @staticmethod
+        def get(ids=None, where=None, include=None, **_kwargs):
+            if isinstance(where, dict) and where.get("logical_drawer_id") == "logical":
+                return {
+                    "ids": ["logical_chunk_000002"],
+                    "documents": ["stale tail only"],
+                    "metadatas": [tail_meta],
+                }
+            if isinstance(where, dict) and "$or" in where:
+                raise RuntimeError("parent sibling get failed")
+            return {"ids": [], "documents": [], "metadatas": []}
+
+    monkeypatch.setattr(mcp_server, "_get_collection", lambda **_kwargs: Collection())
+    monkeypatch.setattr(
+        mcp_server,
+        "_committed_generation_state",
+        lambda _col: (frozenset({"tok"}), frozenset()),
+    )
+
+    fetched = tool_get_drawer("logical")
+    assert "stale tail only" not in fetched.get("content", "")
+    assert "drawer_id" not in fetched
+    assert "current conversation generation" in fetched["error"]
 
 
 class TestDeleteBySource:
