@@ -1132,10 +1132,11 @@ def _publish_changed_generations(
 
     A rewrite or shrink after an interrupted append can find
     ``staging_token == publish_token``, so it does not expose a new tail.
-    Any leftover extra marker still committing the interrupted tail token
-    is retired in the same write burst as the primary switch: earlier
-    would hide the previous complete tail, and skipping it would keep
-    dropped rows visible if stale-row deletion then fails.
+    Every non-tail publication overwrites the deterministic extra tail id
+    in the same upsert as the primary switch: earlier would hide the
+    previous complete tail, and skipping it — including when a tail-marker
+    get fails — would keep dropped rows visible if stale-row deletion then
+    fails. The overwrite does not depend on reading the extra marker first.
     """
     publish_token = commit_metadata.get("mine_generation_commit")
     expose_tail = (
@@ -1145,11 +1146,6 @@ def _publish_changed_generations(
         and isinstance(tail_commit_id, str)
         and tail_commit_id
     )
-    leftover_tail_token = None
-    if not expose_tail:
-        leftover_tail_token = _append_tail_marker_commit_token(
-            collection, tail_commit_id, access_gate
-        )
     commit_document = f"[conversation generation commit] {source_file}"
     ids_to_delete = list(stale_ids)
     try:
@@ -1168,7 +1164,7 @@ def _publish_changed_generations(
         publish_ids = [commit_id]
         publish_docs = [commit_document]
         publish_metas = [commit_metadata]
-        if leftover_tail_token:
+        if not expose_tail and isinstance(tail_commit_id, str) and tail_commit_id:
             # Primary first so a partial upsert cannot uncommit the old
             # tail while the previous generation is still the published view.
             publish_ids.append(tail_commit_id)

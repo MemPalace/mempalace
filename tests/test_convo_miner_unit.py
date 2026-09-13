@@ -1347,11 +1347,23 @@ def _content_hash_prefetch_rows(normalize_version):
             },
         ),
         (
+            "predecessor",
+            {
+                "wing": "wing",
+                "source_file": "active.jsonl",
+                "extract_mode": "exchange",
+                "normalize_version": normalize_version,
+                "content_hash": "predecessor-hash",
+            },
+        ),
+        (
             "marker",
             {
                 "mine_staged": True,
                 "mine_commit_marker": True,
                 "mine_generation_commit": "active-token",
+                "source_file": "active.jsonl",
+                "extract_mode": "exchange",
             },
         ),
     ]
@@ -1384,6 +1396,7 @@ def test_content_hash_prefetch_ignores_staged_generations():
 
     assert ("wing", "staged-hash") not in hashes
     assert ("wing", "retired-hash") not in hashes
+    assert ("wing", "predecessor-hash") not in hashes
     assert hashes[("wing", "committed-hash")] == "committed.jsonl"
     assert hashes[("wing", "active-hash")] == "active.jsonl"
 
@@ -1457,11 +1470,23 @@ def test_content_hash_prefetch_pages_release_metadata_and_keeps_generation_filte
                 },
             ),
             (
+                "predecessor",
+                {
+                    "wing": "wing",
+                    "source_file": "active.jsonl",
+                    "extract_mode": "exchange",
+                    "normalize_version": NORMALIZE_VERSION,
+                    "content_hash": "predecessor-hash",
+                },
+            ),
+            (
                 "marker",
                 {
                     "mine_staged": True,
                     "mine_commit_marker": True,
                     "mine_generation_commit": "active-token",
+                    "source_file": "active.jsonl",
+                    "extract_mode": "exchange",
                 },
             ),
             (
@@ -1511,6 +1536,7 @@ def test_content_hash_prefetch_pages_release_metadata_and_keeps_generation_filte
     assert ("wing", "staged-hash-0") not in hashes
     assert ("wing", "staged-hash-1999") not in hashes
     assert ("wing", "retired-hash") not in hashes
+    assert ("wing", "predecessor-hash") not in hashes
     assert hashes[("wing", "tokenless-hash")] == "tokenless.jsonl"
     assert hashes[("wing", "tokenless-extra")] == "tokenless.jsonl"
     assert hashes[("wing", "active-hash")] == "active.jsonl"

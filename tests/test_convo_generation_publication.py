@@ -2,6 +2,7 @@
 
 import contextlib
 import copy
+import hashlib
 
 import pytest
 
@@ -12,6 +13,7 @@ from mempalace.ids import (
     make_convo_generation_id,
     make_convo_tail_commit_id,
 )
+from mempalace.palace import prefetch_content_hashes
 
 
 class InjectedWriteFailure(RuntimeError):
@@ -28,6 +30,10 @@ class GenerationCollection:
         self.fail_before = False
         self.observe = lambda: None
         self.embedded_documents = []
+        self.upsert_id_batches = []
+
+    def count(self):
+        return len(self.rows)
 
     def get(self, ids=None, where=None, include=None, offset=0, limit=None):
         rows = [
@@ -76,6 +82,7 @@ class GenerationCollection:
 
     def upsert(self, ids, documents, metadatas, embeddings=None):
         self._before_write()
+        self.upsert_id_batches.append(list(ids))
         for index, (key, document, metadata) in enumerate(zip(ids, documents, metadatas)):
             if embeddings is None and not metadata.get("mine_commit_marker"):
                 self.embedded_documents.append(document)
@@ -504,11 +511,18 @@ def test_reader_sees_complete_generation_between_publication_write_bursts(public
     assert mine(gated, next_documents, access_gate=gate)[2] is False
     assert gate.write_sessions > 1
     assert gate.max_ops_in_session == 1
-    assert gate.max_ids_in_session <= 1
+    assert gate.max_ids_in_session <= 2
     assert snapshots
     for token, documents in snapshots:
         assert documents == (previous if token == old_token else next_documents)
     assert gated.embedded_documents == [next_documents[0]]
+    source_file = next(
+        row["metadata"]["source_file"]
+        for row in _non_marker_rows(gated).values()
+        if row["metadata"].get("source_file")
+    )
+    tail_id = make_convo_tail_commit_id(source_file, "exchange")
+    assert [commit_id, tail_id] in gated.upsert_id_batches
 
 
 def _non_marker_rows(collection):
@@ -1232,6 +1246,92 @@ def test_failed_rewrite_cleanup_then_revert_append_exposes_newest_text(tmp_path,
     assert mine(collection, wanted)[2] is False
     _assert_all_read_paths(collection, source, wanted)
     assert all(key not in collection.rows for key in b_ids)
+
+
+def test_tokenless_predecessor_is_not_a_visible_duplicate(tmp_path, monkeypatch):
+    """Failed A→B cleanup must not let retired tokenless A suppress a new file."""
+    source = str(tmp_path / "session.txt")
+    other = str(tmp_path / "reexport.txt")
+    (tmp_path / "session.txt").write_text("transcript", encoding="utf-8")
+    (tmp_path / "reexport.txt").write_text("reexport", encoding="utf-8")
+    monkeypatch.setattr(convo_miner, "mine_lock", lambda *_: contextlib.nullcontext())
+    monkeypatch.setattr(convo_miner, "file_already_mined", lambda *_a, **_k: False)
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 1)
+
+    def mine(collection, documents, source_file, content_hash):
+        chunks = [{"content": text, "chunk_index": index} for index, text in enumerate(documents)]
+        return convo_miner._file_chunks_locked(
+            collection,
+            source_file,
+            chunks,
+            "wing",
+            "general",
+            "agent",
+            "exchange",
+            content_hash=content_hash,
+        )
+
+    class DeleteFailingCollection(GenerationCollection):
+        def __init__(self):
+            super().__init__()
+            self.fail_delete = False
+
+        def delete(self, ids):
+            if self.fail_delete:
+                raise InjectedWriteFailure("stale delete failed")
+            super().delete(ids)
+
+    legacy_a = ["alpha first chunk", "alpha second chunk", "alpha third chunk"]
+    rewritten_b = ["beta first chunk", "beta second chunk", "beta third chunk"]
+    hash_a = hashlib.sha256("\n\n".join(legacy_a).strip().encode("utf-8")).hexdigest()
+    hash_b = hashlib.sha256("\n\n".join(rewritten_b).strip().encode("utf-8")).hexdigest()
+    collection = DeleteFailingCollection()
+    assert mine(collection, legacy_a, source, hash_a)[2] is False
+    _assert_all_read_paths(collection, source, legacy_a)
+    tokenless_a_ids = [
+        key
+        for key, row in _non_marker_rows(collection).items()
+        if not row["metadata"].get("mine_generation_token")
+    ]
+    assert tokenless_a_ids
+    assert any(
+        collection.rows[key]["metadata"].get("content_hash") == hash_a for key in tokenless_a_ids
+    )
+
+    collection.fail_delete = True
+    skipped = mine(collection, rewritten_b, source, hash_b)[2]
+    assert skipped is True
+    assert all(key in collection.rows for key in tokenless_a_ids)
+    _assert_all_read_paths(collection, source, rewritten_b)
+    assert all(
+        not collection.rows[key]["metadata"].get("mine_generation_token") for key in tokenless_a_ids
+    )
+
+    hashes = prefetch_content_hashes(collection, extract_mode="exchange")
+    assert ("wing", hash_a) not in hashes
+    assert hashes[("wing", hash_b)] == source
+    new_items, duplicates = convo_miner._split_new_and_duplicate_conversations(
+        ["\n\n".join(legacy_a)], "wing", other, hashes
+    )
+    assert duplicates == []
+    assert new_items == [(hash_a, "\n\n".join(legacy_a))]
+
+    assert mine(collection, legacy_a, other, hash_a)[2] is False
+    other_visible = []
+    source_visible = []
+    for index, text in enumerate(legacy_a):
+        other_id = make_convo_drawer_id("wing", "general", other, "exchange", index)
+        source_id = make_convo_drawer_id("wing", "general", source, "exchange", index)
+        other_row = mcp_server._logical_generation_record(collection, other_id)
+        source_row = mcp_server._logical_generation_record(collection, source_id)
+        other_visible.append(other_row["content"] if other_row else None)
+        source_visible.append(source_row["content"] if source_row else None)
+    assert other_visible == legacy_a
+    assert source_visible == rewritten_b
+    hashes_after = prefetch_content_hashes(collection, extract_mode="exchange")
+    assert hashes_after[("wing", hash_a)] == other
+    assert hashes_after[("wing", hash_b)] == source
 
 
 def test_failed_tokened_rewrite_cleanup_then_repeated_appends_keep_active_rows(
@@ -2076,6 +2176,18 @@ class DeleteFailingGenerationCollection(GenerationCollection):
     def __init__(self):
         super().__init__()
         self.fail_delete = False
+        self.fail_tail_get = False
+        self.tail_get_id = None
+
+    def get(self, ids=None, where=None, include=None, offset=0, limit=None):
+        if (
+            self.fail_tail_get
+            and self.tail_get_id is not None
+            and ids is not None
+            and list(ids) == [self.tail_get_id]
+        ):
+            raise RuntimeError("tail marker get failed")
+        return super().get(ids=ids, where=where, include=include, offset=offset, limit=limit)
 
     def delete(self, ids):
         if self.fail_delete:
@@ -2083,11 +2195,14 @@ class DeleteFailingGenerationCollection(GenerationCollection):
         super().delete(ids)
 
 
-def test_non_tail_publication_retires_leftover_tail_when_delete_fails():
+@pytest.mark.parametrize("fail_tail_get", [False, True])
+def test_non_tail_publication_retires_leftover_tail_when_delete_fails(fail_tail_get):
     """Rewrite/shrink must uncommit an interrupted append tail even if deletes fail."""
     collection = DeleteFailingGenerationCollection()
     commit_id = "commit"
     tail_id = "tail-commit"
+    collection.fail_tail_get = fail_tail_get
+    collection.tail_get_id = tail_id
     collection.rows["keep-new"] = {
         "document": "new generation",
         "metadata": {
@@ -2182,6 +2297,7 @@ def test_non_tail_publication_retires_leftover_tail_when_delete_fails():
     )
     assert result is False
     assert "stale-tail" in collection.rows
+    assert [commit_id, tail_id] in collection.upsert_id_batches
     assert snapshots
     for primary, extra, documents in snapshots:
         if primary == "old-token":
@@ -2330,9 +2446,10 @@ def test_non_tail_after_unretired_tail_hides_dropped_rows_on_every_write(
     assert saw_tail_rows
 
 
+@pytest.mark.parametrize("fail_tail_get", [False, True])
 @pytest.mark.parametrize("mode", ["shrink", "rewrite"])
 def test_non_tail_after_unretired_tail_hides_dropped_rows_when_delete_fails(
-    tmp_path, monkeypatch, mode
+    tmp_path, monkeypatch, mode, fail_tail_get
 ):
     original, mine, source, previous, grown = _append_visibility_case(tmp_path, monkeypatch)
     leftovers = _interrupt_states_with_unretired_tail(mine, original, grown, source, False)
@@ -2347,6 +2464,8 @@ def test_non_tail_after_unretired_tail_hides_dropped_rows_when_delete_fails(
     )
     next_documents = ["rewritten first chunk", *previous[1:]] if mode == "rewrite" else previous[:3]
     hidden = [*next_documents, *[None] * (len(grown) - len(next_documents))]
+    commit_id = make_convo_commit_id(source, "exchange")
+    tail_id = make_convo_tail_commit_id(source, "exchange")
     gated = DeleteFailingGenerationCollection()
     gated.rows = copy.deepcopy(leftover.rows)
     snapshots = []
@@ -2358,15 +2477,16 @@ def test_non_tail_after_unretired_tail_hides_dropped_rows_when_delete_fails(
 
     gated.observe = observe
     gated.fail_delete = True
+    gated.fail_tail_get = fail_tail_get
+    gated.tail_get_id = tail_id
     skipped = mine(gated, next_documents)[2]
     assert skipped is True
     assert snapshots
+    assert [commit_id, tail_id] in gated.upsert_id_batches
     _assert_unretired_tail_or_new_generation(gated, source, leftover, grown, next_documents)
     _assert_all_read_paths(gated, source, hidden)
     _assert_retired_or_absent_tail_marker(gated, source)
-    tail_token = leftover.rows[make_convo_tail_commit_id(source, "exchange")]["metadata"][
-        "mine_generation_commit"
-    ]
+    tail_token = leftover.rows[tail_id]["metadata"]["mine_generation_commit"]
     assert any(
         row["metadata"].get("mine_generation_token") == tail_token
         for row in _non_marker_rows(gated).values()

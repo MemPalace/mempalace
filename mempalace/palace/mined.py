@@ -26,6 +26,23 @@ def _metadata_matches_extract_mode(meta: dict, extract_mode: Optional[str]) -> b
     return extract_mode == "exchange" and meta.get("ingest_mode") in (None, "convos")
 
 
+def _source_mode_commit_key(meta: dict) -> Optional[tuple]:
+    """``(source_file, extract_mode)`` for generation-commit filtering.
+
+    Tokenless leftover rows are predecessors only for the same source and
+    extraction mode that now has a committed generation token. Legacy convo
+    drawers without ``extract_mode`` are exchange-mode, matching
+    :func:`_metadata_matches_extract_mode`.
+    """
+    src = meta.get("source_file")
+    if not src:
+        return None
+    mode = meta.get("extract_mode")
+    if mode is None and meta.get("ingest_mode") in (None, "convos"):
+        mode = "exchange"
+    return (src, mode)
+
+
 def file_already_mined(
     collection,
     source_file: str,
@@ -271,9 +288,15 @@ def prefetch_content_hashes(
     generations can be filtered while drawer metadata is scanned in
     bounded pages. Pages are released after each batch; the full palace
     metadata is never retained.
+
+    A source that later publishes a tokened generation can leave tokenless
+    predecessor rows behind when stale-row deletion fails. Those leftovers
+    are not visible once the source/mode commit marker names a token, so
+    their hashes must not suppress a later file of the same transcript.
     """
     hashes: dict[tuple[str, str], str] = {}
     committed_tokens = set()
+    tokened_source_modes = set()
 
     def _consider(meta):
         meta = meta or {}
@@ -287,6 +310,10 @@ def prefetch_content_hashes(
         wing = meta.get("wing")
         if not content_hash_field or not src or not wing:
             return
+        if not generation_token:
+            source_mode = _source_mode_commit_key(meta)
+            if source_mode is not None and source_mode in tokened_source_modes:
+                return
         if not _metadata_matches_extract_mode(meta, extract_mode):
             return
         if meta.get("normalize_version", 1) < NORMALIZE_VERSION:
@@ -311,6 +338,9 @@ def prefetch_content_hashes(
                 token = meta.get("mine_generation_commit")
                 if meta.get("mine_commit_marker") is True and token:
                     committed_tokens.add(token)
+                    source_mode = _source_mode_commit_key(meta)
+                    if source_mode is not None:
+                        tokened_source_modes.add(source_mode)
             del marker_batch
             if not marker_ids:
                 break
