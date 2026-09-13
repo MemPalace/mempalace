@@ -145,12 +145,12 @@ def search(
     # creation — their similarity scores will be junk until they run repair.
     _warn_if_legacy_metric(col)
 
-    committed_tokens, tokened_source_modes = _committed_generation_state(col)
-    where = _visible_drawer_where(
-        build_where_filter(wing, room), committed_tokens, tokened_source_modes
-    )
-
     try:
+        committed_tokens, tokened_source_modes = _committed_generation_state(col)
+        where = _visible_drawer_where(
+            build_where_filter(wing, room), committed_tokens, tokened_source_modes
+        )
+
         kwargs = {
             "query_texts": [query],
             # The window is a post-filter (ChromaDB can't range-compare
@@ -175,6 +175,9 @@ def search(
             tokened_source_modes=tokened_source_modes,
         )
 
+    except GenerationStateError as e:
+        print(f"\n  Search error: {e}")
+        raise
     except Exception as e:
         print(f"\n  Search error: {e}")
         raise SearchError(f"Search error: {e}") from e

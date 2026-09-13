@@ -62,13 +62,24 @@ def _is_visible_generation_metadata(
 
 
 def _committed_generation_state(collection) -> tuple[frozenset, frozenset]:
-    """Published generation tokens and the source/mode pairs that carry them."""
+    """Published generation tokens and the source/mode pairs that carry them.
+
+    Incomplete marker scans are not a visibility view: unread later pages
+    would hide their active tokened rows. Raise instead of returning a
+    partial or empty set.
+    """
     try:
-        tokens, modes, _complete = _generation_commit_marker_state(collection)
-        return frozenset(tokens), frozenset(modes)
-    except Exception:
+        tokens, modes, complete = _generation_commit_marker_state(collection)
+    except Exception as exc:
         logger.warning("Could not read conversation generation commit markers", exc_info=True)
-        return frozenset(), frozenset()
+        raise GenerationStateError("Could not read conversation generation commit markers") from exc
+    if not complete:
+        logger.warning(
+            "generation commit marker scan incomplete, %d commit tokens loaded",
+            len(tokens),
+        )
+        raise GenerationStateError("Incomplete conversation generation commit markers")
+    return frozenset(tokens), frozenset(modes)
 
 
 def _committed_generation_tokens(collection) -> frozenset[str]:

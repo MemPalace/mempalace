@@ -48,9 +48,9 @@ def _current_generation_ids_for_query(
             where={"logical_drawer_id": {"$in": sorted(logical_ids)}},
             include=["metadatas"],
         )
-    except Exception:
+    except Exception as exc:
         logger.warning("Could not resolve current conversation generations", exc_info=True)
-        return {}
+        raise GenerationStateError("Could not resolve current conversation generations") from exc
     current = {}
     ids = generations.get("ids") or []
     metas = generations.get("metadatas") or []
@@ -347,7 +347,10 @@ def search_memories(
 
     metric = _metric_for_collection(drawers_col)
     where = build_where_filter(wing, room, source_file)
-    committed_tokens, tokened_source_modes = _committed_generation_state(drawers_col)
+    try:
+        committed_tokens, tokened_source_modes = _committed_generation_state(drawers_col)
+    except GenerationStateError as e:
+        return _search_error_result(str(e))
     drawer_where = _visible_drawer_where(where, committed_tokens, tokened_source_modes)
 
     # Hybrid retrieval: always query drawers directly (the floor), then use
@@ -380,6 +383,8 @@ def search_memories(
             committed_tokens=committed_tokens,
             tokened_source_modes=tokened_source_modes,
         )
+    except GenerationStateError as e:
+        return _search_error_result(str(e))
     except Exception as e:
         return _search_error_result(f"Search error: {e}")
 

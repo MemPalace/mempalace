@@ -55,6 +55,10 @@ class SearchError(Exception):
     """Raised when search cannot proceed (e.g. no palace found)."""
 
 
+class GenerationStateError(SearchError):
+    """Raised when published generation state cannot be read completely."""
+
+
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 
 _FRAGMENT_DIR = Path(__file__).resolve().parent

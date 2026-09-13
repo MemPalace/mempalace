@@ -822,6 +822,8 @@ def _merge_bm25_union_candidates(
         )
     except UnsupportedCapabilityError:
         raise
+    except GenerationStateError:
+        raise
     except Exception:
         logger.debug("candidate_strategy=union: lexical fetch failed", exc_info=True)
         return

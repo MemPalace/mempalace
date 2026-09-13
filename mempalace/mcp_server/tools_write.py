@@ -138,10 +138,10 @@ def _logical_generation_record(col, drawer_id: str):
             where={"logical_drawer_id": drawer_id},
             include=["documents", "metadatas"],
         )
-        committed, tokened_source_modes = _committed_generation_state(col)
     except Exception:
         logger.debug("generation lookup failed for %s", drawer_id, exc_info=True)
         return None
+    committed, tokened_source_modes = _committed_generation_state(col)
     rows = []
     ids = _chroma_field(result, "ids", []) or []
     docs = _chroma_field(result, "documents", []) or []
@@ -178,10 +178,7 @@ def _logical_drawer_record(col, drawer_id: str):
     generation = _logical_generation_record(col, drawer_id)
     if generation is not None:
         return generation
-    try:
-        committed, tokened_source_modes = _committed_generation_state(col)
-    except Exception:
-        committed, tokened_source_modes = frozenset(), frozenset()
+    committed, tokened_source_modes = _committed_generation_state(col)
     direct = _single_drawer_record(col, drawer_id)
     if direct is not None:
         if _is_visible_generation_metadata(direct["metadata"], committed, tokened_source_modes):
@@ -1155,6 +1152,7 @@ def tool_list_drawers(
             where = {"$and": conditions}
 
         listed = None
+        marker_state = None
         committed_tokens = frozenset()
         tokened_source_modes = frozenset()
         if _is_chroma_backend() and _config.palace_path:
@@ -1167,9 +1165,6 @@ def tool_list_drawers(
                 _config.palace_path,
                 _config.collection_name,
             )
-            if marker_state is not None:
-                committed_tokens = frozenset(marker_state[0])
-                tokened_source_modes = frozenset(marker_state[1])
             listed = sqlite_list_id_metadata(
                 _config.palace_path, _config.collection_name, where=where
             )
@@ -1177,6 +1172,14 @@ def tool_list_drawers(
             # Documents are fetched for the displayed page only, below.
             ids, metadatas = listed
             documents = []
+            if marker_state is not None:
+                committed_tokens = frozenset(marker_state[0])
+                tokened_source_modes = frozenset(marker_state[1])
+            else:
+                col = _get_collection()
+                if not col:
+                    return _collection_error_or_no_palace()
+                committed_tokens, tokened_source_modes = _committed_generation_state(col)
         else:
             col = _get_collection()
             if not col:

@@ -721,6 +721,44 @@ class TestWriteTools:
         assert "error" in tool_get_drawer("logical-published")
         assert "error" in tool_get_drawer("removed-logical")
 
+    def test_get_drawer_fails_closed_on_incomplete_generation_markers(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import searcher
+        from mempalace.mcp_server import tool_get_drawer
+
+        monkeypatch.setattr(
+            searcher,
+            "_generation_commit_marker_state",
+            lambda _collection: ({"token-0"}, set(), False),
+        )
+        result = tool_get_drawer("drawer_proj_backend_aaa")
+        assert "error" in result
+        assert "Incomplete" in result["error"]
+        assert "drawer_id" not in result
+
+    def test_list_drawers_fails_closed_on_incomplete_generation_markers(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import searcher
+        from mempalace.mcp_server import tool_list_drawers
+
+        monkeypatch.setattr(
+            searcher,
+            "_generation_commit_marker_state",
+            lambda _collection: ({"token-0"}, set(), False),
+        )
+        monkeypatch.setattr(
+            "mempalace.backends.chroma.sqlite_generation_commit_state",
+            lambda *_args, **_kwargs: None,
+        )
+        result = tool_list_drawers()
+        assert "error" in result
+        assert "Incomplete" in result["error"]
+        assert "drawers" not in result
+
     def test_list_drawers_with_wing_filter(
         self, monkeypatch, config, palace_path, seeded_collection, kg
     ):

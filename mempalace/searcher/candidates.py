@@ -362,6 +362,8 @@ def _finalize_candidate_hits(
                 "Use candidate_strategy='vector' or select a backend that supports lexical search."
             ),
         )
+    except GenerationStateError as e:
+        return [], _search_error_result(str(e))
 
     hits[:] = _collapse_logical_generation_hits(hits)
     vector_weight, bm25_weight = _resolve_hybrid_rank_weights()

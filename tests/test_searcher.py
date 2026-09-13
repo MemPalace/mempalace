@@ -16,6 +16,7 @@ from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 from mempalace.backends import BackendMismatchError
 from mempalace.searcher import (
+    GenerationStateError,
     SearchError,
     _result_drawer_id,
     build_where_filter,
@@ -163,8 +164,21 @@ class TestVisibleDrawerWhereBounds:
         tokens = {f"token-{index}" for index in range(n_sources)}
         modes = {(f"/tmp/session-{index}.jsonl", "exchange") for index in range(n_sources)}
         where = _visible_drawer_where({}, tokens, modes)
+        assert len(tokens) == 80
+        assert len(modes) == 80
         assert _where_source_ne_count(where) == 0
         assert _where_node_count(where) <= 8
+
+        stored = collection.get(ids=["leftover", "current"])
+        assert set(stored["ids"]) == {"leftover", "current"}
+        ranked = collection.query(
+            query_texts=[query],
+            n_results=4,
+            include=["documents"],
+        )
+        ranked_ids = ranked["ids"][0]
+        assert "leftover" in ranked_ids
+        assert "current" in ranked_ids
 
         result = search_memories(query, palace_path, n_results=1)
         assert "error" not in result, result
@@ -172,6 +186,178 @@ class TestVisibleDrawerWhereBounds:
         ids = [hit["drawer_id"] for hit in result["results"]]
         assert "leftover" not in ids
         assert ids[0] in {"current", "kept-logical"}
+
+
+class TestGenerationStateFailClosed:
+    def test_committed_generation_state_raises_on_incomplete_marker_scan(self):
+        from mempalace.searcher import _committed_generation_state
+
+        class Collection:
+            @staticmethod
+            def get(**_kwargs):
+                raise RuntimeError("later marker page failed")
+
+        with pytest.raises(GenerationStateError, match="Incomplete"):
+            _committed_generation_state(Collection())
+
+    def test_committed_generation_state_does_not_return_partial_tokens(self, monkeypatch):
+        from mempalace import searcher
+
+        monkeypatch.setattr(
+            searcher,
+            "_generation_commit_marker_state",
+            lambda _collection: (
+                {"token-0"},
+                {("/tmp/session-0.jsonl", "exchange")},
+                False,
+            ),
+        )
+
+        with pytest.raises(GenerationStateError, match="Incomplete"):
+            searcher._committed_generation_state(object())
+
+    def test_search_memories_fails_closed_on_incomplete_markers(
+        self, palace_path, seeded_collection, monkeypatch
+    ):
+        from mempalace import searcher
+
+        monkeypatch.setattr(
+            searcher,
+            "_generation_commit_marker_state",
+            lambda _collection: (
+                {"token-0"},
+                {("/tmp/session-0.jsonl", "exchange")},
+                False,
+            ),
+        )
+
+        result = search_memories("JWT authentication", palace_path)
+        assert result["results"] == []
+        assert "error" in result
+        assert "Incomplete" in result["error"]
+
+    def test_current_generation_lookup_raises_instead_of_empty_map(self):
+        from mempalace.searcher import _current_generation_ids_for_query
+
+        class Collection:
+            @staticmethod
+            def get(**_kwargs):
+                raise RuntimeError("$in too large")
+
+        raw = {
+            "ids": [["old"]],
+            "documents": [["old text"]],
+            "metadatas": [[{"logical_drawer_id": "logical"}]],
+            "distances": [[0.1]],
+        }
+        with pytest.raises(GenerationStateError, match="current conversation generation"):
+            _current_generation_ids_for_query(Collection(), raw, frozenset())
+
+    def test_post_filter_does_not_drop_logical_hits_when_generation_lookup_fails(self):
+        from mempalace.searcher import _post_filter_drawer_query
+
+        class Collection:
+            @staticmethod
+            def get(**_kwargs):
+                raise RuntimeError("$in too large")
+
+        raw = {
+            "ids": [["kept-logical"]],
+            "documents": [["session hit"]],
+            "metadatas": [
+                [
+                    {
+                        "logical_drawer_id": "kept-logical",
+                        "mine_generation_token": "token-0",
+                    }
+                ]
+            ],
+            "distances": [[0.1]],
+        }
+        with pytest.raises(GenerationStateError, match="current conversation generation"):
+            _post_filter_drawer_query(
+                Collection(),
+                raw,
+                None,
+                None,
+                None,
+                frozenset({"token-0"}),
+            )
+
+    def test_query_fallback_fails_closed_when_current_generation_get_raises(self):
+        from mempalace.searcher import _query_drawers_with_filter_fallback
+
+        current_meta = {
+            "logical_drawer_id": "kept-logical",
+            "mine_generation_token": "token-0",
+        }
+
+        class Collection:
+            @staticmethod
+            def count():
+                return 1
+
+            @staticmethod
+            def get(where=None, include=None, **_kwargs):
+                if isinstance(where, dict) and where.get("mine_commit_marker") is True:
+                    return {
+                        "ids": ["marker"],
+                        "metadatas": [
+                            {
+                                "mine_commit_marker": True,
+                                "mine_generation_commit": "token-0",
+                            }
+                        ],
+                    }
+                raise RuntimeError("Error executing plan: $in too large")
+
+            @staticmethod
+            def query(**_kwargs):
+                return {
+                    "ids": [["kept-logical"]],
+                    "documents": [["session hit"]],
+                    "metadatas": [[current_meta]],
+                    "distances": [[0.1]],
+                }
+
+        with pytest.raises(GenerationStateError, match="current conversation generation"):
+            _query_drawers_with_filter_fallback(
+                Collection(),
+                {"where": {"mine_staged": {"$ne": True}}, "n_results": 1},
+                "query",
+                1,
+                None,
+                None,
+            )
+
+    def test_search_memories_fails_closed_when_current_generation_get_fails(
+        self, palace_path, collection, monkeypatch
+    ):
+        from mempalace import searcher
+
+        collection.upsert(
+            ids=["current"],
+            documents=["bounded-generation-chroma-phrase"],
+            metadatas=[
+                {
+                    "wing": "sessions",
+                    "room": "general",
+                    "logical_drawer_id": "kept-logical",
+                    "mine_generation_token": "token-0",
+                    "filed_at": "2026-09-02T00:00:00",
+                }
+            ],
+        )
+
+        def fail_current(*_args, **_kwargs):
+            raise GenerationStateError("Could not resolve current conversation generations")
+
+        monkeypatch.setattr(searcher, "_current_generation_ids_for_query", fail_current)
+
+        result = search_memories("bounded-generation-chroma-phrase", palace_path, n_results=1)
+        assert result["results"] == []
+        assert "error" in result
+        assert "current conversation generation" in result["error"]
 
 
 # ── search_memories (API) ──────────────────────────────────────────────
@@ -1830,6 +2016,10 @@ def test_search_cli_threads_resolved_stop_words_to_hybrid_rank(monkeypatch, tmp_
                     "metadatas": [[{"wing": "general"}]],
                     "distances": [[0.5]],
                 }
+
+            @staticmethod
+            def get(**_kwargs):
+                return {"ids": [], "metadatas": []}
 
         return _Col()
 

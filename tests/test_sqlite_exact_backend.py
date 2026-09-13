@@ -1093,6 +1093,10 @@ def test_search_union_reports_unsupported_lexical_capability(monkeypatch, tmp_pa
                 distances=[[0.5]],
             )
 
+        @staticmethod
+        def get(**_kwargs):
+            return {"ids": [], "metadatas": []}
+
         def lexical_search(self, **_kwargs):
             raise UnsupportedCapabilityError("no lexical support")
 
