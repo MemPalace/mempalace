@@ -624,7 +624,7 @@ class TestSweeperCLI:
     """The `sweep` subcommand exposes --wing/--room and threads them through."""
 
     def test_cli_sweep_accepts_and_threads_wing_room(
-        self, mock_claude_jsonl, tmp_path, monkeypatch
+        self, mock_claude_jsonl, tmp_path, monkeypatch, capsys
     ):
         import mempalace.sweeper as sweeper
         from mempalace import cli
@@ -658,10 +658,12 @@ class TestSweeperCLI:
                 "cli_wing",
                 "--room",
                 "cli_room",
+                "--direct",
             ],
         )
         cli.main()
         assert captured == {"wing": "cli_wing", "room": "cli_room"}
+        assert "--room is ignored without --wing" not in capsys.readouterr().err
 
     def test_cli_sweep_room_without_wing_warns_and_skips_taxonomy(
         self, mock_claude_jsonl, tmp_path, monkeypatch, capsys
@@ -682,10 +684,11 @@ class TestSweeperCLI:
                 str(mock_claude_jsonl),
                 "--room",
                 "orphan",
+                "--direct",
             ],
         )
         cli.main()
-        assert "--room is ignored without --wing" in capsys.readouterr().err
+        assert capsys.readouterr().err.count("--room is ignored without --wing") == 1
 
         col = get_collection(palace_path, create=False)
         metas = col.get(include=["metadatas"])["metadatas"]
@@ -693,3 +696,129 @@ class TestSweeperCLI:
         for m in metas:
             assert "wing" not in m, f"unexpected wing without --wing: {m}"
             assert "room" not in m, f"orphan --room leaked into metadata: {m}"
+
+
+class TestSweeperDaemonRoute:
+    """A sweep routed through the daemon (`--daemon`, or a prefer/require CLI
+    write-routing policy) classifies drawers the same way the direct route
+    does: the CLI puts --wing/--room in the job payload and the worker hands
+    them to the sweeper."""
+
+    @staticmethod
+    def _submitted_jobs(monkeypatch, argv):
+        from mempalace import cli
+
+        jobs = []
+        monkeypatch.setattr(
+            cli,
+            "_submit_daemon_cli_job",
+            lambda kind, payload, args, **kwargs: jobs.append((kind, payload)),
+        )
+        monkeypatch.setattr("sys.argv", ["mempalace", *argv])
+        cli.main()
+        return jobs
+
+    def test_cli_daemon_route_carries_wing_and_room(
+        self, mock_claude_jsonl, tmp_path, monkeypatch, capsys
+    ):
+        jobs = self._submitted_jobs(
+            monkeypatch,
+            [
+                "--palace",
+                str(tmp_path / "palace"),
+                "sweep",
+                str(mock_claude_jsonl),
+                "--wing",
+                "cli_wing",
+                "--room",
+                "cli_room",
+                "--daemon",
+            ],
+        )
+        assert jobs == [
+            (
+                "sweep",
+                {"target": str(mock_claude_jsonl), "wing": "cli_wing", "room": "cli_room"},
+            )
+        ]
+        assert "--room is ignored without --wing" not in capsys.readouterr().err
+
+    @pytest.mark.parametrize("wing_args", [[], ["--wing", "   "]], ids=["no_wing", "blank_wing"])
+    def test_cli_daemon_route_warns_on_room_without_wing(
+        self, mock_claude_jsonl, tmp_path, monkeypatch, capsys, wing_args
+    ):
+        jobs = self._submitted_jobs(
+            monkeypatch,
+            [
+                "--palace",
+                str(tmp_path / "palace"),
+                "sweep",
+                str(mock_claude_jsonl),
+                *wing_args,
+                "--room",
+                "orphan",
+                "--daemon",
+            ],
+        )
+        assert capsys.readouterr().err.count("--room is ignored without --wing") == 1
+        assert len(jobs) == 1
+
+    def test_cli_blank_room_without_wing_does_not_warn(
+        self, mock_claude_jsonl, tmp_path, monkeypatch, capsys
+    ):
+        jobs = self._submitted_jobs(
+            monkeypatch,
+            [
+                "--palace",
+                str(tmp_path / "palace"),
+                "sweep",
+                str(mock_claude_jsonl),
+                "--room",
+                "   ",
+                "--daemon",
+            ],
+        )
+        assert "--room is ignored without --wing" not in capsys.readouterr().err
+        assert len(jobs) == 1
+
+    def test_cli_routing_error_prints_no_room_warning(
+        self, mock_claude_jsonl, tmp_path, monkeypatch, capsys
+    ):
+        """A sweep that stops on a routing error has not reached --room yet."""
+        with pytest.raises(SystemExit) as exc:
+            self._submitted_jobs(
+                monkeypatch,
+                [
+                    "--palace",
+                    str(tmp_path / "palace"),
+                    "sweep",
+                    str(mock_claude_jsonl),
+                    "--room",
+                    "orphan",
+                    "--direct",
+                    "--background",
+                ],
+            )
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "invalid CLI write routing" in err
+        assert "--room is ignored without --wing" not in err
+
+    @pytest.mark.parametrize("target_kind", ["file", "directory"])
+    def test_daemon_worker_stamps_wing_and_room(self, mock_claude_jsonl, tmp_path, target_kind):
+        from mempalace import service
+        from mempalace.palace import get_collection
+
+        palace_path = str(tmp_path / "palace")
+        target = mock_claude_jsonl if target_kind == "file" else mock_claude_jsonl.parent
+        result = service.execute_job(
+            "sweep",
+            {"palace_path": palace_path, "target": str(target), "wing": "proj", "room": "chat"},
+        )
+        assert result["success"] is True, result
+
+        col = get_collection(palace_path, create=False)
+        metas = col.get(include=["metadatas"])["metadatas"]
+        assert metas, "No drawers written"
+        for m in metas:
+            assert (m.get("wing"), m.get("room")) == ("proj", "chat"), m

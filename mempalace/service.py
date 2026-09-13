@@ -372,6 +372,8 @@ def run_sweep(payload: dict[str, Any]) -> dict[str, Any]:
         }
 
     target = os.path.abspath(os.path.expanduser(target_raw))
+    wing = payload.get("wing")
+    room = payload.get("room")
 
     from .daemon import LOCK_REFUSAL_ERROR_CLASS
     from .palace import MineAlreadyRunning
@@ -379,14 +381,14 @@ def run_sweep(payload: dict[str, Any]) -> dict[str, Any]:
 
     try:
         if os.path.isfile(target):
-            result = sweep(target, palace_path)
+            result = sweep(target, palace_path, wing=wing, room=room)
             print(
                 f" Swept {target}: +{result['drawers_added']} new, "
                 f"{result['drawers_already_present']} already present, "
                 f"{result['drawers_skipped']} skipped (< cursor)."
             )
         elif os.path.isdir(target):
-            result = sweep_directory(target, palace_path)
+            result = sweep_directory(target, palace_path, wing=wing, room=room)
             print(
                 f" Swept {result['files_succeeded']}/"
                 f"{result['files_attempted']} files from {target}: "
