@@ -683,6 +683,157 @@ def _extract_authored_at(filepath):
     return latest
 
 
+def _content_set_generation_token(members: list[tuple[str, str]]) -> str:
+    """Hash the logical drawer ids and chunk hashes that make one visible set.
+
+    Physical ids change when a reused row is copied into a new generation, so
+    the commit token cannot be derived from those ids. A content-set token is
+    stable across retries and A→B→A transitions of the same verbatim chunks.
+    """
+    payload = "\0".join(f"{logical_id}\0{chunk_hash}" for logical_id, chunk_hash in sorted(members))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _reused_generation_copy_id(logical_drawer_id: str, generation_token: str) -> str:
+    """Physical id for a reused chunk cloned into ``generation_token``."""
+    return make_convo_generation_id(logical_drawer_id, f"set:{generation_token}")
+
+
+def _compatible_chunk_generations(
+    candidates: list[tuple[str, dict]], chunk_hash: str
+) -> list[tuple[str, dict]]:
+    return [
+        (physical_id, stored_meta)
+        for physical_id, stored_meta in candidates
+        if stored_meta.get("chunk_hash") == chunk_hash
+        and stored_meta.get("normalize_version", 1) >= NORMALIZE_VERSION
+    ]
+
+
+def _reused_drawer_touch_meta(
+    prev: dict,
+    *,
+    logical_drawer_id: str,
+    chunk_total: int,
+    source_mtime,
+    content_hash,
+    chunk_index,
+) -> dict:
+    touched = dict(prev)
+    touched["logical_drawer_id"] = logical_drawer_id
+    touched["mine_staged"] = False
+    touched["chunk_total"] = chunk_total
+    if source_mtime is not None:
+        touched["source_mtime"] = source_mtime
+    else:
+        # A stale stored mtime with no current one to replace it would let
+        # an old group satisfy a future completion check.
+        touched.pop("source_mtime", None)
+    if content_hash is not None and chunk_index == 0:
+        touched["content_hash"] = content_hash
+    return touched
+
+
+def _embedding_vector(value):
+    if value is None:
+        return None
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if not isinstance(value, list) or not value:
+        return None
+    return list(value)
+
+
+def _existing_embeddings(collection, ids, access_gate) -> dict:
+    """Map physical id → stored embedding for reused generation copies."""
+    embeddings: dict = {}
+    unique_ids = list(dict.fromkeys(ids))
+    for batch_start in range(0, len(unique_ids), DRAWER_UPSERT_BATCH_SIZE):
+        batch_ids = unique_ids[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+        with _access_read(access_gate):
+            result = collection.get(ids=batch_ids, include=["embeddings"])
+        got_ids = result.get("ids") or []
+        got_embs = result.get("embeddings")
+        if not got_ids or got_embs is None:
+            continue
+        for drawer_id, raw in zip(got_ids, got_embs):
+            vector = _embedding_vector(raw)
+            if vector is not None:
+                embeddings[drawer_id] = vector
+    return embeddings
+
+
+def _upsert_staged_convo_drawers(
+    collection,
+    *,
+    ids,
+    documents,
+    metadatas,
+    access_gate,
+    embeddings=None,
+) -> None:
+    try:
+        with _access_write(access_gate):
+            assert_no_collisions(list(zip(ids, metadatas)), collection)
+            kwargs = {
+                "documents": documents,
+                "ids": ids,
+                "metadatas": metadatas,
+            }
+            if embeddings is not None:
+                kwargs["embeddings"] = embeddings
+            collection.upsert(**kwargs)
+    except Exception as exc:
+        if "already exists" not in str(exc).lower():
+            raise
+
+
+def _stage_reused_generation_copies(
+    collection,
+    copies: list[tuple[str, str, str, dict]],
+    *,
+    generation_token: str,
+    access_gate,
+) -> None:
+    """Clone reused drawers under the new token, copying stored embeddings."""
+    if not copies:
+        return
+    embeddings = _existing_embeddings(
+        collection, [source_id for _, source_id, _, _ in copies], access_gate
+    )
+    for batch_start in range(0, len(copies), DRAWER_UPSERT_BATCH_SIZE):
+        batch = copies[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+        with_vectors: list[tuple[str, str, dict, list]] = []
+        without_vectors: list[tuple[str, str, dict]] = []
+        for physical_id, source_id, content, final_meta in batch:
+            staged = dict(final_meta)
+            staged.pop("source_mtime", None)
+            staged["mine_staged"] = True
+            staged["mine_generation_token"] = generation_token
+            vector = embeddings.get(source_id)
+            if vector is not None:
+                with_vectors.append((physical_id, content, staged, vector))
+            else:
+                without_vectors.append((physical_id, content, staged))
+        if with_vectors:
+            _upsert_staged_convo_drawers(
+                collection,
+                ids=[item[0] for item in with_vectors],
+                documents=[item[1] for item in with_vectors],
+                metadatas=[item[2] for item in with_vectors],
+                access_gate=access_gate,
+                embeddings=[item[3] for item in with_vectors],
+            )
+        if without_vectors:
+            _upsert_staged_convo_drawers(
+                collection,
+                ids=[item[0] for item in without_vectors],
+                documents=[item[1] for item in without_vectors],
+                metadatas=[item[2] for item in without_vectors],
+                access_gate=access_gate,
+            )
+
+
 def _publish_changed_generations(
     collection,
     *,
@@ -693,14 +844,18 @@ def _publish_changed_generations(
     source_file,
     access_gate=None,
 ) -> bool:
-    """Atomically publish a staged token, finalize rows, and retire old ones."""
+    """Publish a fully staged generation, finalize rows, and retire old ones.
+
+    Callers must already have written every new-generation row — including
+    generation-specific copies of reused unchanged chunks — under
+    ``mine_generation_token``. Switching the marker is then the crash-atomic
+    visibility flip: before it, the previous committed generation stays
+    complete; after it, the new token is complete even if metadata
+    finalization or stale-row cleanup fails. ``cleanup_pending`` keeps the
+    source retryable until every follow-up write succeeds.
+    """
     try:
         with _access_write(access_gate):
-            # One marker upsert is the crash-atomic visibility switch. Before
-            # it, every new generation is hidden. After it, the complete staged
-            # token is searchable even if the process dies during metadata
-            # finalization or stale-row cleanup. ``cleanup_pending`` keeps the
-            # source retryable until every follow-up write succeeds.
             collection.upsert(
                 ids=[commit_id],
                 documents=[f"[conversation generation commit] {source_file}"],
@@ -730,6 +885,185 @@ def _publish_changed_generations(
     return False
 
 
+def _changed_convo_drawer_meta(
+    *,
+    wing,
+    chunk_room,
+    chunk,
+    source_file,
+    agent,
+    filed_at,
+    authored_at,
+    extract_mode,
+    logical_drawer_id,
+    chunk_total,
+    chunk_hash,
+    source_mtime,
+    content_hash,
+) -> dict:
+    meta = {
+        "wing": wing,
+        "room": chunk_room,
+        "hall": _detect_hall_cached(chunk["content"]),
+        "source_file": source_file,
+        "chunk_index": chunk["chunk_index"],
+        "added_by": agent,
+        "filed_at": filed_at,
+        "entities": entities_metadata(chunk["content"]),
+        "authored_at": authored_at if authored_at is not None else filed_at,
+        "ingest_mode": "convos",
+        "extract_mode": extract_mode,
+        "normalize_version": NORMALIZE_VERSION,
+        "id_recipe": ID_RECIPE,
+        "logical_drawer_id": logical_drawer_id,
+        "mine_staged": False,
+        "chunk_total": chunk_total,
+        "chunk_hash": chunk_hash,
+    }
+    if source_mtime is not None:
+        meta["source_mtime"] = source_mtime
+    # Stamp content_hash only on chunk 0 so multi-conversation privacy-export
+    # hashes are not O(N²)-duplicated across every chunk row.
+    # ``prefetch_content_hashes`` still finds them — it scans all drawers and
+    # splits comma-joined hash fields.
+    if content_hash is not None and chunk.get("chunk_index", 0) == 0:
+        meta["content_hash"] = content_hash
+    return meta
+
+
+def _select_reuse_candidate(matches, copy_id, generation_token):
+    for match in matches:
+        if match[1].get("mine_generation_token") == generation_token:
+            return match
+    for match in matches:
+        if match[0] == copy_id:
+            return match
+    for match in matches:
+        if not match[1].get("mine_generation_token"):
+            return match
+    return matches[0]
+
+
+def _plan_convo_generation_writes(
+    planned_chunks,
+    *,
+    existing,
+    pending_cleanup,
+    wing,
+    source_file,
+    agent,
+    filed_at,
+    authored_at,
+    extract_mode,
+    chunk_total,
+    source_mtime,
+    content_hash,
+):
+    """Decide upserts, in-place refreshes, and generation copies for one pass."""
+    generation_token = _content_set_generation_token(
+        [(item["logical_drawer_id"], item["chunk_hash"]) for item in planned_chunks]
+    )
+    to_upsert: list = []
+    to_touch: list = []
+    to_copy: list = []
+    tentative: list[tuple] = []
+    tentative_ids: set = set()
+    for item in planned_chunks:
+        copy_id = _reused_generation_copy_id(item["logical_drawer_id"], generation_token)
+        matches = item["matches"]
+        if matches:
+            current = _select_reuse_candidate(matches, copy_id, generation_token)
+            tentative.append(("reuse", item, copy_id, current))
+            tentative_ids.add(current[0])
+            continue
+        physical_id = (
+            make_convo_generation_id(item["logical_drawer_id"], item["chunk_hash"])
+            if item["candidates"]
+            else item["logical_drawer_id"]
+        )
+        tentative.append(("upsert", item, copy_id, (physical_id, None)))
+        tentative_ids.add(physical_id)
+
+    # Grow-only passes keep reused physical ids in place and never switch the
+    # commit marker. A rewrite/shrink that will publish a new token must clone
+    # reused rows that still carry the previous token; updating those ids in
+    # place would hide them for the duration of the switch.
+    will_publish = pending_cleanup or any(drawer_id not in tentative_ids for drawer_id in existing)
+    new_ids: set = set()
+    for kind, item, copy_id, current in tentative:
+        chunk = item["chunk"]
+        logical_drawer_id = item["logical_drawer_id"]
+        if kind == "upsert":
+            physical_id = current[0]
+            new_ids.add(physical_id)
+            to_upsert.append(
+                (
+                    physical_id,
+                    chunk["content"],
+                    _changed_convo_drawer_meta(
+                        wing=wing,
+                        chunk_room=item["chunk_room"],
+                        chunk=chunk,
+                        source_file=source_file,
+                        agent=agent,
+                        filed_at=filed_at,
+                        authored_at=authored_at,
+                        extract_mode=extract_mode,
+                        logical_drawer_id=logical_drawer_id,
+                        chunk_total=chunk_total,
+                        chunk_hash=item["chunk_hash"],
+                        source_mtime=source_mtime,
+                        content_hash=content_hash,
+                    ),
+                )
+            )
+            continue
+        physical_id, prev = current
+        reused_token = prev.get("mine_generation_token")
+        if (
+            will_publish
+            and reused_token
+            and reused_token != generation_token
+            and physical_id != copy_id
+        ):
+            source_id, source_meta = next(
+                (match for match in item["matches"] if match[1].get("mine_staged") is not True),
+                current,
+            )
+            new_ids.add(copy_id)
+            to_copy.append(
+                (
+                    copy_id,
+                    source_id,
+                    chunk["content"],
+                    _reused_drawer_touch_meta(
+                        source_meta,
+                        logical_drawer_id=logical_drawer_id,
+                        chunk_total=chunk_total,
+                        source_mtime=source_mtime,
+                        content_hash=content_hash,
+                        chunk_index=chunk.get("chunk_index", 0),
+                    ),
+                )
+            )
+            continue
+        new_ids.add(physical_id)
+        to_touch.append(
+            (
+                physical_id,
+                _reused_drawer_touch_meta(
+                    prev,
+                    logical_drawer_id=logical_drawer_id,
+                    chunk_total=chunk_total,
+                    source_mtime=source_mtime,
+                    content_hash=content_hash,
+                    chunk_index=chunk.get("chunk_index", 0),
+                ),
+            )
+        )
+    return to_upsert, to_touch, to_copy, new_ids, generation_token
+
+
 def _file_chunks_locked(
     collection,
     source_file,
@@ -752,11 +1086,15 @@ def _file_chunks_locked(
     and /compact or /clear can rewrite one in place — only re-embeds the
     chunks whose content actually changed. A changed chunk is staged under a
     content-addressed physical generation instead of overwriting its old
-    logical position. Unchanged chunks get a cheap metadata-only refresh
-    (``source_mtime`` / ``chunk_total``). Existing generations are deleted
-    only after every new batch succeeds, so a crash mid-operation leaves the
-    prior verbatim set untouched; a crash after staging leaves a retryable
-    incomplete group that reuses the staged embeddings (#2183).
+    logical position. Unchanged chunks that still have no generation token
+    get a cheap metadata-only refresh (``source_mtime`` / ``chunk_total``).
+    Unchanged chunks that already belong to another committed generation are
+    cloned under a generation-specific physical id with the stored embedding,
+    so the old token stays complete until the new token is fully staged.
+    Existing generations are deleted only after every new batch succeeds, so
+    a crash mid-operation leaves the prior verbatim set untouched; a crash
+    after staging leaves a retryable incomplete group that reuses the staged
+    embeddings (#2183).
 
     Returns (drawers_added, room_counts_delta, skipped) where drawers_added
     counts only new/changed drawers actually upserted this pass.
@@ -836,9 +1174,7 @@ def _file_chunks_locked(
                 logical_id = physical_id
             existing_by_logical[logical_id].append((physical_id, stored_meta))
 
-        to_upsert: list = []  # (physical_id, content, final_meta)
-        to_touch: list = []  # (physical_id, refreshed_meta)
-        new_ids: set = set()
+        planned_chunks: list[dict] = []
         for chunk in chunks:
             chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
             if extract_mode == "general":
@@ -848,77 +1184,40 @@ def _file_chunks_locked(
             )
             chunk_hash = hashlib.sha256(chunk["content"].encode("utf-8")).hexdigest()
             candidates = existing_by_logical.get(logical_drawer_id, [])
-            current = next(
-                (
-                    (physical_id, stored_meta)
-                    for physical_id, stored_meta in candidates
-                    if stored_meta.get("chunk_hash") == chunk_hash
-                    and stored_meta.get("normalize_version", 1) >= NORMALIZE_VERSION
-                ),
-                None,
+            planned_chunks.append(
+                {
+                    "chunk": chunk,
+                    "chunk_room": chunk_room,
+                    "logical_drawer_id": logical_drawer_id,
+                    "chunk_hash": chunk_hash,
+                    "candidates": candidates,
+                    "matches": _compatible_chunk_generations(candidates, chunk_hash),
+                }
             )
-            if current is not None:
-                physical_id, prev = current
-                new_ids.add(physical_id)
-                touched = dict(prev)
-                touched["logical_drawer_id"] = logical_drawer_id
-                touched["mine_staged"] = False
-                touched["chunk_total"] = chunk_total
-                if source_mtime is not None:
-                    touched["source_mtime"] = source_mtime
-                else:
-                    # A stale stored mtime with no current one to replace it
-                    # would let an old group satisfy a future completion check.
-                    touched.pop("source_mtime", None)
-                # Refresh the chunk-0 conversation-hash stamp so cross-file
-                # dedup keeps seeing conversations added since the last pass.
-                if content_hash is not None and chunk.get("chunk_index", 0) == 0:
-                    touched["content_hash"] = content_hash
-                to_touch.append((physical_id, touched))
-                continue
-            physical_id = (
-                make_convo_generation_id(logical_drawer_id, chunk_hash)
-                if candidates
-                else logical_drawer_id
-            )
-            new_ids.add(physical_id)
-            meta = {
-                "wing": wing,
-                "room": chunk_room,
-                "hall": _detect_hall_cached(chunk["content"]),
-                "source_file": source_file,
-                "chunk_index": chunk["chunk_index"],
-                "added_by": agent,
-                "filed_at": filed_at,
-                "entities": entities_metadata(chunk["content"]),
-                "authored_at": authored_at if authored_at is not None else filed_at,
-                "ingest_mode": "convos",
-                "extract_mode": extract_mode,
-                "normalize_version": NORMALIZE_VERSION,
-                "id_recipe": ID_RECIPE,
-                "logical_drawer_id": logical_drawer_id,
-                "mine_staged": False,
-                "chunk_total": chunk_total,
-                "chunk_hash": chunk_hash,
-            }
-            if source_mtime is not None:
-                meta["source_mtime"] = source_mtime
-            # Stamp content_hash only on chunk 0 so multi-conversation
-            # privacy-export hashes are not O(N²)-duplicated across every
-            # chunk row. ``prefetch_content_hashes`` still finds them —
-            # it scans all drawers and splits comma-joined hash fields.
-            if content_hash is not None and chunk.get("chunk_index", 0) == 0:
-                meta["content_hash"] = content_hash
-            to_upsert.append((physical_id, chunk["content"], meta))
+
+        to_upsert, to_touch, to_copy, new_ids, generation_token = _plan_convo_generation_writes(
+            planned_chunks,
+            existing=existing,
+            pending_cleanup=pending_cleanup,
+            wing=wing,
+            source_file=source_file,
+            agent=agent,
+            filed_at=filed_at,
+            authored_at=authored_at,
+            extract_mode=extract_mode,
+            chunk_total=chunk_total,
+            source_mtime=source_mtime,
+            content_hash=content_hash,
+        )
 
         # A shrink/rewrite needs a two-phase completion marker. New/changed
         # rows are first written without the current source mtime; unchanged
-        # rows keep their old mtime. Only after orphan cleanup succeeds do we
-        # stamp the whole target set current. A transient delete failure then
-        # remains visibly incomplete and retries even if the source never
-        # changes again.
+        # rows keep their old mtime unless they already carry another
+        # generation token, in which case they are cloned first. Only after
+        # orphan cleanup succeeds do we stamp the whole target set current.
+        # A transient delete failure then remains visibly incomplete and
+        # retries even if the source never changes again.
         stale_ids = [drawer_id for drawer_id in existing if drawer_id not in new_ids]
-        generation_token = hashlib.sha256("\0".join(sorted(new_ids)).encode()).hexdigest()
         commit_metadata = {
             "wing": wing,
             "room": "_registry",
@@ -967,6 +1266,12 @@ def _file_chunks_locked(
             except Exception as e:
                 if "already exists" not in str(e).lower():
                     raise
+        _stage_reused_generation_copies(
+            collection,
+            to_copy,
+            generation_token=generation_token,
+            access_gate=access_gate,
+        )
         if not stale_ids and not pending_cleanup:
             for batch_start in range(0, len(to_touch), DRAWER_UPSERT_BATCH_SIZE):
                 batch = to_touch[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
@@ -985,9 +1290,11 @@ def _file_chunks_locked(
         # retries even when the source itself stays unchanged.
         if stale_ids or pending_cleanup:
             final_metadata = []
-            for drawer_id, meta in to_touch + [
-                (item_id, item_meta) for item_id, _, item_meta in to_upsert
-            ]:
+            for drawer_id, meta in (
+                to_touch
+                + [(item_id, item_meta) for item_id, _, item_meta in to_upsert]
+                + [(item_id, item_meta) for item_id, _, _, item_meta in to_copy]
+            ):
                 published_meta = dict(meta)
                 published_meta["mine_staged"] = False
                 published_meta["mine_generation_token"] = generation_token
