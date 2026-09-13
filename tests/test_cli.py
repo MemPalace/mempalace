@@ -743,6 +743,44 @@ def test_cmd_mine_daemon_background_submits_job(mock_config_cls, capsys):
 
 
 @patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_daemon_resolves_relative_source_against_caller_cwd(
+    mock_config_cls, tmp_path, monkeypatch
+):
+    """#2441: the daemon outlives this process and keeps its own cwd, so a
+    relative source has to be resolved here, against the caller's cwd, before
+    it enters the payload. _forward_mine_to_hub already does this for the hub
+    path; the daemon path did not."""
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    monkeypatch.chdir(tmp_path)
+    expected_source = os.getcwd()
+    args = argparse.Namespace(
+        dir=".",
+        palace=None,
+        mode="projects",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+        daemon=True,
+        background=True,
+        backend=None,
+        global_backend=None,
+        max_chunks_per_file=None,
+        redetect_origin=False,
+    )
+    with patch("mempalace.daemon.submit_job", return_value={"id": "job-1"}) as mock_submit:
+        with patch("mempalace.miner.mine") as mock_mine:
+            cmd_mine(args)
+
+    mock_mine.assert_not_called()
+    payload = mock_submit.call_args.args[1]
+    assert payload["source"] == expected_source
+
+
+@patch("mempalace.cli.MempalaceConfig")
 def test_cmd_mine_daemon_lock_deferral_reports_a_runnable_command(mock_config_cls, capsys):
     """A foreground mine refused the palace lock must say so and hand back a
     command that actually works. --palace is global, so it has to be echoed back
