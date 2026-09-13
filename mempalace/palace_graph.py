@@ -33,6 +33,7 @@ from .config import MempalaceConfig, normalize_wing_name
 from .dynamics import initialize_dynamics_fields
 from .palace import get_collection as _get_palace_collection
 from .palace import mine_lock
+from .backends.base import BaseCollection
 
 logger = logging.getLogger("mempalace_graph")
 
@@ -192,6 +193,27 @@ def _get_collection(config=None):
         return None
 
 
+def _iter_all_metadata(col):
+    """Yield every drawer's metadata using the backend's own cursor (#2452).
+
+    ``get_all_metadata`` (#1796) is a single pass on every backend; the
+    offset loop it replaces is O(n^2) on qdrant, where each page re-walks the
+    collection from the start. The loop is kept only for collection objects
+    that predate the contract method.
+    """
+    if isinstance(col, BaseCollection):
+        yield from col.get_all_metadata()
+        return
+    total = col.count()
+    offset = 0
+    while offset < total:
+        batch = col.get(limit=1000, offset=offset, include=["metadatas"])
+        yield from batch["metadatas"]
+        if not batch["ids"]:
+            break
+        offset += len(batch["ids"])
+
+
 def build_graph(col=None, config=None):
     """
     Build the palace graph from ChromaDB metadata.
@@ -231,37 +253,30 @@ def build_graph(col=None, config=None):
     if not col:
         return {}, []
 
-    total = col.count()
     room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0, "dates": set()})
 
-    offset = 0
-    while offset < total:
-        batch = col.get(limit=1000, offset=offset, include=["metadatas"])
-        for meta in batch["metadatas"]:
-            # ChromaDB can return ``None`` for drawers without metadata
-            # (legacy data, partial writes — upstream #1020 territory).
-            # Skip these silently rather than crash the whole graph
-            # build — a single None drawer shouldn't take down /stats
-            # or any caller of build_graph for the entire palace. Caught
-            # 2026-04-25 by palace-daemon's verify-routes.sh smoke test
-            # against the canonical 151K palace. Closes the same gap as
-            # upstream #999 / fork PR #1094 in a different read path.
-            if meta is None:
-                continue
-            room = meta.get("room", "")
-            wing = meta.get("wing", "")
-            hall = meta.get("hall", "")
-            date = meta.get("date", "")
-            if room and wing:
-                room_data[room]["wings"].add(wing)
-                if hall:
-                    room_data[room]["halls"].add(hall)
-                if date:
-                    room_data[room]["dates"].add(date)
-                room_data[room]["count"] += 1
-        if not batch["ids"]:
-            break
-        offset += len(batch["ids"])
+    for meta in _iter_all_metadata(col):
+        # ChromaDB can return ``None`` for drawers without metadata
+        # (legacy data, partial writes — upstream #1020 territory).
+        # Skip these silently rather than crash the whole graph
+        # build — a single None drawer shouldn't take down /stats
+        # or any caller of build_graph for the entire palace. Caught
+        # 2026-04-25 by palace-daemon's verify-routes.sh smoke test
+        # against the canonical 151K palace. Closes the same gap as
+        # upstream #999 / fork PR #1094 in a different read path.
+        if meta is None:
+            continue
+        room = meta.get("room", "")
+        wing = meta.get("wing", "")
+        hall = meta.get("hall", "")
+        date = meta.get("date", "")
+        if room and wing:
+            room_data[room]["wings"].add(wing)
+            if hall:
+                room_data[room]["halls"].add(hall)
+            if date:
+                room_data[room]["dates"].add(date)
+            room_data[room]["count"] += 1
 
     # Build edges from rooms that span multiple wings
     edges = []

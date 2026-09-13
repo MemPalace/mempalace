@@ -6,10 +6,18 @@ spacing effect: stability grows when reinforcement is spaced rather than
 massed.
 
 This module is pure. No I/O, no DB, no chromadb. It operates on plain
-dicts (hall records, tunnel records) and mutates them in place. Callers
-in ``hallways.py`` and ``palace_graph.py`` invoke these functions; the
-math lives here in one place so both connection kinds share identical
-semantics.
+dicts (hall records, tunnel records); the math lives here in one place so
+both connection kinds share identical semantics.
+
+``hallways.py`` and ``palace_graph.py`` currently call only
+``initialize_dynamics_fields``: hall and tunnel records get these fields
+backfilled and preserved across recomputes, but nothing potentiates them on
+access and nothing decays them over time. Wiring that up is a separate
+question (which access counts as a co-access?); this docstring previously
+said those modules invoked these functions, which was not accurate.
+
+Read strength with ``effective_strength(connection, now=...)``. It is pure
+and side-effect free, so a read cannot change a ranking.
 
 Schema fields added to hall + tunnel records (all default-safe — existing
 records without them work via ``initialize_dynamics_fields``):
@@ -160,6 +168,46 @@ def potentiate(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def effective_strength(connection: dict, *, now: Optional[datetime] = None) -> float:
+    """Return what ``connection``'s strength is worth at ``now``.
+
+    ``strength * exp(-days_since_last_activated / stability)``, floored at
+    ``STRENGTH_FLOOR``. Pure: the connection is not modified, so reading a
+    strength cannot change it.
+
+    Prefer this to ``apply_decay``. Because the stored ``strength`` stays the
+    value as of ``last_activated``, the answer depends only on elapsed time —
+    reading twice gives the same number as reading once, and there is no
+    maintenance pass to schedule, to forget, or to accidentally run twice.
+    See ``apply_decay``'s note for what happens otherwise.
+
+    ``now`` is dependency injection for tests. A naive datetime is read as
+    UTC rather than raising: ``_parse_iso`` already forces awareness on the
+    stored timestamp, so without the same treatment here a caller passing
+    ``datetime.now()`` gets a TypeError from the subtraction below.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+
+    last_activated_str = connection.get("last_activated") or connection.get("created_at")
+    last_dt = _parse_iso(last_activated_str)
+    if last_dt is None:
+        return float(connection.get("strength", DEFAULT_STRENGTH))
+
+    days_since = (now - last_dt).total_seconds() / 86400.0
+    if days_since <= 0:
+        return float(connection.get("strength", DEFAULT_STRENGTH))
+
+    stability = float(connection.get("stability", DEFAULT_STABILITY))
+    if stability <= 0:
+        stability = DEFAULT_STABILITY
+
+    current_strength = float(connection.get("strength", DEFAULT_STRENGTH))
+    return max(STRENGTH_FLOOR, current_strength * math.exp(-days_since / stability))
+
+
 def apply_decay(connection: dict, *, now: Optional[datetime] = None) -> dict:
     """Apply Ebbinghaus exponential decay to ``connection``'s strength.
 
@@ -170,6 +218,24 @@ def apply_decay(connection: dict, *, now: Optional[datetime] = None) -> dict:
 
     Idempotent at the same instant — calling twice at the same ``now``
     without a potentiation in between produces the same final strength.
+
+    NOT idempotent across different instants, and that is worth knowing
+    before wiring it into a maintenance pass. It multiplies the *stored*
+    strength while only ``potentiate`` resets ``last_activated``, so the
+    result depends on how many times it ran rather than on how much time
+    passed::
+
+        strength 1.0, stability 5, last activated 10 days ago
+        applied once at day 10        → 0.135335
+        applied at day 5 and day 10   → 0.050000   (STRENGTH_FLOOR)
+
+    Two installations with identical usage would then rank memories
+    differently because one ran maintenance more often, and the
+    twice-decayed connection sits at the floor where it is
+    indistinguishable from one nobody has touched in a year.
+
+    ``effective_strength`` computes the same curve at read time without
+    that hazard, and needs no maintenance pass at all.
 
     Mutates and returns the same dict for chaining. Pure aside from that
     mutation — no I/O.
@@ -253,4 +319,5 @@ __all__ = [
     "initialize_dynamics_fields",
     "potentiate",
     "apply_decay",
+    "effective_strength",
 ]

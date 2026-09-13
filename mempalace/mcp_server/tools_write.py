@@ -22,7 +22,9 @@ def _chunk_index(meta):
 
 
 def _response_safe_meta(meta):
-    safe_meta = _safe_meta(meta)
+    safe_meta = dict(_safe_meta(meta))
+    if not safe_meta.get("last_modified") and safe_meta.get("filed_at"):
+        safe_meta["last_modified"] = safe_meta["filed_at"]
     if safe_meta.get("source_file"):
         safe_meta["source_file"] = Path(safe_meta["source_file"]).name
     return safe_meta
@@ -164,6 +166,21 @@ def _fetch_drawer_rows(col, where=None, page_size: int = 1000, include=None):
     offset = 0
     want_docs = "documents" in include
     want_meta = "metadatas" in include
+
+    # Let the backend walk its own cursor once (#2452): the offset loop below
+    # is O(n^2) on backends whose get(limit=, offset=) re-scans from the start,
+    # the same trap _fetch_all_metadata() avoids through get_all_metadata().
+    from ..backends.base import BaseCollection
+
+    if isinstance(col, BaseCollection):
+        result = col.get_all_rows(where=where, include=include)
+        ids = list(_chroma_field(result, "ids", []) or [])
+        all_docs = _chroma_field(result, "documents", []) or []
+        all_metas = _chroma_field(result, "metadatas", []) or []
+        for idx in range(len(ids)):
+            documents.append(all_docs[idx] if want_docs and idx < len(all_docs) else "")
+            metadatas.append(all_metas[idx] if want_meta and idx < len(all_metas) else {})
+        return ids, documents, metadatas
 
     while True:
         kwargs = {
@@ -398,6 +415,7 @@ def tool_add_drawer(
         "id_recipe": ID_RECIPE,
     }
 
+    base_meta["last_modified"] = base_meta["filed_at"]
     # Idempotency. Three cases to detect a prior committed write:
     # (a) Single-doc path: drawer_id row exists (the only id used).
     # (b) Chunked path: probe the LAST chunk id — its presence implies
@@ -1129,6 +1147,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             if room.lower() != str(old_meta.get("room") or "").lower():
                 new_meta["room"] = room
 
+        new_meta["last_modified"] = datetime.now().isoformat()
         _wal_log(
             "update_drawer",
             {

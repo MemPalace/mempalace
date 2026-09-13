@@ -1087,6 +1087,28 @@ class QdrantCollection(BaseCollection):
         rows = self._rows(where=where)
         return [row["metadata"] for row in rows]
 
+    def get_all_rows(
+        self, where: Optional[dict] = None, include: Optional[list[str]] = None
+    ) -> GetResult:
+        """Every matching row's id plus the requested fields in one cursor pass.
+
+        Same reasoning as :meth:`get_all_metadata` (#1796): the default
+        implementation would call ``get(limit=, offset=)`` in a loop, and each
+        of those calls re-walks the collection from the start (#2452 measured
+        275 s for ``list_drawers`` on 126k drawers). ``_rows()`` already has
+        every id in hand, so hand them back instead of discarding them.
+        """
+        spec = _IncludeSpec.resolve(
+            list(include) if include else ["metadatas"], default_distances=False
+        )
+        rows = self._rows(where=where, with_vector=spec.embeddings)
+        return GetResult(
+            ids=[row["id"] for row in rows],
+            documents=[row["document"] for row in rows] if spec.documents else [],
+            metadatas=[row["metadata"] for row in rows] if spec.metadatas else [],
+            embeddings=[row["embedding"] or [] for row in rows] if spec.embeddings else None,
+        )
+
     def facet_counts(
         self,
         field: str,

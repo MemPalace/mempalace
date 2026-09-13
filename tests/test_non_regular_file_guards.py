@@ -6,19 +6,27 @@ for reading parks in the kernel until a writer appears, so a named pipe
 called ``notes.md`` sitting in a mined directory used to hang ``mine``,
 ``sweep`` and ``init`` forever — no output, no error, no progress.
 
-Every check here is wrapped in :func:`hard_timeout`. A regression must turn
-this file red; it must not hang the suite (an unbounded blocking open would
-otherwise stall pytest itself, which reports as "still running", not as a
-failure).
+Every check that could block is bounded by a deadline; the handful that only
+touch a regular file or a missing path are not, because they have nothing to
+block on. A regression must turn this file red; it must not
+hang the suite (an unbounded blocking open would otherwise stall pytest
+itself, which reports as "still running", not as a failure).
+:func:`hard_timeout` is that deadline wherever the block would happen in a
+call Python makes. Where it happens inside a C library that restarts the
+syscall itself, :func:`_repair_status_bounded` runs the call in a child
+process instead, for the reason its docstring records.
 """
 
 import argparse
 import errno
 import hashlib
+import json
 import os
 import signal
 import socket
 import stat as stat_module
+import subprocess
+import sys
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -65,6 +73,11 @@ needs_unprivileged_posix = pytest.mark.skipif(
     hasattr(os, "geteuid") and os.geteuid() == 0,
     reason="directory permission bits do not gate root",
 )
+
+# The three ``repair.status`` tests need a FIFO but deliberately avoid SIGALRM
+# -- running in a child process is what replaces it there -- so they carry this
+# rather than ``posix_only``, which bundles the two.
+needs_fifo = pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX FIFOs")
 
 TIMEOUT_SECONDS = 10.0
 
@@ -157,6 +170,190 @@ def test_open_regular_file_no_follow_rejects_fifo(tmp_path):
     with hard_timeout(TIMEOUT_SECONDS, "_open_regular_file_no_follow on a FIFO"):
         with pytest.raises(RuntimeError, match="Refusing non-regular file"):
             _open_regular_file_no_follow(str(fifo))
+
+
+# The child's answer travels on stderr, a channel it shares with warnings and
+# logging: ``-I`` drops the ``filterwarnings`` from pyproject.toml, and the
+# import chain reaches third-party code. Framing the answer keeps one stray
+# line from turning a guard regression into a ``JSONDecodeError`` that names
+# nothing.
+_ANSWER_MARKER = "<<<repair-status-answer>>>"
+
+# ``TIMEOUT_SECONDS`` bounds a call already under way. A child has to pay for
+# interpreter start and the chromadb import before the call begins, so it gets
+# its own, larger budget; measured, the whole child takes well under a second.
+CHILD_DEADLINE_SECONDS = 30.0
+
+_STATUS_IN_A_CHILD = """
+import json, sys
+
+sys.path.insert(0, sys.argv[2])
+import mempalace.repair as repair
+
+answer = repair.status(palace_path=sys.argv[1])
+sys.stderr.write(sys.argv[3] + json.dumps(answer))
+"""
+
+
+def _tree_under_test() -> str:
+    """The directory holding the ``mempalace`` package this run imported.
+
+    ``-I`` drops ``PYTHONPATH`` and the script directory, so without this the
+    child would import whatever is installed rather than the checkout pytest
+    is running against, and a broken tree would test green.
+    """
+    import mempalace
+
+    return os.path.dirname(os.path.dirname(os.path.abspath(mempalace.__file__)))
+
+
+def _repair_status_bounded(palace: Path) -> "tuple[dict, str]":
+    """Run ``repair.status`` under a deadline a blocked sqlite3 cannot outlive.
+
+    :func:`hard_timeout` is the tool everywhere else in this file, and it does
+    not work here. The block is inside sqlite3's own ``open``
+    (``repair.sqlite_drawer_count``), and SIGALRM does not interrupt it:
+    measured with the handler armed at 4 s and ``faulthandler`` dumping at 8 s,
+    the handler never ran and the call was still parked at 25 s. A test built
+    on ``hard_timeout`` would therefore hang the suite rather than fail, which
+    is the outcome this whole file exists to prevent. A child process with a
+    kill deadline is a bound that holds regardless of what the callee does with
+    signals.
+
+    Returns ``(answer, printed)``. A regression surfaces as
+    ``subprocess.TimeoutExpired`` out of here, which fails the test.
+    """
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _STATUS_IN_A_CHILD,
+            str(palace),
+            _tree_under_test(),
+            _ANSWER_MARKER,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=CHILD_DEADLINE_SECONDS,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert _ANSWER_MARKER in proc.stderr, proc.stderr
+    return json.loads(proc.stderr.split(_ANSWER_MARKER, 1)[1]), proc.stdout
+
+
+@needs_fifo
+def test_repair_status_rejects_a_fifo_named_chroma_sqlite3(tmp_path):
+    """``repair-status`` must name a FIFO rather than read it.
+
+    Absence is proven with ``ENOENT`` alone (#2293), so every other state
+    reaches a read that runs inside sqlite3, where no ``O_NONBLOCK`` can be
+    passed. A FIFO is the one type whose open never returns, and this is the
+    command an operator reaches for when a palace is already misbehaving.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    make_fifo(palace, "chroma.sqlite3")
+
+    answer, printed = _repair_status_bounded(palace)
+
+    assert answer == {"status": "unknown", "message": "chroma.sqlite3 resolves to a named pipe"}
+    assert "named pipe" in printed
+
+
+_STATUS_WITH_A_MIDCALL_CHMOD_IN_A_CHILD = """
+import io, json, os, stat, sys
+from contextlib import redirect_stdout
+
+sys.path.insert(0, sys.argv[2])
+import mempalace.repair as repair
+
+palace = sys.argv[1]
+counted = repair.sqlite_drawer_count
+was = stat.S_IMODE(os.stat(palace).st_mode)
+
+
+def reachable_only_now(palace_path, collection_name=None):
+    # The world the gate was asked about is not the world of the open: the
+    # directory becomes traversable only after the type check has answered.
+    os.chmod(palace, was)
+    return counted(palace_path, collection_name)
+
+
+repair.sqlite_drawer_count = reachable_only_now
+os.chmod(palace, 0o000)
+buf = io.StringIO()
+with redirect_stdout(buf):
+    answer = repair.status(palace_path=palace)
+sys.stderr.write(sys.argv[3] + json.dumps({"keys": sorted(answer), "printed": buf.getvalue()}))
+"""
+
+
+@needs_unprivileged_posix
+@needs_fifo
+def test_repair_status_survives_a_fifo_that_becomes_reachable_mid_call(tmp_path):
+    """One type check at the top of ``status`` is not enough to avoid the pipe.
+
+    For a FIFO under a directory this process may not enter, that check's
+    ``stat`` fails and answers False by design, so the path goes on. If the
+    directory becomes traversable before the open, the read is handed the pipe
+    and never returns. ``develop`` cannot reach this state at all, because it
+    stops at ``os.path.isfile``; a branch that checked only at the top would be
+    strictly worse there, which is why ``sqlite_drawer_count`` checks again
+    next to its own open.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    make_fifo(palace, "chroma.sqlite3")
+    original_mode = stat_module.S_IMODE(palace.stat().st_mode)
+
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                _STATUS_WITH_A_MIDCALL_CHMOD_IN_A_CHILD,
+                str(palace),
+                _tree_under_test(),
+                _ANSWER_MARKER,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=CHILD_DEADLINE_SECONDS,
+        )
+    finally:
+        # The child leaves the directory at 0o000 on the path that matters --
+        # the one where it is killed -- and pytest cannot clean tmp_path then.
+        # Restoring what was found, not a literal, so a strict umask is kept.
+        os.chmod(palace, original_mode)
+
+    assert proc.returncode == 0, proc.stderr
+    assert _ANSWER_MARKER in proc.stderr, proc.stderr
+    answer = json.loads(proc.stderr.split(_ANSWER_MARKER, 1)[1])
+    # It got past the top gate, as the state requires, and still answered --
+    # with the capacity report, not with the gate's own named-pipe verdict.
+    assert answer["keys"] == ["closets", "drawers"]
+    assert "sqlite count:   (unreadable)" in answer["printed"]
+    assert "named pipe" not in answer["printed"]
+
+
+@needs_fifo
+def test_repair_status_rejects_a_symlink_to_a_fifo(tmp_path):
+    """The link is not the hazard; what it resolves to is.
+
+    ``_integrity_target_is_absent`` uses ``lstat`` and sees a symlink, so the
+    type check has to follow it or the read parks on the FIFO behind it.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    fifo = make_fifo(tmp_path, "elsewhere.fifo")
+    (palace / "chroma.sqlite3").symlink_to(fifo)
+
+    answer, _ = _repair_status_bounded(palace)
+
+    assert answer["status"] == "unknown"
+    assert "named pipe" in answer["message"]
 
 
 @posix_only
