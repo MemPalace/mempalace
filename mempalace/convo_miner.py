@@ -694,6 +694,47 @@ def _content_set_generation_token(members: list[tuple[str, str]]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _drawer_logical_id(physical_id: str, meta: dict) -> str:
+    logical_id = meta.get("logical_drawer_id")
+    if isinstance(logical_id, str) and logical_id:
+        return logical_id
+    return physical_id
+
+
+def _is_convo_registry_meta(meta: dict) -> bool:
+    return meta.get("ingest_mode") == "registry"
+
+
+def _active_drawer_generation_token(existing: dict) -> Optional[str]:
+    """Return the single non-staged drawer token, if the active set agrees."""
+    tokens = {
+        meta.get("mine_generation_token")
+        for meta in existing.values()
+        if not _is_convo_registry_meta(meta)
+        and meta.get("mine_staged") is not True
+        and meta.get("mine_generation_token")
+    }
+    if len(tokens) != 1:
+        return None
+    token = next(iter(tokens))
+    return token if isinstance(token, str) else None
+
+
+def _is_append_only_growth(planned_chunks, existing) -> bool:
+    """True when this pass only adds new logical drawers to an existing set."""
+    if not existing or not planned_chunks:
+        return False
+    planned_logical = {item["logical_drawer_id"] for item in planned_chunks}
+    for physical_id, meta in existing.items():
+        if _is_convo_registry_meta(meta):
+            continue
+        if _drawer_logical_id(physical_id, meta) not in planned_logical:
+            return False
+    if any(item["candidates"] and not item["matches"] for item in planned_chunks):
+        return False
+    return any(not item["matches"] for item in planned_chunks)
+
+
 def _reused_generation_copy_id(logical_drawer_id: str, generation_token: str) -> str:
     """Physical id for a reused chunk cloned into ``generation_token``."""
     return make_convo_generation_id(logical_drawer_id, f"set:{generation_token}")
@@ -968,9 +1009,18 @@ def _plan_convo_generation_writes(
     content_hash,
 ):
     """Decide upserts, in-place refreshes, and generation copies for one pass."""
-    generation_token = _content_set_generation_token(
+    content_set_token = _content_set_generation_token(
         [(item["logical_drawer_id"], item["chunk_hash"]) for item in planned_chunks]
     )
+    active_token = _active_drawer_generation_token(existing)
+    # Repeated appends must not mint a new content-set token: that would clone
+    # every unchanged active row onto new physical ids and delete the old
+    # ones. Reuse the committed token so vectors stay in place; new rows still
+    # inherit it so a later failed shrink cleanup can hide them.
+    if _is_append_only_growth(planned_chunks, existing) and active_token:
+        generation_token = active_token
+    else:
+        generation_token = content_set_token
     to_upsert: list = []
     to_touch: list = []
     to_copy: list = []
@@ -993,12 +1043,12 @@ def _plan_convo_generation_writes(
         tentative_ids.add(physical_id)
 
     # The first complete mine stays tokenless so those rows remain genuine
-    # legacy. Any later pass that adds rows or retires old ones publishes a
-    # content-set token. Growth is included: tokenless appended rows would
-    # otherwise resurface as legacy if a later shrink's stale delete fails.
-    # A rewrite/shrink that publishes a new token must clone reused rows that
-    # still carry the previous token; updating those ids in place would hide
-    # them for the duration of the switch.
+    # legacy. The first growth publishes a content-set token so appended rows
+    # are not tokenless legacy if a later shrink's stale delete fails. Later
+    # append-only growth reuses that active token instead of cloning. A
+    # rewrite/shrink that publishes a new content-set token must clone reused
+    # rows that still carry the previous token; updating those ids in place
+    # would hide them for the duration of the switch.
     has_new_rows = any(kind == "upsert" for kind, *_ in tentative)
     will_publish = (
         pending_cleanup
@@ -1104,9 +1154,12 @@ def _file_chunks_locked(
     content-addressed physical generation instead of overwriting its old
     logical position. Unchanged chunks that still have no generation token
     get a cheap metadata-only refresh (``source_mtime`` / ``chunk_total``).
-    Unchanged chunks that already belong to another committed generation are
-    cloned under a generation-specific physical id with the stored embedding,
-    so the old token stays complete until the new token is fully staged.
+    Append-only growth reuses the active generation token so those rows stay
+    on their existing physical ids. A rewrite or shrink that publishes a new
+    token clones unchanged rows that already belong to another committed
+    generation under a generation-specific physical id with the stored
+    embedding, so the old token stays complete until the new token is fully
+    staged.
     Existing generations are deleted only after every new batch succeeds, so
     a crash mid-operation leaves the prior verbatim set untouched; a crash
     after staging leaves a retryable incomplete group that reuses the staged
@@ -1233,14 +1286,15 @@ def _file_chunks_locked(
             content_hash=content_hash,
         )
 
-        # Shrink, rewrite, and growth after the first complete mine use a
+        # Shrink, rewrite, and the first growth after a tokenless mine use a
         # two-phase completion marker. New/changed rows are first written
         # without the current source mtime; unchanged rows keep their old
-        # mtime unless they already carry another generation token, in which
-        # case they are cloned first. Only after orphan cleanup succeeds do
-        # we stamp the whole target set current. A transient delete failure
-        # then remains visibly incomplete and retries even if the source
-        # never changes again.
+        # mtime unless a rewrite/shrink publishes a new token, in which case
+        # they are cloned first. Append-only growth reuses the active token
+        # so unchanged rows are only metadata-refreshed. Only after orphan
+        # cleanup succeeds do we stamp the whole target set current. A
+        # transient delete failure then remains visibly incomplete and
+        # retries even if the source never changes again.
         stale_ids = [drawer_id for drawer_id in existing if drawer_id not in new_ids]
         commit_metadata = {
             "wing": wing,

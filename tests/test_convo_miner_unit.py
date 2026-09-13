@@ -1084,6 +1084,99 @@ class TestFileChunksLocked:
         assert remaining == {0, 1, 2}
         assert file_already_mined(col, str(source), check_mtime=True, extract_mode="exchange")
 
+    def test_repeated_grown_file_does_not_clone_or_delete_active_rows(self, monkeypatch, tmp_path):
+        """Later appends must keep unchanged active rows on the same physical ids."""
+        import mempalace.convo_miner as convo_miner
+        from mempalace.palace import file_already_mined
+
+        class FakeCol:
+            def __init__(self):
+                self.records = {}
+                self.upserted_ids = []
+                self.updated_ids = []
+                self.deleted_ids = []
+
+            def get(self, where=None, limit=None, offset=0, include=None, ids=None, **kwargs):
+                if ids is not None:
+                    hits = [(i, self.records[i]) for i in ids if i in self.records]
+                    return {
+                        "ids": [i for i, _ in hits],
+                        "metadatas": [m for _, m in hits],
+                    }
+                records = list(self.records.items())
+                if where and "source_file" in where:
+                    records = [
+                        (i, m) for i, m in records if m.get("source_file") == where["source_file"]
+                    ]
+                page = records[offset : offset + (limit or len(records))]
+                return {
+                    "ids": [i for i, _ in page],
+                    "metadatas": [m for _, m in page],
+                }
+
+            def delete(self, ids=None, **kwargs):
+                self.deleted_ids.extend(ids or [])
+                for drawer_id in ids or []:
+                    self.records.pop(drawer_id, None)
+
+            def update(self, ids, metadatas):
+                self.updated_ids.extend(ids)
+                for drawer_id, meta in zip(ids, metadatas):
+                    current = self.records.get(drawer_id, {})
+                    merged = dict(current)
+                    merged.update(meta)
+                    self.records[drawer_id] = merged
+
+            def upsert(self, documents, ids, metadatas):
+                self.upserted_ids.extend(ids)
+                for drawer_id, meta in zip(ids, metadatas):
+                    self.records[drawer_id] = meta
+
+        source = tmp_path / "chat.txt"
+        source.write_text("content\n", encoding="utf-8")
+        first_mtime = source.stat().st_mtime
+        col = FakeCol()
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3)]
+        drawers, _, skipped = _file_chunks_locked(
+            col, str(source), chunks, "wing", "general", "agent", "exchange"
+        )
+        assert (drawers, skipped) == (3, False)
+
+        for extra, total in ((2, 5), (2, 7), (2, 9)):
+            source.write_text("content\n" * extra, encoding="utf-8")
+            os.utime(source, (first_mtime + total, first_mtime + total))
+            active_ids = {
+                drawer_id
+                for drawer_id, meta in col.records.items()
+                if meta.get("mine_commit_marker") is not True
+            }
+            col.upserted_ids.clear()
+            col.updated_ids.clear()
+            col.deleted_ids.clear()
+            chunks = chunks + [
+                {"content": f"chunk {i} " * 20, "chunk_index": i}
+                for i in range(total - extra, total)
+            ]
+            drawers, _, skipped = _file_chunks_locked(
+                col, str(source), chunks, "wing", "general", "agent", "exchange"
+            )
+            assert skipped is False
+            assert drawers == extra
+            assert col.deleted_ids == []
+            assert set(col.upserted_ids).isdisjoint(active_ids)
+            assert active_ids <= set(col.records)
+            drawer_metas = [
+                meta for meta in col.records.values() if meta.get("mine_commit_marker") is not True
+            ]
+            assert all(m.get("chunk_total") == total for m in drawer_metas)
+            assert file_already_mined(col, str(source), check_mtime=True, extract_mode="exchange")
+
 
 def test_end_of_mine_hallways_read_then_fts_validation_write(tmp_path, monkeypatch):
     import mempalace.convo_miner as convo_miner

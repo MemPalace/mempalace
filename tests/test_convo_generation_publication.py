@@ -6,7 +6,7 @@ import copy
 import pytest
 
 from mempalace import convo_miner, mcp_server, searcher
-from mempalace.ids import make_convo_commit_id, make_convo_drawer_id
+from mempalace.ids import make_convo_commit_id, make_convo_drawer_id, make_convo_generation_id
 
 
 class InjectedWriteFailure(RuntimeError):
@@ -504,3 +504,310 @@ def test_reader_sees_complete_generation_between_publication_write_bursts(public
     for token, documents in snapshots:
         assert documents == (previous if token == old_token else next_documents)
     assert gated.embedded_documents == [next_documents[0]]
+
+
+def _non_marker_rows(collection):
+    return {
+        key: row
+        for key, row in collection.rows.items()
+        if row["metadata"].get("mine_commit_marker") is not True
+    }
+
+
+def _snapshot_active_rows(collection):
+    return {
+        key: (list(row["embedding"]), row["document"], row["metadata"].get("mine_generation_token"))
+        for key, row in _non_marker_rows(collection).items()
+    }
+
+
+def _plan_chunk(logical_id, chunk_hash, content, index, stored=None, rewritten=False):
+    candidate = (logical_id, stored) if stored is not None else None
+    if rewritten:
+        candidates = [candidate] if candidate is not None else []
+        matches = []
+    elif candidate is not None:
+        candidates = [candidate]
+        matches = [candidate]
+    else:
+        candidates = []
+        matches = []
+    return {
+        "chunk": {"content": content, "chunk_index": index},
+        "chunk_room": "general",
+        "logical_drawer_id": logical_id,
+        "chunk_hash": chunk_hash,
+        "candidates": candidates,
+        "matches": matches,
+    }
+
+
+def _plan_writes(planned, existing, pending_cleanup=False):
+    return convo_miner._plan_convo_generation_writes(
+        planned,
+        existing=existing,
+        pending_cleanup=pending_cleanup,
+        wing="wing",
+        source_file="session.txt",
+        agent="agent",
+        filed_at="2026-09-13T00:00:00",
+        authored_at=None,
+        extract_mode="exchange",
+        chunk_total=len(planned),
+        source_mtime=1.0,
+        content_hash=None,
+    )
+
+
+def test_plan_reuses_active_token_for_append_only_growth(monkeypatch):
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    active = "active-token"
+    existing = {
+        "drawer-a": {
+            "logical_drawer_id": "drawer-a",
+            "chunk_hash": "hash-a",
+            "mine_generation_token": active,
+            "mine_staged": False,
+            "chunk_index": 0,
+        },
+        "drawer-b": {
+            "logical_drawer_id": "drawer-b",
+            "chunk_hash": "hash-b",
+            "mine_generation_token": active,
+            "mine_staged": False,
+            "chunk_index": 1,
+        },
+    }
+    planned = [
+        _plan_chunk("drawer-a", "hash-a", "A", 0, existing["drawer-a"]),
+        _plan_chunk("drawer-b", "hash-b", "B", 1, existing["drawer-b"]),
+        _plan_chunk("drawer-c", "hash-c", "C", 2),
+    ]
+    to_upsert, to_touch, to_copy, new_ids, token, will_publish = _plan_writes(planned, existing)
+
+    assert token == active
+    assert will_publish is True
+    assert to_copy == []
+    assert {row_id for row_id, _ in to_touch} == {"drawer-a", "drawer-b"}
+    assert [row_id for row_id, _, _ in to_upsert] == ["drawer-c"]
+    assert new_ids == {"drawer-a", "drawer-b", "drawer-c"}
+
+    content_set_token = convo_miner._content_set_generation_token(
+        [(item["logical_drawer_id"], item["chunk_hash"]) for item in planned]
+    )
+    assert content_set_token != active
+
+
+def test_plan_reuses_active_token_when_append_retry_has_pending_cleanup(monkeypatch):
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    active = "active-token"
+    existing = {
+        "drawer-a": {
+            "logical_drawer_id": "drawer-a",
+            "chunk_hash": "hash-a",
+            "mine_generation_token": active,
+            "mine_staged": False,
+        }
+    }
+    planned = [
+        _plan_chunk("drawer-a", "hash-a", "A", 0, existing["drawer-a"]),
+        _plan_chunk("drawer-b", "hash-b", "B", 1),
+    ]
+    to_upsert, to_touch, to_copy, new_ids, token, will_publish = _plan_writes(
+        planned, existing, pending_cleanup=True
+    )
+
+    assert token == active
+    assert will_publish is True
+    assert to_copy == []
+    assert {row_id for row_id, _ in to_touch} == {"drawer-a"}
+    assert [row_id for row_id, _, _ in to_upsert] == ["drawer-b"]
+    assert new_ids == {"drawer-a", "drawer-b"}
+
+
+def test_plan_clones_reused_rows_when_shrinking(monkeypatch):
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    active = "active-token"
+    existing = {
+        "drawer-a": {
+            "logical_drawer_id": "drawer-a",
+            "chunk_hash": "hash-a",
+            "mine_generation_token": active,
+            "mine_staged": False,
+        },
+        "drawer-b": {
+            "logical_drawer_id": "drawer-b",
+            "chunk_hash": "hash-b",
+            "mine_generation_token": active,
+            "mine_staged": False,
+        },
+        "drawer-c": {
+            "logical_drawer_id": "drawer-c",
+            "chunk_hash": "hash-c",
+            "mine_generation_token": active,
+            "mine_staged": False,
+        },
+    }
+    planned = [
+        _plan_chunk("drawer-a", "hash-a", "A", 0, existing["drawer-a"]),
+        _plan_chunk("drawer-b", "hash-b", "B", 1, existing["drawer-b"]),
+    ]
+    to_upsert, to_touch, to_copy, new_ids, token, will_publish = _plan_writes(planned, existing)
+
+    assert will_publish is True
+    assert token != active
+    assert to_upsert == []
+    assert to_touch == []
+    assert {row_id for row_id, _, _, _ in to_copy} == {
+        convo_miner._reused_generation_copy_id("drawer-a", token),
+        convo_miner._reused_generation_copy_id("drawer-b", token),
+    }
+    assert "drawer-c" not in new_ids
+    assert "drawer-a" not in new_ids
+    assert "drawer-b" not in new_ids
+
+
+def test_plan_clones_unchanged_rows_when_rewriting(monkeypatch):
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    active = "active-token"
+    existing = {
+        "drawer-a": {
+            "logical_drawer_id": "drawer-a",
+            "chunk_hash": "hash-a",
+            "mine_generation_token": active,
+            "mine_staged": False,
+        },
+        "drawer-b": {
+            "logical_drawer_id": "drawer-b",
+            "chunk_hash": "hash-b",
+            "mine_generation_token": active,
+            "mine_staged": False,
+        },
+    }
+    planned = [
+        _plan_chunk("drawer-a", "hash-a2", "A2", 0, existing["drawer-a"], rewritten=True),
+        _plan_chunk("drawer-b", "hash-b", "B", 1, existing["drawer-b"]),
+    ]
+    to_upsert, to_touch, to_copy, new_ids, token, will_publish = _plan_writes(planned, existing)
+
+    assert will_publish is True
+    assert token != active
+    assert [row_id for row_id, _, _ in to_upsert] == [
+        make_convo_generation_id("drawer-a", "hash-a2")
+    ]
+    assert to_touch == []
+    assert [row_id for row_id, _, _, _ in to_copy] == [
+        convo_miner._reused_generation_copy_id("drawer-b", token)
+    ]
+    assert "drawer-a" not in new_ids
+    assert "drawer-b" not in new_ids
+
+
+def test_repeated_appends_keep_active_rows_in_place_and_hide_on_failed_shrink(
+    tmp_path, monkeypatch
+):
+    source = str(tmp_path / "session.txt")
+    (tmp_path / "session.txt").write_text("transcript", encoding="utf-8")
+    monkeypatch.setattr(convo_miner, "mine_lock", lambda *_: contextlib.nullcontext())
+    monkeypatch.setattr(convo_miner, "file_already_mined", lambda *_a, **_k: False)
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 1)
+
+    def mine(collection, documents):
+        chunks = [{"content": text, "chunk_index": index} for index, text in enumerate(documents)]
+        return convo_miner._file_chunks_locked(
+            collection, source, chunks, "wing", "general", "agent", "exchange"
+        )
+
+    class TrackingCollection(GenerationCollection):
+        def __init__(self):
+            super().__init__()
+            self.upserted_ids = []
+            self.deleted_ids = []
+            self.fail_delete = False
+
+        def upsert(self, ids, documents, metadatas, embeddings=None):
+            self.upserted_ids.extend(ids)
+            super().upsert(ids, documents, metadatas, embeddings)
+
+        def delete(self, ids):
+            self.deleted_ids.extend(ids)
+            if self.fail_delete:
+                raise InjectedWriteFailure("stale delete failed")
+            super().delete(ids)
+
+    initial = ["original first chunk", "unchanged middle chunk", "unchanged last chunk"]
+    fourth_fifth = ["appended fourth chunk", "appended fifth chunk"]
+    sixth_seventh = ["appended sixth", "appended seventh"]
+    eighth_ninth = ["appended eighth", "appended ninth"]
+    grown = [
+        [*initial, *fourth_fifth],
+        [*initial, *fourth_fifth, *sixth_seventh],
+        [*initial, *fourth_fifth, *sixth_seventh, *eighth_ninth],
+    ]
+    collection = TrackingCollection()
+    assert mine(collection, initial)[2] is False
+    _assert_all_read_paths(collection, source, initial)
+
+    previous_active = None
+    grow_token = None
+    for documents in grown:
+        if previous_active is not None:
+            collection.upserted_ids.clear()
+            collection.deleted_ids.clear()
+            collection.embedded_documents.clear()
+            collection.write_count = 0
+        assert mine(collection, documents)[2] is False
+        _assert_all_read_paths(collection, source, documents)
+        current_active = _snapshot_active_rows(collection)
+        if previous_active is not None:
+            for key, (embedding, document, token) in previous_active.items():
+                assert key in current_active
+                assert current_active[key][0] == embedding
+                assert current_active[key][1] == document
+                assert current_active[key][2] == token
+                assert key not in collection.upserted_ids
+                assert key not in collection.deleted_ids
+            assert collection.deleted_ids == []
+            assert collection.embedded_documents == documents[len(previous_active) :]
+        commit_id = make_convo_commit_id(source, "exchange")
+        grow_token = collection.rows[commit_id]["metadata"]["mine_generation_commit"]
+        appended = [
+            key
+            for key, row in _non_marker_rows(collection).items()
+            if row["metadata"].get("logical_drawer_id")
+            not in {
+                make_convo_drawer_id("wing", "general", source, "exchange", index)
+                for index in range(3)
+            }
+        ]
+        assert appended
+        assert all(
+            collection.rows[key]["metadata"].get("mine_generation_token") == grow_token
+            for key in appended
+        )
+        previous_active = current_active
+
+    appended_physical = [
+        key
+        for key, row in _non_marker_rows(collection).items()
+        if row["metadata"].get("logical_drawer_id")
+        not in {
+            make_convo_drawer_id("wing", "general", source, "exchange", index) for index in range(3)
+        }
+    ]
+    hidden_after_shrink = [*initial, *[None] * (len(grown[-1]) - 3)]
+    collection.embedded_documents.clear()
+    collection.upserted_ids.clear()
+    collection.deleted_ids.clear()
+    collection.fail_delete = True
+    skipped = mine(collection, initial)[2]
+    assert skipped is True
+    assert all(key in collection.rows for key in appended_physical)
+    _assert_all_read_paths(collection, source, hidden_after_shrink)
+    assert collection.embedded_documents == []
+
+    collection.fail_delete = False
+    assert mine(collection, initial)[2] is False
+    _assert_all_read_paths(collection, source, hidden_after_shrink)
+    assert collection.embedded_documents == []
