@@ -610,6 +610,11 @@ TOOLS = {
                     "type": "string",
                     "description": "Target wing for this diary entry (optional). If omitted, uses wing_{agent_name}. Use this to write diary entries to a project wing instead of an agent-specific wing.",
                 },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": "Stable retry key for exactly-once diary writes (optional). Reusing it updates the same logical entry instead of creating a duplicate.",
+                    "maxLength": 512,
+                },
                 "content": {
                     "type": "string",
                     "description": "Alias for 'entry' — accepted because add_drawer uses 'content'. Provide either 'entry' or 'content'; 'entry' wins if both are given.",

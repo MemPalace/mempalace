@@ -33,8 +33,87 @@ def _open_search_collection(palace_path: str, collection_name: str):
         )
 
 
+def _current_generation_ids_for_query(collection, raw, committed_tokens) -> dict:
+    logical_ids = {
+        (meta or {}).get("logical_drawer_id")
+        for meta in _first_or_empty(raw, "metadatas")
+        if (meta or {}).get("logical_drawer_id")
+    }
+    if not logical_ids:
+        return {}
+    try:
+        generations = collection.get(
+            where={"logical_drawer_id": {"$in": sorted(logical_ids)}},
+            include=["metadatas"],
+        )
+    except Exception:
+        logger.warning("Could not resolve current conversation generations", exc_info=True)
+        return {}
+    current = {}
+    ids = generations.get("ids") or []
+    metas = generations.get("metadatas") or []
+    for index, physical_id in enumerate(ids):
+        meta = metas[index] if index < len(metas) else {}
+        if _is_staged_metadata(meta, committed_tokens):
+            continue
+        generation_token = (meta or {}).get("mine_generation_token")
+        if generation_token and generation_token not in committed_tokens:
+            continue
+        logical_id = (meta or {}).get("logical_drawer_id")
+        key = (
+            (meta or {}).get("mine_generation_token") in committed_tokens,
+            (meta or {}).get("filed_at", ""),
+            physical_id,
+        )
+        if logical_id and (logical_id not in current or key > current[logical_id][0]):
+            current[logical_id] = (key, physical_id)
+    return {logical_id: item[1] for logical_id, item in current.items()}
+
+
+def _post_filter_drawer_query(collection, raw, wing, room, source_file, committed_tokens):
+    raw_docs = _first_or_empty(raw, "documents")
+    raw_ids = _aligned_query_ids(raw, len(raw_docs))
+    current_generations = _current_generation_ids_for_query(collection, raw, committed_tokens)
+    fids, fdocs, fmetas, fdists = [], [], [], []
+    for stored_drawer_id, doc, meta, dist in zip(
+        raw_ids,
+        raw_docs,
+        _first_or_empty(raw, "metadatas"),
+        _first_or_empty(raw, "distances"),
+    ):
+        meta = meta or {}
+        if _is_staged_metadata(meta, committed_tokens):
+            continue
+        logical_id = meta.get("logical_drawer_id")
+        if logical_id and current_generations.get(logical_id) != stored_drawer_id:
+            continue
+        if wing and meta.get("wing") != wing:
+            continue
+        if room and meta.get("room") != room:
+            continue
+        if source_file and meta.get("source_file") != source_file:
+            continue
+        fids.append(stored_drawer_id)
+        fdocs.append(doc)
+        fmetas.append(meta)
+        fdists.append(dist)
+    return {
+        "ids": [fids],
+        "documents": [fdocs],
+        "metadatas": [fmetas],
+        "distances": [fdists],
+    }
+
+
 def _query_drawers_with_filter_fallback(
-    drawers_col, dkwargs, query, n_results, wing, room, source_file=None
+    drawers_col,
+    dkwargs,
+    query,
+    n_results,
+    wing,
+    room,
+    source_file=None,
+    committed_tokens=None,
 ):
     """Run the filtered drawer query, falling back to an unfiltered query plus a
     Python-side post-filter when ChromaDB raises on the filtered query.
@@ -47,8 +126,12 @@ def _query_drawers_with_filter_fallback(
     See #1245 / #1035.
     """
     where = dkwargs.get("where")
+    target_results = max(1, int(dkwargs.get("n_results") or n_results))
+    total = None
+    fetch_limit = target_results
+    filtered_query = True
     try:
-        return drawers_col.query(**dkwargs)
+        raw = drawers_col.query(**{**dkwargs, "n_results": fetch_limit})
     except Exception as filter_err:
         if not where:
             raise
@@ -56,37 +139,44 @@ def _query_drawers_with_filter_fallback(
             "Filtered search failed (%s); falling back to unfiltered + post-filter",
             filter_err,
         )
+        if committed_tokens is None:
+            committed_tokens = _committed_generation_tokens(drawers_col)
+        filtered_query = False
+        total = max(1, int(drawers_col.count()))
+        fetch_limit = min(total, max(1, target_results * 15))
         raw = drawers_col.query(
             query_texts=[query],
-            n_results=min(n_results * 15, 500),
+            n_results=fetch_limit,
             include=["documents", "metadatas", "distances"],
         )
-        raw_docs = _first_or_empty(raw, "documents")
-        raw_ids = _aligned_query_ids(raw, len(raw_docs))
-        fids, fdocs, fmetas, fdists = [], [], [], []
-        for stored_drawer_id, doc, meta, dist in zip(
-            raw_ids,
-            raw_docs,
-            _first_or_empty(raw, "metadatas"),
-            _first_or_empty(raw, "distances"),
-        ):
-            meta = meta or {}
-            if wing and meta.get("wing") != wing:
-                continue
-            if room and meta.get("room") != room:
-                continue
-            if source_file and meta.get("source_file") != source_file:
-                continue
-            fids.append(stored_drawer_id)
-            fdocs.append(doc)
-            fmetas.append(meta)
-            fdists.append(dist)
-        return {
-            "ids": [fids],
-            "documents": [fdocs],
-            "metadatas": [fmetas],
-            "distances": [fdists],
+    else:
+        if committed_tokens is None:
+            committed_tokens = _committed_generation_tokens(drawers_col)
+
+    while True:
+        filtered = _post_filter_drawer_query(
+            drawers_col, raw, wing, room, source_file, committed_tokens
+        )
+        if len(filtered["documents"][0]) >= target_results:
+            return filtered
+        if len(_first_or_empty(raw, "documents")) < fetch_limit:
+            return filtered
+        if total is None:
+            try:
+                total = max(1, int(drawers_col.count()))
+            except (AttributeError, TypeError, ValueError):
+                return filtered
+        if fetch_limit >= total:
+            return filtered
+        fetch_limit = min(total, max(fetch_limit + 1, fetch_limit * 2))
+        query_kwargs = {
+            "query_texts": [query],
+            "n_results": fetch_limit,
+            "include": ["documents", "metadatas", "distances"],
         }
+        if filtered_query:
+            query_kwargs["where"] = where
+        raw = drawers_col.query(**query_kwargs)
 
 
 def _backend_capabilities(col) -> frozenset:
@@ -247,6 +337,8 @@ def search_memories(
 
     metric = _metric_for_collection(drawers_col)
     where = build_where_filter(wing, room, source_file)
+    committed_tokens = _committed_generation_tokens(drawers_col)
+    drawer_where = _visible_drawer_where(where, committed_tokens)
 
     # Hybrid retrieval: always query drawers directly (the floor), then use
     # closet hits to boost rankings. Closets are a ranking SIGNAL, never a
@@ -266,10 +358,16 @@ def search_memories(
             "n_results": pool_size,  # over-fetch for re-ranking
             "include": ["documents", "metadatas", "distances"],
         }
-        if where:
-            dkwargs["where"] = where
+        dkwargs["where"] = drawer_where
         drawer_results = _query_drawers_with_filter_fallback(
-            drawers_col, dkwargs, query, n_results, wing, room, source_file
+            drawers_col,
+            dkwargs,
+            query,
+            n_results,
+            wing,
+            room,
+            source_file,
+            committed_tokens=committed_tokens,
         )
     except Exception as e:
         return _search_error_result(f"Search error: {e}")
@@ -302,7 +400,7 @@ def search_memories(
     ):
         meta = meta or {}
         doc = doc or ""
-        if _candidate_out_of_scope(dist, meta, max_distance, since_dt, before_dt):
+        if _candidate_out_of_scope(dist, meta, max_distance, since_dt, before_dt, committed_tokens):
             continue
 
         meta = meta or {}
@@ -348,11 +446,15 @@ def search_memories(
             "_source_file_full": source,
             "_chunk_index": meta.get("chunk_index"),
             "_parent_drawer_id": meta.get("parent_drawer_id"),
+            "_logical_generation_id": meta.get("logical_drawer_id"),
+            "_physical_drawer_id": stored_drawer_id,
+            "_active_generation": meta.get("mine_generation_token") in committed_tokens,
         }
         if closet_preview:
             entry["closet_preview"] = closet_preview
         scored.append(entry)
 
+    scored = _collapse_logical_generation_hits(scored)
     scored.sort(key=lambda h: h["_sort_key"])
     hits = scored[:pre_enrichment_limit]
 
@@ -363,6 +465,7 @@ def search_memories(
         drawers_col,
         query,
         stop_words=stop_words,
+        committed_tokens=committed_tokens,
     )
 
     # Candidate strategy hook: optionally widen the rerank pool's *source*

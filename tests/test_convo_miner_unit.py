@@ -1,7 +1,10 @@
 """Unit tests for convo_miner pure functions (no chromadb needed)."""
 
 import contextlib
+import io
+import os
 import sys
+import threading
 
 import pytest
 
@@ -11,10 +14,30 @@ from mempalace.convo_miner import (
     _extract_authored_at,
     _file_chunks_locked,
     _source_file_delete_ids,
+    _mine_print,
     chunk_exchanges,
     detect_convo_room,
+    mine_output_streams,
     scan_convos,
 )
+
+
+def test_mine_output_streams_are_thread_local(capsys):
+    output = io.StringIO()
+    errors = io.StringIO()
+
+    with mine_output_streams(output, errors):
+        _mine_print("mine-progress")
+        _mine_print("mine-error", file=sys.stderr)
+        peer = threading.Thread(target=lambda: _mine_print("peer-progress"))
+        peer.start()
+        peer.join(timeout=2)
+
+    captured = capsys.readouterr()
+    assert output.getvalue() == "mine-progress\n"
+    assert errors.getvalue() == "mine-error\n"
+    assert captured.out == "peer-progress\n"
+    assert captured.err == ""
 
 
 class TestChunkExchanges:
@@ -607,6 +630,76 @@ class TestScanConvos:
 
 
 class TestFileChunksLocked:
+    def test_access_gate_bounds_backend_reads_and_write_batches(self, monkeypatch):
+        import mempalace.convo_miner as convo_miner
+
+        class RecordingGate:
+            def __init__(self):
+                self.mode = None
+                self.events = []
+
+            @contextlib.contextmanager
+            def read_lock(self):
+                assert self.mode is None
+                self.mode = "read"
+                self.events.append("read-enter")
+                try:
+                    yield
+                finally:
+                    self.events.append("read-exit")
+                    self.mode = None
+
+            @contextlib.contextmanager
+            def write_lock(self):
+                assert self.mode is None
+                self.mode = "write"
+                self.events.append("write-enter")
+                try:
+                    yield
+                finally:
+                    self.events.append("write-exit")
+                    self.mode = None
+
+        class FakeCol:
+            def __init__(self, gate):
+                self.gate = gate
+                self.batch_sizes = []
+
+            def get(self, **_kwargs):
+                assert self.gate.mode in {"read", "write"}
+                return {"ids": [], "metadatas": []}
+
+            def upsert(self, documents, ids, metadatas):
+                assert self.gate.mode == "write"
+                self.batch_sizes.append(len(documents))
+
+        gate = RecordingGate()
+        col = FakeCol(gate)
+        chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3)]
+        monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        drawers, _, skipped = _file_chunks_locked(
+            col,
+            "chat.txt",
+            chunks,
+            "wing",
+            "general",
+            "agent",
+            "exchange",
+            access_gate=gate,
+        )
+
+        assert (drawers, skipped) == (3, False)
+        assert col.batch_sizes == [2, 1]
+        assert gate.events.count("read-enter") == 2
+        assert gate.events.count("write-enter") == 2
+        assert gate.mode is None
+
     def test_uses_bounded_upsert_batches(self, monkeypatch):
         import mempalace.convo_miner as convo_miner
 
@@ -768,6 +861,7 @@ class TestFileChunksLocked:
         class FailingCol:
             def __init__(self):
                 self.records = {}
+                self.documents = {}
                 self.upsert_calls = 0
                 self.deleted_ids = []
 
@@ -793,6 +887,7 @@ class TestFileChunksLocked:
                 self.deleted_ids.extend(ids or [])
                 for drawer_id in ids or []:
                     self.records.pop(drawer_id, None)
+                    self.documents.pop(drawer_id, None)
 
             def update(self, ids, metadatas):
                 for drawer_id, meta in zip(ids, metadatas):
@@ -802,8 +897,9 @@ class TestFileChunksLocked:
                 self.upsert_calls += 1
                 if self.upsert_calls == 2:
                     raise RuntimeError("simulated second-batch failure")
-                for drawer_id, meta in zip(ids, metadatas):
+                for drawer_id, document, meta in zip(ids, documents, metadatas):
                     self.records[drawer_id] = meta
+                    self.documents[drawer_id] = document
 
         source = tmp_path / "chat.txt"
         source.write_text("content\n", encoding="utf-8")
@@ -821,7 +917,9 @@ class TestFileChunksLocked:
                 "source_mtime": 1.0,
                 "chunk_total": 3,
             }
+            col.documents[old_id] = f"old verbatim chunk {i}"
         pre_existing = set(col.records)
+        old_documents = dict(col.documents)
         monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
         monkeypatch.setattr(
             convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
@@ -839,6 +937,12 @@ class TestFileChunksLocked:
         assert pre_existing <= set(col.records), (
             "pre-existing drawers vanished during a failed incremental pass"
         )
+        assert {
+            drawer_id: col.documents[drawer_id] for drawer_id in pre_existing
+        } == old_documents, "a failed later batch overwrote old verbatim drawer contents"
+        staged_ids = set(col.records) - pre_existing
+        assert staged_ids
+        assert all(col.records[drawer_id].get("mine_staged") is True for drawer_id in staged_ids)
         # The real completion check must still see the file as unfinished so
         # the next mine repairs it instead of skipping forever (#2183).
         assert not file_already_mined(
@@ -864,6 +968,7 @@ class TestFileChunksLocked:
                 self.upserted_ids = []
                 self.updated_ids = []
                 self.deleted_ids = []
+                self.fail_delete = False
 
             def get(self, where=None, limit=None, offset=0, include=None, ids=None, **kwargs):
                 if ids is not None:
@@ -884,6 +989,8 @@ class TestFileChunksLocked:
                 }
 
             def delete(self, ids=None, **kwargs):
+                if self.fail_delete:
+                    raise RuntimeError("simulated orphan cleanup failure")
                 self.deleted_ids.extend(ids or [])
                 for drawer_id in ids or []:
                     self.records.pop(drawer_id, None)
@@ -900,6 +1007,7 @@ class TestFileChunksLocked:
 
         source = tmp_path / "chat.txt"
         source.write_text("content\n", encoding="utf-8")
+        first_mtime = source.stat().st_mtime
         col = FakeCol()
         monkeypatch.setattr(
             convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
@@ -916,6 +1024,7 @@ class TestFileChunksLocked:
 
         # The transcript grows by two exchanges; the first three are untouched.
         source.write_text("content\nmore\n", encoding="utf-8")
+        os.utime(source, (first_mtime + 10, first_mtime + 10))
         col.upserted_ids.clear()
         chunks_v2 = chunks_v1 + [
             {"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3, 5)
@@ -938,8 +1047,22 @@ class TestFileChunksLocked:
         assert file_already_mined(col, str(source), check_mtime=True, extract_mode="exchange")
 
         # A rewrite that drops the tail (e.g. /compact) orphans the extra
-        # ids; they are deleted, but only after the new set is written.
+        # ids. A transient cleanup failure must leave the target set visibly
+        # incomplete so the unchanged source retries on the next mine.
         source.write_text("rewritten\n", encoding="utf-8")
+        os.utime(source, (first_mtime + 20, first_mtime + 20))
+        col.fail_delete = True
+        _, _, skipped = _file_chunks_locked(
+            col, str(source), chunks_v1, "wing", "general", "agent", "exchange"
+        )
+        assert skipped is True
+        assert not file_already_mined(
+            col, str(source), check_mtime=True, extract_mode="exchange"
+        ), "failed orphan cleanup made the rewritten source look complete"
+
+        # The source mtime is unchanged, but the incomplete marker forces a
+        # retry; once cleanup succeeds the target rows are finalized current.
+        col.fail_delete = False
         drawers, _, skipped = _file_chunks_locked(
             col, str(source), chunks_v1, "wing", "general", "agent", "exchange"
         )
@@ -951,6 +1074,272 @@ class TestFileChunksLocked:
             "a shrunk re-mine must delete exactly the orphaned ids, nothing else"
         )
         assert file_already_mined(col, str(source), check_mtime=True, extract_mode="exchange")
+
+
+def test_end_of_mine_hallways_read_then_fts_validation_write(tmp_path, monkeypatch):
+    import mempalace.convo_miner as convo_miner
+
+    class RecordingGate:
+        def __init__(self):
+            self.mode = None
+            self.events = []
+
+        @contextlib.contextmanager
+        def _lock(self, mode):
+            assert self.mode is None
+            self.mode = mode
+            self.events.append(f"{mode}-enter")
+            try:
+                yield
+            finally:
+                self.events.append(f"{mode}-exit")
+                self.mode = None
+
+        def read_lock(self):
+            return self._lock("read")
+
+        def write_lock(self):
+            return self._lock("write")
+
+    gate = RecordingGate()
+    collection = object()
+    monkeypatch.setattr(convo_miner, "scan_convos", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(convo_miner, "_open_convo_collection", lambda *_args, **_kwargs: collection)
+    monkeypatch.setattr(convo_miner, "prefetch_mined_set", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(convo_miner, "prefetch_content_hashes", lambda *_args, **_kwargs: {})
+
+    def hallways(*_args, **_kwargs):
+        assert gate.mode == "read"
+
+    def validate(*_args, **_kwargs):
+        assert gate.mode == "write"
+
+    monkeypatch.setattr(convo_miner, "_compute_hallways_for_wing_safe", hallways)
+    monkeypatch.setattr(convo_miner, "_validate_palace_fts5_after_mine", validate)
+
+    convo_miner._mine_convos_impl(
+        str(tmp_path),
+        str(tmp_path / "palace"),
+        wing="test-wing",
+        access_gate=gate,
+    )
+
+    assert gate.events[-4:] == ["read-enter", "read-exit", "write-enter", "write-exit"]
+
+
+def test_publication_rollback_stays_inside_one_write_gate():
+    import mempalace.convo_miner as convo_miner
+
+    class Gate:
+        def __init__(self):
+            self.active = False
+            self.events = []
+
+        @contextlib.contextmanager
+        def write_lock(self):
+            assert not self.active
+            self.active = True
+            self.events.append("write-enter")
+            try:
+                yield
+            finally:
+                self.events.append("write-exit")
+                self.active = False
+
+    class Collection:
+        def __init__(self, gate):
+            self.gate = gate
+            self.updates = []
+            self.upserts = []
+
+        def upsert(self, ids, documents, metadatas):
+            assert self.gate.active
+            self.upserts.append((list(ids), list(documents), list(metadatas)))
+
+        def update(self, ids, metadatas):
+            assert self.gate.active
+            self.updates.append((list(ids), list(metadatas)))
+
+        def delete(self, ids):
+            assert self.gate.active
+            raise RuntimeError("cleanup failed")
+
+    gate = Gate()
+    collection = Collection(gate)
+    marker = {
+        "mine_staged": True,
+        "mine_commit_marker": True,
+        "mine_generation_commit": "token",
+        "mine_cleanup_pending": True,
+    }
+    result = convo_miner._publish_changed_generations(
+        collection,
+        final_metadata=[
+            ("old", {"source_mtime": 2.0, "mine_staged": False}),
+            ("new", {"source_mtime": 2.0, "mine_staged": False}),
+        ],
+        stale_ids=["stale"],
+        commit_id="commit",
+        commit_metadata=marker,
+        source_file="chat.jsonl",
+        access_gate=gate,
+    )
+
+    assert result is False
+    assert gate.events == ["write-enter", "write-exit"]
+    assert collection.upserts[0][0] == ["commit"]
+    assert collection.upserts[0][2][0]["mine_cleanup_pending"] is True
+
+
+def test_content_hash_prefetch_ignores_staged_generations():
+    from mempalace.palace import NORMALIZE_VERSION, prefetch_content_hashes
+
+    class Collection:
+        @staticmethod
+        def count():
+            return 5
+
+        @staticmethod
+        def get(limit, offset, include):
+            if offset:
+                return {"ids": [], "metadatas": []}
+            return {
+                "ids": ["staged", "committed", "retired", "active", "marker"],
+                "metadatas": [
+                    {
+                        "wing": "wing",
+                        "source_file": "staged.jsonl",
+                        "extract_mode": "exchange",
+                        "normalize_version": NORMALIZE_VERSION,
+                        "content_hash": "staged-hash",
+                        "mine_staged": True,
+                    },
+                    {
+                        "wing": "wing",
+                        "source_file": "committed.jsonl",
+                        "extract_mode": "exchange",
+                        "normalize_version": NORMALIZE_VERSION,
+                        "content_hash": "committed-hash",
+                    },
+                    {
+                        "wing": "wing",
+                        "source_file": "retired.jsonl",
+                        "extract_mode": "exchange",
+                        "normalize_version": NORMALIZE_VERSION,
+                        "content_hash": "retired-hash",
+                        "mine_generation_token": "retired-token",
+                    },
+                    {
+                        "wing": "wing",
+                        "source_file": "active.jsonl",
+                        "extract_mode": "exchange",
+                        "normalize_version": NORMALIZE_VERSION,
+                        "content_hash": "active-hash",
+                        "mine_generation_token": "active-token",
+                    },
+                    {
+                        "mine_staged": True,
+                        "mine_commit_marker": True,
+                        "mine_generation_commit": "active-token",
+                    },
+                ],
+            }
+
+    hashes = prefetch_content_hashes(Collection(), extract_mode="exchange")
+
+    assert ("wing", "staged-hash") not in hashes
+    assert ("wing", "retired-hash") not in hashes
+    assert hashes[("wing", "committed-hash")] == "committed.jsonl"
+    assert hashes[("wing", "active-hash")] == "active.jsonl"
+
+
+def test_pending_commit_finishes_when_stale_rows_are_already_gone():
+    import mempalace.convo_miner as convo_miner
+
+    class Collection:
+        def __init__(self):
+            self.marker = None
+            self.fail_completion = True
+
+        def upsert(self, ids, documents, metadatas):
+            self.marker = dict(metadatas[0])
+
+        def update(self, ids, metadatas):
+            if ids == ["commit"] and metadatas[0].get("mine_cleanup_pending") is False:
+                if self.fail_completion:
+                    self.fail_completion = False
+                    raise RuntimeError("crash before marker completion")
+                self.marker = dict(metadatas[0])
+
+        def delete(self, ids):
+            pass
+
+    collection = Collection()
+    marker = {
+        "mine_staged": True,
+        "mine_commit_marker": True,
+        "mine_generation_commit": "token",
+        "mine_cleanup_pending": True,
+    }
+    first = convo_miner._publish_changed_generations(
+        collection,
+        final_metadata=[],
+        stale_ids=["already-deleted"],
+        commit_id="commit",
+        commit_metadata=marker,
+        source_file="chat.jsonl",
+    )
+    assert first is False
+    assert collection.marker["mine_cleanup_pending"] is True
+
+    retry = convo_miner._publish_changed_generations(
+        collection,
+        final_metadata=[],
+        stale_ids=[],
+        commit_id="commit",
+        commit_metadata=marker,
+        source_file="chat.jsonl",
+    )
+    assert retry is True
+    assert collection.marker["mine_cleanup_pending"] is False
+
+
+def test_pending_marker_only_blocks_its_own_extract_mode():
+    from mempalace.palace import NORMALIZE_VERSION, prefetch_mined_set
+
+    class Collection:
+        @staticmethod
+        def count():
+            return 2
+
+        @staticmethod
+        def get(limit, offset, include):
+            if offset:
+                return {"ids": [], "metadatas": []}
+            return {
+                "ids": ["general-marker", "exchange-drawer"],
+                "metadatas": [
+                    {
+                        "source_file": "chat.jsonl",
+                        "extract_mode": "general",
+                        "mine_commit_marker": True,
+                        "mine_cleanup_pending": True,
+                    },
+                    {
+                        "source_file": "chat.jsonl",
+                        "extract_mode": "exchange",
+                        "normalize_version": NORMALIZE_VERSION,
+                        "source_mtime": 42.0,
+                        "chunk_total": 1,
+                    },
+                ],
+            }
+
+    exchange = prefetch_mined_set(Collection(), extract_mode="exchange")
+    general = prefetch_mined_set(Collection(), extract_mode="general")
+
+    assert exchange == {"chat.jsonl": 42.0}
+    assert general == {}
 
 
 class TestSourceFileDeleteIds:

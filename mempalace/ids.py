@@ -97,6 +97,25 @@ def make_convo_drawer_id(
     )
 
 
+def make_convo_generation_id(logical_drawer_id: str, chunk_hash: str) -> str:
+    """Physical ID for a changed conversation drawer generation.
+
+    Reusing ``logical_drawer_id`` for changed text overwrites the old verbatim
+    drawer before a multi-batch re-mine is complete. A content-addressed
+    generation lets the new text be embedded under a fresh ID while the old
+    generation remains untouched; cleanup removes the superseded physical ID
+    only after every changed batch succeeds.
+    """
+    generation = _delimited_sha256((logical_drawer_id, chunk_hash), _HASH_TRUNC_DRAWER)
+    return f"{logical_drawer_id}_gen_{generation}"
+
+
+def make_convo_commit_id(source_file: str, extract_mode: str) -> str:
+    """Stable registry ID holding one source's published generation token."""
+    digest = _delimited_sha256(("convo-commit", source_file, extract_mode), _HASH_TRUNC_DRAWER)
+    return f"_reg_commit_{digest}"
+
+
 def make_convo_sentinel_id(source_file: str, extract_mode: str) -> str:
     """Sentinel registry ID for the conversation miner zero-chunk-file path.
 

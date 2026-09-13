@@ -167,6 +167,69 @@ class TestDiaryTools:
         r = tool_diary_read(agent_name="Nobody")
         assert r["entries"] == []
 
+    def test_diary_write_idempotency_key_reuses_logical_entry(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_diary_read, tool_diary_write
+
+        first = tool_diary_write(
+            agent_name="TestAgent",
+            entry="stable checkpoint body",
+            topic="checkpoint",
+            wing="wing_project",
+            idempotency_key="hook-checkpoint:session-15",
+        )
+        retry = tool_diary_write(
+            agent_name="TestAgent",
+            entry="stable checkpoint body",
+            topic="checkpoint",
+            wing="wing_project",
+            idempotency_key="hook-checkpoint:session-15",
+        )
+
+        assert first["success"] is True
+        assert retry["success"] is True
+        assert retry["entry_id"] == first["entry_id"]
+        read = tool_diary_read(agent_name="TestAgent", wing="wing_project")
+        assert read["total"] == 1
+        assert read["entries"][0]["content"] == "stable checkpoint body"
+
+    def test_keyed_diary_short_retry_removes_old_chunk_representation(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_diary_read, tool_diary_write
+
+        long_entry = "first generation " * (config.chunk_size // 8 + 10)
+        first = tool_diary_write(
+            agent_name="TestAgent",
+            entry=long_entry,
+            topic="checkpoint",
+            wing="wing_project",
+            idempotency_key="hook-checkpoint:resize",
+        )
+        assert first["success"] is True
+        assert first["chunks"] > 1
+
+        retry = tool_diary_write(
+            agent_name="TestAgent",
+            entry="short replacement",
+            topic="checkpoint",
+            wing="wing_project",
+            idempotency_key="hook-checkpoint:resize",
+        )
+
+        assert retry["success"] is True
+        assert retry["entry_id"] == first["entry_id"]
+        read = tool_diary_read(agent_name="TestAgent", wing="wing_project")
+        assert read["total"] == 1
+        assert [item["content"] for item in read["entries"]] == ["short replacement"]
+
     def test_diary_read_pages_past_10000_and_returns_true_latest(self, monkeypatch, config, kg):
         """Entries beyond the old 10k cap must affect both recency and total."""
         _patch_mcp_server(monkeypatch, config, kg)

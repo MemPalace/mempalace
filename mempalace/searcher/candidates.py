@@ -59,6 +59,7 @@ def _enrich_closet_hits(
     drawers_col,
     query: str,
     stop_words: frozenset = frozenset(),
+    committed_tokens=None,
 ) -> list:
     """Hydrate closet-boosted hits and memoise each source/group fetch."""
     query_terms = set(
@@ -68,6 +69,8 @@ def _enrich_closet_hits(
         )
     )
     source_cache: dict = {}
+    if committed_tokens is None:
+        committed_tokens = _committed_generation_tokens(drawers_col)
 
     for hit in hits:
         if hit.get("matched_via") == "drawer":
@@ -108,6 +111,14 @@ def _enrich_closet_hits(
             else:
                 source_cache[cache_key] = (
                     list(
+                        (
+                            source_drawers.get("ids", [])
+                            if isinstance(source_drawers, dict)
+                            else getattr(source_drawers, "ids", None)
+                        )
+                        or []
+                    ),
+                    list(
                         getattr(
                             source_drawers,
                             "documents",
@@ -130,22 +141,21 @@ def _enrich_closet_hits(
         if cached is None:
             continue
 
-        docs, metadatas = cached
+        physical_ids, docs, metadatas = cached
+        if len(physical_ids) < len(docs):
+            physical_ids.extend(
+                f"_hydrated_row_{index}" for index in range(len(physical_ids), len(docs))
+            )
 
         if len(docs) <= 1:
             continue
 
         indexed = []
 
-        for index, (
-            document,
-            metadata,
-        ) in enumerate(
-            zip(
-                docs,
-                metadatas,
-            )
-        ):
+        source_rows = _collapse_physical_generation_rows(
+            list(zip(physical_ids, docs, metadatas)), committed_tokens
+        )
+        for index, (_, document, metadata) in enumerate(source_rows):
             chunk_index = (
                 metadata.get(
                     "chunk_index",
@@ -349,6 +359,7 @@ def _finalize_candidate_hits(
             ),
         )
 
+    hits[:] = _collapse_logical_generation_hits(hits)
     vector_weight, bm25_weight = _resolve_hybrid_rank_weights()
     ranked = _hybrid_rank(
         hits,
@@ -365,6 +376,9 @@ def _finalize_candidate_hits(
         hit.pop("_source_file_full", None)
         hit.pop("_chunk_index", None)
         hit.pop("_parent_drawer_id", None)
+        hit.pop("_logical_generation_id", None)
+        hit.pop("_physical_drawer_id", None)
+        hit.pop("_active_generation", None)
 
     return hits, None
 
@@ -485,13 +499,17 @@ def _window_and_fallback_gate(
     return since_dt, before_dt, active, None
 
 
-def _candidate_out_of_scope(dist, meta, max_distance, since_dt, before_dt) -> bool:
+def _candidate_out_of_scope(
+    dist, meta, max_distance, since_dt, before_dt, committed_tokens=frozenset()
+) -> bool:
     """True when a drawer candidate fails the distance or date-window gate.
 
     Distance is checked on the raw value before rounding to avoid precision
     loss (pre-existing behavior); the date window applies whenever a bound
     is set, with the shared ``[since, before)`` semantics.
     """
+    if _is_staged_metadata(meta, committed_tokens):
+        return True
     if max_distance > 0.0 and dist > max_distance:
         return True
     if (since_dt is not None or before_dt is not None) and not filed_at_in_window(

@@ -638,6 +638,70 @@ class TestWriteTools:
         assert result["count"] == 4
         assert len(result["drawers"]) == 4
 
+    def test_list_drawers_hides_markers_and_uncommitted_generations(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        collection.add(
+            ids=["hidden", "old", "published", "removed", "marker", "ordinary"],
+            documents=["hidden", "old", "published", "removed", "[commit]", "ordinary"],
+            metadatas=[
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "mine_staged": True,
+                    "mine_generation_token": "hidden-token",
+                },
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "logical_drawer_id": "logical-published",
+                    "filed_at": "2026-09-03T00:00:00",
+                },
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "mine_staged": True,
+                    "mine_generation_token": "published-token",
+                    "logical_drawer_id": "logical-published",
+                    "filed_at": "2026-09-02T00:00:00",
+                },
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "logical_drawer_id": "removed-logical",
+                    "mine_generation_token": "retired-token",
+                },
+                {
+                    "wing": "w",
+                    "room": "_registry",
+                    "mine_staged": True,
+                    "mine_commit_marker": True,
+                    "mine_generation_commit": "published-token",
+                },
+                {"wing": "w", "room": "r"},
+            ],
+        )
+
+        from mempalace.mcp_server import (
+            tool_delete_drawer,
+            tool_get_drawer,
+            tool_list_drawers,
+        )
+
+        result = tool_list_drawers(wing="w", room="r", limit=20)
+        ids = {drawer["drawer_id"] for drawer in result["drawers"]}
+        assert ids == {"logical-published", "ordinary"}
+        assert result["total"] == 2
+
+        fetched = tool_get_drawer("logical-published")
+        assert fetched["drawer_id"] == "logical-published"
+        assert fetched["content"] == "published"
+        deleted = tool_delete_drawer("logical-published")
+        assert set(deleted["deleted_ids"]) == {"old", "published"}
+        assert "error" in tool_get_drawer("logical-published")
+        assert "error" in tool_get_drawer("removed-logical")
+
     def test_list_drawers_with_wing_filter(
         self, monkeypatch, config, palace_path, seeded_collection, kg
     ):

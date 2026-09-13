@@ -8,6 +8,7 @@ from mempalace.normalize import (
     _format_tool_result,
     _format_tool_use,
     _messages_to_transcript,
+    _codex_item_text,
     _try_chatgpt_export_json_split,
     _try_chatgpt_json,
     _try_claude_ai_json,
@@ -561,6 +562,18 @@ def test_codex_jsonl_v2_multiple_text_blocks_joined():
     assert result is not None
     assert "part one" in result
     assert "part two" in result
+
+
+def test_codex_item_completed_preserves_text_block_whitespace():
+    item = {
+        "type": "UserMessage",
+        "content": [
+            {"type": "text", "text": "    indented code\n"},
+            {"type": "text", "text": "  trailing spaces  "},
+        ],
+    }
+
+    assert _codex_item_text(item) == "    indented code\n\n  trailing spaces  "
 
 
 def test_codex_jsonl_mixed_v1_v2_resumed_session():

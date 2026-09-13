@@ -145,7 +145,8 @@ def search(
     # creation — their similarity scores will be junk until they run repair.
     _warn_if_legacy_metric(col)
 
-    where = build_where_filter(wing, room)
+    committed_tokens = _committed_generation_tokens(col)
+    where = _visible_drawer_where(build_where_filter(wing, room), committed_tokens)
 
     try:
         kwargs = {
@@ -161,7 +162,15 @@ def search(
         if where:
             kwargs["where"] = where
 
-        results = _query_drawers_with_filter_fallback(col, kwargs, query, n_results, wing, room)
+        results = _query_drawers_with_filter_fallback(
+            col,
+            kwargs,
+            query,
+            n_results,
+            wing,
+            room,
+            committed_tokens=committed_tokens,
+        )
 
     except Exception as e:
         print(f"\n  Search error: {e}")
@@ -170,19 +179,31 @@ def search(
     docs = _first_or_empty(results, "documents")
     metas = _first_or_empty(results, "metadatas")
     dists = _first_or_empty(results, "distances")
+    stored_ids = _aligned_query_ids(results, len(docs))
+
+    visible = [
+        (stored_id, doc, meta, dist)
+        for stored_id, doc, meta, dist in zip(stored_ids, docs, metas, dists)
+        if not _is_staged_metadata(meta, committed_tokens)
+    ]
+    stored_ids = [item[0] for item in visible]
+    docs = [item[1] for item in visible]
+    metas = [item[2] for item in visible]
+    dists = [item[3] for item in visible]
 
     if date_window_active:
         kept = [
-            (doc, meta, dist)
-            for doc, meta, dist in zip(docs, metas, dists)
+            (stored_id, doc, meta, dist)
+            for stored_id, doc, meta, dist in zip(stored_ids, docs, metas, dists)
             if filed_at_in_window((meta or {}).get("filed_at"), since_dt, before_dt)
         ]
         # Keep the whole in-window pool here; the hybrid re-rank below must
         # see every survivor before the display cut to n_results, or a
         # BM25-strong drawer deep in the pool could never surface.
-        docs = [k[0] for k in kept]
-        metas = [k[1] for k in kept]
-        dists = [k[2] for k in kept]
+        stored_ids = [k[0] for k in kept]
+        docs = [k[1] for k in kept]
+        metas = [k[2] for k in kept]
+        dists = [k[3] for k in kept]
 
     if not docs:
         print(f'\n  No results found for: "{query}"')
@@ -198,9 +219,19 @@ def search(
     # see via `mempalace_search`.
     metric = _metric_for_collection(col)
     hits = [
-        {"text": doc or "", "distance": float(dist), "metadata": meta or {}}
-        for doc, meta, dist in zip(docs, metas, dists)
+        {
+            "drawer_id": _result_drawer_id(meta, stored_id),
+            "text": doc or "",
+            "distance": float(dist),
+            "metadata": meta or {},
+            "created_at": (meta or {}).get("filed_at", ""),
+            "_logical_generation_id": (meta or {}).get("logical_drawer_id"),
+            "_physical_drawer_id": stored_id,
+            "_active_generation": (meta or {}).get("mine_generation_token") in committed_tokens,
+        }
+        for stored_id, doc, meta, dist in zip(stored_ids, docs, metas, dists)
     ]
+    hits = _collapse_logical_generation_hits(hits)
     vector_weight, bm25_weight = _resolve_hybrid_rank_weights()
     hits = _hybrid_rank(
         hits,

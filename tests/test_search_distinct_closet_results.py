@@ -125,6 +125,7 @@ def test_closet_enrichment_memoises_by_source_and_parent_group():
         hits,
         drawers_col,
         "token",
+        committed_tokens=frozenset(),
     )
 
     assert drawers_col.get.call_count == 2
@@ -188,24 +189,30 @@ def test_search_promotes_distinct_results_from_wider_pool_and_fetches_source_onc
             ]
         ],
     }
-    drawers_col.get.return_value = SimpleNamespace(
-        documents=[
-            ("context before the target"),
-            ("quasar authentication token rotation exact target"),
-            ("context after the target"),
-        ],
-        metadatas=[
-            {
-                "chunk_index": 0,
-            },
-            {
-                "chunk_index": 1,
-            },
-            {
-                "chunk_index": 2,
-            },
-        ],
-    )
+
+    def get_drawers(*, where, include):
+        if where == {"mine_commit_marker": True}:
+            return {"ids": [], "metadatas": []}
+        return SimpleNamespace(
+            documents=[
+                ("context before the target"),
+                ("quasar authentication token rotation exact target"),
+                ("context after the target"),
+            ],
+            metadatas=[
+                {
+                    "chunk_index": 0,
+                },
+                {
+                    "chunk_index": 1,
+                },
+                {
+                    "chunk_index": 2,
+                },
+            ],
+        )
+
+    drawers_col.get.side_effect = get_drawers
 
     closets_col = MagicMock()
     closets_col.query.return_value = {
@@ -260,7 +267,13 @@ def test_search_promotes_distinct_results_from_wider_pool_and_fetches_source_onc
     assert len(rendered_keys) == 5
     assert hits[0]["drawer_id"] == "same-0"
     assert drawers_col.query.call_args.kwargs["n_results"] == 20
-    assert drawers_col.get.call_count == 1
+    assert drawers_col.get.call_count == 2
+    source_gets = [
+        call
+        for call in drawers_col.get.call_args_list
+        if call.kwargs["where"] != {"mine_commit_marker": True}
+    ]
+    assert len(source_gets) == 1
     assert sum(hit["source_path"] == repeated_source for hit in hits) == 1
 
 

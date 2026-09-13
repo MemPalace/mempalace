@@ -131,7 +131,64 @@ def _logical_chunk_group(col, drawer_id: str):
     }
 
 
+def _logical_generation_record(col, drawer_id: str):
+    """Resolve a stable conversation logical id to its visible physical row."""
+    try:
+        result = col.get(
+            where={"logical_drawer_id": drawer_id},
+            include=["documents", "metadatas"],
+        )
+        markers = col.get(
+            where={"mine_commit_marker": True},
+            include=["metadatas"],
+        )
+    except Exception:
+        logger.debug("generation lookup failed for %s", drawer_id, exc_info=True)
+        return None
+    committed = {
+        (meta or {}).get("mine_generation_commit")
+        for meta in (_chroma_field(markers, "metadatas", []) or [])
+        if (meta or {}).get("mine_generation_commit")
+    }
+    rows = []
+    ids = _chroma_field(result, "ids", []) or []
+    docs = _chroma_field(result, "documents", []) or []
+    metas = _chroma_field(result, "metadatas", []) or []
+    for index, physical_id in enumerate(ids):
+        meta = _safe_meta(metas[index] if index < len(metas) else {})
+        if meta.get("mine_staged") is True and meta.get("mine_generation_token") not in committed:
+            continue
+        generation_token = meta.get("mine_generation_token")
+        if generation_token and generation_token not in committed:
+            continue
+        rows.append(
+            (
+                meta.get("mine_generation_token") in committed,
+                meta.get("filed_at", ""),
+                physical_id,
+                docs[index] if index < len(docs) else "",
+                meta,
+            )
+        )
+    if not rows:
+        return None
+    rows.sort(key=lambda row: (row[0], row[1], row[2]), reverse=True)
+    _, _, physical_id, document, metadata = rows[0]
+    return {
+        "drawer_id": drawer_id,
+        "ids": [row[2] for row in rows],
+        "documents": [row[3] or "" for row in rows],
+        "metadatas": [row[4] for row in rows],
+        "content": document or "",
+        "metadata": metadata,
+        "chunked": False,
+    }
+
+
 def _logical_drawer_record(col, drawer_id: str):
+    generation = _logical_generation_record(col, drawer_id)
+    if generation is not None:
+        return generation
     direct = _single_drawer_record(col, drawer_id)
     if direct is not None:
         return direct
@@ -220,7 +277,7 @@ def _page_physical_ids(page: list) -> list:
         if chunk_ids:
             physical_ids.extend(chunk_ids)
         else:
-            physical_ids.append(drawer["drawer_id"])
+            physical_ids.append(drawer.get("_physical_id") or drawer["drawer_id"])
     return physical_ids
 
 
@@ -231,7 +288,7 @@ def _apply_drawer_previews(page: list, docs_by_id: dict) -> None:
         if chunk_ids:
             content = "".join(docs_by_id.get(cid, "") for cid in chunk_ids)
         else:
-            content = docs_by_id.get(drawer["drawer_id"], "")
+            content = docs_by_id.get(drawer.get("_physical_id") or drawer["drawer_id"], "")
         drawer["content_preview"] = _content_preview(content)
 
 
@@ -270,7 +327,7 @@ def _fill_drawer_previews_from_sqlite(page: list) -> None:
     _apply_drawer_previews(page, docs_by_id)
 
 
-def _collapse_drawer_rows(ids, documents, metadatas):
+def _collapse_drawer_rows(ids, documents, metadatas, committed_tokens=frozenset()):
     groups = {}
     singles = []
 
@@ -289,15 +346,30 @@ def _collapse_drawer_rows(ids, documents, metadatas):
     grouped_ids = set(groups)
     drawers = []
 
-    for drawer_id, doc, meta in singles:
+    chosen_singles = {}
+    for physical_id, doc, meta in singles:
+        logical_id = meta.get("logical_drawer_id") or physical_id
+        candidate = (
+            meta.get("mine_generation_token") in committed_tokens,
+            meta.get("filed_at", ""),
+            physical_id,
+            doc,
+            meta,
+        )
+        current = chosen_singles.get(logical_id)
+        if current is None or candidate[:3] > current[:3]:
+            chosen_singles[logical_id] = candidate
+
+    for logical_id, (_, _, physical_id, doc, meta) in chosen_singles.items():
         # If both a legacy logical row and chunks exist, display one logical row.
-        if drawer_id in grouped_ids:
+        if logical_id in grouped_ids:
             continue
 
         safe_meta = _response_safe_meta(meta)
         drawers.append(
             {
-                "drawer_id": drawer_id,
+                "drawer_id": logical_id,
+                "_physical_id": physical_id,
                 "wing": safe_meta.get("wing", ""),
                 "room": safe_meta.get("room", ""),
                 "content_preview": _content_preview(doc),
@@ -707,6 +779,8 @@ def tool_mine(
     if not src or not (os.path.isdir(src) or (mode == "convos" and os.path.isfile(src))):
         return {"success": False, "error": f"source not found: {source!r}"}
 
+    http_mine_access_gate = _current_http_mine_access_gate() if mode == "convos" else None
+
     def _run():
         if mode == "convos":
             from ..convo_miner import mine_convos
@@ -719,6 +793,7 @@ def tool_mine(
                 limit=limit,
                 dry_run=dry_run,
                 extract_mode=extract,
+                access_gate=http_mine_access_gate,
             )
         if mode == "extract":
             from ..format_miner import mine_formats
@@ -744,7 +819,25 @@ def tool_mine(
 
     try:
         try:
-            _result, output = _capture_fd_stdout(_run)
+            if http_mine_access_gate is None:
+                _result, output = _capture_fd_stdout(_run)
+            else:
+                # redirect_stdout/dup2 are process-global and would capture
+                # peer request output while this long mine interleaves with
+                # searches. Convo mining has a thread-local progress router,
+                # so the HTTP path can capture only this request's messages.
+                import io
+
+                from ..convo_miner import mine_output_streams
+
+                output_buffer = io.StringIO()
+                error_buffer = io.StringIO()
+                with mine_output_streams(output_buffer, error_buffer):
+                    _result = _run()
+                output = output_buffer.getvalue()
+                error_output = error_buffer.getvalue().strip()
+                if error_output:
+                    logger.warning("mempalace_mine: %s", error_output)
         # Order matters: typed handlers precede the bare Exception (mirroring
         # tool_sync) so MineAlreadyRunning / MineValidationError / ValueError
         # don't fall into the generic "mine failed" branch.
@@ -1059,9 +1152,19 @@ def tool_list_drawers(
             where = {"$and": conditions}
 
         listed = None
+        committed_tokens = set()
         if _is_chroma_backend() and _config.palace_path:
-            from ..backends.chroma import sqlite_list_id_metadata
+            from ..backends.chroma import (
+                sqlite_generation_commit_tokens,
+                sqlite_list_id_metadata,
+            )
 
+            marker_tokens = sqlite_generation_commit_tokens(
+                _config.palace_path,
+                _config.collection_name,
+            )
+            if marker_tokens is not None:
+                committed_tokens = marker_tokens
             listed = sqlite_list_id_metadata(
                 _config.palace_path, _config.collection_name, where=where
             )
@@ -1074,7 +1177,31 @@ def tool_list_drawers(
             if not col:
                 return _collection_error_or_no_palace()
             ids, documents, metadatas = _fetch_drawer_rows(col, where=where, include=["metadatas"])
-        drawers = _collapse_drawer_rows(ids, documents, metadatas)
+            marker_result = col.get(where={"mine_commit_marker": True}, include=["metadatas"])
+            committed_tokens = {
+                (meta or {}).get("mine_generation_commit")
+                for meta in (marker_result.get("metadatas") or [])
+                if (meta or {}).get("mine_generation_commit")
+            }
+        visible_rows = [
+            (drawer_id, documents[index] if index < len(documents) else "", meta or {})
+            for index, (drawer_id, meta) in enumerate(zip(ids, metadatas))
+            if (meta or {}).get("mine_commit_marker") is not True
+            and (
+                (meta or {}).get("mine_staged") is not True
+                or (meta or {}).get("mine_generation_token") in committed_tokens
+            )
+            and (
+                not (meta or {}).get("mine_generation_token")
+                or (meta or {}).get("mine_generation_token") in committed_tokens
+            )
+        ]
+        drawers = _collapse_drawer_rows(
+            [row[0] for row in visible_rows],
+            [row[1] for row in visible_rows],
+            [row[2] for row in visible_rows],
+            committed_tokens,
+        )
 
         if since_dt is not None or before_dt is not None:
             drawers = [
@@ -1090,6 +1217,8 @@ def tool_list_drawers(
             col = _get_collection()
             if col:
                 _fill_drawer_previews(col, page)
+        for drawer in page:
+            drawer.pop("_physical_id", None)
 
         return {
             "drawers": page,
@@ -1206,6 +1335,8 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         update_kwargs["metadatas"] = [new_meta]
 
         col.update(**update_kwargs)
+        if len(record["ids"]) > 1:
+            col.delete(ids=record["ids"][1:])
         _invalidate_overview_caches()
 
         logger.info("Updated drawer: %s", drawer_id)

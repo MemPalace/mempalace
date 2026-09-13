@@ -23,6 +23,55 @@ def build_where_filter(wing: str = None, room: str = None, source_file: str = No
     return {"$and": clauses}
 
 
+def _is_staged_metadata(metadata, committed_tokens=frozenset()) -> bool:
+    """True for an unpublished conversation-mine physical generation."""
+    if not isinstance(metadata, dict):
+        return False
+    value = metadata.get("mine_staged")
+    # Chroma returns bools; the sqlite-only fallback reconstructs them from
+    # ``int_value`` as 0/1.
+    if not (value is True or value == 1):
+        return False
+    token = metadata.get("mine_generation_token")
+    return not token or token not in committed_tokens
+
+
+def _committed_generation_tokens(collection) -> frozenset[str]:
+    """Read crash-atomic conversation generation markers from the drawer store."""
+    try:
+        result = collection.get(
+            where={"mine_commit_marker": True},
+            include=["metadatas"],
+        )
+        return frozenset(
+            meta.get("mine_generation_commit")
+            for meta in (result.get("metadatas") or [])
+            if isinstance(meta, dict) and meta.get("mine_generation_commit")
+        )
+    except Exception:
+        logger.warning("Could not read conversation generation commit markers", exc_info=True)
+        return frozenset()
+
+
+def _visible_drawer_where(where: dict, committed_tokens=frozenset()) -> dict:
+    """Exclude staged rows in the backend before its top-K limit is applied."""
+    committed = {"mine_staged": {"$ne": True}}
+    visibility = committed
+    if committed_tokens:
+        visibility = {
+            "$or": [
+                committed,
+                {"mine_generation_token": {"$in": sorted(committed_tokens)}},
+            ]
+        }
+    if not where:
+        return visibility
+    clauses = where.get("$and") if isinstance(where, dict) else None
+    if isinstance(clauses, list):
+        return {"$and": [*clauses, visibility]}
+    return {"$and": [where, visibility]}
+
+
 def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
     """Parse all `→drawer_id_a,drawer_id_b` pointers out of a closet document.
 

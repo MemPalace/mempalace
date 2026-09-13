@@ -61,6 +61,142 @@ def _window_sql_prefilters(since_dt, before_dt) -> list:
     return prefilters
 
 
+def _sqlite_staged_value_sql(conn) -> str:
+    """Return a staged-flag expression compatible with old Chroma schemas."""
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(embedding_metadata)")}
+    except sqlite3.Error:
+        columns = set()
+    if "bool_value" in columns:
+        return "COALESCE(staged.bool_value, staged.int_value, 0)"
+    return "COALESCE(staged.int_value, 0)"
+
+
+def _sqlite_active_generation_rows(
+    db_path: str,
+    collection_name: str,
+    logical_ids: set[str],
+) -> dict[str, dict]:
+    """Hydrate marker-selected physical rows for logical IDs from sqlite."""
+    if not logical_ids:
+        return {}
+    conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+    try:
+        placeholders = ",".join("?" for _ in logical_ids)
+        active = conn.execute(
+            f"""
+            SELECT e.id, e.embedding_id, logical.string_value
+            FROM embedding_metadata logical
+            JOIN embeddings e ON e.id = logical.id
+            JOIN segments s ON e.segment_id = s.id
+            JOIN collections c ON s.collection = c.id
+            JOIN embedding_metadata token
+              ON token.id = e.id AND token.key = 'mine_generation_token'
+            JOIN embedding_metadata marker
+              ON marker.key = 'mine_generation_commit'
+             AND marker.string_value = token.string_value
+            JOIN embeddings marker_embedding ON marker_embedding.id = marker.id
+            JOIN segments marker_segment ON marker_segment.id = marker_embedding.segment_id
+            JOIN collections marker_collection ON marker_collection.id = marker_segment.collection
+            WHERE c.name = ?
+              AND marker_collection.name = ?
+              AND logical.key = 'logical_drawer_id'
+              AND logical.string_value IN ({placeholders})
+            """,
+            (collection_name, collection_name, *sorted(logical_ids)),
+        ).fetchall()
+        if not active:
+            return {}
+        internal_ids = [row[0] for row in active]
+        by_internal = {
+            row[0]: {
+                "drawer_id": row[1],
+                "logical_id": row[2],
+                "metadata": {},
+                "document": "",
+            }
+            for row in active
+        }
+        id_placeholders = ",".join("?" for _ in internal_ids)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(embedding_metadata)")}
+        value_columns = [
+            column
+            for column in ("string_value", "int_value", "float_value", "bool_value")
+            if column in columns
+        ]
+        metadata_rows = conn.execute(
+            f"""
+            SELECT id, key, {", ".join(value_columns)}
+            FROM embedding_metadata
+            WHERE id IN ({id_placeholders})
+            """,
+            internal_ids,
+        ).fetchall()
+        for row in metadata_rows:
+            target = by_internal.get(row[0])
+            if target is None or not row[1]:
+                continue
+            value = next((value for value in row[2:] if value is not None), None)
+            if row[1] == "chroma:document":
+                target["document"] = value or ""
+            elif value is not None:
+                target["metadata"][row[1]] = value
+        return {item["logical_id"]: item for item in by_internal.values()}
+    finally:
+        conn.close()
+
+
+def _resolve_sqlite_generation_candidates(candidates, query, db_path, collection_name):
+    logical_ids = {
+        candidate.get("_logical_generation_id")
+        for candidate in candidates
+        if candidate.get("_logical_generation_id")
+    }
+    try:
+        active = _sqlite_active_generation_rows(db_path, collection_name, logical_ids)
+    except sqlite3.Error:
+        logger.warning("Could not resolve sqlite active generations", exc_info=True)
+        active = {}
+    resolved = []
+    emitted = set()
+    for candidate in candidates:
+        logical_id = candidate.get("_logical_generation_id")
+        if not logical_id:
+            resolved.append(candidate)
+            continue
+        if logical_id in emitted:
+            continue
+        emitted.add(logical_id)
+        current = active.get(logical_id)
+        if current is None:
+            if not candidate.get("_generation_token"):
+                resolved.append(candidate)
+            continue
+        if _bm25_scores(query, [current["document"]])[0] <= 0:
+            continue
+        metadata = current["metadata"]
+        full_source = metadata.get("source_file", "") or ""
+        replacement = dict(candidate)
+        replacement.update(
+            {
+                "drawer_id": logical_id,
+                "text": current["document"],
+                "wing": metadata.get("wing", "unknown"),
+                "room": metadata.get("room", "unknown"),
+                "source_file": Path(full_source).name if full_source else "?",
+                "source_path": full_source,
+                "created_at": metadata.get("filed_at", "unknown"),
+                "authored_at": metadata.get("authored_at", metadata.get("filed_at", "unknown")),
+                "_source_file_full": full_source,
+                "_chunk_index": metadata.get("chunk_index"),
+                "_physical_drawer_id": current["drawer_id"],
+                "_active_generation": True,
+            }
+        )
+        resolved.append(replacement)
+    return resolved
+
+
 def _bm25_only_via_sqlite(
     query: str,
     palace_path: str,
@@ -102,9 +238,64 @@ def _bm25_only_via_sqlite(
 
         collection_name = get_configured_collection_name()
 
+    staged_value_sql = "COALESCE(staged.int_value, 0)"
+
     def _metadata_filter_sql(row_id_expr: str) -> tuple[str, list[str]]:
-        clauses = []
-        params = []
+        clauses = [
+            f"""
+            AND (
+                NOT EXISTS (
+                    SELECT 1
+                    FROM embedding_metadata staged
+                    WHERE staged.id = {row_id_expr}
+                      AND staged.key = 'mine_staged'
+                      AND {staged_value_sql} = 1
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM embedding_metadata token
+                    JOIN embedding_metadata marker
+                      ON marker.key = 'mine_generation_commit'
+                     AND marker.string_value = token.string_value
+                    JOIN embeddings marker_embedding
+                      ON marker_embedding.id = marker.id
+                    JOIN segments marker_segment
+                      ON marker_segment.id = marker_embedding.segment_id
+                    JOIN collections marker_collection
+                      ON marker_collection.id = marker_segment.collection
+                    WHERE token.id = {row_id_expr}
+                      AND token.key = 'mine_generation_token'
+                      AND marker_collection.name = ?
+                )
+            )
+            """,
+            f"""
+            AND (
+                NOT EXISTS (
+                    SELECT 1 FROM embedding_metadata tokened
+                    WHERE tokened.id = {row_id_expr}
+                      AND tokened.key = 'mine_generation_token'
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM embedding_metadata tokened
+                    JOIN embedding_metadata marker
+                      ON marker.key = 'mine_generation_commit'
+                     AND marker.string_value = tokened.string_value
+                    JOIN embeddings marker_embedding
+                      ON marker_embedding.id = marker.id
+                    JOIN segments marker_segment
+                      ON marker_segment.id = marker_embedding.segment_id
+                    JOIN collections marker_collection
+                      ON marker_collection.id = marker_segment.collection
+                    WHERE tokened.id = {row_id_expr}
+                      AND tokened.key = 'mine_generation_token'
+                      AND marker_collection.name = ?
+                )
+            )
+            """,
+        ]
+        params = [collection_name, collection_name]
         for key, value in (("wing", wing), ("room", room), ("source_file", source_file)):
             if not value:
                 continue
@@ -145,7 +336,10 @@ def _bm25_only_via_sqlite(
     except sqlite3.Error as e:
         return _search_error_result(f"sqlite open failed: {e}")
 
+    staged_value_sql = _sqlite_staged_value_sql(conn)
+
     window_active = since_dt is not None or before_dt is not None
+    committed_tokens = set()
     try:
         # FTS5 MATCH expects whitespace-separated tokens. Drop tokens
         # shorter than 3 chars (trigram tokenizer can't match them).
@@ -253,6 +447,23 @@ def _bm25_only_via_sqlite(
             """,
             candidate_ids,
         ).fetchall()
+        committed_tokens = {
+            row[0]
+            for row in conn.execute(
+                """
+                SELECT marker.string_value
+                FROM embedding_metadata marker
+                JOIN embeddings e ON e.id = marker.id
+                JOIN segments s ON e.segment_id = s.id
+                JOIN collections c ON s.collection = c.id
+                WHERE c.name = ?
+                  AND marker.key = 'mine_generation_commit'
+                  AND marker.string_value IS NOT NULL
+                """,
+                (collection_name,),
+            ).fetchall()
+            if row[0]
+        }
     finally:
         conn.close()
 
@@ -307,10 +518,16 @@ def _bm25_only_via_sqlite(
                 # multiple chunks. Stripped before this helper returns.
                 "_source_file_full": full_source,
                 "_chunk_index": meta.get("chunk_index"),
+                "_logical_generation_id": meta.get("logical_drawer_id"),
+                "_physical_drawer_id": d["_stored_drawer_id"],
+                "_active_generation": meta.get("mine_generation_token") in committed_tokens,
+                "_generation_token": meta.get("mine_generation_token"),
             }
         )
 
     # Local BM25 over the candidate set.
+    candidates = _resolve_sqlite_generation_candidates(candidates, query, db_path, collection_name)
+    candidates = _collapse_logical_generation_hits(candidates)
     docs = [c["text"] for c in candidates]
     bm25_raw = _bm25_scores(query, docs, stop_words=stop_words)
     max_bm25 = max(bm25_raw) if bm25_raw else 0.0
@@ -327,6 +544,10 @@ def _bm25_only_via_sqlite(
         if not _include_internal:
             h.pop("_source_file_full", None)
             h.pop("_chunk_index", None)
+            h.pop("_logical_generation_id", None)
+            h.pop("_physical_drawer_id", None)
+            h.pop("_active_generation", None)
+            h.pop("_generation_token", None)
 
     result = {
         "query": query,
@@ -339,6 +560,83 @@ def _bm25_only_via_sqlite(
     if window_pool_truncated:
         result["date_filter_pool_truncated"] = True
     return result
+
+
+def _resolve_lexical_generation_hits(drawers_col, hits, query, committed_tokens):
+    """Replace stale lexical hits with their newest visible physical generation."""
+    logical_metas = [
+        hit.metadata or {} for hit in hits if (hit.metadata or {}).get("logical_drawer_id")
+    ]
+    current_ids = _current_generation_ids_for_query(
+        drawers_col,
+        {"metadatas": [logical_metas]},
+        committed_tokens,
+    )
+    by_physical = {hit.id: hit for hit in hits}
+    missing_ids = sorted(set(current_ids.values()) - set(by_physical))
+    if missing_ids:
+        try:
+            fetched = drawers_col.get(
+                ids=missing_ids,
+                include=["documents", "metadatas"],
+            )
+            fetched_ids = fetched.get("ids") or []
+            fetched_docs = fetched.get("documents") or []
+            fetched_metas = fetched.get("metadatas") or []
+            for index, physical_id in enumerate(fetched_ids):
+                document = fetched_docs[index] if index < len(fetched_docs) else ""
+                metadata = fetched_metas[index] if index < len(fetched_metas) else {}
+                score = _bm25_scores(query, [document or ""])[0]
+                if score > 0:
+                    by_physical[physical_id] = SimpleNamespace(
+                        id=physical_id,
+                        document=document or "",
+                        metadata=metadata or {},
+                        score=score,
+                    )
+        except Exception:
+            logger.warning("Could not hydrate current lexical generations", exc_info=True)
+
+    resolved = []
+    emitted_logical = set()
+    for hit in hits:
+        logical_id = (hit.metadata or {}).get("logical_drawer_id")
+        if not logical_id:
+            resolved.append(hit)
+            continue
+        if logical_id in emitted_logical:
+            continue
+        emitted_logical.add(logical_id)
+        current = by_physical.get(current_ids.get(logical_id))
+        if current is not None:
+            resolved.append(current)
+        elif not (hit.metadata or {}).get("mine_generation_token"):
+            resolved.append(hit)
+    return resolved
+
+
+def _fetch_resolved_lexical_hits(drawers_col, query, where, target_results, committed_tokens):
+    limit = max(1, target_results)
+    total = None
+    while True:
+        result = drawers_col.lexical_search(
+            query=query,
+            n_results=limit,
+            where=where or None,
+        )
+        resolved = _resolve_lexical_generation_hits(
+            drawers_col, result.hits, query, committed_tokens
+        )
+        if len(resolved) >= target_results or len(result.hits) < limit:
+            return resolved
+        if total is None:
+            try:
+                total = max(1, int(drawers_col.count()))
+            except (AttributeError, TypeError, ValueError):
+                return resolved
+        if limit >= total:
+            return resolved
+        limit = min(total, max(limit + 1, limit * 2))
 
 
 def _merge_bm25_union_candidates(
@@ -373,12 +671,15 @@ def _merge_bm25_union_candidates(
     before admitting them, preserving the same distance guarantee as the
     vector-only path.
     """
-    where = build_where_filter(wing, room, source_file)
+    committed_tokens = _committed_generation_tokens(drawers_col)
+    where = _visible_drawer_where(build_where_filter(wing, room, source_file), committed_tokens)
     try:
-        lexical = drawers_col.lexical_search(
-            query=query,
-            n_results=n_results * 3,
-            where=where or None,
+        lexical_hits = _fetch_resolved_lexical_hits(
+            drawers_col,
+            query,
+            where,
+            n_results * 3,
+            committed_tokens,
         )
     except UnsupportedCapabilityError:
         raise
@@ -388,14 +689,16 @@ def _merge_bm25_union_candidates(
 
     metric = _metric_for_collection(drawers_col)
     lexical_distances = (
-        _lexical_hit_vector_distances(drawers_col, query, lexical.hits, metric)
+        _lexical_hit_vector_distances(drawers_col, query, lexical_hits, metric)
         if max_distance > 0.0
         else {}
     )
 
     bm25_extra = []
-    for hit in lexical.hits:
+    for hit in lexical_hits:
         meta = hit.metadata or {}
+        if _is_staged_metadata(meta, committed_tokens):
+            continue
         # The window applies to every candidate source; a lexically strong
         # drawer outside [since, before) must not enter through this side
         # door (the vector-path candidates are filtered upstream).
@@ -430,6 +733,9 @@ def _merge_bm25_union_candidates(
                 "bm25_score": round(float(hit.score), 3),
                 "_source_file_full": full_source,
                 "_chunk_index": meta.get("chunk_index"),
+                "_logical_generation_id": meta.get("logical_drawer_id"),
+                "_physical_drawer_id": hit.id,
+                "_active_generation": meta.get("mine_generation_token") in committed_tokens,
             }
         )
 

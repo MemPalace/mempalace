@@ -9,12 +9,14 @@ Same palace as project mining. Different ingest strategy.
 """
 
 import errno
+import contextlib
 import os
 import sys
 import json
 import hashlib
 import logging
 import stat
+import threading
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -24,7 +26,9 @@ from .backends import PalaceNotFoundError
 from .collision_scan import assert_no_collisions
 from .ids import (
     ID_RECIPE,
+    make_convo_commit_id,
     make_convo_drawer_id,
+    make_convo_generation_id,
     make_convo_sentinel_id,
     make_exchange_drawer_id,
 )
@@ -44,6 +48,51 @@ from .palace import (
 )
 
 logger = logging.getLogger("mempalace_mcp")
+_mine_output_state = threading.local()
+
+
+@contextlib.contextmanager
+def mine_output_streams(stdout, stderr):
+    """Route convo-miner progress for this thread without replacing sys streams."""
+    missing = object()
+    previous_stdout = getattr(_mine_output_state, "stdout", missing)
+    previous_stderr = getattr(_mine_output_state, "stderr", missing)
+    _mine_output_state.stdout = stdout
+    _mine_output_state.stderr = stderr
+    try:
+        yield
+    finally:
+        if previous_stdout is missing:
+            del _mine_output_state.stdout
+        else:
+            _mine_output_state.stdout = previous_stdout
+        if previous_stderr is missing:
+            del _mine_output_state.stderr
+        else:
+            _mine_output_state.stderr = previous_stderr
+
+
+def _mine_print(*args, **kwargs):
+    target = kwargs.get("file")
+    if target is sys.stderr:
+        kwargs["file"] = getattr(_mine_output_state, "stderr", sys.stderr)
+    elif target is None:
+        kwargs["file"] = getattr(_mine_output_state, "stdout", sys.stdout)
+    print(*args, **kwargs)
+
+
+def _access_read(access_gate):
+    """Return the caller's shared backend gate, or a direct-mode no-op."""
+    if access_gate is None:
+        return contextlib.nullcontext()
+    return access_gate.read_lock()
+
+
+def _access_write(access_gate):
+    """Return the caller's exclusive backend gate, or a direct-mode no-op."""
+    if access_gate is None:
+        return contextlib.nullcontext()
+    return access_gate.write_lock()
 
 
 # Cached hall keywords — avoids re-reading config per drawer
@@ -219,6 +268,7 @@ def _register_file(
     agent: str,
     extract_mode: str,
     content_hash: Optional[str] = None,
+    access_gate=None,
 ):
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
 
@@ -256,11 +306,12 @@ def _register_file(
         meta["source_mtime"] = source_mtime
     if content_hash is not None:
         meta["content_hash"] = content_hash
-    collection.upsert(
-        documents=[f"[registry] {source_file}"],
-        ids=[sentinel_id],
-        metadatas=[meta],
-    )
+    with _access_write(access_gate):
+        collection.upsert(
+            documents=[f"[registry] {source_file}"],
+            ids=[sentinel_id],
+            metadatas=[meta],
+        )
 
 
 def _source_file_existing(collection, source_file: str, extract_mode: str) -> dict[str, dict]:
@@ -282,6 +333,8 @@ def _source_file_existing(collection, source_file: str, extract_mode: str) -> di
         batch_ids = batch.get("ids") or []
         metadatas = batch.get("metadatas") or []
         for drawer_id, meta in zip(batch_ids, metadatas):
+            if (meta or {}).get("mine_commit_marker") is True:
+                continue
             if _metadata_matches_extract_mode(meta or {}, extract_mode):
                 existing[drawer_id] = meta or {}
         if not batch_ids:
@@ -549,7 +602,7 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
                 if filepath.is_symlink():
                     rel = filepath.relative_to(convo_path).as_posix()
                     try:
-                        print(f"  SKIP: {rel} (symlink)", file=sys.stderr)
+                        _mine_print(f"  SKIP: {rel} (symlink)", file=sys.stderr)
                     except OSError:
                         pass
                     continue
@@ -564,14 +617,14 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
                     # before any reader touches them — see the matching
                     # gate in ``miner.scan_project``.
                     if not stat.S_ISREG(file_stat.st_mode):
-                        print(
+                        _mine_print(
                             f"  SKIP: {filepath.name} (not a regular file)",
                             file=sys.stderr,
                         )
                         continue
                     file_size = file_stat.st_size
                     if file_size > MAX_FILE_SIZE:
-                        print(
+                        _mine_print(
                             f"  SKIP: {filepath.name} ({file_size / (1024 * 1024):.1f} MB)"
                             f" exceeds {MAX_FILE_SIZE // (1024 * 1024)} MB limit",
                             file=sys.stderr,
@@ -581,7 +634,7 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
                     # Prefer ``exc.strerror`` so the path isn't duplicated in
                     # the output (see the matching comment in
                     # ``miner.scan_project``).
-                    print(
+                    _mine_print(
                         f"  SKIP: {filepath.name} (stat error: {exc.strerror or exc})",
                         file=sys.stderr,
                     )
@@ -630,6 +683,53 @@ def _extract_authored_at(filepath):
     return latest
 
 
+def _publish_changed_generations(
+    collection,
+    *,
+    final_metadata,
+    stale_ids,
+    commit_id,
+    commit_metadata,
+    source_file,
+    access_gate=None,
+) -> bool:
+    """Atomically publish a staged token, finalize rows, and retire old ones."""
+    try:
+        with _access_write(access_gate):
+            # One marker upsert is the crash-atomic visibility switch. Before
+            # it, every new generation is hidden. After it, the complete staged
+            # token is searchable even if the process dies during metadata
+            # finalization or stale-row cleanup. ``cleanup_pending`` keeps the
+            # source retryable until every follow-up write succeeds.
+            collection.upsert(
+                ids=[commit_id],
+                documents=[f"[conversation generation commit] {source_file}"],
+                metadatas=[commit_metadata],
+            )
+            for batch_start in range(0, len(final_metadata), DRAWER_UPSERT_BATCH_SIZE):
+                batch = final_metadata[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+                collection.update(
+                    ids=[drawer_id for drawer_id, _ in batch],
+                    metadatas=[meta for _, meta in batch],
+                )
+            if stale_ids:
+                collection.delete(ids=stale_ids)
+            completed_marker = dict(commit_metadata)
+            completed_marker["mine_cleanup_pending"] = False
+            collection.update(ids=[commit_id], metadatas=[completed_marker])
+        return True
+    except Exception:
+        logger.warning(
+            "Failed to publish changed generations or delete %d orphaned "
+            "convo drawers for %s; leaving the source incomplete so the "
+            "next mine retries",
+            len(stale_ids),
+            source_file,
+            exc_info=True,
+        )
+    return False
+
+
 def _file_chunks_locked(
     collection,
     source_file,
@@ -640,26 +740,23 @@ def _file_chunks_locked(
     extract_mode,
     authored_at=None,
     content_hash=None,
+    access_gate=None,
 ):
     """Lock the source file and file its chunks incrementally.
 
     Combines the per-file serialization that prevents concurrent agents from
     duplicating work (via mine_lock) with an incremental re-mine contract
-    (#2403): drawer ids are deterministic over
+    (#2403): logical drawer ids are deterministic over
     ``(source_file, extract_mode, chunk_index)``, so a re-mine of a changed
     source — a Claude Code session appends to its own transcript every turn,
     and /compact or /clear can rewrite one in place — only re-embeds the
-    chunks whose content actually changed. Unchanged chunks get a cheap
-    metadata-only refresh (``source_mtime`` / ``chunk_total``) so the
-    completion check in ``file_already_mined`` still sees one full
-    current-mtime group. Existing drawers are never deleted before the new
-    set is fully written: orphaned ids (a shrunk/rewritten source, or an id
-    recipe migration) are deleted last, after every upsert and metadata
-    touch has succeeded, so a crash mid-operation leaves everything the
-    palace previously held (append-only ingest; CLAUDE.md "Incremental
-    only"). Any interrupted pass leaves mixed mtime groups, each short of
-    its ``chunk_total`` — ``file_already_mined`` returns False and the next
-    mine repairs (#2183).
+    chunks whose content actually changed. A changed chunk is staged under a
+    content-addressed physical generation instead of overwriting its old
+    logical position. Unchanged chunks get a cheap metadata-only refresh
+    (``source_mtime`` / ``chunk_total``). Existing generations are deleted
+    only after every new batch succeeds, so a crash mid-operation leaves the
+    prior verbatim set untouched; a crash after staging leaves a retryable
+    incomplete group that reuses the staged embeddings (#2183).
 
     Returns (drawers_added, room_counts_delta, skipped) where drawers_added
     counts only new/changed drawers actually upserted this pass.
@@ -667,10 +764,23 @@ def _file_chunks_locked(
     room_counts_delta: dict = defaultdict(int)
     drawers_added = 0
     with mine_lock(source_file):
+        commit_id = make_convo_commit_id(source_file, extract_mode)
         # Re-check after lock — another agent may have just finished this file
         # at the current schema/mtime. A stale hit here returns False, so we
         # still fall through to the incremental path below.
-        if file_already_mined(collection, source_file, check_mtime=True, extract_mode=extract_mode):
+        try:
+            with _access_read(access_gate):
+                marker_result = collection.get(ids=[commit_id], include=["metadatas"])
+                pending_cleanup = any(
+                    (meta or {}).get("mine_cleanup_pending") is True
+                    for meta in (marker_result.get("metadatas") or [])
+                )
+                if not pending_cleanup and file_already_mined(
+                    collection, source_file, check_mtime=True, extract_mode=extract_mode
+                ):
+                    return 0, room_counts_delta, True
+        except Exception:
+            logger.warning("Conversation mine re-check failed for %s", source_file, exc_info=True)
             return 0, room_counts_delta, True
 
         # Snapshot what the palace already holds for this source+mode. A
@@ -683,9 +793,10 @@ def _file_chunks_locked(
         # the old drawers' stored mtime untouched, so the next mine still
         # sees a mismatch and retries.
         try:
-            existing = _source_file_existing(collection, source_file, extract_mode)
+            with _access_read(access_gate):
+                existing = _source_file_existing(collection, source_file, extract_mode)
         except Exception as exc:
-            print(
+            _mine_print(
                 f"  ! [skip] existing-drawer snapshot failed for {source_file!r} "
                 f"({exc!r}); leaving existing drawers untouched, will retry "
                 f"on the next mine",
@@ -714,25 +825,44 @@ def _file_chunks_locked(
         # only needs its completion metadata refreshed; everything else is
         # (re-)upserted. Drawers written before ``chunk_hash`` existed have no
         # hash to compare, count as changed once, and migrate themselves.
-        to_upsert: list = []  # (drawer_id, content, meta)
-        to_touch: list = []  # (drawer_id, refreshed_meta)
+        # Physical ids can differ from their stable logical ids after a
+        # changed-content re-mine. Group every existing generation by logical
+        # position so a crash-left staging generation can be resumed without
+        # re-embedding it, while legacy deterministic ids remain compatible.
+        existing_by_logical: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+        for physical_id, stored_meta in existing.items():
+            logical_id = stored_meta.get("logical_drawer_id")
+            if not isinstance(logical_id, str) or not logical_id:
+                logical_id = physical_id
+            existing_by_logical[logical_id].append((physical_id, stored_meta))
+
+        to_upsert: list = []  # (physical_id, content, final_meta)
+        to_touch: list = []  # (physical_id, refreshed_meta)
         new_ids: set = set()
         for chunk in chunks:
             chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
             if extract_mode == "general":
                 room_counts_delta[chunk_room] += 1
-            drawer_id = make_convo_drawer_id(
+            logical_drawer_id = make_convo_drawer_id(
                 wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
             )
-            new_ids.add(drawer_id)
             chunk_hash = hashlib.sha256(chunk["content"].encode("utf-8")).hexdigest()
-            prev = existing.get(drawer_id)
-            if (
-                prev is not None
-                and prev.get("chunk_hash") == chunk_hash
-                and prev.get("normalize_version", 1) >= NORMALIZE_VERSION
-            ):
+            candidates = existing_by_logical.get(logical_drawer_id, [])
+            current = next(
+                (
+                    (physical_id, stored_meta)
+                    for physical_id, stored_meta in candidates
+                    if stored_meta.get("chunk_hash") == chunk_hash
+                    and stored_meta.get("normalize_version", 1) >= NORMALIZE_VERSION
+                ),
+                None,
+            )
+            if current is not None:
+                physical_id, prev = current
+                new_ids.add(physical_id)
                 touched = dict(prev)
+                touched["logical_drawer_id"] = logical_drawer_id
+                touched["mine_staged"] = False
                 touched["chunk_total"] = chunk_total
                 if source_mtime is not None:
                     touched["source_mtime"] = source_mtime
@@ -744,8 +874,14 @@ def _file_chunks_locked(
                 # dedup keeps seeing conversations added since the last pass.
                 if content_hash is not None and chunk.get("chunk_index", 0) == 0:
                     touched["content_hash"] = content_hash
-                to_touch.append((drawer_id, touched))
+                to_touch.append((physical_id, touched))
                 continue
+            physical_id = (
+                make_convo_generation_id(logical_drawer_id, chunk_hash)
+                if candidates
+                else logical_drawer_id
+            )
+            new_ids.add(physical_id)
             meta = {
                 "wing": wing,
                 "room": chunk_room,
@@ -760,6 +896,8 @@ def _file_chunks_locked(
                 "extract_mode": extract_mode,
                 "normalize_version": NORMALIZE_VERSION,
                 "id_recipe": ID_RECIPE,
+                "logical_drawer_id": logical_drawer_id,
+                "mine_staged": False,
                 "chunk_total": chunk_total,
                 "chunk_hash": chunk_hash,
             }
@@ -771,7 +909,29 @@ def _file_chunks_locked(
             # it scans all drawers and splits comma-joined hash fields.
             if content_hash is not None and chunk.get("chunk_index", 0) == 0:
                 meta["content_hash"] = content_hash
-            to_upsert.append((drawer_id, chunk["content"], meta))
+            to_upsert.append((physical_id, chunk["content"], meta))
+
+        # A shrink/rewrite needs a two-phase completion marker. New/changed
+        # rows are first written without the current source mtime; unchanged
+        # rows keep their old mtime. Only after orphan cleanup succeeds do we
+        # stamp the whole target set current. A transient delete failure then
+        # remains visibly incomplete and retries even if the source never
+        # changes again.
+        stale_ids = [drawer_id for drawer_id in existing if drawer_id not in new_ids]
+        generation_token = hashlib.sha256("\0".join(sorted(new_ids)).encode()).hexdigest()
+        commit_metadata = {
+            "wing": wing,
+            "room": "_registry",
+            "source_file": source_file,
+            "extract_mode": extract_mode,
+            "ingest_mode": "registry",
+            "normalize_version": NORMALIZE_VERSION,
+            "id_recipe": ID_RECIPE,
+            "mine_staged": True,
+            "mine_commit_marker": True,
+            "mine_generation_commit": generation_token,
+            "mine_cleanup_pending": True,
+        }
 
         # Batch into bounded requests so large transcripts keep most of the
         # embedding speedup without one huge Chroma/SQLite request.
@@ -785,44 +945,63 @@ def _file_chunks_locked(
             batch = to_upsert[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
             batch_ids = [drawer_id for drawer_id, _, _ in batch]
             batch_docs = [content for _, content, _ in batch]
-            batch_metas = [meta for _, _, meta in batch]
-            assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
+            if stale_ids:
+                batch_metas = []
+                for _, _, final_meta in batch:
+                    incomplete_meta = dict(final_meta)
+                    incomplete_meta.pop("source_mtime", None)
+                    incomplete_meta["mine_staged"] = True
+                    incomplete_meta["mine_generation_token"] = generation_token
+                    batch_metas.append(incomplete_meta)
+            else:
+                batch_metas = [meta for _, _, meta in batch]
             try:
-                collection.upsert(
-                    documents=batch_docs,
-                    ids=batch_ids,
-                    metadatas=batch_metas,
-                )
+                with _access_write(access_gate):
+                    assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
+                    collection.upsert(
+                        documents=batch_docs,
+                        ids=batch_ids,
+                        metadatas=batch_metas,
+                    )
                 drawers_added += len(batch_docs)
             except Exception as e:
                 if "already exists" not in str(e).lower():
                     raise
-        for batch_start in range(0, len(to_touch), DRAWER_UPSERT_BATCH_SIZE):
-            batch = to_touch[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
-            collection.update(
-                ids=[drawer_id for drawer_id, _ in batch],
-                metadatas=[meta for _, meta in batch],
-            )
+        if not stale_ids and not pending_cleanup:
+            for batch_start in range(0, len(to_touch), DRAWER_UPSERT_BATCH_SIZE):
+                batch = to_touch[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+                with _access_write(access_gate):
+                    collection.update(
+                        ids=[drawer_id for drawer_id, _ in batch],
+                        metadatas=[meta for _, meta in batch],
+                    )
 
         # Delete orphaned drawers LAST — ids the current source no longer
         # produces (shrunk/rewritten file, id recipe migration). Deleting
         # them only after the full new set is in place means an interrupted
         # pass never leaves the palace with less than it had; the worst
-        # crash window leaves transient duplicates that the next
-        # content-change mine sweeps. A failed delete is logged, not fatal,
-        # for the same reason.
-        stale_ids = [drawer_id for drawer_id in existing if drawer_id not in new_ids]
-        if stale_ids:
-            try:
-                collection.delete(ids=stale_ids)
-            except Exception:
-                logger.warning(
-                    "Failed to delete %d orphaned convo drawers for %s; "
-                    "they remain as duplicates until the next content change",
-                    len(stale_ids),
-                    source_file,
-                    exc_info=True,
-                )
+        # crash window leaves transient duplicates. The current-mtime marker
+        # is deliberately withheld until cleanup succeeds, so the next mine
+        # retries even when the source itself stays unchanged.
+        if stale_ids or pending_cleanup:
+            final_metadata = []
+            for drawer_id, meta in to_touch + [
+                (item_id, item_meta) for item_id, _, item_meta in to_upsert
+            ]:
+                published_meta = dict(meta)
+                published_meta["mine_staged"] = False
+                published_meta["mine_generation_token"] = generation_token
+                final_metadata.append((drawer_id, published_meta))
+            if not _publish_changed_generations(
+                collection,
+                final_metadata=final_metadata,
+                stale_ids=stale_ids,
+                commit_id=commit_id,
+                commit_metadata=commit_metadata,
+                source_file=source_file,
+                access_gate=access_gate,
+            ):
+                return drawers_added, room_counts_delta, True
     return drawers_added, room_counts_delta, False
 
 
@@ -937,6 +1116,7 @@ def mine_convos(
     dry_run: bool = False,
     extract_mode: str = "exchange",
     include_subagents: bool = False,
+    access_gate=None,
 ):
     """Mine a directory of conversation files into the palace.
 
@@ -959,6 +1139,12 @@ def mine_convos(
     corrupt anything, and skipping the lock lets dry-run probes coexist
     with a live mine.
 
+    ``access_gate`` is an optional Hub-supplied readers/writer gate. Direct
+    CLI/library calls leave it unset. The HTTP Hub uses it to share Chroma
+    reads with peer searches and to bound exclusive access to individual
+    upsert/update/delete batches while a separate mutation lock preserves the
+    one-writer lifecycle across the complete crash-safe re-mine (#2403).
+
     Chunking parameters (chunk_size, min_chunk_size) are read from
     MempalaceConfig inside :func:`_mine_convos_impl` so `config.json`
     governs both this path and the project-file miner in `miner.py`.
@@ -973,6 +1159,7 @@ def mine_convos(
             dry_run=dry_run,
             extract_mode=extract_mode,
             include_subagents=include_subagents,
+            access_gate=access_gate,
         )
 
     with mine_palace_lock(palace_path):
@@ -985,6 +1172,7 @@ def mine_convos(
             dry_run=dry_run,
             extract_mode=extract_mode,
             include_subagents=include_subagents,
+            access_gate=access_gate,
         )
 
 
@@ -1001,7 +1189,7 @@ def _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=None
 
         compute_hallways_for_wing(wing, col=collection, config=config)
     except Exception as exc:
-        print(f"  (hallways skipped: {exc})")
+        _mine_print(f"  (hallways skipped: {exc})")
 
 
 def _normalize_convo_conversations(
@@ -1013,6 +1201,7 @@ def _normalize_convo_conversations(
     agent: str,
     extract_mode: str,
     dry_run: bool,
+    access_gate=None,
 ) -> Optional[list]:
     """Normalize a transcript file into its individual conversations,
     registering it as filed when there's nothing worth mining. Returns None
@@ -1032,13 +1221,27 @@ def _normalize_convo_conversations(
         return None
     except (OSError, ValueError):
         if not dry_run:
-            _register_file(collection, source_file, wing, agent, extract_mode)
+            _register_file(
+                collection,
+                source_file,
+                wing,
+                agent,
+                extract_mode,
+                access_gate=access_gate,
+            )
         return None
 
     total_len = sum(len(c.strip()) for c in conversations)
     if not conversations or total_len < cfg_min_chunk_size:
         if not dry_run:
-            _register_file(collection, source_file, wing, agent, extract_mode)
+            _register_file(
+                collection,
+                source_file,
+                wing,
+                agent,
+                extract_mode,
+                access_gate=access_gate,
+            )
         return None
 
     return conversations
@@ -1048,17 +1251,20 @@ def _open_convo_collection(
     palace_path: str,
     *,
     dry_run: bool,
+    access_gate=None,
 ):
     """Open the conversation collection without creating it during dry-run."""
     if not dry_run:
-        return get_collection(palace_path)
+        with _access_write(access_gate):
+            return get_collection(palace_path)
 
     try:
-        return get_collection(
-            palace_path,
-            create=False,
-            read_only=True,
-        )
+        with _access_read(access_gate):
+            return get_collection(
+                palace_path,
+                create=False,
+                read_only=True,
+            )
     except PalaceNotFoundError:
         # A missing palace or uninitialized collection represents empty
         # prior state to a dry-run. Do not create either one.
@@ -1074,6 +1280,7 @@ def _mine_convos_impl(
     dry_run: bool = False,
     extract_mode: str = "exchange",
     include_subagents: bool = False,
+    access_gate=None,
 ):
     from .config import MempalaceConfig
 
@@ -1095,21 +1302,22 @@ def _mine_convos_impl(
 
     files = scan_convos(convo_dir, include_subagents=include_subagents)
 
-    print(f"\n{'=' * 55}")
-    print("  MemPalace Mine -- Conversations")
-    print(f"{'=' * 55}")
-    print(f"  Wing:    {wing}")
-    print(f"  Source:  {convo_path}")
+    _mine_print(f"\n{'=' * 55}")
+    _mine_print("  MemPalace Mine -- Conversations")
+    _mine_print(f"{'=' * 55}")
+    _mine_print(f"  Wing:    {wing}")
+    _mine_print(f"  Source:  {convo_path}")
     limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
-    print(f"  Files:   {len(files)}{limit_suffix}")
-    print(f"  Palace:  {palace_path}")
+    _mine_print(f"  Files:   {len(files)}{limit_suffix}")
+    _mine_print(f"  Palace:  {palace_path}")
     if dry_run:
-        print("  DRY RUN -- nothing will be filed")
-    print(f"{'-' * 55}\n")
+        _mine_print("  DRY RUN -- nothing will be filed")
+    _mine_print(f"{'-' * 55}\n")
 
     collection = _open_convo_collection(
         palace_path,
         dry_run=dry_run,
+        access_gate=access_gate,
     )
 
     # Bulk pre-fetch already-mined source_file -> stored mtime in one
@@ -1118,19 +1326,22 @@ def _mine_convos_impl(
     # 2000-file sweep used to spend >1h just deciding to skip.
     # prefetch_mined_set() does the same decisions in a single scan; loop
     # body becomes an O(1) dict lookup + a cheap local mtime comparison.
-    mined_mtimes: dict = (
-        prefetch_mined_set(collection, extract_mode=extract_mode) if collection is not None else {}
-    )
-    # content_hash -> source_file for transcripts already filed. Repeated
-    # exports from Claude/ChatGPT commonly land under a new filename each
-    # run even when the conversation itself is unchanged, so the
-    # source_file-keyed skip above ("mined_mtimes") never recognizes them —
-    # this catches the same conversation reappearing at a new path.
-    mined_content_hashes: dict = (
-        prefetch_content_hashes(collection, extract_mode=extract_mode)
-        if collection is not None
-        else {}
-    )
+    with _access_read(access_gate):
+        mined_mtimes: dict = (
+            prefetch_mined_set(collection, extract_mode=extract_mode)
+            if collection is not None
+            else {}
+        )
+        # content_hash -> source_file for transcripts already filed. Repeated
+        # exports from Claude/ChatGPT commonly land under a new filename each
+        # run even when the conversation itself is unchanged, so the
+        # source_file-keyed skip above ("mined_mtimes") never recognizes them —
+        # this catches the same conversation reappearing at a new path.
+        mined_content_hashes: dict = (
+            prefetch_content_hashes(collection, extract_mode=extract_mode)
+            if collection is not None
+            else {}
+        )
 
     total_drawers = 0
     files_mined = 0
@@ -1167,6 +1378,7 @@ def _mine_convos_impl(
             agent,
             extract_mode,
             dry_run,
+            access_gate=access_gate,
         )
         if conversations is None:
             continue
@@ -1183,9 +1395,16 @@ def _mine_convos_impl(
         )
         if not new_items:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _register_file(
+                    collection,
+                    source_file,
+                    wing,
+                    agent,
+                    extract_mode,
+                    access_gate=access_gate,
+                )
             dup_source = duplicates[0][1]
-            print(
+            _mine_print(
                 f"  = [{i:4}/{len(files)}] {filepath.name[:50]:50} "
                 f"duplicate of {Path(dup_source).name}"
             )
@@ -1210,7 +1429,14 @@ def _mine_convos_impl(
 
         if not chunks:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _register_file(
+                    collection,
+                    source_file,
+                    wing,
+                    agent,
+                    extract_mode,
+                    access_gate=access_gate,
+                )
             continue
 
         # Detect room from content (general mode uses memory_type instead)
@@ -1225,9 +1451,11 @@ def _mine_convos_impl(
 
                 type_counts = Counter(c.get("memory_type", "general") for c in chunks)
                 types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
-                print(f"    [DRY RUN] {filepath.name} -> {len(chunks)} memories ({types_str})")
+                _mine_print(
+                    f"    [DRY RUN] {filepath.name} -> {len(chunks)} memories ({types_str})"
+                )
             else:
-                print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
+                _mine_print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
             total_drawers += len(chunks)
             # Track room counts
             if extract_mode == "general":
@@ -1255,6 +1483,7 @@ def _mine_convos_impl(
             extract_mode,
             authored_at=_extract_authored_at(filepath),
             content_hash=content_hash,
+            access_gate=access_gate,
         )
         if skipped:
             files_skipped += 1
@@ -1266,7 +1495,7 @@ def _mine_convos_impl(
             mined_content_hashes[(wing, h)] = source_file
         total_drawers += drawers_added
         files_mined += 1
-        print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
+        _mine_print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
         if limit > 0 and files_mined >= limit:
             break
 
@@ -1274,25 +1503,32 @@ def _mine_convos_impl(
         # Compute hallways before the FTS5 validation: the latter opens a direct sqlite
         # connection to the Chroma DB, which can invalidate the live collection handle on
         # some Chroma builds and make the hallway fetch fail.
-        _compute_hallways_for_wing_safe(wing, collection, total_drawers, config=palace_config)
-        _validate_palace_fts5_after_mine(palace_path)
+        with _access_read(access_gate):
+            _compute_hallways_for_wing_safe(wing, collection, total_drawers, config=palace_config)
+        # Validation may close cached Chroma handles and rebuild the FTS index,
+        # so it is a mutation even when the common healthy path is read-only.
+        # Keep peer searches out until that maintenance work is complete.
+        with _access_write(access_gate):
+            _validate_palace_fts5_after_mine(palace_path)
 
-    print(f"\n{'=' * 55}")
-    print("  Done.")
-    print(f"  Files processed: {files_processed - files_skipped}")
-    print(f"  Files skipped (already filed): {files_skipped}")
-    print(f"  Drawers filed: {total_drawers}")
+    _mine_print(f"\n{'=' * 55}")
+    _mine_print("  Done.")
+    _mine_print(f"  Files processed: {files_processed - files_skipped}")
+    _mine_print(f"  Files skipped (already filed): {files_skipped}")
+    _mine_print(f"  Drawers filed: {total_drawers}")
     if room_counts:
-        print("\n  By room:")
+        _mine_print("\n  By room:")
         for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
-            print(f"    {room:20} {count} files")
-    print('\n  Next: mempalace search "what you\'re looking for"')
-    print(f"{'=' * 55}\n")
+            _mine_print(f"    {room:20} {count} files")
+    _mine_print('\n  Next: mempalace search "what you\'re looking for"')
+    _mine_print(f"{'=' * 55}\n")
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python convo_miner.py <convo_dir> [--palace PATH] [--limit N] [--dry-run]")
+        _mine_print(
+            "Usage: python convo_miner.py <convo_dir> [--palace PATH] [--limit N] [--dry-run]"
+        )
         sys.exit(1)
     from .config import MempalaceConfig
 

@@ -41,7 +41,57 @@ def _result_drawer_id(meta, stored_drawer_id):
     Kept in sync with ``mcp_server._PARENT_ID_KEYS``.
     """
     meta = meta or {}
-    return meta.get("parent_drawer_id") or meta.get("parent_entry_id") or stored_drawer_id
+    return (
+        meta.get("parent_drawer_id")
+        or meta.get("parent_entry_id")
+        or meta.get("logical_drawer_id")
+        or stored_drawer_id
+    )
+
+
+def _collapse_logical_generation_hits(hits: list) -> list:
+    """Keep the newest visible physical generation for each stable logical id."""
+    chosen = {}
+    passthrough = []
+    for hit in hits:
+        logical_id = hit.get("_logical_generation_id")
+        if not logical_id:
+            passthrough.append(hit)
+            continue
+        key = (
+            bool(hit.get("_active_generation")),
+            hit.get("created_at") or "",
+            hit.get("_physical_drawer_id") or "",
+        )
+        current = chosen.get(logical_id)
+        if current is None or key > current[0]:
+            chosen[logical_id] = (key, hit)
+    return passthrough + [item[1] for item in chosen.values()]
+
+
+def _collapse_physical_generation_rows(rows, committed_tokens) -> list:
+    """Keep the active physical row per logical id; retain ordinary rows."""
+    chosen = {}
+    ordinary = []
+    for physical_id, document, metadata in rows:
+        metadata = metadata or {}
+        if _is_staged_metadata(metadata, committed_tokens):
+            continue
+        logical_id = metadata.get("logical_drawer_id")
+        if not logical_id:
+            ordinary.append((physical_id, document, metadata))
+            continue
+        generation_token = metadata.get("mine_generation_token")
+        if generation_token and generation_token not in committed_tokens:
+            continue
+        key = (
+            metadata.get("mine_generation_token") in committed_tokens,
+            metadata.get("filed_at", ""),
+            physical_id,
+        )
+        if logical_id not in chosen or key > chosen[logical_id][0]:
+            chosen[logical_id] = (key, (physical_id, document, metadata))
+    return ordinary + [item[1] for item in chosen.values()]
 
 
 def _tokenize(text: str, stop_words: frozenset = frozenset()) -> list:

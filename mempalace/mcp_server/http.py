@@ -18,13 +18,21 @@ class _RWLock:
         self._cond = threading.Condition(threading.Lock())
         self._readers = 0
         self._writer = False
+        self._waiting_readers = 0
         self._waiting_writers = 0
+        self._reader_entries = 0
 
     def acquire_read(self) -> None:
         with self._cond:
-            while self._writer or self._waiting_writers:
-                self._cond.wait()
-            self._readers += 1
+            self._waiting_readers += 1
+            try:
+                while self._writer or self._waiting_writers:
+                    self._cond.wait()
+                self._readers += 1
+                self._reader_entries += 1
+                self._cond.notify_all()
+            finally:
+                self._waiting_readers -= 1
 
     def release_read(self) -> None:
         with self._cond:
@@ -47,6 +55,24 @@ class _RWLock:
             self._writer = False
             self._cond.notify_all()
 
+    def yield_to_waiting_reader(self) -> None:
+        """Let one queued reader enter before this thread starts another write.
+
+        The core policy remains writer-preferring, which prevents an endless
+        stream of new searches from starving a mutation. Conversation mining,
+        however, performs many short write bursts back-to-back. Without this
+        explicit handoff the mining thread can re-queue as a writer before a
+        reader awakened by ``release_write`` gets scheduled, starving that
+        already-waiting search for the full mine.
+        """
+        with self._cond:
+            if not self._waiting_readers:
+                return
+            entries_before = self._reader_entries
+            self._cond.notify_all()
+            while self._waiting_readers and self._reader_entries == entries_before:
+                self._cond.wait()
+
     def read_lock(self):
         lock = self
 
@@ -61,6 +87,20 @@ class _RWLock:
 
         return _Read()
 
+    def write_lock(self):
+        lock = self
+
+        class _Write:
+            def __enter__(self):
+                lock.acquire_write()
+                return lock
+
+            def __exit__(self, exc_type, exc, tb):
+                lock.release_write()
+                return False
+
+        return _Write()
+
     def __enter__(self):
         self.acquire_write()
         return self
@@ -71,10 +111,74 @@ class _RWLock:
 
 
 _HTTP_REQUEST_LOCK = _RWLock()
+# Serialize palace mutations independently from the read/write access gate.
+# An interleaved conversation mine owns this lock for its full lifecycle, so
+# another update/delete cannot slip between its crash-safe batches, while
+# searches still share _HTTP_REQUEST_LOCK between actual backend writes.
+_HTTP_MUTATION_LOCK = threading.Lock()
 _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 _HTTP_ACTIVE_CLIENT_WINDOW_S = 120.0
 
 _HTTP_PROTOCOL_METHODS = frozenset({"initialize", "ping", "tools/list"})
+
+
+class _HTTPMineAccessGate:
+    """Gate backend access for one interleaved HTTP conversation mine."""
+
+    @staticmethod
+    def read_lock():
+        return _HTTP_REQUEST_LOCK.read_lock()
+
+    @staticmethod
+    @contextlib.contextmanager
+    def write_lock():
+        try:
+            with _HTTP_REQUEST_LOCK.write_lock():
+                with _write_stall_watch("mempalace_mine", burst=True):
+                    yield
+        finally:
+            # A conversation mine can immediately request its next write
+            # burst. Hand an already-queued search one entry opportunity first.
+            _HTTP_REQUEST_LOCK.yield_to_waiting_reader()
+
+
+_HTTP_MINE_ACCESS_GATE = _HTTPMineAccessGate()
+
+
+def _current_http_mine_access_gate():
+    if getattr(_http_interleaved_mine_state, "active", False):
+        return _HTTP_MINE_ACCESS_GATE
+    return None
+
+
+def _release_http_writer_lease() -> None:
+    """Release the Hub lease after every in-flight palace mutation is done."""
+    with _HTTP_MUTATION_LOCK:
+        with _HTTP_REQUEST_LOCK.write_lock():
+            _release_mcp_writer_lock()
+
+
+@contextlib.contextmanager
+def _http_interleaved_mine_scope():
+    previous = getattr(_http_interleaved_mine_state, "active", False)
+    _http_interleaved_mine_state.active = True
+    try:
+        yield
+    finally:
+        _http_interleaved_mine_state.active = previous
+
+
+def _is_interleavable_http_convo_mine(request, tool_name) -> bool:
+    if tool_name != "mempalace_mine":
+        return False
+    params = request.get("params") if isinstance(request, dict) else None
+    arguments = params.get("arguments") if isinstance(params, dict) else None
+    if not isinstance(arguments, dict):
+        return False
+    return arguments.get("mode", "projects") == "convos" and not bool(
+        arguments.get("dry_run", False)
+    )
+
 
 # RFC 003 phase 5: logstream tools touch only logstream.sqlite3 (its own WAL
 # database with internal locking) — never Chroma or the KG. Dispatching them
@@ -377,6 +481,14 @@ def _http_dispatch(request):
         tool_name = request["params"].get("name")
     if tool_name in _HTTP_LOCK_FREE_TOOLS:
         return handle_request(request)
+    if _is_interleavable_http_convo_mine(request, tool_name):
+        # Keep one palace mutation owner for the complete crash-safe re-mine,
+        # but let searches run during scan/normalize/chunk phases. The miner's
+        # access gate takes the RW lock around Chroma reads and bounded write
+        # bursts, so readers pause only for real backend work (#2403 defect 5).
+        with _HTTP_MUTATION_LOCK:
+            with _http_interleaved_mine_scope():
+                return handle_request(request)
     # service.classify_tool is the authoritative read/write registry. The
     # lock-free set above is a storage-boundary override for independent DBs.
     from ..service import classify_tool
@@ -384,8 +496,9 @@ def _http_dispatch(request):
     if classify_tool(tool_name) == "read":
         with _HTTP_REQUEST_LOCK.read_lock():
             return handle_request(request)
-    with _HTTP_REQUEST_LOCK:
-        return handle_request(request)
+    with _HTTP_MUTATION_LOCK:
+        with _HTTP_REQUEST_LOCK.write_lock():
+            return handle_request(request)
 
 
 def _http_handle_get(handler) -> None:
