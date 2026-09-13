@@ -1353,18 +1353,23 @@ def _plan_convo_generation_writes(
 
     # The first complete mine stays tokenless so those rows remain genuine
     # legacy. The first growth publishes a content-set token so appended rows
-    # are not tokenless legacy if a later shrink's stale delete fails. Later
-    # append-only growth reuses that active token instead of cloning, but
-    # only when the matching rows already belong to it. A rewrite/shrink that
-    # publishes a new content-set token must clone reused rows that still
-    # carry the previous token; updating those ids in place would hide them
-    # for the duration of the switch.
+    # are not tokenless legacy if a later shrink's stale delete fails. That
+    # marker also marks the source/mode as tokened, which hides leftover
+    # tokenless rows, so unchanged tokenless matches must be cloned under the
+    # new token *before* the marker switch. Later append-only growth reuses
+    # the active token instead of cloning, but only when the matching rows
+    # already belong to it. A rewrite/shrink that publishes a new content-set
+    # token must clone reused rows that still carry the previous token;
+    # updating those ids in place would hide them for the duration of the
+    # switch.
     has_new_rows = any(kind == "upsert" for kind, *_ in tentative)
+    # Include staged rows that already carry this pass's token: a crash after
+    # the first tokened upsert of a tokenless→tokened growth leaves that tail
+    # unpublished, and retry must still publish (and clone tokenless prefixes).
     has_pending_tail = any(
         current[1] is not None
         and current[1].get("mine_staged") is True
         and current[1].get("mine_generation_token")
-        and current[1].get("mine_generation_token") != generation_token
         for _kind, _item, _copy_id, current in tentative
     )
     will_publish = (
@@ -1406,10 +1411,11 @@ def _plan_convo_generation_writes(
         # Staged pending-tail matches stay on their physical ids (to_touch)
         # instead of cloning under the active token, which Hub would treat
         # as visible. The write path restages those rows onto the current
-        # unpublished token before that token is exposed.
+        # unpublished token before that token is exposed. Tokenless reused
+        # rows must clone too: publishing the source marker would otherwise
+        # hide them as predecessors of a now-tokened source/mode.
         if (
             will_publish
-            and reused_token
             and reused_token != generation_token
             and physical_id != copy_id
             and prev.get("mine_staged") is not True
@@ -1474,10 +1480,11 @@ def _file_chunks_locked(
     and /compact or /clear can rewrite one in place — only re-embeds the
     chunks whose content actually changed. A changed chunk is staged under a
     content-addressed physical generation instead of overwriting its old
-    logical position. Unchanged chunks that still have no generation token
-    get a cheap metadata-only refresh (``source_mtime`` / ``chunk_total``).
-    Append-only growth reuses the active generation token so unchanged rows
-    stay on their existing physical ids. New tail rows stage under a distinct
+    logical position. Unchanged tokenless chunks are cloned onto the new
+    token with their stored embeddings before the source marker is published,
+    so the old view is not hidden as a tokenless predecessor mid-write.
+    Append-only growth reuses the active generation token so unchanged
+    tokened rows stay on their existing physical ids. New tail rows stage under a distinct
     unpublished content-set token until the whole tail is written; a
     temporary extra marker then exposes that complete tail without hiding
     the prior generation. Recovered pending-tail rows from an interrupted
@@ -1620,10 +1627,10 @@ def _file_chunks_locked(
 
         # Shrink, rewrite, and the first growth after a tokenless mine use a
         # two-phase completion marker. New/changed rows are first written
-        # without the current source mtime; unchanged rows keep their old
-        # mtime unless a rewrite/shrink publishes a new token, in which case
-        # they are cloned first. Append-only growth reuses the commit
-        # marker's active token so unchanged rows are only
+        # without the current source mtime; unchanged tokenless or
+        # previously-tokened rows are cloned first so publishing the source
+        # marker cannot hide them. Append-only growth reuses the commit
+        # marker's active token so unchanged tokened rows are only
         # metadata-refreshed, while new tail rows stage under an
         # unpublished content-set token until the extra tail marker makes
         # the complete append visible. Recovered pending rows still carrying

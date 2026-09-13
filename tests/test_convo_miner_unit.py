@@ -1038,10 +1038,9 @@ class TestFileChunksLocked:
         assert set(col.upserted_ids).isdisjoint(first_pass_ids), (
             "a chunk that did not change was re-upserted"
         )
-        assert set(first_pass_ids) <= set(col.updated_ids), (
-            "unchanged chunks did not get their completion metadata refreshed"
+        assert set(first_pass_ids) <= set(col.deleted_ids), (
+            "tokenless originals must be retired after they are cloned onto the first token"
         )
-        assert col.deleted_ids == [], "a purely-grown file has no orphans to delete"
         # After the incremental pass the file must read as complete.
         drawer_metas = [
             meta for meta in col.records.values() if meta.get("mine_commit_marker") is not True
@@ -1148,6 +1147,7 @@ class TestFileChunksLocked:
         )
         assert (drawers, skipped) == (3, False)
 
+        first_growth = True
         for extra, total in ((2, 5), (2, 7), (2, 9)):
             source.write_text("content\n" * extra, encoding="utf-8")
             os.utime(source, (first_mtime + total, first_mtime + total))
@@ -1168,9 +1168,13 @@ class TestFileChunksLocked:
             )
             assert skipped is False
             assert drawers == extra
-            assert col.deleted_ids == []
-            assert set(col.upserted_ids).isdisjoint(active_ids)
-            assert active_ids <= set(col.records)
+            if first_growth:
+                assert set(active_ids) <= set(col.deleted_ids)
+                first_growth = False
+            else:
+                assert col.deleted_ids == []
+                assert set(col.upserted_ids).isdisjoint(active_ids)
+                assert active_ids <= set(col.records)
             drawer_metas = [
                 meta for meta in col.records.values() if meta.get("mine_commit_marker") is not True
             ]

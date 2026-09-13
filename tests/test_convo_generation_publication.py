@@ -668,8 +668,12 @@ def test_plan_does_not_reuse_token_when_append_matches_retired_tokenless(monkeyp
     assert will_publish is True
     assert "drawer-a-b" not in new_ids
     assert [row_id for row_id, _, _ in to_upsert] == ["drawer-c"]
-    assert {row_id for row_id, _ in to_touch} == {"drawer-a"}
-    assert to_copy == []
+    assert to_touch == []
+    assert [row_id for row_id, source_id, _, _ in to_copy] == [
+        convo_miner._reused_generation_copy_id("drawer-a", token)
+    ]
+    assert [source_id for _, source_id, _, _ in to_copy] == ["drawer-a"]
+    assert "drawer-a" not in new_ids
     content_set_token = convo_miner._content_set_generation_token(
         [(item["logical_drawer_id"], item["chunk_hash"]) for item in planned]
     )
@@ -1065,6 +1069,164 @@ def test_plan_clones_unchanged_rows_when_rewriting(monkeypatch):
     assert "drawer-b" not in new_ids
 
 
+def test_plan_clones_tokenless_reused_rows_on_first_tokened_append(monkeypatch):
+    """Initial tokenless rows must clone before the first source marker."""
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    existing = {
+        "drawer-a": {
+            "logical_drawer_id": "drawer-a",
+            "chunk_hash": "hash-a",
+            "mine_staged": False,
+            "chunk_index": 0,
+        },
+        "drawer-b": {
+            "logical_drawer_id": "drawer-b",
+            "chunk_hash": "hash-b",
+            "mine_staged": False,
+            "chunk_index": 1,
+        },
+    }
+    planned = [
+        _plan_chunk("drawer-a", "hash-a", "A", 0, existing["drawer-a"]),
+        _plan_chunk("drawer-b", "hash-b", "B", 1, existing["drawer-b"]),
+        _plan_chunk("drawer-c", "hash-c", "C", 2),
+    ]
+    to_upsert, to_touch, to_copy, new_ids, token, will_publish = _plan_writes(planned, existing)
+
+    assert will_publish is True
+    assert token
+    assert to_touch == []
+    assert [row_id for row_id, _, _ in to_upsert] == ["drawer-c"]
+    assert {row_id for row_id, source_id, _, _ in to_copy} == {
+        convo_miner._reused_generation_copy_id("drawer-a", token),
+        convo_miner._reused_generation_copy_id("drawer-b", token),
+    }
+    assert {source_id for _, source_id, _, _ in to_copy} == {"drawer-a", "drawer-b"}
+    assert "drawer-a" not in new_ids
+    assert "drawer-b" not in new_ids
+
+
+def test_plan_clones_tokenless_reused_rows_on_partial_rewrite(monkeypatch):
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    existing = {
+        "drawer-a": {
+            "logical_drawer_id": "drawer-a",
+            "chunk_hash": "hash-a",
+            "mine_staged": False,
+        },
+        "drawer-b": {
+            "logical_drawer_id": "drawer-b",
+            "chunk_hash": "hash-b",
+            "mine_staged": False,
+        },
+    }
+    planned = [
+        _plan_chunk("drawer-a", "hash-a2", "A2", 0, existing["drawer-a"], rewritten=True),
+        _plan_chunk("drawer-b", "hash-b", "B", 1, existing["drawer-b"]),
+    ]
+    to_upsert, to_touch, to_copy, new_ids, token, will_publish = _plan_writes(planned, existing)
+
+    assert will_publish is True
+    assert token
+    assert to_touch == []
+    assert [row_id for row_id, _, _ in to_upsert] == [
+        make_convo_generation_id("drawer-a", "hash-a2")
+    ]
+    assert [row_id for row_id, source_id, _, _ in to_copy] == [
+        convo_miner._reused_generation_copy_id("drawer-b", token)
+    ]
+    assert [source_id for _, source_id, _, _ in to_copy] == ["drawer-b"]
+    assert "drawer-a" not in new_ids
+    assert "drawer-b" not in new_ids
+
+
+def test_plan_clones_tokenless_reused_rows_when_shrinking(monkeypatch):
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    existing = {
+        "drawer-a": {
+            "logical_drawer_id": "drawer-a",
+            "chunk_hash": "hash-a",
+            "mine_staged": False,
+        },
+        "drawer-b": {
+            "logical_drawer_id": "drawer-b",
+            "chunk_hash": "hash-b",
+            "mine_staged": False,
+        },
+        "drawer-c": {
+            "logical_drawer_id": "drawer-c",
+            "chunk_hash": "hash-c",
+            "mine_staged": False,
+        },
+    }
+    planned = [
+        _plan_chunk("drawer-a", "hash-a", "A", 0, existing["drawer-a"]),
+        _plan_chunk("drawer-b", "hash-b", "B", 1, existing["drawer-b"]),
+    ]
+    to_upsert, to_touch, to_copy, new_ids, token, will_publish = _plan_writes(planned, existing)
+
+    assert will_publish is True
+    assert token
+    assert to_upsert == []
+    assert to_touch == []
+    assert {row_id for row_id, _, _, _ in to_copy} == {
+        convo_miner._reused_generation_copy_id("drawer-a", token),
+        convo_miner._reused_generation_copy_id("drawer-b", token),
+    }
+    assert "drawer-c" not in new_ids
+    assert "drawer-a" not in new_ids
+    assert "drawer-b" not in new_ids
+
+
+def test_plan_publishes_and_clones_tokenless_prefix_when_retrying_staged_tail(monkeypatch):
+    """Crash after the first tokened upsert must still clone tokenless prefixes."""
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    token = convo_miner._content_set_generation_token(
+        [("drawer-a", "hash-a"), ("drawer-b", "hash-b"), ("drawer-c", "hash-c")]
+    )
+    existing = {
+        "drawer-a": {
+            "logical_drawer_id": "drawer-a",
+            "chunk_hash": "hash-a",
+            "mine_staged": False,
+            "chunk_index": 0,
+        },
+        "drawer-b": {
+            "logical_drawer_id": "drawer-b",
+            "chunk_hash": "hash-b",
+            "mine_staged": False,
+            "chunk_index": 1,
+        },
+        "drawer-c": {
+            "logical_drawer_id": "drawer-c",
+            "chunk_hash": "hash-c",
+            "mine_generation_token": token,
+            "mine_staged": True,
+            "chunk_index": 2,
+        },
+    }
+    planned = [
+        _plan_chunk("drawer-a", "hash-a", "A", 0, existing["drawer-a"]),
+        _plan_chunk("drawer-b", "hash-b", "B", 1, existing["drawer-b"]),
+        _plan_chunk("drawer-c", "hash-c", "C", 2, existing["drawer-c"]),
+    ]
+    to_upsert, to_touch, to_copy, new_ids, planned_token, will_publish = _plan_writes(
+        planned, existing
+    )
+
+    assert planned_token == token
+    assert will_publish is True
+    assert to_upsert == []
+    assert {row_id for row_id, _ in to_touch} == {"drawer-c"}
+    assert {row_id for row_id, source_id, _, _ in to_copy} == {
+        convo_miner._reused_generation_copy_id("drawer-a", token),
+        convo_miner._reused_generation_copy_id("drawer-b", token),
+    }
+    assert "drawer-a" not in new_ids
+    assert "drawer-b" not in new_ids
+    assert "drawer-c" in new_ids
+
+
 def test_repeated_appends_keep_active_rows_in_place_and_hide_on_failed_shrink(
     tmp_path, monkeypatch
 ):
@@ -1391,6 +1553,204 @@ def test_tokenless_shrink_hides_removed_chunk_when_delete_fails(tmp_path, monkey
     assert mine(collection, shrunk)[2] is False
     _assert_all_read_paths(collection, source, [*shrunk, None])
     assert dropped_id not in collection.rows
+
+
+def _tokenless_source_case(tmp_path, monkeypatch):
+    source = str(tmp_path / "session.txt")
+    (tmp_path / "session.txt").write_text("transcript", encoding="utf-8")
+    monkeypatch.setattr(convo_miner, "mine_lock", lambda *_: contextlib.nullcontext())
+    monkeypatch.setattr(convo_miner, "file_already_mined", lambda *_a, **_k: False)
+    monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda *_: "conversations")
+    monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 1)
+
+    def mine(collection, documents):
+        chunks = [{"content": text, "chunk_index": index} for index, text in enumerate(documents)]
+        return convo_miner._file_chunks_locked(
+            collection, source, chunks, "wing", "general", "agent", "exchange"
+        )
+
+    return source, mine
+
+
+def _assert_unchanged_tokenless_prefix_visible(collection, source, prefix):
+    for index, text in enumerate(prefix):
+        logical_id = make_convo_drawer_id("wing", "general", source, "exchange", index)
+        record = mcp_server._logical_generation_record(collection, logical_id)
+        assert record is not None, (
+            f"unchanged chunk {index} hidden after write {collection.write_count}"
+        )
+        assert record["content"] == text
+
+
+def test_tokenless_first_append_keeps_prefix_visible_and_reuses_embeddings(tmp_path, monkeypatch):
+    source, mine = _tokenless_source_case(tmp_path, monkeypatch)
+    tokenless = ["original first chunk", "unchanged middle chunk", "unchanged last chunk"]
+    grown = [*tokenless, "appended fourth chunk"]
+    collection = GenerationCollection()
+    assert mine(collection, tokenless)[2] is False
+    _assert_all_read_paths(collection, source, tokenless)
+    original_embeddings = {
+        make_convo_drawer_id("wing", "general", source, "exchange", index): list(
+            collection.rows[make_convo_drawer_id("wing", "general", source, "exchange", index)][
+                "embedding"
+            ]
+        )
+        for index in range(len(tokenless))
+    }
+    collection.write_count = 0
+    collection.embedded_documents.clear()
+    snapshots = []
+
+    def observe():
+        _assert_unchanged_tokenless_prefix_visible(collection, source, tokenless)
+        snapshots.append(
+            mcp_server._logical_generation_record(
+                collection,
+                make_convo_drawer_id("wing", "general", source, "exchange", len(tokenless)),
+            )
+            is not None
+        )
+
+    collection.observe = observe
+    assert mine(collection, grown)[2] is False
+    assert snapshots
+    _assert_all_read_paths(collection, source, grown)
+    assert collection.embedded_documents == [grown[-1]]
+    for index, text in enumerate(tokenless):
+        logical_id = make_convo_drawer_id("wing", "general", source, "exchange", index)
+        record = mcp_server._logical_generation_record(collection, logical_id)
+        physical_id = record["ids"][0]
+        assert list(collection.rows[physical_id]["embedding"]) == original_embeddings[logical_id]
+        assert record["content"] == text
+        assert physical_id != logical_id
+
+
+def test_tokenless_partial_rewrite_keeps_unchanged_chunk_visible(tmp_path, monkeypatch):
+    source, mine = _tokenless_source_case(tmp_path, monkeypatch)
+    tokenless = ["original first chunk", "unchanged middle chunk", "unchanged last chunk"]
+    rewritten = ["revised first chunk", *tokenless[1:]]
+    collection = GenerationCollection()
+    assert mine(collection, tokenless)[2] is False
+    original_mid = make_convo_drawer_id("wing", "general", source, "exchange", 1)
+    original_embedding = list(collection.rows[original_mid]["embedding"])
+    collection.write_count = 0
+    collection.embedded_documents.clear()
+
+    def observe():
+        for index in (1, 2):
+            logical_id = make_convo_drawer_id("wing", "general", source, "exchange", index)
+            record = mcp_server._logical_generation_record(collection, logical_id)
+            assert record is not None
+            assert record["content"] == tokenless[index]
+
+    collection.observe = observe
+    assert mine(collection, rewritten)[2] is False
+    _assert_all_read_paths(collection, source, rewritten)
+    assert collection.embedded_documents == [rewritten[0]]
+    mid = mcp_server._logical_generation_record(collection, original_mid)
+    assert list(collection.rows[mid["ids"][0]]["embedding"]) == original_embedding
+
+
+def test_tokenless_shrink_keeps_kept_chunks_visible_when_delete_fails(tmp_path, monkeypatch):
+    source, mine = _tokenless_source_case(tmp_path, monkeypatch)
+
+    class DeleteFailingCollection(GenerationCollection):
+        def __init__(self):
+            super().__init__()
+            self.fail_delete = False
+
+        def delete(self, ids):
+            if self.fail_delete:
+                raise InjectedWriteFailure("stale delete failed")
+            super().delete(ids)
+
+    tokenless = ["alpha first chunk", "alpha second chunk", "alpha dropped chunk"]
+    shrunk = ["alpha first chunk", "alpha second chunk"]
+    collection = DeleteFailingCollection()
+    assert mine(collection, tokenless)[2] is False
+    collection.fail_delete = True
+
+    def observe():
+        _assert_unchanged_tokenless_prefix_visible(collection, source, shrunk)
+
+    collection.observe = observe
+    skipped = mine(collection, shrunk)[2]
+    assert skipped is True
+    _assert_all_read_paths(collection, source, [*shrunk, None])
+
+
+@pytest.mark.parametrize("fail_before", [True, False])
+def test_interrupted_tokenless_first_append_never_hides_unchanged_chunks(
+    tmp_path, monkeypatch, fail_before
+):
+    source, mine = _tokenless_source_case(tmp_path, monkeypatch)
+    tokenless = ["original first chunk", "unchanged middle chunk", "unchanged last chunk"]
+    grown = [*tokenless, "appended fourth chunk"]
+    original = GenerationCollection()
+    assert mine(original, tokenless)[2] is False
+    original_embeddings = {
+        make_convo_drawer_id("wing", "general", source, "exchange", index): list(
+            original.rows[make_convo_drawer_id("wing", "general", source, "exchange", index)][
+                "embedding"
+            ]
+        )
+        for index in range(len(tokenless))
+    }
+    original.write_count = 0
+    completed = copy.deepcopy(original)
+    assert mine(completed, grown)[2] is False
+
+    for write_index in range(1, completed.write_count + 1):
+        collection = copy.deepcopy(original)
+        collection.fail_before = fail_before
+        collection.fail_at = write_index
+        try:
+            mine(collection, grown)
+        except InjectedWriteFailure:
+            pass
+        _assert_unchanged_tokenless_prefix_visible(collection, source, tokenless)
+        fourth = mcp_server._logical_generation_record(
+            collection,
+            make_convo_drawer_id("wing", "general", source, "exchange", len(tokenless)),
+        )
+        if fourth is not None:
+            _assert_all_read_paths(collection, source, grown)
+        collection.fail_at = None
+        assert mine(collection, grown)[2] is False
+        _assert_all_read_paths(collection, source, grown)
+        for index, text in enumerate(tokenless):
+            logical_id = make_convo_drawer_id("wing", "general", source, "exchange", index)
+            record = mcp_server._logical_generation_record(collection, logical_id)
+            physical_id = record["ids"][0]
+            assert (
+                list(collection.rows[physical_id]["embedding"]) == original_embeddings[logical_id]
+            )
+            assert record["content"] == text
+
+
+def test_repeated_tokened_append_after_tokenless_growth_does_not_clone(tmp_path, monkeypatch):
+    source, mine = _tokenless_source_case(tmp_path, monkeypatch)
+    tokenless = ["original first chunk", "unchanged middle chunk", "unchanged last chunk"]
+    first_growth = [*tokenless, "appended fourth chunk"]
+    second_growth = [*first_growth, "appended fifth chunk"]
+    collection = GenerationCollection()
+    assert mine(collection, tokenless)[2] is False
+    assert mine(collection, first_growth)[2] is False
+    _assert_all_read_paths(collection, source, first_growth)
+    after_first = _snapshot_active_rows(collection)
+    tokened_ids = {key: value for key, value in after_first.items() if value[2]}
+    assert tokened_ids
+    collection.write_count = 0
+    collection.embedded_documents.clear()
+    assert mine(collection, second_growth)[2] is False
+    _assert_all_read_paths(collection, source, second_growth)
+    after_second = _snapshot_active_rows(collection)
+    for key, (embedding, document, token) in tokened_ids.items():
+        assert key in after_second
+        assert after_second[key][0] == embedding
+        assert after_second[key][1] == document
+        assert after_second[key][2] == token
+    assert collection.embedded_documents == [second_growth[-1]]
 
 
 def test_failed_tokened_rewrite_cleanup_then_repeated_appends_keep_active_rows(
