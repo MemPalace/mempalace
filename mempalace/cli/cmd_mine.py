@@ -17,7 +17,7 @@ def cmd_mine(args):
 
     if getattr(args, "daemon", False):
         payload = {
-            "source": args.dir,
+            "source": os.path.abspath(os.path.expanduser(args.dir)),
             "mode": mode,
             "wing": args.wing,
             "agent": args.agent,
