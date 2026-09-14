@@ -491,6 +491,49 @@ def test_export_opens_the_palace_read_only(monkeypatch, fmt, backend):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+@pytest.mark.parametrize("fmt", ["jsonl", "markdown"])
+def test_cli_export_reports_refusal_without_traceback(monkeypatch, capsys, fmt):
+    """A symlinked output path is refused with a message and exit 1, not a traceback."""
+    import sys
+
+    from mempalace.cli import main
+
+    tmpdir = tempfile.mkdtemp()
+    monkeypatch.setenv("HOME", tmpdir)
+    monkeypatch.setenv("USERPROFILE", tmpdir)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    try:
+        palace_path = _setup_palace(tmpdir)
+        decoy = os.path.join(tmpdir, "decoy")
+        os.makedirs(decoy)
+        output_dir = os.path.join(tmpdir, "export")
+        try:
+            os.symlink(decoy, output_dir)
+        except (OSError, NotImplementedError) as e:
+            pytest.skip(f"symlink creation not supported in this environment: {e}")
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "mempalace",
+                "--palace",
+                palace_path,
+                "export",
+                "--format",
+                fmt,
+                "--output",
+                output_dir,
+            ],
+        )
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 1
+        assert "symbolic link" in capsys.readouterr().err
+        assert os.listdir(decoy) == []
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_cli_import_reports_held_lease_without_traceback(monkeypatch, capsys):
     """A palace already being written refuses the import with a message, not a traceback."""
     import contextlib

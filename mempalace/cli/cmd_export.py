@@ -22,14 +22,16 @@ def cmd_export(args):
     print(f"\n{'=' * 55}")
     print(f"  Exporting palace ({args.format})")
     print(f"{'=' * 55}\n")
-    if args.format == "jsonl":
-        from ..exporter import export_palace_jsonl
+    from ..exporter import export_palace, export_palace_jsonl
 
-        export_palace_jsonl(palace_path, output_dir)
-    else:
-        from ..exporter import export_palace
-
-        export_palace(palace_path, output_dir)
+    export = export_palace_jsonl if args.format == "jsonl" else export_palace
+    try:
+        export(palace_path, output_dir)
+    except (ValueError, OSError) as exc:
+        # The exporter refuses symlinked targets with ValueError, and an unwritable
+        # output directory surfaces as OSError; report either, as `import` does.
+        print(f"  ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_import(args):
