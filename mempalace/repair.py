@@ -853,7 +853,20 @@ def _quick_check_errors(sqlite_path: str) -> list[str]:
     was not proven for it, the same reason every unreadable path reaches here,
     so it gets the same answer rather than a traceback out of ``mempalace
     mine`` and ``mempalace repair``, neither of which guards this call.
+
+    A named pipe at ``sqlite_path`` is the one file type answered before any
+    open: opening it for reading parks until a writer arrives, and the probe
+    behind the MCP integrity gate runs under a lock that gated tool calls wait
+    on. It is refused by type, as :func:`sqlite_drawer_count` refuses it, and
+    reported the way an unopenable path is, since the file is not a database.
+    As there, a name swapped for a pipe between the check and the open still
+    parks, since every open after the check goes by name.
     """
+    if _is_a_named_pipe(sqlite_path):
+        return [
+            f"PRAGMA quick_check failed: {os.path.basename(sqlite_path)} "
+            "resolves to a named pipe, not a database"
+        ]
     try:
         # A writer holding SQLite's lock is contention, not corruption. The
         # sqlite3 module defaults to five seconds, which is shorter than
@@ -902,7 +915,7 @@ def sqlite_integrity_status(palace_path: str) -> SqliteIntegrityStatus:
     # _quick_check_errors, not sqlite_integrity_errors: that one gates on
     # absence again, and a file unlinked between the two gates would come back
     # as an empty list, which is the clean verdict this function exists to
-    # withhold. Past the gate above, only an open attempt may answer.
+    # withhold. Past the gate above, only _quick_check_errors may answer.
     return SqliteIntegrityStatus(
         checked=True,
         errors=tuple(_quick_check_errors(sqlite_path)),

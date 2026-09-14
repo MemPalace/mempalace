@@ -15,9 +15,10 @@ from _chroma_palace_helper import make_minimal_chroma_sqlite
 from mempalace import repair
 
 # Mirrors the guard test_backups declares; test_non_regular_file_guards carries
-# a root-only variant because its cases already sit under posix_only. Neither
-# root nor Windows is stopped by a directory's permission bits, so a test that
-# removes them proves nothing there.
+# a root-only variant because every use of it there also carries a marker that
+# excludes Windows (posix_only or needs_fifo). Neither root nor Windows is
+# stopped by a directory's permission bits, so a test that removes them proves
+# nothing there.
 needs_unprivileged_posix = pytest.mark.skipif(
     os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
     reason="directory permission bits gate neither root nor Windows",
@@ -2006,6 +2007,7 @@ def test_sqlite_integrity_errors_reports_unreadable_sqlite_file(tmp_path):
 
     assert errors
     assert "quick_check failed" in errors[0]
+    assert "named pipe" not in errors[0]
 
 
 def test_sqlite_integrity_status_reports_a_verdict_for_a_healthy_database(tmp_path):
@@ -2055,7 +2057,7 @@ def test_sqlite_integrity_status_asks_about_absence_once(tmp_path, monkeypatch):
     through it would put the same question twice. A file unlinked between the
     two would answer ``[]`` the second time, and an empty list beside
     ``checked=True`` is the clean bill of health this function exists to
-    withhold. Past the gate, only an open attempt may answer.
+    withhold. Past the gate, only ``_quick_check_errors`` may answer.
 
     The counter is the point: it fails on the second call rather than on the
     verdict, so the test names the cause instead of waiting for a race to show
@@ -2086,6 +2088,7 @@ def test_sqlite_integrity_status_asks_about_absence_once(tmp_path, monkeypatch):
     assert status.checked is True
     assert status.errors
     assert "quick_check failed" in status.errors[0]
+    assert "named pipe" not in status.errors[0]
 
 
 def test_sqlite_integrity_errors_does_not_raise_on_a_path_it_cannot_stat(tmp_path):
@@ -2102,6 +2105,7 @@ def test_sqlite_integrity_errors_does_not_raise_on_a_path_it_cannot_stat(tmp_pat
 
     assert errors
     assert "quick_check failed" in errors[0]
+    assert "named pipe" not in errors[0]
 
 
 @needs_posix_filenames
@@ -2152,6 +2156,7 @@ def test_sqlite_integrity_errors_reports_a_path_python_cannot_encode(tmp_path):
     errors = repair.sqlite_integrity_errors(palace)
 
     assert all("quick_check failed" in error for error in errors)
+    assert not any("named pipe" in error for error in errors)
     assert repair.sqlite_integrity_status(palace).checked is True
     if sys.version_info < (3, 13):
         assert errors, "pathname2url raises here, and the probe has to report that"
@@ -2178,6 +2183,7 @@ def test_sqlite_integrity_status_reports_a_path_component_that_is_a_file(tmp_pat
     assert status.checked is True
     assert status.errors
     assert "quick_check failed" in status.errors[0]
+    assert "named pipe" not in status.errors[0]
 
 
 def test_sqlite_integrity_status_reports_a_dangling_symlink_as_an_error(tmp_path):
@@ -2195,6 +2201,25 @@ def test_sqlite_integrity_status_reports_a_dangling_symlink_as_an_error(tmp_path
     assert status.checked is True
     assert status.errors
     assert "quick_check failed" in status.errors[0]
+    assert "named pipe" not in status.errors[0]
+
+
+def test_sqlite_integrity_status_reports_a_directory_named_chroma_sqlite3_as_an_error(tmp_path):
+    """A directory under that name cannot be read as a database, and it is not a named pipe.
+
+    The named-pipe error shares the ``quick_check failed`` prefix these tests
+    check for, so each of them also checks that no pipe is named.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").mkdir()
+
+    status = repair.sqlite_integrity_status(str(palace))
+
+    assert status.checked is True
+    assert len(status.errors) == 1
+    assert "quick_check failed" in status.errors[0]
+    assert "named pipe" not in status.errors[0]
 
 
 @needs_unprivileged_posix
@@ -2221,6 +2246,7 @@ def test_sqlite_integrity_status_reports_an_unreachable_directory_as_an_error(tm
     assert status.checked is True
     assert status.errors
     assert "quick_check failed" in status.errors[0]
+    assert "named pipe" not in status.errors[0]
 
 
 @patch("mempalace.repair._copy_file_no_follow")
