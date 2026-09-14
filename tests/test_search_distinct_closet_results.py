@@ -66,7 +66,9 @@ def test_rendered_dedup_preserves_first_ranked_closet_hit_and_plain_repeats():
 
 
 def _is_commit_marker_where(where) -> bool:
-    return isinstance(where, dict) and where.get("mine_commit_marker") is True
+    return isinstance(where, dict) and (
+        where.get("mine_commit_marker") is True or where.get("diary_commit") is True
+    )
 
 
 def _content_get_calls(collection):

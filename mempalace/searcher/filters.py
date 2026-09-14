@@ -51,10 +51,13 @@ def _load_diary_commit_generations(collection) -> dict:
             where={"diary_commit": True},
             include=["metadatas"],
         )
+        if isinstance(result, dict):
+            metas = result.get("metadatas") or []
+        else:
+            metas = getattr(result, "metadatas", None) or []
     except Exception:
         logger.debug("diary commit marker lookup failed", exc_info=True)
         return generations
-    metas = result.get("metadatas") or []
     for meta in metas:
         if not isinstance(meta, dict):
             continue
