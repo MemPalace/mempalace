@@ -1857,6 +1857,40 @@ def sqlite_generation_commit_state(
     return tokens, source_modes
 
 
+def sqlite_diary_commit_generations(
+    palace_path: str, collection_name: str
+) -> Optional[dict[str, str]]:
+    """Read published diary replacement generations without opening HNSW."""
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        conn = connect_sqlite_read(db_path)
+        try:
+            rows = conn.execute(
+                """
+                SELECT entry.string_value, marker.string_value
+                FROM embedding_metadata marker
+                JOIN embeddings e ON e.id = marker.id
+                JOIN segments s ON e.segment_id = s.id
+                JOIN collections c ON s.collection = c.id
+                JOIN embedding_metadata entry
+                  ON entry.id = e.id AND entry.key = 'diary_entry_id'
+                WHERE c.name = ?
+                  AND marker.key = 'diary_generation_commit'
+                  AND marker.string_value IS NOT NULL
+                  AND entry.string_value IS NOT NULL
+                """,
+                (collection_name,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        logger.debug("sqlite_diary_commit_generations failed", exc_info=True)
+        return None
+    return {entry_id: token for entry_id, token in rows if entry_id and token}
+
+
 def sqlite_generation_commit_tokens(palace_path: str, collection_name: str) -> Optional[set[str]]:
     """Read only published conversation-generation tokens without opening HNSW."""
     state = sqlite_generation_commit_state(palace_path, collection_name)

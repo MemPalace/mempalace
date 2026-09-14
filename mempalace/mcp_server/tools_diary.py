@@ -20,6 +20,37 @@ def _diary_entry_physical_ids(collection, entry_id: str) -> set[str]:
     return physical_ids
 
 
+def _diary_commit_marker_id(entry_id: str) -> str:
+    return f"{entry_id}__diary_commit"
+
+
+def _diary_generation_physical_ids(entry_id: str, generation: str, chunk_count: int) -> list[str]:
+    tag = generation[:12]
+    if chunk_count <= 1:
+        return [f"{entry_id}__g{tag}"]
+    return [f"{entry_id}__g{tag}_chunk_{index:06d}" for index in range(chunk_count)]
+
+
+def _publish_diary_generation(collection, entry_id: str, generation: str, wing: str) -> None:
+    """Switch diary readers to ``generation`` only after its rows are durable."""
+    collection.upsert(
+        ids=[_diary_commit_marker_id(entry_id)],
+        documents=[f"diary-commit:{entry_id}:{generation}"],
+        metadatas=[
+            {
+                "type": "diary_commit",
+                "diary_commit": True,
+                "diary_entry_id": entry_id,
+                "diary_generation": generation,
+                "diary_generation_commit": generation,
+                "room": "_diary_meta",
+                "wing": wing,
+                "hall": "hall_diary",
+            }
+        ],
+    )
+
+
 def tool_diary_write(
     agent_name: str,
     entry: str,
@@ -105,17 +136,45 @@ def tool_diary_write(
         }
         if idempotency_hash:
             base_metadata["idempotency_key_hash"] = idempotency_hash
+            base_metadata["diary_entry_id"] = entry_id
         write_drawers = col.upsert if idempotency_key else col.add
         chunk_size = _config.chunk_size
         if len(entry) <= chunk_size:
-            write_drawers(
-                ids=[entry_id],
-                documents=[entry],
-                metadatas=[{**base_metadata, "chunk_index": 0}],
-            )
-            obsolete_ids = prior_physical_ids - {entry_id}
+            if idempotency_key:
+                import uuid
+
+                generation = uuid.uuid4().hex
+                physical_ids = _diary_generation_physical_ids(entry_id, generation, 1)
+                write_drawers(
+                    ids=physical_ids,
+                    documents=[entry],
+                    metadatas=[
+                        {
+                            **base_metadata,
+                            "chunk_index": 0,
+                            "parent_entry_id": entry_id,
+                            "parent_drawer_id": entry_id,
+                            "diary_generation": generation,
+                        }
+                    ],
+                )
+                _publish_diary_generation(col, entry_id, generation, wing)
+                obsolete_ids = prior_physical_ids - set(physical_ids)
+            else:
+                generation = ""
+                write_drawers(
+                    ids=[entry_id],
+                    documents=[entry],
+                    metadatas=[{**base_metadata, "chunk_index": 0}],
+                )
+                obsolete_ids = prior_physical_ids - {entry_id}
             if obsolete_ids:
-                col.delete(ids=sorted(obsolete_ids))
+                try:
+                    col.delete(ids=sorted(obsolete_ids))
+                except Exception:
+                    if not generation:
+                        raise
+                    logger.debug("diary leftover cleanup failed for %s", entry_id, exc_info=True)
             logger.info(f"Diary entry: {entry_id} -> {wing}/diary/{topic}")
             return {
                 "success": True,
@@ -144,25 +203,39 @@ def tool_diary_write(
         # timestamp-unique IDs; callers supplying an idempotency key use
         # ``upsert`` so an ambiguous transport retry heals the same logical
         # entry instead of creating a duplicate.
-        chunk_ids: list[str] = []
         chunk_docs: list[str] = []
         chunk_metas: list[dict] = []
         for i in range(0, len(entry), chunk_size):
-            chunk_idx = i // chunk_size
-            chunk_ids.append(f"{entry_id}_chunk_{chunk_idx:06d}")
             chunk_docs.append(entry[i : i + chunk_size])
-            chunk_metas.append(
-                {
-                    **base_metadata,
-                    "chunk_index": chunk_idx,
-                    "parent_entry_id": entry_id,
-                    "parent_drawer_id": entry_id,
-                }
-            )
+        if idempotency_key:
+            import uuid
+
+            generation = uuid.uuid4().hex
+            chunk_ids = _diary_generation_physical_ids(entry_id, generation, len(chunk_docs))
+        else:
+            generation = ""
+            chunk_ids = [f"{entry_id}_chunk_{index:06d}" for index in range(len(chunk_docs))]
+        for chunk_idx, _chunk_id in enumerate(chunk_ids):
+            meta = {
+                **base_metadata,
+                "chunk_index": chunk_idx,
+                "parent_entry_id": entry_id,
+                "parent_drawer_id": entry_id,
+            }
+            if generation:
+                meta["diary_generation"] = generation
+            chunk_metas.append(meta)
         write_drawers(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
+        if generation:
+            _publish_diary_generation(col, entry_id, generation, wing)
         obsolete_ids = prior_physical_ids - set(chunk_ids)
         if obsolete_ids:
-            col.delete(ids=sorted(obsolete_ids))
+            try:
+                col.delete(ids=sorted(obsolete_ids))
+            except Exception:
+                if not generation:
+                    raise
+                logger.debug("diary leftover cleanup failed for %s", entry_id, exc_info=True)
         logger.info(f"Diary entry: {entry_id} -> {wing}/diary/{topic} ({len(chunk_ids)} chunks)")
         return {
             "success": True,
@@ -231,6 +304,8 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
         entries = []
         total = 0
         offset = 0
+        _prime_diary_commit_generations(col)
+        committed_tokens, tokened_source_modes = frozenset(), frozenset()
 
         while True:
             results = col.get(
@@ -245,11 +320,14 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
 
             documents = _chroma_field(results, "documents", []) or []
             metadatas = _chroma_field(results, "metadatas", []) or []
-            total += len(batch_ids)
-
             for index in range(len(batch_ids)):
                 doc = documents[index] if index < len(documents) else ""
                 meta = _safe_meta(metadatas[index] if index < len(metadatas) else None)
+                if not _is_visible_generation_metadata(
+                    meta, committed_tokens, tokened_source_modes
+                ):
+                    continue
+                total += 1
                 entries.append(
                     {
                         "date": meta.get("date", ""),

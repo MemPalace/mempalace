@@ -2,6 +2,8 @@
 if __name__ != "mempalace.searcher":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.searcher")
 
+from contextvars import ContextVar
+
 
 def build_where_filter(wing: str = None, room: str = None, source_file: str = None) -> dict:
     """Build a ChromaDB where filter from optional wing/room/source_file.
@@ -36,6 +38,58 @@ def _is_staged_metadata(metadata, committed_tokens=frozenset()) -> bool:
     return not token or token not in committed_tokens
 
 
+_diary_generations_var = ContextVar("diary_commit_generations", default={})
+
+
+def _load_diary_commit_generations(collection) -> dict:
+    """Map logical diary entry IDs to the published replacement generation."""
+    generations = {}
+    if collection is None:
+        return generations
+    try:
+        result = collection.get(
+            where={"diary_commit": True},
+            include=["metadatas"],
+        )
+    except Exception:
+        logger.debug("diary commit marker lookup failed", exc_info=True)
+        return generations
+    metas = result.get("metadatas") or []
+    for meta in metas:
+        if not isinstance(meta, dict):
+            continue
+        entry_id = meta.get("diary_entry_id")
+        token = meta.get("diary_generation")
+        if entry_id and token:
+            generations[entry_id] = token
+    return generations
+
+
+def _prime_diary_commit_generations(collection) -> dict:
+    """Load diary replacement markers for this request's visibility checks."""
+    generations = _load_diary_commit_generations(collection)
+    _diary_generations_var.set(generations)
+    return generations
+
+
+def _diary_parent_id(metadata) -> str:
+    parent = metadata.get("parent_drawer_id") or metadata.get("parent_entry_id")
+    return parent if isinstance(parent, str) and parent else ""
+
+
+def _is_visible_diary_metadata(metadata, diary_generations=None) -> bool:
+    """Hide retired diary chunks after a published idempotent replacement."""
+    if metadata.get("diary_commit") is True:
+        return False
+    generations = diary_generations
+    if generations is None:
+        generations = _diary_generations_var.get()
+    entry_id = metadata.get("diary_entry_id") or _diary_parent_id(metadata)
+    if entry_id and entry_id in generations:
+        return metadata.get("diary_generation") == generations[entry_id]
+    return True
+
+
 def _is_visible_generation_metadata(
     metadata, committed_tokens=frozenset(), tokened_source_modes=frozenset()
 ) -> bool:
@@ -44,7 +98,8 @@ def _is_visible_generation_metadata(
     Tokenless leftover rows from a failed A→B cleanup are not visible once a
     later generation for the same source/mode carries a token. Staged or
     tokened rows from a retired generation are not visible either. Ordinary
-    project/diary rows without a generation token stay readable.
+    project/diary rows without a generation token stay readable. Published
+    diary replacements hide leftover parent chunks from earlier physical IDs.
     """
     if not isinstance(metadata, dict):
         return False
@@ -58,7 +113,7 @@ def _is_visible_generation_metadata(
     source_mode = _source_mode_commit_key(metadata)
     if source_mode is not None and source_mode in tokened_source_modes:
         return False
-    return True
+    return _is_visible_diary_metadata(metadata)
 
 
 def _committed_generation_state(collection) -> tuple[frozenset, frozenset]:
@@ -79,6 +134,7 @@ def _committed_generation_state(collection) -> tuple[frozenset, frozenset]:
             len(tokens),
         )
         raise GenerationStateError("Incomplete conversation generation commit markers")
+    _prime_diary_commit_generations(collection)
     return frozenset(tokens), frozenset(modes)
 
 

@@ -2651,7 +2651,7 @@ def test_failed_final_session_snapshot_stays_pending(tmp_path):
         pending = hooks_cli_mod._pending_checkpoints_for_session("sess")
         assert len(pending) == 1
         payload = json.loads(pending[0].read_text(encoding="utf-8"))
-        assert payload["checkpoint_id"].startswith("session-end:initial:35:")
+        assert payload["checkpoint_id"] == "session-end:initial:35"
         assert hooks_cli_mod._session_checkpoint_epoch("sess") == "initial"
 
 
@@ -2689,6 +2689,137 @@ def test_session_end_does_not_duplicate_replayed_final_boundary(tmp_path):
 
     assert save.call_count == 1
     assert save.call_args.kwargs["checkpoint_id"] == "session-end:initial:15:old-attempt"
+
+
+def test_session_end_keeps_final_pending_until_epoch_advances(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(15)],
+    )
+    last_save_file = tmp_path / "sess_last_save"
+    last_save_file.write_text("0", encoding="utf-8")
+    order = []
+
+    def failing_advance(session_id):
+        order.append("advance")
+        return False
+
+    real_discard = hooks_cli_mod._discard_session_pending_checkpoints
+
+    def tracking_discard(session_id):
+        order.append("discard")
+        return real_discard(session_id)
+
+    with patch("mempalace.hooks_cli.MempalaceConfig") as config:
+        config.return_value.hooks_auto_save = True
+        config.return_value.hook_desktop_toast = False
+        config.return_value.hook_use_daemon = False
+        with (
+            patch("mempalace.server_registry.read_live_serverinfo", return_value=None),
+            patch(
+                "mempalace.mcp_server.tool_diary_write",
+                return_value={"success": True, "entry_id": "saved"},
+            ) as write,
+            patch("mempalace.hooks_cli._ingest_transcript", return_value=False),
+            patch("mempalace.hooks_cli._maybe_auto_ingest"),
+            patch(
+                "mempalace.hooks_cli._advance_session_checkpoint_epoch",
+                side_effect=failing_advance,
+            ),
+            patch(
+                "mempalace.hooks_cli._discard_session_pending_checkpoints",
+                side_effect=tracking_discard,
+            ),
+        ):
+            _capture_hook_output(
+                hook_session_end,
+                {"session_id": "sess", "transcript_path": str(transcript)},
+                state_dir=tmp_path,
+            )
+
+    assert write.call_count == 1
+    assert write.call_args.kwargs["idempotency_key"]
+    assert last_save_file.exists()
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        pending = hooks_cli_mod._pending_checkpoints_for_session("sess")
+        assert len(pending) == 1
+        payload = json.loads(pending[0].read_text(encoding="utf-8"))
+        assert payload["checkpoint_id"] == "session-end:initial:15"
+        assert hooks_cli_mod._session_checkpoint_epoch("sess") == "initial"
+    assert "advance" in order
+    assert "discard" not in order
+
+    with patch("mempalace.hooks_cli.MempalaceConfig") as config:
+        config.return_value.hooks_auto_save = True
+        config.return_value.hook_desktop_toast = False
+        with (
+            patch(
+                "mempalace.hooks_cli._save_diary_direct",
+                return_value={"count": 15, "themes": []},
+            ) as save,
+            patch("mempalace.hooks_cli._ingest_transcript", return_value=False),
+            patch("mempalace.hooks_cli._maybe_auto_ingest"),
+        ):
+            _capture_hook_output(
+                hook_session_end,
+                {"session_id": "sess", "transcript_path": str(transcript)},
+                state_dir=tmp_path,
+            )
+
+    assert save.call_count == 1
+    assert save.call_args.kwargs["checkpoint_id"] == "session-end:initial:15"
+
+
+def test_session_end_discards_pending_after_epoch_advances(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(15)],
+    )
+    order = []
+    real_advance = hooks_cli_mod._advance_session_checkpoint_epoch
+    real_discard = hooks_cli_mod._discard_session_pending_checkpoints
+
+    def tracking_advance(session_id):
+        order.append("advance")
+        return real_advance(session_id)
+
+    def tracking_discard(session_id):
+        order.append("discard")
+        return real_discard(session_id)
+
+    with patch("mempalace.hooks_cli.MempalaceConfig") as config:
+        config.return_value.hooks_auto_save = True
+        config.return_value.hook_desktop_toast = False
+        config.return_value.hook_use_daemon = False
+        with (
+            patch("mempalace.server_registry.read_live_serverinfo", return_value=None),
+            patch(
+                "mempalace.mcp_server.tool_diary_write",
+                return_value={"success": True, "entry_id": "saved"},
+            ),
+            patch("mempalace.hooks_cli._ingest_transcript", return_value=False),
+            patch("mempalace.hooks_cli._maybe_auto_ingest"),
+            patch(
+                "mempalace.hooks_cli._advance_session_checkpoint_epoch",
+                side_effect=tracking_advance,
+            ),
+            patch(
+                "mempalace.hooks_cli._discard_session_pending_checkpoints",
+                side_effect=tracking_discard,
+            ),
+        ):
+            _capture_hook_output(
+                hook_session_end,
+                {"session_id": "sess", "transcript_path": str(transcript)},
+                state_dir=tmp_path,
+            )
+
+    assert order == ["advance", "discard"]
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        assert hooks_cli_mod._pending_checkpoints_for_session("sess") == []
+        assert hooks_cli_mod._session_checkpoint_epoch("sess") != "initial"
 
 
 def test_session_end_defaults_to_saving_when_config_unreadable(tmp_path):

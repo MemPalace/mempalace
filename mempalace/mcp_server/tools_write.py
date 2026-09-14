@@ -113,10 +113,13 @@ def _logical_chunk_group(col, drawer_id: str):
     docs = _chroma_field(result, "documents", []) or []
     metas = _chroma_field(result, "metadatas", []) or []
 
+    committed, tokened_source_modes = _committed_generation_state(col)
     rows = []
     for idx, chunk_id in enumerate(ids):
         doc = docs[idx] if idx < len(docs) else ""
         meta = _safe_meta(metas[idx] if idx < len(metas) else {})
+        if not _is_visible_generation_metadata(meta, committed, tokened_source_modes):
+            continue
         rows.append((_chunk_index(meta), chunk_id, doc or "", meta))
 
     rows.sort(key=lambda row: (row[0], row[1]))
@@ -249,6 +252,13 @@ def _logical_drawer_record(col, drawer_id: str):
         return generation
     committed, tokened_source_modes = _committed_generation_state(col)
     direct = _single_drawer_record(col, drawer_id)
+    diary_generations = _diary_generations_var.get()
+    if (
+        direct is not None
+        and drawer_id in diary_generations
+        and (direct["metadata"] or {}).get("diary_generation") != diary_generations[drawer_id]
+    ):
+        direct = None
     if direct is not None:
         if _is_visible_generation_metadata(direct["metadata"], committed, tokened_source_modes):
             return direct
@@ -1246,6 +1256,14 @@ def tool_list_drawers(
             if marker_state is not None:
                 committed_tokens = frozenset(marker_state[0])
                 tokened_source_modes = frozenset(marker_state[1])
+                from ..backends.chroma import sqlite_diary_commit_generations
+
+                diary_state = sqlite_diary_commit_generations(
+                    _config.palace_path,
+                    _config.collection_name,
+                )
+                if diary_state is not None:
+                    _diary_generations_var.set(diary_state)
             else:
                 col = _get_collection()
                 if not col:

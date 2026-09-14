@@ -2026,7 +2026,7 @@ def _session_checkpoint_epoch(session_id: str) -> str:
     return epoch or "initial"
 
 
-def _advance_session_checkpoint_epoch(session_id: str) -> None:
+def _advance_session_checkpoint_epoch(session_id: str) -> bool:
     """Start a fresh checkpoint generation after SessionEnd clears its marker."""
     import uuid
 
@@ -2037,7 +2037,17 @@ def _advance_session_checkpoint_epoch(session_id: str) -> None:
         temp_file.write_text(uuid.uuid4().hex, encoding="utf-8")
         os.replace(temp_file, epoch_file)
     except OSError:
-        pass
+        return False
+    return True
+
+
+def _session_end_checkpoint_id(epoch: str, boundary: int) -> str:
+    return f"session-end:{epoch}:{boundary}"
+
+
+def _is_session_end_for_boundary(checkpoint_id: str, boundary: int) -> bool:
+    parts = str(checkpoint_id).split(":")
+    return len(parts) >= 3 and parts[0] == "session-end" and parts[2] == str(boundary)
 
 
 def hook_session_end(data: dict, harness: str):
@@ -2071,6 +2081,7 @@ def hook_session_end(data: dict, harness: str):
     # makes _parse_harness_input raise) still runs the finally cleanup below.
     session_id = "unknown"
     session_end_complete = True
+    final_captured = False
     try:
         parsed = _parse_harness_input(data, harness)
         session_id = parsed["session_id"]
@@ -2141,17 +2152,15 @@ def hook_session_end(data: dict, harness: str):
                     toast=toast,
                 )
                 final_boundary = _count_human_messages(valid_transcript)
-                import uuid
-
-                final_prefix = (
-                    f"session-end:{_session_checkpoint_epoch(session_id)}:{final_boundary}:"
+                final_checkpoint_id = _session_end_checkpoint_id(
+                    _session_checkpoint_epoch(session_id),
+                    final_boundary,
                 )
                 final_captured = any(
-                    checkpoint_id.startswith(final_prefix)
+                    _is_session_end_for_boundary(checkpoint_id, final_boundary)
                     for checkpoint_id in flushed_checkpoint_ids
                 )
                 if not final_captured:
-                    final_checkpoint_id = f"{final_prefix}{uuid.uuid4().hex}"
                     final_result = _save_diary_direct(
                         valid_transcript,
                         session_id,
@@ -2161,17 +2170,17 @@ def hook_session_end(data: dict, harness: str):
                         checkpoint_id=final_checkpoint_id,
                     )
                     final_captured = final_result.get("count", 0) > 0
-                    if final_captured:
-                        _discard_pending_checkpoint(session_id, final_checkpoint_id)
                 ingest_status = _ingest_transcript(valid_transcript)
                 session_end_complete = pending_flushed and (final_captured or ingest_status is True)
             _maybe_auto_ingest()
 
         _output({})
     finally:
-        if session_end_complete and not _pending_checkpoints_for_session(session_id):
-            _advance_session_checkpoint_epoch(session_id)
-            _clear_session_last_save(session_id)
+        pending = _pending_checkpoints_for_session(session_id)
+        if session_end_complete and (final_captured or not pending):
+            if _advance_session_checkpoint_epoch(session_id):
+                _discard_session_pending_checkpoints(session_id)
+                _clear_session_last_save(session_id)
 
 
 def hook_precompact(data: dict, harness: str):
