@@ -23,6 +23,21 @@ from datetime import datetime
 from .palace import get_collection
 
 
+def _open_for_export(palace_path: str):
+    """Open the palace for export — read-only whenever a palace exists.
+
+    An existing palace is opened read-only and without create — the two travel
+    together, since sqlite_exact refuses a read-only open that may create. A
+    path holding no palace keeps its long-standing behaviour: the default open
+    files an empty palace and the export comes back empty.
+    """
+    from .backends import detect_backend_for_path
+
+    if os.path.isdir(palace_path) and detect_backend_for_path(palace_path) is not None:
+        return get_collection(palace_path, create=False, read_only=True)
+    return get_collection(palace_path)
+
+
 def _safe_path_component(name: str) -> str:
     """Sanitize a string for use as a directory/file name component."""
     name = re.sub(r'[/\\:*?"<>|]', "_", name)
@@ -83,7 +98,7 @@ def export_palace(palace_path: str, output_dir: str, format: str = "markdown") -
     Returns:
         Stats dict: {"wings": N, "rooms": N, "drawers": N}
     """
-    col = get_collection(palace_path)
+    col = _open_for_export(palace_path)
     total = col.count()
 
     if total == 0:
@@ -299,9 +314,8 @@ def export_palace_jsonl(palace_path: str, output_dir: str) -> dict:
         Stats dict: {"wings": N, "rooms": N, "drawers": N}
     """
     # A pure read: ask the backend not to run schema init, migrations or
-    # metadata writes. (`create` is left at its default — flipping it changes
-    # what exporting a not-yet-existing palace does, which is a separate call.)
-    col = get_collection(palace_path, read_only=True)
+    # metadata writes (see _open_for_export for the create rule).
+    col = _open_for_export(palace_path)
     total = col.count()
 
     manifest_path = os.path.join(output_dir, "export-manifest.json")

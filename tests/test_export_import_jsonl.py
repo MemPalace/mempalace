@@ -459,6 +459,38 @@ def test_cli_export_then_import_round_trips(monkeypatch):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+@pytest.mark.parametrize("backend", ["chroma", "sqlite_exact"])
+@pytest.mark.parametrize("fmt", ["jsonl", "markdown"])
+def test_export_opens_the_palace_read_only(monkeypatch, fmt, backend):
+    """Both export formats are pure reads on every local backend.
+
+    Each opens the palace read-only and without create. sqlite_exact rejects a
+    read-only open that may create, so this also pins that exporting a real
+    sqlite_exact palace works at all.
+    """
+    import mempalace.exporter as exporter_mod
+
+    opened = []
+    real_get_collection = exporter_mod.get_collection
+
+    def _spy(palace_path, *args, **kwargs):
+        opened.append((kwargs.get("read_only", False), kwargs.get("create", True)))
+        return real_get_collection(palace_path, *args, **kwargs)
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        col = get_collection(palace_path, backend=backend)
+        col.add(ids=["d-1"], documents=["hello world"], metadatas=[{"wing": "w", "room": "r"}])
+        monkeypatch.setattr(exporter_mod, "get_collection", _spy)
+        export = exporter_mod.export_palace_jsonl if fmt == "jsonl" else exporter_mod.export_palace
+        stats = export(palace_path, os.path.join(tmpdir, "export"))
+        assert opened == [(True, False)], f"{fmt} export opened with (read_only, create)={opened}"
+        assert stats["drawers"] == 1
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_cli_import_reports_held_lease_without_traceback(monkeypatch, capsys):
     """A palace already being written refuses the import with a message, not a traceback."""
     import contextlib
