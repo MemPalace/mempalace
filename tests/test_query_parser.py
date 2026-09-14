@@ -555,3 +555,70 @@ class TestPalaceCoordinateParser:
         assert params["order"] == "desc"
         assert params["preview"] is True
 
+    def test_bare_flags_do_not_pollute_keyword_values(self):
+        from mempalace.query_parser import parse_exec_input
+
+        target, params = parse_exec_input("UPDATE drw_1 CONTENT HEAD")
+        assert target == "update_drawer"
+        assert params["drawer_id"] == "drw_1"
+        assert params["content"] == "HEAD"
+
+        target, params = parse_coordinate_input(
+            "TASK CREATE project:p from:f to:t goal:RECENT branch:b base:c done:d"
+        )
+        assert target == "task_create"
+        assert params["goal"] == "RECENT"
+
+        target, params = parse_coordinate_input(
+            "TASK CREATE project:p from:f to:t goal:DESC branch:b base:c done:d"
+        )
+        assert target == "task_create"
+        assert params["goal"] == "DESC"
+
+    def test_inbox_explicit_shorthand_order_override(self):
+        action, params = parse_coordinate_input("EVENT INBOX to:agent1 ASC")
+        assert action == "event_list"
+        assert params["to_agent"] == "agent1"
+        assert params["order"] == "asc"
+        assert params["preview"] is True
+
+        action, params = parse_coordinate_input("EVENT INBOX to:agent1 HEAD")
+        assert action == "event_list"
+        assert params["order"] == "asc"
+        assert params["preview"] is True
+
+        action, params = parse_coordinate_input("INBOX to:agent1 ASC")
+        assert action == "event_list"
+        assert params["order"] == "asc"
+        assert params["preview"] is True
+
+        action, params = parse_coordinate_input("EVENT INBOX to:agent1 DESC")
+        assert action == "event_list"
+        assert params["order"] == "desc"
+        assert params["preview"] is True
+
+    def test_wrapped_coordinate_sibling_overrides(self):
+        action, params = parse_coordinate_input(
+            {"command": "EVENT INBOX to:agent1", "order": "asc", "preview": False}
+        )
+        assert action == "event_list"
+        assert params["to_agent"] == "agent1"
+        assert params["order"] == "asc"
+        assert params["preview"] is False
+
+        action, params = parse_coordinate_input(
+            {"command": "EVENT INBOX to:agent1", "to": "agent2", "limit": 10}
+        )
+        assert action == "event_list"
+        assert params["to_agent"] == "agent2"
+        assert params["limit"] == 10
+        assert params["order"] == "desc"
+        assert params["preview"] is True
+
+        action, params = parse_coordinate_input(
+            {"command": "EVENT LIST", "order": "HEAD"}
+        )
+        assert action == "event_list"
+        assert params["order"] == "asc"
+
+

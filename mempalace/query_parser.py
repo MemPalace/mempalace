@@ -23,12 +23,9 @@ class QuotedToken(str):
     """A DSL token that was written in quotes; never treated as a keyword flag."""
 
 
-_BARE_FLAGS = frozenset(
+_BARE_FLAGS = frozenset({"APPLY", "COMMIT", "PREVIEW", "DRY_RUN"})
+_EVENT_LIST_ORDER_FLAGS = frozenset(
     {
-        "APPLY",
-        "COMMIT",
-        "PREVIEW",
-        "DRY_RUN",
         "DESC",
         "ASC",
         "LATEST",
@@ -123,7 +120,9 @@ def tokenize_dsl(text: str) -> List[str]:
     return tokens
 
 
-def _parse_key_value_tokens(tokens: List[str]) -> Dict[str, Any]:
+def _parse_key_value_tokens(
+    tokens: List[str], bare_flags: frozenset | None = None
+) -> Dict[str, Any]:
     """
     Parse tokens that contain key:value pairs, key:"quoted" pairs, or KEY value pairs.
     Handles forms like:
@@ -132,6 +131,7 @@ def _parse_key_value_tokens(tokens: List[str]) -> Dict[str, Any]:
       - `stream : project/app`
       - `STREAM project/app`
     """
+    active_bare_flags = _BARE_FLAGS if bare_flags is None else (_BARE_FLAGS | bare_flags)
     result: Dict[str, Any] = {}
     i = 0
     n = len(tokens)
@@ -178,11 +178,11 @@ def _parse_key_value_tokens(tokens: List[str]) -> Dict[str, Any]:
         if (
             i + 1 < n
             and tok.isupper()
-            and tok.upper() not in _BARE_FLAGS
+            and tok.upper() not in active_bare_flags
             and tokens[i + 1] != ":"
         ):
             nxt = tokens[i + 1]
-            if tok.upper() == "ORDER" or nxt.upper() not in _BARE_FLAGS:
+            if tok.upper() == "ORDER" or nxt.upper() not in active_bare_flags:
                 k = tok.lower().strip()
                 if k:
                     result[k] = _parse_val(nxt)
@@ -1158,8 +1158,35 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
                 ):
                     op, parsed_p = parse_coordinate_input(v_strip)
                     for pk, pv in params.items():
-                        if pk not in (k, "action", "target") and pk not in parsed_p:
+                        if pk in (k, "action", "target"):
+                            continue
+                        if pk == "to":
+                            parsed_p["to_agent"] = pv
+                        elif pk == "from":
+                            parsed_p["from_agent"] = pv
+                        elif pk == "base":
+                            parsed_p["base_commit"] = pv
+                        elif pk == "id" and op == "event_ack":
+                            parsed_p["event_id"] = pv
+                        elif pk == "event_type" and op == "event_append":
+                            parsed_p["type"] = pv
+                        elif pk == "diff" and op == "patch_submit":
+                            parsed_p["content"] = pv
+                        else:
                             parsed_p[pk] = pv
+
+                    if "order" in parsed_p and parsed_p["order"] is not None:
+                        parsed_p["order"] = str(parsed_p["order"]).lower().strip()
+                        if parsed_p["order"] in ("latest", "recent", "tail"):
+                            parsed_p["order"] = "desc"
+                        elif parsed_p["order"] in ("head", "oldest", "from_start"):
+                            parsed_p["order"] = "asc"
+                        if op == "event_list" and parsed_p["order"] not in ("asc", "desc"):
+                            raise QueryParseError(
+                                f"Invalid order '{parsed_p['order']}'; must be 'asc' or 'desc'"
+                            )
+                    if "preview" in parsed_p:
+                        parsed_p["preview"] = bool(parsed_p["preview"])
                     return op, parsed_p
         action = params.pop("action", None) or params.pop("target", None)
         if not action:
@@ -1206,6 +1233,10 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
             params.pop("to")
         if "order" in params and params["order"] is not None:
             params["order"] = str(params["order"]).lower().strip()
+            if params["order"] in ("latest", "recent", "tail"):
+                params["order"] = "desc"
+            elif params["order"] in ("head", "oldest", "from_start"):
+                params["order"] = "asc"
         if "base" in params and "base_commit" not in params:
             params["base_commit"] = params.pop("base")
         elif "base" in params:
@@ -1300,14 +1331,9 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
         first_tok == "EVENT" and len(tokens) > 1 and tokens[1].upper() in ("LIST", "FIND")
     ):
         start_idx = 1 if first_tok in ("INBOX", "LOGSTREAM", "EVENTS") else 2
-        kv = _parse_key_value_tokens(tokens[start_idx:])
-        if is_inbox:
-            if "order" not in kv:
-                kv["order"] = "desc"
-            if "preview" not in kv:
-                kv["preview"] = True
+        kv = _parse_key_value_tokens(tokens[start_idx:], bare_flags=_EVENT_LIST_ORDER_FLAGS)
 
-        # Shorthand flags for ordering and preview
+        # Shorthand flags for ordering and preview (evaluated before inbox defaults)
         for desc_flag in ("desc", "latest", "recent", "tail"):
             if desc_flag in kv:
                 kv.pop(desc_flag)
@@ -1321,8 +1347,18 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
         if "preview" in kv:
             kv["preview"] = bool(kv["preview"])
 
+        if is_inbox:
+            if "order" not in kv:
+                kv["order"] = "desc"
+            if "preview" not in kv:
+                kv["preview"] = True
+
         if "order" in kv and kv["order"] is not None:
             kv["order"] = str(kv["order"]).lower().strip()
+            if kv["order"] in ("latest", "recent", "tail"):
+                kv["order"] = "desc"
+            elif kv["order"] in ("head", "oldest", "from_start"):
+                kv["order"] = "asc"
             if kv["order"] not in ("asc", "desc"):
                 raise QueryParseError(f"Invalid order '{kv['order']}'; must be 'asc' or 'desc'")
 
