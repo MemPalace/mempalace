@@ -279,14 +279,14 @@ The sole cross-adapter requirement for `chunked_content` mode: chunks for a give
 
 Closets are the AAAK-compressed index layer (`palace.build_closet_lines`, `upsert_closet_lines`) that points to drawer content and enables LLM-scale scanning without reading every drawer. Closet-building is not an adapter concern:
 
-- **Core builds closets** from adapter-yielded drawers as a post-step, via the existing `palace.py` helpers. Adapters do not call these APIs.
+- **Core builds closets** from adapter-yielded drawers as a post-step, via the existing `mempalace.palace` helpers. Adapters do not call these APIs.
 - **Adapters MAY emit closet hints** in drawer metadata via a flat `;`-joined string:
   ```python
   metadata["closet_hints"] = "decided GraphQL; migrated to Postgres; fixed PR-567"
   ```
   Core splits on `;` and feeds these as candidate topics alongside the content-scanned ones in `build_closet_lines`. The git adapter can hint decision-signal quotes that raw content-scanning would miss; the conversations adapter can hint section headers; the filesystem adapter has no need and omits the field.
 - **metadata_only drawers get closets too.** Core builds them from the synthesized description content the same way it builds closets for any other drawer. This is how #981's path-level descriptions become searchable.
-- **Closet purging** remains keyed on `source_file` (`purge_file_closets` in `palace.py:221`). Adapters' source_file values must be stable so purge is correct on re-ingest.
+- **Closet purging** remains keyed on `source_file` (`purge_file_closets` in `mempalace/palace/closets.py`). Adapters' source_file values must be stable so purge is correct on re-ingest.
 
 Current `convo_miner.py` does not build closets for conversation drawers — an existing gap. The cleanup PR (§9) routes the conversations adapter through the same post-step closet builder as filesystem, closing the gap as a side effect.
 
@@ -481,12 +481,12 @@ Existing fields retain their current semantics (verified against `miner.py:542-5
 | `added_by` | Agent name (e.g., `lumi`, `claude-code`). Orthogonal to `adapter_name` — the agent is *who* triggered mining; the adapter is *how* data was extracted. |
 | `wing`, `room`, `hall` | Palace routing. Populated by adapter per §2.5. |
 | `chunk_index` | Per §1.6. Always 0 for `whole_record` / `metadata_only`. |
-| `normalize_version` | Palace-wide schema version (currently `palace.py:50`). Unchanged. Separate from `adapter_version`. |
+| `normalize_version` | Palace-wide schema version (currently `NORMALIZE_VERSION` in `mempalace/palace/__init__.py`). Unchanged. Separate from `adapter_version`. |
 | `entities` | Semicolon-joined candidate entity names. Already flat; kept flat (§5.4 replacement). |
 | `ingest_mode` | Per §1.5. Already on conversation drawers; added to filesystem drawers by the cleanup PR. |
 | `extract_mode` | Conversation-adapter-specific (`exchange` vs `general`). Moves into the conversations adapter's declared schema per §5.2. |
 
-**Nothing is renamed. Nothing is removed.** The spec formalizes the shape ingesters already converge on. Existing `where={"source_file": ...}` queries in `searcher.py`, `palace.py`, and callers keep working.
+**Nothing is renamed. Nothing is removed.** The spec formalizes the shape ingesters already converge on. Existing `where={"source_file": ...}` queries in `mempalace.searcher`, `mempalace.palace`, and callers keep working.
 
 **Chroma metadata constraint:** all metadata values MUST be `str | int | float | bool`. No lists, no nested dicts. This matches RFC 001 §1.4 and the underlying ChromaDB contract. Structured side-data goes to the SQLite knowledge graph (§5.5) or to a declared flat JSON-encoded string field (§5.4).
 
@@ -719,8 +719,8 @@ The existing in-tree ingesters are not adapter-shaped. Before RFC 002 can be enf
 - Closet-building wired into the conversations adapter's post-step (currently missing, per §1.7) — side effect of routing through the unified core post-step.
 - `mempalace/cli.py` subcommand `mine` routes through the `mempalace.sources` registry. `--mode {projects,convos}` becomes a deprecated alias for `--source {filesystem,conversations}`.
 - `mempalace/mcp_server.py` `mempalace_mine` tool accepts a `source` parameter.
-- `mempalace/palace.py` exposes `PalaceContext` — a per-mine-invocation facade that bundles the drawer collection, closet collection, knowledge graph, palace config, and progress hooks. Adapters receive this; they do not import `palace.py` directly.
-- `NORMALIZE_VERSION` (currently a module-level constant in `palace.py:50`) stays. It is the palace-wide schema version, orthogonal to per-adapter `adapter_version`.
+- `mempalace.palace` exposes `PalaceContext` — a per-mine-invocation facade that bundles the drawer collection, closet collection, knowledge graph, palace config, and progress hooks. Adapters receive this; they do not import palace fragments directly.
+- `NORMALIZE_VERSION` (currently a module-level constant in `mempalace/palace/__init__.py`) stays. It is the palace-wide schema version, orthogonal to per-adapter `adapter_version`.
 - `KnowledgeGraph.add_triple()` (`knowledge_graph.py:130`) gains two optional parameters: `source_drawer_id: str = None` and `adapter_name: str = None`. Existing callers are unaffected; adapters advertising `supports_kg_triples` (§5.5) populate both. Backwards-compatible change.
 
 This cleanup is substantial — comparable to RFC 001 §10's chroma-import removal — and should land before any new third-party adapter PR merges. Each new adapter is easier after the cleanup, not harder.

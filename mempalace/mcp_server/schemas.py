@@ -133,13 +133,24 @@ TOOLS = {
         "handler": tool_kg_supersede,
     },
     "mempalace_kg_timeline": {
-        "description": "Chronological timeline of facts. Shows the story of an entity (or everything) in order.",
+        "description": "Chronological timeline of facts with pagination. Shows the story of an entity (or everything) in order. Returns total matching count for pagination.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "entity": {
                     "type": "string",
                     "description": "Entity to get timeline for (optional — omit for full timeline)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max facts per page (default 100, max 100)",
+                    "minimum": 1,
+                    "maximum": 100,
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Offset for pagination (default 0)",
+                    "minimum": 0,
                 },
             },
         },

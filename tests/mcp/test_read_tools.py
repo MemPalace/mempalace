@@ -1043,3 +1043,71 @@ class TestListDrawersDateFilters:
 
 
 # ── MCP stdio startup: async preflight ───────────────────────────────────
+
+
+# --- _fetch_drawer_rows: one cursor pass on backend collections (#2452) ---
+
+
+class TestFetchDrawerRowsDelegation:
+    def test_backend_collection_uses_get_all_rows(self):
+        from mempalace import mcp_server
+        from mempalace.backends.base import BaseCollection, GetResult
+
+        class _Col(BaseCollection):
+            def __init__(self):
+                self.calls = []
+
+            def add(self, **kwargs):
+                raise NotImplementedError
+
+            def upsert(self, **kwargs):
+                raise NotImplementedError
+
+            def query(self, **kwargs):
+                raise NotImplementedError
+
+            def delete(self, **kwargs):
+                raise NotImplementedError
+
+            def count(self):
+                return 2
+
+            def get(self, **kwargs):
+                raise AssertionError(
+                    "_fetch_drawer_rows must not page through get() on a backend collection"
+                )
+
+            def get_all_rows(self, where=None, include=None):
+                self.calls.append({"where": where, "include": include})
+                return GetResult(
+                    ids=["a", "b"],
+                    documents=[],
+                    metadatas=[{"wing": "w"}, {"wing": "w"}],
+                    embeddings=None,
+                )
+
+        col = _Col()
+        ids, documents, metadatas = mcp_server._fetch_drawer_rows(
+            col, where={"wing": "w"}, include=["metadatas"]
+        )
+
+        assert ids == ["a", "b"]
+        assert documents == ["", ""]  # not requested: padded like the legacy loop
+        assert metadatas == [{"wing": "w"}, {"wing": "w"}]
+        assert col.calls == [{"where": {"wing": "w"}, "include": ["metadatas"]}]
+
+    def test_plain_collection_keeps_the_offset_loop(self):
+        from mempalace import mcp_server
+
+        pages = [
+            {"ids": ["a"], "documents": ["doc a"], "metadatas": [{"wing": "w"}]},
+            {"ids": [], "documents": [], "metadatas": []},
+        ]
+        col = MagicMock()
+        col.get.side_effect = lambda **kwargs: pages[min(kwargs.get("offset", 0), 1)]
+
+        ids, documents, metadatas = mcp_server._fetch_drawer_rows(col, page_size=1)
+
+        assert ids == ["a"]
+        assert documents == ["doc a"]
+        assert metadatas == [{"wing": "w"}]

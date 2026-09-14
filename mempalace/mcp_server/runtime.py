@@ -96,8 +96,13 @@ def _forward_request_to_hub(base_url: str, headers: dict, request: dict, palace_
 def _request_is_mutating(request: dict) -> bool:
     if request.get("method") != "tools/call":
         return False
-    name = ((request.get("params") or {}).get("name")) or ""
-    return name in _MUTATING_TOOLS
+    # This decides whether a mid-flight failure may be replayed locally, so it
+    # must return a verdict rather than raise: the same `or {}` trap made a
+    # non-mapping `params` throw AttributeError instead of answering "not
+    # mutating", and an unhashable name broke the membership test.
+    _, params = _normalize_envelope(request)
+    name = params.get("name")
+    return isinstance(name, str) and name in _MUTATING_TOOLS
 
 
 def _dispatch_stdio_request(request: dict):
@@ -214,14 +219,34 @@ def _run_stdio_loop() -> None:
         payload = None
         try:
             request = json.loads(line)
-            response = _dispatch_stdio_request(request)
-            if response is not None:
-                payload = json.dumps(response, ensure_ascii=False)
         except KeyboardInterrupt:
             break
-        except Exception as e:
-            logger.error(f"Server error: {e}")
-            continue
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            # Narrow on purpose: reporting a MemoryError or RecursionError as
+            # "Parse error" would be a lie. The id is unknowable here, so it is
+            # null per JSON-RPC 2.0 section 5 -- the "never answer a
+            # notification" rule cannot bind when the notification is exactly
+            # what could not be parsed. Staying silent left the client waiting
+            # on a request it had already sent, while the HTTP transport has
+            # answered -32700 all along.
+            logger.error("Server error: %s", exc)
+            payload = json.dumps(_json_rpc_parse_error(), ensure_ascii=False)
+        else:
+            try:
+                response = _dispatch_stdio_request(request)
+                if response is not None:
+                    payload = json.dumps(response, ensure_ascii=False)
+            except KeyboardInterrupt:
+                break
+            except Exception:
+                # Log with the traceback: the client only gets a generic
+                # -32603, so the stack is the only record of what failed.
+                logger.exception("Server error")
+                req_id = request.get("id") if isinstance(request, dict) else None
+                if req_id is None:
+                    # A notification is owed no response, failure included.
+                    continue
+                payload = json.dumps(_json_rpc_internal_error(req_id), ensure_ascii=False)
 
         if payload is None:
             continue

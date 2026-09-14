@@ -253,6 +253,31 @@ def test_healthz_ok(http_server):
     assert body == b"ok\n"
 
 
+def test_statusz_ok_distinguishes_absent_verdict_from_failed_one(http_server, monkeypatch):
+    """`ok: null` means no integrity verdict exists, not that one came back bad.
+
+    It is the answer for a non-chroma backend (#1931) and for a palace above
+    the startup-probe size limit — the palace in #2240 is about four times the
+    default. Collapsing it with ``bool()`` reported every such server as
+    unhealthy, which is a negative verdict nobody produced.
+    """
+    port, _ = http_server
+
+    monkeypatch.setattr(
+        mcp,
+        "_sqlite_integrity_payload",
+        lambda: {"checked": False, "ok": None, "errors": [], "reason": "probe skipped"},
+    )
+    assert json.loads(_get(port, "/statusz")[1])["ok"] is True
+
+    monkeypatch.setattr(
+        mcp,
+        "_sqlite_integrity_payload",
+        lambda: {"checked": True, "ok": False, "errors": ["malformed inverted index"]},
+    )
+    assert json.loads(_get(port, "/statusz")[1])["ok"] is False
+
+
 def test_statusz_reports_machine_readable_server_and_client_state(http_server, monkeypatch):
     monkeypatch.setattr(mcp, "_sqlite_integrity_payload", lambda: {"ok": True, "errors": []})
     port, _ = http_server
@@ -404,6 +429,47 @@ def test_invalid_json_returns_parse_error(http_server):
     status, body = _post(port, "/mcp", b"{not valid json")
     assert status == 400
     assert json.loads(body)["error"]["code"] == -32700
+
+
+def test_non_string_method_gets_jsonrpc_error(http_server):
+    """A malformed envelope must come back as JSON-RPC, not a dropped socket."""
+    port, _ = http_server
+    status, body = _post(port, "/mcp", {"jsonrpc": "2.0", "id": 3, "method": 123})
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["id"] == 3
+    assert payload["error"]["code"] == -32601
+
+
+def test_dispatch_failure_returns_jsonrpc_error(http_server, monkeypatch):
+    """An unexpected dispatch failure answers -32603 instead of closing the socket."""
+    port, _ = http_server
+
+    def _boom(_request):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(mcp, "_http_dispatch", _boom)
+
+    status, body = _post(port, "/mcp", {"jsonrpc": "2.0", "id": 4, "method": "ping"})
+    assert status == 500
+    payload = json.loads(body)
+    assert payload["id"] == 4
+    assert payload["error"]["code"] == -32603
+    assert "kaboom" not in body.decode("utf-8")
+
+
+def test_dispatch_failure_on_notification_sends_no_body(http_server, monkeypatch):
+    """A notification is owed no response body, a failed one included."""
+    port, _ = http_server
+
+    def _boom(_request):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(mcp, "_http_dispatch", _boom)
+
+    status, body = _post(port, "/mcp", {"jsonrpc": "2.0", "method": "notifications/initialized"})
+    assert status == 500
+    assert body == b""
 
 
 def test_oversized_request_rejected_413(http_server):

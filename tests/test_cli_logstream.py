@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from mempalace.cli import cmd_artifact, cmd_logstream, cmd_task, main
+from mempalace.logstream import Logstream
 
 
 def _append_args(palace, **overrides):
@@ -828,9 +829,27 @@ class TestLogstreamWatch:
         )
         assert _watch_payload(capsys)["count"] == 1
 
-    def test_idle_deadline_caps_the_poll(self, palace_path, capsys):
-        """--idle-exit-ms shorter than --poll-timeout-ms must not wait the poll."""
-        t0 = time.monotonic()
+    def test_idle_deadline_caps_the_poll(self, palace_path, monkeypatch):
+        """--idle-exit-ms shorter than --poll-timeout-ms must not wait the poll.
+
+        Measuring wall-clock time pins the machine rather than the behaviour:
+        a loaded runner can spend seconds on a 200ms deadline while having
+        capped every poll correctly, which is how this test failed on the
+        Windows job. The contract is the timeout handed to the long-poll
+        primitive, so that is what is recorded.
+        """
+        requested = []
+
+        def recording_wait(self, *, timeout_ms=None, **kwargs):
+            requested.append(timeout_ms)
+            # Consume the granted timeout so the idle deadline elapses the way
+            # it would with a real poll, instead of spinning the loop.
+            if timeout_ms:
+                time.sleep(min(timeout_ms, 200) / 1000.0)
+            return {"events": [], "timed_out": True}
+
+        monkeypatch.setattr(Logstream, "wait_events", recording_wait)
+
         with pytest.raises(SystemExit) as exc:
             cmd_logstream(
                 _watch_args(
@@ -840,9 +859,10 @@ class TestLogstreamWatch:
                     poll_timeout_ms=5000,
                 )
             )
-        elapsed = time.monotonic() - t0
+
         assert exc.value.code == 2
-        assert elapsed < 1.5, f"idle 200ms waited {elapsed:.2f}s (poll was 5s)"
+        assert requested, "the watcher exited without reaching the long poll"
+        assert max(requested) <= 200, f"poll asked for {max(requested)}ms on a 200ms idle deadline"
 
     def test_match_does_not_checkpoint_if_output_fails(
         self, palace_path, tmp_path, capsys, monkeypatch

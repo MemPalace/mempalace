@@ -663,6 +663,30 @@ def _decorate_mcp_tool_result(tool_name: str, result):
     return result
 
 
+def _normalize_envelope(request: dict) -> "tuple[str, dict]":
+    """Read `method` and `params` off a request without raising.
+
+    `or ""` / `or {}` only rescue falsy values, so a truthy non-string method
+    reached `.startswith()` and truthy non-object params reached `.get()`,
+    raising AttributeError out of `handle_request`. Over stdio that surfaced
+    as no response at all, leaving the client waiting on an id forever.
+
+    A malformed value falls back to the same default its falsy counterpart has
+    always been given, so nothing that used to be answered stops being
+    answered: `params: []` is legal by-position params this server does not
+    support, and it kept working as an empty mapping before this guard existed.
+    """
+    method = request.get("method")
+    if not isinstance(method, str):
+        method = ""
+
+    params = request.get("params")
+    if not isinstance(params, dict):
+        params = {}
+
+    return method, params
+
+
 def handle_request(request):
     global _last_request_time
     if not isinstance(request, dict):
@@ -672,9 +696,8 @@ def handle_request(request):
             "error": {"code": -32600, "message": "Invalid Request"},
         }
     _last_request_time = time.monotonic()
-    method = request.get("method") or ""
-    params = request.get("params") or {}
     req_id = request.get("id")
+    method, params = _normalize_envelope(request)
 
     if method == "initialize":
         client_version = params.get("protocolVersion", SUPPORTED_PROTOCOL_VERSIONS[-1])
@@ -722,6 +745,12 @@ def handle_request(request):
                     "message": "Invalid params: 'name' is required for tools/call",
                 },
             }
+        if _tool_call_members_invalid(params):
+            return _json_rpc_error(
+                req_id,
+                -32602,
+                "Invalid params: 'name' must be a string and 'arguments' an object",
+            )
         tool_name = params.get("name")
         tool_args = params.get("arguments") or {}
         if tool_name not in TOOLS:
@@ -849,11 +878,7 @@ def handle_request(request):
     # Notifications (missing id) must never get a response
     if req_id is None:
         return None
-    return {
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "error": {"code": -32601, "message": f"Unknown method: {method}"},
-    }
+    return _unknown_method_error(req_id, request)
 
 
 def _restore_stdout():
@@ -1185,9 +1210,54 @@ def _start_idle_exit_watchdog() -> None:
     t.start()
 
 
-def _json_rpc_parse_error(req_id=None):
+def _json_rpc_error(req_id, code: int, message: str) -> dict:
     return {
         "jsonrpc": "2.0",
         "id": req_id,
-        "error": {"code": -32700, "message": "Parse error"},
+        "error": {"code": code, "message": message},
     }
+
+
+def _json_rpc_parse_error(req_id=None):
+    return _json_rpc_error(req_id, -32700, "Parse error")
+
+
+def _tool_call_members_invalid(params: dict) -> bool:
+    """True when `tools/call` params carry an unusable `name` / `arguments`.
+
+    The same `or {}` trap as the envelope, one level down: a truthy non-mapping
+    `arguments` survived the fallback and blew up on `**` unpacking, and an
+    unhashable `name` raised TypeError on the `in TOOLS` membership test.
+    """
+    name = params.get("name")
+    args = params.get("arguments")
+    return not isinstance(name, str) or not isinstance(args, (dict, type(None)))
+
+
+def _unknown_method_error(req_id, request: dict) -> dict:
+    """Name the real problem when `method` was coerced for dispatch.
+
+    A non-string method is mapped to "" so it lands on the long-standing
+    `method: null` path, but rendering that verbatim gives "Unknown method: "
+    with nothing after it, and makes 123 indistinguishable from "123".
+    """
+    raw_method = request.get("method")
+    if not isinstance(raw_method, str):
+        return _json_rpc_error(
+            req_id,
+            -32601,
+            f"Unknown method: expected a string, got {type(raw_method).__name__}",
+        )
+    return _json_rpc_error(req_id, -32601, f"Unknown method: {raw_method}")
+
+
+def _json_rpc_internal_error(req_id) -> dict:
+    """Dispatch-level failure.
+
+    Deliberately generic: unlike `_internal_tool_error`, which reports a known
+    handler's own exception text, this fires for arbitrary code paths whose
+    exception may name internal helpers or filesystem layout. `-32603` also
+    keeps the transport-level failure distinct from the `-32000` this module
+    already uses for application-level tool failures.
+    """
+    return _json_rpc_error(req_id, -32603, "Internal error")
