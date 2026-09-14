@@ -36,6 +36,58 @@ _EVENT_LIST_ORDER_FLAGS = frozenset(
         "FROM_START",
     }
 )
+_PQL_KEYS = frozenset(
+    {
+        "STREAM",
+        "ROOM",
+        "TOPIC",
+        "TYPE",
+        "STATUS",
+        "FROM",
+        "TO",
+        "LIMIT",
+        "SINCE",
+        "BEFORE",
+        "CORRELATION",
+        "ORDER",
+        "PROJECT",
+        "GOAL",
+        "BRANCH",
+        "BASE",
+        "DONE",
+        "CONTENT",
+        "KIND",
+        "TIMEOUT",
+        "AGENT",
+        "ID",
+        "BY",
+        "DIFF",
+        "EVENT_TYPE",
+        "SINCE_ID",
+        "BEFORE_ID",
+        "SINCE_CREATED_AT",
+        "BEFORE_CREATED_AT",
+        "WING",
+        "TITLE",
+        "DRAWER",
+        "CLOSET",
+        "DRAWER_ID",
+        "DOCUMENT",
+        "TEXT",
+        "SUBJECT",
+        "PREDICATE",
+        "OBJECT",
+        "OLD_OBJECT",
+        "NEW_OBJECT",
+        "ENDED",
+        "AT",
+        "DATE",
+        "VALID_FROM",
+        "VALID_TO",
+        "QUERY",
+        "DEPTH",
+    }
+)
 _KG_ADD_FLAGS = frozenset({"FROM", "TO", "VALID_FROM", "VALID_TO", "CLOSET", "DRAWER"})
 _KG_INVALIDATE_FLAGS = frozenset({"ENDED", "AT", "DATE"})
 _KG_SUPERSEDE_FLAGS = frozenset({"AT", "DATE"})
@@ -182,7 +234,11 @@ def _parse_key_value_tokens(
             and tokens[i + 1] != ":"
         ):
             nxt = tokens[i + 1]
-            if tok.upper() == "ORDER" or nxt.upper() not in active_bare_flags:
+            if (
+                isinstance(nxt, QuotedToken)
+                or tok.upper() in _PQL_KEYS
+                or nxt.upper() not in active_bare_flags
+            ):
                 k = tok.lower().strip()
                 if k:
                     result[k] = _parse_val(nxt)
@@ -1207,17 +1263,14 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
             else:
                 action = "event_list"
 
+        is_inbox = False
         action = action.lower()
         if action in ("task", "create_task", "task_create"):
             action = "task_create"
         elif action in ("event", "append_event", "event_append", "emit"):
             action = "event_append"
         elif action in ("events", "list_events", "event_list", "logstream", "inbox", "event_inbox"):
-            if action in ("inbox", "event_inbox"):
-                if "order" not in params:
-                    params["order"] = "desc"
-                if "preview" not in params:
-                    params["preview"] = True
+            is_inbox = action in ("inbox", "event_inbox")
             action = "event_list"
         elif action in ("ack", "event_ack"):
             action = "event_ack"
@@ -1231,6 +1284,34 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
             params["to_agent"] = params.pop("to")
         elif "to" in params:
             params.pop("to")
+        if "since_id" in params and "since_event_id" not in params:
+            params["since_event_id"] = str(params.pop("since_id"))
+        elif "since_id" in params:
+            params.pop("since_id")
+        if "since" in params and "since_event_id" not in params:
+            raw_since = str(params.pop("since"))
+            if _ISO_DATE_RE.match(raw_since):
+                params["since_created_at"] = raw_since
+            elif raw_since.startswith("evt_"):
+                params["since_event_id"] = raw_since
+        if "before_id" in params and "before_event_id" not in params:
+            params["before_event_id"] = str(params.pop("before_id"))
+        elif "before_id" in params:
+            params.pop("before_id")
+        if "before" in params and "before_event_id" not in params:
+            raw_before = str(params.pop("before"))
+            if raw_before.startswith("evt_"):
+                params["before_event_id"] = raw_before
+        if "correlation" in params and "correlation_id" not in params:
+            params["correlation_id"] = str(params.pop("correlation"))
+
+        if is_inbox:
+            has_cursor = bool(params.get("since_event_id"))
+            if "order" not in params and not has_cursor:
+                params["order"] = "desc"
+            if "preview" not in params:
+                params["preview"] = True
+
         if "order" in params and params["order"] is not None:
             params["order"] = str(params["order"]).lower().strip()
             if params["order"] in ("latest", "recent", "tail"):
@@ -1327,8 +1408,10 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
     is_inbox = first_tok == "INBOX" or (
         first_tok == "EVENT" and len(tokens) > 1 and tokens[1].upper() == "INBOX"
     )
-    if is_inbox or first_tok in ("LOGSTREAM", "EVENTS") or (
-        first_tok == "EVENT" and len(tokens) > 1 and tokens[1].upper() in ("LIST", "FIND")
+    if (
+        is_inbox
+        or first_tok in ("LOGSTREAM", "EVENTS")
+        or (first_tok == "EVENT" and len(tokens) > 1 and tokens[1].upper() in ("LIST", "FIND"))
     ):
         start_idx = 1 if first_tok in ("INBOX", "LOGSTREAM", "EVENTS") else 2
         kv = _parse_key_value_tokens(tokens[start_idx:], bare_flags=_EVENT_LIST_ORDER_FLAGS)
@@ -1346,21 +1429,6 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
                     kv["order"] = "asc"
         if "preview" in kv:
             kv["preview"] = bool(kv["preview"])
-
-        if is_inbox:
-            if "order" not in kv:
-                kv["order"] = "desc"
-            if "preview" not in kv:
-                kv["preview"] = True
-
-        if "order" in kv and kv["order"] is not None:
-            kv["order"] = str(kv["order"]).lower().strip()
-            if kv["order"] in ("latest", "recent", "tail"):
-                kv["order"] = "desc"
-            elif kv["order"] in ("head", "oldest", "from_start"):
-                kv["order"] = "asc"
-            if kv["order"] not in ("asc", "desc"):
-                raise QueryParseError(f"Invalid order '{kv['order']}'; must be 'asc' or 'desc'")
 
         if "from" in kv and "from_agent" not in kv:
             kv["from_agent"] = kv.pop("from")
@@ -1394,6 +1462,23 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
                 )
         if "correlation" in kv and "correlation_id" not in kv:
             kv["correlation_id"] = str(kv.pop("correlation"))
+
+        if is_inbox:
+            has_cursor = bool(kv.get("since_event_id"))
+            if "order" not in kv and not has_cursor:
+                kv["order"] = "desc"
+            if "preview" not in kv:
+                kv["preview"] = True
+
+        if "order" in kv and kv["order"] is not None:
+            kv["order"] = str(kv["order"]).lower().strip()
+            if kv["order"] in ("latest", "recent", "tail"):
+                kv["order"] = "desc"
+            elif kv["order"] in ("head", "oldest", "from_start"):
+                kv["order"] = "asc"
+            if kv["order"] not in ("asc", "desc"):
+                raise QueryParseError(f"Invalid order '{kv['order']}'; must be 'asc' or 'desc'")
+
         return "event_list", kv
 
     # --- Event Wait ---
