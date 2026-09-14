@@ -49,7 +49,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   timestamps, so re-exporting an unchanged palace is a zero git diff — and `import <dir>` merges an
   export into another machine's palace by drawer id: adds new drawers, skips existing ones, idempotent
   on re-import, and re-embeds locally since exports deliberately carry no vectors. `--format markdown`
-  exposes the existing browsable markdown exporter on the CLI for the first time. (#452)
+  exposes the existing browsable markdown exporter on the CLI for the first time. `import` follows
+  the CLI write-routing policy (`--daemon` / `--direct`, #2033) like `mine` and `sync`. (#452)
 
 ### Bug Fixes
 

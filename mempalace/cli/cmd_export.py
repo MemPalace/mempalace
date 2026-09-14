@@ -37,12 +37,28 @@ def cmd_import(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     input_dir = os.path.expanduser(args.dir)
 
-    from ..importer import import_palace
-    from ..palace import MineAlreadyRunning
+    # Routed like `mine`, dry runs included: the dry_run flag travels in the
+    # payload, and a dry run never opens the palace wherever it executes.
+    routing = _resolve_cli_write_routing_or_exit(args, "import")
 
     print(f"\n{'=' * 55}")
     print("  Importing palace export" + (" (dry run)" if args.dry_run else ""))
     print(f"{'=' * 55}\n")
+
+    if routing.use_daemon:
+        _submit_daemon_cli_job(
+            "import",
+            # Absolute: the daemon resolves paths against its own cwd (#2467).
+            {"input_dir": os.path.abspath(input_dir), "dry_run": args.dry_run},
+            args,
+            background=bool(getattr(args, "background", False)),
+            auto_start=routing.decision.auto_start_daemon,
+        )
+        return
+
+    from ..importer import import_palace
+    from ..palace import MineAlreadyRunning
+
     try:
         import_palace(palace_path, input_dir, dry_run=args.dry_run)
     except MineAlreadyRunning as exc:

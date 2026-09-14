@@ -324,6 +324,7 @@ def main():
     )
 
     # search
+    add_cli_write_routing_flags(p_import)
     p_search = sub.add_parser("search", help="Find anything, exact words")
     p_search.add_argument("query", help="What to search for")
     p_search.add_argument(
