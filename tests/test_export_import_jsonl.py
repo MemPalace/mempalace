@@ -459,6 +459,42 @@ def test_cli_export_then_import_round_trips(monkeypatch):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_cli_import_reports_held_lease_without_traceback(monkeypatch, capsys):
+    """A palace already being written refuses the import with a message, not a traceback."""
+    import contextlib
+    import sys
+
+    import mempalace.importer as importer_mod
+    from mempalace.cli import main
+    from mempalace.palace import MineAlreadyRunning
+
+    @contextlib.contextmanager
+    def _held(_palace_path):
+        raise MineAlreadyRunning("palace is being written by pid 4242")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(importer_mod, "mine_palace_lock", _held)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    tmpdir = tempfile.mkdtemp()
+    try:
+        export_dir = Path(tmpdir) / "export" / "wing"
+        export_dir.mkdir(parents=True)
+        line = {"id": "d-1", "document": "hello", "metadata": {"wing": "w"}}
+        (export_dir / "room.jsonl").write_text(json.dumps(line) + "\n", encoding="utf-8")
+        palace_path = os.path.join(tmpdir, "palace")
+        monkeypatch.setattr(
+            sys, "argv", ["mempalace", "--palace", palace_path, "import", str(export_dir.parent)]
+        )
+        try:
+            main()
+            raise AssertionError("expected SystemExit")
+        except SystemExit as exc:
+            assert exc.code == 1
+        assert "pid 4242" in capsys.readouterr().err
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_cli_export_default_output_follows_config_dir(monkeypatch):
     """Without --output, export lands in the XDG-aware config dir, not a fixed ~/.mempalace."""
     import sys

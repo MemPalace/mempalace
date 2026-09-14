@@ -38,12 +38,19 @@ def cmd_import(args):
     input_dir = os.path.expanduser(args.dir)
 
     from ..importer import import_palace
+    from ..palace import MineAlreadyRunning
 
     print(f"\n{'=' * 55}")
     print("  Importing palace export" + (" (dry run)" if args.dry_run else ""))
     print(f"{'=' * 55}\n")
     try:
         import_palace(palace_path, input_dir, dry_run=args.dry_run)
+    except MineAlreadyRunning as exc:
+        # The writer lease is non-blocking: a mine or MCP server already writing
+        # this palace refuses the import. Name the holder and exit non-zero, as
+        # `mine` and `sync` do, rather than surfacing a traceback.
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
     except ValueError as exc:
         print(f"  ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
