@@ -1197,7 +1197,7 @@ def _parse_kg_supersede_tokens(tokens: List[str]) -> Dict[str, Any]:
 # ==============================================================================
 
 
-def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # noqa: C901
+def parse_coordinate_input(input_data: Any, _internal: bool = False) -> Tuple[str, Dict[str, Any]]:  # noqa: C901
     """
     Parse input to `palace_coordinate`.
 
@@ -1222,13 +1222,9 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
                     "PEERS",
                     "MESH",
                 ):
-                    v_tokens = tokenize_dsl(v_strip)
-                    first_w = v_tokens[0].upper() if v_tokens else ""
-                    is_inbox_cmd = first_w == "INBOX" or (
-                        first_w == "EVENT" and len(v_tokens) > 1 and v_tokens[1].upper() == "INBOX"
-                    )
-                    op, parsed_p = parse_coordinate_input(v_strip)
+                    op, parsed_p = parse_coordinate_input(v_strip, _internal=True)
                     sibling_has_explicit_order = "order" in params
+                    is_implicit_order = parsed_p.pop("_implicit_inbox_order", False)
 
                     for pk, pv in params.items():
                         if pk in (k, "action", "target"):
@@ -1259,19 +1255,11 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
                             parsed_p["since_event_id"] = raw_since
 
                     has_cursor = bool(parsed_p.get("since_event_id"))
-                    inner_has_explicit_order = any(
-                        t.upper() in _EVENT_LIST_ORDER_FLAGS
-                        or t.upper() == "ORDER"
-                        or t.upper().startswith("ORDER:")
-                        for t in v_tokens
-                    )
-                    if (
-                        is_inbox_cmd
-                        and has_cursor
-                        and not sibling_has_explicit_order
-                        and not inner_has_explicit_order
-                    ):
-                        parsed_p.pop("order", None)
+                    if is_implicit_order and not sibling_has_explicit_order:
+                        if has_cursor:
+                            parsed_p.pop("order", None)
+                        elif _internal:
+                            parsed_p["_implicit_inbox_order"] = True
 
                     if "order" in parsed_p and parsed_p["order"] is not None:
                         parsed_p["order"] = str(parsed_p["order"]).lower().strip()
@@ -1285,6 +1273,8 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
                             )
                     if "preview" in parsed_p:
                         parsed_p["preview"] = bool(parsed_p["preview"])
+                    if not _internal:
+                        parsed_p.pop("_implicit_inbox_order", None)
                     return op, parsed_p
         action = params.pop("action", None) or params.pop("target", None)
         if not action:
@@ -1351,6 +1341,8 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
             has_cursor = bool(params.get("since_event_id"))
             if "order" not in params and not has_cursor:
                 params["order"] = "desc"
+                if _internal:
+                    params["_implicit_inbox_order"] = True
             if "preview" not in params:
                 params["preview"] = True
 
@@ -1374,13 +1366,15 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
             params["content"] = params.pop("diff")
         elif "diff" in params:
             params.pop("diff")
+        if not _internal:
+            params.pop("_implicit_inbox_order", None)
         return action, params
 
     if isinstance(input_data, str) and input_data.strip().startswith("{"):
         try:
             d = json.loads(input_data)
             if isinstance(d, dict):
-                return parse_coordinate_input(d)
+                return parse_coordinate_input(d, _internal=_internal)
         except Exception:
             pass
 
@@ -1509,6 +1503,8 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
             has_cursor = bool(kv.get("since_event_id"))
             if "order" not in kv and not has_cursor:
                 kv["order"] = "desc"
+                if _internal:
+                    kv["_implicit_inbox_order"] = True
             if "preview" not in kv:
                 kv["preview"] = True
 
@@ -1521,6 +1517,8 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
             if kv["order"] not in ("asc", "desc"):
                 raise QueryParseError(f"Invalid order '{kv['order']}'; must be 'asc' or 'desc'")
 
+        if not _internal:
+            kv.pop("_implicit_inbox_order", None)
         return "event_list", kv
 
     # --- Event Wait ---
