@@ -23,9 +23,12 @@ Malformed input is counted and reported, never fatal: a partially corrupted
 export should import everything that survives, loudly. Non-scalar metadata
 values are dropped rather than treated as malformed, but they are COUNTED and
 reported in ``metadata_dropped``. The drop is a property of this import path,
-not of every backend — Chroma rejects non-scalars at write time, ``sqlite_exact``
-does not, so an export taken from a palace that allowed nested metadata loses
-it here and the operator is told rather than left to discover it.
+not a backend limit: it keeps the flat-scalar contract mempalace's own writers
+follow (``sources.base.DrawerRecord``), while the local backends store more —
+Chroma takes non-empty lists of one scalar type, ``sqlite_exact`` any JSON
+value — so an export of a
+palace written outside that contract loses those values here and the operator
+is told rather than left to discover it.
 
 Non-regular entries carrying a ``.jsonl`` name — a FIFO, socket, device node
 or directory — are refused by type rather than opened, so an import never
@@ -46,8 +49,9 @@ import stat
 
 from .palace import get_collection, mine_palace_lock
 
-# Chroma metadata values must be scalars; anything else on a line is dropped
-# rather than failing the whole import.
+# The flat-scalar metadata contract (``sources.base.DrawerRecord``). Values a
+# backend stored beyond it — a Chroma list, a ``sqlite_exact`` null or nested
+# object — are dropped and counted rather than failing the whole import.
 _SCALAR_TYPES = (str, int, float, bool)
 
 _ADD_BATCH_SIZE = 500
@@ -117,11 +121,11 @@ def _sanitize_metadata(meta):
     """Keep only scalar-valued metadata entries; guarantee a non-empty dict.
 
     Returns ``(clean, dropped)``. ``dropped`` is reported rather than
-    discarded silently: Chroma rejects non-scalars at write time, but it is
-    not the only backend — ``sqlite_exact`` serializes metadata with an
-    unrestricted ``json.dumps``, so a palace on that backend can hold a list
-    or a nested dict, the exporter writes it out raw, and this filter would
-    otherwise drop it on the way back in without a word. A lossy round trip
+    discarded silently: Chroma stores non-empty lists of one scalar type, and
+    ``sqlite_exact`` serializes metadata with an unrestricted ``json.dumps``,
+    so a palace can hold a list, a null or a nested dict, the exporter writes
+    it out raw, and this filter would otherwise drop it on the way back in
+    without a word. A lossy round trip
     is a legitimate outcome; a lossy round trip nobody is told about is not.
 
     The drop is a property of THIS import path, not of every backend — do not
@@ -292,8 +296,9 @@ def _import_into(col, jsonl_files, input_dir, dry_run: bool) -> dict:
     if stats["metadata_dropped"]:
         print(
             f"  Note: {stats['metadata_dropped']} metadata value(s) were dropped — "
-            f"this import path stores scalar values only. An export taken from a "
-            f"backend that allows nested metadata does not round-trip them here."
+            f"this import path keeps flat scalar values only (str/int/float/bool). "
+            f"List, null or nested values a backend stored, and a metadata field "
+            f"that is not an object at all, do not round-trip."
         )
     if stats["imported"] and not dry_run:
         print(

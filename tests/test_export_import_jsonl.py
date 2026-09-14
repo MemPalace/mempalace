@@ -256,9 +256,9 @@ def test_import_refuses_entries_outside_the_tree():
 def test_import_reports_dropped_non_scalar_metadata():
     """Non-scalar metadata is dropped, but never silently.
 
-    Chroma rejects non-scalars at write time, but `sqlite_exact` serializes
-    metadata with an unrestricted json.dumps — so a palace on that backend can
-    hold a list, the exporter writes it out raw, and this filter drops it on
+    Chroma stores non-empty lists of one scalar type and `sqlite_exact` serializes
+    metadata with an unrestricted json.dumps — so a palace can hold a list or
+    a nested dict, the exporter writes it out raw, and this filter drops it on
     the way back in. That is a legitimate lossy round trip; an unreported one
     is not.
     """
