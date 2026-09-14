@@ -59,6 +59,16 @@ _PQL_KEYS = frozenset(
         "KIND",
         "TIMEOUT",
         "AGENT",
+        "TO_AGENT",
+        "FROM_AGENT",
+        "CORRELATION_ID",
+        "SINCE_EVENT_ID",
+        "BEFORE_EVENT_ID",
+        "BASE_COMMIT",
+        "TIMEOUT_MS",
+        "CREATED_BY",
+        "EVENT_ID",
+        "ARTIFACT_ID",
         "ID",
         "BY",
         "DIFF",
@@ -1212,7 +1222,14 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
                     "PEERS",
                     "MESH",
                 ):
+                    v_tokens = tokenize_dsl(v_strip)
+                    first_w = v_tokens[0].upper() if v_tokens else ""
+                    is_inbox_cmd = first_w == "INBOX" or (
+                        first_w == "EVENT" and len(v_tokens) > 1 and v_tokens[1].upper() == "INBOX"
+                    )
                     op, parsed_p = parse_coordinate_input(v_strip)
+                    sibling_has_explicit_order = "order" in params
+
                     for pk, pv in params.items():
                         if pk in (k, "action", "target"):
                             continue
@@ -1228,8 +1245,33 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
                             parsed_p["type"] = pv
                         elif pk == "diff" and op == "patch_submit":
                             parsed_p["content"] = pv
+                        elif pk == "since_id":
+                            parsed_p["since_event_id"] = str(pv)
                         else:
                             parsed_p[pk] = pv
+
+                    # Alias cleanups for merged params
+                    if "since" in parsed_p and "since_event_id" not in parsed_p:
+                        raw_since = str(parsed_p.pop("since"))
+                        if _ISO_DATE_RE.match(raw_since):
+                            parsed_p["since_created_at"] = raw_since
+                        elif raw_since.startswith("evt_"):
+                            parsed_p["since_event_id"] = raw_since
+
+                    has_cursor = bool(parsed_p.get("since_event_id"))
+                    inner_has_explicit_order = any(
+                        t.upper() in _EVENT_LIST_ORDER_FLAGS
+                        or t.upper() == "ORDER"
+                        or t.upper().startswith("ORDER:")
+                        for t in v_tokens
+                    )
+                    if (
+                        is_inbox_cmd
+                        and has_cursor
+                        and not sibling_has_explicit_order
+                        and not inner_has_explicit_order
+                    ):
+                        parsed_p.pop("order", None)
 
                     if "order" in parsed_p and parsed_p["order"] is not None:
                         parsed_p["order"] = str(parsed_p["order"]).lower().strip()
