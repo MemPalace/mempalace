@@ -576,6 +576,7 @@ def test_a_rename_the_directory_refuses_falls_back(tmp_path, monkeypatch, capsys
     assert leftovers == [], leftovers
 
 
+@needs_unprivileged_posix
 def test_eperm_on_both_names_falls_back_too(tmp_path, monkeypatch, capsys):
     """``EPERM`` reaches the gate from a filesystem that refuses the operation
     rather than the caller, an NFS export among them. It belongs beside

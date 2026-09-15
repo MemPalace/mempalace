@@ -624,6 +624,40 @@ def test_chroma_client_rebuild_closes_displaced_client(tmp_path, monkeypatch):
         backend.close()
 
 
+def test_chroma_client_rebuild_stops_each_displaced_system(tmp_path, monkeypatch):
+    """#2375: every external-change rebuild must stop its displaced System."""
+    from chromadb.config import System
+
+    stopped = []
+    original_stop = System.stop
+
+    def recording_stop(system, *args, **kwargs):
+        stopped.append(system)
+        return original_stop(system, *args, **kwargs)
+
+    monkeypatch.setattr(System, "stop", recording_stop)
+
+    palace_path = tmp_path / "palace"
+    backend = ChromaBackend()
+    displaced_systems = []
+
+    try:
+        client = backend._client(str(palace_path))
+        db_file = palace_path / "chroma.sqlite3"
+        assert db_file.is_file()
+
+        for _ in range(3):
+            displaced_systems.append(client._system)
+            st = db_file.stat()
+            os.utime(db_file, (st.st_atime, st.st_mtime + 60))
+            client = backend._client(str(palace_path))
+
+        assert stopped == displaced_systems
+        assert client._system not in displaced_systems
+    finally:
+        backend.close()
+
+
 def test_base_collection_update_default_rejects_mismatched_lengths():
     """The ABC default update() raises ValueError rather than silently misaligning."""
     from mempalace.backends.base import BaseCollection
@@ -635,6 +669,165 @@ def test_base_collection_update_default_rejects_mismatched_lengths():
 
     with pytest.raises(ValueError, match="metadatas length"):
         BaseCollection.update(collection, ids=["1", "2"], metadatas=[{"k": 9}])
+
+
+class _PagedCollection:
+    """Minimal collection exposing only ``get`` with real limit/offset paging."""
+
+    def __init__(self, records):
+        self._records = records
+        self.calls = []
+
+    def get(self, *, ids=None, where=None, limit=None, offset=None, include=None, **kwargs):
+        self.calls.append({"where": where, "limit": limit, "offset": offset, "include": include})
+        rows = self._records
+        if where:
+            rows = [r for r in rows if all(r[1].get(k) == v for k, v in where.items())]
+        start = offset or 0
+        end = start + (limit if limit is not None else len(rows))
+        page = rows[start:end]
+        return GetResult(
+            ids=[r[0] for r in page],
+            documents=[r[2] for r in page],
+            metadatas=[r[1] for r in page],
+        )
+
+
+def _recent(collection, **kwargs):
+    from mempalace.backends.base import BaseCollection
+
+    return BaseCollection.get_recent(collection, **kwargs)
+
+
+def test_base_get_recent_default_sorts_window_newest_first():
+    """The ABC default scans a window and sorts it locally by filed_at."""
+    col = _PagedCollection(
+        [
+            ("a", {"filed_at": "2024-01-01T00:00:00Z"}, "oldest"),
+            ("b", {"filed_at": "2026-08-06T00:00:00Z"}, "newest"),
+            ("c", {"filed_at": "2025-05-05T00:00:00Z"}, "middle"),
+        ]
+    )
+    page = _recent(col, limit=10)
+    assert page.ids == ["b", "c", "a"]
+    assert page.documents == ["newest", "middle", "oldest"]
+
+
+def test_base_get_recent_default_sorts_missing_field_last():
+    col = _PagedCollection(
+        [
+            ("a", {}, "undated"),
+            ("b", {"filed_at": ""}, "empty"),
+            ("c", {"filed_at": 20260806}, "not-a-string"),
+            ("d", {"filed_at": "2025-01-01T00:00:00Z"}, "dated"),
+        ]
+    )
+    assert _recent(col, limit=10).ids[0] == "d"
+    assert set(_recent(col, limit=10).ids[1:]) == {"a", "b", "c"}
+
+
+def test_base_get_recent_default_window_is_capped_at_limit():
+    """The default is approximate above ``limit``: it only sees the first window.
+
+    This is exactly the scan-order limitation documented on #1630 — a backend
+    that can push ORDER BY into storage overrides the method to fix it.
+    """
+    records = [("old%d" % i, {"filed_at": "2020-01-01T00:00:00Z"}, "old") for i in range(1200)]
+    records.append(("newest", {"filed_at": "2026-08-06T00:00:00Z"}, "the newest drawer"))
+    col = _PagedCollection(records)
+
+    page = _recent(col, limit=1000)
+
+    assert len(page.ids) == 1000
+    assert "newest" not in page.ids
+    # Paged in 500-record batches rather than one giant fetch.
+    assert [c["limit"] for c in col.calls] == [500, 500]
+    assert [c["offset"] for c in col.calls] == [0, 500]
+
+
+def test_base_get_recent_default_passes_where_and_zero_limit():
+    col = _PagedCollection(
+        [
+            ("a", {"wing": "x", "filed_at": "2024-01-01T00:00:00Z"}, "x drawer"),
+            ("b", {"wing": "y", "filed_at": "2026-01-01T00:00:00Z"}, "y drawer"),
+        ]
+    )
+    page = _recent(col, limit=10, where={"wing": "x"})
+    assert page.ids == ["a"]
+    assert col.calls[0]["where"] == {"wing": "x"}
+
+    assert _recent(col, limit=0).ids == []
+
+
+def test_base_get_recent_default_honours_include_projection():
+    """Unrequested projections come back empty, as they do from ``get``.
+
+    ``metadatas`` is fetched from the backend regardless because the local
+    sort reads ``order_field`` out of it, but it is only returned when the
+    caller asked for it. Without that, a backend without recency pushdown
+    would answer ``include=["metadatas"]`` with a list of padding strings
+    while pgvector answers with ``[]``.
+    """
+
+    class _ProjectingCollection:
+        """Honours ``include`` the way the real backends do."""
+
+        def __init__(self):
+            self.calls = []
+
+        def get(self, *, include=None, limit=None, offset=None, **kwargs):
+            self.calls.append(list(include or []))
+            if offset:
+                return GetResult(ids=[], documents=[], metadatas=[])
+            keys = set(include or [])
+            return GetResult(
+                ids=["a", "b"],
+                documents=["older", "newer"] if "documents" in keys else [],
+                metadatas=(
+                    [
+                        {"filed_at": "2024-01-01T00:00:00Z"},
+                        {"filed_at": "2026-01-01T00:00:00Z"},
+                    ]
+                    if "metadatas" in keys
+                    else []
+                ),
+            )
+
+    col = _ProjectingCollection()
+    page = _recent(col, limit=5, include=["metadatas"])
+    assert page.ids == ["b", "a"]
+    assert page.documents == []
+    assert page.metadatas == [
+        {"filed_at": "2026-01-01T00:00:00Z"},
+        {"filed_at": "2024-01-01T00:00:00Z"},
+    ]
+
+    col = _ProjectingCollection()
+    page = _recent(col, limit=5, include=["documents"])
+    # metadatas are fetched anyway so the sort has order_field to read...
+    assert "metadatas" in col.calls[0]
+    # ...which is why the newest document leads, but they are not returned.
+    assert page.documents == ["newer", "older"]
+    assert page.metadatas == []
+
+
+def test_base_get_recent_default_accepts_dict_shaped_get():
+    """Collections still returning Chroma-shaped dicts page correctly."""
+
+    class _DictCollection:
+        def get(self, **kwargs):
+            if kwargs.get("offset"):
+                return {"ids": [], "documents": [], "metadatas": []}
+            return {
+                "ids": ["a", "b"],
+                "documents": ["older", "newer"],
+                "metadatas": [
+                    {"filed_at": "2024-01-01T00:00:00Z"},
+                    {"filed_at": "2026-01-01T00:00:00Z"},
+                ],
+            }
+
+    assert _recent(_DictCollection(), limit=5).documents == ["newer", "older"]
 
 
 def test_chroma_backend_accepts_palace_ref_kwarg(tmp_path):
@@ -2030,64 +2223,80 @@ def test_chroma_backend_requarantines_after_inode_replacement(tmp_path, monkeypa
 
 
 def test_chroma_backend_resets_system_cache_on_inode_change(tmp_path, monkeypatch):
-    """#2028: ``_client`` must drop chromadb's path-keyed ``SharedSystemClient``
-    cache *before* reconstructing ``PersistentClient`` on an inode/mtime change.
-
-    chromadb caches its ``System`` (and live HNSW segment) keyed by path, so a
-    bare reopen reuses the stale segment and persists an outdated index over a
-    peer/rebuild's on-disk changes -- the #2002 data-loss class reached via
-    ``_client`` instead of ``mcp_server._get_client``. The reset must fire only
-    on a genuine external change (not first open) and must precede the reopen.
-    """
+    """#2028/#2375: drain owned clients, clear the cache, then reopen."""
     palace = tmp_path / "palace"
     palace.mkdir()
     (palace / "chroma.sqlite3").write_text("")
-
+    other_palace = tmp_path / "other-palace"
     events = []
 
-    # Neutralize the on-disk HNSW pre-checks so the test exercises only the
-    # cache-reset / client-rebuild ordering.
-    for _name in (
+    # Neutralize the on-disk HNSW pre-checks so this test exercises only the
+    # client-close / cache-reset / client-rebuild ordering.
+    for name in (
         "_fix_missing_collection_type",
         "_fix_blob_seq_ids",
         "quarantine_invalid_hnsw_metadata",
         "quarantine_stale_hnsw",
     ):
-        monkeypatch.setattr(f"mempalace.backends.chroma.{_name}", lambda path, *a, **k: [])
+        monkeypatch.setattr(
+            f"mempalace.backends.chroma.{name}",
+            lambda path, *args, **kwargs: [],
+        )
 
     monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
 
     class DummyClient:
-        pass
+        def __init__(self, label):
+            self.label = label
 
-    def _record_open(path):
+        def close(self):
+            events.append(("close", self.label))
+
+    def record_open(path):
         events.append(("open", path))
-        return DummyClient()
+        return DummyClient(path)
 
-    monkeypatch.setattr("mempalace.backends.chroma.chromadb.PersistentClient", _record_open)
+    monkeypatch.setattr(
+        "mempalace.backends.chroma.chromadb.PersistentClient",
+        record_open,
+    )
 
     from chromadb.api.client import SharedSystemClient
 
-    def _record_clear(*args, **kwargs):
+    def record_clear(*args, **kwargs):
         events.append(("clear", None))
 
-    monkeypatch.setattr(SharedSystemClient, "clear_system_cache", _record_clear)
+    monkeypatch.setattr(
+        SharedSystemClient,
+        "clear_system_cache",
+        record_clear,
+    )
 
     backend = ChromaBackend()
-    # ``_db_stat`` is called twice per ``_client`` call (freshness check, then
-    # re-stat after reopen). Same inode on the first call (first open, no prior
-    # freshness -> no reset), changed inode on the second (external change).
+
+    # _db_stat is called before each decision and after each open. The second
+    # call observes an external inode change.
     stats = iter([(1, 1.0), (1, 1.0), (2, 2.0), (2, 2.0)])
     monkeypatch.setattr(backend, "_db_stat", lambda path: next(stats))
 
-    backend._client(str(palace))  # first open: no external change -> no clear
-    backend._client(str(palace))  # inode 1 -> 2: clear, then reopen
+    try:
+        backend._client(str(palace))
+        backend._clients[str(other_palace)] = DummyClient(str(other_palace))
+        backend._freshness[str(other_palace)] = (7, 7.0)
 
-    assert events == [
-        ("open", str(palace)),  # first open, no cache reset
-        ("clear", None),  # #2028: reset fires on the inode change...
-        ("open", str(palace)),  # ...strictly before the PersistentClient reopen
-    ], events
+        backend._client(str(palace))
+
+        assert events == [
+            ("open", str(palace)),
+            ("close", str(palace)),
+            ("close", str(other_palace)),
+            ("clear", None),
+            ("open", str(palace)),
+        ]
+        assert set(backend._clients) == {str(palace)}
+        assert set(backend._freshness) == {str(palace)}
+    finally:
+        backend.close()
 
 
 def test_explain_ef_mismatch_recognizes_chromadb_conflict():

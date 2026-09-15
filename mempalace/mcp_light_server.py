@@ -75,6 +75,7 @@ _PQL_KEYWORDS = {
     "EVENT",
     "EVENTS",
     "LOGSTREAM",
+    "INBOX",
     "ARTIFACT",
     "PATCH",
     "PEERS",
@@ -386,10 +387,12 @@ LIGHT_TOOLS = {
     "palace_query": {
         "description": (
             "Unified Palace Query Engine. Retrieve memories, taxonomy, knowledge graph facts/timelines, "
-            "tunnels, hallways, agent diaries, and palace status. "
+            "tunnels, hallways, agent diaries, palace status, and graph statistics. "
+            "Use palace_query for ALL read-only queries, inspections, status checks, and diary reads. "
+            "NEVER use palace_coordinate for reads or queries. "
             "Accepts a concise PQL DSL query string (e.g. 'FIND \"terms\" IN wing/room LIMIT 5', "
             "'TAXONOMY', 'KG Max AS OF 2026-04-01', 'TRAVERSE auth-flow HOPS 2', 'DIARY agent LAST 5', "
-            "'STATUS') or a structured dict payload."
+            "'STATUS') or a structured dict payload (e.g. {'target': 'search', 'query': 'terms', 'wing': 'patient_1042', 'room': 'labs', 'limit': 5})."
         ),
         "input_schema": {
             "type": "object",
@@ -470,6 +473,8 @@ LIGHT_TOOLS = {
             "Unified Palace Execution Engine. Add/update/delete drawers, batch checkpoint, knowledge graph "
             "fact lifecycle (add/invalidate/supersede), cross-wing tunnels, hallways, mining, sync, agent "
             "diaries, and maintenance. "
+            "IMPORTANT: Use palace_exec ONLY for intentional, authorized mutations. Drafting, proposing, "
+            "checking, reading, or explaining must NEVER call palace_exec. "
             "Accepts a concise command DSL string (e.g. 'ADD IN backend/auth \"content\"', "
             "'DELETE DRAWER drw_123', 'KG ADD Max -> loves -> chess', 'KG SUPERSEDE Max -> grade: 6 => 7', "
             "'MINE /path MODE projects', 'SYNC APPLY', 'RECONNECT') or a structured dict payload."
@@ -493,7 +498,19 @@ LIGHT_TOOLS = {
                 "room": {"type": "string", "description": "Target room (optional)"},
                 "content": {
                     "type": "string",
-                    "description": "Verbatim content to store/update (optional)",
+                    "description": "Verbatim content to store/update (optional; also accepted for diary_write)",
+                },
+                "agent_name": {
+                    "type": "string",
+                    "description": "Agent name for diary_write (required when action is diary_write)",
+                },
+                "entry": {
+                    "type": "string",
+                    "description": "Diary entry text for diary_write (required when action is diary_write; content also accepted)",
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "Topic category for diary_write (optional, default: 'general')",
                 },
                 "drawer_id": {
                     "type": "string",
@@ -507,20 +524,27 @@ LIGHT_TOOLS = {
                 "source": {"type": "string", "description": "Source path for mine (optional)"},
                 "subject": {
                     "type": "string",
-                    "description": "Subject for KG operations (optional)",
+                    "description": "Subject for KG operations (required for kg_add, kg_invalidate, kg_supersede)",
                 },
                 "predicate": {
                     "type": "string",
-                    "description": "Predicate for KG operations (optional)",
+                    "description": "Predicate for KG operations (required for kg_add, kg_invalidate, kg_supersede)",
                 },
-                "object": {"type": "string", "description": "Object for KG operations (optional)"},
+                "object": {
+                    "type": "string",
+                    "description": "Object for KG operations (required for kg_add, kg_invalidate)",
+                },
                 "old_object": {
                     "type": "string",
-                    "description": "Old object for KG supersede (optional)",
+                    "description": "Old object being replaced for KG supersede (required for kg_supersede)",
                 },
                 "new_object": {
                     "type": "string",
-                    "description": "New object for KG supersede (optional)",
+                    "description": "New replacement object for KG supersede (required for kg_supersede)",
+                },
+                "at": {
+                    "type": "string",
+                    "description": "Boundary instant for KG supersede (ISO date or datetime, optional; defaults to now UTC)",
                 },
                 "source_file": {
                     "type": "string",
@@ -552,24 +576,26 @@ LIGHT_TOOLS = {
         "description": (
             "Unified Multi-Agent Coordination Engine (RFC 003 / RFC 005). Immutable task delegation, "
             "logstream event append/list/wait/ack, artifact put/get, patch submission, and mesh estate snapshot. "
+            "DO NOT use for reading memories, viewing status, checking graph stats, or querying diaries (use palace_query instead). "
             "Accepts a concise coordination DSL string (e.g. 'TASK CREATE project:mempalace from:agent1 "
             'to:agent2 goal:"fix" branch:b base:c done:"done"\', \'EVENT APPEND type:task.request ...\', '
-            "'EVENT LIST stream:project/x ...', 'EVENT WAIT correlation:task_1', 'EVENT ACK id:evt_1 "
-            "from:agent1 status:applied', 'ARTIFACT PUT kind:patch ...', 'PATCH SUBMIT ...', 'MESH PEERS') "
-            "or a structured dict payload."
+            "'EVENT INBOX to:agent', 'EVENT LIST stream:project/x [DESC|ASC] [LIMIT n] [PREVIEW]', "
+            "'EVENT WAIT correlation:task_1', 'EVENT ACK id:evt_1 from:agent1 status:applied', "
+            "'ARTIFACT PUT kind:patch ...', 'PATCH SUBMIT ...', 'MESH PEERS') "
+            "or a structured dict payload. EVENT LIST defaults to newest-first (order='desc') when no cursor is passed."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "Coordination DSL string (e.g. 'TASK CREATE project:x ...')",
+                    "description": "Coordination DSL string (e.g. 'TASK CREATE project:x ...', 'EVENT INBOX to:agent', 'EVENT LIST stream:project/x DESC')",
                 },
                 "action": {
                     "type": "string",
                     "description": (
                         "Action: task_create, event_append, event_list, event_wait, event_ack, "
-                        "artifact_put, artifact_get, patch_submit, mesh_peers"
+                        "artifact_put, artifact_get, patch_submit, mesh_peers, inbox"
                     ),
                 },
                 "project": {"type": "string", "description": "Project routing name (optional)"},
@@ -590,11 +616,27 @@ LIGHT_TOOLS = {
                 "event_id": {"type": "string", "description": "Event ID to ack (optional)"},
                 "since_event_id": {
                     "type": "string",
-                    "description": "Resume cursor: events after this id (optional)",
+                    "description": "Resume cursor: events strictly after this id in append order (optional)",
                 },
                 "before_event_id": {
                     "type": "string",
-                    "description": "Page backward: events before this id (optional)",
+                    "description": "Page backward: events strictly before this id in append order (optional)",
+                },
+                "since_created_at": {
+                    "type": "string",
+                    "description": "Time window filter, inclusive: events created at or after this timestamp (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional). NOT a resume cursor — use since_event_id for that.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max events to return (default 50, max 500, optional)",
+                },
+                "order": {
+                    "type": "string",
+                    "description": "'desc' (newest first, default without cursor) or 'asc' (forward chronological, default with since_event_id, optional)",
+                },
+                "preview": {
+                    "type": "boolean",
+                    "description": "Truncate each event body to short excerpt (marks body_truncated + body_length) so scanning stays cheap (default false)",
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -833,6 +875,10 @@ def _alias_args_for_handler(handler, params: Dict[str, Any]) -> Dict[str, Any]:
         mapped["project_dir"] = mapped.pop("project")
     if "valid_to" in mapped and "ended" in names and "ended" not in mapped:
         mapped["ended"] = mapped.pop("valid_to")
+    if "old" in mapped and "old_object" in names and "old_object" not in mapped:
+        mapped["old_object"] = mapped.pop("old")
+    if "new" in mapped and "new_object" in names and "new_object" not in mapped:
+        mapped["new_object"] = mapped.pop("new")
     has_var_keyword = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in names.values())
     if has_var_keyword:
         return mapped
@@ -942,7 +988,12 @@ def dispatch_light_stdio_request(request: Dict[str, Any]) -> Optional[Dict[str, 
         if rewritten is not None:
             forwarded = {k: v for k, v in rewritten.items() if not k.startswith("_")}
             underlying = ((forwarded.get("params") or {}).get("name")) or ""
-            refusal = mcp_server._mcp_tool_preflight_refusal(request.get("id"), underlying)
+            # The destination owns the lease: hub forwarding must not first
+            # compete for the hub's local writer lock. Local dispatch still
+            # runs the full gate inside handle_request, as does the hub.
+            refusal = mcp_server._mcp_tool_preflight_refusal(
+                request.get("id"), underlying, check_writer=False
+            )
             if refusal is not None:
                 return refusal
             try:

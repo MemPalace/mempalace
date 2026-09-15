@@ -1480,3 +1480,308 @@ def test_sqlite_exact_source_file_index_used_for_equality_get(tmp_path):
     plan_text = " ".join(str(row[-1]) for row in plan)
     assert _SOURCE_FILE_INDEX in plan_text, plan_text
     assert "idx_documents_collection" not in plan_text
+
+
+@pytest.mark.parametrize("k", [0, 1, 3, 8, 12])
+def test_top_k_preserves_stable_cutoff_ties(tmp_path, k):
+    backend, col = _collection(tmp_path)
+    try:
+        ids = [str(i) for i in range(8)]
+        col.add(ids=ids, documents=ids, embeddings=[[1.0, 0.0]] * 8)
+        assert col.query(query_embeddings=[[1.0, 0.0]], n_results=k).ids == [ids[:k]]
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("backend_name", ["sqlite_exact", "rust_exact"])
+def test_search_open_works_while_other_process_holds_writer_lease(
+    tmp_path, monkeypatch, backend_name
+):
+    from mempalace.searcher import _open_search_collection
+    from mempalace.palace import _open_collection_or_explain
+
+    monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", backend_name)
+    backend, col = _collection(tmp_path)
+    col.add(ids=["a"], documents=["alpha"], embeddings=[[1.0, 0.0]])
+    holder_code = """
+import sys
+from mempalace.palace import mine_palace_lock
+with mine_palace_lock(sys.argv[1]):
+    print("ready", flush=True)
+    sys.stdin.read()
+"""
+    holder = subprocess.Popen(
+        [sys.executable, "-c", holder_code, str(tmp_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=os.environ.copy(),
+    )
+    try:
+        assert holder.stdout.readline().strip() == "ready"
+        reader, error = _open_search_collection(str(tmp_path), "mempalace_drawers")
+        assert error is None
+        assert reader.query(query_embeddings=[[1.0, 0.0]]).ids == [["a"]]
+        diagnostic_reader = _open_collection_or_explain(str(tmp_path), read_only=True)
+        assert diagnostic_reader.count() == 1
+    finally:
+        holder.stdin.close()
+        holder.wait(timeout=10)
+        backend.close()
+
+
+@pytest.mark.parametrize("backend_name", ["sqlite_exact", "rust_exact"])
+def test_read_only_cache_refreshes_after_completed_writer_cycle(tmp_path, backend_name):
+    from mempalace.backends import get_backend_class
+
+    writer_backend, writer = _collection(tmp_path)
+    writer.add(ids=["a"], documents=["alpha"], embeddings=[[1.0, 0.0]])
+    writer_backend.close()
+    backend = get_backend_class(backend_name)()
+    palace = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    try:
+        first = backend.get_collection(
+            palace=palace, collection_name="mempalace_drawers", options={"read_only": True}
+        )
+        assert first.query(query_embeddings=[[1.0, 0.0]]).ids == [["a"]]
+        assert first._handle.immutable
+        code = """
+import sys
+from mempalace.backends.sqlite_exact import SQLiteExactBackend
+b = SQLiteExactBackend()
+c = b.get_collection(sys.argv[1], "mempalace_drawers", create=False)
+c.add(ids=["b"], documents=["beta"], embeddings=[[0.0, 1.0]])
+c._handle.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+b.close()
+"""
+        subprocess.run([sys.executable, "-c", code, str(tmp_path)], check=True, timeout=30)
+        assert not (tmp_path / "sqlite_exact.sqlite3-wal").exists()
+        assert not (tmp_path / "sqlite_exact.sqlite3-shm").exists()
+        second = backend.get_collection(
+            palace=palace, collection_name="mempalace_drawers", options={"read_only": True}
+        )
+        result = second.query(query_embeddings=[[0.0, 1.0]], n_results=1)
+        assert result.ids == [["b"]]
+        assert result.documents == [["beta"]]
+        assert second.count() == 2
+        assert first._handle.closed
+        assert second._handle.immutable
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("backend_name", ["sqlite_exact", "rust_exact"])
+@pytest.mark.parametrize("dimension_column", [False, True])
+def test_legacy_schema_search_is_read_only(tmp_path, monkeypatch, backend_name, dimension_column):
+    import json
+    import struct
+    from mempalace.searcher import _open_search_collection
+    from mempalace.palace import get_backend
+
+    db_path = tmp_path / "sqlite_exact.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript("""
+CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE collections(id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE documents(collection_id INTEGER, id TEXT, document TEXT, metadata_json TEXT,
+                       embedding BLOB, dim INTEGER, PRIMARY KEY(collection_id, id));
+INSERT INTO collections VALUES(1, 'mempalace_drawers');
+""")
+        if dimension_column:
+            conn.execute("ALTER TABLE collections ADD COLUMN dimension INTEGER")
+            conn.execute("UPDATE collections SET dimension=2")
+        conn.execute(
+            "INSERT INTO documents VALUES(1, 'a', 'alpha memory', ?, ?, 2)",
+            (json.dumps({"wing": "project", "room": "notes"}), struct.pack("<ff", 1, 0)),
+        )
+    before = db_path.read_bytes()
+    monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", backend_name)
+    # Any attempted preflight migration would need this lease and fail.
+    holder_code = """
+import sys
+from mempalace.palace import mine_palace_lock
+with mine_palace_lock(sys.argv[1]):
+    print("ready", flush=True)
+    sys.stdin.read()
+"""
+    holder = subprocess.Popen(
+        [sys.executable, "-c", holder_code, str(tmp_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "ready"
+        reader, error = _open_search_collection(str(tmp_path), "mempalace_drawers")
+        assert error is None
+        result = reader.query(query_embeddings=[[1.0, 0.0]], where={"wing": "project"})
+        assert result.ids == [["a"]]
+        assert result.documents == [["alpha memory"]]
+        assert reader.get(where={"wing": "project"}).ids == ["a"]
+        assert reader.facet_counts("room", where={"wing": "project"}) == {"notes": 1}
+        assert reader.lexical_search(query="alpha", where={"wing": "project"}).hits[0].id == "a"
+        with pytest.raises(DimensionMismatchError):
+            reader.query(query_embeddings=[[1.0]])
+        assert db_path.read_bytes() == before
+        assert not (tmp_path / "sqlite_exact.sqlite3-wal").exists()
+    finally:
+        holder.stdin.close()
+        holder.wait(timeout=10)
+        get_backend(backend_name).close_palace(str(tmp_path))
+
+
+@pytest.mark.parametrize("backend_name", ["sqlite_exact", "rust_exact"])
+def test_hybrid_search_keeps_closet_boost_under_writer_lease(tmp_path, monkeypatch, backend_name):
+    from mempalace.backends import get_backend
+    from mempalace.searcher import search_memories
+    import mempalace.backends.embedding_wrapper as embedding_wrapper
+
+    backend, drawers = _collection(tmp_path)
+    closets = backend.get_collection(str(tmp_path), "mempalace_closets", create=True)
+    meta = {"source_file": "fixture.md", "wing": "project", "room": "notes", "chunk_index": 0}
+    drawers.add(
+        ids=["a"], documents=["meshguard memory"], metadatas=[meta], embeddings=[[1.0, 0.0]]
+    )
+    closets.add(ids=["c"], documents=["meshguard index"], metadatas=[meta], embeddings=[[1.0, 0.0]])
+    backend.close()
+    monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", backend_name)
+    monkeypatch.setattr(
+        embedding_wrapper, "_embed_texts", lambda texts: [[1.0, 0.0] for _ in texts]
+    )
+    holder_code = """
+import sys
+from mempalace.palace import mine_palace_lock
+with mine_palace_lock(sys.argv[1]):
+    print("ready", flush=True)
+    sys.stdin.read()
+"""
+    holder = subprocess.Popen(
+        [sys.executable, "-c", holder_code, str(tmp_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "ready"
+        result = search_memories("meshguard", str(tmp_path), n_results=1)
+        assert "error" not in result
+        assert result["results"][0]["matched_via"] == "drawer+closet"
+        assert result["results"][0]["closet_boost"] > 0
+    finally:
+        holder.stdin.close()
+        holder.wait(timeout=10)
+        get_backend(backend_name).close_palace(str(tmp_path))
+
+
+@pytest.mark.parametrize("backend_name", ["sqlite_exact", "rust_exact"])
+def test_retired_reader_wrappers_reconnect_but_explicit_close_stays_closed(tmp_path, backend_name):
+    from mempalace.backends import get_backend
+    from mempalace.backends.base import BackendClosedError
+
+    backend = type(get_backend(backend_name))()
+    peer = SQLiteExactBackend()
+    palace = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    try:
+        writer = peer.get_collection(palace=palace, collection_name="test", create=True)
+        writer.add(ids=["a"], documents=["alpha"], embeddings=[[1.0, 0.0]])
+        peer.close_palace(palace)
+        old = backend.get_collection(
+            palace=palace, collection_name="test", options={"read_only": True}
+        )
+        old_handle = old._handle
+        stale = backend.get_collection(
+            palace=palace, collection_name="test", options={"read_only": True}
+        )
+        writer = peer.get_collection(palace=palace, collection_name="test")
+        writer.add(ids=["b"], documents=["beta"], embeddings=[[0.0, 1.0]])
+        peer.close_palace(palace)
+        fresh = backend.get_collection(
+            palace=palace, collection_name="test", options={"read_only": True}
+        )
+        assert old_handle.closed
+        assert old.count() == 2
+        assert old.query(query_embeddings=[[0.0, 1.0]], n_results=1).ids == [["b"]]
+        old.close()
+        with pytest.raises(BackendClosedError):
+            old.query(query_embeddings=[[1.0, 0.0]])
+        backend.close_palace(palace)
+        with pytest.raises(BackendClosedError):
+            fresh.count()
+        reopened = backend.get_collection(
+            palace=palace, collection_name="test", options={"read_only": True}
+        )
+        assert reopened.count() == 2
+        with pytest.raises(BackendClosedError):
+            stale.count()
+    finally:
+        peer.close()
+        backend.close()
+
+
+@pytest.mark.parametrize("backend_name", ["sqlite_exact", "rust_exact", "rust_fallback"])
+@pytest.mark.parametrize("operation", ["update", "delete"])
+@pytest.mark.parametrize("boundary", ["load", "before_hydrate", "after_hydrate"])
+def test_exact_query_retries_entire_batch_across_all_engines(
+    tmp_path, monkeypatch, backend_name, operation, boundary
+):
+    from mempalace.backends.rust_exact import RustExactBackend, _NativeVectorIndex
+
+    backend = SQLiteExactBackend() if backend_name == "sqlite_exact" else RustExactBackend()
+    peer = SQLiteExactBackend()
+    palace = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    try:
+        writer = peer.get_collection(palace=palace, collection_name="test", create=True)
+        writer.add(ids=["a", "b"], documents=["alpha", "beta"], embeddings=[[1.0, 0.0], [0.0, 1.0]])
+        col = backend.get_collection(
+            palace=palace, collection_name="test", options={"read_only": True}
+        )
+        kwargs = (
+            {"include": ["documents", "distances", "embeddings"]}
+            if backend_name == "rust_fallback"
+            else {}
+        )
+        # Warm either engine's cache before injecting the next-query commit.
+        col.query(query_embeddings=[[1.0, 0.0]], **kwargs)
+        method = "_hydrate"
+        if boundary == "load":
+            method = (
+                "_ensure_native_index"
+                if backend_name == "rust_exact" and _NativeVectorIndex is not None
+                else "_rank_vectors"
+            )
+        original = getattr(col, method)
+        changed = False
+
+        def change():
+            nonlocal changed
+            if changed:
+                return
+            changed = True
+            if operation == "delete":
+                writer.delete(ids=["a"])
+            else:
+                writer.update(ids=["a"], documents=["changed alpha"], embeddings=[[-1.0, 0.0]])
+
+        def intercept(*args, **kw):
+            if boundary == "before_hydrate":
+                change()
+            result = original(*args, **kw)
+            if boundary != "before_hydrate":
+                change()
+            return result
+
+        monkeypatch.setattr(col, method, intercept)
+        result = col.query(query_embeddings=[[1.0, 0.0], [1.0, 0.0]], n_results=2, **kwargs)
+        assert changed
+        assert result.ids == ([["b"], ["b"]] if operation == "delete" else [["b", "a"], ["b", "a"]])
+        assert result.documents == (
+            [["beta"], ["beta"]]
+            if operation == "delete"
+            else [["beta", "changed alpha"], ["beta", "changed alpha"]]
+        )
+        for distances in result.distances:
+            assert distances == pytest.approx([1.0] if operation == "delete" else [1.0, 2.0])
+    finally:
+        peer.close()
+        backend.close()

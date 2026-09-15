@@ -24,6 +24,80 @@ class QuotedToken(str):
 
 
 _BARE_FLAGS = frozenset({"APPLY", "COMMIT", "PREVIEW", "DRY_RUN"})
+_EVENT_LIST_ORDER_FLAGS = frozenset(
+    {
+        "DESC",
+        "ASC",
+        "LATEST",
+        "RECENT",
+        "TAIL",
+        "HEAD",
+        "OLDEST",
+        "FROM_START",
+    }
+)
+_PQL_KEYS = frozenset(
+    {
+        "STREAM",
+        "ROOM",
+        "TOPIC",
+        "TYPE",
+        "STATUS",
+        "FROM",
+        "TO",
+        "LIMIT",
+        "SINCE",
+        "BEFORE",
+        "CORRELATION",
+        "ORDER",
+        "PROJECT",
+        "GOAL",
+        "BRANCH",
+        "BASE",
+        "DONE",
+        "CONTENT",
+        "KIND",
+        "TIMEOUT",
+        "AGENT",
+        "TO_AGENT",
+        "FROM_AGENT",
+        "CORRELATION_ID",
+        "SINCE_EVENT_ID",
+        "BEFORE_EVENT_ID",
+        "BASE_COMMIT",
+        "TIMEOUT_MS",
+        "CREATED_BY",
+        "EVENT_ID",
+        "ARTIFACT_ID",
+        "ID",
+        "BY",
+        "DIFF",
+        "EVENT_TYPE",
+        "SINCE_ID",
+        "BEFORE_ID",
+        "SINCE_CREATED_AT",
+        "BEFORE_CREATED_AT",
+        "WING",
+        "TITLE",
+        "DRAWER",
+        "CLOSET",
+        "DRAWER_ID",
+        "DOCUMENT",
+        "TEXT",
+        "SUBJECT",
+        "PREDICATE",
+        "OBJECT",
+        "OLD_OBJECT",
+        "NEW_OBJECT",
+        "ENDED",
+        "AT",
+        "DATE",
+        "VALID_FROM",
+        "VALID_TO",
+        "QUERY",
+        "DEPTH",
+    }
+)
 _KG_ADD_FLAGS = frozenset({"FROM", "TO", "VALID_FROM", "VALID_TO", "CLOSET", "DRAWER"})
 _KG_INVALIDATE_FLAGS = frozenset({"ENDED", "AT", "DATE"})
 _KG_SUPERSEDE_FLAGS = frozenset({"AT", "DATE"})
@@ -108,7 +182,9 @@ def tokenize_dsl(text: str) -> List[str]:
     return tokens
 
 
-def _parse_key_value_tokens(tokens: List[str]) -> Dict[str, Any]:
+def _parse_key_value_tokens(
+    tokens: List[str], bare_flags: frozenset | None = None
+) -> Dict[str, Any]:
     """
     Parse tokens that contain key:value pairs, key:"quoted" pairs, or KEY value pairs.
     Handles forms like:
@@ -117,6 +193,7 @@ def _parse_key_value_tokens(tokens: List[str]) -> Dict[str, Any]:
       - `stream : project/app`
       - `STREAM project/app`
     """
+    active_bare_flags = _BARE_FLAGS if bare_flags is None else (_BARE_FLAGS | bare_flags)
     result: Dict[str, Any] = {}
     i = 0
     n = len(tokens)
@@ -160,9 +237,18 @@ def _parse_key_value_tokens(tokens: List[str]) -> Dict[str, Any]:
 
         # Case 4: tok is key keyword, next is value (including uppercase values
         # like CONTENT NASA). Bare flags never consume the following token.
-        if i + 1 < n and tok.isupper() and tokens[i + 1] != ":":
+        if (
+            i + 1 < n
+            and tok.isupper()
+            and tok.upper() not in active_bare_flags
+            and tokens[i + 1] != ":"
+        ):
             nxt = tokens[i + 1]
-            if nxt.upper() not in _BARE_FLAGS:
+            if (
+                isinstance(nxt, QuotedToken)
+                or tok.upper() in _PQL_KEYS
+                or nxt.upper() not in active_bare_flags
+            ):
                 k = tok.lower().strip()
                 if k:
                     result[k] = _parse_val(nxt)
@@ -675,11 +761,17 @@ def parse_exec_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # noqa: C9
                 or "room" in params
             ):
                 action = "update_drawer"
+            elif "agent_name" in params and ("entry" in params or "content" in params):
+                action = "diary_write"
             elif "content" in params or "document" in params:
                 action = "add_drawer"
             elif "drawer_id" in params:
                 action = "delete_drawer"
-            elif "subject" in params and "predicate" in params and "old_object" in params:
+            elif (
+                "subject" in params
+                and "predicate" in params
+                and ("old_object" in params or "new_object" in params)
+            ):
                 action = "kg_supersede"
             elif (
                 "subject" in params
@@ -689,7 +781,9 @@ def parse_exec_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # noqa: C9
                 action = "kg_add"
             elif "source_wing" in params and "target_wing" in params:
                 action = "create_tunnel"
-            elif "agent" in params and ("entry" in params or "content" in params):
+            elif ("agent" in params or "agent_name" in params) and (
+                "entry" in params or "content" in params
+            ):
                 action = "diary_write"
             elif "items" in params:
                 action = "checkpoint"
@@ -712,8 +806,16 @@ def parse_exec_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # noqa: C9
             action = "kg_invalidate"
             if "ended" not in params and "valid_to" in params:
                 params["ended"] = params.pop("valid_to")
+        elif action in ("kg_supersede", "supersede"):
+            action = "kg_supersede"
+            if "old_object" not in params and "old" in params:
+                params["old_object"] = params.pop("old")
+            if "new_object" not in params and "new" in params:
+                params["new_object"] = params.pop("new")
         elif action in ("diary_write", "diary"):
             action = "diary_write"
+            if "agent_name" not in params and "agent" in params:
+                params["agent_name"] = params.pop("agent")
             if "diary" in params and isinstance(params["diary"], dict):
                 d = params.pop("diary")
                 params["entry"] = d.get("content") or d.get("entry") or d.get("text") or ""
@@ -721,6 +823,10 @@ def parse_exec_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # noqa: C9
                     params["topic"] = d["topic"]
                 if "wing" in d:
                     params["wing"] = d["wing"]
+                if "agent" in d and "agent_name" not in params:
+                    params["agent_name"] = d["agent"]
+                elif "agent_name" in d and "agent_name" not in params:
+                    params["agent_name"] = d["agent_name"]
             elif "entry" not in params and "content" in params:
                 params["entry"] = params.pop("content")
         return action, params
@@ -1111,7 +1217,7 @@ def _parse_kg_supersede_tokens(tokens: List[str]) -> Dict[str, Any]:
 # ==============================================================================
 
 
-def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # noqa: C901
+def parse_coordinate_input(input_data: Any, _internal: bool = False) -> Tuple[str, Dict[str, Any]]:  # noqa: C901
     """
     Parse input to `palace_coordinate`.
 
@@ -1130,15 +1236,65 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
                     "EVENT",
                     "EVENTS",
                     "LOGSTREAM",
+                    "INBOX",
                     "ARTIFACT",
                     "PATCH",
                     "PEERS",
                     "MESH",
                 ):
-                    op, parsed_p = parse_coordinate_input(v_strip)
+                    op, parsed_p = parse_coordinate_input(v_strip, _internal=True)
+                    sibling_has_explicit_order = "order" in params
+                    is_implicit_order = parsed_p.pop("_implicit_inbox_order", False)
+
                     for pk, pv in params.items():
-                        if pk not in (k, "action", "target") and pk not in parsed_p:
+                        if pk in (k, "action", "target"):
+                            continue
+                        if pk == "to":
+                            parsed_p["to_agent"] = pv
+                        elif pk == "from":
+                            parsed_p["from_agent"] = pv
+                        elif pk == "base":
+                            parsed_p["base_commit"] = pv
+                        elif pk == "id" and op == "event_ack":
+                            parsed_p["event_id"] = pv
+                        elif pk == "event_type" and op == "event_append":
+                            parsed_p["type"] = pv
+                        elif pk == "diff" and op == "patch_submit":
+                            parsed_p["content"] = pv
+                        elif pk == "since_id":
+                            parsed_p["since_event_id"] = str(pv)
+                        else:
                             parsed_p[pk] = pv
+
+                    # Alias cleanups for merged params
+                    if "since" in parsed_p and "since_event_id" not in parsed_p:
+                        raw_since = str(parsed_p.pop("since"))
+                        if _ISO_DATE_RE.match(raw_since):
+                            parsed_p["since_created_at"] = raw_since
+                        elif raw_since.startswith("evt_"):
+                            parsed_p["since_event_id"] = raw_since
+
+                    has_cursor = bool(parsed_p.get("since_event_id"))
+                    if is_implicit_order and not sibling_has_explicit_order:
+                        if has_cursor:
+                            parsed_p.pop("order", None)
+                        elif _internal:
+                            parsed_p["_implicit_inbox_order"] = True
+
+                    if "order" in parsed_p and parsed_p["order"] is not None:
+                        parsed_p["order"] = str(parsed_p["order"]).lower().strip()
+                        if parsed_p["order"] in ("latest", "recent", "tail"):
+                            parsed_p["order"] = "desc"
+                        elif parsed_p["order"] in ("head", "oldest", "from_start"):
+                            parsed_p["order"] = "asc"
+                        if op == "event_list" and parsed_p["order"] not in ("asc", "desc"):
+                            raise QueryParseError(
+                                f"Invalid order '{parsed_p['order']}'; must be 'asc' or 'desc'"
+                            )
+                    if "preview" in parsed_p:
+                        parsed_p["preview"] = bool(parsed_p["preview"])
+                    if not _internal:
+                        parsed_p.pop("_implicit_inbox_order", None)
                     return op, parsed_p
         action = params.pop("action", None) or params.pop("target", None)
         if not action:
@@ -1159,12 +1315,14 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
             else:
                 action = "event_list"
 
+        is_inbox = False
         action = action.lower()
         if action in ("task", "create_task", "task_create"):
             action = "task_create"
         elif action in ("event", "append_event", "event_append", "emit"):
             action = "event_append"
-        elif action in ("events", "list_events", "event_list", "logstream"):
+        elif action in ("events", "list_events", "event_list", "logstream", "inbox", "event_inbox"):
+            is_inbox = action in ("inbox", "event_inbox")
             action = "event_list"
         elif action in ("ack", "event_ack"):
             action = "event_ack"
@@ -1178,6 +1336,42 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
             params["to_agent"] = params.pop("to")
         elif "to" in params:
             params.pop("to")
+        if "since_id" in params and "since_event_id" not in params:
+            params["since_event_id"] = str(params.pop("since_id"))
+        elif "since_id" in params:
+            params.pop("since_id")
+        if "since" in params and "since_event_id" not in params:
+            raw_since = str(params.pop("since"))
+            if _ISO_DATE_RE.match(raw_since):
+                params["since_created_at"] = raw_since
+            elif raw_since.startswith("evt_"):
+                params["since_event_id"] = raw_since
+        if "before_id" in params and "before_event_id" not in params:
+            params["before_event_id"] = str(params.pop("before_id"))
+        elif "before_id" in params:
+            params.pop("before_id")
+        if "before" in params and "before_event_id" not in params:
+            raw_before = str(params.pop("before"))
+            if raw_before.startswith("evt_"):
+                params["before_event_id"] = raw_before
+        if "correlation" in params and "correlation_id" not in params:
+            params["correlation_id"] = str(params.pop("correlation"))
+
+        if is_inbox:
+            has_cursor = bool(params.get("since_event_id"))
+            if "order" not in params and not has_cursor:
+                params["order"] = "desc"
+                if _internal:
+                    params["_implicit_inbox_order"] = True
+            if "preview" not in params:
+                params["preview"] = True
+
+        if "order" in params and params["order"] is not None:
+            params["order"] = str(params["order"]).lower().strip()
+            if params["order"] in ("latest", "recent", "tail"):
+                params["order"] = "desc"
+            elif params["order"] in ("head", "oldest", "from_start"):
+                params["order"] = "asc"
         if "base" in params and "base_commit" not in params:
             params["base_commit"] = params.pop("base")
         elif "base" in params:
@@ -1192,13 +1386,15 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
             params["content"] = params.pop("diff")
         elif "diff" in params:
             params.pop("diff")
+        if not _internal:
+            params.pop("_implicit_inbox_order", None)
         return action, params
 
     if isinstance(input_data, str) and input_data.strip().startswith("{"):
         try:
             d = json.loads(input_data)
             if isinstance(d, dict):
-                return parse_coordinate_input(d)
+                return parse_coordinate_input(d, _internal=_internal)
         except Exception:
             pass
 
@@ -1264,12 +1460,32 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
                 raise QueryParseError(f"EVENT APPEND missing required field: '{req}'")
         return "event_append", kv
 
-    # --- Event List ---
-    if first_tok in ("LOGSTREAM", "EVENTS") or (
-        first_tok == "EVENT" and len(tokens) > 1 and tokens[1].upper() in ("LIST", "FIND")
+    # --- Event List / Inbox ---
+    is_inbox = first_tok == "INBOX" or (
+        first_tok == "EVENT" and len(tokens) > 1 and tokens[1].upper() == "INBOX"
+    )
+    if (
+        is_inbox
+        or first_tok in ("LOGSTREAM", "EVENTS")
+        or (first_tok == "EVENT" and len(tokens) > 1 and tokens[1].upper() in ("LIST", "FIND"))
     ):
-        start_idx = 2 if first_tok == "EVENT" else 1
-        kv = _parse_key_value_tokens(tokens[start_idx:])
+        start_idx = 1 if first_tok in ("INBOX", "LOGSTREAM", "EVENTS") else 2
+        kv = _parse_key_value_tokens(tokens[start_idx:], bare_flags=_EVENT_LIST_ORDER_FLAGS)
+
+        # Shorthand flags for ordering and preview (evaluated before inbox defaults)
+        for desc_flag in ("desc", "latest", "recent", "tail"):
+            if desc_flag in kv:
+                kv.pop(desc_flag)
+                if "order" not in kv:
+                    kv["order"] = "desc"
+        for asc_flag in ("asc", "head", "oldest", "from_start"):
+            if asc_flag in kv:
+                kv.pop(asc_flag)
+                if "order" not in kv:
+                    kv["order"] = "asc"
+        if "preview" in kv:
+            kv["preview"] = bool(kv["preview"])
+
         if "from" in kv and "from_agent" not in kv:
             kv["from_agent"] = kv.pop("from")
         elif "from" in kv:
@@ -1302,6 +1518,27 @@ def parse_coordinate_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # no
                 )
         if "correlation" in kv and "correlation_id" not in kv:
             kv["correlation_id"] = str(kv.pop("correlation"))
+
+        if is_inbox:
+            has_cursor = bool(kv.get("since_event_id"))
+            if "order" not in kv and not has_cursor:
+                kv["order"] = "desc"
+                if _internal:
+                    kv["_implicit_inbox_order"] = True
+            if "preview" not in kv:
+                kv["preview"] = True
+
+        if "order" in kv and kv["order"] is not None:
+            kv["order"] = str(kv["order"]).lower().strip()
+            if kv["order"] in ("latest", "recent", "tail"):
+                kv["order"] = "desc"
+            elif kv["order"] in ("head", "oldest", "from_start"):
+                kv["order"] = "asc"
+            if kv["order"] not in ("asc", "desc"):
+                raise QueryParseError(f"Invalid order '{kv['order']}'; must be 'asc' or 'desc'")
+
+        if not _internal:
+            kv.pop("_implicit_inbox_order", None)
         return "event_list", kv
 
     # --- Event Wait ---

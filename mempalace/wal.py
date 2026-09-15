@@ -16,11 +16,12 @@ import json
 import logging
 import os
 from datetime import datetime
-from pathlib import Path
+
+from .config import _default_config_dir
 
 logger = logging.getLogger(__name__)
 
-_WAL_FILE = Path(os.path.expanduser("~/.mempalace/wal")) / "write_log.jsonl"
+_WAL_FILE = _default_config_dir() / "wal" / "write_log.jsonl"
 _WAL_INITIALIZED_DIR = None
 
 # Keys whose values should be redacted in WAL entries to avoid logging sensitive content

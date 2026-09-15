@@ -27,6 +27,11 @@ import stat
 from pathlib import Path
 from typing import Optional
 
+
+class UnparsedCodexTranscriptError(ValueError):
+    """A recognized Codex rollout did not yield a supported conversation."""
+
+
 # Provenance footer appended to Slack transcript output so downstream consumers
 # know the speaker roles are positionally assigned, not verified.
 _SLACK_PROVENANCE_FOOTER = (
@@ -244,6 +249,21 @@ def _try_normalize_json_split(content: str) -> Optional[list]:
     normalized = _try_codex_jsonl(content)
     if normalized:
         return [normalized]
+
+    # A recognized rollout must never become raw JSON text just because its
+    # conversation schema changed (or its first turn is still incomplete).
+    # Keep this outside the parser so additional supported schemas can return
+    # normally without changing the fallback boundary.
+    for line in content.splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict) and entry.get("type") == "session_meta":
+            raise UnparsedCodexTranscriptError(
+                "Codex rollout contains no complete supported conversation; "
+                "refusing raw JSON fallback"
+            )
 
     normalized = _try_gemini_jsonl(content)
     if normalized:

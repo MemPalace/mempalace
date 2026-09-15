@@ -89,25 +89,34 @@ that MCP is connected.
 
 When shared-brain mode is selected:
 
-- Agree on one stable `<machine>-<harness>` identity for this agent.
+- Agree on a stable `host:harness:project` identity: lowercase host label
+  (machine), harness family (`claude`, `codex`, `grok`, `antigravity`, …),
+  and the current workspace as project. Two windows in the same project
+  are one actor.
 - Render the canonical rules with:
 
   ```bash
-  mempalace rules --agent <machine-harness>
+  mempalace rules --host <host> --harness <harness> --project <example>
   ```
 
+  Default `--mcp full` matches the 45-tool `mempalace-mcp` server this
+  skill registers. If the user opted into `mempalace-light-mcp`, re-render
+  with `--mcp light` instead. Replace an existing
+  `<!-- mempalace-shared-brain -->` block instead of appending a duplicate.
 - Install the rendered marker-delimited block in the harness's durable agent
-  instructions. Replace an existing marked block instead of appending a
-  duplicate.
+  instructions (Claude `~/.claude/CLAUDE.md`, Codex `~/.codex/AGENTS.md`,
+  Grok `~/.grok/AGENTS.md`, Antigravity `~/.gemini/config/GEMINI.md`).
 - Check coordination access with a read-only `mempalace logstream list` or the
   equivalent MCP event-list call.
-- Ask whether the harness can maintain a background watcher. If it can, prepare
-  the documented `mempalace logstream watch --agent ... --state-file ...`
-  command for a local palace owner or synchronized replica. A remote-only MCP
-  client must instead use repeated `mempalace_event_wait` calls, preserving the
-  last event id as `since_event_id`; never point it at a local SQLite watcher.
-  Explain any permission allowlisting needed. If it cannot maintain either
-  loop, record that the agent is turn-based and must sweep its MCP inbox with
+- Interactive sessions are declared-idle: they sweep the inbox on collab /
+  before long tasks and do **not** arm a watcher at session start. Arm
+  `mempalace logstream watch --agent <host>:<harness>:<project>` (the CLI
+  defaults a sanitized `--state-file`) only when the user asked to listen,
+  the agent claimed a task, or it delegated. A remote-only MCP client must
+  instead loop on `mempalace_event_wait`, preserving the last event id as
+  `since_event_id`; never point it at a local SQLite watcher. Explain any
+  permission allowlisting needed. If it cannot maintain either loop, record
+  that the agent is turn-based and must sweep its MCP inbox with
   `mempalace_event_list` on wake-up.
 
 Do not post a test event without telling the user: logstream events are
