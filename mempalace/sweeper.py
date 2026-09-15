@@ -34,6 +34,10 @@ both paths.
 Usage:
     from mempalace.sweeper import sweep
     result = sweep("/path/to/session.jsonl", "/path/to/palace")
+    # Optionally tag drawers with a wing/room (validated upstream, e.g. by
+    # the CLI, which normalizes with normalize_wing_name + sanitize_name):
+    result = sweep("/path/to/session.jsonl", "/path/to/palace",
+                   wing="claude", room="conversations")
 """
 
 from __future__ import annotations
@@ -200,8 +204,24 @@ def _drawer_id_for_message(session_id: str, message_uuid: str) -> str:
     return f"sweep_{session_id}_{message_uuid}"
 
 
-def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None) -> dict:
+def sweep(
+    jsonl_path: str,
+    palace_path: str,
+    source_label: Optional[str] = None,
+    *,
+    wing: Optional[str] = None,
+    room: Optional[str] = None,
+) -> dict:
     """Ingest every user/assistant message not already represented.
+
+    ``wing`` and ``room`` are optional, keyword-only taxonomy tags stamped
+    onto each drawer's metadata (``metadata["wing"]`` / ``metadata["room"]``).
+    They are written verbatim — validation is the caller's responsibility
+    (the CLI normalizes via ``normalize_wing_name`` and validates via
+    ``sanitize_name`` before calling, matching the other miners). When
+    omitted, the metadata shape is unchanged from the untagged behaviour.
+    Note that a re-sweep upserts the full metadata dict, so sweeping the
+    same session with a different tag set replaces (not merges) the tags.
 
     For each message in the jsonl:
       - If timestamp < cursor for that session, skip (strictly earlier
@@ -310,6 +330,10 @@ def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None)
             "filed_at": datetime.now().isoformat(),
             "ingest_mode": "sweep",
         }
+        if wing is not None:
+            metadata["wing"] = wing
+        if room is not None:
+            metadata["room"] = room
 
         batch_ids.append(drawer_id)
         batch_docs.append(document)
@@ -329,8 +353,17 @@ def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None)
     }
 
 
-def sweep_directory(dir_path: str, palace_path: str) -> dict:
+def sweep_directory(
+    dir_path: str,
+    palace_path: str,
+    *,
+    wing: Optional[str] = None,
+    room: Optional[str] = None,
+) -> dict:
     """Sweep every .jsonl file in a directory (recursive).
+
+    ``wing``/``room`` (optional, keyword-only) are propagated to every
+    file's ``sweep`` call — see :func:`sweep` for semantics.
 
     Returns aggregated summary across all files. ``files_attempted``
     includes files that raised, so the count reflects discovery rather
@@ -369,7 +402,7 @@ def sweep_directory(dir_path: str, palace_path: str) -> dict:
             print(f"  SKIP: {f.name} (not a regular file)", file=sys.stderr)
             continue
         try:
-            result = sweep(str(f), palace_path, source_label=str(f))
+            result = sweep(str(f), palace_path, source_label=str(f), wing=wing, room=room)
         except Exception as exc:
             logger.error("sweeper: sweep failed on %s: %s", f, exc)
             print(f"  WARNING: sweep failed on {f}: {exc}", file=sys.stderr)

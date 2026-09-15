@@ -417,3 +417,169 @@ class TestSweeperDuplicateMessageIds:
         assert repeated_document == "USER: second copy, same uuid"
         assert repeated_metadata["timestamp"] == "2020-01-01T00:00:02.000Z"
         assert by_id[assistant_id][0] == "ASSISTANT: ok"
+
+
+class TestSweeperWingRoom:
+    """Optional wing/room tagging of sweep drawers (taxonomy fix).
+
+    Sweep drawers were historically written without wing/room metadata, so
+    the entire transcript corpus was invisible to wing-scoped queries and
+    reported as the ``unknown`` bucket by status. These tests pin the new
+    tagging contract: explicit tags are stamped, omitted tags leave the
+    legacy metadata shape untouched, directory sweeps propagate tags,
+    and re-sweeps with the same tags stay idempotent.
+    """
+
+    def _all_metas(self, palace_path):
+        from mempalace.palace import get_collection
+
+        col = get_collection(palace_path, create=False)
+        data = col.get(include=["metadatas"])
+        return [m for m in (data["metadatas"] or []) if m]
+
+    def test_sweep_stamps_wing_and_room(self, mock_claude_jsonl, tmp_path):
+        from mempalace.sweeper import sweep
+
+        palace_path = str(tmp_path / "palace")
+        sweep(str(mock_claude_jsonl), palace_path, wing="claude", room="conversations")
+
+        metas = self._all_metas(palace_path)
+        assert metas, "No drawers written"
+        for m in metas:
+            assert m.get("wing") == "claude", f"Drawer missing wing tag: {m}"
+            assert m.get("room") == "conversations", f"Drawer missing room tag: {m}"
+            # Untagged fields must be preserved alongside the new tags.
+            assert m.get("session_id") == "abc"
+            assert m.get("ingest_mode") == "sweep"
+
+    def test_sweep_without_tags_keeps_legacy_metadata_shape(self, mock_claude_jsonl, tmp_path):
+        """Backward compatibility: omitting the new keyword-only args must
+        produce exactly the historical metadata keys — no wing/room keys."""
+        from mempalace.sweeper import sweep
+
+        palace_path = str(tmp_path / "palace")
+        sweep(str(mock_claude_jsonl), palace_path)
+
+        metas = self._all_metas(palace_path)
+        assert metas, "No drawers written"
+        for m in metas:
+            assert "wing" not in m, f"Unexpected wing key in legacy sweep: {m}"
+            assert "room" not in m, f"Unexpected room key in legacy sweep: {m}"
+
+    def test_sweep_directory_propagates_tags_to_all_files(self, mock_claude_jsonl, tmp_path):
+        from mempalace.sweeper import sweep_directory
+
+        transcripts = tmp_path / "transcripts"
+        sub = transcripts / "nested"
+        sub.mkdir(parents=True)
+        (transcripts / "s1.jsonl").write_text(mock_claude_jsonl.read_text())
+        # Second file, different session so both files contribute drawers.
+        line = mock_claude_jsonl.read_text().strip().splitlines()[3]  # first user record
+        line = line.replace('"abc"', '"s2"', 1) if '"abc"' in line else line
+        (sub / "s2.jsonl").write_text(line + "\n")
+
+        palace_path = str(tmp_path / "palace")
+        result = sweep_directory(str(transcripts), palace_path, wing="claude", room="conversations")
+        assert result["files_succeeded"] == 2, f"Directory sweep should cover both files: {result}"
+
+        metas = self._all_metas(palace_path)
+        assert metas, "No drawers written"
+        for m in metas:
+            assert m.get("wing") == "claude", f"Drawer missing wing tag: {m}"
+            assert m.get("room") == "conversations", f"Drawer missing room tag: {m}"
+
+    def test_sweep_without_directory_tags_keeps_legacy_shape(self, mock_claude_jsonl, tmp_path):
+        from mempalace.sweeper import sweep_directory
+
+        palace_path = str(tmp_path / "palace")
+        sweep_directory(str(tmp_path), palace_path)
+
+        metas = self._all_metas(palace_path)
+        assert metas, "No drawers written"
+        for m in metas:
+            assert "wing" not in m and "room" not in m, f"Unexpected tags in legacy sweep: {m}"
+
+    def test_rerun_with_same_tags_is_idempotent_and_preserves_tags(
+        self, mock_claude_jsonl, tmp_path
+    ):
+        """A re-sweep of the same transcript must add nothing and must not
+        drop or change the existing tags."""
+        from mempalace.sweeper import sweep
+
+        palace_path = str(tmp_path / "palace")
+        first = sweep(str(mock_claude_jsonl), palace_path, wing="claude", room="conversations")
+        second = sweep(str(mock_claude_jsonl), palace_path, wing="claude", room="conversations")
+
+        assert first["drawers_added"] == 4
+        assert second["drawers_added"] == 0, "Re-sweep must be a no-op"
+
+        metas = self._all_metas(palace_path)
+        assert len(metas) == 4
+        for m in metas:
+            assert m.get("wing") == "claude"
+            assert m.get("room") == "conversations"
+
+
+class TestSweepTagResolution:
+    """CLI-level default/precedence/validation for _resolve_sweep_tags."""
+
+    def _args(self, wing=None, room=None):
+        return type("Args", (), {"wing": wing, "room": room})()
+
+    def test_directory_default_is_normalized_basename(self, tmp_path):
+        from mempalace.cli import _resolve_sweep_tags
+
+        src = tmp_path / "My-Transcripts"
+        src.mkdir()
+        wing, room = _resolve_sweep_tags(self._args(), str(src))
+        assert wing == "my_transcripts", f"basename+normalize mismatch: {wing!r}"
+        assert room == "conversations"
+
+    def test_file_default_is_parent_basename(self, tmp_path):
+        from mempalace.cli import _resolve_sweep_tags
+
+        f = tmp_path / "claude" / "session.jsonl"
+        f.parent.mkdir(parents=True)
+        f.write_text("{}\n")
+        wing, room = _resolve_sweep_tags(self._args(), str(f))
+        assert wing == "claude", f"file default should use parent dir: {wing!r}"
+        assert room == "conversations"
+
+    def test_path_encoded_directory_name_normalizes(self, tmp_path):
+        from mempalace.cli import _resolve_sweep_tags
+
+        src = tmp_path / "-home-cpaquin-Workspace-Git"
+        src.mkdir()
+        wing, _ = _resolve_sweep_tags(self._args(), str(src))
+        assert wing == "home_cpaquin_workspace_git", f"path-encoded name: {wing!r}"
+
+    def test_explicit_flags_take_precedence(self, tmp_path):
+        from mempalace.cli import _resolve_sweep_tags
+
+        src = tmp_path / "claude"
+        src.mkdir()
+        wing, room = _resolve_sweep_tags(
+            self._args(wing="custom_wing", room="custom_room"), str(src)
+        )
+        assert wing == "custom_wing"
+        assert room == "custom_room"
+
+    def test_invalid_wing_raises_value_error(self, tmp_path):
+        import pytest
+
+        from mempalace.cli import _resolve_sweep_tags
+
+        src = tmp_path / "claude"
+        src.mkdir()
+        with pytest.raises(ValueError, match="wing"):
+            _resolve_sweep_tags(self._args(wing="bad/../wing"), str(src))
+
+    def test_invalid_room_raises_value_error(self, tmp_path):
+        import pytest
+
+        from mempalace.cli import _resolve_sweep_tags
+
+        src = tmp_path / "claude"
+        src.mkdir()
+        with pytest.raises(ValueError, match="room"):
+            _resolve_sweep_tags(self._args(room="bad/room"), str(src))

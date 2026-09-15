@@ -370,9 +370,14 @@ def test_cmd_sweep_prefer_submits_daemon_job(tmp_path):
     submit.assert_called_once()
 
     assert submit.call_args.args[0] == "sweep"
-    assert submit.call_args.args[1] == {
-        "target": str(tmp_path / "session.jsonl"),
-    }
+    payload = submit.call_args.args[1]
+    assert payload["target"] == str(tmp_path / "session.jsonl")
+    # No explicit flags: the resolved defaults ride along (wing = source
+    # dir basename normalized, room = conversations).
+    from mempalace.config import normalize_wing_name
+
+    assert payload["wing"] == normalize_wing_name(tmp_path.name)
+    assert payload["room"] == "conversations"
 
 
 def test_init_auto_mine_daemon_preserves_prescan(
@@ -492,6 +497,8 @@ def test_service_run_sweep_file(tmp_path):
     sweep.assert_called_once_with(
         str(target),
         str(palace.resolve()),
+        wing=None,
+        room=None,
     )
     assert result["success"] is True
     assert result["exit_code"] == 0
