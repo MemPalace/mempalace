@@ -92,6 +92,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Documentation
 
+- **macOS LaunchAgent template for `mempalace serve`, and why `ProcessType` matters.** Adds `deploy/com.mempalace.server.plist` alongside the systemd unit. A LaunchAgent with no `ProcessType` is CPU and I/O throttled by launchd, which presents as a slow server rather than as a launchd policy. (#2507)
 - **Codex plugin install instructions use the built-in marketplace.** (#2372)
 
 ---

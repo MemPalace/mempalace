@@ -493,6 +493,10 @@ Two steps per machine:
 
 1. **Run a hub locally** (same `mempalace serve` as above, LaunchAgent /
    systemd unit recommended) — agents on that machine point at `127.0.0.1`.
+   Templates for both ship in [`deploy/`](https://github.com/MemPalace/mempalace/tree/develop/deploy).
+   On macOS, use the template rather than a hand-written plist: a LaunchAgent
+   with no `ProcessType` is CPU and I/O throttled by launchd, which shows up as
+   a slow hub. See [Remote / Team Server](/guide/remote-server#one-command-deployments).
 2. **Name the peers** in `peers.json` in the palace directory — each entry
    is a `name`, the peer hub's `url`, and its bearer `token` (exchange
    tokens out-of-band; never through the coordination stream):
