@@ -151,3 +151,159 @@ def test_migrate_is_idempotent(tmp_path):
     # second run finds nothing left to normalize
     assert migrate_wing_names(str(palace), confirm=True) is False
     assert _wing_ids(palace, "y") == {"drawer__y_r_1"}
+
+
+# --- graph re-key: hallways/tunnels follow drawers after a rename (#1938) ---
+
+
+def _seed_entities(palace, rows):
+    """Seed drawers carrying semicolon-joined ``entities`` metadata."""
+    from mempalace.palace import get_collection
+
+    col = get_collection(str(palace), create=True)
+    col.upsert(
+        ids=[r["id"] for r in rows],
+        documents=[r["doc"] for r in rows],
+        metadatas=[r["meta"] for r in rows],
+        embeddings=[[float(i + 1)] * 8 for i in range(len(rows))],
+    )
+    return col
+
+
+def test_migrate_rekeys_hallways_and_tunnels(tmp_path, monkeypatch):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    # graph side-files resolve as siblings of the configured palace_path
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(palace))
+
+    from mempalace import palace_graph
+    from mempalace.hallways import compute_hallways_for_wing, list_hallways
+
+    col = _seed_entities(
+        palace,
+        [
+            {
+                "id": "a1",
+                "doc": "d",
+                "meta": {
+                    "wing": "_alpha",
+                    "room": "r",
+                    "entities": "Alice;Bob",
+                    "source_file": "a1",
+                },
+            },
+            {
+                "id": "a2",
+                "doc": "d",
+                "meta": {
+                    "wing": "_alpha",
+                    "room": "r",
+                    "entities": "Alice;Bob",
+                    "source_file": "a2",
+                },
+            },
+            {
+                "id": "b1",
+                "doc": "d",
+                "meta": {
+                    "wing": "beta",
+                    "room": "r",
+                    "entities": "Alice;Carol",
+                    "source_file": "b1",
+                },
+            },
+            {
+                "id": "b2",
+                "doc": "d",
+                "meta": {
+                    "wing": "beta",
+                    "room": "r",
+                    "entities": "Alice;Carol",
+                    "source_file": "b2",
+                },
+            },
+        ],
+    )
+    compute_hallways_for_wing("_alpha", col=col)
+    compute_hallways_for_wing("beta", col=col)
+    palace_graph.entity_tunnels_for_wing("_alpha", list_hallways())
+    palace_graph.entity_tunnels_for_wing("beta", list_hallways())
+
+    def tun_wings():
+        return {
+            w
+            for t in palace_graph.list_tunnels()
+            for w in (t["source"]["wing"], t["target"]["wing"])
+        }
+
+    # pre-condition: graph references the un-normalized wing
+    assert "_alpha" in {h["wing"] for h in list_hallways()}
+    assert "_alpha" in tun_wings()
+
+    assert migrate_wing_names(str(palace), confirm=True) is True
+
+    hall_wings = {h["wing"] for h in list_hallways()}
+    assert "_alpha" not in hall_wings and "alpha" in hall_wings
+    assert "_alpha" not in tun_wings() and "alpha" in tun_wings()
+
+
+def test_migrate_merges_colliding_hallways(tmp_path, monkeypatch):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(palace))
+
+    from mempalace.hallways import compute_hallways_for_wing, list_hallways
+
+    col = _seed_entities(
+        palace,
+        [
+            {
+                "id": "g1",
+                "doc": "d",
+                "meta": {
+                    "wing": "gamma",
+                    "room": "r",
+                    "entities": "Alice;Bob",
+                    "source_file": "g1",
+                },
+            },
+            {
+                "id": "g2",
+                "doc": "d",
+                "meta": {
+                    "wing": "gamma",
+                    "room": "r",
+                    "entities": "Alice;Bob",
+                    "source_file": "g2",
+                },
+            },
+            {
+                "id": "g3",
+                "doc": "d",
+                "meta": {
+                    "wing": "_gamma",
+                    "room": "r",
+                    "entities": "Alice;Bob",
+                    "source_file": "g3",
+                },
+            },
+            {
+                "id": "g4",
+                "doc": "d",
+                "meta": {
+                    "wing": "_gamma",
+                    "room": "r",
+                    "entities": "Alice;Bob",
+                    "source_file": "g4",
+                },
+            },
+        ],
+    )
+    compute_hallways_for_wing("gamma", col=col)
+    compute_hallways_for_wing("_gamma", col=col)
+
+    migrate_wing_names(str(palace), confirm=True)
+
+    recs = list_hallways()
+    assert [h["wing"] for h in recs] == ["gamma"]  # single merged record
+    assert recs[0]["co_occurrence_count"] == 4  # 2 + 2 summed

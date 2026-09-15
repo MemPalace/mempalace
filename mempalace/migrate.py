@@ -603,10 +603,37 @@ def migrate_wing_names(palace_path: str, dry_run: bool = False, confirm: bool = 
         _apply_wing_updates(closets, c_updates)
     _apply_topics_by_wing_renames(topic_renames)
 
+    # Re-key the associative graph so hallways/tunnels follow their drawers.
+    # A wing-name migration is a pure rename: drawer membership and entity
+    # co-occurrence are unchanged, so re-keying the graph records (rather than
+    # recomputing them from drawers) is sufficient and preserves the #1578
+    # dynamics layer. Use an explicit config derived from this migration's
+    # palace_path so side-files resolve beside the selected palace instead of
+    # falling back to the ambient/default palace.
+    rename_map = {old: new for (old, new) in d_summary}
+    rename_map.update({old: new for (old, new) in c_summary})
+    h_changed = t_changed = 0
+    try:
+        from .hallways import rekey_hallway_wings
+        from .palace_graph import rekey_tunnel_wings
+
+        graph_config = MempalaceConfig(palace_path=palace_path)
+        h_changed = rekey_hallway_wings(rename_map, config=graph_config)
+        t_changed = rekey_tunnel_wings(rename_map, config=graph_config)
+    except Exception as exc:
+        print(
+            "  WARNING: graph re-key failed; hallways/tunnels may still "
+            f"reference the old wing ({exc})"
+        )
+
     parts = [f"{len(d_updates)} drawer(s)"]
     if c_updates:
         parts.append(f"{len(c_updates)} closet(s)")
     if topic_renames:
         parts.append(f"{len(topic_renames)} topic key(s)")
+    if h_changed:
+        parts.append(f"{h_changed} hallway(s)")
+    if t_changed:
+        parts.append(f"{t_changed} tunnel(s)")
     print(f"\n  Migrated {', '.join(parts)}.\n")
     return True
