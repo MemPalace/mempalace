@@ -64,19 +64,6 @@ def _split_entries(text):
     return entries
 
 
-def _diary_drawer_id(wing: str, date_str: str) -> str:
-    """Stable, wing-scoped legacy drawer ID (file-level).
-
-    Retained for backwards-compatible cleanup of palaces that ingested
-    diaries before #1539 — those palaces hold one ``drawer_diary_{...}``
-    per file. New drawers use ``_diary_drawer_id_entry`` so each ``##``
-    entry becomes its own drawer (with per-entry character chunking
-    when an entry exceeds ``chunk_size``).
-    """
-    suffix = hashlib.sha256(f"{wing}|{date_str}".encode()).hexdigest()[:24]
-    return f"drawer_diary_{suffix}"
-
-
 def _diary_drawer_id_entry(wing: str, date_str: str, entry_idx: int, entry_chunk_idx: int) -> str:
     """Per-entry, per-chunk drawer ID introduced in #1539.
 

@@ -199,6 +199,22 @@ mempalace instructions help
 mempalace instructions status
 ```
 
+## `mempalace rules`
+
+Render the canonical shared-brain system-prompt block, marker-wrapped so
+a later re-render can replace it in place. Identity is
+`host:harness:project` (stable lowercase tokens). `--project` is the
+example workspace name; the block tells the agent to compose the project
+component from the current workspace.
+
+```bash
+mempalace rules --host mac --harness claude --project myapp
+mempalace rules --host windows --harness grok --project mempalace --mcp light
+```
+
+`--mcp full` (default) names the 45-tool `mempalace-mcp` tools.
+`--mcp light` names the 3-tool triad. Prose is identical.
+
 ## `mempalace logstream`
 
 Agent coordination events — delegate work, wait for replies, acknowledge
@@ -216,8 +232,8 @@ mempalace logstream wait --correlation-id task_123 --type patch.ready \
 mempalace logstream ack evt_... --from-agent mac --status applied
 
 # Background watcher: blocks, wakes on what needs you, exits 0 on a match
-mempalace logstream watch --agent mac --type task.request --type task.reply --type patch.ready \
-  --state-file ~/.mempalace/watch/mac.json --json
+mempalace logstream watch --agent mac:claude:myapp --type task.request --type task.reply --type patch.ready \
+  --json
 ```
 
 | Subcommand | Description |
@@ -225,7 +241,7 @@ mempalace logstream watch --agent mac --type task.request --type task.reply --ty
 | `append` | Append an immutable event (`--type`, `--stream`, `--room`, `--from-agent` required; `--body`/`--body-file`, `--artifact-id` repeatable) |
 | `list` | List events, oldest first (all routing fields as filters, `--since-event-id`, `--limit`) |
 | `wait` | Long-poll until a match or timeout (`--timeout-ms`, max 300000; exits `2` on timeout) |
-| `watch` | Background watcher: re-arms past the `wait` cap, carries the cursor, and exits `0` on a match / `2` on `--idle-exit-ms`. `--agent ID` is shorthand for `--to-agent ID --exclude-from-agent ID` so your own `*` broadcasts never wake you. Filters repeat to mean "or"; `--state-file` resumes exactly; `--follow` stays alive past the first match; a cursorless first run starts at the tip (`--from-start` to replay); exits `130` if interrupted; `--follow --json` emits NDJSON — one batch envelope per line (`{"events": [...], "count": N, "cursor": ...}`), not one event per line |
+| `watch` | Background watcher: re-arms past the `wait` cap, carries the cursor, and exits `0` on a match / `2` on `--idle-exit-ms`. `--agent ID` is shorthand for `--to-agent ID --exclude-from-agent ID` so your own `*` broadcasts never wake you. Filters repeat to mean "or"; `--state-file` resumes exactly (defaults from `--agent`, with `_` doubled and `:` sanitized to `_`); `--follow` stays alive past the first match; a cursorless first run starts at the tip (`--from-start` to replay); exits `130` if interrupted; `--follow --json` emits NDJSON — one batch envelope per line (`{"events": [...], "count": N, "cursor": ...}`), not one event per line |
 | `ack` | Append an `event.ack` for an event (`--from-agent` required, `--status`, `--body`) |
 | `sync` | Pull missing events/artifacts from peer replicas (`--peer URL --token T`, or all peers in `peers.json`) |
 

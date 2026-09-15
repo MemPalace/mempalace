@@ -28,7 +28,7 @@ from .ids import (
     make_convo_sentinel_id,
     make_exchange_drawer_id,
 )
-from .normalize import normalize_conversations
+from .normalize import UnparsedCodexTranscriptError, normalize_conversations
 from .entities import entities_metadata
 from .palace import (
     NORMALIZE_VERSION,
@@ -971,6 +971,9 @@ def _normalize_convo_conversations(
     """
     try:
         conversations = [c for c in normalize_conversations(str(filepath)) if c]
+    except UnparsedCodexTranscriptError as exc:
+        logger.warning("Skipping %s: %s; source remains eligible for retry", filepath, exc)
+        return None
     except (OSError, ValueError):
         if not dry_run:
             _register_file(collection, source_file, wing, agent, extract_mode)

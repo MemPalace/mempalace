@@ -26,11 +26,30 @@ def _strip_leaked_pythonpath_from_sys_path() -> None:
     if not leaked:
         return
 
+    import sysconfig
+
     def _norm(path: str) -> str:
         return os.path.normcase(os.path.normpath(path))
 
+    # Preserve this interpreter's package directories (#2484), not every
+    # descendant of sys.prefix: shared installations and nested venvs can
+    # contain packages built for another Python ABI under the same prefix.
+    paths = sysconfig.get_paths()
+    own_site_packages = {_norm(os.path.realpath(paths[name])) for name in ("purelib", "platlib")}
+
+    def _belongs_to_this_environment(path: str) -> bool:
+        try:
+            resolved = _norm(os.path.realpath(path))
+        except OSError:
+            return False
+        return resolved in own_site_packages
+
     leaked_entries = {_norm(p) for p in leaked.split(os.pathsep) if p}
-    sys.path[:] = [p for p in sys.path if not p or _norm(p) not in leaked_entries]
+    sys.path[:] = [
+        p
+        for p in sys.path
+        if not p or _norm(p) not in leaked_entries or _belongs_to_this_environment(p)
+    ]
 
 
 _strip_leaked_pythonpath_from_sys_path()

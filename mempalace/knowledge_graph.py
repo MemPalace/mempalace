@@ -47,6 +47,11 @@ from .ids import make_triple_id
 
 
 DEFAULT_KG_PATH = os.path.expanduser("~/.mempalace/knowledge_graph.sqlite3")
+_MIN_ENTITY_CANDIDATE_LEN = 3
+
+
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _is_date_only_temporal(value: str) -> bool:
@@ -551,6 +556,108 @@ class KnowledgeGraph:
                         }
                     )
 
+            if not results:
+                exact_exists = (
+                    conn.execute("SELECT 1 FROM entities WHERE id = ?", (eid,)).fetchone()
+                    is not None
+                )
+                if not exact_exists:
+                    candidates = self._lookup_entity_candidates(conn, name, eid)
+                    if len(candidates) == 1:
+                        cand_id = candidates[0]["id"]
+                        cand_name = candidates[0]["name"]
+                        results.extend(
+                            self._triples_for_entity(
+                                conn,
+                                cand_id,
+                                cand_name,
+                                direction,
+                                temporal_sql,
+                                temporal_params,
+                            )
+                        )
+
+        return results
+
+    def find_entity_candidates(self, name: str) -> list:
+        """Return token/prefix entity matches for disambiguation (never substring)."""
+        if not name or len(name.strip()) < _MIN_ENTITY_CANDIDATE_LEN:
+            return []
+        eid = self._entity_id(name)
+        with self._lock:
+            return self._lookup_entity_candidates(self._conn(), name, eid)
+
+    def _lookup_entity_candidates(self, conn, name: str, eid: str) -> list:
+        if not name or len(name.strip()) < _MIN_ENTITY_CANDIDATE_LEN:
+            return []
+        name_esc = _escape_like(name.strip())
+        id_esc = _escape_like(eid)
+        rows = conn.execute(
+            "SELECT id, name FROM entities WHERE "
+            "id = ? OR name = ? OR "
+            "name LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\' OR "
+            "id LIKE ? ESCAPE '\\' OR id LIKE ? ESCAPE '\\' OR id LIKE ? ESCAPE '\\' "
+            "LIMIT 5",
+            (
+                eid,
+                name,
+                f"{name_esc} %",
+                f"% {name_esc}",
+                f"% {name_esc} %",
+                f"{id_esc}\\_%",
+                f"%\\_{id_esc}",
+                f"%\\_{id_esc}\\_%",
+            ),
+        ).fetchall()
+        out = []
+        for row in rows:
+            if row["id"] == eid:
+                continue
+            out.append({"id": row["id"], "name": row["name"]})
+        return out
+
+    def _triples_for_entity(
+        self, conn, eid: str, name: str, direction: str, temporal_sql: str, temporal_params: list
+    ) -> list:
+        results = []
+        if direction in ("outgoing", "both"):
+            query = (
+                "SELECT t.*, e.name as obj_name FROM triples t "
+                "JOIN entities e ON t.object = e.id WHERE t.subject = ?" + temporal_sql
+            )
+            for row in conn.execute(query, [eid] + temporal_params).fetchall():
+                results.append(
+                    {
+                        "direction": "outgoing",
+                        "subject": name,
+                        "predicate": row["predicate"],
+                        "object": row["obj_name"],
+                        "valid_from": row["valid_from"],
+                        "valid_to": row["valid_to"],
+                        "confidence": row["confidence"],
+                        "source_closet": row["source_closet"],
+                        "current": row["valid_to"] is None,
+                    }
+                )
+        if direction in ("incoming", "both"):
+            query = (
+                "SELECT t.*, e.name as sub_name FROM triples t "
+                "JOIN entities e ON t.subject = e.id WHERE t.object = ?" + temporal_sql
+            )
+            for row in conn.execute(query, [eid] + temporal_params).fetchall():
+                results.append(
+                    {
+                        "direction": "incoming",
+                        "subject": row["sub_name"],
+                        "predicate": row["predicate"],
+                        "object": name,
+                        "valid_from": row["valid_from"],
+                        "valid_to": row["valid_to"],
+                        "confidence": row["confidence"],
+                        "source_closet": row["source_closet"],
+                        "current": row["valid_to"] is None,
+                    }
+                )
         return results
 
     def query_relationship(self, predicate: str, as_of: str = None):
@@ -588,8 +695,16 @@ class KnowledgeGraph:
                 )
         return results
 
-    def timeline(self, entity_name: str = None):
-        """Get all facts in chronological order, optionally filtered by entity."""
+    def timeline(self, entity_name: str = None, limit: int = 100, offset: int = 0):
+        """Get facts in chronological order, optionally filtered by entity.
+
+        Paginated with ``limit``/``offset`` (same convention as drawer
+        listing); defaults preserve the historical behavior of returning
+        the first 100 facts. Use :meth:`timeline_total` for the full
+        matching count.
+        """
+        limit = max(1, int(limit))
+        offset = max(0, int(offset))
         with self._lock:
             conn = self._conn()
             if entity_name:
@@ -601,20 +716,23 @@ class KnowledgeGraph:
                     JOIN entities s ON t.subject = s.id
                     JOIN entities o ON t.object = o.id
                     WHERE (t.subject = ? OR t.object = ?)
-                    ORDER BY t.valid_from ASC NULLS LAST
-                    LIMIT 100
+                    ORDER BY t.valid_from ASC NULLS LAST, t.id ASC
+                    LIMIT ? OFFSET ?
                 """,
-                    (eid, eid),
+                    (eid, eid, limit, offset),
                 ).fetchall()
             else:
-                rows = conn.execute("""
+                rows = conn.execute(
+                    """
                     SELECT t.*, s.name as sub_name, o.name as obj_name
                     FROM triples t
                     JOIN entities s ON t.subject = s.id
                     JOIN entities o ON t.object = o.id
-                    ORDER BY t.valid_from ASC NULLS LAST
-                    LIMIT 100
-                """).fetchall()
+                    ORDER BY t.valid_from ASC NULLS LAST, t.id ASC
+                    LIMIT ? OFFSET ?
+                """,
+                    (limit, offset),
+                ).fetchall()
 
         return [
             {
@@ -627,6 +745,20 @@ class KnowledgeGraph:
             }
             for r in rows
         ]
+
+    def timeline_total(self, entity_name: str = None) -> int:
+        """Total number of facts a :meth:`timeline` query matches (all pages)."""
+        with self._lock:
+            conn = self._conn()
+            if entity_name:
+                eid = self._entity_id(entity_name)
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM triples WHERE subject = ? OR object = ?",
+                    (eid, eid),
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT COUNT(*) FROM triples").fetchone()
+        return row[0]
 
     # ── Stats ─────────────────────────────────────────────────────────────
 

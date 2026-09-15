@@ -196,15 +196,18 @@ non-default backend is opt-in.
 | Backend | Mode | Install | Namespaces | Lexical | Configure with |
 | ------- | ---- | ------- | :--------: | :-----: | -------------- |
 | `chroma` _(default)_ | Local (embedded) | bundled | – | ✓ | – |
-| `sqlite_exact` | Local (exact) | bundled | – | ✓ | – |
+| `sqlite_exact` | Local (exact NumPy) | bundled | – | ✓ | – |
+| `rust_exact` | Local (native vectors) | wheel / compiled | – | ✓ | – |
 | `milvus` | Local (Lite) · Server opt-in | `mempalace[milvus]` | ✓ | ✓ | `MEMPALACE_MILVUS_URI` |
 | `qdrant` | Server (REST) | bundled | ✓ | ✓ | `MEMPALACE_QDRANT_URL` |
 | `pgvector` | Server (Postgres) | `mempalace[pgvector]` | ✓ | ✓ | `MEMPALACE_PGVECTOR_DSN` |
 
 Select with `--backend <name>`, `MEMPALACE_BACKEND=<name>`, or
-`"backend": "<name>"` in `config.json`. See
-[Storage backends](/guide/configuration#storage-backends) for connection
-variables, namespace behavior, and deployment notes.
+`"backend": "<name>"` in `config.json`. `rust_exact` uses the exact same `sqlite_exact.sqlite3` file on disk as `sqlite_exact` with zero data migration. See [native installation and vector CLI usage](crates/README.md) for the separately distributed wheel and executables.
+
+### Native vector search
+
+`rust_exact` and the standalone `mempalace-native` CLI scan the same `sqlite_exact` database with a native Rust engine. The `rust_exact` adapter falls back to the Python backend for complex filters, requests for returned embeddings, and installs without the native extension; the `mempalace-native` executable is Rust-only and has no Python fallback. No benchmark figures are published for this release; `mempalace-native bench --db <sqlite_exact.sqlite3>` measures it on your own data. See [`crates/`](crates/) for the core workspace, PyO3 bindings, and native CLI.
 
 ## Quickstart
 
@@ -351,7 +354,7 @@ PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 MIT — see [LICENSE](LICENSE).
 
 <!-- Link Definitions -->
-[version-shield]: https://img.shields.io/badge/version-3.9.0-4dc9f6?style=flat-square&labelColor=0a0e14
+[version-shield]: https://img.shields.io/badge/version-3.10.0-4dc9f6?style=flat-square&labelColor=0a0e14
 [release-link]: https://github.com/MemPalace/mempalace/releases
 [python-shield]: https://img.shields.io/badge/python-3.9+-7dd8f8?style=flat-square&labelColor=0a0e14&logo=python&logoColor=7dd8f8
 [python-link]: https://www.python.org/

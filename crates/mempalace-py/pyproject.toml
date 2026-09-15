@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "mempalace-native-core"
+dynamic = ["version"]
+description = "Optional native exact-vector accelerator for MemPalace"
+requires-python = ">=3.9"
+license = "MIT"
+
+[tool.maturin]
+bindings = "pyo3"
+module-name = "mempalace_core_rs"
