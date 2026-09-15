@@ -17,6 +17,13 @@ run_mempalace_hook() {
     return $?
   fi
 
+  # Windows: the py launcher often works when python3/python resolve to broken
+  # Microsoft Store stubs (present on PATH, but exit non-zero on any use).
+  if command -v py >/dev/null 2>&1 && py -c "import mempalace" >/dev/null 2>&1; then
+    py -m mempalace hook run "$@"
+    return $?
+  fi
+
   echo "MemPalace hook error: could not find a runnable mempalace command or module" >&2
   return 1
 }
