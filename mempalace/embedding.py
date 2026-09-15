@@ -10,17 +10,19 @@ Three embedding-model options are available, selected via
 
 * ``minilm`` (default) — ``all-MiniLM-L6-v2``, 384-dim, English-only training.
   ChromaDB's default; what every existing palace was built with.
-* ``embeddinggemma`` — ``onnx-community/embeddinggemma-300m-ONNX`` (q8), 384-dim
+* ``embeddinggemma`` — ``onnx-community/embeddinggemma-300m-ONNX``, 384-dim
   via Matryoshka truncation, multilingual (100+ languages). Cross-lingual cos
   ~0.88 on parallel translations vs MiniLM's ~0.35. Recommended for any
-  non-English use; onboarding offers it as the default. The ~300 MB ONNX
-  model is lazy-downloaded from HuggingFace on first use. Switching models
-  on an existing palace requires ``mempalace repair rebuild-index``
-  (different vector space). Its ``session.run()`` sub-batch size (32 docs by
-  default, #1770) is overridable via ``MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE``
-  or ``embeddinggemma_batch_size`` in ``config.json`` for palaces whose
-  drawers are long enough that the default sub-batch exceeds available
-  memory (#2330).
+  non-English use; onboarding offers it as the default. The ~300 MB q8 ONNX
+  variant is the backward-compatible default; FP16 is opt-in through
+  ``MEMPALACE_EMBEDDINGGEMMA_VARIANT`` or ``embeddinggemma_variant`` in the
+  config file. The model is lazy-downloaded from HuggingFace on first use.
+  Switching models or variants on an existing palace requires
+  ``mempalace repair rebuild-index`` (different vector space). Its
+  ``session.run()`` sub-batch size (32 docs by default, #1770) is overridable
+  via ``MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE`` or
+  ``embeddinggemma_batch_size`` in ``config.json`` for palaces whose drawers
+  are long enough that the default sub-batch exceeds available memory (#2330).
 * ``openai-compat`` — embeddings served by any OpenAI-compatible
   ``/v1/embeddings`` endpoint (LM Studio, llama.cpp, vLLM, Ollama's OpenAI
   shim, or a self-hosted server) instead of a local ONNX model. Useful for
@@ -261,11 +263,14 @@ def _build_ef_class():
     return _MempalaceONNX
 
 
-# Embeddinggemma-300m ONNX (q8) — 100+ languages, MRL-truncated to 384 dims so
+# Embeddinggemma-300m ONNX — 100+ languages, MRL-truncated to 384 dims so
 # it drops into existing ChromaDB collections without a schema change. Lazy:
-# the model (~300 MB) downloads on first call and is cached by huggingface_hub.
+# the selected model downloads on first call and is cached by huggingface_hub.
 _EMBEDDINGGEMMA_REPO = "onnx-community/embeddinggemma-300m-ONNX"
-_EMBEDDINGGEMMA_ONNX = "model_quantized.onnx"
+_EMBEDDINGGEMMA_ONNX_BY_VARIANT = {
+    "q8": "model_quantized.onnx",
+    "fp16": "model_fp16.onnx",
+}
 _EMBEDDINGGEMMA_PREFIX = "task: sentence similarity | query: "
 _EMBEDDINGGEMMA_DIM = 384  # Matryoshka truncation — first 384 dims of the 768
 _EMBEDDINGGEMMA_MAX_LEN = 2048
@@ -363,7 +368,7 @@ def _embeddinggemma_session_is_healthy(session, tokenizer, output_idx, np) -> bo
 
 
 class EmbeddinggemmaONNX:
-    """ChromaDB-compatible EF using embeddinggemma-300m ONNX (q8, MRL→384d).
+    """ChromaDB-compatible EF using embeddinggemma-300m ONNX (MRL→384d).
 
     Cross-lingual cosine similarity on parallel-translated text averages 0.88
     across DE/FR/HI/IT/KO/RU vs 0.35 for ``all-MiniLM-L6-v2``. Output dim is
@@ -371,9 +376,10 @@ class EmbeddinggemmaONNX:
     drop-in replacement for the MiniLM-shaped 384-dim collections ChromaDB
     creates by default — same vector width, no schema change.
 
-    Switching an existing palace from minilm → embeddinggemma still requires
-    re-embedding (different vector space) — collections persist the EF name
-    and ChromaDB rejects mismatched reads. Run ``mempalace repair rebuild-index``.
+    Switching an existing palace from minilm → embeddinggemma, or between q8
+    and FP16, requires re-embedding (different vector space). The outer
+    embedder-identity guard detects variant changes while this function's
+    ChromaDB name remains stable. Run ``mempalace repair rebuild-index``.
     """
 
     @staticmethod
@@ -388,9 +394,15 @@ class EmbeddinggemmaONNX:
         preferred_providers=None,
         batch_size: int = _EMBEDDINGGEMMA_BATCH_SIZE,
         intra_op_num_threads: int = 0,
+        variant: str = "q8",
     ):
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        variant = str(variant).strip().lower()
+        if variant not in _EMBEDDINGGEMMA_ONNX_BY_VARIANT:
+            raise ValueError("variant must be one of: fp16, q8")
+        self._variant = variant
+        self._onnx_filename = _EMBEDDINGGEMMA_ONNX_BY_VARIANT[variant]
         self._providers = (
             list(preferred_providers) if preferred_providers else ["CPUExecutionProvider"]
         )
@@ -427,13 +439,15 @@ class EmbeddinggemmaONNX:
             logger.info(
                 "Downloading %s/%s (cached after first run)…",
                 _EMBEDDINGGEMMA_REPO,
-                _EMBEDDINGGEMMA_ONNX,
+                self._onnx_filename,
             )
             model_path = hf_hub_download(
-                _EMBEDDINGGEMMA_REPO, subfolder="onnx", filename=_EMBEDDINGGEMMA_ONNX
+                _EMBEDDINGGEMMA_REPO, subfolder="onnx", filename=self._onnx_filename
             )
             hf_hub_download(
-                _EMBEDDINGGEMMA_REPO, subfolder="onnx", filename=_EMBEDDINGGEMMA_ONNX + "_data"
+                _EMBEDDINGGEMMA_REPO,
+                subfolder="onnx",
+                filename=self._onnx_filename + "_data",
             )
             tok_path = hf_hub_download(_EMBEDDINGGEMMA_REPO, filename="tokenizer.json")
 
@@ -742,7 +756,8 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
     ``device=None`` reads :attr:`MempalaceConfig.embedding_device`;
     ``model=None`` reads :attr:`MempalaceConfig.embedding_model`.
     The returned function is shared across calls with the same resolved
-    provider list + model so we only pay model-load cost once per process.
+    provider list, model, and EmbeddingGemma variant so we only pay model-load
+    cost once per process.
     """
     if device is None or model is None:
         from .config import MempalaceConfig
@@ -752,6 +767,10 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
             device = cfg.embedding_device
         if model is None:
             model = cfg.embedding_model
+
+    from .config import normalize_embedding_model
+
+    model = normalize_embedding_model(model)
 
     # OpenAI-compatible embedding API: bypasses local ONNX entirely. Checked
     # before device→provider resolution since it needs no hardware accelerator.
@@ -788,8 +807,14 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
         )
         return ef
 
+    variant = None
+    if model == "embeddinggemma":
+        from .config import MempalaceConfig
+
+        variant = MempalaceConfig().embeddinggemma_variant
+
     providers, effective = _resolve_providers(device, model)
-    cache_key = (model, tuple(providers))
+    cache_key = (model, variant, tuple(providers))
     cached = _EF_CACHE.get(cache_key)  # lock-free fast path; dict.get is GIL-atomic
     if cached is not None:
         return cached
@@ -803,6 +828,7 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
             ef = EmbeddinggemmaONNX(
                 preferred_providers=providers,
                 intra_op_num_threads=threads,
+                variant=variant,
                 batch_size=_resolve_embeddinggemma_batch_size(),
             )
         else:
@@ -849,18 +875,37 @@ def describe_device(device: Optional[str] = None, model: Optional[str] = None) -
 _DIM_CACHE: dict = {}
 
 
+def canonical_model_name(model: str) -> str:
+    """Normalize an embedder identity name without loading the model."""
+    name = str(model).strip().lower()
+    if name.startswith("embeddinggemma:"):
+        _, variant = name.split(":", 1)
+        if variant == "q8":
+            return "embeddinggemma"
+        if variant != "fp16":
+            raise ValueError("EmbeddingGemma identity variant must be one of: fp16, q8")
+    return name
+
+
 def current_model_name(model: Optional[str] = None) -> str:
     """Resolve the canonical embedder model name (cheap, no model load).
 
     This is the configured ``embedding_model`` (``"minilm"`` /
-    ``"embeddinggemma"`` / ...), not the embedding function's internal
-    ``name()`` (which is spoofed to ``"default"`` for ChromaDB compatibility).
+    ``"embeddinggemma"`` / ...), plus a non-default EmbeddingGemma variant,
+    not the embedding function's internal ``name()`` (which stays stable for
+    ChromaDB compatibility). The default q8 variant keeps the legacy
+    ``"embeddinggemma"`` identity; FP16 resolves to ``"embeddinggemma:fp16"``.
     """
-    if model is not None:
-        return str(model).strip().lower()
     from .config import MempalaceConfig
 
-    return MempalaceConfig().embedding_model
+    cfg = MempalaceConfig()
+    raw_name = str(model).strip().lower() if model is not None else cfg.embedding_model
+    if raw_name.startswith("embeddinggemma:"):
+        return canonical_model_name(raw_name)
+    name = canonical_model_name(raw_name)
+    if name == "embeddinggemma" and cfg.embeddinggemma_variant != "q8":
+        return f"{name}:{cfg.embeddinggemma_variant}"
+    return name
 
 
 def probe_dimension(device: Optional[str] = None, model: Optional[str] = None) -> int:
