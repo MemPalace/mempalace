@@ -30,7 +30,9 @@ const HOOK_EVENT_NAMES = { stop: 'Stop', precompact: 'PreCompact', 'session-end'
 export function apply(ctx, config) {
   const settings = resolveSettings(config)
   const logger = ctx.logger('mempalace-autosave')
-  const root = settings.transcriptDir ?? path.join(dshHome(), 'mempalace', 'transcripts')
+  // Absolute once: the hook runs with the session's workspace as its cwd, so a
+  // relative directory would name a different file there than it does here.
+  const root = path.resolve(settings.transcriptDir ?? path.join(dshHome(), 'mempalace', 'transcripts'))
 
   /** sessionId -> { id, cwd, log, queue, runner } */
   const sessions = new Map()

@@ -14,7 +14,7 @@
 // `system-prompt/assemble` waterfall. So the only place that can hold a
 // session's first call for its memory is that waterfall, and the only way to
 // deliver memory that arrived while it waited is to patch the assembly already
-// built. The wait is bounded and never fails the step.
+// built. The wait is bounded, happens once per session, and never fails a step.
 
 import { describeFailure, isTracked, projectWing, resolveSettings, runCli } from './palace.js'
 
@@ -29,8 +29,8 @@ export const SECTION_TEXT = `## MemPalace memory\n\n{{${VARIABLE_NAME}}}`
 
 /** What `Layer0.render` prints when ~/.mempalace/identity.txt does not exist. */
 const L0_PLACEHOLDER = '## L0 — IDENTITY\nNo identity configured. Create ~/.mempalace/identity.txt'
-/** Headings `mempalace wake-up` prints in place of L1 when the palace cannot be read. */
-const L1_UNAVAILABLE = [/^## L1 — No palace found\b/, /^No palace found\b/, /^## Palace is busy\b/]
+/** Blocks `mempalace wake-up` prints in place of L1 when the palace cannot be read. */
+const L1_UNAVAILABLE = [/^## L1 — No palace found\b/, /^## Palace is busy\b/]
 
 /**
  * The memory in `mempalace wake-up` output, verbatim, or '' when there is none.
@@ -45,10 +45,12 @@ export function parseWakeup(stdout) {
   let start = 0
   if (/^Wake-up text \(~\d+ tokens\):$/.test(lines[0] ?? '')) start = /^=+$/.test(lines[1] ?? '') ? 2 : 1
 
+  // Blocks start only at a section heading, so a stored line that happens to
+  // read like a CLI hint stays inside its block and is kept.
   const blocks = lines
     .slice(start)
     .join('\n')
-    .split(/\n(?=## |No palace found)/)
+    .split(/\n(?=## )/)
   const kept = blocks.filter((block) => {
     const trimmed = block.trim()
     return trimmed !== L0_PLACEHOLDER && !L1_UNAVAILABLE.some((pattern) => pattern.test(trimmed))
@@ -86,13 +88,16 @@ export function searchInstruction(searchTool, wing) {
   return `search the full palace with \`${searchTool}\` (leave out its \`wing\` argument to search every wing)`
 }
 
-/** Read and render one session's memory. Resolves '' on any failure; never rejects. */
-export async function readMemory(ctx, settings, cwd, onFailure = () => {}) {
+/**
+ * Read and render one session's memory. Resolves '' on any failure; never
+ * rejects. An aborted read is not a failure worth reporting.
+ */
+export async function readMemory(ctx, settings, cwd, onFailure = () => {}, signal) {
   const wing = settings.wing ?? (await projectWing(cwd))
   const args = wing === undefined ? ['wake-up'] : ['wake-up', '--wing', wing]
-  const result = await runCli(ctx, settings, args, { cwd })
+  const result = await runCli(ctx, settings, args, { cwd, signal })
   if (!result.ok) {
-    onFailure(`mempalace wake-up failed: ${describeFailure(result)}`)
+    if (!signal?.aborted) onFailure(`mempalace wake-up failed: ${describeFailure(result)}`)
     return ''
   }
   const memory = parseWakeup(result.stdout)
@@ -108,6 +113,12 @@ export function apply(ctx, config) {
   /** sessionId -> disposers for what this row registered on that agent. */
   const registrations = new Map()
   const reads = new Set()
+  /**
+   * Aborted when the plugin unloads, so a slow `wake-up` cannot hold the
+   * unload open. Deliberately not tied to any turn's signal: cancelling one
+   * turn must not cost the whole session its memory.
+   */
+  const unloading = new AbortController()
   let warned = false
 
   const onFailure = (message) => {
@@ -122,8 +133,8 @@ export function apply(ctx, config) {
     if (!isTracked(session, settings) || wired.has(agent)) return
     wired.add(agent)
 
-    const memory = { text: '', pending: undefined }
-    const read = readMemory(ctx, settings, session.header.cwd, onFailure)
+    const memory = { text: '', pending: undefined, waited: false }
+    const read = readMemory(ctx, settings, session.header.cwd, onFailure, unloading.signal)
       .then((text) => {
         memory.text = text
       })
@@ -147,8 +158,14 @@ export function apply(ctx, config) {
       )
       disposers.push(
         agent.ctx.on('system-prompt/assemble', async (assembly, context, next) => {
-          if (memory.pending !== undefined && settings.firstAssemblyBudgetMs > 0) {
-            await settleWithin(memory.pending, settings.firstAssemblyBudgetMs, context?.signal)
+          const signal = context?.signal
+          // One assembly per session waits. A read slower than the budget must
+          // not add the budget to every later step; later assemblies pick the
+          // memory up from the providers once it lands. A turn already
+          // cancelled does not wait, and leaves the wait to the next assembly.
+          if (memory.pending !== undefined && !memory.waited && settings.firstAssemblyBudgetMs > 0 && !signal?.aborted) {
+            memory.waited = true
+            await settleWithin(memory.pending, settings.firstAssemblyBudgetMs, signal)
             if (memory.text.length > 0) deliver(assembly, memory.text)
           }
           return next()
@@ -167,6 +184,7 @@ export function apply(ctx, config) {
 
   ctx.effect(
     () => async () => {
+      unloading.abort()
       for (const disposers of registrations.values()) {
         for (const dispose of disposers) {
           try {
@@ -193,6 +211,8 @@ function deliver(assembly, text) {
 
 /** Resolve when `promise` settles, `ms` elapses, or `signal` aborts, whichever is first. */
 function settleWithin(promise, ms, signal) {
+  // An abort that already happened fires no event; listening for it would wait out `ms`.
+  if (signal?.aborted) return Promise.resolve()
   return new Promise((resolve) => {
     const finish = () => {
       clearTimeout(timer)

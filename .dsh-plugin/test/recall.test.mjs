@@ -232,6 +232,60 @@ test('unloading the plugin removes the section from live agents', async () => {
   assert.equal(render(await assemble()), '')
 })
 
+test('a palace slower than the budget delays only the first assembly, not every step', async () => {
+  const host = createHost({ reply: wakeUp(WAKEUP, { delayMs: 1500 }) })
+  recall.apply(host.ctx, { firstAssemblyBudgetMs: 300 })
+  const { agent, assemble } = createAgent()
+  host.emit('agent/session-start', { agent, source: 'startup' })
+
+  await assemble()
+  const started = Date.now()
+  assert.equal(render(await assemble()), '', 'memory has not arrived yet')
+  assert.ok(Date.now() - started < 150, 'the second assembly did not wait the budget again')
+
+  await tick(1500)
+  assert.match(render(await assemble()), /I am Atlas/)
+})
+
+test('a turn cancelled before assembly does not wait, and leaves the wait for the next assembly', async () => {
+  const host = createHost({ reply: wakeUp(WAKEUP, { delayMs: 800 }) })
+  recall.apply(host.ctx, {})
+  const { agent, assemble } = createAgent()
+  host.emit('agent/session-start', { agent, source: 'startup' })
+
+  const controller = new AbortController()
+  controller.abort()
+  const started = Date.now()
+  await assemble({ signal: controller.signal })
+  assert.ok(Date.now() - started < 400, 'an already-cancelled turn returned at once')
+
+  assert.match(render(await assemble()), /I am Atlas/, 'the next assembly still waited for the memory')
+})
+
+test('a stored line that starts like a CLI hint stays in memory', () => {
+  const stored = WAKEUP.replace(
+    '  - chose the append-only transcript (dsh plugin)',
+    'No palace found in the old notes, so we re-mined.\n  - chose the append-only transcript (dsh plugin)',
+  )
+  const memory = recall.parseWakeup(stored)
+  assert.match(memory, /^No palace found in the old notes, so we re-mined\.$/m)
+  assert.match(memory, /chose the append-only transcript/)
+})
+
+test('unloading the plugin cancels a wake-up still running, without warning about it', async () => {
+  const host = createHost({ reply: () => ({ hang: true }) })
+  recall.apply(host.ctx, { timeoutMs: 60_000 })
+  const { agent } = createAgent()
+  host.emit('agent/session-start', { agent, source: 'startup' })
+  for (let i = 0; i < 100 && host.spawns.length === 0; i += 1) await tick(5)
+  assert.equal(host.spawns.length, 1)
+
+  const started = Date.now()
+  await host.unload()
+  assert.ok(Date.now() - started < 2000, 'unload did not wait for the CLI timeout')
+  assert.equal(host.warnings.length, 0)
+})
+
 test('the project wing follows the miner: mempalace.yaml, then the normalised directory name', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'mempalace-dsh-'))
   try {

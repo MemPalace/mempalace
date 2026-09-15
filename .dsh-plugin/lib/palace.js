@@ -6,7 +6,7 @@
 // plugins, and every harness API they use arrives through `ctx`.
 
 import { statSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
+import { readFile, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
 
@@ -142,31 +142,92 @@ export function describeFailure(result) {
  * `wing:` from mempalace.yaml (or the legacy mempal.yaml), else the directory
  * name through `config.normalize_wing_name`.
  *
- * @returns the wing, or undefined when the directory yields no usable name.
+ * @returns the wing, or undefined to wake up the whole palace: when the
+ *   directory yields no usable name, or when the configured `wing:` uses YAML
+ *   this reader cannot read exactly (guessing would read a wing the miner
+ *   never files into).
  */
 export async function projectWing(cwd) {
   if (typeof cwd !== 'string' || cwd.length === 0) return undefined
   const dir = path.resolve(cwd)
   for (const file of ['mempalace.yaml', 'mempal.yaml']) {
+    const config = path.join(dir, file)
+    // A regular file only, as the miner checks: reading a FIFO would block
+    // until a writer appears, and this runs before any CLI timeout applies.
+    if (!(await isRegularFile(config))) continue
     let yaml
     try {
-      yaml = await readFile(path.join(dir, file), 'utf8')
+      yaml = await readFile(config, 'utf8')
     } catch {
-      continue
+      break
     }
-    return yamlWing(yaml) ?? normalizeWingName(path.basename(dir))
+    const wing = yamlWing(yaml)
+    if (wing === null) return undefined
+    return wing ?? normalizeWingName(path.basename(dir))
   }
   return normalizeWingName(path.basename(dir))
 }
 
-/** The top-level `wing:` scalar of a mempalace.yaml, if it has one. */
+async function isRegularFile(file) {
+  try {
+    return (await stat(file)).isFile()
+  } catch {
+    return false
+  }
+}
+
+/**
+ * The top-level `wing:` scalar of a mempalace.yaml, read the way YAML reads it.
+ *
+ * @returns the wing; undefined when there is no top-level `wing:` or it is
+ *   empty; null when the value uses YAML this reader does not handle (flow or
+ *   block syntax, anchors, tags, an unknown escape, a quote left open).
+ */
 export function yamlWing(yaml) {
-  const match = /^wing:[ \t]*(.*)$/m.exec(yaml)
+  const match = /^wing:(?:[ \t]+(.*))?$/m.exec(yaml.replace(/\r\n?/g, '\n'))
   if (match === null) return undefined
-  let value = match[1].replace(/\s+#.*$/, '').trim()
+  return yamlScalar(match[1] ?? '')
+}
+
+const DOUBLE_QUOTED_ESCAPES = { '"': '"', '\\': '\\', '/': '/', t: '\t', n: '\n' }
+
+function yamlScalar(raw) {
+  const value = raw.trim()
+  if (value.length === 0) return undefined
+  if (value[0] === "'" || value[0] === '"') return quotedScalar(value)
+  if (/^[[{&*!|>%@`]/.test(value)) return null
+  // In a plain scalar a comment starts only at a `#` preceded by whitespace.
+  const plain = value.replace(/(^|[ \t])#.*$/, '').trim()
+  return plain.length > 0 ? plain : undefined
+}
+
+function quotedScalar(value) {
   const quote = value[0]
-  if (value.length >= 2 && (quote === '"' || quote === "'") && value.at(-1) === quote) value = value.slice(1, -1)
-  return value.length > 0 ? value : undefined
+  let result = ''
+  for (let i = 1; i < value.length; i += 1) {
+    const char = value[i]
+    if (char === quote) {
+      // Inside single quotes, a doubled quote is one literal quote.
+      if (quote === "'" && value[i + 1] === "'") {
+        result += "'"
+        i += 1
+        continue
+      }
+      const rest = value.slice(i + 1)
+      // After the closing quote YAML allows only whitespace and a comment.
+      if (rest.trim().length > 0 && !/^[ \t]+#/.test(rest)) return null
+      return result.length > 0 ? result : undefined
+    }
+    if (quote === '"' && char === '\\') {
+      const escaped = DOUBLE_QUOTED_ESCAPES[value[i + 1]]
+      if (escaped === undefined) return null
+      result += escaped
+      i += 1
+      continue
+    }
+    result += char
+  }
+  return null
 }
 
 /** Port of `mempalace.config.normalize_wing_name`. */

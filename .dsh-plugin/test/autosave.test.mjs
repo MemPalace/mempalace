@@ -237,6 +237,34 @@ test('a session whose workspace is gone still runs its hook, with its own cwd in
   assert.equal(JSON.parse(call.stdio.stdin.data).cwd, gone, 'the hook still derives the wing from the session cwd')
 })
 
+test('every session id gets its own transcript file, even on a case-insensitive filesystem', () => {
+  const ids = ['a/b', 'a_b', 'a~002fb', 'Session-1', 'session-1', 'session-e4db4ca6-efe7-4ee5-92e9-d5ae15ae6159']
+  const names = ids.map(transcriptFileName)
+  assert.equal(new Set(names.map((name) => name.toLowerCase())).size, ids.length)
+  for (const name of names) assert.match(name, /^[a-z0-9_~-]+\.jsonl$/)
+  assert.equal(transcriptFileName('session-e4db4ca6-efe7-4ee5-92e9-d5ae15ae6159'), 'session-e4db4ca6-efe7-4ee5-92e9-d5ae15ae6159.jsonl')
+})
+
+test('a relative transcriptDir is resolved once, so the hook reads the file the plugin wrote', async () => {
+  const host = createHost({ reply: () => ({ stdout: '{}' }) })
+  const previous = process.cwd()
+  process.chdir(dir)
+  try {
+    autosave.apply(host.ctx, { transcriptDir: 'relative-transcripts' })
+  } finally {
+    process.chdir(previous)
+  }
+  const { session } = createAgent({ cwd: previous })
+  host.emit('session/event', session, userSaid(1, 'hello'))
+  host.emit('session/disposed', session)
+  await settle(host)
+
+  const { transcript_path: transcriptPath } = JSON.parse(hookCalls(host)[0].stdio.stdin.data)
+  assert.ok(path.isAbsolute(transcriptPath), transcriptPath)
+  assert.ok(transcriptPath.endsWith(path.join('relative-transcripts', transcriptFileName('session-1'))), transcriptPath)
+  assert.equal((await readLines(transcriptPath))[0].message.content, 'hello')
+})
+
 test('unloading waits for a hook still running', async () => {
   const host = createHost({ reply: () => ({ delayMs: 60, stdout: '{}' }) })
   autosave.apply(host.ctx, { transcriptDir: dir })

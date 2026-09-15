@@ -10,9 +10,19 @@
 import { appendFile, mkdir, readFile } from 'node:fs/promises'
 import path from 'node:path'
 
-/** A session id as a file name the hook runner's path validator accepts. */
+/**
+ * A session id as a transcript file name. The encoding is injective even on
+ * case-insensitive filesystems, so two sessions never share a file, and it uses
+ * only characters the hook runner's path validator and every filesystem accept:
+ * `a-z`, `0-9`, `_` and `-` pass through, and any other UTF-16 code unit
+ * (uppercase letters and `~` included) becomes `~` plus four hex digits.
+ */
 export function transcriptFileName(sessionId) {
-  return `${String(sessionId).replace(/[^A-Za-z0-9_-]/g, '_')}.jsonl`
+  const encoded = String(sessionId).replace(
+    /[^a-z0-9_-]/g,
+    (char) => `~${char.charCodeAt(0).toString(16).padStart(4, '0')}`,
+  )
+  return `${encoded}.jsonl`
 }
 
 /** The text blocks of a message, verbatim; reasoning, tool calls and images are not text. */

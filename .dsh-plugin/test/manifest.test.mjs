@@ -6,7 +6,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'))
-const patch = readFileSync(path.join(root, 'cordis.patch.yml'), 'utf8')
+// A Windows checkout may carry CRLF line endings; the assertions read LF.
+const patch = readFileSync(path.join(root, 'cordis.patch.yml'), 'utf8').replace(/\r\n/g, '\n')
 const rows = [...patch.matchAll(/- id: (\S+)\n\s+name: '([^']+)'/g)].map(([, id, name]) => ({ id, name }))
 
 test('the bundle manifest points at its patch layer', () => {
