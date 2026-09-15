@@ -24,7 +24,7 @@ def test_normalize_transcript_path_preserves_spaces_and_unicode():
 
 
 def test_parse_stop_payload_keeps_session_strict_but_path_not_over_sanitized():
-    session_id, stop_active, transcript_path = hook_shell.parse_stop_payload(
+    session_id, stop_active, transcript_path, cwd = hook_shell.parse_stop_payload(
         {
             "session_id": "../bad session!!",
             "stop_hook_active": "yes",
@@ -35,6 +35,7 @@ def test_parse_stop_payload_keeps_session_strict_but_path_not_over_sanitized():
     assert session_id == "badsession"
     assert stop_active == "True"
     assert transcript_path == "C:/Users/Me User/.claude/projects/emoji 🧠/session.jsonl"
+    assert cwd == ""
 
 
 def test_parse_precompact_cli_outputs_sentinel_and_normalized_path():
@@ -51,10 +52,14 @@ def test_parse_precompact_cli_outputs_sentinel_and_normalized_path():
         check=True,
     )
 
+    # Trailing "" is the wing line: the payload carries no cwd, and
+    # hooks.wing_from_cwd is off by default, so the hooks mine with no
+    # --wing exactly as before.
     assert result.stdout.splitlines() == [
         "__MEMPAL_PARSE_OK__",
         "sess-1",
         "D:/Claude/projects/-Users-me-App/session.jsonl",
+        "",
     ]
 
 

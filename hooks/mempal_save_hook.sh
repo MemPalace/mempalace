@@ -166,9 +166,15 @@ _MEMPAL_PARSE_MARKER=$(printf '%s\n' "$_mempal_parsed" | sed -n '1p')
 SESSION_ID=$(printf '%s\n' "$_mempal_parsed" | sed -n '2p')
 STOP_HOOK_ACTIVE=$(printf '%s\n' "$_mempal_parsed" | sed -n '3p')
 TRANSCRIPT_PATH=$(printf '%s\n' "$_mempal_parsed" | sed -n '4p')
+# Line 5 is the destination wing, already resolved by hook_shell: the slug
+# derived from the payload's cwd when `hooks.wing_from_cwd` is enabled, and
+# empty otherwise. The shell deliberately holds no slug or config logic —
+# empty simply means "mine with no --wing", i.e. today's default.
+MINE_WING=$(printf '%s\n' "$_mempal_parsed" | sed -n '5p')
 SESSION_ID="${SESSION_ID:-unknown}"
 STOP_HOOK_ACTIVE="${STOP_HOOK_ACTIVE:-False}"
 TRANSCRIPT_PATH="${TRANSCRIPT_PATH:-}"
+MINE_WING="${MINE_WING:-}"
 
 # Defense-in-depth: if INPUT was non-empty but Python never reached the
 # print() calls (sentinel missing), parsing silently failed. Surface the
@@ -264,9 +270,17 @@ if [ "$SINCE_LAST" -ge "$SAVE_INTERVAL" ] && [ "$EXCHANGE_COUNT" -gt 0 ]; then
     #      (code, notes, docs)
     # MEMPAL_DIR is *additive*, not an override: a user with MEMPAL_DIR
     # pointed at their project still gets the active conversation mined.
+    # $MINE_WING is passed as a separate quoted argument rather than spliced
+    # into one command string, so a wing can never word-split into extra
+    # flags. The two branches differ only by that argument.
     if is_valid_transcript_path "$TRANSCRIPT_PATH" && [ -f "$TRANSCRIPT_PATH" ]; then
-        "$MEMPAL_PYTHON_BIN" -m mempalace mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
-            >> "$STATE_DIR/hook.log" 2>&1 &
+        if [ -n "$MINE_WING" ]; then
+            "$MEMPAL_PYTHON_BIN" -m mempalace mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
+                --wing "$MINE_WING" >> "$STATE_DIR/hook.log" 2>&1 &
+        else
+            "$MEMPAL_PYTHON_BIN" -m mempalace mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
+                >> "$STATE_DIR/hook.log" 2>&1 &
+        fi
     elif [ -n "$TRANSCRIPT_PATH" ]; then
         echo "[$(date '+%H:%M:%S')] Skipping invalid transcript path: $TRANSCRIPT_PATH" \
             >> "$STATE_DIR/hook.log"

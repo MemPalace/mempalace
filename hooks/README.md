@@ -140,6 +140,30 @@ export MEMPALACE_HOOKS_AUTO_SAVE=false
 
 When disabled, both the stop hook and precompact hook pass through without blocking. You can still save manually with `mempalace mine <dir> --mode convos`.
 
+### Mining Into a Per-Project Wing
+
+By default the hooks mine with no `--wing`. Because your transcripts live under `~/.claude/projects` (or `~/.codex`, `~/.gemini`), the miner recognizes an AI-tool path and files everything into the shared `wing_api` wing. That keeps all assistant conversations in one place, which is what you want if you don't maintain per-project wings.
+
+If you *do* keep per-project wings, that default means automatic mining lands in a wing your searches never touch. Enable `hooks.wing_from_cwd` to mine into a wing derived from the working directory the hook payload reports instead:
+
+**Option 1 — config file** (`~/.mempalace/config.json`):
+```json
+{
+  "hooks": {
+    "wing_from_cwd": true
+  }
+}
+```
+
+**Option 2 — environment variable:**
+```bash
+export MEMPALACE_HOOKS_WING_FROM_CWD=true
+```
+
+A session whose cwd is `/home/you/code/my-app` then mines into `home_you_code_my_app` — the same slug `mempalace mine --wing` and the miner's own directory-name fallback produce, so wing-scoped searches find it.
+
+Off by default; existing installs keep filing into `wing_api` until they opt in. This only affects where *new* mining lands — drawers already in `wing_api` stay there.
+
 ### mempalace CLI
 
 The relevant commands are:
