@@ -10,6 +10,7 @@ on:
       - '.claude-plugin/marketplace.json'
       - '.claude-plugin/plugin.json'
       - '.codex-plugin/plugin.json'
+      - '.dsh-plugin/package.json'
       - 'integrations/openclaw/SKILL.md'
       - '.github/workflows/version-guard.yml'
 
@@ -28,6 +29,7 @@ jobs:
           marketplace_version=$(jq -r '.plugins[0].version' .claude-plugin/marketplace.json)
           plugin_version=$(jq -r '.version' .claude-plugin/plugin.json)
           codex_version=$(jq -r '.version' .codex-plugin/plugin.json)
+          dsh_version=$(jq -r '.version' .dsh-plugin/package.json)
           openclaw_version=$(grep -E '^version:' integrations/openclaw/SKILL.md | cut -d' ' -f2)
 
           {
@@ -36,6 +38,7 @@ jobs:
             echo "marketplace_version=$marketplace_version"
             echo "plugin_version=$plugin_version"
             echo "codex_version=$codex_version"
+            echo "dsh_version=$dsh_version"
             echo "openclaw_version=$openclaw_version"
           } >> "$GITHUB_OUTPUT"
 
@@ -49,6 +52,7 @@ jobs:
             echo "| .claude-plugin/marketplace.json | \`$marketplace_version\` |"
             echo "| .claude-plugin/plugin.json | \`$plugin_version\` |"
             echo "| .codex-plugin/plugin.json | \`$codex_version\` |"
+            echo "| .dsh-plugin/package.json | \`$dsh_version\` |"
             echo "| integrations/openclaw/SKILL.md | \`$openclaw_version\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -59,6 +63,7 @@ jobs:
           MARKETPLACE: ${{ steps.versions.outputs.marketplace_version }}
           PLUGIN: ${{ steps.versions.outputs.plugin_version }}
           CODEX: ${{ steps.versions.outputs.codex_version }}
+          DSH: ${{ steps.versions.outputs.dsh_version }}
           OPENCLAW: ${{ steps.versions.outputs.openclaw_version }}
         run: |
           set -euo pipefail
@@ -70,11 +75,12 @@ jobs:
               fail=1
             fi
           }
-          # All six must agree with each other (use version.py as the reference, per CLAUDE.md)
+          # All seven must agree with each other (use version.py as the reference, per CLAUDE.md)
           check "pyproject.toml" "$PYPROJECT" "$PY"
           check ".claude-plugin/marketplace.json" "$MARKETPLACE" "$PY"
           check ".claude-plugin/plugin.json" "$PLUGIN" "$PY"
           check ".codex-plugin/plugin.json" "$CODEX" "$PY"
+          check ".dsh-plugin/package.json" "$DSH" "$PY"
           check "integrations/openclaw/SKILL.md" "$OPENCLAW" "$PY"
           exit $fail
 

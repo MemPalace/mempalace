@@ -574,9 +574,30 @@ def test_diary_agent_for_harness_unknown_falls_back_to_name():
         assert _diary_agent_for_harness(harness) != "session-hook"
 
 
+def test_dsh_harness_is_accepted_and_reads_diary_under_its_own_name():
+    """The DeepSeek Harness plugin drives `hook run --harness dsh`.
+
+    DSH supplies its own transcript (its on-disk session logs are
+    zstd-compressed and unreadable outside the harness), so `dsh` needs nothing
+    beyond being a recognised harness: the same input shape as Claude Code, and
+    a diary identity a `diary_read(agent_name="dsh")` call can actually find.
+    """
+    parsed = hooks_cli_mod._parse_harness_input(
+        {"session_id": "session-x", "transcript_path": "/tmp/t.jsonl"},
+        "dsh",
+    )
+    assert parsed == {
+        "session_id": "session-x",
+        "stop_hook_active": False,
+        "transcript_path": "/tmp/t.jsonl",
+    }
+    assert _diary_agent_for_harness("dsh") == "dsh"
+    assert "dsh" in hooks_cli_mod.SUPPORTED_HARNESSES
+
+
 @pytest.mark.parametrize(
     "harness,expected_agent",
-    [("claude-code", "claude"), ("codex", "codex")],
+    [("claude-code", "claude"), ("codex", "codex"), ("dsh", "dsh")],
 )
 def test_stop_hook_files_checkpoint_under_harness_agent(tmp_path, harness, expected_agent):
     """The Stop hook must file checkpoints under the agent identity that the
