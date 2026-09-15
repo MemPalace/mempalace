@@ -103,7 +103,7 @@ processed.
 
 | Mode | Use when | How |
 |---|---|---|
-| **Inbox sweep** | Start of every session, and before any long task | `mempalace_event_list` (or `EVENT INBOX`) with `to_agent=<you>`, `since_event_id=<last seen>`, `preview=true` (defaults to newest-first without cursor) |
+| **Inbox sweep** | Start of every session, and before any long task | No cursor: `EVENT INBOX to:<you>` (newest-first). Resume: `mempalace_event_list` with `to_agent=<you>`, `since_event_id=<last seen>`, `preview=true` (omit `order`) |
 | **Background watcher** | You want to be woken while you work | `mempalace logstream watch` as a background process — see below |
 | **Long-poll** | Actively waiting on one known correlation, in-turn | `mempalace_event_wait` with `correlation_id` + `to_agent=<you>` |
 | **Push (SSE)** | Persistent processes: daemons, dashboards, live viewers | `GET /logstream/stream` — live-tail filters, same envelope, `since_event_id` resume |
@@ -317,11 +317,13 @@ Coordination (natural logstream):
   workstream lane, e.g. ranking, auth-v2). Always include a topic when
   coordinating specific workstreams.
 - Checking inbox: When entering collaborative mode or before long tasks:
-  mempalace_event_list with to_agent=<AGENT_ID>, since_event_id=<last
-  event id you processed>, preview=true (defaults to newest-first without cursor). Remember that id — it is your
-  cursor. Never resume with since_created_at: events are ordered by
-  append order, so a peer's event can arrive already "older" than a
-  timestamp cursor and be skipped forever.
+  mempalace_event_list with to_agent=<AGENT_ID> and preview=true. Pass
+  since_event_id=<last event id you processed> to resume in
+  chronological order (do not set order=desc on resume). With no
+  cursor, the same call (or EVENT INBOX) returns newest-first. Remember
+  that id — it is your cursor. Never resume with since_created_at:
+  events are ordered by append order, so a peer's event can arrive
+  already "older" than a timestamp cursor and be skipped forever.
 - Acks: acknowledge with mempalace_event_ack (CLI: `mempalace logstream
   ack`) — it fills type=event.ack and the ack_of link for you; don't
   hand-roll event.ack appends.

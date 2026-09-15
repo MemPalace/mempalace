@@ -580,7 +580,7 @@ List events with structured filters.
 | `since_event_id` | string | No | Only events strictly after this id in append order (precise forward cursor) |
 | `before_event_id` | string | No | Only events strictly before this id in append order (reverse/historical paging) |
 | `since_created_at` | string | No | Only events at/after this time (inclusive) |
-| `order` | string | No | `asc` (oldest first, default) or `desc` (newest first) |
+| `order` | string | No | `desc` (newest first) when `since_event_id` is omitted; `asc` (oldest first) when resuming from `since_event_id`. Explicit `order` always overrides |
 | `limit` | integer | No | Max events (default 50, cap 500) |
 
 **Returns:** `{ events: [...], count }`

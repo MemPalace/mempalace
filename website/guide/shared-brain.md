@@ -148,11 +148,13 @@ Coordination (natural logstream):
   workstream lane, e.g. ranking, auth-v2). Always include a topic when
   coordinating specific workstreams.
 - Checking inbox: When entering collaborative mode or before long tasks:
-  mempalace_event_list with to_agent=<AGENT_ID>, since_event_id=<last
-  event id you processed>, preview=true (defaults to newest-first without cursor). Remember that id — it is your
-  cursor. Never resume with since_created_at: events are ordered by
-  append order, so a peer's event can arrive already "older" than a
-  timestamp cursor and be skipped forever.
+  mempalace_event_list with to_agent=<AGENT_ID> and preview=true. Pass
+  since_event_id=<last event id you processed> to resume in
+  chronological order (do not set order=desc on resume). With no
+  cursor, the same call (or EVENT INBOX) returns newest-first. Remember
+  that id — it is your cursor. Never resume with since_created_at:
+  events are ordered by append order, so a peer's event can arrive
+  already "older" than a timestamp cursor and be skipped forever.
 - Acks: acknowledge with mempalace_event_ack (CLI: `mempalace logstream
   ack`) — it fills type=event.ack and the ack_of link for you; don't
   hand-roll event.ack appends.
