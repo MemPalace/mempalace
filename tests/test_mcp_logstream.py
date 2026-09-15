@@ -92,7 +92,10 @@ class TestRegistration:
         assert LOGSTREAM_TOOLS <= mcp_server._SQLITE_INTEGRITY_ALLOWED_TOOLS
 
     def test_mutating_logstream_tools_exempt_from_peer_writer_gate(self):
-        assert LOGSTREAM_MUTATING == mcp_server._PEER_WRITER_EXEMPT_TOOLS
+        # Subset (not equality): the KG tools (#2297) also join the exempt
+        # set, so the logstream family is a *subset* of all peer-writer
+        # exemptions, not the whole thing.
+        assert LOGSTREAM_MUTATING <= mcp_server._PEER_WRITER_EXEMPT_TOOLS
 
 
 # ── Dispatch round trips ──────────────────────────────────────────────────

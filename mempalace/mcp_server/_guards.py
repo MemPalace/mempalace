@@ -212,11 +212,24 @@ _MUTATING_TOOLS = frozenset(
     }
 )
 
+# Tools exempt from the peer-writer lease.
+#
 # Logstream mutating tools (RFC 003) write only to logstream.sqlite3 — an
 # independent WAL database with no Chroma/HNSW in-memory state — so the
 # peer-writer lease that protects Chroma does not apply to them. Exempting
 # them keeps agent coordination alive while a CLI mine or a peer stdio
-# writer holds the palace lock. They remain in _MUTATING_TOOLS so operator
+# writer holds the palace lock.
+#
+# Knowledge-graph tools (#2297): KnowledgeGraph opens its own
+# knowledge_graph.sqlite3 in WAL mode with its own threading.Lock.
+# None of these paths touch Chroma or the HNSW segment, so the
+# peer-writer lease — which exists to serialise two Chroma
+# PersistentClients against the same palace — has no claim on them.
+# Gate them through the lease and a second session loses the ability
+# to record durable facts for the lifetime of the other session,
+# even though the write is provably safe.
+#
+# All exempted tools remain in _MUTATING_TOOLS so operator
 # read-only mode (--read-only / MEMPALACE_MCP_READ_ONLY) still hides and
 # refuses them.
 _PEER_WRITER_EXEMPT_TOOLS = frozenset(
@@ -226,6 +239,9 @@ _PEER_WRITER_EXEMPT_TOOLS = frozenset(
         "mempalace_event_ack",
         "mempalace_artifact_put",
         "mempalace_patch_submit",
+        "mempalace_kg_add",
+        "mempalace_kg_invalidate",
+        "mempalace_kg_supersede",
     }
 )
 
