@@ -956,14 +956,14 @@ def test_layer2_handles_none_metadata():
 # ---------------------------------------------------------------------------
 # Read-only opens and lock reporting
 #
-# This stack is pure read. Before it opened the palace read-only, every read
-# demanded the mine lock, so `mempalace wake-up` failed outright whenever any
-# other MemPalace process (the MCP server, a daemon, a mine) was running — and
+# This stack is pure read. Before it asked for a read-only open, a writable
+# open on sqlite_exact took the mine lock, so `mempalace wake-up` failed
+# whenever another MemPalace process (the hub, a daemon, a mine) held it — and
 # the swallowed exception reported that healthy palace as missing.
 # ---------------------------------------------------------------------------
 
 
-def test_layers_open_read_only_and_never_take_the_mine_lock():
+def test_layers_open_the_palace_read_only():
     """Every read in this stack opens with create=False, read_only=True."""
     with patch("mempalace.layers._get_collection") as mock_open:
         Layer1(palace_path="/some/palace").generate()

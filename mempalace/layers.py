@@ -13,8 +13,9 @@ Load only what you need, when you need it.
 Wake-up cost: ~600-900 tokens (L0+L1). Leaves 95%+ of context free.
 
 Reads through the configured storage backend (ChromaDB default, pluggable)
-via ``palace.get_collection`` and ~/.mempalace/identity.txt. Every open here
-is read-only: this stack never writes, so it never takes the mine lock.
+via ``palace.get_collection`` and ~/.mempalace/identity.txt. This stack never
+writes, and every open asks for ``read_only=True``; see ``_open_for_read`` for
+which backends honour that.
 """
 
 import os
@@ -35,16 +36,18 @@ from .searcher import (
 def _open_for_read(palace_path: str):
     """Open the drawers collection for a pure read.
 
-    The whole stack below is read-only, so it must not demand the mine lock.
-    Without ``read_only=True`` the backend takes the write lock, and every one
-    of these call sites runs while some other MemPalace process may legitimately
-    hold it — the MCP server, a daemon, a long mine. The failure was silent and
-    actively misleading: the ``except Exception`` around each call turned a lock
-    conflict into "No palace found. Run: mempalace mine <dir>", which invited a
-    re-mine of a perfectly healthy palace.
+    The whole stack below only reads, so it asks for ``read_only=True``. On
+    ``sqlite_exact`` a writable open takes the palace mine lock to initialise its
+    schema, and every one of these call sites runs while some other MemPalace
+    process may legitimately hold that lock — the hub, a daemon, a long mine.
+    The failure was silent and actively misleading: the ``except Exception``
+    around each call turned the lock conflict into "No palace found. Run:
+    mempalace mine <dir>", which invited a re-mine of a perfectly healthy palace.
 
-    ``read_only=True`` asks the backend to open without schema initialization,
-    migrations, or metadata writes, and is what makes a read lock-free here.
+    ``read_only`` is a request, not a guarantee. Backends that support it open
+    without schema initialization, migrations, or metadata writes, and take no
+    lock. ChromaDB ignores it; its collection open takes no mine lock either,
+    though its client still writes ``chroma.sqlite3``.
     """
     return _get_collection(palace_path, create=False, read_only=True)
 
@@ -60,8 +63,8 @@ def _read_open_failure(exc: Exception) -> str:
         return (
             "## Palace is busy — another MemPalace process holds the write lock.\n"
             f"{exc}\n"
-            "Reads are lock-free, so this is a write lock held by that process; "
-            "stop it or wait for it to finish."
+            "This backend could not open the palace without that lock; "
+            "stop that process or wait for it to finish."
         )
     return "No palace found. Run: mempalace mine <dir>"
 
