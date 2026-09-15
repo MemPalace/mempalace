@@ -2,6 +2,8 @@
 if __name__ != "mempalace.searcher":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.searcher")
 
+from contextvars import ContextVar
+
 
 def build_where_filter(wing: str = None, room: str = None, source_file: str = None) -> dict:
     """Build a ChromaDB where filter from optional wing/room/source_file.
@@ -21,6 +23,159 @@ def build_where_filter(wing: str = None, room: str = None, source_file: str = No
     if len(clauses) == 1:
         return clauses[0]
     return {"$and": clauses}
+
+
+def _is_staged_metadata(metadata, committed_tokens=frozenset()) -> bool:
+    """True for an unpublished conversation-mine physical generation."""
+    if not isinstance(metadata, dict):
+        return False
+    value = metadata.get("mine_staged")
+    # Chroma returns bools; the sqlite-only fallback reconstructs them from
+    # ``int_value`` as 0/1.
+    if not (value is True or value == 1):
+        return False
+    token = metadata.get("mine_generation_token")
+    return not token or token not in committed_tokens
+
+
+_diary_generations_var = ContextVar("diary_commit_generations", default={})
+
+
+def _load_diary_commit_generations(collection) -> dict:
+    """Map logical diary entry IDs to the published replacement generation."""
+    generations = {}
+    if collection is None:
+        return generations
+    try:
+        result = collection.get(
+            where={"diary_commit": True},
+            include=["metadatas"],
+        )
+        if isinstance(result, dict):
+            metas = result.get("metadatas") or []
+        else:
+            metas = getattr(result, "metadatas", None) or []
+    except Exception:
+        logger.debug("diary commit marker lookup failed", exc_info=True)
+        return generations
+    for meta in metas:
+        if not isinstance(meta, dict):
+            continue
+        entry_id = meta.get("diary_entry_id")
+        token = meta.get("diary_generation")
+        if entry_id and token:
+            generations[entry_id] = token
+    return generations
+
+
+def _prime_diary_commit_generations(collection) -> dict:
+    """Load diary replacement markers for this request's visibility checks."""
+    generations = _load_diary_commit_generations(collection)
+    _diary_generations_var.set(generations)
+    return generations
+
+
+def _diary_parent_id(metadata) -> str:
+    parent = metadata.get("parent_drawer_id") or metadata.get("parent_entry_id")
+    return parent if isinstance(parent, str) and parent else ""
+
+
+def _is_visible_diary_metadata(metadata, diary_generations=None) -> bool:
+    """Hide retired diary chunks after a published idempotent replacement."""
+    if metadata.get("diary_commit") is True:
+        return False
+    generations = diary_generations
+    if generations is None:
+        generations = _diary_generations_var.get()
+    entry_id = metadata.get("diary_entry_id") or _diary_parent_id(metadata)
+    if entry_id and entry_id in generations:
+        return metadata.get("diary_generation") == generations[entry_id]
+    return True
+
+
+def _is_visible_generation_metadata(
+    metadata, committed_tokens=frozenset(), tokened_source_modes=frozenset()
+) -> bool:
+    """True when a stored drawer belongs to the currently readable generation.
+
+    Tokenless leftover rows from a failed A→B cleanup are not visible once a
+    later generation for the same source/mode carries a token. Staged or
+    tokened rows from a retired generation are not visible either. Ordinary
+    project/diary rows without a generation token stay readable. Published
+    diary replacements hide leftover parent chunks from earlier physical IDs.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    if metadata.get("mine_commit_marker") is True:
+        return False
+    if _is_staged_metadata(metadata, committed_tokens):
+        return False
+    token = metadata.get("mine_generation_token")
+    if token:
+        return token in committed_tokens
+    source_mode = _source_mode_commit_key(metadata)
+    if source_mode is not None and source_mode in tokened_source_modes:
+        return False
+    return _is_visible_diary_metadata(metadata)
+
+
+def _committed_generation_state(collection) -> tuple[frozenset, frozenset]:
+    """Published generation tokens and the source/mode pairs that carry them.
+
+    Incomplete marker scans are not a visibility view: unread later pages
+    would hide their active tokened rows. Raise instead of returning a
+    partial or empty set.
+    """
+    try:
+        tokens, modes, complete = _generation_commit_marker_state(collection)
+    except Exception as exc:
+        logger.warning("Could not read conversation generation commit markers", exc_info=True)
+        raise GenerationStateError("Could not read conversation generation commit markers") from exc
+    if not complete:
+        logger.warning(
+            "generation commit marker scan incomplete, %d commit tokens loaded",
+            len(tokens),
+        )
+        raise GenerationStateError("Incomplete conversation generation commit markers")
+    _prime_diary_commit_generations(collection)
+    return frozenset(tokens), frozenset(modes)
+
+
+def _committed_generation_tokens(collection) -> frozenset[str]:
+    """Read crash-atomic conversation generation markers from the drawer store."""
+    tokens, _modes = _committed_generation_state(collection)
+    return tokens
+
+
+def _visible_drawer_where(
+    where: dict, committed_tokens=frozenset(), tokened_source_modes=frozenset()
+) -> dict:
+    """Exclude unpublished staged rows before the backend top-K limit.
+
+    Tokenless predecessors of a tokened source/mode are *not* encoded as one
+    nested ``$and`` guard per source: that AST is O(sources) and turns
+    sqlite_exact FTS into O(matches × sources) ``_matches_where`` work, and
+    it can exceed Chroma filter limits. ``tokened_source_modes`` stays a
+    Python set used by :func:`_is_visible_generation_metadata` (O(1) lookup).
+    Callers refill after that post-filter so retired rows cannot consume the
+    user-visible limit. ``tokened_source_modes`` is kept in the signature so
+    existing call sites stay unchanged.
+    """
+    committed = {"mine_staged": {"$ne": True}}
+    visibility = committed
+    if committed_tokens:
+        visibility = {
+            "$or": [
+                committed,
+                {"mine_generation_token": {"$in": sorted(committed_tokens)}},
+            ]
+        }
+    if not where:
+        return visibility
+    clauses = where.get("$and") if isinstance(where, dict) else None
+    if isinstance(clauses, list):
+        return {"$and": [*clauses, visibility]}
+    return {"$and": [where, visibility]}
 
 
 def _extract_drawer_ids_from_closet(closet_doc: str) -> list:

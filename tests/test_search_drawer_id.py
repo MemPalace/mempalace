@@ -335,11 +335,13 @@ def test_cli_scoped_search_uses_existing_filter_fallback(capsys):
     drawers_col = MagicMock()
     drawers_col.distance_metric = "cosine"
     drawers_col.metadata = {"hnsw:space": "cosine"}
+    drawers_col.count.return_value = 3
+    drawers_col.get.return_value = {"ids": [], "metadatas": []}
     drawers_col.query.side_effect = [
         RuntimeError("Error finding id"),
         {
-            "ids": [["drop-id", "keep-id"]],
-            "documents": [["drop document", "keep document"]],
+            "ids": [["drop-id", "keep-id", "staged-id"]],
+            "documents": [["drop document", "keep document", "staged document"]],
             "metadatas": [
                 [
                     {
@@ -352,9 +354,15 @@ def test_cli_scoped_search_uses_existing_filter_fallback(capsys):
                         "room": "notes",
                         "source_file": "/palace/keep.md",
                     },
+                    {
+                        "wing": "keep",
+                        "room": "notes",
+                        "source_file": "/palace/staged.md",
+                        "mine_staged": True,
+                    },
                 ]
             ],
-            "distances": [[0.2, 0.1]],
+            "distances": [[0.2, 0.1, 0.05]],
         },
     ]
 
@@ -378,9 +386,12 @@ def test_cli_scoped_search_uses_existing_filter_fallback(capsys):
     assert drawers_col.query.call_count == 2
 
     filtered_call, fallback_call = drawers_col.query.call_args_list
-    assert filtered_call.kwargs["where"] == {"$and": [{"wing": "keep"}, {"room": "notes"}]}
+    assert filtered_call.kwargs["where"] == {
+        "$and": [{"wing": "keep"}, {"room": "notes"}, {"mine_staged": {"$ne": True}}]
+    }
     assert "where" not in fallback_call.kwargs
-    assert fallback_call.kwargs["n_results"] == 30
+    assert fallback_call.kwargs["n_results"] == 3
 
     assert "keep document" in output
     assert "drop document" not in output
+    assert "staged document" not in output

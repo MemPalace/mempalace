@@ -167,6 +167,121 @@ class TestDiaryTools:
         r = tool_diary_read(agent_name="Nobody")
         assert r["entries"] == []
 
+    def test_diary_write_idempotency_key_reuses_logical_entry(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_diary_read, tool_diary_write
+
+        first = tool_diary_write(
+            agent_name="TestAgent",
+            entry="stable checkpoint body",
+            topic="checkpoint",
+            wing="wing_project",
+            idempotency_key="hook-checkpoint:session-15",
+        )
+        retry = tool_diary_write(
+            agent_name="TestAgent",
+            entry="stable checkpoint body",
+            topic="checkpoint",
+            wing="wing_project",
+            idempotency_key="hook-checkpoint:session-15",
+        )
+
+        assert first["success"] is True
+        assert retry["success"] is True
+        assert retry["entry_id"] == first["entry_id"]
+        read = tool_diary_read(agent_name="TestAgent", wing="wing_project")
+        assert read["total"] == 1
+        assert read["entries"][0]["content"] == "stable checkpoint body"
+
+    def test_keyed_diary_short_retry_removes_old_chunk_representation(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_diary_read, tool_diary_write
+
+        long_entry = "first generation " * (config.chunk_size // 8 + 10)
+        first = tool_diary_write(
+            agent_name="TestAgent",
+            entry=long_entry,
+            topic="checkpoint",
+            wing="wing_project",
+            idempotency_key="hook-checkpoint:resize",
+        )
+        assert first["success"] is True
+        assert first["chunks"] > 1
+
+        retry = tool_diary_write(
+            agent_name="TestAgent",
+            entry="short replacement",
+            topic="checkpoint",
+            wing="wing_project",
+            idempotency_key="hook-checkpoint:resize",
+        )
+
+        assert retry["success"] is True
+        assert retry["entry_id"] == first["entry_id"]
+        read = tool_diary_read(agent_name="TestAgent", wing="wing_project")
+        assert read["total"] == 1
+        assert [item["content"] for item in read["entries"]] == ["short replacement"]
+
+    def test_keyed_diary_shrink_hides_leftover_when_tail_delete_fails(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.backends.chroma import ChromaCollection
+        from mempalace.mcp_server import (
+            tool_diary_read,
+            tool_diary_write,
+            tool_get_drawer,
+            tool_search,
+        )
+
+        long_entry = "shrinkTailToken " * (config.chunk_size // 8 + 10)
+        first = tool_diary_write(
+            agent_name="TestAgent",
+            entry=long_entry,
+            topic="checkpoint",
+            wing="wing_project",
+            idempotency_key="hook-checkpoint:atomic-resize",
+        )
+        assert first["success"] is True
+        assert first["chunks"] > 1
+
+        original_delete = ChromaCollection.delete
+
+        def failing_delete(self, *, ids=None, where=None):
+            id_list = list(ids or [])
+            if any("_chunk_" in str(item) for item in id_list):
+                raise RuntimeError("stale diary tail delete failed")
+            return original_delete(self, ids=ids, where=where)
+
+        monkeypatch.setattr(ChromaCollection, "delete", failing_delete)
+        retry = tool_diary_write(
+            agent_name="TestAgent",
+            entry="short replacement",
+            topic="checkpoint",
+            wing="wing_project",
+            idempotency_key="hook-checkpoint:atomic-resize",
+        )
+        assert retry["success"] is True
+        assert retry["entry_id"] == first["entry_id"]
+
+        fetched = tool_get_drawer(first["entry_id"])
+        assert fetched["content"] == "short replacement"
+        read = tool_diary_read(agent_name="TestAgent", wing="wing_project")
+        assert read["total"] == 1
+        assert [item["content"] for item in read["entries"]] == ["short replacement"]
+        searched = tool_search(query="shrinkTailToken", wing="wing_project", room="diary", limit=10)
+        assert not any("shrinkTailToken" in hit["text"] for hit in searched["results"])
+
     def test_diary_read_pages_past_10000_and_returns_true_latest(self, monkeypatch, config, kg):
         """Entries beyond the old 10k cap must affect both recency and total."""
         _patch_mcp_server(monkeypatch, config, kg)

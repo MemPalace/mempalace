@@ -5,7 +5,7 @@ if __name__ != "mempalace.cli":
 
 def cmd_search(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
-    if _search_args_forwardable(args) and _forward_search_to_hub(args, palace_path):
+    if _forward_search_to_hub(args, palace_path):
         return
 
     from ..searcher import search, SearchError

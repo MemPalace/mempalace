@@ -400,6 +400,113 @@ def test_sqlite_exact_lexical_search_filters_after_full_fts_window(tmp_path):
     assert [hit.id for hit in hits] == ["target"]
 
 
+def _where_source_ne_count(where) -> int:
+    if not isinstance(where, dict):
+        return 0
+    count = 0
+    for key, value in where.items():
+        if key in ("$and", "$or") and isinstance(value, list):
+            count += sum(_where_source_ne_count(item) for item in value)
+        elif key == "source_file" and isinstance(value, dict) and "$ne" in value:
+            count += 1
+    return count
+
+
+def test_sqlite_exact_generation_filter_work_is_bounded_for_many_sources(tmp_path, monkeypatch):
+    """Predecessor exclusion must not walk one nested guard per source per FTS hit."""
+    import mempalace.backends.embedding_wrapper as embedding_wrapper
+    import mempalace.backends.sqlite_exact as sqlite_exact_mod
+    from mempalace.palace import get_collection
+    from mempalace.searcher import _visible_drawer_where, search_memories
+
+    n_sources = 400
+    n_matches = 24
+    orig_matches_where = sqlite_exact_mod._matches_where
+    work = {"calls": 0, "source_ne": 0}
+
+    def counting_matches_where(meta, where):
+        work["calls"] += 1
+        work["source_ne"] += _where_source_ne_count(where)
+        return orig_matches_where(meta, where)
+
+    monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
+    monkeypatch.setattr(
+        embedding_wrapper, "_embed_texts", lambda texts: [[1.0, 0.0] for _ in texts]
+    )
+    monkeypatch.setattr(sqlite_exact_mod, "_matches_where", counting_matches_where)
+
+    col = get_collection(str(tmp_path), create=True)
+    ids = [f"marker-{index}" for index in range(n_sources)]
+    ids.extend([f"hit-{index}" for index in range(n_matches)])
+    ids.append("leftover")
+    ids.append("current")
+    documents = ["marker"] * n_sources + ["needle shared lexical note"] * n_matches
+    documents.extend(["needle leftover retired text", "needle current committed text"])
+    metadatas = [
+        {
+            "mine_staged": True,
+            "mine_commit_marker": True,
+            "mine_generation_commit": f"token-{index}",
+            "source_file": f"/tmp/session-{index}.jsonl",
+            "extract_mode": "exchange",
+            "wing": "w",
+            "room": "r",
+        }
+        for index in range(n_sources)
+    ]
+    metadatas.extend(
+        [
+            {
+                "wing": "w",
+                "room": "r",
+                "source_file": f"/tmp/other-{index}.md",
+                "chunk_index": 0,
+            }
+            for index in range(n_matches)
+        ]
+    )
+    metadatas.append(
+        {
+            "wing": "w",
+            "room": "r",
+            "source_file": "/tmp/session-0.jsonl",
+            "extract_mode": "exchange",
+            "ingest_mode": "convos",
+            "chunk_index": 0,
+        }
+    )
+    metadatas.append(
+        {
+            "wing": "w",
+            "room": "r",
+            "source_file": "/tmp/session-0.jsonl",
+            "extract_mode": "exchange",
+            "ingest_mode": "convos",
+            "mine_generation_token": "token-0",
+            "logical_drawer_id": "kept-logical",
+            "chunk_index": 0,
+        }
+    )
+    col.add(ids=ids, documents=documents, metadatas=metadatas)
+
+    tokens = {f"token-{index}" for index in range(n_sources)}
+    modes = {(f"/tmp/session-{index}.jsonl", "exchange") for index in range(n_sources)}
+    where = _visible_drawer_where({}, tokens, modes)
+    assert _where_source_ne_count(where) == 0
+
+    work["calls"] = 0
+    work["source_ne"] = 0
+    hits = col.lexical_search(query="needle", n_results=n_matches, where=where).hits
+    assert hits
+    assert work["source_ne"] == 0
+    assert work["calls"] <= (n_matches + 2) * 8
+
+    result = search_memories("needle leftover retired", str(tmp_path), n_results=5)
+    assert "error" not in result, result
+    result_ids = [hit["drawer_id"] for hit in result["results"]]
+    assert "leftover" not in result_ids
+
+
 def test_sqlite_exact_logical_filters_evaluate_sibling_predicates(tmp_path):
     _backend, col = _collection(tmp_path)
     col.add(
@@ -985,6 +1092,10 @@ def test_search_union_reports_unsupported_lexical_capability(monkeypatch, tmp_pa
                 metadatas=[[{"source_file": "/tmp/a.md", "chunk_index": 0}]],
                 distances=[[0.5]],
             )
+
+        @staticmethod
+        def get(**_kwargs):
+            return {"ids": [], "metadatas": []}
 
         def lexical_search(self, **_kwargs):
             raise UnsupportedCapabilityError("no lexical support")

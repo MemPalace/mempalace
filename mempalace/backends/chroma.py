@@ -1809,6 +1809,97 @@ def sqlite_list_id_metadata(
     return ids, metas
 
 
+def sqlite_generation_commit_state(
+    palace_path: str, collection_name: str
+) -> Optional[tuple[set[str], set[tuple]]]:
+    """Read published generation tokens and their source/mode pairs from sqlite."""
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        conn = connect_sqlite_read(db_path)
+        try:
+            rows = conn.execute(
+                """
+                SELECT marker.string_value, src.string_value,
+                       mode.string_value, ingest.string_value
+                FROM embedding_metadata marker
+                JOIN embeddings e ON e.id = marker.id
+                JOIN segments s ON e.segment_id = s.id
+                JOIN collections c ON s.collection = c.id
+                LEFT JOIN embedding_metadata src
+                  ON src.id = e.id AND src.key = 'source_file'
+                LEFT JOIN embedding_metadata mode
+                  ON mode.id = e.id AND mode.key = 'extract_mode'
+                LEFT JOIN embedding_metadata ingest
+                  ON ingest.id = e.id AND ingest.key = 'ingest_mode'
+                WHERE c.name = ?
+                  AND marker.key = 'mine_generation_commit'
+                  AND marker.string_value IS NOT NULL
+                """,
+                (collection_name,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        logger.debug("sqlite_generation_commit_state failed", exc_info=True)
+        return None
+    tokens: set[str] = set()
+    source_modes: set[tuple] = set()
+    for token, src, mode, ingest in rows:
+        if not token:
+            continue
+        tokens.add(token)
+        if not src:
+            continue
+        if mode is None and ingest in (None, "convos"):
+            mode = "exchange"
+        source_modes.add((src, mode))
+    return tokens, source_modes
+
+
+def sqlite_diary_commit_generations(
+    palace_path: str, collection_name: str
+) -> Optional[dict[str, str]]:
+    """Read published diary replacement generations without opening HNSW."""
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        conn = connect_sqlite_read(db_path)
+        try:
+            rows = conn.execute(
+                """
+                SELECT entry.string_value, marker.string_value
+                FROM embedding_metadata marker
+                JOIN embeddings e ON e.id = marker.id
+                JOIN segments s ON e.segment_id = s.id
+                JOIN collections c ON s.collection = c.id
+                JOIN embedding_metadata entry
+                  ON entry.id = e.id AND entry.key = 'diary_entry_id'
+                WHERE c.name = ?
+                  AND marker.key = 'diary_generation_commit'
+                  AND marker.string_value IS NOT NULL
+                  AND entry.string_value IS NOT NULL
+                """,
+                (collection_name,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        logger.debug("sqlite_diary_commit_generations failed", exc_info=True)
+        return None
+    return {entry_id: token for entry_id, token in rows if entry_id and token}
+
+
+def sqlite_generation_commit_tokens(palace_path: str, collection_name: str) -> Optional[set[str]]:
+    """Read only published conversation-generation tokens without opening HNSW."""
+    state = sqlite_generation_commit_state(palace_path, collection_name)
+    if state is None:
+        return None
+    return state[0]
+
+
 def sqlite_documents_for_ids(
     palace_path: str,
     collection_name: str,

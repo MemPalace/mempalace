@@ -1318,32 +1318,10 @@ class SQLiteExactCollection(BaseCollection):
         scored.sort(key=lambda hit: hit.score, reverse=True)
         return LexicalResult(hits=scored[:n_results])
 
-    def _lexical_search_fts(self, cur, *, query: str, n_results: int, where: Optional[dict]):
-        if not self._fts_available(cur):
-            return None
-        tokens = [t for t in _tokenize(query) if len(t) >= 2]
-        if not tokens:
-            return None
-        fts_query = " OR ".join(tokens)
-        collection_id = self._collection_id(cur)
-        try:
-            limit_sql = "" if where else "LIMIT ?"
-            params = (fts_query, collection_id)
-            if not where:
-                params = (*params, max(n_results * 5, n_results))
-            rows = cur.execute(
-                f"""
-                SELECT doc_id, bm25(docs_fts) AS rank
-                FROM docs_fts
-                WHERE docs_fts MATCH ? AND collection_id = ?
-                ORDER BY rank
-                {limit_sql}
-                """,
-                params,
-            ).fetchall()
-        except sqlite3.Error:
-            logger.debug("sqlite_exact FTS query failed; using Python lexical scan", exc_info=True)
-            return None
+    def _lexical_hits_from_fts_rows(
+        self, cur, collection_id: int, rows, where: Optional[dict], n_results: int
+    ) -> list[LexicalHit]:
+        """Hydrate FTS rows and apply ``where`` before the caller-visible limit."""
         if not rows:
             return []
         ids = [row[0] for row in rows]
@@ -1368,7 +1346,7 @@ class SQLiteExactCollection(BaseCollection):
             if doc_meta is None:
                 continue
             doc, meta = doc_meta
-            if not _matches_where(meta, where):
+            if where and not _matches_where(meta, where):
                 continue
             hits.append(
                 LexicalHit(
@@ -1381,6 +1359,38 @@ class SQLiteExactCollection(BaseCollection):
             if len(hits) >= n_results:
                 break
         return hits
+
+    def _lexical_search_fts(self, cur, *, query: str, n_results: int, where: Optional[dict]):
+        if not self._fts_available(cur):
+            return None
+        tokens = [t for t in _tokenize(query) if len(t) >= 2]
+        if not tokens:
+            return None
+        fts_query = " OR ".join(tokens)
+        collection_id = self._collection_id(cur)
+        fetch_limit = max(n_results * 5, n_results)
+        try:
+            while True:
+                rows = cur.execute(
+                    """
+                    SELECT doc_id, bm25(docs_fts) AS rank
+                    FROM docs_fts
+                    WHERE docs_fts MATCH ? AND collection_id = ?
+                    ORDER BY rank
+                    LIMIT ?
+                    """,
+                    (fts_query, collection_id, fetch_limit),
+                ).fetchall()
+                hits = self._lexical_hits_from_fts_rows(cur, collection_id, rows, where, n_results)
+                if not where or len(hits) >= n_results or len(rows) < fetch_limit:
+                    return hits
+                next_limit = fetch_limit * 2
+                if next_limit <= fetch_limit:
+                    return hits
+                fetch_limit = next_limit
+        except sqlite3.Error:
+            logger.debug("sqlite_exact FTS query failed; using Python lexical scan", exc_info=True)
+            return None
 
     def close(self) -> None:
         self._closed = True

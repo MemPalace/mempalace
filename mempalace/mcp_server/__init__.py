@@ -101,8 +101,13 @@ from ..backends import BackendMismatchError, PalaceRef, detect_backend_for_path 
 from ..date_window import filed_at_in_window, parse_date_bound  # noqa: E402
 from ..query_sanitizer import sanitize_query  # noqa: E402
 from ..searcher import (  # noqa: E402
+    GenerationStateError,
     SearchError,
+    _committed_generation_state,
+    _diary_generations_var,
     _distance_to_similarity,
+    _is_visible_generation_metadata,
+    _prime_diary_commit_generations,
     _metric_for_collection,
     search as cli_search,
     search_memories,

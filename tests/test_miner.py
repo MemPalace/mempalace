@@ -939,7 +939,9 @@ def test_file_already_mined_extract_mode_paginates_large_sources():
     )
 
     class FakeCollection:
-        def get(self, where=None, limit=1, offset=0, include=None):
+        def get(self, ids=None, where=None, limit=1, offset=0, include=None):
+            if ids is not None:
+                return {"ids": [], "metadatas": []}
             batch = metadatas[offset : offset + limit]
             return {
                 "ids": [f"id-{i}" for i in range(offset, offset + len(batch))],

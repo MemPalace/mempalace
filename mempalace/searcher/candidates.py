@@ -59,6 +59,8 @@ def _enrich_closet_hits(
     drawers_col,
     query: str,
     stop_words: frozenset = frozenset(),
+    committed_tokens=None,
+    tokened_source_modes=None,
 ) -> list:
     """Hydrate closet-boosted hits and memoise each source/group fetch."""
     query_terms = set(
@@ -68,6 +70,9 @@ def _enrich_closet_hits(
         )
     )
     source_cache: dict = {}
+    if committed_tokens is None or tokened_source_modes is None:
+        committed_tokens, tokened_source_modes = _committed_generation_state(drawers_col)
+    tokened_source_modes = tokened_source_modes or frozenset()
 
     for hit in hits:
         if hit.get("matched_via") == "drawer":
@@ -108,6 +113,14 @@ def _enrich_closet_hits(
             else:
                 source_cache[cache_key] = (
                     list(
+                        (
+                            source_drawers.get("ids", [])
+                            if isinstance(source_drawers, dict)
+                            else getattr(source_drawers, "ids", None)
+                        )
+                        or []
+                    ),
+                    list(
                         getattr(
                             source_drawers,
                             "documents",
@@ -130,22 +143,23 @@ def _enrich_closet_hits(
         if cached is None:
             continue
 
-        docs, metadatas = cached
+        physical_ids, docs, metadatas = cached
+        if len(physical_ids) < len(docs):
+            physical_ids.extend(
+                f"_hydrated_row_{index}" for index in range(len(physical_ids), len(docs))
+            )
 
         if len(docs) <= 1:
             continue
 
         indexed = []
 
-        for index, (
-            document,
-            metadata,
-        ) in enumerate(
-            zip(
-                docs,
-                metadatas,
-            )
-        ):
+        source_rows = _collapse_physical_generation_rows(
+            list(zip(physical_ids, docs, metadatas)),
+            committed_tokens,
+            tokened_source_modes,
+        )
+        for index, (_, document, metadata) in enumerate(source_rows):
             chunk_index = (
                 metadata.get(
                     "chunk_index",
@@ -255,6 +269,173 @@ def _dedupe_rendered_hits(
     return unique
 
 
+def _collection_get_rows(result) -> tuple[list, list, list]:
+    """Normalize a collection.get() payload to (ids, documents, metadatas)."""
+    if isinstance(result, dict):
+        ids = result.get("ids") or []
+        docs = result.get("documents") or []
+        metas = result.get("metadatas") or []
+    else:
+        ids = getattr(result, "ids", None) or []
+        docs = getattr(result, "documents", None) or []
+        metas = getattr(result, "metadatas", None) or []
+    return list(ids), list(docs), list(metas)
+
+
+def _parent_ids_from_hits(hits: list) -> list:
+    parent_ids = []
+    seen = set()
+    for hit in hits:
+        parent_id = hit.get("_parent_drawer_id") or hit.get("_parent_entry_id")
+        if not parent_id:
+            parent_id = _logical_parent_id(hit.get("metadata"))
+        if parent_id and parent_id not in seen:
+            seen.add(parent_id)
+            parent_ids.append(parent_id)
+    return parent_ids
+
+
+def _sibling_search_hit(physical_id, doc, meta, distance, committed_tokens, metric="cosine"):
+    """Build a drawer hit from a parent-linked sibling loaded via get()."""
+    source = (meta or {}).get("source_file", "") or ""
+    bounded = max(0.0, min(2.0, distance))
+    return {
+        "drawer_id": _result_drawer_id(meta, physical_id),
+        "text": doc,
+        "wing": (meta or {}).get("wing", "unknown"),
+        "room": (meta or {}).get("room", "unknown"),
+        "source_file": Path(source).name if source else "?",
+        "source_path": source,
+        **_result_date_fields(meta or {}),
+        "similarity": round(_distance_to_similarity(distance, metric), 3),
+        "distance": round(distance, 4),
+        "effective_distance": round(bounded, 4),
+        "closet_boost": 0.0,
+        "matched_via": "drawer",
+        "_sort_key": distance,
+        "_source_file_full": source,
+        "_chunk_index": (meta or {}).get("chunk_index"),
+        "_parent_drawer_id": (meta or {}).get("parent_drawer_id"),
+        "_parent_entry_id": (meta or {}).get("parent_entry_id"),
+        "_logical_generation_id": _logical_generation_id(meta),
+        "_physical_drawer_id": physical_id,
+        "_active_generation": (meta or {}).get("mine_generation_token") in committed_tokens,
+    }
+
+
+def _sibling_matches_request_filters(meta, wing=None, room=None, source_file=None) -> bool:
+    """True when a refilled sibling satisfies the caller's search filters."""
+    meta = meta or {}
+    if wing and meta.get("wing") != wing:
+        return False
+    if room and meta.get("room") != room:
+        return False
+    if source_file and meta.get("source_file") != source_file:
+        return False
+    return True
+
+
+def _mixed_generation_leftover_ids(ids, metas, parent_id, committed_tokens, tokened_source_modes):
+    """Physical IDs that still carry ``logical_drawer_id`` beside a stripped prefix.
+
+    A failed shrink leaves rewritten prefix chunks without generation identity
+    and the unread tail still carrying ``logical_drawer_id``. Ordinary parent
+    groups share one identity and must not be refilled wholesale.
+    """
+    stripped = False
+    leftovers = []
+    for index, physical_id in enumerate(ids):
+        meta = metas[index] if index < len(metas) else {}
+        if _logical_parent_id(meta) != parent_id:
+            continue
+        if not _is_visible_generation_metadata(meta, committed_tokens, tokened_source_modes):
+            continue
+        if meta.get("logical_drawer_id"):
+            leftovers.append(physical_id)
+        else:
+            stripped = True
+    if not stripped:
+        return set()
+    return set(leftovers)
+
+
+def _include_matching_parent_siblings(
+    hits: list,
+    drawers_col,
+    query: str,
+    committed_tokens,
+    tokened_source_modes,
+    stop_words=frozenset(),
+    metric: str = "cosine",
+    wing=None,
+    room=None,
+    source_file=None,
+) -> list:
+    """Add leftover parent chunks that HNSW omitted but get() can still read.
+
+    A failed shrink delete leaves the new prefix without ``logical_drawer_id``
+    and the old tail still parent-linked. Vector query can drop that tail
+    after the prefix upsert; logical drawer reads already recover it via
+    parent ``get()``. Search must return the same verbatim leftover chunk
+    without admitting every query-term sibling into the pre-rerank pool.
+    """
+    if not hits or not query:
+        return hits
+    query_terms = set(_tokenize(query, stop_words))
+    if not query_terms:
+        return hits
+
+    seen_ids = {hit.get("_physical_drawer_id") for hit in hits if hit.get("_physical_drawer_id")}
+    added = []
+    for parent_id in _parent_ids_from_hits(hits):
+        try:
+            result = drawers_col.get(
+                where=_logical_parent_where(parent_id),
+                include=["documents", "metadatas"],
+            )
+        except Exception:
+            logger.debug("parent sibling refill failed for %s", parent_id, exc_info=True)
+            continue
+        ids, docs, metas = _collection_get_rows(result)
+        leftover_ids = _mixed_generation_leftover_ids(
+            ids, metas, parent_id, committed_tokens, tokened_source_modes
+        )
+        if not leftover_ids:
+            continue
+        parent_distances = [
+            hit.get("distance")
+            for hit in hits
+            if (hit.get("_parent_drawer_id") or hit.get("_parent_entry_id")) == parent_id
+            and hit.get("distance") is not None
+        ]
+        seed_dist = min(parent_distances) if parent_distances else 2.0
+        for index, physical_id in enumerate(ids):
+            if physical_id not in leftover_ids or physical_id in seen_ids:
+                continue
+            meta = metas[index] if index < len(metas) else {}
+            if not _sibling_matches_request_filters(
+                meta, wing=wing, room=room, source_file=source_file
+            ):
+                continue
+            doc = docs[index] if index < len(docs) else ""
+            doc = doc or ""
+            lowered = doc.lower()
+            if not any(term in lowered for term in query_terms):
+                continue
+            seen_ids.add(physical_id)
+            added.append(
+                _sibling_search_hit(
+                    physical_id,
+                    doc,
+                    meta,
+                    seed_dist,
+                    committed_tokens,
+                    metric=metric,
+                )
+            )
+    return hits + added
+
+
 # Strategy dispatch — keeps search_memories' branch count under the
 # project's complexity ceiling (C901 max-complexity=25). New strategies
 # register here.
@@ -348,7 +529,10 @@ def _finalize_candidate_hits(
                 "Use candidate_strategy='vector' or select a backend that supports lexical search."
             ),
         )
+    except GenerationStateError as e:
+        return [], _search_error_result(str(e))
 
+    hits[:] = _collapse_logical_generation_hits(hits)
     vector_weight, bm25_weight = _resolve_hybrid_rank_weights()
     ranked = _hybrid_rank(
         hits,
@@ -365,6 +549,10 @@ def _finalize_candidate_hits(
         hit.pop("_source_file_full", None)
         hit.pop("_chunk_index", None)
         hit.pop("_parent_drawer_id", None)
+        hit.pop("_parent_entry_id", None)
+        hit.pop("_logical_generation_id", None)
+        hit.pop("_physical_drawer_id", None)
+        hit.pop("_active_generation", None)
 
     return hits, None
 
@@ -485,13 +673,23 @@ def _window_and_fallback_gate(
     return since_dt, before_dt, active, None
 
 
-def _candidate_out_of_scope(dist, meta, max_distance, since_dt, before_dt) -> bool:
+def _candidate_out_of_scope(
+    dist,
+    meta,
+    max_distance,
+    since_dt,
+    before_dt,
+    committed_tokens=frozenset(),
+    tokened_source_modes=frozenset(),
+) -> bool:
     """True when a drawer candidate fails the distance or date-window gate.
 
     Distance is checked on the raw value before rounding to avoid precision
     loss (pre-existing behavior); the date window applies whenever a bound
     is set, with the shared ``[since, before)`` semantics.
     """
+    if not _is_visible_generation_metadata(meta, committed_tokens, tokened_source_modes):
+        return True
     if max_distance > 0.0 and dist > max_distance:
         return True
     if (since_dt is not None or before_dt is not None) and not filed_at_in_window(

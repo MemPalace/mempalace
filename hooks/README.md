@@ -120,11 +120,39 @@ Edit `mempal_save_hook.sh` to change:
 - **`MEMPAL_DIR`** — Optional **project directory** (code, notes, docs) to also mine on each save trigger, with `--mode projects`. The hook ALWAYS mines the active conversation transcript automatically with `--mode convos` — `MEMPAL_DIR` is purely additive, never an override. Leave blank if you don't want to ingest project files.
 - **`MEMPALACE_PYTHON`** — Optional env var. Python interpreter with mempalace + chromadb installed. Auto-detects: `MEMPALACE_PYTHON` env var → repo `venv/bin/python3` → system `python3`. Set this if your venv is in a non-standard location.
 
-### Disabling Auto-Save (Silent Mode)
+### The two capture layers have separate switches
 
-To keep hooks installed but disable auto-save blocking entirely, set `hooks.auto_save` to `false` in your config:
+The hooks write two very different things, and you can turn them off independently:
 
-**Option 1 — config file** (`~/.mempalace/config.json`):
+| Setting | Turns off | What you lose |
+|---------|-----------|---------------|
+| `hooks.auto_save` | Everything — all three hooks pass straight through | Both layers below |
+| `hooks.mine_transcript` | Only the raw transcript mine | The verbatim archive of the session, tool output included |
+
+The **diary checkpoint** is a single compressed entry built from your recent
+prompts (truncated, no assistant text and no tool output). It is what
+`mempalace_diary_read` returns at the start of the next session, and it costs one
+drawer.
+
+The **transcript mine** files the whole JSONL session verbatim — every Bash
+result, every file read, every build error. That is the point of it, and it is
+also its cost: a long session can file thousands of drawers, and anything a
+command printed goes in exactly as printed. MemPalace stores verbatim by design
+and does not redact, so if your tool output contains a token, so does the palace.
+
+Continuity without the archive — checkpoints on, raw mine off:
+
+```json
+{
+  "hooks": {
+    "auto_save": true,
+    "mine_transcript": false
+  }
+}
+```
+
+Nothing at all, hooks left installed:
+
 ```json
 {
   "hooks": {
@@ -133,12 +161,28 @@ To keep hooks installed but disable auto-save blocking entirely, set `hooks.auto
 }
 ```
 
-**Option 2 — environment variable:**
+Both have environment equivalents, which win over the config file:
+
 ```bash
 export MEMPALACE_HOOKS_AUTO_SAVE=false
+export MEMPALACE_HOOKS_MINE_TRANSCRIPT=false
 ```
 
-When disabled, both the stop hook and precompact hook pass through without blocking. You can still save manually with `mempalace mine <dir> --mode convos`.
+With `auto_save` off, the stop and precompact hooks pass through without
+blocking. With only `mine_transcript` off, checkpoints still land — including at
+`PreCompact`, where the hook files one instead of mining so compaction is never
+silent. Either way you can still archive a session by hand with
+`mempalace mine <transcript> --mode convos`.
+
+### Running a hub
+
+If the palace is served by a hub (`mempalace serve` — see
+[shared brain](../website/guide/shared-brain.md)), that process holds the writer
+lease for its whole lifetime and hooks cannot write to the palace directly. Both
+capture paths forward to it over HTTP automatically: the mine through the
+`mempalace` CLI, the checkpoint through the hub's `mempalace_diary_write`. Set
+`MEMPALACE_HUB_FORWARD=0` to force direct writes (they will be refused while the
+hub is up).
 
 ### mempalace CLI
 

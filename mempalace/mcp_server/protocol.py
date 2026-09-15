@@ -1066,6 +1066,10 @@ _WRITE_STALL_EXIT_CODE = 75
 _write_stall_lock = threading.Lock()
 # Optional[dict]: {"tool": str, "since": float(monotonic), "warned": bool}
 _write_stall_inflight: Optional[dict] = None
+# HTTP conversation mines run outside the request-wide RW write lock and take
+# it only for backend access bursts. The request-level watchdog must therefore
+# stay quiet; the burst gate arms it around the actual Chroma mutation.
+_http_interleaved_mine_state = threading.local()
 
 
 def _write_stall_secs(env_name: str, default: float) -> float:
@@ -1093,11 +1097,21 @@ def _write_stall_action(elapsed: float, warn_secs: float, exit_secs: float, warn
 
 
 @contextlib.contextmanager
-def _write_stall_watch(tool_name: str):
+def _write_stall_watch(tool_name: str, *, burst: bool = False):
     """Register a vector write as in flight for the stall watchdog."""
     global _write_stall_inflight
 
     if tool_name not in _VECTOR_WRITE_TOOLS:
+        yield
+        return
+    if (
+        tool_name == "mempalace_mine"
+        and getattr(_http_interleaved_mine_state, "active", False)
+        and not burst
+    ):
+        # The interleaved HTTP path watches each short write burst through
+        # _HTTPMineAccessGate instead of timing parsing/chunking/embedding prep
+        # as if the backend itself had stalled (#2403 defect 5).
         yield
         return
 

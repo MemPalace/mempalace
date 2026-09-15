@@ -26,6 +26,103 @@ def _metadata_matches_extract_mode(meta: dict, extract_mode: Optional[str]) -> b
     return extract_mode == "exchange" and meta.get("ingest_mode") in (None, "convos")
 
 
+def _source_mode_commit_key(meta: dict) -> Optional[tuple]:
+    """``(source_file, extract_mode)`` for generation-commit filtering.
+
+    Tokenless leftover rows are predecessors only for the same source and
+    extraction mode that now has a committed generation token. Legacy convo
+    drawers without ``extract_mode`` are exchange-mode, matching
+    :func:`_metadata_matches_extract_mode`.
+    """
+    src = meta.get("source_file")
+    if not src:
+        return None
+    mode = meta.get("extract_mode")
+    if mode is None and meta.get("ingest_mode") in (None, "convos"):
+        mode = "exchange"
+    return (src, mode)
+
+
+def _record_generation_commit_marker(meta, committed_tokens, tokened_source_modes) -> None:
+    """Collect a published generation token and its source/mode, if present."""
+    meta = meta or {}
+    token = meta.get("mine_generation_commit")
+    if meta.get("mine_commit_marker") is not True or not token:
+        return
+    committed_tokens.add(token)
+    source_mode = _source_mode_commit_key(meta)
+    if source_mode is not None:
+        tokened_source_modes.add(source_mode)
+
+
+def _ingest_generation_commit_marker_batch(batch, committed_tokens, tokened_source_modes) -> int:
+    """Record one marker page and return its id count."""
+    marker_ids = batch.get("ids") or []
+    for meta in batch.get("metadatas") or []:
+        _record_generation_commit_marker(meta, committed_tokens, tokened_source_modes)
+    return len(marker_ids)
+
+
+def _generation_commit_marker_state(collection) -> tuple[set, set, bool]:
+    """Load published generation markers as ``(tokens, source_modes, complete)``.
+
+    ``complete`` is False when any marker page fails. Hash dedup must not use
+    partial source/mode state: a missing later page would treat leftover
+    tokenless rows as live and permanently skip another file of that text.
+
+    Compatibility backends may accept ``offset=0`` and raise ``TypeError`` for
+    later pages. That truncated scan is not complete: retry unpaginated, or
+    fail closed if the full fetch also fails.
+    """
+    committed_tokens: set = set()
+    tokened_source_modes: set = set()
+    marker_offset = 0
+    page_size = 1000
+    paginated = True
+    try:
+        while True:
+            kwargs = {
+                "where": {"mine_commit_marker": True},
+                "include": ["metadatas"],
+            }
+            if paginated:
+                kwargs["limit"] = page_size
+                kwargs["offset"] = marker_offset
+            try:
+                marker_batch = collection.get(**kwargs)
+            except TypeError:
+                if not paginated:
+                    raise
+                logger.warning(
+                    "generation commit marker pagination rejected at offset %d; "
+                    "retrying unpaginated fetch",
+                    marker_offset,
+                )
+                paginated = False
+                committed_tokens.clear()
+                tokened_source_modes.clear()
+                marker_batch = collection.get(
+                    where={"mine_commit_marker": True},
+                    include=["metadatas"],
+                )
+            page_len = _ingest_generation_commit_marker_batch(
+                marker_batch, committed_tokens, tokened_source_modes
+            )
+            del marker_batch
+            if not paginated or not page_len:
+                break
+            marker_offset += page_len
+            if page_len < page_size:
+                break
+        return committed_tokens, tokened_source_modes, True
+    except Exception:
+        logger.warning(
+            "generation commit marker fetch failed, %d commit tokens loaded",
+            len(committed_tokens),
+        )
+        return committed_tokens, tokened_source_modes, False
+
+
 def file_already_mined(
     collection,
     source_file: str,
@@ -65,6 +162,18 @@ def file_already_mined(
     exactly as before.
     """
     try:
+        if extract_mode is not None:
+            from ..ids import make_convo_commit_id
+
+            commit_marker = collection.get(
+                ids=[make_convo_commit_id(source_file, extract_mode)],
+                include=["metadatas"],
+            )
+            if any(
+                (meta or {}).get("mine_cleanup_pending") is True
+                for meta in (commit_marker.get("metadatas") or [])
+            ):
+                return False
         # Under the additive-mining model, a single ``source_file`` can have
         # multiple ``parent_drawer_id`` groups in the palace — one per
         # mining pass — each with its own stored ``source_mtime`` and
@@ -93,6 +202,8 @@ def file_already_mined(
             metadatas = results.get("metadatas") or []
             for meta in metadatas:
                 meta = meta or {}
+                if meta.get("mine_staged") is True:
+                    continue
                 # extract_mode scoping (was the existing ``else`` branch):
                 if extract_mode is not None and not _metadata_matches_extract_mode(
                     meta, extract_mode
@@ -160,46 +271,59 @@ def prefetch_mined_set(
     `collection.get(where={"source_file": X})` costs ~2s on a 150k-drawer
     palace, making a 2000-file sweep take >1h of pure skip-checking. This
     helper drops that to a single paginated scan plus O(1) lookups.
+
+    A truncated scan is unusable, matching hash-dedup marker completeness:
+    later pages may hold ``mine_cleanup_pending`` markers. Returning the
+    groups seen so far would skip those sources and defer cleanup retry.
+    Compatibility backends that reject later ``offset`` with ``TypeError``
+    retry once unpaginated; any remaining fetch failure returns ``{}``.
     """
-    # Per source_file: per stored_mtime group → count + optional chunk_total.
-    # A source is only "mined" once some group is complete.
     groups: dict[str, dict] = {}
+    pending_sources: set[str] = set()
+    page_size = 1000
+    paginated = True
+    offset = 0
     try:
-        total = collection.count()
-        offset = 0
-        while offset < total:
-            batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
-            for meta in batch["metadatas"]:
-                meta = meta or {}
-                src = meta.get("source_file")
-                if not src:
-                    continue
-                if not _metadata_matches_extract_mode(meta, extract_mode):
-                    continue
-                # Same default as file_already_mined: missing version == 1
-                version = meta.get("normalize_version", 1)
-                if version < NORMALIZE_VERSION:
-                    continue
-                stored_mtime = meta.get("source_mtime")
-                mtime_key = float(stored_mtime) if stored_mtime is not None else None
-                entry = groups.setdefault(src, {}).setdefault(
-                    mtime_key, {"count": 0, "chunk_total": None}
+        while True:
+            kwargs = {"include": ["metadatas"]}
+            if paginated:
+                kwargs["limit"] = page_size
+                kwargs["offset"] = offset
+            try:
+                batch = collection.get(**kwargs)
+            except TypeError:
+                if not paginated:
+                    raise
+                logger.warning(
+                    "prefetch_mined_set pagination rejected at offset %d; "
+                    "retrying unpaginated fetch",
+                    offset,
                 )
-                entry["count"] += 1
-                chunk_total = meta.get("chunk_total")
-                if chunk_total is not None:
-                    try:
-                        entry["chunk_total"] = int(chunk_total)
-                    except (TypeError, ValueError):
-                        pass
-            if not batch["ids"]:
+                paginated = False
+                groups.clear()
+                pending_sources.clear()
+                batch = collection.get(include=["metadatas"])
+            ids = batch.get("ids") or []
+            for meta in batch.get("metadatas") or []:
+                _ingest_prefetch_mined_metadata(meta, extract_mode, groups, pending_sources)
+            page_len = len(ids)
+            del ids, batch
+            if not paginated or not page_len:
                 break
-            offset += len(batch["ids"])
+            offset += page_len
+            if page_len < page_size:
+                break
     except Exception:
-        logger.warning("prefetch_mined_set: partial fetch, %d source groups loaded", len(groups))
+        logger.warning(
+            "prefetch_mined_set: incomplete fetch, discarding %d source groups",
+            len(groups),
+        )
+        return {}
 
     mined: dict[str, Optional[float]] = {}
     for src, by_mtime in groups.items():
+        if src in pending_sources:
+            continue
         for mtime_key, entry in by_mtime.items():
             chunk_total = entry["chunk_total"]
             if chunk_total is None:
@@ -210,6 +334,39 @@ def prefetch_mined_set(
                 mined[src] = mtime_key
                 break
     return mined
+
+
+def _ingest_prefetch_mined_metadata(meta, extract_mode, groups, pending_sources) -> None:
+    """Fold one metadata row into mined-set groups and pending-source marks."""
+    meta = meta or {}
+    if meta.get("mine_commit_marker") is True:
+        if (
+            meta.get("mine_cleanup_pending") is True
+            and meta.get("source_file")
+            and _metadata_matches_extract_mode(meta, extract_mode)
+        ):
+            pending_sources.add(meta["source_file"])
+        return
+    if meta.get("mine_staged") is True:
+        return
+    src = meta.get("source_file")
+    if not src:
+        return
+    if not _metadata_matches_extract_mode(meta, extract_mode):
+        return
+    version = meta.get("normalize_version", 1)
+    if version < NORMALIZE_VERSION:
+        return
+    stored_mtime = meta.get("source_mtime")
+    mtime_key = float(stored_mtime) if stored_mtime is not None else None
+    entry = groups.setdefault(src, {}).setdefault(mtime_key, {"count": 0, "chunk_total": None})
+    entry["count"] += 1
+    chunk_total = meta.get("chunk_total")
+    if chunk_total is not None:
+        try:
+            entry["chunk_total"] = int(chunk_total)
+        except (TypeError, ValueError):
+            pass
 
 
 def prefetch_content_hashes(
@@ -239,32 +396,65 @@ def prefetch_content_hashes(
     the ones that didn't. Only the first source_file seen for a given
     (wing, hash) pair is kept — good enough to detect and skip a repeat,
     the point is not to track every alias.
+
+    Commit markers are loaded first as a small set so unpublished
+    generations can be filtered while drawer metadata is scanned in
+    bounded pages. Pages are released after each batch; the full palace
+    metadata is never retained.
+
+    A source that later publishes a tokened generation can leave tokenless
+    predecessor rows behind when stale-row deletion fails. Those leftovers
+    are not visible once the source/mode commit marker names a token, so
+    their hashes must not suppress a later file of the same transcript.
     """
     hashes: dict[tuple[str, str], str] = {}
+    committed_tokens, tokened_source_modes, markers_complete = _generation_commit_marker_state(
+        collection
+    )
+    if not markers_complete:
+        logger.warning(
+            "prefetch_content_hashes: marker fetch incomplete, disabling cross-file hash dedup"
+        )
+        return hashes
+
+    def _consider(meta):
+        meta = meta or {}
+        generation_token = meta.get("mine_generation_token")
+        if meta.get("mine_staged") is True and generation_token not in committed_tokens:
+            return
+        if generation_token and generation_token not in committed_tokens:
+            return
+        content_hash_field = meta.get("content_hash")
+        src = meta.get("source_file")
+        wing = meta.get("wing")
+        if not content_hash_field or not src or not wing:
+            return
+        if not generation_token:
+            source_mode = _source_mode_commit_key(meta)
+            if source_mode is not None and source_mode in tokened_source_modes:
+                return
+        if not _metadata_matches_extract_mode(meta, extract_mode):
+            return
+        if meta.get("normalize_version", 1) < NORMALIZE_VERSION:
+            return
+        for content_hash in content_hash_field.split(","):
+            key = (wing, content_hash)
+            if content_hash and key not in hashes:
+                hashes[key] = src
+
     try:
         total = collection.count()
         offset = 0
         while offset < total:
             batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
-            for meta in batch["metadatas"]:
-                meta = meta or {}
-                content_hash_field = meta.get("content_hash")
-                src = meta.get("source_file")
-                wing = meta.get("wing")
-                if not content_hash_field or not src or not wing:
-                    continue
-                if not _metadata_matches_extract_mode(meta, extract_mode):
-                    continue
-                version = meta.get("normalize_version", 1)
-                if version < NORMALIZE_VERSION:
-                    continue
-                for content_hash in content_hash_field.split(","):
-                    key = (wing, content_hash)
-                    if content_hash and key not in hashes:
-                        hashes[key] = src
-            if not batch["ids"]:
+            ids = batch.get("ids") or []
+            for meta in batch.get("metadatas") or []:
+                _consider(meta)
+            page_len = len(ids)
+            del ids, batch
+            if not page_len:
                 break
-            offset += len(batch["ids"])
+            offset += page_len
     except Exception:
         logger.warning("prefetch_content_hashes: partial fetch, %d hashes loaded", len(hashes))
     return hashes

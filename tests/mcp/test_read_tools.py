@@ -908,6 +908,7 @@ class TestNoneMetadataSafety:
         # Confirm the update call carried the new wing without inheriting None.
         update_call = stub_col.update.call_args
         assert update_call is not None
+        stub_col.upsert.assert_not_called()
         new_meta = update_call.kwargs["metadatas"][0]
         assert new_meta["wing"] == "recovered"
 

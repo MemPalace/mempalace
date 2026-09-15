@@ -7,6 +7,7 @@ plus mock-based tests for error paths.
 
 import sqlite3
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -15,6 +16,7 @@ from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 from mempalace.backends import BackendMismatchError
 from mempalace.searcher import (
+    GenerationStateError,
     SearchError,
     _result_drawer_id,
     build_where_filter,
@@ -66,6 +68,358 @@ class TestBuildWhereFilter:
         }
 
 
+def _where_node_count(where) -> int:
+    """Count nested dict/list nodes in a Chroma-style where clause."""
+    if isinstance(where, dict):
+        return 1 + sum(_where_node_count(value) for value in where.values())
+    if isinstance(where, list) and where and isinstance(where[0], dict):
+        return 1 + sum(_where_node_count(item) for item in where)
+    return 0
+
+
+def _where_source_ne_count(where) -> int:
+    """Count ``source_file: {$ne: ...}`` leaves — the old per-source guards."""
+    if not isinstance(where, dict):
+        return 0
+    count = 0
+    for key, value in where.items():
+        if key in ("$and", "$or") and isinstance(value, list):
+            count += sum(_where_source_ne_count(item) for item in value)
+        elif key == "source_file" and isinstance(value, dict) and "$ne" in value:
+            count += 1
+    return count
+
+
+class TestVisibleDrawerWhereBounds:
+    def test_many_tokened_sources_do_not_expand_query_guards(self):
+        from mempalace.searcher import _is_visible_generation_metadata, _visible_drawer_where
+
+        n_sources = 3000
+        tokens = {f"token-{index}" for index in range(n_sources)}
+        modes = {(f"/tmp/session-{index}.jsonl", "exchange") for index in range(n_sources)}
+        where = _visible_drawer_where({}, tokens, modes)
+
+        assert _where_source_ne_count(where) == 0
+        assert _where_node_count(where) <= 8
+        leftover = {
+            "source_file": "/tmp/session-0.jsonl",
+            "extract_mode": "exchange",
+            "ingest_mode": "convos",
+        }
+        current = {**leftover, "mine_generation_token": "token-0"}
+        assert _is_visible_generation_metadata(leftover, tokens, modes) is False
+        assert _is_visible_generation_metadata(current, tokens, modes) is True
+
+    def test_chroma_hides_tokenless_predecessor_among_many_tokened_sources(
+        self, palace_path, collection
+    ):
+        query = "bounded-generation-chroma-phrase"
+        n_sources = 80
+        collection.upsert(
+            ids=[f"marker-{index}" for index in range(n_sources)] + ["leftover", "current"],
+            # Production commit markers are unique per source. Chroma 1.5.7
+            # HNSW omits rows from query() when one upsert is dominated by
+            # identical embeddings, even though get() still returns them.
+            documents=[
+                f"[conversation generation commit] /tmp/session-{index}.jsonl"
+                for index in range(n_sources)
+            ]
+            + [query, query],
+            metadatas=[
+                *[
+                    {
+                        "mine_staged": True,
+                        "mine_commit_marker": True,
+                        "mine_generation_commit": f"token-{index}",
+                        "source_file": f"/tmp/session-{index}.jsonl",
+                        "extract_mode": "exchange",
+                        "wing": "sessions",
+                        "room": "general",
+                    }
+                    for index in range(n_sources)
+                ],
+                {
+                    "wing": "sessions",
+                    "room": "general",
+                    "source_file": "/tmp/session-0.jsonl",
+                    "extract_mode": "exchange",
+                    "ingest_mode": "convos",
+                    "filed_at": "2026-09-01T00:00:00",
+                },
+                {
+                    "wing": "sessions",
+                    "room": "general",
+                    "source_file": "/tmp/session-0.jsonl",
+                    "extract_mode": "exchange",
+                    "ingest_mode": "convos",
+                    "mine_generation_token": "token-0",
+                    "logical_drawer_id": "kept-logical",
+                    "filed_at": "2026-09-02T00:00:00",
+                },
+            ],
+        )
+
+        from mempalace.searcher import _visible_drawer_where
+
+        tokens = {f"token-{index}" for index in range(n_sources)}
+        modes = {(f"/tmp/session-{index}.jsonl", "exchange") for index in range(n_sources)}
+        where = _visible_drawer_where({}, tokens, modes)
+        assert len(tokens) == 80
+        assert len(modes) == 80
+        assert _where_source_ne_count(where) == 0
+        assert _where_node_count(where) <= 8
+
+        stored = collection.get(ids=["leftover", "current"])
+        assert set(stored["ids"]) == {"leftover", "current"}
+        ranked = collection.query(
+            query_texts=[query],
+            n_results=4,
+            include=["documents"],
+        )
+        ranked_ids = ranked["ids"][0]
+        assert "leftover" in ranked_ids
+        assert "current" in ranked_ids
+
+        result = search_memories(query, palace_path, n_results=1)
+        assert "error" not in result, result
+        assert result["results"]
+        ids = [hit["drawer_id"] for hit in result["results"]]
+        assert "leftover" not in ids
+        assert ids[0] in {"current", "kept-logical"}
+
+
+class TestGenerationStateFailClosed:
+    def test_committed_generation_state_raises_on_incomplete_marker_scan(self):
+        from mempalace.searcher import _committed_generation_state
+
+        class Collection:
+            @staticmethod
+            def get(**_kwargs):
+                raise RuntimeError("later marker page failed")
+
+        with pytest.raises(GenerationStateError, match="Incomplete"):
+            _committed_generation_state(Collection())
+
+    def test_committed_generation_state_does_not_return_partial_tokens(self, monkeypatch):
+        from mempalace import searcher
+
+        monkeypatch.setattr(
+            searcher,
+            "_generation_commit_marker_state",
+            lambda _collection: (
+                {"token-0"},
+                {("/tmp/session-0.jsonl", "exchange")},
+                False,
+            ),
+        )
+
+        with pytest.raises(GenerationStateError, match="Incomplete"):
+            searcher._committed_generation_state(object())
+
+    def test_search_memories_fails_closed_on_incomplete_markers(
+        self, palace_path, seeded_collection, monkeypatch
+    ):
+        from mempalace import searcher
+
+        monkeypatch.setattr(
+            searcher,
+            "_generation_commit_marker_state",
+            lambda _collection: (
+                {"token-0"},
+                {("/tmp/session-0.jsonl", "exchange")},
+                False,
+            ),
+        )
+
+        result = search_memories("JWT authentication", palace_path)
+        assert result["results"] == []
+        assert "error" in result
+        assert "Incomplete" in result["error"]
+
+    def test_current_generation_lookup_raises_instead_of_empty_map(self):
+        from mempalace.searcher import _current_generation_ids_for_query
+
+        class Collection:
+            @staticmethod
+            def get(**_kwargs):
+                raise RuntimeError("$in too large")
+
+        raw = {
+            "ids": [["old"]],
+            "documents": [["old text"]],
+            "metadatas": [[{"logical_drawer_id": "logical"}]],
+            "distances": [[0.1]],
+        }
+        with pytest.raises(GenerationStateError, match="current conversation generation"):
+            _current_generation_ids_for_query(Collection(), raw, frozenset())
+
+    def test_post_filter_does_not_drop_logical_hits_when_generation_lookup_fails(self):
+        from mempalace.searcher import _post_filter_drawer_query
+
+        class Collection:
+            @staticmethod
+            def get(**_kwargs):
+                raise RuntimeError("$in too large")
+
+        raw = {
+            "ids": [["kept-logical"]],
+            "documents": [["session hit"]],
+            "metadatas": [
+                [
+                    {
+                        "logical_drawer_id": "kept-logical",
+                        "mine_generation_token": "token-0",
+                    }
+                ]
+            ],
+            "distances": [[0.1]],
+        }
+        with pytest.raises(GenerationStateError, match="current conversation generation"):
+            _post_filter_drawer_query(
+                Collection(),
+                raw,
+                None,
+                None,
+                None,
+                frozenset({"token-0"}),
+            )
+
+    def test_query_fallback_fails_closed_when_current_generation_get_raises(self):
+        from mempalace.searcher import _query_drawers_with_filter_fallback
+
+        current_meta = {
+            "logical_drawer_id": "kept-logical",
+            "mine_generation_token": "token-0",
+        }
+
+        class Collection:
+            @staticmethod
+            def count():
+                return 1
+
+            @staticmethod
+            def get(where=None, include=None, **_kwargs):
+                if isinstance(where, dict) and where.get("mine_commit_marker") is True:
+                    return {
+                        "ids": ["marker"],
+                        "metadatas": [
+                            {
+                                "mine_commit_marker": True,
+                                "mine_generation_commit": "token-0",
+                            }
+                        ],
+                    }
+                raise RuntimeError("Error executing plan: $in too large")
+
+            @staticmethod
+            def query(**_kwargs):
+                return {
+                    "ids": [["kept-logical"]],
+                    "documents": [["session hit"]],
+                    "metadatas": [[current_meta]],
+                    "distances": [[0.1]],
+                }
+
+        with pytest.raises(GenerationStateError, match="current conversation generation"):
+            _query_drawers_with_filter_fallback(
+                Collection(),
+                {"where": {"mine_staged": {"$ne": True}}, "n_results": 1},
+                "query",
+                1,
+                None,
+                None,
+            )
+
+    def test_search_memories_fails_closed_when_current_generation_get_fails(
+        self, palace_path, collection, monkeypatch
+    ):
+        from mempalace import searcher
+
+        collection.upsert(
+            ids=["current"],
+            documents=["bounded-generation-chroma-phrase"],
+            metadatas=[
+                {
+                    "wing": "sessions",
+                    "room": "general",
+                    "logical_drawer_id": "kept-logical",
+                    "mine_generation_token": "token-0",
+                    "filed_at": "2026-09-02T00:00:00",
+                }
+            ],
+        )
+
+        def fail_current(*_args, **_kwargs):
+            raise GenerationStateError("Could not resolve current conversation generations")
+
+        monkeypatch.setattr(searcher, "_current_generation_ids_for_query", fail_current)
+
+        result = search_memories("bounded-generation-chroma-phrase", palace_path, n_results=1)
+        assert result["results"] == []
+        assert "error" in result
+        assert "current conversation generation" in result["error"]
+
+    def test_lexical_hydrate_fails_closed_when_current_row_get_raises(self):
+        from types import SimpleNamespace
+
+        from mempalace.searcher import _resolve_lexical_generation_hits
+
+        old = SimpleNamespace(
+            id="old",
+            document="old text",
+            metadata={
+                "logical_drawer_id": "logical",
+                "mine_generation_token": "token-0",
+            },
+            score=1.0,
+        )
+
+        class Collection:
+            @staticmethod
+            def get(**kwargs):
+                if kwargs.get("ids"):
+                    raise RuntimeError("hydrate failed")
+                return {
+                    "ids": ["current"],
+                    "metadatas": [
+                        {
+                            "logical_drawer_id": "logical",
+                            "mine_generation_token": "token-0",
+                            "filed_at": "2026-09-02T00:00:00",
+                        }
+                    ],
+                }
+
+        with pytest.raises(GenerationStateError, match="current conversation generation"):
+            _resolve_lexical_generation_hits(Collection(), [old], "query", frozenset({"token-0"}))
+
+    def test_sqlite_active_generation_query_error_does_not_drop_tokened_hits(self, monkeypatch):
+        import sqlite3
+
+        from mempalace.searcher import _resolve_sqlite_generation_candidates
+
+        candidates = [
+            {
+                "_logical_generation_id": "kept-logical",
+                "_generation_token": "token-0",
+                "text": "tokened session hit",
+            }
+        ]
+
+        def boom(*_args, **_kwargs):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr("mempalace.searcher._sqlite_active_generation_rows", boom)
+        with pytest.raises(GenerationStateError, match="current conversation generation"):
+            _resolve_sqlite_generation_candidates(
+                candidates,
+                "tokened session hit",
+                "/unused/chroma.sqlite3",
+                "mempalace_drawers",
+                frozenset({"token-0"}),
+            )
+
+
 # ── search_memories (API) ──────────────────────────────────────────────
 
 
@@ -76,6 +430,66 @@ class TestSearchMemories:
         assert len(result["results"]) > 0
         assert result["query"] == "JWT authentication"
 
+    def test_staged_conversation_generation_is_not_searchable(self, palace_path, collection):
+        staged_text = "unpublished generation sentinel phrase"
+        staged_ids = [f"staged-generation-{index}" for index in range(8)]
+        collection.upsert(
+            ids=[*staged_ids, "old-generation", "committed-generation"],
+            documents=[
+                *[staged_text] * len(staged_ids),
+                staged_text,
+                "committed fallback text",
+            ],
+            metadatas=[
+                *[
+                    {
+                        "wing": "sessions",
+                        "room": "general",
+                        "source_file": f"/tmp/staged-{index}.jsonl",
+                        "filed_at": "2026-09-02T00:00:00",
+                        "mine_staged": True,
+                        "mine_generation_token": "generation-token",
+                        "logical_drawer_id": "logical-generation",
+                    }
+                    for index in range(len(staged_ids))
+                ],
+                {
+                    "wing": "sessions",
+                    "room": "general",
+                    "source_file": "/tmp/old.jsonl",
+                    "filed_at": "2026-09-03T00:00:00",
+                    "logical_drawer_id": "logical-generation",
+                },
+                {
+                    "wing": "sessions",
+                    "room": "general",
+                    "source_file": "/tmp/committed.jsonl",
+                    "filed_at": "2026-09-02T00:00:00",
+                },
+            ],
+        )
+
+        result = search_memories(staged_text, palace_path, n_results=1)
+
+        assert len(result["results"]) == 1
+        assert result["results"][0]["source_path"] == "/tmp/old.jsonl"
+
+        collection.upsert(
+            ids=["generation-commit"],
+            documents=["[commit]"],
+            metadatas=[
+                {
+                    "mine_staged": True,
+                    "mine_commit_marker": True,
+                    "mine_generation_commit": "generation-token",
+                }
+            ],
+        )
+        published = search_memories(staged_text, palace_path, n_results=10)
+        assert published["results"][0]["source_path"].startswith("/tmp/staged-")
+        assert published["results"][0]["drawer_id"] == "logical-generation"
+        assert sum(hit["drawer_id"] == "logical-generation" for hit in published["results"]) == 1
+
     def test_wing_filter(self, palace_path, seeded_collection):
         result = search_memories("planning", palace_path, wing="notes")
         assert all(r["wing"] == "notes" for r in result["results"])
@@ -83,6 +497,609 @@ class TestSearchMemories:
     def test_room_filter(self, palace_path, seeded_collection):
         result = search_memories("database", palace_path, room="backend")
         assert all(r["room"] == "backend" for r in result["results"])
+
+    def test_filtered_query_fallback_refills_past_staged_top_k(self):
+        from mempalace.searcher import _query_drawers_with_filter_fallback
+
+        class Collection:
+            def __init__(self):
+                self.unfiltered_limits = []
+
+            @staticmethod
+            def count():
+                return 20
+
+            @staticmethod
+            def get(**_kwargs):
+                return {"ids": [], "metadatas": []}
+
+            def query(self, **kwargs):
+                if "where" in kwargs:
+                    raise RuntimeError("filtered HNSW mismatch")
+                limit = kwargs["n_results"]
+                self.unfiltered_limits.append(limit)
+                ids = [f"staged-{index}" for index in range(min(limit, 19))]
+                docs = ["staged"] * len(ids)
+                metas = [{"mine_staged": True}] * len(ids)
+                if limit >= 20:
+                    ids.append("committed")
+                    docs.append("committed")
+                    metas.append({"source_file": "/tmp/committed"})
+                return {
+                    "ids": [ids],
+                    "documents": [docs],
+                    "metadatas": [metas],
+                    "distances": [[0.1] * len(ids)],
+                }
+
+        collection = Collection()
+        result = _query_drawers_with_filter_fallback(
+            collection,
+            {"where": {"mine_staged": {"$ne": True}}},
+            "query",
+            1,
+            None,
+            None,
+        )
+
+        assert collection.unfiltered_limits == [15, 20]
+        assert result["ids"] == [["committed"]]
+
+    def test_filtered_query_refills_until_current_logical_generation_is_present(self):
+        from mempalace.searcher import _query_drawers_with_filter_fallback
+
+        old_meta = {
+            "logical_drawer_id": "logical",
+            "filed_at": "2026-09-01T00:00:00",
+        }
+        current_meta = {
+            "logical_drawer_id": "logical",
+            "filed_at": "2026-09-02T00:00:00",
+        }
+
+        class Collection:
+            def __init__(self):
+                self.query_limits = []
+
+            @staticmethod
+            def count():
+                return 2
+
+            @staticmethod
+            def get(where, include):
+                if "mine_commit_marker" in where:
+                    return {"ids": [], "metadatas": []}
+                return {
+                    "ids": ["old", "current"],
+                    "metadatas": [old_meta, current_meta],
+                }
+
+            def query(self, **kwargs):
+                limit = kwargs["n_results"]
+                self.query_limits.append(limit)
+                ids = ["old"] if limit == 1 else ["old", "current"]
+                metas = [old_meta] if limit == 1 else [old_meta, current_meta]
+                return {
+                    "ids": [ids],
+                    "documents": [["old"] if limit == 1 else ["old", "current"]],
+                    "metadatas": [metas],
+                    "distances": [[0.1] if limit == 1 else [0.1, 1.0]],
+                }
+
+        collection = Collection()
+        result = _query_drawers_with_filter_fallback(
+            collection,
+            {"where": {"mine_staged": {"$ne": True}}, "n_results": 1},
+            "query",
+            1,
+            None,
+            None,
+        )
+
+        assert collection.query_limits == [1, 2]
+        assert result["ids"] == [["current"]]
+
+    def test_filtered_query_refills_past_tokenless_predecessors_before_limit(self):
+        from mempalace.searcher import _query_drawers_with_filter_fallback
+
+        leftover_meta = {
+            "source_file": "/tmp/session.jsonl",
+            "extract_mode": "exchange",
+            "ingest_mode": "convos",
+        }
+        current_meta = {
+            **leftover_meta,
+            "logical_drawer_id": "kept-logical",
+            "mine_generation_token": "active-token",
+        }
+
+        class Collection:
+            def __init__(self):
+                self.query_limits = []
+
+            @staticmethod
+            def count():
+                return 8
+
+            @staticmethod
+            def get(where=None, include=None, **_kwargs):
+                if isinstance(where, dict) and where.get("mine_commit_marker") is True:
+                    return {
+                        "ids": ["marker"],
+                        "metadatas": [
+                            {
+                                "mine_commit_marker": True,
+                                "mine_generation_commit": "active-token",
+                                "source_file": leftover_meta["source_file"],
+                                "extract_mode": "exchange",
+                                "ingest_mode": "convos",
+                            }
+                        ],
+                    }
+                return {"ids": ["current"], "metadatas": [current_meta]}
+
+            def query(self, **kwargs):
+                limit = kwargs["n_results"]
+                self.query_limits.append(limit)
+                leftover_count = min(limit, 7)
+                ids = [f"leftover-{index}" for index in range(leftover_count)]
+                metas = [leftover_meta] * leftover_count
+                docs = ["retired leftover text"] * leftover_count
+                if limit >= 8:
+                    ids.append("current")
+                    metas.append(current_meta)
+                    docs.append("current committed text")
+                return {
+                    "ids": [ids],
+                    "documents": [docs],
+                    "metadatas": [metas],
+                    "distances": [[0.1] * len(ids)],
+                }
+
+        collection = Collection()
+        result = _query_drawers_with_filter_fallback(
+            collection,
+            {"where": {"mine_staged": {"$ne": True}}, "n_results": 1},
+            "query",
+            1,
+            None,
+            None,
+        )
+
+        assert collection.query_limits[-1] >= 8
+        assert result["ids"] == [["current"]]
+        assert result["documents"] == [["current committed text"]]
+
+    def test_lexical_union_replaces_old_hit_with_current_generation(self):
+        from mempalace.searcher import _resolve_lexical_generation_hits
+
+        old_meta = {
+            "logical_drawer_id": "logical",
+            "filed_at": "2026-09-01T00:00:00",
+        }
+        current_meta = {
+            "logical_drawer_id": "logical",
+            "filed_at": "2026-09-02T00:00:00",
+        }
+        old_hit = SimpleNamespace(
+            id="old",
+            document="target phrase in stale content",
+            metadata=old_meta,
+            score=10.0,
+        )
+
+        class Collection:
+            @staticmethod
+            def get(**kwargs):
+                if "where" in kwargs:
+                    return {
+                        "ids": ["old", "current"],
+                        "metadatas": [old_meta, current_meta],
+                    }
+                return {
+                    "ids": ["current"],
+                    "documents": ["target phrase in current content"],
+                    "metadatas": [current_meta],
+                }
+
+        resolved = _resolve_lexical_generation_hits(
+            Collection(), [old_hit], "target phrase", frozenset()
+        )
+
+        assert [hit.id for hit in resolved] == ["current"]
+        assert resolved[0].document == "target phrase in current content"
+
+        retired_hit = SimpleNamespace(
+            id="retired",
+            document="retired text",
+            metadata={
+                "logical_drawer_id": "removed-logical",
+                "mine_generation_token": "retired-token",
+            },
+            score=5.0,
+        )
+
+        class NoCurrentCollection:
+            @staticmethod
+            def get(**_kwargs):
+                return {"ids": [], "metadatas": []}
+
+        assert (
+            _resolve_lexical_generation_hits(
+                NoCurrentCollection(), [retired_hit], "retired", frozenset()
+            )
+            == []
+        )
+
+    def test_lexical_union_refills_after_retired_hits_are_dropped(self):
+        from mempalace.searcher import _fetch_resolved_lexical_hits
+
+        retired = [
+            SimpleNamespace(
+                id=f"retired-{index}",
+                document="retired",
+                metadata={
+                    "logical_drawer_id": f"removed-{index}",
+                    "mine_generation_token": "retired-token",
+                },
+                score=10.0,
+            )
+            for index in range(3)
+        ]
+        ordinary = [
+            SimpleNamespace(
+                id=f"ordinary-{index}",
+                document="ordinary",
+                metadata={},
+                score=1.0,
+            )
+            for index in range(3)
+        ]
+
+        class Collection:
+            def __init__(self):
+                self.limits = []
+
+            @staticmethod
+            def count():
+                return 6
+
+            @staticmethod
+            def get(**_kwargs):
+                return {"ids": [], "metadatas": []}
+
+            def lexical_search(self, query, n_results, where):
+                self.limits.append(n_results)
+                hits = retired if n_results == 3 else [*retired, *ordinary]
+                return SimpleNamespace(hits=hits)
+
+        collection = Collection()
+        resolved = _fetch_resolved_lexical_hits(
+            collection,
+            "query",
+            {"mine_staged": {"$ne": True}},
+            3,
+            frozenset(),
+        )
+
+        assert collection.limits == [3, 6]
+        assert [hit.id for hit in resolved] == [
+            "ordinary-0",
+            "ordinary-1",
+            "ordinary-2",
+        ]
+
+    def test_closet_source_rows_prefer_active_token_over_newer_stale_row(self):
+        from mempalace.searcher import _collapse_physical_generation_rows
+
+        rows = [
+            (
+                "stale-b",
+                "obsolete text",
+                {
+                    "logical_drawer_id": "logical",
+                    "mine_generation_token": "old-token",
+                    "filed_at": "2026-09-03T00:00:00",
+                },
+            ),
+            (
+                "active-a",
+                "current text",
+                {
+                    "logical_drawer_id": "logical",
+                    "mine_generation_token": "active-token",
+                    "filed_at": "2026-09-01T00:00:00",
+                },
+            ),
+            (
+                "removed-chunk",
+                "removed text",
+                {
+                    "logical_drawer_id": "removed-logical",
+                    "mine_generation_token": "retired-token",
+                    "filed_at": "2026-09-04T00:00:00",
+                },
+            ),
+        ]
+
+        collapsed = _collapse_physical_generation_rows(rows, {"active-token"})
+
+        assert [(row[0], row[1]) for row in collapsed] == [("active-a", "current text")]
+
+    def test_tokenless_predecessor_of_tokened_source_is_not_collapsed_as_current(self):
+        from mempalace.searcher import _collapse_physical_generation_rows
+
+        rows = [
+            (
+                "dropped-tokenless",
+                "deleted text",
+                {
+                    "logical_drawer_id": "removed-logical",
+                    "source_file": "/tmp/session.jsonl",
+                    "extract_mode": "exchange",
+                    "ingest_mode": "convos",
+                },
+            ),
+            (
+                "active-tokened",
+                "current text",
+                {
+                    "logical_drawer_id": "kept-logical",
+                    "source_file": "/tmp/session.jsonl",
+                    "extract_mode": "exchange",
+                    "ingest_mode": "convos",
+                    "mine_generation_token": "active-token",
+                },
+            ),
+        ]
+
+        collapsed = _collapse_physical_generation_rows(
+            rows, {"active-token"}, {("/tmp/session.jsonl", "exchange")}
+        )
+
+        assert [(row[0], row[1]) for row in collapsed] == [("active-tokened", "current text")]
+
+    def test_parent_chunks_sharing_logical_id_are_not_collapsed(self):
+        from mempalace.searcher import (
+            _collapse_logical_generation_hits,
+            _collapse_physical_generation_rows,
+        )
+
+        rows = [
+            (
+                f"logical_chunk_{index:06d}",
+                f"chunk-{index}-UNIQUE",
+                {
+                    "logical_drawer_id": "logical",
+                    "parent_drawer_id": "logical",
+                    "chunk_index": index,
+                    "mine_generation_token": "active-token",
+                    "filed_at": "2026-09-01T00:00:00",
+                },
+            )
+            for index in range(3)
+        ]
+
+        collapsed = _collapse_physical_generation_rows(rows, {"active-token"})
+        assert [(row[0], row[1]) for row in collapsed] == [
+            (f"logical_chunk_{index:06d}", f"chunk-{index}-UNIQUE") for index in range(3)
+        ]
+
+        hits = [
+            {
+                "text": f"chunk-{index}-UNIQUE",
+                "_logical_generation_id": "logical",
+                "_parent_drawer_id": "logical",
+                "_physical_drawer_id": f"logical_chunk_{index:06d}",
+                "_active_generation": True,
+                "created_at": "2026-09-01T00:00:00",
+            }
+            for index in range(3)
+        ]
+        assert [hit["text"] for hit in _collapse_logical_generation_hits(hits)] == [
+            f"chunk-{index}-UNIQUE" for index in range(3)
+        ]
+
+    def test_post_filter_keeps_all_parent_chunks_sharing_logical_id(self):
+        from mempalace.searcher import _post_filter_drawer_query
+
+        chunk_ids = ["logical_chunk_000000", "logical_chunk_000001"]
+        metas = [
+            {
+                "logical_drawer_id": "logical",
+                "parent_drawer_id": "logical",
+                "chunk_index": 0,
+                "mine_generation_token": "tok",
+            },
+            {
+                "logical_drawer_id": "logical",
+                "parent_drawer_id": "logical",
+                "chunk_index": 1,
+                "mine_generation_token": "tok",
+            },
+        ]
+
+        class Collection:
+            @staticmethod
+            def get(**_kwargs):
+                return {"ids": chunk_ids, "metadatas": metas}
+
+        raw = {
+            "ids": [chunk_ids],
+            "documents": [["alpha chunk", "beta chunk"]],
+            "metadatas": [metas],
+            "distances": [[0.1, 0.2]],
+        }
+        filtered = _post_filter_drawer_query(
+            Collection(), raw, None, None, None, frozenset({"tok"})
+        )
+        assert filtered["ids"][0] == chunk_ids
+        assert filtered["documents"][0] == ["alpha chunk", "beta chunk"]
+
+    def test_parent_sibling_refill_restores_hnsw_omitted_leftover(self):
+        from mempalace.searcher import _include_matching_parent_siblings
+
+        prefix = {
+            "text": "shrinkDelta prefix",
+            "drawer_id": "logical",
+            "_parent_drawer_id": "logical",
+            "_physical_drawer_id": "logical_chunk_000000",
+            "distance": 0.2,
+        }
+        tail = "shrinkGamma leftover verbatim"
+
+        class Collection:
+            @staticmethod
+            def get(**_kwargs):
+                return {
+                    "ids": ["logical_chunk_000000", "logical_chunk_000002"],
+                    "documents": ["shrinkDelta prefix", tail],
+                    "metadatas": [
+                        {
+                            "parent_drawer_id": "logical",
+                            "wing": "sessions",
+                            "room": "general",
+                            "mine_generation_token": "tok",
+                            "filed_at": "2026-09-01T00:00:00",
+                        },
+                        {
+                            "logical_drawer_id": "logical",
+                            "parent_drawer_id": "logical",
+                            "wing": "sessions",
+                            "room": "general",
+                            "mine_generation_token": "tok",
+                            "filed_at": "2026-09-01T00:00:00",
+                        },
+                    ],
+                }
+
+        filled = _include_matching_parent_siblings(
+            [prefix], Collection(), "shrinkGamma", frozenset({"tok"}), frozenset()
+        )
+        matching = [hit for hit in filled if hit["text"] == tail]
+        assert matching
+        assert matching[0]["drawer_id"] == "logical"
+        assert matching[0]["_physical_drawer_id"] == "logical_chunk_000002"
+        assert filled[0]["text"] == "shrinkDelta prefix"
+
+    def test_parent_sibling_refill_skips_nonmatching_and_failed_get(self):
+        from mempalace.searcher import _include_matching_parent_siblings
+
+        prefix = {
+            "text": "shrinkDelta prefix",
+            "_parent_drawer_id": "logical",
+            "_physical_drawer_id": "logical_chunk_000000",
+            "distance": 0.2,
+        }
+
+        class NoMatch:
+            @staticmethod
+            def get(**_kwargs):
+                return {
+                    "ids": ["logical_chunk_000002"],
+                    "documents": ["unrelated leftover"],
+                    "metadatas": [{"parent_drawer_id": "logical", "mine_generation_token": "tok"}],
+                }
+
+        class Boom:
+            @staticmethod
+            def get(**_kwargs):
+                raise RuntimeError("sibling get failed")
+
+        assert _include_matching_parent_siblings(
+            [prefix], NoMatch(), "shrinkGamma", frozenset({"tok"}), frozenset()
+        ) == [prefix]
+        assert _include_matching_parent_siblings(
+            [prefix], Boom(), "shrinkGamma", frozenset({"tok"}), frozenset()
+        ) == [prefix]
+
+    def test_parent_sibling_refill_applies_request_filters_and_skips_uniform_groups(self):
+        from mempalace.searcher import _include_matching_parent_siblings
+
+        prefix = {
+            "text": "shrinkDelta prefix",
+            "_parent_drawer_id": "logical",
+            "_physical_drawer_id": "logical_chunk_000000",
+            "distance": 0.2,
+        }
+        tail = "shrinkGamma leftover verbatim"
+        leftover_meta = {
+            "logical_drawer_id": "logical",
+            "parent_drawer_id": "logical",
+            "wing": "sessions",
+            "room": "general",
+            "source_file": "/tmp/legacy-mined-session.jsonl",
+            "mine_generation_token": "tok",
+        }
+
+        class Mixed:
+            @staticmethod
+            def get(**_kwargs):
+                return {
+                    "ids": ["logical_chunk_000000", "logical_chunk_000002"],
+                    "documents": ["shrinkDelta prefix", tail],
+                    "metadatas": [
+                        {
+                            "parent_drawer_id": "logical",
+                            "wing": "moved",
+                            "room": "elsewhere",
+                            "mine_generation_token": "tok",
+                        },
+                        leftover_meta,
+                    ],
+                }
+
+        class Uniform:
+            @staticmethod
+            def get(**_kwargs):
+                return {
+                    "ids": ["logical_chunk_000000", "logical_chunk_000001"],
+                    "documents": ["common token alpha", "common token beta"],
+                    "metadatas": [
+                        {
+                            "logical_drawer_id": "logical",
+                            "parent_drawer_id": "logical",
+                            "mine_generation_token": "tok",
+                        },
+                        {
+                            "logical_drawer_id": "logical",
+                            "parent_drawer_id": "logical",
+                            "mine_generation_token": "tok",
+                        },
+                    ],
+                }
+
+        filtered = _include_matching_parent_siblings(
+            [prefix],
+            Mixed(),
+            "shrinkGamma",
+            frozenset({"tok"}),
+            frozenset(),
+            wing="moved",
+            room="elsewhere",
+        )
+        assert [hit["text"] for hit in filtered] == ["shrinkDelta prefix"]
+
+        same_scope = _include_matching_parent_siblings(
+            [prefix],
+            Mixed(),
+            "shrinkGamma",
+            frozenset({"tok"}),
+            frozenset(),
+            wing="sessions",
+            room="general",
+        )
+        assert any(hit["text"] == tail for hit in same_scope)
+
+        uniform_prefix = {
+            "text": "common token alpha",
+            "_parent_drawer_id": "logical",
+            "_physical_drawer_id": "logical_chunk_000000",
+            "distance": 0.1,
+        }
+        assert _include_matching_parent_siblings(
+            [uniform_prefix], Uniform(), "common token", frozenset({"tok"}), frozenset()
+        ) == [uniform_prefix]
 
     def test_wing_and_room_filter(self, palace_path, seeded_collection):
         result = search_memories("code", palace_path, wing="project", room="frontend")
@@ -662,6 +1679,71 @@ class TestSearchCLI:
         assert "mempalace repair" in captured.out
         assert "diary entry that matches" in captured.out
 
+    def test_search_bm25_fallback_raises_when_generation_lookup_fails(
+        self, fake_palace_path, capsys
+    ):
+        """CLI BM25 fallback must not print a successful empty result on error.
+
+        ``_bm25_only_via_sqlite`` returns ``{error, results: []}``. Checking
+        only ``results`` made ``mempalace search`` print "No results found"
+        and exit 0.
+        """
+        bm25_error = {
+            "error": "Could not resolve current conversation generations",
+            "results": [],
+        }
+        with (
+            patch("mempalace.searcher.resolve_backend_name", return_value="chroma"),
+            patch(
+                "mempalace.backends.chroma.hnsw_capacity_status",
+                return_value={"diverged": True, "message": "test divergence"},
+            ),
+            patch("mempalace.searcher._bm25_only_via_sqlite", return_value=bm25_error),
+            patch("mempalace.searcher.get_collection") as mock_get_collection,
+        ):
+            with pytest.raises(SearchError, match="current conversation generation"):
+                search("anything", fake_palace_path)
+        captured = capsys.readouterr()
+        mock_get_collection.assert_not_called()
+        assert "Search error" in captured.out
+        assert "No results found" not in captured.out
+
+    def test_cmd_search_exits_nonzero_when_bm25_generation_lookup_fails(
+        self, fake_palace_path, capsys
+    ):
+        import argparse
+
+        from mempalace.cli import cmd_search
+
+        bm25_error = {
+            "error": "Could not resolve current conversation generations",
+            "results": [],
+        }
+        args = argparse.Namespace(
+            palace=fake_palace_path,
+            query="anything",
+            wing=None,
+            room=None,
+            results=5,
+            since=None,
+            before=None,
+        )
+        with (
+            patch("mempalace.cli._forward_search_to_hub", return_value=False),
+            patch("mempalace.searcher.resolve_backend_name", return_value="chroma"),
+            patch(
+                "mempalace.backends.chroma.hnsw_capacity_status",
+                return_value={"diverged": True, "message": "test divergence"},
+            ),
+            patch("mempalace.searcher._bm25_only_via_sqlite", return_value=bm25_error),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_search(args)
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "Search error" in captured.out
+        assert "No results found" not in captured.out
+
     def test_search_proceeds_to_vector_when_hnsw_healthy(self, fake_palace_path, capsys):
         """Paired guard: when HNSW is healthy, the divergence probe must NOT
         short-circuit to BM25 — vector search proceeds normally.
@@ -1059,6 +2141,331 @@ def test_bm25_only_via_sqlite_forwards_stop_words_to_bm25_scores(monkeypatch, tm
     assert captured["stop_words"] == frozenset({"the"})
 
 
+def test_bm25_commit_marker_is_scoped_to_selected_collection(tmp_path):
+    from mempalace import searcher
+
+    db = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE VIRTUAL TABLE embedding_fulltext_search USING fts5(string_value, tokenize='trigram');
+        CREATE TABLE embedding_metadata (
+            id INTEGER, key TEXT, string_value TEXT, int_value INTEGER,
+            float_value REAL, bool_value INTEGER
+        );
+        CREATE TABLE collections (id TEXT PRIMARY KEY, name TEXT);
+        CREATE TABLE segments (id TEXT PRIMARY KEY, collection TEXT);
+        CREATE TABLE embeddings (
+            id INTEGER PRIMARY KEY, segment_id TEXT, embedding_id TEXT, created_at TEXT
+        );
+        INSERT INTO collections VALUES ('target', 'target_drawers');
+        INSERT INTO collections VALUES ('other', 'other_drawers');
+        INSERT INTO segments VALUES ('target-seg', 'target');
+        INSERT INTO segments VALUES ('other-seg', 'other');
+        INSERT INTO embeddings VALUES (1, 'target-seg', 'staged-drawer', '2026-09-02');
+        INSERT INTO embeddings VALUES (2, 'other-seg', 'foreign-marker', '2026-09-02');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (1, 'scoped generation phrase');
+        INSERT INTO embedding_metadata VALUES
+            (1, 'chroma:document', 'scoped generation phrase', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (1, 'mine_staged', NULL, NULL, NULL, 1);
+        INSERT INTO embedding_metadata VALUES
+            (1, 'mine_generation_token', 'shared-token', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (2, 'mine_generation_commit', 'shared-token', NULL, NULL, NULL);
+        """
+    )
+    conn.commit()
+
+    hidden = searcher._bm25_only_via_sqlite(
+        "scoped generation",
+        str(tmp_path),
+        collection_name="target_drawers",
+    )
+    assert hidden["results"] == []
+
+    conn.execute("INSERT INTO embeddings VALUES (3, 'target-seg', 'local-marker', '2026-09-02')")
+    conn.execute(
+        "INSERT INTO embedding_metadata VALUES "
+        "(3, 'mine_generation_commit', 'shared-token', NULL, NULL, NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    visible = searcher._bm25_only_via_sqlite(
+        "scoped generation",
+        str(tmp_path),
+        collection_name="target_drawers",
+    )
+    assert [hit["drawer_id"] for hit in visible["results"]] == ["staged-drawer"]
+
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        INSERT INTO embeddings VALUES (4, 'target-seg', 'old-b', '2026-09-03');
+        INSERT INTO embeddings VALUES (5, 'target-seg', 'active-a', '2026-09-01');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (4, 'obsolete dinosaur only');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (5, 'current replacement text');
+        INSERT INTO embedding_metadata VALUES
+            (4, 'chroma:document', 'obsolete dinosaur only', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (4, 'logical_drawer_id', 'logical-revert', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (4, 'filed_at', '2026-09-03T00:00:00', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (5, 'chroma:document', 'current replacement text', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (5, 'logical_drawer_id', 'logical-revert', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (5, 'mine_generation_token', 'shared-token', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (5, 'filed_at', '2026-09-01T00:00:00', NULL, NULL, NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    reverted = searcher._bm25_only_via_sqlite(
+        "obsolete dinosaur",
+        str(tmp_path),
+        collection_name="target_drawers",
+    )
+    assert reverted["results"] == []
+
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        INSERT INTO embeddings VALUES (6, 'target-seg', 'removed-chunk', '2026-09-04');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (6, 'removed unicorn memory');
+        INSERT INTO embedding_metadata VALUES
+            (6, 'chroma:document', 'removed unicorn memory', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (6, 'logical_drawer_id', 'removed-logical', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (6, 'mine_generation_token', 'retired-token', NULL, NULL, NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+    removed = searcher._bm25_only_via_sqlite(
+        "removed unicorn",
+        str(tmp_path),
+        collection_name="target_drawers",
+    )
+    assert removed["results"] == []
+
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        INSERT INTO embedding_metadata VALUES
+            (3, 'source_file', '/tmp/session.jsonl', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (3, 'extract_mode', 'exchange', NULL, NULL, NULL);
+        INSERT INTO embeddings VALUES (8, 'target-seg', 'tokenless-drop', '2026-09-06');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (8, 'deleted tokenless predecessor phrase');
+        INSERT INTO embedding_metadata VALUES
+            (8, 'chroma:document', 'deleted tokenless predecessor phrase', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (8, 'logical_drawer_id', 'tokenless-drop', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (8, 'source_file', '/tmp/session.jsonl', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (8, 'extract_mode', 'exchange', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (8, 'ingest_mode', 'convos', NULL, NULL, NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+    tokenless_drop = searcher._bm25_only_via_sqlite(
+        "deleted tokenless predecessor",
+        str(tmp_path),
+        collection_name="target_drawers",
+    )
+    assert tokenless_drop["results"] == []
+
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        INSERT INTO embeddings VALUES (7, 'target-seg', 'ordinary-match', '2026-09-05');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (7, 'removed unicorn ordinary');
+        INSERT INTO embedding_metadata VALUES
+            (7, 'chroma:document', 'removed unicorn ordinary', NULL, NULL, NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+    limited = searcher._bm25_only_via_sqlite(
+        "removed unicorn",
+        str(tmp_path),
+        collection_name="target_drawers",
+        max_candidates=1,
+    )
+    assert [hit["drawer_id"] for hit in limited["results"]] == ["ordinary-match"]
+
+
+def test_bm25_only_via_sqlite_missing_db_is_no_palace(tmp_path):
+    from mempalace import searcher
+
+    result = searcher._bm25_only_via_sqlite("anything", str(tmp_path))
+    assert result["error"] == "No palace found"
+    assert result["results"] == []
+
+
+def test_bm25_only_via_sqlite_fails_closed_when_active_generation_query_fails(
+    monkeypatch, tmp_path
+):
+    import sqlite3
+
+    from mempalace import searcher
+
+    db = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE VIRTUAL TABLE embedding_fulltext_search USING fts5(string_value, tokenize='trigram');
+        CREATE TABLE embedding_metadata (
+            id INTEGER, key TEXT, string_value TEXT, int_value INTEGER,
+            float_value REAL, bool_value INTEGER
+        );
+        CREATE TABLE collections (id TEXT PRIMARY KEY, name TEXT);
+        CREATE TABLE segments (id TEXT PRIMARY KEY, collection TEXT);
+        CREATE TABLE embeddings (
+            id INTEGER PRIMARY KEY, segment_id TEXT, embedding_id TEXT, created_at TEXT
+        );
+        INSERT INTO collections VALUES ('target', 'target_drawers');
+        INSERT INTO segments VALUES ('target-seg', 'target');
+        INSERT INTO embeddings VALUES (1, 'target-seg', 'physical-current', '2026-09-02');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (1, 'tokened generation session phrase');
+        INSERT INTO embedding_metadata VALUES
+            (1, 'chroma:document', 'tokened generation session phrase', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (1, 'logical_drawer_id', 'kept-logical', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (1, 'mine_generation_token', 'token-0', NULL, NULL, NULL);
+        INSERT INTO embeddings VALUES (2, 'target-seg', 'marker-0', '2026-09-02');
+        INSERT INTO embedding_metadata VALUES
+            (2, 'mine_generation_commit', 'token-0', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES
+            (2, 'mine_commit_marker', NULL, NULL, NULL, 1);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    def boom(*_args, **_kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(searcher, "_sqlite_active_generation_rows", boom)
+    result = searcher._bm25_only_via_sqlite(
+        "tokened generation session",
+        str(tmp_path),
+        collection_name="target_drawers",
+    )
+    assert result["results"] == []
+    assert "error" in result
+    assert "current conversation generation" in result["error"]
+
+
+def test_bm25_only_via_sqlite_fails_closed_when_commit_state_query_fails(monkeypatch, tmp_path):
+    import sqlite3
+
+    from mempalace import searcher
+
+    db = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE VIRTUAL TABLE embedding_fulltext_search USING fts5(string_value, tokenize='trigram');
+        CREATE TABLE embedding_metadata (
+            id INTEGER, key TEXT, string_value TEXT, int_value INTEGER,
+            float_value REAL, bool_value INTEGER
+        );
+        CREATE TABLE collections (id TEXT PRIMARY KEY, name TEXT);
+        CREATE TABLE segments (id TEXT PRIMARY KEY, collection TEXT);
+        CREATE TABLE embeddings (
+            id INTEGER PRIMARY KEY, segment_id TEXT, embedding_id TEXT, created_at TEXT
+        );
+        INSERT INTO collections VALUES ('target', 'target_drawers');
+        INSERT INTO segments VALUES ('target-seg', 'target');
+        INSERT INTO embeddings VALUES (1, 'target-seg', 'physical-current', '2026-09-02');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (1, 'tokened generation session phrase');
+        INSERT INTO embedding_metadata VALUES
+            (1, 'chroma:document', 'tokened generation session phrase', NULL, NULL, NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    def boom(*_args, **_kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(searcher, "_sqlite_generation_commit_state", boom)
+    result = searcher._bm25_only_via_sqlite(
+        "tokened generation session",
+        str(tmp_path),
+        collection_name="target_drawers",
+    )
+    assert result["results"] == []
+    assert "error" in result
+    assert "generation commit" in result["error"].lower()
+
+
+def test_search_memories_vector_disabled_commit_state_error_is_envelope(monkeypatch, tmp_path):
+    import sqlite3
+
+    from mempalace import searcher
+
+    db = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE VIRTUAL TABLE embedding_fulltext_search USING fts5(string_value, tokenize='trigram');
+        CREATE TABLE embedding_metadata (
+            id INTEGER, key TEXT, string_value TEXT, int_value INTEGER,
+            float_value REAL, bool_value INTEGER
+        );
+        CREATE TABLE collections (id TEXT PRIMARY KEY, name TEXT);
+        CREATE TABLE segments (id TEXT PRIMARY KEY, collection TEXT);
+        CREATE TABLE embeddings (
+            id INTEGER PRIMARY KEY, segment_id TEXT, embedding_id TEXT, created_at TEXT
+        );
+        INSERT INTO collections VALUES ('c1', 'mempalace_drawers');
+        INSERT INTO segments VALUES ('s1', 'c1');
+        INSERT INTO embeddings VALUES (1, 's1', 'physical-current', '2026-09-02');
+        INSERT INTO embedding_fulltext_search (rowid, string_value)
+            VALUES (1, 'tokened generation session phrase');
+        INSERT INTO embedding_metadata VALUES
+            (1, 'chroma:document', 'tokened generation session phrase', NULL, NULL, NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    def boom(*_args, **_kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(searcher, "_sqlite_generation_commit_state", boom)
+    monkeypatch.setattr(searcher, "resolve_backend_name", lambda *_a, **_k: "chroma")
+    result = search_memories(
+        "tokened generation session",
+        str(tmp_path),
+        vector_disabled=True,
+    )
+    assert isinstance(result, dict)
+    assert result["results"] == []
+    assert "error" in result
+    assert "generation commit" in result["error"].lower()
+
+
 def test_finalize_candidate_hits_forwards_stop_words_to_hybrid_rank(monkeypatch):
     """`_finalize_candidate_hits` must forward `stop_words` into the final
     `_hybrid_rank` re-rank — the BM25 site on the vector/union path. (The
@@ -1132,6 +2539,10 @@ def test_search_cli_threads_resolved_stop_words_to_hybrid_rank(monkeypatch, tmp_
                     "metadatas": [[{"wing": "general"}]],
                     "distances": [[0.5]],
                 }
+
+            @staticmethod
+            def get(**_kwargs):
+                return {"ids": [], "metadatas": []}
 
         return _Col()
 

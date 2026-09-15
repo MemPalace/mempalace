@@ -168,12 +168,38 @@ class TestServerRegistry:
 # ── mine forwarding ──────────────────────────────────────────────────
 
 
+_LOCAL_SEARCHER_IMPORT_ERROR = "live hub path must not import the local storage stack"
+_FAIL_CLOSED_HINTS = ("HNSW", "MEMPALACE_HUB_FORWARD=0", "Repair the hub")
+
+
+def _block_local_searcher_import(monkeypatch):
+    real_import = builtins.__import__
+
+    def import_without_local_searcher(name, *args, **kwargs):
+        if name == "mempalace.searcher":
+            raise AssertionError(_LOCAL_SEARCHER_IMPORT_ERROR)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_local_searcher)
+
+
+def _assert_fail_closed_search(capsys, secrets=()):
+    captured = capsys.readouterr()
+    for hint in _FAIL_CLOSED_HINTS:
+        assert hint in captured.err
+    for secret in secrets:
+        assert secret not in captured.err
+        assert secret not in captured.out
+    return captured
+
+
 class _FakeHub:
     """Minimal /healthz + /mcp endpoint standing in for `mempalace serve`."""
 
     def __init__(self, mine_result=None, search_result=None, rpc_error=None, required_token=None):
         self.requests = []
         self.auth_headers = []
+        self._lock = threading.Lock()
         outer = self
 
         mine_result = mine_result or {"success": True, "mode": "convos", "output": "filed 1"}
@@ -208,13 +234,15 @@ class _FakeHub:
 
             def do_POST(self):
                 authorization = self.headers.get("Authorization")
-                outer.auth_headers.append(authorization)
+                with outer._lock:
+                    outer.auth_headers.append(authorization)
                 if required_token is not None and authorization != f"Bearer {required_token}":
                     self.send_error(401)
                     return
                 length = int(self.headers.get("Content-Length", "0"))
                 request = json.loads(self.rfile.read(length))
-                outer.requests.append(request)
+                with outer._lock:
+                    outer.requests.append(request)
                 if rpc_error is not None:
                     payload = {"jsonrpc": "2.0", "id": request.get("id"), "error": rpc_error}
                 else:
@@ -438,8 +466,8 @@ class TestForwardSearchToHub:
             hub.stop()
 
     @pytest.mark.parametrize("local_token", [None, "stale-token"])
-    def test_authenticated_hub_without_matching_token_keeps_direct_path(
-        self, isolated_home, local_token
+    def test_authenticated_hub_without_matching_token_exits_without_direct_search(
+        self, isolated_home, local_token, monkeypatch, capsys
     ):
         palace = str(isolated_home / "palace")
         hub = _FakeHub(required_token="actual-token")
@@ -447,9 +475,16 @@ class TestForwardSearchToHub:
             _register_hub(palace, hub)
             if local_token is not None:
                 server_registry.server_token_path(palace).write_text(local_token)
+            _block_local_searcher_import(monkeypatch)
 
-            assert cli._forward_search_to_hub(_search_args(), palace) is False
+            with pytest.raises(SystemExit) as exc:
+                cli.cmd_search(_search_args(palace=palace))
+            assert exc.value.code == 1
             assert hub.requests == []
+            secrets = ["actual-token"]
+            if local_token is not None:
+                secrets.append(local_token)
+            _assert_fail_closed_search(capsys, secrets)
         finally:
             hub.stop()
 
@@ -519,15 +554,22 @@ class TestForwardSearchToHub:
         assert cli._forward_search_to_hub(_search_args(), palace) is False
         assert fake_hub.requests == []
 
-    def test_old_hub_without_cli_compatible_capability_keeps_direct_path(
-        self, isolated_home, fake_hub
+    def test_old_hub_without_cli_compatible_capability_exits_without_direct_search(
+        self, isolated_home, fake_hub, monkeypatch, capsys
     ):
         palace = str(isolated_home / "palace")
         _register_hub(palace, fake_hub, capabilities=[])
-        assert cli._forward_search_to_hub(_search_args(), palace) is False
-        assert fake_hub.requests == []
+        _block_local_searcher_import(monkeypatch)
 
-    def test_persisted_config_drift_keeps_direct_path(self, isolated_home, fake_hub):
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_search(_search_args(palace=palace))
+        assert exc.value.code == 1
+        assert fake_hub.requests == []
+        _assert_fail_closed_search(capsys)
+
+    def test_persisted_config_drift_exits_without_direct_search(
+        self, isolated_home, fake_hub, monkeypatch, capsys
+    ):
         palace = str(isolated_home / "palace")
         _register_hub(palace, fake_hub)
         config_dir = isolated_home / ".mempalace"
@@ -535,12 +577,16 @@ class TestForwardSearchToHub:
         (config_dir / "config.json").write_text(
             json.dumps({"backend": "qdrant", "palace_path": palace})
         )
+        _block_local_searcher_import(monkeypatch)
 
-        assert cli._forward_search_to_hub(_search_args(), palace) is False
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_search(_search_args(palace=palace))
+        assert exc.value.code == 1
         assert fake_hub.requests == []
+        _assert_fail_closed_search(capsys, ("qdrant",))
 
-    def test_artifact_detected_backend_config_drift_keeps_direct_path(
-        self, isolated_home, fake_hub, monkeypatch
+    def test_artifact_detected_backend_config_drift_exits_without_direct_search(
+        self, isolated_home, fake_hub, monkeypatch, capsys
     ):
         monkeypatch.delenv("MEMPALACE_BACKEND", raising=False)
         monkeypatch.delenv("MEMPALACE_BACKEND_EXPLICIT", raising=False)
@@ -554,9 +600,13 @@ class TestForwardSearchToHub:
         config_path.write_text(json.dumps({"qdrant_timeout": 5}))
         _register_hub(palace, fake_hub)
         config_path.write_text(json.dumps({"qdrant_timeout": 15}))
+        _block_local_searcher_import(monkeypatch)
 
-        assert cli._forward_search_to_hub(_search_args(), palace) is False
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_search(_search_args(palace=palace))
+        assert exc.value.code == 1
         assert fake_hub.requests == []
+        _assert_fail_closed_search(capsys, ("qdrant_timeout",))
 
     def test_hook_setting_write_keeps_hub_path(self, isolated_home, fake_hub):
         palace = str(isolated_home / "palace")
@@ -597,7 +647,9 @@ class TestForwardSearchToHub:
         assert cli._forward_search_to_hub(_search_args(), palace) is True
         assert len(fake_hub.requests) == 1
 
-    def test_active_embedding_api_config_drift_keeps_direct_path(self, isolated_home, fake_hub):
+    def test_active_embedding_api_config_drift_exits_without_direct_search(
+        self, isolated_home, fake_hub, monkeypatch, capsys
+    ):
         palace = str(isolated_home / "palace")
         config_dir = isolated_home / ".mempalace"
         config_dir.mkdir(exist_ok=True)
@@ -621,9 +673,16 @@ class TestForwardSearchToHub:
                 }
             )
         )
+        _block_local_searcher_import(monkeypatch)
 
-        assert cli._forward_search_to_hub(_search_args(), palace) is False
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_search(_search_args(palace=palace))
+        assert exc.value.code == 1
         assert fake_hub.requests == []
+        _assert_fail_closed_search(
+            capsys,
+            ("https://old.example.test", "https://new.example.test", "embed-v1"),
+        )
 
     @pytest.mark.parametrize(
         ("setting", "value"),
@@ -649,8 +708,8 @@ class TestForwardSearchToHub:
         assert cli._forward_search_to_hub(_search_args(), palace) is True
         assert len(fake_hub.requests) == 1
 
-    def test_hub_start_environment_drift_keeps_direct_path(
-        self, isolated_home, fake_hub, monkeypatch
+    def test_hub_start_environment_drift_exits_without_direct_search(
+        self, isolated_home, fake_hub, monkeypatch, capsys
     ):
         palace = str(isolated_home / "palace")
         monkeypatch.setenv("MEMPALACE_BACKEND", "qdrant")
@@ -661,19 +720,24 @@ class TestForwardSearchToHub:
             fake_hub,
             search_config_fingerprint=hub_fingerprint,
         )
+        _block_local_searcher_import(monkeypatch)
 
-        assert cli._forward_search_to_hub(_search_args(), palace) is False
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_search(_search_args(palace=palace))
+        assert exc.value.code == 1
         assert fake_hub.requests == []
+        _assert_fail_closed_search(capsys, ("qdrant", hub_fingerprint))
 
-    def test_hub_rpc_error_exits_without_local_fallback(self, isolated_home, capsys):
+    def test_hub_rpc_error_exits_without_local_fallback(self, isolated_home, monkeypatch, capsys):
         palace = str(isolated_home / "palace")
-        hub = _FakeHub(rpc_error={"code": -32000, "message": "search failed"})
+        hub = _FakeHub(rpc_error={"code": -32000, "message": "search failed with secret drawer"})
         try:
             _register_hub(palace, hub)
+            _block_local_searcher_import(monkeypatch)
             with pytest.raises(SystemExit) as exc:
-                cli._forward_search_to_hub(_search_args(), palace)
+                cli.cmd_search(_search_args(palace=palace))
             assert exc.value.code == 1
-            assert "search failed" in capsys.readouterr().err
+            _assert_fail_closed_search(capsys, ("secret drawer",))
         finally:
             hub.stop()
 
@@ -694,6 +758,182 @@ class TestForwardSearchToHub:
         monkeypatch.setattr(builtins, "__import__", import_without_local_searcher)
         cli.cmd_search(args)
         assert len(fake_hub.requests) == 1
+
+    def test_unreachable_registered_hub_exits_without_direct_search(
+        self, isolated_home, monkeypatch, capsys
+    ):
+        palace = str(isolated_home / "palace")
+        probe = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+        dead_port = probe.server_address[1]
+        probe.server_close()
+        server_registry.write_serverinfo(
+            palace,
+            host="127.0.0.1",
+            port=dead_port,
+            scheme="http",
+            read_only=False,
+            capabilities=["search_cli_compatible"],
+            search_config_fingerprint=MempalaceConfig(palace_path=palace).search_config_fingerprint,
+        )
+        _block_local_searcher_import(monkeypatch)
+
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_search(_search_args(palace=palace))
+        assert exc.value.code == 1
+        _assert_fail_closed_search(capsys)
+
+    def test_malformed_hub_response_exits_without_direct_search(
+        self, isolated_home, monkeypatch, capsys
+    ):
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(search_result=["not", "an", "object"])
+        try:
+            _register_hub(palace, hub)
+            _block_local_searcher_import(monkeypatch)
+            with pytest.raises(SystemExit) as exc:
+                cli.cmd_search(_search_args(palace=palace))
+            assert exc.value.code == 1
+            _assert_fail_closed_search(capsys)
+        finally:
+            hub.stop()
+
+    def test_hub_search_error_payload_exits_without_leaking_details(
+        self, isolated_home, monkeypatch, capsys
+    ):
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(
+            search_result={
+                "error": "Embedder identity mismatch",
+                "details": "stored minilm vs live embeddinggemma; drawer verbatim",
+            }
+        )
+        try:
+            _register_hub(palace, hub)
+            _block_local_searcher_import(monkeypatch)
+            with pytest.raises(SystemExit) as exc:
+                cli.cmd_search(_search_args(palace=palace))
+            assert exc.value.code == 1
+            _assert_fail_closed_search(
+                capsys,
+                ("minilm", "embeddinggemma", "drawer verbatim"),
+            )
+        finally:
+            hub.stop()
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"backend": "sqlite_exact"},
+            {"query": "x" * 201},
+            {"query": " needle "},
+            {"results": 101},
+            {"wing": "sales/2026"},
+        ],
+    )
+    def test_non_forwardable_args_with_live_hub_exit_without_direct_search(
+        self, isolated_home, fake_hub, monkeypatch, capsys, overrides
+    ):
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        _block_local_searcher_import(monkeypatch)
+
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_search(_search_args(palace=palace, **overrides))
+        assert exc.value.code == 1
+        assert fake_hub.requests == []
+        secrets = [value for key, value in overrides.items() if key in {"query", "backend", "wing"}]
+        _assert_fail_closed_search(capsys, secrets)
+
+    def test_per_invocation_override_with_live_hub_exits_without_direct_search(
+        self, isolated_home, fake_hub, monkeypatch, capsys
+    ):
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "minilm")
+        _block_local_searcher_import(monkeypatch)
+
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_search(_search_args(palace=palace))
+        assert exc.value.code == 1
+        assert fake_hub.requests == []
+        _assert_fail_closed_search(capsys, ("minilm",))
+
+    def test_no_hub_keeps_direct_path_for_non_forwardable_args(self, isolated_home, monkeypatch):
+        palace = str(isolated_home / "palace")
+        args = _search_args(palace=palace, backend="sqlite_exact")
+        called = []
+
+        def fake_search(**kwargs):
+            called.append(kwargs)
+
+        monkeypatch.setattr("mempalace.searcher.search", fake_search)
+        cli.cmd_search(args)
+        assert called
+        assert called[0]["palace_path"] == palace
+
+    def test_kill_switch_allows_direct_path_when_hub_is_live(
+        self, isolated_home, fake_hub, monkeypatch
+    ):
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        monkeypatch.setenv("MEMPALACE_HUB_FORWARD", "0")
+        called = []
+        monkeypatch.setattr("mempalace.searcher.search", lambda **kwargs: called.append(kwargs))
+
+        cli.cmd_search(_search_args(palace=palace))
+        assert fake_hub.requests == []
+        assert called
+
+    def test_concurrent_cli_searches_forward_without_local_index(
+        self, isolated_home, fake_hub, monkeypatch
+    ):
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        _block_local_searcher_import(monkeypatch)
+        args = _search_args(palace=palace)
+        errors = []
+
+        def run():
+            try:
+                cli.cmd_search(args)
+            except Exception as exc:
+                errors.append(exc)
+
+        workers = [threading.Thread(target=run) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        assert errors == []
+        assert len(fake_hub.requests) == 2
+
+    def test_concurrent_cli_rejections_do_not_open_local_index(self, isolated_home, monkeypatch):
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(required_token="actual-token")
+        try:
+            _register_hub(palace, hub)
+            _block_local_searcher_import(monkeypatch)
+            args = _search_args(palace=palace)
+            outcomes = []
+
+            def run():
+                try:
+                    cli.cmd_search(args)
+                    outcomes.append("returned")
+                except SystemExit as exc:
+                    outcomes.append(exc.code)
+                except Exception as exc:
+                    outcomes.append(exc)
+
+            workers = [threading.Thread(target=run) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join()
+            assert outcomes == [1, 1]
+            assert hub.requests == []
+        finally:
+            hub.stop()
 
     def test_explicit_backend_is_not_forwardable(self):
         assert cli._search_args_forwardable(_search_args()) is True

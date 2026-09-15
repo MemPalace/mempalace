@@ -250,6 +250,7 @@ def test_update_drawer_stamps_last_modified_and_preserves_filed_at(
 
     assert result["success"] is True
     collection.update.assert_called_once()
+    collection.upsert.assert_not_called()
 
     metadata = collection.update.call_args.kwargs["metadatas"][0]
 

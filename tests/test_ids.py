@@ -121,6 +121,18 @@ def test_make_convo_drawer_id_returns_expected_prefix():
     assert result.startswith("drawer_claude_diary_")
 
 
+def test_make_convo_generation_id_is_content_addressed():
+    logical = ids.make_convo_drawer_id("w", "r", "/c.jsonl", "exchange", 0)
+
+    first = ids.make_convo_generation_id(logical, "a" * 64)
+    retry = ids.make_convo_generation_id(logical, "a" * 64)
+    changed = ids.make_convo_generation_id(logical, "b" * 64)
+
+    assert first == retry
+    assert first != changed
+    assert first.startswith(f"{logical}_gen_")
+
+
 # ── make_convo_sentinel_id ────────────────────────────────────────────
 
 
