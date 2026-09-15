@@ -259,6 +259,26 @@ persistent volumes. Embeddings stay local to the MemPalace container.
 `mempalace serve` with its config from `/etc/mempalace/server.env`. Install
 steps are in the file's header comment.
 
+**launchd (macOS):**
+
+`deploy/com.mempalace.server.plist` is a LaunchAgent template that runs
+`mempalace serve` on loopback at login. Install steps are in the file's header
+comment.
+
+It sets `ProcessType` to `Interactive`, which matters more than it looks.
+`launchd.plist(5)`: "If left unspecified, the system will apply light resource
+limits to the job, throttling its CPU usage and I/O bandwidth." A throttled
+server still answers, just slowly and erratically, so it reads as MemPalace
+being slow rather than as a launchd policy. Check a running agent with
+`ps -o pri= -p <pid>`: a throttled job sits at `PRI 20` where a normal process
+sits at `31`, while `nice` stays `0` in both cases, so `nice` and `renice` give
+no hint.
+
+One more launchd difference: the job gets the minimal
+`/usr/bin:/bin:/usr/sbin:/sbin` PATH rather than your shell's, so
+`ProgramArguments` needs the absolute path to `mempalace` (`which mempalace`
+prints it).
+
 ## See also
 
 - [MCP Integration](/guide/mcp-integration) — the tools clients get once connected
