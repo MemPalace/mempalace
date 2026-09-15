@@ -1979,6 +1979,10 @@ def test_sqlite_integrity_errors_uses_bounded_contention_timeout(tmp_path, monke
         calls.append(("connect", database, kwargs))
         return _Connection()
 
+    # Pin the plain open: on Linux an anchor connection opens first (#2302).
+    from mempalace.backends import _inproc_sqlite
+
+    monkeypatch.setattr(_inproc_sqlite, "_ANCHORED", False)
     monkeypatch.setattr(repair.sqlite3, "connect", _connect)
 
     assert repair.sqlite_integrity_errors(str(palace)) == []
