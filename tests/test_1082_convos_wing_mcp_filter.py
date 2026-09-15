@@ -26,6 +26,8 @@ See issue #1082, helpers at ``mempalace/searcher.py``
 
 from unittest.mock import MagicMock
 
+import logging
+
 import pytest
 
 from mempalace.searcher import _query_drawers_with_filter_fallback
@@ -40,12 +42,7 @@ def _make_col(*, fail_filtered_widths=frozenset(), fail_unfiltered_widths=frozen
     """
     col = MagicMock()
     col.query.side_effect = (
-        lambda
-        query_texts=None,
-        n_results=None,
-        where=None,
-        include=None,
-        **kwargs: (
+        lambda query_texts=None, n_results=None, where=None, include=None, **kwargs: (
             _fail("Error finding id")
             if (n_results in fail_filtered_widths and where)
             else (
@@ -176,9 +173,7 @@ def test_progressive_fallback_gives_up_when_all_widths_fail():
     genuinely unrecoverable index.
     """
     col = MagicMock()
-    col.query.side_effect = Exception(
-        "Error executing plan: Internal error: Error finding id"
-    )
+    col.query.side_effect = Exception("Error executing plan: Internal error: Error finding id")
 
     with pytest.raises(Exception, match="Error finding id"):
         _query_drawers_with_filter_fallback(
@@ -190,3 +185,119 @@ def test_progressive_fallback_gives_up_when_all_widths_fail():
             room=None,
             source_file=None,
         )
+
+
+def test_last_resort_fallback_empty_post_filter_emits_warning(caplog):
+    """Last-resort fallback recovers into an EMPTY post-filter set.
+
+    The filtered query fails (``"Error finding id"``), the wide unfiltered
+    retry also fails, and the narrow unfiltered retry (``n_results``) succeeds
+    but returns rows whose wing/room/source_file all mismatch the request —
+    so the Python-side post-filter keeps 0 rows.  Before the fix this path
+    returned an empty result silently, so the user saw ``"no results"`` with
+    no signal that recovery was degraded.  Now it must emit a WARNING that
+    reports (a) how many rows the unfiltered pool returned and (b) how many
+    survived the post-filter.
+    """
+    convos_wing = "chats_general"
+    other_wing = "sample_repo"
+    # filtered (pool) fails, wide unfiltered fails, narrow unfiltered succeeds
+    # with TWO rows that both live in a *different* wing → post-filter = 0.
+    col = MagicMock()
+    col.query.side_effect = [
+        Exception("Error finding id"),  # filtered (pool)
+        Exception("Error finding id"),  # wide unfiltered (n_results * 15)
+        {
+            "ids": [
+                [
+                    f"drawer_{other_wing}_planning_deadbeefcafe1234567890",
+                    f"drawer_{other_wing}_planning_cafebabe1234567890",
+                ]
+            ],
+            "documents": [["planning a launch", "planning another launch"]],
+            "metadatas": [
+                [
+                    {"wing": other_wing, "room": "planning"},
+                    {"wing": other_wing, "room": "planning2"},
+                ]
+            ],
+            "distances": [[0.5, 0.6]],
+        },
+    ]
+
+    with caplog.at_level(logging.WARNING, logger="mempalace_mcp"):
+        result = _query_drawers_with_filter_fallback(
+            drawers_col=col,
+            dkwargs=_dkwargs(pool_n=20, wing=convos_wing),
+            query="decisions",
+            n_results=5,
+            wing=convos_wing,
+            room=None,
+            source_file=None,
+        )
+
+    # Recovery happened but the post-filter kept nothing.
+    assert result["ids"][0] == []
+    assert result["documents"][0] == []
+
+    # A WARNING was emitted for the degraded last-resort fallback...
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, "expected a WARNING for the degraded last-resort fallback"
+    degraded = [r for r in warnings if "Last-resort fallback" in r.getMessage()]
+    assert degraded, "expected the degraded-recovery WARNING (pool-vs-survivors)"
+    # ...reporting both the unfiltered pool size (2 rows) and the
+    # post-filter survivor count (0 rows).
+    msg = degraded[0].getMessage()
+    assert "unfiltered pool=2 row(s)" in msg
+    assert "0 row(s) survived" in msg
+
+
+def test_last_resort_fallback_nonempty_post_filter_still_emits_warning(caplog):
+    """The same WARNING is emitted even when the post-filter keeps at least
+    one row: the whole point is to log that recovery ran via the degraded
+    (unfiltered) path, regardless of whether it was thin or empty.
+    """
+    convos_wing = "chats_general"
+    other_wing = "sample_repo"
+    col = MagicMock()
+    col.query.side_effect = [
+        Exception("Error finding id"),  # filtered (pool)
+        Exception("Error finding id"),  # wide unfiltered
+        {
+            "ids": [
+                [
+                    "drawer_chats_general_decision_abc123def4567890123456",
+                    f"drawer_{other_wing}_planning_deadbeefcafe1234567890",
+                ]
+            ],
+            "documents": [["decisions on the async refactor", "planning a launch"]],
+            "metadatas": [
+                [
+                    {"wing": convos_wing, "room": "decision"},
+                    {"wing": other_wing, "room": "planning"},
+                ]
+            ],
+            "distances": [[0.4, 0.5]],
+        },
+    ]
+
+    with caplog.at_level(logging.WARNING, logger="mempalace_mcp"):
+        result = _query_drawers_with_filter_fallback(
+            drawers_col=col,
+            dkwargs=_dkwargs(pool_n=20, wing=convos_wing),
+            query="decisions",
+            n_results=5,
+            wing=convos_wing,
+            room=None,
+            source_file=None,
+        )
+
+    # One row survived the post-filter.
+    assert [m["wing"] for m in (result["metadatas"][0] or [{}])] == [convos_wing]
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    degraded = [r for r in warnings if "Last-resort fallback" in r.getMessage()]
+    assert degraded, "expected the degraded-recovery WARNING (pool-vs-survivors)"
+    msg = degraded[0].getMessage()
+    assert "unfiltered pool=2 row(s)" in msg
+    assert "1 row(s) survived" in msg

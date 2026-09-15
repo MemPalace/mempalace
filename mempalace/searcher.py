@@ -1915,6 +1915,25 @@ def _query_drawers_with_filter_fallback(
                 fdocs.append(doc)
                 fmetas.append(meta)
                 fdists.append(dist)
+            # Signal degraded recovery: this path is only reached after the
+            # filtered query failed, and the unfiltered pool spans every wing,
+            # so on a large palace it is dominated by the other wings and the
+            # post-filter can return 0 rows. Reporting pool-vs-survivors is the
+            # same "recovery is degraded" signal the searcher fallback uses —
+            # without it the user sees "no results" with no indication that the
+            # index recovered into an empty set.
+            logger.warning(
+                "Last-resort fallback (unfiltered + post-filter) recovered after "
+                "a filtered failure: unfiltered pool=%d row(s), %d row(s) "
+                "survived the wing/room/source_file post-filter (wing=%r "
+                "room=%r source_file=%r). Recovery is degraded — the unfiltered "
+                "pool was dominated by other wings; results may be thin or empty.",
+                len(raw_docs),
+                len(fids),
+                wing,
+                room,
+                source_file,
+            )
             return {
                 "ids": [fids],
                 "documents": [fdocs],
