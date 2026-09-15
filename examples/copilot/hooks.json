@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "hooks": {
+    "agentStop": [
+      {
+        "type": "command",
+        "bash": "mempalace hook run --hook stop --harness copilot",
+        "command": "mempalace hook run --hook stop --harness copilot",
+        "timeoutSec": 30
+      }
+    ],
+    "sessionEnd": [
+      {
+        "type": "command",
+        "bash": "mempalace hook run --hook session-end --harness copilot",
+        "command": "mempalace hook run --hook session-end --harness copilot",
+        "timeoutSec": 30
+      }
+    ],
+    "preCompact": [
+      {
+        "type": "command",
+        "bash": "mempalace hook run --hook precompact --harness copilot",
+        "command": "mempalace hook run --hook precompact --harness copilot",
+        "timeoutSec": 90
+      }
+    ]
+  }
+}

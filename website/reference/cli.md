@@ -174,18 +174,23 @@ mempalace mcp --palace ~/.custom-palace
 
 ## `mempalace hook`
 
-Run hook logic for Claude Code / Codex integration.
+Run hook logic for Claude Code, Codex, Grok, or any other harness.
 
 ```bash
 mempalace hook run --hook stop --harness claude-code
 mempalace hook run --hook precompact --harness claude-code
 mempalace hook run --hook session-start --harness codex
+mempalace hook run --hook stop --harness grok
+mempalace hook run --hook stop --harness copilot
+mempalace hook run --hook stop --harness auto
 ```
 
 | Option | Values | Description |
 |--------|--------|-------------|
-| `--hook` | `session-start`, `stop`, `precompact` | Hook name |
-| `--harness` | `claude-code`, `codex` | Harness type |
+| `--hook` | `session-start`, `stop`, `session-end`, `precompact` | Hook name |
+| `--harness` | `claude-code`, `codex`, `grok`, `copilot`, `auto`, or any token | Harness type. `auto` detects Grok from `GROK_SESSION_ID` / `GROK_HOOK_EVENT`, Copilot from `COPILOT_HOME` / `stopReason` / a `session-state` transcript path, otherwise Claude-compatible JSON. |
+
+Grok users: copy [`examples/grok/hooks.json`](https://github.com/MemPalace/mempalace/blob/develop/examples/grok/hooks.json) to `~/.grok/hooks/mempalace.json`. Do not use `hooks/mempal_save_hook.sh` for Grok.
 
 ## `mempalace instructions`
 
