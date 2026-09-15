@@ -220,8 +220,10 @@ def sweep(
     (the CLI normalizes via ``normalize_wing_name`` and validates via
     ``sanitize_name`` before calling, matching the other miners). When
     omitted, the metadata shape is unchanged from the untagged behaviour.
-    Note that a re-sweep upserts the full metadata dict, so sweeping the
-    same session with a different tag set replaces (not merges) the tags.
+    Tag stamping only affects drawers actually upserted during a sweep: the
+    cursor skips messages older than what is already stored, so historical
+    drawers keep the tags they were written with. Re-tagging an existing
+    corpus requires a metadata backfill, not a re-sweep.
 
     For each message in the jsonl:
       - If timestamp < cursor for that session, skip (strictly earlier

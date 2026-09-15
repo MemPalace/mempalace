@@ -583,3 +583,74 @@ class TestSweepTagResolution:
         src.mkdir()
         with pytest.raises(ValueError, match="room"):
             _resolve_sweep_tags(self._args(room="bad/room"), str(src))
+
+    def test_current_directory_target_resolves_to_cwd_basename(self, tmp_path, monkeypatch):
+        """`mempalace sweep .` must not fail: Path('.').name is empty, so
+        the helper must resolve before taking the basename."""
+        from mempalace.cli import _resolve_sweep_tags
+
+        monkeypatch.chdir(tmp_path)
+        wing, room = _resolve_sweep_tags(self._args(), ".")
+        expected = tmp_path.name.lower().replace("-", "_").replace(" ", "_")
+        assert wing == expected, f"cwd basename mismatch: {wing!r} != {expected!r}"
+        assert room == "conversations"
+
+    def test_root_directory_target_raises_clean_value_error(self):
+        """`sweep /` (root has no usable basename) must raise a clean
+        ValueError, not a crash deeper in the stack."""
+        import pytest
+
+        from mempalace.cli import _resolve_sweep_tags
+
+        with pytest.raises(ValueError, match="wing"):
+            _resolve_sweep_tags(self._args(), "/")
+
+
+class TestSweepCliEndToEnd:
+    """cmd_sweep end-to-end: explicit flags reach stored metadata; invalid
+    names exit 1 with a clean message (no traceback)."""
+
+    def test_explicit_wing_room_reach_stored_metadata(self, mock_claude_jsonl, tmp_path):
+        import argparse
+
+        from mempalace.cli import cmd_sweep
+
+        palace_path = str(tmp_path / "palace")
+        args = argparse.Namespace(
+            target=str(mock_claude_jsonl),
+            palace=palace_path,
+            wing="claude",
+            room="conversations",
+        )
+        cmd_sweep(args)
+
+        from mempalace.palace import get_collection
+
+        col = get_collection(palace_path, create=False)
+        metas = [m for m in (col.get(include=["metadatas"])["metadatas"] or []) if m]
+        assert metas, "No drawers written by cmd_sweep"
+        for m in metas:
+            assert m.get("wing") == "claude"
+            assert m.get("room") == "conversations"
+
+    def test_invalid_wing_exits_1_without_traceback(self, mock_claude_jsonl, tmp_path, capsys):
+        import argparse
+
+        from mempalace.cli import cmd_sweep
+
+        args = argparse.Namespace(
+            target=str(mock_claude_jsonl),
+            palace=str(tmp_path / "palace"),
+            wing="bad/../wing",
+            room=None,
+        )
+        try:
+            cmd_sweep(args)
+            raised = None
+        except SystemExit as exc:
+            raised = exc
+        assert raised is not None, "invalid wing must exit non-zero"
+        assert raised.code == 1
+        err = capsys.readouterr().err
+        assert "ERROR" in err, f"expected a clean ERROR line, got: {err!r}"
+        assert "Traceback" not in err
