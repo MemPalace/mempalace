@@ -44,6 +44,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **Shared-brain rules are `host:harness:project`, declared-idle, and MCP-shape aware.** `mempalace rules` takes `--host --harness --project` (stable lowercase tokens) and optional `--mcp full|light` (default `full`, matching the 45-tool server). The packaged snippet is the only coordination text: compose the identity from the current workspace, arm `logstream watch` only on listen / claim / delegate, write topics on named lanes without filtering the default inbox on them, claim with a lowest-HLC mutex, and use `kg_supersede` for single-valued fact changes. `--mcp light` swaps tool tokens onto the 3-tool triad; prose is identical. `logstream watch --agent` now defaults a sanitized `--state-file` (`:` → `_` under `~/.mempalace/watch/`) so Windows tuple identities do not need a private path overlay.
 
+### Performance
+
+- **pgvector lexical search no longer scrolls the whole table.** `lexical_search` pushed every document over the wire on every call, which made hybrid search unusable on a remote palace of ~141k drawers. Postgres now evaluates a substring filter that is a provable superset of the documents BM25 can score above zero, so only candidate rows cross the wire. Scoring, ranking and the `n_results` cut stay client-side and produce the same ids and the same scores as before. Collections gain a `token_count` column and a `pg_trgm` index; a palace created earlier picks both up on open and is backfilled once. `maintenance_state()` now reports `lexical_pushdown` so an operator can see which path a collection is on. (#2165)
+
 ### Bug Fixes
 
 - **The transcript-path fallback no longer gives every git worktree its own wing.** `_wing_from_transcript_path`'s primary path (reading `cwd` from the JSONL) already collapsed a `<project>/.claude/worktrees/<wt>` segment before deriving the wing; the fallback path, used whenever `cwd` is absent, had no equivalent strip, so the flattened `--claude-worktrees-<wt>` segment survived into the wing name. Applied the same collapse there. (#2388)
