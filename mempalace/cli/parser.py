@@ -259,6 +259,16 @@ def main():
         "target",
         help="A .jsonl transcript file, or a directory to scan recursively",
     )
+    p_sweep.add_argument(
+        "--wing",
+        default=None,
+        help="Wing for swept drawers (default: source directory basename)",
+    )
+    p_sweep.add_argument(
+        "--room",
+        default=None,
+        help="Room for swept drawers (default: conversations)",
+    )
 
     # sync
     add_cli_write_routing_flags(p_sweep)

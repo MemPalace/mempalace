@@ -316,6 +316,34 @@ def mine_source_adapter(
                 knowledge_graph.close()
 
 
+def _resolve_sweep_tags(args, target: str) -> tuple:
+    """Resolve wing/room tags for a sweep, following the ``mine`` convention.
+
+    Defaults: wing is the source directory's basename (for a file target,
+    its parent directory), normalized with ``normalize_wing_name``; room is
+    ``conversations`` (the same fallback room ``convo_miner`` uses for
+    conversation content). Explicit flags always take precedence.
+
+    Raises ``ValueError`` (with a user-ready message) when a name fails
+    ``sanitize_name`` validation.
+    """
+    from pathlib import Path
+
+    from ..config import normalize_wing_name, sanitize_name
+
+    wing = getattr(args, "wing", None)
+    room = getattr(args, "room", None)
+    if wing is None:
+        p = Path(target).resolve()
+        base = p.name if p.is_dir() else p.parent.name
+        wing = normalize_wing_name(base)
+    if room is None:
+        room = "conversations"
+    wing = sanitize_name(wing, "wing")
+    room = sanitize_name(room, "room")
+    return wing, room
+
+
 def cmd_sweep(args):
     """Sweep a transcript file or directory.
 
@@ -331,6 +359,12 @@ def cmd_sweep(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     target = os.path.expanduser(args.target)
 
+    try:
+        wing, room = _resolve_sweep_tags(args, target)
+    except ValueError as exc:
+        print(f"  ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     routing = _resolve_cli_write_routing_or_exit(
         args,
         "sweep",
@@ -338,21 +372,21 @@ def cmd_sweep(args):
     if routing.use_daemon:
         _submit_daemon_cli_job(
             "sweep",
-            {"target": target},
+            {"target": target, "wing": wing, "room": room},
             args,
             background=bool(getattr(args, "background", False)),
             auto_start=routing.decision.auto_start_daemon,
         )
         return
     if os.path.isfile(target):
-        result = sweep(target, palace_path)
+        result = sweep(target, palace_path, wing=wing, room=room)
         print(
             f"  Swept {target}: +{result['drawers_added']} new, "
             f"{result['drawers_already_present']} already present, "
             f"{result['drawers_skipped']} skipped (< cursor)."
         )
     elif os.path.isdir(target):
-        result = sweep_directory(target, palace_path)
+        result = sweep_directory(target, palace_path, wing=wing, room=room)
         print(
             f"  Swept {result['files_succeeded']}/{result['files_attempted']} "
             f"files from {target}: +{result['drawers_added']} new, "
