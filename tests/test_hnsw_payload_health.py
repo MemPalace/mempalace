@@ -261,3 +261,260 @@ def test_quarantine_still_catches_inconsistent_label_maps(tmp_path):
     moved = quarantine_invalid_hnsw_metadata(str(tmp_path))
     assert len(moved) == 1
     assert not seg_dir.is_dir()
+
+
+# --- quarantine must clear the segment's max_seq_id watermark (#2428) ---
+
+
+def _palace_with_watermark(tmp_path, seg_id, seq_id=798, *, extra_rows=()):
+    """A palace whose sqlite carries a real ``max_seq_id`` row for ``seg_id``."""
+    import sqlite3
+
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    db_path = palace / "chroma.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE max_seq_id (segment_id TEXT PRIMARY KEY, seq_id INTEGER)")
+        conn.execute("INSERT INTO max_seq_id VALUES (?, ?)", (seg_id, seq_id))
+        for other_id, other_seq in extra_rows:
+            conn.execute("INSERT INTO max_seq_id VALUES (?, ?)", (other_id, other_seq))
+    return palace, db_path
+
+
+def _watermarks(db_path):
+    import sqlite3
+
+    with sqlite3.connect(db_path) as conn:
+        return dict(conn.execute("SELECT segment_id, seq_id FROM max_seq_id").fetchall())
+
+
+def test_quarantine_clears_the_quarantined_segment_watermark(tmp_path):
+    """Renaming the segment without clearing its watermark truncates the rebuild.
+
+    Chroma reads a surviving ``max_seq_id`` as "already synced through N" and
+    replays nothing below it into the new, empty index, so the rebuild the
+    quarantine exists to force produces a permanently short index while
+    ``collection.count()`` still reports the full total.
+    """
+    seg_id = "11111111-2222-3333-4444-555555555555"
+    metadata_seg = "99999999-8888-7777-6666-555555555555"
+    palace, db_path = _palace_with_watermark(tmp_path, seg_id, extra_rows=((metadata_seg, 981),))
+    _write_segment(
+        palace / seg_id,
+        data_size=100,
+        link_size=int(100 * (_HNSW_LINK_TO_DATA_MAX_RATIO + 1)),
+    )
+    same_time = 1_700_000_000
+    os.utime(db_path, (same_time, same_time))
+    os.utime(palace / seg_id / "data_level0.bin", (same_time, same_time))
+
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=999_999)
+
+    assert len(moved) == 1
+    # The quarantined segment's row is gone; the sibling metadata segment's is not.
+    assert _watermarks(db_path) == {metadata_seg: 981}
+
+
+def test_a_segment_left_in_place_keeps_its_watermark(tmp_path):
+    """Clearing the watermark of a live segment would replay the whole queue."""
+    seg_id = "11111111-2222-3333-4444-555555555555"
+    palace, db_path = _palace_with_watermark(tmp_path, seg_id)
+    _write_segment(palace / seg_id, data_size=100, link_size=100)
+    same_time = 1_700_000_000
+    os.utime(db_path, (same_time, same_time))
+    os.utime(palace / seg_id / "data_level0.bin", (same_time, same_time))
+
+    assert quarantine_stale_hnsw(str(palace), stale_seconds=999_999) == []
+    assert _watermarks(db_path) == {seg_id: 798}
+
+
+def test_the_metadata_quarantine_path_clears_the_watermark_too(tmp_path):
+    """Both quarantine paths rename a segment, so both must clear its watermark."""
+    from mempalace.backends.chroma import quarantine_invalid_hnsw_metadata
+
+    seg_id = "11111111-2222-3333-4444-555555555555"
+    palace, db_path = _palace_with_watermark(tmp_path, seg_id)
+    state = _state(labels=100, total=120)
+    state["label_to_id"] = {i: f"WRONG-{i}" for i in range(100)}
+    _write_pickled_segment(palace / seg_id, state)
+
+    assert len(quarantine_invalid_hnsw_metadata(str(palace))) == 1
+    assert _watermarks(db_path) == {}
+
+
+def test_quarantine_survives_a_palace_whose_sqlite_is_unreadable(tmp_path):
+    """The rename is the safety action; the watermark is best effort."""
+    from mempalace.backends.chroma import _clear_segment_watermark
+
+    db_path = tmp_path / "chroma.sqlite3"
+    db_path.write_text("sqlite placeholder")
+
+    assert _clear_segment_watermark(str(db_path), "11111111-2222-3333-4444-555555555555") is False
+
+
+def test_the_watermark_connection_is_closed(tmp_path, monkeypatch):
+    """Quarantine runs before `PersistentClient` opens the palace.
+
+    An open Python sqlite3 connection against a ChromaDB 1.5.x WAL-mode
+    database leaves state that segfaults that call, which is why
+    `_fix_blob_seq_ids` and the collection-type migration both close theirs
+    explicitly. A bare `with sqlite3.connect(...)` commits but does not close.
+    """
+    import sqlite3
+
+    from mempalace.backends import chroma
+
+    seg_id = "11111111-2222-3333-4444-555555555555"
+    _, db_path = _palace_with_watermark(tmp_path, seg_id)
+    closed: list[bool] = []
+    real_connect = sqlite3.connect
+
+    class TrackingConnection:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, *args, **kwargs):
+            return self._inner.execute(*args, **kwargs)
+
+        def commit(self):
+            return self._inner.commit()
+
+        def close(self):
+            closed.append(True)
+            return self._inner.close()
+
+    monkeypatch.setattr(
+        chroma.sqlite3, "connect", lambda *a, **kw: TrackingConnection(real_connect(*a, **kw))
+    )
+
+    assert chroma._clear_segment_watermark(str(db_path), seg_id) is True
+    assert closed == [True], "the connection outlived the call"
+
+
+# --- quarantine must say when the WAL cannot replay what it renamed (#2510) ---
+
+
+def _palace_with_purged_queue(tmp_path, *, total=8, purge_below=5):
+    """A real chromadb palace whose embeddings_queue has been purged, as 1.5.x does.
+
+    Every handle is released before returning. ``del client`` is enough on
+    POSIX, where an open file does not stop its directory from being renamed,
+    but not on Windows: a caller that quarantines the segment directory gets
+    ``PermissionError: [WinError 5]`` from ``os.rename`` and measures the
+    failure path instead of the code under test. Use the same close sequence
+    the repair path uses, and close the sqlite connection too, since
+    ``with sqlite3.connect(...)`` commits but does not close.
+    """
+    import gc
+    import sqlite3
+    from contextlib import closing
+
+    import chromadb
+
+    from mempalace.backends.chroma import _clear_chroma_system_cache, _close_client
+
+    palace = tmp_path / "palace"
+    client = chromadb.PersistentClient(path=str(palace))
+    collection = client.get_or_create_collection("mempalace_drawers")
+    collection.add(
+        ids=[f"id{i}" for i in range(total)],
+        embeddings=[[float(i), 0.0, 1.0] for i in range(total)],
+        documents=[f"doc {i}" for i in range(total)],
+    )
+    del collection
+    _close_client(client)
+    del client
+    _clear_chroma_system_cache()
+    gc.collect()
+
+    db_path = palace / "chroma.sqlite3"
+    with closing(sqlite3.connect(db_path)) as conn:
+        if purge_below is not None:
+            conn.execute("DELETE FROM embeddings_queue WHERE seq_id < ?", (purge_below,))
+            conn.commit()
+        segment_id = conn.execute(
+            "SELECT id FROM segments WHERE type LIKE '%hnsw%' OR scope = 'VECTOR' LIMIT 1"
+        ).fetchone()[0]
+    return palace, str(db_path), segment_id
+
+
+def test_a_purged_queue_reports_what_it_cannot_replay(tmp_path):
+    """The rebuild replays from the queue, and chromadb purges it.
+
+    Everything written below the purge watermark is absent from the rebuilt
+    index while its metadata row survives, which is why the count and an
+    unfiltered search both keep looking healthy.
+    """
+    from mempalace.backends.chroma import _wal_unreplayable_count
+
+    _, db_path, segment_id = _palace_with_purged_queue(tmp_path, total=8, purge_below=5)
+
+    assert _wal_unreplayable_count(db_path, segment_id) == 4
+
+
+def test_an_intact_queue_reports_nothing_lost(tmp_path):
+    from mempalace.backends.chroma import _wal_unreplayable_count
+
+    _, db_path, segment_id = _palace_with_purged_queue(tmp_path, total=8, purge_below=None)
+
+    assert _wal_unreplayable_count(db_path, segment_id) == 0
+
+
+def test_an_unmeasurable_palace_reports_none_not_zero(tmp_path):
+    """A failure must not read as "nothing was lost"."""
+    from mempalace.backends.chroma import _wal_unreplayable_count
+
+    db_path = tmp_path / "chroma.sqlite3"
+    db_path.write_text("sqlite placeholder")
+
+    assert _wal_unreplayable_count(str(db_path), "11111111-2222-3333-4444-555555555555") is None
+
+
+def test_quarantine_reports_the_unreplayable_remainder(tmp_path, caplog):
+    """The wiring, not just the measurement: the rename must say what it costs."""
+    import logging
+
+    palace, db_path, segment_id = _palace_with_purged_queue(tmp_path, total=8, purge_below=5)
+    seg_dir = palace / segment_id
+    _write_segment(
+        seg_dir,
+        data_size=100,
+        link_size=int(100 * (_HNSW_LINK_TO_DATA_MAX_RATIO + 1)),
+    )
+    same_time = 1_700_000_000
+    os.utime(db_path, (same_time, same_time))
+    os.utime(seg_dir / "data_level0.bin", (same_time, same_time))
+
+    with caplog.at_level(logging.ERROR, logger="mempalace.backends.chroma"):
+        moved = quarantine_stale_hnsw(str(palace), stale_seconds=999_999)
+
+    assert len(moved) == 1, [record.getMessage() for record in caplog.records]
+    assert any(
+        "can no longer replay" in record.getMessage() and "4 embedding" in record.getMessage()
+        for record in caplog.records
+    ), [record.getMessage() for record in caplog.records]
+
+
+def test_blob_seq_ids_are_not_counted_as_unreplayable(tmp_path):
+    """0.6.x wrote seq_id as a BLOB, and SQLite orders every blob after every integer.
+
+    Counting those rows would report an intact queue as a total loss.
+    """
+    import sqlite3
+
+    from mempalace.backends.chroma import _wal_unreplayable_count
+
+    _, db_path, segment_id = _palace_with_purged_queue(tmp_path, total=8, purge_below=None)
+    assert _wal_unreplayable_count(db_path, segment_id) == 0
+
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT segment_id, embedding_id, created_at FROM embeddings LIMIT 1"
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO embeddings (segment_id, embedding_id, seq_id, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (row[0], "legacy-blob-row", (12345).to_bytes(8, "big"), row[2]),
+        )
+
+    assert _wal_unreplayable_count(db_path, segment_id) == 0

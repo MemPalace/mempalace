@@ -718,6 +718,90 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     return _hnsw_metadata_marker_intact(seg_dir)
 
 
+def _clear_segment_watermark(db_path: str, segment_id: str) -> bool:
+    """Drop a quarantined segment's ``max_seq_id`` row. True if one went.
+
+    Quarantine renames a segment directory so Chroma builds a fresh, empty
+    HNSW in its place. The segment's ``max_seq_id`` row stays behind, and
+    Chroma reads that as "already synced through seq_id N", so it replays
+    nothing below N into the new index: the rebuild quarantine exists to force
+    instead produces a permanently short one. ``collection.count()`` keeps
+    reporting the full total, because that reads the metadata segment, and an
+    unfiltered query keeps returning plausible neighbours from whatever nodes
+    are present. The shortfall only surfaces when a filtered query resolves an
+    id that is not in the index.
+
+    The directory name is the segment UUID, so this deletes exactly the
+    quarantined VECTOR segment's row and leaves METADATA rows and every other
+    collection alone. Call it only after the rename succeeded: clearing the
+    watermark of a segment that is still live would make Chroma replay the
+    whole queue into an index that already holds it.
+    """
+    # `contextlib.closing`, not a bare `with`: the connection context manager
+    # commits, it does not close. Quarantine runs before `PersistentClient`
+    # opens the palace, and an open Python sqlite3 connection against a
+    # ChromaDB 1.5.x WAL-mode database leaves state that segfaults that call
+    # (see `_fix_blob_seq_ids`, which takes the same precaution).
+    try:
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            deleted = conn.execute(
+                "DELETE FROM max_seq_id WHERE segment_id = ?", (segment_id,)
+            ).rowcount
+            conn.commit()
+    except sqlite3.Error:
+        logger.exception(
+            "Quarantined segment %s but could not clear its max_seq_id row; "
+            "the rebuilt index may stay short until a repair rebuild runs",
+            segment_id,
+        )
+        return False
+    return deleted > 0
+
+
+def _wal_unreplayable_count(db_path: str, segment_id: str) -> "int | None":
+    """Embeddings the write-ahead queue can no longer replay into this segment.
+
+    Quarantine renames a segment so Chroma rebuilds it from `embeddings_queue`.
+    chromadb 1.5.x purges that queue, so the rebuild replays only from the purge
+    watermark: every embedding written below it is absent from the new index
+    while its `embedding_metadata` row survives. That is why `collection.count()`
+    keeps reporting the full total and an unfiltered search keeps returning
+    confident neighbours over whatever remains (#2510).
+
+    Returns None when the figure cannot be measured. The caller must treat that
+    as "nothing to report", never as "nothing was lost".
+    """
+    try:
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            collection = conn.execute(
+                "SELECT collection FROM segments WHERE id = ?", (segment_id,)
+            ).fetchone()
+            if not collection or collection[0] is None:
+                return None
+            # No `typeof` guard on seq_id: SQLite's storage-class order puts
+            # every blob after every integer, so a 0.6.x BLOB seq_id can never
+            # satisfy `< <floor>` and is excluded by the comparison itself.
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM embeddings e
+                JOIN segments s ON e.segment_id = s.id
+                WHERE s.collection = ?
+                  AND e.seq_id < (
+                      SELECT MIN(seq_id) FROM embeddings_queue
+                      WHERE topic LIKE '%' || ?
+                  )
+                """,
+                (collection[0], collection[0]),
+            ).fetchone()
+    except sqlite3.Error:
+        logger.debug("Could not measure WAL coverage for %s", segment_id, exc_info=True)
+        return None
+    if not row or row[0] is None:
+        return None
+    return int(row[0])
+
+
 def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> list[str]:
     """Rename HNSW segment dirs that look unsafe to open.
 
@@ -816,12 +900,31 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
         try:
             os.rename(seg_dir, target)
             moved.append(target)
+            _clear_segment_watermark(db_path, name)
             logger.warning(
                 "Quarantined corrupt HNSW segment %s (%s); renamed to %s",
                 seg_dir,
                 reason,
                 target,
             )
+            # The rebuild replays from `embeddings_queue`, and chromadb purges
+            # it. Whatever was written below the purge watermark cannot come
+            # back on its own, and nothing else says so: the metadata rows
+            # survive, so the count and unfiltered search both stay plausible.
+            # The vectors are still in the renamed directory, so this is a
+            # recoverable state that only needs to stop being silent (#2510).
+            unreplayable = _wal_unreplayable_count(db_path, name)
+            if unreplayable:
+                logger.error(
+                    "Quarantine of %s leaves %d embedding(s) the write-ahead queue "
+                    "can no longer replay: the rebuilt index will be short by that "
+                    "much while collection.count() and unfiltered search still look "
+                    "healthy. The vectors are preserved in %s. Run `mempalace repair` "
+                    "to rebuild from SQLite.",
+                    seg_dir,
+                    unreplayable,
+                    target,
+                )
         except OSError:
             logger.exception("Failed to quarantine corrupt HNSW segment %s", seg_dir)
 
@@ -2058,6 +2161,7 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
         try:
             os.rename(seg_dir, target)
             moved.append(target)
+            _clear_segment_watermark(os.path.join(palace_path, "chroma.sqlite3"), name)
             logger.warning("Quarantined invalid HNSW metadata in %s: %s", seg_dir, reason)
         except OSError:
             logger.exception("Failed to quarantine invalid HNSW metadata in %s", seg_dir)
