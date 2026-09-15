@@ -1173,6 +1173,29 @@ class TestWriteTools:
         assert result["chunks"] == 1
         assert "chunk_ids" not in result
 
+    def test_search_touches_retrieval_counters(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+
+        from mempalace.mcp_server import tool_add_drawer, tool_get_drawer, tool_search
+
+        added = tool_add_drawer(
+            wing="project",
+            room="search",
+            content="hybrid retrieval counter search signal",
+        )
+        drawer_id = added["drawer_id"]
+
+        result = tool_search(query="retrieval search signal", limit=5)
+        assert "results" in result
+        assert result["results"]
+        assert all("_logical_drawer_id" not in hit for hit in result["results"])
+
+        fetched = tool_get_drawer(drawer_id)
+        # Search touched once, then tool_get_drawer touched once more.
+        assert fetched["metadata"]["retrieval_count"] >= 2
+
 
 def test_add_drawer_chunked_logical_id_fetches_deletes_and_lists_as_one(
     monkeypatch, config, palace_path, kg

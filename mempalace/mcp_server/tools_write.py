@@ -363,7 +363,12 @@ def _build_chunk_rows(drawer_id: str, content: str, meta: dict, chunk_size: int)
 
 
 def tool_add_drawer(
-    wing: str, room: str, content: str, source_file: str = None, added_by: str = "mcp"
+    wing: str,
+    room: str,
+    content: str,
+    source_file: str = None,
+    added_by: str = "mcp",
+    _extra_metadata: dict = None,
 ):
     """File verbatim content into a wing/room. Checks for duplicates first.
 
@@ -384,6 +389,7 @@ def tool_add_drawer(
         if source_file:
             source_file = strip_lone_surrogates(source_file)
         added_by = strip_lone_surrogates(added_by)
+        extra_metadata = _normalize_extra_metadata(_extra_metadata)
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
@@ -400,6 +406,7 @@ def tool_add_drawer(
             "wing": wing,
             "room": room,
             "added_by": added_by,
+            "extra_metadata_keys": sorted(extra_metadata.keys()),
             "content_length": len(content),
             "content_preview": content[:200],
         },
@@ -413,7 +420,10 @@ def tool_add_drawer(
         "added_by": added_by,
         "filed_at": datetime.now().isoformat(),
         "id_recipe": ID_RECIPE,
+        "retrieval_count": 0,
+        "last_retrieved": "",
     }
+    base_meta.update(extra_metadata)
 
     base_meta["last_modified"] = base_meta["filed_at"]
     # Idempotency. Three cases to detect a prior committed write:
@@ -1008,6 +1018,7 @@ def tool_get_drawer(drawer_id: str):
         record = _logical_drawer_record(col, drawer_id)
         if record is None:
             return {"error": f"Drawer not found: {drawer_id}"}
+        _touch_record_read(col, record)
         return _drawer_payload(record)
     except Exception as e:
         return {"error": str(e)}
@@ -1219,3 +1230,101 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def _coerce_non_negative_int(value, default: int = 0) -> int:
+    try:
+        parsed = int(value)
+        return parsed if parsed >= 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_extra_metadata(extra_meta):
+    """Return scalar-only metadata safe for Chroma storage."""
+    if extra_meta is None:
+        return {}
+    if not isinstance(extra_meta, dict):
+        raise ValueError("extra metadata must be an object")
+
+    normalized = {}
+    for key, value in extra_meta.items():
+        if not isinstance(key, str):
+            continue
+        key = strip_lone_surrogates(key).strip()
+        if not key or key in _DRAWER_META_RESERVED_KEYS:
+            continue
+        if value is None:
+            continue
+        if isinstance(value, (bool, int, float)):
+            normalized[key] = value
+            continue
+        if isinstance(value, str):
+            normalized[key] = strip_lone_surrogates(value)
+            continue
+        normalized[key] = strip_lone_surrogates(str(value))
+
+    return normalized
+
+
+def _touch_record_read(col, record):
+    """Update read-path counters for one logical drawer record."""
+    if not record or not record.get("ids"):
+        return
+
+    ids = record.get("ids") or []
+    metadatas = record.get("metadatas") or []
+    if not ids or len(ids) != len(metadatas):
+        return
+
+    retrieved_at = datetime.now().isoformat()
+    updated = []
+    for meta in metadatas:
+        current = _safe_meta(meta)
+        reads = _coerce_non_negative_int(current.get("retrieval_count"), default=0)
+        current["retrieval_count"] = reads + 1
+        current["last_retrieved"] = retrieved_at
+        updated.append(current)
+
+    try:
+        col.update(ids=ids, metadatas=updated)
+        record["metadatas"] = updated
+        if updated:
+            record["metadata"] = updated[0]
+    except Exception:
+        logger.debug("read-touch update failed for drawer ids=%s", ids, exc_info=True)
+
+
+def _touch_logical_drawers(col, logical_ids):
+    """Increment retrieval counters for a batch of logical drawer IDs."""
+    if not col:
+        return
+
+    seen = set()
+    for logical_id in logical_ids or []:
+        if not logical_id or logical_id in seen:
+            continue
+        seen.add(logical_id)
+        record = _logical_drawer_record(col, logical_id)
+        if record is None:
+            continue
+        _touch_record_read(col, record)
+
+
+def _logical_drawer_id_for_any_id(col, drawer_id: str) -> str:
+    """Resolve a row/chunk id to its logical drawer id when possible."""
+    record = _single_drawer_record(col, drawer_id)
+    if record is None:
+        return drawer_id
+    meta = _safe_meta(record.get("metadata"))
+    parent_id = meta.get("parent_drawer_id")
+    if isinstance(parent_id, str) and parent_id:
+        return parent_id
+    return drawer_id
+
+
+def _height_from_record(record) -> int:
+    if not record:
+        return 0
+    meta = _safe_meta(record.get("metadata") or {})
+    return _coerce_non_negative_int(meta.get("height"), default=0)

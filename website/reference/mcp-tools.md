@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 45 MCP tools.
+Detailed parameter schemas for all 53 MCP tools.
 
 ## Palace — Read Tools
 
@@ -251,13 +251,16 @@ Update an existing drawer's content and/or metadata (wing, room). Fetches the ex
 
 ### `mempalace_kg_query`
 
-Query entity relationships with time filtering.
+Query entity relationships with time filtering. Defaults to one-hop; set `recurse=true` for breadth-first traversal, optionally narrowed to a single `predicate`.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `entity` | string | **Yes** | Entity to query (e.g. "Max", "MyProject") |
 | `as_of` | string | No | Date filter — only facts valid at this date (YYYY-MM-DD) |
 | `direction` | string | No | `outgoing`, `incoming`, or `both` (default: `both`) |
+| `predicate` | string | No | Optional predicate filter (e.g. `merged-into`, `synthesized-from`) |
+| `recurse` | boolean | No | Enable breadth-first traversal beyond one hop (default: `false`) |
+| `max_depth` | integer | No | Maximum traversal depth when `recurse=true` (default: 20) |
 
 **Returns:** `{ entity, as_of, facts: [{ direction, subject, predicate, object, valid_from, valid_to, current }], count }`
 
@@ -265,15 +268,20 @@ Query entity relationships with time filtering.
 
 ### `mempalace_kg_add`
 
-Add a fact to the knowledge graph.
+Add a fact to the knowledge graph. Subject → predicate → object with optional time window. Pass `valid_to` to backfill an already-ended historical fact in a single call.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `subject` | string | **Yes** | The entity doing/being something |
 | `predicate` | string | **Yes** | Relationship type (e.g. "loves", "works_on") |
 | `object` | string | **Yes** | The entity being connected to |
-| `valid_from` | string | No | When this became true (YYYY-MM-DD) |
+| `valid_from` | string | No | When this became true (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ) |
+| `valid_to` | string | No | When this stopped being true (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ). Use for backfilling already-ended historical facts |
 | `source_closet` | string | No | Closet ID where this fact appears |
+| `source_file` | string | No | Source file path the fact was extracted from |
+| `source_drawer_id` | string | No | Drawer ID the fact was extracted from (RFC 002 provenance) |
+
+> Parameters are strict-validated: passing a key not listed above fails the whole call with JSON-RPC `-32602 Unknown parameter`, it is not ignored.
 
 **Returns:** `{ success, triple_id, fact }`
 
@@ -329,6 +337,92 @@ Knowledge graph overview.
 **Parameters:** None
 
 **Returns:** `{ entities, triples, current_facts, expired_facts, relationship_types }`
+
+---
+
+## Graph Tools
+
+These tools operate directly on lineage and merge predicates in the KG,
+without requiring a separate node-kind API.
+
+### `mempalace_resolve_canonical`
+
+Follow the `merged-into` chain to the canonical node (cycle-guarded).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `node_id` | string | **Yes** | Node id to resolve |
+| `max_hops` | integer | No | Maximum chain length to follow (default: 50) |
+
+**Returns:** `{ node_id, canonical_node_id, hops, chain }`
+
+---
+
+### `mempalace_get_height`
+
+Compute the longest-path lineage height over outgoing lineage edges. Resolves
+canonical id first.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `node_id` | string | **Yes** | Node id to evaluate |
+
+**Returns:** `{ node_id, height, stored_height, canonical_chain }`
+
+---
+
+### `mempalace_find_merge_candidates`
+
+Surface semantically near node pairs and optionally require topological distance
+(no shared lineage ancestry). This is advisory only.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `drawer_id` | string | No | Optional seed node id; omitted scans nodes |
+| `threshold` | number | No | Similarity threshold 0-1 (default: 0.9) |
+| `limit` | integer | No | Max candidates to return (default: 20) |
+| `max_nodes` | integer | No | Max nodes to scan when seed omitted (default: 40) |
+| `max_depth` | integer | No | Max ancestor depth for topology checks (default: 20) |
+| `wing` | string | No | Optional wing filter |
+| `room` | string | No | Optional room filter |
+| `require_topological_distance` | boolean | No | Require no shared ancestors (default: true) |
+
+**Returns:** `{ candidates, count, scanned_nodes, threshold, require_topological_distance }`
+
+---
+
+### `mempalace_find_closet_lineage_issues`
+
+Validate closet lineage quality. Flags closets with broken
+or stale lineage references and optional stored/computed height
+mismatches.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `wing` | string | No | Optional wing filter for closets |
+| `room` | string | No | Optional room filter for closets |
+| `include_merged` | boolean | No | Include closets already merged into another canonical node (default: false) |
+| `limit` | integer | No | Max rows to return (default: 20, max: 500) |
+| `offset` | integer | No | Pagination offset (default: 0) |
+
+**Returns:** `{ orphans, count, total, limit, offset, target }`
+
+---
+
+### `mempalace_apply_merge`
+
+Apply a deterministic merge by adding a `merged-into` edge from source to
+canonical, invalidating divergent prior `merged-into` links, and optionally
+invalidating source lineage edges.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `source_node_id` | string | **Yes** | Node being merged |
+| `canonical_node_id` | string | **Yes** | Canonical target node |
+| `ended` | string | No | End timestamp for invalidations |
+| `invalidate_source_edges` | boolean | No | Invalidate source lineage edges (default: true) |
+
+**Returns:** `{ success, merged, source_node_id, canonical_node_id, merged_edge_added, invalidated_prior_merged_into, invalidated_lineage_edges, ended }`
 
 ---
 
