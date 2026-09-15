@@ -61,20 +61,40 @@ def _detached_popen_kwargs() -> dict:
     return kwargs
 
 
+def _config_root() -> Path:
+    """The directory this install keeps its config in (XDG-aware since #148)."""
+    from .config import _default_config_dir
+
+    return _default_config_dir()
+
+
 def _palace_root_exists() -> bool:
     """User-removable kill-switch.
 
-    If ~/.mempalace/ does not exist, the user has explicitly cleared it.
-    All hook side effects (logging, state dir creation, mining, ingestion)
-    must respect this and short-circuit BEFORE touching disk — including
-    before logging the short-circuit itself.
+    If neither ~/.mempalace/ nor the install's config directory exists, the
+    user has explicitly cleared it. All hook side effects (logging, state dir
+    creation, mining, ingestion) must respect this and short-circuit BEFORE
+    touching disk — including before logging the short-circuit itself.
+
+    Since #148 a fresh install keeps its config and palace in the XDG config
+    directory (``~/.config/mempalace`` by default) and never creates
+    ``~/.mempalace``, so checking only the legacy path silently disabled every
+    hook on new installs. The legacy directory still passes on its own, which
+    leaves every existing install exactly as it was. On an XDG install
+    ``~/.mempalace`` can appear later (hook state, mine locks), so removing
+    only the config directory is not enough to disable hooks there.
 
     Uses ``is_dir()`` rather than ``exists()`` so a stray regular file at
-    ``~/.mempalace`` (or a broken symlink) is treated as absent — otherwise
-    the kill-switch would be bypassed and ``STATE_DIR.mkdir()`` would later
-    crash on ``NotADirectoryError``.
+    either path (or a broken symlink) is treated as absent — otherwise the
+    kill-switch would be bypassed and ``STATE_DIR.mkdir()`` would later crash
+    on ``NotADirectoryError``.
     """
-    return PALACE_ROOT.is_dir()
+    if PALACE_ROOT.is_dir():
+        return True
+    try:
+        return _config_root().is_dir()
+    except (OSError, ValueError):
+        return False
 
 
 def _mempalace_python() -> str:

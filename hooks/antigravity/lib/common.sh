@@ -147,15 +147,45 @@ mempal_log() {
 # Disabled if ANY of:
 #   * MEMPAL_DISABLE_HOOK is a truthy string
 #   * MEMPALACE_HOOKS_AUTO_SAVE is false/0/no
-#   * ~/.mempalace/config.json sets hooks.auto_save: false
-#   * ~/.mempalace/ directory does not exist (user nuked the palace)
+#   * <config dir>/config.json sets hooks.auto_save: false
+#   * neither ~/.mempalace/ nor the config dir exists (user nuked the palace)
 #
 # Returns 0 (kill switch tripped, hook should short-circuit) or non-zero
 # (proceed normally).
+
+# Print the config directory, resolved the way mempalace.config does (#148):
+# $MEMPALACE_CONFIG_DIR, then a ~/.mempalace that holds a real install, then
+# $XDG_CONFIG_HOME/mempalace (absolute values only), then ~/.config/mempalace.
+mempal_config_dir() {
+    case "${MEMPALACE_CONFIG_DIR:-}" in
+        *[![:space:]]*)
+            printf '%s\n' "$MEMPALACE_CONFIG_DIR"
+            return
+            ;;
+    esac
+    local legacy="$HOME/.mempalace"
+    if [ -f "$legacy/config.json" ] || [ -f "$legacy/people_map.json" ] \
+        || [ -f "$legacy/palace/chroma.sqlite3" ]; then
+        printf '%s\n' "$legacy"
+        return
+    fi
+    case "${XDG_CONFIG_HOME:-}" in
+        /*|[A-Za-z]:[\\/]*)
+            printf '%s\n' "$XDG_CONFIG_HOME/mempalace"
+            return
+            ;;
+    esac
+    printf '%s\n' "$HOME/.config/mempalace"
+}
+
 mempal_kill_switch_tripped() {
+    local cfg_dir
+    cfg_dir="$(mempal_config_dir)"
+
     # Palace nuke is the strongest signal: respect it before touching
-    # disk for state, logging, etc.
-    if [ ! -d "$HOME/.mempalace" ]; then
+    # disk for state, logging, etc. A fresh install since #148 lives in the
+    # XDG config dir and has no ~/.mempalace, so either directory passes.
+    if [ ! -d "$HOME/.mempalace" ] && [ ! -d "$cfg_dir" ]; then
         return 0
     fi
 
@@ -167,7 +197,7 @@ mempal_kill_switch_tripped() {
         false|FALSE|0|no|NO) return 0 ;;
     esac
 
-    local cfg="$HOME/.mempalace/config.json"
+    local cfg="$cfg_dir/config.json"
     if [ -f "$cfg" ]; then
         local auto
         auto=$("$MEMPAL_PYTHON_BIN" -c "

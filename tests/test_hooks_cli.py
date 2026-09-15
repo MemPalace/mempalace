@@ -2231,6 +2231,9 @@ def _redirect_palace_root(monkeypatch, tmp_path):
     monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", fake_root)
     monkeypatch.setattr(hooks_cli_mod, "STATE_DIR", fake_root / "hook_state")
     monkeypatch.setattr(hooks_cli_mod, "_state_dir_initialized", False)
+    # The config dir satisfies the kill-switch too (#148); keep it absent so
+    # these tests exercise the "user cleared everything" path.
+    monkeypatch.setattr(hooks_cli_mod, "_config_root", lambda: tmp_path / "absent-config")
     return fake_root
 
 
@@ -2568,6 +2571,31 @@ def test_existing_dir_proceeds_normally(tmp_path, monkeypatch):
     assert (fake_root / "hook_state" / "hook.log").is_file()
 
 
+def test_config_dir_satisfies_kill_switch_without_legacy_root(tmp_path, monkeypatch):
+    """A fresh install since #148 has its config dir but no ~/.mempalace.
+
+    Before the fix every hook short-circuited on such an install, so a fresh
+    ``mempalace init`` followed by a PreCompact hook filed nothing.
+    """
+    fake_root = _redirect_palace_root(monkeypatch, tmp_path)
+    config_root = tmp_path / "xdg" / "mempalace"
+    config_root.mkdir(parents=True)
+    monkeypatch.setattr(hooks_cli_mod, "_config_root", lambda: config_root)
+
+    assert hooks_cli_mod._palace_root_exists() is True
+    _log("test message")
+    assert (fake_root / "hook_state" / "hook.log").is_file()
+
+
+def test_kill_switch_config_root_follows_config_resolution(tmp_path, monkeypatch):
+    """``_config_root`` resolves the way ``mempalace.config`` does."""
+    config_dir = tmp_path / "explicit-config"
+    config_dir.mkdir()
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(config_dir))
+
+    assert hooks_cli_mod._config_root() == config_dir
+
+
 def test_regular_file_at_palace_root_treated_as_absent(tmp_path, monkeypatch):
     """A regular file at ~/.mempalace must be treated the same as absent.
 
@@ -2579,6 +2607,7 @@ def test_regular_file_at_palace_root_treated_as_absent(tmp_path, monkeypatch):
     fake_root = tmp_path / "file-not-dir"
     fake_root.write_text("oops, this is a file not a directory")
     monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", fake_root)
+    monkeypatch.setattr(hooks_cli_mod, "_config_root", lambda: tmp_path / "absent-config")
     monkeypatch.setattr(hooks_cli_mod, "STATE_DIR", fake_root / "hook_state")
     monkeypatch.setattr(hooks_cli_mod, "_state_dir_initialized", False)
 
