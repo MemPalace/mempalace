@@ -371,22 +371,37 @@ def run_sweep(payload: dict[str, Any]) -> dict[str, Any]:
 
     target = os.path.abspath(os.path.expanduser(target_raw))
 
+    from .config import sanitize_name
     from .daemon import LOCK_REFUSAL_ERROR_CLASS
     from .palace import MineAlreadyRunning
     from .sweeper import sweep, sweep_directory
 
+    # The CLI validates these before submission, but the daemon also
+    # accepts persisted or hand-crafted payloads, and the sweeper stamps
+    # whatever it is given verbatim — so re-check at this boundary.
+    wing = payload.get("wing")
+    if wing is not None:
+        try:
+            wing = sanitize_name(wing, "wing")
+        except ValueError as exc:
+            return {"success": False, "error": str(exc), "exit_code": 2}
+    room = payload.get("room")
+    if room is not None:
+        try:
+            room = sanitize_name(room, "room")
+        except ValueError as exc:
+            return {"success": False, "error": str(exc), "exit_code": 2}
+
     try:
         if os.path.isfile(target):
-            result = sweep(target, palace_path, wing=payload.get("wing"), room=payload.get("room"))
+            result = sweep(target, palace_path, wing=wing, room=room)
             print(
                 f" Swept {target}: +{result['drawers_added']} new, "
                 f"{result['drawers_already_present']} already present, "
                 f"{result['drawers_skipped']} skipped (< cursor)."
             )
         elif os.path.isdir(target):
-            result = sweep_directory(
-                target, palace_path, wing=payload.get("wing"), room=payload.get("room")
-            )
+            result = sweep_directory(target, palace_path, wing=wing, room=room)
             print(
                 f" Swept {result['files_succeeded']}/"
                 f"{result['files_attempted']} files from {target}: "
