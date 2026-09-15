@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import logging
 import json
 import math
 import os
@@ -35,6 +36,31 @@ from .palace import (
     mine_palace_lock,
     resolve_backend_name,
 )
+
+
+log = logging.getLogger("mempalace.daemon")
+
+_FOREGROUND_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+
+def configure_foreground_logging(level: int = logging.INFO) -> None:
+    """Send daemon lifecycle logging to stderr for a foreground run.
+
+    A supervisor (launchd, systemd) captures the foreground process's
+    stderr/stdout, so this is the only place its log file can be fed from.
+    The detached child of a background start already has its stdio bound to
+    the per-daemon log file and needs nothing here. Idempotent: a second call
+    does not add another handler.
+    """
+    logger = logging.getLogger("mempalace.daemon")
+    if any(getattr(h, "_mempalace_foreground", False) for h in logger.handlers):
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter(_FOREGROUND_LOG_FORMAT))
+    handler._mempalace_foreground = True  # type: ignore[attr-defined]
+    logger.addHandler(handler)
+    logger.setLevel(level)
+
 
 HOST = "127.0.0.1"
 STATE_ROOT_ENV = "MEMPALACE_DAEMON_STATE_ROOT"
@@ -917,8 +943,9 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
         protocol_version = "HTTP/1.1"
         timeout = 10
 
-        def log_message(self, fmt, *args):  # pragma: no cover - stdlib access logging noise
-            return
+        def log_message(self, fmt, *args):
+            # Access lines are debug-level noise; lifecycle events go out at INFO.
+            log.debug("%s %s", self.address_string(), fmt % args)
 
         def _authorized(self) -> bool:
             auth = self.headers.get("Authorization")
@@ -1057,10 +1084,20 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
             _write_private(endpoint_path(palace_path), json.dumps(endpoint, indent=2) + "\n")
             _write_private(pid_path(palace_path), f"{os.getpid()}\n")
             runtime.start_worker()
+            log.info(
+                "daemon listening on http://%s:%s (pid %s, backend %s, palace %s)",
+                HOST,
+                actual_port,
+                os.getpid(),
+                resolved_backend,
+                palace_path,
+            )
             try:
                 httpd.serve_forever(poll_interval=0.5)
             finally:
+                log.info("daemon stopping (pid %s)", os.getpid())
                 _drain_and_cleanup(runtime, palace_path, previous_env)
+                log.info("daemon stopped (pid %s)", os.getpid())
     finally:
         _close_or_defer_writer_lease(writer_lease, runtime)
         _restore_server_process_state(previous_env, prev_umask)
@@ -1308,7 +1345,9 @@ def start_daemon(
         return existing
     if foreground:
         # Blocks until the daemon stops. A clean stop is a normal exit, not an
-        # error — return None so the caller (cmd_daemon) exits 0.
+        # error — return None so the caller (cmd_daemon) exits 0. Lifecycle
+        # lines go to stderr so a supervisor's log capture is not empty.
+        configure_foreground_logging()
         run_server(palace_path, backend=backend, port=0)
         return None  # type: ignore[return-value]
 
