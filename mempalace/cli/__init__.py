@@ -18,6 +18,8 @@ Commands:
     mempalace mine <dir> --mode extract   Mine binary office documents (PDF/DOCX/etc.)
     mempalace mine <source> --source NAME Mine through a registered source adapter
     mempalace search "query"              Find anything, exact words
+    mempalace export --output <dir>       Export palace to JSONL for git-based sync
+    mempalace import <dir>                Merge a JSONL export into the palace
     mempalace mcp                         Show MCP setup command
     mempalace task create ...             Create a complete agent handoff
     mempalace task launch ...             Run a stored task headlessly
@@ -86,6 +88,7 @@ _FRAGMENTS = (
     "_hub.py",
     "cmd_mine.py",
     "cmd_sync.py",
+    "cmd_export.py",
     "cmd_query.py",
     "cmd_update.py",
     "cmd_coord.py",

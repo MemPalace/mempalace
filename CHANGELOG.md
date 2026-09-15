@@ -64,6 +64,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Hallway recompute reads only the mined wing.** `compute_hallways_for_wing` fetched every drawer in the palace on each mine; it now pages through `get(where={"wing": ...})` in bounded pages, keeping the #1619 variable-limit protection, so the cost follows the wing rather than the palace. On Qdrant, whose `get()` still scrolls `offset + limit` rows for each page, a wing larger than one page re-reads its earlier pages. (#2466, #2477)
 - **CLI `status` reads backend metadata in one pass when the direct SQLite tally is unavailable.** Chroma palaces are still tallied straight from `chroma.sqlite3`. On the collection path, used by backends such as Qdrant, `status()` now calls `get_all_metadata()` when the collection exposes it instead of paging with `get()`: 1 m 46 s down to 3.4 s on a 160k-drawer Qdrant palace. (#2153, #2154)
 
+- **Cross-device sync: `mempalace export` / `mempalace import`.** `export` (default `--format jsonl`)
+  writes a deterministic, git-friendly JSONL tree organized by wing/room — sorted ids, sorted keys, no
+  timestamps, so re-exporting an unchanged palace is a zero git diff — and `import <dir>` merges an
+  export into another machine's palace by drawer id: adds new drawers, skips existing ones, idempotent
+  on re-import, and re-embeds locally since exports deliberately carry no vectors. `--format markdown`
+  exposes the existing browsable markdown exporter on the CLI for the first time. `import` follows
+  the CLI write-routing policy (`--daemon` / `--direct`, #2033) like `mine` and `sync`. (#452)
+
 ### Bug Fixes
 
 - **The transcript-path fallback no longer gives every git worktree its own wing.** `_wing_from_transcript_path`'s primary path (reading `cwd` from the JSONL) already collapsed a `<project>/.claude/worktrees/<wt>` segment before deriving the wing; the fallback path, used whenever `cwd` is absent, had no equivalent strip, so the flattened `--claude-worktrees-<wt>` segment survived into the wing name. Applied the same collapse there. (#2388, #2454)

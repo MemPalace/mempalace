@@ -633,3 +633,150 @@ def test_service_run_mine_rejects_non_list_files_payload(
         "error": "mine files payload must be a list",
         "exit_code": 2,
     }
+
+
+def test_cmd_import_prefer_submits_daemon_job(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    args = _args(palace=str(tmp_path / "palace"), dir="export", dry_run=False)
+
+    with (
+        patch(
+            "mempalace.cli._resolve_cli_write_routing_or_exit",
+            return_value=_route(WriteRoutingPolicy.PREFER),
+        ),
+        patch("mempalace.cli._submit_daemon_cli_job") as submit,
+        patch("mempalace.importer.import_palace") as direct_import,
+    ):
+        cli.cmd_import(args)
+
+    direct_import.assert_not_called()
+    submit.assert_called_once()
+    assert submit.call_args.args[0] == "import"
+    # Relative sources are resolved against the caller's cwd, not the daemon's.
+    assert submit.call_args.args[1] == {"input_dir": str(tmp_path / "export"), "dry_run": False}
+
+
+def test_cmd_import_direct_policy_preserves_direct_path(tmp_path):
+    args = _args(palace=str(tmp_path / "palace"), dir=str(tmp_path / "export"), dry_run=False)
+
+    with (
+        patch(
+            "mempalace.cli._resolve_cli_write_routing_or_exit",
+            return_value=_route(WriteRoutingPolicy.DIRECT),
+        ),
+        patch("mempalace.cli._submit_daemon_cli_job") as submit,
+        patch("mempalace.importer.import_palace") as direct_import,
+    ):
+        cli.cmd_import(args)
+
+    submit.assert_not_called()
+    direct_import.assert_called_once_with(
+        str(tmp_path / "palace"), str(tmp_path / "export"), dry_run=False
+    )
+
+
+def test_cmd_import_dry_run_is_routed_like_mine(tmp_path):
+    # `mine` forwards dry_run to the daemon rather than bypassing the policy;
+    # import does the same, and the dry run still never opens the palace there.
+    args = _args(palace=str(tmp_path / "palace"), dir=str(tmp_path / "export"), dry_run=True)
+
+    with (
+        patch(
+            "mempalace.cli._resolve_cli_write_routing_or_exit",
+            return_value=_route(WriteRoutingPolicy.PREFER),
+        ),
+        patch("mempalace.cli._submit_daemon_cli_job") as submit,
+        patch("mempalace.importer.import_palace") as direct_import,
+    ):
+        cli.cmd_import(args)
+
+    direct_import.assert_not_called()
+    submit.assert_called_once()
+    assert submit.call_args.args[1] == {"input_dir": str(tmp_path / "export"), "dry_run": True}
+
+
+def test_import_parser_accepts_routing_flags(tmp_path, monkeypatch):
+    import sys
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["mempalace", "--palace", str(tmp_path / "palace"), "import", str(tmp_path), "--direct"],
+    )
+
+    with (
+        patch("mempalace.cli._submit_daemon_cli_job") as submit,
+        patch("mempalace.importer.import_palace") as direct_import,
+    ):
+        cli.main()
+
+    submit.assert_not_called()
+    direct_import.assert_called_once()
+
+
+def test_service_run_import(tmp_path):
+    palace = tmp_path / "palace"
+    source = tmp_path / "export"
+    source.mkdir()
+    stats = {"files": 1, "imported": 2, "skipped_existing": 0, "malformed": 0}
+
+    with patch("mempalace.importer.import_palace", return_value=stats) as run:
+        result = service.run_import({"palace_path": str(palace), "input_dir": str(source)})
+
+    run.assert_called_once_with(str(palace.resolve()), str(source), dry_run=False)
+    assert result["success"] is True
+    assert result["exit_code"] == 0
+    assert result["result"] == stats
+
+
+def test_service_run_import_forwards_dry_run(tmp_path):
+    source = tmp_path / "export"
+    source.mkdir()
+
+    with patch("mempalace.importer.import_palace", return_value={}) as run:
+        service.run_import(
+            {"palace_path": str(tmp_path / "palace"), "input_dir": str(source), "dry_run": True}
+        )
+
+    assert run.call_args.kwargs == {"dry_run": True}
+
+
+def test_service_run_import_rejects_relative_source(tmp_path):
+    with patch("mempalace.importer.import_palace") as run:
+        result = service.run_import(
+            {"palace_path": str(tmp_path / "palace"), "input_dir": "export"}
+        )
+
+    run.assert_not_called()
+    assert result["success"] is False
+    assert result["exit_code"] == 2
+
+
+def test_service_run_import_lock_refusal_is_deferrable(tmp_path):
+    from mempalace.daemon import LOCK_REFUSAL_ERROR_CLASS
+    from mempalace.palace import MineAlreadyRunning
+
+    with patch(
+        "mempalace.importer.import_palace",
+        side_effect=MineAlreadyRunning("held by pid 4242"),
+    ):
+        result = service.run_import(
+            {"palace_path": str(tmp_path / "palace"), "input_dir": str(tmp_path)}
+        )
+
+    assert result["success"] is False
+    assert result["error_class"] == LOCK_REFUSAL_ERROR_CLASS
+
+
+def test_execute_job_dispatches_import():
+    with patch(
+        "mempalace.service.run_import",
+        return_value={"success": True, "exit_code": 0},
+    ) as run_import:
+        result = service.execute_job("import", {"input_dir": "/tmp/export"})
+
+    run_import.assert_called_once_with({"input_dir": "/tmp/export"})
+    assert result["success"] is True
