@@ -310,7 +310,9 @@ def _try_antigravity_jsonl(content: str) -> Optional[str]:
             text = m.group(1).strip() if m else content_val.strip()
             # Clean additional metadata / user settings tags
             text = re.sub(r"<ADDITIONAL_METADATA>[\s\S]*?</ADDITIONAL_METADATA>", "", text).strip()
-            text = re.sub(r"<USER_SETTINGS_CHANGE>[\s\S]*?</USER_SETTINGS_CHANGE>", "", text).strip()
+            text = re.sub(
+                r"<USER_SETTINGS_CHANGE>[\s\S]*?</USER_SETTINGS_CHANGE>", "", text
+            ).strip()
             text = strip_noise(text)
             if text:
                 messages.append(("user", text))
