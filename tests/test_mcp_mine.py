@@ -72,6 +72,62 @@ def test_invalid_mode_returns_structured_error(monkeypatch, config, tmp_dir):
     assert "invalid mode" in result["error"].lower()
 
 
+def test_room_rejected_for_non_projects_mode(monkeypatch, config, tmp_dir):
+    """``room`` only means something to the projects miner; reject it elsewhere."""
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "src")
+    os.makedirs(src)
+
+    result = mcp_server.tool_mine(source=src, mode="convos", room="docs")
+    assert result["success"] is False
+    assert "projects mode" in result["error"]
+
+
+def test_invalid_room_name_returns_structured_error(monkeypatch, config, tmp_dir):
+    """Room names go through the same sanitize_name gate as add_drawer."""
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "src")
+    os.makedirs(src)
+
+    result = mcp_server.tool_mine(source=src, mode="projects", room="bad/room")
+    assert result["success"] is False
+    assert "invalid path characters" in result["error"]
+
+
+def test_room_is_threaded_into_the_projects_miner(monkeypatch, config, tmp_dir):
+    """The accepted room reaches miner.mine() as its ``room`` argument."""
+    import mempalace.miner as miner
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "src")
+    os.makedirs(src)
+
+    seen = {}
+
+    def fake_mine(**kwargs):
+        seen.update(kwargs)
+        return {"drawers": 0}
+
+    monkeypatch.setattr(miner, "mine", fake_mine)
+    result = mcp_server.tool_mine(source=src, mode="projects", room="docs")
+
+    assert result["success"] is True
+    assert seen.get("room") == "docs"
+
+
+def test_room_is_advertised_in_the_mine_schema():
+    from mempalace import mcp_server
+
+    props = mcp_server.TOOLS["mempalace_mine"]["input_schema"]["properties"]
+    assert "room" in props
+    assert props["room"]["type"] == "string"
+
+
 def test_missing_source_dir_returns_structured_error(monkeypatch, config):
     from mempalace import mcp_server
 
