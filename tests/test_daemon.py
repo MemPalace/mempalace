@@ -1184,6 +1184,46 @@ def test_run_mine_invalid_mode_returns_structured_error(tmp_path):
     assert out["exit_code"] == 2
 
 
+def test_run_mine_rejects_room_outside_projects_mode(tmp_path):
+    """room is projects-only; other modes get the structured refusal."""
+    from mempalace import service
+
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    out = service.run_mine({"palace_path": str(palace), "mode": "convos", "room": "docs"})
+    assert out["success"] is False
+    assert "projects mode" in out["error"]
+    assert out["exit_code"] == 2
+
+
+def test_run_mine_forwards_room_to_the_projects_miner(tmp_path, monkeypatch):
+    """The daemon path threads room through to miner.mine."""
+    from mempalace import service
+
+    seen = {}
+
+    def fake_mine(**kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr("mempalace.miner.mine", fake_mine)
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    source = tmp_path / "src"
+    source.mkdir()
+
+    out = service.run_mine(
+        {
+            "palace_path": str(palace),
+            "source": str(source),
+            "mode": "projects",
+            "room": "docs",
+        }
+    )
+
+    assert out["success"] is True
+    assert seen["room"] == "docs"
+
+
 def test_run_mine_source_adapter_dispatches_through_adapter_runner(tmp_path, monkeypatch):
     """Daemon mine jobs preserve the CLI's explicit source-adapter dispatch."""
     from mempalace import cli, service

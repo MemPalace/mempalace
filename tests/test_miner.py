@@ -16,6 +16,7 @@ from mempalace.miner import (
     detect_room,
     load_config,
     mine,
+    resolve_room,
     scan_project,
     status,
 )
@@ -1737,6 +1738,50 @@ def test_detect_room_filename_match_uses_token_boundary(tmp_path):
     assert detect_room(f3, "x", rooms3, project) == "foo"
 
 
+def test_resolve_room_call_override_wins(tmp_path):
+    """A call-level room beats per-file routing (the wing_override precedent)."""
+    project = tmp_path
+    rooms = [{"name": "docs", "keywords": []}, {"name": "general", "keywords": []}]
+    f = project / "docs" / "x.md"
+    f.parent.mkdir(parents=True)
+    f.write_text("x")
+
+    # Folder routing would pick "docs" on its own ...
+    assert resolve_room(f, "x", rooms, project) == "docs"
+    # ... but an explicit call-level room overrides it.
+    assert resolve_room(f, "x", rooms, project, call_room="reference") == "reference"
+
+
+def test_resolve_room_rule_override_beats_routing(tmp_path):
+    """A per-path rule beats routing and loses to the call-level override.
+
+    ``rule_room`` is unused today (reserved for the paths: config form); this
+    pins the precedence so that form can rely on it.
+    """
+    project = tmp_path
+    rooms = [{"name": "docs", "keywords": []}, {"name": "general", "keywords": []}]
+    f = project / "src" / "x.py"
+    f.parent.mkdir(parents=True)
+    f.write_text("x")
+
+    assert resolve_room(f, "x", rooms, project) == "general"
+    assert resolve_room(f, "x", rooms, project, rule_room="code") == "code"
+    assert resolve_room(f, "x", rooms, project, call_room="docs", rule_room="code") == "docs"
+
+
+def test_resolve_room_without_overrides_matches_detect_room(tmp_path):
+    """No override means no behaviour change: identical to detect_room."""
+    project = tmp_path
+    rooms = [{"name": "docs", "keywords": ["documentation"]}, {"name": "general", "keywords": []}]
+    f = project / "docs" / "guide.md"
+    f.parent.mkdir(parents=True)
+    f.write_text("documentation")
+
+    assert resolve_room(f, "documentation", rooms, project) == detect_room(
+        f, "documentation", rooms, project
+    )
+
+
 def test_add_drawer_stamps_normalize_version(tmp_path):
     """Fresh drawers carry the current schema version so future upgrades work."""
     from mempalace.miner import add_drawer
@@ -2942,6 +2987,57 @@ def test_mine_limit_zero_mines_all(tmp_path, capsys):
     assert call_count == 4
     out = capsys.readouterr().out
     assert "Drawers filed: 4" in out
+
+
+def test_mine_room_override_reaches_process_file(tmp_path, capsys):
+    """A call-level room is threaded into process_file as room_override."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=2)
+    palace_path = project_root / "palace"
+
+    seen = []
+
+    def fake_process_file(*args, **kwargs):
+        seen.append(kwargs.get("room_override"))
+        return (1, "docs", None)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path), room="docs")
+
+    assert seen == ["docs", "docs"]
+    assert "Room override: docs" in capsys.readouterr().out
+
+
+def test_mine_room_override_rejects_invalid_name(tmp_path):
+    """An invalid room name fails loudly rather than filing garbage metadata."""
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=1)
+
+    with pytest.raises(ValueError):
+        mine(str(project_root), str(project_root / "palace"), room="bad/room")
+
+
+def test_mine_without_room_override_leaves_banner_unchanged(tmp_path, capsys):
+    """Omitting room leaves the summary banner unchanged (back-compat)."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=1)
+    palace_path = project_root / "palace"
+
+    def fake_process_file(*args, **kwargs):
+        assert kwargs.get("room_override") is None
+        return (1, "general", None)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path))
+
+    assert "Room override:" not in capsys.readouterr().out
 
 
 def test_mine_limit_dry_run(tmp_path, capsys):

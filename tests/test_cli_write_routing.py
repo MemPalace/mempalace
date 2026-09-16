@@ -219,6 +219,7 @@ def _mine_args(tmp_path, **overrides):
         "dir": str(tmp_path / "project"),
         "mode": "projects",
         "wing": None,
+        "room": None,
         "agent": "mempalace",
         "limit": 0,
         "dry_run": False,
@@ -264,6 +265,50 @@ def test_cmd_mine_prefer_submits_daemon_job(tmp_path):
         "background": False,
         "auto_start": True,
     }
+
+
+def test_cmd_mine_payload_carries_room_override(tmp_path):
+    """--room reaches the mine payload (call-level room override)."""
+    args = _mine_args(tmp_path, room="docs")
+
+    with (
+        patch(
+            "mempalace.cli._resolve_cli_write_routing_or_exit",
+            return_value=_route(WriteRoutingPolicy.PREFER),
+        ),
+        patch(
+            "mempalace.cli._submit_daemon_cli_job",
+        ) as submit,
+        patch(
+            "mempalace.miner.mine",
+        ),
+    ):
+        cli.cmd_mine(args)
+
+    _kind, payload, _submitted = submit.call_args.args
+    assert payload["room"] == "docs"
+
+
+def test_cmd_mine_payload_room_defaults_to_none(tmp_path):
+    """Without --room the payload carries room=None, so per-file routing stands."""
+    args = _mine_args(tmp_path)
+
+    with (
+        patch(
+            "mempalace.cli._resolve_cli_write_routing_or_exit",
+            return_value=_route(WriteRoutingPolicy.PREFER),
+        ),
+        patch(
+            "mempalace.cli._submit_daemon_cli_job",
+        ) as submit,
+        patch(
+            "mempalace.miner.mine",
+        ),
+    ):
+        cli.cmd_mine(args)
+
+    _kind, payload, _submitted = submit.call_args.args
+    assert payload["room"] is None
 
 
 def test_cmd_mine_direct_preserves_direct_path(tmp_path):

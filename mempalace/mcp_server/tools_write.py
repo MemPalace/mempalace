@@ -651,6 +651,7 @@ def tool_mine(
     limit: int = 0,
     dry_run: bool = False,
     extract: str = "exchange",
+    room: str = None,
 ):
     """Mine a directory into the palace — the MCP equivalent of ``mempalace mine``.
 
@@ -694,6 +695,18 @@ def tool_mine(
             "success": False,
             "error": f"invalid mode '{mode}'; expected one of: {', '.join(valid_modes)}",
         }
+
+    # ``room`` overrides per-file room routing. Only the projects miner routes
+    # by folder/filename/content — convos and extract have their own room
+    # semantics — so reject it elsewhere rather than silently ignoring it
+    # (mirroring run_mine's "supported only in projects mode" guard).
+    if room is not None:
+        if mode != "projects":
+            return {"success": False, "error": "mine room is supported only in projects mode"}
+        try:
+            room = sanitize_name(room, "room")
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
 
     src = os.path.expanduser(source) if source else ""
     # convos accepts one conversation file as well as a directory — the CLI has
@@ -740,6 +753,7 @@ def tool_mine(
             agent=agent,
             limit=limit,
             dry_run=dry_run,
+            room=room,
         )
 
     try:
