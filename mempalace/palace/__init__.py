@@ -20,7 +20,9 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
+
+from .._source_state import source_fingerprint
 
 from ..backends import (
     BackendClosedError,
