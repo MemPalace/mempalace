@@ -136,7 +136,7 @@ from ..ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
 # CLI sync path and the daemon service layer can audit writes without importing
 # this module, whose import installs MCP stdio protection (os.dup2(2, 1) and
 # sys.stdout = sys.stderr) that would misroute their output.
-from ..wal import _wal_log  # noqa: E402
+from ..wal import _wal_log, _wal_result  # noqa: E402
 
 _FRAGMENT_DIR = Path(__file__).resolve().parent
 # Load order is a dependency sequence, not a catalog: later files use names
