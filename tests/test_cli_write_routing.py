@@ -370,9 +370,14 @@ def test_cmd_sweep_prefer_submits_daemon_job(tmp_path):
     submit.assert_called_once()
 
     assert submit.call_args.args[0] == "sweep"
-    assert submit.call_args.args[1] == {
-        "target": str(tmp_path / "session.jsonl"),
-    }
+    payload = submit.call_args.args[1]
+    assert payload["target"] == str(tmp_path / "session.jsonl")
+    # No explicit flags: the resolved defaults ride along (wing = source
+    # dir basename normalized, room = conversations).
+    from mempalace.config import normalize_wing_name
+
+    assert payload["wing"] == normalize_wing_name(tmp_path.name)
+    assert payload["room"] == "conversations"
 
 
 def test_init_auto_mine_daemon_preserves_prescan(
@@ -492,10 +497,121 @@ def test_service_run_sweep_file(tmp_path):
     sweep.assert_called_once_with(
         str(target),
         str(palace.resolve()),
+        wing=None,
+        room=None,
     )
     assert result["success"] is True
     assert result["exit_code"] == 0
     assert result["result"] == sweep_result
+
+
+def test_service_run_sweep_file_with_tags(tmp_path):
+    palace = tmp_path / "palace"
+    target = tmp_path / "session.jsonl"
+    target.write_text("{}\n", encoding="utf-8")
+
+    sweep_result = {
+        "drawers_added": 1,
+        "drawers_already_present": 0,
+        "drawers_skipped": 0,
+    }
+
+    with patch(
+        "mempalace.sweeper.sweep",
+        return_value=sweep_result,
+    ) as sweep:
+        result = service.run_sweep(
+            {
+                "palace_path": str(palace),
+                "target": str(target),
+                "wing": "claude",
+                "room": "conversations",
+            }
+        )
+
+    sweep.assert_called_once_with(
+        str(target),
+        str(palace.resolve()),
+        wing="claude",
+        room="conversations",
+    )
+    assert result["success"] is True
+
+
+def test_service_run_sweep_directory_with_tags(tmp_path):
+    palace = tmp_path / "palace"
+    target = tmp_path / "sessions"
+    target.mkdir()
+
+    sweep_result = {
+        "files_succeeded": 1,
+        "files_attempted": 1,
+        "drawers_added": 1,
+        "drawers_already_present": 0,
+        "drawers_skipped": 0,
+        "failures": [],
+    }
+
+    with patch(
+        "mempalace.sweeper.sweep_directory",
+        return_value=sweep_result,
+    ) as sweep_dir:
+        result = service.run_sweep(
+            {
+                "palace_path": str(palace),
+                "target": str(target),
+                "wing": "codex",
+                "room": "conversations",
+            }
+        )
+
+    sweep_dir.assert_called_once_with(
+        str(target),
+        str(palace.resolve()),
+        wing="codex",
+        room="conversations",
+    )
+    assert result["success"] is True
+
+
+def test_service_run_sweep_rejects_invalid_wing(tmp_path):
+    palace = tmp_path / "palace"
+    target = tmp_path / "session.jsonl"
+    target.write_text("{}\n", encoding="utf-8")
+
+    with patch("mempalace.sweeper.sweep") as sweep:
+        result = service.run_sweep(
+            {
+                "palace_path": str(palace),
+                "target": str(target),
+                "wing": "bad/with/slash",
+                "room": "conversations",
+            }
+        )
+
+    sweep.assert_not_called()
+    assert result["success"] is False
+    assert result["exit_code"] == 2
+    assert "wing" in result["error"]
+
+
+def test_service_run_sweep_rejects_non_string_room(tmp_path):
+    palace = tmp_path / "palace"
+    target = tmp_path / "session.jsonl"
+    target.write_text("{}\n", encoding="utf-8")
+
+    with patch("mempalace.sweeper.sweep") as sweep:
+        result = service.run_sweep(
+            {
+                "palace_path": str(palace),
+                "target": str(target),
+                "room": {"not": "a string"},
+            }
+        )
+
+    sweep.assert_not_called()
+    assert result["success"] is False
+    assert result["exit_code"] == 2
 
 
 def test_service_run_sweep_directory_partial_failure(
