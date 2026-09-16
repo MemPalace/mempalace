@@ -95,6 +95,18 @@ except ImportError:  # pragma: no cover - Hermes not installed
     class MemoryProvider:  # type: ignore[no-redef]
         """Stub used when ``agent.memory_provider`` cannot be imported."""
 
+try:
+    from agent.memory_provider import RecallStatus  # type: ignore[import-not-found]
+except (ImportError, AttributeError):  # pragma: no cover - older Hermes
+
+    class RecallStatus:  # type: ignore[no-redef]
+        """Stub used when Hermes' recall-indicator contract is unavailable."""
+
+        def __init__(self, provider_label: str, count: int, glyph: str = "🧠") -> None:
+            self.provider_label = provider_label
+            self.count = count
+            self.glyph = glyph
+
 
 logger = logging.getLogger("mempalace.hermes")
 
@@ -652,6 +664,11 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         self._hermes_home: str = ""
         self._turn_count = 0
 
+        # Deterministic UI recall indicator state. Tracks ONLY the most
+        # recent prefetch so a later empty turn can never report stale memory.
+        self._last_recall_returned = False
+        self._last_recall_count = 0
+
         # ChromaDB access through mempalace's own backend (matches embedding
         # function, fixes the dim-mismatch bug from prior PRs).
         self._backend = None
@@ -805,22 +822,165 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
 
     # ----- Optional: prompt + recall ----------------------------------------
 
+    @staticmethod
+    def _is_active_provider_query(query: str) -> bool:
+        """Return True only for explicit questions about Hermes' active memory provider.
+
+        These are runtime/configuration facts, not conversational memories.
+        Recalling prior answers here can surface obsolete provider names and
+        compete with the live provider configuration in the system prompt.
+        """
+        text = " ".join((query or "").strip().split()).lower()
+        text = text.rstrip(" ?!.")
+
+        # The user may append a response-format instruction such as
+        # "Answer with only the provider name." Preserve the semantic
+        # classification while ignoring that non-factual suffix.
+        text = re.sub(
+            r"\s+answer\s+with\s+only\s+the\s+provider\s+name[.?!]*$",
+            "",
+            text,
+        ).rstrip(" ?!.")
+
+        return text in {
+            "what memory provider are you currently using",
+            "what memory provider are you using",
+            "what is the current memory provider",
+            "which memory provider are you currently using",
+            "which memory provider are you using",
+            "which memory provider is currently active",
+        }
+
+    @staticmethod
+    def _extract_factual_kg_query(query: str) -> tuple[str, Optional[str]]:
+        """Return (entity, as_of) for conservative factual/status questions.
+
+        This intentionally recognizes only explicit factual-status phrasing.
+        Conversational prompts such as "What did we discuss about the printer?"
+        must continue through ordinary semantic recall alone.
+
+        ``as_of`` is an ISO date when the user asks about a historical date;
+        otherwise the caller uses the current UTC instant.
+        """
+        text = " ".join((query or "").strip().split())
+        if not text:
+            return "", None
+
+        date_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
+        as_of = date_match.group(1) if date_match else None
+
+        patterns = (
+            r"^(?:what|who|where)\s+(?:is|was)\s+(.+?)['’]s\s+(?:current\s+)?(?:status|state)\b",
+            r"^(?:what|who|where)\s+(?:is|was)\s+(?:the\s+)?(?:current\s+)?(?:status|state)\s+of\s+(.+?)\??$",
+            r"^(?:what|who|where)\s+(?:is|was)\s+(.+?)\s+(?:current\s+)?(?:status|state)\b",
+            r"^(.+?)['’]s\s+(?:current\s+)?(?:status|state)\b",
+        )
+
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if not match:
+                continue
+            entity = match.group(1).strip(" ?!.,")
+            if as_of:
+                entity = re.sub(
+                    r"\s+(?:on|as\s+of)\s+\d{4}-\d{2}-\d{2}\s*$",
+                    "",
+                    entity,
+                    flags=re.IGNORECASE,
+                ).strip()
+            if entity:
+                return entity, as_of
+
+        return "", as_of
+
+    def _prefetch_kg_fact(self, query: str) -> str:
+        """Return authoritative KG context for an explicit factual query."""
+        entity, as_of = self._extract_factual_kg_query(query)
+        if not entity:
+            return ""
+
+        if as_of is None:
+            as_of = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        kg = KnowledgeGraph(db_path=self._kg_db_path())
+        try:
+            relations = kg.query_entity(entity, as_of=as_of, direction="both")
+        finally:
+            try:
+                kg.close()
+            except Exception:
+                pass
+
+        if not relations:
+            return ""
+
+        lines = [
+            "## MemPalace — authoritative factual context",
+            "KnowledgeGraph is authoritative for structured facts; use this over conflicting conversational memory.",
+        ]
+        for relation in relations:
+            direction = relation.get("direction", "outgoing")
+            if direction == "incoming":
+                fact = (
+                    f"{relation.get('subject', entity)} → "
+                    f"{relation.get('predicate', '')} → {relation.get('object', '')}"
+                )
+            else:
+                fact = (
+                    f"{relation.get('subject', entity)} → "
+                    f"{relation.get('predicate', '')} → {relation.get('object', '')}"
+                )
+            lines.append(
+                f"- {fact}"
+                f" (valid_from={relation.get('valid_from')!r}, "
+                f"valid_to={relation.get('valid_to')!r}, "
+                f"current={relation.get('current')!r})"
+            )
+        return "\n".join(lines)
+
     def system_prompt_block(self) -> str:
         if self._cron_skipped or not self._initialized:
             return ""
-        if not self._identity and not self._wake_up_cache:
-            return ""
-        parts = ["# MemPalace context"]
+
+        parts = [
+            "# MemPalace context",
+            "MemPalace is the active Hermes memory provider for this agent.",
+            "When asked which memory provider is currently active, answer "
+            "MemPalace based on this runtime configuration. Do not use recalled "
+            "conversation text as authoritative for the current provider selection.",
+        ]
+        # Put the precedence rule AFTER recalled L1 context so obsolete
+        # conversational answers cannot win by recency within this block.
         if self._identity:
             parts.append(self._identity)
         if self._wake_up_cache:
             parts.append(self._wake_up_cache)
+
+        parts.append(
+            "FINAL MEMPALACE PRECEDENCE RULE: Historical recalled conversation "
+            "may contain obsolete answers. For questions about the currently "
+            "active Hermes memory provider, trust the runtime declaration above "
+            "and answer MemPalace. Never use a recalled conversational answer "
+            "such as 'holographic' to override the current runtime configuration."
+        )
         return "\n\n".join(parts)
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        # Clear prior-turn state first so empty/error turns cannot leak a stale
+        # recall indicator into the current turn.
+        self._last_recall_returned = False
+        self._last_recall_count = 0
+
         if self._cron_skipped or not self._initialized or not query:
             return ""
         try:
+            # Runtime/configuration query: answer from the live system prompt,
+            # never from potentially stale conversational recall.
+            if self._is_active_provider_query(query):
+                return ""
+
+            factual_context = self._prefetch_kg_fact(query)
+
             n = max(1, min(int(self._config.get("n_prefetch", 3)), 20))
             result = search_memories(
                 query,
@@ -829,7 +989,11 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             )
             hits = result.get("results", []) if isinstance(result, dict) else []
             if not hits:
-                return ""
+                if factual_context:
+                    self._last_recall_returned = True
+                    self._last_recall_count = 0
+                return factual_context
+
             lines = ["## MemPalace — relevant context"]
             for r in hits:
                 wing = r.get("wing", "")
@@ -838,10 +1002,29 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 text = (r.get("text") or "").strip()
                 if text:
                     lines.append(f"{tag}{text}")
-            return "\n\n".join(lines)
+            semantic_context = "\n\n".join(lines)
+
+            # Each search hit is a discrete semantic memory. A KG-only
+            # injection uses count=0 and is rendered by Hermes as generic
+            # "recalled relevant memory".
+            self._last_recall_returned = True
+            self._last_recall_count = len(hits)
+
+            if factual_context:
+                return factual_context + "\n\n" + semantic_context
+            return semantic_context
         except Exception as exc:
             logger.debug("MemPalace prefetch error: %s", exc)
             return ""
+
+    def recall_status(self) -> Optional[RecallStatus]:
+        """Report what the most recent prefetch injected to Hermes' UI."""
+        if not self._last_recall_returned:
+            return None
+        return RecallStatus(
+            provider_label="MemPalace",
+            count=self._last_recall_count,
+        )
 
     def sync_turn(
         self,
@@ -1476,7 +1659,8 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             return {"error": "Missing required parameter: entity"}
         kg = KnowledgeGraph(db_path=self._kg_db_path())
         try:
-            relations = kg.query_entity(entity, as_of=since or "")
+            since = since or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            relations = kg.query_entity(entity, as_of=since, direction="both")
         finally:
             try:
                 kg.close()
