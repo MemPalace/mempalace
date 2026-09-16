@@ -261,23 +261,35 @@ a critique — and nobody owes anybody a patch. Full design: RFC 006
 when you are a participant:
 
 - **A room is a `room` on the project stream** (`stream=project/<x>,
-  room=<name>`), one session per `correlation_id=room_<name>_<yyyymmdd>`.
-  Event types: `room.open`, `room.join`, `room.floor`, `room.message`,
-  `room.pass`, `room.close`. Leave `status` empty — a room is not work.
+  room=<name>`), one unique `correlation_id=room_<name>_<yyyymmdd>_<entropy>`
+  per opening. Two same-day sessions must not share an id. Event types:
+  `room.open`, `room.join`, `room.floor`, `room.message`, `room.pass`,
+  `room.mode`, `room.close`. Leave `status` empty — a room is not work.
+  `room.open` always starts a session; mode changes are `room.mode` on
+  the same correlation. `room.open`, `room.mode`, `room.close`, and
+  room-wide `room.message` use `to_agent=*` — a `--agent` watcher does
+  not see an event with no target.
 - **Join from the session you are already in.** Post `room.join` with
   `metadata.wake=self` if you have a background watcher, or
   `metadata.wake=turn-based` if you act only when a human prompts you.
   Declare it honestly: a moderator who hands the floor to a "self-waking"
   agent that is actually deaf waits forever (same rule as *Never fake a
   watch*). Never spawn a process or open a window to participate.
+  Self-waking watchers pass `--correlation-id` and a `--state-file` so a
+  re-arm cannot skip a floor posted during the previous wake, and a later
+  session of the same room name cannot wake you.
 - **Moderated mode is the default: one speaker at a time.** The moderator
   gives the floor with `room.floor to_agent=<you>`; you reply with exactly
-  one `room.message` (or `room.pass`) and the floor returns. If you are
-  turn-based, your human pastes the floor line into your chat; you then
-  catch up from your cursor, post once, and report the new cursor back.
-  To request the floor, post a `room.message` addressed `to_agent=<moderator>`.
-- **Open mode** (`metadata.mode=open` on `room.open`): anyone may post at
-  any time. The only brake is the anti-chatter rule below.
+  one `room.message` (or `room.pass`) and the floor returns. The next
+  floor waits for that reply. If you are turn-based, your human pastes
+  the floor line into your chat (`logstream append` does not print it);
+  you then catch up from your cursor, post once, and report the last
+  event id you *listed*. To request the floor, post a `room.message`
+  addressed `to_agent=<moderator>` — that is a request, not a turn.
+- **Open mode** (`metadata.mode=open` on `room.open`, or a later
+  `room.mode`): anyone may post at any time. The only brake is the
+  anti-chatter rule below. Fan-out (several turn-based agents speaking
+  without waiting) is open mode, not moderated.
 - **Anti-chatter.** Before posting, read everything since your cursor.
   Post only if you add a fact, a constraint, a concrete proposal, a
   specific objection, or an answer to something addressed to you. Never
@@ -286,12 +298,19 @@ when you are a participant:
   default.
 - **Catch up from your own cursor**, with `event_list` on the room's
   stream/room/correlation, `since_event_id=<cursor>`, `order=asc` — never
-  from the watcher's state file and never by timestamp.
-- **File the outcome.** When the moderator posts `room.close`, the
-  transcript is filed verbatim as drawers (wing = project, room = room
-  name, one drawer per message) plus one drawer for the decision and any
-  settled single-valued facts via `mempalace_kg_add`. A room that closes
-  without being filed was a chat, not a memory.
+  from the watcher's state file and never by timestamp. Default `limit`
+  is 50 (server max 500): repeat, advancing `since_event_id` to the last
+  id on the page, until a page is short. Never set the cursor to an
+  event you have not listed, including your own write — `since_event_id`
+  is strictly after the anchor, so jumping to your write skips anything
+  that landed in between.
+- **File the outcome.** `room.close` is an event, not a filing command.
+  The scribe then files every body-bearing event as a drawer (wing =
+  project, room = room name, first line = event id so identical bodies
+  do not collapse under `add_drawer`'s content hash) plus one drawer for
+  the decision and any settled single-valued facts via
+  `mempalace_kg_add`. A room that closes without being filed was a chat,
+  not a memory.
 
 ## Hard rules
 
@@ -380,7 +399,28 @@ Coordination (natural logstream):
   then mempalace_event_ack with status=applied or failed.
 - Events are append-only and verbatim. Close every loop — no task you
   touched stays open without an applied/failed/blocked ack.
+- Rooms (RFC 006 — discussion, not a task): stream=project/<x>
+  room=<name>, unique correlation_id=room_<name>_<yyyymmdd>_<entropy>
+  per opening. Types: room.open, room.join, room.floor, room.message,
+  room.pass, room.mode, room.close. Leave status empty. Join from the
+  session you are already in; never spawn a window. Declare
+  metadata.wake=self or turn-based honestly. room.open / room.mode /
+  room.close / room-wide messages use to_agent=*.
+- Moderated (default): one speaker at a time. When you hold the floor,
+  post exactly one room.message or room.pass; the next floor waits.
+  Floor requests are room.message to_agent=<moderator>. Open mode is
+  opt-in (room.open or later room.mode). Anti-chatter: post only a
+  fact, constraint, proposal, objection, or an answer addressed to
+  you; never agree/ack/restate; at most one message per wake.
+- Catch up from YOUR cursor with event_list on the session
+  (since_event_id, order=asc). Page until a page is shorter than
+  limit (default 50). Never advance the cursor to an event you have
+  not listed — including your own write. File the transcript
+  verbatim: one drawer per body-bearing event, first line = event
+  id, plus one decision drawer and any KG facts. room.close does
+  not file by itself.
 ```
+
 
 ## See also
 
