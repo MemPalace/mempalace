@@ -936,6 +936,31 @@ def main():
         help="Storage backend (default: config/env/detected/chroma)",
     )
 
+    # hermes
+    p_hermes = sub.add_parser("hermes", help="Hermes agent integration commands")
+    hermes_sub = p_hermes.add_subparsers(dest="hermes_command")
+
+    p_hermes_install = hermes_sub.add_parser(
+        "install",
+        help="Install the MemPalace memory provider plugin into your Hermes agent",
+    )
+    p_hermes_install.add_argument(
+        "--hermes-home",
+        default=None,
+        metavar="PATH",
+        help="Path to Hermes home directory [default: ~/.hermes]",
+    )
+    p_hermes_install.add_argument(
+        "--skip-backfill",
+        action="store_true",
+        help="Skip mining existing Hermes sessions into the palace",
+    )
+    p_hermes_install.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip all confirmation prompts",
+    )
+
     args = parser.parse_args()
     _apply_backend_arg(args)
 
@@ -958,6 +983,14 @@ def main():
             return
         args.name = name
         cmd_instructions(args)
+        return
+
+    if args.command == "hermes":
+        if not getattr(args, "hermes_command", None):
+            p_hermes.print_help()
+            return
+        if args.hermes_command == "install":
+            cmd_hermes_install(args)
         return
 
     if args.command == "palace":
