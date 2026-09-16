@@ -954,8 +954,17 @@ class TestCacheInvalidation:
                 closed.append(path)
 
         class _FakeCol:
-            def count(self):
-                return 3
+            # The reconnect diagnostic reports LOGICAL drawers, so the fake has
+            # to serve the row path rather than a bare count(): three unchunked
+            # drawers -> 3 drawers / 0 chunks / 3 rows.
+            def get(self, **kwargs):
+                if kwargs.get("offset"):
+                    return {"ids": [], "documents": [], "metadatas": []}
+                return {
+                    "ids": ["a", "b", "c"],
+                    "documents": ["", "", ""],
+                    "metadatas": [{"wing": "w", "room": "r"}] * 3,
+                }
 
         monkeypatch.setattr(palace, "get_backend_for_palace", lambda _path: _FakeBackend())
         monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: False)
@@ -965,6 +974,8 @@ class TestCacheInvalidation:
 
         assert result["success"] is True
         assert result["drawers"] == 3
+        assert result["chunks"] == 0
+        assert result["rows"] == 3
         assert len(closed) == 1
         assert closed[0].local_path == palace_path
 
