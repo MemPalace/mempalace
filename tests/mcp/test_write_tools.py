@@ -1576,6 +1576,30 @@ class TestDeleteDrawers:
         assert result["deleted"] == 1
         assert tool_status()["total_drawers"] == 2
 
+    def test_registered_and_dispatchable(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import handle_request
+
+        # Listed in tools/list
+        listed = handle_request({"method": "tools/list", "id": 1, "params": {}})
+        names = {t["name"] for t in listed["result"]["tools"]}
+        assert "mempalace_delete_drawers" in names
+
+        # Dispatches and defaults to dry-run (no destructive side effect)
+        resp = handle_request(
+            {
+                "method": "tools/call",
+                "id": 2,
+                "params": {
+                    "name": "mempalace_delete_drawers",
+                    "arguments": {"wing": "doomed"},
+                },
+            }
+        )
+        content = json.loads(resp["result"]["content"][0]["text"])
+        assert content["dry_run"] is True
+        assert content["match_count"] == 2
+
 
 class TestMoveDrawers:
     """``tool_move_drawers`` — bulk re-file by explicit id or by wing/room scope."""
@@ -1701,6 +1725,30 @@ class TestMoveDrawers:
         assert result["moved"] == 1
         assert tool_list_drawers(wing="origin", room="archive")["total"] == 1
         assert tool_list_drawers(wing="origin", room="general")["total"] == 1
+
+    def test_registered_and_dispatchable(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import handle_request
+
+        # Listed in tools/list
+        listed = handle_request({"method": "tools/list", "id": 1, "params": {}})
+        names = {t["name"] for t in listed["result"]["tools"]}
+        assert "mempalace_move_drawers" in names
+
+        # Dispatches and defaults to dry-run (no destructive side effect)
+        resp = handle_request(
+            {
+                "method": "tools/call",
+                "id": 2,
+                "params": {
+                    "name": "mempalace_move_drawers",
+                    "arguments": {"wing": "origin", "target_wing": "dest"},
+                },
+            }
+        )
+        content = json.loads(resp["result"]["content"][0]["text"])
+        assert content["dry_run"] is True
+        assert content["match_count"] == 2
 
 
 # ── KG Tools ────────────────────────────────────────────────────────────
