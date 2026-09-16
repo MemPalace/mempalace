@@ -335,24 +335,33 @@ def cmd_sweep(args):
         args,
         "sweep",
     )
+
+    # --room only takes effect alongside --wing (a room needs a wing to nest
+    # in); flag the no-op rather than dropping the value silently. The sweeper
+    # treats a blank value as unset, and so does this check. It runs before
+    # the route is taken, so a daemon-routed sweep warns the same way.
+    if (args.room or "").strip() and not (args.wing or "").strip():
+        print("  WARNING: --room is ignored without --wing.", file=sys.stderr)
+
     if routing.use_daemon:
         _submit_daemon_cli_job(
             "sweep",
-            {"target": target},
+            {"target": target, "wing": args.wing, "room": args.room},
             args,
             background=bool(getattr(args, "background", False)),
             auto_start=routing.decision.auto_start_daemon,
         )
         return
+
     if os.path.isfile(target):
-        result = sweep(target, palace_path)
+        result = sweep(target, palace_path, wing=args.wing, room=args.room)
         print(
             f"  Swept {target}: +{result['drawers_added']} new, "
             f"{result['drawers_already_present']} already present, "
             f"{result['drawers_skipped']} skipped (< cursor)."
         )
     elif os.path.isdir(target):
-        result = sweep_directory(target, palace_path)
+        result = sweep_directory(target, palace_path, wing=args.wing, room=args.room)
         print(
             f"  Swept {result['files_succeeded']}/{result['files_attempted']} "
             f"files from {target}: +{result['drawers_added']} new, "
