@@ -21,6 +21,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   write looked frozen. The temporary name is now opened directly with
   `O_CREAT | O_EXCL`, retried only on a real collision and only a few times, so
   the permission error reaches the fallback on every interpreter. (#2530)
+- **Importing `mempalace.mcp_server` no longer parses the importing program's
+  command line.** `mempalace-light-mcp --help` printed the full server's options,
+  and a host program exited 2 on its own `--port abc`. The entry points apply
+  their flags now, so `mempalace-light-mcp --palace` also starts instead of
+  raising `AttributeError`. A daemon started with
+  `mempalace daemon start --foreground` and no `--palace` now writes `mcp_tool`
+  knowledge-graph facts beside its palace, not to
+  `~/.mempalace/knowledge_graph.sqlite3`. (#2528)
 
 ### Upgrade notes
 

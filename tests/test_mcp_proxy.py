@@ -9,7 +9,9 @@ light, and losing the hub must still leave a working -- and visibly degraded
 -- session rather than a broken one.
 """
 
+import io
 import json
+import os
 import subprocess
 import sys
 import urllib.error
@@ -233,3 +235,63 @@ def test_importing_the_proxy_does_not_import_the_storage_stack():
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "", f"heavy modules imported by the proxy: {out.stdout.strip()}"
+
+
+def test_local_fallback_serves_the_palace_the_proxy_was_started_for(monkeypatch, tmp_path):
+    """When the hub this proxy started with is gone, the proxy serves the session
+    in-process through _LocalServer.load(), which never runs the server's main(),
+    so the proxy's own flags have to be applied there. Otherwise the session
+    silently serves the configured default palace."""
+    from _mcp_server_helpers import _keep_server_command_line_state
+    from mempalace import mcp_server
+
+    _keep_server_command_line_state(monkeypatch)
+    monkeypatch.setattr(mcp_server, "_restore_stdout", lambda: None)
+    monkeypatch.setattr(mcp_server, "_start_idle_exit_watchdog", lambda: None)
+    monkeypatch.setattr(mcp_server, "_start_write_stall_watchdog", lambda: None)
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    palace = tmp_path / "palace"
+    # --collection is a light-server flag the proxy lets through; the server's
+    # parser has to ignore it.
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "mempalace-mcp",
+            "--palace",
+            str(palace),
+            "--backend",
+            "sqlite_exact",
+            "--collection",
+            "c",
+            "--read-only",
+        ],
+    )
+
+    module = mcp_proxy._LocalServer().load()
+
+    assert module is mcp_server
+    assert mcp_server._config.palace_path == str(palace)
+    assert mcp_server._resolve_kg_path() == str(palace / "knowledge_graph.sqlite3")
+    assert mcp_server._READ_ONLY is True
+    assert os.environ["MEMPALACE_BACKEND"] == "sqlite_exact"
+
+
+def test_local_fallback_restores_stdout_before_a_flag_can_be_refused(monkeypatch):
+    """A refused flag must not leave fd 1 pointing at stderr: the proxy keeps
+    answering over stdout after a failed load, and a client waiting there would
+    never see a response."""
+    from _mcp_server_helpers import _keep_server_command_line_state
+    from mempalace import mcp_server
+    from mempalace.backends.registry import BackendUnavailableError
+
+    _keep_server_command_line_state(monkeypatch)
+    restored = []
+    monkeypatch.setattr(mcp_server, "_restore_stdout", lambda: restored.append(True))
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    monkeypatch.setattr(sys, "argv", ["mempalace-mcp", "--backend", "no-such-backend"])
+
+    with pytest.raises(BackendUnavailableError):
+        mcp_proxy._LocalServer().load()
+
+    assert restored == [True]

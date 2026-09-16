@@ -573,6 +573,7 @@ def run_diary_write(payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+@_restores_palace_env
 def run_mcp_tool(payload: dict[str, Any]) -> dict[str, Any]:
     """Execute an MCP tool by name over the daemon queue.
 
@@ -595,11 +596,18 @@ def run_mcp_tool(payload: dict[str, Any]) -> dict[str, Any]:
             "error": f"daemon mcp_tool only accepts write tools; {name!r} is {classification}",
             "exit_code": 2,
         }
-    from .mcp_server import TOOLS
+    from . import mcp_server
 
-    if name not in TOOLS:
+    # A daemon serves the one palace it was started for. Point the server at it
+    # as --palace would, which is also what puts knowledge-graph writes beside
+    # that palace rather than in the per-user default graph. The decorator
+    # restores the environment variable; the server's --palace flag stays raised
+    # for the daemon's lifetime, as it would for a server started with --palace.
+    mcp_server._apply_server_flags(palace=payload.get("palace_path"))
+
+    if name not in mcp_server.TOOLS:
         return {"success": False, "error": f"unknown MCP tool: {name}", "exit_code": 2}
-    result = TOOLS[name]["handler"](**arguments)
+    result = mcp_server.TOOLS[name]["handler"](**arguments)
     if isinstance(result, dict):
         # Several write tools signal failure with a bare {"error": ...} and no
         # explicit success flag (e.g. tool_create_tunnel / tool_delete_tunnel

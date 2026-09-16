@@ -1015,17 +1015,11 @@ def main():
     parser.add_argument("--read-only", action="store_true", help="Run in read-only mode")
     args = parser.parse_args()
 
-    if args.palace:
-        mcp_server._config.palace_path = args.palace
-        os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(args.palace)
+    mcp_server._apply_server_flags(
+        palace=args.palace, backend=args.backend, read_only=args.read_only
+    )
     if args.collection:
         mcp_server._config.collection_name = args.collection
-    if args.backend:
-        backend_name = str(args.backend).strip().lower()
-        os.environ["MEMPALACE_BACKEND_EXPLICIT"] = backend_name
-        os.environ["MEMPALACE_BACKEND"] = backend_name
-    if args.read_only:
-        mcp_server._READ_ONLY = True
 
     # Run stdio protocol loop with lightweight dispatcher
     _restore_stdout()

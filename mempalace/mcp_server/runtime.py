@@ -432,6 +432,10 @@ def _install_shutdown_signal_handlers() -> None:
 def main():
     """MCP server entry point for the ``mempalace-mcp`` console script.
 
+    Parses ``sys.argv`` and applies ``--palace`` / ``--backend`` / ``--read-only``
+    to the process, including ``MEMPALACE_PALACE_PATH`` and ``MEMPALACE_BACKEND``
+    in ``os.environ``; importing the package parses no argv (#2528).
+
     Side effect: pops ``PYTHONPATH`` from ``os.environ`` (see #1423) so any
     subprocess this server spawns inherits a clean env. Host applications that
     call ``main()`` programmatically should be aware that the parent process
@@ -444,6 +448,10 @@ def main():
       process, avoiding the long-lived stdio framing failure surface from
       #1801.
     """
+    global _args
+
+    _args = _parse_args()
+    _apply_server_flags(palace=_args.palace, backend=_args.backend, read_only=_args.read_only)
 
     # Drop leaked PYTHONPATH so any subprocess this server spawns starts
     # with a clean env. The sys.path filter in mempalace/__init__.py

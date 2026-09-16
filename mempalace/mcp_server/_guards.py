@@ -18,7 +18,7 @@ def _get_result_ids(result) -> list:
     return []
 
 
-def _parse_args():
+def _parse_args(argv=None):
     parser = argparse.ArgumentParser(description="MemPalace MCP Server")
     parser.add_argument(
         "--palace",
@@ -64,33 +64,61 @@ def _parse_args():
         help="Serve a read-only tool surface: the tools that change state are hidden "
         "from tools/list and refused at dispatch (env MEMPALACE_MCP_READ_ONLY)",
     )
-    args, unknown = parser.parse_known_args()
+    args, unknown = parser.parse_known_args(argv)
     if unknown:
         logger.debug("Ignoring unknown args: %s", unknown)
     return args
 
 
-_args = _parse_args()
+# Defaults only. Programs other than this server import this package too (the
+# light server, the daemon, the hook runner, integrations), so parsing a command
+# line is left to the entry points, which apply their flags with
+# _apply_server_flags() before serving (#2528). A reload keeps what they applied,
+# here and in _READ_ONLY and _palace_flag_given below.
+_args = globals().get("_args") or _parse_args([])
 
-if _args.palace:
-    os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(_args.palace)
-if _args.backend:
-    backend_name = str(_args.backend).strip().lower()
-    from ..backends import get_backend_class  # noqa: E402
 
-    get_backend_class(backend_name)
-    os.environ["MEMPALACE_BACKEND_EXPLICIT"] = backend_name
-    os.environ["MEMPALACE_BACKEND"] = backend_name
+def _apply_server_flags(palace=None, backend=None, read_only=False) -> None:
+    """Apply ``--palace`` / ``--backend`` / ``--read-only`` to this process.
+
+    Call it before the server handles a request: everything the import derived
+    from these flags' defaults is derived again here.
+    """
+    global _READ_ONLY, _palace_flag_given
+    global _STALE_LIBRARY_WATCHED_DISTS, _STARTUP_DIST_STATE
+    global _STARTUP_DIST_VERSIONS, _STARTUP_DIST_ERRORS
+
+    if backend:
+        backend_name = str(backend).strip().lower()
+        from ..backends import get_backend_class
+
+        get_backend_class(backend_name)
+        os.environ["MEMPALACE_BACKEND_EXPLICIT"] = backend_name
+        os.environ["MEMPALACE_BACKEND"] = backend_name
+        # The stale-library gate's watch list follows _config.backend, which
+        # --backend sets through MEMPALACE_BACKEND unless config.json names a
+        # backend, and its baseline was read at import for the list watched then.
+        watched = _stale_library_watched_dists()
+        if watched != _STALE_LIBRARY_WATCHED_DISTS:
+            _STALE_LIBRARY_WATCHED_DISTS = watched
+            _STARTUP_DIST_STATE = _initial_dist_state()
+            _STARTUP_DIST_VERSIONS, _STARTUP_DIST_ERRORS = _STARTUP_DIST_STATE
+    if palace:
+        os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(palace)
+        _palace_flag_given = True
+    if read_only:
+        _READ_ONLY = True
+
 
 _config = MempalaceConfig()
 
 # Read-only server mode: when on, the tools in _READ_ONLY_REFUSED_TOOLS (defined
 # below) are hidden from tools/list and refused at dispatch (-32003). That is a
-# wider set than the _MUTATING_TOOLS the peer-writer guard uses. Resolved once at
-# startup from --read-only or MEMPALACE_MCP_READ_ONLY. Computed inline (not via
-# _truthy_env, defined below) so it is available to the request path regardless
-# of import order.
-_READ_ONLY = bool(getattr(_args, "read_only", False)) or os.environ.get(
+# wider set than the _MUTATING_TOOLS the peer-writer guard uses. Resolved at
+# startup: from MEMPALACE_MCP_READ_ONLY here, and from --read-only by
+# _apply_server_flags(). Computed inline (not via _truthy_env, defined below) so it
+# is available to the request path regardless of import order.
+_READ_ONLY = globals().get("_READ_ONLY", False) or os.environ.get(
     "MEMPALACE_MCP_READ_ONLY", ""
 ).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -103,7 +131,8 @@ _logstream_cache_lock = threading.Lock()
 # Keep that entire scope single-threaded even when tool_search is invoked
 # outside the HTTP dispatch lock (tests, embedded hosts, future transports).
 _cli_search_capture_lock = threading.Lock()
-_palace_flag_given: bool = bool(_args.palace)
+# Raised by _apply_server_flags() for --palace; _resolve_kg_path() reads it.
+_palace_flag_given: bool = globals().get("_palace_flag_given", False)
 
 # MCP server idle auto-exit (#1552).  Stale MCP servers from ended Claude
 # Code sessions do not self-terminate, accumulating ChromaDB/HNSW file
@@ -323,9 +352,9 @@ _READ_ONLY_REFUSED_TOOLS = _MUTATING_TOOLS | {
 # chromadb is a hard dependency rather than an extra, so it is installed even
 # for someone serving from pgvector, and watching it unconditionally would
 # refuse that person's writes over an upgrade to a library that touches nothing
-# they own. The backend is read once here, at import, from the same config the
-# server goes on to serve with. One that cannot be resolved counts as chroma:
-# watching a distribution that turns out not to matter costs a restart, while
+# they own. The backend is read from _config here at import, and again when
+# _apply_server_flags() applies --backend. One that cannot be resolved counts as
+# chroma: watching a distribution that turns out not to matter costs a restart, while
 # not watching the one that does costs the silent corruption this exists to
 # prevent.
 #
