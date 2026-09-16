@@ -113,6 +113,10 @@ Agents get lighter ways in: a 3-tool MCP server with Palace Query Language, shar
 - **Hallway recompute reads only the mined wing.** `compute_hallways_for_wing` fetched every drawer in the palace on each mine; it now pages through `get(where={"wing": ...})` in bounded pages, keeping the #1619 variable-limit protection, so the cost follows the wing rather than the palace. On Qdrant, whose `get()` still scrolls `offset + limit` rows for each page, a wing larger than one page re-reads its earlier pages. (#2466, #2477)
 - **CLI `status` reads backend metadata in one pass when the direct SQLite tally is unavailable.** Chroma palaces are still tallied straight from `chroma.sqlite3`. On the collection path, used by backends such as Qdrant, `status()` now calls `get_all_metadata()` when the collection exposes it instead of paging with `get()`: 1 m 46 s down to 3.4 s on a 160k-drawer Qdrant palace. (#2153, #2154)
 
+### Performance
+
+- **pgvector lexical search no longer scrolls the whole table.** `lexical_search` pushed every document over the wire on every call, which made hybrid search unusable on a remote palace of ~141k drawers. Postgres now evaluates a substring filter that is a provable superset of the documents BM25 can score above zero, so only candidate rows cross the wire. Scoring, ranking and the `n_results` cut stay client-side and produce the same ids and the same scores as before. Collections gain a `token_count` column and a `pg_trgm` index; a palace created earlier picks both up on open and is backfilled once. `maintenance_state()` now reports `lexical_pushdown` so an operator can see which path a collection is on. (#2165)
+
 ### Bug Fixes
 
 - **`init` accepts `--palace` in the natural invocation order (#2366).** `mempalace init <dir> --palace <path>` previously failed with `unrecognized arguments: --palace` because the flag was registered only on the global parser. `--palace` now mirrors the existing `serve` subcommand pattern (#1877), so both `--palace <path> init <dir>` and `init <dir> --palace <path>` work. The global form takes precedence on Python <3.12 where subparser defaults can otherwise clobber it.
