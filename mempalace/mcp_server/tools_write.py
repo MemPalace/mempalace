@@ -330,6 +330,19 @@ def _collapse_drawer_rows(ids, documents, metadatas):
     return drawers
 
 
+def count_drawer_rows(ids, documents, metadatas) -> DrawerCount:
+    """Count one fetched row set as logical drawers plus physical rows.
+
+    A missing ``chunks`` key counts as 0: ``_collapse_drawer_rows`` only sets it
+    on grouped drawers, so an unchunked single carries none.
+    """
+    collapsed = _collapse_drawer_rows(ids, documents, metadatas)
+    chunks = 0
+    for drawer in collapsed:
+        chunks += int(drawer.get("chunks") or 0)
+    return DrawerCount(drawers=len(collapsed), chunks=chunks, rows=len(ids))
+
+
 def _build_chunk_rows(drawer_id: str, content: str, meta: dict, chunk_size: int):
     chunk_size = max(1, int(chunk_size or 1))
 

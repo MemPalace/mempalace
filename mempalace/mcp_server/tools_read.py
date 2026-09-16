@@ -129,13 +129,31 @@ def _sqlite_taxonomy():
     normalized: dict = {}
     for wing, room_counts in wing_rooms.items():
         dest = normalized.setdefault(_norm(wing), {})
-        for room, n in room_counts.items():
+        for room, count in room_counts.items():
             rkey = _norm(room)
-            dest[rkey] = dest.get(rkey, 0) + n
+            dest[rkey] = dest.get(rkey, DRAWER_COUNT_ZERO) + count
     result = total, normalized
     _taxonomy_cache = (cache_key, result)
     _taxonomy_cache_time = now
     return result
+
+
+def _drawer_totals(wing_rooms, wing=None):
+    """Collapse a ``{wing: {room: DrawerCount}}`` tally into per-wing/per-room ints.
+
+    These are logical drawer counts, so a total reported here agrees with what
+    ``list_drawers`` shows for the same scope — which is the whole point of
+    routing every count through ``DrawerCount``.
+    """
+    wings = {}
+    rooms = {}
+    for w, room_counts in wing_rooms.items():
+        if wing and w != wing:
+            continue
+        for r, count in room_counts.items():
+            wings[w] = wings.get(w, 0) + count.drawers
+            rooms[r] = rooms.get(r, 0) + count.drawers
+    return wings, rooms
 
 
 def _sqlite_graph_stats():
@@ -282,14 +300,11 @@ def tool_status():
     fast = _sqlite_taxonomy()
     if fast is not None:
         total, wing_rooms = fast
-        wings = {}
-        rooms = {}
-        for w, room_counts in wing_rooms.items():
-            wings[w] = wings.get(w, 0) + sum(room_counts.values())
-            for r, n in room_counts.items():
-                rooms[r] = rooms.get(r, 0) + n
+        wings, rooms = _drawer_totals(wing_rooms)
         return {
-            "total_drawers": total,
+            "total_drawers": total.drawers,
+            "total_chunks": total.chunks,
+            "total_rows": total.rows,
             "wings": wings,
             "rooms": rooms,
             "protocol": PALACE_PROTOCOL,
@@ -400,9 +415,7 @@ def tool_list_wings():
     fast = _sqlite_taxonomy()
     if fast is not None:
         _total, wing_rooms = fast
-        wings = {}
-        for w, room_counts in wing_rooms.items():
-            wings[w] = wings.get(w, 0) + sum(room_counts.values())
+        wings, _rooms = _drawer_totals(wing_rooms)
         return {"wings": wings}
     col = _get_collection()
     if not col:
@@ -447,12 +460,7 @@ def tool_list_rooms(wing: str = None):
     fast = _sqlite_taxonomy()
     if fast is not None:
         _total, wing_rooms = fast
-        rooms = {}
-        for w, room_counts in wing_rooms.items():
-            if wing and w != wing:
-                continue
-            for r, n in room_counts.items():
-                rooms[r] = rooms.get(r, 0) + n
+        _wings, rooms = _drawer_totals(wing_rooms, wing=wing)
         return {"wing": wing or "all", "rooms": rooms}
     col = _get_collection()
     if not col:
@@ -498,7 +506,12 @@ def tool_get_taxonomy():
     fast = _sqlite_taxonomy()
     if fast is not None:
         _total, wing_rooms = fast
-        return {"taxonomy": {w: dict(room_counts) for w, room_counts in wing_rooms.items()}}
+        return {
+            "taxonomy": {
+                w: {r: count.drawers for r, count in room_counts.items()}
+                for w, room_counts in wing_rooms.items()
+            }
+        }
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()

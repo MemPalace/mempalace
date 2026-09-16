@@ -98,6 +98,41 @@ class EmbedderIdentityUnknownWarning(UserWarning):
 
 
 @dataclass(frozen=True)
+class DrawerCount:
+    """A set of stored rows counted in both logical and physical units.
+
+    ``drawers`` counts logical drawers and ``chunks`` the child rows attached to
+    them, matching what the drawer-listing tools show. ``rows`` is what the
+    backend physically stores, and is what a bulk move or delete actually
+    touches. Reporting all three is what keeps "how many drawers" from meaning
+    two different things in two different tools.
+
+    ``rows`` is counted rather than derived: a backend that stores both a legacy
+    logical row and its chunks can drop the duplicate, so ``rows`` is not always
+    ``drawers + chunks``.
+    """
+
+    drawers: int
+    chunks: int
+    rows: int
+
+    def __add__(self, other: "DrawerCount") -> "DrawerCount":
+        """Sum two counts, so a caller can aggregate across wings or rooms."""
+        return DrawerCount(
+            drawers=self.drawers + other.drawers,
+            chunks=self.chunks + other.chunks,
+            rows=self.rows + other.rows,
+        )
+
+    def as_dict(self) -> dict[str, int]:
+        """Flat form, for embedding in an existing tool response."""
+        return {"drawers": self.drawers, "chunks": self.chunks, "rows": self.rows}
+
+
+DRAWER_COUNT_ZERO = DrawerCount(drawers=0, chunks=0, rows=0)
+
+
+@dataclass(frozen=True)
 class PalaceRef:
     """A handle to a palace, consumed by backends.
 
