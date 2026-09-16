@@ -237,6 +237,30 @@ def test_enforcement_model_swap_raises(tmp_path, monkeypatch, clear_identity_cac
         P.get_collection(str(tmp_path), collection_name="mempalace_drawers", create=False)
 
 
+def test_enforcement_fp16_variant_rejects_legacy_q8_palace(
+    tmp_path, monkeypatch, clear_identity_cache
+):
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "embeddinggemma")
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", "fp16")
+    from mempalace import palace as P
+
+    _seed_sqlite_with_identity(tmp_path, "embeddinggemma")
+    P._VALIDATED_IDENTITY.clear()
+
+    with pytest.raises(EmbedderIdentityMismatchError):
+        P.get_collection(str(tmp_path), collection_name="mempalace_drawers", create=False)
+
+
+def test_default_q8_variant_keeps_legacy_embeddinggemma_identity(monkeypatch):
+    """Characterize the pre-variant identity so existing palaces still open."""
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "embeddinggemma")
+    monkeypatch.delenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", raising=False)
+    from mempalace.embedding import current_model_name
+
+    assert current_model_name() == "embeddinggemma"
+
+
 def test_enforcement_brand_new_records_current_model(tmp_path, monkeypatch, clear_identity_cache):
     monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
     monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "minilm")
@@ -307,6 +331,34 @@ def test_set_palace_identity_override_requires_force(tmp_path, monkeypatch, clea
     # With force it goes through, recording the name only (no foreign load).
     old, new = P.set_palace_embedder_identity(str(tmp_path), model="embeddinggemma", force=True)
     assert old.model_name == "minilm" and new.model_name == "embeddinggemma"
+
+
+def test_set_palace_identity_canonicalizes_explicit_embeddinggemma_q8(
+    tmp_path, monkeypatch, clear_identity_cache
+):
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "minilm")
+    from mempalace import palace as P
+
+    old, new = P.set_palace_embedder_identity(str(tmp_path), model="embeddinggemma:q8", force=True)
+
+    assert old is None
+    assert new.model_name == "embeddinggemma"
+    stored = _sqlite_collection(tmp_path).get_stored_embedder_identity()
+    assert stored is not None and stored.model_name == "embeddinggemma"
+
+
+def test_set_palace_identity_rejects_unknown_embeddinggemma_variant(
+    tmp_path, monkeypatch, clear_identity_cache
+):
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "minilm")
+    from mempalace import palace as P
+
+    with pytest.raises(ValueError, match="EmbeddingGemma identity variant.*fp16.*q8"):
+        P.set_palace_embedder_identity(str(tmp_path), model="embeddinggemma:fp32", force=True)
+
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_set_palace_identity_empty_target_raises(tmp_path, monkeypatch):
