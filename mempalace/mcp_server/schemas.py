@@ -525,6 +525,66 @@ TOOLS = {
         },
         "handler": tool_delete_by_source,
     },
+    "mempalace_delete_drawers": {
+        "description": "Bulk-delete drawers by explicit drawer_ids, or by wing and/or room scope. Refuses an unscoped call. Returns a dry-run match count and a sample of the affected (wing, room) pairs by default; pass dry_run=false to commit. Irreversible.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "drawer_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Explicit drawer IDs to delete. Takes precedence over wing/room. Optional.",
+                },
+                "wing": {
+                    "type": "string",
+                    "description": "Scope filter: delete every drawer in this wing (optional)",
+                },
+                "room": {
+                    "type": "string",
+                    "description": "Scope filter: delete every drawer in this room (optional)",
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Preview the match count without deleting; default true. Pass false to actually delete.",
+                },
+            },
+        },
+        "handler": tool_delete_drawers,
+    },
+    "mempalace_move_drawers": {
+        "description": "Bulk-move drawers to another wing and/or room without touching their content. Scope by explicit drawer_ids or by wing and/or room; refuses an unscoped call. Returns a dry-run match count and sample by default; pass dry_run=false to commit.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "drawer_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Explicit drawer IDs to move. Takes precedence over wing/room. Optional.",
+                },
+                "wing": {
+                    "type": "string",
+                    "description": "Scope filter: move every drawer in this wing (optional)",
+                },
+                "room": {
+                    "type": "string",
+                    "description": "Scope filter: move every drawer in this room (optional)",
+                },
+                "target_wing": {
+                    "type": "string",
+                    "description": "Destination wing (optional if target_room is given)",
+                },
+                "target_room": {
+                    "type": "string",
+                    "description": "Destination room (optional if target_wing is given)",
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Preview the match count without moving; default true. Pass false to actually move.",
+                },
+            },
+        },
+        "handler": tool_move_drawers,
+    },
     "mempalace_sync": {
         "description": "Prune drawers whose source files are gitignored, deleted, or moved. Returns dry-run report by default; pass apply=true to commit deletions.",
         "input_schema": {

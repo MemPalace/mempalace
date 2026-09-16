@@ -973,6 +973,378 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
         return {"success": False, "error": str(e)}
 
 
+# --- Bulk drawer operations ------------------------------------------------
+#
+# Two shapes, because the backend APIs differ. A delete is pushed down as one
+# ``where`` clause: no client-side id list, so neither the SQLite variable
+# limit nor the 10k get() truncation applies (the idiom delete_by_source uses).
+# An update needs explicit ids, so it enumerates and then BATCHES -- one
+# ``col.update`` per _BULK_DRAWER_BATCH rows, never one call per drawer.
+#
+# The fan-out form is what wedges a palace. chromadb's Rust upsert blocks with
+# no timeout of its own while the process holds the mine lock, so N concurrent
+# round trips turn a slow move into a palace-wide outage.
+_BULK_DRAWER_BATCH = 500
+
+
+def _bulk_scope_where(drawer_ids, wing: str = None, room: str = None):
+    """Resolve a bulk selection to ``(where, explicit_ids, error)``.
+
+    Explicit ids win over a wing/room filter when both are given. A call with
+    neither is refused: unscoped, these tools match every drawer in the palace,
+    which is never what a caller means. Both forms come back as a ``where``
+    dict so the fetch helpers stay the single pagination path.
+    """
+    explicit = [str(item).strip() for item in (drawer_ids or []) if str(item).strip()]
+    if explicit:
+        # Returned as ids, never as a where clause: chroma's ``where`` matches
+        # metadata only, and a plain drawer carries no parent key, so an
+        # id-shaped ``where`` would silently match nothing. The caller resolves
+        # these through _bulk_explicit_rows instead.
+        return None, explicit, None
+
+    conditions = []
+    if wing:
+        conditions.append({"wing": wing})
+    if room:
+        conditions.append({"room": room})
+    if not conditions:
+        return (
+            None,
+            None,
+            (
+                "Refusing an unscoped bulk operation: pass drawer_ids, or wing and/or "
+                "room to bound it. Without a scope this would match every drawer in "
+                "the palace."
+            ),
+        )
+    # Chroma rejects a multi-key ``where`` -- conjoined filters must be an
+    # explicit $and (palace_graph.py builds wing+room the same way).
+    where = conditions[0] if len(conditions) == 1 else {"$and": conditions}
+    return where, None, None
+
+
+def _bulk_explicit_rows(col, drawer_ids: list):
+    """Resolve explicit ids to ``(physical_ids, metadatas, not_found)``.
+
+    Goes through ``_logical_drawer_record`` -- the same logical-to-physical
+    resolution the singular tools use -- so passing either a logical id or one
+    of its chunk ids selects the same rows. Rows are then re-read so every
+    physical id carries its OWN metadata: a chunked drawer's chunks differ in
+    chunk_index and line range, so one logical metadata cannot stand in for all
+    of them. A missing id is reported rather than aborting the batch.
+    """
+    physical_ids = []
+    not_found = []
+    for drawer_id in drawer_ids:
+        record = _logical_drawer_record(col, drawer_id)
+        if record is None:
+            not_found.append(drawer_id)
+            continue
+        physical_ids.extend(record["ids"])
+
+    ids = []
+    metadatas = []
+    for start in range(0, len(physical_ids), _BULK_DRAWER_BATCH):
+        batch = physical_ids[start : start + _BULK_DRAWER_BATCH]
+        got = col.get(ids=batch, include=["metadatas"])
+        ids.extend(got.get("ids") or [])
+        metadatas.extend(got.get("metadatas") or [])
+    return ids, metadatas, not_found
+
+
+def _bulk_scope_echo(where: dict, drawer_ids) -> dict:
+    """Echo the selection back to the caller without reprinting a huge $or."""
+    explicit = [str(item).strip() for item in (drawer_ids or []) if str(item).strip()]
+    if explicit:
+        return {"drawer_ids": explicit, "drawer_id_count": len(explicit)}
+    return {key: value for key, value in (where or {}).items()}
+
+
+def _bulk_not_found_field(not_found: list) -> dict:
+    """Surface unresolved explicit ids only when there are any.
+
+    A bulk operation over a stale id list should do what it can and report the
+    rest, not abort -- so the misses travel alongside the counts.
+    """
+    return {"not_found": not_found} if not_found else {}
+
+
+def _bulk_scope_sample(metadatas, limit: int = 5) -> list:
+    """Distinct (wing, room) pairs among the matched drawers, capped at ``limit``."""
+    sample = []
+    seen = set()
+    for meta in metadatas:
+        meta = _safe_meta(meta)
+        key = (meta.get("wing", ""), meta.get("room", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        sample.append({"wing": key[0], "room": key[1]})
+        if len(sample) >= limit:
+            break
+    return sample
+
+
+def tool_delete_drawers(
+    drawer_ids: list = None, wing: str = None, room: str = None, dry_run: bool = True
+):
+    """Bulk-delete drawers by explicit id, or by wing/room scope.
+
+    The scoped counterpart to ``delete_drawer``, for the case the singular tool
+    cannot serve: a room or a wing's worth of drawers that must go in one
+    operation. Selection is by ``drawer_ids`` or by ``wing``/``room``; a call
+    with neither is refused rather than treated as "everything".
+
+    Deletion is pushed down as a single ``where`` clause, so the drawer count is
+    irrelevant to cost and no client-side id list is built. Matching closets are
+    purged by source_file afterwards -- best-effort, because the drawers are
+    already gone and a purge hiccup must not turn a successful delete into an
+    error (#2325).
+
+    Defaults to a dry run: it reports the match count and a sample of the
+    distinct (wing, room) pairs so the blast radius is visible before anything
+    is removed. Pass ``dry_run=False`` to commit (irreversible).
+    """
+    global _metadata_cache
+
+    where, explicit, error = _bulk_scope_where(drawer_ids, wing, room)
+    if error:
+        return {"success": False, "error": error}
+
+    col = _get_collection()
+    if not col:
+        return _collection_error_or_no_palace()
+
+    try:
+        if explicit:
+            physical_ids, metas, not_found = _bulk_explicit_rows(col, explicit)
+        else:
+            physical_ids, not_found = None, []
+            metas = _fetch_all_metadata(col, where=where)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+    match_count = len(metas)
+    sample = _bulk_scope_sample(metas)
+    source_files = sorted({str(_safe_meta(meta).get("source_file") or "") for meta in metas} - {""})
+
+    if dry_run:
+        return {
+            "success": True,
+            "dry_run": True,
+            "scope": _bulk_scope_echo(where, drawer_ids),
+            **_bulk_not_found_field(not_found),
+            "match_count": match_count,
+            "sample": sample,
+            "hint": (
+                "No drawers were deleted. Re-run with dry_run=false to remove these "
+                f"{match_count} drawer(s)."
+                if match_count
+                else "No drawers match this scope."
+            ),
+        }
+
+    if match_count == 0:
+        # Idempotent: deleting an empty scope is a no-op, not an error.
+        return {
+            "success": True,
+            "dry_run": False,
+            "scope": _bulk_scope_echo(where, drawer_ids),
+            **_bulk_not_found_field(not_found),
+            "deleted": 0,
+            "closets_deleted": 0,
+        }
+
+    _wal_log(
+        "delete_drawers",
+        {"where": where, "match_count": match_count, "sample": sample},
+    )
+    try:
+        if explicit:
+            col.delete(ids=physical_ids)
+        else:
+            col.delete(where=where)
+        _invalidate_overview_caches()
+        # Closets are keyed by source_file, not drawer_id (#1722), so a drawer
+        # delete strands a closet quoting the now-deleted text (#2325). A scoped
+        # delete can span many sources, so purge each.
+        closets_deleted = 0
+        for source_file in source_files:
+            closets_deleted += _purge_source_closets(source_file, commit=True)
+
+        logger.info(
+            "Deleted %d drawer(s) across %d source(s); %d closet(s) purged",
+            match_count,
+            len(source_files),
+            closets_deleted,
+        )
+        return {
+            "success": True,
+            "dry_run": False,
+            "scope": _bulk_scope_echo(where, drawer_ids),
+            **_bulk_not_found_field(not_found),
+            "deleted": match_count,
+            "closets_deleted": closets_deleted,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def tool_move_drawers(
+    drawer_ids: list = None,
+    wing: str = None,
+    room: str = None,
+    target_wing: str = None,
+    target_room: str = None,
+    dry_run: bool = True,
+):
+    """Bulk-move drawers to another wing and/or room, by id or by scope.
+
+    The scoped counterpart to ``update_drawer``. Re-files matching drawers under
+    ``target_wing``/``target_room`` without touching their content: selection is
+    by ``drawer_ids`` or by ``wing``/``room``, and a call with no scope is
+    refused rather than treated as "everything".
+
+    Unlike a delete this cannot be pushed down -- the backend's update API takes
+    explicit ids -- so rows are enumerated and then written in batches of
+    _BULK_DRAWER_BATCH. That batching is the point: issuing one call per drawer,
+    or fanning several out concurrently, is what wedges the palace while the
+    process holds the mine lock.
+
+    Rows already at the target are counted as ``unchanged`` and skipped, matching
+    ``update_drawer``. Closets are deliberately NOT purged: a closet quotes the
+    source_file rather than the stored drawer, so a wing/room change leaves it
+    correct (#2325).
+
+    Defaults to a dry run reporting the match count and a sample of the distinct
+    (wing, room) pairs; pass ``dry_run=False`` to commit.
+    """
+    global _metadata_cache
+
+    if not target_wing and not target_room:
+        return {
+            "success": False,
+            "error": "move_drawers needs target_wing and/or target_room; nothing to change.",
+        }
+
+    if target_wing is not None:
+        try:
+            target_wing = sanitize_name(target_wing, "wing")
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+    if target_room is not None:
+        try:
+            target_room = sanitize_name(target_room, "room")
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+    where, explicit, error = _bulk_scope_where(drawer_ids, wing, room)
+    if error:
+        return {"success": False, "error": error}
+
+    col = _get_collection()
+    if not col:
+        return _collection_error_or_no_palace()
+
+    try:
+        if explicit:
+            ids, metas, not_found = _bulk_explicit_rows(col, explicit)
+        else:
+            ids, _documents, metas = _fetch_drawer_rows(col, where=where, include=["metadatas"])
+            not_found = []
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+    match_count = len(ids)
+    sample = _bulk_scope_sample(metas)
+
+    if dry_run:
+        return {
+            "success": True,
+            "dry_run": True,
+            "scope": _bulk_scope_echo(where, drawer_ids),
+            **_bulk_not_found_field(not_found),
+            "match_count": match_count,
+            "sample": sample,
+            "target_wing": target_wing,
+            "target_room": target_room,
+            "hint": (
+                "No drawers were moved. Re-run with dry_run=false to move these "
+                f"{match_count} drawer(s)."
+                if match_count
+                else "No drawers match this scope."
+            ),
+        }
+
+    if match_count == 0:
+        return {
+            "success": True,
+            "dry_run": False,
+            "scope": _bulk_scope_echo(where, drawer_ids),
+            **_bulk_not_found_field(not_found),
+            "moved": 0,
+            "unchanged": 0,
+        }
+
+    _wal_log(
+        "move_drawers",
+        {
+            "where": where,
+            "match_count": match_count,
+            "sample": sample,
+            "target_wing": target_wing,
+            "target_room": target_room,
+        },
+    )
+    try:
+        now = datetime.now().isoformat()
+        updated_ids = []
+        updated_metas = []
+        unchanged = 0
+        for physical_id, meta in zip(ids, metas):
+            new_meta = dict(_safe_meta(meta))
+            changed = False
+            if (
+                target_wing is not None
+                and target_wing.lower() != str(new_meta.get("wing") or "").lower()
+            ):
+                new_meta["wing"] = target_wing
+                changed = True
+            if (
+                target_room is not None
+                and target_room.lower() != str(new_meta.get("room") or "").lower()
+            ):
+                new_meta["room"] = target_room
+                changed = True
+            if not changed:
+                unchanged += 1
+                continue
+            new_meta["last_modified"] = now
+            updated_ids.append(physical_id)
+            updated_metas.append(new_meta)
+
+        for start in range(0, len(updated_ids), _BULK_DRAWER_BATCH):
+            end = start + _BULK_DRAWER_BATCH
+            col.update(ids=updated_ids[start:end], metadatas=updated_metas[start:end])
+
+        _invalidate_overview_caches()
+
+        logger.info("Moved %d drawer(s) (%d already at target)", len(updated_ids), unchanged)
+        return {
+            "success": True,
+            "dry_run": False,
+            "scope": _bulk_scope_echo(where, drawer_ids),
+            **_bulk_not_found_field(not_found),
+            "moved": len(updated_ids),
+            "unchanged": unchanged,
+            "target_wing": target_wing,
+            "target_room": target_room,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
     """Prune drawers whose source files are gitignored, missing, or moved (#1252)."""
     global _metadata_cache
