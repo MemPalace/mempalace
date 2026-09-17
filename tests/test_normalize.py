@@ -13,6 +13,7 @@ from mempalace.normalize import (
     _try_claude_ai_json,
     _try_claude_code_jsonl,
     _try_codex_jsonl,
+    _try_cursor_jsonl,
     _try_gemini_json,
     _try_gemini_jsonl,
     _try_continue_json,
@@ -210,6 +211,20 @@ def test_format_tool_use_write():
     }
     result = _format_tool_use(block)
     assert result == "[Write /home/jp/file.py]"
+
+
+def test_format_tool_use_cursor_shell_and_path_aliases():
+    assert _format_tool_use({"name": "Shell", "input": {"command": "uv run pytest"}}) == (
+        "[Shell] uv run pytest"
+    )
+    assert _format_tool_use({"name": "Read", "input": {"path": "mcp.json"}}) == "[Read mcp.json]"
+    assert _format_tool_use({"name": "Write", "input": {"path": "out.py"}}) == "[Write out.py]"
+    assert _format_tool_use({"name": "StrReplace", "input": {"path": "mcp.json"}}) == (
+        "[StrReplace mcp.json]"
+    )
+    assert _format_tool_use({"name": "Glob", "input": {"glob_pattern": "tests/test_*.py"}}) == (
+        "[Glob] tests/test_*.py"
+    )
 
 
 def test_format_tool_use_unknown_tool():
@@ -2166,3 +2181,106 @@ def test_pi_jsonl_invalid_lines_skipped():
     ]
     result = _try_pi_jsonl("\n".join(lines))
     assert result is not None
+
+
+def _cursor_line(role, *blocks):
+    return json.dumps({"role": role, "message": {"content": list(blocks)}})
+
+
+def test_cursor_jsonl_unwraps_user_query_and_drops_injected_blocks():
+    lines = [
+        _cursor_line(
+            "user",
+            {
+                "type": "text",
+                "text": (
+                    "<timestamp>Thursday Sep 17</timestamp>\n"
+                    "<system_reminder>\n\nDo a thing.\n\n</system_reminder>\n"
+                    "<user_query>Ship the hub-first Cursor fix.</user_query>"
+                ),
+            },
+        ),
+        _cursor_line("assistant", {"type": "text", "text": "On it."}),
+        json.dumps({"type": "turn_ended", "status": "completed"}),
+    ]
+    result = _try_cursor_jsonl("\n".join(lines))
+    assert result is not None
+    assert "Ship the hub-first Cursor fix." in result
+    assert "Thursday Sep 17" not in result
+    assert "Do a thing." not in result
+    assert "On it." in result
+    assert "turn_ended" not in result
+
+
+def test_cursor_jsonl_merges_tool_loop_and_formats_cursor_tools():
+    lines = [
+        _cursor_line("user", {"type": "text", "text": "<user_query>edit the file</user_query>"}),
+        _cursor_line(
+            "assistant",
+            {"type": "text", "text": "Looking."},
+            {"type": "tool_use", "name": "Read", "input": {"path": "mcp.json"}},
+        ),
+        _cursor_line(
+            "assistant",
+            {
+                "type": "tool_use",
+                "name": "StrReplace",
+                "input": {"path": "mcp.json", "old_string": "a", "new_string": "b"},
+            },
+            {"type": "tool_use", "name": "Shell", "input": {"command": "uv run pytest"}},
+            {"type": "tool_use", "name": "Glob", "input": {"glob_pattern": "tests/test_*.py"}},
+        ),
+        json.dumps({"type": "turn_ended", "status": "completed"}),
+    ]
+    result = _try_cursor_jsonl("\n".join(lines))
+    assert result is not None
+    assert "edit the file" in result
+    assert "[Read mcp.json]" in result
+    assert "[StrReplace mcp.json]" in result
+    assert "[Shell] uv run pytest" in result
+    assert "[Glob] tests/test_*.py" in result
+
+
+def test_cursor_jsonl_drops_own_hook_prompts():
+    lines = [
+        _cursor_line("user", {"type": "text", "text": "<user_query>Ship the parser.</user_query>"}),
+        _cursor_line("assistant", {"type": "text", "text": "Working."}),
+        _cursor_line(
+            "user",
+            {
+                "type": "text",
+                "text": (
+                    "<user_query>MemPalace save checkpoint. Call mempalace_checkpoint</user_query>"
+                ),
+            },
+        ),
+        _cursor_line("assistant", {"type": "text", "text": "Filed."}),
+    ]
+    result = _try_cursor_jsonl("\n".join(lines))
+    assert result is not None
+    assert "Ship the parser." in result
+    assert "MemPalace save checkpoint." not in result
+    assert "Filed." in result
+
+
+def test_cursor_jsonl_does_not_claim_claude_code():
+    lines = [
+        json.dumps({"type": "user", "message": {"content": [{"type": "text", "text": "Q"}]}}),
+        json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "A"}]}}),
+    ]
+    blob = "\n".join(lines)
+    assert _try_cursor_jsonl(blob) is None
+    assert _try_claude_code_jsonl(blob) is not None
+
+
+def test_claude_code_jsonl_does_not_claim_cursor():
+    lines = [
+        _cursor_line("user", {"type": "text", "text": "<user_query>Q</user_query>"}),
+        _cursor_line("assistant", {"type": "text", "text": "A"}),
+    ]
+    blob = "\n".join(lines)
+    assert _try_claude_code_jsonl(blob) is None
+    assert _try_cursor_jsonl(blob) is not None
+    split = _try_normalize_json_split(blob)
+    assert split is not None
+    assert "Q" in split[0]

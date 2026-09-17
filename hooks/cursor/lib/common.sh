@@ -112,6 +112,18 @@ except Exception:
     return 1
 }
 
+# Followup / user_message is opt-in. Silent by default so the
+# background mine stays off the chat window — normalize.py now
+# parses Cursor JSONL. MEMPAL_CURSOR_SILENT is a no-op alias kept
+# so older installs that set it do not change behaviour (already
+# silent).
+mempal_verbose() {
+    case "${MEMPAL_VERBOSE:-}" in
+        1|true|yes|on) return 0 ;;
+    esac
+    return 1
+}
+
 # ── Stdin parser ──────────────────────────────────────────────────────
 #
 # Reads Cursor's hook JSON from $1 and exports:

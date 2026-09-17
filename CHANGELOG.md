@@ -8,6 +8,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Features
+
+- **Cursor agent transcripts parse as conversations.** `normalize.py`
+  now reads Cursor IDE JSONL (`role` + `message.content`, plus
+  `turn_ended` records): unwraps `<user_query>`, drops injected Cursor
+  blocks, merges tool-loop assistant turns, and formats Cursor tool
+  names. `mempalace mine ~/.cursor/projects/... --mode convos` lands in
+  `wing_api` unless `--wing` is set. The Cursor save hook is silent by
+  default; the background mine is the verbatim path.
+
+### Upgrade notes
+
+- **Cursor save hook no longer emits a followup by default.** Set
+  `MEMPAL_VERBOSE=true` to keep the diary-nudge `followup_message`.
+  `MEMPAL_CURSOR_SILENT` is a no-op alias. The preCompact
+  `user_message` is also verbose-only.
+
 ### Bug Fixes
 
 - **A `known_entities.json` write no longer appears to hang on Windows when the
