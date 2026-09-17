@@ -2,9 +2,14 @@
 
 import json
 import os
+import ntpath
 import tempfile
 from unittest import mock
-from mempalace.config import MempalaceConfig, canonical_palace_path
+from mempalace.config import (
+    MempalaceConfig,
+    canonical_palace_path,
+    _resolve_palace_leaf,
+)
 
 
 def _make_leaf(root: str, name: str = "palace") -> str:
@@ -85,7 +90,9 @@ def test_palace_path_expands_tilde_from_config_file():
         "This causes mempalace mine to create a literal '~' directory "
         "relative to CWD instead of writing to the home directory."
     )
-    assert result == os.path.expanduser("~/.mempalace/palace")
+    # Mirror the code's normalization (abspath + expanduser). expanduser alone
+    # would diverge on Windows, where abspath also prepends the drive letter.
+    assert result == os.path.abspath(os.path.expanduser("~/.mempalace/palace"))
 
 
 def test_palace_path_expands_tilde_nested():
@@ -94,14 +101,18 @@ def test_palace_path_expands_tilde_nested():
     cfg._file_config["palace_path"] = "~/custom/mempalace"
     result = cfg.palace_path
     assert not result.startswith("~")
-    assert result == os.path.expanduser("~/custom/mempalace")
+    # Mirror the code's normalization so the assertion holds cross-platform
+    # (see the tilde test above for the Windows drive-letter reasoning).
+    assert result == os.path.abspath(os.path.expanduser("~/custom/mempalace"))
 
 
 def test_palace_path_absolute_unchanged():
     """Absolute paths pass through without modification."""
     cfg = MempalaceConfig()
     cfg._file_config["palace_path"] = "/tmp/test_palace"
-    assert cfg.palace_path == "/tmp/test_palace"
+    # The code returns the abspath-normalized form; resolve the expectation
+    # the same way so it pins the leaf without being host-specific.
+    assert cfg.palace_path == os.path.abspath(os.path.expanduser("/tmp/test_palace"))
 
 
 def test_init_persists_constructor_override_not_default():
@@ -268,3 +279,103 @@ def test_palace_path_cache_slot_seeded_none(tmp_path):
     assert hasattr(cfg, "_palace_path_cache")
     assert cfg._palace_path_cache is None
 
+
+# ---------------------------------------------------------------------------
+# Windows-shaped simulation (#2418 / t_f253e712)
+#
+# The seven CI failures were Windows-only assertions: the code normalises
+# palace_path through os.path.abspath (which on Windows prepends the drive
+# letter and emits backslashes) while the tests compared against bare POSIX
+# literals or expanduser() without abspath. The fixes above align the
+# assertions with the code's own primitives. Beyond that, the tests below
+# drive the *real* leaf-resolution logic under Windows path semantics
+# (ntpath + a recorded FS) so a regression is caught on any host, without
+# needing a Windows runner. They pin that D:\-prefixed leaf selection is
+# deterministic and correct under a Windows drive+backslash shape.
+# ---------------------------------------------------------------------------
+
+
+class _FakeWindowsOS:
+    """Minimal stand-in for the :mod:`os` surface _resolve_palace_leaf uses.
+
+    Path semantics come from :mod:`ntpath` (drive letters + backslash
+    joins + abspath), while the filesystem predicates (isdir / isfile) and
+    listdir are recorded as a small in-memory layout so a single
+    Windows-shaped tree can be asserted on any host. The resolver reads
+    ``os.listdir`` from the top-level object and ``os.path.<pred>`` from the
+    ``path`` namespace, so both are provided here explicitly.
+    """
+
+    def __init__(self, files=(), dirs=(), listable=(), unreadable=()):
+        self.files = set(files)
+        self.dirs = set(dirs)
+        self._listable = dict(listable)
+        self._unreadable = set(unreadable)
+        # _resolve_palace_leaf accesses these via ``_os.path.*`` and
+        # ``_os.listdir`` — expose the same surface it expects.
+        self.listdir = self._listdir
+        self.isdir = lambda p: p in self.dirs
+        self.isfile = lambda p: p in self.files
+        self.path = _NtpathFake(self.dirs, self.files)
+
+    def _listdir(self, base):
+        if base in self._unreadable:
+            raise OSError("simulated unreadable directory")
+        return self._listable.get(base, [])
+
+
+class _NtpathFake:
+    """``os.path`` replacement: ntpath text ops + set-backed FS predicates."""
+
+    def __init__(self, dirs, files):
+        self._dirs = dirs
+        self._files = files
+        self.abspath = staticmethod(ntpath.abspath)
+        self.expanduser = staticmethod(ntpath.expanduser)
+        self.join = staticmethod(ntpath.join)
+        self.isdir = lambda p: p in dirs
+        self.isfile = lambda p: p in files
+
+
+def test_canonical_leaf_windows_single_store_child():
+    """D:\\palace-root with one child holding chroma.sqlite3 -> that child."""
+    base = "D:\\palace-root"
+    leaf = "D:\\palace-root\\palace"
+    leaf_store = "D:\\palace-root\\palace\\chroma.sqlite3"
+    fs = _FakeWindowsOS(
+        files={leaf_store},
+        dirs={leaf},
+        listable={base: ["palace"]},
+    )
+    assert _resolve_palace_leaf(base, _os=fs, _pathmod=ntpath) == leaf
+
+
+def test_canonical_leaf_windows_base_holds_store_unchanged():
+    """A base that already holds the store must be returned unchanged."""
+    base = "D:\\palace-root"
+    base_store = "D:\\palace-root\\chroma.sqlite3"
+    fs = _FakeWindowsOS(files={base_store}, dirs={base}, listable={base: ["x"]})
+    assert _resolve_palace_leaf(base, _os=fs, _pathmod=ntpath) == base
+
+
+def test_canonical_leaf_windows_ambiguous_returns_base():
+    """Two store-holding siblings -> never guess, return the base unchanged."""
+    base = "D:\\palace-root"
+    a = "D:\\palace-root\\a"
+    b = "D:\\palace-root\\b"
+    fs = _FakeWindowsOS(
+        files={
+            "D:\\palace-root\\a\\chroma.sqlite3",
+            "D:\\palace-root\\b\\chroma.sqlite3",
+        },
+        dirs={a, b},
+        listable={base: ["a", "b"]},
+    )
+    assert _resolve_palace_leaf(base, _os=fs, _pathmod=ntpath) == base
+
+
+def test_canonical_leaf_windows_missing_dir_passes_through():
+    """Unreadable directory -> base returned (abspath-normalised) unchanged."""
+    base = "D:\\palace-root"
+    fs = _FakeWindowsOS(unreadable={base})
+    assert _resolve_palace_leaf(base, _os=fs, _pathmod=ntpath) == "D:\\palace-root"

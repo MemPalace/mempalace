@@ -405,6 +405,10 @@ def connect_sqlite_read(
 
 
 def canonical_palace_path(palace_path: str) -> str:
+    return _resolve_palace_leaf(palace_path)
+
+
+def _resolve_palace_leaf(palace_path: str, _os=None, _pathmod=None) -> str:
     """Return the canonical *leaf* palace directory for ``palace_path`` (#2404).
 
     A palace is the single directory that holds the ChromaDB SQLite store
@@ -429,21 +433,37 @@ def canonical_palace_path(palace_path: str) -> str:
 
     This keeps the invariant "the reader opens the same store the writer
     wrote to" in one place, so every consumer of ``palace_path`` benefits.
+
+    The ``_os`` / ``_pathmod`` overloads exist solely so the resolution logic
+    can be exercised against a Windows path flavour (``ntpath`` + fake FS
+    predicates) from a non-Windows host — see the cross-platform tests. They
+    default to the native OS modules, so every runtime consumer is unchanged.
     """
-    base = os.path.abspath(os.path.expanduser(palace_path))
-    if os.path.isfile(os.path.join(base, _CHROMA_SQLITE_NAME)):
+    if _pathmod is None:
+        import os as _native_os
+
+        _os = _native_os
+        _pathmod = _native_os.path
+    abspath = _pathmod.abspath
+    expanduser = _pathmod.expanduser
+    join = _pathmod.join
+    listdir = _os.listdir
+    isdir = _os.path.isdir
+    isfile = _os.path.isfile
+
+    base = abspath(expanduser(palace_path))
+    if isfile(join(base, _CHROMA_SQLITE_NAME)):
         return base
     try:
-        entries = os.listdir(base)
+        entries = listdir(base)
     except OSError:
         # Not a directory yet (first-run palace) or unreadable: nothing to
         # re-point to; let the caller fall through and create it.
         return base
     leaves = [
-        os.path.join(base, name)
+        join(base, name)
         for name in entries
-        if os.path.isdir(os.path.join(base, name))
-        and os.path.isfile(os.path.join(base, name, _CHROMA_SQLITE_NAME))
+        if isdir(join(base, name)) and isfile(join(base, name, _CHROMA_SQLITE_NAME))
     ]
     if len(leaves) == 1:
         return leaves[0]

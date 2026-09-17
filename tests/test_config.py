@@ -48,7 +48,11 @@ def test_config_from_file():
     with open(os.path.join(tmpdir, "config.json"), "w") as f:
         json.dump({"palace_path": "/custom/palace"}, f)
     cfg = MempalaceConfig(config_dir=tmpdir)
-    assert cfg.palace_path == "/custom/palace"
+    # Resolve the expectation with the same primitives the code uses
+    # (abspath + expanduser) so the assertion is platform-agnostic — on
+    # Windows this yields "D:\custom\palace" while a bare "/custom/palace"
+    # string would never match (the code prepends the current drive).
+    assert cfg.palace_path == os.path.abspath(os.path.expanduser("/custom/palace"))
 
 
 def test_backend_from_config_wins_over_env(tmp_path, monkeypatch):
