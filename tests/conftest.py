@@ -165,6 +165,7 @@ def _reset_loaded_mcp_writer_state(mcp_server) -> None:
             ("_MCP_WRITER_READ_ONLY", False),
             ("_MCP_WRITER_LOCK_FAILED", False),
             ("_MCP_WRITER_LOCK_ERROR", ""),
+            ("_MCP_WRITER_HOLDER", ""),
         ):
             if hasattr(mcp_server, name):
                 setattr(mcp_server, name, value)
