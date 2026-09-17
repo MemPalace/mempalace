@@ -3,17 +3,24 @@ if __name__ != "mempalace.mcp_server":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.mcp_server")
 
 
+def _chroma_backend():
+    """Return the process-wide ChromaBackend, the one palace.get_collection uses."""
+    from ..backends import get_backend
+
+    return get_backend("chroma")
+
+
 def _get_client():
-    """Return a ChromaDB PersistentClient, reconnecting if the database changed on disk.
+    """Return the palace's ChromaDB client from the process-wide ``ChromaBackend`` cache.
 
-    Detects palace rebuilds (repair/nuke/purge) by checking the inode of
-    chroma.sqlite3.  A full rebuild replaces the file, changing the inode.
-    Also detects external writes (scripts, CLI) via mtime changes — the
-    inode check alone misses in-place modifications that invalidate the
-    in-memory HNSW index.
+    Search and mining use the same cache through ``palace.get_collection``, and
+    the backend re-stamps chroma.sqlite3's inode/mtime after this process's own
+    opens and writes, so those do not reload the HNSW index.
 
-    Note: FAT/exFAT may return 0 for st_ino — the ``current_inode != 0``
-    guard skips reconnect detection on those filesystems (safe fallback).
+    The local inode/mtime copy decides when to run the HNSW capacity probe
+    before the backend may reopen the palace. ``st_ino`` may be 0 (Python only
+    promises it identifies the file when non-zero); the ``current_inode != 0``
+    guard then leaves change detection to mtime.
     """
     global \
         _client_cache, \
@@ -56,27 +63,37 @@ def _get_client():
     if _client_cache is None or inode_changed or mtime_changed:
         # Run the HNSW capacity probe BEFORE chromadb opens the segment --
         # if the index is severely undersized, segment load can segfault
-        # the whole MCP server (#1222). The probe is pure sqlite +
-        # metadata read; never touches the HNSW binary files.
+        # the whole MCP server (#1222). The probe reads sqlite, the
+        # metadata pickle and the header.bin prefix; it never loads the index.
         _refresh_vector_disabled_flag()
-        if inode_changed or mtime_changed:
-            ChromaBackend._quarantined_paths.discard(_config.palace_path)
-            # #2002: a peer process changed chroma.sqlite3 on disk. chromadb
-            # caches its System (and the live HNSW segment) keyed by path, so
-            # make_client() below would hand back the STALE segment, which then
-            # persists its outdated index over the peer's writes, driving the
-            # persisted count backwards. Drop chromadb's shared cache first so
-            # make_client() rebuilds the segment from the on-disk state.
-            _force_chroma_cache_reset()
-        _client_cache = ChromaBackend.make_client(_config.palace_path)
+    backend = _chroma_backend()
+    client = backend._client(_config.palace_path)
+    if client is not _client_cache:
+        _client_cache = client
         _collection_cache = None
         _collection_cache_backend = None
         _collection_cache_palace = None
         _collection_open_error = None
         _invalidate_overview_caches()
-        _palace_db_inode = current_inode
-        _palace_db_mtime = current_mtime
+    _palace_db_inode, _palace_db_mtime = backend._freshness.get(
+        _config.palace_path, (current_inode, current_mtime)
+    )
     return _client_cache
+
+
+def _adopt_opened_collection(raw):
+    """Wrap a collection this process just opened, and re-baseline the shared stat.
+
+    ``_pin_hnsw_threads`` writes chroma.sqlite3, so the open itself moves the
+    mtime the backend compares against. ``backend=`` makes writes through the
+    wrapper re-baseline it too (#2307). A write by another process that lands
+    during the open is absorbed into the new stamp, as it is for the backend's
+    own opens (see ``ChromaBackend._restamp``).
+    """
+    _pin_hnsw_threads(raw)
+    backend = _chroma_backend()
+    backend._restamp(_config.palace_path)
+    return ChromaCollection(raw, palace_path=_config.palace_path, backend=backend)
 
 
 def _get_collection(create=False):
@@ -257,8 +274,7 @@ def _get_collection(create=False):
                         },
                         **ef_kwargs,
                     )
-                _pin_hnsw_threads(raw)
-                _collection_cache = ChromaCollection(raw, palace_path=_config.palace_path)
+                _collection_cache = _adopt_opened_collection(raw)
                 _collection_cache_backend = "chroma"
                 _collection_cache_palace = _config.palace_path
                 _collection_open_error = None
@@ -267,8 +283,7 @@ def _get_collection(create=False):
                 ef = ChromaBackend._resolve_embedding_function()
                 ef_kwargs = {"embedding_function": ef} if ef is not None else {}
                 raw = client.get_collection(_config.collection_name, **ef_kwargs)
-                _pin_hnsw_threads(raw)
-                _collection_cache = ChromaCollection(raw, palace_path=_config.palace_path)
+                _collection_cache = _adopt_opened_collection(raw)
                 _collection_cache_backend = "chroma"
                 _collection_cache_palace = _config.palace_path
                 _collection_open_error = None
@@ -301,14 +316,9 @@ def _get_collection(create=False):
                 # Reset all caches so the next attempt forces _get_client()
                 # to rebuild the chromadb client from scratch, reopening
                 # the collection cleanly and healing the common
-                # stale-handle case.
-                _client_cache = None
-                _collection_cache = None
-                _collection_cache_backend = None
-                _collection_cache_palace = None
-                _palace_db_inode = 0
-                _palace_db_mtime = 0.0
-                _invalidate_overview_caches()
+                # stale-handle case. The client lives in the backend's
+                # cache, so close it there.
+                _force_chroma_cache_reset()
                 _collection_open_error = {
                     "error": "Backend open failed",
                     "details": "Could not open the Chroma collection.",
