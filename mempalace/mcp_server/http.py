@@ -292,9 +292,10 @@ def _http_status_payload(httpd) -> dict:
         os.path.abspath(os.path.expanduser(_config.palace_path)) if _config.palace_path else ""
     )
     return {
-        # `ok` is None in the two cases the payload reports as an absent
-        # verdict: a non-chroma backend (#1931), and a chroma palace with no
-        # database file yet. That is an absence, not a failure, and collapsing
+        # `ok` is None in the three cases the payload reports as an absent
+        # verdict: a non-chroma backend (#1931), a chroma palace with no
+        # database file yet (#2290), and a palace above the startup probe's
+        # size limit (#2240). That is an absence, not a failure, and collapsing
         # it with bool() would report a freshly installed server as unhealthy.
         # A missing key is not one of those cases and still fails closed.
         "ok": integrity.get("ok", False) is not False,
@@ -365,7 +366,10 @@ def _http_dispatch(request):
     the lock; palace writes take it exclusively. Unclassified tools fail
     closed onto the exclusive side.
     """
-    method = request.get("method") or "" if isinstance(request, dict) else ""
+    # Same envelope trap as handle_request, on a dispatcher added after it: the
+    # `or ""` fallback only rescues falsy values, so a truthy non-string method
+    # reached .startswith() below and raised out of the handler thread.
+    method, _ = _normalize_envelope(request) if isinstance(request, dict) else ("", {})
     if method in _HTTP_PROTOCOL_METHODS or method.startswith("notifications/"):
         return handle_request(request)
     tool_name = None
@@ -704,6 +708,10 @@ def _mesh_peers_payload() -> dict:
     }
 
 
+_peer_sync_thread: Optional[threading.Thread] = None
+_peer_sync_stop_event: Optional[threading.Event] = None
+
+
 def _peer_sync_interval_s() -> float:
     try:
         return float(os.environ.get("MEMPALACE_SYNC_INTERVAL", "") or 15)
@@ -711,7 +719,29 @@ def _peer_sync_interval_s() -> float:
         return 15.0
 
 
-def _start_peer_sync_thread() -> None:
+def _stop_peer_sync_thread(timeout: float = 5.0) -> bool:
+    """Signal shutdown to the peer sync thread and wait for it to exit.
+
+    Returns True if the thread stopped (or was not running), False if it timed out.
+    """
+    global _peer_sync_thread, _peer_sync_stop_event
+    if _peer_sync_stop_event is not None:
+        _peer_sync_stop_event.set()
+    stopped = True
+    if _peer_sync_thread is not None and _peer_sync_thread.is_alive():
+        _peer_sync_thread.join(timeout=timeout)
+        stopped = not _peer_sync_thread.is_alive()
+        if not stopped:
+            logger.warning("peer sync thread did not terminate within %.1fs", timeout)
+    if stopped:
+        _peer_sync_thread = None
+        _peer_sync_stop_event = None
+    return stopped
+
+
+def _start_peer_sync_thread(
+    stop_event: Optional[threading.Event] = None,
+) -> Optional[threading.Thread]:
     """Background anti-entropy loop for the logstream (RFC 004 step 0).
 
     Runs in the serving process so a hub with configured peers converges
@@ -728,20 +758,33 @@ def _start_peer_sync_thread() -> None:
     """
     from ..logsync import sync_all
 
+    global _peer_sync_thread, _peer_sync_stop_event
+    if not _stop_peer_sync_thread():
+        logger.warning("cannot start peer sync thread: previous thread is still alive")
+        return None
+
     palace_path = getattr(_config, "palace_path", None)
     if not palace_path:
-        return
+        return None
     interval = _peer_sync_interval_s()
     if interval <= 0:
-        return
+        return None
+
+    canonical_ls_path = _canonicalize_kg_path(
+        os.path.join(os.path.expanduser(palace_path), LOGSTREAM_DB_FILENAME)
+    )
+    stop = stop_event if stop_event is not None else threading.Event()
 
     def _loop():
         malformed_logged = False
-        while True:
-            time.sleep(interval)
+        while not stop.wait(interval):
+            if stop.is_set():
+                break
             try:
-                ls = _get_logstream()
+                ls = _get_logstream(canonical_ls_path)
                 for stats in sync_all(ls, palace_path):
+                    if stop.is_set():
+                        break
                     _record_peer_sync(stats)
                     if stats.get("error"):
                         logger.warning("peer sync %s: %s", stats.get("peer_name"), stats["error"])
@@ -752,6 +795,8 @@ def _start_peer_sync_thread() -> None:
                             stats["pulled_events"],
                             stats["pulled_artifacts"],
                         )
+                if stop.is_set():
+                    break
                 # Publish once per round, not per peer: the estate is only
                 # coherent after every configured peer has been attempted.
                 _publish_mesh_state(palace_path)
@@ -764,8 +809,11 @@ def _start_peer_sync_thread() -> None:
                 logger.warning("peer sync round failed", exc_info=True)
 
     thread = threading.Thread(target=_loop, name="mempalace-logsync", daemon=True)
+    _peer_sync_thread = thread
+    _peer_sync_stop_event = stop
     thread.start()
     logger.info("peer sync thread started (interval %.0fs)", interval)
+    return thread
 
 
 def _sse_acquire_slot(httpd) -> bool:
@@ -1012,7 +1060,29 @@ def _build_http_server(host: str, port: int):
 
             # Locking policy lives in _http_dispatch: global lock for
             # Chroma-touching tools, lock-free for logstream tools.
-            response = _http_dispatch(request)
+            try:
+                response = _http_dispatch(request)
+            except Exception:
+                # Without this the exception escaped into BaseHTTPRequestHandler,
+                # which closes the connection with no reply at all -- the client
+                # sees a dropped socket instead of a JSON-RPC error. Log with the
+                # traceback: -32603 tells the client nothing diagnostic, so the
+                # stack is the only record of what actually failed.
+                logger.exception("HTTP JSON-RPC dispatch error")
+                req_id = request.get("id") if isinstance(request, dict) else None
+                if req_id is None:
+                    # A notification is owed no response body, failure included,
+                    # matching the 202 branch below and the stdio loop. The
+                    # status still reports the failure at the transport level.
+                    self._record_request(500)
+                    self.send_response(500)
+                    self.send_header("Content-Length", "0")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.close_connection = True
+                    return
+                self._send_json(500, _json_rpc_internal_error(req_id))
+                return
 
             if response is None:
                 # JSON-RPC notifications intentionally have no response body.
@@ -1126,6 +1196,7 @@ def _serve_http(host: str, port: int) -> None:
         except KeyboardInterrupt:
             logger.info("MemPalace MCP HTTP server shutting down")
         finally:
+            _stop_peer_sync_thread()
             if _registered_palace:
                 try:
                     from .. import server_registry

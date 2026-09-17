@@ -296,13 +296,5 @@ def main():
     print(f"\nDone in {elapsed/60:.1f}min. Wrote {len(rows)} rows to {output_summary}")
 
 
-def write_csv(path: Path, rows: list[dict]):
-    """Batch-write helper, kept for callers that already have all rows in memory."""
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
 if __name__ == "__main__":
     main()

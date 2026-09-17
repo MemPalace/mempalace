@@ -261,6 +261,38 @@ def test_cmd_init_normalizes_wing_name_for_topics_registry(mock_config_cls, tmp_
         assert mock_register.call_args.kwargs["wing"] == "my_cool_app"
 
 
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_init_does_not_report_a_registry_update_that_did_not_happen(
+    mock_config_cls, tmp_path, capsys
+):
+    """``add_to_known_entities`` answers ``None`` when it left the registry
+    alone and printed why. Printing "Registry updated" over that would tell
+    the user the opposite of what stderr just said."""
+    project = tmp_path / "app"
+    project.mkdir()
+    detected = {
+        "people": [{"name": "Alice"}],
+        "projects": [],
+        "topics": [],
+        "uncertain": [],
+    }
+    confirmed = {"people": ["Alice"], "projects": [], "topics": []}
+    args = argparse.Namespace(dir=str(project), yes=True)
+    with (
+        patch("mempalace.entity_detector.scan_for_detection", return_value=[project / "a.txt"]),
+        patch("mempalace.entity_detector.detect_entities", return_value=detected),
+        patch("mempalace.entity_detector.confirm_entities", return_value=confirmed),
+        patch("mempalace.miner.add_to_known_entities", return_value=None),
+        patch("mempalace.room_detector_local.detect_rooms_local"),
+        patch("builtins.open", MagicMock()),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
+        patch("mempalace.cli._run_pass_zero", return_value=None),
+    ):
+        cmd_init(args)
+
+    assert "Registry updated" not in capsys.readouterr().out
+
+
 def test_cmd_init_honors_palace_flag(tmp_path, monkeypatch):
     """Regression for #1313: ``cmd_init`` must honor ``--palace`` instead of
     silently writing to ``~/.mempalace``. Mirrors the env-var pattern used
@@ -711,6 +743,44 @@ def test_cmd_mine_daemon_background_submits_job(mock_config_cls, capsys):
 
 
 @patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_daemon_resolves_relative_source_against_caller_cwd(
+    mock_config_cls, tmp_path, monkeypatch
+):
+    """#2441: the daemon outlives this process and keeps its own cwd, so a
+    relative source has to be resolved here, against the caller's cwd, before
+    it enters the payload. _forward_mine_to_hub already does this for the hub
+    path; the daemon path did not."""
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    monkeypatch.chdir(tmp_path)
+    expected_source = os.getcwd()
+    args = argparse.Namespace(
+        dir=".",
+        palace=None,
+        mode="projects",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+        daemon=True,
+        background=True,
+        backend=None,
+        global_backend=None,
+        max_chunks_per_file=None,
+        redetect_origin=False,
+    )
+    with patch("mempalace.daemon.submit_job", return_value={"id": "job-1"}) as mock_submit:
+        with patch("mempalace.miner.mine") as mock_mine:
+            cmd_mine(args)
+
+    mock_mine.assert_not_called()
+    payload = mock_submit.call_args.args[1]
+    assert payload["source"] == expected_source
+
+
+@patch("mempalace.cli.MempalaceConfig")
 def test_cmd_mine_daemon_lock_deferral_reports_a_runnable_command(mock_config_cls, capsys):
     """A foreground mine refused the palace lock must say so and hand back a
     command that actually works. --palace is global, so it has to be echoed back
@@ -924,6 +994,46 @@ def test_main_init_dispatches():
     ):
         main()
         mock_cmd.assert_called_once()
+
+
+def test_main_init_accepts_palace_after_subcommand():
+    """Regression for #2366: ``mempalace init <dir> --palace <path>`` must
+    parse, not raise ``unrecognized arguments: --palace``.
+
+    Pre-fix, ``--palace`` was registered only on the *global* parser, so the
+    natural (human-readable) invocation order the reporter used in the issue
+    body — flag after the subcommand/positional — was rejected. Mirroring the
+    existing ``p_serve`` ``--palace`` (#1877) added a subcommand-level
+    ``--palace`` on ``p_init`` with ``default=argparse.SUPPRESS`` so it cannot
+    clobber the global value on Python <3.12, yet both positions work.
+
+    We assert on the *parsed* ``args.palace`` rather than the env-stamp in
+    ``cmd_init`` (covered by ``test_cmd_init_honors_palace_flag``) — the parser
+    is the layer that was actually broken.
+    """
+    captured = {}
+    with (
+        patch("sys.argv", ["mempalace", "init", "/some/project", "--palace", "/custom/palace"]),
+        patch("mempalace.cli.cmd_init", side_effect=lambda args: captured.update(args.__dict__)),
+    ):
+        main()  # pre-fix would have raised SystemExit("unrecognized arguments") here
+    assert captured["palace"] == "/custom/palace", captured
+    assert captured["dir"] == "/some/project", captured
+
+
+def test_main_init_accepts_palace_before_subcommand():
+    """The global-order invocation (``--palace <path> init <dir>``) — the form
+    ``#1313``'s fix added — must keep working alongside the new natural order.
+    Together the two tests pin the full "either position is accepted" contract.
+    """
+    captured = {}
+    with (
+        patch("sys.argv", ["mempalace", "--palace", "/custom/palace", "init", "/some/project"]),
+        patch("mempalace.cli.cmd_init", side_effect=lambda args: captured.update(args.__dict__)),
+    ):
+        main()
+    assert captured["palace"] == "/custom/palace", captured
+    assert captured["dir"] == "/some/project", captured
 
 
 def test_main_mine_dispatches():

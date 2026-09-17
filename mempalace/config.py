@@ -1,12 +1,22 @@
 """
 MemPalace configuration system.
 
-Priority: env vars > config file (~/.mempalace/config.json) > defaults
+Priority: env vars > config file > defaults.
+
+The default config directory follows the XDG Base Directory Specification
+(https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html)
+with back-compat for existing installs:
+
+  1. $MEMPALACE_CONFIG_DIR if set (explicit override, used by tests and CI)
+  2. ~/.mempalace if it already exists (existing installs keep working)
+  3. $XDG_CONFIG_HOME/mempalace if XDG_CONFIG_HOME is set
+  4. ~/.config/mempalace (XDG default fallback)
 """
 
 import errno
 import hashlib
 import json
+import math
 import os
 import stat
 import re
@@ -223,6 +233,51 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
     return strip_lone_surrogates(value)
 
 
+# ── XDG Base Directory resolution ─────────────────────────────────────────────
+
+# Files that mark a ~/.mempalace directory as a real legacy install rather
+# than an empty/leftover directory. Any one is enough for back-compat.
+_LEGACY_MARKERS = ("config.json", "people_map.json")
+
+
+def _has_legacy_install(legacy: Path) -> bool:
+    """Return True if ``legacy`` is a real legacy install, not an empty dir.
+
+    A bare ``palace`` directory created by some other tool should not hijack
+    the XDG path, so the palace sub-directory only counts when it contains
+    an actual ChromaDB store (``chroma.sqlite3``).
+    """
+    if any((legacy / marker).is_file() for marker in _LEGACY_MARKERS):
+        return True
+    return (legacy / "palace" / "chroma.sqlite3").is_file()
+
+
+def _default_config_dir() -> Path:
+    """Return the default config directory.
+
+    See the module docstring for the resolution order.
+    """
+    env_dir = os.environ.get("MEMPALACE_CONFIG_DIR")
+    if env_dir and env_dir.strip():
+        return Path(env_dir).expanduser()
+
+    legacy = Path.home() / ".mempalace"
+    if legacy.is_dir() and _has_legacy_install(legacy):
+        return legacy
+
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg and xdg.strip():
+        xdg_path = Path(xdg).expanduser()
+        # Per XDG spec, relative paths must be ignored as invalid.
+        if xdg_path.is_absolute():
+            return xdg_path / "mempalace"
+
+    return Path.home() / ".config" / "mempalace"
+
+
+# DEPRECATED: kept only for backward compatibility with external importers.
+# This constant is frozen at the legacy location and is NOT XDG-aware — prefer
+# MempalaceConfig().palace_path in new code.
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
 DEFAULT_BACKEND = "chroma"
@@ -239,6 +294,13 @@ _MILVUS_CONSISTENCY_LEVELS = {
 # migrate`` and ``mempalace repair max-seq-id`` — see
 # ``MempalaceConfig.max_backups``.
 DEFAULT_MAX_BACKUPS = 10
+
+# Weights for the hybrid re-rank blend (vector embedding-similarity vs BM25
+# lexical) in ``searcher._hybrid_rank``. These were the function's hardcoded
+# defaults; surfaced as config so users can retune the blend without patching
+# site-packages (#2298).
+DEFAULT_HYBRID_VECTOR_WEIGHT = 0.6
+DEFAULT_HYBRID_BM25_WEIGHT = 0.4
 
 
 def normalize_milvus_consistency_level(value) -> str:
@@ -263,6 +325,50 @@ def sqlite_read_uri(db_path: str) -> str:
 
     db_path = os.fspath(db_path)
     return f"file:{pathname2url(db_path)}?mode=ro"
+
+
+def _is_wal_without_sidecars(db_path: str) -> bool:
+    """True for a WAL database whose ``-wal``/``-shm`` sidecars are both absent.
+
+    Byte 18 of the SQLite header is the file format write version: 1 for a
+    rollback journal, 2 for WAL. Reading it costs one open and answers the
+    question a connection cannot answer without already being usable.
+    """
+    if os.path.exists(f"{db_path}-shm") or os.path.exists(f"{db_path}-wal"):
+        return False
+    try:
+        with open(db_path, "rb") as handle:
+            header = handle.read(19)
+    except OSError:
+        # Unreadable for another reason; let the normal open report it.
+        return False
+    return len(header) == 19 and header[:16] == b"SQLite format 3\x00" and header[18] == 2
+
+
+def connect_sqlite_read(db_path: str, *, timeout: "float | None" = None):
+    """Open ``db_path`` for reading, and keep reading when ``mode=ro`` cannot.
+
+    A WAL database whose ``-wal`` and ``-shm`` sidecars are absent cannot be
+    read through a read-only connection on every SQLite build: Apple's system
+    library, which CPython links on macOS, accepts the connect and then fails
+    the first statement with ``SQLITE_CANTOPEN``, because a read-only
+    connection may not create the shared-memory index that WAL needs. The
+    sidecars are absent exactly when nothing holds the palace open, which is
+    the ordinary state before this process opens chroma, so a healthy palace
+    came back as unreadable and the integrity gate refused every tool (#2489).
+
+    Only that case takes a normal open, which creates the sidecars the
+    read-only connection may not and takes SQLite's usual locks. ``immutable=1``
+    would also open, but it disables locking and can read a torn page set from
+    under a live writer, so it is not a substitute. Everything else keeps the
+    read-only connection it had.
+    """
+    import sqlite3
+
+    kwargs = {} if timeout is None else {"timeout": timeout}
+    if _is_wal_without_sidecars(db_path):
+        return sqlite3.connect(os.fspath(db_path), **kwargs)
+    return sqlite3.connect(sqlite_read_uri(db_path), uri=True, **kwargs)
 
 
 @lru_cache(maxsize=1)
@@ -610,14 +716,13 @@ class MempalaceConfig:
 
         Args:
             config_dir: Override config directory (useful for testing).
-                        Defaults to ~/.mempalace.
+                        Defaults to the XDG-aware base directory — see
+                        _default_config_dir() for the resolution order.
             palace_path: Explicit palace data directory. This is primarily
                          used by CLI operations that received ``--palace``;
                          it takes precedence over environment and file config.
         """
-        self._config_dir = (
-            Path(config_dir) if config_dir else Path(os.path.expanduser("~/.mempalace"))
-        )
+        self._config_dir = Path(config_dir).expanduser() if config_dir else _default_config_dir()
         self._config_file = self._config_dir / "config.json"
         self._people_map_file = self._config_dir / "people_map.json"
         self._palace_path_override = (
@@ -801,17 +906,39 @@ class MempalaceConfig:
             print(f"  ! Could not write {self._config_file}: {exc}", file=sys.stderr)
 
     @property
+    def config_dir(self):
+        """Active config directory (XDG-aware).
+
+        Public accessor for the resolved config-dir path so callers outside
+        ``config.py`` can derive sibling locations (write-ahead-log dir,
+        cache dir, etc.) without reaching into ``_config_dir``.
+        """
+        return self._config_dir
+
+    @property
     def palace_path(self):
-        """Path to the memory palace data directory."""
+        """Path to the memory palace data directory.
+
+        Defaults to a "palace" sub-directory inside the active config
+        directory, so the palace follows the config wherever XDG places it.
+        """
         if self._palace_path_override is not None:
             return self._palace_path_override
-        env_val = os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALACE_PATH")
+        # Precedence: MEMPALACE_PALACE_PATH (documented, primary) >
+        # MEMPALACE_PALACE (short alias accepted per #2366) > MEMPAL_PALACE_PATH (legacy).
+        env_val = (
+            os.environ.get("MEMPALACE_PALACE_PATH")
+            or os.environ.get("MEMPALACE_PALACE")
+            or os.environ.get("MEMPAL_PALACE_PATH")
+        )
         if env_val:
             # Normalize: expand ~ and collapse .. to match the CLI --palace
             # code path (mcp_server.py:62) and prevent surprise redirection
             # when the env var contains unresolved components.
             return os.path.abspath(os.path.expanduser(env_val))
-        return os.path.expanduser(self._file_config.get("palace_path", DEFAULT_PALACE_PATH))
+        return os.path.expanduser(
+            self._file_config.get("palace_path", str(self._config_dir / "palace"))
+        )
 
     @property
     def tunnel_file(self):
@@ -964,6 +1091,26 @@ class MempalaceConfig:
         if env_val:
             return env_val.strip()
         value = self._file_config.get("pgvector_namespace")
+        return str(value).strip() if value else None
+
+    @property
+    def pgvector_shared_namespace(self):
+        """Optional shared table namespace for a pgvector palace spanning hosts.
+
+        By default the pgvector backend derives each table name from a hash of
+        the palace's *local* path, so several machines pointed at one Postgres
+        silently write to separate tables instead of sharing memory. Set this to
+        any name the whole fleet agrees on (letters, digits and ``_ - . / :``
+        or spaces) and every node resolves the same tables.
+
+        Leave unset — the default — for single-machine palaces; table naming is
+        then exactly as before and no migration is needed. It is orthogonal to
+        ``pgvector_namespace``, which stays the tenant-isolation dimension.
+        """
+        env_val = os.environ.get("MEMPALACE_PGVECTOR_SHARED_NAMESPACE")
+        if env_val:
+            return env_val.strip()
+        value = self._file_config.get("pgvector_shared_namespace")
         return str(value).strip() if value else None
 
     @property
@@ -1241,6 +1388,41 @@ class MempalaceConfig:
             return _EMBEDDINGGEMMA_BATCH_SIZE
         return val if val > 0 else _EMBEDDINGGEMMA_BATCH_SIZE
 
+    @property
+    def hybrid_rank_vector_weight(self) -> float:
+        """Weight of the vector (embedding-similarity) signal in the hybrid
+        re-rank (``searcher._hybrid_rank``).
+
+        Read from env ``MEMPALACE_HYBRID_VECTOR_WEIGHT`` first, then
+        ``hybrid_rank_vector_weight`` in ``config.json``, then the built-in
+        default (``0.6``). Unset, non-numeric, infinite, or negative values
+        fall back to the default rather than raising — a hand-edited
+        ``config.json`` shouldn't take retrieval down. The default reproduces
+        the previously-hardcoded weight, so leaving it unset is a
+        byte-identical blend (#2298).
+        """
+        return self._resolve_float_setting(
+            "MEMPALACE_HYBRID_VECTOR_WEIGHT",
+            "hybrid_rank_vector_weight",
+            DEFAULT_HYBRID_VECTOR_WEIGHT,
+        )
+
+    @property
+    def hybrid_rank_bm25_weight(self) -> float:
+        """Weight of the BM25 (lexical) signal in the hybrid re-rank
+        (``searcher._hybrid_rank``).
+
+        Read from env ``MEMPALACE_HYBRID_BM25_WEIGHT`` first, then
+        ``hybrid_rank_bm25_weight`` in ``config.json``, then the built-in
+        default (``0.4``). Unset, non-numeric, infinite, or negative values
+        fall back to the default rather than raising (#2298).
+        """
+        return self._resolve_float_setting(
+            "MEMPALACE_HYBRID_BM25_WEIGHT",
+            "hybrid_rank_bm25_weight",
+            DEFAULT_HYBRID_BM25_WEIGHT,
+        )
+
     def set_embedding_model(self, model: str) -> None:
         """Persist the embedding-model choice to ``config.json``.
 
@@ -1286,6 +1468,29 @@ class MempalaceConfig:
         if isinstance(cfg_val, str) and cfg_val.strip():
             return cfg_val.strip()
         return None
+
+    def _resolve_float_setting(self, env_var: str, config_key: str, default: float) -> float:
+        """Resolve a float setting: env var > ``config.json`` > ``default``.
+
+        Whitespace-only values are treated as unset, so a blank env var or a
+        hand-edited empty config key doesn't mask the value below it. A set
+        value that is not a finite, non-negative number falls back to
+        ``default`` rather than raising — a stray type or non-numeric string
+        in ``config.json`` shouldn't take retrieval down (mirrors
+        ``embedding_threads`` / ``embeddinggemma_batch_size``).
+        """
+        raw = os.environ.get(env_var)
+        if raw is None or not str(raw).strip():
+            raw = self._file_config.get(config_key)
+        if raw is None:
+            return default
+        try:
+            val = float(str(raw).strip())
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(val) or val < 0:
+            return default
+        return val
 
     @property
     def embedding_api_url(self):

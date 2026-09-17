@@ -309,7 +309,7 @@ class TestSkills:
             "private local palace",
             "shared-brain hub",
             "client joining an existing hub",
-            "mempalace rules --agent",
+            "mempalace rules --host",
             "mempalace logstream",
         ):
             assert contract in body, f"setup skill is missing onboarding contract: {contract}"
