@@ -44,6 +44,11 @@ def _search_args_forwardable(args) -> bool:
     """Return whether ``mempalace_search`` preserves this CLI search exactly."""
     if _backend_arg(args) or not 1 <= args.results <= _HUB_SEARCH_MAX_RESULTS:
         return False
+
+    # --source-file filtering and --json output only exist on the local path;
+    # forwarding a request carrying either would silently drop them.
+    if getattr(args, "source_file", None) or getattr(args, "json", False):
+        return False
     if any(os.environ.get(name, "").strip() for name in _SEARCH_OVERRIDE_ENV_VARS):
         return False
 
