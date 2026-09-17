@@ -104,6 +104,26 @@ class TestEnsureHub:
         assert hub_bootstrap.ensure_hub(palace) is True
         assert state["spawns"] == 1
 
+    def test_dead_child_still_waits_for_sibling_hub(self, tmp_path, monkeypatch):
+        palace = str(tmp_path / "palace")
+        calls = {"n": 0}
+
+        class _Dead:
+            returncode = 2
+
+            def poll(self):
+                return 2
+
+        def ready(path):
+            calls["n"] += 1
+            return calls["n"] >= 3
+
+        monkeypatch.setattr(hub_bootstrap, "_hub_ready", ready)
+        monkeypatch.setattr(hub_bootstrap, "_READY_TIMEOUT_S", 1.0)
+        monkeypatch.setattr(hub_bootstrap, "_READY_POLL_S", 0)
+        assert hub_bootstrap._wait_for_hub(palace, _Dead()) is True
+        assert calls["n"] >= 3
+
     def test_spawn_failure_falls_back(self, tmp_path, monkeypatch):
         monkeypatch.setattr(hub_bootstrap, "_hub_ready", lambda path: False)
         monkeypatch.setattr(hub_bootstrap, "_spawn_hub", lambda *a, **k: None)

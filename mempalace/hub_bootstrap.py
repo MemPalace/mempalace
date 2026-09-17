@@ -166,16 +166,22 @@ def _spawn_hub(palace_path: str, backend: str | None, log_path: Path) -> subproc
 
 def _wait_for_hub(palace_path: str, proc: subprocess.Popen | None) -> bool:
     deadline = time.monotonic() + _READY_TIMEOUT_S
+    child_exit_logged = False
     while time.monotonic() < deadline:
         if _hub_ready(palace_path):
             return True
-        if proc is not None and proc.poll() is not None:
-            logger.warning(
-                "palace hub exited during startup with code %s",
+        if proc is not None and proc.poll() is not None and not child_exit_logged:
+            # Our child died (Windows has no flock, so a sibling often wins
+            # the lease with WRITER_WAIT=0). Keep polling: the winner's
+            # serverinfo is what matters, not this process's pid.
+            logger.info(
+                "palace hub child exited with code %s; waiting for a sibling hub",
                 proc.returncode,
             )
-            return False
+            child_exit_logged = True
         time.sleep(_READY_POLL_S)
+    if _hub_ready(palace_path):
+        return True
     logger.warning(
         "palace hub did not become ready within %.0fs; falling back to local",
         _READY_TIMEOUT_S,
