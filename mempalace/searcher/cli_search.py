@@ -53,7 +53,7 @@ def _print_search_results_bm25_only(
             full_source = hit.get("source_path") or hit.get("source_file", "?")
             out.append(
                 {
-                    "drawer_id": hit.get("_id", "?"),
+                    "drawer_id": hit.get("drawer_id") or hit.get("_id", "?"),
                     "source_file": full_source,
                     "source_file_name": Path(full_source).name,
                     "wing": hit.get("wing", "?"),
@@ -202,19 +202,25 @@ def search(
     docs = _first_or_empty(results, "documents")
     metas = _first_or_empty(results, "metadatas")
     dists = _first_or_empty(results, "distances")
+    ids = _first_or_empty(results, "ids")
+    if not ids and docs:
+        # Backends that do not return entry ids still produce hits; the
+        # drawer_id display just falls back to metadata.
+        ids = [None] * len(docs)
 
     if date_window_active:
         kept = [
-            (doc, meta, dist)
-            for doc, meta, dist in zip(docs, metas, dists)
+            (rid, doc, meta, dist)
+            for rid, doc, meta, dist in zip(ids, docs, metas, dists)
             if filed_at_in_window((meta or {}).get("filed_at"), since_dt, before_dt)
         ]
         # Keep the whole in-window pool here; the hybrid re-rank below must
         # see every survivor before the display cut to n_results, or a
         # BM25-strong drawer deep in the pool could never surface.
-        docs = [k[0] for k in kept]
-        metas = [k[1] for k in kept]
-        dists = [k[2] for k in kept]
+        ids = [k[0] for k in kept]
+        docs = [k[1] for k in kept]
+        metas = [k[2] for k in kept]
+        dists = [k[3] for k in kept]
 
     if not docs:
         if json_output:
@@ -233,8 +239,8 @@ def search(
     # see via `mempalace_search`.
     metric = _metric_for_collection(col)
     hits = [
-        {"text": doc or "", "distance": float(dist), "metadata": meta or {}}
-        for doc, meta, dist in zip(docs, metas, dists)
+        {"id": rid, "text": doc or "", "distance": float(dist), "metadata": meta or {}}
+        for rid, doc, meta, dist in zip(ids, docs, metas, dists)
     ]
     vector_weight, bm25_weight = _resolve_hybrid_rank_weights()
     hits = _hybrid_rank(
@@ -256,7 +262,7 @@ def search(
             meta = hit["metadata"]
             out.append(
                 {
-                    "drawer_id": meta.get("drawer_id", "?"),
+                    "drawer_id": hit.get("id") or meta.get("drawer_id", "?"),
                     "parent_drawer_id": meta.get("parent_drawer_id"),
                     "source_file": meta.get("source_file", "?"),
                     "source_file_name": Path(meta.get("source_file", "?")).name,
@@ -292,7 +298,7 @@ def search(
         source = Path(meta.get("source_file", "?")).name
         wing_name = meta.get("wing", "?")
         room_name = meta.get("room", "?")
-        drawer_id = meta.get("drawer_id", "?")
+        drawer_id = hit.get("id") or meta.get("drawer_id", "?")
         parent_drawer_id = meta.get("parent_drawer_id", "?")
 
         print(f"  [{i}] {wing_name} / {room_name}")
