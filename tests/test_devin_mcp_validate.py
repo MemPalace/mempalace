@@ -234,7 +234,7 @@ class TestHttpToolList:
                 text=True,
                 env={**os.environ, "HOME": str(home)},
             )
-            assert proc.returncode == 1
+            assert proc.returncode == 2
             result = json.loads(proc.stdout)
             assert result["decision"] == "block"
             assert "missing required field: name" in result["reason"]
