@@ -273,6 +273,10 @@ class TestMcpConfig:
             f"mempalace server command must be 'mempalace-mcp' (the binary "
             f"shipped by the package); got {entry.get('command')!r}"
         )
+        assert entry.get("args") == ["--ensure-hub"], (
+            "Cursor must opt into --ensure-hub so per-window stdio children "
+            f"proxy to one loopback hub; got {entry.get('args')!r}"
+        )
 
 
 # ── skills/ ─────────────────────────────────────────────────────────

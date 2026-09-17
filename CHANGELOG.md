@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Features
+
+- **Cursor's MCP plugin starts one loopback hub.** `mempalace-mcp --ensure-hub`
+  (also `MEMPALACE_MCP_ENSURE_HUB=1`) flock-serializes a detached
+  `127.0.0.1` HTTP hub when none is registered, then the stdio child
+  proxies to it. The Cursor plugin `mcp.json` opts in so per-window
+  servers stop racing for the ChromaDB writer lease. Other hosts are
+  unchanged. Manual stop: kill the pid in
+  `~/.mempalace/server/*/serverinfo.json`. The idle watchdog still
+  retires an unused hub.
+
 ### Bug Fixes
 
 - **A `known_entities.json` write no longer appears to hang on Windows when the

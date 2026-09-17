@@ -1491,7 +1491,7 @@ def test_get_client_if_running_uses_short_probe_timeout(monkeypatch):
 
 
 def test_detached_kwargs_posix(tmp_path, monkeypatch):
-    monkeypatch.setattr("mempalace.daemon.os.name", "posix")
+    monkeypatch.setattr("mempalace.hub_bootstrap.os.name", "posix")
     kwargs = daemon._detached_kwargs(tmp_path / "daemon.log")
     fh = kwargs["stdout"]
     try:
@@ -1504,14 +1504,22 @@ def test_detached_kwargs_posix(tmp_path, monkeypatch):
 
 
 def test_detached_kwargs_windows(tmp_path, monkeypatch):
-    monkeypatch.setattr("mempalace.daemon.os.name", "nt")
-    monkeypatch.setattr("mempalace.daemon.subprocess.CREATE_NO_WINDOW", 0x08000000, raising=False)
-    monkeypatch.setattr("mempalace.daemon.subprocess.DETACHED_PROCESS", 0x00000008, raising=False)
+    monkeypatch.setattr("mempalace.hub_bootstrap.os.name", "nt")
     monkeypatch.setattr(
-        "mempalace.daemon.subprocess.CREATE_NEW_PROCESS_GROUP", 0x00000200, raising=False
+        "mempalace.hub_bootstrap.subprocess.CREATE_NO_WINDOW", 0x08000000, raising=False
     )
     monkeypatch.setattr(
-        "mempalace.daemon.subprocess.CREATE_BREAKAWAY_FROM_JOB", 0x01000000, raising=False
+        "mempalace.hub_bootstrap.subprocess.DETACHED_PROCESS", 0x00000008, raising=False
+    )
+    monkeypatch.setattr(
+        "mempalace.hub_bootstrap.subprocess.CREATE_NEW_PROCESS_GROUP",
+        0x00000200,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "mempalace.hub_bootstrap.subprocess.CREATE_BREAKAWAY_FROM_JOB",
+        0x01000000,
+        raising=False,
     )
     kwargs = daemon._detached_kwargs(tmp_path / "daemon.log")
     fh = kwargs["stdout"]

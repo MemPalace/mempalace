@@ -81,11 +81,15 @@ This plugin ships `mcp.json` at the plugin root, so Cursor auto-loads the `mempa
 {
   "mcpServers": {
     "mempalace": {
-      "command": "mempalace-mcp"
+      "type": "stdio",
+      "command": "mempalace-mcp",
+      "args": ["--ensure-hub"]
     }
   }
 }
 ```
+
+`--ensure-hub` starts one loopback `mempalace serve` hub (if none is already registered) and keeps every Cursor window a thin proxy. Without it, each window's stdio child races for the ChromaDB writer lease and all but one go read-only. Other hosts can keep calling `mempalace-mcp` with no flags.
 
 All 45 MemPalace MCP tools (`mempalace_search`, `mempalace_add_drawer`, `mempalace_diary_write`, `mempalace_check_duplicate`, `mempalace_diary_read`, …) become available to the agent immediately. No manual `~/.cursor/mcp.json` edit required.
 

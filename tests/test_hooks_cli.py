@@ -1389,7 +1389,7 @@ def test_detached_popen_kwargs_posix(monkeypatch):
     """On POSIX, kwargs include start_new_session so the child detaches."""
     from mempalace.hooks_cli import _detached_popen_kwargs
 
-    monkeypatch.setattr("mempalace.hooks_cli.os.name", "posix")
+    monkeypatch.setattr("mempalace.hub_bootstrap.os.name", "posix")
     kwargs = _detached_popen_kwargs()
     assert kwargs.get("start_new_session") is True
     assert kwargs.get("stdin") is subprocess.DEVNULL
@@ -1412,17 +1412,24 @@ def test_detached_popen_kwargs_windows(monkeypatch):
     """
     from mempalace.hooks_cli import _detached_popen_kwargs
 
-    monkeypatch.setattr("mempalace.hooks_cli.os.name", "nt")
+    monkeypatch.setattr("mempalace.hub_bootstrap.os.name", "nt")
     # Simulate Windows-only Popen flag constants on the imported subprocess
     # module so getattr() picks them up cross-platform.
     monkeypatch.setattr(
-        "mempalace.hooks_cli.subprocess.CREATE_NO_WINDOW", 0x08000000, raising=False
+        "mempalace.hub_bootstrap.subprocess.CREATE_NO_WINDOW", 0x08000000, raising=False
     )
     monkeypatch.setattr(
-        "mempalace.hooks_cli.subprocess.DETACHED_PROCESS", 0x00000008, raising=False
+        "mempalace.hub_bootstrap.subprocess.DETACHED_PROCESS", 0x00000008, raising=False
     )
     monkeypatch.setattr(
-        "mempalace.hooks_cli.subprocess.CREATE_NEW_PROCESS_GROUP", 0x00000200, raising=False
+        "mempalace.hub_bootstrap.subprocess.CREATE_NEW_PROCESS_GROUP",
+        0x00000200,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "mempalace.hub_bootstrap.subprocess.CREATE_BREAKAWAY_FROM_JOB",
+        0x01000000,
+        raising=False,
     )
     kwargs = _detached_popen_kwargs()
     assert kwargs.get("stdin") is subprocess.DEVNULL

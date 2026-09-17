@@ -1,7 +1,9 @@
 {
   "mcpServers": {
     "mempalace": {
-      "command": "mempalace-mcp"
+      "type": "stdio",
+      "command": "mempalace-mcp",
+      "args": ["--ensure-hub"]
     }
   }
 }

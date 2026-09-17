@@ -1237,38 +1237,18 @@ def get_client_if_running(palace_path: str, *, health_timeout: float = 5.0) -> D
 def _detached_kwargs(log_path: Path) -> dict[str, Any]:
     """Kwargs that spawn the daemon with a hidden console, detached from the CLI.
 
-    Shares the Windows flag logic with ``hooks_cli._detached_popen_kwargs``
-    (which takes no args and opens no log file). On Windows we use
-    ``CREATE_NO_WINDOW`` rather than ``DETACHED_PROCESS``: the latter gives the
-    child no console, so a console-subsystem grandchild later allocates a fresh
-    *visible* window (#1783); ``CREATE_NO_WINDOW`` gives a hidden console that
-    descendants inherit instead. Surviving the launching terminal is carried by
-    ``CREATE_BREAKAWAY_FROM_JOB`` (escapes the parent Job Object's kill-on-close)
-    plus the daemon never being attached to that console -- not by the console
-    flag -- while ``CREATE_NEW_PROCESS_GROUP`` isolates Ctrl-C/Ctrl-Break routing.
-    ``CREATE_NO_WINDOW`` is ignored when OR'd with ``DETACHED_PROCESS``, so this
-    replaces that flag rather than adding it. ``stdin=DEVNULL`` and stdout/stderr
-    redirected to the log avoid the #1268 parent hang.
+    Delegates the Windows/POSIX process-group flags to
+    :func:`hub_bootstrap.detached_popen_kwargs` so the daemon, hooks, and
+    ``--ensure-hub`` path stay in lockstep. This wrapper still opens the
+    owner-only log file the daemon needs.
     """
+    from .hub_bootstrap import detached_popen_kwargs
+
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_fh = open(log_path, "a", encoding="utf-8")
     # The daemon log may capture verbatim content in tracebacks — owner-only.
     _chmod_private(log_path)
-    kwargs: dict[str, Any] = {
-        "stdin": subprocess.DEVNULL,
-        "stdout": log_fh,
-        "stderr": log_fh,
-        "close_fds": True,
-    }
-    if os.name == "nt":
-        flags = 0
-        for name in ("CREATE_NO_WINDOW", "CREATE_NEW_PROCESS_GROUP", "CREATE_BREAKAWAY_FROM_JOB"):
-            flags |= getattr(subprocess, name, 0)
-        if flags:
-            kwargs["creationflags"] = flags
-    else:
-        kwargs["start_new_session"] = True
-    return kwargs
+    return detached_popen_kwargs(stdout=log_fh, stderr=log_fh)
 
 
 def _process_start_time_windows(pid: int) -> float | None:
