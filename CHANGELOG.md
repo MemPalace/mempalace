@@ -10,6 +10,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Bug Fixes
 
+- **The MCP server no longer reloads the HNSW index after its own writes, and
+  search sees drawers another process mines after a duplicate check.** The
+  server kept a ChromaDB client of its own next to the one search and mining
+  share, and never re-stamped it after its own writes. So
+  `mempalace_add_drawer`, `mempalace_check_duplicate` and
+  `mempalace_diary_write` read the index from disk again. Reopening that client
+  also dropped the search path's stat record, so a search could keep answering
+  from the server's older index. The server now uses the backend's client,
+  which re-stamps after this process's own opens and writes. (#2535)
 - **A `known_entities.json` write no longer appears to hang on Windows when the
   directory refuses a temporary file.** `_publish_registry` falls back to writing
   in place when the directory takes no new name, and it learned that from the

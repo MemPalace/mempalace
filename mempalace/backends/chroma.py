@@ -3021,8 +3021,13 @@ class ChromaBackend(BaseBackend):
         must reacquire them through :meth:`get_collection`.
         """
         clients = list(self._clients.values())
+        dropped = set(self._clients) | set(self._freshness)
         self._clients.clear()
         self._freshness.clear()
+        # As in close_palace: without a stat record the next open cannot see a
+        # change, so re-arm the HNSW pre-checks for every palace dropped here.
+        for path in dropped:
+            ChromaBackend._quarantined_paths.discard(path)
         for client in clients:
             _close_client(client)
 
@@ -3146,9 +3151,10 @@ class ChromaBackend(BaseBackend):
     # *cold-start* protection -- they catch segments that arrive stale relative
     # to ``chroma.sqlite3`` or invalid on disk (e.g. cross-machine replication,
     # partial restore, crashed-mid-write). The gate is cleared whenever the
-    # palace changes on disk (inode swap, mtime bump, or file appearance), so
-    # external writes that drift HNSW segments are caught on the next open
-    # without requiring a full process restart.
+    # palace changes on disk (inode swap, mtime bump, or file appearance), when
+    # :meth:`close_palace` is called for it, and when a drain drops its stat
+    # record, so external writes that drift HNSW segments are caught on the next
+    # open without requiring a full process restart.
     #
     # Thread-safety: this set is mutated without a lock. Two concurrent
     # ``make_client()`` calls for the same palace can both pass the
@@ -3325,6 +3331,9 @@ class ChromaBackend(BaseBackend):
             return
         _close_client(self._clients.pop(path, None))
         self._freshness.pop(path, None)
+        # Without its stat record the next open cannot see a change on disk, so
+        # re-arm the HNSW pre-checks for it (#1573).
+        ChromaBackend._quarantined_paths.discard(path)
 
     def close(self) -> None:
         self._drain_clients()

@@ -1163,10 +1163,10 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 
         # A closet quotes the source file, not the stored drawer, so it only
         # goes stale on a content change; wing/room alone leaves it correct (#2325).
-        closets_deleted = 0
-        source_file = old_meta.get("source_file")
-        if content is not None and source_file:
-            closets_deleted = _purge_source_closets(source_file, commit=True)
+        # Purge after the drawer write, as the delete tools do: the purge opens
+        # the closets through the backend, and a rebuild there closes the client
+        # ``col`` came from.
+        source_file = old_meta.get("source_file") if content is not None else None
 
         chunk_size = max(1, int(getattr(_config, "chunk_size", 800) or 800))
         should_chunk = bool(record.get("chunked")) or len(new_doc) > chunk_size
@@ -1187,6 +1187,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 col.delete(ids=stale_ids)
 
             _invalidate_overview_caches()
+            closets_deleted = _purge_source_closets(source_file, commit=True) if source_file else 0
 
             logger.info("Updated drawer: %s (%s rows)", drawer_id, len(chunk_ids))
 
@@ -1207,6 +1208,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 
         col.update(**update_kwargs)
         _invalidate_overview_caches()
+        closets_deleted = _purge_source_closets(source_file, commit=True) if source_file else 0
 
         logger.info("Updated drawer: %s", drawer_id)
 
