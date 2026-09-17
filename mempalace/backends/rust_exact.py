@@ -2,9 +2,9 @@
 
 High-performance native backend powered by crates/mempalace-core and PyO3.
 Stores data in the same sqlite_exact.sqlite3 database as SQLiteExactBackend,
-but uses a native contiguous vector index in Rust.
-Memory consumption is 526 MB for 334k documents (vs 2,430 MB in pure Python)
-and multi-core parallel queries execute in 7–11 ms.
+but uses a native contiguous vector index in Rust. Complex filters, requests for
+returned embeddings, and installs without the native extension use the Python
+backend.
 """
 
 from __future__ import annotations

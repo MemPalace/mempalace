@@ -596,6 +596,7 @@ def test_read_only_off_exposes_mutating_tools(http_server):
 
 
 def test_writable_http_refuses_startup_without_writer_lease(monkeypatch):
+    monkeypatch.setenv("MEMPALACE_MCP_WRITER_WAIT_SECONDS", "0")
     monkeypatch.setattr(mcp, "_READ_ONLY", False)
     monkeypatch.setattr(
         mcp,
@@ -612,6 +613,144 @@ def test_writable_http_refuses_startup_without_writer_lease(monkeypatch):
         mcp._run_http_loop()
 
     assert exc_info.value.code == 2
+
+
+class _FakeClock:
+    """Deterministic monotonic clock whose sleep advances time instead of blocking."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _patch_http_startup(monkeypatch, events):
+    monkeypatch.setattr(mcp, "_READ_ONLY", False)
+    monkeypatch.setattr(mcp, "_MCP_WRITER_READ_ONLY", False)
+    monkeypatch.setattr(mcp, "_MCP_WRITER_LOCK_CM", None)
+    monkeypatch.setattr(mcp, "_discard_mcp_storage_handles", lambda: None)
+    monkeypatch.setattr(mcp, "_refresh_vector_disabled_flag", lambda: None)
+    monkeypatch.setattr(mcp, "_start_idle_exit_watchdog", lambda: None)
+    monkeypatch.setattr(mcp, "_start_write_stall_watchdog", lambda: None)
+    monkeypatch.setattr(mcp, "_serve_http", lambda host, port: events.append("serve"))
+
+
+def _contended_then_free(attempts_before_free, events):
+    """Stand-in for _acquire_mcp_writer_lock: a peer holds the lease N times, then frees it."""
+
+    class Lease:
+        def __exit__(self, *exc):
+            return False
+
+    state = {"calls": 0}
+
+    def acquire():
+        state["calls"] += 1
+        events.append("attempt")
+        if state["calls"] <= attempts_before_free:
+            mcp._MCP_WRITER_READ_ONLY = True
+            return False, "another mempalace writer already holds the palace lock"
+        mcp._MCP_WRITER_READ_ONLY = False
+        mcp._MCP_WRITER_LOCK_CM = Lease()
+        return True, ""
+
+    return acquire
+
+
+def test_writable_http_waits_for_a_peer_to_release_the_writer_lease(monkeypatch):
+    """#2500: a transient holder is waited out instead of refusing startup."""
+    events = []
+    clock = _FakeClock()
+    _patch_http_startup(monkeypatch, events)
+    monkeypatch.setenv("MEMPALACE_MCP_WRITER_WAIT_SECONDS", "60")
+    monkeypatch.setattr(mcp, "_acquire_mcp_writer_lock", _contended_then_free(2, events))
+    monkeypatch.setattr(mcp.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(mcp.time, "sleep", clock.sleep)
+
+    mcp._run_http_loop()
+
+    assert events == ["attempt", "attempt", "attempt", "serve"]
+    assert clock.sleeps == [0.5, 1.0], "backoff doubles between attempts"
+
+
+def test_writable_http_exits_2_when_the_writer_lease_wait_runs_out(monkeypatch):
+    events = []
+    clock = _FakeClock()
+    _patch_http_startup(monkeypatch, events)
+    monkeypatch.setenv("MEMPALACE_MCP_WRITER_WAIT_SECONDS", "10")
+    monkeypatch.setattr(mcp, "_acquire_mcp_writer_lock", _contended_then_free(10**6, events))
+    monkeypatch.setattr(mcp.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(mcp.time, "sleep", clock.sleep)
+
+    with pytest.raises(SystemExit) as exc_info:
+        mcp._run_http_loop()
+
+    assert exc_info.value.code == 2
+    assert "serve" not in events
+    assert sum(clock.sleeps) == pytest.approx(10.0), "never sleeps past the configured wait"
+    assert max(clock.sleeps) <= 5.0, "backoff is capped"
+
+
+def test_writable_http_does_not_wait_on_a_writer_setup_failure(monkeypatch):
+    """Waiting cannot fix a backend or lock-directory failure, so it refuses at once."""
+    events = []
+    clock = _FakeClock()
+    _patch_http_startup(monkeypatch, events)
+    monkeypatch.setenv("MEMPALACE_MCP_WRITER_WAIT_SECONDS", "60")
+
+    def setup_failure():
+        events.append("attempt")
+        mcp._MCP_WRITER_READ_ONLY = False
+        return False, "could not acquire MCP peer-writer lock"
+
+    monkeypatch.setattr(mcp, "_acquire_mcp_writer_lock", setup_failure)
+    monkeypatch.setattr(mcp.time, "sleep", clock.sleep)
+
+    with pytest.raises(SystemExit) as exc_info:
+        mcp._run_http_loop()
+
+    assert exc_info.value.code == 2
+    assert events == ["attempt"]
+    assert clock.sleeps == []
+
+
+def test_writer_wait_zero_restores_immediate_refusal(monkeypatch):
+    events = []
+    clock = _FakeClock()
+    _patch_http_startup(monkeypatch, events)
+    monkeypatch.setenv("MEMPALACE_MCP_WRITER_WAIT_SECONDS", "0")
+    monkeypatch.setattr(mcp, "_acquire_mcp_writer_lock", _contended_then_free(1, events))
+    monkeypatch.setattr(mcp.time, "sleep", clock.sleep)
+
+    with pytest.raises(SystemExit) as exc_info:
+        mcp._run_http_loop()
+
+    assert exc_info.value.code == 2
+    assert events == ["attempt"]
+    assert clock.sleeps == []
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("", 120.0),
+        ("45", 45.0),
+        ("0", 0.0),
+        ("-3", 120.0),
+        ("nan", 120.0),
+        ("inf", 120.0),
+        ("soon", 120.0),
+    ],
+)
+def test_writer_wait_seconds_parsing(monkeypatch, raw, expected):
+    monkeypatch.setenv("MEMPALACE_MCP_WRITER_WAIT_SECONDS", raw)
+    assert mcp._writer_wait_seconds() == expected
 
 
 def test_read_only_http_skips_writer_lease(monkeypatch):

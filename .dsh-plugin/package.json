@@ -1,6 +1,6 @@
 {
   "name": "@mempalace/dsh-plugin",
-  "version": "3.9.0",
+  "version": "3.10.0",
   "description": "MemPalace for the DeepSeek Harness: stored memory in each session's system prompt, conversations filed through MemPalace's own hooks, and the palace tools over MCP.",
   "type": "module",
   "license": "MIT",

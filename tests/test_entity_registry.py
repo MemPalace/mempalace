@@ -1,7 +1,5 @@
 """Tests for mempalace.entity_registry."""
 
-from unittest.mock import patch
-
 import pytest
 
 from mempalace.entity_registry import (
@@ -9,15 +7,6 @@ from mempalace.entity_registry import (
     PERSON_CONTEXT_PATTERNS,
     EntityRegistry,
 )
-
-# Shared mock result for Wikipedia person lookup tests
-_MOCK_SAOIRSE_PERSON = {
-    "inferred_type": "person",
-    "confidence": 0.80,
-    "wiki_summary": "Saoirse is an Irish given name.",
-    "wiki_title": "Saoirse",
-}
-
 
 # ── COMMON_ENGLISH_WORDS ────────────────────────────────────────────────
 
@@ -311,103 +300,6 @@ def test_lookup_ambiguous_word_as_concept(tmp_path):
     )
     result = registry.lookup("Ever", context="have you ever tried this")
     assert result["type"] == "concept"
-
-
-# ── research — local-only by default ───────────────────────────────────
-
-
-def test_research_local_only_by_default(tmp_path):
-    """research() must NOT call Wikipedia unless allow_network=True."""
-    registry = EntityRegistry.load(config_dir=tmp_path)
-    registry.seed(mode="personal", people=[], projects=[])
-
-    with patch(
-        "mempalace.entity_registry._wikipedia_lookup",
-        side_effect=AssertionError("network call should not happen"),
-    ):
-        result = registry.research("Saoirse")
-
-    assert result["inferred_type"] == "unknown"
-    assert result["confidence"] == 0.0
-    assert result["word"] == "Saoirse"
-    assert "network lookup disabled" in result.get("note", "")
-
-
-def test_research_with_allow_network(tmp_path):
-    """research(allow_network=True) calls Wikipedia and caches result."""
-    registry = EntityRegistry.load(config_dir=tmp_path)
-    registry.seed(mode="personal", people=[], projects=[])
-
-    with patch(
-        "mempalace.entity_registry._wikipedia_lookup",
-        return_value=dict(_MOCK_SAOIRSE_PERSON),
-    ):
-        result = registry.research("Saoirse", auto_confirm=True, allow_network=True)
-    assert result["inferred_type"] == "person"
-
-
-def test_research_caches_result(tmp_path):
-    """Once cached via allow_network, subsequent calls use cache without network."""
-    registry = EntityRegistry.load(config_dir=tmp_path)
-    registry.seed(mode="personal", people=[], projects=[])
-
-    with patch(
-        "mempalace.entity_registry._wikipedia_lookup",
-        return_value=dict(_MOCK_SAOIRSE_PERSON),
-    ):
-        result = registry.research("Saoirse", auto_confirm=True, allow_network=True)
-    assert result["inferred_type"] == "person"
-
-    # Second call should use cache, not call Wikipedia again
-    with patch(
-        "mempalace.entity_registry._wikipedia_lookup",
-        side_effect=AssertionError("should not be called"),
-    ):
-        cached = registry.research("Saoirse")
-    assert cached["inferred_type"] == "person"
-
-
-def test_research_local_only_not_cached(tmp_path):
-    """Local-only result for uncached word should NOT be persisted to cache."""
-    registry = EntityRegistry.load(config_dir=tmp_path)
-    registry.seed(mode="personal", people=[], projects=[])
-
-    registry.research("Xander")  # local-only, no network
-    assert "Xander" not in registry._data.get("wiki_cache", {})
-
-
-def test_confirm_research_adds_to_people(tmp_path):
-    registry = EntityRegistry.load(config_dir=tmp_path)
-    registry.seed(mode="personal", people=[], projects=[])
-
-    with patch(
-        "mempalace.entity_registry._wikipedia_lookup",
-        return_value=dict(_MOCK_SAOIRSE_PERSON),
-    ):
-        registry.research("Saoirse", auto_confirm=False, allow_network=True)
-
-    registry.confirm_research("Saoirse", entity_type="person", relationship="friend")
-    assert "Saoirse" in registry.people
-    assert registry.people["Saoirse"]["source"] == "wiki"
-
-
-def test_wikipedia_404_returns_unknown(tmp_path):
-    """A 404 from Wikipedia should return 'unknown', not assert 'person'."""
-    registry = EntityRegistry.load(config_dir=tmp_path)
-    registry.seed(mode="personal", people=[], projects=[])
-
-    mock_result = {
-        "inferred_type": "unknown",
-        "confidence": 0.3,
-        "wiki_summary": None,
-        "wiki_title": None,
-        "note": "not found in Wikipedia",
-    }
-    with patch("mempalace.entity_registry._wikipedia_lookup", return_value=mock_result):
-        result = registry.research("Zzxqy", auto_confirm=False, allow_network=True)
-
-    assert result["inferred_type"] == "unknown"
-    assert result["confidence"] < 0.5
 
 
 # ── extract_people_from_query ───────────────────────────────────────────

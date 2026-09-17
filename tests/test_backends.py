@@ -155,6 +155,40 @@ def test_chroma_collection_delegates_writes():
     assert kinds == ["add", "upsert", "delete", "count"]
 
 
+def test_chroma_clients_are_opened_with_telemetry_disabled(monkeypatch, tmp_path):
+    """Both client paths must say anonymized_telemetry=False explicitly (GHSA-8h77)."""
+    seen = []
+
+    def fake_client(path, settings=None, **kwargs):
+        seen.append(settings)
+        return object()
+
+    monkeypatch.setattr(chroma_module.chromadb, "PersistentClient", fake_client)
+    monkeypatch.setattr(
+        chroma_module.ChromaBackend, "_prepare_palace_for_open", staticmethod(lambda p: None)
+    )
+
+    ChromaBackend()._client(str(tmp_path))
+    ChromaBackend.make_client(str(tmp_path))
+
+    assert len(seen) == 2, f"expected both client paths to open one client each, got {len(seen)}"
+    for settings in seen:
+        assert settings is not None, "client opened without explicit Settings"
+        assert settings.anonymized_telemetry is False
+
+
+def test_chroma_telemetry_env_default_is_off():
+    """Importing mempalace opts out for any chromadb client in the process."""
+    import os
+
+    from chromadb.config import Settings
+
+    import mempalace  # noqa: F401  (import for its side effects)
+
+    assert os.environ.get("ANONYMIZED_TELEMETRY") == "False"
+    assert Settings().anonymized_telemetry is False
+
+
 def test_registry_exposes_chroma_by_default():
     names = available_backends()
     assert "chroma" in names
@@ -164,6 +198,18 @@ def test_registry_exposes_chroma_by_default():
 def test_registry_unknown_backend_raises():
     with pytest.raises(KeyError):
         get_backend("no-such-backend-exists")
+
+
+def test_registry_unknown_backend_names_the_resolved_config_file(tmp_path, monkeypatch):
+    from mempalace.backends.registry import BackendUnavailableError
+
+    config_dir = tmp_path / "xdg" / "mempalace"
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(config_dir))
+
+    with pytest.raises(BackendUnavailableError) as excinfo:
+        get_backend("no-such-backend-exists")
+
+    assert str(config_dir / "config.json") in excinfo.value.args[0]
 
 
 def test_resolve_backend_priority_order(tmp_path):
@@ -2108,7 +2154,8 @@ def test_chroma_backend_preflights_metadata_before_persistent_client(tmp_path, m
         pass
 
     monkeypatch.setattr(
-        "mempalace.backends.chroma.chromadb.PersistentClient", lambda path: DummyClient()
+        "mempalace.backends.chroma.chromadb.PersistentClient",
+        lambda path, settings=None: DummyClient(),
     )
 
     backend = ChromaBackend()
@@ -2151,7 +2198,8 @@ def test_chroma_backend_quarantine_rearms_on_mtime_refresh(tmp_path, monkeypatch
         pass
 
     monkeypatch.setattr(
-        "mempalace.backends.chroma.chromadb.PersistentClient", lambda path: DummyClient()
+        "mempalace.backends.chroma.chromadb.PersistentClient",
+        lambda path, settings=None: DummyClient(),
     )
 
     backend = ChromaBackend()
@@ -2200,7 +2248,8 @@ def test_chroma_backend_requarantines_after_inode_replacement(tmp_path, monkeypa
         pass
 
     monkeypatch.setattr(
-        "mempalace.backends.chroma.chromadb.PersistentClient", lambda path: DummyClient()
+        "mempalace.backends.chroma.chromadb.PersistentClient",
+        lambda path, settings=None: DummyClient(),
     )
 
     backend = ChromaBackend()
@@ -2252,7 +2301,7 @@ def test_chroma_backend_resets_system_cache_on_inode_change(tmp_path, monkeypatc
         def close(self):
             events.append(("close", self.label))
 
-    def record_open(path):
+    def record_open(path, settings=None):
         events.append(("open", path))
         return DummyClient(path)
 

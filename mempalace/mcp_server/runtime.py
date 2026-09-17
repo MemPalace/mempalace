@@ -264,6 +264,87 @@ def _run_stdio_loop() -> None:
             break
 
 
+_MCP_WRITER_WAIT_SECONDS_ENV = "MEMPALACE_MCP_WRITER_WAIT_SECONDS"
+_MCP_WRITER_WAIT_SECONDS_DEFAULT = 120.0
+_MCP_WRITER_WAIT_MAX_DELAY = 5.0
+
+
+def _writer_wait_seconds() -> float:
+    """How long a writable HTTP server waits for a peer to release the writer lease.
+
+    ``MEMPALACE_MCP_WRITER_WAIT_SECONDS`` (default 120). ``0`` restores the old
+    behaviour of refusing immediately. A value that is not a finite,
+    non-negative number falls back to the default with a warning.
+    """
+    import math
+
+    raw = os.environ.get(_MCP_WRITER_WAIT_SECONDS_ENV, "").strip()
+    if not raw:
+        return _MCP_WRITER_WAIT_SECONDS_DEFAULT
+    try:
+        seconds = float(raw)
+    except ValueError:
+        seconds = -1.0
+    if not math.isfinite(seconds) or seconds < 0:
+        logger.warning(
+            "Invalid %s=%r; using default %.0f s",
+            _MCP_WRITER_WAIT_SECONDS_ENV,
+            raw,
+            _MCP_WRITER_WAIT_SECONDS_DEFAULT,
+        )
+        return _MCP_WRITER_WAIT_SECONDS_DEFAULT
+    return seconds
+
+
+def _acquire_writer_lease_for_http_startup() -> tuple[bool, str]:
+    """Acquire the writer lease for writable HTTP startup, waiting if a peer holds it.
+
+    #2500: refusing at once turned a transient holder into an outage. A peer
+    session's MCP server, a hook-driven mine or a CLI write that holds the
+    lease releases it when it finishes, but ``SystemExit(2)`` before binding
+    meant nothing retried, and under ``Restart=always`` the unit restarted
+    forever without ever starting. The server now retries for a bounded time
+    with backoff, logging once when the wait starts, and still exits 2 when
+    the wait runs out so a supervisor sees a terminal failure.
+
+    Only contention waits. ``_acquire_mcp_writer_lock`` sets
+    ``_MCP_WRITER_READ_ONLY`` when another writer holds the lock; a setup
+    failure (backend or lock directory) leaves it unset, and waiting would not
+    fix that, so it returns at once as before.
+    """
+    ok, reason = _acquire_mcp_writer_lock()
+    if ok or not _MCP_WRITER_READ_ONLY:
+        return ok, reason
+
+    budget = _writer_wait_seconds()
+    if budget <= 0:
+        return ok, reason
+
+    logger.warning(
+        "Writable MCP HTTP startup is waiting up to %g s for the writer lease: %s",
+        budget,
+        reason,
+    )
+    started = time.monotonic()
+    deadline = started + budget
+    delay = 0.5
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, reason
+        time.sleep(min(delay, remaining))
+        delay = min(delay * 2, _MCP_WRITER_WAIT_MAX_DELAY)
+        ok, reason = _acquire_mcp_writer_lock()
+        if ok:
+            logger.info(
+                "Writable MCP HTTP startup acquired the writer lease after %.1f s",
+                time.monotonic() - started,
+            )
+            return True, ""
+        if not _MCP_WRITER_READ_ONLY:
+            return False, reason
+
+
 def _run_http_loop() -> None:
     # In HTTP mode there is no JSON-RPC stdio channel. Keeping the import-time
     # stdout->stderr guard in place means any accidental print from a dependency
@@ -273,10 +354,11 @@ def _run_http_loop() -> None:
     # A writable HTTP server is a long-lived storage client, so it must own the
     # local palace before it binds. Refusing at startup avoids advertising a
     # writable service that will only fail (or race) on its first mutation.
+    # A peer holding the lease is waited out for a bounded time first (#2500).
     # Explicit read-only HTTP remains safe to run beside the one writer owner.
     owns_writer_lease = False
     if not _READ_ONLY:
-        writer_ok, writer_reason = _acquire_mcp_writer_lock()
+        writer_ok, writer_reason = _acquire_writer_lease_for_http_startup()
         if not writer_ok:
             logger.error("Writable MCP HTTP startup refused: %s", writer_reason)
             raise SystemExit(2)

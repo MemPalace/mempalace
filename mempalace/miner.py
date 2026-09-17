@@ -912,6 +912,39 @@ def _registry_write_target(registry_path):
     return registry_path
 
 
+# ``mkstemp`` is not usable where a permission error has to reach the caller.
+# On Windows it treats ``PermissionError`` as a name collision and tries the
+# next candidate, up to ``tempfile.TMP_MAX`` of them. That constant is 20 on
+# Python 3.13 and later, and ``os.TMP_MAX`` -- 2_147_483_647 -- on 3.12 and
+# earlier, where the sweep runs for hours at roughly 21_000 names a second and
+# reads as a hang. Both callers below need the error instead: it is how they
+# learn the directory takes no new names. (#2530)
+_TEMP_NAME_ATTEMPTS = 8
+
+
+def _open_new_temp_file(directory, prefix: str, suffix: str = ""):
+    """Create one new file under ``directory`` and return ``(fd, path)``.
+
+    Only a name already taken is retried, and only ``_TEMP_NAME_ATTEMPTS``
+    times. Every other ``OSError`` -- ``EPERM``, ``EACCES``, ``EROFS`` among
+    them -- is raised for the caller to act on, which is what ``mkstemp``
+    cannot be relied on to do. Exhausting the attempts raises
+    ``FileExistsError``, as ``mkstemp`` does.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    names = tempfile._get_candidate_names()
+    for _ in range(_TEMP_NAME_ATTEMPTS):
+        candidate = os.path.join(str(directory), f"{prefix}{next(names)}{suffix}")
+        try:
+            return os.open(candidate, flags, 0o600), candidate
+        except FileExistsError:
+            continue
+    raise FileExistsError(
+        errno.EEXIST,
+        f"no usable temporary file name found in {directory} after {_TEMP_NAME_ATTEMPTS} attempts",
+    )
+
+
 def _keep_unmergeable_registry(registry_path) -> Optional[str]:
     """Move a registry this call could not merge aside, keeping its bytes.
 
@@ -929,8 +962,8 @@ def _keep_unmergeable_registry(registry_path) -> Optional[str]:
 
     registry_path = _registry_write_target(registry_path)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    fd, target = tempfile.mkstemp(
-        dir=str(registry_path.parent),
+    fd, target = _open_new_temp_file(
+        registry_path.parent,
         prefix=f"{registry_path.name}.unreadable-{stamp}-",
     )
     os.close(fd)
@@ -1037,8 +1070,8 @@ def _publish_registry(registry_path, payload: dict) -> None:
         # directory for a name of its own instead: what it says about a name
         # it chooses is about the directory.
         try:
-            fd, tmp = tempfile.mkstemp(
-                dir=str(registry_path.parent),
+            fd, tmp = _open_new_temp_file(
+                registry_path.parent,
                 prefix=f".{registry_path.name}.",
                 suffix=".tmp",
             )
