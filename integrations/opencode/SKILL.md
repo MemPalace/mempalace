@@ -36,6 +36,10 @@ MemPalace provides persistent memory for OpenCode. Every conversation is automat
 
 Both memory injection and persistence are handled by the plugin — no model discipline required.
 
+## Relationship to the built-in OpenCode source adapter
+
+MemPalace ships a first-party OpenCode source adapter (`mempalace.sources.opencode`, see #1484) for historical ingest of existing sessions. This plugin is the complementary real-time layer: it captures turns as they happen (`chat.message` + `session.idle` + exit hooks), injects live recall into prompts, and files AI checkpoints and pre-compaction emergency saves via MCP tools. Use the source adapter to backfill history, this plugin to never lose the present.
+
 ## Architecture
 
 ```
