@@ -43,6 +43,31 @@ conversation, copy the `alwaysApply: true` variant from
 `examples/cursor/rules/` into `~/.cursor/rules/` — a heavier, deliberate
 opt-in.
 
+## Why one hub
+
+Cursor starts a new `mempalace-mcp` stdio process per window and per
+agent worker. ChromaDB (the default backend) allows one writer. The
+first child to file a drawer holds the lease for its whole life —
+Cursor pings keep resetting the idle watchdog — and every sibling
+gets `Peer MCP writer active`. Claude Code does not hit this: it
+runs one MCP process per session.
+
+The Cursor plugin therefore launches `mempalace-mcp --ensure-hub`.
+That starts one loopback HTTP hub (`127.0.0.1`, ephemeral port,
+registered in `~/.mempalace/server/`) if none is already up, and
+every stdio child plus `mempalace mine` from the hooks proxy writes
+to it. The hub exits after `MEMPALACE_MCP_IDLE_HOURS` (default 8)
+with no requests. To stop it by hand:
+
+```bash
+# the live hub records its pid next to the palace token
+python3 -c "import json,pathlib; p=next(pathlib.Path.home().glob('.mempalace/server/*/serverinfo.json')); print(json.loads(p.read_text())['pid'])"
+```
+
+Any editor that spawns per-window stdio MCPs against a local palace
+needs the same topology. `--ensure-hub` is opt-in; Claude Code and
+other single-process hosts stay unchanged.
+
 ## What They Do
 
 | Hook | When It Fires | What Happens |

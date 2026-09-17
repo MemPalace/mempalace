@@ -22,7 +22,14 @@ from mempalace import mcp_proxy
 class TestInvocationRouting:
     @pytest.mark.parametrize(
         "argv",
-        [[], ["--transport", "stdio"], ["--transport=stdio"], ["--palace", "/tmp/p"]],
+        [
+            [],
+            ["--transport", "stdio"],
+            ["--transport=stdio"],
+            ["--palace", "/tmp/p"],
+            ["--ensure-hub"],
+            ["--palace", "/tmp/p", "--ensure-hub"],
+        ],
     )
     def test_plain_stdio_invocations_can_be_proxied(self, argv):
         assert mcp_proxy._is_plain_stdio_invocation(argv) is True

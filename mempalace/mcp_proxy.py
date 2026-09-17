@@ -26,6 +26,7 @@ import logging
 import sys
 import urllib.error
 
+from .hub_bootstrap import ENSURE_HUB_FLAG, ensure_hub, wants_ensure_hub
 from .hub_client import HUB_FORWARD_ENV, HUB_PROXY_TIMEOUT_S, discover_hub
 
 from .update_awareness import cached_update_status, schedule_update_check
@@ -54,6 +55,7 @@ def _is_plain_stdio_invocation(argv: list) -> bool:
     way would silently drop a flag, so unknown arguments count as "not plain".
     """
     allowed_flags = {"--palace", "--collection", "--backend"}
+    boolean_flags = {ENSURE_HUB_FLAG}
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -67,6 +69,9 @@ def _is_plain_stdio_invocation(argv: list) -> bool:
                 return False
             i += 1
             continue
+        if arg in boolean_flags:
+            i += 1
+            continue
         if arg in allowed_flags:
             i += 2
             continue
@@ -77,13 +82,22 @@ def _is_plain_stdio_invocation(argv: list) -> bool:
     return True
 
 
+def _flag_value(argv: list, name: str):
+    """Return the value of ``--name`` / ``--name=`` from argv, or None."""
+    for i, arg in enumerate(argv):
+        if arg == name and i + 1 < len(argv):
+            return argv[i + 1]
+        prefix = name + "="
+        if arg.startswith(prefix):
+            return arg.split("=", 1)[1]
+    return None
+
+
 def _palace_path(argv: list):
     """Resolve the palace path without importing the server."""
-    for i, arg in enumerate(argv):
-        if arg == "--palace" and i + 1 < len(argv):
-            return argv[i + 1]
-        if arg.startswith("--palace="):
-            return arg.split("=", 1)[1]
+    explicit = _flag_value(argv, "--palace")
+    if explicit is not None:
+        return explicit
     try:
         from .config import MempalaceConfig
 
@@ -91,6 +105,11 @@ def _palace_path(argv: list):
     except Exception:
         logger.debug("palace path unresolved; serving locally", exc_info=True)
         return None
+
+
+def _backend_name(argv: list):
+    """Return an explicit ``--backend`` value, or None to use config/env."""
+    return _flag_value(argv, "--backend")
 
 
 def _hub_target(palace_path):
@@ -320,6 +339,8 @@ def main() -> None:
         return mcp_server.main()
 
     palace_path = _palace_path(argv)
+    if wants_ensure_hub(argv):
+        ensure_hub(palace_path, _backend_name(argv))
     if _hub_target(palace_path) is None:
         from . import mcp_server
 

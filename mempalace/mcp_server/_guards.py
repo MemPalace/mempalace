@@ -64,6 +64,13 @@ def _parse_args():
         help="Serve a read-only tool surface: the tools that change state are hidden "
         "from tools/list and refused at dispatch (env MEMPALACE_MCP_READ_ONLY)",
     )
+    parser.add_argument(
+        "--ensure-hub",
+        action="store_true",
+        help="Start a loopback HTTP hub if none is registered, then proxy to it "
+        "(env MEMPALACE_MCP_ENSURE_HUB). Honoured by mempalace-mcp; ignored here "
+        "when this process is already the hub.",
+    )
     args, unknown = parser.parse_known_args()
     if unknown:
         logger.debug("Ignoring unknown args: %s", unknown)

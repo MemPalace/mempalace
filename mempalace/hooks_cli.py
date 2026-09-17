@@ -43,22 +43,13 @@ PALACE_ROOT = Path.home() / ".mempalace"
 def _detached_popen_kwargs() -> dict:
     """Kwargs that give a Popen child a hidden console so the hook can exit.
 
-    Without these, Windows holds the parent open until the child closes the
-    inherited stdout/stderr handles — manifesting as "Stop hook hangs" at
-    session end (#1268). On POSIX the parent can already exit (orphan
-    reparents to init), but ``start_new_session`` makes the boundary
-    explicit so signals to the hook don't propagate to the background mine.
+    Delegates to :func:`hub_bootstrap.detached_popen_kwargs` so hooks, the
+    daemon, and ``mempalace-mcp --ensure-hub`` share one Windows/POSIX
+    detach recipe.
     """
-    kwargs: dict = {"stdin": subprocess.DEVNULL, "close_fds": True}
-    if os.name == "nt":
-        flags = 0
-        for name in ("CREATE_NO_WINDOW", "CREATE_NEW_PROCESS_GROUP", "CREATE_BREAKAWAY_FROM_JOB"):
-            flags |= getattr(subprocess, name, 0)
-        if flags:
-            kwargs["creationflags"] = flags
-    else:
-        kwargs["start_new_session"] = True
-    return kwargs
+    from mempalace.hub_bootstrap import detached_popen_kwargs
+
+    return detached_popen_kwargs()
 
 
 def _config_root() -> Path:

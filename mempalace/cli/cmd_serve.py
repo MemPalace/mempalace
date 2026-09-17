@@ -47,6 +47,8 @@ def cmd_mcp(args):
     print("MemPalace MCP quick setup:")
     print(f"  claude mcp add mempalace -- {server_cmd}")
     print(f"  codex mcp add mempalace -- {server_cmd}")
+    print("  Cursor plugin default (one hub for every window):")
+    print(f"    {base_server_cmd} --ensure-hub")
     print("\nLightweight MCP setup (3 consolidated tools, ~92% fewer schema tokens):")
     print(f"  claude mcp add mempalace-light -- {light_cmd}")
     print(f"  codex mcp add mempalace-light -- {light_cmd}")
@@ -194,6 +196,8 @@ def cmd_serve(args):
         )
     else:
         print(f"  claude mcp add --transport http mempalace {url}")
+    print("  Cursor (stdio, auto-starts a loopback hub if needed):")
+    print("    mempalace-mcp --ensure-hub")
     print(f"  curl {scheme}://{client_host}:{port}/healthz   # liveness (no auth)\n")
     sys.stdout.flush()
 
