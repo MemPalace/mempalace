@@ -545,15 +545,17 @@ class TestPreCompactHook:
 
     def test_mine_invocation_uses_python_module_and_wing(self):
         text = PRECOMPACT_HOOK.read_text()
-        assert '-m mempalace mine' in text
+        assert "-m mempalace mine" in text
         assert '--wing "$WING"' in text
+        assert "command -v mempalace" not in text
 
 
 class TestSaveHookMinesWithWing:
     def test_mine_invocation_uses_python_module_and_wing(self):
         text = SAVE_HOOK.read_text()
-        assert '-m mempalace mine' in text
+        assert "-m mempalace mine" in text
         assert '--wing "$WING"' in text
+        assert "command -v mempalace" not in text
 
 
 # ── wake (sessionStart) hook ───────────────────────────────────────
@@ -572,6 +574,25 @@ class TestWakeHook:
         assert "mempalace_search" in ctx
         assert "mempalace_diary_read" in ctx
         assert "cursor-ide" in ctx
+
+    def test_workspace_space_and_hyphen_match_normalize_wing_name(self, tmp_path):
+        """safe_str must keep spaces in workspace_roots so infer_wing can
+        emit the same slug as config.normalize_wing_name."""
+        payload = json.dumps(
+            {
+                "conversation_id": "conv-hyphen",
+                "session_id": "conv-hyphen",
+                "hook_event_name": "sessionStart",
+                "is_background_agent": False,
+                "composer_mode": "agent",
+                "workspace_roots": ["/Users/test/My Cool-App"],
+            }
+        )
+        out, _ = _run_hook(WAKE_HOOK, payload, tmp_path)
+        ctx = json.loads(out)["additional_context"]
+        assert "my_cool_app" in ctx, f"expected normalize_wing_name slug; got {ctx!r}"
+        assert "mycool-app" not in ctx
+        assert "mycoolapp" not in ctx
 
     def test_falls_back_to_env_when_workspace_roots_missing(self, tmp_path):
         # Cursor always provides workspace_roots, but the env-var
@@ -642,6 +663,14 @@ class TestInferWing:
 
     def test_spaces_collapsed_to_underscore(self):
         assert _call_infer_wing("/Users/me/my project") == "my_project"
+
+    def test_hyphens_become_underscores(self):
+        # Must match config.normalize_wing_name so mine --wing and
+        # mempalace init land in the same slug.
+        assert _call_infer_wing("/Users/me/My-Cool-App") == "my_cool_app"
+
+    def test_mixed_hyphen_and_space(self):
+        assert _call_infer_wing("/Users/me/My Cool-App") == "my_cool_app"
 
     def test_lowercases_uppercase_basename(self):
         # Cursor on macOS often hands us /Users/<user>/Projects/MyApp.
