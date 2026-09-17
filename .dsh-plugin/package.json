@@ -1,0 +1,45 @@
+{
+  "name": "@mempalace/dsh-plugin",
+  "version": "3.10.0",
+  "description": "MemPalace for the DeepSeek Harness: stored memory in each session's system prompt, conversations filed through MemPalace's own hooks, and the palace tools over MCP.",
+  "type": "module",
+  "license": "MIT",
+  "author": {
+    "name": "MemPalace"
+  },
+  "homepage": "https://github.com/MemPalace/mempalace",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MemPalace/mempalace.git",
+    "directory": ".dsh-plugin"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "mempalace",
+    "memory",
+    "verbatim"
+  ],
+  "exports": {
+    "./recall": "./lib/recall.js",
+    "./autosave": "./lib/autosave.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20.3"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

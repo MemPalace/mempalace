@@ -140,6 +140,8 @@ def execute_job(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
             return run_mine(payload)
         if kind == "sync":
             return run_sync(payload)
+        if kind == "sweep":
+            return run_sweep(payload)
         if kind == "diary_write":
             return run_diary_write(payload)
         if kind == "mcp_tool":
@@ -187,6 +189,73 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
     agent = payload.get("agent") or "mempalace"
     limit = int(payload.get("limit") or 0)
     dry_run = bool(payload.get("dry_run"))
+
+    raw_files = payload.get("files")
+    files = None
+
+    if raw_files is not None:
+        if source_adapter:
+            return {
+                "success": False,
+                "error": ("mine files payload cannot be combined with a source adapter"),
+                "exit_code": 2,
+            }
+
+        if mode != "projects":
+            return {
+                "success": False,
+                "error": "mine files payload is supported only in projects mode",
+                "exit_code": 2,
+            }
+
+        if not isinstance(raw_files, list):
+            return {
+                "success": False,
+                "error": "mine files payload must be a list",
+                "exit_code": 2,
+            }
+
+        if not isinstance(source, str) or not source.strip():
+            return {
+                "success": False,
+                "error": "mine source is required when files are provided",
+                "exit_code": 2,
+            }
+
+        from pathlib import Path
+
+        project_root = Path(source).expanduser().resolve(strict=False)
+        files = []
+
+        for index, raw_file in enumerate(raw_files):
+            if not isinstance(raw_file, str) or not raw_file.strip():
+                return {
+                    "success": False,
+                    "error": (
+                        "mine files payload entries must be non-empty strings; "
+                        f"invalid entry at index {index}"
+                    ),
+                    "exit_code": 2,
+                }
+
+            candidate = Path(raw_file).expanduser()
+            if not candidate.is_absolute():
+                candidate = project_root / candidate
+
+            resolved_file = candidate.resolve(strict=False)
+
+            try:
+                resolved_file.relative_to(project_root)
+            except ValueError:
+                return {
+                    "success": False,
+                    "error": (
+                        f"mine files payload contains a path outside the project root: {raw_file}"
+                    ),
+                    "exit_code": 2,
+                }
+
+            files.append(resolved_file)
 
     if payload.get("redetect_origin") and not source_adapter:
         from .cli import _run_pass_zero
@@ -243,6 +312,7 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
                 respect_gitignore=not bool(payload.get("no_gitignore")),
                 include_ignored=include_ignored,
                 max_chunks_per_file=payload.get("max_chunks_per_file"),
+                files=files,
             )
         else:
             return {"success": False, "error": f"invalid mine mode: {mode}", "exit_code": 2}
@@ -277,6 +347,91 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
         "kind": "mine",
         "mode": result_mode,
         "dry_run": dry_run,
+        "exit_code": 0,
+    }
+
+
+@_restores_palace_env
+def run_sweep(payload: dict[str, Any]) -> dict[str, Any]:
+    """Run transcript sweep through the daemon worker."""
+
+    palace_path = os.path.abspath(
+        os.path.expanduser(payload.get("palace_path") or MempalaceConfig().palace_path)
+    )
+    os.environ["MEMPALACE_PALACE_PATH"] = palace_path
+    _apply_backend(payload.get("backend"))
+
+    target_raw = payload.get("target")
+    if not isinstance(target_raw, str) or not target_raw.strip():
+        return {
+            "success": False,
+            "error": "sweep target must be a non-empty path",
+            "exit_code": 2,
+        }
+
+    target = os.path.abspath(os.path.expanduser(target_raw))
+
+    from .daemon import LOCK_REFUSAL_ERROR_CLASS
+    from .palace import MineAlreadyRunning
+    from .sweeper import sweep, sweep_directory
+
+    try:
+        if os.path.isfile(target):
+            result = sweep(target, palace_path)
+            print(
+                f" Swept {target}: +{result['drawers_added']} new, "
+                f"{result['drawers_already_present']} already present, "
+                f"{result['drawers_skipped']} skipped (< cursor)."
+            )
+        elif os.path.isdir(target):
+            result = sweep_directory(target, palace_path)
+            print(
+                f" Swept {result['files_succeeded']}/"
+                f"{result['files_attempted']} files from {target}: "
+                f"+{result['drawers_added']} new, "
+                f"{result['drawers_already_present']} already present, "
+                f"{result['drawers_skipped']} skipped (< cursor)."
+            )
+        else:
+            return {
+                "success": False,
+                "error": f"Not a file or directory: {target}",
+                "exit_code": 1,
+            }
+    except MineAlreadyRunning as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "error_class": LOCK_REFUSAL_ERROR_CLASS,
+            "exit_code": 1,
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": f"sweep failed: {exc}",
+            "exit_code": 1,
+        }
+
+    failures = result.get("failures") or []
+    if failures:
+        print(
+            f" WARNING: {len(failures)} file(s) failed to sweep - see stderr / logs for details.",
+            file=sys.stderr,
+        )
+        return {
+            "success": False,
+            "kind": "sweep",
+            "target": target,
+            "result": result,
+            "error": f"{len(failures)} file(s) failed to sweep",
+            "exit_code": 2,
+        }
+
+    return {
+        "success": True,
+        "kind": "sweep",
+        "target": target,
+        "result": result,
         "exit_code": 0,
     }
 

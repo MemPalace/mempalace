@@ -41,6 +41,20 @@ releaser time:
   the marketplace plugin installable, and `tests/test_codex_plugin_manifest.py`
   pins it. A missing `.codex-plugin/.mcp.json` is not a bug.
 
+The DeepSeek Harness bundle runs the **light** server instead, so it does not
+appear in that list. Check it separately:
+
+```bash
+grep -r mempalace-light-mcp pyproject.toml .dsh-plugin/cordis.patch.yml
+```
+
+Expected on a healthy `develop`:
+
+```
+pyproject.toml:mempalace-light-mcp = "mempalace.mcp_light_server:main"
+.dsh-plugin/cordis.patch.yml:        command: mempalace-light-mcp
+```
+
 If `pyproject.toml` has no match at all, **stop** — the entry point is
 missing and any fresh `pip install` will ship a plugin config pointing at a
 binary that was never installed. Investigate whether the release branch was
@@ -78,11 +92,11 @@ Done once per project; both steps require PyPI owner / GitHub admin rights.
 
 ### Cutting a release
 
-1. Bump the version in **all six** sources on `develop` so `version-guard.yml`
+1. Bump the version in **all seven** sources on `develop` so `version-guard.yml`
    stays green (it is the single source of truth at `mempalace/version.py`,
    mirrored in `pyproject.toml`, `.claude-plugin/marketplace.json`,
-   `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, and
-   `integrations/openclaw/SKILL.md`).
+   `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`,
+   `.dsh-plugin/package.json`, and `integrations/openclaw/SKILL.md`).
 2. Land everything for the release on `develop`, then merge `develop → main`.
    Releases publish **only from `main`** — the workflow refuses any tag whose
    commit is not an ancestor of `main`. Don't commit the bump directly to

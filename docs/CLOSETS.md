@@ -74,14 +74,14 @@ If no closets exist (palace created before this feature) — or all closet hits 
 
 ## For developers
 
-Closet functions live in `mempalace/palace.py`:
+Closet functions live in `mempalace.palace` (`mempalace/palace/collection.py` and `mempalace/palace/closets.py`):
 - `get_closets_collection()` — get the closets ChromaDB collection
 - `build_closet_lines()` — extract topics/entities/quotes into pointer lines
 - `upsert_closet_lines()` — write lines to closets respecting the char limit (overwrites existing IDs; does not append — call `purge_file_closets` first when re-mining)
 - `purge_file_closets()` — delete every closet for a given source file before rebuild
 - `CLOSET_CHAR_LIMIT` / `CLOSET_EXTRACT_WINDOW` — size constants
 
-The closet-first search path lives in `mempalace/searcher.py`:
+The closet-first search path lives in `mempalace.searcher` (`mempalace/searcher/`):
 - `_extract_drawer_ids_from_closet()` — parse `→drawer_a,drawer_b` pointers out of a closet document
 - `_closet_first_hits()` — query closets, parse pointers, hydrate matching drawers, return chunk-level hits or `None` to fall back
 

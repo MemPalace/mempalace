@@ -196,6 +196,12 @@ class TestPalaceExecParser:
             assert params["content"] == quoted
             assert isinstance(params["content"], str)
 
+    def test_structured_agent_name_plus_content_is_diary_write(self):
+        action, params = parse_exec_input({"agent_name": "bot", "content": "observation"})
+        assert action == "diary_write"
+        assert params["agent_name"] == "bot"
+        assert params.get("entry", params.get("content")) == "observation"
+
     def test_structured_drawer_id_plus_content_is_update(self):
         action, params = parse_exec_input({"drawer_id": "drw_1", "content": "replacement"})
         assert action == "update_drawer"
@@ -502,3 +508,285 @@ class TestPalaceCoordinateParser:
         assert action == "patch_submit"
         assert params["content"] == "diff --git a/b"
         assert "diff" not in params
+
+    def test_inbox_dsl_and_shorthand_ordering(self):
+        action, params = parse_coordinate_input("INBOX to:agent1")
+        assert action == "event_list"
+        assert params["to_agent"] == "agent1"
+        assert params["order"] == "desc"
+        assert params["preview"] is True
+
+        action, params = parse_coordinate_input("EVENT INBOX stream:project/x")
+        assert action == "event_list"
+        assert params["stream"] == "project/x"
+        assert params["order"] == "desc"
+        assert params["preview"] is True
+
+        action, params = parse_coordinate_input("EVENT LIST to:agent1 DESC PREVIEW")
+        assert action == "event_list"
+        assert params["to_agent"] == "agent1"
+        assert params["order"] == "desc"
+        assert params["preview"] is True
+
+        for flag in ("LATEST", "RECENT", "TAIL"):
+            action, params = parse_coordinate_input(f"EVENT LIST to:agent1 {flag}")
+            assert action == "event_list"
+            assert params["order"] == "desc"
+
+        for flag in ("ASC", "HEAD", "OLDEST", "FROM_START"):
+            action, params = parse_coordinate_input(f"EVENT LIST to:agent1 {flag}")
+            assert action == "event_list"
+            assert params["order"] == "asc"
+
+    def test_order_case_insensitivity_and_structured_inbox(self):
+        action, params = parse_coordinate_input("EVENT LIST to:agent1 ORDER DESC")
+        assert action == "event_list"
+        assert params["order"] == "desc"
+
+        action, params = parse_coordinate_input("EVENT LIST to:agent1 ORDER ASC")
+        assert action == "event_list"
+        assert params["order"] == "asc"
+
+        action, params = parse_coordinate_input(
+            {"action": "event_list", "order": "DESC", "to_agent": "agent1"}
+        )
+        assert action == "event_list"
+        assert params["order"] == "desc"
+
+        action, params = parse_coordinate_input({"action": "inbox", "to_agent": "agent1"})
+        assert action == "event_list"
+        assert params["to_agent"] == "agent1"
+        assert params["order"] == "desc"
+        assert params["preview"] is True
+
+    def test_bare_flags_do_not_pollute_keyword_values(self):
+        from mempalace.query_parser import parse_exec_input
+
+        target, params = parse_exec_input("UPDATE drw_1 CONTENT HEAD")
+        assert target == "update_drawer"
+        assert params["drawer_id"] == "drw_1"
+        assert params["content"] == "HEAD"
+
+        target, params = parse_coordinate_input(
+            "TASK CREATE project:p from:f to:t goal:RECENT branch:b base:c done:d"
+        )
+        assert target == "task_create"
+        assert params["goal"] == "RECENT"
+
+        target, params = parse_coordinate_input(
+            "TASK CREATE project:p from:f to:t goal:DESC branch:b base:c done:d"
+        )
+        assert target == "task_create"
+        assert params["goal"] == "DESC"
+
+    def test_inbox_explicit_shorthand_order_override(self):
+        action, params = parse_coordinate_input("EVENT INBOX to:agent1 ASC")
+        assert action == "event_list"
+        assert params["to_agent"] == "agent1"
+        assert params["order"] == "asc"
+        assert params["preview"] is True
+
+        action, params = parse_coordinate_input("EVENT INBOX to:agent1 HEAD")
+        assert action == "event_list"
+        assert params["order"] == "asc"
+        assert params["preview"] is True
+
+        action, params = parse_coordinate_input("INBOX to:agent1 ASC")
+        assert action == "event_list"
+        assert params["order"] == "asc"
+        assert params["preview"] is True
+
+        action, params = parse_coordinate_input("EVENT INBOX to:agent1 DESC")
+        assert action == "event_list"
+        assert params["order"] == "desc"
+        assert params["preview"] is True
+
+    def test_wrapped_coordinate_sibling_overrides(self):
+        action, params = parse_coordinate_input(
+            {"command": "EVENT INBOX to:agent1", "order": "asc", "preview": False}
+        )
+        assert action == "event_list"
+        assert params["to_agent"] == "agent1"
+        assert params["order"] == "asc"
+        assert params["preview"] is False
+
+        action, params = parse_coordinate_input(
+            {"command": "EVENT INBOX to:agent1", "to": "agent2", "limit": 10}
+        )
+        assert action == "event_list"
+        assert params["to_agent"] == "agent2"
+        assert params["limit"] == 10
+        assert params["order"] == "desc"
+        assert params["preview"] is True
+
+        action, params = parse_coordinate_input({"command": "EVENT LIST", "order": "HEAD"})
+        assert action == "event_list"
+        assert params["order"] == "asc"
+
+    def test_event_list_filters_consume_ordering_words(self):
+        action, params = parse_coordinate_input("EVENT LIST TYPE recent")
+        assert action == "event_list"
+        assert params["type"] == "recent"
+        assert "order" not in params
+
+        action, params = parse_coordinate_input('EVENT LIST TYPE "recent"')
+        assert action == "event_list"
+        assert params["type"] == "recent"
+
+        action, params = parse_coordinate_input("EVENT LIST TO head")
+        assert action == "event_list"
+        assert params["to_agent"] == "head"
+        assert "order" not in params
+
+        action, params = parse_coordinate_input("EVENT LIST STREAM desc")
+        assert action == "event_list"
+        assert params["stream"] == "desc"
+        assert "order" not in params
+
+        action, params = parse_coordinate_input("EVENT LIST TOPIC latest")
+        assert action == "event_list"
+        assert params["topic"] == "latest"
+
+        action, params = parse_coordinate_input("EVENT LIST STATUS recent")
+        assert action == "event_list"
+        assert params["status"] == "recent"
+
+        action, params = parse_coordinate_input("EVENT LIST TO_AGENT HEAD")
+        assert action == "event_list"
+        assert params["to_agent"] == "HEAD"
+        assert "order" not in params
+
+        action, params = parse_coordinate_input("EVENT LIST FROM_AGENT HEAD")
+        assert action == "event_list"
+        assert params["from_agent"] == "HEAD"
+        assert "order" not in params
+
+        action, params = parse_coordinate_input("EVENT LIST CORRELATION_ID task_1")
+        assert action == "event_list"
+        assert params["correlation_id"] == "task_1"
+
+    def test_inbox_cursor_preserves_chronological_order(self):
+        action, params = parse_coordinate_input("EVENT INBOX to:agent1 since_id:evt_100")
+        assert action == "event_list"
+        assert params["to_agent"] == "agent1"
+        assert params["since_event_id"] == "evt_100"
+        assert params["preview"] is True
+        assert "order" not in params
+
+        action, params = parse_coordinate_input(
+            {"action": "inbox", "to_agent": "agent1", "since_event_id": "evt_100"}
+        )
+        assert action == "event_list"
+        assert params["to_agent"] == "agent1"
+        assert params["since_event_id"] == "evt_100"
+        assert params["preview"] is True
+        assert "order" not in params
+
+        action, params = parse_coordinate_input("EVENT INBOX to:agent1 since_id:evt_100 DESC")
+        assert action == "event_list"
+        assert params["to_agent"] == "agent1"
+        assert params["since_event_id"] == "evt_100"
+        assert params["order"] == "desc"
+        assert params["preview"] is True
+
+        action, params = parse_coordinate_input(
+            {"command": "EVENT INBOX to:agent1", "since_event_id": "evt_100"}
+        )
+        assert action == "event_list"
+        assert params["to_agent"] == "agent1"
+        assert params["since_event_id"] == "evt_100"
+        assert params["preview"] is True
+        assert "order" not in params
+
+        action, params = parse_coordinate_input(
+            {"command": "EVENT INBOX to:agent1", "since_id": "evt_100"}
+        )
+        assert action == "event_list"
+        assert params["to_agent"] == "agent1"
+        assert params["since_event_id"] == "evt_100"
+        assert params["preview"] is True
+        assert "order" not in params
+
+        action, params = parse_coordinate_input(
+            {"command": "EVENT INBOX to:agent1", "since_event_id": "evt_100", "order": "desc"}
+        )
+        assert action == "event_list"
+        assert params["to_agent"] == "agent1"
+        assert params["since_event_id"] == "evt_100"
+        assert params["order"] == "desc"
+        assert params["preview"] is True
+
+        action, params = parse_coordinate_input(
+            {"command": "EVENT INBOX to:agent1 DESC", "since_event_id": "evt_100"}
+        )
+        assert action == "event_list"
+        assert params["to_agent"] == "agent1"
+        assert params["since_event_id"] == "evt_100"
+        assert params["order"] == "desc"
+        assert params["preview"] is True
+
+    def test_wrapped_inbox_filter_values_not_treated_as_order_flags(self):
+        # Filtering by a type named "recent" must not be mistaken for an explicit DESC order flag
+        action, params = parse_coordinate_input(
+            {"command": "EVENT INBOX TYPE recent", "since_event_id": "evt_100"}
+        )
+        assert action == "event_list"
+        assert params["type"] == "recent"
+        assert params["since_event_id"] == "evt_100"
+        assert params["preview"] is True
+        assert "order" not in params
+        assert "_implicit_inbox_order" not in params
+
+        action, params = parse_coordinate_input(
+            {"command": "EVENT INBOX STREAM desc", "since_event_id": "evt_100"}
+        )
+        assert action == "event_list"
+        assert params["stream"] == "desc"
+        assert params["since_event_id"] == "evt_100"
+        assert "order" not in params
+
+        action, params = parse_coordinate_input(
+            {"command": "EVENT INBOX TOPIC latest", "since_event_id": "evt_100"}
+        )
+        assert action == "event_list"
+        assert params["topic"] == "latest"
+        assert "order" not in params
+
+        action, params = parse_coordinate_input(
+            {"command": "EVENT INBOX TO head", "since_event_id": "evt_100"}
+        )
+        assert action == "event_list"
+        assert params["to_agent"] == "head"
+        assert "order" not in params
+
+        action, params = parse_coordinate_input(
+            {"command": "EVENT INBOX TO_AGENT HEAD", "since_event_id": "evt_100"}
+        )
+        assert action == "event_list"
+        assert params["to_agent"] == "HEAD"
+        assert "order" not in params
+
+        # Explicit order inside command must still be preserved
+        action, params = parse_coordinate_input(
+            {"command": "EVENT INBOX TYPE recent DESC", "since_event_id": "evt_100"}
+        )
+        assert action == "event_list"
+        assert params["type"] == "recent"
+        assert params["since_event_id"] == "evt_100"
+        assert params["order"] == "desc"
+
+        # Explicit sibling order must still be preserved
+        action, params = parse_coordinate_input(
+            {"command": "EVENT INBOX TYPE recent", "since_event_id": "evt_100", "order": "desc"}
+        )
+        assert action == "event_list"
+        assert params["type"] == "recent"
+        assert params["since_event_id"] == "evt_100"
+        assert params["order"] == "desc"
+
+        # Cursorless inbox retains default order="desc"
+        action, params = parse_coordinate_input({"command": "EVENT INBOX TYPE recent"})
+        assert action == "event_list"
+        assert params["type"] == "recent"
+        assert params["order"] == "desc"
+        assert "_implicit_inbox_order" not in params
