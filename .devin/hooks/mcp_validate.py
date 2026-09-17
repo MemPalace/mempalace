@@ -16,7 +16,7 @@ Optimizations for performance / health:
     every tool call.
 
 If the arguments are invalid, it prints a JSON decision with a block reason
-and exits non-zero. If valid or validation cannot be performed, it prints
+and exits 2 (the Devin blocking exit code). If valid or validation cannot be performed, it prints
 {"decision": "approve"}.
 """
 
@@ -350,7 +350,7 @@ def main():
                 {"decision": "block", "reason": "mcp_call_tool missing server_name or tool_name"}
             )
         )
-        return 1
+        return 2
 
     server_config = load_server_config(server_name)
     if not server_config:
@@ -430,7 +430,7 @@ def main():
     if errors:
         msg = f"Invalid arguments for {server_name}/{requested_tool}: " + "; ".join(errors)
         print(json.dumps({"decision": "block", "reason": msg}))
-        return 1
+        return 2
 
     print(json.dumps({"decision": "approve"}))
     return 0
