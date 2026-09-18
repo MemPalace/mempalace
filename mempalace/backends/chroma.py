@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import chromadb
+from chromadb.config import Settings as _ChromaSettings
 from chromadb.errors import NotFoundError as _ChromaNotFoundError
 
 from ..config import connect_sqlite_read
@@ -40,6 +41,15 @@ from .base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ChromaDB's own default is ``anonymized_telemetry=True``. In the 1.x line we
+# support its posthog client is a no-op stub and posthog is not a dependency, so
+# nothing is transmitted today — but that default belongs to ChromaDB, not to us,
+# and MemPalace promises the data never leaves the machine. Every client this
+# backend opens says no explicitly, so a future ChromaDB release cannot turn
+# collection back on underneath us. (GHSA-8h77)
+_CLIENT_SETTINGS = _ChromaSettings(anonymized_telemetry=False)
 
 
 _REQUIRED_OPERATORS = frozenset({"$eq", "$ne", "$in", "$nin", "$and", "$or", "$contains"})
@@ -3085,7 +3095,7 @@ class ChromaBackend(BaseBackend):
                 _close_client(self._clients.pop(palace_path, None))
 
             ChromaBackend._prepare_palace_for_open(palace_path)
-            cached = chromadb.PersistentClient(path=palace_path)
+            cached = chromadb.PersistentClient(path=palace_path, settings=_CLIENT_SETTINGS)
             self._clients[palace_path] = cached
             # Re-stat after the client constructor runs: chromadb creates
             # chroma.sqlite3 lazily, so the stat captured before the call
@@ -3195,7 +3205,7 @@ class ChromaBackend(BaseBackend):
         disk change. See :attr:`_quarantined_paths` for the gate logic.
         """
         ChromaBackend._prepare_palace_for_open(palace_path)
-        return chromadb.PersistentClient(path=palace_path)
+        return chromadb.PersistentClient(path=palace_path, settings=_CLIENT_SETTINGS)
 
     @staticmethod
     def backend_version() -> str:

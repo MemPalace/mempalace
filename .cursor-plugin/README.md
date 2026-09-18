@@ -87,7 +87,7 @@ This plugin ships `mcp.json` at the plugin root, so Cursor auto-loads the `mempa
 }
 ```
 
-All 36 MemPalace MCP tools (`mempalace_search`, `mempalace_add_drawer`, `mempalace_diary_write`, `mempalace_check_duplicate`, `mempalace_diary_read`, …) become available to the agent immediately. No manual `~/.cursor/mcp.json` edit required.
+All 45 MemPalace MCP tools (`mempalace_search`, `mempalace_add_drawer`, `mempalace_diary_write`, `mempalace_check_duplicate`, `mempalace_diary_read`, …) become available to the agent immediately. No manual `~/.cursor/mcp.json` edit required.
 
 If the server doesn't appear, confirm `mempalace-mcp` is on the user `$PATH`:
 

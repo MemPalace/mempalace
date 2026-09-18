@@ -8,6 +8,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **A `known_entities.json` write no longer appears to hang on Windows when the
+  directory refuses a temporary file.** `_publish_registry` falls back to writing
+  in place when the directory takes no new name, and it learned that from the
+  `EPERM` / `EACCES` / `EROFS` that `tempfile.mkstemp` raises. On Windows
+  `mkstemp` does not raise it: it reads a `PermissionError` as a name collision
+  and tries the next candidate, `tempfile.TMP_MAX` times. That is 20 on Python
+  3.13 and later, but `os.TMP_MAX` — 2,147,483,647 — on 3.12 and earlier, about
+  28 hours of retries at the measured rate, so the fallback never ran and the
+  write looked frozen. The temporary name is now opened directly with
+  `O_CREAT | O_EXCL`, retried only on a real collision and only a few times, so
+  the permission error reaches the fallback on every interpreter. (#2530)
+
+### Upgrade notes
+
+- **`EntityRegistry.research()` and `confirm_research()` are removed.** They were
+  a Wikipedia lookup for unknown words, and the only call the package could make
+  to a third-party service without the user configuring an endpoint. (The hub
+  client, `llm_client`, `closet_llm`, the openai-compat embedder and the Qdrant
+  backend also reach the network, but only to an address the user sets.) Nothing in the CLI, MCP server, miners or hooks called them, and the
+  lookup was already opt-in and off by default, so no shipped code path reached
+  the network. They are gone rather than merely gated, so local-first is a
+  property of the code and not of a default argument. Existing `wiki_cache`
+  entries in `entities.json` are still read by `lookup()`; nothing new is written
+  to that cache. (GHSA-mrj5)
+
+### Security
+
+- **ChromaDB telemetry is disabled explicitly, not just silenced.** MemPalace only
+  raised the log level on `chromadb.telemetry.product.posthog`, leaving ChromaDB's
+  own `anonymized_telemetry=True` default in place. Nothing is transmitted on the
+  1.x line we support, where the posthog client is a no-op stub and posthog is not
+  a dependency, so this was never exploitable — but the default was ChromaDB's to
+  change. Every client the backend opens now passes
+  `Settings(anonymized_telemetry=False)`, and importing `mempalace` sets
+  `ANONYMIZED_TELEMETRY=False` (via `setdefault`, so an explicit operator export
+  still wins) for any other chromadb client in the process. (GHSA-8h77)
+
 ---
 
 ## [3.10.0] — 2026-09-15
@@ -76,6 +115,8 @@ Agents get lighter ways in: a 3-tool MCP server with Palace Query Language, shar
 
 ### Bug Fixes
 
+- **`init` accepts `--palace` in the natural invocation order (#2366).** `mempalace init <dir> --palace <path>` previously failed with `unrecognized arguments: --palace` because the flag was registered only on the global parser. `--palace` now mirrors the existing `serve` subcommand pattern (#1877), so both `--palace <path> init <dir>` and `init <dir> --palace <path>` work. The global form takes precedence on Python <3.12 where subparser defaults can otherwise clobber it.
+- **`MEMPALACE_PALACE` environment variable is honored (#2366).** The short var name from the issue body now resolves through `MempalaceConfig.palace_path`, so `MEMPALACE_PALACE=<dir> mempalace status` (and every other command reading `palace_path`) targets the intended palace. Precedence: `MEMPALACE_PALACE_PATH` > `MEMPALACE_PALACE` > legacy `MEMPAL_PALACE_PATH`.
 - **The transcript-path fallback no longer gives every git worktree its own wing.** `_wing_from_transcript_path`'s primary path (reading `cwd` from the JSONL) already collapsed a `<project>/.claude/worktrees/<wt>` segment before deriving the wing; the fallback path, used whenever `cwd` is absent, had no equivalent strip, so the flattened `--claude-worktrees-<wt>` segment survived into the wing name. Applied the same collapse there. (#2388, #2454)
 - **`mempalace mine --daemon` no longer mines the daemon's own working directory instead of the caller's.** The daemon is a long-lived background process that keeps whatever cwd it happened to start with, so a relative source (`mempalace mine .`) submitted to it resolved against that stale cwd rather than the directory the CLI call actually ran from, silently mining the wrong project into the wrong wing on every subsequent hook-driven call. `cmd_mine` now resolves the source to an absolute path before it enters the daemon job payload, matching the resolution `_forward_mine_to_hub` already does for the hub-forwarding path. (#2441, #2467)
 - **`mempalace init` no longer replaces a `known_entities.json` it could not read with the entities of that one run.** The merge reads the registry, falls back to an empty dict when the read does not conclude, and rewrites the file whole, so a registry holding four categories became one holding `people: 1`, measured, with `_load_known_entities` dropping from 10 names to 1 and `get_topics_by_wing` from two wings to none, while the command printed `Registry updated`. None of that needs an interrupted write: through the CLI, one `mempalace init` replaced a 28-byte JSON array and a 172-byte truncated object alike, and a registry re-saved in a legacy encoding ended the run in a traceback before any of it. The writer also truncates the file and serializes into it afterwards, so a killed run or a full disk leaves the same kinds of file. Reads now treat only `FileNotFoundError` as an absent registry. One that does not parse, whether from a truncated write, a byte that is not UTF-8, a hand-edit that lost a brace or a JSON array, is renamed aside and its new name printed before a fresh registry is written, and one that exists but cannot be read is left alone with a message rather than overwritten. The write itself goes through a temporary file and a rename, as `migrate._apply_topics_by_wing_renames` already did for this same file, so an interrupted run leaves the previous registry byte for byte. A byte that is not UTF-8 also stopped leaving `UnicodeDecodeError` out of the call, where `mempalace init` rendered it as a traceback. The call answers `None` when it wrote nothing, so `mempalace init` no longer prints `Registry updated` over a registry it left alone; a registry reached through a symlink is written through it rather than replaced; a directory that will not take a temporary file gets the merge in place with a message rather than a traceback; and a UTF-8 byte-order mark is no longer read as a parse failure. (#2358, #2359)
@@ -101,11 +142,11 @@ Agents get lighter ways in: a 3-tool MCP server with Palace Query Language, shar
 - **Hooks run on fresh installs that keep their config under `~/.config/mempalace`.** Since #148 a new install writes its config and palace to the XDG config directory and never creates `~/.mempalace`, but the hooks' kill-switch only looked for `~/.mempalace`, so the Stop, PreCompact and SessionEnd hooks returned `{}` without saving anything: a fresh `mempalace init` followed by a PreCompact hook filed 0 drawers, against 20 once `~/.mempalace` existed. The kill-switch in `hooks_cli` and in the Antigravity shell hooks now also accepts the resolved config directory, and the shell hooks read `hooks.auto_save` from it. Existing installs behave exactly as before.
 - **`mempalace wake-up` no longer reports a healthy palace as missing while a hub is running.** The L1–L3 layers opened the palace writable, and on the `sqlite_exact` backend a writable open takes the palace mine lock to initialise its schema. With a hub, daemon or mine holding that lock the open failed, and the swallowed exception printed "No palace found. Run: mempalace mine <dir>", inviting a pointless re-mine. The layers now ask for a read-only open, which `sqlite_exact` serves without the lock; ChromaDB ignores the option, but its collection open never took the mine lock. A lock conflict that does surface gets its own message instead of the missing-palace one.
 - **A writable `mempalace serve` waits for a busy writer lease instead of restart-looping.** Startup refused with status `2` the moment another process held the palace writer lease, and under the systemd template's `Restart=always` that became a loop that never started, never gave up and never reached `failed`. The server now retries with backoff for `MEMPALACE_MCP_WRITER_WAIT_SECONDS` (default `120`, `0` refuses at once) and logs once when the wait starts; a backend or lock-directory failure still refuses immediately. The unit sets `RestartPreventExitStatus=2`, so a wait that runs out lands in `failed` with the reason in the journal, and the idle watchdog runs the registered cleanup before exiting, so `serverinfo.json` no longer advertises a dead PID. (#2500, #2501)
+- **`mempalace daemon start` and `stop` recover from a stale registration.** The #2442 guard refused to start while the registered pid was alive, and after a crash that pid can belong to an unrelated process, so start refused forever; the suggested `mempalace daemon stop` used the same failing health probe and did nothing. A registered pid that is dead, or whose process started after the registration was written, is now treated as stale: `start` replaces it and `stop` removes it. A live daemon that does not answer keeps its registration, a foreground start refuses beside it as a background one does, and both commands name the process to stop.
 
 ### Documentation
 
 - **Codex plugin install instructions use the built-in marketplace.** (#2372)
-
 ---
 
 ## [3.9.0] — 2026-08-31
