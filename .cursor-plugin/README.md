@@ -118,8 +118,8 @@ What you get:
 | Hook event     | What it does                                                                                          |
 |----------------|-------------------------------------------------------------------------------------------------------|
 | `sessionStart` | Injects an `additional_context` recap of relevant memories scoped to the workspace wing               |
-| `stop`         | Counts agent turns; every N turns, emits a `followup_message` instructing a memory checkpoint         |
-| `preCompact`   | Synchronously mines the transcript before compaction, drops a marker so the next `stop` saves a diary |
+| `stop`         | Counts agent turns; every N turns, mines the Cursor transcript in the background (silent by default) |
+| `preCompact`   | Synchronously mines the transcript before compaction; diary nudge is opt-in via `MEMPAL_VERBOSE`     |
 
 Full details: [`website/guide/cursor-hooks.md`](../website/guide/cursor-hooks.md) and [`hooks/cursor/README.md`](../hooks/cursor/README.md).
 

@@ -367,6 +367,28 @@ def test_is_ai_tool_path_dotclaude_without_projects_not_matched(tmp_path):
     assert _is_ai_tool_path(target) is False
 
 
+def test_is_ai_tool_path_cursor_projects_subdir(tmp_path):
+    """A subdirectory inside ~/.cursor/projects/ is an AI tool path."""
+    target = tmp_path / ".cursor" / "projects" / "Users-test-myapp" / "agent-transcripts"
+    target.mkdir(parents=True)
+    assert _is_ai_tool_path(target) is True
+
+
+def test_is_ai_tool_path_cursor_projects_root(tmp_path):
+    """The ~/.cursor/projects/ directory itself is an AI tool path."""
+    target = tmp_path / ".cursor" / "projects"
+    target.mkdir(parents=True)
+    assert _is_ai_tool_path(target) is True
+
+
+def test_is_ai_tool_path_dotcursor_without_projects_not_matched(tmp_path):
+    """`.cursor/` alone (without `/projects`) is the editor settings
+    dir — it MUST NOT auto-route to wing_api."""
+    target = tmp_path / ".cursor"
+    target.mkdir()
+    assert _is_ai_tool_path(target) is False
+
+
 def test_is_ai_tool_path_unrelated_directory(tmp_path):
     target = tmp_path / "Documents" / "myproject"
     target.mkdir(parents=True)
@@ -405,6 +427,12 @@ def test_resolve_wing_codex_auto_routes_to_wing_api(tmp_path):
 
 def test_resolve_wing_gemini_auto_routes_to_wing_api(tmp_path):
     target = tmp_path / ".gemini" / "tmp" / "abc" / "chats"
+    target.mkdir(parents=True)
+    assert _resolve_wing(target, wing=None) == "wing_api"
+
+
+def test_resolve_wing_cursor_projects_auto_routes_to_wing_api(tmp_path):
+    target = tmp_path / ".cursor" / "projects" / "Users-test-myapp" / "agent-transcripts"
     target.mkdir(parents=True)
     assert _resolve_wing(target, wing=None) == "wing_api"
 

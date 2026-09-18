@@ -790,6 +790,9 @@ def _is_ai_tool_path(path: Path) -> bool:
       - the consecutive segment pair ``.claude/projects`` (Claude Code).
         ``.claude`` alone is NOT matched — that is the settings/config dir,
         not a conversation source.
+      - the consecutive segment pair ``.cursor/projects`` (Cursor IDE
+        agent transcripts). ``.cursor`` alone is NOT matched — that is
+        the editor settings dir.
 
     Used by ``_resolve_wing`` to default the destination wing to
     ``wing_api`` when the user hasn't passed an explicit ``--wing``.
@@ -805,6 +808,8 @@ def _is_ai_tool_path(path: Path) -> bool:
         return True
     for i in range(len(parts) - 1):
         if parts[i] == ".claude" and parts[i + 1] == "projects":
+            return True
+        if parts[i] == ".cursor" and parts[i + 1] == "projects":
             return True
     return False
 

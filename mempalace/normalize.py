@@ -8,6 +8,7 @@ Supported:
     - ChatGPT conversations.json (a single conversation, or the top-level
       array of them that a real data export ships)
     - Claude Code JSONL (with tool_use/tool_result block capture)
+    - Cursor IDE agent JSONL (~/.cursor/projects/<proj>/agent-transcripts/)
     - OpenAI Codex CLI JSONL
     - Gemini CLI JSONL (~/.gemini/tmp/<project_hash>/chats/session-*.jsonl)
     - Pi agent JSONL
@@ -84,6 +85,8 @@ _NOISE_LINE_PREFIXES = (
     "Auto-save reminder...",
     "Checking pipeline...",
     "MemPalace auto-save checkpoint.",
+    "MemPalace save checkpoint.",
+    "MemPalace wake-up.",
 )
 
 _NOISE_LINE_PATTERNS = [
@@ -246,6 +249,10 @@ def _try_normalize_json_split(content: str) -> Optional[list]:
     if normalized:
         return [normalized]
 
+    normalized = _try_cursor_jsonl(content)
+    if normalized:
+        return [normalized]
+
     normalized = _try_codex_jsonl(content)
     if normalized:
         return [normalized]
@@ -354,6 +361,91 @@ def _try_claude_code_jsonl(content: str) -> Optional[str]:
                     messages[-1] = (prev_role, prev_text + "\n" + text)
                 else:
                     messages.append(("assistant", text))
+
+    if len(messages) >= 2:
+        return _messages_to_transcript(messages)
+    return None
+
+
+_CLAUDE_CODE_MSG_TYPES = frozenset({"user", "assistant", "human"})
+_CURSOR_ROLES = frozenset({"user", "assistant"})
+_CURSOR_SKIP_TYPES = frozenset({"turn_ended"})
+_CURSOR_INJECTED_TAGS = (
+    "system_reminder",
+    "timestamp",
+    "manually_attached_skills",
+    "dynamic_tool_catalog",
+    "hooks_context",
+    "attached_files",
+    "system_notification",
+)
+_CURSOR_USER_QUERY_RE = re.compile(
+    r"<user_query(?:\s[^>]*)?>([\s\S]*?)</user_query>",
+)
+_CURSOR_INJECTED_TAG_RES = [
+    re.compile(rf"<{name}(?:\s[^>]*)?>[\s\S]*?</{name}>") for name in _CURSOR_INJECTED_TAGS
+]
+
+
+def _strip_cursor_noise(text: str) -> str:
+    """Drop Cursor-injected blocks and unwrap ``<user_query>``.
+
+    Applied per message so a dangling tag cannot eat a neighbour. Injected
+    blocks may contain blank lines, so this does not use ``_tag_pattern``.
+    The inner ``user_query`` text is the user's exact words.
+    """
+
+    for pat in _CURSOR_INJECTED_TAG_RES:
+        text = pat.sub("", text)
+    queries = [part.strip() for part in _CURSOR_USER_QUERY_RE.findall(text) if part.strip()]
+    if queries:
+        text = "\n".join(queries)
+    return strip_noise(text)
+
+
+def _try_cursor_jsonl(content: str) -> Optional[str]:
+    """Cursor IDE agent transcripts.
+
+    Observed 2026-09-17 under ``~/.cursor/projects/<proj>/agent-transcripts/``:
+    ``{"role": "user"|"assistant", "message": {"content": [...]}}`` plus
+    ``{"type": "turn_ended"}``. Claude Code uses top-level ``type`` instead of
+    ``role``; any such record means this is not Cursor.
+    """
+
+    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    messages = []
+
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        msg_type = entry.get("type", "")
+        if msg_type in _CLAUDE_CODE_MSG_TYPES:
+            return None
+        if msg_type in _CURSOR_SKIP_TYPES:
+            continue
+        role = entry.get("role")
+        if role not in _CURSOR_ROLES:
+            continue
+        message = entry.get("message", {})
+        if not isinstance(message, dict):
+            continue
+        msg_content = message.get("content", "")
+        text = _extract_content(msg_content)
+        if text:
+            text = _strip_cursor_noise(text)
+        if not text:
+            continue
+        if role == "user":
+            messages.append(("user", text))
+        elif messages and messages[-1][0] == "assistant":
+            prev_role, prev_text = messages[-1]
+            messages[-1] = (prev_role, prev_text + "\n" + text)
+        else:
+            messages.append(("assistant", text))
 
     if len(messages) >= 2:
         return _messages_to_transcript(messages)
@@ -892,14 +984,15 @@ def _format_tool_use(block: dict) -> str:
     if isinstance(inp, list):
         inp = {}
 
-    if name == "Bash":
+    if name in ("Bash", "Shell"):
         cmd = inp.get("command", "")
         if len(cmd) > 200:
             cmd = cmd[:200] + "..."
-        return f"[Bash] {cmd}"
+        label = "Bash" if name == "Bash" else "Shell"
+        return f"[{label}] {cmd}"
 
     if name == "Read":
-        path = inp.get("file_path", "?")
+        path = inp.get("file_path") or inp.get("path") or "?"
         offset = inp.get("offset")
         limit = inp.get("limit")
         if offset is not None and limit is not None:
@@ -915,11 +1008,15 @@ def _format_tool_use(block: dict) -> str:
         return f"[Grep] {pattern} in {target}"
 
     if name == "Glob":
-        pattern = inp.get("pattern", "")
+        pattern = inp.get("pattern") or inp.get("glob_pattern") or ""
         return f"[Glob] {pattern}"
 
+    if name == "StrReplace":
+        path = inp.get("path") or inp.get("file_path") or "?"
+        return f"[StrReplace {path}]"
+
     if name in ("Edit", "Write"):
-        path = inp.get("file_path", "?")
+        path = inp.get("file_path") or inp.get("path") or "?"
         return f"[{name} {path}]"
 
     # Unknown tool — serialize input, truncate
