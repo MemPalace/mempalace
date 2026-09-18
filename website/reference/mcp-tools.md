@@ -217,7 +217,9 @@ Fetch a single drawer by ID — returns full content and metadata.
 |-----------|------|----------|-------------|
 | `drawer_id` | string | **Yes** | ID of the drawer to fetch |
 
-**Returns:** `{ drawer_id, content, wing, room, metadata }` where `metadata.source_file`, when present, is the basename only — the absolute path written by the miners is reduced before the dict is returned to MCP clients.
+**Returns:** `{ drawer_id, content, wing, room, metadata, access }` where `metadata.source_file`, when present, is the basename only — the absolute path written by the miners is reduced before the dict is returned to MCP clients.
+
+`access` is `{ retrieval_count, last_retrieved }`: how many times the drawer has been returned by `mempalace_search` or fetched here, and when last. The counts are kept beside the palace in `access.sqlite3`, never in drawer metadata, so reading a drawer does not rewrite it. A read-only server records nothing.
 
 ---
 

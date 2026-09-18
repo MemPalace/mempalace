@@ -428,8 +428,6 @@ def tool_add_drawer(
         "added_by": added_by,
         "filed_at": datetime.now().isoformat(),
         "id_recipe": ID_RECIPE,
-        "retrieval_count": 0,
-        "last_retrieved": "",
     }
     base_meta.update(extra_metadata)
     if source_file:
@@ -1032,8 +1030,10 @@ def tool_get_drawer(drawer_id: str):
         record = _logical_drawer_record(col, drawer_id)
         if record is None:
             return {"error": f"Drawer not found: {drawer_id}"}
-        _touch_record_read(col, record)
-        return _drawer_payload(record)
+        payload = _drawer_payload(record)
+        _record_drawer_reads([payload["drawer_id"]])
+        payload["access"] = _drawer_access(payload["drawer_id"])
+        return payload
     except Exception as e:
         return {"error": str(e)}
 
@@ -1281,48 +1281,26 @@ def _normalize_extra_metadata(extra_meta):
     return normalized
 
 
-def _touch_record_read(col, record):
-    """Update read-path counters for one logical drawer record."""
-    if not record or not record.get("ids"):
+def _record_drawer_reads(logical_ids) -> None:
+    """Count one read of each logical drawer id, beside the palace.
+
+    Counts go to ``access_stats`` (``<palace>/access.sqlite3``), never into
+    drawer metadata, so a read never writes to the drawer store. Read-only
+    servers record nothing.
+    """
+    if _READ_ONLY or not _config.palace_path:
         return
+    from .. import access_stats
 
-    ids = record.get("ids") or []
-    metadatas = record.get("metadatas") or []
-    if not ids or len(ids) != len(metadatas):
-        return
-
-    retrieved_at = datetime.now().isoformat()
-    updated = []
-    for meta in metadatas:
-        current = _safe_meta(meta)
-        reads = _coerce_non_negative_int(current.get("retrieval_count"), default=0)
-        current["retrieval_count"] = reads + 1
-        current["last_retrieved"] = retrieved_at
-        updated.append(current)
-
-    try:
-        col.update(ids=ids, metadatas=updated)
-        record["metadatas"] = updated
-        if updated:
-            record["metadata"] = updated[0]
-    except Exception:
-        logger.debug("read-touch update failed for drawer ids=%s", ids, exc_info=True)
+    access_stats.record_access(_config.palace_path, logical_ids)
 
 
-def _touch_logical_drawers(col, logical_ids):
-    """Increment retrieval counters for a batch of logical drawer IDs."""
-    if not col:
-        return
+def _drawer_access(drawer_id: str) -> dict:
+    """``{retrieval_count, last_retrieved}`` for one logical drawer."""
+    from .. import access_stats
 
-    seen = set()
-    for logical_id in logical_ids or []:
-        if not logical_id or logical_id in seen:
-            continue
-        seen.add(logical_id)
-        record = _logical_drawer_record(col, logical_id)
-        if record is None:
-            continue
-        _touch_record_read(col, record)
+    found = access_stats.access_for(_config.palace_path, [drawer_id]).get(drawer_id)
+    return found or {"retrieval_count": 0, "last_retrieved": None}
 
 
 def _logical_drawer_id_for_any_id(col, drawer_id: str) -> str:

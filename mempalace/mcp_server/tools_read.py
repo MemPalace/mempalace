@@ -549,10 +549,11 @@ def tool_get_taxonomy():
 
 
 def _touch_search_hits(result) -> None:
-    """Increment per-drawer retrieval counters for each search hit.
+    """Count one read of each drawer a search returned.
 
     Hits carry an internal ``_logical_drawer_id`` (added by the searcher and
-    popped here) so counters land on the logical drawer, not the chunk row.
+    popped here) so counts land on the logical drawer, not the chunk row. One
+    batched upsert beside the palace; the drawer store is not touched.
     """
     logical_ids = []
     for hit in result.get("results", []) if isinstance(result.get("results"), list) else []:
@@ -561,11 +562,8 @@ def _touch_search_hits(result) -> None:
         logical_id = hit.pop("_logical_drawer_id", None)
         if logical_id:
             logical_ids.append(logical_id)
-    if not logical_ids:
-        return
-    col = _get_collection()
-    if col:
-        _touch_logical_drawers(col, logical_ids)
+    if logical_ids:
+        _record_drawer_reads(logical_ids)
 
 
 def tool_search(
