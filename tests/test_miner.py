@@ -1111,8 +1111,10 @@ def test_sqlite_wing_room_counts_exact_tally(palace_path, seeded_collection):
     result = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
     assert result is not None
     total, wing_rooms = result
-    assert total == 4
-    assert {w: dict(r) for w, r in wing_rooms.items()} == {
+    assert total.drawers == 4
+    assert {
+        w: {r: c.drawers for r, c in rooms.items()} for w, rooms in wing_rooms.items()
+    } == {
         "project": {"backend": 2, "frontend": 1},
         "notes": {"planning": 1},
     }
@@ -1160,7 +1162,9 @@ def test_sqlite_wing_room_counts_numeric_wing_not_dropped(palace_path, collectio
     result = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
     assert result is not None
     _, wing_rooms = result
-    assert {w: dict(r) for w, r in wing_rooms.items()} == {"2026": {"7": 1}}
+    assert {
+        w: {r: c.drawers for r, c in rooms.items()} for w, rooms in wing_rooms.items()
+    } == {"2026": {"7": 1}}
 
 
 def test_sqlite_wing_room_counts_partial_metadata_buckets_question_mark(palace_path, collection):
@@ -1178,8 +1182,10 @@ def test_sqlite_wing_room_counts_partial_metadata_buckets_question_mark(palace_p
     result = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
     assert result is not None
     total, wing_rooms = result
-    assert total == 2  # neither drawer dropped
-    assert {w: dict(r) for w, r in wing_rooms.items()} == {
+    assert total.drawers == 2  # neither drawer dropped
+    assert {
+        w: {r: c.drawers for r, c in rooms.items()} for w, rooms in wing_rooms.items()
+    } == {
         "alpha": {"?": 1},
         "?": {"beta": 1},
     }

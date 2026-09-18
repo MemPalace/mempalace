@@ -2588,7 +2588,17 @@ def status(palace_path: str):
     counts = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
     if counts is not None:
         total, wing_rooms = counts
-        _print_status(total, wing_rooms)
+        # The sqlite path reports a DrawerCount per bucket (logical drawers plus
+        # physical rows). The client fallbacks below still tally rows, so both
+        # paths are reduced to the logical number here rather than teaching
+        # _print_status two shapes.
+        _print_status(
+            total.drawers,
+            {
+                wing: {room: count.drawers for room, count in rooms.items()}
+                for wing, rooms in wing_rooms.items()
+            },
+        )
         return
 
     col = _open_collection_or_explain(palace_path)
