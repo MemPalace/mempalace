@@ -37,7 +37,7 @@ TOOLS = {
         "handler": tool_get_aaak_spec,
     },
     "mempalace_kg_query": {
-        "description": "Query the knowledge graph for an entity's relationships. Returns typed facts with temporal validity. E.g. 'Max' → child_of Alice, loves chess, does swimming. Filter by date with as_of to see what was true at a point in time.",
+        "description": "Query the knowledge graph for an entity's relationships. Default behavior is one-hop. Set recurse=true to traverse recursively with optional predicate filtering.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -52,6 +52,18 @@ TOOLS = {
                 "direction": {
                     "type": "string",
                     "description": "outgoing (entity→?), incoming (?→entity), or both (default: both)",
+                },
+                "predicate": {
+                    "type": "string",
+                    "description": "Optional predicate filter (e.g. 'synthesized-from', 'merged-into').",
+                },
+                "recurse": {
+                    "type": "boolean",
+                    "description": "When true, breadth-first traversal continues beyond one hop (default: false).",
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "description": "Maximum traversal depth when recurse=true (default 20).",
                 },
             },
             "required": ["entity"],
@@ -160,6 +172,102 @@ TOOLS = {
         "description": "Knowledge graph overview: entities, triples, current vs expired facts, relationship types.",
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_kg_stats,
+    },
+    "mempalace_resolve_canonical": {
+        "description": "Resolve a node to its canonical target by following active merged-into edges.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "node_id": {"type": "string", "description": "Node ID to resolve"},
+                "max_hops": {
+                    "type": "integer",
+                    "description": "Maximum merged-into hops to follow (default 50)",
+                },
+            },
+            "required": ["node_id"],
+        },
+        "handler": tool_resolve_canonical,
+    },
+    "mempalace_get_height": {
+        "description": "Compute lineage height for a node as longest synthesized-from path to a source leaf.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "node_id": {"type": "string", "description": "Node ID to evaluate"},
+            },
+            "required": ["node_id"],
+        },
+        "handler": tool_get_height,
+    },
+    "mempalace_find_merge_candidates": {
+        "description": "Find semantically near drawer-node pairs, optionally requiring topological distance (no common synthesized-from ancestry).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "drawer_id": {
+                    "type": "string",
+                    "description": "Optional seed node ID to evaluate; omitted scans drawer nodes.",
+                },
+                "threshold": {
+                    "type": "number",
+                    "description": "Similarity threshold 0-1 passed to duplicate detection (default 0.9).",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum candidate pairs to return (default 20).",
+                },
+                "max_nodes": {
+                    "type": "integer",
+                    "description": "When drawer_id is omitted, maximum drawer nodes to scan (default 40).",
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "description": "Ancestor traversal depth used for topological checks (default 20).",
+                },
+                "wing": {
+                    "type": "string",
+                    "description": "Optional wing filter when scanning drawer nodes.",
+                },
+                "room": {
+                    "type": "string",
+                    "description": "Optional room filter when scanning drawer nodes.",
+                },
+                "require_topological_distance": {
+                    "type": "boolean",
+                    "description": "If true (default), only return pairs without common ancestors.",
+                },
+            },
+        },
+        "handler": tool_find_merge_candidates,
+    },
+    "mempalace_find_closet_lineage_issues": {
+        "description": "Validate closet lineage: report broken sources, stale merged references, and stored-height mismatches.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "wing": {
+                    "type": "string",
+                    "description": "Optional wing filter for closet records.",
+                },
+                "room": {
+                    "type": "string",
+                    "description": "Optional room filter for closet records.",
+                },
+                "include_merged": {
+                    "type": "boolean",
+                    "description": "Include closets that already resolve to another canonical node (default false).",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum orphan rows to return (default 20, max 500).",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Pagination offset for orphan rows (default 0).",
+                },
+            },
+        },
+        "handler": tool_find_closet_lineage_issues,
     },
     "mempalace_traverse": {
         "description": "Walk the palace graph from a room. Shows connected ideas across wings — the tunnels. Like following a thread through the palace: start at 'chromadb-setup' in wing_code, discover it connects to wing_myproject (planning) and wing_user (feelings about it).",
@@ -433,6 +541,32 @@ TOOLS = {
             "required": ["items"],
         },
         "handler": tool_checkpoint,
+    },
+    "mempalace_apply_merge": {
+        "description": "Apply a deterministic merge between nodes: link source to canonical via merged-into and optionally invalidate source synthesized-from edges.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "source_node_id": {
+                    "type": "string",
+                    "description": "Node to merge into canonical.",
+                },
+                "canonical_node_id": {
+                    "type": "string",
+                    "description": "Canonical node target that survives resolution.",
+                },
+                "ended": {
+                    "type": "string",
+                    "description": "Optional end date/time for invalidated facts (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ).",
+                },
+                "invalidate_source_edges": {
+                    "type": "boolean",
+                    "description": "Invalidate source synthesized-from edges after merge (default true).",
+                },
+            },
+            "required": ["source_node_id", "canonical_node_id"],
+        },
+        "handler": tool_apply_merge,
     },
     "mempalace_delete_drawer": {
         "description": "Delete a drawer by ID. Irreversible.",

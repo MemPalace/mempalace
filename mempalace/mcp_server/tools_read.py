@@ -548,6 +548,24 @@ def tool_get_taxonomy():
     return result
 
 
+def _touch_search_hits(result) -> None:
+    """Count one read of each drawer a search returned.
+
+    Hits carry an internal ``_logical_drawer_id`` (added by the searcher and
+    popped here) so counts land on the logical drawer, not the chunk row. One
+    batched upsert beside the palace; the drawer store is not touched.
+    """
+    logical_ids = []
+    for hit in result.get("results", []) if isinstance(result.get("results"), list) else []:
+        if not isinstance(hit, dict):
+            continue
+        logical_id = hit.pop("_logical_drawer_id", None)
+        if logical_id:
+            logical_ids.append(logical_id)
+    if logical_ids:
+        _record_drawer_reads(logical_ids)
+
+
 def tool_search(
     query: str,
     limit: int = 5,
@@ -691,6 +709,8 @@ def tool_search(
     if _vector_disabled:
         result["vector_disabled"] = True
         result["vector_disabled_reason"] = _vector_disabled_reason
+
+    _touch_search_hits(result)
     # Attach sanitizer metadata for transparency
     if sanitized["was_sanitized"]:
         result["query_sanitized"] = True

@@ -1,6 +1,7 @@
 """MCP server tests — drawer write/update/delete and delete-by-source."""
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
 
@@ -1203,6 +1204,48 @@ class TestWriteTools:
         assert result["success"] is True
         assert result["chunks"] == 1
         assert "chunk_ids" not in result
+
+    def test_search_touches_retrieval_counters(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+
+        from mempalace.mcp_server import tool_add_drawer, tool_get_drawer, tool_search
+
+        added = tool_add_drawer(
+            wing="project",
+            room="search",
+            content="hybrid retrieval counter search signal",
+        )
+        drawer_id = added["drawer_id"]
+
+        result = tool_search(query="retrieval search signal", limit=5)
+        assert "results" in result
+        assert result["results"]
+        assert all("_logical_drawer_id" not in hit for hit in result["results"])
+
+        fetched = tool_get_drawer(drawer_id)
+        # Search counted once, then tool_get_drawer counted once more.
+        assert fetched["access"]["retrieval_count"] >= 2
+        assert fetched["access"]["last_retrieved"]
+        # Counts live beside the palace; reading never rewrites the drawer.
+        assert "retrieval_count" not in fetched["metadata"]
+        assert "last_retrieved" not in fetched["metadata"]
+        assert (Path(palace_path) / "access.sqlite3").is_file()
+
+    def test_read_only_server_records_no_reads(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+
+        from mempalace import mcp_server
+
+        added = mcp_server.tool_add_drawer(wing="project", room="search", content="read only hit")
+        monkeypatch.setattr(mcp_server, "_READ_ONLY", True)
+
+        fetched = mcp_server.tool_get_drawer(added["drawer_id"])
+        assert fetched["access"]["retrieval_count"] == 0
+        assert not (Path(palace_path) / "access.sqlite3").exists()
 
 
 def test_add_drawer_chunked_logical_id_fetches_deletes_and_lists_as_one(
