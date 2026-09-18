@@ -896,7 +896,14 @@ def test_register_file_sentinel_includes_source_mtime():
         client = chromadb.PersistentClient(path=palace_path)
         col = client.get_or_create_collection("mempalace_drawers")
 
-        _register_file(col, str(tiny_file), "test", "mempalace", "exchange")
+        _register_file(
+            col,
+            str(tiny_file),
+            "test",
+            "mempalace",
+            "exchange",
+            source_metadata={"source_mtime": tiny_file.stat().st_mtime},
+        )
 
         mined = prefetch_mined_set(col, extract_mode="exchange")
         assert str(tiny_file) in mined

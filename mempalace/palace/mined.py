@@ -31,6 +31,7 @@ def file_already_mined(
     source_file: str,
     check_mtime: bool = False,
     extract_mode: Optional[str] = None,
+    check_source_fingerprint: bool = False,
 ) -> bool:
     """Check if a file has already been filed in the palace.
 
@@ -39,6 +40,10 @@ def file_already_mined(
       - the stored `normalize_version` is missing or older than the current
         schema (triggers silent rebuild after a normalization upgrade)
       - `check_mtime=True` and the file's mtime differs from the stored one
+
+    With check_source_fingerprint=True, the currentness check requires an
+    exact source fingerprint instead of the legacy mtime tolerance. Rows
+    without it are re-mined once to record a verified source snapshot.
 
     When check_mtime=True (used by the project miner, and by the convo
     miner's in-lock recheck), also re-mines on content change. Conversation
@@ -77,7 +82,15 @@ def file_already_mined(
         # Iterating via the same paginated pattern used in the
         # extract_mode-is-set branch lets the function short-circuit on the
         # first matching group regardless of ordering.
-        current_mtime = os.path.getmtime(source_file) if check_mtime else None
+        check_mtime = check_mtime or check_source_fingerprint
+        current_mtime = (
+            os.path.getmtime(source_file) if check_mtime and not check_source_fingerprint else None
+        )
+        current_fingerprint = (
+            source_fingerprint(os.stat(source_file))
+            if check_mtime and check_source_fingerprint
+            else None
+        )
         offset = 0
         # Tracks, per matching stored_mtime group, how many drawers have
         # been seen so far toward that group's own chunk_total (#21).
@@ -105,17 +118,24 @@ def file_already_mined(
                 if not check_mtime:
                     return True
                 stored_mtime = meta.get("source_mtime")
-                if stored_mtime is None:
-                    continue
-                if abs(float(stored_mtime) - current_mtime) >= 0.001:
-                    continue
+                if check_source_fingerprint:
+                    if meta.get("source_fingerprint") != current_fingerprint:
+                        continue
+                else:
+                    if stored_mtime is None:
+                        continue
+                    if abs(float(stored_mtime) - current_mtime) >= 0.001:
+                        continue
                 chunk_total = meta.get("chunk_total")
                 if chunk_total is None:
                     # No completion marker on this drawer — can't verify
                     # completeness for its group, trust the match as before.
                     return True
-                seen = group_counts.get(stored_mtime, 0) + 1
-                group_counts[stored_mtime] = seen
+                group_key = (
+                    meta.get("source_fingerprint") if check_source_fingerprint else stored_mtime
+                )
+                seen = group_counts.get(group_key, 0) + 1
+                group_counts[group_key] = seen
                 if seen >= chunk_total:
                     return True
             if not ids:
@@ -127,8 +147,8 @@ def file_already_mined(
 
 
 def prefetch_mined_set(
-    collection, extract_mode: Optional[str] = None
-) -> dict[str, Optional[float]]:
+    collection, extract_mode: Optional[str] = None, source_fingerprints: bool = False
+) -> dict[str, Optional[Union[float, str]]]:
     """Pre-fetch source_file -> stored source_mtime for files already mined
     at the current NORMALIZE_VERSION, in one bulk pass instead of one
     ChromaDB query per file.
@@ -146,6 +166,10 @@ def prefetch_mined_set(
     stored (drawers written before this field existed) or getmtime failed
     when the drawer was written -- both should be treated as stale.
 
+    With source_fingerprints=True, values and completion groups use exact
+    source fingerprints instead. Missing fingerprints return None so callers
+    re-mine legacy files rather than trusting a possibly stale mtime.
+
     When extract_mode is set, mirrors file_already_mined(..., extract_mode=...)
     so conversation mines skip per extraction mode rather than per source file.
 
@@ -161,7 +185,7 @@ def prefetch_mined_set(
     palace, making a 2000-file sweep take >1h of pure skip-checking. This
     helper drops that to a single paginated scan plus O(1) lookups.
     """
-    # Per source_file: per stored_mtime group → count + optional chunk_total.
+    # Per source_file: per source-state group → count + optional chunk_total.
     # A source is only "mined" once some group is complete.
     groups: dict[str, dict] = {}
     try:
@@ -180,10 +204,13 @@ def prefetch_mined_set(
                 version = meta.get("normalize_version", 1)
                 if version < NORMALIZE_VERSION:
                     continue
-                stored_mtime = meta.get("source_mtime")
-                mtime_key = float(stored_mtime) if stored_mtime is not None else None
+                if source_fingerprints:
+                    state_key = meta.get("source_fingerprint")
+                else:
+                    stored_mtime = meta.get("source_mtime")
+                    state_key = float(stored_mtime) if stored_mtime is not None else None
                 entry = groups.setdefault(src, {}).setdefault(
-                    mtime_key, {"count": 0, "chunk_total": None}
+                    state_key, {"count": 0, "chunk_total": None}
                 )
                 entry["count"] += 1
                 chunk_total = meta.get("chunk_total")
@@ -198,16 +225,16 @@ def prefetch_mined_set(
     except Exception:
         logger.warning("prefetch_mined_set: partial fetch, %d source groups loaded", len(groups))
 
-    mined: dict[str, Optional[float]] = {}
-    for src, by_mtime in groups.items():
-        for mtime_key, entry in by_mtime.items():
+    mined: dict[str, Optional[Union[float, str]]] = {}
+    for src, by_state in groups.items():
+        for state_key, entry in by_state.items():
             chunk_total = entry["chunk_total"]
             if chunk_total is None:
                 # Legacy / registry: no completion marker — trust membership.
-                mined[src] = mtime_key
+                mined[src] = state_key
                 break
             if entry["count"] >= chunk_total:
-                mined[src] = mtime_key
+                mined[src] = state_key
                 break
     return mined
 

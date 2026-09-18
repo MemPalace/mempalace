@@ -20,6 +20,7 @@ from datetime import datetime
 from collections import defaultdict
 from typing import Optional
 
+from ._source_state import source_fingerprint
 from .backends import PalaceNotFoundError
 from .collision_scan import assert_no_collisions
 from .ids import (
@@ -28,7 +29,11 @@ from .ids import (
     make_convo_sentinel_id,
     make_exchange_drawer_id,
 )
-from .normalize import UnparsedCodexTranscriptError, normalize_conversations
+from .normalize import (
+    SourceChangedDuringReadError,
+    UnparsedCodexTranscriptError,
+    normalize_conversations,
+)
 from .source_identity import identity_metadata, source_directory_identity
 from .entities import entities_metadata
 from .palace import (
@@ -223,6 +228,7 @@ def _register_file(
     agent: str,
     extract_mode: str,
     content_hash: Optional[str] = None,
+    source_metadata: Optional[dict] = None,
 ):
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
 
@@ -230,7 +236,7 @@ def _register_file(
     re-read and re-processed on every mine run because nothing was written to
     ChromaDB on the first pass.
 
-    Stamps source_mtime like every real drawer does, so a file that later
+    Stamps the verified source state like every real drawer does, so a file that later
     grows past the min-chunk-size floor (e.g. a short session that gets
     extended) is correctly detected as changed on the next mine instead of
     being skipped forever by this sentinel.
@@ -238,12 +244,8 @@ def _register_file(
     Also used to register a file recognized as a content-duplicate of an
     already-mined transcript under a different path (see
     ``prefetch_content_hashes``) — stamping it here means the next run skips
-    it via the cheap mtime check instead of re-normalizing and re-hashing it.
+    it via the cheap fingerprint check instead of re-normalizing and re-hashing it.
     """
-    try:
-        source_mtime = os.path.getmtime(source_file)
-    except OSError:
-        source_mtime = None
     sentinel_id = make_convo_sentinel_id(source_file, extract_mode)
     meta = {
         "wing": wing,
@@ -256,8 +258,7 @@ def _register_file(
         "normalize_version": NORMALIZE_VERSION,
         "id_recipe": ID_RECIPE,
     }
-    if source_mtime is not None:
-        meta["source_mtime"] = source_mtime
+    meta.update(source_metadata or {})
     if content_hash is not None:
         meta["content_hash"] = content_hash
     collection.upsert(
@@ -640,6 +641,7 @@ def _file_chunks_locked(
     authored_at=None,
     content_hash=None,
     source_dir_ino=None,
+    source_metadata=None,
 ):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
@@ -659,7 +661,13 @@ def _file_chunks_locked(
         # Re-check after lock — another agent may have just finished this file
         # at the current schema/mtime. A stale hit here returns False, so we
         # still fall through to the purge+rebuild path below.
-        if file_already_mined(collection, source_file, check_mtime=True, extract_mode=extract_mode):
+        if file_already_mined(
+            collection,
+            source_file,
+            check_mtime=True,
+            extract_mode=extract_mode,
+            check_source_fingerprint=True,
+        ):
             return 0, room_counts_delta, True
 
         # Purge stale drawers first. Fires both on a normalize-schema bump
@@ -700,10 +708,6 @@ def _file_chunks_locked(
         # a stable mtime + any surviving drawer permanently skips the file
         # and the missing exchanges never come back.
         filed_at = datetime.now().isoformat()
-        try:
-            source_mtime = os.path.getmtime(source_file)
-        except OSError:
-            source_mtime = None
         chunk_total = len(chunks)
         try:
             for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
@@ -737,8 +741,7 @@ def _file_chunks_locked(
                         "id_recipe": ID_RECIPE,
                         "chunk_total": chunk_total,
                     }
-                    if source_mtime is not None:
-                        meta["source_mtime"] = source_mtime
+                    meta.update(source_metadata or {})
                     if source_dir_ino:
                         # Which directory this transcript was read from, so
                         # ``sync`` can tell a neighbour in the same directory
@@ -835,26 +838,19 @@ def _split_new_and_duplicate_conversations(
     return new_items, duplicates
 
 
-def _is_unchanged_since_last_mine(source_file: str, mined_mtimes: dict) -> bool:
-    """True iff source_file was mined at the current schema AND its on-disk
-    mtime still matches what was stored -- the mtime-aware replacement for
-    "we've seen this source_file before" (transcripts are not immutable).
+def _is_unchanged_since_last_mine(source_file: str, mined_fingerprints: dict) -> bool:
+    """Skip only a complete, verified snapshot matching the source exactly.
 
-    False (re-mine) whenever the file isn't in mined_mtimes at all, its
-    stored mtime is None (never recorded -- pre-mtime-tracking drawer, or
-    getmtime failed when it was written), or getmtime fails right now
-    (treat as changed rather than silently trusting stale data).
+    Legacy rows without a fingerprint need one re-mine. A failed stat also
+    leaves the source eligible rather than trusting stale content.
     """
-    if source_file not in mined_mtimes:
-        return False
-    stored_mtime = mined_mtimes[source_file]
-    if stored_mtime is None:
+    fingerprint = mined_fingerprints.get(source_file)
+    if fingerprint is None:
         return False
     try:
-        current_mtime = os.path.getmtime(source_file)
+        return fingerprint == source_fingerprint(os.stat(source_file))
     except OSError:
         return False
-    return abs(stored_mtime - current_mtime) < 0.001
 
 
 def _resolve_wing(convo_path: Path, wing: Optional[str]) -> str:
@@ -967,6 +963,7 @@ def _normalize_convo_conversations(
     agent: str,
     extract_mode: str,
     dry_run: bool,
+    source_metadata: Optional[dict] = None,
 ) -> Optional[list]:
     """Normalize a transcript file into its individual conversations,
     registering it as filed when there's nothing worth mining. Returns None
@@ -979,20 +976,28 @@ def _normalize_convo_conversations(
     bundle means one new conversation added to a re-export changes the
     whole-file hash and hides the conversations that didn't change.
     """
+    if source_metadata is None:
+        source_metadata = {}
     try:
-        conversations = [c for c in normalize_conversations(str(filepath)) if c]
-    except UnparsedCodexTranscriptError as exc:
+        conversations = [
+            c for c in normalize_conversations(str(filepath), source_metadata=source_metadata) if c
+        ]
+    except (UnparsedCodexTranscriptError, SourceChangedDuringReadError) as exc:
         logger.warning("Skipping %s: %s; source remains eligible for retry", filepath, exc)
         return None
     except (OSError, ValueError):
         if not dry_run:
-            _register_file(collection, source_file, wing, agent, extract_mode)
+            _register_file(
+                collection, source_file, wing, agent, extract_mode, source_metadata=source_metadata
+            )
         return None
 
     total_len = sum(len(c.strip()) for c in conversations)
     if not conversations or total_len < cfg_min_chunk_size:
         if not dry_run:
-            _register_file(collection, source_file, wing, agent, extract_mode)
+            _register_file(
+                collection, source_file, wing, agent, extract_mode, source_metadata=source_metadata
+            )
         return None
 
     return conversations
@@ -1066,19 +1071,21 @@ def _mine_convos_impl(
         dry_run=dry_run,
     )
 
-    # Bulk pre-fetch already-mined source_file -> stored mtime in one
+    # Bulk pre-fetch already-mined source_file -> verified fingerprint in one
     # paginated pass instead of `len(files)` separate WHERE-source_file
     # queries. On a 150k-drawer palace each per-file query costs ~2s, so a
     # 2000-file sweep used to spend >1h just deciding to skip.
     # prefetch_mined_set() does the same decisions in a single scan; loop
-    # body becomes an O(1) dict lookup + a cheap local mtime comparison.
-    mined_mtimes: dict = (
-        prefetch_mined_set(collection, extract_mode=extract_mode) if collection is not None else {}
+    # body becomes an O(1) dict lookup + a cheap local stat comparison.
+    mined_fingerprints: dict = (
+        prefetch_mined_set(collection, extract_mode=extract_mode, source_fingerprints=True)
+        if collection is not None
+        else {}
     )
     # content_hash -> source_file for transcripts already filed. Repeated
     # exports from Claude/ChatGPT commonly land under a new filename each
     # run even when the conversation itself is unchanged, so the
-    # source_file-keyed skip above ("mined_mtimes") never recognizes them —
+    # source_file-keyed skip above never recognizes them —
     # this catches the same conversation reappearing at a new path.
     mined_content_hashes: dict = (
         prefetch_content_hashes(collection, extract_mode=extract_mode)
@@ -1104,7 +1111,7 @@ def _mine_convos_impl(
         # Falling through re-mines: _file_chunks_locked purges this
         # source_file's stale drawers before inserting fresh ones, so this
         # never leaves duplicates behind.
-        if _is_unchanged_since_last_mine(source_file, mined_mtimes):
+        if _is_unchanged_since_last_mine(source_file, mined_fingerprints):
             files_skipped += 1
             continue
 
@@ -1112,6 +1119,7 @@ def _mine_convos_impl(
             files_skipped += 1
             continue
 
+        source_metadata: dict = {}
         conversations = _normalize_convo_conversations(
             filepath,
             source_file,
@@ -1121,6 +1129,7 @@ def _mine_convos_impl(
             agent,
             extract_mode,
             dry_run,
+            source_metadata=source_metadata,
         )
         if conversations is None:
             continue
@@ -1137,7 +1146,14 @@ def _mine_convos_impl(
         )
         if not new_items:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _register_file(
+                    collection,
+                    source_file,
+                    wing,
+                    agent,
+                    extract_mode,
+                    source_metadata=source_metadata,
+                )
             dup_source = duplicates[0][1]
             print(
                 f"  = [{i:4}/{len(files)}] {filepath.name[:50]:50} "
@@ -1164,7 +1180,14 @@ def _mine_convos_impl(
 
         if not chunks:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _register_file(
+                    collection,
+                    source_file,
+                    wing,
+                    agent,
+                    extract_mode,
+                    source_metadata=source_metadata,
+                )
             continue
 
         # Detect room from content (general mode uses memory_type instead)
@@ -1210,6 +1233,7 @@ def _mine_convos_impl(
             authored_at=_extract_authored_at(filepath),
             content_hash=content_hash,
             source_dir_ino=source_directory_identity(filepath),
+            source_metadata=source_metadata,
         )
         if skipped:
             files_skipped += 1
