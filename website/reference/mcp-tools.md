@@ -204,6 +204,7 @@ Mine a directory into the palace — the MCP equivalent of `mempalace mine`. `mo
 | `source` | string | **Yes** | Directory to mine, or one conversation file with `mode='convos'` |
 | `mode` | string | No | `projects` (code/docs, default), `convos` (chat transcripts), or `extract` (office docs; needs the `mempalace[extract]` extra) |
 | `wing` | string | No | Target wing (default: source directory name) |
+| `room` | string | No | Target room for projects mode; overrides per-file room routing (default: route each file by folder/filename/content) |
 | `agent` | string | No | Recorded on every drawer (default: `mempalace`) |
 | `limit` | integer | No | Max files to process (0 = all; default 0) |
 | `dry_run` | boolean | No | Report what would be filed without writing (default false) |
