@@ -18,9 +18,11 @@ import pytest
 
 from mempalace.backends.chroma import (
     _hnsw_element_count,
+    _hnsw_indexed_ids,
     _vector_segment_id,
     hnsw_capacity_status,
     reset_hnsw_capacity_cache,
+    searchable_coverage,
 )
 from mempalace.searcher import _bm25_only_via_sqlite
 
@@ -1244,3 +1246,269 @@ def test_capacity_status_tolerates_small_palace_stub(tmp_path):
     info = hnsw_capacity_status(str(tmp_path), COLLECTION)
     assert info["diverged"] is False
     assert info["flush_unreachable"] is False
+
+
+# ── searchable coverage (#2514) ───────────────────────────────────────
+#
+# The capacity probe above compares the flushed index against sqlite, so it
+# falls silent whenever index_metadata.pickle is absent — the ordinary state
+# of every palace holding fewer records than its hnsw:sync_threshold, since
+# chroma writes that pickle only when a compaction fires. These cover the
+# measurement that still works there: a drawer is searchable when its vector
+# is either flushed into HNSW or still pending replay in embeddings_queue.
+
+
+def _seed_embeddings_queue(
+    palace: str,
+    ids: list[str],
+    *,
+    collection_id: str = "col-test",
+    with_vector: bool = True,
+) -> None:
+    """Add chroma's write-ahead log rows for ``ids`` under one collection.
+
+    Creates ``embeddings_queue`` on first use with the columns chroma 1.5.x
+    writes, including the ``topic`` the rows are scoped by — one table
+    carries every collection in the palace, so the probe has to filter.
+    """
+    conn = sqlite3.connect(os.path.join(palace, "chroma.sqlite3"))
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS embeddings_queue (
+                seq_id INTEGER PRIMARY KEY,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                operation INTEGER NOT NULL,
+                topic TEXT NOT NULL,
+                id TEXT NOT NULL,
+                vector BLOB,
+                encoding TEXT,
+                metadata TEXT
+            )
+            """
+        )
+        topic = f"persistent://default/default/{collection_id}"
+        for queued_id in ids:
+            conn.execute(
+                "INSERT INTO embeddings_queue (operation, topic, id, vector) VALUES (0, ?, ?, ?)",
+                (topic, queued_id, b"\x00\x01\x02\x03" if with_vector else None),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_searchable_coverage_full_when_nothing_has_ever_flushed(tmp_path):
+    """The reported case: below sync_threshold, no pickle, every drawer fine.
+
+    hnsw_capacity_status can only answer "unknown" here. The drawers are all
+    sitting in the write log, which chroma replays on open, so every one of
+    them is searchable and the palace needs no repair (#2514).
+    """
+    seg = "seg-unflushed"
+    _seed_chroma_db(str(tmp_path), sqlite_count=50, segment_id=seg, sync_threshold=1_000)
+    _seed_embeddings_queue(str(tmp_path), [f"d-{i}" for i in range(50)])
+
+    assert hnsw_capacity_status(str(tmp_path), COLLECTION)["status"] == "unknown"
+
+    coverage = searchable_coverage(str(tmp_path), COLLECTION)
+    assert coverage["coverage"] == 1.0
+    assert coverage["live_count"] == 50
+    assert coverage["covered_count"] == 50
+    assert coverage["flushed_count"] == 0
+    assert coverage["pending_count"] == 50
+    assert coverage["unsearchable_count"] == 0
+    assert coverage["degraded"] is False
+
+
+def test_searchable_coverage_goes_red_when_the_index_is_gone(tmp_path):
+    """The other half of the same unknown: drawers in neither place.
+
+    A palace whose flushed index was quarantined away after the write log had
+    already been purged reads identically to the healthy case above through
+    hnsw_capacity_status — both are "no flushed metadata yet". This is the
+    reading that has to stay red, or the fix trades a false alarm for a false
+    reassurance.
+    """
+    seg = "seg-index-lost"
+    _seed_chroma_db(str(tmp_path), sqlite_count=45, segment_id=seg, sync_threshold=10)
+    _seed_embeddings_queue(str(tmp_path), [f"d-{i}" for i in range(39, 45)])
+
+    assert hnsw_capacity_status(str(tmp_path), COLLECTION)["status"] == "unknown"
+
+    coverage = searchable_coverage(str(tmp_path), COLLECTION)
+    assert coverage["degraded"] is True
+    assert coverage["covered_count"] == 6
+    assert coverage["unsearchable_count"] == 39
+    assert coverage["coverage"] == pytest.approx(6 / 45)
+    assert "neither the flushed HNSW index nor the pending write log" in coverage["message"]
+
+
+def test_searchable_coverage_spans_flushed_and_pending_after_a_flush(tmp_path):
+    """Post-flush split: chroma purges the queue as it compacts.
+
+    Neither set describes a healthy palace on its own here — the write log
+    alone reads as 11% coverage — so the measurement has to take both.
+    """
+    seg = "seg-split"
+    _seed_chroma_db(str(tmp_path), sqlite_count=45, segment_id=seg, sync_threshold=10)
+    _write_pickle(str(tmp_path), seg, hnsw_count=40)
+    _seed_embeddings_queue(str(tmp_path), [f"d-{i}" for i in range(40, 45)])
+
+    coverage = searchable_coverage(str(tmp_path), COLLECTION)
+    assert coverage["coverage"] == 1.0
+    assert coverage["flushed_count"] == 40
+    assert coverage["pending_count"] == 5
+    assert coverage["degraded"] is False
+
+
+def test_searchable_coverage_unions_the_sets_instead_of_summing_them(tmp_path):
+    """Re-upserted drawers sit in both sets, and a sum lets that hide a gap.
+
+    Five of ten drawers are flushed and the same five are pending again after
+    a re-upsert. ``hnsw_count + wal_count >= sqlite_count`` reads 10 >= 10 and
+    passes; the five that were never written are still missing.
+    """
+    seg = "seg-overlap"
+    _seed_chroma_db(str(tmp_path), sqlite_count=10, segment_id=seg, sync_threshold=1_000)
+    _write_pickle(str(tmp_path), seg, hnsw_count=5)
+    _seed_embeddings_queue(str(tmp_path), [f"d-{i}" for i in range(5)])
+
+    coverage = searchable_coverage(str(tmp_path), COLLECTION)
+    assert coverage["flushed_count"] + coverage["pending_count"] == 5
+    assert coverage["covered_count"] == 5
+    assert coverage["unsearchable_count"] == 5
+    assert coverage["degraded"] is True
+
+
+def test_searchable_coverage_ignores_another_collections_write_log(tmp_path):
+    """One embeddings_queue carries the whole palace, so scope by topic.
+
+    Closet rows counting toward the drawer collection would report a palace
+    with no searchable drawers at all as fully covered.
+    """
+    seg = "seg-scoped"
+    _seed_chroma_db(str(tmp_path), sqlite_count=4, segment_id=seg, sync_threshold=1_000)
+    _seed_embeddings_queue(
+        str(tmp_path),
+        [f"d-{i}" for i in range(4)],
+        collection_id="col-closets",
+    )
+
+    coverage = searchable_coverage(str(tmp_path), COLLECTION)
+    assert coverage["covered_count"] == 0
+    assert coverage["unsearchable_count"] == 4
+    assert coverage["degraded"] is True
+
+
+def test_searchable_coverage_unmeasured_when_the_pickle_cannot_be_read(tmp_path):
+    """A pickle that is there but unreadable means unknown, not zero flushed.
+
+    Counting it as zero would report a fully flushed palace as having lost
+    everything — exactly the false alarm this whole check exists to remove.
+    """
+    seg = "seg-badpickle"
+    _seed_chroma_db(str(tmp_path), sqlite_count=20, segment_id=seg, sync_threshold=1_000)
+    os.makedirs(os.path.join(str(tmp_path), seg), exist_ok=True)
+    with open(os.path.join(str(tmp_path), seg, "index_metadata.pickle"), "wb") as f:
+        f.write(b"not a pickle")
+    _seed_embeddings_queue(str(tmp_path), [])
+
+    coverage = searchable_coverage(str(tmp_path), COLLECTION)
+    assert coverage["coverage"] is None
+    assert coverage["degraded"] is False
+    assert "could not read the flushed index" in coverage["message"]
+
+
+def test_searchable_coverage_unmeasured_without_a_write_log(tmp_path):
+    """No embeddings_queue to read means unknown, never a red verdict."""
+    seg = "seg-noqueue"
+    _seed_chroma_db(str(tmp_path), sqlite_count=20, segment_id=seg, sync_threshold=1_000)
+
+    coverage = searchable_coverage(str(tmp_path), COLLECTION)
+    assert coverage["coverage"] is None
+    assert coverage["degraded"] is False
+    assert "could not read the write log" in coverage["message"]
+
+
+def test_searchable_coverage_quiet_on_an_empty_collection(tmp_path):
+    """Nothing live is nothing to measure, and no line to print."""
+    seg = "seg-empty"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=seg, sync_threshold=1_000)
+
+    coverage = searchable_coverage(str(tmp_path), COLLECTION)
+    assert coverage["coverage"] is None
+    assert coverage["live_count"] == 0
+    assert coverage["message"] == ""
+
+
+def test_hnsw_indexed_ids_separates_never_flushed_from_unreadable(tmp_path):
+    """The empty set and None are different answers and stay different."""
+    seg = "seg-ids"
+    os.makedirs(os.path.join(str(tmp_path), seg), exist_ok=True)
+    assert _hnsw_indexed_ids(str(tmp_path), seg) == set()
+
+    _write_pickle(str(tmp_path), seg, hnsw_count=3)
+    assert _hnsw_indexed_ids(str(tmp_path), seg) == {"d-0", "d-1", "d-2"}
+
+    with open(os.path.join(str(tmp_path), seg, "index_metadata.pickle"), "wb") as f:
+        f.write(b"not a pickle")
+    assert _hnsw_indexed_ids(str(tmp_path), seg) is None
+
+
+def test_repair_status_tells_an_unflushed_palace_from_one_that_lost_its_index(tmp_path, capsys):
+    """Both report status UNKNOWN; repair-status must still separate them.
+
+    Reading `status` alone cannot: it is load-bearing for MCP's global vector
+    gating, so it deliberately stays "unknown" on an inconclusive capacity
+    probe. The coverage line and the `searchable` dict are what tell the
+    operator, and a health check, which of the two palaces needs repair.
+    """
+    from mempalace.repair import status as repair_status
+
+    healthy = tmp_path / "healthy"
+    healthy.mkdir()
+    _seed_chroma_db(str(healthy), sqlite_count=50, segment_id="seg-h", sync_threshold=1_000)
+    _seed_embeddings_queue(str(healthy), [f"d-{i}" for i in range(50)])
+
+    damaged = tmp_path / "damaged"
+    damaged.mkdir()
+    _seed_chroma_db(str(damaged), sqlite_count=50, segment_id="seg-d", sync_threshold=1_000)
+    _seed_embeddings_queue(str(damaged), [f"d-{i}" for i in range(6)])
+
+    healthy_result = repair_status(palace_path=str(healthy))
+    healthy_out = capsys.readouterr().out
+    damaged_result = repair_status(palace_path=str(damaged))
+    damaged_out = capsys.readouterr().out
+
+    assert healthy_result["drawers"]["status"] == "unknown"
+    assert damaged_result["drawers"]["status"] == "unknown"
+
+    assert healthy_result["drawers"]["searchable"]["degraded"] is False
+    assert "50 / 50 drawers (100.0%)" in healthy_out
+    assert "mempalace repair --mode from-sqlite" not in healthy_out
+
+    assert damaged_result["drawers"]["searchable"]["degraded"] is True
+    assert damaged_result["drawers"]["searchable"]["unsearchable_count"] == 44
+    assert "6 / 50 drawers (12.0%)" in damaged_out
+    assert "mempalace repair --mode from-sqlite --archive-existing" in damaged_out
+
+
+def test_repair_status_prints_flush_unreachable_as_its_own_line(tmp_path, capsys):
+    """A collection that can never reach its own flush threshold is benign.
+
+    It is also indistinguishable from a fault if it only ever appears as
+    prose in ``note:``, so it gets a line and a dict key of its own (#2514).
+    """
+    from mempalace.repair import status as repair_status
+
+    _seed_chroma_db(str(tmp_path), sqlite_count=2_500, segment_id="seg-fu", sync_threshold=50_000)
+    _seed_embeddings_queue(str(tmp_path), [f"d-{i}" for i in range(2_500)])
+
+    result = repair_status(palace_path=str(tmp_path))
+    captured = capsys.readouterr().out
+
+    assert result["drawers"]["flush_unreachable"] is True
+    assert "flush:          unreachable at this collection size" in captured
+    assert "2,500 / 2,500 drawers (100.0%)" in captured
+    assert "mempalace repair --mode from-sqlite" not in captured
