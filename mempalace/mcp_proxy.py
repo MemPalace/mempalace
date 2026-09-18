@@ -203,6 +203,14 @@ class _LocalServer:
                 except (AttributeError, OSError):
                     pass
 
+            # This path never runs the server's main(), so apply the flags main()
+            # would have applied. After the stdout restore: a refused flag raises,
+            # and the proxy keeps answering over stdout.
+            args = mcp_server._parse_args(sys.argv[1:])
+            mcp_server._apply_server_flags(
+                palace=args.palace, backend=args.backend, read_only=args.read_only
+            )
+
             for start in (
                 mcp_server._start_idle_exit_watchdog,
                 mcp_server._start_write_stall_watchdog,
