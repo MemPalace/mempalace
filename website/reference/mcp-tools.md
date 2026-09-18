@@ -268,6 +268,8 @@ Query entity relationships with time filtering. Defaults to one-hop; set `recurs
 
 **Returns:** `{ entity, as_of, facts: [{ direction, subject, predicate, object, valid_from, valid_to, current }], count }`
 
+With `recurse=true`, each fact also carries `depth` (the hop at which the walk reached it), the result adds `visited_nodes`, and a walk that reaches 5,000 facts stops there and returns `truncated: true` with `max_facts`. Narrow it with `predicate` or a smaller `max_depth`.
+
 ---
 
 ### `mempalace_kg_add`
@@ -417,7 +419,9 @@ mismatches.
 
 Apply a deterministic merge by adding a `merged-into` edge from source to
 canonical, invalidating divergent prior `merged-into` links, and optionally
-invalidating source lineage edges.
+invalidating source lineage edges. The link changes are one transaction: if any of
+them is refused (for example an `ended` earlier than a link's start), none of
+them is applied.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

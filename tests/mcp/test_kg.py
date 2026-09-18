@@ -741,6 +741,127 @@ class TestKGTools:
         assert "error" in result
         assert "drawer_id not found" in result["error"]
 
+    def test_find_merge_candidates_scan_queries_with_stored_vectors(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Without a seed the tool scans the palace, and it queries with the
+        vectors already stored rather than embedding each seed's text again."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace import mcp_server
+
+        for i in range(4):
+            mcp_server.tool_add_drawer(wing="g", room="syn", content=f"merge candidate {i}")
+
+        seen = {}
+        real = mcp_server._batch_duplicate_matches_for_records
+
+        def _spy(col, seed_records, threshold):
+            seen["records"] = seed_records
+            return real(col, seed_records, threshold)
+
+        monkeypatch.setattr(mcp_server, "_batch_duplicate_matches_for_records", _spy)
+
+        result = mcp_server.tool_find_merge_candidates(threshold=0.0, wing="g")
+
+        assert "error" not in result, result
+        assert result["scanned_nodes"] == 4
+        assert result["count"] >= 1
+        assert all(rec["embedding"] for rec in seen["records"])
+
+    def test_find_closet_lineage_issues_opens_closets_once(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """The audit reads every closet's lineage in bulk: missing, stale and
+        looping sources are all reported, and the closets collection is opened
+        once however many closets take part."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace import mcp_server, palace
+
+        live = mcp_server.tool_add_drawer(wing="g", room="raw", content="live source")["drawer_id"]
+        old = mcp_server.tool_add_drawer(wing="g", room="raw", content="old source")["drawer_id"]
+        for cid in ("closet_ok", "closet_missing", "closet_stale", "closet_loop", "closet_plain"):
+            self._add_closet_row(palace_path, cid)
+
+        mcp_server.tool_kg_add(subject="closet_ok", predicate="synthesized-from", object=live)
+        mcp_server.tool_kg_add(
+            subject="closet_missing", predicate="synthesized-from", object="drawer_gone"
+        )
+        mcp_server.tool_kg_add(subject="closet_stale", predicate="synthesized-from", object=old)
+        mcp_server.tool_kg_add(subject=old, predicate="merged-into", object=live)
+        mcp_server.tool_kg_add(subject="closet_loop", predicate="synthesized-from", object="x1")
+        mcp_server.tool_kg_add(subject="x1", predicate="merged-into", object="x2")
+        mcp_server.tool_kg_add(subject="x2", predicate="merged-into", object="x1")
+
+        opened = []
+        real_open = palace.get_closets_collection
+
+        def _count(*args, **kwargs):
+            opened.append(args)
+            return real_open(*args, **kwargs)
+
+        monkeypatch.setattr(palace, "get_closets_collection", _count)
+
+        result = mcp_server.tool_find_closet_lineage_issues(limit=50)
+
+        assert len(opened) == 1
+        by_id = {row["closet_id"]: row for row in result["orphans"]}
+        assert set(by_id) == {"closet_missing", "closet_stale", "closet_loop"}
+        assert by_id["closet_missing"]["issues"] == ["missing_source_nodes"]
+        assert by_id["closet_stale"]["issues"] == ["stale_source_references"]
+        assert by_id["closet_stale"]["stale_sources"] == [
+            {"source_node_id": old, "canonical_node_id": live}
+        ]
+        assert by_id["closet_loop"]["unresolvable_source_ids"] == ["x1"]
+
+    def test_resolve_canonical_does_not_follow_a_near_match(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """A lineage id that does not exist resolves to itself; it is never
+        swapped for a stored id that merely looks like it."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        mcp_server.tool_kg_add(
+            subject="drawer_one_two", predicate="merged-into", object="elsewhere"
+        )
+
+        resolved = mcp_server.tool_resolve_canonical("drawer_one")
+
+        assert resolved["canonical_node_id"] == "drawer_one"
+        assert resolved["chain"] == ["drawer_one"]
+
+    def test_apply_merge_refused_part_way_changes_nothing(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace import mcp_server
+
+        s1 = mcp_server.tool_add_drawer(wing="g", room="raw", content="src-1")["drawer_id"]
+        source = mcp_server.tool_add_drawer(wing="g", room="syn", content="source")["drawer_id"]
+        target = mcp_server.tool_add_drawer(wing="g", room="syn", content="target")["drawer_id"]
+        mcp_server.tool_kg_add(
+            subject=source, predicate="synthesized-from", object=s1, valid_from="2026-06-01"
+        )
+
+        refused = mcp_server.tool_apply_merge(
+            source_node_id=source, canonical_node_id=target, ended="2026-01-01"
+        )
+
+        assert refused["success"] is False
+        assert mcp_server.tool_resolve_canonical(source)["canonical_node_id"] == source
+        current = [
+            f
+            for f in mcp_server.tool_kg_query(source, direction="outgoing")["facts"]
+            if f["current"]
+        ]
+        assert [(f["predicate"], f["object"]) for f in current] == [("synthesized-from", s1)]
+
     @staticmethod
     def _add_closet_row(palace_path, closet_id, wing="g", room="syn", extra_meta=None):
         from mempalace.palace import get_closets_collection

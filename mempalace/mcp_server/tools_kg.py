@@ -5,6 +5,10 @@ if __name__ != "mempalace.mcp_server":
 
 # ==================== KNOWLEDGE GRAPH ====================
 
+# A recursive kg_query stops after this many facts and says so, so a walk
+# with no predicate over a dense graph cannot return the whole graph.
+_KG_QUERY_MAX_FACTS = 5000
+
 
 def _temporal_bound_key(value, *, end: bool = False) -> Optional[str]:
     if not value:
@@ -111,45 +115,18 @@ def tool_kg_query(
 
         return payload
 
-    queue = deque([(entity, 0)])
-    seen_nodes = {entity}
-    seen_facts = set()
-    traversed = []
-
-    while queue:
-        current, depth = queue.popleft()
-        for fact in _filtered_facts(current):
-            subject = fact.get("subject")
-            predicate_value = fact.get("predicate")
-            object_value = fact.get("object")
-            fact_key = (
-                subject,
-                predicate_value,
-                object_value,
-                fact.get("valid_from"),
-                fact.get("valid_to"),
-                fact.get("current"),
-            )
-            if fact_key not in seen_facts:
-                seen_facts.add(fact_key)
-                enriched = dict(fact)
-                enriched["depth"] = depth
-                traversed.append(enriched)
-
-            if depth >= max_depth:
-                continue
-
-            neighbors = []
-            if direction in ("outgoing", "both") and isinstance(object_value, str) and object_value:
-                neighbors.append(object_value)
-            if direction in ("incoming", "both") and isinstance(subject, str) and subject:
-                neighbors.append(subject)
-
-            for neighbor in neighbors:
-                if neighbor in seen_nodes:
-                    continue
-                seen_nodes.add(neighbor)
-                queue.append((neighbor, depth + 1))
+    # One query per level of the walk, not one query_entity() per node.
+    walk = _call_kg(
+        lambda kg: kg.traverse(
+            entity,
+            direction=direction,
+            predicate=predicate,
+            as_of=as_of,
+            max_depth=max_depth,
+            max_facts=_KG_QUERY_MAX_FACTS,
+        )
+    )
+    traversed = walk["facts"]
 
     payload = {
         "entity": entity,
@@ -158,10 +135,13 @@ def tool_kg_query(
         "predicate": predicate,
         "recurse": True,
         "max_depth": max_depth,
-        "visited_nodes": len(seen_nodes),
+        "visited_nodes": walk["visited_nodes"],
         "facts": traversed,
         "count": len(traversed),
     }
+    if walk["truncated"]:
+        payload["truncated"] = True
+        payload["max_facts"] = _KG_QUERY_MAX_FACTS
 
     if not traversed:
         candidates = _call_kg(lambda kg: kg.find_entity_candidates(entity))
@@ -353,91 +333,151 @@ def tool_kg_stats():
     return _call_kg(lambda kg: kg.stats())
 
 
-def _kg_related_nodes(node_id: str, predicate: str, direction: str, field: str) -> list[str]:
-    """Fetch related node IDs for one predicate/direction from the KG.
+# ==================== LINEAGE AND MERGE GRAPH ====================
+#
+# Lineage (``synthesized-from``) and merge (``merged-into``) links are ordinary
+# KG facts. These tools read every link a call needs with
+# KnowledgeGraph.reachable_edges(), one query per level of the walk for all
+# the nodes at once, and walk the result in memory with mempalace.lineage.
+#
+# Each tool opens the drawer collection once and passes it down instead of
+# calling another tool that opens it again: _get_collection() can replace the
+# client between calls, and a handle taken before that stops working.
 
-    A thin projection of one string field over :func:`_kg_active_facts`, so the
-    "current fact for this predicate/direction" filter lives in a single place.
+_MERGED_INTO = "merged-into"
+_SYNTHESIZED_FROM = "synthesized-from"
+_MAX_MERGE_HOPS = 50
+
+
+def _canonical_chains(nodes, max_hops: int = _MAX_MERGE_HOPS) -> dict:
+    """Follow ``merged-into`` for many nodes with one walk.
+
+    Returns ``{node: {"chain": [...]}}`` or, for a node whose chain loops,
+    ``{node: {"error": ..., "chain": [...]}}``. Chains hold stored names and
+    start with the node exactly as given.
     """
-    nodes = []
-    for fact in _kg_active_facts(node_id, predicate, direction):
-        value = fact.get(field)
-        if isinstance(value, str) and value:
-            nodes.append(value)
-    return nodes
+    from .. import lineage
+
+    nodes = list(dict.fromkeys(nodes))
+    if not nodes:
+        return {}
+
+    def _resolve(kg):
+        edges, names = kg.reachable_edges(nodes, _MERGED_INTO, max_depth=max_hops)
+        merged_into = lineage.adjacency(edges)
+        out = {}
+        for node in nodes:
+            chain, cycle = lineage.canonical_chain(kg.entity_id(node), merged_into, max_hops)
+            if cycle is not None:
+                out[node] = {
+                    "error": "merged-into cycle detected",
+                    "chain": [node] + [names.get(i, i) for i in cycle[1:]],
+                }
+            else:
+                out[node] = {"chain": [node] + [names.get(i, i) for i in chain[1:]]}
+        return out
+
+    return _call_kg(_resolve)
 
 
-def _kg_active_facts(node_id: str, predicate: str, direction: str) -> list[dict]:
-    """Return current KG fact rows for one predicate/direction."""
-    facts = _call_kg(lambda kg: kg.query_entity(node_id, direction=direction))
-    rows = []
-    for fact in facts:
-        if not isinstance(fact, dict):
-            continue
-        if fact.get("predicate") != predicate:
-            continue
-        if fact.get("current") is False:
-            continue
-        rows.append(fact)
-    return rows
+def _lineage_parents(kg, starts, max_depth=None):
+    """``synthesized-from`` adjacency (by id) below ``starts``, and id -> name."""
+    from .. import lineage
+
+    edges, names = kg.reachable_edges(starts, _SYNTHESIZED_FROM, max_depth=max_depth)
+    return lineage.adjacency(edges), names
 
 
-def _ancestor_closure(node_id: str, max_depth: int) -> set[str]:
-    """Return all synthesized-from ancestors reachable within max_depth."""
-    queue = deque([(node_id, 0)])
-    seen = {node_id}
-    ancestors = set()
+def _ancestor_sets(nodes, max_depth: int) -> dict:
+    """Each node's ``synthesized-from`` ancestors (stored names), one walk for all."""
+    from .. import lineage
 
-    while queue:
-        current, depth = queue.popleft()
-        if depth >= max_depth:
-            continue
-        parents = sorted(
-            set(
-                _kg_related_nodes(
-                    current,
-                    predicate="synthesized-from",
-                    direction="outgoing",
-                    field="object",
-                )
-            )
-        )
-        for parent in parents:
-            if parent in seen:
-                continue
-            seen.add(parent)
-            ancestors.add(parent)
-            queue.append((parent, depth + 1))
+    nodes = list(dict.fromkeys(nodes))
+    if not nodes:
+        return {}
 
-    return ancestors
+    def _walk(kg):
+        parents, names = _lineage_parents(kg, nodes, max_depth=max_depth)
+        return {
+            node: {
+                names.get(a, a) for a in lineage.ancestors(kg.entity_id(node), parents, max_depth)
+            }
+            for node in nodes
+        }
+
+    return _call_kg(_walk)
 
 
-def _merge_scan_node_ids(col, wing: str = None, room: str = None) -> list[str]:
-    """List logical drawer IDs available for graph-level merge analysis."""
-    ids, docs, metas = _fetch_drawer_rows(col, include_documents=False)
-    drawers = _collapse_drawer_rows(ids, docs, metas)
+def tool_resolve_canonical(node_id: str, max_hops: int = 50):
+    """Resolve canonical node by following active merged-into links."""
+    try:
+        node_id = sanitize_kg_value(node_id, "node_id")
+    except ValueError as e:
+        return {"error": str(e)}
 
-    filtered = []
-    for drawer in drawers:
-        if wing and drawer.get("wing") != wing:
-            continue
-        if room and drawer.get("room") != room:
-            continue
-        filtered.append(drawer["drawer_id"])
+    max_hops = max(1, min(int(max_hops or 50), 200))
+    resolved = _canonical_chains([node_id], max_hops)[node_id]
+    if "error" in resolved:
+        return resolved
 
-    return sorted(filtered)
+    chain = resolved["chain"]
+    return {
+        "node_id": node_id,
+        "canonical_node_id": chain[-1],
+        "hops": len(chain) - 1,
+        "chain": chain,
+    }
 
 
-def _closet_records(wing: str = None, room: str = None) -> list[dict]:
-    """List closet records with minimal metadata for graph-validity checks."""
+def tool_get_height(node_id: str):
+    """Compute canonical lineage height over active ``synthesized-from`` edges.
+
+    Height is defined as the longest outgoing path from the canonical node to a
+    leaf source (no outgoing lineage edges). Returns both computed height and
+    any stored metadata hint for observability.
+    """
+    from .. import lineage
+
+    resolved = tool_resolve_canonical(node_id)
+    if "error" in resolved:
+        return resolved
+
+    start = resolved["canonical_node_id"]
+
+    def _height(kg):
+        parents, _names = _lineage_parents(kg, [start])
+        start_id = kg.entity_id(start)
+        return lineage.heights(parents, [start_id])[start_id]
+
+    computed_height = _call_kg(_height)
+
+    stored_height = None
+    col = _get_collection()
+    if col:
+        record = _logical_drawer_record(col, start)
+        if record is not None:
+            stored_height = _height_from_record(record)
+
+    return {
+        "node_id": start,
+        "height": computed_height,
+        "stored_height": stored_height,
+        "canonical_chain": resolved.get("chain", [start]),
+    }
+
+
+def _closets_collection():
     from ..palace import get_closets_collection
 
     try:
-        closets_col = get_closets_collection(_config.palace_path, create=False)
+        return get_closets_collection(_config.palace_path, create=False)
     except Exception:
         logger.debug("closet collection lookup failed", exc_info=True)
-        return []
+        return None
 
+
+def _closet_records(closets_col, wing: str = None, room: str = None) -> list[dict]:
+    """List closet records with minimal metadata for graph-validity checks."""
     if closets_col is None:
         return []
 
@@ -446,6 +486,8 @@ def _closet_records(wing: str = None, room: str = None) -> list[dict]:
         where["wing"] = wing
     if room:
         where["room"] = room
+    if len(where) > 1:
+        where = {"$and": [{key: value} for key, value in where.items()]}
 
     get_kwargs = {"include": ["metadatas"]}
     if where:
@@ -459,40 +501,41 @@ def _closet_records(wing: str = None, room: str = None) -> list[dict]:
 
     ids = _get_result_ids(results)
     metadatas = _chroma_field(results, "metadatas", []) or []
-
-    records = []
-    for idx, closet_id in enumerate(ids):
-        records.append(
-            {
-                "closet_id": closet_id,
-                "metadata": _safe_meta(metadatas[idx] if idx < len(metadatas) else {}),
-            }
-        )
-    return records
+    return [
+        {
+            "closet_id": closet_id,
+            "metadata": _safe_meta(metadatas[idx] if idx < len(metadatas) else {}),
+        }
+        for idx, closet_id in enumerate(ids)
+    ]
 
 
-def _entity_exists_as_drawer_or_closet(col, entity_id: str) -> bool:
-    """Return True when an entity id resolves to a drawer row or a closet row."""
-    if _logical_drawer_record(col, entity_id) is not None:
-        return True
+def _existing_nodes(col, closets_col, node_ids, page_size: int = 500) -> set[str]:
+    """The members of ``node_ids`` that are a drawer, a chunked drawer, or a closet.
 
-    from ..palace import get_closets_collection
+    Batched: one ``get`` per page against drawers, then one per page against
+    closets for what is left. Only ids still missing after both fall back to
+    the per-id logical lookup, which finds a chunked drawer by its parent id.
+    """
+    pending = sorted({n for n in node_ids if isinstance(n, str) and n})
+    found = set()
 
-    try:
-        closets_col = get_closets_collection(_config.palace_path, create=False)
-    except Exception:
-        logger.debug("closet collection lookup failed", exc_info=True)
-        return False
+    def _probe(collection, ids):
+        for start in range(0, len(ids), page_size):
+            try:
+                found.update(
+                    _get_result_ids(collection.get(ids=ids[start : start + page_size], include=[]))
+                )
+            except Exception:
+                logger.debug("existence probe failed", exc_info=True)
 
-    if closets_col is None:
-        return False
-
-    try:
-        result = closets_col.get(ids=[entity_id], include=[])
-        return bool(_get_result_ids(result))
-    except Exception:
-        logger.debug("closet existence probe failed for %s", entity_id, exc_info=True)
-        return False
+    _probe(col, pending)
+    if closets_col is not None:
+        _probe(closets_col, [n for n in pending if n not in found])
+    for node in [n for n in pending if n not in found]:
+        if _logical_drawer_record(col, node) is not None:
+            found.add(node)
+    return found
 
 
 def tool_find_closet_lineage_issues(
@@ -512,7 +555,13 @@ def tool_find_closet_lineage_issues(
 
     Ordinary closets with no lineage participation are skipped to avoid
     false positives; this tool focuses on lineage-aware closet records.
+
+    The whole audit costs a fixed number of graph queries per level of
+    lineage plus one existence probe per page of sources, whatever the number
+    of closets.
     """
+    from .. import lineage
+
     try:
         wing = _sanitize_optional_name(wing, "wing")
         room = _sanitize_optional_name(room, "room")
@@ -521,61 +570,88 @@ def tool_find_closet_lineage_issues(
 
     limit = max(1, min(int(limit or 20), 500))
     offset = max(0, int(offset or 0))
+    empty = {
+        "orphans": [],
+        "count": 0,
+        "total": 0,
+        "limit": limit,
+        "offset": offset,
+        "target": "closets",
+    }
 
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
 
-    closet_records = _closet_records(wing=wing, room=room)
+    closets_col = _closets_collection()
+    closet_records = _closet_records(closets_col, wing=wing, room=room)
     if not closet_records:
-        return {
-            "orphans": [],
-            "count": 0,
-            "total": 0,
-            "limit": limit,
-            "offset": offset,
-            "target": "closets",
+        return empty
+    meta_by_id = {record["closet_id"]: record["metadata"] for record in closet_records}
+
+    def _lineage(kg):
+        participating = kg.entities_in_triples(meta_by_id)
+        members = [cid for cid in meta_by_id if cid in participating]
+        parents, names = _lineage_parents(kg, members)
+        sources = {
+            cid: sorted({names.get(p, p) for p in parents.get(kg.entity_id(cid), ())})
+            for cid in members
         }
+        return members, parents, sources
+
+    members, parents, sources = _call_kg(_lineage)
+    if not members:
+        return empty
+
+    chains = _canonical_chains(members + [s for srcs in sources.values() for s in srcs])
+
+    # Heights are measured from each closet's canonical node. The walk above
+    # covered the closets themselves; a merged closet's canonical node may
+    # have lineage of its own.
+    canonical_of = {cid: chains[cid]["chain"][-1] for cid in members if "error" not in chains[cid]}
+
+    def _heights(kg):
+        extra = [c for c in set(canonical_of.values()) if kg.entity_id(c) not in parents]
+        merged_parents = dict(parents)
+        if extra:
+            more, _names = _lineage_parents(kg, extra)
+            for node, targets in more.items():
+                merged_parents.setdefault(node, targets)
+        start_ids = {c: kg.entity_id(c) for c in set(canonical_of.values())}
+        computed = lineage.heights(merged_parents, start_ids.values())
+        return {c: computed.get(i, 0) for c, i in start_ids.items()}
+
+    height_of = _call_kg(_heights) if canonical_of else {}
+
+    canonical_sources = {
+        chains[s]["chain"][-1]
+        for srcs in sources.values()
+        for s in srcs
+        if "error" not in chains.get(s, {"error": True})
+    }
+    existing = _existing_nodes(col, closets_col, canonical_sources)
 
     issues = []
-    for record in closet_records:
-        closet_id = record["closet_id"]
-        meta = record["metadata"]
-
-        canonical = tool_resolve_canonical(closet_id)
-        if "error" in canonical:
+    for closet_id in members:
+        meta = meta_by_id[closet_id]
+        resolved = chains[closet_id]
+        if "error" in resolved:
             issues.append(
                 {
                     "closet_id": closet_id,
                     "wing": meta.get("wing", ""),
                     "room": meta.get("room", ""),
                     "issues": ["canonical_resolution_failed"],
-                    "canonical_error": canonical.get("error"),
+                    "canonical_error": resolved["error"],
                 }
             )
             continue
 
-        canonical_id = canonical["canonical_node_id"]
+        canonical_id = canonical_of[closet_id]
         if not include_merged and canonical_id != closet_id:
             continue
 
-        # Guard against false positives for ordinary mined closets that do not
-        # participate in lineage edges at all.
-        participates = bool(
-            _call_kg(lambda kg, cid=closet_id: kg.query_entity(cid, direction="both"))
-        )
-        if not participates:
-            continue
-
-        source_facts = _kg_active_facts(closet_id, "synthesized-from", direction="outgoing")
-        source_ids = sorted(
-            {
-                fact.get("object")
-                for fact in source_facts
-                if isinstance(fact.get("object"), str) and fact.get("object")
-            }
-        )
-
+        source_ids = sources[closet_id]
         found_issues = []
         missing_sources = []
         unresolvable_sources = []
@@ -585,18 +661,16 @@ def tool_find_closet_lineage_issues(
             found_issues.append("no_active_sources")
 
         for source_id in source_ids:
-            resolved_source = tool_resolve_canonical(source_id)
+            resolved_source = chains[source_id]
             if "error" in resolved_source:
                 unresolvable_sources.append(source_id)
                 continue
-
-            canonical_source_id = resolved_source["canonical_node_id"]
+            canonical_source_id = resolved_source["chain"][-1]
             if canonical_source_id != source_id:
                 stale_sources.append(
                     {"source_node_id": source_id, "canonical_node_id": canonical_source_id}
                 )
-
-            if not _entity_exists_as_drawer_or_closet(col, canonical_source_id):
+            if canonical_source_id not in existing:
                 missing_sources.append(
                     {"source_node_id": source_id, "canonical_node_id": canonical_source_id}
                 )
@@ -609,12 +683,8 @@ def tool_find_closet_lineage_issues(
             found_issues.append("stale_source_references")
 
         stored_height = meta.get("height")
-        computed_height = tool_get_height(closet_id)
-        computed_value = None
-        if isinstance(computed_height, dict) and "error" not in computed_height:
-            computed_value = _coerce_non_negative_int(computed_height.get("height"), default=0)
-
-        if stored_height is not None and computed_value is not None:
+        computed_value = _coerce_non_negative_int(height_of.get(canonical_id), default=0)
+        if stored_height is not None:
             stored_value = _coerce_non_negative_int(stored_height, default=0)
             if stored_value != computed_value:
                 found_issues.append("stored_height_mismatch")
@@ -650,97 +720,106 @@ def tool_find_closet_lineage_issues(
     }
 
 
-def tool_resolve_canonical(node_id: str, max_hops: int = 50):
-    """Resolve canonical node by following active merged-into links."""
-    try:
-        node_id = sanitize_kg_value(node_id, "node_id")
-    except ValueError as e:
-        return {"error": str(e)}
+def _merge_scan_node_ids(col, wing: str = None, room: str = None) -> list[str]:
+    """Logical drawer ids available for merge analysis, sorted.
 
-    max_hops = max(1, min(int(max_hops or 50), 200))
-
-    chain = [node_id]
-    current = node_id
-    for _ in range(max_hops):
-        next_nodes = sorted(
-            set(
-                _kg_related_nodes(
-                    current, predicate="merged-into", direction="outgoing", field="object"
-                )
-            )
-        )
-        if not next_nodes:
-            break
-        nxt = next_nodes[0]
-        if nxt in chain:
-            return {
-                "error": "merged-into cycle detected",
-                "chain": chain + [nxt],
-            }
-        chain.append(nxt)
-        current = nxt
-
-    return {
-        "node_id": node_id,
-        "canonical_node_id": current,
-        "hops": len(chain) - 1,
-        "chain": chain,
-    }
-
-
-def tool_get_height(node_id: str):
-    """Compute canonical lineage height over active ``synthesized-from`` edges.
-
-    Height is defined as the longest outgoing path from the canonical node to a
-    leaf source (no outgoing lineage edges). Returns both computed height and
-    any stored metadata hint for observability.
+    Reads ids and metadata only (never documents), from sqlite directly on the
+    Chroma backend.
     """
-    resolved = tool_resolve_canonical(node_id)
-    if "error" in resolved:
-        return resolved
+    conditions = []
+    if wing:
+        conditions.append({"wing": wing})
+    if room:
+        conditions.append({"room": room})
+    where = None
+    if len(conditions) == 1:
+        where = conditions[0]
+    elif conditions:
+        where = {"$and": conditions}
 
-    start = resolved["canonical_node_id"]
-    memo = {}
+    listed = None
+    if _is_chroma_backend() and _config.palace_path:
+        from ..backends.chroma import sqlite_list_id_metadata
 
-    def _height(current: str, trail: set[str]) -> int:
-        if current in memo:
-            return memo[current]
-        if current in trail:
-            return 0
-        parents = sorted(
-            set(
-                _kg_related_nodes(
-                    current,
-                    predicate="synthesized-from",
-                    direction="outgoing",
-                    field="object",
-                )
-            )
+        listed = sqlite_list_id_metadata(_config.palace_path, _config.collection_name, where=where)
+    if listed is not None:
+        ids, metadatas = listed
+    else:
+        ids, _docs, metadatas = _fetch_drawer_rows(col, where=where, include=["metadatas"])
+
+    logical = set()
+    for idx, row_id in enumerate(ids):
+        meta = _safe_meta(metadatas[idx] if idx < len(metadatas) else {})
+        parent = meta.get("parent_drawer_id")
+        logical.add(parent if isinstance(parent, str) and parent else row_id)
+    return sorted(logical)
+
+
+def _seed_records(col, seeds: list[str]) -> list[dict]:
+    """``{drawer_id, embedding, content}`` for each seed that exists.
+
+    Uses the vectors already stored for the seed instead of embedding its text
+    again: one ``get`` for seeds stored as a single row, one more for the
+    chunks of chunked seeds, whose vectors are averaged. Seeds that are not
+    found are dropped.
+    """
+    import math
+
+    seeds = list(dict.fromkeys(seeds))
+    if not seeds:
+        return []
+
+    rows_by_seed = {}
+    direct = col.get(ids=seeds, include=["embeddings", "documents"])
+    direct_ids = _get_result_ids(direct)
+    direct_embs = _chroma_field(direct, "embeddings", []) or []
+    direct_docs = _chroma_field(direct, "documents", []) or []
+    for idx, row_id in enumerate(direct_ids):
+        emb = direct_embs[idx] if idx < len(direct_embs) else None
+        doc = direct_docs[idx] if idx < len(direct_docs) else ""
+        rows_by_seed[row_id] = [(0, emb, doc)]
+
+    chunked = [s for s in seeds if s not in rows_by_seed]
+    if chunked:
+        rest = col.get(
+            where={"parent_drawer_id": {"$in": chunked}},
+            include=["embeddings", "documents", "metadatas"],
         )
-        if not parents:
-            memo[current] = 0
-            return 0
-        next_trail = set(trail)
-        next_trail.add(current)
-        computed = max(_height(parent, next_trail) for parent in parents) + 1
-        memo[current] = computed
-        return computed
+        rest_ids = _get_result_ids(rest)
+        rest_embs = _chroma_field(rest, "embeddings", []) or []
+        rest_docs = _chroma_field(rest, "documents", []) or []
+        rest_metas = _chroma_field(rest, "metadatas", []) or []
+        for idx, _row_id in enumerate(rest_ids):
+            meta = _safe_meta(rest_metas[idx] if idx < len(rest_metas) else {})
+            parent = meta.get("parent_drawer_id")
+            if parent in chunked:
+                rows_by_seed.setdefault(parent, []).append(
+                    (
+                        _coerce_non_negative_int(meta.get("chunk_index"), default=0),
+                        rest_embs[idx] if idx < len(rest_embs) else None,
+                        rest_docs[idx] if idx < len(rest_docs) else "",
+                    )
+                )
 
-    computed_height = _height(start, set())
-
-    stored_height = None
-    col = _get_collection()
-    if col:
-        record = _logical_drawer_record(col, start)
-        if record is not None:
-            stored_height = _height_from_record(record)
-
-    return {
-        "node_id": start,
-        "height": computed_height,
-        "stored_height": stored_height,
-        "canonical_chain": resolved.get("chain", [start]),
-    }
+    records = []
+    for seed in seeds:
+        rows = sorted(rows_by_seed.get(seed, ()), key=lambda row: row[0])
+        if not rows:
+            continue
+        vectors = [list(row[1]) for row in rows if row[1] is not None and len(row[1])]
+        embedding = None
+        if vectors and len(vectors) == len(rows):
+            mean = [sum(values) / len(vectors) for values in zip(*vectors)]
+            norm = math.sqrt(sum(v * v for v in mean)) or 1.0
+            embedding = [float(v / norm) for v in mean]
+        records.append(
+            {
+                "drawer_id": seed,
+                "embedding": embedding,
+                "content": "".join(row[2] or "" for row in rows),
+            }
+        )
+    return records
 
 
 def _batch_duplicate_matches_for_records(
@@ -748,13 +827,23 @@ def _batch_duplicate_matches_for_records(
     seed_records: list[dict],
     threshold: float,
 ) -> tuple[dict[str, list[dict]], dict | None]:
-    """Run one batched vector query and map thresholded matches by seed drawer ID."""
+    """Run one batched vector query and map thresholded matches by seed drawer ID.
+
+    Queries with the seeds' stored vectors when every seed has one, so no seed
+    text is embedded again; falls back to the text otherwise.
+    """
+    embeddings = [rec.get("embedding") for rec in seed_records]
     try:
-        batch_results = col.query(
-            query_texts=[rec["content"] for rec in seed_records],
-            n_results=5,
-            include=["distances"],
-        )
+        if all(emb is not None for emb in embeddings):
+            batch_results = col.query(
+                query_embeddings=embeddings, n_results=5, include=["distances"]
+            )
+        else:
+            batch_results = col.query(
+                query_texts=[rec["content"] for rec in seed_records],
+                n_results=5,
+                include=["distances"],
+            )
     except Exception as e:
         return {}, {"error": f"Batch query failed: {e}"}
 
@@ -771,26 +860,12 @@ def _batch_duplicate_matches_for_records(
             for i, match_id in enumerate(ids_rows[idx]):
                 if i >= len(row_dists):
                     continue
-                dist = row_dists[i]
-                similarity = round(_distance_to_similarity(dist, metric), 3)
+                similarity = round(_distance_to_similarity(row_dists[i], metric), 3)
                 if similarity >= threshold:
                     matches.append({"id": match_id, "similarity": similarity})
         matches_by_seed[seed] = matches
 
     return matches_by_seed, None
-
-
-def _resolve_canonical_cached(node: str, canonical_cache: dict[str, str | None]) -> str | None:
-    """Resolve canonical node ID with memoization and error-to-None normalization."""
-    if node in canonical_cache:
-        return canonical_cache[node]
-    resolved = tool_resolve_canonical(node)
-    if "error" in resolved:
-        canonical_cache[node] = None
-        return None
-    canonical = resolved["canonical_node_id"]
-    canonical_cache[node] = canonical
-    return canonical
 
 
 def _logical_drawer_ids_for_any_ids(
@@ -875,50 +950,33 @@ def tool_find_merge_candidates(
         if not isinstance(drawer_id, str) or not drawer_id.strip():
             return {"error": "drawer_id must be a non-empty string when provided"}
         seed = _logical_drawer_id_for_any_id(col, strip_lone_surrogates(drawer_id.strip()))
-        seed_record = _logical_drawer_record(col, seed)
-        if seed_record is None:
+        if _logical_drawer_record(col, seed) is None:
             return {"error": f"drawer_id not found: {drawer_id.strip()}"}
         seeds = [seed]
     else:
         seeds = _merge_scan_node_ids(col, wing=wing, room=room)[:max_nodes]
 
+    base = {
+        "candidates": [],
+        "count": 0,
+        "scanned_nodes": len(seeds),
+        "threshold": threshold,
+        "require_topological_distance": bool(require_topological_distance),
+    }
     if not seeds:
-        return {
-            "candidates": [],
-            "count": 0,
-            "scanned_nodes": 0,
-            "require_topological_distance": bool(require_topological_distance),
-        }
+        return base
 
     _refresh_vector_disabled_flag()
     if _vector_disabled:
         return {
-            "candidates": [],
-            "count": 0,
-            "scanned_nodes": len(seeds),
-            "threshold": threshold,
-            "require_topological_distance": bool(require_topological_distance),
+            **base,
             "vector_disabled": True,
             "vector_disabled_reason": _vector_disabled_reason,
         }
 
-    seed_records = []
-    if drawer_id is not None:
-        seed_records = [seed_record]
-    else:
-        for seed in seeds:
-            rec = _logical_drawer_record(col, seed)
-            if rec:
-                seed_records.append(rec)
-
+    seed_records = _seed_records(col, seeds)
     if not seed_records:
-        return {
-            "candidates": [],
-            "count": 0,
-            "scanned_nodes": len(seeds),
-            "threshold": threshold,
-            "require_topological_distance": bool(require_topological_distance),
-        }
+        return base
 
     matches_by_seed, batch_error = _batch_duplicate_matches_for_records(
         col,
@@ -931,76 +989,64 @@ def tool_find_merge_candidates(
     all_match_ids = _collect_match_ids(matches_by_seed)
     match_logical_ids = _logical_drawer_ids_for_any_ids(col, all_match_ids)
 
-    canonical_cache = {}
-    ancestor_cache = {}
+    # Every canonical id this call needs, in one walk; then every ancestor set
+    # the surviving pairs need, in one more.
+    seed_ids = [rec["drawer_id"] for rec in seed_records]
+    chains = _canonical_chains(seed_ids + [match_logical_ids.get(m, m) for m in all_match_ids])
+
+    def _canonical(node):
+        resolved = chains.get(node)
+        return None if not resolved or "error" in resolved else resolved["chain"][-1]
+
     seen_pairs = set()
-    candidates = []
-
-    for seed_record in seed_records:
-        seed = seed_record["drawer_id"]
-
-        seed_canonical = _resolve_canonical_cached(seed, canonical_cache)
+    pairs = []
+    for seed in seed_ids:
+        seed_canonical = _canonical(seed)
         if not seed_canonical:
             continue
-
-        matches = matches_by_seed.get(seed, [])
-
-        for match in matches:
+        for match in matches_by_seed.get(seed, []):
             match_id = match.get("id")
             if not isinstance(match_id, str) or not match_id:
                 continue
-
             match_logical_id = match_logical_ids.get(match_id, match_id)
             if match_logical_id == seed:
                 continue
-
-            target_canonical = _resolve_canonical_cached(match_logical_id, canonical_cache)
+            target_canonical = _canonical(match_logical_id)
             if not target_canonical or target_canonical == seed_canonical:
                 continue
-
             pair_key = tuple(sorted((seed_canonical, target_canonical)))
             if pair_key in seen_pairs:
                 continue
             seen_pairs.add(pair_key)
+            pairs.append((seed, match_logical_id, seed_canonical, target_canonical, match))
 
-            seed_ancestors = ancestor_cache.get(seed_canonical)
-            if seed_ancestors is None:
-                seed_ancestors = _ancestor_closure(seed_canonical, max_depth=max_depth)
-                ancestor_cache[seed_canonical] = seed_ancestors
+    ancestors = _ancestor_sets([p[2] for p in pairs] + [p[3] for p in pairs], max_depth=max_depth)
 
-            target_ancestors = ancestor_cache.get(target_canonical)
-            if target_ancestors is None:
-                target_ancestors = _ancestor_closure(target_canonical, max_depth=max_depth)
-                ancestor_cache[target_canonical] = target_ancestors
-
-            common_ancestors = sorted(seed_ancestors.intersection(target_ancestors))
-            topologically_distant = len(common_ancestors) == 0
-            if require_topological_distance and not topologically_distant:
-                continue
-
-            candidates.append(
-                {
-                    "source_node_id": seed,
-                    "target_node_id": match_logical_id,
-                    "source_canonical_node_id": seed_canonical,
-                    "target_canonical_node_id": target_canonical,
-                    "similarity": match.get("similarity"),
-                    "topologically_distant": topologically_distant,
-                    "common_ancestor_count": len(common_ancestors),
-                    "common_ancestors": common_ancestors[:10],
-                }
-            )
+    candidates = []
+    for seed, target, seed_canonical, target_canonical, match in pairs:
+        common_ancestors = sorted(
+            ancestors.get(seed_canonical, set()) & ancestors.get(target_canonical, set())
+        )
+        topologically_distant = not common_ancestors
+        if require_topological_distance and not topologically_distant:
+            continue
+        candidates.append(
+            {
+                "source_node_id": seed,
+                "target_node_id": target,
+                "source_canonical_node_id": seed_canonical,
+                "target_canonical_node_id": target_canonical,
+                "similarity": match.get("similarity"),
+                "topologically_distant": topologically_distant,
+                "common_ancestor_count": len(common_ancestors),
+                "common_ancestors": common_ancestors[:10],
+            }
+        )
 
     candidates.sort(key=lambda item: float(item.get("similarity") or 0.0), reverse=True)
     capped = candidates[:limit]
 
-    return {
-        "candidates": capped,
-        "count": len(capped),
-        "scanned_nodes": len(seeds),
-        "threshold": threshold,
-        "require_topological_distance": bool(require_topological_distance),
-    }
+    return {**base, "candidates": capped, "count": len(capped)}
 
 
 def tool_apply_merge(
@@ -1009,7 +1055,11 @@ def tool_apply_merge(
     ended: str = None,
     invalidate_source_edges: bool = True,
 ):
-    """Apply a deterministic merge by wiring merged-into and retiring stale edges."""
+    """Apply a deterministic merge by wiring merged-into and retiring stale edges.
+
+    The link changes are one transaction (``KnowledgeGraph.apply_merge``): a
+    failure part way through leaves the graph as it was.
+    """
     if not isinstance(source_node_id, str) or not source_node_id.strip():
         return {"success": False, "error": "source_node_id is required"}
     if not isinstance(canonical_node_id, str) or not canonical_node_id.strip():
@@ -1032,24 +1082,18 @@ def tool_apply_merge(
     source_logical = _logical_drawer_id_for_any_id(col, source_node_id)
     canonical_logical = _logical_drawer_id_for_any_id(col, canonical_node_id)
 
-    source_record = _logical_drawer_record(col, source_logical)
-    if source_record is None:
+    if _logical_drawer_record(col, source_logical) is None:
         return {"success": False, "error": f"source node not found: {source_node_id}"}
-
-    target_record = _logical_drawer_record(col, canonical_logical)
-    if target_record is None:
+    if _logical_drawer_record(col, canonical_logical) is None:
         return {"success": False, "error": f"canonical node not found: {canonical_node_id}"}
 
-    source_resolved = tool_resolve_canonical(source_logical)
-    if "error" in source_resolved:
-        return {"success": False, "error": source_resolved["error"]}
+    chains = _canonical_chains([source_logical, canonical_logical])
+    for node in (source_logical, canonical_logical):
+        if "error" in chains[node]:
+            return {"success": False, "error": chains[node]["error"]}
 
-    target_resolved = tool_resolve_canonical(canonical_logical)
-    if "error" in target_resolved:
-        return {"success": False, "error": target_resolved["error"]}
-
-    source_canonical = source_resolved["canonical_node_id"]
-    target_canonical = target_resolved["canonical_node_id"]
+    source_canonical = chains[source_logical]["chain"][-1]
+    target_canonical = chains[canonical_logical]["chain"][-1]
 
     if source_canonical == target_canonical:
         return {
@@ -1060,66 +1104,37 @@ def tool_apply_merge(
             "canonical_node_id": target_canonical,
         }
 
-    prior_merge_facts = _kg_active_facts(source_canonical, "merged-into", direction="outgoing")
-    invalidated_prior_merged_into = 0
-    has_active_target_edge = False
+    _wal_log(
+        "apply_merge",
+        {
+            "source_node_id": source_canonical,
+            "canonical_node_id": target_canonical,
+            "ended": ended,
+            "invalidate_source_edges": bool(invalidate_source_edges),
+        },
+    )
 
-    for fact in prior_merge_facts:
-        object_id = fact.get("object")
-        if not isinstance(object_id, str) or not object_id:
-            continue
-        if object_id == target_canonical:
-            has_active_target_edge = True
-            continue
-        invalidate = tool_kg_invalidate(
-            subject=source_canonical,
-            predicate="merged-into",
-            object=object_id,
-            ended=ended,
-        )
-        if invalidate.get("success"):
-            invalidated_prior_merged_into += 1
-
-    merged_edge_added = False
-    if not has_active_target_edge:
-        add_result = tool_kg_add(
-            subject=source_canonical,
-            predicate="merged-into",
-            object=target_canonical,
-            source_drawer_id=source_canonical,
-        )
-        if not add_result.get("success"):
-            return {
-                "success": False,
-                "error": add_result.get("error", "failed to add merged-into edge"),
-            }
-        merged_edge_added = True
-
-    invalidated_lineage_edges = 0
-    if invalidate_source_edges:
-        active_synth_edges = _kg_active_facts(
-            source_canonical, "synthesized-from", direction="outgoing"
-        )
-        for fact in active_synth_edges:
-            object_id = fact.get("object")
-            if not isinstance(object_id, str) or not object_id:
-                continue
-            invalidate = tool_kg_invalidate(
-                subject=source_canonical,
-                predicate="synthesized-from",
-                object=object_id,
+    try:
+        result = _call_kg(
+            lambda kg: kg.apply_merge(
+                source_canonical,
+                target_canonical,
                 ended=ended,
+                merge_predicate=_MERGED_INTO,
+                lineage_predicate=_SYNTHESIZED_FROM,
+                retire_lineage=bool(invalidate_source_edges),
             )
-            if invalidate.get("success"):
-                invalidated_lineage_edges += 1
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
 
     return {
         "success": True,
         "merged": True,
         "source_node_id": source_canonical,
         "canonical_node_id": target_canonical,
-        "merged_edge_added": merged_edge_added,
-        "invalidated_prior_merged_into": invalidated_prior_merged_into,
-        "invalidated_lineage_edges": invalidated_lineage_edges,
-        "ended": ended or date.today().isoformat(),
+        "merged_edge_added": result["merged_edge_added"],
+        "invalidated_prior_merged_into": result["invalidated_prior_merged_into"],
+        "invalidated_lineage_edges": result["invalidated_lineage_edges"],
+        "ended": result["ended"],
     }
