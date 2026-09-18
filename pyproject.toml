@@ -1,6 +1,6 @@
 [project]
 name = "mempalace"
-version = "3.9.0"
+version = "3.10.0"
 description = "Give your AI a memory — mine projects and conversations into a searchable palace. No API key required."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -194,6 +194,12 @@ ignore = ["E501"]
 "mempalace/cli/_*.py" = ["F821"]
 "mempalace/cli/cmd_*.py" = ["F821"]
 "mempalace/cli/parser.py" = ["F821"]
+# searcher fragments exec into the package namespace.
+"mempalace/searcher/__init__.py" = ["F401"]
+"mempalace/searcher/*.py" = ["F821"]
+# palace fragments exec into the package namespace.
+"mempalace/palace/__init__.py" = ["F401"]
+"mempalace/palace/*.py" = ["F821"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 25

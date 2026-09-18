@@ -204,9 +204,11 @@ def _logstream_watch(ls, args, as_json):
         WATCH_STATE_ABSENT,
         WATCH_STATE_CORRUPT,
         read_watch_state,
+        resolve_watch_state_file,
         write_watch_cursor,
     )
 
+    args.state_file = resolve_watch_state_file(args.state_file, args.agent)
     spec = _watch_spec(args, as_json)
 
     stored_cursor, state_condition = read_watch_state(args.state_file)

@@ -10,11 +10,13 @@ import json
 import subprocess
 import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from mempalace.cli import cmd_artifact, cmd_logstream, cmd_task, main
+from mempalace.logstream import Logstream
 
 
 def _append_args(palace, **overrides):
@@ -699,7 +701,9 @@ def _watch_args(palace, **overrides):
         exclude_from_agent=None,
         correlation_id=None,
         since_event_id=None,
-        state_file=None,
+        # Empty string = explicit disable. None would now default a
+        # ~/.mempalace/watch/<agent>.json path from --agent.
+        state_file="",
         # These cases seed events and then watch for them, so they opt into
         # the replay. The tip default is exercised explicitly by the
         # first-run tests below.
@@ -828,9 +832,27 @@ class TestLogstreamWatch:
         )
         assert _watch_payload(capsys)["count"] == 1
 
-    def test_idle_deadline_caps_the_poll(self, palace_path, capsys):
-        """--idle-exit-ms shorter than --poll-timeout-ms must not wait the poll."""
-        t0 = time.monotonic()
+    def test_idle_deadline_caps_the_poll(self, palace_path, monkeypatch):
+        """--idle-exit-ms shorter than --poll-timeout-ms must not wait the poll.
+
+        Measuring wall-clock time pins the machine rather than the behaviour:
+        a loaded runner can spend seconds on a 200ms deadline while having
+        capped every poll correctly, which is how this test failed on the
+        Windows job. The contract is the timeout handed to the long-poll
+        primitive, so that is what is recorded.
+        """
+        requested = []
+
+        def recording_wait(self, *, timeout_ms=None, **kwargs):
+            requested.append(timeout_ms)
+            # Consume the granted timeout so the idle deadline elapses the way
+            # it would with a real poll, instead of spinning the loop.
+            if timeout_ms:
+                time.sleep(min(timeout_ms, 200) / 1000.0)
+            return {"events": [], "timed_out": True}
+
+        monkeypatch.setattr(Logstream, "wait_events", recording_wait)
+
         with pytest.raises(SystemExit) as exc:
             cmd_logstream(
                 _watch_args(
@@ -840,9 +862,10 @@ class TestLogstreamWatch:
                     poll_timeout_ms=5000,
                 )
             )
-        elapsed = time.monotonic() - t0
+
         assert exc.value.code == 2
-        assert elapsed < 1.5, f"idle 200ms waited {elapsed:.2f}s (poll was 5s)"
+        assert requested, "the watcher exited without reaching the long poll"
+        assert max(requested) <= 200, f"poll asked for {max(requested)}ms on a 200ms idle deadline"
 
     def test_match_does_not_checkpoint_if_output_fails(
         self, palace_path, tmp_path, capsys, monkeypatch
@@ -1199,6 +1222,63 @@ class TestLogstreamWatch:
             cmd_logstream(_watch_args(palace_path, agent="mac-claude", limit=0))
         assert exc.value.code == 1
         assert "limit" in json.loads(capsys.readouterr().out)["error"]
+
+    def test_omitted_state_file_defaults_from_agent_with_colons_sanitized(
+        self, palace_path, tmp_path, capsys, monkeypatch
+    ):
+        """`--agent windows:grok:mempalace` without `--state-file` must persist.
+
+        Colons are illegal in Windows filenames; the default path uses
+        underscores so the same identity works on every OS.
+        """
+        from mempalace.logstream import default_watch_state_file
+
+        monkeypatch.setattr("mempalace.logstream.Path.home", lambda: tmp_path)
+        expected = default_watch_state_file("windows:grok:mempalace", home=str(tmp_path))
+        assert expected.endswith("windows_grok_mempalace.json")
+
+        cmd_logstream(
+            _append_args(palace_path, to_agent="windows:grok:mempalace", from_agent="mac:claude:x")
+        )
+        capsys.readouterr()
+
+        cmd_logstream(
+            _watch_args(
+                palace_path, agent="windows:grok:mempalace", state_file=None, from_start=True
+            )
+        )
+        payload = _watch_payload(capsys)
+        assert payload["count"] == 1
+        stored = json.loads(Path(expected).read_text(encoding="utf-8"))
+        assert stored["cursor"] == payload["cursor"]
+        assert stored["agent"] == "windows:grok:mempalace"
+
+
+class TestWatchStateFileDefault:
+    def test_sanitize_replaces_colons_and_slashes(self):
+        from mempalace.logstream import sanitize_watch_state_basename
+
+        assert sanitize_watch_state_basename("windows:grok:mempalace") == "windows_grok_mempalace"
+        assert sanitize_watch_state_basename("a/b\\c") == "a_b_c"
+
+    def test_sanitize_keeps_underscore_and_colon_identities_distinct(self):
+        from mempalace.logstream import sanitize_watch_state_basename
+
+        left = sanitize_watch_state_basename("a:b_c:proj")
+        right = sanitize_watch_state_basename("a_b:c:proj")
+        assert left == "a_b__c_proj"
+        assert right == "a__b_c_proj"
+        assert left != right
+
+    def test_resolve_none_with_agent_defaults_empty_string_disables(self):
+        from mempalace.logstream import default_watch_state_file, resolve_watch_state_file
+
+        assert resolve_watch_state_file("", "windows:grok:x") is None
+        assert resolve_watch_state_file("/tmp/w.json", "windows:grok:x") == "/tmp/w.json"
+        assert resolve_watch_state_file(None, None) is None
+        got = resolve_watch_state_file(None, "windows:grok:x")
+        assert got == default_watch_state_file("windows:grok:x")
+        assert got.endswith("windows_grok_x.json")
 
 
 class TestTopicAndOrderCli:

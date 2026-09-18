@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 from hypothesis import given
@@ -20,6 +20,7 @@ from mempalace.hooks_cli import (
     _extract_recent_messages,
     _get_mine_targets,
     _hooks_daemon_enabled,
+    _is_harness_boilerplate,
     _log,
     _maybe_auto_ingest,
     _mempalace_python,
@@ -256,6 +257,168 @@ def test_extract_recent_messages_skips_commands(tmp_path):
     assert msgs[0] == "real msg"
 
 
+def test_extract_recent_messages_skips_harness_boilerplate(tmp_path):
+    """Harness-injected role=user text must not become the checkpoint summary."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {
+                "message": {
+                    "role": "user",
+                    "content": "<local-command-caveat>Caveat: the messages below...",
+                }
+            },
+            {
+                "message": {
+                    "role": "user",
+                    "content": "<task-notification>\n<task-id>abc</task-id>\n",
+                }
+            },
+            {
+                "message": {
+                    "role": "user",
+                    "content": "[SYSTEM NOTIFICATION - NOT USER INPUT] background task done",
+                }
+            },
+            {
+                "message": {
+                    "role": "user",
+                    "content": "Base directory for this skill: /skills/example",
+                }
+            },
+            {"message": {"role": "user", "content": "why is wake-up showing old drawers"}},
+        ],
+    )
+    assert _extract_recent_messages(str(transcript)) == ["why is wake-up showing old drawers"]
+
+
+def test_extract_recent_messages_skips_boilerplate_in_list_content(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "<task-notification>done</...>"}],
+                }
+            },
+            {
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "ship the fix"}],
+                }
+            },
+        ],
+    )
+    assert _extract_recent_messages(str(transcript)) == ["ship the fix"]
+
+
+def test_extract_recent_messages_skips_boilerplate_in_codex_format(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "[SYSTEM NOTIFICATION - NOT USER INPUT] agent finished",
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "review the diff"},
+            },
+        ],
+    )
+    assert _extract_recent_messages(str(transcript)) == ["review the diff"]
+
+
+def test_extract_recent_messages_keeps_text_mentioning_a_marker_word(tmp_path):
+    """Only the literal wrappers are filtered, not ordinary talk about them."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": "the task notification arrived late"}}],
+    )
+    assert _extract_recent_messages(str(transcript)) == ["the task notification arrived late"]
+
+
+def test_extract_recent_messages_keeps_long_message_quoting_a_wrapper(tmp_path):
+    """Regression: a wrapper quoted deep in genuine prose is not boilerplate.
+
+    Taken from a real transcript: a 7.7k-character message that discusses how
+    background events arrive, quoting the literal tag around 5k characters in.
+    Matching the marker anywhere threw the whole message away even though the
+    first 200 characters, the only part the checkpoint keeps, are pure prose.
+    """
+    real_text = (
+        "the deck should keep a persistent watcher instead of polling, so arm one "
+        "now with persistent true and let it idle between runs. "
+    )
+    real_text += "Padding out the body the way a long design message runs on. " * 90
+    real_text += "Its events arrive as <task-notification> messages and wake this loop."
+    assert len(real_text) > 5000
+    assert real_text.index("<task-notification>") > 5000
+
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(transcript, [{"message": {"role": "user", "content": real_text}}])
+
+    msgs = _extract_recent_messages(str(transcript))
+    assert len(msgs) == 1
+    assert msgs[0].startswith("the deck should keep a persistent watcher")
+
+
+def test_extract_recent_messages_skips_additional_harness_wrappers(tmp_path):
+    """Wrappers seen leading real transcripts but missing from the first pass."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {"message": {"role": "user", "content": "<local-command-stdout>Set model to opus"}},
+            {"message": {"role": "user", "content": "<command-name>/dira</command-name>"}},
+            {"message": {"role": "user", "content": "[Request interrupted by user for tool use]"}},
+            {
+                "message": {
+                    "role": "user",
+                    "content": "[Image: original 2880x1458, displayed at 2000x1013.]",
+                }
+            },
+            {"message": {"role": "user", "content": "now wire the checkpoint to the deck"}},
+        ],
+    )
+    assert _extract_recent_messages(str(transcript)) == ["now wire the checkpoint to the deck"]
+
+
+def test_is_harness_boilerplate_is_anchored_to_the_message_opening():
+    """The unit contract: a leading wrapper is boilerplate, a quote is not."""
+    assert _is_harness_boilerplate("<system-reminder>do the thing</system-reminder>")
+    assert _is_harness_boilerplate("   \n <task-notification>done</task-notification>")
+    assert not _is_harness_boilerplate("x" * 400 + "<system-reminder>quoted</system-reminder>")
+
+
+def test_is_harness_boilerplate_keeps_a_wrapper_quoted_inside_the_kept_window():
+    """A quote at offset 20 is inside the 200 characters the checkpoint keeps.
+
+    Bounding the match to a leading window instead of anchoring it is not
+    enough: this message's wrapper sits well inside that window, and every
+    character of it is text the checkpoint would store. Position, not
+    proximity, is what separates an injection from prose about one.
+    """
+    quoted = (
+        "The harness sends <task-notification> blocks to wake the loop, so the "
+        "stop hook has to ignore them when it composes the recent line."
+    )
+    offset = quoted.index("<task-notification>")
+    assert 0 < offset < 200 and len(quoted) < 200  # entirely inside the kept window
+    assert not _is_harness_boilerplate(quoted)
+
+    # ...and the same wrapper genuinely opening the message is still caught.
+    assert _is_harness_boilerplate("<task-notification>" + quoted)
+
+
 def test_extract_recent_messages_missing_file():
     assert _extract_recent_messages("/nonexistent.jsonl") == []
 
@@ -282,6 +445,15 @@ def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None):
     type(mock_config).hook_silent_save = PropertyMock(return_value=True)
     type(mock_config).hook_desktop_toast = PropertyMock(return_value=False)
     patches.append(patch("mempalace.config.MempalaceConfig", return_value=mock_config))
+    # A Stop or PreCompact hook spawns the transcript ingest through
+    # ``_spawn_mine``, and a real child here outlives the test that started
+    # it: it holds the palace's writer lease, and the next test file to ask
+    # for one is refused with "Peer MCP writer active". Nothing in this file
+    # asserts on a real mine. A test that asserts on the spawn installs its
+    # own stand-in before calling this helper, so only put one here when the
+    # attribute is still the real ``Popen``.
+    if not isinstance(hooks_cli_mod.subprocess.Popen, Mock):
+        patches.append(patch("mempalace.hooks_cli.subprocess.Popen"))
     with contextlib.ExitStack() as stack:
         for p in patches:
             stack.enter_context(p)
@@ -411,9 +583,30 @@ def test_diary_agent_for_harness_unknown_falls_back_to_name():
         assert _diary_agent_for_harness(harness) != "session-hook"
 
 
+def test_dsh_harness_is_accepted_and_reads_diary_under_its_own_name():
+    """The DeepSeek Harness plugin drives `hook run --harness dsh`.
+
+    DSH supplies its own transcript (its on-disk session logs are
+    zstd-compressed and unreadable outside the harness), so `dsh` needs nothing
+    beyond being a recognised harness: the same input shape as Claude Code, and
+    a diary identity a `diary_read(agent_name="dsh")` call can actually find.
+    """
+    parsed = hooks_cli_mod._parse_harness_input(
+        {"session_id": "session-x", "transcript_path": "/tmp/t.jsonl"},
+        "dsh",
+    )
+    assert parsed == {
+        "session_id": "session-x",
+        "stop_hook_active": False,
+        "transcript_path": "/tmp/t.jsonl",
+    }
+    assert _diary_agent_for_harness("dsh") == "dsh"
+    assert "dsh" in hooks_cli_mod.SUPPORTED_HARNESSES
+
+
 @pytest.mark.parametrize(
     "harness,expected_agent",
-    [("claude-code", "claude"), ("codex", "codex")],
+    [("claude-code", "claude"), ("codex", "codex"), ("dsh", "dsh")],
 )
 def test_stop_hook_files_checkpoint_under_harness_agent(tmp_path, harness, expected_agent):
     """The Stop hook must file checkpoints under the agent identity that the
@@ -2047,6 +2240,9 @@ def _redirect_palace_root(monkeypatch, tmp_path):
     monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", fake_root)
     monkeypatch.setattr(hooks_cli_mod, "STATE_DIR", fake_root / "hook_state")
     monkeypatch.setattr(hooks_cli_mod, "_state_dir_initialized", False)
+    # The config dir satisfies the kill-switch too (#148); keep it absent so
+    # these tests exercise the "user cleared everything" path.
+    monkeypatch.setattr(hooks_cli_mod, "_config_root", lambda: tmp_path / "absent-config")
     return fake_root
 
 
@@ -2384,6 +2580,31 @@ def test_existing_dir_proceeds_normally(tmp_path, monkeypatch):
     assert (fake_root / "hook_state" / "hook.log").is_file()
 
 
+def test_config_dir_satisfies_kill_switch_without_legacy_root(tmp_path, monkeypatch):
+    """A fresh install since #148 has its config dir but no ~/.mempalace.
+
+    Before the fix every hook short-circuited on such an install, so a fresh
+    ``mempalace init`` followed by a PreCompact hook filed nothing.
+    """
+    fake_root = _redirect_palace_root(monkeypatch, tmp_path)
+    config_root = tmp_path / "xdg" / "mempalace"
+    config_root.mkdir(parents=True)
+    monkeypatch.setattr(hooks_cli_mod, "_config_root", lambda: config_root)
+
+    assert hooks_cli_mod._palace_root_exists() is True
+    _log("test message")
+    assert (fake_root / "hook_state" / "hook.log").is_file()
+
+
+def test_kill_switch_config_root_follows_config_resolution(tmp_path, monkeypatch):
+    """``_config_root`` resolves the way ``mempalace.config`` does."""
+    config_dir = tmp_path / "explicit-config"
+    config_dir.mkdir()
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(config_dir))
+
+    assert hooks_cli_mod._config_root() == config_dir
+
+
 def test_regular_file_at_palace_root_treated_as_absent(tmp_path, monkeypatch):
     """A regular file at ~/.mempalace must be treated the same as absent.
 
@@ -2395,6 +2616,7 @@ def test_regular_file_at_palace_root_treated_as_absent(tmp_path, monkeypatch):
     fake_root = tmp_path / "file-not-dir"
     fake_root.write_text("oops, this is a file not a directory")
     monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", fake_root)
+    monkeypatch.setattr(hooks_cli_mod, "_config_root", lambda: tmp_path / "absent-config")
     monkeypatch.setattr(hooks_cli_mod, "STATE_DIR", fake_root / "hook_state")
     monkeypatch.setattr(hooks_cli_mod, "_state_dir_initialized", False)
 

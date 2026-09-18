@@ -407,11 +407,10 @@ def test_validator_passes_logger_progress_not_print_to_autoheal(tmp_path, monkey
     called with). This test instead captures the actual kwargs passed and
     invokes the captured progress callable, asserting nothing lands on stdout.
 
-    Deliberately not pinned to logger.info specifically: which severity level
-    is used is a verbosity choice, not a correctness requirement -- the bug
-    was "raw print() to stdout", not "wrong log level". Asserting equality to
-    one specific level method would make the test fail on a reasonable future
-    change (e.g. to logger.debug) that doesn't reintroduce the actual bug.
+    Deliberately not pinned to one level method here: the bug this guards was
+    "raw print() to stdout", not "wrong log level". The separate floor on the
+    level -- it has to be one the default configuration does not discard -- is
+    pinned by the test below instead.
     """
     from mempalace import repair as repair_mod
     from mempalace.palace import logger as palace_logger
@@ -441,6 +440,65 @@ def test_validator_passes_logger_progress_not_print_to_autoheal(tmp_path, monkey
     assert getattr(progress, "__self__", None) is palace_logger
     out, _ = capsys.readouterr()
     assert out == ""
+
+
+def test_validator_progress_level_survives_the_default_logging_config(tmp_path, monkeypatch):
+    """A message the operator never sees closes nothing (#2240).
+
+    Nothing configures logging on the ``mempalace mine`` path, so
+    ``mempalace.palace`` inherits the root logger's WARNING and INFO records
+    are discarded before any handler runs. Everything this call can report --
+    a rebuild attempted against the operator's data, refused, or completed --
+    describes a palace whose quick_check already failed, so it has to be
+    emitted at a level that survives that default.
+
+    The level is read off an actual record rather than compared to a bound
+    method, so any level at or above the floor passes.
+    """
+    import logging
+
+    from mempalace import repair as repair_mod
+    from mempalace.palace import logger as palace_logger
+
+    palace = tmp_path / "palace"
+    _build_palace_with_drawer(palace)
+
+    captured = {}
+    monkeypatch.setattr(
+        repair_mod,
+        "sqlite_integrity_errors",
+        lambda _p: ["malformed inverted index for FTS5 table main.embedding_fulltext_search"],
+    )
+
+    def _fake_heal(palace_path, errors, **kwargs):
+        captured["progress"] = kwargs.get("progress")
+        return []
+
+    monkeypatch.setattr(repair_mod, "maybe_autoheal_fts5_index", _fake_heal)
+
+    _validate_palace_fts5_after_mine(str(palace))
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Capture(level=logging.NOTSET)
+    palace_logger.addHandler(handler)
+    previous = palace_logger.level
+    palace_logger.setLevel(logging.NOTSET)
+    try:
+        captured["progress"]("declined for a reason the operator must read")
+    finally:
+        palace_logger.setLevel(previous)
+        palace_logger.removeHandler(handler)
+
+    assert records, "progress produced no log record at all"
+    assert records[-1].levelno >= logging.WARNING, (
+        f"emitted at {records[-1].levelname}; the default root level is "
+        f"{logging.getLevelName(logging.WARNING)}, so it would be discarded"
+    )
 
 
 def test_validator_still_raises_when_autoheal_cannot_clear(tmp_path, monkeypatch):
@@ -524,6 +582,17 @@ def test_mine_validation_error_rejects_empty_errors():
         MineValidationError("/tmp/x", [])
     with pytest.raises(ValueError, match="non-empty palace_path"):
         MineValidationError("", ["err"])
+
+
+def test_mine_validation_error_names_the_sqlite_build():
+    """#2240 names the post-mine check. The CLI handler renders the banner,
+    which carries the version; the MCP and HTTP handlers render this message
+    instead, so it carries the version too."""
+    import sqlite3
+
+    exc = MineValidationError("/palace", ["malformed inverted index for FTS5 table main.x"])
+    assert sqlite3.sqlite_version in str(exc)
+    assert exc.errors == ("malformed inverted index for FTS5 table main.x",)
 
 
 def test_mine_validation_error_errors_attribute_is_immutable():

@@ -1,4 +1,4 @@
-"""Shared helpers for tests/mcp/ (split from test_mcp_server.py)."""
+"""Shared helpers for the MCP server tests (split from test_mcp_server.py)."""
 
 import os
 
@@ -18,6 +18,32 @@ def _patch_mcp_server(monkeypatch, config, kg):
     from mempalace.palace_graph import invalidate_graph_cache
 
     invalidate_graph_cache()
+
+
+def _keep_server_command_line_state(monkeypatch):
+    """Undo, after the test, whatever the server's command-line flags set.
+
+    Running an entry point applies its flags to process-wide state on purpose,
+    and a test that runs one must not leave them behind for the rest of the
+    session. The flags' environment variables start the test unset.
+    """
+    from mempalace import mcp_server
+
+    for name in (
+        "_args",
+        "_READ_ONLY",
+        "_palace_flag_given",
+        "_STALE_LIBRARY_WATCHED_DISTS",
+        "_STARTUP_DIST_STATE",
+        "_STARTUP_DIST_VERSIONS",
+        "_STARTUP_DIST_ERRORS",
+    ):
+        monkeypatch.setattr(mcp_server, name, getattr(mcp_server, name))
+    for name in ("MEMPALACE_PALACE_PATH", "MEMPALACE_BACKEND", "MEMPALACE_BACKEND_EXPLICIT"):
+        # delenv() of an unset variable records nothing, so a value the entry
+        # point sets would outlive the test. Setting it first records "unset".
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
 
 
 def _unexpected_client_read(*_a, **_k):

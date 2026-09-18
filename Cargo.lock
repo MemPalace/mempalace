@@ -299,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "mempalace-cli"
-version = "3.9.0"
+version = "3.10.0"
 dependencies = [
  "clap",
  "mempalace-core",
@@ -311,7 +311,7 @@ dependencies = [
 
 [[package]]
 name = "mempalace-core"
-version = "3.9.0"
+version = "3.10.0"
 dependencies = [
  "rayon",
  "rusqlite",
@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "mempalace-py"
-version = "3.9.0"
+version = "3.10.0"
 dependencies = [
  "mempalace-core",
  "pyo3",

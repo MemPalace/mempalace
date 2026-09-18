@@ -11,10 +11,11 @@ The Python package that powers MemPalace. All modules, all logic.
 | `normalize.py` | Converts 5 chat formats (Claude Code JSONL, Claude.ai JSON, ChatGPT JSON, Slack JSON, plain text) to standard transcript format |
 | `miner.py` | Project file ingest — scans directories, chunks by paragraph, stores to ChromaDB |
 | `convo_miner.py` | Conversation ingest — chunks by exchange pair (Q+A), detects rooms from content |
-| `searcher.py` | Semantic search via ChromaDB vectors — filters by wing/room, returns verbatim + scores |
+| `searcher/` | Hybrid BM25 + vector search; public import is still `mempalace.searcher` |
 | `layers.py` | 4-layer memory stack: L0 (identity), L1 (critical facts), L2 (room recall), L3 (deep search) |
 | `dialect.py` | AAAK compression — entity codes, emotion markers, 30x lossless ratio |
 | `knowledge_graph.py` | Temporal entity-relationship graph — SQLite, time-filtered queries, fact invalidation |
+| `palace/` | Collection access, closets, mine locks; public import is still `mempalace.palace` |
 | `palace_graph.py` | Room-based navigation graph — BFS traversal, tunnel detection across wings |
 | `mcp_server/` | MCP server package — tools, schemas, protocol, HTTP; public import is still `mempalace.mcp_server` |
 | `onboarding.py` | Guided first-run setup — asks about people/projects, generates AAAK bootstrap + wing config |

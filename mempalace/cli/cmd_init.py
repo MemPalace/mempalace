@@ -168,7 +168,10 @@ def cmd_init(args):
             # without this, hyphenated dirnames silently lose tunnels).
             wing = normalize_wing_name(project_path.name)
             registry_path = add_to_known_entities(confirmed, wing=wing)
-            print(f"  Registry updated: {registry_path}")
+            if registry_path:
+                print(f"  Registry updated: {registry_path}")
+            # ``None`` means the registry was left alone and said why on
+            # stderr, so reporting an update here would contradict it.
     else:
         print("  No entities detected -- proceeding with directory-based rooms.")
 
@@ -275,6 +278,37 @@ def _maybe_run_mine_after_init(args, cfg) -> None:
             return
 
     palace_path = cfg.palace_path
+    routing = _resolve_cli_write_routing_or_exit(
+        args,
+        "init auto-mine",
+    )
+    if routing.use_daemon:
+        payload = {
+            "source": os.path.abspath(os.path.expanduser(project_dir)),
+            "mode": "projects",
+            "wing": None,
+            "agent": "mempalace",
+            "limit": 0,
+            "dry_run": False,
+            "extract": "exchange",
+            "no_gitignore": False,
+            "include_ignored": [],
+            "max_chunks_per_file": None,
+            "redetect_origin": False,
+            "files": (
+                [str(file_path) for file_path in scanned_files]
+                if scanned_files is not None
+                else None
+            ),
+        }
+        _submit_daemon_cli_job(
+            "mine",
+            payload,
+            args,
+            background=False,
+            auto_start=routing.decision.auto_start_daemon,
+        )
+        return
     try:
         mine(
             project_dir=project_dir,

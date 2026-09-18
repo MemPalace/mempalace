@@ -116,17 +116,28 @@ def tool_event_list(
     before_event_id: str = None,
     since_created_at: str = None,
     limit: int = 50,
-    order: str = "asc",
+    order: str = None,
     preview: bool = False,
 ):
     """List coordination events with structured filters.
 
-    ``order='desc'`` returns newest events first (e.g. for sweeping recent inbox
-    or checking recent project history in a single call). Default is ``'asc'``.
+    Context-aware ordering default:
+    When ``order`` is omitted or None:
+    - If ``since_event_id`` is supplied (resuming from a cursor), defaults to ``'asc'``
+      so events replay in forward chronological append order without skipping.
+    - Otherwise (inbox sweeps, history checks), defaults to ``'desc'`` so the
+      newest events are returned first rather than ancient events from far back.
+
+    Explicit ``order='asc'`` or ``order='desc'`` (case-insensitive) always overrides.
     ``preview=True`` truncates each event's verbatim body to a short excerpt
     (marking ``body_truncated`` + ``body_length``) so scanning many events
     stays cheap.
     """
+    if order is None:
+        resolved_order = "asc" if since_event_id else "desc"
+    else:
+        resolved_order = str(order).lower().strip()
+
     try:
         events = _call_logstream(
             lambda ls: ls.list_events(
@@ -142,7 +153,7 @@ def tool_event_list(
                 before_event_id=before_event_id,
                 since_created_at=since_created_at,
                 limit=limit,
-                order=order,
+                order=resolved_order,
             )
         )
     except ValueError as e:

@@ -7,6 +7,7 @@ from mempalace.searcher import (
     _aligned_query_ids,
     _finalize_candidate_hits,
     _query_drawers_with_filter_fallback,
+    search,
     search_memories,
 )
 
@@ -328,3 +329,58 @@ def test_union_results_use_parent_or_lexical_hit_id():
         and "_parent_drawer_id" not in hit
         for hit in hits
     )
+
+
+def test_cli_scoped_search_uses_existing_filter_fallback(capsys):
+    drawers_col = MagicMock()
+    drawers_col.distance_metric = "cosine"
+    drawers_col.metadata = {"hnsw:space": "cosine"}
+    drawers_col.query.side_effect = [
+        RuntimeError("Error finding id"),
+        {
+            "ids": [["drop-id", "keep-id"]],
+            "documents": [["drop document", "keep document"]],
+            "metadatas": [
+                [
+                    {
+                        "wing": "keep",
+                        "room": "other",
+                        "source_file": "/palace/drop.md",
+                    },
+                    {
+                        "wing": "keep",
+                        "room": "notes",
+                        "source_file": "/palace/keep.md",
+                    },
+                ]
+            ],
+            "distances": [[0.2, 0.1]],
+        },
+    ]
+
+    with patch(
+        "mempalace.searcher.resolve_backend_name",
+        return_value="sqlite_exact",
+    ):
+        with patch(
+            "mempalace.searcher._open_collection_or_explain",
+            return_value=drawers_col,
+        ):
+            search(
+                "needle",
+                "/unused",
+                wing="keep",
+                room="notes",
+                n_results=2,
+            )
+
+    output = capsys.readouterr().out
+    assert drawers_col.query.call_count == 2
+
+    filtered_call, fallback_call = drawers_col.query.call_args_list
+    assert filtered_call.kwargs["where"] == {"$and": [{"wing": "keep"}, {"room": "notes"}]}
+    assert "where" not in fallback_call.kwargs
+    assert fallback_call.kwargs["n_results"] == 30
+
+    assert "keep document" in output
+    assert "drop document" not in output

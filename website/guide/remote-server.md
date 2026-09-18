@@ -95,7 +95,12 @@ The backend can also be set with `--backend milvus` (or `qdrant` /
 
 Prefer Postgres? Install `pip install mempalace[pgvector]`, point
 `MEMPALACE_BACKEND=pgvector` at a database with the `vector` extension, and
-the rest of this guide applies unchanged.
+the rest of this guide applies unchanged. If more than one machine talks to
+that database and they are meant to share one palace, set the same
+`MEMPALACE_PGVECTOR_SHARED_NAMESPACE` on each — without it, pgvector table
+names include each node's local palace path and the nodes silently end up with
+separate tables. See
+[Sharing one palace across machines](/guide/configuration#sharing-one-palace-across-machines).
 
 ## 2. GPU embedding (optional)
 
@@ -204,6 +209,15 @@ messages between machines.
   `/statusz` follows the bearer-token policy because it exposes operational
   metadata; it is not a public liveness probe. Probe traffic does **not**
   count as activity for the idle watchdog below; only MCP requests do.
+- **Waiting for the writer lease**: a writable server that finds another
+  process holding the palace's writer lease (a session's MCP server, a hook
+  mine, a CLI write) waits for it instead of refusing at once, retrying with
+  backoff for `MEMPALACE_MCP_WRITER_WAIT_SECONDS` (default `120`). It logs
+  once when the wait starts. If the lease is still held when the wait runs
+  out, it exits with status `2`, which the systemd template does not restart,
+  so the unit lands in `failed` with the reason in the journal. Set it to `0`
+  to refuse immediately. A backend or lock-directory failure is never waited
+  on.
 - **Idle shutdown**: the server exits by itself once `MEMPALACE_MCP_IDLE_HOURS`
   have passed with no MCP request (default `8`). That default is there to reap
   the per-session stdio servers that would otherwise pile up holding ChromaDB
