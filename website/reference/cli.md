@@ -188,7 +188,7 @@ mempalace hook run --hook stop --harness auto
 | Option | Values | Description |
 |--------|--------|-------------|
 | `--hook` | `session-start`, `stop`, `session-end`, `precompact` | Hook name |
-| `--harness` | `claude-code`, `codex`, `grok`, `copilot`, `dsh`, `auto`, or any token | Harness type. `auto` detects Grok from `GROK_SESSION_ID` / `GROK_HOOK_EVENT`, Copilot from `COPILOT_HOME` / `stopReason` / a `session-state` transcript path, otherwise Claude-compatible JSON. `dsh` uses the same Claude-shaped transcript the DeepSeek Harness plugin writes. |
+| `--harness` | `claude-code`, `codex`, `grok`, `copilot`, `dsh`, `auto`, or any token | Harness type. `auto` detects Grok from `GROK_SESSION_ID` / `GROK_HOOK_EVENT`. Copilot from `stopReason` / a `session-state` transcript path, or `COPILOT_HOME` when stdin is not already a Claude envelope. Otherwise Claude-compatible JSON. `dsh` uses the same Claude-shaped transcript the DeepSeek Harness plugin writes. |
 
 Grok users: copy [`examples/grok/hooks.json`](https://github.com/MemPalace/mempalace/blob/develop/examples/grok/hooks.json) to `~/.grok/hooks/mempalace.json`. Do not use `hooks/mempal_save_hook.sh` for Grok.
 

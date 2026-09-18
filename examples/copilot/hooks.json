@@ -5,6 +5,7 @@
       {
         "type": "command",
         "bash": "mempalace hook run --hook stop --harness copilot",
+        "powershell": "mempalace hook run --hook stop --harness copilot",
         "command": "mempalace hook run --hook stop --harness copilot",
         "timeoutSec": 30
       }
@@ -13,6 +14,7 @@
       {
         "type": "command",
         "bash": "mempalace hook run --hook session-end --harness copilot",
+        "powershell": "mempalace hook run --hook session-end --harness copilot",
         "command": "mempalace hook run --hook session-end --harness copilot",
         "timeoutSec": 30
       }
@@ -21,6 +23,7 @@
       {
         "type": "command",
         "bash": "mempalace hook run --hook precompact --harness copilot",
+        "powershell": "mempalace hook run --hook precompact --harness copilot",
         "command": "mempalace hook run --hook precompact --harness copilot",
         "timeoutSec": 90
       }

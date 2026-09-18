@@ -14,6 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Bug Fixes
 
+- **Generic hook adapters no longer split Claude worktree diaries, double-spawn Grok waiters, skip Grok SessionEnd, or mis-detect Copilot.** `_wing_from_cwd` collapses `<project>/.claude/worktrees/<wt>` to the parent project so Stop files with `#2388` instead of `wing_<worktree>`. A deferred Grok Stop writes `{session}_last_save` when the waiter starts, so turn 16 does not spawn another. Grok SessionEnd waits up to 5s for `chat_history.jsonl` before giving up on the final flush. `examples/copilot/hooks.json` includes `powershell` so Windows Copilot CLI actually runs the commands. `--harness auto` reads a Claude snake_case envelope before `COPILOT_HOME`, and a path that merely ends in `events.jsonl` is no longer Copilot.
+
 - **A `known_entities.json` write no longer appears to hang on Windows when the
   directory refuses a temporary file.** `_publish_registry` falls back to writing
   in place when the directory takes no new name, and it learned that from the

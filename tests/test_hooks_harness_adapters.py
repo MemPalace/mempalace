@@ -21,6 +21,7 @@ from mempalace.hooks_cli import (
     _diary_agent_for_harness,
     _extract_recent_messages,
     _parse_harness_input,
+    hook_session_end,
     hook_stop,
 )
 from tests.test_hooks_cli import _capture_hook_output, _write_transcript
@@ -321,6 +322,24 @@ def test_wing_from_cwd_uses_leaf():
     assert hooks_cli_mod._wing_from_cwd("/Users/vijay/Projects/Engram") == "wing_engram"
 
 
+def test_wing_from_cwd_collapses_claude_worktree():
+    """Claude Stop always sends cwd, so worktree collapse must live in _wing_from_cwd.
+
+    Without it, ``<project>/.claude/worktrees/<wt>`` files as ``wing_<wt>``
+    and splits one project's diary (#2388, PR #2478).
+    """
+    cwd = "/Users/u/projects/gsd-core/.claude/worktrees/hardcore-wilbur-48691a"
+    transcript = (
+        "/Users/u/.claude/projects/"
+        "-Users-u-projects-gsd-core--claude-worktrees-hardcore-wilbur-48691a/x.jsonl"
+    )
+    assert hooks_cli_mod._wing_from_cwd(cwd) == "wing_gsd_core"
+    assert hooks_cli_mod._project_wing({"cwd": cwd}, transcript) == "wing_gsd_core"
+    assert (
+        hooks_cli_mod._project_wing({"cwd": cwd.replace("/", "\\")}, transcript) == "wing_gsd_core"
+    )
+
+
 def test_diary_agent_for_grok():
     assert _diary_agent_for_harness("grok") == "grok"
 
@@ -389,6 +408,34 @@ def test_stop_hook_grok_defers_save_when_history_unflushed(tmp_path):
     mock_defer.assert_called_once()
 
 
+def test_stop_hook_grok_defer_writes_last_save_so_second_stop_does_not_respawn(
+    tmp_path,
+):
+    """A live Grok Stop that spawns a waiter must mark last_save immediately.
+
+    Otherwise turn 16 still sees since_last >= 15 and starts a second waiter
+    (PR #2478).
+    """
+    cwd = "/Users/vijay/Projects/mempalace"
+    sid = "unflushed-stop-twice"
+    dest = tmp_path / "sessions" / quote(cwd, safe="") / sid
+    _write_grok_events(dest / "events.jsonl", SAVE_INTERVAL)
+    last_save = tmp_path / f"{sid}_last_save"
+    payload = {"sessionId": sid, "cwd": cwd, "reason": "end_turn"}
+    with patch("mempalace.hooks_cli._save_diary_direct") as mock_save:
+        with patch.object(hooks_cli_mod, "_grok_sessions_root", return_value=tmp_path / "sessions"):
+            with patch.object(
+                hooks_cli_mod, "_spawn_deferred_grok_save", return_value=True
+            ) as mock_defer:
+                _capture_hook_output(hook_stop, payload, harness="grok", state_dir=tmp_path)
+                _write_grok_events(dest / "events.jsonl", SAVE_INTERVAL + 1)
+                _capture_hook_output(hook_stop, payload, harness="grok", state_dir=tmp_path)
+    assert last_save.is_file()
+    assert last_save.read_text(encoding="utf-8") == str(SAVE_INTERVAL)
+    assert mock_defer.call_count == 1
+    mock_save.assert_not_called()
+
+
 def test_harness_notice_output_grok_is_empty():
     assert hooks_cli_mod._harness_notice_output("grok", "✦ 15 memories woven") == {}
 
@@ -418,6 +465,46 @@ def test_stop_hook_grok_skips_subagent(tmp_path):
         )
     assert result == {}
     mock_save.assert_not_called()
+
+
+def test_session_end_grok_waits_for_unflushed_history(tmp_path):
+    """Grok SessionEnd must wait for chat_history.jsonl, not skip the diary.
+
+    Live shutdown locates the transcript immediately, sees nothing, and
+    would otherwise leave a short session unsaved (PR #2478).
+    """
+    cwd = "/Users/vijay/Projects/mempalace"
+    sid = "unflushed-end"
+    dest = tmp_path / "sessions" / quote(cwd, safe="") / sid
+    dest.mkdir(parents=True)
+    _write_grok_events(dest / "events.jsonl", 5)
+    history = dest / "chat_history.jsonl"
+
+    def fake_wait(parsed, sessions_root=None, timeout_s=None):
+        _write_grok_history(
+            history,
+            [_grok_user("<user_query>\nhi\n</user_query>", prompt_index=0)],
+        )
+        return history
+
+    with patch("mempalace.hooks_cli._save_diary_direct", return_value={"count": 1}) as mock_save:
+        with patch.object(hooks_cli_mod, "_grok_sessions_root", return_value=tmp_path / "sessions"):
+            with patch.object(
+                hooks_cli_mod, "_wait_for_grok_chat_history", side_effect=fake_wait
+            ) as mock_wait:
+                with patch.object(hooks_cli_mod, "_ingest_transcript") as mock_ingest:
+                    with patch.object(hooks_cli_mod, "_maybe_auto_ingest"):
+                        result = _capture_hook_output(
+                            hook_session_end,
+                            {"sessionId": sid, "cwd": cwd, "reason": "shutdown"},
+                            harness="grok",
+                            state_dir=tmp_path,
+                        )
+    assert result == {}
+    mock_wait.assert_called_once()
+    mock_save.assert_called_once()
+    mock_ingest.assert_called_once()
+    assert mock_save.call_args.args[0] == str(history)
 
 
 def test_stop_hook_grok_skips_session_teardown_stop(tmp_path):
@@ -517,6 +604,22 @@ def test_detect_harness_copilot_from_stop_reason_and_transcript():
 
 def test_detect_harness_copilot_from_home_env():
     assert hooks_cli_mod._detect_harness({}, {"COPILOT_HOME": "/tmp/copilot-home"}) == "copilot"
+
+
+def test_detect_harness_claude_stdin_wins_over_copilot_home():
+    claude_stdin = {"session_id": "s", "transcript_path": "/tmp/t.jsonl"}
+    assert hooks_cli_mod._detect_harness(claude_stdin, {}) == "claude-code"
+    assert (
+        hooks_cli_mod._detect_harness(claude_stdin, {"COPILOT_HOME": "/tmp/copilot-home"})
+        == "claude-code"
+    )
+
+
+def test_detect_harness_bare_events_jsonl_is_not_copilot():
+    assert (
+        hooks_cli_mod._detect_harness({"transcriptPath": "/tmp/foo/events.jsonl"}, {})
+        == "claude-code"
+    )
 
 
 def test_locate_copilot_events_jsonl(tmp_path):
@@ -622,3 +725,20 @@ def test_grok_example_hooks_json_is_installable():
         assert f"--hook {hook_name}" in command
         assert "--harness grok" in command
         assert "auto" not in command
+
+
+def test_copilot_example_hooks_json_has_powershell():
+    """Copilot CLI runs `powershell` on Windows; bash-only JSON is a no-op there."""
+    path = Path(__file__).resolve().parents[1] / "examples" / "copilot" / "hooks.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    expected = {
+        "agentStop": "stop",
+        "sessionEnd": "session-end",
+        "preCompact": "precompact",
+    }
+    for event, hook_name in expected.items():
+        handler = data["hooks"][event][0]
+        command = f"mempalace hook run --hook {hook_name} --harness copilot"
+        assert handler["type"] == "command"
+        assert handler["bash"] == command
+        assert handler["powershell"] == command

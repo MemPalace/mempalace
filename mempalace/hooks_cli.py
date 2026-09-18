@@ -1354,11 +1354,23 @@ def _detect_harness(data: dict, env: Optional[Mapping[str, str]] = None) -> str:
         data.get("conversation_id") and data.get("workspace_roots")
     ):
         return "cursor"
-    if env.get("COPILOT_HOME"):
-        return "copilot"
     transcript = str(data.get("transcriptPath") or data.get("transcript_path") or "")
     transcript_norm = transcript.replace("\\", "/")
-    if "session-state" in transcript_norm or transcript_norm.endswith("events.jsonl"):
+    stop_reason = data.get("stopReason")
+    if stop_reason is None:
+        stop_reason = data.get("stop_reason")
+    # Claude snake_case envelopes win over an ambient COPILOT_HOME. A path
+    # that merely ends in events.jsonl is not enough to call it Copilot.
+    if (
+        data.get("session_id")
+        and data.get("transcript_path")
+        and stop_reason is None
+        and "session-state" not in transcript_norm
+    ):
+        return "claude-code"
+    if env.get("COPILOT_HOME"):
+        return "copilot"
+    if "session-state" in transcript_norm:
         return "copilot"
     if data.get("stopReason") is not None:
         return "copilot"
@@ -1431,8 +1443,19 @@ def _parse_harness_input(
 
 
 def _wing_from_cwd(cwd: str) -> str:
-    """Derive ``wing_<slug>`` from a workspace path leaf."""
-    name = Path(str(cwd).rstrip("/\\")).name if cwd else "sessions"
+    """Derive ``wing_<slug>`` from a workspace path leaf.
+
+    A cwd inside ``<project>/.claude/worktrees/<wt>`` belongs to ``<project>``,
+    matching ``_wing_from_jsonl_cwd`` / #2388. Claude Stop always sends cwd, so
+    this is the path Stop actually uses.
+    """
+    cwd_norm = str(cwd or "").replace("\\", "/").rstrip("/")
+    if not cwd_norm:
+        return "wing_sessions"
+    _wt_marker = "/.claude/worktrees/"
+    if _wt_marker in cwd_norm:
+        cwd_norm = cwd_norm.split(_wt_marker, 1)[0]
+    name = Path(cwd_norm).name if cwd_norm else "sessions"
     return f"wing_{_safe_wing_slug(name)}"
 
 
@@ -1872,6 +1895,13 @@ def hook_stop(data: dict, harness: str):
                         _log(
                             f"Deferred Grok save; chat_history unflushed at exchange {exchange_count}"
                         )
+                        # Mark the interval now so the next Stop does not spawn
+                        # another waiter while this child is still waiting for
+                        # chat_history.jsonl. SessionEnd recovers a dead waiter.
+                        try:
+                            last_save_file.write_text(str(exchange_count), encoding="utf-8")
+                        except OSError:
+                            pass
                         _output({})
                         return
                 # Save directly via Python API — systemMessage renders in terminal
@@ -1995,6 +2025,12 @@ def hook_session_end(data: dict, harness: str):
         session_id = parsed["session_id"]
         harness = parsed.get("harness") or harness
         transcript_path = _locate_transcript(harness, parsed)
+        if harness == "grok" and (
+            not transcript_path or _count_human_messages(transcript_path) == 0
+        ):
+            waited = _wait_for_grok_chat_history(parsed)
+            if waited:
+                transcript_path = str(waited)
 
         # Read config defensively (mirror hook_stop): a corrupt or unreadable
         # config must not lose the final save, so default to auto-save on and
