@@ -10,12 +10,46 @@ from mempalace.update_awareness import (
     cached_update_status,
     check_updates,
     configure_updates,
+    fetch_latest_stable,
     prepare_upgrade,
     schedule_update_check,
 )
+from mempalace.user_agent import USER_AGENT
 
 
 NOW = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+
+
+class _FakePyPIResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self):
+        return json.dumps(self._payload).encode("utf-8")
+
+
+def test_release_check_identifies_itself_by_version_and_purpose(monkeypatch):
+    """PyPI gets the shared versioned identifier, with the purpose kept as a
+    suffix so an update ping stays distinguishable from provider traffic."""
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["ua"] = request.get_header("User-agent")
+        captured["accept"] = request.get_header("Accept")
+        return _FakePyPIResponse({"info": {"version": "9.9.9"}})
+
+    monkeypatch.setattr("mempalace.update_awareness.urlopen", fake_urlopen)
+
+    assert fetch_latest_stable() == "9.9.9"
+    assert captured["ua"] == f"{USER_AGENT} (update-check)"
+    assert captured["ua"].startswith("mempalace/")
+    assert captured["accept"] == "application/json"
 
 
 def test_disabled_automatic_check_never_contacts_release_source(tmp_path):
