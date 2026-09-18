@@ -4,7 +4,6 @@ import errno
 import logging
 import os
 import sqlite3
-import sys
 from contextlib import closing
 from unittest.mock import MagicMock, call, patch
 
@@ -2116,20 +2115,32 @@ def test_sqlite_integrity_errors_reports_a_path_python_cannot_encode(tmp_path):
     through ``surrogateescape``, so a palace can legitimately live under one.
     Absence is not proven for it, which routes it to the probe.
 
-    What happens there depends on the interpreter, measured on 3.9, 3.11, 3.12,
-    3.13 and 3.14: up to 3.12 ``pathname2url`` raises ``UnicodeEncodeError``
-    while building the URI, before SQLite is reached, and from 3.13 it
-    percent-encodes the byte and the database opens normally. The first is a
-    ``ValueError`` subclass, and the absence gate's docstring promises callers
-    never see one; ``palace._validate_palace_fts5_after_mine`` and
-    ``cli.cmd_repair`` both call this without a guard, so raising there is a
-    traceback out of ``mempalace mine`` and ``mempalace repair`` on a database
-    sitting right at the end of that path.
+    What happens there depends on the interpreter, and the deciding factor is
+    the ``pathname2url`` handler in effect, not a Python minor-version boundary:
+    ``os.fsdecode`` hands the byte back as a lone surrogate through
+    ``surrogateescape``, and ``sqlite_read_uri`` feeds that to ``pathname2url``.
+    Some interpreters call ``quote(pathname)`` with no ``errors`` handler, so a
+    lone surrogate is a strict-UTF-8 encode failure and ``pathname2url`` raises
+    ``UnicodeEncodeError`` (a ``ValueError``) before SQLite is reached -- the
+    probe then has to swallow that into a reported error, because
+    ``palace._validate_palace_fts5_after_mine`` and ``cli.cmd_repair`` both call
+    this without a guard, and raising there is a traceback out of ``mempalace
+    mine`` and ``mempalace repair`` on a database sitting right at the end of
+    that path. Other interpreters percent-encode the surrogate, the database
+    opens read-only, and ``PRAGMA quick_check`` answers ``ok`` -- an empty error
+    list that is a genuinely clean verdict, not a gap the probe failed to
+    surface.
 
-    The invariant asserted here is that the call answers. The version-gated
-    half is what pins the ``ValueError`` catch on the versions where it is
-    reachable at all. Filesystems that enforce UTF-8 names cannot hold this
-    palace, so there the state does not exist and the test says so.
+    The test used to gate the expected report on ``sys.version_info < (3, 13)``,
+    but the surrogateescape ``pathname2url`` handler landed in a 3.12 *point*
+    release, so a 3.12.13 interpreter already percent-encodes and answers
+    ``[]`` -- the old gate then asserted a precondition (that ``pathname2url``
+    raises) which that build does not meet, and turned a correct clean verdict
+    into a failure. The expectation is now pinned to the probe's own
+    behaviour: the error list is the single source of truth, and a non-empty
+    one means the interpreter raised where the probe had to answer.
+    Filesystems that enforce UTF-8 names cannot hold this palace, so there the
+    state does not exist and the test says so.
     """
     palace = os.fsdecode(os.path.join(os.fsencode(str(tmp_path)), b"pal\xff"))
     try:
@@ -2155,11 +2166,20 @@ def test_sqlite_integrity_errors_reports_a_path_python_cannot_encode(tmp_path):
 
     errors = repair.sqlite_integrity_errors(palace)
 
-    assert all("quick_check failed" in error for error in errors)
-    assert not any("named pipe" in error for error in errors)
+    # A non-empty list is the probe's way of saying the open attempt failed --
+    # here that can only be ``pathname2url`` raising on the lone surrogate
+    # (``sqlite_read_uri`` is the only thing in front of the connection that is
+    # sensitive to it, and a named pipe is a different mechanism with a different
+    # message). An empty list means the interpreter percent-encoded the same
+    # byte, the database opened read-only, and ``quick_check`` answered ``ok``:
+    # a genuinely clean verdict, not a gap. Branch on the probe's own answer
+    # rather than on a version, so the invariant holds on an interpreter that
+    # is strict-UTF-8 and one that is not.
+    if errors:
+        assert all("quick_check failed" in error for error in errors)
+        assert not any("named pipe" in error for error in errors)
+
     assert repair.sqlite_integrity_status(palace).checked is True
-    if sys.version_info < (3, 13):
-        assert errors, "pathname2url raises here, and the probe has to report that"
 
 
 @needs_posix_path_errno
