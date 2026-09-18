@@ -99,10 +99,12 @@ def _request_is_mutating(request: dict) -> bool:
     # This decides whether a mid-flight failure may be replayed locally, so it
     # must return a verdict rather than raise: the same `or {}` trap made a
     # non-mapping `params` throw AttributeError instead of answering "not
-    # mutating", and an unhashable name broke the membership test.
+    # mutating", and an unhashable name broke the membership test. A call that
+    # changes state outside the palace must not be rerun either, so this reads
+    # read-only mode's set rather than the palace-write one.
     _, params = _normalize_envelope(request)
     name = params.get("name")
-    return isinstance(name, str) and name in _MUTATING_TOOLS
+    return isinstance(name, str) and name in _READ_ONLY_REFUSED_TOOLS
 
 
 def _dispatch_stdio_request(request: dict):
@@ -115,6 +117,7 @@ def _dispatch_stdio_request(request: dict):
     mutating call that failed mid-flight must NOT be replayed locally (the
     hub may still be executing it), so it surfaces as a JSON-RPC error.
     """
+    import http.client
     import urllib.error
 
     target = _hub_proxy_target()
@@ -128,7 +131,13 @@ def _dispatch_stdio_request(request: dict):
             request,
             _forward_request_to_hub(base_url, headers, request, _config.palace_path),
         )
-    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+    except (
+        urllib.error.URLError,
+        OSError,
+        TimeoutError,
+        ValueError,
+        http.client.HTTPException,
+    ) as exc:
         reached_hub = isinstance(exc, urllib.error.HTTPError)
         if not reached_hub and not _request_is_mutating(request):
             logger.warning("Hub at %s unreachable (%s); handling request locally", base_url, exc)
