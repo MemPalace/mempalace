@@ -186,9 +186,20 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
     source_adapter = payload.get("source_adapter")
     mode = payload.get("mode") or "projects"
     wing = payload.get("wing")
+    room = payload.get("room")
     agent = payload.get("agent") or "mempalace"
     limit = int(payload.get("limit") or 0)
     dry_run = bool(payload.get("dry_run"))
+
+    # ``room`` overrides per-file room routing, which only the projects miner
+    # does; convos and extract have their own room semantics. Reject it for
+    # those modes rather than silently ignoring it (mirrors the files guard).
+    if room is not None and mode != "projects":
+        return {
+            "success": False,
+            "error": "mine room is supported only in projects mode",
+            "exit_code": 2,
+        }
 
     raw_files = payload.get("files")
     files = None
@@ -313,6 +324,7 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
                 include_ignored=include_ignored,
                 max_chunks_per_file=payload.get("max_chunks_per_file"),
                 files=files,
+                room=room,
             )
         else:
             return {"success": False, "error": f"invalid mine mode: {mode}", "exit_code": 2}
