@@ -10,6 +10,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Bug Fixes
 
+- **The stdio MCP servers no longer exit on a line `json.loads` cannot load.** An
+  integer past Python's digit limit raises `ValueError` and nesting too deep to
+  parse raises `RecursionError`. Neither the full server's stdio loop nor the light
+  server's caught them, so one such line ended the session. The full server
+  (`mempalace-mcp` with no hub running) now answers it with `-32700`, as the hub's
+  HTTP transport does, and `mempalace-light-mcp` skips it, as it skips invalid
+  JSON. (#2556)
 - **A `known_entities.json` write no longer appears to hang on Windows when the
   directory refuses a temporary file.** `_publish_registry` falls back to writing
   in place when the directory takes no new name, and it learned that from the
