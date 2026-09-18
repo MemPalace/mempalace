@@ -157,6 +157,44 @@ Delete a drawer by ID. Irreversible.
 
 ---
 
+### `mempalace_delete_drawers`
+
+Bulk-delete drawers by explicit `drawer_ids`, or by wing and/or room scope. Refuses an unscoped call. Returns a dry-run match count and a sample of the affected (wing, room) pairs by default; pass `dry_run=false` to commit. Closets quoting a deleted drawer's `source_file` are purged with it (#2325). Irreversible.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `drawer_ids` | array of strings | No | Explicit drawer IDs to delete. Takes precedence over wing/room |
+| `wing` | string | No | Scope filter: delete every drawer in this wing |
+| `room` | string | No | Scope filter: delete every drawer in this room |
+| `dry_run` | boolean | No | Preview the match count without deleting; default `true`. Pass `false` to actually delete |
+
+**Returns (dry run):** `{ success, dry_run, scope, match_count, match_chunks, match_rows, sample, hint }`
+**Returns (commit):** `{ success, dry_run, scope, deleted, deleted_chunks, deleted_rows, closets_deleted }`
+
+IDs that resolve to nothing are reported in `not_found` (omitted when empty), so one stale id does not fail the batch.
+
+---
+
+### `mempalace_move_drawers`
+
+Bulk-move drawers to another wing and/or room without touching their content. Scope by explicit `drawer_ids` or by wing and/or room; refuses an unscoped call. Returns a dry-run match count and sample by default; pass `dry_run=false` to commit. Unlike a delete, a move leaves closets alone.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `drawer_ids` | array of strings | No | Explicit drawer IDs to move. Takes precedence over wing/room |
+| `wing` | string | No | Scope filter: move every drawer in this wing |
+| `room` | string | No | Scope filter: move every drawer in this room |
+| `target_wing` | string | No | Destination wing (optional if `target_room` is given) |
+| `target_room` | string | No | Destination room (optional if `target_wing` is given) |
+| `dry_run` | boolean | No | Preview the match count without moving; default `true`. Pass `false` to actually move |
+
+**Returns (dry run):** `{ success, dry_run, scope, match_count, match_chunks, match_rows, sample, target_wing, target_room, hint }`
+**Returns (commit):** `{ success, dry_run, scope, moved, unchanged, moved_rows, target_wing, target_room }`
+
+Drawers already at the target are counted in `unchanged` rather than rewritten. `moved` counts logical drawers and `moved_rows` the physical rows they occupy.
+
+---
+
 ### `mempalace_mine`
 
 Mine a directory into the palace — the MCP equivalent of `mempalace mine`. `mode='convos'` also accepts a single conversation file. Wraps the same in-process miners the CLI uses; runs synchronously and returns the miner's summary as `output`. The palace write lock is automatic — a concurrent mine returns a structured already-running error. Orphan cleanup is separate (see `mempalace_sync`).

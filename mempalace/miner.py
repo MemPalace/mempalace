@@ -2371,7 +2371,7 @@ def _mine_impl(
     try:
         for i, filepath in enumerate(files, 1):
             try:
-                drawers, room, skip_reason = process_file(
+                drawers, resolved_room, skip_reason = process_file(
                     filepath=filepath,
                     project_path=project_path,
                     collection=collection,
@@ -2408,7 +2408,7 @@ def _mine_impl(
                     files_skipped_chunk_cap += 1
             else:
                 total_drawers += drawers
-                room_counts[room] += 1
+                room_counts[resolved_room] += 1
                 files_mined += 1
                 if not dry_run:
                     print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers}")
