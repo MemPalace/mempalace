@@ -22,9 +22,19 @@ def _chunk_index(meta):
 
 
 def _response_safe_meta(meta):
-    safe_meta = _safe_meta(meta)
+    safe_meta = dict(_safe_meta(meta))
+    if not safe_meta.get("last_modified") and safe_meta.get("filed_at"):
+        safe_meta["last_modified"] = safe_meta["filed_at"]
     if safe_meta.get("source_file"):
         safe_meta["source_file"] = Path(safe_meta["source_file"]).name
+    # ``source_dir_ino`` is bookkeeping for ``sync``, which reads the metadata
+    # directly. It says nothing a caller can use and it describes the host's
+    # filesystem, which is the same reason the path above is cut to its name.
+    # It comes off the copy made above, never the record: ``_safe_meta`` hands
+    # back the caller's own dict, and popping the field from a record a writer
+    # still holds would drop it from whatever that writer filed next. No caller
+    # passes a record it goes on to write through here today.
+    safe_meta.pop("source_dir_ino", None)
     return safe_meta
 
 
@@ -164,6 +174,21 @@ def _fetch_drawer_rows(col, where=None, page_size: int = 1000, include=None):
     offset = 0
     want_docs = "documents" in include
     want_meta = "metadatas" in include
+
+    # Let the backend walk its own cursor once (#2452): the offset loop below
+    # is O(n^2) on backends whose get(limit=, offset=) re-scans from the start,
+    # the same trap _fetch_all_metadata() avoids through get_all_metadata().
+    from ..backends.base import BaseCollection
+
+    if isinstance(col, BaseCollection):
+        result = col.get_all_rows(where=where, include=include)
+        ids = list(_chroma_field(result, "ids", []) or [])
+        all_docs = _chroma_field(result, "documents", []) or []
+        all_metas = _chroma_field(result, "metadatas", []) or []
+        for idx in range(len(ids)):
+            documents.append(all_docs[idx] if want_docs and idx < len(all_docs) else "")
+            metadatas.append(all_metas[idx] if want_meta and idx < len(all_metas) else {})
+        return ids, documents, metadatas
 
     while True:
         kwargs = {
@@ -397,7 +422,14 @@ def tool_add_drawer(
         "filed_at": datetime.now().isoformat(),
         "id_recipe": ID_RECIPE,
     }
+    if source_file:
+        # A drawer filed here names a source file the same way a mined one
+        # does, and ``sync`` decides both by the same rule, so it records the
+        # same directory identity (#2320). Without it this tool would file the
+        # one kind of drawer in a palace that sync cannot protect.
+        base_meta.update(identity_metadata(source_file))
 
+    base_meta["last_modified"] = base_meta["filed_at"]
     # Idempotency. Three cases to detect a prior committed write:
     # (a) Single-doc path: drawer_id row exists (the only id used).
     # (b) Chunked path: probe the LAST chunk id — its presence implies
@@ -1129,6 +1161,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             if room.lower() != str(old_meta.get("room") or "").lower():
                 new_meta["room"] = room
 
+        new_meta["last_modified"] = datetime.now().isoformat()
         _wal_log(
             "update_drawer",
             {

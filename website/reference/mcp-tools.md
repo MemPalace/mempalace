@@ -68,8 +68,22 @@ Semantic search. Returns verbatim drawer content with similarity scores.
 | `limit` | integer | No | Max results (default: 5) |
 | `wing` | string | No | Filter by wing |
 | `room` | string | No | Filter by room |
+| `since` | string | No | Include drawers filed on or after this ISO date/datetime |
+| `before` | string | No | Include drawers filed strictly before this ISO date/datetime |
 
 **Returns:** `{ query, filters, results: [{ text, wing, room, source_file, similarity }] }`
+
+Each hit also includes date provenance: `filed_at` (equal to legacy `created_at`),
+legacy `authored_at`, `authored_at_source`, `content_date`, and
+`content_date_source`. `authored_at_source` identifies stored authorship metadata
+(`authored_at`), the historical ingestion-time fallback (`filed_at`), or missing
+evidence (`unknown`). An inferred `content_date` is kept separate; its source is
+`filename`, `frontmatter`, `body`, `mtime`, or `unknown` for unrecorded provenance.
+Missing content dates are `null`. These fields do not change ranking or the
+filing-date semantics of `since`/`before`.
+
+See [date provenance](https://github.com/MemPalace/mempalace/blob/develop/docs/authored-at.md)
+for interpretation and compatibility details.
 
 ---
 
@@ -187,7 +201,11 @@ Prune drawers whose source files are gitignored, deleted, or moved. Returns a dr
 
 **Returns:** `{ scanned, kept, gitignored, missing, unresolved, no_source, out_of_scope, removed_drawers, removed_closets, dry_run, by_source, unresolved_by_source }`
 
-Only `gitignored` and `missing` are removed. A source file that is not at its path counts as `missing` only while the palace can still see a source file of its own in the same directory: a deletion leaves its neighbours behind, an unmounted volume takes all of them at once. Everything else counts as `unresolved`, which is kept and named in `unresolved_by_source` the way removals are named in `by_source`.
+Only `gitignored` and `missing` are removed. A source file that is not at its path counts as `missing` only while the palace can still see a source file of its own in the same directory, and only while that directory is still the one the missing file was mined from: a deletion leaves its neighbours behind, an unmounted volume takes all of them at once, and a volume or bind mount put in place of that directory has neighbours that never knew the file. Everything else counts as `unresolved`, which is kept and named in `unresolved_by_source` the way removals are named in `by_source`.
+
+Mining records which directory that was by storing its inode on each drawer. A path is only a name: mount something at it and the name resolves to the root of what was mounted, which is a different inode, and unmounting brings the original back. Nothing is written to the source tree for this, so a read-only mount records an identity like any other. Drawers filed before this existed carry none, and are decided by the neighbour rule alone. One volume swapped for another at the same path is not separated, since the root of a filesystem carries a fixed inode for its type. A directory deleted and recreated may come back with a different inode, which keeps the drawers of files that really went. There is no bulk way out of that on purpose, since a drawer stranded that way and a drawer a volume is holding are the same reading: `unresolved_by_source` names the sources, and `mempalace_delete_by_source` removes them one at a time. That tool is blunter than this pass, matching `source_file` exactly and consulting neither the neighbours nor the identity, so read its dry run before applying it.
+
+`removed_closets` counts the closets of the sources this pass left holding no drawer, not of every source a drawer was removed from. Since the verdict is per drawer, a source can lose one and keep another, and purging by source would strand that survivor without the lines that index it. A source whose remaining drawers are in a wing this run did not read keeps its closets for the same reason. The sources it covers are therefore a subset of those named in `by_source`, though the count itself is of closet rows rather than of sources, and a source that kept its closets is not distinguished from one that had none.
 
 ---
 
@@ -566,7 +584,7 @@ List events with structured filters.
 | `since_event_id` | string | No | Only events strictly after this id in append order (precise forward cursor) |
 | `before_event_id` | string | No | Only events strictly before this id in append order (reverse/historical paging) |
 | `since_created_at` | string | No | Only events at/after this time (inclusive) |
-| `order` | string | No | `asc` (oldest first, default) or `desc` (newest first) |
+| `order` | string | No | `desc` (newest first) when `since_event_id` is omitted; `asc` (oldest first) when resuming from `since_event_id`. Explicit `order` always overrides |
 | `limit` | integer | No | Max events (default 50, cap 500) |
 
 **Returns:** `{ events: [...], count }`

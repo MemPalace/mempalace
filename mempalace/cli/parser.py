@@ -52,7 +52,7 @@ def main():
     parser.add_argument(
         "--palace",
         default=None,
-        help="Where the palace lives (default: from ~/.mempalace/config.json or ~/.mempalace/palace)",
+        help="Where the palace lives (default: palace_path from config.json, resolved via XDG — see mempalace.config)",
     )
     parser.add_argument(
         "--backend",
@@ -66,6 +66,12 @@ def main():
     # init
     p_init = sub.add_parser("init", help="Detect rooms from your folder structure")
     p_init.add_argument("dir", help="Project directory to set up")
+    p_init.add_argument(
+        "--palace",
+        default=argparse.SUPPRESS,
+        help="Where the palace lives (default: from ~/.mempalace/config.json or ~/.mempalace/palace); "
+        "may be passed before or after the subcommand — both positions are accepted (#2366)",
+    )
     p_init.add_argument(
         "--backend",
         default=None,
@@ -151,6 +157,11 @@ def main():
     )
 
     # mine
+    add_cli_write_routing_flags(
+        p_init,
+        allow_background=False,
+    )
+
     p_mine = sub.add_parser("mine", help="Mine files into the palace")
     p_mine.add_argument(
         "dir", help="Directory to mine, or one conversation file with --mode convos"
@@ -212,16 +223,7 @@ def main():
     p_mine.add_argument(
         "--dry-run", action="store_true", help="Show what would be filed without filing"
     )
-    p_mine.add_argument(
-        "--daemon",
-        action="store_true",
-        help="Submit this mine to the opt-in local daemon queue",
-    )
-    p_mine.add_argument(
-        "--background",
-        action="store_true",
-        help="With --daemon, return a job id immediately instead of waiting",
-    )
+    add_cli_write_routing_flags(p_mine)
     p_mine.add_argument(
         "--extract",
         choices=["exchange", "general"],
@@ -265,6 +267,7 @@ def main():
     )
 
     # sync
+    add_cli_write_routing_flags(p_sweep)
     p_sync = sub.add_parser(
         "sync",
         help="Prune drawers whose source files are gitignored, deleted, or moved (#1252)",
@@ -295,18 +298,9 @@ def main():
         action="store_false",
         help="Actually delete drawers (overrides --dry-run; requires --wing or a project root)",
     )
-    p_sync.add_argument(
-        "--daemon",
-        action="store_true",
-        help="Submit this sync to the opt-in local daemon queue",
-    )
-    p_sync.add_argument(
-        "--background",
-        action="store_true",
-        help="With --daemon, return a job id immediately instead of waiting",
-    )
 
     # search
+    add_cli_write_routing_flags(p_sync)
     p_search = sub.add_parser("search", help="Find anything, exact words")
     p_search.add_argument("query", help="What to search for")
     p_search.add_argument(
@@ -387,7 +381,7 @@ def main():
     p_hook_run.add_argument(
         "--harness",
         required=True,
-        choices=["claude-code", "codex"],
+        choices=["claude-code", "codex", "dsh"],
         help="Harness type (determines stdin JSON format)",
     )
 
@@ -409,9 +403,31 @@ def main():
         ),
     )
     p_rules.add_argument(
-        "--agent",
+        "--host",
         required=True,
-        help="Stable agent identity to render into the rules, e.g. mac-claude",
+        help="Stable machine label (lowercase), e.g. windows, mac, blade",
+    )
+    p_rules.add_argument(
+        "--harness",
+        required=True,
+        help="Runtime family (lowercase), e.g. claude, codex, grok, antigravity",
+    )
+    p_rules.add_argument(
+        "--project",
+        required=True,
+        help=(
+            "Example workspace/repo name (lowercase). The rendered block tells "
+            "the agent to compose host:harness:<project> from the current workspace"
+        ),
+    )
+    p_rules.add_argument(
+        "--mcp",
+        choices=["full", "light"],
+        default="full",
+        help=(
+            "Tool names in the block: 'full' (default, the 45-tool mempalace-mcp) or "
+            "'light' (palace_query / palace_exec / palace_coordinate)"
+        ),
     )
 
     # repair
@@ -755,7 +771,11 @@ def main():
     p_ls_watch.add_argument(
         "--state-file",
         default=None,
-        help="Persist the cursor here so a restart resumes exactly where it stopped",
+        help=(
+            "Persist the cursor here so a restart resumes exactly where it stopped. "
+            "When omitted with --agent, defaults to "
+            "~/.mempalace/watch/<agent>.json with '_' doubled and ':' sanitized to '_'"
+        ),
     )
     p_ls_watch.add_argument(
         "--from-start",

@@ -133,13 +133,24 @@ TOOLS = {
         "handler": tool_kg_supersede,
     },
     "mempalace_kg_timeline": {
-        "description": "Chronological timeline of facts. Shows the story of an entity (or everything) in order.",
+        "description": "Chronological timeline of facts with pagination. Shows the story of an entity (or everything) in order. Returns total matching count for pagination.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "entity": {
                     "type": "string",
                     "description": "Entity to get timeline for (optional — omit for full timeline)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max facts per page (default 100, max 100)",
+                    "minimum": 1,
+                    "maximum": 100,
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Offset for pagination (default 0)",
+                    "minimum": 0,
                 },
             },
         },
@@ -786,9 +797,10 @@ TOOLS = {
     },
     "mempalace_event_list": {
         "description": (
-            "List agent-coordination events with structured filters. Use order='desc' to return"
-            " newest events first (e.g. for sweeping recent inbox or inspecting project tail in"
-            " a single call); default order is 'asc' (oldest first, append order). Use"
+            "List agent-coordination events with structured filters. Defaults to order='desc'"
+            " (newest events first) when since_event_id is omitted (e.g. for sweeping recent inbox"
+            " or inspecting recent history); defaults to order='asc' (chronological forward order)"
+            " when resuming from since_event_id. Explicit order always overrides this default. Use"
             " since_event_id as the resume cursor: it means strictly AFTER that event in append"
             " order (rowid > anchor), so it cannot skip anything. For reverse/historical paging,"
             " use before_event_id (rowid < anchor). Do NOT resume with since_created_at — a"
@@ -835,7 +847,7 @@ TOOLS = {
                 "limit": {"type": "integer", "description": "Max events to return (default 50)"},
                 "order": {
                     "type": "string",
-                    "description": "'asc' (oldest first, default) or 'desc' (newest first, optional)",
+                    "description": "'desc' (newest first, default without cursor) or 'asc' (chronological forward, default with since_event_id, optional)",
                 },
                 "preview": {
                     "type": "boolean",

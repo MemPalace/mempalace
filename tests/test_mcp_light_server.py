@@ -2,9 +2,17 @@
 test_mcp_light_server.py — Integration tests for Lightweight MemPalace MCP Server.
 """
 
+import io
 import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 from mempalace import mcp_light_server, mcp_server
 from mempalace.palace_graph import invalidate_graph_cache
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _patch_light_server(monkeypatch, config, kg):
@@ -40,6 +48,10 @@ class TestLightMcpProtocol:
         tools = res["result"]["tools"]
         tool_names = [t["name"] for t in tools]
         assert tool_names == ["palace_query", "palace_exec", "palace_coordinate"]
+        coord_tool = next(t for t in tools if t["name"] == "palace_coordinate")
+        props = coord_tool["inputSchema"]["properties"]
+        for expected_prop in ("order", "limit", "preview", "since_created_at"):
+            assert expected_prop in props, f"Missing {expected_prop} in palace_coordinate schema"
 
     def test_tools_list_read_only(self, monkeypatch, config, kg):
         _patch_light_server(monkeypatch, config, kg)
@@ -230,10 +242,27 @@ class TestPalaceCoordinate:
         task_event = payload.get("task", {})
         assert task_event.get("type") == "task.request"
 
-        # List events
+        # Append a second event
+        second_cmd = (
+            "EVENT APPEND type:status stream:project/mempalace room:status "
+            'from:windows:claude:mempalace to:windows:antigravity:mempalace body:"Task acknowledged"'
+        )
+        second_res = mcp_light_server.handle_light_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 51,
+                "method": "tools/call",
+                "params": {"name": "palace_coordinate", "arguments": second_cmd},
+            }
+        )
+        second_payload = json.loads(second_res["result"]["content"][0]["text"])
+        assert second_payload.get("success") is True
+        second_event = second_payload["event"]
+
+        # 1. Default without cursor returns newest first
         list_req = {
             "jsonrpc": "2.0",
-            "id": 51,
+            "id": 52,
             "method": "tools/call",
             "params": {
                 "name": "palace_coordinate",
@@ -243,7 +272,55 @@ class TestPalaceCoordinate:
         list_res = mcp_light_server.handle_light_request(list_req)
         list_payload = json.loads(list_res["result"]["content"][0]["text"])
         events = list_payload.get("events", [])
-        assert len(events) >= 1
+        assert len(events) == 2
+        assert events[0]["id"] == second_event["id"]
+        assert events[1]["id"] == task_event["id"]
+
+        # 2. EVENT INBOX defaults to newest first and preview=True
+        inbox_req = {
+            "jsonrpc": "2.0",
+            "id": 53,
+            "method": "tools/call",
+            "params": {
+                "name": "palace_coordinate",
+                "arguments": "EVENT INBOX to:windows:claude:mempalace",
+            },
+        }
+        inbox_res = mcp_light_server.handle_light_request(inbox_req)
+        inbox_payload = json.loads(inbox_res["result"]["content"][0]["text"])
+        inbox_events = inbox_payload.get("events", [])
+        assert len(inbox_events) == 1
+        assert inbox_events[0]["id"] == task_event["id"]
+
+        # 3. Resuming with since_event_id returns forward chronological order
+        resume_req = {
+            "jsonrpc": "2.0",
+            "id": 54,
+            "method": "tools/call",
+            "params": {
+                "name": "palace_coordinate",
+                "arguments": f"EVENT LIST stream:project/mempalace since_id:{task_event['id']}",
+            },
+        }
+        resume_res = mcp_light_server.handle_light_request(resume_req)
+        resume_payload = json.loads(resume_res["result"]["content"][0]["text"])
+        assert len(resume_payload.get("events", [])) == 1
+        assert resume_payload["events"][0]["id"] == second_event["id"]
+
+        # 4. Uppercase ORDER DESC works cleanly
+        desc_req = {
+            "jsonrpc": "2.0",
+            "id": 55,
+            "method": "tools/call",
+            "params": {
+                "name": "palace_coordinate",
+                "arguments": f"EVENT LIST stream:project/mempalace ORDER DESC since_id:{task_event['id']}",
+            },
+        }
+        desc_res = mcp_light_server.handle_light_request(desc_req)
+        desc_payload = json.loads(desc_res["result"]["content"][0]["text"])
+        assert len(desc_payload.get("events", [])) == 1
+        assert desc_payload["events"][0]["id"] == second_event["id"]
 
     def test_artifact_put_and_get(self, monkeypatch, config, kg):
         _patch_light_server(monkeypatch, config, kg)
@@ -714,3 +791,124 @@ class TestHubDispatch:
         assert captured["name"] == "mempalace_traverse"
         assert captured["arguments"]["start_room"] == "auth-flow"
         assert captured["arguments"]["max_hops"] == 3
+
+    def test_tools_list_schema_includes_hardened_fields(self, monkeypatch, config, kg):
+        _patch_light_server(monkeypatch, config, kg)
+        req = {"jsonrpc": "2.0", "id": 98, "method": "tools/list"}
+        res = mcp_light_server.handle_light_request(req)
+        tools = {t["name"]: t for t in res["result"]["tools"]}
+
+        exec_schema = tools["palace_exec"]["inputSchema"]["properties"]
+        assert "agent_name" in exec_schema
+        assert "entry" in exec_schema
+        assert "at" in exec_schema
+        assert "old_object" in exec_schema
+        assert "new_object" in exec_schema
+
+        assert "authorized mutations" in tools["palace_exec"]["description"]
+        assert "NEVER use palace_coordinate for reads" in tools["palace_query"]["description"]
+        assert "DO NOT use for reading memories" in tools["palace_coordinate"]["description"]
+
+    def test_palace_exec_structured_diary_write(self, monkeypatch, config, kg):
+        _patch_light_server(monkeypatch, config, kg)
+        req = {
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "tools/call",
+            "params": {
+                "name": "palace_exec",
+                "arguments": {
+                    "action": "diary_write",
+                    "agent_name": "medgemma",
+                    "entry": "Patient HbA1c 7.4% stable",
+                    "topic": "clinical",
+                },
+            },
+        }
+        res = mcp_light_server.handle_light_request(req)
+        assert res["id"] == 99
+        payload = json.loads(res["result"]["content"][0]["text"])
+        assert payload.get("success") is True or "drawer_id" in payload or "entry_id" in payload
+
+    def test_palace_exec_structured_kg_supersede(self, monkeypatch, config, kg):
+        _patch_light_server(monkeypatch, config, kg)
+        kg.add_triple("Max", "grade", "6", valid_from="2025-01-01")
+        req = {
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "tools/call",
+            "params": {
+                "name": "palace_exec",
+                "arguments": {
+                    "action": "kg_supersede",
+                    "subject": "Max",
+                    "predicate": "grade",
+                    "old_object": "6",
+                    "new_object": "7",
+                },
+            },
+        }
+        res = mcp_light_server.handle_light_request(req)
+        assert res["id"] == 100
+        payload = json.loads(res["result"]["content"][0]["text"])
+        assert payload.get("success") is True
+
+
+def test_light_server_help_lists_the_light_servers_own_options():
+    """``--help`` reaches the light server's parser (#2528).
+
+    It used to be answered while the light server was still importing the full
+    server, which parsed argv on import and printed its own options, including
+    an HTTP transport the light server rejects.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-c", "from mempalace.mcp_light_server import main; main()", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=str(REPO_ROOT),
+    )
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 0, output
+    assert "MemPalace Lightweight MCP Server" in output
+    assert "--transport" not in output
+
+
+def test_light_server_applies_the_flags_it_shares_with_the_full_server(monkeypatch, tmp_path):
+    """``--palace``, ``--backend`` and ``--read-only`` reach the state the tools read.
+
+    ``--palace`` also puts the knowledge graph beside that palace, as it does
+    for the full server.
+    """
+    from _mcp_server_helpers import _keep_server_command_line_state
+
+    _keep_server_command_line_state(monkeypatch)
+    for name in (
+        "_maybe_eager_warmup_embedder",
+        "_start_idle_exit_watchdog",
+        "_start_write_stall_watchdog",
+    ):
+        monkeypatch.setattr(mcp_server, name, lambda: None)
+    monkeypatch.setattr(mcp_light_server, "_restore_stdout", lambda: None)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    palace = tmp_path / "palace"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "mempalace-light-mcp",
+            "--palace",
+            str(palace),
+            "--backend",
+            "sqlite_exact",
+            "--read-only",
+        ],
+    )
+
+    mcp_light_server.main()
+
+    assert mcp_server._config.palace_path == str(palace)
+    assert mcp_server._READ_ONLY is True
+    assert os.environ["MEMPALACE_BACKEND"] == "sqlite_exact"
+    assert mcp_server._resolve_kg_path() == str(palace / "knowledge_graph.sqlite3")

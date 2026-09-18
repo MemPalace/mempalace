@@ -41,6 +41,21 @@ def _maintenance_requires_chroma(palace_path: str, command_name: str) -> bool:
     return False
 
 
+def _resolve_cli_write_routing_or_exit(args, operation: str):
+    """Resolve routine CLI routing and render configuration errors."""
+    try:
+        return resolve_cli_write_routing(
+            args,
+            operation=operation,
+        )
+    except WriteRoutingError as exc:
+        print(
+            f"mempalace: invalid CLI write routing: {exc}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from exc
+
+
 def _gather_origin_samples(project_dir) -> list:
     """Collect Tier-1 samples for corpus-origin detection.
 

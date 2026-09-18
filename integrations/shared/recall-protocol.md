@@ -30,34 +30,34 @@ question-driven, not reflexive.
 
 1. **On wake-up** (if a session-start hook injected context, honour its wing scoping / `additional_context`): scope recall to the wing inferred from the workspace, then continue.
 2. **Before responding** about people, projects, past events, or prior
-   decisions: call `mempalace_search` first. For relational or temporal
+   decisions: call `palace_query FIND` (or `mempalace_search`) first. For relational or temporal
    facts ("who reported to whom in March", "what was true then"), call
-   `mempalace_kg_query` instead or as well.
+   `palace_query KG` (or `mempalace_kg_query`) instead or as well.
 3. **If unsure** about a fact (name, age, relationship, preference): say
    "let me check the palace" and query. Wrong is worse than slow.
 4. **Return verbatim.** Quote the drawer's exact stored words. Never
    summarize, paraphrase, or lossy-compress what the palace returns —
    that is the whole point of the system.
 5. **After a substantive session**, record continuity with
-   `mempalace_diary_write` (background hooks may already do this — do not
+   `palace_exec DIARY WRITE` or `mempalace_diary_write` (background hooks may already do this — do not
    double-file).
 6. **When a fact changes**, choose the operation that preserves temporal
-   history: use `mempalace_kg_supersede` for single-valued replacements
+   history: use `palace_exec KG SUPERSEDE` (or `mempalace_kg_supersede`) for single-valued replacements
    (model, employer, owner, address, current status),
-   `mempalace_kg_invalidate` for facts that ended without replacement,
-   and `mempalace_kg_add` for independent/coexisting facts.
+   `palace_exec KG INVALIDATE` (or `mempalace_kg_invalidate`) for facts that ended without replacement,
+   and `palace_exec KG ADD` (or `mempalace_kg_add`) for independent/coexisting facts.
 
 ## Tool selection
 
-| You need | Tool |
-|---|---|
-| Find any memory by meaning | `mempalace_search` (start here) |
-| Relational / time-bound facts about an entity | `mempalace_kg_query` |
-| Replace a single-valued fact | `mempalace_kg_supersede` |
-| The chronological story of an entity | `mempalace_kg_timeline` |
-| Recent session continuity | `mempalace_diary_read` |
-| Which wings / rooms exist (when scope unknown) | `mempalace_list_wings`, `mempalace_list_rooms` |
-| Record this session | `mempalace_diary_write` |
+| You need | Light MCP (Preferred) | Full MCP (Legacy) |
+|---|---|---|
+| Find any memory by meaning | `palace_query FIND <terms>` | `mempalace_search` |
+| Relational / time-bound facts about an entity | `palace_query KG <entity>` | `mempalace_kg_query` |
+| Replace a single-valued fact | `palace_exec KG SUPERSEDE` | `mempalace_kg_supersede` |
+| The chronological story of an entity | `palace_query KG TIMELINE <entity>` | `mempalace_kg_timeline` |
+| Recent session continuity | `palace_query DIARY <agent>` | `mempalace_diary_read` |
+| Which wings / rooms exist (when scope unknown) | `palace_query WINGS`, `palace_query ROOMS` | `mempalace_list_wings`, `mempalace_list_rooms` |
+| Record this session | `palace_exec DIARY WRITE` | `mempalace_diary_write` |
 
 `mempalace_search` takes a short natural-language `query` (keywords or a
 question — not a system prompt or pasted conversation) plus optional

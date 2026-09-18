@@ -2491,3 +2491,1231 @@ class TestUnresolvedSources:
         named = [line for line in out.splitlines() if line.startswith("    ") and "gone.py" in line]
         assert len(named) == 5, out
         assert "    and 2 more source file(s)" in out, out
+
+
+class TestMinedFilesystemIdentity:
+    """#2320's remaining mount shapes: the witness is not in the directory the
+    file it speaks for was mined from.
+
+    Corroboration asks whether the palace still sees a source of its own in
+    the directory. It cannot ask whether that directory is the one the missing
+    file was mined from, so a mount point whose lower layer holds a mined
+    file, a volume mounted over a directory the palace knows, and a bind mount
+    of another directory over it all corroborate removals they should not.
+    ``source_identity`` records the directory's inode at mine time; these
+    tests drive what sync does with it.
+    """
+
+    def _seed(self, palace_path, rows, wing="demo"):
+        """rows: list of (drawer_id, source_file, source_dir_ino or None)."""
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+        metadatas = []
+        for _, source_file, fs_id in rows:
+            meta = {
+                "wing": wing,
+                "room": "src",
+                "source_file": str(source_file),
+                "chunk_index": 0,
+                "added_by": "miner",
+                "filed_at": "2026-08-23T00:00:00",
+            }
+            if fs_id:
+                meta["source_dir_ino"] = fs_id
+            metadatas.append(meta)
+        col.add(
+            ids=[r[0] for r in rows],
+            documents=[f"doc {i}" for i in range(len(rows))],
+            embeddings=[[float(i + 1), 0.0, 0.0] for i in range(len(rows))],
+            metadatas=metadatas,
+        )
+        del client
+
+    def _repo_with_a_neighbour(self, tmp_dir):
+        repo = Path(tmp_dir) / "repo"
+        repo.mkdir(parents=True)
+        neighbour = repo / "neighbour.py"
+        neighbour.write_text("# still here\n")
+        gone = repo / "gone.py"
+        gone.write_text("# was here\n")
+        gone.unlink()
+        return repo, neighbour, gone
+
+    def _run(self, palace_path, repo):
+        from mempalace.sync import sync_palace
+
+        return sync_palace(
+            palace_path=palace_path, project_dirs=[str(repo)], wing="demo", dry_run=True
+        )
+
+    @pytest.mark.parametrize("matching_first", [True, False])
+    def test_each_drawer_is_decided_by_its_own_identity(self, tmp_dir, palace_path, matching_first):
+        """One source's drawers need not agree about the identity: a mine
+        records one, a sweep of the same file records none, and a re-mine after
+        the directory was replaced records a different one. Deciding the source
+        once and applying that to every drawer would make the verdict turn on
+        which drawer the pass reached first, which is the thing #2322 rules out
+        for the corroboration itself."""
+        from mempalace import source_identity as si
+
+        repo, neighbour, gone = self._repo_with_a_neighbour(tmp_dir)
+        here = si.directory_identity(repo)
+        mined_elsewhere = "1000000"  # an inode that is not this directory's
+        assert here is not None and here != mined_elsewhere
+        matching = ("d_gone_here", gone, here)
+        other = ("d_gone_elsewhere", gone, mined_elsewhere)
+        rows = [matching, other] if matching_first else [other, matching]
+
+        self._seed(palace_path, rows + [("d_neighbour", neighbour, here)])
+        report = self._run(palace_path, repo)
+
+        assert report["missing"] == 1
+        assert report["unresolved"] == 1
+        assert report["by_source"] == {str(gone): 1}
+
+    def test_a_source_keeps_its_closets_while_one_of_its_drawers_survives(
+        self, tmp_dir, palace_path
+    ):
+        """The closet purge is per source, and the verdict is per drawer.
+
+        A source can now have one drawer removed and another kept, so purging
+        its closets on the first removal would strand the survivor without the
+        lines that index it. Nothing rebuilds them either: ``file_already_mined``
+        skips a file whose mtime has not moved, so the loss would outlive the
+        volume's return. This is the only test here that applies rather than
+        reports, because the purge sits behind the dry-run return.
+        """
+        from mempalace import source_identity as si
+        from mempalace.sync import sync_palace
+
+        repo, neighbour, gone = self._repo_with_a_neighbour(tmp_dir)
+        here = si.directory_identity(repo)
+        mined_elsewhere = "1000000"  # an inode that is not this directory's
+        assert here is not None and here != mined_elsewhere
+
+        self._seed(
+            palace_path,
+            [
+                ("d_gone_here", gone, here),  # removable
+                ("d_gone_elsewhere", gone, mined_elsewhere),  # kept
+                ("d_neighbour", neighbour, here),
+            ],
+        )
+        client = chromadb.PersistentClient(path=palace_path)
+        closets = client.get_or_create_collection(
+            "mempalace_closets", metadata={"hnsw:space": "cosine"}
+        )
+        closets.add(
+            ids=["closet_gone_01"],
+            documents=["topic line"],
+            embeddings=[[1.0, 0.0, 0.0]],
+            metadatas=[
+                {
+                    "wing": "demo",
+                    "room": "src",
+                    "source_file": str(gone),
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-08-23T00:00:00",
+                }
+            ],
+        )
+        del closets, client
+
+        report = sync_palace(
+            palace_path=palace_path, project_dirs=[str(repo)], wing="demo", dry_run=False
+        )
+
+        assert report["missing"] == 1, report
+        assert report["unresolved"] == 1, report
+        assert report["removed_drawers"] == 1, report
+        assert report["removed_closets"] == 0, report
+
+        client = chromadb.PersistentClient(path=palace_path)
+        drawers_left = set(client.get_collection("mempalace_drawers").get(include=[])["ids"])
+        closets_left = client.get_collection("mempalace_closets").get(include=[])["ids"]
+        assert drawers_left == {"d_gone_elsewhere", "d_neighbour"}, drawers_left
+        assert closets_left == ["closet_gone_01"], closets_left
+
+    def test_a_wing_scoped_run_keeps_closets_a_drawer_outside_it_still_needs(
+        self, tmp_dir, palace_path
+    ):
+        """A wing-scoped pass reads one wing's drawers, so it cannot count how
+        many a source has: its drawers elsewhere are never looked at. Deciding
+        emptiness from that count would purge the closets of a source whose
+        drawers in another wing were not touched at all.
+        """
+        from mempalace.sync import sync_palace
+
+        repo, neighbour, gone = self._repo_with_a_neighbour(tmp_dir)
+        self._seed(palace_path, [("d_gone_demo", gone, None)], wing="demo")
+        self._seed(palace_path, [("d_neighbour", neighbour, None)], wing="demo")
+        self._seed(palace_path, [("d_gone_other", gone, None)], wing="other")
+
+        client = chromadb.PersistentClient(path=palace_path)
+        client.get_or_create_collection("mempalace_closets", metadata={"hnsw:space": "cosine"}).add(
+            ids=["closet_gone_01"],
+            documents=["topic line"],
+            embeddings=[[1.0, 0.0, 0.0]],
+            metadatas=[{"wing": "demo", "room": "src", "source_file": str(gone)}],
+        )
+        del client
+
+        report = sync_palace(
+            palace_path=palace_path, project_dirs=[str(repo)], wing="demo", dry_run=False
+        )
+
+        assert report["removed_drawers"] == 1, report
+        assert report["removed_closets"] == 0, report
+
+        client = chromadb.PersistentClient(path=palace_path)
+        drawers_left = set(client.get_collection("mempalace_drawers").get(include=[])["ids"])
+        closets_left = client.get_collection("mempalace_closets").get(include=[])["ids"]
+        assert "d_gone_other" in drawers_left, drawers_left
+        assert closets_left == ["closet_gone_01"], closets_left
+
+    def test_a_directory_answering_with_another_identity_keeps_the_drawer(
+        self, tmp_dir, palace_path
+    ):
+        """What both open mount shapes look like from here: the neighbour is
+        there and readable, and it is not in the directory the missing file
+        was mined from."""
+        from mempalace import source_identity as si
+
+        repo, neighbour, gone = self._repo_with_a_neighbour(tmp_dir)
+        here = si.directory_identity(repo)
+        assert here is not None
+        mined_elsewhere = "1000000"  # an inode that is not this directory's
+        assert mined_elsewhere != here
+
+        self._seed(
+            palace_path,
+            [("d_gone", gone, mined_elsewhere), ("d_neighbour", neighbour, here)],
+        )
+        report = self._run(palace_path, repo)
+
+        assert report["missing"] == 0, report
+        assert report["unresolved"] == 1, report
+        assert str(gone) in report["unresolved_by_source"], report
+
+    def test_the_same_identity_prunes_exactly_as_before(self, tmp_dir, palace_path):
+        from mempalace import source_identity as si
+
+        repo, neighbour, gone = self._repo_with_a_neighbour(tmp_dir)
+        here = si.directory_identity(repo)
+
+        self._seed(palace_path, [("d_gone", gone, here), ("d_neighbour", neighbour, here)])
+        report = self._run(palace_path, repo)
+
+        assert report["missing"] == 1, report
+        assert report["unresolved"] == 0, report
+
+    def test_an_inode_that_does_not_match_keeps_the_drawer(self, tmp_dir, palace_path):
+        """The directory is right there and answers, but with an inode other
+        than the one the drawer carries. That is a different directory at the
+        same path, and it establishes nothing about the missing file."""
+        from mempalace import source_identity as si
+
+        repo, neighbour, gone = self._repo_with_a_neighbour(tmp_dir)
+
+        here = si.directory_identity(repo)
+        mined_elsewhere = "1234567"  # an inode that is not this directory's
+        assert here is not None and here != mined_elsewhere
+
+        self._seed(
+            palace_path,
+            [
+                ("d_gone", gone, mined_elsewhere),
+                ("d_neighbour", neighbour, None),
+            ],
+        )
+        report = self._run(palace_path, repo)
+
+        assert report["missing"] == 0, report
+        assert report["unresolved"] == 1, report
+
+    def test_a_drawer_with_no_identity_is_decided_as_before(self, tmp_dir, palace_path):
+        """Everything filed before this existed, and everything from a volume
+        that could not be marked, keeps the behaviour #2322 shipped."""
+        from mempalace import source_identity as si
+
+        repo, neighbour, gone = self._repo_with_a_neighbour(tmp_dir)
+        # The directory does answer with an identity; what this pins is that a
+        # drawer carrying none is decided without it.
+        assert si.directory_identity(repo) is not None
+
+        self._seed(palace_path, [("d_gone", gone, None), ("d_neighbour", neighbour, None)])
+        report = self._run(palace_path, repo)
+
+        assert report["missing"] == 1, report
+        assert report["unresolved"] == 0, report
+
+    def test_a_stranded_drawer_stays_kept_and_is_named(self, tmp_dir, palace_path):
+        """A directory deleted and recreated can come back with a different
+        inode, and the drawers of files that really went are then kept for
+        good. There is no bulk way out of that on purpose: a stranded drawer
+        and a drawer a volume is holding are the same reading, so anything
+        that pruned the first in bulk would prune the second. The report names
+        the sources, and ``mempalace_delete_by_source`` takes them one by one."""
+        from mempalace import source_identity as si
+
+        repo, neighbour, gone = self._repo_with_a_neighbour(tmp_dir)
+        here = si.directory_identity(repo)
+        mined_elsewhere = "999999"  # an inode that is not this directory's
+        assert here is not None and here != mined_elsewhere
+
+        self._seed(
+            palace_path, [("d_gone", gone, mined_elsewhere), ("d_neighbour", neighbour, None)]
+        )
+
+        report = self._run(palace_path, repo)
+
+        assert report["missing"] == 0, report
+        assert report["unresolved"] == 1, report
+        assert report["unresolved_by_source"] == {str(gone): 1}, report
+
+    def test_a_directory_that_changes_under_the_pass_settles_nothing(
+        self, monkeypatch, tmp_dir, palace_path
+    ):
+        """The identity is read on both sides of the corroboration. A mount
+        that arrives or leaves while the witnesses are being stat'ed makes the
+        two readings describe different directories, and a verdict built from
+        them is a verdict about neither."""
+        from mempalace import source_identity as si
+        from mempalace import sync as sync_mod
+
+        repo, neighbour, gone = self._repo_with_a_neighbour(tmp_dir)
+        recorded = si.directory_identity(repo)
+        assert recorded is not None
+        # Derived from what the directory answered rather than written down,
+        # so the run cannot turn on a literal that happens to be this
+        # directory's own number.
+        intruder = str(int(recorded) + 1)
+        self._seed(palace_path, [("d_gone", gone, recorded), ("d_neighbour", neighbour, None)])
+
+        answers = {"n": 0}
+
+        def changing(directory):
+            # The mount arrives inside the verdict: the corroboration is read
+            # against a directory that is not the recorded one, and by the time
+            # the identity is read again the recorded one is back. Comparing
+            # only the second reading to what the drawer carries would call
+            # that a match and remove a drawer settled against another
+            # directory entirely.
+            answers["n"] += 1
+            return intruder if answers["n"] == 1 else recorded
+
+        monkeypatch.setattr(sync_mod, "directory_identity", changing)
+
+        report = self._run(palace_path, repo)
+
+        assert answers["n"] >= 2, answers
+        assert report["missing"] == 0, report
+        assert report["unresolved"] == 1, report
+
+    def test_the_identity_is_read_at_verdict_time_not_earlier(
+        self, monkeypatch, tmp_dir, palace_path
+    ):
+        """A volume can be swapped inside one pass. The identity has to be
+        read where the verdict is formed, next to the other two readings, or
+        a reading taken while the right volume was there condemns drawers
+        settled after it was gone."""
+        from mempalace import source_identity as si
+        from mempalace import sync as sync_mod
+
+        repo, neighbour, gone = self._repo_with_a_neighbour(tmp_dir)
+        here = si.directory_identity(repo)
+        self._seed(palace_path, [("d_gone", gone, here), ("d_neighbour", neighbour, here)])
+
+        real_iter = sync_mod._iter_drawer_metadata
+
+        def iter_then_swap_the_volume(col, wing):
+            yield from real_iter(col, wing)
+            # The scan is done; the directory at that path is replaced
+            # before any verdict is formed, exactly as an unmount partway
+            # through a long pass puts a different one there.
+            replacement = Path(tmp_dir) / "replacement"
+            replacement.mkdir()
+            (replacement / neighbour.name).write_text("# still here\n")
+            repo.rename(Path(tmp_dir) / "moved-away")
+            replacement.rename(repo)
+
+        monkeypatch.setattr(sync_mod, "_iter_drawer_metadata", iter_then_swap_the_volume)
+        report = self._run(palace_path, repo)
+
+        assert report["missing"] == 0, report
+        assert report["unresolved"] == 1, report
+
+    def test_an_identity_recorded_for_a_subtree_is_found_from_the_project_root(
+        self, tmp_dir, palace_path
+    ):
+        """Regression cover, and it passes on ``develop`` too, where there is
+        no identity to take: ``mine <project>/subdir`` records the
+        subdirectory while ``sync <project>`` starts from the project root, so
+        the identity has to come from where the drawer's own source file
+        lives. Taking it from the root of the pass would leave every such
+        drawer unresolvable forever."""
+        from mempalace import source_identity as si
+
+        repo = Path(tmp_dir) / "repo"
+        sub = repo / "sub"
+        sub.mkdir(parents=True)
+        neighbour = sub / "neighbour.py"
+        neighbour.write_text("# still here\n")
+        gone = sub / "gone.py"
+        gone.write_text("# was here\n")
+        gone.unlink()
+        recorded = si.directory_identity(sub)
+        assert recorded is not None
+
+        self._seed(palace_path, [("d_gone", gone, recorded), ("d_neighbour", neighbour, recorded)])
+        report = self._run(palace_path, repo)
+
+        assert report["missing"] == 1, report
+        assert report["unresolved"] == 0, report
+
+    def _seed_closet(self, palace_path, source_file, closet_id="closet_gone_01"):
+        client = chromadb.PersistentClient(path=palace_path)
+        closets = client.get_or_create_collection(
+            "mempalace_closets", metadata={"hnsw:space": "cosine"}
+        )
+        closets.add(
+            ids=[closet_id],
+            documents=["topic line"],
+            embeddings=[[1.0, 0.0, 0.0]],
+            metadatas=[
+                {
+                    "wing": "demo",
+                    "room": "src",
+                    "source_file": str(source_file),
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-08-23T00:00:00",
+                }
+            ],
+        )
+        del client
+
+    def _closets_left(self, palace_path):
+        client = chromadb.PersistentClient(path=palace_path)
+        left = sorted(
+            client.get_or_create_collection("mempalace_closets", metadata={"hnsw:space": "cosine"})
+            .get(include=[])
+            .get("ids")
+            or []
+        )
+        del client
+        return left
+
+    def test_every_spelling_of_a_bookkeeping_row_is_recognised(self):
+        """Which rows the closet probe may not count as drawers, each by the
+        mark that names it. Both sentinel writers stamp a field and an id, and
+        either alone has to be enough: a row written before one of the fields
+        existed still carries the id, the same way ``_is_registry_row`` reads
+        an ``_reg_`` id from a row with neither of its fields. A real drawer
+        is none of these, which is the point of choice."""
+        from mempalace.sync import _is_bookkeeping_row
+
+        assert _is_bookkeeping_row({"room": "_registry"}, "anything") is True
+        assert _is_bookkeeping_row({"ingest_mode": "registry"}, "anything") is True
+        assert _is_bookkeeping_row({}, "_reg_abc") is True
+        assert _is_bookkeeping_row({"is_sentinel": True}, "anything") is True
+        # No field at all, only the id the format sentinel is written under.
+        assert _is_bookkeeping_row({"room": "documents"}, "sentinel_demo_abc") is True
+        # A drawer of the file's own content.
+        assert _is_bookkeeping_row({"room": "documents", "chunk_index": 0}, "d_1") is False
+        assert _is_bookkeeping_row({}, "") is False
+
+    def test_a_registry_sentinel_is_not_a_drawer_that_survived(self, tmp_dir, palace_path):
+        """A convo sentinel names the same source as the drawers it tracks and
+        is never removed, so it is present after every one of them is gone.
+        Counting it as a survivor would leave the closets of a source with
+        nothing left to index pointing at drawers that are not there, and
+        nothing would ever clear them: the sentinel outlives every pass."""
+        from mempalace.sync import sync_palace
+
+        repo = Path(tmp_dir) / "repo"
+        repo.mkdir(parents=True)
+        (repo / ".gitignore").write_text("*.jsonl\n")
+        transcript = repo / "t.jsonl"
+        transcript.write_text("{}\n")
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+        col.add(
+            ids=["d_content", "_reg_abc"],
+            documents=["real content", "[registry]"],
+            embeddings=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            metadatas=[
+                {
+                    "wing": "demo",
+                    "room": "src",
+                    "source_file": str(transcript),
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-08-23T00:00:00",
+                },
+                {
+                    "wing": "demo",
+                    "room": "_registry",
+                    "source_file": str(transcript),
+                    "ingest_mode": "registry",
+                    "added_by": "miner",
+                    "filed_at": "2026-08-23T00:00:00",
+                },
+            ],
+        )
+        del client
+        self._seed_closet(palace_path, transcript)
+
+        report = sync_palace(
+            palace_path=palace_path, project_dirs=[str(repo)], wing="demo", dry_run=False
+        )
+
+        assert report["removed_drawers"] == 1, report
+        assert report["removed_closets"] == 1, report
+        assert self._closets_left(palace_path) == []
+
+    @staticmethod
+    def _probing(kwargs) -> bool:
+        """Whether this ``get`` is a survivor probe, batched or one at a time.
+
+        Both name ``source_file`` in the ``where``, which no other read this
+        pass makes does: the scan filters on ``wing`` or on nothing.
+        """
+        return "source_file" in (kwargs.get("where") or {})
+
+    def test_a_survivor_probe_that_raises_keeps_the_closets(
+        self, monkeypatch, tmp_dir, palace_path
+    ):
+        """The probe is the only thing standing between a purge that strands a
+        surviving drawer and one that leaves closets pointing at nothing. A
+        read that failed establishes neither, so it has to keep them: an
+        orphaned closet can still be removed later, a purged one cannot be
+        rebuilt while ``file_already_mined`` skips the file.
+
+        Every form of the read fails here, the batch and the single-source
+        probe it halves down to, so what is pinned is the answer at the end of
+        that path rather than at the first step of it."""
+        from mempalace import sync as sync_mod
+        from mempalace.sync import sync_palace
+
+        repo = Path(tmp_dir) / "repo"
+        repo.mkdir(parents=True)
+        (repo / ".gitignore").write_text("*.log\n")
+        gone = repo / "app.log"
+        gone.write_text("noise\n")
+
+        self._seed(palace_path, [("d_gone", gone, None)])
+        self._seed_closet(palace_path, gone)
+
+        real_get_collection = sync_mod.get_collection
+        forms: list = []
+
+        def collection_whose_probe_fails(*args, **kwargs):
+            col = real_get_collection(*args, **kwargs)
+            real_get = col.get
+
+            def get(*a, **kw):
+                if self._probing(kw):
+                    forms.append((kw.get("where") or {}).get("source_file"))
+                    raise RuntimeError("too many SQL variables")
+                return real_get(*a, **kw)
+
+            col.get = get
+            return col
+
+        monkeypatch.setattr(sync_mod, "get_collection", collection_whose_probe_fails)
+
+        report = sync_palace(
+            palace_path=palace_path, project_dirs=[str(repo)], wing="demo", dry_run=False
+        )
+
+        assert report["removed_drawers"] == 1, report
+        assert report["removed_closets"] == 0, report
+        assert self._closets_left(palace_path) == ["closet_gone_01"]
+        # The batch names its sources in an ``$in`` and the fallback names one
+        # outright, which is what tells the two reads apart. Both were tried.
+        assert {"$in": [str(gone)]} in forms and str(gone) in forms, forms
+
+    def test_a_probe_that_answered_short_keeps_the_closets(self, monkeypatch, tmp_dir, palace_path):
+        """A backend that hands back fewer metadata rows than ids has not
+        answered this question. ``zip`` would drop the rows that did not come
+        back without a word, so a source whose drawers are all still filed
+        would read as empty and lose the closets that index them.
+
+        Answered short in both forms, so the batch dropping to the bounded
+        read does not turn one unanswered question into an answer."""
+        from mempalace import sync as sync_mod
+        from mempalace.sync import sync_palace
+
+        repo = Path(tmp_dir) / "repo"
+        repo.mkdir(parents=True)
+        (repo / ".gitignore").write_text("*.log\n")
+        gone = repo / "app.log"
+        gone.write_text("noise\n")
+
+        self._seed(palace_path, [("d_gone", gone, None)])
+        self._seed_closet(palace_path, gone)
+
+        real_get_collection = sync_mod.get_collection
+
+        def collection_whose_probe_answers_short(*args, **kwargs):
+            col = real_get_collection(*args, **kwargs)
+            real_get = col.get
+
+            def get(*a, **kw):
+                if self._probing(kw):
+                    # Ids for rows that are still filed, metadata for none of
+                    # them: the shape a backend with no length contract may
+                    # answer with.
+                    return {"ids": ["still_filed_1", "still_filed_2"], "metadatas": []}
+                return real_get(*a, **kw)
+
+            col.get = get
+            return col
+
+        monkeypatch.setattr(sync_mod, "get_collection", collection_whose_probe_answers_short)
+
+        report = sync_palace(
+            palace_path=palace_path, project_dirs=[str(repo)], wing="demo", dry_run=False
+        )
+
+        assert report["removed_drawers"] == 1, report
+        assert report["removed_closets"] == 0, report
+        assert self._closets_left(palace_path) == ["closet_gone_01"]
+
+    def test_a_probe_answering_with_an_unattributable_row_keeps_the_closets(
+        self, monkeypatch, tmp_dir, palace_path
+    ):
+        """A batched probe files each row it gets back under the source its
+        metadata names. A row that names none cannot be filed under any of
+        them, and counting it as nobody's would leave the source it really
+        belongs to looking empty, which is the purge stranding a survivor.
+        It is not an answer, so the batch is read one source at a time."""
+        from mempalace import sync as sync_mod
+        from mempalace.sync import sync_palace
+
+        repo = Path(tmp_dir) / "repo"
+        repo.mkdir(parents=True)
+        (repo / ".gitignore").write_text("*.log\n")
+        gone = repo / "app.log"
+        gone.write_text("noise\n")
+
+        self._seed(palace_path, [("d_gone", gone, None)])
+        self._seed_closet(palace_path, gone)
+
+        real_get_collection = sync_mod.get_collection
+        singles: list = []
+
+        def collection_whose_batch_is_unattributable(*args, **kwargs):
+            col = real_get_collection(*args, **kwargs)
+            real_get = col.get
+
+            def get(*a, **kw):
+                if self._probing(kw):
+                    asked = (kw.get("where") or {}).get("source_file")
+                    if isinstance(asked, dict):
+                        return {"ids": ["nameless"], "metadatas": [{"wing": "demo"}]}
+                    singles.append(asked)
+                    # The bounded read finds a drawer still filed, so the
+                    # source is not empty and its closets stay.
+                    return {"ids": ["still_filed"], "metadatas": [{"source_file": str(gone)}]}
+                return real_get(*a, **kw)
+
+            col.get = get
+            return col
+
+        monkeypatch.setattr(sync_mod, "get_collection", collection_whose_batch_is_unattributable)
+
+        report = sync_palace(
+            palace_path=palace_path, project_dirs=[str(repo)], wing="demo", dry_run=False
+        )
+
+        assert singles == [str(gone)], singles
+        assert report["removed_drawers"] == 1, report
+        assert report["removed_closets"] == 0, report
+        assert self._closets_left(palace_path) == ["closet_gone_01"]
+
+    def test_a_batch_the_backend_refuses_is_halved_rather_than_abandoned(
+        self, monkeypatch, tmp_dir, palace_path
+    ):
+        """The batch binds a variable per entry and per matching row, so a
+        wide enough one is refused rather than answered. Abandoning it would
+        keep the closets of every source in it, so it is halved until it
+        answers, and a single source that still cannot be batched is read the
+        bounded way. The verdict has to come out the same either way, which
+        is what makes the split a fallback rather than a second rule."""
+        from mempalace import sync as sync_mod
+        from mempalace.sync import sync_palace
+
+        repo = Path(tmp_dir) / "repo"
+        repo.mkdir(parents=True)
+        (repo / ".gitignore").write_text("*.log\n")
+
+        rows, paths = [], []
+        for i in range(4):
+            gone = repo / f"app{i}.log"
+            gone.write_text("noise\n")
+            rows.append((f"d_gone_{i}", gone, None))
+            paths.append(gone)
+        self._seed(palace_path, rows)
+        for i, gone in enumerate(paths):
+            self._seed_closet(palace_path, gone, closet_id=f"closet_half_{i:02d}")
+
+        real_get_collection = sync_mod.get_collection
+        widths: list = []
+
+        def collection_that_refuses_wide_batches(*args, **kwargs):
+            col = real_get_collection(*args, **kwargs)
+            real_get = col.get
+
+            def get(*a, **kw):
+                if self._probing(kw):
+                    clause = (kw.get("where") or {}).get("source_file") or {}
+                    entries = clause.get("$in") if isinstance(clause, dict) else None
+                    if entries is not None:
+                        widths.append(len(entries))
+                        if len(entries) > 1:
+                            raise RuntimeError("too many SQL variables")
+                return real_get(*a, **kw)
+
+            col.get = get
+            return col
+
+        monkeypatch.setattr(sync_mod, "get_collection", collection_that_refuses_wide_batches)
+
+        report = sync_palace(
+            palace_path=palace_path, project_dirs=[str(repo)], wing="demo", dry_run=False
+        )
+
+        # Four, two, two, one each: halved down to what the backend accepts.
+        assert widths[0] == 4 and max(widths[1:]) == 2 and widths.count(1) == 4, widths
+        assert report["removed_drawers"] == 4, report
+        assert report["removed_closets"] == 4, report
+        assert self._closets_left(palace_path) == []
+
+    def test_the_batched_probe_reads_no_more_than_the_batch_can_account_for(
+        self, monkeypatch, tmp_dir, palace_path
+    ):
+        """What one source still holds cannot set the size of the batch's read.
+
+        A wing-scoped pass removes a source's drawers in the wing it scanned
+        and leaves the ones it did not, which is the case this probe exists
+        for. Asking for every matching row then brings that whole other wing
+        back for one question with a yes or no answer, and a source large
+        enough makes the read bind past what the backend takes and be refused,
+        which costs the halving and reaches the same verdict the bounded read
+        reaches for nothing.
+
+        The shipped bound is wider than a palace this test can seed in any
+        reasonable time, so it is narrowed here and the property asserted
+        against it: no probing read comes back with more rows than the bound,
+        whatever one source holds. What the shipped width has to be is a
+        separate question, asked below it.
+        """
+        from mempalace import sync as sync_mod
+        from mempalace.sync import _IN_CLAUSE_LIMIT, sync_palace
+
+        repo = Path(tmp_dir) / "repo"
+        repo.mkdir(parents=True)
+        (repo / ".gitignore").write_text("*.log\n")
+
+        gone = []
+        for i in range(4):
+            path = repo / f"app{i}.log"
+            path.write_text("noise\n")
+            gone.append(path)
+        big = repo / "big.log"
+        big.write_text("noise\n")
+        gone.append(big)
+
+        self._seed(palace_path, [(f"d_gone_{i}", path, None) for i, path in enumerate(gone)])
+        # The one source that survives this pass: sixty rows in a wing the
+        # wing-scoped run never scans, so they are there when the probe asks.
+        self._seed(
+            palace_path,
+            [(f"d_other_{i}", big, None) for i in range(60)],
+            wing="other_wing",
+        )
+        for i, path in enumerate(gone):
+            self._seed_closet(palace_path, path, closet_id=f"closet_bound_{i:02d}")
+
+        sizes: list = []
+        real_get_collection = sync_mod.get_collection
+
+        def collection_that_records_answer_sizes(*args, **kwargs):
+            col = real_get_collection(*args, **kwargs)
+            real_get = col.get
+
+            def get(*a, **kw):
+                answer = real_get(*a, **kw)
+                if self._probing(kw):
+                    sizes.append(len(answer.get("ids") or []))
+                return answer
+
+            col.get = get
+            return col
+
+        monkeypatch.setattr(sync_mod, "get_collection", collection_that_records_answer_sizes)
+        narrowed = 40
+        assert narrowed < 60, "the surviving source has to sit past the bound for this to ask it"
+        monkeypatch.setattr(sync_mod, "_BATCH_PROBE_LIMIT", narrowed)
+
+        report = sync_palace(
+            palace_path=palace_path, project_dirs=[str(repo)], wing="demo", dry_run=False
+        )
+
+        assert max(sizes) <= narrowed, sizes
+        assert _IN_CLAUSE_LIMIT >= len(gone)
+        # And the bound did not change the verdict: the source still holding
+        # rows keeps its closets, the emptied ones do not.
+        assert report["removed_closets"] == 4, report
+        assert self._closets_left(palace_path) == ["closet_bound_04"]
+
+    def test_the_bound_leaves_room_for_a_full_batch_of_bookkeeping_rows(self):
+        """The bound has to be wider than any answer a purge legitimately gets.
+
+        A source this pass emptied can be left with bookkeeping rows: a convo
+        registry sentinel per extract mode and a format sentinel. A bound that
+        a full batch of such sources could fill would send every one of those
+        batches down the one-at-a-time path, where the per-source probe fills
+        its own bound on the same rows and keeps closets that index nothing.
+        """
+        from mempalace.sync import _BATCH_PROBE_LIMIT, _IN_CLAUSE_LIMIT, _SURVIVOR_PROBE_LIMIT
+
+        assert _BATCH_PROBE_LIMIT >= _SURVIVOR_PROBE_LIMIT * _IN_CLAUSE_LIMIT
+        # And it still binds far under what the backend refuses at, which is
+        # 32,762 for the list and one variable per row it hands back.
+        assert _BATCH_PROBE_LIMIT + _IN_CLAUSE_LIMIT < 32762
+
+    def test_a_batch_answer_that_filled_its_bound_is_read_one_source_at_a_time(self):
+        """A read that filled its bound says nothing about what sits past it.
+
+        Sources the answer does not name are not thereby empty, so a bound the
+        answer reached is not an answer to this question and the batch is read
+        one source at a time instead. Counting the unnamed as empty would purge
+        the closets of a source whose drawers merely sat further down.
+        """
+        from mempalace.sync import (
+            _BATCH_PROBE_LIMIT,
+            _SURVIVOR_PROBE_LIMIT,
+            _sources_holding_nothing,
+        )
+
+        batch = ["/repo/a.md", "/repo/b.md"]
+        rows = {
+            # Every row the bound returns belongs to one source, so the other
+            # is unnamed by an answer that is not complete.
+            "/repo/a.md": [
+                ("d_a_%d" % i, {"source_file": "/repo/a.md"}) for i in range(_BATCH_PROBE_LIMIT + 1)
+            ],
+            "/repo/b.md": [("d_b", {"source_file": "/repo/b.md"})],
+        }
+
+        class Backend:
+            def __init__(self):
+                self.asked = []
+
+            def get(self, where=None, limit=None, include=None):
+                spec = where["source_file"]
+                wanted = spec["$in"] if isinstance(spec, dict) else [spec]
+                self.asked.append(wanted)
+                matched = [row for source in wanted for row in rows.get(source, [])]
+                if limit is not None:
+                    matched = matched[:limit]
+                return {
+                    "ids": [i for i, _ in matched],
+                    "metadatas": [m for _, m in matched],
+                }
+
+        col = Backend()
+        got = _sources_holding_nothing(col, list(batch))
+
+        assert got == [], got
+        # The batch was asked first and then each source on its own, which is
+        # the only reading that can see past a bound the answer reached.
+        assert col.asked[0] == batch
+        assert col.asked[1:] == [["/repo/a.md"], ["/repo/b.md"]], col.asked
+        assert _SURVIVOR_PROBE_LIMIT < _BATCH_PROBE_LIMIT
+
+    def test_the_probe_asks_about_sources_in_a_fixed_order(self, monkeypatch, tmp_dir, palace_path):
+        """Sources arrive here as a set, whose iteration order changes with the
+        hash seed. The purge batches them, so an unordered pass composes a
+        different set of ``$in`` calls on every run and a log of one says
+        nothing about the next. Sorting costs nothing beside that."""
+        from mempalace import sync as sync_mod
+        from mempalace.sync import sync_palace
+
+        repo = Path(tmp_dir) / "repo"
+        repo.mkdir(parents=True)
+        (repo / ".gitignore").write_text("*.log\n")
+        names = ["delta.log", "alpha.log", "charlie.log", "bravo.log"]
+        rows = []
+        paths = []
+        for i, name in enumerate(names):
+            path = repo / name
+            path.write_text("noise\n")
+            rows.append((f"d_{i}", path, None))
+            paths.append(path)
+        self._seed(palace_path, rows)
+        # The probe only runs where there are closets to purge, so each source
+        # needs one for this to have anything to record.
+        for i, path in enumerate(paths):
+            self._seed_closet(palace_path, path, closet_id=f"closet_order_{i}")
+
+        asked: list = []
+        real_get_collection = sync_mod.get_collection
+
+        def collection_that_records_the_probe(*args, **kwargs):
+            col = real_get_collection(*args, **kwargs)
+            real_get = col.get
+
+            def get(*a, **kw):
+                clause = (kw.get("where") or {}).get("source_file")
+                if isinstance(clause, dict) and clause.get("$in") is not None:
+                    asked.extend(clause["$in"])
+                elif isinstance(clause, str):
+                    asked.append(clause)
+                return real_get(*a, **kw)
+
+            col.get = get
+            return col
+
+        monkeypatch.setattr(sync_mod, "get_collection", collection_that_records_the_probe)
+
+        sync_palace(palace_path=palace_path, project_dirs=[str(repo)], wing="demo", dry_run=False)
+
+        assert asked == sorted(asked), asked
+        assert [Path(p).name for p in asked] == sorted(names), asked
+
+    def test_a_probe_that_fills_its_bound_without_a_drawer_settles_nothing(
+        self, monkeypatch, tmp_dir, palace_path
+    ):
+        """The single-source probe reads a fixed number of rows, so a source
+        with more drawers than the backend takes variables for cannot make it
+        answer with an error instead of a result. Filling that bound with
+        sentinels means a drawer may sit past it, which is not an established
+        absence, so the closets stay.
+
+        The batch is what runs first and its own bound is wider, so reaching
+        this at all means driving the pass down to the fallback: the batched
+        read is refused here, which is the shape that leads to it."""
+        from mempalace import sync as sync_mod
+        from mempalace.sync import _SURVIVOR_PROBE_LIMIT, sync_palace
+
+        repo = Path(tmp_dir) / "repo"
+        repo.mkdir(parents=True)
+        (repo / ".gitignore").write_text("*.jsonl\n")
+        transcript = repo / "t.jsonl"
+        transcript.write_text("{}\n")
+
+        sentinels = _SURVIVOR_PROBE_LIMIT + 2
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+        ids = ["d_content"] + [f"_reg_{i}" for i in range(sentinels)]
+        metas = [
+            {
+                "wing": "demo",
+                "room": "src",
+                "source_file": str(transcript),
+                "chunk_index": 0,
+                "added_by": "miner",
+                "filed_at": "2026-08-23T00:00:00",
+            }
+        ]
+        metas += [
+            {
+                "wing": "demo",
+                "room": "_registry",
+                "source_file": str(transcript),
+                "ingest_mode": "registry",
+                "added_by": "miner",
+                "filed_at": "2026-08-23T00:00:00",
+            }
+            for _ in range(sentinels)
+        ]
+        col.add(
+            ids=ids,
+            documents=[f"doc {i}" for i in range(len(ids))],
+            embeddings=[[float(i + 1), 0.0, 0.0] for i in range(len(ids))],
+            metadatas=metas,
+        )
+        del client
+        self._seed_closet(palace_path, transcript)
+
+        real_get_collection = sync_mod.get_collection
+
+        def collection_that_refuses_the_batch(*args, **kwargs):
+            col = real_get_collection(*args, **kwargs)
+            real_get = col.get
+
+            def get(*a, **kw):
+                clause = (kw.get("where") or {}).get("source_file")
+                if isinstance(clause, dict) and clause.get("$in") is not None:
+                    raise RuntimeError("too many SQL variables")
+                return real_get(*a, **kw)
+
+            col.get = get
+            return col
+
+        monkeypatch.setattr(sync_mod, "get_collection", collection_that_refuses_the_batch)
+
+        report = sync_palace(
+            palace_path=palace_path, project_dirs=[str(repo)], wing="demo", dry_run=False
+        )
+
+        assert report["removed_drawers"] == 1, report
+        assert report["removed_closets"] == 0, report
+        assert self._closets_left(palace_path) == ["closet_gone_01"]
+
+    def test_a_format_sentinel_is_not_a_drawer_the_closets_index(self, tmp_dir, palace_path):
+        """`format_miner` files a sentinel for a source that extracted to
+        nothing, under `room="documents"` with an id of its own, so the
+        registry predicate does not name it. A closet indexes drawers, and
+        that row is not one: left counting as a survivor, a source whose every
+        real drawer this pass removed keeps closet lines pointing at rows that
+        are gone, which `develop` purged. It is the stranding this function
+        exists to prevent, arrived at from the other side."""
+        from mempalace.sync import sync_palace
+
+        repo = Path(tmp_dir) / "repo"
+        repo.mkdir(parents=True)
+        (repo / ".gitignore").write_text("*.log\n")
+        gone = repo / "app.log"
+        gone.write_text("noise\n")
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+        # The sentinel sits in a wing this run does not read, so it outlives
+        # the pass and is what the probe finds. A drawer there would keep the
+        # closets and rightly so; a sentinel is not one.
+        col.add(
+            ids=["d_gone", "sentinel_other_abc123"],
+            documents=["content", "[empty]"],
+            embeddings=[[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            metadatas=[
+                {
+                    "wing": "demo",
+                    "room": "src",
+                    "source_file": str(gone),
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-08-23T00:00:00",
+                },
+                {
+                    "wing": "other",
+                    "room": "documents",
+                    "source_file": str(gone),
+                    "chunk_index": -1,
+                    "added_by": "miner",
+                    "filed_at": "2026-08-23T00:00:00",
+                    "ingest_mode": "extract",
+                    "extract_mode": "format",
+                    "is_sentinel": True,
+                },
+            ],
+        )
+        del client
+        self._seed_closet(palace_path, gone)
+
+        report = sync_palace(
+            palace_path=palace_path, project_dirs=[str(repo)], wing="demo", dry_run=False
+        )
+
+        assert report["removed_drawers"] == 1, report
+        assert report["removed_closets"] == 1, report
+        assert self._closets_left(palace_path) == []
+        client = chromadb.PersistentClient(path=palace_path)
+        left = sorted(
+            client.get_or_create_collection("mempalace_drawers", metadata={"hnsw:space": "cosine"})
+            .get(include=[])
+            .get("ids")
+            or []
+        )
+        del client
+        assert left == ["sentinel_other_abc123"], left
+
+    def test_a_source_left_holding_only_sentinels_loses_its_closets(self, tmp_dir, palace_path):
+        """The batched read has room for far more sentinels than one source
+        carries, so a source whose every remaining row is a registry sentinel
+        is seen for what it is: nothing of the file is filed any more, and the
+        closets index rows that are gone. The bounded fallback keeps them
+        instead, since a drawer may sit past its narrower bound; that is the
+        cost of the fallback, not the rule."""
+        from mempalace.sync import _SURVIVOR_PROBE_LIMIT, sync_palace
+
+        repo = Path(tmp_dir) / "repo"
+        repo.mkdir(parents=True)
+        (repo / ".gitignore").write_text("*.jsonl\n")
+        transcript = repo / "t.jsonl"
+        transcript.write_text("{}\n")
+
+        sentinels = _SURVIVOR_PROBE_LIMIT + 2
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+        ids = ["d_content"] + [f"_reg_{i}" for i in range(sentinels)]
+        metas = [
+            {
+                "wing": "demo",
+                "room": "src",
+                "source_file": str(transcript),
+                "chunk_index": 0,
+                "added_by": "miner",
+                "filed_at": "2026-08-23T00:00:00",
+            }
+        ]
+        metas += [
+            {
+                "wing": "demo",
+                "room": "_registry",
+                "source_file": str(transcript),
+                "ingest_mode": "registry",
+                "added_by": "miner",
+                "filed_at": "2026-08-23T00:00:00",
+            }
+            for _ in range(sentinels)
+        ]
+        col.add(
+            ids=ids,
+            documents=[f"doc {i}" for i in range(len(ids))],
+            embeddings=[[float(i + 1), 0.0, 0.0] for i in range(len(ids))],
+            metadatas=metas,
+        )
+        del client
+        self._seed_closet(palace_path, transcript)
+
+        report = sync_palace(
+            palace_path=palace_path, project_dirs=[str(repo)], wing="demo", dry_run=False
+        )
+
+        assert report["removed_drawers"] == 1, report
+        assert report["removed_closets"] == 1, report
+        assert self._closets_left(palace_path) == []
+
+    def test_the_closet_purge_holds_more_sources_than_one_in_clause_carries(
+        self, monkeypatch, tmp_dir, palace_path
+    ):
+        """``$in`` binds one variable per entry, and the backend refuses past
+        32,766 of them. A pass that emptied that many sources would end in an
+        error where it should have purged their closets, so the clause is
+        batched. The limit is lowered here rather than seeding 32,766 files."""
+        from mempalace import sync as sync_mod
+        from mempalace.sync import sync_palace
+
+        monkeypatch.setattr(sync_mod, "_IN_CLAUSE_LIMIT", 2)
+        repo = Path(tmp_dir) / "repo"
+        repo.mkdir(parents=True)
+        (repo / ".gitignore").write_text("*.log\n")
+
+        rows, seen = [], []
+        for i in range(5):
+            gone = repo / f"app{i}.log"
+            gone.write_text("noise\n")
+            rows.append((f"d_gone_{i}", gone, None))
+            seen.append(gone)
+        self._seed(palace_path, rows)
+        for i, gone in enumerate(seen):
+            self._seed_closet(palace_path, gone, closet_id=f"closet_gone_{i:02d}")
+
+        widths = []
+        real_get_closets = sync_mod.get_closets_collection
+
+        def watched(*args, **kwargs):
+            closets = real_get_closets(*args, **kwargs)
+            real_get = closets.get
+
+            def get(*a, **kw):
+                where = kw.get("where") or {}
+                clause = (where.get("source_file") or {}).get("$in")
+                if clause is not None:
+                    widths.append(len(clause))
+                return real_get(*a, **kw)
+
+            closets.get = get
+            return closets
+
+        monkeypatch.setattr(sync_mod, "get_closets_collection", watched)
+
+        report = sync_palace(
+            palace_path=palace_path, project_dirs=[str(repo)], wing="demo", dry_run=False
+        )
+
+        assert widths and max(widths) <= 2, widths
+        assert report["removed_closets"] == 5, report
+        assert self._closets_left(palace_path) == []
+
+    def test_an_identity_a_backend_hands_back_as_a_number_still_matches(self, tmp_dir, palace_path):
+        """What a drawer holds is whatever its backend gave back. The miner
+        writes a string, and one that round-trips metadata through JSON may
+        answer with a number; compared by identity rather than as text, a
+        match would read as a mismatch and the drawer would never be
+        removable again."""
+        from mempalace.sync import _mined_directory_still_answers
+
+        assert _mined_directory_still_answers(1331592, "1331592") is True
+        assert _mined_directory_still_answers("1331592", 1331592) is True
+        assert _mined_directory_still_answers("1331592", "1331593") is False
+        assert _mined_directory_still_answers("1331592", None) is False
+
+    def test_a_recorded_zero_reads_as_no_identity_in_either_spelling(self):
+        """A filesystem with no inode of its own reports zero, which
+        ``source_identity`` refuses to record. A row carrying one from
+        anywhere else means what the absent key means: decide by
+        corroboration. Deciding that on the value as it arrived would split
+        the same zero in two, since ``0`` is falsy and ``"0"`` is not, and the
+        drawer holding the string would match nothing ever again."""
+        from mempalace.sync import _mined_directory_still_answers
+
+        for zero in (0, "0"):
+            assert _mined_directory_still_answers(zero, "1331592") is True, zero
+            assert _mined_directory_still_answers(zero, None) is True, zero
+        # The point of choice: a real identity still decides.
+        assert _mined_directory_still_answers("1331592", "1331592") is True
+        assert _mined_directory_still_answers("1331592", "0") is False
+
+    def test_an_identity_a_backend_keeps_as_a_double_still_matches(self):
+        """A backend that keeps metadata numbers as doubles hands one back for
+        what the miner wrote as a string. Refused, that reads as no identity
+        at all, which puts the drawer back where it was before any of this and
+        lets corroboration alone remove it: the protection would be off with
+        nothing in the report to say so. A number that is not whole is not an
+        inode and stays refused."""
+        from mempalace.sync import _as_inode, _mined_directory_still_answers
+
+        assert _as_inode(1331592.0) == 1331592
+        assert _as_inode(1331592.5) is None
+        # The point of choice: a mismatch has to stay a mismatch either way.
+        assert _mined_directory_still_answers(1331592.0, "1331592") is True
+        assert _mined_directory_still_answers(1331592.0, "1331593") is False
+        assert _mined_directory_still_answers(1331592.0, None) is False
+
+    def test_a_recorded_boolean_is_not_an_identity(self):
+        """``bool`` is an integer to Python, so a row carrying ``True`` would
+        otherwise be read as inode 1: the root of every tmpfs, and a directory
+        some drawer really was mined from. Nothing here writes one, but the
+        row is whatever the backend gave back, and a value read as an identity
+        it is not decides removals. Refused, so such a row is decided by
+        corroboration the way one with no key at all is."""
+        from mempalace.sync import _as_inode, _mined_directory_still_answers
+
+        assert _as_inode(True) is None
+        assert _as_inode(False) is None
+        # Read as 1, ``True`` would match a tmpfs root and refuse everything
+        # else; read as no identity, both answer by corroboration alone.
+        assert _mined_directory_still_answers(True, "1") is True
+        assert _mined_directory_still_answers(True, "1331592") is True
+        assert _mined_directory_still_answers(False, "1331592") is True
+        # The point of choice: the same numbers spelled as integers still decide.
+        assert _mined_directory_still_answers(1, "1") is True
+        assert _mined_directory_still_answers(1, "1331592") is False

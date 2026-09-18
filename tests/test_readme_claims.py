@@ -40,6 +40,18 @@ def _mcp_server_source() -> str:
     return "\n".join(_read(path) for path in sorted(pkg.glob("*.py")))
 
 
+def _searcher_source() -> str:
+    """Concatenate searcher package sources."""
+    pkg = MEMPALACE_PKG / "searcher"
+    return "\n".join(_read(path) for path in sorted(pkg.glob("*.py")))
+
+
+def _palace_source() -> str:
+    """Concatenate palace package sources."""
+    pkg = MEMPALACE_PKG / "palace"
+    return "\n".join(_read(path) for path in sorted(pkg.glob("*.py")))
+
+
 def _tools_dict_keys() -> list:
     """Return the list of tool names registered in the TOOLS dict."""
     # Import the module-level TOOLS dict.  We can't just import mcp_server
@@ -148,7 +160,7 @@ class TestClosetsExist:
     def test_get_closets_collection_exists(self):
         """Claim: closets are a shipped feature.
         palace.py must export get_closets_collection()."""
-        src = _read(MEMPALACE_PKG / "palace.py")
+        src = _palace_source()
         assert "def get_closets_collection(" in src, (
             "palace.py does not define get_closets_collection(). "
             "Closets are described in README but the collection function is missing."
@@ -172,7 +184,7 @@ class TestClosetFirstSearch:
     def test_closet_boost_search_exists(self):
         """Claim: search uses closets as a boost signal.
         searcher.py must have CLOSET_RANK_BOOSTS and query closets_col."""
-        src = _read(MEMPALACE_PKG / "searcher.py")
+        src = _searcher_source()
         assert "CLOSET_RANK_BOOSTS" in src, (
             "searcher.py has no closet boost logic. "
             "README describes closet-based search but searcher.py has no closet ranking."
@@ -180,7 +192,7 @@ class TestClosetFirstSearch:
 
     def test_searcher_imports_closets(self):
         """searcher.py must import get_closets_collection to use closets."""
-        src = _read(MEMPALACE_PKG / "searcher.py")
+        src = _searcher_source()
         assert "get_closets_collection" in src, (
             "searcher.py does not reference get_closets_collection. "
             "Closet-first search can't work without the closets collection."
@@ -198,7 +210,7 @@ class TestBM25HybridSearch:
     def test_bm25_in_searcher(self):
         """Claim: BM25 hybrid search is shipped.
         searcher.py must have BM25 scoring or hybrid ranking logic."""
-        src = _read(MEMPALACE_PKG / "searcher.py")
+        src = _searcher_source()
         has_bm25 = any(
             term in src.lower()
             for term in [
@@ -228,7 +240,7 @@ class TestEntityMetadataExtraction:
         """Claim: entity extraction is part of the mining pipeline.
         Either miner.py or palace.py must extract entities."""
         miner_src = _read(MEMPALACE_PKG / "miner.py")
-        palace_src = _read(MEMPALACE_PKG / "palace.py")
+        palace_src = _palace_source()
         # Entity extraction can be in either file — palace.py has it for closets
         has_entity_extraction = (
             "entities" in palace_src and "_ENTITY_STOPLIST" in palace_src
@@ -392,7 +404,7 @@ class TestMineLock:
     def test_mine_lock_exists(self):
         """Claim: multi-agent file locking is shipped.
         palace.py must define mine_lock."""
-        src = _read(MEMPALACE_PKG / "palace.py")
+        src = _palace_source()
         assert "def mine_lock(" in src, (
             "palace.py does not define mine_lock(). "
             "Multi-agent locking is claimed as shipped but function is missing."
@@ -406,7 +418,7 @@ class TestMineLock:
 
     def test_mine_lock_is_context_manager(self):
         """mine_lock should be a context manager (used with `with` statement)."""
-        src = _read(MEMPALACE_PKG / "palace.py")
+        src = _palace_source()
         # It should be decorated with @contextlib.contextmanager or similar
         # Find the mine_lock definition and check for context manager pattern
         assert "@contextlib.contextmanager" in src or "def __enter__" in src, (
