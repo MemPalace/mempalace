@@ -129,13 +129,84 @@ def _sqlite_taxonomy():
     normalized: dict = {}
     for wing, room_counts in wing_rooms.items():
         dest = normalized.setdefault(_norm(wing), {})
-        for room, n in room_counts.items():
+        for room, count in room_counts.items():
             rkey = _norm(room)
-            dest[rkey] = dest.get(rkey, 0) + n
+            dest[rkey] = dest.get(rkey, DRAWER_COUNT_ZERO) + count
     result = total, normalized
     _taxonomy_cache = (cache_key, result)
     _taxonomy_cache_time = now
     return result
+
+
+def _drawer_totals(wing_rooms, wing=None):
+    """Collapse a ``{wing: {room: DrawerCount}}`` tally into per-wing/per-room ints.
+
+    These are logical drawer counts, so a total reported here agrees with what
+    ``list_drawers`` shows for the same scope — which is the whole point of
+    routing every count through ``DrawerCount``.
+    """
+    wings = {}
+    rooms = {}
+    for w, room_counts in wing_rooms.items():
+        if wing and w != wing:
+            continue
+        for r, count in room_counts.items():
+            wings[w] = wings.get(w, 0) + count.drawers
+            rooms[r] = rooms.get(r, 0) + count.drawers
+    return wings, rooms
+
+
+def _drawer_count_total(wing_rooms):
+    """Sum a ``{wing: {room: DrawerCount}}`` tally into one ``DrawerCount``."""
+    total = DRAWER_COUNT_ZERO
+    for room_counts in wing_rooms.values():
+        for count in room_counts.values():
+            total = total + count
+    return total
+
+
+def logical_drawer_count(col=None):
+    """Whole-palace ``DrawerCount`` for diagnostics, preferring the sqlite fast path.
+
+    Tools that report a bare ``col.count()`` are reporting physical rows, so the
+    number disagrees with ``list_drawers`` on any palace with chunked drawers.
+    This answers the same question ``list_drawers`` answers, and only pays for a
+    metadata walk when the sqlite aggregate is unavailable. Returns ``None`` when
+    there is no collection to count.
+    """
+    try:
+        fast = _sqlite_taxonomy()
+        if fast is not None:
+            return fast[0]
+        if col is None:
+            col = _get_collection()
+        if not col:
+            return None
+        return _drawer_count_total(_client_taxonomy(col))
+    except Exception:
+        # A diagnostic must not fail because counting is unavailable; callers
+        # omit the fields rather than reporting a number in the wrong unit.
+        logger.debug("logical drawer count unavailable", exc_info=True)
+        return None
+
+
+def _drawer_count_fields(count) -> dict:
+    """Response fields for a ``DrawerCount`` that may be unavailable."""
+    if count is None:
+        return {}
+    return {"drawers": count.drawers, "chunks": count.chunks, "rows": count.rows}
+
+
+def _client_taxonomy(col, where=None):
+    """Logical wing/room tally built from fetched rows.
+
+    The fallback for backends whose facets are unavailable — or available but
+    counted in physical rows. Counts distinct logical drawers so a chunked drawer
+    is counted once, the same rule the sqlite fast path applies in SQL. Without
+    it the two paths disagree on the same palace, which is the bug being fixed.
+    """
+    ids, _documents, metadatas = _fetch_drawer_rows(col, where=where, include=["metadatas"])
+    return tally_drawer_rows(ids, metadatas)
 
 
 def _sqlite_graph_stats():
@@ -282,14 +353,11 @@ def tool_status():
     fast = _sqlite_taxonomy()
     if fast is not None:
         total, wing_rooms = fast
-        wings = {}
-        rooms = {}
-        for w, room_counts in wing_rooms.items():
-            wings[w] = wings.get(w, 0) + sum(room_counts.values())
-            for r, n in room_counts.items():
-                rooms[r] = rooms.get(r, 0) + n
+        wings, rooms = _drawer_totals(wing_rooms)
         return {
-            "total_drawers": total,
+            "total_drawers": total.drawers,
+            "total_chunks": total.chunks,
+            "total_rows": total.rows,
             "wings": wings,
             "rooms": rooms,
             "protocol": PALACE_PROTOCOL,
@@ -303,59 +371,25 @@ def tool_status():
     col = _get_collection(create=db_exists)
     if not col:
         return _collection_error_or_no_palace()
-    count = col.count()
-    wings = {}
-    rooms = {}
     result = {
-        "total_drawers": count,
-        "wings": wings,
-        "rooms": rooms,
+        "total_drawers": 0,
+        "total_chunks": 0,
+        "total_rows": 0,
+        "wings": {},
+        "rooms": {},
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
         "backend": _selected_backend_name(),
     }
     try:
-        if _supports_metadata_facets(col):
-            try:
-                temp_wings = col.facet_counts("wing")
-                wings.update(temp_wings)
-                try:
-                    unknown_wings = count - sum(temp_wings.values())
-                    if unknown_wings > 0:
-                        wings["unknown"] = wings.get("unknown", 0) + unknown_wings
-                except (TypeError, ValueError):
-                    pass
-
-                temp_rooms = col.facet_counts("room")
-                rooms.update(temp_rooms)
-                try:
-                    unknown_rooms = count - sum(temp_rooms.values())
-                    if unknown_rooms > 0:
-                        rooms["unknown"] = rooms.get("unknown", 0) + unknown_rooms
-                except (TypeError, ValueError):
-                    pass
-
-            except Exception as e:
-                logger.warning(
-                    "Failed to fetch metadata facets, falling back to client-side loop: %s", e
-                )
-                rooms.clear()
-                wings.clear()
-                all_meta = _get_cached_metadata(col)
-                for m in all_meta:
-                    m = m or {}
-                    w = m.get("wing", "unknown")
-                    r = m.get("room", "unknown")
-                    wings[w] = wings.get(w, 0) + 1
-                    rooms[r] = rooms.get(r, 0) + 1
-        else:
-            all_meta = _get_cached_metadata(col)
-            for m in all_meta:
-                m = m or {}
-                w = m.get("wing", "unknown")
-                r = m.get("room", "unknown")
-                wings[w] = wings.get(w, 0) + 1
-                rooms[r] = rooms.get(r, 0) + 1
+        wing_rooms = _client_taxonomy(col)
+        total = _drawer_count_total(wing_rooms)
+        wings, rooms = _drawer_totals(wing_rooms)
+        result["total_drawers"] = total.drawers
+        result["total_chunks"] = total.chunks
+        result["total_rows"] = total.rows
+        result["wings"] = wings
+        result["rooms"] = rooms
     except Exception as e:
         logger.exception("tool_status metadata fetch failed")
         result["error"] = str(e)
@@ -400,38 +434,15 @@ def tool_list_wings():
     fast = _sqlite_taxonomy()
     if fast is not None:
         _total, wing_rooms = fast
-        wings = {}
-        for w, room_counts in wing_rooms.items():
-            wings[w] = wings.get(w, 0) + sum(room_counts.values())
+        wings, _rooms = _drawer_totals(wing_rooms)
         return {"wings": wings}
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
-    wings = {}
-    result = {"wings": wings}
+    result = {"wings": {}}
     try:
-        try:
-            if not _supports_metadata_facets(col):
-                raise ValueError("facets not supported")
-            temp_wings = col.facet_counts("wing")
-            wings.update(temp_wings)
-            try:
-                unknown_wings = col.count() - sum(temp_wings.values())
-                if unknown_wings > 0:
-                    wings["unknown"] = wings.get("unknown", 0) + unknown_wings
-            except (TypeError, ValueError):
-                pass
-        except Exception as e:
-            if _supports_metadata_facets(col):
-                logger.warning(
-                    "Failed to fetch metadata facets, falling back to client-side loop: %s", e
-                )
-            wings.clear()
-            all_meta = _get_cached_metadata(col)
-            for m in all_meta:
-                m = m or {}
-                w = m.get("wing", "unknown")
-                wings[w] = wings.get(w, 0) + 1
+        wings, _rooms = _drawer_totals(_client_taxonomy(col))
+        result["wings"] = wings
     except Exception as e:
         logger.exception("tool_list_wings metadata fetch failed")
         result["error"] = str(e)
@@ -447,46 +458,16 @@ def tool_list_rooms(wing: str = None):
     fast = _sqlite_taxonomy()
     if fast is not None:
         _total, wing_rooms = fast
-        rooms = {}
-        for w, room_counts in wing_rooms.items():
-            if wing and w != wing:
-                continue
-            for r, n in room_counts.items():
-                rooms[r] = rooms.get(r, 0) + n
+        _wings, rooms = _drawer_totals(wing_rooms, wing=wing)
         return {"wing": wing or "all", "rooms": rooms}
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
-    rooms = {}
-    result = {"wing": wing or "all", "rooms": rooms}
+    result = {"wing": wing or "all", "rooms": {}}
     where = {"wing": wing} if wing else None
     try:
-        try:
-            if not _supports_metadata_facets(col):
-                raise ValueError("facets not supported")
-            temp_rooms = col.facet_counts("room", where=where)
-            rooms.update(temp_rooms)
-            try:
-                if wing:
-                    wing_count = col.facet_counts("wing", where={"wing": wing}).get(wing, 0)
-                    unknown_rooms = wing_count - sum(temp_rooms.values())
-                else:
-                    unknown_rooms = col.count() - sum(temp_rooms.values())
-                if unknown_rooms > 0:
-                    rooms["unknown"] = rooms.get("unknown", 0) + unknown_rooms
-            except (TypeError, ValueError):
-                pass
-        except Exception as e:
-            if _supports_metadata_facets(col):
-                logger.warning(
-                    "Failed to fetch metadata facets, falling back to client-side loop: %s", e
-                )
-            rooms.clear()
-            all_meta = _fetch_all_metadata(col, where=where)
-            for m in all_meta:
-                m = m or {}
-                r = m.get("room", "unknown")
-                rooms[r] = rooms.get(r, 0) + 1
+        _wings, rooms = _drawer_totals(_client_taxonomy(col, where=where))
+        result["rooms"] = rooms
     except Exception as e:
         logger.exception("tool_list_rooms metadata fetch failed")
         result["error"] = str(e)
@@ -498,49 +479,22 @@ def tool_get_taxonomy():
     fast = _sqlite_taxonomy()
     if fast is not None:
         _total, wing_rooms = fast
-        return {"taxonomy": {w: dict(room_counts) for w, room_counts in wing_rooms.items()}}
+        return {
+            "taxonomy": {
+                w: {r: count.drawers for r, count in room_counts.items()}
+                for w, room_counts in wing_rooms.items()
+            }
+        }
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
-    taxonomy = {}
-    result = {"taxonomy": taxonomy}
+    result = {"taxonomy": {}}
     try:
-        try:
-            if not _supports_metadata_facets(col):
-                raise ValueError("facets not supported")
-            from concurrent.futures import ThreadPoolExecutor
-
-            wing_counts = col.facet_counts("wing")
-            wings = list(wing_counts.keys())
-            temp_taxonomy = {}
-            with ThreadPoolExecutor(max_workers=max(1, min(8, len(wings)))) as executor:
-                futures = {
-                    wing: executor.submit(col.facet_counts, "room", where={"wing": wing})
-                    for wing in wings
-                }
-                for wing, future in futures.items():
-                    room_counts = future.result()
-                    try:
-                        unknown_rooms = wing_counts[wing] - sum(room_counts.values())
-                        if unknown_rooms > 0:
-                            room_counts["unknown"] = room_counts.get("unknown", 0) + unknown_rooms
-                    except (TypeError, ValueError):
-                        pass
-                    temp_taxonomy[wing] = room_counts
-                taxonomy.update(temp_taxonomy)
-        except Exception as e:
-            if _supports_metadata_facets(col):
-                logger.warning(
-                    "Failed to fetch metadata facets, falling back to client-side loop: %s", e
-                )
-            all_meta = _get_cached_metadata(col)
-            for m in all_meta:
-                m = m or {}
-                w = m.get("wing", "unknown")
-                r = m.get("room", "unknown")
-                if w not in taxonomy:
-                    taxonomy[w] = {}
-                taxonomy[w][r] = taxonomy[w].get(r, 0) + 1
+        wing_rooms = _client_taxonomy(col)
+        result["taxonomy"] = {
+            w: {r: count.drawers for r, count in room_counts.items()}
+            for w, room_counts in wing_rooms.items()
+        }
     except Exception as e:
         logger.exception("tool_get_taxonomy metadata fetch failed")
         result["error"] = str(e)

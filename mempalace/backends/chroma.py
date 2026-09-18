@@ -23,6 +23,7 @@ from chromadb.errors import NotFoundError as _ChromaNotFoundError
 
 from ..config import connect_sqlite_read
 from ._magic import has_sqlite_magic
+from .base import DRAWER_COUNT_ZERO, DrawerCount
 from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
     BaseBackend,
@@ -1589,17 +1590,39 @@ def _sqlite_wing_room_counts(
                 return None
             rows = conn.execute(
                 """
-                SELECT COALESCE(wm.string_value, CAST(wm.int_value AS TEXT),
-                                CAST(wm.float_value AS TEXT), '?') AS wing,
-                       COALESCE(rm.string_value, CAST(rm.int_value AS TEXT),
-                                CAST(rm.float_value AS TEXT), '?') AS room,
-                       COUNT(*) AS n
-                FROM embeddings e
-                JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
-                JOIN collections c ON s.collection = c.id
-                LEFT JOIN embedding_metadata wm ON wm.id = e.id AND wm.key = 'wing'
-                LEFT JOIN embedding_metadata rm ON rm.id = e.id AND rm.key = 'room'
-                WHERE c.name = ?
+                WITH logical AS (
+                    SELECT COALESCE(wm.string_value, CAST(wm.int_value AS TEXT),
+                                    CAST(wm.float_value AS TEXT), '?') AS wing,
+                           COALESCE(rm.string_value, CAST(rm.int_value AS TEXT),
+                                    CAST(rm.float_value AS TEXT), '?') AS room,
+                           -- A row's logical drawer is its parent when it has one,
+                           -- else the row itself. Scalar subqueries rather than
+                           -- joins: a row carrying both parent keys must not fan
+                           -- out into two rows and inflate the chunk tally.
+                           COALESCE(
+                               (SELECT p.string_value FROM embedding_metadata p
+                                WHERE p.id = e.id AND p.key = 'parent_drawer_id'),
+                               (SELECT p.string_value FROM embedding_metadata p
+                                WHERE p.id = e.id AND p.key = 'parent_entry_id'),
+                               e.id
+                           ) AS logical_id,
+                           EXISTS (
+                               SELECT 1 FROM embedding_metadata p
+                               WHERE p.id = e.id
+                                 AND p.key IN ('parent_drawer_id', 'parent_entry_id')
+                           ) AS is_chunk
+                    FROM embeddings e
+                    JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
+                    JOIN collections c ON s.collection = c.id
+                    LEFT JOIN embedding_metadata wm ON wm.id = e.id AND wm.key = 'wing'
+                    LEFT JOIN embedding_metadata rm ON rm.id = e.id AND rm.key = 'room'
+                    WHERE c.name = ?
+                )
+                SELECT wing, room,
+                       COUNT(DISTINCT logical_id) AS drawers,
+                       SUM(CASE WHEN is_chunk THEN 1 ELSE 0 END) AS chunks,
+                       COUNT(*) AS row_count
+                FROM logical
                 GROUP BY wing, room
                 """,
                 (collection_name,),
@@ -1609,11 +1632,12 @@ def _sqlite_wing_room_counts(
     except sqlite3.Error:
         return None
 
-    total = 0
-    wing_rooms: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    for wing, room, n in rows:
-        wing_rooms[wing][room] += int(n)
-        total += int(n)
+    total = DRAWER_COUNT_ZERO
+    wing_rooms: dict[str, dict[str, DrawerCount]] = defaultdict(dict)
+    for wing, room, drawers, chunks, row_count in rows:
+        count = DrawerCount(drawers=int(drawers), chunks=int(chunks), rows=int(row_count))
+        wing_rooms[wing][room] = wing_rooms[wing].get(room, DRAWER_COUNT_ZERO) + count
+        total = total + count
     return total, wing_rooms
 
 
