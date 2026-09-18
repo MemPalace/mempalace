@@ -3,7 +3,11 @@ Hook logic for MemPalace — Python implementation of session-start, stop, sessi
 
 Reads JSON from stdin, outputs JSON to stdout.
 Supported hooks: session-start, stop, session-end, precompact
-Supported harnesses: claude-code, codex, dsh (extensible to cursor, gemini, etc.)
+Supported harnesses: claude-code, codex, grok, copilot, dsh, auto, or any other token.
+Payload parsing is alias-based (session_id/sessionId, transcript_path, cwd,
+stopReason). Grok locates ~/.grok/sessions/<urlencoded-cwd>/<id>/chat_history.jsonl
+when the payload has no transcript_path. Copilot locates
+~/.copilot/session-state/<id>/events.jsonl (COPILOT_HOME overrides the root).
 
 ``dsh`` (the DeepSeek Harness) cannot hand a hook its own transcript: DSH stores
 sessions zstd-compressed, and its hook bridge passes an empty
@@ -24,7 +28,8 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
+from urllib.parse import quote
 
 from mempalace.config import MempalaceConfig
 from mempalace.write_routing import (
@@ -38,6 +43,7 @@ from mempalace.write_routing import (
 SAVE_INTERVAL = 15
 STATE_DIR = Path.home() / ".mempalace" / "hook_state"
 PALACE_ROOT = Path.home() / ".mempalace"
+_USER_QUERY_RE = re.compile(r"<user_query>\s*(.*?)\s*</user_query>", re.DOTALL)
 
 
 def _detached_popen_kwargs() -> dict:
@@ -176,6 +182,56 @@ def _validate_transcript_path(transcript_path: str) -> Path:
     return path
 
 
+def _record_text(entry: dict) -> str:
+    """Flatten a transcript record's text from string or typed content blocks."""
+    content = entry.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(parts)
+    return ""
+
+
+def _is_grok_user_turn(entry: dict) -> bool:
+    """Grok chat_history.jsonl: real prompts, not synthetics or user_info.
+
+    Fresh turns carry ``prompt_index``. Compacted resumes often omit it but
+    still wrap the typed prompt in ``<user_query>``.
+    """
+    if entry.get("type") != "user":
+        return False
+    if entry.get("synthetic_reason"):
+        return False
+    if "prompt_index" in entry:
+        return True
+    return "<user_query>" in _record_text(entry)
+
+
+def _copilot_user_text(entry: dict) -> str:
+    """Copilot session-state events.jsonl: type=user.message, text in data.content."""
+    if entry.get("type") != "user.message":
+        return ""
+    payload = entry.get("data") or {}
+    if not isinstance(payload, dict):
+        return ""
+    content = payload.get("content")
+    return content.strip() if isinstance(content, str) else ""
+
+
+def _normalize_user_text(text: str) -> str:
+    if not text or not isinstance(text, str):
+        return ""
+    match = _USER_QUERY_RE.search(text)
+    body = (match.group(1) if match else text).strip()
+    return re.sub(r"\s+", " ", body)
+
+
 def _count_human_messages(transcript_path: str) -> int:
     """Count human messages in a JSONL transcript, skipping command-messages."""
     path = _validate_transcript_path(transcript_path)
@@ -191,6 +247,14 @@ def _count_human_messages(transcript_path: str) -> int:
             for line in f:
                 try:
                     entry = json.loads(line)
+                    if not isinstance(entry, dict):
+                        continue
+                    if _is_grok_user_turn(entry):
+                        count += 1
+                        continue
+                    if _copilot_user_text(entry):
+                        count += 1
+                        continue
                     msg = entry.get("message", {})
                     if isinstance(msg, dict) and msg.get("role") == "user":
                         content = msg.get("content", "")
@@ -716,8 +780,20 @@ def _log_hook_write_blocked(routing: HookWriteRouting, operation: str) -> None:
     _log(f"{routing.notice} Operation skipped: {operation}.")
 
 
-def _blocked_hook_output(routing: HookWriteRouting) -> dict:
-    return {"systemMessage": routing.notice}
+def _harness_notice_output(harness: str, notice: str) -> dict:
+    """Return a user-visible hook notice for harnesses that render it.
+
+    Claude Code shows ``systemMessage``. Grok Stop ignores that key, and
+    Grok ``additionalContext`` on Stop keeps the agent working, so Grok
+    silent-save must emit empty JSON.
+    """
+    if (harness or "") == "grok":
+        return {}
+    return {"systemMessage": notice}
+
+
+def _blocked_hook_output(routing: HookWriteRouting, harness: str = "") -> dict:
+    return _harness_notice_output(harness, routing.notice)
 
 
 def _submit_daemon_job(
@@ -965,6 +1041,17 @@ def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUN
             for line in f:
                 try:
                     entry = json.loads(line)
+                    if not isinstance(entry, dict):
+                        continue
+                    if _is_grok_user_turn(entry):
+                        text = _normalize_user_text(_record_text(entry))
+                        if text:
+                            messages.append(text[:200])
+                        continue
+                    copilot_text = _copilot_user_text(entry)
+                    if copilot_text:
+                        messages.append(copilot_text[:200])
+                        continue
                     # Claude Code format
                     msg = entry.get("message") or entry.get("event_message") or {}
                     if isinstance(msg, dict) and msg.get("role") == "user":
@@ -1205,7 +1292,15 @@ def _ingest_transcript(transcript_path: str):
         _log(f"transcript ingest hook failed: {exc}")
 
 
-SUPPORTED_HARNESSES = {"claude-code", "codex", "dsh"}
+SUPPORTED_HARNESSES = {
+    "claude-code",
+    "codex",
+    "grok",
+    "cursor",
+    "copilot",
+    "dsh",
+    "auto",
+}
 
 
 def _diary_agent_for_harness(harness: str) -> str:
@@ -1219,19 +1314,347 @@ def _diary_agent_for_harness(harness: str) -> str:
     returning the harness name keeps a newly supported harness discoverable
     instead of silently invisible again.
     """
-    return "claude" if harness == "claude-code" else harness
+    resolved = harness if harness and harness != "auto" else "claude-code"
+    return "claude" if resolved == "claude-code" else resolved
 
 
-def _parse_harness_input(data: dict, harness: str) -> dict:
-    """Parse stdin JSON according to the harness type."""
-    if harness not in SUPPORTED_HARNESSES:
-        print(f"Unknown harness: {harness}", file=sys.stderr)
-        sys.exit(1)
+def _first_payload_str(
+    data: dict,
+    *keys: str,
+    env: Optional[Mapping[str, str]] = None,
+    env_keys: tuple = (),
+) -> str:
+    """Return the first non-empty string from payload keys, then env keys."""
+    for key in keys:
+        value = data.get(key)
+        if value is None or value == "":
+            continue
+        if isinstance(value, list):
+            if not value:
+                continue
+            value = value[0]
+        return str(value).strip()
+    if env:
+        for key in env_keys:
+            value = env.get(key)
+            if value:
+                return str(value).strip()
+    return ""
+
+
+def _detect_harness(data: dict, env: Optional[Mapping[str, str]] = None) -> str:
+    """Infer harness from env and payload when ``--harness auto`` is used."""
+    env = env or {}
+    explicit = str(env.get("MEMPALACE_HOOK_HARNESS") or "").strip()
+    if explicit and explicit != "auto":
+        return explicit
+    if env.get("GROK_SESSION_ID") or env.get("GROK_HOOK_EVENT") or env.get("GROK_WORKSPACE_ROOT"):
+        return "grok"
+    if env.get("CURSOR_TRANSCRIPT_PATH") or (
+        data.get("conversation_id") and data.get("workspace_roots")
+    ):
+        return "cursor"
+    transcript = str(data.get("transcriptPath") or data.get("transcript_path") or "")
+    transcript_norm = transcript.replace("\\", "/")
+    stop_reason = data.get("stopReason")
+    if stop_reason is None:
+        stop_reason = data.get("stop_reason")
+    # Claude snake_case envelopes win over an ambient COPILOT_HOME. A path
+    # that merely ends in events.jsonl is not enough to call it Copilot.
+    if (
+        data.get("session_id")
+        and data.get("transcript_path")
+        and stop_reason is None
+        and "session-state" not in transcript_norm
+    ):
+        return "claude-code"
+    if env.get("COPILOT_HOME"):
+        return "copilot"
+    if "session-state" in transcript_norm:
+        return "copilot"
+    if data.get("stopReason") is not None:
+        return "copilot"
+    return "claude-code"
+
+
+def _resolve_harness_name(harness: str, data: dict, env: Optional[Mapping[str, str]] = None) -> str:
+    if harness and harness != "auto":
+        return harness
+    return _detect_harness(data, env)
+
+
+def _parse_harness_input(
+    data: dict,
+    harness: str,
+    env: Optional[Mapping[str, str]] = None,
+) -> dict:
+    """Parse stdin JSON using camelCase/snake_case aliases shared across harnesses."""
+    if env is None:
+        env = os.environ
+    harness = _resolve_harness_name(harness, data, env)
+    session_id = _first_payload_str(
+        data,
+        "session_id",
+        "sessionId",
+        "conversation_id",
+        env=env,
+        env_keys=("GROK_SESSION_ID",),
+    )
+    cwd = _first_payload_str(
+        data,
+        "cwd",
+        "workspaceRoot",
+        "workspace_root",
+        "workspace_roots",
+        env=env,
+        env_keys=("GROK_WORKSPACE_ROOT", "CURSOR_PROJECT_DIR", "CLAUDE_PROJECT_DIR"),
+    )
+    transcript_path = _first_payload_str(
+        data,
+        "transcript_path",
+        "transcriptPath",
+        env=env,
+        env_keys=("CURSOR_TRANSCRIPT_PATH",),
+    )
+    stop_hook_active = data.get("stop_hook_active", data.get("stopHookActive", False))
+    loop_count = data.get("loop_count", data.get("loopCount"))
+    if loop_count not in (None, "", False) and not stop_hook_active:
+        try:
+            stop_hook_active = int(loop_count) > 0
+        except (TypeError, ValueError):
+            pass
+    subagent = (
+        data.get("subagentType")
+        or data.get("subagent_type")
+        or data.get("agentType")
+        or data.get("agent_type")
+    )
+    subagent_s = str(subagent).strip() if subagent else ""
+    reason = data.get("stopReason") or data.get("stop_reason") or data.get("reason")
     return {
-        "session_id": _sanitize_session_id(str(data.get("session_id", "unknown"))),
-        "stop_hook_active": data.get("stop_hook_active", False),
-        "transcript_path": str(data.get("transcript_path", "")),
+        "session_id": _sanitize_session_id(session_id or "unknown"),
+        "stop_hook_active": stop_hook_active,
+        "transcript_path": transcript_path,
+        "cwd": cwd,
+        "stop_reason": str(reason) if reason else "",
+        "subagent_type": subagent_s,
+        "harness": harness,
     }
+
+
+def _wing_from_cwd(cwd: str) -> str:
+    """Derive ``wing_<slug>`` from a workspace path leaf.
+
+    A cwd inside ``<project>/.claude/worktrees/<wt>`` belongs to ``<project>``,
+    matching ``_wing_from_jsonl_cwd`` / #2388. Claude Stop always sends cwd, so
+    this is the path Stop actually uses.
+    """
+    cwd_norm = str(cwd or "").replace("\\", "/").rstrip("/")
+    if not cwd_norm:
+        return "wing_sessions"
+    _wt_marker = "/.claude/worktrees/"
+    if _wt_marker in cwd_norm:
+        cwd_norm = cwd_norm.split(_wt_marker, 1)[0]
+    name = Path(cwd_norm).name if cwd_norm else "sessions"
+    return f"wing_{_safe_wing_slug(name)}"
+
+
+def _project_wing(parsed: dict, transcript_path: str) -> str:
+    cwd = str(parsed.get("cwd") or "")
+    if cwd:
+        return _wing_from_cwd(cwd)
+    return _wing_from_transcript_path(transcript_path)
+
+
+def _grok_sessions_root() -> Path:
+    home = os.environ.get("GROK_HOME") or str(Path.home() / ".grok")
+    return Path(home).expanduser() / "sessions"
+
+
+def _find_grok_session_dir(
+    session_id: str, cwd: str, sessions_root: Optional[Path] = None
+) -> Optional[Path]:
+    if not session_id:
+        return None
+    root = sessions_root or _grok_sessions_root()
+    if cwd:
+        candidate = root / quote(cwd, safe="") / session_id
+        if candidate.is_dir():
+            return candidate
+    for name in ("events.jsonl", "chat_history.jsonl"):
+        matches = sorted(p.parent for p in root.glob(f"*/{session_id}/{name}"))
+        if matches:
+            return matches[0]
+    return None
+
+
+def _find_grok_chat_history(
+    session_id: str, cwd: str, sessions_root: Optional[Path] = None
+) -> Optional[Path]:
+    session_dir = _find_grok_session_dir(session_id, cwd, sessions_root=sessions_root)
+    if session_dir is None:
+        return None
+    history = session_dir / "chat_history.jsonl"
+    return history if history.is_file() else None
+
+
+def _find_grok_events(
+    session_id: str, cwd: str, sessions_root: Optional[Path] = None
+) -> Optional[Path]:
+    session_dir = _find_grok_session_dir(session_id, cwd, sessions_root=sessions_root)
+    if session_dir is None:
+        return None
+    events = session_dir / "events.jsonl"
+    return events if events.is_file() else None
+
+
+def _count_grok_event_turns(events_path: str) -> int:
+    """Count ``turn_started`` events. Written at turn start, before Stop."""
+    path = Path(events_path)
+    if not path.is_file():
+        return 0
+    count = 0
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(entry, dict) and entry.get("type") == "turn_started":
+                    count += 1
+    except OSError:
+        return 0
+    return count
+
+
+def _grok_turn_count(parsed: dict, sessions_root: Optional[Path] = None) -> int:
+    """Turn count that does not depend on chat_history.jsonl being flushed.
+
+    Live Grok Stop runs at turn_ended while chat_history.jsonl is still
+    unflushed, so a history-only count is always 0. events.jsonl already
+    has turn_started for the current turn.
+    """
+    sid = str(parsed.get("session_id") or "")
+    cwd = str(parsed.get("cwd") or "")
+    history = _find_grok_chat_history(sid, cwd, sessions_root=sessions_root)
+    events = _find_grok_events(sid, cwd, sessions_root=sessions_root)
+    hist = _count_human_messages(str(history)) if history else 0
+    ev = _count_grok_event_turns(str(events)) if events else 0
+    return max(hist, ev)
+
+
+_GROK_DEFERRED_SAVE_ENV = "MEMPALACE_GROK_DEFERRED_SAVE"
+_GROK_HISTORY_WAIT_S = 5.0
+
+
+def _wait_for_grok_chat_history(
+    parsed: dict,
+    sessions_root: Optional[Path] = None,
+    timeout_s: float = _GROK_HISTORY_WAIT_S,
+) -> Optional[Path]:
+    sid = str(parsed.get("session_id") or "")
+    cwd = str(parsed.get("cwd") or "")
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    found = None
+    while True:
+        found = _find_grok_chat_history(sid, cwd, sessions_root=sessions_root)
+        if found and _count_human_messages(str(found)) > 0:
+            return found
+        if time.monotonic() >= deadline:
+            return found
+        time.sleep(0.05)
+
+
+def _spawn_deferred_grok_save(data: dict) -> bool:
+    """Rerun Stop after chat_history.jsonl is flushed. Must not block this Stop."""
+    if os.environ.get(_GROK_DEFERRED_SAVE_ENV):
+        return False
+    env = os.environ.copy()
+    env[_GROK_DEFERRED_SAVE_ENV] = "1"
+    kwargs = _detached_popen_kwargs()
+    kwargs["stdin"] = subprocess.PIPE
+    kwargs["stdout"] = subprocess.DEVNULL
+    kwargs["stderr"] = subprocess.DEVNULL
+    try:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "mempalace",
+                "hook",
+                "run",
+                "--hook",
+                "stop",
+                "--harness",
+                "grok",
+            ],
+            env=env,
+            **kwargs,
+        )
+        if proc.stdin is not None:
+            proc.stdin.write(json.dumps(data).encode("utf-8"))
+            proc.stdin.close()
+    except OSError as exc:
+        _log(f"WARNING: could not spawn deferred Grok save: {exc}")
+        return False
+    return True
+
+
+def _copilot_sessions_root() -> Path:
+    home = os.environ.get("COPILOT_HOME") or str(Path.home() / ".copilot")
+    return Path(home).expanduser() / "session-state"
+
+
+def _find_copilot_events(session_id: str, sessions_root: Optional[Path] = None) -> Optional[Path]:
+    if not session_id:
+        return None
+    root = sessions_root or _copilot_sessions_root()
+    candidate = root / session_id / "events.jsonl"
+    if candidate.is_file():
+        return candidate
+    matches = sorted(root.glob(f"*/{session_id}/events.jsonl"))
+    return matches[0] if matches else None
+
+
+def _locate_transcript(
+    harness: str,
+    parsed: dict,
+    *,
+    sessions_root: Optional[Path] = None,
+) -> str:
+    """Return a readable transcript path, locating Grok sessions when omitted."""
+    explicit = str(parsed.get("transcript_path") or "")
+    validated = _validate_transcript_path(explicit)
+    if validated is not None and validated.is_file():
+        return str(validated)
+    resolved = parsed.get("harness") or harness
+    if resolved == "auto":
+        resolved = _detect_harness(parsed, os.environ)
+    if resolved == "grok":
+        found = _find_grok_chat_history(
+            str(parsed.get("session_id") or ""),
+            str(parsed.get("cwd") or ""),
+            sessions_root=sessions_root,
+        )
+        return str(found) if found else ""
+    if resolved == "copilot":
+        found = _find_copilot_events(
+            str(parsed.get("session_id") or ""),
+            sessions_root=sessions_root,
+        )
+        return str(found) if found else ""
+    return explicit
+
+
+def _should_skip_stop(parsed: dict) -> bool:
+    """Skip nested/teardown Stop fires that would double-save or count as turns."""
+    if parsed.get("subagent_type"):
+        return True
+    if parsed.get("harness") not in ("grok", "copilot"):
+        return False
+    reason = parsed.get("stop_reason") or ""
+    return bool(reason) and reason != "end_turn"
 
 
 # Common parent-dir tokens stripped from the encoded folder when no
@@ -1391,7 +1814,15 @@ def hook_stop(data: dict, harness: str):
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
     stop_hook_active = parsed["stop_hook_active"]
-    transcript_path = parsed["transcript_path"]
+    harness = parsed.get("harness") or harness
+    if _should_skip_stop(parsed):
+        _output({})
+        return
+    transcript_path = _locate_transcript(harness, parsed)
+    if harness == "grok" and os.environ.get(_GROK_DEFERRED_SAVE_ENV):
+        waited = _wait_for_grok_chat_history(parsed)
+        if waited:
+            transcript_path = str(waited)
 
     # Respect auto_save config toggle (clean opt-out)
     if not MempalaceConfig().hooks_auto_save:
@@ -1415,8 +1846,12 @@ def hook_stop(data: dict, harness: str):
             _output({})
             return
 
-    # Count human messages
-    exchange_count = _count_human_messages(transcript_path)
+    # Count human messages. Grok Stop runs before chat_history.jsonl is
+    # flushed; events.jsonl turn_started is already on disk.
+    if harness == "grok":
+        exchange_count = _grok_turn_count(parsed)
+    else:
+        exchange_count = _count_human_messages(transcript_path)
 
     # Track last save point
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1436,7 +1871,7 @@ def hook_stop(data: dict, harness: str):
         with _hook_write_routing_context() as routing:
             if routing.blocked:
                 _log_hook_write_blocked(routing, "stop-hook checkpoint")
-                _output(_blocked_hook_output(routing))
+                _output(_blocked_hook_output(routing, harness))
                 return
 
             _log(f"TRIGGERING SAVE at exchange {exchange_count}")
@@ -1450,9 +1885,25 @@ def hook_stop(data: dict, harness: str):
                 silent = True
                 toast = False
 
-            project_wing = _wing_from_transcript_path(transcript_path)
+            project_wing = _project_wing(parsed, transcript_path)
 
             if silent:
+                if harness == "grok" and (
+                    not transcript_path or _count_human_messages(transcript_path) == 0
+                ):
+                    if _spawn_deferred_grok_save(data):
+                        _log(
+                            f"Deferred Grok save; chat_history unflushed at exchange {exchange_count}"
+                        )
+                        # Mark the interval now so the next Stop does not spawn
+                        # another waiter while this child is still waiting for
+                        # chat_history.jsonl. SessionEnd recovers a dead waiter.
+                        try:
+                            last_save_file.write_text(str(exchange_count), encoding="utf-8")
+                        except OSError:
+                            pass
+                        _output({})
+                        return
                 # Save directly via Python API — systemMessage renders in terminal
                 result = {"count": 0}
                 if transcript_path:
@@ -1477,11 +1928,8 @@ def hook_stop(data: dict, harness: str):
                         tag = " \u2014 " + ", ".join(themes)
                     else:
                         tag = ""
-                    _output(
-                        {
-                            "systemMessage": f"\u2726 {count} memories woven into the palace{tag}",
-                        }
-                    )
+                    notice = f"\u2726 {count} memories woven into the palace{tag}"
+                    _output(_harness_notice_output(harness, notice))
                 else:
                     _output({})
             else:
@@ -1519,7 +1967,7 @@ def hook_session_start(data: dict, harness: str):
     with _hook_write_routing_context() as routing:
         if routing.blocked:
             _log_hook_write_blocked(routing, "session-start readiness check")
-            _output(_blocked_hook_output(routing))
+            _output(_blocked_hook_output(routing, harness))
             return
 
     # Pass through — no blocking on session start
@@ -1575,7 +2023,14 @@ def hook_session_end(data: dict, harness: str):
     try:
         parsed = _parse_harness_input(data, harness)
         session_id = parsed["session_id"]
-        transcript_path = parsed["transcript_path"]
+        harness = parsed.get("harness") or harness
+        transcript_path = _locate_transcript(harness, parsed)
+        if harness == "grok" and (
+            not transcript_path or _count_human_messages(transcript_path) == 0
+        ):
+            waited = _wait_for_grok_chat_history(parsed)
+            if waited:
+                transcript_path = str(waited)
 
         # Read config defensively (mirror hook_stop): a corrupt or unreadable
         # config must not lose the final save, so default to auto-save on and
@@ -1623,14 +2078,14 @@ def hook_session_end(data: dict, harness: str):
         with _hook_write_routing_context() as routing:
             if routing.blocked:
                 _log_hook_write_blocked(routing, "session-end flush")
-                _output(_blocked_hook_output(routing))
+                _output(_blocked_hook_output(routing, harness))
                 return
 
             if valid_transcript:
                 _save_diary_direct(
                     valid_transcript,
                     session_id,
-                    wing=_wing_from_transcript_path(valid_transcript),
+                    wing=_project_wing(parsed, valid_transcript),
                     toast=toast,
                     agent_name=_diary_agent_for_harness(harness),
                 )
@@ -1653,7 +2108,8 @@ def hook_precompact(data: dict, harness: str):
         return
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
-    transcript_path = parsed["transcript_path"]
+    harness = parsed.get("harness") or harness
+    transcript_path = _locate_transcript(harness, parsed)
 
     # Respect auto_save config toggle (clean opt-out)
     if not MempalaceConfig().hooks_auto_save:
@@ -1665,7 +2121,7 @@ def hook_precompact(data: dict, harness: str):
     with _hook_write_routing_context() as routing:
         if routing.blocked:
             _log_hook_write_blocked(routing, "precompact flush")
-            _output(_blocked_hook_output(routing))
+            _output(_blocked_hook_output(routing, harness))
             return
 
         # Capture tool output via our normalize path before compaction loses it
@@ -1700,4 +2156,5 @@ def run_hook(hook_name: str, harness: str):
         print(f"Unknown hook: {hook_name}", file=sys.stderr)
         sys.exit(1)
 
+    harness = _resolve_harness_name(harness, data, os.environ)
     handler(data, harness)
