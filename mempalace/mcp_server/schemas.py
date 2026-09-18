@@ -256,6 +256,15 @@ TOOLS = {
                     "type": "string",
                     "description": "Filter hallways by wing",
                 },
+                "limit": {
+                    "type": "integer",
+                    "default": _LIST_HALLWAYS_DEFAULT_LIMIT,
+                    "maximum": _LIST_HALLWAYS_MAX_LIMIT,
+                    "description": "Max hallways to return, strongest-first. "
+                    "Bounded to keep dense wings within the client tool "
+                    "budget; the response also carries `total` (full match "
+                    "count) and `truncated` (true when the answer was capped).",
+                },
             },
         },
         "handler": tool_list_hallways,
