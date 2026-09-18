@@ -11,6 +11,7 @@ policy until an exclusive-maintenance protocol exists.
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import dataclass
 
 from .config import MempalaceConfig
@@ -21,6 +22,25 @@ from .write_routing import (
     WriteRoutingPolicy,
     choose_write_route,
 )
+
+_CLI_ROUTING_SCOPE_ENV = "MEMPALACE_CLI_ROUTING_SCOPE"
+_VALID_CLI_ROUTING_SCOPES = ("cli", "hooks")
+
+
+def _cli_routing_scope() -> str:
+    """Which named write-routing scope a routine CLI write resolves against.
+
+    Defaults to ``cli``. The portable shell hooks under ``hooks/`` shell out
+    to ``mempalace mine`` instead of writing in-process through
+    :mod:`mempalace.hooks_cli`, so they set
+    ``MEMPALACE_CLI_ROUTING_SCOPE=hooks`` before invoking it: without this,
+    a ``write_routing.hooks`` policy configured to keep hook-triggered
+    writes on the daemon is silently ignored for every shell-hook mine,
+    which instead reads ``write_routing.cli`` (default direct).
+    """
+
+    value = os.environ.get(_CLI_ROUTING_SCOPE_ENV, "cli").strip().lower()
+    return value if value in _VALID_CLI_ROUTING_SCOPES else "cli"
 
 
 @dataclass(frozen=True)
@@ -112,7 +132,7 @@ def resolve_cli_write_routing(
         )
         explicit = True
     else:
-        resolved = MempalaceConfig().resolve_write_routing("cli")
+        resolved = MempalaceConfig().resolve_write_routing(_cli_routing_scope())
         explicit = False
 
     decision = choose_write_route(
