@@ -171,6 +171,7 @@ def test_change_during_read_is_recovered_on_next_stable_mine(tmp_path, monkeypat
 
 
 def test_atomic_replacement_with_same_size_and_mtime_is_remined(tmp_path):
+    """File freshness can change while sync's source directory stays the same."""
     source = tmp_path / "session.txt"
     initial = _INITIAL + "\n> Shipping plan?\nOLD_REPLACE_MARKER: keep transport local.\n"
     revised = initial.replace("OLD_REPLACE_MARKER", "NEW_REPLACE_MARKER")
@@ -178,6 +179,14 @@ def test_atomic_replacement_with_same_size_and_mtime_is_remined(tmp_path):
     palace = tmp_path / "palace"
     _mine(source, palace)
     original_stat = source.stat()
+    original_rows = get_collection(str(palace)).get(
+        where={"source_file": str(source)}, include=["metadatas"]
+    )
+    assert original_rows["ids"]
+    original_fingerprints = {m["source_fingerprint"] for m in original_rows["metadatas"]}
+    directory_inode = source.parent.stat().st_ino
+    directory_identity = str(directory_inode) if directory_inode else None
+    assert all(m.get("source_dir_ino") == directory_identity for m in original_rows["metadatas"])
 
     replacement = tmp_path / "replacement.txt"
     replacement.write_text(revised, encoding="utf-8")
@@ -196,6 +205,15 @@ def test_atomic_replacement_with_same_size_and_mtime_is_remined(tmp_path):
     docs = _documents(palace)
     assert any("NEW_REPLACE_MARKER" in doc for doc in docs)
     assert not any("OLD_REPLACE_MARKER" in doc for doc in docs)
+    replaced_rows = get_collection(str(palace)).get(
+        where={"source_file": str(source)}, include=["metadatas"]
+    )
+    assert replaced_rows["ids"]
+    assert all(
+        m["source_fingerprint"] not in original_fingerprints
+        and m.get("source_dir_ino") == directory_identity
+        for m in replaced_rows["metadatas"]
+    )
 
 
 def test_legacy_mtime_only_rows_upgrade_once_then_skip(tmp_path, monkeypatch):

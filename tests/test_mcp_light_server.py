@@ -2,9 +2,17 @@
 test_mcp_light_server.py — Integration tests for Lightweight MemPalace MCP Server.
 """
 
+import io
 import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 from mempalace import mcp_light_server, mcp_server
 from mempalace.palace_graph import invalidate_graph_cache
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _patch_light_server(monkeypatch, config, kg):
@@ -844,3 +852,63 @@ class TestHubDispatch:
         assert res["id"] == 100
         payload = json.loads(res["result"]["content"][0]["text"])
         assert payload.get("success") is True
+
+
+def test_light_server_help_lists_the_light_servers_own_options():
+    """``--help`` reaches the light server's parser (#2528).
+
+    It used to be answered while the light server was still importing the full
+    server, which parsed argv on import and printed its own options, including
+    an HTTP transport the light server rejects.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-c", "from mempalace.mcp_light_server import main; main()", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=str(REPO_ROOT),
+    )
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 0, output
+    assert "MemPalace Lightweight MCP Server" in output
+    assert "--transport" not in output
+
+
+def test_light_server_applies_the_flags_it_shares_with_the_full_server(monkeypatch, tmp_path):
+    """``--palace``, ``--backend`` and ``--read-only`` reach the state the tools read.
+
+    ``--palace`` also puts the knowledge graph beside that palace, as it does
+    for the full server.
+    """
+    from _mcp_server_helpers import _keep_server_command_line_state
+
+    _keep_server_command_line_state(monkeypatch)
+    for name in (
+        "_maybe_eager_warmup_embedder",
+        "_start_idle_exit_watchdog",
+        "_start_write_stall_watchdog",
+    ):
+        monkeypatch.setattr(mcp_server, name, lambda: None)
+    monkeypatch.setattr(mcp_light_server, "_restore_stdout", lambda: None)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    palace = tmp_path / "palace"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "mempalace-light-mcp",
+            "--palace",
+            str(palace),
+            "--backend",
+            "sqlite_exact",
+            "--read-only",
+        ],
+    )
+
+    mcp_light_server.main()
+
+    assert mcp_server._config.palace_path == str(palace)
+    assert mcp_server._READ_ONLY is True
+    assert os.environ["MEMPALACE_BACKEND"] == "sqlite_exact"
+    assert mcp_server._resolve_kg_path() == str(palace / "knowledge_graph.sqlite3")

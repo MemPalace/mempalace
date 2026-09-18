@@ -34,6 +34,7 @@ from .normalize import (
     UnparsedCodexTranscriptError,
     normalize_conversations,
 )
+from .source_identity import identity_metadata, source_directory_identity
 from .entities import entities_metadata
 from .palace import (
     NORMALIZE_VERSION,
@@ -139,6 +140,9 @@ def file_conversation_exchange(
         "extract_mode": "exchange",
         "normalize_version": NORMALIZE_VERSION,
         "id_recipe": ID_RECIPE,
+        # Same directory identity a mined drawer carries, so ``sync`` decides
+        # a live exchange and a historical one by the same rule (#2320).
+        **identity_metadata(source_file),
     }
     if extra_metadata:
         for key, value in extra_metadata.items():
@@ -636,6 +640,7 @@ def _file_chunks_locked(
     extract_mode,
     authored_at=None,
     content_hash=None,
+    source_dir_ino=None,
     source_metadata=None,
 ):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
@@ -737,6 +742,11 @@ def _file_chunks_locked(
                         "chunk_total": chunk_total,
                     }
                     meta.update(source_metadata or {})
+                    if source_dir_ino:
+                        # Which directory this transcript was read from, so
+                        # ``sync`` can tell a neighbour in the same directory
+                        # from one on a volume mounted there since (#2320).
+                        meta["source_dir_ino"] = source_dir_ino
                     # Stamp content_hash only on chunk 0 so multi-conversation
                     # privacy-export hashes are not O(N²)-duplicated across every
                     # chunk row. ``prefetch_content_hashes`` still finds them —
@@ -1222,6 +1232,7 @@ def _mine_convos_impl(
             extract_mode,
             authored_at=_extract_authored_at(filepath),
             content_hash=content_hash,
+            source_dir_ino=source_directory_identity(filepath),
             source_metadata=source_metadata,
         )
         if skipped:
