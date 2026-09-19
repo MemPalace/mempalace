@@ -267,31 +267,45 @@ def _register_file(
     )
 
 
-def _source_file_delete_ids(collection, source_file: str, extract_mode: str) -> list[str]:
-    """Collect drawer IDs for one source file and extraction mode.
+def _source_file_rows(
+    collection, source_file: str, extract_mode: str, *, include_documents: bool = False
+) -> dict:
+    """Map drawer ID -> (document, metadata) for one source file and mode.
+
+    ``document`` is None unless ``include_documents``: the purge path needs
+    only ids, and a transcript's documents are large enough that fetching
+    them to build a delete list would cost more than the delete.
 
     Legacy conversation drawers did not carry extract_mode; treat those as
     exchange-mode rows so schema rebuilds can still clean them up without
     deleting newer general-mode drawers for the same transcript.
     """
-    ids: list[str] = []
+    include = ["metadatas", "documents"] if include_documents else ["metadatas"]
+    rows: dict = {}
     offset = 0
     while True:
         batch = collection.get(
             where={"source_file": source_file},
             limit=1000,
             offset=offset,
-            include=["metadatas"],
+            include=include,
         )
         batch_ids = batch.get("ids") or []
         metadatas = batch.get("metadatas") or []
-        for drawer_id, meta in zip(batch_ids, metadatas):
+        documents = (batch.get("documents") or []) if include_documents else []
+        for idx, (drawer_id, meta) in enumerate(zip(batch_ids, metadatas)):
             if _metadata_matches_extract_mode(meta or {}, extract_mode):
-                ids.append(drawer_id)
+                doc = documents[idx] if idx < len(documents) else None
+                rows[drawer_id] = (doc, meta or {})
         if not batch_ids:
             break
         offset += len(batch_ids)
-    return ids
+    return rows
+
+
+def _source_file_delete_ids(collection, source_file: str, extract_mode: str) -> list[str]:
+    """Collect drawer IDs for one source file and extraction mode."""
+    return list(_source_file_rows(collection, source_file, extract_mode))
 
 
 # =============================================================================
@@ -662,23 +676,26 @@ def _file_chunks_locked(
         if file_already_mined(collection, source_file, check_mtime=True, extract_mode=extract_mode):
             return 0, room_counts_delta, True
 
-        # Purge stale drawers first. Fires both on a normalize-schema bump
-        # (file_already_mined() returned False for pre-v2 drawers) and on a
-        # changed/grown transcript (mtime differs) — clean them out so the
-        # source doesn't end up with mixed old/new drawers.
+        # Read what this source already has filed so an append-only transcript
+        # can keep the vectors it already paid for. A live Claude Code session
+        # re-mines the same file every SAVE_INTERVAL human messages, and chunk
+        # N of a source always hashes to the same drawer id, so a chunk whose
+        # text is byte-identical at the current schema needs no re-embedding --
+        # only the metadata this pass changes. Holds the source's documents in
+        # memory for the length of the mine, bounded by the transcript, which
+        # is what buys skipping its re-embedding.
         #
-        # A failed purge must abort this file's mine attempt rather than
-        # fall through to upsert: proceeding on top of an unpurged (or
-        # partially purged) set produces duplicate/stale drawers under
-        # mixed schema versions, with no operator-visible signal beyond a
-        # debug log (#105 — convo_miner's own instance of the same swallow
-        # already fixed for miner.py at #23). Returning here leaves the old
-        # drawers' stored mtime untouched, so the next mine still sees a
-        # mismatch and retries.
+        # This read also decides which drawers are stale, so a failure here
+        # aborts the file exactly as a failed purge does (#105): without
+        # knowing what is already filed we can neither purge what the new
+        # chunk set drops nor tell a reusable drawer from a stale one, and
+        # upserting on top of that leaves duplicates/orphans behind. Returning
+        # leaves the old drawers' stored mtime untouched, so the next mine
+        # still sees a mismatch and retries.
         try:
-            delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
-            if delete_ids:
-                collection.delete(ids=delete_ids)
+            existing = _source_file_rows(
+                collection, source_file, extract_mode, include_documents=True
+            )
         except Exception as exc:
             print(
                 f"  ! [skip] stale-drawer purge failed for {source_file!r} "
@@ -689,68 +706,136 @@ def _file_chunks_locked(
             logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
             return 0, room_counts_delta, True
 
-        # Batch chunks into bounded upserts so large transcripts keep most of
-        # the embedding speedup without one huge Chroma/SQLite request. Keep
-        # one filed_at per source file so all transcript drawers share an
+        # Keep one filed_at per source file so all transcript drawers share an
         # ingest timestamp.
         #
         # Every drawer of this pass carries ``chunk_total`` so
         # ``file_already_mined`` / ``prefetch_mined_set`` can tell a complete
         # multi-batch mine from one that crashed mid-file (#2183). Without it
         # a stable mtime + any surviving drawer permanently skips the file
-        # and the missing exchanges never come back.
+        # and the missing exchanges never come back. Reused drawers receive it
+        # through the metadata-only update below rather than the upsert.
         filed_at = datetime.now().isoformat()
         try:
             source_mtime = os.path.getmtime(source_file)
         except OSError:
             source_mtime = None
         chunk_total = len(chunks)
+
+        reuse_ids: list = []
+        reuse_metas: list = []
+        write_docs: list = []
+        write_ids: list = []
+        write_metas: list = []
+        for chunk in chunks:
+            chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
+            if extract_mode == "general":
+                room_counts_delta[chunk_room] += 1
+            drawer_id = make_convo_drawer_id(
+                wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
+            )
+            is_first_chunk = chunk.get("chunk_index", 0) == 0
+            prior_doc, prior_meta = existing.get(drawer_id, (None, None))
+            if (
+                prior_meta is not None
+                and prior_doc == chunk["content"]
+                and prior_meta.get("normalize_version") == NORMALIZE_VERSION
+                and prior_meta.get("id_recipe") == ID_RECIPE
+            ):
+                # Only the fields this pass changes. ``update`` merges metadata,
+                # so hall / entities / authored_at keep their stored values and
+                # are not recomputed either.
+                reuse_meta = {"filed_at": filed_at, "chunk_total": chunk_total}
+                if source_mtime is not None:
+                    reuse_meta["source_mtime"] = source_mtime
+                if source_dir_ino:
+                    # Refreshed for the same reason source_mtime is: a reused
+                    # drawer must carry this pass's directory identity, not the
+                    # one it was first filed under (#2320).
+                    reuse_meta["source_dir_ino"] = source_dir_ino
+                if content_hash is not None and is_first_chunk:
+                    reuse_meta["content_hash"] = content_hash
+                reuse_ids.append(drawer_id)
+                reuse_metas.append(reuse_meta)
+                continue
+            meta = {
+                "wing": wing,
+                "room": chunk_room,
+                "hall": _detect_hall_cached(chunk["content"]),
+                "source_file": source_file,
+                "chunk_index": chunk["chunk_index"],
+                "added_by": agent,
+                "filed_at": filed_at,
+                "entities": entities_metadata(chunk["content"]),
+                "authored_at": authored_at if authored_at is not None else filed_at,
+                "ingest_mode": "convos",
+                "extract_mode": extract_mode,
+                "normalize_version": NORMALIZE_VERSION,
+                "id_recipe": ID_RECIPE,
+                "chunk_total": chunk_total,
+            }
+            if source_mtime is not None:
+                meta["source_mtime"] = source_mtime
+            if source_dir_ino:
+                # Which directory this transcript was read from, so
+                # ``sync`` can tell a neighbour in the same directory
+                # from one on a volume mounted there since (#2320).
+                meta["source_dir_ino"] = source_dir_ino
+            # Stamp content_hash only on chunk 0 so multi-conversation
+            # privacy-export hashes are not duplicated across every chunk row.
+            # ``prefetch_content_hashes`` still finds them -- it scans all
+            # drawers and splits comma-joined hash fields.
+            if content_hash is not None and is_first_chunk:
+                meta["content_hash"] = content_hash
+            write_docs.append(chunk["content"])
+            write_ids.append(drawer_id)
+            write_metas.append(meta)
+
+        # Purge only what this pass does NOT rewrite: drawers whose id no
+        # longer appears in the new chunk set. Fires on a normalize-schema
+        # bump (file_already_mined() returned False for pre-v2 drawers) and on
+        # a transcript that shrank or was rewritten in place by /compact or
+        # /clear -- transcripts are not assumed immutable. Ids this pass
+        # re-writes are left to the upsert, which replaces them in place.
+        #
+        # A failed purge must abort this file's mine attempt rather than
+        # fall through to upsert: proceeding on top of an unpurged (or
+        # partially purged) set produces duplicate/stale drawers under
+        # mixed schema versions, with no operator-visible signal beyond a
+        # debug log (#105 -- convo_miner's own instance of the same swallow
+        # already fixed for miner.py at #23). Returning here leaves the old
+        # drawers' stored mtime untouched, so the next mine still sees a
+        # mismatch and retries.
+        keep_ids = set(reuse_ids)
+        keep_ids.update(write_ids)
+        stale_ids = [drawer_id for drawer_id in existing if drawer_id not in keep_ids]
         try:
-            for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
-                batch_docs: list = []
-                batch_ids: list = []
-                batch_metas: list = []
-                for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                    chunk_room = (
-                        chunk.get("memory_type", room) if extract_mode == "general" else room
-                    )
-                    if extract_mode == "general":
-                        room_counts_delta[chunk_room] += 1
-                    drawer_id = make_convo_drawer_id(
-                        wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
-                    )
-                    batch_docs.append(chunk["content"])
-                    batch_ids.append(drawer_id)
-                    meta = {
-                        "wing": wing,
-                        "room": chunk_room,
-                        "hall": _detect_hall_cached(chunk["content"]),
-                        "source_file": source_file,
-                        "chunk_index": chunk["chunk_index"],
-                        "added_by": agent,
-                        "filed_at": filed_at,
-                        "entities": entities_metadata(chunk["content"]),
-                        "authored_at": authored_at if authored_at is not None else filed_at,
-                        "ingest_mode": "convos",
-                        "extract_mode": extract_mode,
-                        "normalize_version": NORMALIZE_VERSION,
-                        "id_recipe": ID_RECIPE,
-                        "chunk_total": chunk_total,
-                    }
-                    if source_mtime is not None:
-                        meta["source_mtime"] = source_mtime
-                    if source_dir_ino:
-                        # Which directory this transcript was read from, so
-                        # ``sync`` can tell a neighbour in the same directory
-                        # from one on a volume mounted there since (#2320).
-                        meta["source_dir_ino"] = source_dir_ino
-                    # Stamp content_hash only on chunk 0 so multi-conversation
-                    # privacy-export hashes are not O(N²)-duplicated across every
-                    # chunk row. ``prefetch_content_hashes`` still finds them —
-                    # it scans all drawers and splits comma-joined hash fields.
-                    if content_hash is not None and chunk.get("chunk_index", 0) == 0:
-                        meta["content_hash"] = content_hash
-                    batch_metas.append(meta)
+            if stale_ids:
+                collection.delete(ids=stale_ids)
+        except Exception as exc:
+            print(
+                f"  ! [skip] stale-drawer purge failed for {source_file!r} "
+                f"({exc!r}); leaving existing drawers untouched, will retry "
+                f"on the next mine",
+                file=sys.stderr,
+            )
+            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
+            return 0, room_counts_delta, True
+
+        try:
+            # Metadata-only. Passing no documents keeps each drawer's stored
+            # vector: re-embedding an unchanged exchange is exactly what made a
+            # re-mine cost the whole transcript.
+            if reuse_ids:
+                collection.update(ids=reuse_ids, metadatas=reuse_metas)
+                drawers_added += len(reuse_ids)
+            # Batch chunks into bounded upserts so large transcripts keep most of
+            # the embedding speedup without one huge Chroma/SQLite request.
+            for batch_start in range(0, len(write_ids), DRAWER_UPSERT_BATCH_SIZE):
+                batch_slice = slice(batch_start, batch_start + DRAWER_UPSERT_BATCH_SIZE)
+                batch_docs = write_docs[batch_slice]
+                batch_ids = write_ids[batch_slice]
+                batch_metas = write_metas[batch_slice]
                 assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
                 try:
                     collection.upsert(
