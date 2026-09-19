@@ -752,6 +752,110 @@ class TestFileChunksLocked:
             "crash would leave mtime-stamped partials that skip forever (#2183)"
         )
 
+    def test_reuses_vectors_for_unchanged_chunks_on_remine(self, monkeypatch):
+        """An append-only transcript must not re-embed what it already filed.
+
+        A live Claude Code session re-mines the same file every SAVE_INTERVAL
+        human messages. Re-embedding the whole transcript on each of those
+        passes made one session's ingest cost grow with the square of its
+        length; chunk N of a source always hashes to the same drawer id, so a
+        chunk whose text is unchanged keeps its vector and only has the pass's
+        metadata refreshed.
+        """
+        import mempalace.convo_miner as convo_miner
+
+        class StoreCol:
+            def __init__(self):
+                self.rows = {}
+                self.upserted_docs = []
+                self.updated_ids = []
+                self.deleted_ids = []
+
+            def get(self, ids=None, where=None, include=None, limit=None, offset=None, **kwargs):
+                if ids is not None:
+                    selected = [row_id for row_id in ids if row_id in self.rows]
+                else:
+                    selected = list(self.rows)[offset or 0 :][: limit or None]
+                result = {
+                    "ids": selected,
+                    "metadatas": [self.rows[row_id][1] for row_id in selected],
+                }
+                if include and "documents" in include:
+                    result["documents"] = [self.rows[row_id][0] for row_id in selected]
+                return result
+
+            def upsert(self, documents, ids, metadatas):
+                self.upserted_docs.append(list(documents))
+                for document, row_id, meta in zip(documents, ids, metadatas):
+                    self.rows[row_id] = (document, dict(meta))
+
+            def update(self, ids, documents=None, metadatas=None, embeddings=None):
+                assert documents is None, (
+                    "the reuse path passed documents to update() — the backend "
+                    "would re-embed them, which is the cost being avoided"
+                )
+                self.updated_ids.append(list(ids))
+                for index, row_id in enumerate(ids):
+                    if row_id in self.rows and metadatas is not None:
+                        document, meta = self.rows[row_id]
+                        merged = dict(meta)
+                        merged.update(metadatas[index] or {})
+                        self.rows[row_id] = (document, merged)
+
+            def delete(self, ids=None, **kwargs):
+                for row_id in ids or []:
+                    self.deleted_ids.append(row_id)
+                    self.rows.pop(row_id, None)
+
+        def chunks_for(count):
+            return [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(count)]
+
+        col = StoreCol()
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        first, _, _ = _file_chunks_locked(
+            col, "chat.txt", chunks_for(3), "wing", "general", "agent", "exchange"
+        )
+        assert first == 3
+        assert col.upserted_docs == [[c["content"] for c in chunks_for(3)]]
+
+        # The transcript grew by one exchange; the first three are byte-identical.
+        col.upserted_docs.clear()
+        second, _, skipped = _file_chunks_locked(
+            col, "chat.txt", chunks_for(4), "wing", "general", "agent", "exchange"
+        )
+
+        assert skipped is False
+        assert second == 4, "a re-mine must still report every drawer the file now has"
+        embedded = [document for call in col.upserted_docs for document in call]
+        assert embedded == [chunks_for(4)[3]["content"]], (
+            "the re-mine re-embedded chunks whose text never changed — that is "
+            "the whole-transcript cost the reuse path exists to remove"
+        )
+        assert col.updated_ids and len(col.updated_ids[0]) == 3, (
+            "unchanged chunks must still get this pass's metadata refreshed"
+        )
+        assert col.deleted_ids == [], "nothing is stale when the transcript only grew"
+        assert all(meta.get("chunk_total") == 4 for _, meta in col.rows.values()), (
+            "reused drawers must carry the new pass's chunk_total (#2183)"
+        )
+
+        # A transcript rewritten shorter in place (/compact) drops the tail.
+        col.upserted_docs.clear()
+        col.updated_ids.clear()
+        _file_chunks_locked(
+            col, "chat.txt", chunks_for(2), "wing", "general", "agent", "exchange"
+        )
+        assert len(col.deleted_ids) == 2, (
+            "chunks the shrunken transcript no longer has must be purged, not "
+            "left behind as orphans"
+        )
+        assert col.upserted_docs == [], "the surviving chunks were re-embedded needlessly"
+
     def test_cleans_partial_drawers_after_batch_upsert_failure(self, monkeypatch, tmp_path):
         """A failed later batch must not leave mtime-stamped partials (#2183)."""
         import mempalace.convo_miner as convo_miner
