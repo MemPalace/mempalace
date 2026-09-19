@@ -1860,6 +1860,11 @@ def test_parse_harness_input_unknown():
     assert exc_info.value.code == 1
 
 
+def test_parse_harness_input_normalizes_null_transcript_path():
+    result = _parse_harness_input({"session_id": "abc-123", "transcript_path": None}, "claude-code")
+    assert result["transcript_path"] == ""
+
+
 def test_parse_harness_input_valid():
     result = _parse_harness_input(
         {
