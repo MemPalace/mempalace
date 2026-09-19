@@ -140,6 +140,7 @@ PHP_EXTENSIONS = {
 READABLE_EXTENSIONS = {
     ".txt",
     ".md",
+    ".rst",
     ".py",
     ".js",
     ".ts",
