@@ -1227,10 +1227,12 @@ def _parse_harness_input(data: dict, harness: str) -> dict:
     if harness not in SUPPORTED_HARNESSES:
         print(f"Unknown harness: {harness}", file=sys.stderr)
         sys.exit(1)
+    raw_transcript_path = data.get("transcript_path", "")
+    transcript_path = "" if raw_transcript_path is None else str(raw_transcript_path)
     return {
         "session_id": _sanitize_session_id(str(data.get("session_id", "unknown"))),
         "stop_hook_active": data.get("stop_hook_active", False),
-        "transcript_path": str(data.get("transcript_path", "")),
+        "transcript_path": transcript_path,
     }
 
 
