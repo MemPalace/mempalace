@@ -87,8 +87,28 @@ def _init_logging() -> None:
     # MEMPALACE_LOG_FILE is operator-supplied and opt-in; this is a
     # local-first server (CLAUDE.md design principle), so no path
     # sanitization — the operator's process UID is the trust boundary.
+    # When unset, default to ~/.mempalace/mcp_server.log so an unhandled crash
+    # leaves a persistent record on disk — the MCP client swallows stderr, so
+    # stderr-only is a silent-death black hole.
+    #
+    # Two things bound the default:
+    #
+    # * Standalone only. An unconfigured root logger is the standalone
+    #   ``mempalace-mcp`` process — the one whose stderr the client swallows.
+    #   When a host app already owns root (#1860), "with MEMPALACE_LOG_FILE
+    #   unset the root logger is not touched at all" stays literally true;
+    #   defaulting there would attach a handler the host never asked for.
+    # * Only if ~/.mempalace ALREADY exists. The module must never create the
+    #   palace root on import — a missing ~/.mempalace is the documented
+    #   kill-switch (#1676; hooks_cli._palace_root_exists()) for disabling
+    #   autosave/mining hooks, and recreating it would silently re-arm them.
+    #   When the dir is absent we stay stderr-only, matching that intent.
     log_file = os.environ.get("MEMPALACE_LOG_FILE", "").strip()
     file_handler: logging.Handler | None = None
+    if not log_file and not logging.getLogger().handlers:
+        default_log_dir = Path(os.path.expanduser("~/.mempalace"))
+        if default_log_dir.is_dir():
+            log_file = str(default_log_dir / "mcp_server.log")
     file_handler_error: Exception | None = None
     if log_file:
         try:
@@ -131,3 +151,24 @@ def _init_logging() -> None:
 
 _init_logging()
 logger = logging.getLogger("mempalace_mcp")
+
+
+def _log_uncaught(exc_type, exc_value, exc_tb) -> None:
+    """sys.excepthook: log the full traceback before the process dies.
+
+    The MCP client does not surface a crashed server's stderr, so an
+    unhandled exception escaping ``main()`` (or raised during the import /
+    startup path) otherwise leaves no record — the silent-death failure
+    mode. Routing it through ``logger`` ensures the persistent logfile
+    (see ``_init_logging``) captures a full stack trace. KeyboardInterrupt
+    is delegated to the default hook so Ctrl-C stays clean.
+    """
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    logger.critical(
+        "Uncaught exception — server is exiting", exc_info=(exc_type, exc_value, exc_tb)
+    )
+
+
+sys.excepthook = _log_uncaught
