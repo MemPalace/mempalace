@@ -711,7 +711,7 @@ class MempalaceConfig:
     Load order: env vars > config file > defaults.
     """
 
-    def __init__(self, config_dir=None, palace_path=None):
+    def __init__(self, config_dir=None, palace_path=None, collection_name=None):
         """Initialize config.
 
         Args:
@@ -721,6 +721,11 @@ class MempalaceConfig:
             palace_path: Explicit palace data directory. This is primarily
                          used by CLI operations that received ``--palace``;
                          it takes precedence over environment and file config.
+            collection_name: Explicit ChromaDB collection name. Used by
+                         callers that opened a non-default collection so
+                         derived structures (palace graph, affinity) bind
+                         to the same target instead of the file-configured
+                         default.
         """
         self._config_dir = Path(config_dir).expanduser() if config_dir else _default_config_dir()
         self._config_file = self._config_dir / "config.json"
@@ -730,6 +735,7 @@ class MempalaceConfig:
             if palace_path is not None
             else None
         )
+        self._collection_name_override = collection_name
         self._file_config = {}
         # What this process established about the file on disk, which decides
         # what the first setter is allowed to do with it. The defaults below
@@ -960,6 +966,8 @@ class MempalaceConfig:
     @property
     def collection_name(self):
         """ChromaDB collection name."""
+        if self._collection_name_override is not None:
+            return self._collection_name_override
         return self._file_config.get("collection_name", DEFAULT_COLLECTION_NAME)
 
     @property

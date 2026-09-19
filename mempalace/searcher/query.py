@@ -140,6 +140,120 @@ def _closet_boosts(closets_col, *, query: str, n_results: int, where: dict) -> d
     return boosts
 
 
+# Cross-wing expansion: a baseline whose best hit sits above this
+# effective_distance is a weak answer — expansion tries to do better.
+_THIN_TOP_EFFECTIVE_DISTANCE = 1.0
+
+
+def _baseline_is_thin(hits: list, n_results: int) -> bool:
+    """True when the baseline under-served the query: fewer hits than asked
+    for, or a top hit whose effective distance marks it as a weak match."""
+    if len(hits) < n_results:
+        return True
+    top = hits[0]
+    score = top.get("effective_distance")
+    if score is None:
+        score = top.get("distance", 9.9)
+    return score > _THIN_TOP_EFFECTIVE_DISTANCE
+
+
+def _bm25_baseline_is_thin(hits: list, n_results: int) -> bool:
+    """BM25 fallback thin check — count-only; bm25 scores are not
+    threshold-reliable enough to judge top-hit quality."""
+    return len(hits) < n_results
+
+
+def _expand_result_dict(
+    result: dict,
+    *,
+    wings_to_try: list,
+    fetch_wing,
+    n_results: int,
+    rank_key,
+) -> dict:
+    """Merge wing-scoped results into a finished result dict.
+
+    Additive only: baseline hits are never removed. Dedupes on
+    ``drawer_id``, re-ranks the merged pool, cuts to ``n_results``, and
+    annotates ``wing_expansion`` with exactly what was applied.
+    """
+    hits = result.get("results") or []
+    seen = {h.get("drawer_id") for h in hits if isinstance(h, dict)}
+    seen_text = {h.get("text") for h in hits if isinstance(h, dict)}
+    added = []
+    for w in wings_to_try:
+        try:
+            extra = fetch_wing(w)
+        except Exception:
+            logger.debug("wing expansion query failed for wing %r", w, exc_info=True)
+            continue
+        for h in (extra or {}).get("results") or []:
+            if not isinstance(h, dict):
+                continue
+            did = h.get("drawer_id")
+            if (did is not None and did in seen) or h.get("text") in seen_text:
+                continue
+            if did is not None:
+                seen.add(did)
+            seen_text.add(h.get("text"))
+            added.append(h)
+    merged = hits + added
+    merged.sort(key=rank_key)
+    result["results"] = merged[:n_results]
+    result["wing_expansion"] = {
+        "applied": bool(added),
+        "wings": wings_to_try,
+        "added": len(added),
+    }
+    return result
+
+
+def _maybe_expand_across_wings(
+    result: dict,
+    *,
+    query: str,
+    palace_path: str,
+    collection_name,
+    drawers_col,
+    expand_wings: bool,
+    wing,
+    room,
+    source_file,
+    n_results: int,
+    fetch_wing,
+    rank_key,
+    thin_check,
+) -> dict:
+    """Thin-gated additive wing expansion on a finished result dict.
+
+    Expansion fires only when the caller enabled it, no explicit
+    wing/room/source_file filter was given, and the baseline is thin.
+    Anything else returns ``result`` untouched.
+    """
+    if not expand_wings or wing or room or source_file or not isinstance(result, dict):
+        return result
+    hits = result.get("results")
+    if not isinstance(hits, list) or not thin_check(hits):
+        return result
+
+    from mempalace.wing_affinity import expand_wings as _score_expand
+
+    # Bind affinity scoring to the actual search target: the opened
+    # collection for graph signals, a config carrying this palace and
+    # collection for palace-level files.
+    bound_cfg = MempalaceConfig(palace_path=palace_path, collection_name=collection_name)
+    wings = _score_expand(query, col=drawers_col, config=bound_cfg)
+    if not wings:
+        return result
+    return _expand_result_dict(
+        result,
+        wings_to_try=wings,
+        fetch_wing=fetch_wing,
+        n_results=n_results,
+        rank_key=rank_key,
+    )
+
+
 def search_memories(
     query: str,
     palace_path: str,
@@ -154,6 +268,7 @@ def search_memories(
     candidate_strategy: str = "vector",
     collection_name: str = None,
     lang: Optional[str] = None,
+    expand_wings: bool = True,
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
 
@@ -208,6 +323,12 @@ def search_memories(
               When ``max_distance > 0.0`` is also set, BM25-only candidates
               are admitted only if their stored embeddings can be loaded and
               their computed vector distance satisfies that threshold.
+        expand_wings: When True (default) and no wing/room/source_file
+            filter is given, a thin baseline triggers additive cross-wing
+            expansion: the most structurally relevant wings (passive
+            same-room connections, hallways, room names) get their own
+            scoped queries and their hits merge, dedupe, and rerank into
+            the baseline — which is never filtered or reduced.
         lang: Locale code for BM25 stop-word filtering (opt-in). When
             omitted, reads ``MempalaceConfig().lang_explicit`` — returns an
             empty set unless the user has set ``MEMPALACE_LANG`` /
@@ -239,7 +360,33 @@ def search_memories(
         stop_words=stop_words,
     )
     if short_circuit is not None:
-        return short_circuit
+        # The vector-disabled/BM25 fallback returns here — expansion applies
+        # on this path too so the fallback scope matches the vector path.
+        return _maybe_expand_across_wings(
+            short_circuit,
+            query=query,
+            palace_path=palace_path,
+            collection_name=collection_name,
+            drawers_col=None,
+            expand_wings=expand_wings,
+            wing=wing,
+            room=room,
+            source_file=source_file,
+            n_results=n_results,
+            fetch_wing=lambda w: _vector_disabled_search(
+                query=query,
+                palace_path=palace_path,
+                wing=w,
+                room=None,
+                n_results=n_results,
+                collection_name=collection_name,
+                stop_words=stop_words,
+                since_dt=since_dt,
+                before_dt=before_dt,
+            ),
+            rank_key=lambda h: -(h.get("bm25_score") or 0.0),
+            thin_check=lambda hits: _bm25_baseline_is_thin(hits, n_results),
+        )
 
     drawers_col, open_error = _open_search_collection(palace_path, collection_name)
     if open_error:
@@ -390,7 +537,7 @@ def search_memories(
     if strategy_error:
         return strategy_error
 
-    return _search_result_envelope(
+    result = _search_result_envelope(
         query=query,
         wing=wing,
         room=room,
@@ -401,6 +548,41 @@ def search_memories(
         candidates_fetched=len(_first_or_empty(drawer_results, "documents")),
         pool_size=pool_size,
         date_window_active=date_window_active,
+    )
+    return _maybe_expand_across_wings(
+        result,
+        query=query,
+        palace_path=palace_path,
+        collection_name=collection_name,
+        drawers_col=drawers_col,
+        expand_wings=expand_wings,
+        wing=wing,
+        room=room,
+        source_file=source_file,
+        n_results=n_results,
+        # Wing-scoped expansion re-enters search_memories with expansion
+        # disabled, so each scoped query gets the full pipeline — closets,
+        # union candidates, date window — applied identically.
+        fetch_wing=lambda w: search_memories(
+            query=query,
+            palace_path=palace_path,
+            wing=w,
+            since=since,
+            before=before,
+            n_results=n_results,
+            max_distance=max_distance,
+            vector_disabled=vector_disabled,
+            candidate_strategy=candidate_strategy,
+            collection_name=collection_name,
+            lang=lang,
+            expand_wings=False,
+        ),
+        rank_key=lambda h: (
+            h.get("effective_distance")
+            if h.get("effective_distance") is not None
+            else h.get("distance", 9.9)
+        ),
+        thin_check=lambda h: _baseline_is_thin(h, n_results),
     )
 
 

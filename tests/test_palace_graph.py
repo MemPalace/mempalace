@@ -183,20 +183,37 @@ class TestBuildGraph:
         nodes, _ = build_graph(col=col)
         assert len(nodes["busy"]["dates"]) <= 5
 
-    def test_cache_returns_same_result(self):
-        """Second call within TTL returns cached nodes without re-scanning.
+    def test_explicit_col_bypasses_cache(self):
+        """Caller-supplied collections bypass the warm cache entirely.
 
-        The cache intentionally ignores col/config args when warm — this is
-        correct for the MCP server's single-palace use case. Callers that
-        switch collections must call invalidate_graph_cache() first.
+        Cache identity cannot be verified for an injected collection, so
+        every explicit ``col=`` call rebuilds — two collections in one
+        process can never be served each other's graph (the
+        cross-target contamination path flagged in the #2341 review).
         """
         col = _make_fake_collection(
             [{"room": "auth", "wing": "wing_code", "hall": "security", "date": "2026-01-01"}]
         )
         nodes1, edges1 = build_graph(col=col)
-        # Second call with a *different* collection — should still return cached result
+        # Second call with a *different* collection gets its own graph.
         col2 = _make_fake_collection([])
         nodes2, edges2 = build_graph(col=col2)
+        assert nodes1 != nodes2
+        assert nodes2 == {}
+        assert edges2 == []
+
+    def test_cache_returns_same_result(self):
+        """Second config-bound call within TTL returns cached nodes without
+        re-scanning. Cache is keyed on (palace_path, collection_name)."""
+        col = _make_fake_collection(
+            [{"room": "auth", "wing": "wing_code", "hall": "security", "date": "2026-01-01"}]
+        )
+        with (
+            patch("mempalace.palace_graph._get_collection", return_value=col),
+            patch("mempalace.palace_graph._try_sqlite_nodes_edges", return_value=None),
+        ):
+            nodes1, edges1 = build_graph()
+            nodes2, edges2 = build_graph()
         assert nodes1 == nodes2
         assert edges1 == edges2
 

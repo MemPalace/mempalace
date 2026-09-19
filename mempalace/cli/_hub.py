@@ -178,6 +178,7 @@ def _forward_search_to_hub(args, palace_path: str) -> bool:
         "query": args.query,
         "limit": args.results,
         "cli_compatible": True,
+        "expand_wings": bool(getattr(args, "expand_wings", True)),
     }
     for name in ("wing", "room", "since", "before"):
         value = getattr(args, name, None)

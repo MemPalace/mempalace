@@ -396,6 +396,7 @@ class TestForwardSearchToHub:
                 "query": "needle",
                 "limit": 8,
                 "cli_compatible": True,
+                "expand_wings": True,
                 "wing": "project",
                 "room": "decisions",
                 "since": "2026-08-01",
