@@ -27,6 +27,12 @@ These are non-negotiable. Every PR, every feature, every refactor must honor the
 - **Privacy by architecture** — The system physically cannot send your data because it never leaves your machine. No telemetry, no phone-home, no external service dependencies for core operations.
 - **Background everything** — Filing, indexing, timestamps, and pipeline work happen via hooks in the background. Nothing interrupts the user's conversation. Zero tokens spent on bookkeeping in the chat window.
 
+## Hook Return Contract
+
+Claude Code recognizes exactly one top-level `decision` value: `"block"`. Anything else is a pass-through by accident — `{"decision": "allow"}` is NOT a recognized value (see [#872](https://github.com/MemPalace/mempalace/issues/872)). To not block, return `{}`.
+
+**PreCompact hooks must never block**: Claude Code cancels compaction and re-fires the hook, causing a deadlock (see [#863](https://github.com/MemPalace/mempalace/issues/863), [#856](https://github.com/MemPalace/mempalace/issues/856), [#858](https://github.com/MemPalace/mempalace/issues/858)). Mine synchronously, then return `{}`.
+
 ## Contributing
 
 We welcome bug fixes, performance improvements, new language support, better entity disambiguation, documentation, and test coverage.
