@@ -227,7 +227,10 @@ def sweep(
         wing: When set, classify swept drawers under this wing like
             ``mine --wing`` so they leave the ``?/?`` bucket; blank/whitespace
             is treated as unset. When unset, no wing/room metadata is written
-            and the historical unclassified behavior is preserved.
+            and the historical unclassified behavior is preserved. A classified
+            drawer is in scope for ``sync --wing <wing>`` like a mined one: its
+            ``source_file`` takes part in root auto-detection and it can be
+            pruned as gitignored or missing.
         room: Room for the swept drawers when ``wing`` is set; defaults to the
             miners' fallback room ``"general"``. Ignored when ``wing`` is unset.
 

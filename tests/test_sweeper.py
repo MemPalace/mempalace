@@ -619,6 +619,51 @@ class TestSweeperTaxonomy:
             "taxonomy changed the drawer id or cursor logic."
         )
 
+    def test_sweep_with_wing_still_records_the_directory(self, mock_claude_jsonl, tmp_path):
+        """Taxonomy and the directory identity (#2320) land on the same drawer,
+        so ``sync`` still decides a classified swept drawer by the same reading
+        as a mined one. Each key is covered on its own, above and in
+        ``TestSweptDrawersCarryTheirDirectory``; this pins the pair."""
+        from mempalace import source_identity as si
+        from mempalace.palace import get_collection
+        from mempalace.sweeper import sweep
+
+        palace_path = str(tmp_path / "palace")
+        sweep(str(mock_claude_jsonl), palace_path, wing="proj", room="chat")
+
+        expected = si.directory_identity(mock_claude_jsonl.parent)
+        assert expected is not None, "the filesystem reports no inode to record"
+        col = get_collection(palace_path, create=False)
+        metas = col.get(include=["metadatas"])["metadatas"]
+        assert metas, "No drawers written"
+        for m in metas:
+            assert (m.get("wing"), m.get("room"), m.get("source_dir_ino")) == (
+                "proj",
+                "chat",
+                expected,
+            ), f"a classified drawer lost part of its metadata: {m}"
+
+    def test_sweep_with_wing_is_read_by_a_wing_scoped_sync(self, mock_claude_jsonl, tmp_path):
+        """Classifying a swept drawer puts it where ``sync --wing`` looks, as
+        ``mine --wing`` does for a mined one, so it can be pruned with the
+        rest of the wing. An unclassified one stays outside that scope."""
+        from mempalace.sweeper import sweep
+        from mempalace.sync import sync_palace
+
+        classified = str(tmp_path / "palace_classified")
+        sweep(str(mock_claude_jsonl), classified, wing="proj", room="chat")
+        unclassified = str(tmp_path / "palace_unclassified")
+        sweep(str(mock_claude_jsonl), unclassified)
+
+        classified_report = sync_palace(classified, wing="proj", dry_run=True)
+        assert classified_report["scanned"] == 4, (
+            f"a classified swept drawer is outside sync --wing scope: {classified_report}"
+        )
+        unclassified_report = sync_palace(unclassified, wing="proj", dry_run=True)
+        assert unclassified_report["scanned"] == 0, (
+            f"an unclassified swept drawer leaked into sync --wing scope: {unclassified_report}"
+        )
+
 
 class TestSweeperCLI:
     """The `sweep` subcommand exposes --wing/--room and threads them through."""
