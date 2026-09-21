@@ -1817,7 +1817,9 @@ def add_drawer(
     miner uses ``_build_drawer_metadata`` + a batched ``collection.upsert``
     to amortize the embedding model's forward-pass cost across chunks.
     """
-    drawer_id = make_drawer_id_from_chunk(wing, room, source_file, chunk_index)
+    drawer_id = make_drawer_id_for_write(
+        content, wing=wing, room=room, source_file=source_file, chunk_index=chunk_index
+    )
     try:
         source_mtime = os.path.getmtime(source_file)
     except OSError:
@@ -1861,6 +1863,7 @@ def process_file(
     chunk_overlap: int = None,
     min_chunk_size: int = None,
     max_chunks_per_file: Optional[int] = None,
+    oplog=None,
 ) -> tuple:
     """Read, chunk, route, and file one file.
 
@@ -1922,6 +1925,23 @@ def process_file(
         # Re-check after acquiring lock — another agent may have just finished
         if file_already_mined(collection, source_file, check_mtime=True):
             return 0, room, None
+
+        # Snapshot this file's existing drawers BEFORE the purge so the op-log
+        # can tombstone any chunk id that a shrinking re-mine drops (RFC 004 2a).
+        # Empty for a first mine; only read when op emission is active.
+        prior_drawers: dict = {}
+        if oplog is not None:
+            try:
+                res = collection.get(
+                    where={"source_file": source_file}, include=["documents", "metadatas"]
+                )
+                p_ids = list((res.get("ids") if hasattr(res, "get") else None) or [])
+                p_docs = list((res.get("documents") if hasattr(res, "get") else None) or [])
+                p_metas = list((res.get("metadatas") if hasattr(res, "get") else None) or [])
+                for p_id, p_doc, p_meta in zip(p_ids, p_docs, p_metas):
+                    prior_drawers[p_id] = (p_doc or "", p_meta or {})
+            except Exception:
+                logger.debug("op-log prior-drawer read failed for %s", source_file, exc_info=True)
 
         # Purge stale drawers for this file before re-inserting the fresh chunks.
         # Converts modified-file re-mines from upsert-over-existing-IDs (which hits
@@ -2045,7 +2065,14 @@ def process_file(
             purge_file_closets(closets_col, source_file)
         if closets_col and drawers_added > 0:
             drawer_ids = [
-                make_drawer_id_from_chunk(wing, room, source_file, c["chunk_index"]) for c in chunks
+                make_drawer_id_for_write(
+                    c["content"],
+                    wing=wing,
+                    room=room,
+                    source_file=source_file,
+                    chunk_index=c["chunk_index"],
+                )
+                for c in chunks
             ]
             # Pass drawer_metas so build_closet_lines can emit the Tier 6a
             # 4-segment pointer (``topic|entities|YYYY-MM-DD:Lstart-Lend|→ids``)
@@ -2328,9 +2355,20 @@ def _mine_impl(
     if not dry_run:
         collection = get_collection(palace_path)
         closets_col = get_closets_collection(palace_path)
+        # Dual-write shadow op-log (RFC 004 2a): every mined chunk also emits a
+        # memory op so mined content replicates. Best-effort — a mine must not
+        # fail because the op-log is unavailable.
+        try:
+            from .oplog import get_oplog
+
+            oplog = get_oplog(palace_path)
+        except Exception:
+            logger.debug("op-log unavailable; mining without op emission", exc_info=True)
+            oplog = None
     else:
         collection = None
         closets_col = None
+        oplog = None
 
     total_drawers = 0
     files_mined = 0
@@ -2353,6 +2391,7 @@ def _mine_impl(
                     agent=agent,
                     dry_run=dry_run,
                     closets_col=closets_col,
+                    oplog=oplog,
                     chunk_size=cfg_chunk_size,
                     chunk_overlap=cfg_chunk_overlap,
                     min_chunk_size=cfg_min_chunk_size,
@@ -2618,7 +2657,10 @@ def status(palace_path: str):
     counts = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
     if counts is not None:
         total, wing_rooms = counts
-        _print_status(total, wing_rooms)
+        ghost_count = None
+        if ID_RECIPE == "v4":
+            ghost_count = _sqlite_v3_ghost_drawer_count(palace_path, "mempalace_drawers")
+        _print_status(total, wing_rooms, v3_ghost_count=ghost_count)
         return
 
     col = _open_collection_or_explain(palace_path)
@@ -2664,10 +2706,21 @@ def status(palace_path: str):
             wing_rooms[m.get("wing", "?")][m.get("room", "?")] += 1
         offset += len(batch)
 
-    _print_status(total, wing_rooms)
+    ghost_count = None
+    if ID_RECIPE == "v4":
+        try:
+            from .reconcile_v3 import plan_v3_reconcile
+
+            ghost_count = plan_v3_reconcile(col)["ghost_drawers"]
+        except Exception:
+            logger.debug("status v3 ghost diagnostic unavailable", exc_info=True)
+
+    _print_status(total, wing_rooms, v3_ghost_count=ghost_count)
 
 
-def _print_status(total: int, wing_rooms: dict[str, dict[str, int]]) -> None:
+def _print_status(
+    total: int, wing_rooms: dict[str, dict[str, int]], v3_ghost_count: Optional[int] = None
+) -> None:
     """Render the wing/room histogram shared by both status code paths."""
     print(f"\n{'=' * 55}")
     print(f"  MemPalace Status -- {total} drawers")
@@ -2677,4 +2730,10 @@ def _print_status(total: int, wing_rooms: dict[str, dict[str, int]]) -> None:
         for room, count in sorted(rooms.items(), key=lambda x: x[1], reverse=True):
             print(f"    ROOM: {room:20} {count:5} drawers")
         print()
+    if v3_ghost_count:
+        print(
+            f"  WARNING: {v3_ghost_count:,} legacy v3 ghost drawer(s) remain after "
+            "the v4 write-flip."
+        )
+        print("           Run `mempalace reconcile-ids` and apply after stopping the hub.\n")
     print(f"{'=' * 55}\n")

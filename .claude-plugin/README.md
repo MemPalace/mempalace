@@ -23,7 +23,7 @@ claude plugin add /path/to/mempalace
 
 ## Post-Install Setup
 
-After installing the plugin, run the init command to complete setup (installs the `mempalace` package via `uv tool` or `pip`, configures MCP, etc.):
+After installing the plugin, run the init command to complete setup. It checks that the `mempalace` package is installed, helps configure your palace path, and verifies the local tools:
 
 ```
 /mempalace:init

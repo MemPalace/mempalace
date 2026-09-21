@@ -2695,7 +2695,11 @@ class ChromaCollection(BaseCollection):
         try:
             if tokens:
                 fts_query = " OR ".join(tokens)
-                # If a metadata filter is present, do not cap before filtering:
+                # Order by SQLite FTS rank before applying the unfiltered cap.
+                # Without this, FTS returns rowid order; newer exact matches
+                # can fall outside the first window and global recall misses
+                # them even though a wing-scoped search finds them. If a
+                # metadata filter is present, do not cap before filtering:
                 # otherwise a common term can fill the window with wrong-scope
                 # rows and hide valid scoped hits later in the FTS result set.
                 limit_sql = "" if where else "LIMIT ?"
@@ -2712,6 +2716,7 @@ class ChromaCollection(BaseCollection):
                         JOIN collections c ON s.collection = c.id
                         WHERE embedding_fulltext_search MATCH ?
                           AND c.name = ?
+                        ORDER BY rank
                         {limit_sql}
                         """,
                         params,

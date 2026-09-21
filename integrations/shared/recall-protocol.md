@@ -47,6 +47,18 @@ question-driven, not reflexive.
    `palace_exec KG INVALIDATE` (or `mempalace_kg_invalidate`) for facts that ended without replacement,
    and `palace_exec KG ADD` (or `mempalace_kg_add`) for independent/coexisting facts.
 
+## Answer shape
+
+For memory-backed answers, make the provenance obvious:
+
+- Cite the source location first: wing, room, source file, or drawer id
+  when available.
+- Quote the drawer's exact stored words before any synthesis.
+- Keep your inference separate from the quote, and label it when it is
+  not directly stored in the drawer.
+- Include source dates or authored-at metadata when available, especially
+  when the memory may be stale.
+
 ## Tool selection
 
 | You need | Light MCP (Preferred) | Full MCP (Legacy) |
@@ -71,6 +83,13 @@ question — not a system prompt or pasted conversation) plus optional
 - **MCP unavailable / tool error.** Surface the error plainly and suggest
   the user verify the server (`mempalace status`, or re-run install).
   Do not silently fall back to guessing from model memory.
+- **Weak or unrelated results.** Refine inside MemPalace: try an exact
+  phrase, entity-plus-topic keywords, or a wing/room filter discovered
+  with `mempalace_list_wings` / `mempalace_list_rooms`. Do not use broad
+  `rg`, `grep`, or `find` scans over home directories, editor caches,
+  project folders, or conversation archives unless the user explicitly
+  asks for filesystem search; that bypasses palace provenance and can
+  drown exact memories in unrelated files.
 - **Palace index corrupt / compactor error.** When the server returns an
   error mentioning the HNSW segment writer, a ChromaDB compaction
   failure, or a stuck "Not connected" state after a write, the on-disk

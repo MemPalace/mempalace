@@ -29,6 +29,16 @@ codex
 > $mempalace:mempalace init
 ```
 
+4. Verify the plugin and MCP server:
+
+```bash
+codex plugin list
+codex mcp list
+```
+
+`codex mcp list` should show a local `mempalace` server whose command is `mempalace-mcp`.
+Start a fresh Codex thread after installing so Codex loads the new skills and MCP tools.
+
 ## Available Skills
 
 | Skill | Description |
@@ -51,7 +61,7 @@ The main `$mempalace:mempalace` skill can be invoked with five different subcomm
 
 ## Hooks
 
-The plugin includes auto-save hooks that run on session stop (every 15 messages) and before context compaction, automatically preserving conversation context into your palace.
+The plugin includes auto-save hooks that run on session start, session stop, and before context compaction. They call `mempalace hook run` locally, mine the active transcript into the palace, and optionally mine `MEMPAL_DIR` as project context.
 
 Set the `MEMPAL_DIR` environment variable to a directory path to automatically run `mempalace mine` on that directory during each save trigger.
 

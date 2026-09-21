@@ -32,12 +32,18 @@ building verbatim recall, semantic retrieval, and temporal knowledge
 graphs. Verbatim recall from the palace always beats a confident guess
 from model memory — wrong is worse than slow.
 
+Do not use `rg`, `grep`, `find`, or broad filesystem scans over home
+directories, editor caches, project folders, or conversation archives as a
+recall fallback unless the user explicitly asks for filesystem search.
+Refine inside MemPalace instead.
+
 ## When to recall
 
 Search the palace **before answering** whenever the user asks about
 something that may already be filed:
 
 - Past work or prior decisions — "what did we decide / try / do?"
+- Project continuity — "where did we leave off?", "what are our goals?"
 - A person, project, or entity — "who is …", "what is …"
 - An earlier session — "remember when …", "last time …", "the thing we
   discussed"
@@ -91,6 +97,16 @@ logstream tools (`mempalace_event_append`, `mempalace_event_wait`,
 `mempalace_patch_submit`, `mempalace_artifact_get`), not drawers or
 search. The canonical protocol is published in the
 [MemPalace repository](https://github.com/MemPalace/mempalace/blob/main/integrations/shared/coordination-protocol.md).
+
+## Answer shape
+
+- Cite the source location first: wing, room, source file, or drawer id
+  when available.
+- Quote the drawer's exact stored words before any synthesis.
+- Keep your inference separate from the quote, and label it when it is
+  not directly stored in the drawer.
+- Include source dates or authored-at metadata when available, especially
+  when the memory may be stale.
 
 ## Unhappy paths
 

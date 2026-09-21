@@ -936,6 +936,63 @@ def main():
         help="Storage backend (default: config/env/detected/chroma)",
     )
 
+
+
+    p_replica = sub.add_parser(
+        "replica", help="Read-replica pull of drawers + KG from peers (RFC 004)"
+    )
+    replica_sub = p_replica.add_subparsers(dest="replica_action")
+    p_rep_pull = replica_sub.add_parser("pull", help="Pull drawers + KG from peers")
+    p_rep_pull.add_argument("--peer", default=None, help="Origin base URL (default: peers.json)")
+    p_rep_pull.add_argument("--token", default=None, help="Bearer token for --peer")
+    p_rep_pull.add_argument("--no-reconcile", action="store_true", help="Skip delete reconcile")
+    p_rep_pull.add_argument("--no-kg", action="store_true", help="Skip knowledge-graph rows")
+    p_rep_pull.add_argument("--with-vectors", action="store_true", help="Prefer peer-cached vectors")
+    p_rep_pull.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    # RFC 004 — memory op-log / id migration (replicated palace)
+    p_oplog = sub.add_parser(
+        "oplog", help="Canonical memory op-log — status, sync, fold, promote, verify (RFC 004)"
+    )
+    oplog_sub = p_oplog.add_subparsers(dest="oplog_action")
+    p_oplog_status = oplog_sub.add_parser("status", help="Show op-log summary")
+    p_oplog_status.add_argument("--json", action="store_true", help="Machine-readable output")
+    p_oplog_verify = oplog_sub.add_parser("verify", help="Verify shadow store matches op-log")
+    p_oplog_verify.add_argument("--json", action="store_true", help="Machine-readable output")
+    p_oplog_sync = oplog_sub.add_parser("sync", help="Pull missing memory ops from peers")
+    p_oplog_sync.add_argument("--peer", default=None, help="Peer base URL (default: peers.json)")
+    p_oplog_sync.add_argument("--token", default=None, help="Bearer token for --peer")
+    p_oplog_sync.add_argument("--json", action="store_true", help="Machine-readable output")
+    p_oplog_fold = oplog_sub.add_parser("fold", help="Fold unapplied ops into the local store")
+    p_oplog_fold.add_argument("--json", action="store_true", help="Machine-readable output")
+    p_oplog_promote = oplog_sub.add_parser(
+        "promote", help="Emit drawer.add ops for local drawers missing from the op-log"
+    )
+    p_oplog_promote.add_argument("--dry-run", action="store_true", help="Count without writing")
+    p_oplog_promote.add_argument("--limit", type=int, default=None, help="Max drawers to promote")
+    p_oplog_promote.add_argument("--batch", type=int, default=2000, help="Scan batch size")
+    p_oplog_promote.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_migrate_ids = sub.add_parser(
+        "migrate-ids",
+        help="Plan/apply the v4 content-pure id migration (dry-run by default)",
+    )
+    p_migrate_ids.add_argument("--apply", action="store_true", help="Materialize into --target")
+    p_migrate_ids.add_argument("--target", default=None, help="Fresh palace path for --apply")
+    p_migrate_ids.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_reconcile_ids = sub.add_parser(
+        "reconcile-ids",
+        help="Drain legacy v3-keyed ghost drawers to content-hash v4 ids (dry-run by default)",
+    )
+    p_reconcile_ids.add_argument("--apply", action="store_true", help="Rewrite ghosts in place")
+    p_reconcile_ids.add_argument(
+        "--force-live-hub",
+        action="store_true",
+        help="Allow --apply even with a live write-capable hub (recovery only)",
+    )
+    p_reconcile_ids.add_argument("--json", action="store_true", help="Machine-readable output")
+
     args = parser.parse_args()
     _apply_backend_arg(args)
 
@@ -995,6 +1052,20 @@ def main():
         cmd_daemon(args)
         return
 
+    if args.command == "replica":
+        if not getattr(args, "replica_action", None):
+            p_replica.print_help()
+            return
+        cmd_replica(args)
+        return
+
+    if args.command == "oplog":
+        if not getattr(args, "oplog_action", None):
+            p_oplog.print_help()
+            return
+        cmd_oplog(args)
+        return
+
     dispatch = {
         "init": cmd_init,
         "rules": cmd_rules,
@@ -1011,6 +1082,8 @@ def main():
         "repair-status": cmd_repair_status,
         "migrate": cmd_migrate,
         "migrate-wings": cmd_migrate_wings,
+        "migrate-ids": cmd_migrate_ids,
+        "reconcile-ids": cmd_reconcile_ids,
         "hallways": cmd_hallways,
         "status": cmd_status,
         "update": cmd_update,

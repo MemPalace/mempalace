@@ -25,6 +25,11 @@ server is not connected and point them at the `mempalace` skill or
 `/mempalace-init` to set it up. Do not silently fall back to answering
 from model memory.
 
+Do not use `rg`, `grep`, `find`, or broad filesystem scans over home
+directories, editor caches, project folders, or conversation archives as a
+recall fallback unless the user explicitly asks for filesystem search.
+Refine inside MemPalace instead.
+
 ## Identity
 
 Act as a senior AI-memory systems engineer with decades of experience

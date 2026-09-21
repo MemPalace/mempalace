@@ -22,7 +22,7 @@ import hashlib
 # as legacy ``v1`` (pre-delimiter recipe), drawers with ``id_recipe="v2"``
 # are guaranteed collision-safe within the v2 generation. The constant is
 # exported so call sites use ``ids.ID_RECIPE`` rather than a magic string.
-ID_RECIPE: str = "v3"
+ID_RECIPE: str = "v4"
 
 # '|' is reserved in Windows filenames and cannot appear in source paths
 # on any supported platform, making it strictly safer than ':' (which
@@ -78,6 +78,58 @@ def make_drawer_id_from_content(wing: str, room: str, content: str) -> str:
     freeform text).
     """
     return f"drawer_{wing}_{room}_{_delimited_sha256((wing, room, content), _HASH_TRUNC_DRAWER)}"
+
+
+# v4 content-pure recipe (the RFC 004 id-purity design). Identity is the verbatim content
+# ALONE — wing/room (organization) and source_file (provenance) become plain
+# metadata, so the same content anywhere in the mesh is the same drawer
+# (content-addressed cross-machine dedup, and org becomes op-carried). Not yet
+# the default ID_RECIPE: the write paths keep minting v3 until the staged
+# migration + write-flip cut over. The hash is 128-bit (32 hex) because these
+# ids are global rather than wing/room-scoped.
+V4_RECIPE: str = "v4"
+_HASH_TRUNC_V4: int = 32
+
+
+def make_drawer_id_content_pure(content: str) -> str:
+    """v4 content-pure drawer id: ``drawer_<hash(content)>`` (the RFC 004 id-purity design).
+
+    The hash covers the drawer's full logical content and nothing else, so two
+    replicas that hold identical content converge on the same id without ever
+    exchanging placement. Chunk rows keep the existing ``_chunk_NNNNNN`` suffix
+    on this id.
+    """
+    return f"drawer_{_delimited_sha256((content,), _HASH_TRUNC_V4)}"
+
+
+def make_drawer_id_for_write(
+    content: str,
+    *,
+    wing: str = "",
+    room: str = "",
+    source_file: str = "",
+    chunk_index: int = 0,
+    extract_mode: str = None,
+) -> str:
+    """The drawer id a write path mints under the ACTIVE recipe (``ID_RECIPE``).
+
+    One switch flips every write path. Under v4 the identity is the verbatim
+    content ALONE (content-pure, so the same content anywhere in the mesh is the
+    same drawer — no v3-keyed cross-replica divergence, and re-mining a migrated
+    source stays on its content-hash id). Under v3 it falls back to the
+    historical per-path recipe: the conversation miner keys on
+    ``(source_file, extract_mode, chunk_index)``, the project/format miners on
+    ``(source_file, chunk_index)``, and the MCP ``add_drawer`` path on
+    ``(wing, room, content)``. Callers pass everything; only the active recipe
+    decides what is used.
+    """
+    if ID_RECIPE == V4_RECIPE:
+        return make_drawer_id_content_pure(content)
+    if extract_mode is not None:
+        return make_convo_drawer_id(wing, room, source_file, extract_mode, chunk_index)
+    if source_file:
+        return make_drawer_id_from_chunk(wing, room, source_file, chunk_index)
+    return make_drawer_id_from_content(wing, room, content)
 
 
 def make_convo_drawer_id(

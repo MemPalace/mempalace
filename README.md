@@ -212,9 +212,13 @@ Select with `--backend <name>`, `MEMPALACE_BACKEND=<name>`, or
 ## Quickstart
 
 ```bash
+# Optional: choose a shared local palace for multiple agents on one machine
+mempalace config set palace-path ~/.mempalace/palaces/shared-agent-brain
+
 # Mine content into the palace
 mempalace mine ~/projects/myapp                    # project files
 mempalace mine ~/.claude/projects/ --mode convos   # Claude Code sessions (scope with --wing per project)
+mempalace mine ~/.local/share/opencode --mode convos # OpenCode sessions
 
 # Search
 mempalace search "why did we switch to GraphQL"
@@ -297,6 +301,19 @@ cross-wing navigation, drawer management, agent diaries, and agent
 coordination (logstream events + artifact handoffs). Installation
 and the full tool list:
 [mempalaceofficial.com/reference/mcp-tools](https://mempalaceofficial.com/reference/mcp-tools.html).
+
+For multiple agents writing to the same local palace, run one shared MCP
+HTTP server and connect every client to that endpoint:
+
+```bash
+mempalace serve --host 127.0.0.1 --port 8765
+```
+
+Launching separate stdio `mempalace-mcp` servers against one palace is
+safe for recall, but only the first writer can mutate; later servers run
+mutating tools read-only to avoid ChromaDB stale-state corruption. The
+`mempalace serve` command prints ready-to-paste client config for the
+shared-server shape.
 
 ## Agents
 

@@ -40,13 +40,21 @@ If MCP tools are not available, fall back to the CLI:
 
     mempalace search "query" [--wing X] [--room Y]
 
+Do not use `rg`, `grep`, `find`, or broad filesystem scans over home
+directories, editor caches, project folders, or conversation archives as a
+recall fallback unless the user explicitly asks for filesystem search. Stay
+inside MemPalace tools so provenance, filters, and verbatim drawer text remain
+intact.
+
 ## 5. Present Results
 
 When presenting search results:
 - Always include source attribution: wing, room, and drawer for each result
 - Show relevance or similarity scores if available
 - Group results by wing/room when returning multiple hits
-- Quote or summarize the memory content clearly
+- Quote the exact drawer text. Do not summarize or paraphrase stored content.
+- Put any synthesis after the quote and label it as your inference when it is
+  not directly stored in the drawer.
 
 ## 6. Offer Next Steps
 
