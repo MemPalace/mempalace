@@ -9,6 +9,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Bug Fixes
+- **The legacy `mempalace repair` no longer runs without the palace lease, so a
+  hook miner can no longer destroy a repair that is already half done.**
+  `cmd_repair` extracted every drawer and copied the whole palace to
+  `<palace>.backup` with no `mine_palace_lock` held, and only the per-batch
+  acquires inside the rebuild contended. On a large palace that is minutes of
+  work during which a `mempalace mine` started by a hook could take the lease,
+  after which the rebuild failed with `MineAlreadyRunning` and the extraction
+  and the backup were both discarded. The lease is now held across the whole
+  pass and contention is reported with the holder's identity before anything is
+  read or copied - what `rebuild_index` and `rebuild_from_sqlite` already did.
+  (#2562, #2569)
+
 
 - **A `known_entities.json` write no longer appears to hang on Windows when the
   directory refuses a temporary file.** `_publish_registry` falls back to writing
