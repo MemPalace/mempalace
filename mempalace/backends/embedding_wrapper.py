@@ -4,18 +4,30 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .base import BaseCollection
+from .base import BaseCollection, GetResult, initialize_last_modified_metadata
 
 
 def _embed_texts(texts: list[str]) -> list[list[float]]:
-    """Embed ``texts`` with the configured local embedding function."""
+    """Embed ``texts`` with the configured local embedding function.
+
+    Embedding functions return ``list[np.ndarray]`` (float32). ``list(arr)``
+    would unpack that into ``np.float32`` *scalars*, which ChromaDB's
+    ``normalize_embeddings`` rejects outright ("Expected embeddings to be a
+    list of floats or ints..."), so every write through this wrapper must
+    convert to real Python floats. ``.tolist()`` does that in C; the
+    ``float(x)`` branch covers embedders that already hand back plain
+    sequences.
+    """
     if not texts:
         return []
     from ..embedding import get_embedding_function
 
     ef = get_embedding_function()
     vectors = ef(input=texts)
-    return [list(v) for v in vectors]
+    return [
+        v.tolist() if hasattr(v, "tolist") else [float(x) for x in v]  # numpy | plain sequence
+        for v in vectors
+    ]
 
 
 def _as_list(value):
@@ -79,7 +91,7 @@ class EmbeddingCollection(BaseCollection):
         documents = _as_list(documents)
         ids = _as_list(ids)
         if metadatas is not None:
-            metadatas = _as_list(metadatas)
+            metadatas = initialize_last_modified_metadata(_as_list(metadatas))
         if embeddings is None:
             embeddings = _embed_texts(documents)
         return self._inner.add(
@@ -93,7 +105,7 @@ class EmbeddingCollection(BaseCollection):
         documents = _as_list(documents)
         ids = _as_list(ids)
         if metadatas is not None:
-            metadatas = _as_list(metadatas)
+            metadatas = initialize_last_modified_metadata(_as_list(metadatas))
         if embeddings is None:
             embeddings = _embed_texts(documents)
         return self._inner.upsert(
@@ -155,6 +167,21 @@ class EmbeddingCollection(BaseCollection):
     def lexical_search(self, *, query: str, n_results: int = 10, where: Optional[dict] = None):
         return self._inner.lexical_search(query=query, n_results=n_results, where=where)
 
+    def get_recent(
+        self,
+        *,
+        limit: int,
+        where: Optional[dict] = None,
+        order_field: str = "filed_at",
+        include: Optional[list[str]] = None,
+    ):
+        # Concrete on ``BaseCollection`` (the scan-and-sort default), so MRO
+        # would resolve it here and shadow a backend that pushes the ordering
+        # into storage. Forward explicitly.
+        return self._inner.get_recent(
+            limit=limit, where=where, order_field=order_field, include=include
+        )
+
     def facet_counts(
         self, field: str, where: Optional[dict] = None, limit: int = 1000
     ) -> dict[str, int]:
@@ -178,6 +205,15 @@ class EmbeddingCollection(BaseCollection):
         # over the wire. Same MRO-shadow pattern as ``facet_counts`` /
         # ``lexical_search`` above.
         return self._inner.get_all_metadata(where=where)
+
+    def get_all_rows(
+        self, where: Optional[dict] = None, include: Optional[list[str]] = None
+    ) -> GetResult:
+        # Same MRO shadow as ``get_all_metadata`` right above: the concrete
+        # default on ``BaseCollection`` pages through ``self.get()``, so without
+        # this forwarder a backend's single-pass implementation (qdrant scrolls
+        # its own cursor) is never reached and the O(n^2) offset walk comes back.
+        return self._inner.get_all_rows(where=where, include=include)
 
     def update(self, *, ids, documents=None, metadatas=None, embeddings=None):
         ids = _as_list(ids)

@@ -10,6 +10,7 @@ from mempalace.convo_miner import (
     _emit_bounded,
     _extract_authored_at,
     _file_chunks_locked,
+    _source_file_delete_ids,
     chunk_exchanges,
     detect_convo_room,
     scan_convos,
@@ -509,6 +510,101 @@ class TestScanConvos:
         assert "SKIP: unreadable.txt" in err
         assert "stat error" in err
 
+    def test_scan_skips_subagent_dirs_by_default(self, tmp_path):
+        # Mimic Claude Code layout: ~/.claude/projects/<slug>/<session>/subagents/agent-*.jsonl
+        session_dir = tmp_path / "session-abc"
+        session_dir.mkdir()
+        (session_dir / "main.jsonl").write_text('{"type":"user"}\n', encoding="utf-8")
+        subagents_dir = session_dir / "subagents"
+        subagents_dir.mkdir()
+        (subagents_dir / "agent-abc.jsonl").write_text('{"type":"user"}\n', encoding="utf-8")
+        (subagents_dir / "agent-def.jsonl").write_text('{"type":"user"}\n', encoding="utf-8")
+
+        files = scan_convos(str(tmp_path))
+        names = [f.name for f in files]
+
+        assert "main.jsonl" in names
+        assert "agent-abc.jsonl" not in names
+        assert "agent-def.jsonl" not in names
+
+    def test_scan_includes_subagent_dirs_when_opted_in(self, tmp_path):
+        session_dir = tmp_path / "session-abc"
+        session_dir.mkdir()
+        (session_dir / "main.jsonl").write_text('{"type":"user"}\n', encoding="utf-8")
+        subagents_dir = session_dir / "subagents"
+        subagents_dir.mkdir()
+        (subagents_dir / "agent-abc.jsonl").write_text('{"type":"user"}\n', encoding="utf-8")
+
+        files = scan_convos(str(tmp_path), include_subagents=True)
+        names = [f.name for f in files]
+
+        assert "main.jsonl" in names
+        assert "agent-abc.jsonl" in names
+
+    def test_scan_skips_subagent_dirs_at_any_depth(self, tmp_path):
+        # The "subagents" name match is by directory name, not by depth: verify
+        # both shallow (top-level) and nested subagents/ get skipped.
+        (tmp_path / "subagents").mkdir()
+        (tmp_path / "subagents" / "agent-top.jsonl").write_text("{}", encoding="utf-8")
+        nested = tmp_path / "session" / "subagents"
+        nested.mkdir(parents=True)
+        (nested / "agent-deep.jsonl").write_text("{}", encoding="utf-8")
+        (tmp_path / "session" / "main.jsonl").write_text("{}", encoding="utf-8")
+
+        files = scan_convos(str(tmp_path))
+        names = [f.name for f in files]
+
+        assert "main.jsonl" in names
+        assert "agent-top.jsonl" not in names
+        assert "agent-deep.jsonl" not in names
+
+    def test_scan_does_not_skip_suffix_named_dirs(self, tmp_path):
+        # Exact name match only: 'mysubagents' or 'subagentsbackup' must still
+        # be mined. Guards against future regression to substring/regex match.
+        for dir_name in ("mysubagents", "subagentsbackup", "subagent"):
+            d = tmp_path / dir_name
+            d.mkdir()
+            (d / f"{dir_name}.jsonl").write_text("{}", encoding="utf-8")
+
+        files = scan_convos(str(tmp_path))
+        names = {f.name for f in files}
+
+        assert "mysubagents.jsonl" in names
+        assert "subagentsbackup.jsonl" in names
+        assert "subagent.jsonl" in names
+
+    def test_scan_skips_subagents_case_insensitive(self, tmp_path):
+        # On Windows + macOS APFS the filesystem is case-preserving; if Claude
+        # Code or a plugin ever emits 'Subagents' (capitalized), the filter
+        # must still match. Only one variant per tmp_path because case-
+        # insensitive filesystems collapse 'Subagents' and 'SUBAGENTS'.
+        d = tmp_path / "Subagents"
+        d.mkdir()
+        (d / "agent.jsonl").write_text("{}", encoding="utf-8")
+        (tmp_path / "main.jsonl").write_text("{}", encoding="utf-8")
+
+        files = scan_convos(str(tmp_path))
+        names = {f.name for f in files}
+
+        assert "main.jsonl" in names
+        assert "agent.jsonl" not in names
+
+    def test_scan_mines_an_explicitly_named_file_inside_subagents(self, tmp_path):
+        # The skip is directory pruning, so it cannot reach a caller who names
+        # one file: that path feeds a single synthetic entry with no directories
+        # to prune. The split is deliberate -- --include-subagents governs what a
+        # directory walk sweeps up, while naming a path is an explicit request
+        # and stays honored. Pinned because the two behaviours were written
+        # independently and nothing else exercises them together.
+        subagents_dir = tmp_path / "session-abc" / "subagents"
+        subagents_dir.mkdir(parents=True)
+        target = subagents_dir / "agent-abc.jsonl"
+        target.write_text('{"type":"user"}\n', encoding="utf-8")
+
+        files = scan_convos(str(target))
+
+        assert [f.name for f in files] == ["agent-abc.jsonl"]
+
 
 class TestFileChunksLocked:
     def test_uses_bounded_upsert_batches(self, monkeypatch):
@@ -583,6 +679,176 @@ class TestFileChunksLocked:
         assert "rag/foo.py" in entities
         assert "do_thing_now" in entities
 
+    def test_aborts_when_stale_drawer_purge_fails(self, monkeypatch):
+        """#105: a failed purge must abort the mine attempt, not silently
+        proceed to upsert on top of it — the same swallow already fixed
+        for miner.py's process_file at #23, own instance here."""
+        import mempalace.convo_miner as convo_miner
+
+        class FailingPurgeCol:
+            def __init__(self):
+                self.upsert_called = False
+
+            def get(self, *args, **kwargs):
+                raise RuntimeError("simulated transient backend error")
+
+            def delete(self, *args, **kwargs):
+                pass
+
+            def upsert(self, documents, ids, metadatas):
+                self.upsert_called = True
+
+        chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3)]
+        col = FailingPurgeCol()
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        drawers, room_counts, skipped = _file_chunks_locked(
+            col, "chat.txt", chunks, "wing", "general", "agent", "exchange"
+        )
+
+        assert col.upsert_called is False, (
+            "_file_chunks_locked inserted new chunks even though the "
+            "stale-drawer purge raised — old and new rows can now coexist "
+            "as duplicates/orphans"
+        )
+        assert drawers == 0
+        assert skipped is True
+
+    def test_stamps_chunk_total_for_completion_check(self, monkeypatch):
+        """Every convo drawer of one pass must carry chunk_total (#2183)."""
+        import mempalace.convo_miner as convo_miner
+
+        class FakeCol:
+            def __init__(self):
+                self.metas = []
+
+            def delete(self, *args, **kwargs):
+                pass
+
+            def get(self, ids=None, include=None, **kwargs):
+                return {"ids": [], "metadatas": []}
+
+            def upsert(self, documents, ids, metadatas):
+                self.metas.extend(metadatas)
+
+        chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(5)]
+        col = FakeCol()
+        monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        _file_chunks_locked(col, "chat.txt", chunks, "wing", "general", "agent", "exchange")
+
+        assert len(col.metas) == 5
+        assert all(m.get("chunk_total") == 5 for m in col.metas), (
+            "not every convo chunk carries the pass's chunk_total — a mid-file "
+            "crash would leave mtime-stamped partials that skip forever (#2183)"
+        )
+
+    def test_cleans_partial_drawers_after_batch_upsert_failure(self, monkeypatch, tmp_path):
+        """A failed later batch must not leave mtime-stamped partials (#2183)."""
+        import mempalace.convo_miner as convo_miner
+
+        class FailingCol:
+            def __init__(self):
+                self.records = []
+                self.upsert_calls = 0
+                self.deleted_ids = []
+
+            def get(self, where=None, limit=None, offset=0, include=None, ids=None, **kwargs):
+                if ids is not None:
+                    return {"ids": [], "metadatas": []}
+                records = self.records
+                if where and "source_file" in where:
+                    records = [
+                        r
+                        for r in records
+                        if r["metadata"].get("source_file") == where["source_file"]
+                    ]
+                page = records[offset : offset + (limit or len(records))]
+                return {
+                    "ids": [r["id"] for r in page],
+                    "metadatas": [r["metadata"] for r in page],
+                }
+
+            def delete(self, ids=None, where=None, **kwargs):
+                if ids:
+                    self.deleted_ids.extend(ids)
+                    id_set = set(ids)
+                    self.records = [r for r in self.records if r["id"] not in id_set]
+                    return
+                if where and "source_file" in where:
+                    src = where["source_file"]
+                    self.records = [
+                        r for r in self.records if r["metadata"].get("source_file") != src
+                    ]
+
+            def upsert(self, documents, ids, metadatas):
+                self.upsert_calls += 1
+                if self.upsert_calls == 2:
+                    raise RuntimeError("simulated second-batch failure")
+                self.records.extend(
+                    {"id": drawer_id, "metadata": metadata}
+                    for drawer_id, metadata in zip(ids, metadatas)
+                )
+
+        source = tmp_path / "chat.txt"
+        source.write_text("content\n", encoding="utf-8")
+        chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3)]
+        col = FailingCol()
+        monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        with pytest.raises(RuntimeError, match="second-batch failure"):
+            _file_chunks_locked(col, str(source), chunks, "wing", "general", "agent", "exchange")
+
+        assert col.records == [], (
+            "partial convo drawers survived a mid-file upsert failure — the "
+            "next mine would skip this incomplete file forever (#2183)"
+        )
+        assert col.deleted_ids, "cleanup did not delete the partial drawer ids"
+
+
+class TestSourceFileDeleteIds:
+    """#104: the sweeper writes drawers with no extract_mode at all
+    (ingest_mode="sweep"). convo_miner's default exchange-mode purge
+    must not scoop those up — they were never meant to carry
+    extract_mode, unlike a genuine legacy pre-schema convo_miner row."""
+
+    def test_excludes_sweeper_rows_from_exchange_mode_purge(self):
+        class FakeCol:
+            def get(self, where=None, limit=None, offset=0, include=None):
+                if offset > 0:
+                    return {"ids": [], "metadatas": []}
+                return {
+                    "ids": ["sweep_1", "exchange_1", "legacy_1"],
+                    "metadatas": [
+                        {"ingest_mode": "sweep", "session_id": "s1", "role": "user"},
+                        {"ingest_mode": "convos", "extract_mode": "exchange"},
+                        {"source_file": "chat.txt"},  # pre-ingest_mode legacy row
+                    ],
+                }
+
+        delete_ids = _source_file_delete_ids(FakeCol(), "chat.txt", "exchange")
+
+        assert "sweep_1" not in delete_ids, (
+            "sweeper's drawer was scooped into convo_miner's default "
+            "exchange-mode purge and would be deleted on the next re-mine"
+        )
+        assert "exchange_1" in delete_ids
+        assert "legacy_1" in delete_ids
+
 
 class TestExtractAuthoredAt:
     """authored_at = max per-line ``timestamp`` in a transcript (real authored date,
@@ -643,3 +909,136 @@ class TestExtractAuthoredAt:
         f = tmp_path / "session.jsonl"
         f.write_text('{"timestamp": 1}\n{"timestamp": false}\n')
         assert _extract_authored_at(f) is None
+
+
+def test_scan_convos_accepts_one_file_without_scanning_siblings(
+    tmp_path,
+):
+    selected = tmp_path / "selected.jsonl"
+    sibling = tmp_path / "sibling.jsonl"
+
+    selected.write_text(
+        '{"type": "user"}\n',
+        encoding="utf-8",
+    )
+    sibling.write_text(
+        '{"type": "user"}\n',
+        encoding="utf-8",
+    )
+
+    assert scan_convos(str(selected)) == [selected.resolve()]
+
+
+class TestSourceDirectoryIdentity:
+    """A transcript on a volume that goes away must not have its drawers
+    pruned by a witness that was never on that volume (#2320)."""
+
+    def test_the_identity_is_stamped_on_every_chunk(self, monkeypatch):
+        import contextlib
+
+        import mempalace.convo_miner as convo_miner
+
+        class FakeCol:
+            def __init__(self):
+                self.metadatas: list = []
+
+            def get(self, *args, **kwargs):
+                return {"ids": []}
+
+            def delete(self, *args, **kwargs):
+                pass
+
+            def upsert(self, documents, ids, metadatas):
+                self.metadatas.extend(metadatas)
+
+        chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3)]
+        col = FakeCol()
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        _file_chunks_locked(
+            col,
+            "chat.txt",
+            chunks,
+            "wing",
+            "general",
+            "agent",
+            "exchange",
+            source_dir_ino="1000000",
+        )
+
+        assert col.metadatas
+        assert all(m["source_dir_ino"] == "1000000" for m in col.metadatas), col.metadatas
+
+    def test_no_identity_leaves_the_key_off(self, monkeypatch):
+        import contextlib
+
+        import mempalace.convo_miner as convo_miner
+
+        class FakeCol:
+            def __init__(self):
+                self.metadatas: list = []
+
+            def get(self, *args, **kwargs):
+                return {"ids": []}
+
+            def delete(self, *args, **kwargs):
+                pass
+
+            def upsert(self, documents, ids, metadatas):
+                self.metadatas.extend(metadatas)
+
+        col = FakeCol()
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        _file_chunks_locked(
+            col,
+            "chat.txt",
+            [{"content": "chunk " * 40, "chunk_index": 0}],
+            "w",
+            "g",
+            "a",
+            "exchange",
+        )
+
+        assert col.metadatas
+        assert all("source_dir_ino" not in m for m in col.metadatas), col.metadatas
+
+
+def test_mine_convos_passes_the_directory_it_read_from(tmp_path, monkeypatch):
+    """The storing half is covered above; this covers the wiring, so removing
+    the call in ``_mine_convos_impl`` cannot pass unnoticed (#2320)."""
+    from mempalace import convo_miner
+    from mempalace import source_identity as si
+
+    transcripts = tmp_path / "transcripts"
+    transcripts.mkdir()
+    transcript = transcripts / "session.jsonl"
+    transcript.write_text(
+        '{"type":"user","message":{"role":"user","content":"'
+        + "a conversation long enough to file a drawer " * 6
+        + '"},"timestamp":"2026-04-13T10:00:00Z","uuid":"u1","sessionId":"s1"}\n',
+        encoding="utf-8",
+    )
+
+    seen = {}
+
+    def record(*args, **kwargs):
+        seen["source_dir_ino"] = kwargs.get("source_dir_ino")
+        # Same shape the real helper returns: (drawers_added, room_delta,
+        # skipped), with the middle one a mapping the caller merges.
+        return (0, {}, True)
+
+    monkeypatch.setattr(convo_miner, "_file_chunks_locked", record)
+    # The stub returns what the real helper returns, so the pass runs to the
+    # end and a failure after the recorded call is a failure of this test.
+    convo_miner.mine_convos(str(transcripts), str(tmp_path / "palace"))
+
+    assert seen.get("source_dir_ino") == si.directory_identity(transcripts)

@@ -128,6 +128,7 @@ Default path: `~/.mempalace/knowledge_graph.sqlite3`
 | `add_entity(name, entity_type='unknown', properties=None)` | Name, type, props dict | `str` (entity ID) | Add or update entity node |
 | `add_triple(subject, predicate, obj, valid_from, valid_to, confidence, source_closet, source_file)` | See below | `str` (triple ID) | Add relationship triple |
 | `invalidate(subject, predicate, obj, ended=None)` | Entity names, end date | — | Mark relationship as ended |
+| `supersede(...)` | Entity names, replacement value, optional boundary | `str` (new triple ID) | Atomically replace one current relationship with another |
 
 **`add_triple` parameters:**
 
@@ -141,6 +142,42 @@ Default path: `~/.mempalace/knowledge_graph.sqlite3`
 | `confidence` | `float` | `1.0` | Confidence score 0.0–1.0 |
 | `source_closet` | `str` | `None` | Link to verbatim memory |
 | `source_file` | `str` | `None` | Original source file |
+
+**`supersede` signature:**
+
+```python
+supersede(
+    subject,
+    predicate,
+    old_obj,
+    new_obj,
+    at=None,
+    confidence=1.0,
+    source_closet=None,
+    source_file=None,
+    source_drawer_id=None,
+    adapter_name=None,
+)
+```
+
+**`supersede` parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `subject` | `str` | — | Source entity name |
+| `predicate` | `str` | — | Single-valued relationship type |
+| `old_obj` | `str` | — | Current value to close if it is open |
+| `new_obj` | `str` | — | Replacement value to open |
+| `at` | `str` | current UTC instant | Handoff boundary; date-only values normalize to midnight UTC |
+| `confidence` | `float` | `1.0` | Confidence score 0.0–1.0 |
+| `source_closet` | `str` | `None` | Link to verbatim memory |
+| `source_file` | `str` | `None` | Original source file |
+| `source_drawer_id` | `str` | `None` | Source drawer provenance |
+| `adapter_name` | `str` | `None` | Source adapter provenance |
+
+Use `supersede` when a single-valued relationship changes, such as a model, employer, address, or primary assignment.
+It closes the old fact and opens the new fact at the same precise boundary, so an as-of query at the handoff returns only the successor.
+Use `invalidate` for facts that simply ended, and `add_triple` for facts that can coexist.
 
 #### Query Methods
 

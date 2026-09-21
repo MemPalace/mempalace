@@ -10,6 +10,7 @@ only the configured model name (cheap), and persistence is exercised with
 
 import os
 import warnings
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -26,6 +27,31 @@ from mempalace.backends.base import (
 # ---------------------------------------------------------------------------
 # Three-state helper
 # ---------------------------------------------------------------------------
+
+
+def test_enforce_embedder_identity_skips_count_on_hnsw_divergence():
+    """count() on a diverged HNSW segment can hard-crash the process
+    (#1222) -- a try/except cannot save it, since a native crash takes the
+    whole process down regardless. _enforce_embedder_identity runs on
+    EVERY get_collection() call (the universal chokepoint every tool
+    passes through) and must never reach count() when hnsw_capacity_status
+    reports divergence (#89)."""
+    from mempalace.palace import _enforce_embedder_identity
+
+    collection = MagicMock()
+    collection.effective_embedder_identity.side_effect = Exception("not supported")
+    collection.get_stored_embedder_identity.return_value = None
+
+    with (
+        patch("mempalace.embedding.current_model_name", return_value="minilm"),
+        patch(
+            "mempalace.backends.chroma.hnsw_capacity_status",
+            return_value={"diverged": True, "message": "test divergence"},
+        ),
+    ):
+        _enforce_embedder_identity(collection, "/fake/palace", "mempalace_drawers", create=True)
+
+    collection.count.assert_not_called()
 
 
 def test_unknown_when_nothing_stored():
@@ -219,6 +245,24 @@ def test_enforcement_brand_new_records_current_model(tmp_path, monkeypatch, clea
     col = P.get_collection(str(tmp_path), collection_name="mempalace_drawers", create=True)
     got = col.get_stored_embedder_identity()
     assert got is not None and got.model_name == "minilm"
+
+
+def test_clear_validated_embedder_identity_scoped_to_palace(
+    tmp_path, monkeypatch, clear_identity_cache
+):
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "minilm")
+    from mempalace import palace as P
+
+    keep = (str(tmp_path / "other"), "mempalace_drawers", "minilm")
+    drop = (str(tmp_path), "mempalace_drawers", "minilm")
+    P._VALIDATED_IDENTITY.add(keep)
+    P._VALIDATED_IDENTITY.add(drop)
+
+    P.clear_validated_embedder_identity(str(tmp_path))
+
+    assert keep in P._VALIDATED_IDENTITY
+    assert drop not in P._VALIDATED_IDENTITY
 
 
 def test_enforcement_legacy_with_data_warns(tmp_path, monkeypatch, clear_identity_cache):

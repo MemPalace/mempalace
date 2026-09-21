@@ -10,6 +10,7 @@ import pickle
 import re
 import shlex
 import sqlite3
+import struct
 import time
 from collections import defaultdict
 from numbers import Integral
@@ -17,9 +18,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 import chromadb
+from chromadb.config import Settings as _ChromaSettings
 from chromadb.errors import NotFoundError as _ChromaNotFoundError
 
-from ..config import sqlite_read_uri
+from ..config import connect_sqlite_read
+from ._magic import has_sqlite_magic
 from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
     BaseBackend,
@@ -34,9 +37,19 @@ from .base import (
     QueryResult,
     UnsupportedFilterError,
     _IncludeSpec,
+    initialize_last_modified_metadata,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ChromaDB's own default is ``anonymized_telemetry=True``. In the 1.x line we
+# support its posthog client is a no-op stub and posthog is not a dependency, so
+# nothing is transmitted today — but that default belongs to ChromaDB, not to us,
+# and MemPalace promises the data never leaves the machine. Every client this
+# backend opens says no explicitly, so a future ChromaDB release cannot turn
+# collection back on underneath us. (GHSA-8h77)
+_CLIENT_SETTINGS = _ChromaSettings(anonymized_telemetry=False)
 
 
 _REQUIRED_OPERATORS = frozenset({"$eq", "$ne", "$in", "$nin", "$and", "$or", "$contains"})
@@ -53,6 +66,57 @@ _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 # Treat only >10x as corruption so normal flush lag or small segments do not get
 # quarantined.
 _HNSW_LINK_TO_DATA_MAX_RATIO = 10.0
+_HNSW_PERSISTENCE_VERSION = 1
+_HNSW_SANE_ELEMENT_CAP = 50_000_000
+# Current chroma-hnswlib header.bin prefix: native-endian int version,
+# followed by 64-bit size_t offsetLevel0, max_elements, and current_count.
+_HNSW_HEADER_PREFIX = struct.Struct("=iQQQ")
+
+
+def _read_hnsw_binary_header(
+    segment_dir: str,
+) -> Optional[dict[str, int]]:
+    """Read the version and count prefix from chroma-hnswlib header.bin."""
+    if struct.calcsize("P") != 8:
+        return None
+
+    header_path = os.path.join(segment_dir, "header.bin")
+    try:
+        with open(header_path, "rb") as handle:
+            raw = handle.read(_HNSW_HEADER_PREFIX.size)
+    except OSError:
+        return None
+
+    if len(raw) != _HNSW_HEADER_PREFIX.size:
+        return None
+
+    try:
+        version, offset_level0, max_elements, current_count = _HNSW_HEADER_PREFIX.unpack(raw)
+    except struct.error:
+        return None
+
+    return {
+        "persistence_version": int(version),
+        "offset_level0": int(offset_level0),
+        "max_elements": int(max_elements),
+        "cur_element_count": int(current_count),
+    }
+
+
+def _hnsw_binary_header_has_impossible_counts(
+    header: dict[str, int],
+) -> bool:
+    """Return True only for impossible counts in the known v1 layout."""
+    if header.get("persistence_version") != _HNSW_PERSISTENCE_VERSION:
+        return False
+
+    max_elements = int(header["max_elements"])
+    current_count = int(header["cur_element_count"])
+    return (
+        current_count > max_elements
+        or max_elements > _HNSW_SANE_ELEMENT_CAP
+        or current_count > _HNSW_SANE_ELEMENT_CAP
+    )
 
 
 def _hnsw_link_to_data_ratio(seg_dir: str) -> Optional[float]:
@@ -160,39 +224,314 @@ def _hnsw_payload_appears_sane(seg_dir: str) -> bool:
     return ratio is None or ratio <= _HNSW_LINK_TO_DATA_MAX_RATIO
 
 
-# HNSW batch/sync thresholds applied at collection creation.
+# HNSW batch/sync thresholds applied at collection creation — chromadb's own
+# documented defaults (chromadb/api/configuration.py:263-273,
+# chromadb/api/collection_configuration.py:451-454,
+# chromadb/segment/impl/vector/hnsw_params.py:79-80, and
+# https://docs.trychroma.com/docs/collections/configure).
 #
-# chromadb's Rust HNSW segment writes index_metadata.pickle and
-# link_lists.bin only when internal counters cross both thresholds
-# (batch_size gates _apply_batch; sync_threshold gates _persist).
-# Records below both thresholds stay in memory and are lost on exit.
+# Both ran at 2 to answer #1579 (a sub-threshold mine left index_metadata.pickle
+# absent, and quarantine_stale_hnsw renamed the segment away). Three findings on
+# chromadb 1.5.9 (PersistentClient / Rust bindings, single writer) retire that:
 #
-# Previously 50k/50k to work around link_lists.bin sparse-file bloat
-# in pre-1.5.x Python chromadb (#344).  chromadb >=1.5.4 Rust bindings
-# (the minimum mempalace supports) do not exhibit that bloat; verified
-# at batch_size=2 with 20k records: link_lists.bin = 171 KB, no
-# sparse-file inflation.
+#   * 2 SITS OUTSIDE CHROMA'S OWN DECLARED VALID RANGE. hnsw_params.py:21-22
+#     validates both knobs as `isinstance(p, int) and p > 2`. Not an inequality
+#     between the two — a floor on each.
 #
-# The 50k guard caused #1579: mines under 50k drawers never triggered
-# _persist(), leaving index_metadata.pickle absent and link_lists.bin
-# empty.  quarantine_stale_hnsw then renamed the segment on every cold
-# open after a 300s mtime gap, accumulating .drift-* directories.
+#   * IT COSTS WRITE AMPLIFICATION, measured. Bytes written (/proc/self/io) for
+#     one mine of N records, 64-dim, num_threads=1, identical corpus and seed:
 #
-# Lowered to 2 (empirical Rust-side minimum for chromadb >=1.5.4; the
-# Rust bindings reject 1 with InvalidArgumentError) so any mine of 2+
-# drawers triggers a natural persist.  Existing palaces created under
-# the old 50k guard keep those thresholds in their collection metadata
-# until the user runs repair --mode from-sqlite --archive-existing.
-_HNSW_BLOAT_GUARD = {
-    "hnsw:batch_size": 2,
-    "hnsw:sync_threshold": 2,
+#         N        2/2        100/1000     ratio
+#         10,000    47.1 MB    28.1 MB     1.67x
+#         20,000   127.4 MB    60.0 MB     2.12x
+#         40,000   390.3 MB   134.0 MB     2.91x
+#
+#     Two runs at N=20,000 reproduced within 0.1%. sync_threshold dominates:
+#     3/3 measured identical to 2/2, and 1000/1000 identical to 100/1000. The
+#     ratio grows with collection size, so the cost is worst on the largest
+#     palaces.
+#
+#   * IT BUYS NOTHING. A 5-record collection at 100/1000 — far below the
+#     threshold, so no persist ever fires — reads back whole from a FRESH
+#     PROCESS (count and vector query both answer). On that artifact
+#     link_lists.bin is 0 bytes with no index_metadata.pickle, which is #1579's
+#     trigger shape exactly, and quarantine_stale_hnsw() creates no drift dir:
+#     _segment_appears_healthy reads it as never-persisted rather than as a torn
+#     persist.
+#
+# NOT claimed here: that a small sync_threshold is a known chroma failure mode.
+# No such report was found in chroma's issues or docs, and chroma's own guidance
+# runs the other way (raise sync_threshold for bulk inserts). The Python
+# persist path that #1579 and chroma#6975 describe does not execute under the
+# Rust bindings at all — hnswlib is not a dependency of this line.
+#
+# A palace keeps whatever thresholds it was created under;
+# `repair --mode from-sqlite --archive-existing` re-creates it under these.
+_HNSW_WRITE_DEFAULTS = {
+    "hnsw:batch_size": 100,
+    "hnsw:sync_threshold": 1000,
 }
+
+
+def _hnsw_creation_metadata(options: Optional[dict]) -> dict:
+    """Build the ``metadata=`` dict for a fresh collection from caller options.
+
+    Centralizes the HNSW knobs so a multi-collection palace can tune each
+    collection at creation while the base keeps every config value in the
+    ``collection_metadata`` table where the divergence guard, the cosine-space
+    detector (``ChromaCollection.distance_metric``), and ``_read_sync_threshold``
+    already read it. The legacy ``metadata=`` keys are kept deliberately: the
+    modern ``configuration=`` API stores the same parameters in
+    ``configuration_json`` instead, leaving ``collection.metadata`` empty and
+    silently blinding all of that existing tooling.
+
+    Caller option -> chromadb metadata key:
+
+    * ``hnsw_space``       -> ``hnsw:space``        (default ``"cosine"``)
+    * ``num_threads``      -> ``hnsw:num_threads``  (default 1; serializes inserts)
+    * ``ef_construction``  -> ``hnsw:construction_ef``
+    * ``max_neighbors``    -> ``hnsw:M``
+    * ``sync_threshold``   -> ``hnsw:sync_threshold``
+    * ``batch_size``       -> ``hnsw:batch_size``
+
+    ``sync_threshold``/``batch_size`` default to chromadb's own values
+    (:data:`_HNSW_WRITE_DEFAULTS`), which amortize the index flush across a
+    mine. A caller tunes them per collection; a caller writing far fewer
+    records than the threshold still keeps them (the Rust writer holds the
+    sub-threshold tail durable — see :data:`_HNSW_WRITE_DEFAULTS`).
+    ``ef_construction``/``max_neighbors`` are omitted when the caller does not
+    set them, so chromadb applies its own defaults.
+    """
+    opts = options if isinstance(options, dict) else {}
+    md: dict[str, Any] = {
+        "hnsw:space": opts.get("hnsw_space", "cosine"),
+        "hnsw:num_threads": int(opts.get("num_threads", 1)),
+        **_HNSW_WRITE_DEFAULTS,
+    }
+    if "ef_construction" in opts and opts["ef_construction"] is not None:
+        md["hnsw:construction_ef"] = int(opts["ef_construction"])
+    if "max_neighbors" in opts and opts["max_neighbors"] is not None:
+        md["hnsw:M"] = int(opts["max_neighbors"])
+    if "sync_threshold" in opts and opts["sync_threshold"] is not None:
+        md["hnsw:sync_threshold"] = int(opts["sync_threshold"])
+    if "batch_size" in opts and opts["batch_size"] is not None:
+        md["hnsw:batch_size"] = int(opts["batch_size"])
+    return md
+
+
+def _caller_vector_schema(options: Optional[dict]):
+    """Build an embedding-function-free schema for caller vectors."""
+    opts = options if isinstance(options, dict) else {}
+
+    def option_int(
+        name: str,
+        default: int,
+    ) -> int:
+        value = opts.get(name)
+        return default if value is None else int(value)
+
+    hnsw_options: dict[str, Any] = {
+        "num_threads": option_int(
+            "num_threads",
+            1,
+        ),
+        "batch_size": option_int(
+            "batch_size",
+            _HNSW_WRITE_DEFAULTS["hnsw:batch_size"],
+        ),
+        "sync_threshold": option_int(
+            "sync_threshold",
+            _HNSW_WRITE_DEFAULTS["hnsw:sync_threshold"],
+        ),
+    }
+
+    for option in (
+        "ef_construction",
+        "max_neighbors",
+    ):
+        if opts.get(option) is not None:
+            hnsw_options[option] = int(opts[option])
+
+    return chromadb.Schema().create_index(
+        config=chromadb.VectorIndexConfig(
+            embedding_function=None,
+            hnsw=chromadb.HnswIndexConfig(**hnsw_options),
+            space=str(opts.get("hnsw_space") or "cosine"),
+        )
+    )
+
+
+def _collection_vector_index_config(
+    collection,
+):
+    """Return Chroma's live #embedding vector config, if available."""
+    try:
+        values = collection.schema.keys.get("#embedding")
+        vector_index = values.float_list.vector_index
+
+        if vector_index is None:
+            return None
+
+        return vector_index.config
+    except (
+        AttributeError,
+        KeyError,
+        TypeError,
+    ):
+        return None
+
+
+def _caller_vector_embedding_sources(
+    collection,
+) -> list[str]:
+    """Return active or unverifiable Chroma embedding sources."""
+    sources: list[str] = []
+    missing = object()
+
+    client_embedding_function = getattr(
+        collection,
+        "_embedding_function",
+        missing,
+    )
+
+    if client_embedding_function is missing:
+        sources.append("client-unavailable")
+    elif client_embedding_function is not None:
+        sources.append("client")
+
+    configuration = getattr(
+        collection,
+        "configuration",
+        missing,
+    )
+
+    if not isinstance(
+        configuration,
+        dict,
+    ):
+        sources.append("configuration-unavailable")
+    elif configuration.get("embedding_function") is not None:
+        sources.append("configuration")
+
+    vector_config = _collection_vector_index_config(collection)
+
+    if vector_config is None:
+        sources.append("schema-unavailable")
+    elif (
+        getattr(
+            vector_config,
+            "embedding_function",
+            None,
+        )
+        is not None
+    ):
+        sources.append("schema")
+
+    return sources
+
+
+def _require_caller_vector_collection(
+    collection,
+) -> None:
+    """Fail closed unless every live Chroma embedding source is disabled."""
+    sources = _caller_vector_embedding_sources(collection)
+
+    if not sources:
+        return
+
+    raise ValueError(
+        "caller-vector mode requires an "
+        "embedding-function-free Chroma collection; "
+        "active or unverifiable sources: "
+        f"{', '.join(sources)}. "
+        "Create a new caller-vector collection or rebuild "
+        "this collection with an EF-free schema."
+    )
+
+
+def _read_collection_schema(
+    connection,
+    collection_name: str,
+) -> Optional[dict]:
+    """Read a collection's persisted schema_str when supported."""
+    columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(collections)").fetchall()
+    }
+
+    if "schema_str" not in columns:
+        return None
+
+    row = connection.execute(
+        """
+        SELECT schema_str
+        FROM collections
+        WHERE name = ?
+        """,
+        (collection_name,),
+    ).fetchone()
+
+    if not row or not row[0]:
+        return None
+
+    try:
+        schema = json.loads(row[0])
+    except (
+        TypeError,
+        json.JSONDecodeError,
+    ):
+        return None
+
+    return schema if isinstance(schema, dict) else None
+
+
+def _schema_hnsw_config(
+    schema: Optional[dict],
+) -> Optional[dict]:
+    """Return the persisted #embedding HNSW configuration."""
+    try:
+        hnsw = schema["keys"]["#embedding"]["float_list"]["vector_index"]["config"].get("hnsw")
+    except (
+        KeyError,
+        TypeError,
+    ):
+        return None
+
+    return hnsw if isinstance(hnsw, dict) else None
+
 
 # Below this size, data_level0.bin is too small for a meaningful HNSW graph.
 # Used by _hnsw_link_lists_is_usable_for_payload (empty link_lists is fine
 # when data is trivially small) and _missing_dimensionality_appears_recoverable
 # (don't attempt recovery on segments with negligible data).
 _HNSW_MISSING_METADATA_DATA_FLOOR = 1024
+
+# Lower bound on the bytes one HNSW element can occupy in data_level0.bin,
+# used to derive a capacity CEILING from payload size when
+# index_metadata.pickle is absent. A real element costs dim*4 bytes for the
+# vector alone (1,536 at dim=384) plus link and label overhead, so 256 sits
+# far below any real configuration: it over-estimates capacity, which means
+# the stub check below only fires on unambiguous cases and never on a
+# segment that is merely lagging.
+_HNSW_MIN_BYTES_PER_ELEMENT = 256
+
+
+def _hnsw_capacity_ceiling_from_payload(palace_path: str, segment_id: str) -> Optional[int]:
+    """Upper bound on the elements a segment's payload could hold, or None.
+
+    Returns None when ``data_level0.bin`` does not exist: a segment that has
+    never written payload is genuinely fresh, and its missing pickle says
+    nothing about whether vector search is usable. When payload IS present,
+    its size caps how many elements the segment can possibly hold, which is
+    enough to recognise a replacement stub standing in for a lost index
+    without loading the segment.
+    """
+    data_path = os.path.join(palace_path, segment_id, "data_level0.bin")
+    try:
+        if not os.path.isfile(data_path):
+            return None
+        return os.path.getsize(data_path) // _HNSW_MIN_BYTES_PER_ELEMENT
+    except OSError:
+        return None
 
 
 def _validate_where(where: Optional[dict]) -> None:
@@ -367,6 +706,10 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     files and quarantine_stale_hnsw would conservatively rename them
     out of the way.
     """
+    binary_header = _read_hnsw_binary_header(seg_dir)
+    if binary_header is not None and _hnsw_binary_header_has_impossible_counts(binary_header):
+        return False
+
     meta_path = os.path.join(seg_dir, "index_metadata.pickle")
 
     if not os.path.isfile(meta_path):
@@ -388,7 +731,7 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
 def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> list[str]:
     """Rename HNSW segment dirs that look unsafe to open.
 
-    This catches two classes of HNSW corruption before ChromaDB opens the
+    This catches three classes of HNSW corruption before ChromaDB opens the
     native segment reader:
 
     1. stale-by-mtime segments whose ``index_metadata.pickle`` fails the
@@ -439,14 +782,18 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
 
         payload_ratio = _hnsw_link_to_data_ratio(seg_dir)
         payload_corrupt = payload_ratio is not None and payload_ratio > _HNSW_LINK_TO_DATA_MAX_RATIO
+        binary_header = _read_hnsw_binary_header(seg_dir)
+        header_corrupt = binary_header is not None and _hnsw_binary_header_has_impossible_counts(
+            binary_header
+        )
 
-        if not payload_corrupt and sqlite_mtime - hnsw_mtime < stale_seconds:
+        if not payload_corrupt and not header_corrupt and sqlite_mtime - hnsw_mtime < stale_seconds:
             continue
 
         # Stage 2: integrity gate. Mtime drift alone is not corruption because
         # Chroma flushes HNSW asynchronously. A healthy metadata file proves the
         # ordinary stale-by-mtime case is just flush lag.
-        if not payload_corrupt and _segment_appears_healthy(seg_dir):
+        if not payload_corrupt and not header_corrupt and _segment_appears_healthy(seg_dir):
             logger.info(
                 "HNSW mtime gap %.0fs on %s exceeds threshold but segment "
                 "metadata and payload size are intact — flush-lag, not "
@@ -459,7 +806,13 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
         stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         target = f"{seg_dir}.drift-{stamp}"
 
-        if payload_corrupt:
+        if header_corrupt:
+            reason = (
+                "header.bin contains impossible HNSW element counts "
+                f"(max={binary_header['max_elements']:,}, "
+                f"current={binary_header['cur_element_count']:,})"
+            )
+        elif payload_corrupt:
             reason = (
                 f"link_lists.bin/data_level0.bin ratio {payload_ratio:.1f}x "
                 f"exceeds {_HNSW_LINK_TO_DATA_MAX_RATIO:.1f}x"
@@ -495,7 +848,7 @@ def _vector_segment_id(palace_path: str, collection_name: str) -> Optional[str]:
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             row = conn.execute(
                 """
@@ -633,9 +986,10 @@ def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
 # read the collection metadata (older palaces missing the row, sqlite
 # unreadable). 2000 = 2 × chromadb's default sync_threshold of 1000.
 #
-# Why dynamic: legacy palaces may still carry ``sync_threshold = 50_000``
-# (the pre-#1579 guard), so flush-lag can grow up to 50K on those palaces.
-# New palaces use sync_threshold=2 (#1579) and flush almost immediately.
+# Why dynamic: a palace carries whatever ``sync_threshold`` it was created
+# under, and flush-lag grows to that threshold before a persist fires — up
+# to 50K on a palace created under an old large guard, and 2 on one created
+# under the small guard that #1308 traces back to.
 # A fixed 2000 floor would flag actively-written legacy palaces as
 # DIVERGED the moment their queue exceeded 10% of sqlite_count, even
 # though chromadb is behaving correctly. The floor must scale with the
@@ -647,73 +1001,111 @@ _HNSW_DIVERGENCE_FRACTION = 0.10
 _HNSW_PERSISTENT_DIVERGENCE_GRACE_SECONDS = 300.0
 
 
-def _read_sync_threshold(palace_path: str, collection_name: str) -> int:
-    """Return the ``hnsw:sync_threshold`` for a collection, or 1000 default.
+def _read_sync_threshold(
+    palace_path: str,
+    collection_name: str,
+) -> int:
+    """Read sync_threshold from legacy metadata or schema_str."""
+    db_path = os.path.join(
+        palace_path,
+        "chroma.sqlite3",
+    )
 
-    The configured sync_threshold drives chromadb's HNSW flush cadence —
-    larger values mean fewer, bigger flushes (less index-bloat risk per
-    PR #1191) but also larger steady-state lag between
-    ``index_metadata.pickle`` and the live sqlite count. The divergence
-    probe scales its tolerance to ``2 × sync_threshold`` so that lag is
-    not mistaken for corruption.
-
-    Falls back to 1000 (chromadb's own default) if the collection has no
-    explicit setting — matches what older mempalace palaces were created
-    with before PR #1191.
-    """
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return 1000
+
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        connection = connect_sqlite_read(db_path)
         try:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT cm.int_value
-                FROM collection_metadata cm
-                JOIN collections c ON cm.collection_id = c.id
-                WHERE c.name = ? AND cm.key = 'hnsw:sync_threshold'
-                """,
-                (collection_name,),
-            )
-            row = cur.fetchone()
+            try:
+                row = connection.execute(
+                    """
+                    SELECT cm.int_value
+                    FROM collection_metadata cm
+                    JOIN collections c
+                      ON cm.collection_id = c.id
+                    WHERE c.name = ?
+                      AND cm.key = 'hnsw:sync_threshold'
+                    """,
+                    (collection_name,),
+                ).fetchone()
+            except sqlite3.Error:
+                row = None
+
             if row and row[0] is not None:
                 return int(row[0])
+
+            hnsw = _schema_hnsw_config(
+                _read_collection_schema(
+                    connection,
+                    collection_name,
+                )
+            )
+
+            if hnsw is not None and hnsw.get("sync_threshold") is not None:
+                return int(hnsw["sync_threshold"])
+
             return 1000
         finally:
-            conn.close()
+            connection.close()
     except Exception:
-        logger.debug("_read_sync_threshold failed", exc_info=True)
+        logger.debug(
+            "_read_sync_threshold failed",
+            exc_info=True,
+        )
         return 1000
 
 
-def _collection_has_sync_threshold_metadata(palace_path: str, collection_name: str) -> bool:
-    """Return True when the collection explicitly stores hnsw:sync_threshold."""
+def _collection_has_sync_threshold_metadata(
+    palace_path: str,
+    collection_name: str,
+) -> bool:
+    """Return True when metadata or schema stores sync_threshold."""
+    db_path = os.path.join(
+        palace_path,
+        "chroma.sqlite3",
+    )
 
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return False
 
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        connection = connect_sqlite_read(db_path)
         try:
-            row = conn.execute(
-                """
-                SELECT 1
-                  FROM collection_metadata cm
-                  JOIN collections c ON cm.collection_id = c.id
-                 WHERE c.name = ?
-                   AND cm.key = 'hnsw:sync_threshold'
-                 LIMIT 1
-                """,
-                (collection_name,),
-            ).fetchone()
-            return row is not None
+            try:
+                row = connection.execute(
+                    """
+                    SELECT 1
+                    FROM collection_metadata cm
+                    JOIN collections c
+                      ON cm.collection_id = c.id
+                    WHERE c.name = ?
+                      AND cm.key = 'hnsw:sync_threshold'
+                    LIMIT 1
+                    """,
+                    (collection_name,),
+                ).fetchone()
+            except sqlite3.Error:
+                row = None
+
+            if row is not None:
+                return True
+
+            hnsw = _schema_hnsw_config(
+                _read_collection_schema(
+                    connection,
+                    collection_name,
+                )
+            )
+
+            return hnsw is not None and "sync_threshold" in hnsw
         finally:
-            conn.close()
+            connection.close()
     except Exception:
-        logger.debug("_collection_has_sync_threshold_metadata failed", exc_info=True)
+        logger.debug(
+            "_collection_has_sync_threshold_metadata failed",
+            exc_info=True,
+        )
         return False
 
 
@@ -799,6 +1191,22 @@ def _pickle_signature(palace_path: str, segment_id: Optional[str]) -> tuple[int,
     return _stat_signature(os.path.join(palace_path, segment_id, "index_metadata.pickle"))
 
 
+def _header_signature(
+    palace_path: str,
+    segment_id: Optional[str],
+) -> tuple[int, int, int]:
+    """Signature of the segment's header.bin."""
+    if not segment_id:
+        return (0, 0, 0)
+    return _stat_signature(
+        os.path.join(
+            palace_path,
+            segment_id,
+            "header.bin",
+        )
+    )
+
+
 def _segment_id_safe(palace_path: str, collection_name: str) -> Optional[str]:
     """``_vector_segment_id`` that never raises, for the pre-probe signature."""
     try:
@@ -808,15 +1216,19 @@ def _segment_id_safe(palace_path: str, collection_name: str) -> Optional[str]:
 
 
 def _capacity_fingerprint(palace_path: str, segment_id: Optional[str]) -> tuple:
-    """Signature over every file the probe reads: the sqlite family + the pickle.
+    """Signature over every file the probe reads: sqlite, pickle, and header.
 
-    Both halves must be captured for the same ``segment_id`` so a rewrite of
+    All parts must be captured for the same ``segment_id`` so a rewrite of
     ``index_metadata.pickle`` is caught. The probe reads that pickle partway
     through, then makes two more sqlite calls, so a signature taken only after
     the probe returned would record a mid-probe pickle rewrite as "unchanged"
     while the verdict still reflected the pre-write file (#1471 review).
     """
-    return (_db_family_signature(palace_path), _pickle_signature(palace_path, segment_id))
+    return (
+        _db_family_signature(palace_path),
+        _pickle_signature(palace_path, segment_id),
+        _header_signature(palace_path, segment_id),
+    )
 
 
 def reset_hnsw_capacity_cache() -> None:
@@ -888,7 +1300,7 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
     # Snapshot the files the probe is about to read, before it reads them, and
     # again after — using the segment id the probe itself resolved. Caching
     # only when both snapshots agree makes an external write during the probe
-    # (sqlite OR the pickle) fall through uncached rather than pin a verdict
+    # (sqlite, pickle, OR header) fall through uncached rather than pin a verdict
     # the disk no longer supports.
     before = _capacity_fingerprint(palace_path, _segment_id_safe(palace_path, collection_name))
     out = _hnsw_capacity_status_uncached(palace_path, collection_name)
@@ -923,6 +1335,7 @@ def _hnsw_capacity_status_uncached(
         "hnsw_count": None,
         "divergence": None,
         "diverged": False,
+        "flush_unreachable": False,
         "status": "unknown",
         "message": "",
     }
@@ -936,6 +1349,31 @@ def _hnsw_capacity_status_uncached(
 
         if seg_id is None or sqlite_count is None:
             out["message"] = "palace state unreadable; skipping HNSW capacity check"
+            return out
+
+        binary_header = _read_hnsw_binary_header(
+            os.path.join(
+                palace_path,
+                seg_id,
+            )
+        )
+        if binary_header is not None and _hnsw_binary_header_has_impossible_counts(binary_header):
+            out.update(
+                {
+                    "status": "diverged",
+                    "diverged": True,
+                    "hnsw_binary_persistence_version": binary_header["persistence_version"],
+                    "hnsw_binary_max_elements": binary_header["max_elements"],
+                    "hnsw_binary_cur_element_count": binary_header["cur_element_count"],
+                    "message": (
+                        "HNSW header.bin contains impossible element counts "
+                        f"(max={binary_header['max_elements']:,}, "
+                        f"current={binary_header['cur_element_count']:,}). "
+                        "Vector reads are disabled until `mempalace repair` "
+                        "rebuilds the index."
+                    ),
+                }
+            )
             return out
 
         hnsw_count = _hnsw_element_count(palace_path, seg_id)
@@ -958,6 +1396,50 @@ def _hnsw_capacity_status_uncached(
             # so MCP does not globally disable vectors on an inconclusive
             # signal. Corrupt/invalid metadata, when present, is handled by
             # quarantine_invalid_hnsw_metadata before Chroma opens.
+            # Cause 1: the collection can never reach its own flush
+            # threshold. Chroma compacts its write buffer into HNSW - and
+            # only then writes index_metadata.pickle - once the buffer
+            # reaches hnsw:sync_threshold. Collections created before the
+            # threshold default dropped still carry the old large value, so
+            # one that never grows past it never builds an index at all.
+            # This is not flush-lag and will not resolve on its own.
+            if sqlite_count >= _HNSW_DIVERGENCE_FALLBACK_FLOOR and sqlite_count < sync_threshold:
+                out["flush_unreachable"] = True
+                out["message"] = (
+                    f"hnsw:sync_threshold is {sync_threshold:,} but the collection holds "
+                    f"only {sqlite_count:,} records, so Chroma's write buffer can never "
+                    "reach the compaction threshold: no HNSW index is built and no "
+                    "metadata is written. It will not resolve on its own. Lower "
+                    "sync_threshold below the collection size via collection.modify() "
+                    "and re-upsert to force a flush."
+                )
+                return out
+
+            # Cause 2: payload size caps how many elements the segment can
+            # hold. After a quarantine Chroma creates a replacement sized for
+            # ~100 elements; that stub has no pickle either, so treating "no
+            # pickle" as unconditionally inconclusive leaves the #1222
+            # fallback disarmed against an index holding 100 slots while
+            # sqlite holds six figures.
+            ceiling = _hnsw_capacity_ceiling_from_payload(palace_path, seg_id)
+            if ceiling is not None:
+                shortfall = sqlite_count - ceiling
+                stub_threshold = max(
+                    _HNSW_DIVERGENCE_FALLBACK_FLOOR,
+                    int(sqlite_count * _HNSW_DIVERGENCE_FRACTION),
+                )
+                if shortfall > stub_threshold:
+                    out["divergence"] = shortfall
+                    out["status"] = "diverged"
+                    out["diverged"] = True
+                    out["message"] = (
+                        f"HNSW payload can hold at most ~{ceiling:,} elements but sqlite "
+                        f"has {sqlite_count:,} embeddings, and no metadata pickle was "
+                        "written - this is a replacement stub, not flush-lag. "
+                        "Run `mempalace repair` to rebuild."
+                    )
+                    return out
+
             out["message"] = (
                 "HNSW capacity unavailable: metadata has not been flushed; "
                 "leaving vector search enabled"
@@ -1029,7 +1511,7 @@ def _sqlite_embedding_count(palace_path: str, collection_name: str) -> Optional[
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             row = conn.execute(
                 """
@@ -1090,7 +1572,7 @@ def _sqlite_wing_room_counts(
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             # Wait out a transient writer/checkpoint lock rather than falling
             # straight back to the expensive vector-index path (#1681).
@@ -1133,6 +1615,281 @@ def _sqlite_wing_room_counts(
         wing_rooms[wing][room] += int(n)
         total += int(n)
     return total, wing_rooms
+
+
+def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Optional[list[tuple]]:
+    """Grouped ``(room, wing, hall, n, last_date)`` from ``chroma.sqlite3``.
+
+    ``last_date`` is the newest ``date`` metadata value in the group, so
+    ``find_tunnels`` can still report ``recent`` without paging every drawer
+    (``build_graph`` only ever uses the maximum). Returns ``None`` when sqlite
+    cannot be trusted, so the caller falls back to the client path.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        conn = connect_sqlite_read(db_path)
+        try:
+            conn.execute("PRAGMA busy_timeout = 3000")
+            if (
+                conn.execute(
+                    "SELECT 1 FROM collections WHERE name = ?", (collection_name,)
+                ).fetchone()
+                is None
+            ):
+                return None
+            return conn.execute(
+                """
+                SELECT
+                    COALESCE(rm.string_value, CAST(rm.int_value AS TEXT),
+                             CAST(rm.float_value AS TEXT), '') AS room,
+                    COALESCE(wm.string_value, CAST(wm.int_value AS TEXT),
+                             CAST(wm.float_value AS TEXT), '') AS wing,
+                    COALESCE(hm.string_value, CAST(hm.int_value AS TEXT),
+                             CAST(hm.float_value AS TEXT), '') AS hall,
+                    COUNT(*) AS n,
+                    COALESCE(MAX(dm.string_value), '') AS last_date
+                FROM embeddings e
+                JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
+                JOIN collections c ON s.collection = c.id
+                LEFT JOIN embedding_metadata rm ON rm.id = e.id AND rm.key = 'room'
+                LEFT JOIN embedding_metadata wm ON wm.id = e.id AND wm.key = 'wing'
+                LEFT JOIN embedding_metadata hm ON hm.id = e.id AND hm.key = 'hall'
+                LEFT JOIN embedding_metadata dm ON dm.id = e.id AND dm.key = 'date'
+                WHERE c.name = ?
+                GROUP BY room, wing, hall
+                """,
+                (collection_name,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
+def _metadata_value_columns(conn) -> list[str]:
+    """Value columns actually present on ``embedding_metadata``.
+
+    Older chromadb builds predate ``bool_value``; probing keeps one reader
+    working across schema versions (same approach as the lexical path).
+    """
+    present = {row[1] for row in conn.execute("PRAGMA table_info(embedding_metadata)")}
+    return [c for c in ("string_value", "int_value", "float_value", "bool_value") if c in present]
+
+
+def _equality_filters(where: Optional[dict]) -> Optional[dict]:
+    """Flatten ``tool_list_drawers``-shaped ``where`` into ``{key: value}``.
+
+    Supports equality on ``wing``/``room`` and an ``$and`` of those. Returns
+    ``None`` for anything else so the caller falls back to ``col.get`` paging
+    rather than silently answering a filter it did not apply.
+    """
+    if not where:
+        return {}
+    if not isinstance(where, dict):
+        return None
+    clauses = []
+    if list(where.keys()) == ["$and"]:
+        for child in where["$and"] or []:
+            if not isinstance(child, dict) or len(child) != 1:
+                return None
+            clauses.append(next(iter(child.items())))
+    elif len(where) == 1 and not next(iter(where.keys())).startswith("$"):
+        clauses.append(next(iter(where.items())))
+    else:
+        return None
+    filters = {}
+    for key, val in clauses:
+        if key not in ("wing", "room"):
+            return None
+        filters[key] = val
+    return filters
+
+
+def sqlite_list_id_metadata(
+    palace_path: str,
+    collection_name: str,
+    where: Optional[dict] = None,
+) -> Optional[tuple[list[str], list[dict]]]:
+    """All matching drawer ids + metadata from sqlite, without opening HNSW.
+
+    Documents are deliberately excluded: ``chroma:document`` lives in the same
+    ``embedding_metadata`` table, and joining it in would materialize the whole
+    palace's verbatim text (hundreds of MB on a six-figure palace) just to
+    render one page of previews. Callers hydrate the page they display via
+    :func:`sqlite_documents_for_ids`.
+
+    ``where`` supports equality on ``wing``/``room`` and ``$and`` of those,
+    matching ``tool_list_drawers``; it is applied in SQL. Returns ``None`` when
+    sqlite cannot be trusted so the caller can fall back to ``col.get`` paging.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    filters = _equality_filters(where)
+    if filters is None:
+        return None
+    try:
+        conn = connect_sqlite_read(db_path)
+        try:
+            conn.execute("PRAGMA busy_timeout = 3000")
+            if (
+                conn.execute(
+                    "SELECT 1 FROM collections WHERE name = ?", (collection_name,)
+                ).fetchone()
+                is None
+            ):
+                return None
+            value_columns = _metadata_value_columns(conn)
+            if not value_columns:
+                return None
+            # Push the filter down as an inner join per key. Non-string operands
+            # cannot be matched against ``string_value``, so those stay in the
+            # Python pass below rather than silently matching nothing.
+            joins = []
+            params: list = []
+            for idx, (key, val) in enumerate(sorted(filters.items())):
+                if not isinstance(val, str):
+                    continue
+                alias = f"f{idx}"
+                joins.append(
+                    f"JOIN embedding_metadata {alias} ON {alias}.id = e.id "
+                    f"AND {alias}.key = ? AND {alias}.string_value = ?"
+                )
+                params.extend([key, val])
+            params.append(collection_name)
+            rows = conn.execute(
+                f"""
+                SELECT e.embedding_id, m.key, {", ".join("m." + c for c in value_columns)}
+                FROM embeddings e
+                JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
+                JOIN collections c ON s.collection = c.id
+                {" ".join(joins)}
+                LEFT JOIN embedding_metadata m
+                    ON m.id = e.id AND m.key != 'chroma:document'
+                WHERE c.name = ?
+                ORDER BY e.id
+                """,
+                params,
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+    # Column positions are resolved once: this loop runs per metadata row —
+    # millions of them on a large palace — so per-row dict building there is
+    # the difference between one second and several.
+    def _cell(name):
+        return value_columns.index(name) + 2 if name in value_columns else None
+
+    s_at, i_at, f_at, b_at = (
+        _cell(c) for c in ("string_value", "int_value", "float_value", "bool_value")
+    )
+    by_id: dict[str, dict] = {}
+    order: list[str] = []
+    for row in rows:
+        doc_id = row[0]
+        meta = by_id.get(doc_id)
+        if meta is None:
+            meta = by_id[doc_id] = {}
+            order.append(doc_id)
+        key = row[1]
+        if not key:
+            continue
+        value = _metadata_cell_value(
+            row[s_at] if s_at is not None else None,
+            row[i_at] if i_at is not None else None,
+            row[f_at] if f_at is not None else None,
+            row[b_at] if b_at is not None else None,
+        )
+        if value is None:
+            continue
+        meta[key] = value
+
+    ids: list[str] = []
+    metas: list[dict] = []
+    for doc_id in order:
+        meta = by_id[doc_id]
+        if any(meta.get(key) != val for key, val in filters.items()):
+            continue
+        ids.append(doc_id)
+        metas.append(meta)
+    return ids, metas
+
+
+def sqlite_documents_for_ids(
+    palace_path: str,
+    collection_name: str,
+    ids: list,
+) -> Optional[dict]:
+    """``{drawer_id: document}`` for ``ids`` only, straight from sqlite.
+
+    Hydrates previews for the page being displayed without opening HNSW and
+    without reading the rest of the palace's text.
+
+    Resolved in two indexed steps rather than one join: ``embedding_id`` is
+    only indexed as part of ``UNIQUE (segment_id, embedding_id)``, so a join
+    that filters on it alone degenerates into a full scan of
+    ``embedding_metadata`` — 5.7s for a 20-row page on a 165k-drawer palace.
+    Seeking the segment first, then ``embedding_metadata``'s ``(id, key)``
+    primary key, keeps both steps on an index.
+    """
+    if not ids:
+        return {}
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    wanted = [str(i) for i in ids]
+    docs: dict[str, str] = {}
+    try:
+        conn = connect_sqlite_read(db_path)
+        try:
+            conn.execute("PRAGMA busy_timeout = 3000")
+            segments = [
+                row[0]
+                for row in conn.execute(
+                    """
+                    SELECT s.id FROM segments s
+                    JOIN collections c ON s.collection = c.id
+                    WHERE c.name = ? AND s.scope = 'METADATA'
+                    """,
+                    (collection_name,),
+                )
+            ]
+            if not segments:
+                return None
+            seg_placeholders = ",".join("?" for _ in segments)
+            for start in range(0, len(wanted), 900):
+                chunk = wanted[start : start + 900]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT id, embedding_id FROM embeddings
+                    WHERE segment_id IN ({seg_placeholders})
+                      AND embedding_id IN ({placeholders})
+                    """,
+                    [*segments, *chunk],
+                ).fetchall()
+                if not rows:
+                    continue
+                public_by_internal = {int(row[0]): str(row[1]) for row in rows}
+                internal = list(public_by_internal)
+                internal_placeholders = ",".join("?" for _ in internal)
+                for internal_id, value in conn.execute(
+                    f"""
+                    SELECT id, string_value FROM embedding_metadata
+                    WHERE key = 'chroma:document' AND id IN ({internal_placeholders})
+                    """,
+                    internal,
+                ):
+                    docs[public_by_internal[int(internal_id)]] = str(value or "")
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    return docs
 
 
 def _pin_hnsw_threads(collection) -> None:
@@ -1480,6 +2237,38 @@ def _close_client(client) -> None:
         logger.debug("client.close() unavailable or failed", exc_info=True)
 
 
+def _clear_chroma_system_cache() -> None:
+    """Drop Chroma's process-global ``SharedSystemClient`` cache.
+
+    ``clear_system_cache()`` replaces Chroma's system and refcount maps without
+    calling ``System.stop()``. Callers must close every client they own before
+    invoking this helper, while Chroma can still resolve those maps.
+
+    Chroma caches its ``System`` (and the live HNSW segment) keyed by path. A
+    bare ``chromadb.PersistentClient(path=...)`` reopen reuses that cached
+    System, so after a peer or rebuild changes ``chroma.sqlite3`` on disk we
+    would rebuild against stale in-memory state and could persist an outdated
+    index over the on-disk changes -- the same data-loss class as #2002,
+    reached through :meth:`ChromaBackend._client` instead of
+    ``mcp_server._get_client``.
+
+    The clear is process-global because Chroma exposes no public per-path
+    eviction primitive. It runs only on the external inode/mtime-change branch,
+    never on the steady-state hot path.
+    """
+    try:
+        from chromadb.api.client import SharedSystemClient
+
+        clear = getattr(SharedSystemClient, "clear_system_cache", None)
+        if callable(clear):
+            clear()
+    except Exception:
+        logger.debug(
+            "Failed to clear chromadb SharedSystemClient cache",
+            exc_info=True,
+        )
+
+
 class ChromaCollection(BaseCollection):
     """Thin adapter translating ChromaDB dict returns into typed results.
 
@@ -1500,15 +2289,27 @@ class ChromaCollection(BaseCollection):
     directly without going through ``ChromaBackend``.
     """
 
-    def __init__(self, collection, palace_path: Optional[str] = None):
+    def __init__(self, collection, palace_path: Optional[str] = None, backend=None):
         self._collection = collection
         self._palace_path = palace_path
+        # Owning ChromaBackend, when this collection came through one. Used
+        # only to re-baseline that backend's freshness stat after our writes
+        # (see _write_lock). None for directly-constructed test doubles.
+        self._backend = backend
 
     @contextlib.contextmanager
     def _write_lock(self):
         """Acquire ``mine_palace_lock`` for the configured palace, if any.
 
         No-op (yields immediately) when ``self._palace_path`` is None.
+
+        On exit, re-baselines the owning backend's client-cache freshness stat.
+        A write moves ``chroma.sqlite3``'s mtime, and that stat is how
+        :meth:`ChromaBackend._client` detects an *external* change; without the
+        re-baseline our own upsert looks like somebody else's write and the
+        next collection open rebuilds the client, reloading every HNSW segment
+        it had already paid for. That made the file-a-drawer-then-search cycle
+        reload the whole index each time.
         """
         if self._palace_path is None:
             yield
@@ -1517,7 +2318,11 @@ class ChromaCollection(BaseCollection):
         from ..palace import mine_palace_lock
 
         with mine_palace_lock(self._palace_path):
-            yield
+            try:
+                yield
+            finally:
+                if self._backend is not None:
+                    self._backend._restamp(self._palace_path)
 
     # ------------------------------------------------------------------
     # Writes
@@ -1535,6 +2340,7 @@ class ChromaCollection(BaseCollection):
         misses a case (or skips for performance), reaching the chromadb
         client always goes through here first.
         """
+        metadatas = initialize_last_modified_metadata(metadatas)
         if metadatas is None:
             return None
         return [
@@ -1583,6 +2389,9 @@ class ChromaCollection(BaseCollection):
         return [_sanitize(d) if isinstance(d, str) else d for d in documents]
 
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
+        if getattr(self, "_require_embeddings", False) and embeddings is None:
+            raise ValueError("caller-vector collection requires explicit embeddings")
+
         kwargs: dict[str, Any] = {
             "documents": self._sanitize_documents_for_chromadb(documents),
             "ids": ids,
@@ -1596,6 +2405,9 @@ class ChromaCollection(BaseCollection):
             self._collection.add(**kwargs)
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
+        if getattr(self, "_require_embeddings", False) and embeddings is None:
+            raise ValueError("caller-vector collection requires explicit embeddings")
+
         kwargs: dict[str, Any] = {
             "documents": self._sanitize_documents_for_chromadb(documents),
             "ids": ids,
@@ -1616,6 +2428,13 @@ class ChromaCollection(BaseCollection):
         metadatas=None,
         embeddings=None,
     ):
+        if (
+            getattr(self, "_require_embeddings", False)
+            and documents is not None
+            and embeddings is None
+        ):
+            raise ValueError("caller-vector collection requires explicit embeddings")
+
         if documents is None and metadatas is None and embeddings is None:
             raise ValueError("update requires at least one of documents, metadatas, embeddings")
         kwargs: dict[str, Any] = {"ids": ids}
@@ -1642,6 +2461,9 @@ class ChromaCollection(BaseCollection):
         where_document=None,
         include=None,
     ) -> QueryResult:
+        if getattr(self, "_require_embeddings", False) and query_texts is not None:
+            raise ValueError("caller-vector collection requires query_embeddings")
+
         _validate_where(where)
         _validate_where(where_document)
 
@@ -1864,7 +2686,7 @@ class ChromaCollection(BaseCollection):
         # rowid, embedding_id is the user-facing drawer id.
         public_ids: dict[int, str] = {}
         try:
-            conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+            conn = connect_sqlite_read(db_path)
             conn.row_factory = sqlite3.Row
         except sqlite3.Error:
             logger.debug("Chroma lexical sqlite open failed", exc_info=True)
@@ -2026,19 +2848,39 @@ class ChromaCollection(BaseCollection):
 
     @property
     def distance_metric(self) -> str:
-        """Report this collection's actual space from ``hnsw:space``.
+        """Report HNSW space from legacy metadata or live schema."""
+        metadata_space = str(
+            self.metadata.get(
+                "hnsw:space",
+                "",
+            )
+            or ""
+        ).lower()
 
-        MemPalace sets ``hnsw:space=cosine`` on every creation path, so a
-        healthy palace reports ``"cosine"``. When the key is absent, empty, or
-        an unrecognized value, the collection is genuinely using Chroma's HNSW
-        default — **L2** (Euclidean) — because cosine was never set on it. We
-        report ``"l2"`` in that case so core ranking maps the distances
-        correctly; reporting ``"cosine"`` here would reintroduce the
-        floor-every-result-to-zero misranking this property exists to fix.
-        """
-        space = str(self.metadata.get("hnsw:space", "") or "").lower()
-        if space in ("cosine", "l2", "ip"):
-            return space
+        if metadata_space in (
+            "cosine",
+            "l2",
+            "ip",
+        ):
+            return metadata_space
+
+        vector_config = _collection_vector_index_config(self._collection)
+        schema_space = str(
+            getattr(
+                vector_config,
+                "space",
+                "",
+            )
+            or ""
+        ).lower()
+
+        if schema_space in (
+            "cosine",
+            "l2",
+            "ip",
+        ):
+            return schema_space
+
         return "l2"
 
     # ------------------------------------------------------------------
@@ -2085,6 +2927,7 @@ class ChromaBackend(BaseBackend):
     name = "chroma"
     capabilities = frozenset(
         {
+            "requires_explicit_embeddings",
             "supports_embeddings_in",
             "supports_embeddings_passthrough",
             "supports_embeddings_out",
@@ -2166,6 +3009,23 @@ class ChromaBackend(BaseBackend):
         except OSError:
             return (0, 0.0)
 
+    def _drain_clients(self) -> None:
+        """Close and forget every client owned by this backend.
+
+        Chroma's cache reset is process-global. Draining only the palace that
+        changed would leave this backend's other clients untracked after the
+        reset, so their later ``close()`` calls could not stop their Systems.
+
+        Draining invalidates every ``ChromaCollection`` previously returned by
+        those clients, including collections for unchanged palaces. Callers
+        must reacquire them through :meth:`get_collection`.
+        """
+        clients = list(self._clients.values())
+        self._clients.clear()
+        self._freshness.clear()
+        for client in clients:
+            _close_client(client)
+
     def _client(self, palace_path: str):
         """Return a cached ``PersistentClient``, rebuilding on inode/mtime change.
 
@@ -2212,25 +3072,70 @@ class ChromaBackend(BaseBackend):
 
         if cached is None or inode_changed or mtime_changed or mtime_appeared:
             # Drop the per-process quarantine gate so the HNSW pre-checks
-            # run again against the new disk state.  An inode swap means a
-            # different physical DB (post-restore, fresh palace at the same
-            # path); an mtime/appearance change means an external in-place
-            # write (closet_llm, mine, compress) that may have drifted the
-            # HNSW index while this process was running.
-            if (
+            # run again against the new disk state. An inode swap means a
+            # different physical DB; an mtime/appearance change means an
+            # external writer may have drifted the in-memory HNSW state.
+            external_change = (
                 inode_changed
                 or mtime_changed
                 or (mtime_appeared and palace_path in self._freshness)
-            ):
+            )
+            if external_change:
                 ChromaBackend._quarantined_paths.discard(palace_path)
+
+                # #2028/#2375: Chroma's cache reset is process-global and only
+                # forgets its maps. Close all clients owned by this backend
+                # first, while their close() calls can still decrement the
+                # refcounts and stop the corresponding Systems.
+                self._drain_clients()
+                _clear_chroma_system_cache()
+            else:
+                # Cold open or a missing-DB invalidation does not require a
+                # global reset; release only the requested path.
+                _close_client(self._clients.pop(palace_path, None))
+
             ChromaBackend._prepare_palace_for_open(palace_path)
-            cached = chromadb.PersistentClient(path=palace_path)
+            cached = chromadb.PersistentClient(path=palace_path, settings=_CLIENT_SETTINGS)
             self._clients[palace_path] = cached
             # Re-stat after the client constructor runs: chromadb creates
             # chroma.sqlite3 lazily, so the stat captured before the call
             # may still be (0, 0.0) on first open.
             self._freshness[palace_path] = self._db_stat(palace_path)
         return cached
+
+    def _restamp(self, palace_path: str) -> None:
+        """Re-baseline the freshness stat after this backend's own writes.
+
+        Opening a ``chromadb.PersistentClient`` writes to ``chroma.sqlite3``,
+        and so do the collection opens that follow it, so the mtime this cache
+        keys on moves *while we are using it*. Stamping only at
+        client-construction time (as :meth:`_client` does above) therefore left
+        the recorded value stale the moment the surrounding operation finished
+        its own writes, and the next ``_client()`` call read our own footprint
+        as an external change.
+
+        The effect was a cache that essentially never hit: a single search
+        opens ``mempalace_drawers`` and then ``mempalace_closets``, and the
+        first open bumped the mtime that the second one checked, so every
+        search rebuilt the client and reloaded both HNSW segments.
+
+        Stamping again once the operation is done makes the recorded value mean
+        "``chroma.sqlite3`` as this backend last left it", so a later
+        difference is genuinely somebody else's write.
+
+        Trade-off: an external write that lands *while* one of our operations
+        is in flight is absorbed into the new stamp and will not trigger a
+        rebuild until the next change. That window is one collection open wide.
+        It cannot be closed with mtime alone, and ``PRAGMA data_version`` does
+        not help -- it reports writes by any other *connection*, and chromadb's
+        own connection is foreign to a probe connection, so our own opens would
+        register as external there too.
+
+        No-ops when the path has no cached client, so an eviction that races
+        the operation (``close_palace``) is not resurrected as a stale stamp.
+        """
+        if palace_path in self._freshness:
+            self._freshness[palace_path] = self._db_stat(palace_path)
 
     # ------------------------------------------------------------------
     # Public static helpers (legacy; prefer :meth:`get_collection`)
@@ -2300,7 +3205,7 @@ class ChromaBackend(BaseBackend):
         disk change. See :attr:`_quarantined_paths` for the gate logic.
         """
         ChromaBackend._prepare_palace_for_open(palace_path)
-        return chromadb.PersistentClient(path=palace_path)
+        return chromadb.PersistentClient(path=palace_path, settings=_CLIENT_SETTINGS)
 
     @staticmethod
     def backend_version() -> str:
@@ -2326,6 +3231,8 @@ class ChromaBackend(BaseBackend):
           — still used by callers not yet migrated.
         """
         palace_ref, collection_name, create, options = _normalize_get_collection_args(args, kwargs)
+        self.require_namespace_support(palace_ref)
+        caller_vectors = bool(options and options.get("caller_vectors", False))
 
         palace_path = palace_ref.local_path
         if palace_path is None:
@@ -2342,26 +3249,38 @@ class ChromaBackend(BaseBackend):
                 pass
 
         client = self._client(palace_path)
-        hnsw_space = "cosine"
-        if options and isinstance(options, dict):
-            hnsw_space = options.get("hnsw_space", hnsw_space)
 
-        ef = self._resolve_embedding_function()
-        ef_kwargs = {"embedding_function": ef} if ef is not None else {}
+        if caller_vectors:
+            # Passing None explicitly prevents Chroma's client default EF.
+            ef_kwargs = {
+                "embedding_function": None,
+            }
+        else:
+            ef = self._resolve_embedding_function()
+            ef_kwargs = (
+                {
+                    "embedding_function": ef,
+                }
+                if ef is not None
+                else {}
+            )
 
         if create:
             try:
                 collection = client.get_collection(collection_name, **ef_kwargs)
             except _ChromaNotFoundError:
-                collection = client.create_collection(
-                    collection_name,
-                    metadata={
-                        "hnsw:space": hnsw_space,
-                        "hnsw:num_threads": 1,
-                        **_HNSW_BLOAT_GUARD,
-                    },
-                    **ef_kwargs,
-                )
+                if caller_vectors:
+                    collection = client.create_collection(
+                        collection_name,
+                        schema=_caller_vector_schema(options),
+                        embedding_function=None,
+                    )
+                else:
+                    collection = client.create_collection(
+                        collection_name,
+                        metadata=_hnsw_creation_metadata(options),
+                        **ef_kwargs,
+                    )
             except ValueError as e:
                 explanation = self._explain_ef_mismatch(e, palace_path)
                 if explanation:
@@ -2377,8 +3296,21 @@ class ChromaBackend(BaseBackend):
                 if explanation:
                     raise ValueError(explanation) from e
                 raise
-        _pin_hnsw_threads(collection)
-        return ChromaCollection(collection, palace_path=palace_path)
+        if caller_vectors:
+            _require_caller_vector_collection(collection)
+        else:
+            _pin_hnsw_threads(collection)
+        # Our own client construction and collection open just wrote to
+        # chroma.sqlite3; re-baseline so the next _client() call does not read
+        # that as an external change and rebuild the client.
+        self._restamp(palace_path)
+        wrapped = ChromaCollection(
+            collection,
+            palace_path=palace_path,
+            backend=self,
+        )
+        wrapped._require_embeddings = caller_vectors
+        return wrapped
 
     def close_palace(self, palace) -> None:
         """Drop cached handles for ``palace`` and release its SQLite file lock.
@@ -2395,10 +3327,7 @@ class ChromaBackend(BaseBackend):
         self._freshness.pop(path, None)
 
     def close(self) -> None:
-        for client in self._clients.values():
-            _close_client(client)
-        self._clients.clear()
-        self._freshness.clear()
+        self._drain_clients()
         self._closed = True
 
     def health(self, palace: Optional[PalaceRef] = None) -> HealthStatus:
@@ -2419,15 +3348,13 @@ class ChromaBackend(BaseBackend):
         as chromadb's ``PersistentClient`` does any work, so this check
         accepts every real chroma palace while rejecting empty / garbage
         files. See #1893.
+
+        Probed through :func:`mempalace.backends._magic.has_sqlite_magic`,
+        which never opens a plain descriptor on the file -- see that module for
+        why a plain open+close of a live database drops the process's POSIX
+        locks on it.
         """
-        db_path = os.path.join(path, "chroma.sqlite3")
-        if not os.path.isfile(db_path):
-            return False
-        try:
-            with open(db_path, "rb") as f:
-                return f.read(16) == b"SQLite format 3\x00"
-        except OSError:
-            return False
+        return has_sqlite_magic(os.path.join(path, "chroma.sqlite3"))
 
     # ------------------------------------------------------------------
     # Legacy (pre-RFC 001) surface — retained while callers migrate.
@@ -2440,6 +3367,7 @@ class ChromaBackend(BaseBackend):
     def delete_collection(self, palace_path: str, collection_name: str) -> None:
         """Delete ``collection_name`` from the palace at ``palace_path``."""
         self._client(palace_path).delete_collection(collection_name)
+        self._restamp(palace_path)
 
     def create_collection(
         self, palace_path: str, collection_name: str, hnsw_space: str = "cosine"
@@ -2449,14 +3377,11 @@ class ChromaBackend(BaseBackend):
         ef_kwargs = {"embedding_function": ef} if ef is not None else {}
         collection = self._client(palace_path).create_collection(
             collection_name,
-            metadata={
-                "hnsw:space": hnsw_space,
-                "hnsw:num_threads": 1,
-                **_HNSW_BLOAT_GUARD,
-            },
+            metadata=_hnsw_creation_metadata({"hnsw_space": hnsw_space}),
             **ef_kwargs,
         )
-        return ChromaCollection(collection, palace_path=palace_path)
+        self._restamp(palace_path)
+        return ChromaCollection(collection, palace_path=palace_path, backend=self)
 
 
 def _normalize_get_collection_args(args, kwargs):

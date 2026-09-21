@@ -18,6 +18,7 @@ from mempalace.backends import (
     available_backends,
     get_backend,
 )
+from mempalace.backends import chroma as chroma_module
 from mempalace.backends.chroma import (
     ChromaBackend,
     ChromaCollection,
@@ -154,6 +155,40 @@ def test_chroma_collection_delegates_writes():
     assert kinds == ["add", "upsert", "delete", "count"]
 
 
+def test_chroma_clients_are_opened_with_telemetry_disabled(monkeypatch, tmp_path):
+    """Both client paths must say anonymized_telemetry=False explicitly (GHSA-8h77)."""
+    seen = []
+
+    def fake_client(path, settings=None, **kwargs):
+        seen.append(settings)
+        return object()
+
+    monkeypatch.setattr(chroma_module.chromadb, "PersistentClient", fake_client)
+    monkeypatch.setattr(
+        chroma_module.ChromaBackend, "_prepare_palace_for_open", staticmethod(lambda p: None)
+    )
+
+    ChromaBackend()._client(str(tmp_path))
+    ChromaBackend.make_client(str(tmp_path))
+
+    assert len(seen) == 2, f"expected both client paths to open one client each, got {len(seen)}"
+    for settings in seen:
+        assert settings is not None, "client opened without explicit Settings"
+        assert settings.anonymized_telemetry is False
+
+
+def test_chroma_telemetry_env_default_is_off():
+    """Importing mempalace opts out for any chromadb client in the process."""
+    import os
+
+    from chromadb.config import Settings
+
+    import mempalace  # noqa: F401  (import for its side effects)
+
+    assert os.environ.get("ANONYMIZED_TELEMETRY") == "False"
+    assert Settings().anonymized_telemetry is False
+
+
 def test_registry_exposes_chroma_by_default():
     names = available_backends()
     assert "chroma" in names
@@ -163,6 +198,18 @@ def test_registry_exposes_chroma_by_default():
 def test_registry_unknown_backend_raises():
     with pytest.raises(KeyError):
         get_backend("no-such-backend-exists")
+
+
+def test_registry_unknown_backend_names_the_resolved_config_file(tmp_path, monkeypatch):
+    from mempalace.backends.registry import BackendUnavailableError
+
+    config_dir = tmp_path / "xdg" / "mempalace"
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(config_dir))
+
+    with pytest.raises(BackendUnavailableError) as excinfo:
+        get_backend("no-such-backend-exists")
+
+    assert str(config_dir / "config.json") in excinfo.value.args[0]
 
 
 def test_resolve_backend_priority_order(tmp_path):
@@ -455,6 +502,208 @@ def test_chroma_cache_picks_up_db_created_after_first_open(tmp_path):
     assert backend._freshness[str(palace_path)] != (0, 0.0)
 
 
+def _count_persistent_clients(monkeypatch):
+    """Patch ``chromadb.PersistentClient`` with a counting passthrough.
+
+    Returns the list whose length is the number of constructions so far.
+    """
+    built = []
+    real = chromadb.PersistentClient
+
+    def counting(*args, **kwargs):
+        built.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(chromadb, "PersistentClient", counting)
+    return built
+
+
+def test_chroma_client_cache_survives_its_own_writes(tmp_path, monkeypatch):
+    """Opening several collections must not rebuild the client each time.
+
+    Regression for the unbounded-memory bug: ``PersistentClient(...)`` writes
+    to ``chroma.sqlite3``, so an mtime stamp taken at construction time was
+    already stale by the time the *next* open checked it. A search opens
+    ``mempalace_drawers`` then ``mempalace_closets``, so the first open
+    invalidated the cache for the second, and every search rebuilt the client
+    and reloaded both HNSW segments -- ~440 MB per collection on a large
+    palace, never released, until the server sat on multiple GB.
+
+    The invariant that matters is construction *count*: one client for a
+    palace that nothing else is writing to, no matter how many opens.
+    """
+    palace_path = tmp_path / "palace"
+    palace_path.mkdir()
+    ref = PalaceRef(id=str(palace_path), local_path=str(palace_path))
+    backend = ChromaBackend()
+    built = _count_persistent_clients(monkeypatch)
+
+    # A tmp palace with no drawers opens in well under the 0.01s epsilon, so
+    # its own writes land inside a single mtime tick and the bug stays hidden.
+    # Model the real palace instead: push the mtime forward from inside
+    # get_collection (_pin_hnsw_threads is the last step before the restamp)
+    # so every open leaves the DB visibly newer than the stamp that preceded
+    # it -- which is exactly what a 165k-drawer palace does on its own.
+    real_pin = chroma_module._pin_hnsw_threads
+
+    def pin_and_touch(collection):
+        result = real_pin(collection)
+        db_file = palace_path / "chroma.sqlite3"
+        if db_file.is_file():
+            st = db_file.stat()
+            os.utime(db_file, (st.st_atime, st.st_mtime + 1))
+        return result
+
+    monkeypatch.setattr(chroma_module, "_pin_hnsw_threads", pin_and_touch)
+
+    try:
+        for _ in range(3):
+            for name in ("mempalace_drawers", "mempalace_closets"):
+                backend.get_collection(palace=ref, collection_name=name, create=True)
+        assert len(built) == 1, f"rebuilt the client {len(built)} times for one palace"
+    finally:
+        backend.close()
+
+
+def test_chroma_collection_write_does_not_rebuild_client(tmp_path, monkeypatch):
+    """Filing a drawer must not make the next open reload the index.
+
+    A write through ChromaCollection moves chroma.sqlite3's mtime, which is
+    the same signal _client() reads to detect an external change. Without a
+    re-baseline the file-then-search cycle -- the hot path for hook-driven
+    filing -- rebuilt the client on every iteration and reloaded every HNSW
+    segment it had already paid for.
+    """
+    palace_path = tmp_path / "palace"
+    palace_path.mkdir()
+    ref = PalaceRef(id=str(palace_path), local_path=str(palace_path))
+    backend = ChromaBackend()
+    built = _count_persistent_clients(monkeypatch)
+
+    try:
+        col = backend.get_collection(palace=ref, collection_name="mempalace_drawers", create=True)
+        assert len(built) == 1
+
+        for i in range(3):
+            col.upsert(documents=[f"doc {i}"], ids=[f"id{i}"], metadatas=[{"k": "v"}])
+            backend.get_collection(palace=ref, collection_name="mempalace_drawers", create=True)
+        assert len(built) == 1, f"a write forced {len(built) - 1} client rebuild(s)"
+    finally:
+        backend.close()
+
+
+def test_chroma_client_cache_still_rebuilds_on_external_write(tmp_path, monkeypatch):
+    """Re-stamping our own writes must not blind the cache to somebody else's.
+
+    The memory fix works by treating the freshness stat as "the DB as this
+    backend last left it". That is only safe if a genuine external change --
+    a peer sync, a concurrent ``mine``, a restore -- still forces the rebuild
+    that #2002/#2028 rely on to avoid serving a stale HNSW segment.
+    """
+    palace_path = tmp_path / "palace"
+    palace_path.mkdir()
+    ref = PalaceRef(id=str(palace_path), local_path=str(palace_path))
+    backend = ChromaBackend()
+    built = _count_persistent_clients(monkeypatch)
+
+    try:
+        backend.get_collection(palace=ref, collection_name="mempalace_drawers", create=True)
+        assert len(built) == 1
+
+        # Somebody else writes the palace. Move the mtime well past the 0.01s
+        # epsilon so the change is unambiguous on coarse-grained filesystems.
+        db_file = palace_path / "chroma.sqlite3"
+        st = db_file.stat()
+        os.utime(db_file, (st.st_atime, st.st_mtime + 60))
+
+        backend.get_collection(palace=ref, collection_name="mempalace_drawers", create=True)
+        assert len(built) == 2, "external write did not invalidate the cached client"
+    finally:
+        backend.close()
+
+
+def test_chroma_restamp_ignores_uncached_palace(tmp_path):
+    """``_restamp`` must not resurrect a stamp for an evicted palace.
+
+    ``close_palace`` can race an in-flight ``get_collection``; if the restamp
+    that follows re-added a freshness entry with no client behind it, the next
+    open would compare against a stamp it never earned.
+    """
+    palace_path = tmp_path / "palace"
+    palace_path.mkdir()
+    (palace_path / "chroma.sqlite3").write_bytes(b"")
+
+    backend = ChromaBackend()
+    backend._restamp(str(palace_path))
+    assert str(palace_path) not in backend._freshness
+
+
+def test_chroma_client_rebuild_closes_displaced_client(tmp_path, monkeypatch):
+    """A rebuild must close the client it replaces, not just drop the reference.
+
+    The displaced client pins its own copy of every HNSW segment it opened;
+    dict eviction alone leaves that native memory allocated for the life of
+    the process.
+    """
+    palace_path = tmp_path / "palace"
+    palace_path.mkdir()
+    db_file = palace_path / "chroma.sqlite3"
+    db_file.write_bytes(b"")
+    st = db_file.stat()
+
+    closed = []
+
+    class _Sentinel:
+        def close(self):
+            closed.append(1)
+
+    backend = ChromaBackend()
+    backend._clients[str(palace_path)] = _Sentinel()
+    backend._freshness[str(palace_path)] = (st.st_ino, st.st_mtime)
+    # External write forces the rebuild branch.
+    os.utime(db_file, (st.st_atime, st.st_mtime + 60))
+
+    try:
+        backend._client(str(palace_path))
+        assert closed == [1], "displaced client was dropped without being closed"
+    finally:
+        backend.close()
+
+
+def test_chroma_client_rebuild_stops_each_displaced_system(tmp_path, monkeypatch):
+    """#2375: every external-change rebuild must stop its displaced System."""
+    from chromadb.config import System
+
+    stopped = []
+    original_stop = System.stop
+
+    def recording_stop(system, *args, **kwargs):
+        stopped.append(system)
+        return original_stop(system, *args, **kwargs)
+
+    monkeypatch.setattr(System, "stop", recording_stop)
+
+    palace_path = tmp_path / "palace"
+    backend = ChromaBackend()
+    displaced_systems = []
+
+    try:
+        client = backend._client(str(palace_path))
+        db_file = palace_path / "chroma.sqlite3"
+        assert db_file.is_file()
+
+        for _ in range(3):
+            displaced_systems.append(client._system)
+            st = db_file.stat()
+            os.utime(db_file, (st.st_atime, st.st_mtime + 60))
+            client = backend._client(str(palace_path))
+
+        assert stopped == displaced_systems
+        assert client._system not in displaced_systems
+    finally:
+        backend.close()
+
+
 def test_base_collection_update_default_rejects_mismatched_lengths():
     """The ABC default update() raises ValueError rather than silently misaligning."""
     from mempalace.backends.base import BaseCollection
@@ -466,6 +715,165 @@ def test_base_collection_update_default_rejects_mismatched_lengths():
 
     with pytest.raises(ValueError, match="metadatas length"):
         BaseCollection.update(collection, ids=["1", "2"], metadatas=[{"k": 9}])
+
+
+class _PagedCollection:
+    """Minimal collection exposing only ``get`` with real limit/offset paging."""
+
+    def __init__(self, records):
+        self._records = records
+        self.calls = []
+
+    def get(self, *, ids=None, where=None, limit=None, offset=None, include=None, **kwargs):
+        self.calls.append({"where": where, "limit": limit, "offset": offset, "include": include})
+        rows = self._records
+        if where:
+            rows = [r for r in rows if all(r[1].get(k) == v for k, v in where.items())]
+        start = offset or 0
+        end = start + (limit if limit is not None else len(rows))
+        page = rows[start:end]
+        return GetResult(
+            ids=[r[0] for r in page],
+            documents=[r[2] for r in page],
+            metadatas=[r[1] for r in page],
+        )
+
+
+def _recent(collection, **kwargs):
+    from mempalace.backends.base import BaseCollection
+
+    return BaseCollection.get_recent(collection, **kwargs)
+
+
+def test_base_get_recent_default_sorts_window_newest_first():
+    """The ABC default scans a window and sorts it locally by filed_at."""
+    col = _PagedCollection(
+        [
+            ("a", {"filed_at": "2024-01-01T00:00:00Z"}, "oldest"),
+            ("b", {"filed_at": "2026-08-06T00:00:00Z"}, "newest"),
+            ("c", {"filed_at": "2025-05-05T00:00:00Z"}, "middle"),
+        ]
+    )
+    page = _recent(col, limit=10)
+    assert page.ids == ["b", "c", "a"]
+    assert page.documents == ["newest", "middle", "oldest"]
+
+
+def test_base_get_recent_default_sorts_missing_field_last():
+    col = _PagedCollection(
+        [
+            ("a", {}, "undated"),
+            ("b", {"filed_at": ""}, "empty"),
+            ("c", {"filed_at": 20260806}, "not-a-string"),
+            ("d", {"filed_at": "2025-01-01T00:00:00Z"}, "dated"),
+        ]
+    )
+    assert _recent(col, limit=10).ids[0] == "d"
+    assert set(_recent(col, limit=10).ids[1:]) == {"a", "b", "c"}
+
+
+def test_base_get_recent_default_window_is_capped_at_limit():
+    """The default is approximate above ``limit``: it only sees the first window.
+
+    This is exactly the scan-order limitation documented on #1630 — a backend
+    that can push ORDER BY into storage overrides the method to fix it.
+    """
+    records = [("old%d" % i, {"filed_at": "2020-01-01T00:00:00Z"}, "old") for i in range(1200)]
+    records.append(("newest", {"filed_at": "2026-08-06T00:00:00Z"}, "the newest drawer"))
+    col = _PagedCollection(records)
+
+    page = _recent(col, limit=1000)
+
+    assert len(page.ids) == 1000
+    assert "newest" not in page.ids
+    # Paged in 500-record batches rather than one giant fetch.
+    assert [c["limit"] for c in col.calls] == [500, 500]
+    assert [c["offset"] for c in col.calls] == [0, 500]
+
+
+def test_base_get_recent_default_passes_where_and_zero_limit():
+    col = _PagedCollection(
+        [
+            ("a", {"wing": "x", "filed_at": "2024-01-01T00:00:00Z"}, "x drawer"),
+            ("b", {"wing": "y", "filed_at": "2026-01-01T00:00:00Z"}, "y drawer"),
+        ]
+    )
+    page = _recent(col, limit=10, where={"wing": "x"})
+    assert page.ids == ["a"]
+    assert col.calls[0]["where"] == {"wing": "x"}
+
+    assert _recent(col, limit=0).ids == []
+
+
+def test_base_get_recent_default_honours_include_projection():
+    """Unrequested projections come back empty, as they do from ``get``.
+
+    ``metadatas`` is fetched from the backend regardless because the local
+    sort reads ``order_field`` out of it, but it is only returned when the
+    caller asked for it. Without that, a backend without recency pushdown
+    would answer ``include=["metadatas"]`` with a list of padding strings
+    while pgvector answers with ``[]``.
+    """
+
+    class _ProjectingCollection:
+        """Honours ``include`` the way the real backends do."""
+
+        def __init__(self):
+            self.calls = []
+
+        def get(self, *, include=None, limit=None, offset=None, **kwargs):
+            self.calls.append(list(include or []))
+            if offset:
+                return GetResult(ids=[], documents=[], metadatas=[])
+            keys = set(include or [])
+            return GetResult(
+                ids=["a", "b"],
+                documents=["older", "newer"] if "documents" in keys else [],
+                metadatas=(
+                    [
+                        {"filed_at": "2024-01-01T00:00:00Z"},
+                        {"filed_at": "2026-01-01T00:00:00Z"},
+                    ]
+                    if "metadatas" in keys
+                    else []
+                ),
+            )
+
+    col = _ProjectingCollection()
+    page = _recent(col, limit=5, include=["metadatas"])
+    assert page.ids == ["b", "a"]
+    assert page.documents == []
+    assert page.metadatas == [
+        {"filed_at": "2026-01-01T00:00:00Z"},
+        {"filed_at": "2024-01-01T00:00:00Z"},
+    ]
+
+    col = _ProjectingCollection()
+    page = _recent(col, limit=5, include=["documents"])
+    # metadatas are fetched anyway so the sort has order_field to read...
+    assert "metadatas" in col.calls[0]
+    # ...which is why the newest document leads, but they are not returned.
+    assert page.documents == ["newer", "older"]
+    assert page.metadatas == []
+
+
+def test_base_get_recent_default_accepts_dict_shaped_get():
+    """Collections still returning Chroma-shaped dicts page correctly."""
+
+    class _DictCollection:
+        def get(self, **kwargs):
+            if kwargs.get("offset"):
+                return {"ids": [], "documents": [], "metadatas": []}
+            return {
+                "ids": ["a", "b"],
+                "documents": ["older", "newer"],
+                "metadatas": [
+                    {"filed_at": "2024-01-01T00:00:00Z"},
+                    {"filed_at": "2026-01-01T00:00:00Z"},
+                ],
+            }
+
+    assert _recent(_DictCollection(), limit=5).documents == ["newer", "older"]
 
 
 def test_chroma_backend_accepts_palace_ref_kwarg(tmp_path):
@@ -509,6 +917,31 @@ def test_chroma_backend_create_true_creates_directory_and_collection(tmp_path):
     client.get_collection("mempalace_drawers")
 
 
+def test_palace_wrapper_embeds_for_chroma(tmp_path, monkeypatch):
+    """Normal Chroma callers should not rely on Chroma's internal ONNX embedder."""
+    import mempalace.backends.embedding_wrapper as embedding_wrapper
+    from mempalace.backends.embedding_wrapper import EmbeddingCollection
+    from mempalace.palace import get_collection
+
+    calls = []
+
+    def fake_embed(texts):
+        texts = list(texts)
+        calls.append(texts)
+        return [[float(len(text)), 1.0, 0.0, 0.0] for text in texts]
+
+    monkeypatch.setattr(embedding_wrapper, "_embed_texts", fake_embed)
+
+    col = get_collection(str(tmp_path), create=True, backend="chroma")
+    assert isinstance(col, EmbeddingCollection)
+
+    col.add(ids=["a"], documents=["alpha"], metadatas=[{"wing": "w"}])
+    result = col.query(query_texts=["alpha"], n_results=1)
+
+    assert result.ids == [["a"]]
+    assert calls == [["alpha"], ["alpha"]]
+
+
 def test_chroma_backend_creates_collection_with_cosine_distance(tmp_path):
     palace_path = tmp_path / "palace"
 
@@ -523,13 +956,12 @@ def test_chroma_backend_creates_collection_with_cosine_distance(tmp_path):
     assert col.metadata.get("hnsw:space") == "cosine"
 
 
-def test_chroma_backend_sets_hnsw_bloat_guard_on_creation(tmp_path):
+def test_chroma_backend_sets_hnsw_write_defaults_on_creation(tmp_path):
     """HNSW batch/sync thresholds must land on freshly-created collection metadata.
 
-    Low thresholds (2/2 per #1579) make chromadb's Rust HNSW segment
-    persist index_metadata and link_lists after any mine of 2+ drawers.
-    Asserting both keys land on the persisted metadata also covers the
-    #1161 "config silently dropped" concern at CI time.
+    That both keys land covers #1161, where the configuration was silently dropped.
+    The values are chromadb's own documented defaults, so a collection this backend
+    creates indexes on the same terms as one chromadb creates itself.
     """
     palace_path = tmp_path / "palace"
 
@@ -541,35 +973,44 @@ def test_chroma_backend_sets_hnsw_bloat_guard_on_creation(tmp_path):
 
     client = chromadb.PersistentClient(path=str(palace_path))
     col = client.get_collection("mempalace_drawers")
-    assert col.metadata.get("hnsw:batch_size") == 2
-    assert col.metadata.get("hnsw:sync_threshold") == 2
+    batch = col.metadata.get("hnsw:batch_size")
+    sync = col.metadata.get("hnsw:sync_threshold")
+    assert batch == 100
+    assert sync == 1000
+    assert batch <= sync, "chromadb permits batch_size <= sync_threshold"
 
 
-def test_chroma_backend_create_collection_sets_hnsw_bloat_guard(tmp_path):
-    """Same guard must apply via the legacy create_collection() path."""
+def test_chroma_backend_create_collection_sets_hnsw_write_defaults(tmp_path):
+    """The same defaults must apply via the legacy create_collection() path."""
     palace_path = tmp_path / "palace"
 
     ChromaBackend().create_collection(str(palace_path), "mempalace_drawers")
 
     client = chromadb.PersistentClient(path=str(palace_path))
     col = client.get_collection("mempalace_drawers")
-    assert col.metadata.get("hnsw:batch_size") == 2
-    assert col.metadata.get("hnsw:sync_threshold") == 2
+    assert col.metadata.get("hnsw:batch_size") == 100
+    assert col.metadata.get("hnsw:sync_threshold") == 1000
 
 
-def test_sub_threshold_mine_persists_hnsw_metadata(tmp_path):
-    """Regression for #1579: small mines must persist HNSW metadata.
+def test_sub_threshold_mine_survives_reopen_and_escapes_quarantine(tmp_path):
+    """Regression for #1579, asserted as the PROPERTY, not the mechanism.
 
-    _HNSW_BLOAT_GUARD sets batch_size=2 and sync_threshold=2 so that any
-    upsert of 2+ records crosses both thresholds, triggering chromadb's
-    _apply_batch and _persist.  Without this, index_metadata and link_lists
-    stay empty and quarantine_stale_hnsw renames the segment on cold open.
+    #1579 is a durability bug: a sub-threshold mine lost its drawers when
+    quarantine_stale_hnsw renamed the segment away on cold open. So assert what
+    the user needs — the drawers read back from a FRESH backend, and quarantine
+    leaves the segment alone.
+
+    Asserting the mechanism instead (index_metadata.pickle present after 3
+    records) only holds at sync_threshold=2, a value chromadb's own parameter
+    validation rejects. Under chromadb's documented thresholds the Rust writer
+    keeps the tail durable WITHOUT a pickle, so
+    the pickle is rightly absent here and asserting on it would fail a healthy
+    palace.
     """
     palace_path = str(tmp_path / "palace")
     backend = ChromaBackend()
     try:
         col = backend.get_collection(palace_path, "mempalace_drawers", create=True)
-
         col.upsert(
             ids=["a", "b", "c"],
             documents=["doc a", "doc b", "doc c"],
@@ -579,34 +1020,34 @@ def test_sub_threshold_mine_persists_hnsw_metadata(tmp_path):
     finally:
         backend.close()
 
-    found_healthy_segment = False
-    for entry in (tmp_path / "palace").iterdir():
-        if not entry.is_dir() or entry.name.startswith("."):
-            continue
-        meta = entry / "index_metadata.pickle"
-        link = entry / "link_lists.bin"
-        data = entry / "data_level0.bin"
-        if data.exists() and data.stat().st_size > _HNSW_MISSING_METADATA_DATA_FLOOR:
-            assert meta.exists(), "index_metadata missing after sub-threshold upsert"
-            assert link.exists() and link.stat().st_size > 0, "link_lists empty"
-            assert _segment_appears_healthy(str(entry))
-            found_healthy_segment = True
-
-    assert found_healthy_segment, "no VECTOR segment with data found"
-
-    # stale_seconds=0.0 forces the stage-2 integrity gate (_segment_appears_healthy)
-    # to run on every segment regardless of mtime delta, proving the fix directly.
+    # Quarantine runs on cold open; stale_seconds=0.0 forces the integrity gate
+    # onto every segment regardless of mtime delta, so the gate itself is proven.
     moved = quarantine_stale_hnsw(palace_path, stale_seconds=0.0)
-    assert moved == [], f"quarantine fired on freshly-persisted segment: {moved}"
+    assert moved == [], f"quarantine fired on a healthy sub-threshold segment: {moved}"
+
+    for entry in (tmp_path / "palace").iterdir():
+        if entry.is_dir() and not entry.name.startswith("."):
+            assert _segment_appears_healthy(str(entry))
+
+    # The durability claim: a FRESH backend still finds every drawer, and the
+    # vector index still answers.
+    reopened = ChromaBackend()
+    try:
+        col = reopened.get_collection(palace_path, "mempalace_drawers")
+        assert col.count() == 3, "sub-threshold mine lost drawers across reopen"
+        hits = col.query(query_embeddings=[[0.1] * _TEST_EMBED_DIM], n_results=3)
+        assert len(hits["ids"][0]) == 3, "vector index empty after reopen"
+    finally:
+        reopened.close()
 
 
 def test_single_record_upsert_not_quarantined(tmp_path):
     """A single-record upsert must not trigger quarantine.
 
-    With batch_size=2 chromadb only persists HNSW metadata after the second
-    record.  A one-record segment has no index_metadata.pickle and no
-    link_lists.bin data; _segment_appears_healthy must treat that combination
-    as sub-threshold (never persisted), not as corruption.
+    A one-record segment sits below the HNSW thresholds, so chromadb never
+    persists: no index_metadata.pickle, no link_lists.bin data.
+    _segment_appears_healthy must read that combination as sub-threshold
+    (never persisted), not as corruption.
     """
     palace_path = str(tmp_path / "palace")
     backend = ChromaBackend()
@@ -657,7 +1098,7 @@ def test_get_collection_create_true_preserves_existing_metadata(tmp_path):
     backend.get_collection(palace, collection_name="mempalace_drawers", create=True)
     col = backend.get_collection(palace, collection_name="mempalace_drawers", create=True)
     assert col._collection.metadata["hnsw:space"] == "cosine"
-    assert col._collection.metadata.get("hnsw:batch_size") == 2
+    assert col._collection.metadata.get("hnsw:batch_size") == 100
 
 
 def test_fix_blob_seq_ids_converts_blobs_to_integers(tmp_path):
@@ -1713,7 +2154,8 @@ def test_chroma_backend_preflights_metadata_before_persistent_client(tmp_path, m
         pass
 
     monkeypatch.setattr(
-        "mempalace.backends.chroma.chromadb.PersistentClient", lambda path: DummyClient()
+        "mempalace.backends.chroma.chromadb.PersistentClient",
+        lambda path, settings=None: DummyClient(),
     )
 
     backend = ChromaBackend()
@@ -1756,7 +2198,8 @@ def test_chroma_backend_quarantine_rearms_on_mtime_refresh(tmp_path, monkeypatch
         pass
 
     monkeypatch.setattr(
-        "mempalace.backends.chroma.chromadb.PersistentClient", lambda path: DummyClient()
+        "mempalace.backends.chroma.chromadb.PersistentClient",
+        lambda path, settings=None: DummyClient(),
     )
 
     backend = ChromaBackend()
@@ -1805,7 +2248,8 @@ def test_chroma_backend_requarantines_after_inode_replacement(tmp_path, monkeypa
         pass
 
     monkeypatch.setattr(
-        "mempalace.backends.chroma.chromadb.PersistentClient", lambda path: DummyClient()
+        "mempalace.backends.chroma.chromadb.PersistentClient",
+        lambda path, settings=None: DummyClient(),
     )
 
     backend = ChromaBackend()
@@ -1825,6 +2269,83 @@ def test_chroma_backend_requarantines_after_inode_replacement(tmp_path, monkeypa
         ("invalid", str(palace)),
         ("stale", str(palace)),
     ]
+
+
+def test_chroma_backend_resets_system_cache_on_inode_change(tmp_path, monkeypatch):
+    """#2028/#2375: drain owned clients, clear the cache, then reopen."""
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("")
+    other_palace = tmp_path / "other-palace"
+    events = []
+
+    # Neutralize the on-disk HNSW pre-checks so this test exercises only the
+    # client-close / cache-reset / client-rebuild ordering.
+    for name in (
+        "_fix_missing_collection_type",
+        "_fix_blob_seq_ids",
+        "quarantine_invalid_hnsw_metadata",
+        "quarantine_stale_hnsw",
+    ):
+        monkeypatch.setattr(
+            f"mempalace.backends.chroma.{name}",
+            lambda path, *args, **kwargs: [],
+        )
+
+    monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
+
+    class DummyClient:
+        def __init__(self, label):
+            self.label = label
+
+        def close(self):
+            events.append(("close", self.label))
+
+    def record_open(path, settings=None):
+        events.append(("open", path))
+        return DummyClient(path)
+
+    monkeypatch.setattr(
+        "mempalace.backends.chroma.chromadb.PersistentClient",
+        record_open,
+    )
+
+    from chromadb.api.client import SharedSystemClient
+
+    def record_clear(*args, **kwargs):
+        events.append(("clear", None))
+
+    monkeypatch.setattr(
+        SharedSystemClient,
+        "clear_system_cache",
+        record_clear,
+    )
+
+    backend = ChromaBackend()
+
+    # _db_stat is called before each decision and after each open. The second
+    # call observes an external inode change.
+    stats = iter([(1, 1.0), (1, 1.0), (2, 2.0), (2, 2.0)])
+    monkeypatch.setattr(backend, "_db_stat", lambda path: next(stats))
+
+    try:
+        backend._client(str(palace))
+        backend._clients[str(other_palace)] = DummyClient(str(other_palace))
+        backend._freshness[str(other_palace)] = (7, 7.0)
+
+        backend._client(str(palace))
+
+        assert events == [
+            ("open", str(palace)),
+            ("close", str(palace)),
+            ("close", str(other_palace)),
+            ("clear", None),
+            ("open", str(palace)),
+        ]
+        assert set(backend._clients) == {str(palace)}
+        assert set(backend._freshness) == {str(palace)}
+    finally:
+        backend.close()
 
 
 def test_explain_ef_mismatch_recognizes_chromadb_conflict():

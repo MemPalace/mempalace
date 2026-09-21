@@ -56,6 +56,9 @@ mempalace migrate-wings --yes \
 - Re-keys the `wing` **metadata field** on drawers and closets to the normalized
   form, merging collisions into the existing wing.
 - Re-keys the `topics_by_wing` registry (merging topic lists on collision).
+- For explicit `--rename` mappings, rewrites matching explicit-tunnel
+  endpoints and regenerates their canonical IDs. If that creates an ID
+  collision, a tunnel already at the destination wins deterministically.
 
 ## What it leaves alone
 
@@ -64,8 +67,10 @@ mempalace migrate-wings --yes \
   closet `→drawer_id` pointers valid and lets future mining still skip
   already-mined files (no duplicates). The verbatim drawer content is never
   read or rewritten.
-- **Tunnels** already normalize wing names at read time, so they resolve under
-  the new name without a rewrite.
+- **Tunnels during automatic punctuation normalization** already normalize
+  wing names at read time, so they resolve under the new name without a
+  rewrite. Arbitrary `--rename` mappings cannot be inferred at read time and
+  therefore are migrated as described above.
 
 ## Notes
 

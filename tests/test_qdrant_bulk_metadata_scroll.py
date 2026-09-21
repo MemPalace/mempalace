@@ -304,6 +304,209 @@ class TestQdrantGetAllMetadataSingleScroll:
 
 
 # ---------------------------------------------------------------------------
+# 2a. get_all_rows(): ids-plus-fields sibling of get_all_metadata (issue #2452)
+# ---------------------------------------------------------------------------
+
+
+class _FakeOffsetPagedRowCollection(_FakeOffsetPagedCollection):
+    """Offset-cursor collection whose get() also returns ids and documents."""
+
+    def get(
+        self, *, ids=None, where=None, where_document=None, limit=None, offset=None, include=None
+    ):
+        self.get_call_count += 1
+        self.last_include = include
+        offset = offset or 0
+        limit = limit if limit is not None else len(self._all)
+        page = self._all[offset : offset + limit]
+        start = offset
+        include = include or ["documents", "metadatas"]
+        return GetResult(
+            ids=[f"d{start + i}" for i in range(len(page))],
+            documents=[f"doc{start + i}" for i in range(len(page))]
+            if "documents" in include
+            else [],
+            metadatas=page if "metadatas" in include else [],
+            embeddings=None,
+        )
+
+
+class TestBaseCollectionDefaultGetAllRows:
+    def test_returns_ids_and_metadata_across_pages(self):
+        all_meta = [{"wing": f"w{i}"} for i in range(2500)]
+        col = _FakeOffsetPagedRowCollection(all_meta)
+
+        result = col.get_all_rows()
+
+        assert result.ids == [f"d{i}" for i in range(2500)]
+        assert result.metadatas == all_meta
+        assert result.documents == []
+        assert col.last_include == ["metadatas"]
+        assert 3 <= col.get_call_count <= 4
+
+    def test_includes_documents_when_asked(self):
+        col = _FakeOffsetPagedRowCollection([{"wing": "a"}, {"wing": "b"}])
+
+        result = col.get_all_rows(include=["documents", "metadatas"])
+
+        assert result.ids == ["d0", "d1"]
+        assert result.documents == ["doc0", "doc1"]
+        assert result.metadatas == [{"wing": "a"}, {"wing": "b"}]
+
+    def test_empty_collection(self):
+        assert _FakeOffsetPagedRowCollection([]).get_all_rows().ids == []
+
+    def test_passes_where_through(self):
+        col = _FakeOffsetPagedRowCollection([{"wing": "a"}])
+        captured = {}
+        original_get = col.get
+
+        def spy_get(**kwargs):
+            captured.update(kwargs)
+            return original_get(**kwargs)
+
+        col.get = spy_get
+        col.get_all_rows(where={"wing": "a"})
+        assert captured.get("where") == {"wing": "a"}
+
+
+class TestQdrantGetAllRowsSingleScroll:
+    def test_returns_ids_and_metadata_in_one_pass(self, monkeypatch):
+        page1 = ([_fake_point(f"d{i}", "wing_a") for i in range(3)], "cursor-1")
+        page2 = ([_fake_point(f"d{i}", "wing_b") for i in range(3, 5)], None)
+        col, call_log = _make_qdrant_collection(monkeypatch, [page1, page2])
+
+        result = col.get_all_rows()
+
+        assert result.ids == ["d0", "d1", "d2", "d3", "d4"]
+        assert result.metadatas[0] == {"wing": "wing_a"}
+        assert result.metadatas[-1] == {"wing": "wing_b"}
+        assert result.documents == []  # metadatas only by default
+        assert len(call_log) == 2, (
+            f"expected one cursor pass (2 pages), got {len(call_log)} scroll calls"
+        )
+
+    def test_documents_only_when_included(self, monkeypatch):
+        page1 = ([_fake_point("d0", "wing_a")], None)
+        col, _ = _make_qdrant_collection(monkeypatch, [page1])
+
+        result = col.get_all_rows(include=["documents", "metadatas"])
+
+        assert result.documents == ["content for d0"]
+
+    def test_does_not_call_get_internally(self, monkeypatch):
+        page1 = ([_fake_point("d0", "wing_a")], None)
+        col, _ = _make_qdrant_collection(monkeypatch, [page1])
+        col.get = mock.MagicMock(side_effect=AssertionError("get() should not be called"))
+
+        assert col.get_all_rows().ids == ["d0"]
+        col.get.assert_not_called()
+
+    def test_filters_by_where_locally_when_required(self, monkeypatch):
+        page1 = (
+            [_fake_point("d0", "wing_a"), _fake_point("d1", "wing_b"), _fake_point("d2", "wing_c")],
+            None,
+        )
+        col, _ = _make_qdrant_collection(monkeypatch, [page1])
+
+        result = col.get_all_rows(where={"$or": [{"wing": "wing_a"}, {"wing": "wing_b"}]})
+
+        assert result.ids == ["d0", "d1"]
+
+
+# ---------------------------------------------------------------------------
+# 2b. QdrantCollection.get() bounded scroll (issue #2363)
+# ---------------------------------------------------------------------------
+
+
+class TestQdrantGetBoundedScroll:
+    def test_get_with_limit_stops_after_first_sufficient_page(self, monkeypatch):
+        """
+        Three pages of 3 rows each (9 total, cursor-chained) all match a
+        plain, push-down-able filter. get(where=..., limit=1) only needs
+        the first page to satisfy limit=1, so it must not touch page 2/3.
+        """
+        page1 = ([_fake_point(f"d{i}", "wing_a") for i in range(3)], "cursor-1")
+        page2 = ([_fake_point(f"d{i}", "wing_a") for i in range(3, 6)], "cursor-2")
+        page3 = ([_fake_point(f"d{i}", "wing_a") for i in range(6, 9)], None)
+        col, call_log = _make_qdrant_collection(monkeypatch, [page1, page2, page3])
+
+        result = col.get(where={"wing": "wing_a"}, limit=1)
+
+        assert result.ids == ["d0"]
+        assert len(call_log) == 1, (
+            f"limit=1 must be satisfied by the first page alone, got {len(call_log)} scroll calls"
+        )
+
+    def test_get_with_limit_and_offset_walks_only_up_to_requested_range(self, monkeypatch):
+        """offset=3, limit=1 needs rows [3:4], which is page 2, not page 3."""
+        page1 = ([_fake_point(f"d{i}", "wing_a") for i in range(3)], "cursor-1")
+        page2 = ([_fake_point(f"d{i}", "wing_a") for i in range(3, 6)], "cursor-2")
+        page3 = ([_fake_point(f"d{i}", "wing_a") for i in range(6, 9)], None)
+        col, call_log = _make_qdrant_collection(monkeypatch, [page1, page2, page3])
+
+        result = col.get(where={"wing": "wing_a"}, limit=1, offset=3)
+
+        assert result.ids == ["d3"]
+        assert len(call_log) == 2, (
+            f"offset=3/limit=1 needs rows through index 4, not page 3, got {len(call_log)} calls"
+        )
+
+    def test_get_requests_bounded_page_limit_not_full_page_size(self, monkeypatch):
+        """The per-call `limit` sent to scroll_points() must shrink to what's
+        still needed (offset+limit), not stay pinned at _SCROLL_PAGE_SIZE."""
+        page1 = ([_fake_point("d0", "wing_a")], None)
+        col, call_log = _make_qdrant_collection(monkeypatch, [page1])
+
+        col.get(where={"wing": "wing_a"}, limit=1)
+
+        assert call_log[0]["limit"] == 1
+
+    def test_get_with_local_filter_still_walks_full_collection(self, monkeypatch):
+        """
+        An $or clause requires the local Python re-check
+        (_requires_local_filter() == True), so qdrant's own filter cannot be
+        trusted to have selected exactly the right rows, so bounding the
+        scroll here could return fewer than `limit` genuine matches. Must
+        still walk every page.
+        """
+        page1 = ([_fake_point("d0", "wing_a"), _fake_point("d1", "wing_b")], "cursor-1")
+        page2 = ([_fake_point("d2", "wing_c")], None)
+        col, call_log = _make_qdrant_collection(monkeypatch, [page1, page2])
+
+        result = col.get(where={"$or": [{"wing": "wing_a"}, {"wing": "wing_b"}]}, limit=1)
+
+        assert result.ids == ["d0"]
+        assert len(call_log) == 2, "an $or filter must not shortcut the scroll"
+
+    def test_get_with_ids_still_walks_full_collection(self, monkeypatch):
+        """An id lookup must scan every matching point regardless of scroll
+        order: offset/limit slicing happens after id resolution, so
+        bounding the scroll here could miss a requested id."""
+        page1 = ([_fake_point("d0", "wing_a")], "cursor-1")
+        page2 = ([_fake_point("d1", "wing_a")], None)
+        col, call_log = _make_qdrant_collection(monkeypatch, [page1, page2])
+
+        result = col.get(ids=["d1"], limit=1)
+
+        assert result.ids == ["d1"]
+        assert len(call_log) == 2, "an id lookup must not shortcut the scroll"
+
+    def test_get_all_metadata_remains_unbounded(self, monkeypatch):
+        """Regression guard: get_all_metadata() must keep walking the whole
+        matching set even though _rows()/_scroll_all() now accept a
+        max_rows bound, since it has no limit/offset concept at all."""
+        page1 = ([_fake_point(f"d{i}", "wing_a") for i in range(3)], "cursor-1")
+        page2 = ([_fake_point(f"d{i}", "wing_a") for i in range(3, 6)], None)
+        col, call_log = _make_qdrant_collection(monkeypatch, [page1, page2])
+
+        result = col.get_all_metadata()
+
+        assert len(result) == 6
+        assert len(call_log) == 2
+
+
+# ---------------------------------------------------------------------------
 # 3. Scroll page-size constant
 # ---------------------------------------------------------------------------
 

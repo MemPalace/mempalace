@@ -3,7 +3,13 @@ Hook logic for MemPalace — Python implementation of session-start, stop, sessi
 
 Reads JSON from stdin, outputs JSON to stdout.
 Supported hooks: session-start, stop, session-end, precompact
-Supported harnesses: claude-code, codex (extensible to cursor, gemini, etc.)
+Supported harnesses: claude-code, codex, dsh (extensible to cursor, gemini, etc.)
+
+``dsh`` (the DeepSeek Harness) cannot hand a hook its own transcript: DSH stores
+sessions zstd-compressed, and its hook bridge passes an empty
+``transcript_path``. The MemPalace DSH plugin (``.dsh-plugin/``) therefore keeps
+an append-only JSONL transcript per session, in the Claude Code record shape
+with ``cwd`` on every record, and passes that file's path here.
 """
 
 import hashlib
@@ -55,20 +61,40 @@ def _detached_popen_kwargs() -> dict:
     return kwargs
 
 
+def _config_root() -> Path:
+    """The directory this install keeps its config in (XDG-aware since #148)."""
+    from .config import _default_config_dir
+
+    return _default_config_dir()
+
+
 def _palace_root_exists() -> bool:
     """User-removable kill-switch.
 
-    If ~/.mempalace/ does not exist, the user has explicitly cleared it.
-    All hook side effects (logging, state dir creation, mining, ingestion)
-    must respect this and short-circuit BEFORE touching disk — including
-    before logging the short-circuit itself.
+    If neither ~/.mempalace/ nor the install's config directory exists, the
+    user has explicitly cleared it. All hook side effects (logging, state dir
+    creation, mining, ingestion) must respect this and short-circuit BEFORE
+    touching disk — including before logging the short-circuit itself.
+
+    Since #148 a fresh install keeps its config and palace in the XDG config
+    directory (``~/.config/mempalace`` by default) and never creates
+    ``~/.mempalace``, so checking only the legacy path silently disabled every
+    hook on new installs. The legacy directory still passes on its own, which
+    leaves every existing install exactly as it was. On an XDG install
+    ``~/.mempalace`` can appear later (hook state, mine locks), so removing
+    only the config directory is not enough to disable hooks there.
 
     Uses ``is_dir()`` rather than ``exists()`` so a stray regular file at
-    ``~/.mempalace`` (or a broken symlink) is treated as absent — otherwise
-    the kill-switch would be bypassed and ``STATE_DIR.mkdir()`` would later
-    crash on ``NotADirectoryError``.
+    either path (or a broken symlink) is treated as absent — otherwise the
+    kill-switch would be bypassed and ``STATE_DIR.mkdir()`` would later crash
+    on ``NotADirectoryError``.
     """
-    return PALACE_ROOT.is_dir()
+    if PALACE_ROOT.is_dir():
+        return True
+    try:
+        return _config_root().is_dir()
+    except (OSError, ValueError):
+        return False
 
 
 def _mempalace_python() -> str:
@@ -723,7 +749,31 @@ def _submit_daemon_job(
         wait=wait,
         auto_start=False,
         timeout=timeout,
+        # A job refused the palace lock is deferred, not failed (#2014), so it
+        # is never terminal while the holder lives. The waiting callers below
+        # wait on purpose, but a parked job cannot reach the state they wait
+        # for: they would burn the whole timeout and then report a failure that
+        # did not happen. Take the parked job back instead; the daemon still
+        # runs it once the lock frees.
+        stop_on_lock_deferral=True,
     )
+
+
+def _job_deferred_by_lock(job: dict) -> bool:
+    """True when the daemon parked this job behind the palace write lock.
+
+    Imported lazily like ``submit_job`` above: only callers that actually reach
+    the daemon pay for the module, and by this point it is already loaded.
+    """
+    from .daemon import job_deferred_by_lock
+
+    return job_deferred_by_lock(job)
+
+
+def _lock_deferral_reason(job: dict) -> str:
+    """Operator-facing reason a job is parked, for the hook log."""
+    reason = (job.get("error") or {}).get("message") or "the palace write lock is held"
+    return f"{reason} (job {job.get('id')} stays queued and runs when the holder exits)"
 
 
 def _maybe_auto_ingest():
@@ -802,7 +852,12 @@ def _mine_sync():
                         timeout=60,
                     )
                     result = job.get("result") or {}
-                    if job.get("state") != "succeeded" or not result.get("success", True):
+                    if _job_deferred_by_lock(job):
+                        # Parked behind the palace lock, not failed: the daemon
+                        # runs it once the holder exits. Saying "failed" here
+                        # would be the false report #2014 is about.
+                        _log(f"Daemon sync mine deferred: {_lock_deferral_reason(job)}")
+                    elif job.get("state") != "succeeded" or not result.get("success", True):
                         _log(f"Daemon sync mine failed: {result.get('error', job.get('error'))}")
                 except Exception as exc:
                     # Daemon accepted context — don't fall back (would double-mine).
@@ -850,8 +905,57 @@ def _desktop_toast(body: str, title: str = "MemPalace"):
         pass
 
 
+#: Markers of harness-injected text that lands in the transcript with
+#: ``role: "user"`` but was never typed by the user. A message opening with
+#: any of them is skipped when composing the checkpoint's ``recent:`` line,
+#: which otherwise fills with the same boilerplate in every session instead of
+#: what the session was about. Literal substrings, deliberately: the wrappers
+#: are fixed strings and a regex would cost more for no gain in the hook budget.
+_HARNESS_BOILERPLATE_MARKERS = (
+    "<command-message>",  # slash-command expansion
+    "<command-name>",  # slash-command name, when it leads
+    "<command-args>",  # slash-command arguments
+    "<system-reminder>",  # injected reminders
+    "<local-command-caveat>",  # local command output caveat block
+    "<local-command-stdout>",  # local command output body
+    "<task-notification>",  # background task completion notices
+    "[SYSTEM NOTIFICATION",  # unbracketed notification banner
+    "[Request interrupted by user",  # interruption record, carries no topic
+    "[Image:",  # pasted-image placeholder, no words to summarize
+    "Base directory for this skill:",  # skill preamble
+)
+
+
+def _is_harness_boilerplate(text: str) -> bool:
+    """True when a ``role: user`` message is harness injection, not user words.
+
+    Anchored at the opening of the message, after leading whitespace. Position
+    is the whole discriminator: the harness emits a wrapper *as* the message,
+    so an injection always opens one, while a wrapper appearing later is a
+    human quoting the tooling. Matching anywhere in the body discarded real
+    messages over text further in than the checkpoint ever keeps: someone
+    writing "its events arrive as ``<task-notification>`` messages and wake the
+    loop" thousands of characters into a design note lost the whole note, even
+    though the leading 200 characters :func:`_extract_recent_messages` stores
+    were pure prose.
+
+    A bounded leading *window* was tried before the anchor and is not enough. A
+    quote inside the first 200 characters is still a quote, and a window turns
+    the rule into a tunable with a false-positive rate attached to its size.
+    ``startswith`` has no such knob. Measured over 4,778 real ``role: "user"``
+    text messages, the two agree on every message, so the anchor gives up no
+    recall for the knob it removes.
+    """
+    return text.lstrip().startswith(_HARNESS_BOILERPLATE_MARKERS)
+
+
 def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUNT) -> list[str]:
-    """Extract the last N user messages from a JSONL transcript."""
+    """Extract the last N user messages from a JSONL transcript.
+
+    Harness-injected messages are skipped (see
+    :data:`_HARNESS_BOILERPLATE_MARKERS`) so the checkpoint summarizes the
+    conversation rather than the tooling around it.
+    """
     path = Path(transcript_path).expanduser()
     if not path.is_file():
         return []
@@ -871,7 +975,7 @@ def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUN
                             )
                         if not isinstance(content, str) or not content.strip():
                             continue
-                        if "<command-message>" in content or "<system-reminder>" in content:
+                        if _is_harness_boilerplate(content):
                             continue
                         messages.append(content.strip()[:200])
                     # Codex CLI format
@@ -880,7 +984,7 @@ def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUN
                         if isinstance(payload, dict) and payload.get("type") == "user_message":
                             text = payload.get("message", "")
                             if isinstance(text, str) and text.strip():
-                                if "<command-message>" not in text:
+                                if not _is_harness_boilerplate(text):
                                     messages.append(text.strip()[:200])
                 except (json.JSONDecodeError, AttributeError):
                     pass
@@ -935,6 +1039,9 @@ def _save_diary_direct(
     the agent wrote to, so project-derived wings stay discoverable.
 
     Returns {"count": N, "themes": [...]} on success, {"count": 0} on failure.
+    A daemon lock deferral also returns {"count": 0}: nothing is filed yet, but
+    the entry is queued and the daemon files it once the holder exits, so the
+    checkpoint marker is deliberately not advanced.
     """
     messages = _extract_recent_messages(transcript_path)
     if not messages:
@@ -993,6 +1100,12 @@ def _save_diary_direct(
                 if toast:
                     _desktop_toast(f"Checkpoint saved - {len(messages)} messages archived")
                 return {"count": len(messages), "themes": themes}
+            if _job_deferred_by_lock(job):
+                # Queued behind the palace lock: the entry is held and the daemon
+                # files it once the holder exits. Not a failure, and not a reason
+                # to re-file it here -- that would duplicate verbatim content.
+                _log(f"Daemon diary checkpoint deferred: {_lock_deferral_reason(job)}")
+                return {"count": 0}
             _log(f"Daemon diary checkpoint failed: {result.get('error', job.get('error'))}")
             return {"count": 0}
 
@@ -1052,12 +1165,12 @@ def _ingest_transcript(transcript_path: str):
                 _submit_daemon_job(
                     "mine",
                     {
-                        "source": str(path.parent),
+                        "source": str(path),
                         "mode": "convos",
                         "wing": "sessions",
                         "agent": "mempalace",
                     },
-                    dedupe_key=_daemon_mine_dedupe_key(str(path.parent), "convos"),
+                    dedupe_key=_daemon_mine_dedupe_key(str(path), "convos"),
                     wait=False,
                 )
                 _log(f"Transcript ingest submitted to daemon: {path.name}")
@@ -1075,7 +1188,7 @@ def _ingest_transcript(transcript_path: str):
                 "-m",
                 "mempalace",
                 "mine",
-                str(path.parent),
+                str(path),
                 "--mode",
                 "convos",
                 "--wing",
@@ -1092,7 +1205,7 @@ def _ingest_transcript(transcript_path: str):
         _log(f"transcript ingest hook failed: {exc}")
 
 
-SUPPORTED_HARNESSES = {"claude-code", "codex"}
+SUPPORTED_HARNESSES = {"claude-code", "codex", "dsh"}
 
 
 def _diary_agent_for_harness(harness: str) -> str:
@@ -1188,6 +1301,12 @@ def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
                 cwd_norm = cwd.replace("\\", "/").rstrip("/")
                 if not cwd_norm:
                     continue
+                # A cwd inside "<project>/.claude/worktrees/<wt>" (a git
+                # worktree) belongs to <project>, not the ephemeral worktree
+                # directory -- otherwise every worktree spawns its own wing.
+                _wt_marker = "/.claude/worktrees/"
+                if _wt_marker in cwd_norm:
+                    cwd_norm = cwd_norm.split(_wt_marker, 1)[0]
                 project = cwd_norm.rsplit("/", 1)[-1]
                 if project:
                     return f"wing_{_safe_wing_slug(project)}"
@@ -1235,6 +1354,12 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
     match = re.search(r"/\.claude/projects/-([^/]+)", normalized)
     if match:
         encoded = match.group(1)
+        # "<project>/.claude/worktrees/<wt>" flattens to "-<project>--claude-worktrees-<wt>"
+        # here; collapse it to <project> like _wing_from_jsonl_cwd already does for cwd,
+        # or every worktree spawns its own wing.
+        _wt_marker = "-claude-worktrees-"
+        if _wt_marker in encoded:
+            encoded = encoded.split(_wt_marker, 1)[0]
         # Strip platform user-home prefix so the wing isn't dominated by
         # /Users/<user>/ or /home/<user>/.
         m = re.match(r"(?:Users|home)-[^-]+-(.+)", encoded)

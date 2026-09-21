@@ -57,7 +57,7 @@ DEFAULT_WINGS = {
 
 
 def _hr():
-    print(f"\n{'─' * 58}")
+    print(f"\n{'-' * 58}")
 
 
 def _header(text):
@@ -121,9 +121,9 @@ def _ask_mode() -> str:
 """)
     print("  How are you using MemPalace?")
     print()
-    print("    [1]  Work     — notes, projects, clients, colleagues, decisions")
-    print("    [2]  Personal — diary, family, health, relationships, reflections")
-    print("    [3]  Both     — personal and professional mixed")
+    print("    [1]  Work     -- notes, projects, clients, colleagues, decisions")
+    print("    [2]  Personal -- diary, family, health, relationships, reflections")
+    print("    [3]  Both     -- personal and professional mixed")
     print()
 
     while True:
@@ -430,7 +430,7 @@ def run_onboarding(
             print()
             if _yn("  Add any of these to your registry?"):
                 for e in detected:
-                    ans = input(f"    {e['name']} — (p)erson, (s)kip? ").strip().lower()
+                    ans = input(f"    {e['name']} -- (p)erson, (s)kip? ").strip().lower()
                     if ans == "p":
                         rel = input(f"    Relationship/role for {e['name']}? ").strip()
                         ctx = (
@@ -439,7 +439,7 @@ def run_onboarding(
                             else (
                                 "work"
                                 if mode == "work"
-                                else input("    Context — (p)ersonal or (w)ork? ")
+                                else input("    Context -- (p)ersonal or (w)ork? ")
                                 .strip()
                                 .lower()
                                 .replace("w", "work")

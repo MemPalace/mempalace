@@ -24,8 +24,24 @@ User=mempalace
 Group=mempalace
 EnvironmentFile=/etc/mempalace/server.env
 ExecStart=mempalace serve --host 0.0.0.0 --port 8765
-Restart=on-failure
+# The idle watchdog exits with status 0, which on-failure reads as an
+# intentional stop, so the server would stay down. server.env disables the
+# watchdog; Restart=always covers a deployment that has not set it.
+Restart=always
 RestartSec=2
+# Status 2 is the writable-startup refusal: another process holds the palace
+# writer lease. That is not transient from this process's side -- it exits
+# before binding and re-acquires nothing on the way back up -- so Restart=always
+# turns it into an unbounded loop that never starts, never gives up, and never
+# reaches `failed`, leaving `systemctl is-active` at `activating` forever with
+# nothing in the unit state saying why (#2500; a field unit reached restart
+# counter 27). systemd's own start limiter does not catch it: each attempt lives
+# about a second, which is under StartLimitBurst=5 per StartLimitIntervalSec=10s
+# at RestartSec=2. Preventing the restart lands the unit in `failed` with the
+# refusal reason in the journal, which is a state an operator can act on.
+# The server first waits up to MEMPALACE_MCP_WRITER_WAIT_SECONDS (default
+# 120) for the lease, so status 2 means that wait ran out.
+RestartPreventExitStatus=2
 
 # --- Hardening ---------------------------------------------------------------
 NoNewPrivileges=true

@@ -776,6 +776,30 @@ class TestDiaryIngest:
         assert result["days_updated"] >= 1
         assert get_collection(str(palace_dir)).count() >= 1
 
+    def test_ingested_drawers_carry_the_directory_they_were_read_from(self, tmp_path):
+        """A diary drawer and a mined drawer describe the same kind of source
+        file, so sync has to decide them the same way (#2320)."""
+        from mempalace import source_identity as si
+        from mempalace.diary_ingest import ingest_diaries
+
+        diary_dir = tmp_path / "diaries"
+        diary_dir.mkdir()
+        (diary_dir / "2026-04-13.md").write_text(
+            "# 2026-04-13\n\n## 10:00 PDT — Test\n\nBuilt the auth system.\n"
+        )
+        palace_dir = tmp_path / "palace"
+        before = sorted(p.name for p in diary_dir.iterdir())
+
+        ingest_diaries(str(diary_dir), str(palace_dir), force=True)
+
+        metas = get_collection(str(palace_dir)).get(include=["metadatas"])["metadatas"]
+        expected = si.directory_identity(diary_dir)
+        assert expected is not None
+        assert metas, "the ingest filed nothing"
+        assert all(m.get("source_dir_ino") == expected for m in metas), metas
+        # And nothing was written into the diary directory itself.
+        assert sorted(p.name for p in diary_dir.iterdir()) == before
+
     def test_ingest_skips_unchanged_on_second_run(self, tmp_path):
         diary_dir = tmp_path / "diaries"
         diary_dir.mkdir()
@@ -1535,9 +1559,10 @@ class TestDrawerGrepExpansion:
         ``source_file + chunk_index`` pulls chunks from both groups as if
         they were sequential neighbors, corrupting the enriched text.
         Scoping by ``parent_drawer_id`` when present keeps each logical
-        group isolated. (``tool_diary_write`` chunks tag a different key
-        (``parent_entry_id``) and are written without ``source_file``, so
-        they never reach this enrichment path.)
+        group isolated. (``tool_diary_write`` chunks are written without
+        ``source_file``, so they never reach this enrichment path at all --
+        it returns early on the missing key -- regardless of which
+        parent-id key they carry.)
         """
         col = get_collection(palace_path)
         source = "shared.log"
@@ -1711,7 +1736,12 @@ class TestDrawerGrepExpansion:
         )
 
         result = search_memories("JWT authentication", palace_path)
-        assert result["results"]
+        # Surface the full envelope when search fails (Windows CI has flaked
+        # with KeyError on a bare ``result["results"]`` after a mid-query
+        # error dict that lacked the key).
+        assert "results" in result, f"search envelope missing results: {result!r}"
+        assert result["results"], f"hybrid search returned no hits: {result!r}"
+        assert "error" not in result, f"hybrid search failed: {result!r}"
         boosted = [h for h in result["results"] if h["matched_via"] == "drawer+closet"]
         assert boosted, "hybrid search should mark the closet-agreeing source"
         top = boosted[0]

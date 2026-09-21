@@ -84,6 +84,7 @@ from .palace import (
 from .config import MempalaceConfig, normalize_wing_name
 from .collision_scan import assert_no_collisions
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
+from .source_identity import identity_metadata, source_directory_identity
 from .miner import (
     _compute_topic_tunnels_for_wing,
     chunk_text,
@@ -362,7 +363,7 @@ def extract_text(
         logger.info("skip:unreadable (file gone after scan) %s", p)
         return None, ExtractionStatus.SKIP_UNREADABLE
     except OSError as exc:
-        logger.info("skip:unreadable %s — %s", p, exc)
+        logger.info("skip:unreadable %s -- %s", p, exc)
         return None, ExtractionStatus.SKIP_UNREADABLE
 
     # Fringe Case 5 — empty file. Skip silently.
@@ -433,9 +434,9 @@ def extract_text(
         # Fringe Case 4 vs Case 10: encrypted vs generic crash, by message.
         msg = str(exc)
         if _ENCRYPTED_PATTERNS.search(msg):
-            logger.info("skip:encrypted %s — %s", p, msg[:120])
+            logger.info("skip:encrypted %s -- %s", p, msg[:120])
             return None, ExtractionStatus.SKIP_ENCRYPTED
-        logger.warning("skip:extraction_error %s — %s: %s", p, type(exc).__name__, msg[:200])
+        logger.warning("skip:extraction_error %s -- %s: %s", p, type(exc).__name__, msg[:200])
         return None, ExtractionStatus.SKIP_EXTRACTION_ERROR
 
     # Either transformer can legitimately return None / empty (malformed
@@ -443,7 +444,7 @@ def extract_text(
     # so the caller knows to skip rather than file an empty drawer.
     if not text:
         transformer = "striprtf" if is_rtf else "markitdown"
-        logger.info("skip:extraction_error %s — %s returned None/empty", p, transformer)
+        logger.info("skip:extraction_error %s -- %s returned None/empty", p, transformer)
         return None, ExtractionStatus.SKIP_EXTRACTION_ERROR
 
     return text, ExtractionStatus.OK
@@ -575,6 +576,10 @@ def _register_file(collection, source_file: str, wing: str, agent: str) -> None:
                     "extract_mode": "format",
                     "normalize_version": NORMALIZE_VERSION,
                     "is_sentinel": True,
+                    # The sentinel names a real source file and ``sync`` reads
+                    # it as an ordinary drawer, so it needs the identity for
+                    # the same reason the file's own drawers do (#2320).
+                    **identity_metadata(source_file),
                 }
             ],
         )
@@ -591,6 +596,7 @@ def _file_chunks_locked(
     agent,
     source_mtime: Optional[float] = None,
     content: Optional[str] = None,
+    source_dir_ino: Optional[str] = None,
 ):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
@@ -608,13 +614,19 @@ def _file_chunks_locked(
     """
     # Lazy imports to avoid a module-load cycle (miner.py imports from this
     # module's package, so we defer these helpers until call time).
-    from .miner import _extract_content_date, _extract_entities_for_metadata, detect_hall
+    from .miner import (
+        _extract_content_date_with_source,
+        _extract_entities_for_metadata,
+        detect_hall,
+    )
 
     # Tier 6a content-date: extract once per file (not per chunk). Format-mined
     # files often have date-rich content (RTF/PDF dates in body text, mtimes on
     # the binary source). Caller may pass ``content`` (full extracted text) for
     # the body-scan branch; if absent, the helper still uses filename + mtime.
-    file_content_date = _extract_content_date(source_file, content or "")
+    file_content_date, file_content_date_source = _extract_content_date_with_source(
+        source_file, content or ""
+    )
 
     drawers_added = 0
     with mine_lock(source_file):
@@ -659,6 +671,11 @@ def _file_chunks_locked(
                 }
                 if source_mtime is not None:
                     meta["source_mtime"] = source_mtime
+                if source_dir_ino:
+                    # Which directory this file was read from, so ``sync``
+                    # can tell a neighbour in the same directory from one on
+                    # a volume mounted there since (#2320).
+                    meta["source_dir_ino"] = source_dir_ino
                 # Tier 6a — propagate line range from chunk dict into drawer
                 # metadata so closet pointers can carry "where in source"
                 # info. Chunks emitted by older code paths without these
@@ -670,6 +687,7 @@ def _file_chunks_locked(
                 # Tier 6a content-date: shared across all chunks of the file.
                 if file_content_date:
                     meta["content_date"] = file_content_date
+                    meta["content_date_source"] = file_content_date_source
                 entities = _extract_entities_for_metadata(content)
                 if entities:
                     meta["entities"] = entities
@@ -803,7 +821,7 @@ def mine_formats(
         files = scan_formats(format_path)
 
         print(f"\n{'=' * 55}")
-        print("  MemPalace Mine — Format extraction")
+        print("  MemPalace Mine -- Format extraction")
         print(f"{'=' * 55}")
         print(f"  Wing:    {wing}")
         print(f"  Source:  {format_path}")
@@ -811,7 +829,7 @@ def mine_formats(
         print(f"  Files:   {len(files)}{limit_suffix}")
         print(f"  Palace:  {palace_path}")
         if dry_run:
-            print("  DRY RUN — nothing will be filed")
+            print("  DRY RUN -- nothing will be filed")
         print(f"{'-' * 55}\n")
 
         collection = get_collection(palace_path) if not dry_run else None
@@ -876,7 +894,7 @@ def mine_formats(
                 files_with_text += 1
 
                 if dry_run:
-                    print(f"    [DRY RUN] {filepath.name} → {len(chunks)} drawers")
+                    print(f"    [DRY RUN] {filepath.name} -> {len(chunks)} drawers")
                     total_drawers += len(chunks)
                     files_mined += 1
                     if limit > 0 and files_mined >= limit:
@@ -892,6 +910,7 @@ def mine_formats(
                     agent,
                     source_mtime=source_mtime,
                     content=text,
+                    source_dir_ino=source_directory_identity(filepath),
                 )
                 if skipped:
                     files_skipped += 1

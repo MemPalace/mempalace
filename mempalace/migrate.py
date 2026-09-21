@@ -29,7 +29,7 @@ from collections import defaultdict
 from contextlib import closing
 from datetime import datetime
 
-from .backups import prune_backups
+from .backups import copy_palace_dir, prune_backups
 from .config import MempalaceConfig
 
 
@@ -244,22 +244,43 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
     # A plain count() is not enough: some 0.6.x -> 1.5.x migrated collections
     # are readable but silently drop upsert/delete operations. In that state,
     # migrate must rebuild from SQLite instead of returning "No migration needed."
+    #
+    # Preflight HNSW divergence before touching the collection at all: the
+    # #1222 SIGSEGV/panic class crashes on count() against a diverged
+    # segment, and a native crash can't be caught by the except Exception
+    # below -- a diverged palace must never reach col.count() in the first
+    # place. The already-diverged case degrades to exactly the same
+    # SQLite-extraction path the except branch below already falls back to.
+    from .backends.chroma import hnsw_capacity_status
+
     try:
-        col = ChromaBackend().get_collection(palace_path, "mempalace_drawers")
-        count = col.count()
-
-        if collection_write_roundtrip_works(col):
-            print(f"\n Palace is already readable and writable by chromadb {target_version}.")
-            print(f" {count} drawers found. No migration needed.")
-            return True
-
-        print(
-            f"\n Palace is readable by chromadb {target_version}, but write/delete verification failed."
-        )
-        print(" Rebuilding from SQLite to restore native write/delete behavior...")
+        capacity_info = hnsw_capacity_status(palace_path, "mempalace_drawers")
     except Exception:
-        print(f"\n Palace is NOT readable by chromadb {target_version}.")
+        capacity_info = {}
+
+    if capacity_info.get("diverged"):
+        print(
+            f"\n Palace is NOT readable by chromadb {target_version}: HNSW index diverged from SQLite."
+        )
+        print(f" ({capacity_info.get('message', 'divergence detected')})")
         print(" Extracting from SQLite directly...")
+    else:
+        try:
+            col = ChromaBackend().get_collection(palace_path, "mempalace_drawers")
+            count = col.count()
+
+            if collection_write_roundtrip_works(col):
+                print(f"\n Palace is already readable and writable by chromadb {target_version}.")
+                print(f" {count} drawers found. No migration needed.")
+                return True
+
+            print(
+                f"\n Palace is readable by chromadb {target_version}, but write/delete verification failed."
+            )
+            print(" Rebuilding from SQLite to restore native write/delete behavior...")
+        except Exception:
+            print(f"\n Palace is NOT readable by chromadb {target_version}.")
+            print(" Extracting from SQLite directly...")
 
     # Extract all drawers via raw SQL
     drawers = extract_drawers_from_sqlite(db_path)
@@ -284,7 +305,7 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
             print(f"      ROOM: {room:30} {count:5}")
 
     if dry_run:
-        print("\n  DRY RUN — no changes made.")
+        print("\n  DRY RUN -- no changes made.")
         print(f"  Would migrate {len(drawers)} drawers.")
         return True
 
@@ -295,7 +316,7 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = f"{palace_path}.pre-migrate.{timestamp}"
     print(f"\n  Backing up to {backup_path}...")
-    shutil.copytree(palace_path, backup_path, symlinks=True)
+    copy_palace_dir(palace_path, backup_path, symlinks=True, log=print)
 
     # Enforce backup retention so repeated migrations cannot fill the disk
     # with full-palace copies. The backup we just created is the newest, so
@@ -528,6 +549,66 @@ def _apply_topics_by_wing_renames(renames):
         raise
 
 
+def plan_tunnel_wing_renames(tunnels, explicit_renames):
+    """Rewrite explicit-tunnel endpoints and deterministically deduplicate IDs.
+
+    An unchanged tunnel already at the destination wins a collision. Otherwise
+    the tunnel with the lexicographically smallest original ID wins. Every
+    field other than the rewritten endpoint wings and canonical ID is kept.
+    """
+    from .palace_graph import _canonical_tunnel_id
+
+    candidates = []
+    changed_count = 0
+    for index, tunnel in enumerate(tunnels):
+        if not isinstance(tunnel, dict):
+            candidates.append((f"invalid:{index}", False, "", index, tunnel))
+            continue
+        source = tunnel.get("source")
+        target = tunnel.get("target")
+        if not isinstance(source, dict) or not isinstance(target, dict):
+            candidates.append((f"invalid:{index}", False, str(tunnel.get("id", "")), index, tunnel))
+            continue
+        source_wing = source.get("wing")
+        target_wing = target.get("wing")
+        new_source_wing = explicit_renames.get(source_wing, source_wing)
+        new_target_wing = explicit_renames.get(target_wing, target_wing)
+        changed = new_source_wing != source_wing or new_target_wing != target_wing
+        if not changed:
+            candidates.append(
+                (str(tunnel.get("id", "")), False, str(tunnel.get("id", "")), index, tunnel)
+            )
+            continue
+
+        migrated = dict(tunnel)
+        migrated["source"] = dict(source, wing=new_source_wing)
+        migrated["target"] = dict(target, wing=new_target_wing)
+        migrated["id"] = _canonical_tunnel_id(
+            new_source_wing,
+            source.get("room"),
+            new_target_wing,
+            target.get("room"),
+        )
+        changed_count += 1
+        candidates.append((migrated["id"], True, str(tunnel.get("id", "")), index, migrated))
+
+    if not changed_count:
+        return list(tunnels), 0, 0
+
+    by_id = defaultdict(list)
+    for candidate in candidates:
+        by_id[candidate[0]].append(candidate)
+
+    winners = []
+    collisions = 0
+    for group in by_id.values():
+        winner = min(group, key=lambda item: (item[1], item[2], item[3]))
+        winners.append(winner)
+        collisions += len(group) - 1
+    winners.sort(key=lambda item: item[3])
+    return [item[4] for item in winners], changed_count, collisions
+
+
 def migrate_wing_names(
     palace_path: str,
     dry_run: bool = False,
@@ -544,15 +625,18 @@ def migrate_wing_names(
     """
     from .palace import get_closets_collection, get_collection
 
+    explicit_renames = explicit_renames or {}
+    drawers = None
     try:
         drawers = get_collection(palace_path, create=False)
     except Exception as exc:
-        print(f"  No drawer collection found at {palace_path} ({exc}).")
-        return False
+        if not explicit_renames:
+            print(f"  No drawer collection found at {palace_path} ({exc}).")
+            return False
+        print(f"  No drawer collection found at {palace_path} ({exc}); checking sidecars.")
 
-    d_items = list(_iter_collection_items(drawers))
+    d_items = list(_iter_collection_items(drawers)) if drawers is not None else []
     all_wings = {(m or {}).get("wing") for _, m in d_items if (m or {}).get("wing")}
-    explicit_renames = explicit_renames or {}
     d_summary, d_updates = plan_wing_renames(d_items, explicit_renames)
 
     closets = None
@@ -565,8 +649,19 @@ def migrate_wing_names(
 
     topic_renames = _plan_topics_by_wing_renames(explicit_renames)
 
-    if not d_updates and not c_updates and not topic_renames:
-        print("  No wing names need migration — nothing to migrate.")
+    tunnel_plan, tunnel_updates, tunnel_collisions = [], 0, 0
+    tunnel_config = None
+    if explicit_renames:
+        from .palace_graph import _load_tunnels
+
+        tunnel_config = MempalaceConfig(palace_path=palace_path)
+        tunnels = _load_tunnels(tunnel_config)
+        tunnel_plan, tunnel_updates, tunnel_collisions = plan_tunnel_wing_renames(
+            tunnels, explicit_renames
+        )
+
+    if not d_updates and not c_updates and not topic_renames and not tunnel_updates:
+        print("  All wing names are already normalized -- nothing to migrate.")
         return False
 
     print("\n  Wing-name migration plan:")
@@ -580,9 +675,12 @@ def migrate_wing_names(
         print(f"    {old!r} -> {new!r}: {d_count} drawer(s), {c_count} closet(s){note}")
     if topic_renames:
         print(f"    topics_by_wing: {len(topic_renames)} key(s) re-keyed")
+    if tunnel_updates:
+        collision_note = f", {tunnel_collisions} collision(s) removed" if tunnel_collisions else ""
+        print(f"    explicit tunnels: {tunnel_updates} endpoint record(s) re-keyed{collision_note}")
 
     if dry_run:
-        print("\n  DRY RUN — no changes made.\n")
+        print("\n  DRY RUN -- no changes made.\n")
         return True
 
     if not confirm:
@@ -594,15 +692,22 @@ def migrate_wing_names(
             print("  Aborted.")
             return False
 
-    _apply_wing_updates(drawers, d_updates)
+    if drawers is not None and d_updates:
+        _apply_wing_updates(drawers, d_updates)
     if closets is not None and c_updates:
         _apply_wing_updates(closets, c_updates)
     _apply_topics_by_wing_renames(topic_renames)
+    if tunnel_updates:
+        from .palace_graph import _save_tunnels
+
+        _save_tunnels(tunnel_plan, tunnel_config)
 
     parts = [f"{len(d_updates)} drawer(s)"]
     if c_updates:
         parts.append(f"{len(c_updates)} closet(s)")
     if topic_renames:
         parts.append(f"{len(topic_renames)} topic key(s)")
+    if tunnel_updates:
+        parts.append(f"{tunnel_updates} tunnel(s)")
     print(f"\n  Migrated {', '.join(parts)}.\n")
     return True

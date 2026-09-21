@@ -3,6 +3,9 @@
 This backend is intentionally simple and local-first. It is a correctness
 backend, not a high-throughput ANN backend: vectors are stored as float32
 blobs and query uses exact cosine distance over the matching collection.
+Unfiltered query() ranks from the embedding column only (vectorized numpy),
+hydrates the top-k documents afterwards, and caches the matrix on the
+long-lived handle so a hub does not re-read every blob on the next search.
 """
 
 from __future__ import annotations
@@ -15,12 +18,15 @@ import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
 
+from ._magic import has_sqlite_magic, read_header_fields
 from .base import (
     BackendClosedError,
+    BackendError,
     BaseBackend,
     BaseCollection,
     CollectionNotInitializedError,
@@ -32,6 +38,7 @@ from .base import (
     PalaceNotFoundError,
     PalaceRef,
     QueryResult,
+    UnsupportedCapabilityError,
     UnsupportedFilterError,
     _IncludeSpec,
 )
@@ -61,10 +68,6 @@ def _json_loads(text: str | None) -> dict:
     except json.JSONDecodeError:
         return {}
     return value if isinstance(value, dict) else {}
-
-
-def _encode_vector(vector: list[float]) -> bytes:
-    return _as_vector_array(vector).tobytes()
 
 
 def _as_vector_array(vector: list[float]) -> np.ndarray:
@@ -208,6 +211,217 @@ def _matches_where(meta: dict, where: Optional[dict]) -> bool:
     return True
 
 
+_FACET_FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_CACHED_META_KEYS = frozenset({"wing", "room", "source_file"})
+# Palace loci. VIRTUAL generated columns + one composite index give
+# structured access (status, list_drawers where, graph_stats) without
+# rewriting the embedding blob table. Mirrors mempalace-structural's
+# "search the wing/room, not the whole palace" — as a sqlite index.
+_LOCUS_FIELDS = ("wing", "room", "hall")
+_LOCUS_INDEX = "idx_documents_coll_wing_room_hall"
+# Expression index for closet-enrichment ``get(where={source_file})``.
+# Locus columns stay wing/room/hall (low-cardinality facets); source_file
+# is high-cardinality and stays in metadata_json.
+_SOURCE_FILE_INDEX = "idx_documents_coll_source_file"
+
+
+def _json_field_sql(key: str, *, locus_columns: bool = True) -> str:
+    """SQL expression for a metadata key; locus fields are real columns."""
+    if locus_columns and key in _LOCUS_FIELDS:
+        return key
+    return f"json_extract(metadata_json, '$.{key}')"
+
+
+def _document_column_names(conn: sqlite3.Connection) -> set[str]:
+    """Column names including VIRTUAL generated columns.
+
+    ``PRAGMA table_info`` omits VIRTUAL generated columns on some SQLite
+    builds; ``table_xinfo`` reports them (hidden=2).
+    """
+    try:
+        rows = conn.execute("PRAGMA table_xinfo(documents)").fetchall()
+    except sqlite3.OperationalError:
+        rows = conn.execute("PRAGMA table_info(documents)").fetchall()
+    return {row[1] for row in rows}
+
+
+def _documents_has_locus_columns(conn: sqlite3.Connection) -> bool:
+    return set(_LOCUS_FIELDS) <= _document_column_names(conn)
+
+
+def _where_uses_only_cached_keys(where: Optional[dict]) -> bool:
+    """True when ``where`` can be evaluated against the cached wing/room/source_file."""
+    if not where:
+        return True
+    if not isinstance(where, dict):
+        return False
+    if list(where.keys()) == ["$and"]:
+        return all(_where_uses_only_cached_keys(child) for child in (where["$and"] or []))
+    for key, expected in where.items():
+        if key.startswith("$") or key not in _CACHED_META_KEYS or isinstance(expected, dict):
+            return False
+    return True
+
+
+def _equality_where_sql(
+    where: Optional[dict], *, locus_columns: bool = True
+) -> Optional[tuple[str, list]]:
+    """Push equality / ``$and``-of-equality filters into SQL, else ``None``.
+
+    ``None`` means the filter needs the Python ``_matches_where`` path
+    (``$or``, comparisons, ``$contains``, non-identifier keys).
+    """
+    if not where:
+        return "1=1", []
+    if not isinstance(where, dict):
+        return None
+    if list(where.keys()) == ["$and"]:
+        clauses = []
+        params: list = []
+        for child in where["$and"] or []:
+            part = _equality_where_sql(child, locus_columns=locus_columns)
+            if part is None:
+                return None
+            sql, child_params = part
+            clauses.append(f"({sql})")
+            params.extend(child_params)
+        return (" AND ".join(clauses) if clauses else "1=1"), params
+    clauses = []
+    params = []
+    for key, expected in where.items():
+        if key.startswith("$") or isinstance(expected, dict) or not _FACET_FIELD_RE.match(key):
+            return None
+        clauses.append(f"{_json_field_sql(key, locus_columns=locus_columns)} = ?")
+        params.append(expected)
+    return (" AND ".join(clauses) if clauses else "1=1"), params
+
+
+def _cosine_distances(
+    mat: np.ndarray, query: np.ndarray, norms: Optional[np.ndarray] = None
+) -> np.ndarray:
+    """Exact cosine distance (1 - cos) for every row of ``mat`` vs ``query``."""
+    q = np.asarray(query, dtype=np.float32)
+    if mat.size == 0:
+        return np.zeros((0,), dtype=np.float32)
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        q_norm = float(np.linalg.norm(q))
+        if norms is None:
+            norms = np.linalg.norm(mat, axis=1)
+        denom = norms * q_norm
+        dots = mat @ q
+        cos = np.zeros(dots.shape, dtype=np.float32)
+        np.divide(dots, denom, out=cos, where=denom > 0)
+    # Finite float32 inputs can still overflow or underflow intermediate
+    # products. Recompute only affected rows in float64; ordinary embeddings
+    # retain the cached float32 path and zero vectors retain distance one.
+    unsafe = (~np.isfinite(denom)) | (~np.isfinite(dots)) | (denom < np.finfo(np.float32).tiny)
+    if np.any(unsafe):
+        wide = mat[unsafe].astype(np.float64)
+        wide_q = q.astype(np.float64)
+        wide_denom = np.linalg.norm(wide, axis=1) * np.linalg.norm(wide_q)
+        wide_cos = np.zeros(len(wide), dtype=np.float64)
+        np.divide(wide @ wide_q, wide_denom, out=wide_cos, where=wide_denom > 0)
+        cos[unsafe] = wide_cos
+    np.clip(cos, -1.0, 1.0, out=cos)
+    return 1.0 - cos
+
+
+def sqlite_wing_room_counts(
+    palace_path: str, collection_name: str
+) -> Optional[tuple[int, dict[str, dict[str, int]]]]:
+    """Tally drawers by wing/room from ``sqlite_exact.sqlite3`` without paging.
+
+    Returns ``(total, {wing: {room: count}})`` or ``None`` when the read
+    cannot be trusted. ``None``/missing wing-or-room values are stored as
+    ``"?"`` so ``mcp_server._sqlite_taxonomy`` can map them to ``"unknown"``.
+    """
+    db_path = os.path.join(palace_path, _DB_FILENAME)
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        db_uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True)
+        try:
+            conn.execute("PRAGMA busy_timeout=2000")
+            row = conn.execute(
+                "SELECT id FROM collections WHERE name = ?",
+                (collection_name,),
+            ).fetchone()
+            if row is None:
+                return None
+            collection_id = int(row[0])
+            total_row = conn.execute(
+                "SELECT COUNT(*) FROM documents WHERE collection_id = ?",
+                (collection_id,),
+            ).fetchone()
+            total = int(total_row[0]) if total_row and total_row[0] is not None else 0
+            wing_rooms: dict[str, dict[str, int]] = {}
+            locus = _documents_has_locus_columns(conn)
+            wing_expr = "wing" if locus else "json_extract(metadata_json, '$.wing')"
+            room_expr = "room" if locus else "json_extract(metadata_json, '$.room')"
+            for wing, room, n in conn.execute(
+                f"""
+                SELECT {wing_expr}, {room_expr}, COUNT(*)
+                FROM documents
+                WHERE collection_id = ?
+                GROUP BY 1, 2
+                """,
+                (collection_id,),
+            ):
+                wkey = "?" if wing is None else str(wing)
+                rkey = "?" if room is None else str(room)
+                dest = wing_rooms.setdefault(wkey, {})
+                dest[rkey] = dest.get(rkey, 0) + int(n)
+            return total, wing_rooms
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
+def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Optional[list[tuple]]:
+    """Grouped ``(room, wing, hall, n, last_date)`` rows, or ``None``.
+
+    ``last_date`` is the newest ``date`` metadata value in the group — enough
+    for ``find_tunnels``' ``recent`` field without paging every drawer.
+    """
+    db_path = os.path.join(palace_path, _DB_FILENAME)
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        db_uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True)
+        try:
+            conn.execute("PRAGMA busy_timeout=2000")
+            row = conn.execute(
+                "SELECT id FROM collections WHERE name = ?",
+                (collection_name,),
+            ).fetchone()
+            if row is None:
+                return None
+            collection_id = int(row[0])
+            locus = _documents_has_locus_columns(conn)
+            room_expr = "room" if locus else "json_extract(metadata_json, '$.room')"
+            wing_expr = "wing" if locus else "json_extract(metadata_json, '$.wing')"
+            hall_expr = "hall" if locus else "json_extract(metadata_json, '$.hall')"
+            return list(
+                conn.execute(
+                    f"""
+                    SELECT {room_expr}, {wing_expr}, {hall_expr}, COUNT(*),
+                           COALESCE(MAX(json_extract(metadata_json, '$.date')), '')
+                    FROM documents
+                    WHERE collection_id = ?
+                    GROUP BY 1, 2, 3
+                    """,
+                    (collection_id,),
+                )
+            )
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
 def _matches_where_document(document: str, where_document: Optional[dict]) -> bool:
     if not where_document:
         return True
@@ -246,26 +460,93 @@ def _validate_write_batch(
         raise ValueError(f"embeddings length {len(embeddings)} does not match ids length {n}")
 
 
+class _SnapshotChanged(Exception):
+    """Retry the complete exact query after a concurrent database change."""
+
+
 class _SQLiteExactHandle:
-    def __init__(self, conn: sqlite3.Connection, lock: threading.RLock):
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        lock: threading.RLock,
+        palace_path: str,
+        *,
+        read_only: bool = False,
+        immutable: bool = False,
+    ):
         self.conn = conn
         self.lock = lock
+        self.palace_path = palace_path
+        self.read_only = read_only
+        # True when opened with ``immutable=1`` because no WAL existed at connect
+        # time. Reopen after an active WAL appears or the main file changes;
+        # a writer may commit and remove its sidecars between searches.
+        self.immutable = immutable
+        self.immutable_signature = None
+        self.has_dimension_column = True
+        self.has_locus_columns = True
         self.closed = False
+        self.retired = False
+        self.lifetime = None
+        # collection_id -> (ids, float32 matrix, mini-metadata). Filled lazily
+        # by query() so a long-lived hub does not re-read every embedding blob
+        # on the next search. Mini-metadata is wing/room/source_file for
+        # ``_vector_cache_data_version`` detects commits from other handles.
+        self._vector_cache: dict[int, tuple[list[str], np.ndarray, np.ndarray, list[dict]]] = {}
+        self._vector_cache_data_version: Optional[int] = None
+        # Native accelerators share one versioned index per collection across
+        # the short-lived wrappers created by application searches.
+        self._native_cache: dict[str, tuple[tuple, Any]] = {}
 
 
 class SQLiteExactCollection(BaseCollection):
-    def __init__(self, handle: _SQLiteExactHandle, collection_name: str):
+    def __init__(
+        self,
+        handle: _SQLiteExactHandle,
+        collection_name: str,
+        backend: Optional[SQLiteExactBackend] = None,
+    ):
         self._handle = handle
         self._collection_name = collection_name
+        self._backend = backend
         self._closed = False
 
     def _ensure_open(self) -> None:
         if self._closed or self._handle.closed:
             raise BackendClosedError("SQLiteExactCollection has been closed")
 
+    def _refresh_read_handle(self) -> None:
+        if not self._closed and self._handle.read_only and self._backend is not None:
+            with self._backend._clients_lock:
+                path = self._handle.palace_path
+                # Explicit close_palace ends this lifetime, even if a newer
+                # collection has since reopened the same directory.
+                if self._backend._palace_lifetimes.get(path) is self._handle.lifetime:
+                    self._handle = self._backend._connect(path, create=False, read_only=True)
+
     @contextlib.contextmanager
-    def _cursor(self):
+    def _write_lock(self):
+        """Serialize this handle before taking process-wide writer ownership.
+
+        ``mine_palace_lock`` grants cross-thread re-entrant access whenever
+        this process already owns the palace. Taking it before ``handle.lock``
+        lets a waiting thread consume that re-entrant credit, outlive the
+        thread that owns the OS lease, and then mutate after the lease has been
+        released. The handle mutex must therefore be the outer context.
+        """
+        # Late import avoids a palace.py -> backend -> palace.py cycle.
+        from ..palace import mine_palace_lock
+
         with self._handle.lock:
+            self._ensure_open()
+            with mine_palace_lock(self._handle.palace_path):
+                yield
+
+    @contextlib.contextmanager
+    def _cursor(self, *, write: bool = False):
+        self._refresh_read_handle()
+        serialization = self._write_lock() if write else self._handle.lock
+        with serialization:
             self._ensure_open()
             cur = self._handle.conn.cursor()
             try:
@@ -275,6 +556,9 @@ class SQLiteExactCollection(BaseCollection):
                 raise
             else:
                 self._handle.conn.commit()
+                if write:
+                    self._handle._vector_cache.clear()
+                    self._handle._native_cache.clear()
             finally:
                 cur.close()
 
@@ -288,6 +572,12 @@ class SQLiteExactCollection(BaseCollection):
         return int(row[0])
 
     def _collection_dimension(self, cur, collection_id: int) -> Optional[int]:
+        if not self._handle.has_dimension_column:
+            row = cur.execute(
+                "SELECT dim FROM documents WHERE collection_id = ? ORDER BY rowid LIMIT 1",
+                (collection_id,),
+            ).fetchone()
+            return int(row[0]) if row is not None else None
         row = cur.execute(
             "SELECT dimension FROM collections WHERE id = ?",
             (collection_id,),
@@ -345,7 +635,7 @@ class SQLiteExactCollection(BaseCollection):
     def set_embedder_identity(self, identity) -> None:
         if not identity or not identity.model_name:
             return
-        with self._cursor() as cur:
+        with self._cursor(write=True) as cur:
             cur.execute(
                 "INSERT INTO meta(key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -375,7 +665,7 @@ class SQLiteExactCollection(BaseCollection):
             raise ValueError("sqlite_exact requires explicit embeddings")
         metadatas = metadatas or [{} for _ in ids]
         now = _utcnow()
-        with self._cursor() as cur:
+        with self._cursor(write=True) as cur:
             collection_id = self._collection_id(cur)
             prepared = []
             for doc_id, doc, meta, emb in zip(ids, documents, metadatas, embeddings):
@@ -413,7 +703,7 @@ class SQLiteExactCollection(BaseCollection):
             raise ValueError("sqlite_exact requires explicit embeddings")
         metadatas = metadatas or [{} for _ in ids]
         now = _utcnow()
-        with self._cursor() as cur:
+        with self._cursor(write=True) as cur:
             collection_id = self._collection_id(cur)
             prepared = []
             for doc_id, doc, meta, emb in zip(ids, documents, metadatas, embeddings):
@@ -457,7 +747,7 @@ class SQLiteExactCollection(BaseCollection):
         ):
             if value is not None and len(value) != n:
                 raise ValueError(f"{label} length {len(value)} does not match ids length {n}")
-        with self._cursor() as cur:
+        with self._cursor(write=True) as cur:
             collection_id = self._collection_id(cur)
             updates = []
             for idx, doc_id in enumerate(ids):
@@ -496,23 +786,47 @@ class SQLiteExactCollection(BaseCollection):
                 )
                 self._replace_fts(cur, collection_id, doc_id, doc)
 
-    def _rows(self, cur, *, where=None, where_document=None, limit=None, offset=None) -> list[dict]:
+    def _rows(
+        self,
+        cur,
+        *,
+        where=None,
+        where_document=None,
+        limit=None,
+        offset=None,
+        spec: Optional[_IncludeSpec] = None,
+    ) -> list[dict]:
         _validate_where(where)
         _validate_where(where_document)
+        spec = spec or _IncludeSpec.resolve(None, default_distances=False)
         collection_id = self._collection_id(cur)
-        sql = (
-            "SELECT id, document, metadata_json, embedding\n"
-            "FROM documents\n"
-            "WHERE collection_id = ?\n"
-            "ORDER BY rowid"
+        push = (
+            None
+            if where_document
+            else _equality_where_sql(where, locus_columns=self._handle.has_locus_columns)
         )
-        params = [collection_id]
-        # Emit SQL LIMIT/OFFSET only on an unfiltered page. With a
-        # where/where_document the post-filter loop below drops rows *after*
-        # this scan, so a SQL LIMIT/OFFSET would cut the wrong rows; those
-        # callers scan in full and paginate in Python. SQLite requires a LIMIT
-        # before OFFSET, so an offset-only page uses "LIMIT -1" (unbounded).
-        if where is None and where_document is None and (limit is not None or offset):
+        python_where = where is not None and push is None
+        need_doc = spec.documents or bool(where_document)
+        need_meta = spec.metadatas or python_where
+        need_emb = spec.embeddings
+        cols = ["id"]
+        if need_doc:
+            cols.append("document")
+        if need_meta:
+            cols.append("metadata_json")
+        if need_emb:
+            cols.append("embedding")
+        sql = f"SELECT {', '.join(cols)}\nFROM documents\nWHERE collection_id = ?"
+        params: list = [collection_id]
+        if push is not None and where:
+            extra_sql, extra_params = push
+            sql += " AND " + extra_sql
+            params.extend(extra_params)
+        sql += "\nORDER BY rowid"
+        # Equality where is applied in SQL, so LIMIT/OFFSET are safe there too.
+        # Python-side filters still have to scan, then slice.
+        can_limit = (not python_where) and not where_document
+        if can_limit and (limit is not None or offset):
             if limit is not None:
                 sql += "\nLIMIT ?"
                 params.append(int(limit))
@@ -521,25 +835,115 @@ class SQLiteExactCollection(BaseCollection):
             if offset:
                 sql += "\nOFFSET ?"
                 params.append(int(offset))
-        rows = cur.execute(sql, params).fetchall()
+        raw = cur.execute(sql, params).fetchall()
         out = []
-        for doc_id, doc, meta_json, emb_blob in rows:
-            meta = _json_loads(meta_json)
-            if not _matches_where(meta, where):
+        for row in raw:
+            idx = 1
+            doc = ""
+            meta: dict = {}
+            emb_blob = None
+            if need_doc:
+                doc = row[idx] or ""
+                idx += 1
+            if need_meta:
+                meta = _json_loads(row[idx])
+                idx += 1
+            if need_emb:
+                emb_blob = row[idx]
+            if python_where and not _matches_where(meta, where):
                 continue
-            if not _matches_where_document(doc or "", where_document):
+            if where_document and not _matches_where_document(doc, where_document):
                 continue
             out.append(
                 {
-                    "id": doc_id,
-                    "document": doc or "",
+                    "id": row[0],
+                    "document": doc,
                     "metadata": meta,
                     "embedding": emb_blob,
                 }
             )
         return out
 
-    def query(
+    def _rows_by_ids(self, cur, collection_id: int, ids: list[str], spec: _IncludeSpec) -> dict:
+        """Fetch requested columns for ``ids`` via ``IN``, keyed by id."""
+        unique = []
+        seen = set()
+        for doc_id in ids:
+            if doc_id not in seen:
+                seen.add(doc_id)
+                unique.append(doc_id)
+        if not unique:
+            return {}
+        cols = ["id"]
+        if spec.documents:
+            cols.append("document")
+        if spec.metadatas:
+            cols.append("metadata_json")
+        if spec.embeddings:
+            cols.append("embedding")
+        by_id: dict = {}
+        for start in range(0, len(unique), 900):
+            chunk = unique[start : start + 900]
+            placeholders = ",".join("?" for _ in chunk)
+            for row in cur.execute(
+                f"SELECT {', '.join(cols)} FROM documents "
+                f"WHERE collection_id = ? AND id IN ({placeholders})",
+                (collection_id, *chunk),
+            ):
+                idx = 1
+                doc = ""
+                meta: dict = {}
+                emb_blob = None
+                if spec.documents:
+                    doc = row[idx] or ""
+                    idx += 1
+                if spec.metadatas:
+                    meta = _json_loads(row[idx])
+                    idx += 1
+                if spec.embeddings:
+                    emb_blob = row[idx]
+                by_id[row[0]] = {
+                    "id": row[0],
+                    "document": doc,
+                    "metadata": meta,
+                    "embedding": emb_blob,
+                }
+        return by_id
+
+    def _index_version(self, cur):
+        if self._handle.immutable:
+            db_file = os.path.join(self._handle.palace_path, _DB_FILENAME)
+            # Immutable SQLite connections do not observe peer commits at all.
+            # Reject an obsolete snapshot instead of combining it with a fresh
+            # query; the next attempt reopens through the backend.
+            try:
+                wal_has_frames = os.path.getsize(db_file + "-wal") > 0
+            except FileNotFoundError:
+                wal_has_frames = False
+            # SQLite's native read-only opener may leave empty sidecars. They
+            # contain no newer data; nonempty WALs or main-file changes do.
+            if (
+                self._backend._database_signature(db_file) != self._handle.immutable_signature
+                or wal_has_frames
+            ):
+                raise _SnapshotChanged()
+        return (
+            self._handle.conn,
+            int(cur.execute("PRAGMA data_version").fetchone()[0]),
+            self._handle.conn.total_changes,
+        )
+
+    def query(self, **kwargs) -> QueryResult:
+        for _ in range(3):
+            try:
+                return self._query_once(**kwargs)
+            except _SnapshotChanged:
+                with self._handle.lock:
+                    self._handle._native_cache.pop(self._collection_name, None)
+                    self._handle._vector_cache.clear()
+        raise BackendError("Palace changed repeatedly during exact search; retry the query")
+
+    def _query_once(
         self,
         *,
         query_texts=None,
@@ -564,38 +968,67 @@ class SQLiteExactCollection(BaseCollection):
         outer_metas: list[list[dict]] = []
         outer_dists: list[list[float]] = []
         outer_embeds: list[list[list[float]]] = []
+        n_results = max(0, int(n_results))
 
         with self._cursor() as cur:
+            snapshot = self._index_version(cur)
             collection_id = self._collection_id(cur)
             expected_dim = self._collection_dimension(cur, collection_id)
-            rows = self._rows(cur, where=where, where_document=where_document)
-            row_vectors = [(row, _decode_array(row["embedding"])) for row in rows]
 
-        for query_vector in query_embeddings:
-            q = _as_vector_array(query_vector)
-            if expected_dim is not None and int(q.size) != expected_dim:
-                raise DimensionMismatchError(
-                    f"sqlite_exact collection {self._collection_name!r} expects "
-                    f"embedding dimension {expected_dim}, got {int(q.size)}"
-                )
-            q_norm = float(np.linalg.norm(q))
-            scored = []
-            for row, vec in row_vectors:
-                if vec is None or vec.size != q.size:
+            ids, mat, norms = self._rank_vectors(
+                cur, collection_id, where=where, where_document=where_document
+            )
+
+            for query_vector in query_embeddings:
+                q = _as_vector_array(query_vector)
+                if expected_dim is not None and int(q.size) != expected_dim:
+                    raise DimensionMismatchError(
+                        f"sqlite_exact collection {self._collection_name!r} expects "
+                        f"embedding dimension {expected_dim}, got {int(q.size)}"
+                    )
+                if mat.size == 0 or n_results == 0:
+                    outer_ids.append([])
+                    outer_docs.append([])
+                    outer_metas.append([])
+                    outer_dists.append([])
+                    if spec.embeddings:
+                        outer_embeds.append([])
                     continue
-                denom = q_norm * float(np.linalg.norm(vec))
-                cos = 0.0 if denom <= 0 else float(np.dot(q, vec) / denom)
-                distance = 1.0 - max(-1.0, min(1.0, cos))
-                scored.append((distance, row, vec))
-            scored.sort(key=lambda item: item[0])
-            top = scored[:n_results]
+                if mat.shape[1] != q.size:
+                    raise DimensionMismatchError(
+                        f"sqlite_exact collection {self._collection_name!r} expects "
+                        f"embedding dimension {int(mat.shape[1])}, got {int(q.size)}"
+                    )
+                dist = _cosine_distances(mat, q, norms)
+                k = min(n_results, int(dist.size))
+                if k < int(dist.size):
+                    # Preserve the old stable row-order tie break, including
+                    # ties at the cutoff; argpartition alone selects arbitrary ties.
+                    cutoff = np.partition(dist, k - 1)[k - 1]
+                    below = np.flatnonzero(dist < cutoff)
+                    tied = np.flatnonzero(dist == cutoff)[: k - len(below)]
+                    selected = np.concatenate((below, tied))
+                    order = selected[np.argsort(dist[selected], kind="mergesort")]
+                else:
+                    order = np.argsort(dist, kind="mergesort")
+                top_ids = [ids[int(i)] for i in order]
+                docs_by_id: dict[str, str] = {}
+                metas_by_id: dict[str, dict] = {}
+                if spec.documents or spec.metadatas:
+                    docs_by_id, metas_by_id = self._hydrate(cur, collection_id, top_ids, spec)
+                outer_ids.append(top_ids)
+                outer_docs.append(
+                    [docs_by_id.get(doc_id, "") for doc_id in top_ids] if spec.documents else []
+                )
+                outer_metas.append(
+                    [metas_by_id.get(doc_id, {}) for doc_id in top_ids] if spec.metadatas else []
+                )
+                outer_dists.append([float(dist[i]) for i in order] if spec.distances else [])
+                if spec.embeddings:
+                    outer_embeds.append([mat[int(i)].astype(float).tolist() for i in order])
 
-            outer_ids.append([row["id"] for _, row, _ in top])
-            outer_docs.append([row["document"] for _, row, _ in top] if spec.documents else [])
-            outer_metas.append([row["metadata"] for _, row, _ in top] if spec.metadatas else [])
-            outer_dists.append([float(dist) for dist, _, _ in top] if spec.distances else [])
-            if spec.embeddings:
-                outer_embeds.append([vec.astype(float).tolist() for _, _, vec in top])
+            if snapshot != self._index_version(cur):
+                raise _SnapshotChanged()
 
         return QueryResult(
             ids=outer_ids,
@@ -604,6 +1037,128 @@ class SQLiteExactCollection(BaseCollection):
             distances=outer_dists,
             embeddings=outer_embeds if spec.embeddings else None,
         )
+
+    def _rank_vectors(
+        self,
+        cur,
+        collection_id: int,
+        *,
+        where,
+        where_document,
+    ) -> tuple[list[str], np.ndarray, np.ndarray]:
+        """Load (ids, embedding matrix, norms) for exact cosine ranking.
+
+        The full embedding matrix and precomputed norms are cached on the
+        handle after the first scan so later searches — filtered or not —
+        do not re-read blobs or recompute vector norms.
+        Equality filters then restrict by id; other filters fall back to
+        ``_rows`` only to decide membership.
+        """
+        _validate_where(where)
+        _validate_where(where_document)
+        expected = self._collection_dimension(cur, collection_id)
+        empty = np.zeros((0, expected or 0), dtype=np.float32)
+        empty_norms = np.zeros((0,), dtype=np.float32)
+        data_version = int(cur.execute("PRAGMA data_version").fetchone()[0])
+        if self._handle._vector_cache_data_version != data_version:
+            self._handle._vector_cache.clear()
+            self._handle._vector_cache_data_version = data_version
+        cached = self._handle._vector_cache.get(collection_id)
+        if cached is None:
+            cached = self._load_all_vectors(cur, collection_id, expected)
+            self._handle._vector_cache[collection_id] = cached
+        ids, mat, norms, metas = cached
+        if not where and not where_document:
+            return ids, mat, norms
+        if mat.size == 0:
+            return ids, mat, norms
+        if where_document or not _where_uses_only_cached_keys(where):
+            wanted = {
+                row["id"] for row in self._rows(cur, where=where, where_document=where_document)
+            }
+            keep = [i for i, doc_id in enumerate(ids) if doc_id in wanted]
+        else:
+            keep = [i for i, meta in enumerate(metas) if _matches_where(meta, where)]
+        if not keep:
+            return (
+                [],
+                empty if mat.size == 0 else np.zeros((0, mat.shape[1]), dtype=np.float32),
+                empty_norms,
+            )
+        idx = np.array(keep, dtype=np.intp)
+        return [ids[i] for i in keep], mat[idx], norms[idx]
+
+    def _load_all_vectors(
+        self, cur, collection_id: int, expected: Optional[int]
+    ) -> tuple[list[str], np.ndarray, np.ndarray, list[dict]]:
+        wing_expr = _json_field_sql("wing", locus_columns=self._handle.has_locus_columns)
+        room_expr = _json_field_sql("room", locus_columns=self._handle.has_locus_columns)
+        rows = cur.execute(
+            f"""
+            SELECT id, embedding, {wing_expr}, {room_expr},
+                   json_extract(metadata_json, '$.source_file')
+            FROM documents
+            WHERE collection_id = ?
+            ORDER BY rowid
+            """,
+            (collection_id,),
+        ).fetchall()
+        ids: list[str] = []
+        vecs: list[np.ndarray] = []
+        metas: list[dict] = []
+        for doc_id, blob, wing, room, source_file in rows:
+            vec = _decode_array(blob)
+            if vec is None:
+                continue
+            if expected is not None and vec.size != expected:
+                continue
+            ids.append(doc_id)
+            vecs.append(vec)
+            meta = {}
+            if wing is not None:
+                meta["wing"] = wing
+            if room is not None:
+                meta["room"] = room
+            if source_file is not None:
+                meta["source_file"] = source_file
+            metas.append(meta)
+        if not vecs:
+            return (
+                ids,
+                np.zeros((0, expected or 0), dtype=np.float32),
+                np.zeros((0,), dtype=np.float32),
+                metas,
+            )
+        mat = np.stack(vecs)
+        norms = np.linalg.norm(mat, axis=1)
+        return ids, mat, norms, metas
+
+    def _hydrate(self, cur, collection_id: int, ids: list[str], spec) -> tuple[dict, dict]:
+        docs: dict[str, str] = {}
+        metas: dict[str, dict] = {}
+        if not ids:
+            return docs, metas
+        cols = ["id"]
+        if spec.documents:
+            cols.append("document")
+        if spec.metadatas:
+            cols.append("metadata_json")
+        for start in range(0, len(ids), 900):
+            chunk = ids[start : start + 900]
+            placeholders = ",".join("?" for _ in chunk)
+            for row in cur.execute(
+                f"SELECT {', '.join(cols)} FROM documents "
+                f"WHERE collection_id = ? AND id IN ({placeholders})",
+                (collection_id, *chunk),
+            ):
+                doc_id = row[0]
+                idx = 1
+                if spec.documents:
+                    docs[doc_id] = row[idx] or ""
+                    idx += 1
+                if spec.metadatas:
+                    metas[doc_id] = _json_loads(row[idx])
+        return docs, metas
 
     def get(
         self,
@@ -616,33 +1171,66 @@ class SQLiteExactCollection(BaseCollection):
         include=None,
     ) -> GetResult:
         spec = _IncludeSpec.resolve(include, default_distances=False)
-        # Fast path for the common unfiltered page (e.g. the prefetch_mined_set
-        # and status sweeps): push LIMIT/OFFSET into the scan instead of
-        # materializing the whole collection and slicing in Python. Safe only
-        # with no post-filter (ids/where/where_document drop rows after the
-        # scan) and non-negative bounds: SQLite does not honor a negative LIMIT
-        # or OFFSET the way a Python slice does, so those keep the slice path.
+        # get(ids=...) must not scan the collection: look up by primary key.
+        if ids is not None:
+            _validate_where(where)
+            _validate_where(where_document)
+            lookup_spec = _IncludeSpec(
+                documents=spec.documents or bool(where_document),
+                metadatas=spec.metadatas or bool(where),
+                distances=False,
+                embeddings=spec.embeddings,
+            )
+            with self._cursor() as cur:
+                collection_id = self._collection_id(cur)
+                by_id = self._rows_by_ids(cur, collection_id, list(ids), lookup_spec)
+            rows = [
+                by_id[doc_id]
+                for doc_id in ids
+                if doc_id in by_id
+                and _matches_where(by_id[doc_id]["metadata"], where)
+                and _matches_where_document(by_id[doc_id]["document"], where_document)
+            ]
+            if offset:
+                rows = rows[offset:]
+            if limit is not None:
+                rows = rows[:limit]
+            return self._get_result(rows, spec)
+
+        # Unfiltered (or SQL-pushable equality) pages: LIMIT/OFFSET in SQL.
+        # Negative bounds stay on the Python slice path — SQLite does not
+        # honor a negative LIMIT/OFFSET the way a Python slice does.
+        python_where = bool(where_document) or (
+            where is not None
+            and _equality_where_sql(where, locus_columns=self._handle.has_locus_columns) is None
+        )
         push_page = (
-            ids is None
-            and where is None
-            and where_document is None
+            not python_where
             and (limit is None or limit >= 0)
             and (offset is None or offset >= 0)
             and (limit is not None or offset)
         )
         with self._cursor() as cur:
             if push_page:
-                rows = self._rows(cur, limit=limit, offset=offset)
+                rows = self._rows(
+                    cur,
+                    where=where,
+                    where_document=where_document,
+                    limit=limit,
+                    offset=offset,
+                    spec=spec,
+                )
             else:
-                rows = self._rows(cur, where=where, where_document=where_document)
+                rows = self._rows(cur, where=where, where_document=where_document, spec=spec)
         if not push_page:
-            if ids is not None:
-                by_id = {row["id"]: row for row in rows}
-                rows = [by_id[doc_id] for doc_id in ids if doc_id in by_id]
             if offset:
                 rows = rows[offset:]
             if limit is not None:
                 rows = rows[:limit]
+        return self._get_result(rows, spec)
+
+    @staticmethod
+    def _get_result(rows: list[dict], spec: _IncludeSpec) -> GetResult:
         return GetResult(
             ids=[row["id"] for row in rows],
             documents=[row["document"] for row in rows] if spec.documents else [],
@@ -653,7 +1241,7 @@ class SQLiteExactCollection(BaseCollection):
         )
 
     def delete(self, *, ids=None, where=None):
-        with self._cursor() as cur:
+        with self._cursor(write=True) as cur:
             collection_id = self._collection_id(cur)
             if ids is None:
                 rows = self._rows(cur, where=where)
@@ -677,6 +1265,37 @@ class SQLiteExactCollection(BaseCollection):
                 (collection_id,),
             ).fetchone()
             return int(row[0]) if row else 0
+
+    def facet_counts(
+        self,
+        field: str,
+        where: Optional[dict] = None,
+        limit: int = 1000,
+    ) -> dict[str, int]:
+        _validate_where(where)
+        if not _FACET_FIELD_RE.match(field):
+            raise UnsupportedCapabilityError(f"facet field {field!r} is not a JSON key")
+        push = _equality_where_sql(where, locus_columns=self._handle.has_locus_columns)
+        if push is None:
+            raise UnsupportedCapabilityError("facet_counts does not support local-only filters")
+        extra_sql, params = push
+        with self._cursor() as cur:
+            collection_id = self._collection_id(cur)
+            expr = _json_field_sql(field, locus_columns=self._handle.has_locus_columns)
+            rows = cur.execute(
+                f"""
+                SELECT {expr} AS k, COUNT(*)
+                FROM documents
+                WHERE collection_id = ?
+                  AND {expr} IS NOT NULL
+                  AND ({extra_sql})
+                GROUP BY 1
+                ORDER BY 2 DESC, 1
+                LIMIT ?
+                """,
+                (collection_id, *params, int(limit)),
+            ).fetchall()
+        return {str(key): int(count) for key, count in rows if key is not None}
 
     def lexical_search(self, *, query: str, n_results: int = 10, where: Optional[dict] = None):
         _validate_where(where)
@@ -782,8 +1401,22 @@ class SQLiteExactCollection(BaseCollection):
             with self._cursor() as cur:
                 page_count = cur.execute("PRAGMA page_count").fetchone()
                 freelist = cur.execute("PRAGMA freelist_count").fetchone()
+                data_version = cur.execute("PRAGMA data_version").fetchone()
             state["page_count"] = int(page_count[0]) if page_count else 0
             state["freelist_pages"] = int(freelist[0]) if freelist else 0
+            db_path = SQLiteExactBackend._db_path(self._handle.palace_path)
+            file_token = []
+            for suffix in ("", "-wal"):
+                path = f"{db_path}{suffix}"
+                try:
+                    stat = os.stat(path)
+                    file_token.append([suffix or "db", stat.st_size, stat.st_mtime_ns])
+                except FileNotFoundError:
+                    file_token.append([suffix or "db", None, None])
+            state["consistency_token"] = {
+                "data_version": int(data_version[0]) if data_version else 0,
+                "files": file_token,
+            }
         except Exception:
             pass
         return state
@@ -797,17 +1430,16 @@ class SQLiteExactCollection(BaseCollection):
             )
         if kind == "analyze":
             # Refresh planner stats. Concurrent runs serialize on the handle lock.
-            with self._cursor() as cur:
+            with self._cursor(write=True) as cur:
                 cur.execute("ANALYZE")
             return MaintenanceResult(kind="analyze", status="ran")
 
         # compact → VACUUM. It cannot run inside a transaction, so flip the
-        # connection to autocommit for the duration. The handle lock serializes
-        # concurrent runs in-process; SQLite's own write lock serializes across
-        # processes.
+        # connection to autocommit for the duration. _write_lock takes the
+        # handle mutex before the palace lease so a waiting thread cannot
+        # retain stale process-reentrant ownership after another thread exits.
         before = self.maintenance_state()
-        with self._handle.lock:
-            self._ensure_open()
+        with self._write_lock():
             conn = self._handle.conn
             prev_isolation = conn.isolation_level
             try:
@@ -838,6 +1470,7 @@ class SQLiteExactBackend(BaseBackend):
             "supports_embeddings_passthrough",
             "supports_embeddings_out",
             "supports_metadata_filters",
+            "supports_metadata_facets",
             "supports_lexical_search",
             "local_mode",
         }
@@ -848,6 +1481,8 @@ class SQLiteExactBackend(BaseBackend):
 
     def __init__(self):
         self._clients: dict[str, _SQLiteExactHandle] = {}
+        self._read_only_clients: dict[str, _SQLiteExactHandle] = {}
+        self._palace_lifetimes: dict[str, object] = {}
         self._clients_lock = threading.RLock()
         self._closed = False
 
@@ -855,9 +1490,85 @@ class SQLiteExactBackend(BaseBackend):
     def _db_path(palace_path: str) -> str:
         return os.path.join(palace_path, _DB_FILENAME)
 
-    def _connect(self, palace_path: str, create: bool):
+    @staticmethod
+    def _database_signature(db_path: str) -> tuple:
+        """Detect completed writer/checkpoint cycles, even with unchanged size.
+
+        Stat identity and times detect replacement and updates between
+        checkpoints; the header fields SQLite exposes through pragmas
+        (schema cookie, page count, freelist count, user version, application
+        id) cover the page-1 changes a checkpoint can land without touching the
+        size. Never return a cached snapshot after a failed filesystem read.
+
+        The header is read through a throwaway ``immutable=1`` connection, not
+        a plain ``open()``: closing a non-SQLite descriptor on the database
+        drops every POSIX lock this process holds on it, including the SHARED
+        lock a sibling writer keeps for the life of its WAL connection. See
+        :mod:`mempalace.backends._magic`.
+        """
+        stat = os.stat(db_path)
+        header = read_header_fields(db_path)
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, header)
+
+    @staticmethod
+    def _wal_sidecar_state(db_path: str) -> tuple[bool, bool]:
+        return (
+            os.path.isfile(f"{db_path}-wal"),
+            os.path.isfile(f"{db_path}-shm"),
+        )
+
+    @staticmethod
+    def _connect_read_only(db_path: str) -> tuple[sqlite3.Connection, bool]:
+        """Open without creating WAL files while preserving an active WAL.
+
+        Returns ``(connection, immutable)``. ``immutable`` is True when the
+        database was clean (no WAL) and was opened with ``immutable=1``.
+        """
+        wal_exists, shm_exists = SQLiteExactBackend._wal_sidecar_state(db_path)
+        if wal_exists != shm_exists:
+            raise BackendError(
+                "sqlite_exact read-only open found an incomplete WAL sidecar set; "
+                "open the palace after its writer exits cleanly or restore both "
+                "the -wal and -shm files"
+            )
+
+        db_uri = Path(db_path).resolve().as_uri()
+        if wal_exists:
+            # An active writer's uncheckpointed rows live in the WAL. With both
+            # sidecars already present, mode=ro can read them without creating
+            # filesystem state, including on a read-only mount.
+            db_uri = f"{db_uri}?mode=ro"
+            immutable = False
+        else:
+            # A clean WAL-mode database would otherwise make SQLite create new
+            # -wal/-shm files while connecting. Immutable mode is safe here
+            # only until a writer creates sidecars this connection would miss.
+            db_uri = f"{db_uri}?mode=ro&immutable=1"
+            immutable = True
+        return sqlite3.connect(db_uri, uri=True, check_same_thread=False), immutable
+
+    def _retire_read_only_handle(self, palace_path: str, handle: _SQLiteExactHandle) -> None:
+        """Drop a cached read-only handle so the next open re-evaluates WAL state."""
+        self._read_only_clients.pop(palace_path, None)
+        with handle.lock:
+            handle.retired = True
+            if handle.closed:
+                return
+            handle.closed = True
+            try:
+                handle.conn.close()
+            except Exception:
+                logger.debug(
+                    "Failed to close stale immutable sqlite_exact reader for %s",
+                    palace_path,
+                    exc_info=True,
+                )
+
+    def _connect(self, palace_path: str, create: bool, *, read_only: bool = False):
         if self._closed:
             raise BackendClosedError("SQLiteExactBackend has been closed")
+        if create and read_only:
+            raise ValueError("sqlite_exact read-only connections cannot create a palace")
         db_path = self._db_path(palace_path)
         if not create and not os.path.isfile(db_path):
             raise PalaceNotFoundError(db_path)
@@ -877,20 +1588,67 @@ class SQLiteExactBackend(BaseBackend):
         with self._clients_lock:
             if self._closed:
                 raise BackendClosedError("SQLiteExactBackend has been closed")
-            cached = self._clients.get(palace_path)
+            clients = self._read_only_clients if read_only else self._clients
+            cached = clients.get(palace_path)
             if cached is not None and not cached.closed:
-                return cached
-            conn = sqlite3.connect(db_path, check_same_thread=False)
+                if read_only and cached.immutable:
+                    # An immutable snapshot freezes the clean-database view.
+                    # An active WAL or a completed writer/checkpoint cycle makes
+                    # the immutable snapshot stale. A lone sidecar with an
+                    # unchanged database remains a transient mid-open state.
+                    wal_exists, shm_exists = self._wal_sidecar_state(db_path)
+                    changed = self._database_signature(db_path) != cached.immutable_signature
+                    try:
+                        wal_has_data = wal_exists and os.path.getsize(db_path + "-wal") > 0
+                    except FileNotFoundError:
+                        wal_has_data = False
+                    # Native read-only opens may leave empty sidecars. They
+                    # contain no commit and must not evict the warm index.
+                    if (wal_has_data and shm_exists) or changed:
+                        self._retire_read_only_handle(palace_path, cached)
+                        cached = None
+                if cached is not None:
+                    return cached
+            if read_only:
+                # Capture before opening/reading so a concurrent writer cannot
+                # make an old snapshot appear to have the new file's signature.
+                signature = self._database_signature(db_path)
+                conn, immutable = self._connect_read_only(db_path)
+            else:
+                conn = sqlite3.connect(db_path, check_same_thread=False)
+                immutable = False
             try:
                 conn.row_factory = sqlite3.Row
                 lock = threading.RLock()
-                handle = _SQLiteExactHandle(conn, lock)
+                handle = _SQLiteExactHandle(
+                    conn,
+                    lock,
+                    palace_path,
+                    read_only=read_only,
+                    immutable=immutable,
+                )
+                handle.immutable_signature = signature if immutable else None
+                handle.lifetime = self._palace_lifetimes.setdefault(palace_path, object())
                 with handle.lock:
-                    self._init_schema(conn)
+                    if read_only:
+                        # ``mode=ro`` prevents filesystem writes. ``query_only``
+                        # adds a second connection-local guard so a future
+                        # refactor cannot accidentally introduce a temp/schema
+                        # write through a read-only MCP collection.
+                        conn.execute("PRAGMA query_only=ON")
+                    else:
+                        from ..palace import mine_palace_lock
+
+                        with mine_palace_lock(palace_path):
+                            self._init_schema(conn)
+                    handle.has_dimension_column = "dimension" in {
+                        row[1] for row in conn.execute("PRAGMA table_info(collections)")
+                    }
+                    handle.has_locus_columns = _documents_has_locus_columns(conn)
             except BaseException:
                 conn.close()
                 raise
-            self._clients[palace_path] = handle
+            clients[palace_path] = handle
             return handle
 
     def _init_schema(self, conn: sqlite3.Connection) -> None:
@@ -926,6 +1684,7 @@ class SQLiteExactBackend(BaseBackend):
         columns = {row[1] for row in conn.execute("PRAGMA table_info(collections)").fetchall()}
         if "dimension" not in columns:
             conn.execute("ALTER TABLE collections ADD COLUMN dimension INTEGER")
+        self._ensure_locus_columns(conn)
         try:
             conn.execute(
                 """
@@ -950,18 +1709,57 @@ class SQLiteExactBackend(BaseBackend):
             )
         conn.commit()
 
+    @staticmethod
+    def _ensure_locus_columns(conn: sqlite3.Connection) -> None:
+        """Add VIRTUAL wing/room/hall columns, the locus index, and source_file.
+
+        VIRTUAL generated columns are metadata-only (no table rewrite), so a
+        1.6 GB palace does not copy embedding blobs. CREATE INDEX walks
+        metadata_json once and stores the loci. Existing palaces migrate
+        here on the next writable open. The source_file expression index is
+        the closet-enrichment lookup (``get(where={source_file})``).
+        """
+        cols = _document_column_names(conn)
+        for field in _LOCUS_FIELDS:
+            if field in cols:
+                continue
+            try:
+                conn.execute(
+                    f"ALTER TABLE documents ADD COLUMN {field} TEXT "
+                    f"GENERATED ALWAYS AS (json_extract(metadata_json, '$.{field}')) VIRTUAL"
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+        conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS {_LOCUS_INDEX}
+                ON documents(collection_id, wing, room, hall)
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS {_SOURCE_FILE_INDEX}
+                ON documents(
+                    collection_id,
+                    (json_extract(metadata_json, '$.source_file'))
+                )
+            """
+        )
+
     def get_collection(
         self,
         *args,
         **kwargs,
     ) -> SQLiteExactCollection:
-        palace, collection_name, create = self._normalize_args(args, kwargs)
+        palace, collection_name, create, read_only = self._normalize_args(args, kwargs)
+        self.require_namespace_support(palace)
         palace_path = palace.local_path
         if palace_path is None:
             raise PalaceNotFoundError("SQLiteExactBackend requires PalaceRef.local_path")
         if not create and not os.path.isdir(palace_path):
             raise PalaceNotFoundError(palace_path)
-        handle = self._connect(palace_path, create=create)
+        handle = self._connect(palace_path, create=create, read_only=read_only)
         with handle.lock:
             row = handle.conn.execute(
                 "SELECT id FROM collections WHERE name = ?",
@@ -970,12 +1768,15 @@ class SQLiteExactBackend(BaseBackend):
             if row is None:
                 if not create:
                     raise CollectionNotInitializedError(collection_name)
-                handle.conn.execute(
-                    "INSERT INTO collections(name, created_at) VALUES (?, ?)",
-                    (collection_name, _utcnow()),
-                )
-                handle.conn.commit()
-        return SQLiteExactCollection(handle, collection_name)
+                from ..palace import mine_palace_lock
+
+                with mine_palace_lock(palace_path):
+                    handle.conn.execute(
+                        "INSERT INTO collections(name, created_at) VALUES (?, ?)",
+                        (collection_name, _utcnow()),
+                    )
+                    handle.conn.commit()
+        return SQLiteExactCollection(handle, collection_name, backend=self)
 
     @staticmethod
     def _normalize_args(args, kwargs):
@@ -985,10 +1786,11 @@ class SQLiteExactBackend(BaseBackend):
                 raise TypeError("palace= must be a PalaceRef instance")
             collection_name = kwargs.pop("collection_name")
             create = bool(kwargs.pop("create", False))
-            kwargs.pop("options", None)
+            options = kwargs.pop("options", None) or {}
+            read_only = bool(options.get("read_only", False))
             if args or kwargs:
                 raise TypeError("unexpected arguments to get_collection")
-            return palace, collection_name, create
+            return palace, collection_name, create, read_only
         if args:
             palace_path = args[0]
             rest = list(args[1:])
@@ -996,18 +1798,32 @@ class SQLiteExactBackend(BaseBackend):
             if collection_name is None:
                 raise TypeError("collection_name is required")
             create = kwargs.pop("create", False)
+            options = kwargs.pop("options", None) or {}
+            read_only = bool(options.get("read_only", False))
             if rest:
                 create = rest.pop(0)
             if rest or kwargs:
                 raise TypeError("unexpected arguments to get_collection")
-            return PalaceRef(id=palace_path, local_path=palace_path), collection_name, bool(create)
+            return (
+                PalaceRef(id=palace_path, local_path=palace_path),
+                collection_name,
+                bool(create),
+                read_only,
+            )
         if "palace_path" in kwargs:
             palace_path = kwargs.pop("palace_path")
             collection_name = kwargs.pop("collection_name")
             create = bool(kwargs.pop("create", False))
+            options = kwargs.pop("options", None) or {}
+            read_only = bool(options.get("read_only", False))
             if kwargs:
                 raise TypeError("unexpected arguments to get_collection")
-            return PalaceRef(id=palace_path, local_path=palace_path), collection_name, create
+            return (
+                PalaceRef(id=palace_path, local_path=palace_path),
+                collection_name,
+                create,
+                read_only,
+            )
         raise TypeError("get_collection requires palace= or a positional palace_path")
 
     def close_palace(self, palace: PalaceRef | str) -> None:
@@ -1015,11 +1831,16 @@ class SQLiteExactBackend(BaseBackend):
         if path is None:
             return
         with self._clients_lock:
-            cached = self._clients.pop(path, None)
-        if cached is not None:
-            with cached.lock:
-                cached.closed = True
-                cached.conn.close()
+            self._palace_lifetimes.pop(path, None)
+            cached_handles = [
+                self._clients.pop(path, None),
+                self._read_only_clients.pop(path, None),
+            ]
+        for cached in cached_handles:
+            if cached is not None:
+                with cached.lock:
+                    cached.closed = True
+                    cached.conn.close()
 
     def close(self) -> None:
         # Flip _closed under the registry lock so a concurrent _connect either
@@ -1028,8 +1849,10 @@ class SQLiteExactBackend(BaseBackend):
         # Unlocked readers of _closed elsewhere are advisory fast-fails; the
         # locked recheck in _connect is the authoritative gate.
         with self._clients_lock:
-            handles = list(self._clients.values())
+            handles = list(self._clients.values()) + list(self._read_only_clients.values())
             self._clients.clear()
+            self._read_only_clients.clear()
+            self._palace_lifetimes.clear()
             self._closed = True
         for handle in handles:
             with handle.lock:
@@ -1053,15 +1876,16 @@ class SQLiteExactBackend(BaseBackend):
         behind because the SQLite header is written on the first statement,
         not on connection. The 16-byte ``SQLite format 3\\x00`` magic prefix
         accepts every real palace while rejecting empty / garbage files. See #1893.
+
+        The probe goes through :func:`mempalace.backends._magic.has_sqlite_magic`
+        and never opens a plain descriptor on the file: ``detect()`` runs on
+        nearly every MCP tool call, and closing a non-SQLite descriptor on the
+        database this backend already holds a WAL connection to drops every
+        POSIX lock the process owns on that inode -- including the SHARED lock
+        that stops an external ``close()`` from checkpointing and unlinking the
+        live ``-wal`` / ``-shm`` sidecars.
         """
-        db_path = os.path.join(path, _DB_FILENAME)
-        if not os.path.isfile(db_path):
-            return False
-        try:
-            with open(db_path, "rb") as f:
-                return f.read(16) == b"SQLite format 3\x00"
-        except OSError:
-            return False
+        return has_sqlite_magic(os.path.join(path, _DB_FILENAME))
 
     def create_collection(self, palace_path: str, collection_name: str) -> SQLiteExactCollection:
         return self.get_collection(palace_path, collection_name, create=True)

@@ -23,14 +23,13 @@ import os
 import sys
 import json
 import re
-import string
 import shutil
 import tempfile
 import argparse
 import urllib.request
 import urllib.error
 from pathlib import Path
-from collections import Counter, defaultdict
+from collections import defaultdict
 from datetime import datetime
 
 import chromadb
@@ -87,35 +86,6 @@ CATEGORIES = {
     4: "Open-domain",
     5: "Adversarial",
 }
-
-
-# =============================================================================
-# METRICS (from LoCoMo's evaluation.py)
-# =============================================================================
-
-
-def normalize_answer(s):
-    """Normalize answer for F1 comparison."""
-    s = s.replace(",", "")
-    s = re.sub(r"\b(a|an|the|and)\b", " ", s)
-    s = " ".join(s.split())
-    s = "".join(ch for ch in s if ch not in string.punctuation)
-    return s.lower().strip()
-
-
-def f1_score(prediction, ground_truth):
-    """Token-level F1 with normalization."""
-    pred_tokens = normalize_answer(prediction).split()
-    truth_tokens = normalize_answer(ground_truth).split()
-    if not pred_tokens or not truth_tokens:
-        return float(pred_tokens == truth_tokens)
-    common = Counter(pred_tokens) & Counter(truth_tokens)
-    num_same = sum(common.values())
-    if num_same == 0:
-        return 0.0
-    precision = num_same / len(pred_tokens)
-    recall = num_same / len(truth_tokens)
-    return (2 * precision * recall) / (precision + recall)
 
 
 # =============================================================================
@@ -443,34 +413,6 @@ def _assign_room(session_text, api_key, model="claude-haiku-4-5-20251001"):
     return "general"
 
 
-def _route_question(question, api_key, model="claude-haiku-4-5-20251001"):
-    """Ask LLM which 1-2 rooms a question is about. Returns list of room names."""
-    prompt = (
-        f"Which 1 or 2 rooms from the list below does this question relate to?\n"
-        f"Reply with ONLY room name(s), comma-separated if two, nothing else.\n\n"
-        f"Rooms:\n{_PALACE_ROOM_LIST}\n\n"
-        f"Question: {question}"
-    )
-    raw = _llm_call(prompt, api_key, model=model, max_tokens=40)
-    raw_lower = raw.lower()
-    found = []
-    for room in PALACE_ROOMS:
-        if room in raw_lower:
-            found.append(room)
-        if len(found) >= 2:
-            break
-    if not found:
-        # fallback: partial word match
-        for part in re.split(r"[,\s]+", raw_lower):
-            part = part.strip("_").strip()
-            for room in PALACE_ROOMS:
-                if part and part in room and room not in found:
-                    found.append(room)
-                if len(found) >= 2:
-                    break
-    return found or PALACE_ROOMS  # if routing fails, search everywhere
-
-
 def palace_assign_rooms(sessions, sample_id, api_key, cache, model="claude-haiku-4-5-20251001"):
     """
     Assign each session to a palace room. Uses cache to avoid re-calling LLM.
@@ -636,7 +578,7 @@ def run_benchmark(
     llm_base_url="",
 ):
     """Run LoCoMo retrieval benchmark."""
-    with open(data_file) as f:
+    with open(data_file, encoding="utf-8") as f:
         data = json.load(f)
 
     if limit > 0:
@@ -661,11 +603,11 @@ def run_benchmark(
             Path(__file__).parent / "palace_cache_locomo.json"
         )
         if Path(_palace_cache_path).exists():
-            with open(_palace_cache_path) as f:
+            with open(_palace_cache_path, encoding="utf-8") as f:
                 palace_cache = json.load(f)
             print(f"  Palace cache: {len(palace_cache)} room assignments loaded")
 
-    rerank_label = f" + LLM re-rank ({llm_model.split('-')[1]})" if llm_rerank_enabled else ""
+    rerank_label = f" + LLM re-rank ({llm_model})" if llm_rerank_enabled else ""
 
     print(f"\n{'=' * 60}")
     print("  MemPal × LoCoMo Benchmark")
@@ -675,7 +617,7 @@ def run_benchmark(
     print(f"  Top-k:       {top_k}")
     print(f"  Mode:        {mode}{rerank_label}")
     print(f"  Granularity: {granularity}")
-    print(f"{'─' * 60}\n")
+    print(f"{'-' * 60}\n")
 
     all_recall = []
     per_category = defaultdict(list)
@@ -703,14 +645,14 @@ def run_benchmark(
             )
             # Persist updated cache after each conversation
             if _palace_cache_path:
-                with open(_palace_cache_path, "w") as f:
+                with open(_palace_cache_path, "w", encoding="utf-8") as f:
                     json.dump(palace_cache, f, indent=2)
             rooms_summary = {}
             for sid, room in room_assignments.items():
                 rooms_summary[room] = rooms_summary.get(room, 0) + 1
             print(
                 f"  [{conv_idx + 1}/{len(data)}] {sample_id}: "
-                f"{len(sessions)} sessions → {len(rooms_summary)} rooms, {len(qa_pairs)} questions"
+                f"{len(sessions)} sessions -> {len(rooms_summary)} rooms, {len(qa_pairs)} questions"
             )
             print(f"    Rooms: {dict(sorted(rooms_summary.items(), key=lambda x: -x[1]))}")
         else:
@@ -977,7 +919,7 @@ def run_benchmark(
     print(f"\n{'=' * 60}\n")
 
     if out_file:
-        with open(out_file, "w") as f:
+        with open(out_file, "w", encoding="utf-8") as f:
             json.dump(results_log, f, indent=2)
         print(f"  Results saved to: {out_file}")
 

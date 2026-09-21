@@ -40,12 +40,14 @@ from __future__ import annotations
 
 import json
 import logging
+import stat
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Optional
 
 from .palace import get_collection
+from .source_identity import source_directory_identity
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +103,16 @@ def parse_claude_jsonl(path: str) -> Iterator[dict]:
     queue-operation, last-prompt) are filtered out. Malformed lines are
     skipped silently — data quality is the transcript writer's problem,
     not ours.
+
+    Raises ``OSError`` when ``path`` is not a regular file. ``rglob`` in
+    ``sweep_directory`` lists a FIFO named ``session.jsonl`` like any
+    other match, and opening one for reading blocks in the kernel until a
+    writer appears — an unbounded hang for the whole sweep. ``stat`` never
+    blocks on one, and it raises for a missing path exactly as ``open``
+    did before, so callers see the same error for the same mistake.
     """
+    if not stat.S_ISREG(Path(path).stat().st_mode):
+        raise OSError(f"Refusing non-regular file: {path}")
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
@@ -230,34 +241,60 @@ def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None)
         nonlocal drawers_added, drawers_already_present
         if not batch_ids:
             return
-        # Pre-flight: which IDs in this batch are already present?
-        # Upsert is idempotent on data but counts as "added" would lie;
-        # this pre-query makes the metric honest (Copilot PR 998 review).
+        # Collapse repeated deterministic IDs before backend calls.
+        # Rewritten transcripts can contain the same message UUID more than
+        # once, and Chroma rejects duplicate IDs in one get or upsert request.
+        # Reassigning a dict key preserves its first position but replaces its
+        # value, so the final occurrence supplies the document and metadata.
+        deduped: dict[str, tuple[str, dict]] = {}
+        for drawer_id, document, metadata in zip(
+            batch_ids,
+            batch_docs,
+            batch_metas,
+        ):
+            deduped[drawer_id] = (document, metadata)
+
+        unique_ids = list(deduped)
+        unique_docs = [deduped[drawer_id][0] for drawer_id in unique_ids]
+        unique_metas = [deduped[drawer_id][1] for drawer_id in unique_ids]
+
+        # Pre-flight: which unique IDs are already present?
         try:
-            existing = collection.get(ids=list(batch_ids), include=[])
-            # Chroma returns a dict; typed backends return GetResult — the
-            # compat shim makes ``.get("ids")`` work on both.
+            existing = collection.get(
+                ids=unique_ids,
+                include=[],
+            )
+            # Chroma returns a dict; typed backends return GetResult - the
+            # compatibility shim makes .get("ids") work on both.
             present = set(existing.get("ids") or [])
         except Exception as exc:
             logger.warning(
                 "sweeper: existence pre-check failed (%s); "
-                "counting all batch rows as new (metric may over-count on reruns).",
+                "counting all unique batch rows as new "
+                "(metric may over-count on reruns).",
                 exc,
             )
             present = set()
-        new_count = sum(1 for rid in batch_ids if rid not in present)
-        already_count = len(batch_ids) - new_count
+
+        new_count = sum(1 for drawer_id in unique_ids if drawer_id not in present)
+        already_count = len(unique_ids) - new_count
 
         collection.upsert(
-            ids=batch_ids,
-            documents=batch_docs,
-            metadatas=batch_metas,
+            ids=unique_ids,
+            documents=unique_docs,
+            metadatas=unique_metas,
         )
         drawers_added += new_count
         drawers_already_present += already_count
         batch_ids.clear()
         batch_docs.clear()
         batch_metas.clear()
+
+    # Established once per transcript, before any drawer is built, and taken
+    # from the directory of the path that goes into ``source_file`` below.
+    # ``sync`` looks the drawer up by that path, so an identity read from any
+    # other directory would answer for something the drawer never names.
+    source_dir_ino = source_directory_identity(source_label or jsonl_path)
 
     for rec in parse_claude_jsonl(jsonl_path):
         sid = rec["session_id"]
@@ -280,6 +317,10 @@ def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None)
             "filed_at": datetime.now().isoformat(),
             "ingest_mode": "sweep",
         }
+        # The directory this drawer's ``source_file`` sits in, so ``sync``
+        # decides a swept drawer by the same reading as a mined one (#2320).
+        if source_dir_ino:
+            metadata["source_dir_ino"] = source_dir_ino
 
         batch_ids.append(drawer_id)
         batch_docs.append(document)
@@ -317,6 +358,27 @@ def sweep_directory(dir_path: str, palace_path: str) -> dict:
 
     failures: list[dict] = []
     for f in files:
+        # A non-regular match is not a sweep failure, it is nothing to sweep.
+        # ``rglob`` lists a FIFO or a symlink to /dev/null like any other
+        # ``*.jsonl``; report it the way ``miner.scan_project`` reports one
+        # and leave ``failures`` (and the exit status) for real errors.
+        # ``parse_claude_jsonl`` still refuses one, for callers arriving by
+        # another route.
+        try:
+            regular = stat.S_ISREG(f.stat().st_mode)
+        except OSError as exc:
+            # A stat that FAILS is a real error, not a benign type. A dangling
+            # symlink, a symlink loop and a file unlinked between rglob and
+            # here all land here, and every one of them used to reach ``open``
+            # and be booked below. Keep booking them, or ``sweep`` reports
+            # success on a transcript it could not read.
+            logger.error("sweeper: stat failed on %s: %s", f, exc)
+            print(f"  WARNING: stat failed on {f}: {exc}", file=sys.stderr)
+            failures.append({"file": str(f), "error": str(exc)})
+            continue
+        if not regular:
+            print(f"  SKIP: {f.name} (not a regular file)", file=sys.stderr)
+            continue
         try:
             result = sweep(str(f), palace_path, source_label=str(f))
         except Exception as exc:

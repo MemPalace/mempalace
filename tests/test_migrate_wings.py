@@ -7,7 +7,12 @@ stay discoverable under the new name, merging collisions. IDs are left untouched
 (they are opaque keys), and the pass is idempotent.
 """
 
-from mempalace.migrate import migrate_wing_names, plan_wing_renames
+from mempalace.migrate import (
+    migrate_wing_names,
+    plan_tunnel_wing_renames,
+    plan_wing_renames,
+)
+from mempalace.palace_graph import _canonical_tunnel_id
 
 
 # --- pure planner ---------------------------------------------------------
@@ -69,6 +74,71 @@ def test_plan_renames_applies_explicit_consolidation_map():
     )
     assert dict(summary) == {("wing_claude", "sessions"): 1}
     assert updates == [("d1", {"wing": "sessions", "room": "diary"})]
+
+
+def _tunnel(source_wing, target_wing, *, label="kept", marker=None):
+    tunnel = {
+        "id": _canonical_tunnel_id(source_wing, "source-room", target_wing, "target-room"),
+        "source": {"wing": source_wing, "room": "source-room", "drawer_id": "source-id"},
+        "target": {"wing": target_wing, "room": "target-room", "drawer_id": "target-id"},
+        "label": label,
+        "kind": "explicit",
+    }
+    if marker is not None:
+        tunnel["marker"] = marker
+    return tunnel
+
+
+def test_plan_tunnel_renames_source_endpoint_and_preserves_metadata():
+    planned, changed, collisions = plan_tunnel_wing_renames(
+        [_tunnel("wing_claude", "knowledge")], {"wing_claude": "sessions"}
+    )
+
+    assert (changed, collisions) == (1, 0)
+    assert planned[0]["source"] == {
+        "wing": "sessions",
+        "room": "source-room",
+        "drawer_id": "source-id",
+    }
+    assert planned[0]["target"]["wing"] == "knowledge"
+    assert planned[0]["label"] == "kept"
+    assert planned[0]["kind"] == "explicit"
+    assert planned[0]["id"] == _canonical_tunnel_id(
+        "sessions", "source-room", "knowledge", "target-room"
+    )
+
+
+def test_plan_tunnel_renames_target_endpoint():
+    planned, changed, collisions = plan_tunnel_wing_renames(
+        [_tunnel("knowledge", "wing_claude")], {"wing_claude": "sessions"}
+    )
+
+    assert (changed, collisions) == (1, 0)
+    assert planned[0]["source"]["wing"] == "knowledge"
+    assert planned[0]["target"]["wing"] == "sessions"
+
+
+def test_plan_tunnel_renames_both_endpoints():
+    planned, changed, collisions = plan_tunnel_wing_renames(
+        [_tunnel("wing_claude", "wing_codex")],
+        {"wing_claude": "sessions", "wing_codex": "sessions"},
+    )
+
+    assert (changed, collisions) == (1, 0)
+    assert planned[0]["source"]["wing"] == "sessions"
+    assert planned[0]["target"]["wing"] == "sessions"
+
+
+def test_plan_tunnel_renames_collision_prefers_existing_destination():
+    destination = _tunnel("sessions", "knowledge", label="destination", marker="winner")
+    legacy = _tunnel("wing_claude", "knowledge", label="legacy", marker="discarded")
+
+    planned, changed, collisions = plan_tunnel_wing_renames(
+        [legacy, destination], {"wing_claude": "sessions"}
+    )
+
+    assert (changed, collisions) == (1, 1)
+    assert planned == [destination]
 
 
 # --- integration over a real backend collection ---------------------------
@@ -145,6 +215,9 @@ def test_migrate_merges_collision_into_existing_wing(tmp_path):
 
 
 def test_migrate_applies_explicit_consolidation_map(tmp_path):
+    from mempalace.config import MempalaceConfig
+    from mempalace.palace_graph import _load_tunnels, _save_tunnels
+
     palace = tmp_path / "palace"
     palace.mkdir()
     _seed(
@@ -167,6 +240,8 @@ def test_migrate_applies_explicit_consolidation_map(tmp_path):
             },
         ],
     )
+    tunnel_config = MempalaceConfig(palace_path=palace)
+    _save_tunnels([_tunnel("wing_claude", "master-brain")], tunnel_config)
 
     assert (
         migrate_wing_names(
@@ -183,6 +258,12 @@ def test_migrate_applies_explicit_consolidation_map(tmp_path):
     }
     assert _wing_ids(palace, "wing_claude") == set()
     assert _wing_ids(palace, "master-brain") == {"drawer_master_r_3"}
+    migrated_tunnels = _load_tunnels(tunnel_config)
+    assert migrated_tunnels[0]["source"]["wing"] == "sessions"
+    assert migrated_tunnels[0]["target"]["wing"] == "master-brain"
+    assert migrated_tunnels[0]["id"] == _canonical_tunnel_id(
+        "sessions", "source-room", "master-brain", "target-room"
+    )
 
 
 def test_migrate_dry_run_changes_nothing(tmp_path):

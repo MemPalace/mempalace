@@ -84,7 +84,7 @@ def export_palace(palace_path: str, output_dir: str, format: str = "markdown") -
     total = col.count()
 
     if total == 0:
-        print("  Palace is empty — nothing to export.")
+        print("  Palace is empty -- nothing to export.")
         return {"wings": 0, "rooms": 0, "drawers": 0}
 
     _reject_symlink(output_dir, "output_dir")

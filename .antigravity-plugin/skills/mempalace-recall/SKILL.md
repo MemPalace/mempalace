@@ -65,8 +65,11 @@ and violates MemPalace's "memory should feel instant" budget.
 5. **After a substantive session**, record continuity with
    `mempalace_diary_write` (background hooks may already do this — do not
    double-file).
-6. **When a fact changes**, call `mempalace_kg_invalidate` on the old
-   fact, then `mempalace_kg_add` for the new one.
+6. **When a fact changes**, choose the operation that preserves temporal
+   history: use `mempalace_kg_supersede` for single-valued replacements
+   (model, employer, owner, address, current status),
+   `mempalace_kg_invalidate` for facts that ended without replacement,
+   and `mempalace_kg_add` for independent/coexisting facts.
 
 The full canonical protocol — shared verbatim with the Antigravity
 recall rule and the other integrations — lives in
@@ -78,6 +81,7 @@ recall rule and the other integrations — lives in
 |---|---|
 | Find any memory by meaning | `mempalace_search` (start here) |
 | Relational / time-bound facts about an entity | `mempalace_kg_query` |
+| Replace a single-valued fact | `mempalace_kg_supersede` |
 | The chronological story of an entity | `mempalace_kg_timeline` |
 | Recent session continuity | `mempalace_diary_read` |
 | Which wings / rooms exist (scope unknown) | `mempalace_list_wings`, `mempalace_list_rooms` |
@@ -97,8 +101,9 @@ question — not a system prompt or pasted conversation) plus optional
   installer `hooks/antigravity/install.sh`). Do not silently fall back
   to guessing from model memory.
 - **Stale or conflicting facts.** Prefer the knowledge graph's
-  time-valid answer; if a fact has changed, invalidate the old one and
-  add the new one rather than overwriting context silently.
+  time-valid answer. Use `mempalace_kg_supersede` for single-valued replacements,
+  `mempalace_kg_invalidate` for facts that ended without replacement,
+  and `mempalace_kg_add` for independent/coexisting facts.
 
 ## Anti-patterns — never do these
 

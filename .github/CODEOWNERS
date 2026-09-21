@@ -1,13 +1,19 @@
+# Every owner listed here must have write access to the repository —
+# GitHub silently ignores a rule naming a user who does not, which
+# leaves the matching paths with no reviewer at all.
+
 # Default owners for everything
-* @milla-jovovich @bensig @igorls
+* @milla-jovovich @igorls
 
 # Core library
-mempalace/ @milla-jovovich @bensig
+mempalace/ @milla-jovovich @igorls
 
 # CI and workflows
-.github/ @bensig
+.github/ @igorls
 
 # Plugins and integrations
-.claude-plugin/ @bensig
-.codex-plugin/ @bensig
-integrations/ @bensig
+.antigravity-plugin/ @igorls
+.claude-plugin/ @igorls
+.codex-plugin/ @igorls
+.cursor-plugin/ @igorls
+integrations/ @igorls

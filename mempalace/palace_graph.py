@@ -33,6 +33,7 @@ from .config import MempalaceConfig, normalize_wing_name
 from .dynamics import initialize_dynamics_fields
 from .palace import get_collection as _get_palace_collection
 from .palace import mine_lock
+from .backends.base import BaseCollection
 
 logger = logging.getLogger("mempalace_graph")
 
@@ -66,6 +67,111 @@ _graph_cache_time = 0.0
 _GRAPH_CACHE_TTL = 60.0  # seconds — graph changes less often than metadata
 
 
+def sqlite_grouped_counts_reader(config=None):
+    """Return the backend's grouped-counts function, or ``None``.
+
+    ``None`` means the sqlite path cannot serve this palace and the caller
+    should use the collection — which is also how a missing or unreadable
+    palace keeps reporting a real diagnostic instead of an empty graph.
+
+    The backend is resolved from *configuration*, not by sniffing the palace
+    directory for db files: a directory holding artifacts for two backends is
+    a ``BackendMismatchError`` on every normal path, and sniffing would quietly
+    pick one instead of surfacing that.
+    """
+    config = config or MempalaceConfig()
+    if not config.palace_path:
+        return None
+    try:
+        from .palace import resolve_backend_name
+
+        backend = resolve_backend_name(
+            config.palace_path, explicit=os.environ.get("MEMPALACE_BACKEND_EXPLICIT")
+        )
+        if backend == "chroma":
+            from .backends.chroma import sqlite_room_wing_hall_counts
+
+            db_name = "chroma.sqlite3"
+        elif backend in {"sqlite_exact", "rust_exact"}:
+            from .backends.sqlite_exact import _DB_FILENAME as db_name
+            from .backends.sqlite_exact import sqlite_room_wing_hall_counts
+        else:
+            return None
+        if not os.path.isfile(os.path.join(config.palace_path, db_name)):
+            return None
+        return sqlite_room_wing_hall_counts
+    except Exception:
+        logger.debug("backend resolution for the sqlite graph path failed", exc_info=True)
+    return None
+
+
+def _try_sqlite_nodes_edges(config=None):
+    """Build graph nodes/edges from backend sqlite metadata, no HNSW.
+
+    Returns ``(nodes, edges)`` or ``None`` when the palace is not a sqlite
+    backend we know how to read, so the caller falls back to client paging.
+    """
+    config = config or MempalaceConfig()
+    reader = sqlite_grouped_counts_reader(config)
+    if reader is None:
+        return None
+    try:
+        rows = reader(config.palace_path, config.collection_name)
+    except Exception:
+        logger.debug("sqlite graph path failed; falling back to client paging", exc_info=True)
+        return None
+    if rows is None:
+        return None
+    return _nodes_edges_from_grouped_rows(rows)
+
+
+def _nodes_edges_from_grouped_rows(rows):
+    """Mirror ``build_graph``'s per-drawer filter from grouped rows.
+
+    Rows are ``(room, wing, hall, n)`` with an optional fifth ``last_date``
+    column — backends that cannot supply a date still work, they just leave
+    ``dates`` empty as the client path does for undated drawers.
+    """
+    room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0, "dates": set()})
+    for row in rows:
+        room, wing, hall, n = row[0], row[1], row[2], row[3]
+        last_date = row[4] if len(row) > 4 else ""
+        if not room or not wing:
+            continue
+        node = room_data[str(room)]
+        node["wings"].add(str(wing))
+        if hall:
+            node["halls"].add(str(hall))
+        if last_date:
+            node["dates"].add(str(last_date))
+        node["count"] += int(n)
+    edges = []
+    nodes = {}
+    for room, data in room_data.items():
+        wings = sorted(data["wings"])
+        halls = sorted(data["halls"])
+        nodes[room] = {
+            "wings": wings,
+            "halls": halls,
+            "count": data["count"],
+            "dates": sorted(data["dates"])[-5:] if data["dates"] else [],
+        }
+        if len(wings) >= 2:
+            for i, wa in enumerate(wings):
+                for wb in wings[i + 1 :]:
+                    for hall in halls:
+                        edges.append(
+                            {
+                                "room": room,
+                                "wing_a": wa,
+                                "wing_b": wb,
+                                "hall": hall,
+                                "count": data["count"],
+                            }
+                        )
+    return nodes, edges
+
+
 def invalidate_graph_cache():
     """Clear the graph cache. Called from mcp_server.py on writes."""
     global _graph_cache_nodes, _graph_cache_edges, _graph_cache_time
@@ -85,6 +191,27 @@ def _get_collection(config=None):
         )
     except Exception:
         return None
+
+
+def _iter_all_metadata(col):
+    """Yield every drawer's metadata using the backend's own cursor (#2452).
+
+    ``get_all_metadata`` (#1796) is a single pass on every backend; the
+    offset loop it replaces is O(n^2) on qdrant, where each page re-walks the
+    collection from the start. The loop is kept only for collection objects
+    that predate the contract method.
+    """
+    if isinstance(col, BaseCollection):
+        yield from col.get_all_metadata()
+        return
+    total = col.count()
+    offset = 0
+    while offset < total:
+        batch = col.get(limit=1000, offset=offset, include=["metadatas"])
+        yield from batch["metadatas"]
+        if not batch["ids"]:
+            break
+        offset += len(batch["ids"])
 
 
 def build_graph(col=None, config=None):
@@ -110,42 +237,46 @@ def build_graph(col=None, config=None):
         if _graph_cache_nodes is not None and (now - _graph_cache_time) < _GRAPH_CACHE_TTL:
             return _graph_cache_nodes, _graph_cache_edges
 
+    # Only when the caller did not pass a collection: MCP tools. Tests that
+    # inject ``col=`` keep the client paging path against that collection.
     if col is None:
+        sqlite_graph = _try_sqlite_nodes_edges(config)
+        if sqlite_graph is not None:
+            nodes, edges = sqlite_graph
+            if nodes:
+                with _graph_cache_lock:
+                    _graph_cache_nodes = nodes
+                    _graph_cache_edges = edges
+                    _graph_cache_time = time.time()
+            return nodes, edges
         col = _get_collection(config)
     if not col:
         return {}, []
 
-    total = col.count()
     room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0, "dates": set()})
 
-    offset = 0
-    while offset < total:
-        batch = col.get(limit=1000, offset=offset, include=["metadatas"])
-        for meta in batch["metadatas"]:
-            # ChromaDB can return ``None`` for drawers without metadata
-            # (legacy data, partial writes — upstream #1020 territory).
-            # Skip these silently rather than crash the whole graph
-            # build — a single None drawer shouldn't take down /stats
-            # or any caller of build_graph for the entire palace. Caught
-            # 2026-04-25 by palace-daemon's verify-routes.sh smoke test
-            # against the canonical 151K palace. Closes the same gap as
-            # upstream #999 / fork PR #1094 in a different read path.
-            if meta is None:
-                continue
-            room = meta.get("room", "")
-            wing = meta.get("wing", "")
-            hall = meta.get("hall", "")
-            date = meta.get("date", "")
-            if room and room != "general" and wing:
-                room_data[room]["wings"].add(wing)
-                if hall:
-                    room_data[room]["halls"].add(hall)
-                if date:
-                    room_data[room]["dates"].add(date)
-                room_data[room]["count"] += 1
-        if not batch["ids"]:
-            break
-        offset += len(batch["ids"])
+    for meta in _iter_all_metadata(col):
+        # ChromaDB can return ``None`` for drawers without metadata
+        # (legacy data, partial writes — upstream #1020 territory).
+        # Skip these silently rather than crash the whole graph
+        # build — a single None drawer shouldn't take down /stats
+        # or any caller of build_graph for the entire palace. Caught
+        # 2026-04-25 by palace-daemon's verify-routes.sh smoke test
+        # against the canonical 151K palace. Closes the same gap as
+        # upstream #999 / fork PR #1094 in a different read path.
+        if meta is None:
+            continue
+        room = meta.get("room", "")
+        wing = meta.get("wing", "")
+        hall = meta.get("hall", "")
+        date = meta.get("date", "")
+        if room and wing:
+            room_data[room]["wings"].add(wing)
+            if hall:
+                room_data[room]["halls"].add(hall)
+            if date:
+                room_data[room]["dates"].add(date)
+            room_data[room]["count"] += 1
 
     # Build edges from rooms that span multiple wings
     edges = []
@@ -293,24 +424,37 @@ def find_tunnels(wing_a: str = None, wing_b: str = None, col=None, config=None):
 
 
 def graph_stats(col=None, config=None):
-    """Summary statistics about the palace graph."""
+    """Summary statistics about the palace graph.
+
+    ``total_rooms`` keeps its historical meaning: unique room-name nodes in
+    the passive graph. ``total_room_instances`` counts distinct (wing, room)
+    placements, which is the number users naturally compare with ``status``.
+    Explicit tunnel records are reported separately so the overview does not
+    silently omit agent-created graph connections.
+    """
     nodes, edges = build_graph(col, config)
 
-    tunnel_rooms = sum(1 for n in nodes.values() if len(n["wings"]) >= 2)
+    passive_tunnel_rooms = sum(1 for n in nodes.values() if len(n["wings"]) >= 2)
+    total_room_instances = sum(len(n["wings"]) for n in nodes.values())
+    explicit_tunnel_count = len(_load_tunnels(config))
     wing_counts = Counter()
     for data in nodes.values():
-        for w in data["wings"]:
-            wing_counts[w] += 1
+        for wing in data["wings"]:
+            wing_counts[wing] += 1
 
     return {
         "total_rooms": len(nodes),
-        "tunnel_rooms": tunnel_rooms,
+        "total_room_instances": total_room_instances,
+        "tunnel_rooms": passive_tunnel_rooms,
+        "passive_tunnel_rooms": passive_tunnel_rooms,
+        "explicit_tunnels": explicit_tunnel_count,
         "total_edges": len(edges),
+        "total_connections": len(edges) + explicit_tunnel_count,
         "rooms_per_wing": dict(wing_counts.most_common()),
         "top_tunnels": [
-            {"room": r, "wings": d["wings"], "count": d["count"]}
-            for r, d in sorted(nodes.items(), key=lambda x: -len(x[1]["wings"]))[:10]
-            if len(d["wings"]) >= 2
+            {"room": room, "wings": data["wings"], "count": data["count"]}
+            for room, data in sorted(nodes.items(), key=lambda item: -len(item[1]["wings"]))[:10]
+            if len(data["wings"]) >= 2
         ],
     }
 

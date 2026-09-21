@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import os
 import secrets
 import sqlite3
@@ -28,6 +29,12 @@ from urllib import request as urlrequest
 from urllib.parse import parse_qs, urlparse
 
 from .config import MempalaceConfig
+from .palace import (
+    MineAlreadyRunning,
+    backend_requires_single_writer,
+    mine_palace_lock,
+    resolve_backend_name,
+)
 
 HOST = "127.0.0.1"
 STATE_ROOT_ENV = "MEMPALACE_DAEMON_STATE_ROOT"
@@ -39,6 +46,39 @@ DEFAULT_WAIT_TIMEOUT = 60.0 * 60.0
 HOOK_PROBE_TIMEOUT = 0.5
 TERMINAL_STATES = {"succeeded", "failed", "cancelled"}
 MAX_ATTEMPTS = 3
+# ``error_class`` marking a job refused the per-palace write lock. The lock
+# wraps the palace write itself, so a refusal means no drawer was filed and
+# re-running cannot duplicate palace content. Distinct from a crash
+# mid-execution, whose outcome is unknown -- see ``QueueStore.defer``.
+LOCK_REFUSAL_ERROR_CLASS = "LockHeldByOtherProcess"
+_DEFAULT_LOCK_BACKOFF_SECONDS = 60.0
+
+
+def _lock_defer_backoff_seconds() -> float:
+    """Seconds a job refused the lock cools off before the worker re-claims it.
+
+    The holder keeps the lock for as long as its write runs, which can be a long
+    mine, so re-claiming at once would spin without progress. Anything that is
+    not a positive, finite number yields the default: a typo must not crash the
+    daemon at import; ``0`` or a negative value would make the cooldown expire
+    instantly and spin the worker against a lock it cannot take; and ``inf``
+    would park the job until the daemon restarts, which is the dropped work
+    #2014 is about.
+    """
+    try:
+        value = float(
+            os.environ.get("MEMPALACE_DAEMON_LOCK_BACKOFF_SECONDS", "")
+            or _DEFAULT_LOCK_BACKOFF_SECONDS
+        )
+    except ValueError:
+        return _DEFAULT_LOCK_BACKOFF_SECONDS
+    if not math.isfinite(value) or value <= 0:
+        return _DEFAULT_LOCK_BACKOFF_SECONDS
+    return value
+
+
+# Override via env for operators; tests patch the module attribute directly.
+LOCK_DEFER_BACKOFF_SECONDS = _lock_defer_backoff_seconds()
 MAX_BODY_BYTES = 1 << 20  # 1 MiB cap on request bodies (auth-gated DoS guard)
 SHUTDOWN_DRAIN_SECONDS = 10.0
 # Terminal jobs are kept for diagnostics then pruned so the queue DB (which
@@ -411,36 +451,67 @@ class QueueStore:
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
             return self._row_to_job(row)
 
-    def claim_next(self) -> Job | None:
+    def claim_next(self, *, exclude: set[str] | None = None) -> Job | None:
         # Atomic across processes: the UPDATE only fires if the row is still
         # 'queued'. If two daemon processes SELECT the same row, the first to
         # UPDATE it flips state to 'running' (rowcount=1); the second's UPDATE
         # matches 0 rows (WHERE state='queued' is now false) and we re-loop
         # instead of double-executing the job. The in-process RLock does not
         # protect against a second OS process — this guard does.
+        #
+        # ``exclude`` skips jobs still cooling off after a lock refusal, so the
+        # ordering below cannot hand back the same refused job forever while
+        # newer work waits behind it. The cooldown is the worker's, held in
+        # memory rather than the schema (which has no migrations): a restart
+        # just retries such a job at once, costing one refusal, never the work.
+        #
+        # The filter runs in Python rather than as ``id NOT IN (?, ?, ...)``:
+        # that binds one host parameter per cooling job, and
+        # SQLITE_MAX_VARIABLE_NUMBER defaults to 999 below SQLite 3.32 (we
+        # support Python 3.9, whose bundled SQLite can predate it). Over the cap
+        # the query raises into the worker's catch-all, which retries a second
+        # later against a set that only ages out on the cooldown, so the queue
+        # would stall in cooldown-long fits rather than drain. Fetching
+        # ``len(exclude) + 1`` rows costs one parameter and is enough by
+        # pigeonhole: at most ``len(exclude)`` of those rows can be excluded, so
+        # the first one that survives the filter is the row a plain LIMIT 1 would
+        # have returned.
+        #
+        # ``error_json`` is cleared because it describes the claim that just
+        # ended: ``defer`` parks the refusal reason on a queued job, and a stale
+        # one would outlive its cause -- reporting a lock refusal for a job that
+        # later crashed, and leaking into recover_running's dead-letter (which
+        # COALESCEs it) in place of ``MaxAttemptsExceeded``.
+        exclude = exclude or set()
         with self._lock, self._connect() as conn:
-            row = conn.execute(
+            # Only the ids: the rows being skipped are here to be discarded, and
+            # jobs carry verbatim payloads, so selecting * would materialise a
+            # cooling job's user content just to read its id past it.
+            candidates = conn.execute(
                 """
-                SELECT * FROM jobs
+                SELECT id FROM jobs
                 WHERE state = 'queued'
                 ORDER BY priority DESC, created_at ASC
-                LIMIT 1
-                """
-            ).fetchone()
-            if row is None:
+                LIMIT ?
+                """,
+                (len(exclude) + 1,),
+            ).fetchall()
+            job_id = next((r["id"] for r in candidates if r["id"] not in exclude), None)
+            if job_id is None:
                 return None
             cur = conn.execute(
                 """
                 UPDATE jobs
-                SET state = 'running', started_at = ?, attempts = attempts + 1
+                SET state = 'running', started_at = ?, attempts = attempts + 1,
+                    error_json = NULL
                 WHERE id = ? AND state = 'queued'
                 """,
-                (_now(), row["id"]),
+                (_now(), job_id),
             )
             if cur.rowcount != 1:
                 # Lost the race to another process — nothing to run this iteration.
                 return None
-            claimed = conn.execute("SELECT * FROM jobs WHERE id = ?", (row["id"],)).fetchone()
+            claimed = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
             return self._row_to_job(claimed)
 
     def finish(
@@ -472,6 +543,56 @@ class QueueStore:
                     json.dumps(result or {}, ensure_ascii=False),
                     json.dumps(error or {}, ensure_ascii=False) if error else None,
                     job_id,
+                ),
+            )
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            return self._row_to_job(row)
+
+    def defer(
+        self,
+        job_id: str,
+        *,
+        claimed_started_at: str | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> Job:
+        """Return a job refused the palace write lock to ``queued``, unspent.
+
+        ``mine_palace_lock`` wraps the palace write itself, so a refusal means
+        no drawer was filed and re-running cannot duplicate palace content.
+        That is what separates it from the failure ``MAX_ATTEMPTS`` guards -- a
+        daemon that died mid-execution, whose outcome is unknown and whose blind
+        retry would re-file verbatim content. Undoing ``claim_next``'s increment
+        keeps a palace that stays locked from spending the retry budget of work
+        that never landed.
+
+        ``error`` records why the job went back to the queue, so a job parked
+        behind a lock is distinguishable from one merely awaiting its turn.
+        ``claim_next`` clears it on the next claim, so the reason never outlives
+        the claim it describes.
+
+        The ``state = 'running'`` guard mirrors ``finish(only_if_running=True)``:
+        if shutdown already cancelled this job, deferring must not resurrect it.
+        ``claimed_started_at`` narrows the update further, to the claim that was
+        actually refused: if the row was re-queued and re-claimed in the window
+        (recover_running on another daemon start), a late defer must not throw
+        away that newer claim by re-queuing -- and refunding -- work it does not
+        own. ``None`` skips the check.
+        """
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET state = 'queued', started_at = NULL,
+                    attempts = MAX(attempts - 1, 0),
+                    error_json = ?
+                WHERE id = ? AND state = 'running'
+                  AND (? IS NULL OR started_at = ?)
+                """,
+                (
+                    json.dumps(error or {}, ensure_ascii=False) if error else None,
+                    job_id,
+                    claimed_started_at,
+                    claimed_started_at,
                 ),
             )
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
@@ -523,6 +644,24 @@ class QueueStore:
         )
 
 
+def job_deferred_by_lock(job: dict[str, Any]) -> bool:
+    """True when a job's last claim was refused the palace lock.
+
+    Such a job is deferred, not failed (#2014): it went back to the queue and
+    runs once the lock frees. That makes it non-terminal, so a caller blocking
+    until ``TERMINAL_STATES`` would wait out the holder -- which can be a
+    long-lived session. Interactive callers use this to report the parked job
+    instead of stranding the terminal.
+
+    Keyed on the reason ``defer`` records, which ``claim_next`` clears on the
+    next claim: the answer is about the claim that just ended, not a live probe
+    of the lock (the holder may already have exited during the backoff).
+    """
+    if job.get("state") != "queued":
+        return False
+    return (job.get("error") or {}).get("error_class") == LOCK_REFUSAL_ERROR_CLASS
+
+
 def job_to_dict(job: Job, *, include_payload: bool = True) -> dict[str, Any]:
     out = {
         "id": job.id,
@@ -551,6 +690,9 @@ class DaemonRuntime:
         self.worker_wake = threading.Event()
         self.active_job_id: str | None = None
         self.worker_thread: threading.Thread | None = None
+        # job_id -> monotonic deadline before which a lock-refused job is not
+        # re-claimed (#2014). Worker-owned; only _worker_loop touches it.
+        self._deferred_until: dict[str, float] = {}
 
     def start_worker(self) -> threading.Thread:
         self.store.recover_running()
@@ -579,12 +721,37 @@ class DaemonRuntime:
         except Exception:  # noqa: BLE001 - a finish failure must not kill the worker
             pass
 
+    def _safe_defer(
+        self, job_id: str, *, claimed_started_at: str | None = None, error: dict | None = None
+    ) -> None:
+        try:
+            self.store.defer(job_id, claimed_started_at=claimed_started_at, error=error)
+        except Exception:  # noqa: BLE001 - a defer failure must not kill the worker
+            # The job stays 'running', so recover_running normally re-queues it
+            # on the next start and the work is still held -- mirroring
+            # _safe_finish's swallow. (recover_running does not refund the
+            # attempt, so repeated defer failures across MAX_ATTEMPTS restarts
+            # would eventually dead-letter it.)
+            pass
+
+    def _cooling_job_ids(self) -> set[str]:
+        """Ids of jobs still inside their post-refusal cooldown.
+
+        Pruned on every read, so the map tracks only jobs the worker is actually
+        holding back and cannot grow without bound.
+        """
+        now = time.monotonic()
+        self._deferred_until = {
+            job_id: until for job_id, until in self._deferred_until.items() if until > now
+        }
+        return set(self._deferred_until)
+
     def _worker_loop(self) -> None:
         from .service import execute_job
 
         while not self.shutdown_event.is_set():
             try:
-                job = self.store.claim_next()
+                job = self.store.claim_next(exclude=self._cooling_job_ids())
             except Exception:  # noqa: BLE001 - sqlite/disk errors must not kill the worker
                 self.shutdown_event.wait(1.0)
                 continue
@@ -602,6 +769,32 @@ class DaemonRuntime:
                     payload["backend"] = self.backend
                 result = execute_job(job.kind, payload)
                 ok = bool(result.get("success", True))
+                if not ok and result.get("error_class") == LOCK_REFUSAL_ERROR_CLASS:
+                    # Refused the palace write lock: no drawer was filed, so this
+                    # is a deferral, not a failure (#2014). Dead-lettering it
+                    # here would silently drop the work -- only hook-submitted
+                    # kinds get re-emitted, and the hook is not a retry
+                    # mechanism.
+                    self._safe_defer(
+                        job.id,
+                        claimed_started_at=job.started_at,
+                        error={
+                            "error_class": LOCK_REFUSAL_ERROR_CLASS,
+                            "message": result.get(
+                                "error", "palace write lock held by another process"
+                            ),
+                        },
+                    )
+                    # Cool the job off in the map instead of sleeping here. This
+                    # is the only worker, and the holder may outlive any wait we
+                    # could pick -- it keeps the lock until its write finishes,
+                    # and that write can be a long mine. Blocking would stall
+                    # every unrelated job behind a lock that has nothing to do
+                    # with them, and a job merely queued behind this one would
+                    # never be claimed, so it would never get the refusal marker
+                    # its caller waits on: the #2014 hang wearing a different hat.
+                    self._deferred_until[job.id] = time.monotonic() + LOCK_DEFER_BACKOFF_SECONDS
+                    continue
                 state = "succeeded" if ok else "failed"
                 error = None if ok else {"message": result.get("error", "job failed")}
                 self._safe_finish(job.id, state=state, result=result, error=error)
@@ -633,6 +826,49 @@ def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[s
     handler.close_connection = True
 
 
+def _restore_server_process_state(previous_env: dict[str, str | None], previous_umask: int) -> None:
+    for key, value in previous_env.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    os.umask(previous_umask)
+
+
+def _close_writer_lease_after_worker(
+    writer_lease: contextlib.ExitStack,
+    worker: threading.Thread,
+) -> None:
+    """Retain writer ownership until a timed-out daemon worker really exits.
+
+    The normal daemon process may terminate first, in which case the operating
+    system releases the file lock. When ``run_server`` is embedded in a larger
+    process, this reaper prevents the server thread from exposing the palace to
+    another writer while the old worker is still finishing a mutation.
+    """
+
+    def _wait_and_close() -> None:
+        worker.join()
+        writer_lease.close()
+
+    threading.Thread(
+        target=_wait_and_close,
+        name="mempalace-daemon-writer-lease-reaper",
+        daemon=True,
+    ).start()
+
+
+def _close_or_defer_writer_lease(
+    writer_lease: contextlib.ExitStack,
+    runtime: "DaemonRuntime | None",
+) -> None:
+    worker = runtime.worker_thread if runtime is not None else None
+    if worker is not None and worker.is_alive():
+        _close_writer_lease_after_worker(writer_lease, worker)
+    else:
+        writer_lease.close()
+
+
 def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -> None:
     palace_path = canonical_palace_path(palace_path)
     previous_env = {
@@ -651,8 +887,31 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
     # QueueStore (its _init_db opens the DB in WAL mode) — not only once the HTTP
     # server starts. Restored in the finally at the end of run_server.
     prev_umask = os.umask(0o077)
-    token = ensure_token(palace_path)
-    runtime = DaemonRuntime(palace_path, backend=backend)
+    runtime = None
+    writer_lease = contextlib.ExitStack()
+    try:
+        resolved_backend = resolve_backend_name(palace_path, explicit=backend)
+        if backend_requires_single_writer(resolved_backend):
+            try:
+                writer_lease.enter_context(mine_palace_lock(palace_path))
+            except MineAlreadyRunning as exc:
+                raise DaemonError(
+                    "writable daemon startup refused: another writer owns "
+                    f"local backend {resolved_backend!r} for {palace_path!r}; "
+                    "stop the existing writable MCP/direct/daemon owner, or "
+                    "route all writes through that owner"
+                ) from exc
+
+        token = ensure_token(palace_path)
+        # Backend resolution above is only the ownership decision. Preserve
+        # the caller's explicit/implicit distinction in queued payloads:
+        # DaemonRuntime historically injects a backend only when one was
+        # explicitly selected.
+        runtime = DaemonRuntime(palace_path, backend=backend)
+    except BaseException:
+        writer_lease.close()
+        _restore_server_process_state(previous_env, prev_umask)
+        raise
 
     class _Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -803,7 +1062,8 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
             finally:
                 _drain_and_cleanup(runtime, palace_path, previous_env)
     finally:
-        os.umask(prev_umask)
+        _close_or_defer_writer_lease(writer_lease, runtime)
+        _restore_server_process_state(previous_env, prev_umask)
 
 
 def _drain_and_cleanup(
@@ -935,11 +1195,23 @@ class DaemonClient:
     def list_jobs(self, limit: int = 20) -> list[dict[str, Any]]:
         return self.request("GET", f"/jobs?limit={int(limit)}")["jobs"]
 
-    def wait(self, job_id: str, *, timeout: float = DEFAULT_WAIT_TIMEOUT) -> dict[str, Any]:
+    def wait(
+        self,
+        job_id: str,
+        *,
+        timeout: float = DEFAULT_WAIT_TIMEOUT,
+        stop_on_lock_deferral: bool = False,
+    ) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
         while True:
             job = self.get_job(job_id)
             if job["state"] in TERMINAL_STATES:
+                return job
+            # A job parked behind the palace lock never becomes terminal on its
+            # own, so an interactive caller must be able to stop here instead of
+            # waiting out the holder (#2014). Background callers keep the old
+            # behaviour and simply wait.
+            if stop_on_lock_deferral and job_deferred_by_lock(job):
                 return job
             if time.monotonic() >= deadline:
                 raise DaemonError(f"timed out waiting for job {job_id}")
@@ -999,6 +1271,236 @@ def _detached_kwargs(log_path: Path) -> dict[str, Any]:
     return kwargs
 
 
+def _process_start_time_windows(pid: int) -> float | None:
+    """Creation time of ``pid`` as a Unix timestamp via ``GetProcessTimes``."""
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    filetime_p = ctypes.POINTER(wintypes.FILETIME)
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.GetProcessTimes.argtypes = (
+        wintypes.HANDLE,
+        filetime_p,
+        filetime_p,
+        filetime_p,
+        filetime_p,
+    )
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return None
+    try:
+        creation, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+        ok = kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exited),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        )
+        if not ok:
+            return None
+        ticks = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+        # FILETIME counts 100 ns intervals since 1601-01-01.
+        return ticks / 10_000_000 - 11_644_473_600
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _process_start_time_linux(pid: int) -> float | None:
+    """Start time of ``pid`` from ``/proc`` (boot time plus clock ticks)."""
+    try:
+        stat = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8")
+        # The command name can contain spaces and parentheses; fields resume
+        # after the last ")". starttime is field 22, index 19 from "state".
+        fields = stat[stat.rindex(")") + 2 :].split()
+        start_ticks = int(fields[19])
+        boot = next(
+            int(line.split()[1])
+            for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines()
+            if line.startswith("btime ")
+        )
+        return boot + start_ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError, StopIteration):
+        return None
+
+
+def _process_start_time_ps(pid: int) -> float | None:
+    """Start time of ``pid`` from ``ps -o lstart=`` (macOS and other POSIX)."""
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(int(pid))],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            env={**os.environ, "LC_ALL": "C"},
+            check=False,
+        ).stdout.strip()
+        if not out:
+            return None
+        return time.mktime(time.strptime(out, "%a %b %d %H:%M:%S %Y"))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _process_start_time(pid: int) -> float | None:
+    """When ``pid`` started, as a Unix timestamp, or None when it cannot be read.
+
+    Used to tell a live registered daemon from an unrelated process that has
+    since been given the same pid. ``psutil`` is only a development
+    dependency, so it is used when present and the platform source otherwise.
+    """
+    if pid <= 0:
+        return None
+    try:
+        import psutil  # type: ignore[import-not-found]
+    except ImportError:
+        psutil = None
+    if psutil is not None:
+        try:
+            return float(psutil.Process(int(pid)).create_time())
+        except Exception:
+            return None
+    if os.name == "nt":
+        try:
+            return _process_start_time_windows(pid)
+        except OSError:
+            return None
+    if Path("/proc/self/stat").exists():
+        return _process_start_time_linux(pid)
+    return _process_start_time_ps(pid)
+
+
+# A process that started after the registration was written cannot be the
+# daemon that wrote it. The slack absorbs timestamp granularity between the
+# process start clock and file modification times.
+_REGISTRATION_START_SLACK_SECONDS = 2.0
+
+
+def _registration_state(palace_path: str) -> tuple[str, int | None]:
+    """Classify the daemon registration for ``palace_path``.
+
+    Returns ``("none", None)`` when nothing is registered, ``("stale", pid)``
+    when the registered pid is dead or now belongs to a process that started
+    after the registration was written (pid reuse after a crash), and
+    ``("live", pid)`` when the pid is alive and is, or may be, the daemon that
+    registered. An unreadable start time counts as live: refusing is
+    recoverable, discarding a live owner's registration is not (#2442).
+    """
+    pid = _registered_pid(palace_path)
+    if pid is None:
+        return "none", None
+    if not _pid_alive(pid):
+        return "stale", pid
+    started = _process_start_time(pid)
+    if started is None:
+        return "live", pid
+    written = []
+    for path in (endpoint_path(palace_path), pid_path(palace_path)):
+        try:
+            written.append(path.stat().st_mtime)
+        except OSError:
+            pass
+    if written and started > max(written) + _REGISTRATION_START_SLACK_SECONDS:
+        return "stale", pid
+    return "live", pid
+
+
+def _refuse_live_registration(palace_path: str) -> None:
+    """Raise when a registered daemon is alive but did not answer the probe.
+
+    Its process may still own the palace (the lock, or for backends without a
+    single-writer lease, the endpoint), so a second server must not start and
+    the registration must stay for when it answers again (#2442).
+    """
+    state, registered_pid = _registration_state(palace_path)
+    if state == "live":
+        raise DaemonError(
+            f"daemon pid {registered_pid} is running but did not answer the "
+            "health probe (busy or wedged); not starting a second one. "
+            f"Retry later, or stop that process ({_stop_hint(registered_pid)}) "
+            "and start again."
+        )
+
+
+@contextlib.contextmanager
+def _no_start_in_flight(palace_path: str):
+    """Yield True unless a ``daemon start`` holds the spawn lock right now.
+
+    ``start_daemon`` holds ``start.lock`` from its check until the new daemon
+    answers, and the new daemon writes its registration inside that window.
+    Taking the lock without waiting keeps ``stop_daemon`` from removing a
+    registration a concurrent start has just published. Windows has no spawn
+    lock; there ``_remove_registration(expected_pid=...)`` narrows the race.
+    """
+    if _fcntl is None:
+        yield True
+        return
+    try:
+        lock_fh = open(state_dir(palace_path) / "start.lock", "a")
+    except OSError:
+        # No state directory: nothing can be registered or starting.
+        yield True
+        return
+    with lock_fh:
+        try:
+            _fcntl.flock(lock_fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            _fcntl.flock(lock_fh.fileno(), _fcntl.LOCK_UN)
+
+
+def _remove_registration(palace_path: str, *, expected_pid: int | None = None) -> None:
+    """Remove the endpoint and pid files.
+
+    With ``expected_pid``, only when they still name that pid, so a
+    registration published after the caller classified the old one survives.
+    """
+    if expected_pid is not None and _registered_pid(palace_path) != expected_pid:
+        return
+    for stale in (endpoint_path(palace_path), pid_path(palace_path)):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
+def _stop_hint(pid: int) -> str:
+    return f"taskkill /PID {pid} /F" if os.name == "nt" else f"kill {pid}"
+
+
+def _registered_pid(palace_path: str) -> int | None:
+    """Pid recorded by the last daemon that registered for ``palace_path``.
+
+    Reads ``endpoint.json`` first (written together with the pid file by
+    ``run_server``), then the bare pid file, so a partially written
+    registration still yields the pid. Returns None when nothing is registered
+    or the value is not an int.
+    """
+    try:
+        pid = _read_endpoint(palace_path).get("pid")
+    except DaemonError:
+        pid = None
+    if pid is None:
+        try:
+            pid = pid_path(palace_path).read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+    try:
+        return int(pid)
+    except (TypeError, ValueError):
+        return None
+
+
 def start_daemon(
     palace_path: str,
     *,
@@ -1012,6 +1514,9 @@ def start_daemon(
     if existing is not None:
         return existing
     if foreground:
+        # The same guard as the spawn path below: a foreground server must not
+        # start beside a registered daemon that is alive but not answering.
+        _refuse_live_registration(palace_path)
         # Blocks until the daemon stops. A clean stop is a normal exit, not an
         # error — return None so the caller (cmd_daemon) exits 0.
         run_server(palace_path, backend=backend, port=0)
@@ -1039,11 +1544,17 @@ def start_daemon(
             # The other starter failed without bringing the daemon up; fall
             # through and spawn ourselves (we now hold the lock).
 
-    for stale in (endpoint_path(palace_path), pid_path(palace_path)):
-        try:
-            stale.unlink()
-        except OSError:
-            pass
+    # The health probe above can fail while the registered daemon is alive but
+    # busy (a long mine) or wedged. Its process still owns the palace lock, so
+    # a replacement would die at startup -- and unlinking the registration
+    # first would leave the live owner unreachable (#2442). Refuse instead of
+    # spawning; ``daemon stop`` is the explicit way to replace it.
+    # A pid that is dead, or that now belongs to a process started after the
+    # registration was written (pid reuse after a crash), is stale and is
+    # replaced below.
+    _refuse_live_registration(palace_path)
+
+    _remove_registration(palace_path)
     cmd = [
         sys.executable,
         "-m",
@@ -1120,6 +1631,7 @@ def submit_job(
     wait: bool = True,
     auto_start: bool = False,
     timeout: float = DEFAULT_WAIT_TIMEOUT,
+    stop_on_lock_deferral: bool = False,
 ) -> dict[str, Any]:
     # Strictly opt-in: callers that want the daemon auto-started must say so
     # explicitly (the CLI --daemon path passes auto_start=True). The default
@@ -1133,15 +1645,37 @@ def submit_job(
     job = client.submit(kind, payload, dedupe_key=dedupe_key, priority=priority)
     if not wait:
         return job
-    return client.wait(job["id"], timeout=timeout)
+    return client.wait(job["id"], timeout=timeout, stop_on_lock_deferral=stop_on_lock_deferral)
 
 
 def stop_daemon(palace_path: str) -> bool:
+    """Ask the registered daemon to stop. True when a running daemon was asked.
+
+    When the health probe fails, the registration decides what happens: a dead
+    pid, or a pid reused by an unrelated process, is a stale registration and
+    is removed so the next ``daemon start`` works. A live daemon that does not
+    answer cannot be asked to stop over HTTP, so its registration is left in
+    place (#2442) and the error names the process to stop instead.
+    """
     client = get_client_if_running(palace_path)
-    if client is None:
-        return False
-    client.shutdown()
-    return True
+    if client is not None:
+        client.shutdown()
+        return True
+    state, pid = _registration_state(palace_path)
+    if state == "live":
+        raise DaemonError(
+            f"daemon pid {pid} is registered and running but did not answer the "
+            "health probe (busy or wedged), so it cannot be asked to stop. Wait "
+            f"for it, or stop that process ({_stop_hint(pid)}); its registration "
+            "is kept until it exits."
+        )
+    if state == "stale":
+        # A start in flight replaces the stale files itself; removing them now
+        # could delete the registration it is about to publish.
+        with _no_start_in_flight(palace_path) as free:
+            if free:
+                _remove_registration(palace_path, expected_pid=pid)
+    return False
 
 
 def _cmd_serve(args) -> None:
