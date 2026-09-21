@@ -193,6 +193,14 @@ def main():
     )
     p_mine.add_argument("--wing", default=None, help="Wing name (default: directory name)")
     p_mine.add_argument(
+        "--room",
+        default=None,
+        help=(
+            "Target room for projects mode; overrides per-file room routing "
+            "(default: route each file by folder/filename/content)"
+        ),
+    )
+    p_mine.add_argument(
         "--no-gitignore",
         action="store_true",
         help="Don't respect .gitignore files when scanning project files",
