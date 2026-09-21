@@ -491,6 +491,98 @@ class KnowledgeGraph:
                 )
                 return triple_id
 
+    def apply_merge(
+        self,
+        source: str,
+        target: str,
+        ended: str = None,
+        merge_predicate: str = "merged-into",
+        lineage_predicate: str = "synthesized-from",
+        retire_lineage: bool = True,
+    ) -> dict:
+        """Point ``source`` at ``target`` in one transaction.
+
+        Ends every other current ``merge_predicate`` link from ``source``, opens
+        ``source -> target`` unless it is already current, and, with
+        ``retire_lineage``, ends ``source``'s current ``lineage_predicate``
+        links. Either all of it lands or none of it does: a failure part way
+        through cannot leave a merge that points two ways at once.
+
+        Raises ``ValueError`` (and changes nothing) if ``ended`` precedes the
+        start of a link it would end.
+        """
+        ended = sanitize_iso_temporal(ended or date.today().isoformat(), "ended")
+        sub_id = self._entity_id(source)
+        tgt_id = self._entity_id(target)
+        merge_pred = merge_predicate.lower().replace(" ", "_")
+        lineage_pred = lineage_predicate.lower().replace(" ", "_")
+        ending = [merge_pred] + ([lineage_pred] if retire_lineage else [])
+
+        with self._lock:
+            conn = self._conn()
+            with conn:
+                rows = conn.execute(
+                    f"SELECT predicate, object, valid_from FROM triples "
+                    f"WHERE subject=? AND valid_to IS NULL "
+                    f"AND predicate IN ({','.join('?' * len(ending))})",
+                    [sub_id, *ending],
+                ).fetchall()
+                for row in rows:
+                    if row["predicate"] == merge_pred and row["object"] == tgt_id:
+                        continue
+                    valid_from = row["valid_from"]
+                    if valid_from is not None and _temporal_end_key(ended) < _temporal_start_key(
+                        valid_from
+                    ):
+                        raise ValueError(
+                            f"valid_to={ended!r} is before valid_from={valid_from!r}; "
+                            "an inverted interval would be invisible to every KG query"
+                        )
+
+                ended_merges = conn.execute(
+                    "UPDATE triples SET valid_to=? "
+                    "WHERE subject=? AND predicate=? AND object<>? AND valid_to IS NULL",
+                    (ended, sub_id, merge_pred, tgt_id),
+                ).rowcount
+
+                edge_added = False
+                if not any(r["predicate"] == merge_pred and r["object"] == tgt_id for r in rows):
+                    for name, eid in ((source, sub_id), (target, tgt_id)):
+                        conn.execute(
+                            "INSERT OR IGNORE INTO entities (id, name) VALUES (?, ?)",
+                            (eid, name),
+                        )
+                    conn.execute(
+                        """INSERT INTO triples (
+                            id, subject, predicate, object, source_drawer_id
+                        ) VALUES (?, ?, ?, ?, ?)""",
+                        (
+                            make_triple_id(
+                                sub_id, merge_pred, tgt_id, None, datetime.now().isoformat()
+                            ),
+                            sub_id,
+                            merge_pred,
+                            tgt_id,
+                            source,
+                        ),
+                    )
+                    edge_added = True
+
+                ended_lineage = 0
+                if retire_lineage:
+                    ended_lineage = conn.execute(
+                        "UPDATE triples SET valid_to=? "
+                        "WHERE subject=? AND predicate=? AND valid_to IS NULL",
+                        (ended, sub_id, lineage_pred),
+                    ).rowcount
+
+        return {
+            "ended": ended,
+            "merged_edge_added": edge_added,
+            "invalidated_prior_merged_into": ended_merges,
+            "invalidated_lineage_edges": ended_lineage,
+        }
+
     # ── Query operations ──────────────────────────────────────────────────
 
     def query_entity(self, name: str, as_of: str = None, direction: str = "outgoing"):
@@ -578,6 +670,192 @@ class KnowledgeGraph:
                         )
 
         return results
+
+    # ── Graph walks ───────────────────────────────────────────────────────
+    #
+    # Breadth-first walks that read a whole level of the graph per query
+    # instead of calling query_entity() once per node, so the number of
+    # queries follows the depth of the walk rather than the number of nodes
+    # it touches. Lineage walks use exact ids: an id that does not exist is a
+    # missing node, never a near match.
+
+    _WALK_CHUNK = 400
+
+    def entity_id(self, name: str) -> str:
+        """The id ``name`` is stored under (lowercased, spaces to underscores)."""
+        return self._entity_id(name)
+
+    def _frontier_rows(
+        self, conn, ids, side, predicate=None, temporal_sql="", temporal_params=(), current=False
+    ):
+        """Triples whose ``side`` column is one of ``ids``, with both names."""
+        ids = list(ids)
+        filters = ""
+        extra = []
+        if predicate:
+            filters += " AND t.predicate = ?"
+            extra.append(predicate)
+        if current:
+            filters += " AND t.valid_to IS NULL"
+        rows = []
+        for start in range(0, len(ids), self._WALK_CHUNK):
+            chunk = ids[start : start + self._WALK_CHUNK]
+            rows.extend(
+                conn.execute(
+                    "SELECT t.*, s.name AS sub_name, o.name AS obj_name FROM triples t "
+                    "LEFT JOIN entities s ON s.id = t.subject "
+                    "LEFT JOIN entities o ON o.id = t.object "
+                    f"WHERE t.{side} IN ({','.join('?' * len(chunk))})" + filters + temporal_sql,
+                    [*chunk, *extra, *temporal_params],
+                ).fetchall()
+            )
+        return rows
+
+    def traverse(
+        self,
+        name: str,
+        direction: str = "both",
+        predicate: str = None,
+        as_of: str = None,
+        max_depth: int = 20,
+        max_facts: int = None,
+    ) -> dict:
+        """Every fact within ``max_depth`` hops of ``name``, breadth first.
+
+        Returns the same fact fields as :meth:`query_entity`, plus ``depth``:
+        the hop at which the walk first reached the fact. ``predicate`` limits
+        both the facts returned and the edges followed, and ``as_of`` applies
+        the same temporal filter as :meth:`query_entity`. The start entity
+        resolves like :meth:`query_entity` does, including its single-candidate
+        fallback. ``max_facts`` stops the walk once that many facts are
+        collected and sets ``truncated``.
+
+        Returns ``{"facts", "visited_nodes", "truncated"}``.
+        """
+        as_of = sanitize_iso_temporal(as_of, "as_of")
+        pred = predicate.lower().replace(" ", "_") if predicate else None
+        temporal_sql, temporal_params = _temporal_filter_sql(as_of) if as_of else ("", [])
+        sides = []
+        if direction in ("outgoing", "both"):
+            sides.append(("subject", "object", "outgoing"))
+        if direction in ("incoming", "both"):
+            sides.append(("object", "subject", "incoming"))
+
+        root_id = self._entity_id(name)
+        root_name = name
+        with self._lock:
+            conn = self._conn()
+            if conn.execute("SELECT 1 FROM entities WHERE id = ?", (root_id,)).fetchone() is None:
+                candidates = self._lookup_entity_candidates(conn, name, root_id)
+                if len(candidates) == 1:
+                    root_id, root_name = candidates[0]["id"], candidates[0]["name"]
+
+            names = {root_id: root_name}
+            frontier = [root_id]
+            facts = []
+            seen_facts = set()
+            truncated = False
+            depth = 0
+            while frontier and not truncated:
+                next_frontier = []
+                for side, other, label in sides:
+                    rows = self._frontier_rows(
+                        conn, frontier, side, pred, temporal_sql, temporal_params
+                    )
+                    for row in rows:
+                        if row["id"] in seen_facts:
+                            continue
+                        seen_facts.add(row["id"])
+                        facts.append(
+                            {
+                                "direction": label,
+                                "subject": names.get(row["subject"])
+                                or row["sub_name"]
+                                or row["subject"],
+                                "predicate": row["predicate"],
+                                "object": names.get(row["object"])
+                                or row["obj_name"]
+                                or row["object"],
+                                "valid_from": row["valid_from"],
+                                "valid_to": row["valid_to"],
+                                "confidence": row["confidence"],
+                                "source_closet": row["source_closet"],
+                                "current": row["valid_to"] is None,
+                                "depth": depth,
+                            }
+                        )
+                        if max_facts and len(facts) >= max_facts:
+                            truncated = True
+                            break
+                        neighbor = row[other]
+                        if depth < max_depth and neighbor not in names:
+                            names[neighbor] = row["obj_name" if other == "object" else "sub_name"]
+                            next_frontier.append(neighbor)
+                    if truncated:
+                        break
+                frontier = next_frontier
+                depth += 1
+
+        return {"facts": facts, "visited_nodes": len(names), "truncated": truncated}
+
+    def reachable_edges(self, names, predicate: str, direction: str = "outgoing", max_depth=None):
+        """Current ``predicate`` edges reachable from any of ``names``.
+
+        Follows current edges only (``valid_to IS NULL``): subject to object
+        for ``outgoing``, object to subject for ``incoming``. Every seed is
+        walked at once, one level per query. Seeds match by exact id.
+
+        Returns ``(edges, names_by_id)``: ``edges`` is a list of
+        ``(subject_id, object_id)`` for every edge leaving a node the walk
+        reached within ``max_depth`` hops (``None`` for no limit), and
+        ``names_by_id`` maps each id touched to its stored name.
+        """
+        pred = predicate.lower().replace(" ", "_")
+        side, other = ("subject", "object") if direction == "outgoing" else ("object", "subject")
+        seen = {}
+        frontier = []
+        for name in names:
+            eid = self._entity_id(name)
+            if eid not in seen:
+                seen[eid] = name
+                frontier.append(eid)
+
+        edges = []
+        with self._lock:
+            conn = self._conn()
+            depth = 0
+            while frontier and (max_depth is None or depth < max_depth):
+                next_frontier = []
+                for row in self._frontier_rows(conn, frontier, side, pred, current=True):
+                    edges.append((row["subject"], row["object"]))
+                    for col, label in (("subject", "sub_name"), ("object", "obj_name")):
+                        if row[col] not in seen:
+                            seen[row[col]] = row[label] or row[col]
+                            if col == other:
+                                next_frontier.append(row[col])
+                frontier = next_frontier
+                depth += 1
+        return edges, seen
+
+    def entities_in_triples(self, names) -> set:
+        """The members of ``names`` that are the subject or object of any triple."""
+        by_id = {}
+        for name in names:
+            by_id.setdefault(self._entity_id(name), []).append(name)
+        ids = list(by_id)
+        found = set()
+        with self._lock:
+            conn = self._conn()
+            for start in range(0, len(ids), self._WALK_CHUNK):
+                chunk = ids[start : start + self._WALK_CHUNK]
+                marks = ",".join("?" * len(chunk))
+                for row in conn.execute(
+                    f"SELECT subject AS id FROM triples WHERE subject IN ({marks}) "
+                    f"UNION SELECT object FROM triples WHERE object IN ({marks})",
+                    [*chunk, *chunk],
+                ):
+                    found.update(by_id.get(row["id"], ()))
+        return found
 
     def find_entity_candidates(self, name: str) -> list:
         """Return token/prefix entity matches for disambiguation (never substring)."""
