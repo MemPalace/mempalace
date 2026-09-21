@@ -1050,7 +1050,10 @@ def main():
             continue
         try:
             req = json.loads(line)
-        except json.JSONDecodeError:
+        except ValueError:
+            # ValueError, not json.JSONDecodeError: a JSON integer longer than
+            # sys.get_int_max_str_digits() raises the plain ValueError, which
+            # used to end the loop and every request after it (#2556).
             continue
         try:
             resp = dispatch_light_stdio_request(req)

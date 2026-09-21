@@ -912,3 +912,48 @@ def test_light_server_applies_the_flags_it_shares_with_the_full_server(monkeypat
     assert mcp_server._READ_ONLY is True
     assert os.environ["MEMPALACE_BACKEND"] == "sqlite_exact"
     assert mcp_server._resolve_kg_path() == str(palace / "knowledge_graph.sqlite3")
+
+
+def test_light_stdio_loop_survives_an_unparsable_huge_integer(monkeypatch, tmp_path):
+    """#2556: an integer longer than ``sys.get_int_max_str_digits()`` makes
+    ``json.loads`` raise a plain ``ValueError``, which the loop's
+    ``JSONDecodeError`` guard did not catch, so one such line ended the process
+    and every later request went unanswered. The line is still dropped, not
+    answered -- the light server answers nothing it cannot parse -- but the
+    loop must keep serving."""
+    from _mcp_server_helpers import _keep_server_command_line_state
+
+    _keep_server_command_line_state(monkeypatch)
+    for name in (
+        "_maybe_eager_warmup_embedder",
+        "_start_idle_exit_watchdog",
+        "_start_write_stall_watchdog",
+    ):
+        monkeypatch.setattr(mcp_server, name, lambda: None)
+    monkeypatch.setattr(mcp_light_server, "_restore_stdout", lambda: None)
+
+    huge = '{"jsonrpc":"2.0","id":1,"method":"ping","x": ' + "1" * 5000 + "}"
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(huge + "\n" + '{"jsonrpc":"2.0","id":2,"method":"ping"}\n'),
+    )
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "mempalace-light-mcp",
+            "--palace",
+            str(tmp_path / "palace"),
+            "--backend",
+            "sqlite_exact",
+            "--read-only",
+        ],
+    )
+
+    mcp_light_server.main()
+
+    responses = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+    assert [response["id"] for response in responses] == [2]

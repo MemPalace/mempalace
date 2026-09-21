@@ -148,6 +148,26 @@ class TestStdioLoopAlwaysResponds:
         # The loop stays alive and serves the next line.
         assert responses[1]["id"] == 2
 
+    def test_integer_over_the_digit_limit_is_answered_not_fatal(self, monkeypatch):
+        """A 5000-digit integer makes ``json.loads`` raise a plain ``ValueError``
+        (``sys.get_int_max_str_digits()``), not a ``JSONDecodeError``, so the parse
+        guard missed it and the process died on the line (#2556)."""
+        responses = _run_loop(
+            monkeypatch,
+            [
+                '{"jsonrpc":"2.0","id":1,"method":"ping","x": ' + "1" * 5000 + "}",
+                '{"jsonrpc":"2.0","id":2,"method":"ping"}',
+            ],
+        )
+
+        assert responses[0] == {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": "Parse error"},
+        }
+        # The loop stays alive and serves the next line.
+        assert responses[1]["id"] == 2
+
     def test_non_string_method_is_answered_over_stdio(self, monkeypatch):
         responses = _run_loop(
             monkeypatch,

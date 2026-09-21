@@ -221,7 +221,12 @@ def _run_stdio_loop() -> None:
             request = json.loads(line)
         except KeyboardInterrupt:
             break
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        except ValueError as exc:
+            # ValueError, not json.JSONDecodeError: json.loads raises a plain
+            # ValueError for an integer longer than sys.get_int_max_str_digits(),
+            # and that escaped the narrower guard -- one such line ended the
+            # process and every later request went unanswered (#2556). Both
+            # JSONDecodeError and UnicodeDecodeError are ValueError subclasses.
             # Narrow on purpose: reporting a MemoryError or RecursionError as
             # "Parse error" would be a lie. The id is unknowable here, so it is
             # null per JSON-RPC 2.0 section 5 -- the "never answer a
