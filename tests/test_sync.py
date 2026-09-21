@@ -2493,18 +2493,8 @@ class TestUnresolvedSources:
         assert "    and 2 more source file(s)" in out, out
 
 
-class TestMinedFilesystemIdentity:
-    """#2320's remaining mount shapes: the witness is not in the directory the
-    file it speaks for was mined from.
-
-    Corroboration asks whether the palace still sees a source of its own in
-    the directory. It cannot ask whether that directory is the one the missing
-    file was mined from, so a mount point whose lower layer holds a mined
-    file, a volume mounted over a directory the palace knows, and a bind mount
-    of another directory over it all corroborate removals they should not.
-    ``source_identity`` records the directory's inode at mine time; these
-    tests drive what sync does with it.
-    """
+class _IdentityRows:
+    """Rows that may carry a recorded directory identity, and a wing-scoped run."""
 
     def _seed(self, palace_path, rows, wing="demo"):
         """rows: list of (drawer_id, source_file, source_dir_ino or None)."""
@@ -2533,6 +2523,27 @@ class TestMinedFilesystemIdentity:
         )
         del client
 
+    def _run(self, palace_path, repo, dry_run=True):
+        from mempalace.sync import sync_palace
+
+        return sync_palace(
+            palace_path=palace_path, project_dirs=[str(repo)], wing="demo", dry_run=dry_run
+        )
+
+
+class TestMinedFilesystemIdentity(_IdentityRows):
+    """#2320's remaining mount shapes: the witness is not in the directory the
+    file it speaks for was mined from.
+
+    Corroboration asks whether the palace still sees a source of its own in
+    the directory. It cannot ask whether that directory is the one the missing
+    file was mined from, so a mount point whose lower layer holds a mined
+    file, a volume mounted over a directory the palace knows, and a bind mount
+    of another directory over it all corroborate removals they should not.
+    ``source_identity`` records the directory's inode at mine time; these
+    tests drive what sync does with it.
+    """
+
     def _repo_with_a_neighbour(self, tmp_dir):
         repo = Path(tmp_dir) / "repo"
         repo.mkdir(parents=True)
@@ -2542,13 +2553,6 @@ class TestMinedFilesystemIdentity:
         gone.write_text("# was here\n")
         gone.unlink()
         return repo, neighbour, gone
-
-    def _run(self, palace_path, repo):
-        from mempalace.sync import sync_palace
-
-        return sync_palace(
-            palace_path=palace_path, project_dirs=[str(repo)], wing="demo", dry_run=True
-        )
 
     @pytest.mark.parametrize("matching_first", [True, False])
     def test_each_drawer_is_decided_by_its_own_identity(self, tmp_dir, palace_path, matching_first):
@@ -2795,7 +2799,8 @@ class TestMinedFilesystemIdentity:
         intruder = str(int(recorded) + 1)
         self._seed(palace_path, [("d_gone", gone, recorded), ("d_neighbour", neighbour, None)])
 
-        answers = {"n": 0}
+        answers = {"after_witness": 0, "witness_read": False}
+        real_witness = sync_mod._is_a_present_file
 
         def changing(directory):
             # The mount arrives inside the verdict: the corroboration is read
@@ -2804,14 +2809,23 @@ class TestMinedFilesystemIdentity:
             # only the second reading to what the drawer carries would call
             # that a match and remove a drawer settled against another
             # directory entirely.
-            answers["n"] += 1
-            return intruder if answers["n"] == 1 else recorded
+            if answers["witness_read"]:
+                answers["after_witness"] += 1
+            return recorded if answers["witness_read"] else intruder
+
+        def witness(path):
+            # The witness probe is the reading inside the window, so the
+            # change is keyed to it rather than to how many times the
+            # identity was read: the classify pass reads it as well.
+            answers["witness_read"] = True
+            return real_witness(path)
 
         monkeypatch.setattr(sync_mod, "directory_identity", changing)
+        monkeypatch.setattr(sync_mod, "_is_a_present_file", witness)
 
         report = self._run(palace_path, repo)
 
-        assert answers["n"] >= 2, answers
+        assert answers["after_witness"] >= 1, answers
         assert report["missing"] == 0, report
         assert report["unresolved"] == 1, report
 
@@ -3719,3 +3733,343 @@ class TestMinedFilesystemIdentity:
         # The point of choice: the same numbers spelled as integers still decide.
         assert _mined_directory_still_answers(1, "1") is True
         assert _mined_directory_still_answers(1, "1331592") is False
+
+
+class TestGitignoredRouteIdentity(_IdentityRows):
+    """The ``gitignored`` route decided a drawer from one reading of its path:
+    the path answers, and a rule found above it ignores it. Neither reading
+    says whose directory answered. A volume mounted over a directory the
+    palace knows, carrying a file of the same name and a ``.gitignore`` that
+    names it, made the route remove the drawer of a file it never saw, while
+    the ``missing`` route kept that file's neighbour by the identity
+    ``source_identity`` records. These tests drive what the route does with
+    that identity.
+    """
+
+    def _repo_with_an_ignored_file(self, tmp_dir, rule="ignored.py\n"):
+        repo = Path(tmp_dir) / "repo"
+        repo.mkdir(parents=True)
+        (repo / ".gitignore").write_text(rule)
+        ignored = repo / "ignored.py"
+        ignored.write_text("# built here\n")
+        return repo, ignored
+
+    def test_a_rule_read_in_another_directory_keeps_the_drawer(self, tmp_dir, palace_path):
+        """The file is at its path and a rule ignores it, but the directory
+        answering there is not the one the drawer was mined from. That is a
+        volume over the mined directory, and its rule says nothing about the
+        file underneath."""
+        from mempalace import source_identity as si
+
+        repo, ignored = self._repo_with_an_ignored_file(tmp_dir)
+        here = si.directory_identity(repo)
+        assert here is not None
+        mined_elsewhere = str(int(here) + 1)  # derived, so no literal can be this directory's
+
+        self._seed(palace_path, [("d_ignored", ignored, mined_elsewhere)])
+        report = self._run(palace_path, repo)
+
+        assert report["gitignored"] == 0, report
+        assert report["unresolved"] == 1, report
+        assert str(ignored) in report["unresolved_by_source"], report
+
+    def test_the_same_identity_prunes_a_gitignored_file_as_before(self, tmp_dir, palace_path):
+        from mempalace import source_identity as si
+
+        repo, ignored = self._repo_with_an_ignored_file(tmp_dir)
+        here = si.directory_identity(repo)
+        assert here is not None
+
+        self._seed(palace_path, [("d_ignored", ignored, here)])
+        report = self._run(palace_path, repo)
+
+        assert report["gitignored"] == 1, report
+        assert report["unresolved"] == 0, report
+
+    def test_a_gitignored_drawer_with_no_identity_is_decided_as_before(self, tmp_dir, palace_path):
+        """Everything filed before the identity existed keeps the behaviour it
+        had: the rule alone removes it."""
+        from mempalace import source_identity as si
+
+        repo, ignored = self._repo_with_an_ignored_file(tmp_dir)
+        assert si.directory_identity(repo) is not None
+
+        self._seed(palace_path, [("d_ignored", ignored, None)])
+        report = self._run(palace_path, repo)
+
+        assert report["gitignored"] == 1, report
+        assert report["unresolved"] == 0, report
+
+    @pytest.mark.parametrize("matching_first", [True, False])
+    def test_each_drawer_is_decided_by_its_own_identity_on_this_route(
+        self, tmp_dir, palace_path, matching_first
+    ):
+        """One source's drawers need not agree about the identity, and the
+        classification is cached per source. The verdict has to be the
+        drawer's, whichever of them the pass reached first."""
+        from mempalace import source_identity as si
+
+        repo, ignored = self._repo_with_an_ignored_file(tmp_dir)
+        here = si.directory_identity(repo)
+        assert here is not None
+        mined_elsewhere = str(int(here) + 1)
+
+        rows = [("d_matching", ignored, here), ("d_other", ignored, mined_elsewhere)]
+        if not matching_first:
+            rows.reverse()
+        self._seed(palace_path, rows)
+        report = self._run(palace_path, repo)
+
+        assert report["gitignored"] == 1, report
+        assert report["unresolved"] == 1, report
+
+    def test_the_identity_is_read_after_the_rule_as_well_as_before(
+        self, tmp_dir, palace_path, monkeypatch
+    ):
+        """The directory that answered before the rule was read is the one the
+        drawer was mined from; the one answering after it is not. The rule was
+        read from one of them, and nothing says which, so the drawer is kept."""
+        from mempalace import source_identity as si
+        from mempalace import sync as sync_mod
+
+        repo, ignored = self._repo_with_an_ignored_file(tmp_dir)
+        here = si.directory_identity(repo)
+        assert here is not None
+        elsewhere = str(int(here) + 1)  # derived, so no literal can be this directory's
+        self._seed(palace_path, [("d_ignored", ignored, here)])
+
+        answer = {"forced": None}  # None: answer truthfully
+        real_identity = sync_mod.directory_identity
+        real_loader = sync_mod.load_gitignore_matcher
+
+        def identity(directory):
+            return answer["forced"] or real_identity(directory)
+
+        def loader(dir_path, cache):
+            matcher = real_loader(dir_path, cache)
+            answer["forced"] = elsewhere  # the volume leaves once the rule is in hand
+            return matcher
+
+        monkeypatch.setattr(sync_mod, "directory_identity", identity)
+        monkeypatch.setattr(sync_mod, "load_gitignore_matcher", loader)
+        report = self._run(palace_path, repo)
+
+        assert report["gitignored"] == 0, report
+        assert report["unresolved"] == 1, report
+
+    def test_the_identity_is_read_before_the_rule_as_well_as_after(
+        self, tmp_dir, palace_path, monkeypatch
+    ):
+        """The mirror image: another directory answered before the rule was
+        read, and the mined one answers after it. A reading taken only after
+        the rule would match the drawer and remove it."""
+        from mempalace import source_identity as si
+        from mempalace import sync as sync_mod
+
+        repo, ignored = self._repo_with_an_ignored_file(tmp_dir)
+        here = si.directory_identity(repo)
+        assert here is not None
+        elsewhere = str(int(here) + 1)
+        self._seed(palace_path, [("d_ignored", ignored, here)])
+
+        answer = {"forced": elsewhere}  # the volume is there when the pass starts
+        real_identity = sync_mod.directory_identity
+        real_loader = sync_mod.load_gitignore_matcher
+
+        def identity(directory):
+            return answer["forced"] or real_identity(directory)
+
+        def loader(dir_path, cache):
+            matcher = real_loader(dir_path, cache)
+            answer["forced"] = None  # and leaves once the rule is in hand
+            return matcher
+
+        monkeypatch.setattr(sync_mod, "directory_identity", identity)
+        monkeypatch.setattr(sync_mod, "load_gitignore_matcher", loader)
+        report = self._run(palace_path, repo)
+
+        assert report["gitignored"] == 0, report
+        assert report["unresolved"] == 1, report
+
+    def _pass_crossed_by_a_volume(
+        self,
+        tmp_dir,
+        palace_path,
+        monkeypatch,
+        real_rule,
+        volume_rule,
+        arrives_after_the_key,
+        below_the_rule=False,
+    ):
+        """Two sources in one directory, and a volume over it that leaves
+        once the first source is decided, so the second is read after it
+        left. The volume is either there from the start, or arrives after
+        the identity was read for the rule cache and before the rule itself
+        was read. Whichever source the pass reads first is the one crossed.
+        With ``below_the_rule`` the sources sit in a subdirectory and the
+        rule stays at the root, so the entry read across the change is an
+        ancestor's."""
+        from mempalace import source_identity as si
+        from mempalace import sync as sync_mod
+
+        repo = Path(tmp_dir) / "repo"
+        home = repo / "sub" if below_the_rule else repo
+        home.mkdir(parents=True)
+        (repo / ".gitignore").write_text(real_rule)
+        first = home / "first.py"
+        first.write_text("# here\n")
+        second = home / "second.py"
+        second.write_text("# here too\n")
+        here = si.directory_identity(home)
+        above = si.directory_identity(repo)
+        assert here is not None and above is not None
+        # Above both, so the volume's answer can be neither directory's.
+        elsewhere = str(max(int(here), int(above)) + 1)
+        self._seed(palace_path, [("d_first", first, here), ("d_second", second, here)])
+
+        state = {"forced": None, "one_decided": False}
+        if not arrives_after_the_key:
+            (repo / ".gitignore").write_text(volume_rule)
+            state["forced"] = elsewhere
+        real_identity = sync_mod.directory_identity
+        real_loader = sync_mod.load_gitignore_matcher
+        real_classify = sync_mod._classify_drawer
+
+        def identity(directory):
+            answer = state["forced"] or real_identity(directory)
+            if state["one_decided"] and state["forced"]:
+                # The first source's verdict was formed; the volume leaves.
+                (repo / ".gitignore").write_text(real_rule)
+                state["forced"] = None
+            return answer
+
+        def loader(dir_path, cache):
+            if arrives_after_the_key and not state["one_decided"] and not state["forced"]:
+                # The key was read from the mined directory; the volume
+                # arrives now, before the rule is.
+                (repo / ".gitignore").write_text(volume_rule)
+                state["forced"] = elsewhere
+            return real_loader(dir_path, cache)
+
+        def classify(meta, matcher_cache, roots, drawer_id=""):
+            bucket = real_classify(meta, matcher_cache, roots, drawer_id)
+            if state["forced"] and bucket != "gitignored":
+                # No reading follows a verdict other than gitignored, so the
+                # volume leaves here instead.
+                (repo / ".gitignore").write_text(real_rule)
+                state["forced"] = None
+            state["one_decided"] = True
+            return bucket
+
+        monkeypatch.setattr(sync_mod, "directory_identity", identity)
+        monkeypatch.setattr(sync_mod, "load_gitignore_matcher", loader)
+        monkeypatch.setattr(sync_mod, "_classify_drawer", classify)
+        return self._run(palace_path, repo, dry_run=False)
+
+    def test_a_rule_read_under_another_identity_is_not_reused(
+        self, tmp_dir, palace_path, monkeypatch
+    ):
+        """Rules are read once per directory identity and kept for the rest
+        of the pass. A rule read while a volume answered for the directory
+        must not decide a source read after the volume left, even though the
+        directory then answers with the inode that source's drawer carries."""
+        report = self._pass_crossed_by_a_volume(
+            tmp_dir,
+            palace_path,
+            monkeypatch,
+            real_rule="# no rule\n",
+            volume_rule="*.py\n",
+            arrives_after_the_key=False,
+        )
+
+        assert report["gitignored"] == 0, report
+        assert report["unresolved"] == 1, report
+        assert report["kept"] == 1, report
+        assert report["removed_drawers"] == 0, report
+
+    def test_a_rule_read_as_a_volume_arrived_does_not_decide_later_sources(
+        self, tmp_dir, palace_path, monkeypatch
+    ):
+        """The rule cache is keyed by the identity read just before the rule.
+        A volume arriving between the two would leave its rule under the
+        mined directory's key, and once it is gone every later source of that
+        directory would be removed by it. The identity is read again after
+        the rule, and an entry read across a change is dropped."""
+        report = self._pass_crossed_by_a_volume(
+            tmp_dir,
+            palace_path,
+            monkeypatch,
+            real_rule="# no rule\n",
+            volume_rule="*.py\n",
+            arrives_after_the_key=True,
+        )
+
+        assert report["gitignored"] == 0, report
+        assert report["unresolved"] == 1, report
+        assert report["kept"] == 1, report
+        assert report["removed_drawers"] == 0, report
+
+    def test_an_ancestor_rule_read_as_a_volume_arrived_does_not_decide_later_sources(
+        self, tmp_dir, palace_path, monkeypatch
+    ):
+        """The same window at an ancestor: the sources sit below the
+        directory whose rule was read across the change, and that entry is
+        the one dropped."""
+        report = self._pass_crossed_by_a_volume(
+            tmp_dir,
+            palace_path,
+            monkeypatch,
+            real_rule="# no rule\n",
+            volume_rule="*.py\n",
+            arrives_after_the_key=True,
+            below_the_rule=True,
+        )
+
+        assert report["gitignored"] == 0, report
+        assert report["unresolved"] == 1, report
+        assert report["kept"] == 1, report
+        assert report["removed_drawers"] == 0, report
+
+    def test_a_missing_rule_read_as_a_volume_arrived_does_not_shield_later_sources(
+        self, tmp_dir, palace_path, monkeypatch
+    ):
+        """The mirror image: the directory's own rule ignores both files and
+        the volume carries none. The source crossed by the volume is kept,
+        since the rule read for it ignored nothing; the one read after the
+        volume left is decided by the directory's rule and removed."""
+        report = self._pass_crossed_by_a_volume(
+            tmp_dir,
+            palace_path,
+            monkeypatch,
+            real_rule="*.py\n",
+            volume_rule="# no rule\n",
+            arrives_after_the_key=True,
+        )
+
+        assert report["gitignored"] == 1, report
+        assert report["kept"] == 1, report
+        assert report["removed_drawers"] == 1, report
+
+    def test_apply_removes_nothing_the_rule_could_not_establish(self, tmp_dir, palace_path):
+        """The verdict reaches the palace: a mismatched identity leaves the
+        drawer in the collection on apply, and a matching one removes it."""
+        from mempalace import source_identity as si
+
+        repo, ignored = self._repo_with_an_ignored_file(tmp_dir)
+        here = si.directory_identity(repo)
+        assert here is not None
+        mined_elsewhere = str(int(here) + 1)
+        self._seed(palace_path, [("d_ignored", ignored, mined_elsewhere)])
+
+        report = self._run(palace_path, repo, dry_run=False)
+        assert report["removed_drawers"] == 0, report
+        client, col = _open_drawers(palace_path)
+        assert _drawer_ids(col) == {"d_ignored"}, _drawer_ids(col)
+        col.update(ids=["d_ignored"], metadatas=[{"source_dir_ino": here}])
+        del col, client
+
+        report = self._run(palace_path, repo, dry_run=False)
+        assert report["removed_drawers"] == 1, report
+        client, col = _open_drawers(palace_path)
+        assert _drawer_ids(col) == set(), _drawer_ids(col)
+        del col, client
