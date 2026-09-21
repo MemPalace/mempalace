@@ -214,8 +214,14 @@ _MCP_WRITER_LOCK_CM = None
 _MCP_WRITER_READ_ONLY = False
 _MCP_WRITER_LOCK_FAILED = False
 _MCP_WRITER_LOCK_ERROR = ""
+_MCP_WRITER_HOLDER = ""
 _MCP_WRITER_ATEXIT_REGISTERED = False
 _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
+_PEER_WRITER_HINT = (
+    "Stop the holder, or run one hub (`mempalace serve`) so stdio sessions "
+    "proxy instead of competing for the writer lease."
+)
+_HELD_BY_RE = re.compile(r"is held by (.+?)(?:;|$)")
 
 _MUTATING_TOOLS = frozenset(
     {
@@ -492,13 +498,55 @@ def _discard_mcp_storage_handles() -> None:
     _invalidate_overview_caches()
 
 
+def _holder_from_lock_error(exc: BaseException) -> str:
+    """Extract the lock-holder identity from ``MineAlreadyRunning``.
+
+    ``palace_lock`` formats the body as ``palace <path> is held by <holder>;
+    wait...``. Tests and older raise sites may pass a bare string; those
+    become the holder as-is so diagnostics never invent a PID.
+    """
+
+    text = str(exc).strip()
+    match = _HELD_BY_RE.search(text)
+    if match:
+        return match.group(1).strip()
+    return text
+
+
+def _mcp_writer_status_payload() -> dict:
+    """Lease role for ``mempalace_status`` — diagnose without failing a write."""
+
+    holder = _MCP_WRITER_HOLDER
+    target_fn = globals().get("_hub_proxy_target")
+    if callable(target_fn):
+        try:
+            if target_fn() is not None:
+                return {"role": "hub_proxy", "holder": holder}
+        except Exception:
+            logger.debug("hub-proxy probe for status failed", exc_info=True)
+    if _MCP_WRITER_LOCK_CM is not None:
+        return {"role": "writer", "holder": ""}
+    if _MCP_WRITER_READ_ONLY:
+        return {"role": "read_only_peer", "holder": holder}
+    return {"role": "idle", "holder": holder}
+
+
+def _with_writer_status(result):
+    """Attach ``writer`` to a status dict without touching non-dicts."""
+
+    if isinstance(result, dict):
+        result["writer"] = _mcp_writer_status_payload()
+    return result
+
+
 def _release_mcp_writer_lock() -> None:
     """Close writable handles and release this process's palace lease."""
 
-    global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY
+    global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY, _MCP_WRITER_HOLDER
 
     lock_cm = _MCP_WRITER_LOCK_CM
     if lock_cm is None:
+        _MCP_WRITER_HOLDER = ""
         return
 
     try:
@@ -508,6 +556,7 @@ def _release_mcp_writer_lock() -> None:
         # repeatedly without exiting the same context manager twice.
         _MCP_WRITER_LOCK_CM = None
         _MCP_WRITER_READ_ONLY = False
+        _MCP_WRITER_HOLDER = ""
         lock_cm.__exit__(None, None, None)
 
 
@@ -530,7 +579,7 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     """
 
     global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY, _MCP_WRITER_LOCK_FAILED
-    global _MCP_WRITER_LOCK_ERROR, _MCP_WRITER_ATEXIT_REGISTERED
+    global _MCP_WRITER_LOCK_ERROR, _MCP_WRITER_HOLDER, _MCP_WRITER_ATEXIT_REGISTERED
 
     if _MCP_WRITER_LOCK_CM is not None:
         return True, ""
@@ -543,6 +592,7 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     _MCP_WRITER_READ_ONLY = False
     _MCP_WRITER_LOCK_FAILED = False
     _MCP_WRITER_LOCK_ERROR = ""
+    _MCP_WRITER_HOLDER = ""
 
     try:
         from ..palace import (
@@ -566,6 +616,7 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
         lock_cm.__enter__()
     except MineAlreadyRunning as exc:
         _MCP_WRITER_READ_ONLY = True
+        _MCP_WRITER_HOLDER = _holder_from_lock_error(exc)
         _MCP_WRITER_LOCK_ERROR = (
             "another mempalace writer already holds the palace lock for "
             f"{_config.palace_path!r}: {exc}"
@@ -573,6 +624,7 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
         return False, _MCP_WRITER_LOCK_ERROR
     except Exception as exc:
         _MCP_WRITER_LOCK_FAILED = True
+        _MCP_WRITER_HOLDER = ""
         _MCP_WRITER_LOCK_ERROR = (
             "could not acquire MCP peer-writer lock for "
             f"{_config.palace_path!r}: {exc!r}; refusing this mutating tool "
@@ -595,6 +647,7 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     _MCP_WRITER_READ_ONLY = False
     _MCP_WRITER_LOCK_FAILED = False
     _MCP_WRITER_LOCK_ERROR = ""
+    _MCP_WRITER_HOLDER = ""
     return True, ""
 
 
@@ -606,24 +659,35 @@ def _mcp_peer_writer_refusal(req_id, tool_name: str):
     if ok:
         return None
 
+    setup_failed = _MCP_WRITER_LOCK_FAILED
+    holder = _MCP_WRITER_HOLDER
+    if setup_failed:
+        message = "MCP writer initialization failed; this server is read-only for mutating tools"
+    elif holder:
+        message = (
+            f"Peer MCP writer active (held by {holder}); "
+            "this server is read-only for mutating tools"
+        )
+    else:
+        message = "Peer MCP writer active; this server is read-only for mutating tools"
+
+    data = {
+        "tool": tool_name,
+        "palace": _config.palace_path,
+        "reason": reason,
+        "failure_kind": "initialization_failed" if setup_failed else "peer_contention",
+    }
+    if not setup_failed:
+        data["holder"] = holder
+        data["hint"] = _PEER_WRITER_HINT
+
     return {
         "jsonrpc": "2.0",
         "id": req_id,
         "error": {
             "code": -32001,
-            "message": (
-                "MCP writer initialization failed; this server is read-only for mutating tools"
-                if _MCP_WRITER_LOCK_FAILED
-                else "Peer MCP writer active; this server is read-only for mutating tools"
-            ),
-            "data": {
-                "tool": tool_name,
-                "palace": _config.palace_path,
-                "reason": reason,
-                "failure_kind": (
-                    "initialization_failed" if _MCP_WRITER_LOCK_FAILED else "peer_contention"
-                ),
-            },
+            "message": message,
+            "data": data,
         },
     }
 

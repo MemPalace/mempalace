@@ -17,6 +17,7 @@ def isolated_writer(monkeypatch, tmp_path):
         ("_MCP_WRITER_READ_ONLY", False),
         ("_MCP_WRITER_LOCK_FAILED", False),
         ("_MCP_WRITER_LOCK_ERROR", ""),
+        ("_MCP_WRITER_HOLDER", ""),
     ):
         monkeypatch.setattr(mcp, name, value)
     monkeypatch.setattr(mcp, "_discard_mcp_storage_handles", lambda: None)
@@ -43,20 +44,40 @@ def test_unavailable_backend_refusal_and_recovery(isolated_writer, monkeypatch):
 
 def test_contention_then_setup_failure_has_fresh_diagnostic(isolated_writer, monkeypatch):
     def busy(*args, **kwargs):
-        raise palace.MineAlreadyRunning("synthetic peer")
+        raise palace.MineAlreadyRunning(
+            "palace /tmp/palace is held by PID 6704 (/Users/robs/.local/bin/mempalace-mcp); "
+            "wait for it to finish or stop the holder before retrying"
+        )
 
     monkeypatch.setattr(palace, "mine_palace_lock", busy)
     result = mcp._mcp_peer_writer_refusal(1, "mempalace_add_drawer")
-    assert "Peer MCP writer active" in result["error"]["message"]
+    error = result["error"]
+    assert "Peer MCP writer active" in error["message"]
+    assert "held by PID 6704 (/Users/robs/.local/bin/mempalace-mcp)" in error["message"]
+    assert error["data"]["holder"] == "PID 6704 (/Users/robs/.local/bin/mempalace-mcp)"
+    assert "hub" in error["data"]["hint"]
+    assert mcp._MCP_WRITER_HOLDER == "PID 6704 (/Users/robs/.local/bin/mempalace-mcp)"
     monkeypatch.setenv("MEMPALACE_BACKEND", "unregistered_test_backend")
     result = mcp._mcp_peer_writer_refusal(2, "mempalace_add_drawer")
     assert "Peer MCP writer active" not in result["error"]["message"]
+    assert "holder" not in result["error"]["data"]
     assert not mcp._MCP_WRITER_READ_ONLY
 
     monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
     result = mcp._mcp_peer_writer_refusal(3, "mempalace_add_drawer")
     assert result["error"]["data"]["failure_kind"] == "peer_contention"
     assert not mcp._MCP_WRITER_LOCK_FAILED
+
+
+def test_status_reports_read_only_peer_holder(isolated_writer, monkeypatch):
+    def busy(*args, **kwargs):
+        raise palace.MineAlreadyRunning("palace /tmp/p is held by PID 42 (mempalace-mcp); wait")
+
+    monkeypatch.setattr(palace, "mine_palace_lock", busy)
+    mcp._mcp_peer_writer_refusal(1, "mempalace_add_drawer")
+    status = mcp._mcp_writer_status_payload()
+    assert status["role"] == "read_only_peer"
+    assert status["holder"] == "PID 42 (mempalace-mcp)"
 
 
 def test_lock_setup_error_does_not_claim_contention(isolated_writer, monkeypatch):

@@ -21,7 +21,7 @@ def _tool_status_via_sqlite() -> dict:
 
     db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
-        return _no_palace()
+        return _with_writer_status(_no_palace())
     collection_name = _config.collection_name
 
     wings: dict = {}
@@ -78,7 +78,7 @@ def _tool_status_via_sqlite() -> dict:
             "hnsw_count": _vector_capacity_status.get("hnsw_count"),
             "divergence": _vector_capacity_status.get("divergence"),
         }
-    return result
+    return _with_writer_status(result)
 
 
 def _sqlite_taxonomy():
@@ -262,7 +262,7 @@ def tool_status():
             result["sqlite_integrity_failed"] = True
             result["error"] = "SQLite integrity check failed"
             result["partial"] = True
-        return result
+        return _with_writer_status(result)
 
     # Run the safe sqlite/pickle probe before we touch chromadb. In the
     # #1222 failure mode, opening the persistent client to call .count()
@@ -288,21 +288,23 @@ def tool_status():
             wings[w] = wings.get(w, 0) + sum(room_counts.values())
             for r, n in room_counts.items():
                 rooms[r] = rooms.get(r, 0) + n
-        return {
-            "total_drawers": total,
-            "wings": wings,
-            "rooms": rooms,
-            "protocol": PALACE_PROTOCOL,
-            "aaak_dialect": AAAK_SPEC,
-            "backend": _selected_backend_name(),
-        }
+        return _with_writer_status(
+            {
+                "total_drawers": total,
+                "wings": wings,
+                "rooms": rooms,
+                "protocol": PALACE_PROTOCOL,
+                "aaak_dialect": AAAK_SPEC,
+                "backend": _selected_backend_name(),
+            }
+        )
 
     # Use create=True only when a palace DB already exists on disk -- this
     # bootstraps the ChromaDB collection on a valid-but-empty palace without
     # accidentally creating a palace in a non-existent directory (#830).
     col = _get_collection(create=db_exists)
     if not col:
-        return _collection_error_or_no_palace()
+        return _with_writer_status(_collection_error_or_no_palace())
     count = col.count()
     wings = {}
     rooms = {}
@@ -360,7 +362,7 @@ def tool_status():
         logger.exception("tool_status metadata fetch failed")
         result["error"] = str(e)
         result["partial"] = True
-    return result
+    return _with_writer_status(result)
 
 
 # ── AAAK Dialect Spec ─────────────────────────────────────────────────────────
