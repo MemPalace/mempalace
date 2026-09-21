@@ -126,8 +126,14 @@ def file_already_mined(
         return False
 
 
+# Above this many candidate files, a single `where`-filtered get() binds
+# more query variables than a full paginated scan costs in round trips, so
+# the scoped path below stops paying off (#2561).
+_PREFETCH_SCOPE_THRESHOLD = 50
+
+
 def prefetch_mined_set(
-    collection, extract_mode: Optional[str] = None
+    collection, extract_mode: Optional[str] = None, source_files: Optional[list] = None
 ) -> dict[str, Optional[float]]:
     """Pre-fetch source_file -> stored source_mtime for files already mined
     at the current NORMALIZE_VERSION, in one bulk pass instead of one
@@ -160,41 +166,61 @@ def prefetch_mined_set(
     `collection.get(where={"source_file": X})` costs ~2s on a 150k-drawer
     palace, making a 2000-file sweep take >1h of pure skip-checking. This
     helper drops that to a single paginated scan plus O(1) lookups.
+
+    When `source_files` is given and holds at most `_PREFETCH_SCOPE_THRESHOLD`
+    paths, the caller already knows the only source_file values that could
+    possibly match, so a single `where={"source_file": {"$in": ...}}` get()
+    replaces the full-collection scan (#2561: for a one-file hook-triggered
+    mine against a 660k-drawer palace, the full scan was 79% of total mine
+    time). Above the threshold, or when source_files is omitted, the
+    behaviour is unchanged: a bulk sweep still benefits more from one full
+    scan than from many filtered queries.
     """
     # Per source_file: per stored_mtime group → count + optional chunk_total.
     # A source is only "mined" once some group is complete.
     groups: dict[str, dict] = {}
+
+    def _absorb(meta):
+        meta = meta or {}
+        src = meta.get("source_file")
+        if not src:
+            return
+        if not _metadata_matches_extract_mode(meta, extract_mode):
+            return
+        # Same default as file_already_mined: missing version == 1
+        version = meta.get("normalize_version", 1)
+        if version < NORMALIZE_VERSION:
+            return
+        stored_mtime = meta.get("source_mtime")
+        mtime_key = float(stored_mtime) if stored_mtime is not None else None
+        entry = groups.setdefault(src, {}).setdefault(mtime_key, {"count": 0, "chunk_total": None})
+        entry["count"] += 1
+        chunk_total = meta.get("chunk_total")
+        if chunk_total is not None:
+            try:
+                entry["chunk_total"] = int(chunk_total)
+            except (TypeError, ValueError):
+                pass
+
     try:
-        total = collection.count()
-        offset = 0
-        while offset < total:
-            batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
-            for meta in batch["metadatas"]:
-                meta = meta or {}
-                src = meta.get("source_file")
-                if not src:
-                    continue
-                if not _metadata_matches_extract_mode(meta, extract_mode):
-                    continue
-                # Same default as file_already_mined: missing version == 1
-                version = meta.get("normalize_version", 1)
-                if version < NORMALIZE_VERSION:
-                    continue
-                stored_mtime = meta.get("source_mtime")
-                mtime_key = float(stored_mtime) if stored_mtime is not None else None
-                entry = groups.setdefault(src, {}).setdefault(
-                    mtime_key, {"count": 0, "chunk_total": None}
+        if source_files is not None and len(source_files) <= _PREFETCH_SCOPE_THRESHOLD:
+            if source_files:
+                scoped = collection.get(
+                    where={"source_file": {"$in": list(source_files)}},
+                    include=["metadatas"],
                 )
-                entry["count"] += 1
-                chunk_total = meta.get("chunk_total")
-                if chunk_total is not None:
-                    try:
-                        entry["chunk_total"] = int(chunk_total)
-                    except (TypeError, ValueError):
-                        pass
-            if not batch["ids"]:
-                break
-            offset += len(batch["ids"])
+                for meta in scoped.get("metadatas") or []:
+                    _absorb(meta)
+        else:
+            total = collection.count()
+            offset = 0
+            while offset < total:
+                batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
+                for meta in batch["metadatas"]:
+                    _absorb(meta)
+                if not batch["ids"]:
+                    break
+                offset += len(batch["ids"])
     except Exception:
         logger.warning("prefetch_mined_set: partial fetch, %d source groups loaded", len(groups))
 
@@ -239,6 +265,21 @@ def prefetch_content_hashes(
     the ones that didn't. Only the first source_file seen for a given
     (wing, hash) pair is kept — good enough to detect and skip a repeat,
     the point is not to track every alias.
+
+    Deliberately NOT scoped by candidate source_files the way
+    prefetch_mined_set is (#2561): a stored `content_hash` can hold several
+    comma-joined hashes (one privacy-export bundle drawer covers several
+    conversations), so a `where`-filtered query can only match a document
+    whose entire stored value equals one candidate hash and would silently
+    miss any bundle row. An incomplete result here is worse than none,
+    because a caller reading the returned dict has no way to tell "no
+    duplicate" from "the query couldn't see this row". Narrowing this scan
+    correctly needs either a schema change (one hash per metadata field
+    instead of a joined list) or a second index; out of scope for the fix
+    that scoped prefetch_mined_set. See test_mine_convos_skips_same_content_
+    under_new_filename and test_mine_convos_skips_same_conversation_within_
+    re_exported_bundle, which a source_files-scoped or skipped version of
+    this function broke.
     """
     hashes: dict[tuple[str, str], str] = {}
     try:
