@@ -94,10 +94,16 @@ def patched_lazy_load(monkeypatch):
     Returns a dict of recording counters so tests can assert how many times
     each was called (e.g. confirm lazy-load caches after first call).
     """
-    calls = {"hf_hub_download": 0, "InferenceSession": 0, "Tokenizer.from_file": 0}
+    calls = {
+        "hf_hub_download": 0,
+        "downloads": [],
+        "InferenceSession": 0,
+        "Tokenizer.from_file": 0,
+    }
 
     def fake_download(repo, filename=None, subfolder=None, **kwargs):
         calls["hf_hub_download"] += 1
+        calls["downloads"].append(filename)
         return f"/tmp/fake/{subfolder or ''}/{filename}"
 
     fake_session_cls = _make_fake_session()
@@ -137,6 +143,22 @@ def test_lazy_load_runs_once(patched_lazy_load):
     assert patched_lazy_load["hf_hub_download"] == 3  # model + weights + tokenizer, once
     assert patched_lazy_load["InferenceSession"] == 1
     assert patched_lazy_load["Tokenizer.from_file"] == 1
+
+
+@pytest.mark.parametrize(
+    ("variant", "model_filename"),
+    [("q8", "model_quantized.onnx"), ("fp16", "model_fp16.onnx")],
+)
+def test_variant_downloads_matching_model_and_weights(patched_lazy_load, variant, model_filename):
+    ef = embedding.EmbeddinggemmaONNX(variant=variant)
+
+    ef(["one"])
+
+    assert patched_lazy_load["downloads"] == [
+        model_filename,
+        model_filename + "_data",
+        "tokenizer.json",
+    ]
 
 
 def test_output_shape_is_truncated_to_384(patched_lazy_load):
@@ -545,6 +567,41 @@ def test_get_embedding_function_dispatches_to_embeddinggemma(monkeypatch):
     ef = embedding.get_embedding_function(device="cpu", model="embeddinggemma")
     assert isinstance(ef, embedding.EmbeddinggemmaONNX)
     assert ef.name() == "embeddinggemma_300m"
+
+
+def test_factory_uses_configured_embeddinggemma_variant(monkeypatch):
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", "fp16")
+    monkeypatch.setattr(
+        embedding,
+        "_resolve_providers",
+        lambda device, model=None: (["CPUExecutionProvider"], "cpu"),
+    )
+
+    ef = embedding.get_embedding_function(device="cpu", model="embeddinggemma")
+
+    assert ef._variant == "fp16"
+
+
+def test_factory_rejects_combined_embeddinggemma_model_name():
+    with pytest.raises(ValueError, match="embeddinggemma_variant"):
+        embedding.get_embedding_function(device="cpu", model="embeddinggemma:fp16")
+
+
+def test_cache_key_separates_embeddinggemma_variants(monkeypatch):
+    monkeypatch.setattr(
+        embedding,
+        "_resolve_providers",
+        lambda device, model=None: (["CPUExecutionProvider"], "cpu"),
+    )
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", "q8")
+    q8 = embedding.get_embedding_function(device="cpu", model="embeddinggemma")
+
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", "fp16")
+    fp16 = embedding.get_embedding_function(device="cpu", model="embeddinggemma")
+
+    assert q8 is not fp16
+    assert q8._variant == "q8"
+    assert fp16._variant == "fp16"
 
 
 def test_cache_key_separates_models(monkeypatch):
