@@ -749,6 +749,29 @@ class SQLiteExactCollection(BaseCollection):
                 raise ValueError(f"{label} length {len(value)} does not match ids length {n}")
         with self._cursor(write=True) as cur:
             collection_id = self._collection_id(cur)
+            if documents is None and embeddings is None:
+                # Metadata-only update (a wing or room move): merge the JSON
+                # and leave the document, its embedding and its FTS row alone.
+                # Rewriting the FTS row per drawer made a 240k-row wing split
+                # run at ~1k rows/min; this path is one UPDATE per row.
+                now = _utcnow()
+                params = []
+                for idx, doc_id in enumerate(ids):
+                    row = cur.execute(
+                        "SELECT metadata_json FROM documents WHERE collection_id = ? AND id = ?",
+                        (collection_id, doc_id),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    meta = _json_loads(row[0])
+                    meta.update(metadatas[idx] or {})
+                    params.append((_json_dumps(meta), now, collection_id, doc_id))
+                cur.executemany(
+                    "UPDATE documents SET metadata_json = ?, updated_at = ? "
+                    "WHERE collection_id = ? AND id = ?",
+                    params,
+                )
+                return
             updates = []
             for idx, doc_id in enumerate(ids):
                 row = cur.execute(
@@ -784,7 +807,8 @@ class SQLiteExactCollection(BaseCollection):
                     """,
                     (doc, _json_dumps(meta), emb_blob, dim, _utcnow(), collection_id, doc_id),
                 )
-                self._replace_fts(cur, collection_id, doc_id, doc)
+                if documents is not None:
+                    self._replace_fts(cur, collection_id, doc_id, doc)
 
     def _rows(
         self,

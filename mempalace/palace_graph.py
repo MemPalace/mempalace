@@ -1028,11 +1028,73 @@ def topic_tunnels_for_wing(
     return created
 
 
+ENTITY_TUNNEL_MIN_COUNT = 3
+ENTITY_TUNNEL_MAX_PER_WING = 25
+# An entity present in more wings than this share of all wings (and in more
+# than ENTITY_TUNNEL_UBIQUITY_MIN_WINGS) is vocabulary, not a link: ``Server``
+# shows up in every project, ``block_num`` in the two Hyperion ones.
+ENTITY_TUNNEL_UBIQUITY_SHARE = 0.25
+ENTITY_TUNNEL_UBIQUITY_MIN_WINGS = 3
+
+
+def entity_tunnel_candidates(hallways: list, min_count: int = ENTITY_TUNNEL_MIN_COUNT) -> dict:
+    """``{entity: {wing_norm: (display_wing, strength)}}`` for entities in ≥2 wings.
+
+    Strength is the entity's strongest hallway co-occurrence in that wing.
+    Left out: generic tokens (``content``, ``WebFetch``, ``compose.yml``),
+    entities below ``min_count`` in a wing, and ubiquitous entities — present
+    in more than a quarter of all wings (and in more than three). A tunnel
+    on any of them links nothing. Spelling variants of one entity merge
+    under the shortest spelling.
+    """
+    from .hallways import canonical_entities, entity_spelling_key, is_generic_entity
+
+    by_key: dict = {}
+    display: dict = {}
+    for h in hallways:
+        if not isinstance(h, dict):
+            continue
+        h_wing = h.get("wing")
+        if not isinstance(h_wing, str) or not h_wing.strip():
+            continue
+        wing_norm = normalize_wing_name(h_wing.strip())
+        # A record without a count is hand-made or legacy; it passes the bar.
+        count = int(h["co_occurrence_count"]) if "co_occurrence_count" in h else min_count
+        for ent_key in ("entity_a", "entity_b"):
+            ent = h.get(ent_key)
+            if not isinstance(ent, str) or not ent.strip() or is_generic_entity(ent):
+                continue
+            key = entity_spelling_key(ent)
+            display[key] = canonical_entities([display.get(key, ent), ent])[0]
+            wings = by_key.setdefault(key, {})
+            prev = wings.get(wing_norm)
+            if prev is None or count > prev[1]:
+                wings[wing_norm] = (h_wing, count)
+    all_wings = {
+        normalize_wing_name(str(h.get("wing")).strip())
+        for h in hallways
+        if isinstance(h, dict) and h.get("wing")
+    }
+    ubiquity_cap = max(
+        ENTITY_TUNNEL_UBIQUITY_MIN_WINGS, int(len(all_wings) * ENTITY_TUNNEL_UBIQUITY_SHARE)
+    )
+    out = {}
+    for key, wings in by_key.items():
+        if len(wings) > ubiquity_cap:
+            continue
+        strong = {w: v for w, v in wings.items() if v[1] >= min_count}
+        if len(strong) >= 2:
+            out[display[key]] = strong
+    return out
+
+
 def entity_tunnels_for_wing(
     wing: str,
     hallways: list,
     label_prefix: str = "shared entity",
     config=None,
+    min_count: int = ENTITY_TUNNEL_MIN_COUNT,
+    max_per_wing: int = ENTITY_TUNNEL_MAX_PER_WING,
 ) -> list:
     """Compute entity tunnels involving a single wing.
 
@@ -1055,42 +1117,25 @@ def entity_tunnels_for_wing(
         return []
 
     wing_norm = normalize_wing_name(wing.strip())
-
-    # Build: entity -> {normalized_wing -> original_wing_display_name}
-    # Both entity_a and entity_b positions count toward "this entity is
-    # in this wing"; the hallway primitive treats the pair as unordered.
-    entity_wings: dict = {}
-    for h in hallways:
-        if not isinstance(h, dict):
-            continue
-        h_wing = h.get("wing")
-        if not isinstance(h_wing, str) or not h_wing.strip():
-            continue
-        h_wing_norm = normalize_wing_name(h_wing.strip())
-        for ent_key in ("entity_a", "entity_b"):
-            ent = h.get(ent_key)
-            if not isinstance(ent, str) or not ent.strip():
-                continue
-            # setdefault preserves the first-seen display form so the
-            # tunnel endpoint matches the wing name the caller used.
-            entity_wings.setdefault(ent, {}).setdefault(h_wing_norm, h_wing)
-
-    if not entity_wings:
+    candidates = entity_tunnel_candidates(hallways, min_count=min_count)
+    if not candidates:
         return []
 
+    # Strongest shared entities first (by the weaker side of the link) so the
+    # per-wing cap keeps the links that matter; ties break on the name so
+    # tunnels.json stays diff-able across runs.
+    def rank(item):
+        entity, wings_for_entity = item
+        others = [v[1] for w, v in wings_for_entity.items() if w != wing_norm]
+        return (-min(wings_for_entity[wing_norm][1], max(others)), entity)
+
+    ranked = sorted((i for i in candidates.items() if wing_norm in i[1]), key=rank)
     created: list = []
-    # Stable entity order so tunnels materialize deterministically across
-    # runs — matters for tests and for diff-able tunnels.json files.
-    for entity in sorted(entity_wings.keys()):
-        wings_for_entity = entity_wings[entity]
-        if wing_norm not in wings_for_entity:
-            continue
-        own_wing_display = wings_for_entity[wing_norm]
-        # Stable other-wing order; ``wing_norm`` itself is excluded so an
-        # entity that lives only in this wing produces zero tunnels.
+    for entity, wings_for_entity in ranked[:max_per_wing]:
+        own_wing_display = wings_for_entity[wing_norm][0]
         other_wings_norm = sorted(w for w in wings_for_entity if w != wing_norm)
         for other_norm in other_wings_norm:
-            other_display = wings_for_entity[other_norm]
+            other_display = wings_for_entity[other_norm][0]
             room = f"entity:{entity}"
             tunnel = create_tunnel(
                 source_wing=own_wing_display,

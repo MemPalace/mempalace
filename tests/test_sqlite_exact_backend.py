@@ -1785,3 +1785,26 @@ def test_exact_query_retries_entire_batch_across_all_engines(
     finally:
         peer.close()
         backend.close()
+
+
+def test_sqlite_exact_metadata_only_update_keeps_document_embedding_and_fts(tmp_path):
+    """A wing/room move must not touch the document, its vector or its FTS row (#audit split)."""
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b"],
+        documents=["rareterm alpha note", "plain beta note"],
+        metadatas=[{"wing": "w", "room": "r", "keep": 1}, {"wing": "w", "room": "r"}],
+        embeddings=[[1, 0], [0, 1]],
+    )
+    col.update(
+        ids=["a", "missing"], metadatas=[{"wing": "target", "last_modified": "t"}, {"wing": "x"}]
+    )
+
+    got = col.get(ids=["a"], include=["documents", "metadatas", "embeddings"])
+    assert got["documents"] == ["rareterm alpha note"]
+    assert got["metadatas"][0] == {"wing": "target", "room": "r", "keep": 1, "last_modified": "t"}
+    assert list(got["embeddings"][0]) == [1.0, 0.0]
+    # The FTS row survived untouched and the new wing filter finds it.
+    hits = col.lexical_search(query="rareterm", n_results=5, where={"wing": "target"}).hits
+    assert [hit.id for hit in hits] == ["a"]
+    assert col.lexical_search(query="rareterm", n_results=5, where={"wing": "w"}).hits == []

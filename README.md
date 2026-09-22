@@ -221,6 +221,9 @@ mempalace search "why did we switch to GraphQL"
 
 # Load context for a new session
 mempalace wake-up
+
+# Score how well organized the palace is (read-only, safe while the MCP server runs)
+mempalace audit
 ```
 
 For Claude Code, Gemini CLI, [Antigravity](https://mempalaceofficial.com/guide/antigravity.html),

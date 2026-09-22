@@ -1105,9 +1105,8 @@ class TestWriteTools:
 
         seeded = self._seed_hallways(monkeypatch, tmp_path)
         result = mcp_server.tool_list_hallways()
-        assert isinstance(result, list)
-        assert len(result) == len(seeded)
-        ids = {h["id"] for h in result}
+        assert result["total"] == len(seeded) and result["count"] == len(seeded)
+        ids = {h["id"] for h in result["hallways"]}
         assert ids == {h["id"] for h in seeded}
 
     def test_tool_list_hallways_filters_by_wing(self, monkeypatch, tmp_path):
@@ -1116,8 +1115,8 @@ class TestWriteTools:
 
         self._seed_hallways(monkeypatch, tmp_path)
         result = mcp_server.tool_list_hallways(wing="wing_a")
-        assert len(result) == 1
-        assert result[0]["wing"] == "wing_a"
+        assert result["count"] == 1
+        assert result["hallways"][0]["wing"] == "wing_a"
 
     def test_tool_list_hallways_rejects_invalid_wing_name(self, monkeypatch, tmp_path):
         """Invalid wing names go through _sanitize_optional_name and return a
@@ -1138,7 +1137,7 @@ class TestWriteTools:
         target_id = seeded[0]["id"]
         result = mcp_server.tool_delete_hallway(hallway_id=target_id)
         assert result == {"deleted": True}
-        remaining = mcp_server.tool_list_hallways()
+        remaining = mcp_server.tool_list_hallways()["hallways"]
         assert target_id not in {h["id"] for h in remaining}
 
     def test_tool_delete_hallway_unknown_id_returns_false(self, monkeypatch, tmp_path):

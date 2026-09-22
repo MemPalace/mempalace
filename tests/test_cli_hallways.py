@@ -72,3 +72,49 @@ def test_explicit_palace_scopes_hallway_listing(monkeypatch, tmp_path):
     cmd_hallways(Namespace(wing="wing_aya", limit=50, palace=str(selected)))
 
     assert calls == [("wing_aya", str(selected))]
+
+
+def test_prune_spellings_dry_run_then_apply(monkeypatch, capsys):
+    calls = []
+
+    def fake_prune(config=None, apply=False):
+        calls.append(apply)
+        return {
+            "total": 10,
+            "self_links": 2,
+            "duplicates": 1,
+            "by_wing": {"w": 3},
+            "sample": ["main.zig ↔ src/main.zig"],
+            "removed": 3 if apply else 0,
+        }
+
+    monkeypatch.setattr(hallways_mod, "prune_spelling_hallways", fake_prune)
+    cmd_hallways(Namespace(wing=None, limit=50, prune_spellings=True, yes=False))
+    out = capsys.readouterr().out
+    assert "3 of 10 hallways are spelling artifacts" in out
+    assert "Dry run" in out
+    cmd_hallways(Namespace(wing=None, limit=50, prune_spellings=True, yes=True))
+    assert "Removed 3." in capsys.readouterr().out
+    assert calls == [False, True]
+
+
+def test_rebuild_recomputes_every_wing(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr("mempalace.palace.get_collection", lambda *a, **k: object())
+    monkeypatch.setattr(
+        "mempalace.palace_graph.sqlite_grouped_counts_reader",
+        lambda config: lambda path, name: [("r", "b", "", 1), ("r", "a", "", 1)],
+    )
+    monkeypatch.setattr(
+        hallways_mod,
+        "compute_hallways_for_wing",
+        lambda wing, col=None, config=None: (
+            calls.append(wing) or [{"id": 1}] * (2 if wing == "a" else 1)
+        ),
+    )
+    cmd_hallways(Namespace(wing=None, limit=50, rebuild=True, palace="/p"))
+    out = capsys.readouterr().out
+    assert calls == ["a", "b"]
+    assert "Rebuilt 3 hallways across 2 wing(s)." in out
+    cmd_hallways(Namespace(wing="a", limit=50, rebuild=True, palace="/p"))
+    assert calls[-1] == "a"

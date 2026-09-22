@@ -944,3 +944,77 @@ class TestTunnelDynamicsIntegration:
         assert recreated["stability"] == DEFAULT_STABILITY
         assert recreated["access_count"] == 0
         assert "last_activated" in recreated
+
+
+class TestEntityTunnelFilters:
+    """Audit repair session, 2026-09-21: generic tokens, weak links and spelling variants
+    must not become tunnels; the strongest shared entities win the per-wing cap."""
+
+    def test_candidates_drop_generic_and_weak_and_merge_spellings(self):
+        hallways = [
+            {
+                "wing": "a",
+                "entity_a": "content",
+                "entity_b": "ChatStore",
+                "co_occurrence_count": 50,
+            },
+            {
+                "wing": "b",
+                "entity_a": "content",
+                "entity_b": "ChatStore.swift",
+                "co_occurrence_count": 40,
+            },
+            {"wing": "a", "entity_a": "RootView", "entity_b": "swim.zig", "co_occurrence_count": 2},
+            {
+                "wing": "b",
+                "entity_a": "RootView",
+                "entity_b": "codec.zig",
+                "co_occurrence_count": 9,
+            },
+        ]
+        cands = palace_graph.entity_tunnel_candidates(hallways, min_count=3)
+        assert set(cands) == {"ChatStore"}  # generic dropped; RootView too weak in wing a
+        assert cands["ChatStore"] == {"a": ("a", 50), "b": ("b", 40)}
+
+    def test_candidates_drop_stoplisted_and_ubiquitous_entities(self):
+        wings = [f"w{i}" for i in range(12)]
+        hallways = []
+        for w in wings:  # "Server" and "WebFetch" everywhere; "pool.ts" in two wings only
+            hallways.append(
+                {"wing": w, "entity_a": "Server", "entity_b": "Thing", "co_occurrence_count": 90}
+            )
+            hallways.append(
+                {"wing": w, "entity_a": "WebFetch", "entity_b": "Thing", "co_occurrence_count": 90}
+            )
+        hallways.append(
+            {"wing": "w0", "entity_a": "pool.ts", "entity_b": "Q", "co_occurrence_count": 9}
+        )
+        hallways.append(
+            {"wing": "w1", "entity_a": "pool.ts", "entity_b": "Q", "co_occurrence_count": 9}
+        )
+        cands = palace_graph.entity_tunnel_candidates(hallways, min_count=3)
+        assert set(cands) == {"pool.ts", "Q"}  # Server, WebFetch: stoplisted; Thing: ubiquitous
+
+    def test_per_wing_cap_keeps_strongest(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        hallways = []
+        for i in range(30):
+            hallways.append(
+                {
+                    "wing": "a",
+                    "entity_a": f"Sym{i}",
+                    "entity_b": "X",
+                    "co_occurrence_count": 100 - i,
+                }
+            )
+            hallways.append(
+                {
+                    "wing": "b",
+                    "entity_a": f"Sym{i}",
+                    "entity_b": "Y",
+                    "co_occurrence_count": 100 - i,
+                }
+            )
+        created = palace_graph.entity_tunnels_for_wing("a", hallways, max_per_wing=5)
+        names = sorted(t["source"]["room"] for t in created)
+        assert names == ["entity:Sym0", "entity:Sym1", "entity:Sym2", "entity:Sym3", "entity:Sym4"]

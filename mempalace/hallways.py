@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import logging
 import os
 import tempfile
@@ -155,6 +156,107 @@ def _save_hallways(hallways: list[dict], config=None) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Core algorithm — compute entity-pair hallways for one wing
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+# File extensions stripped when deciding whether two entity spellings name
+# the same file. A fixed set on purpose: ``ChatStore`` and ``ChatStore.send``
+# are different entities and must not collapse.
+_CODE_EXTENSIONS = frozenset(
+    "py js ts tsx jsx mjs cjs zig swift rs go md json yaml yml toml sh c h cpp hpp "
+    "java kt rb php html css sql txt cs vue svelte".split()
+)
+
+
+def entity_spelling_key(entity: str) -> str:
+    """Basename without a known code extension, lower-cased.
+
+    ``src/main.zig``, ``main.zig`` and ``/Users/x/proj/src/main.zig`` all key
+    to ``main``; ``mcp_server`` and ``mcp_server.py`` both key to
+    ``mcp_server``. Two entities sharing a key are one thing spelled two
+    ways, so a hallway between them is the entity co-occurring with itself,
+    not an association. Used by the miner to skip such pairs and by
+    ``mempalace audit`` / ``mempalace hallways --prune-self-links`` to find
+    the ones older mines already wrote.
+    """
+    base = str(entity).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    stem, dot, ext = base.rpartition(".")
+    if dot and stem and ext.lower() in _CODE_EXTENSIONS:
+        base = stem
+    return base.lower()
+
+
+_GENERIC_ENTITY_RE = re.compile(r"[a-z]{2,8}")
+
+# Names that appear in every coding transcript and identify no project: the
+# harness's tool names, generic nouns, and files every repo has. Matched
+# case-insensitively after stripping a trailing slash.
+GENERIC_ENTITY_STOPLIST = frozenset(
+    """
+    bash read write edit grep glob task agent websearch webfetch toolsearch
+    structuredoutput askuserquestion skill monitor notebookedit todowrite
+    app server service client gateway api handler controller model view
+    config settings utils util helpers helper index main core common base
+    test tests spec fixture mock github github.com gitlab git npm pip uv
+    docker dockerfile compose.yml docker-compose.yml package.json package-lock.json
+    tsconfig.json pyproject.toml requirements.txt readme readme.md changelog.md
+    license .env .gitignore makefile lib src dist build node_modules
+    created_at updated_at id name type value data result results error errors
+    """.split()
+)
+
+
+def is_generic_entity(name: str) -> bool:
+    """A name that identifies no project: a short lower-case word (``content``,
+    ``thinking``), a harness tool (``WebFetch``), a generic noun (``Server``)
+    or a file every repo has (``compose.yml``).
+
+    Symbols (``ChatStore``), qualified names (``store.baseURL``) and project
+    names pass; the boundary with a short lower-case project name is fuzzy
+    by construction. Cross-wing ubiquity is judged separately, where the
+    wing counts are known.
+    """
+    text = str(name).strip()
+    if _GENERIC_ENTITY_RE.fullmatch(text):
+        return True
+    # A bare single-segment path (``/app``, ``/model``) or a shouting constant
+    # (``MESSAGES``, ``TEMPLATES``) is structure every project has.
+    if re.fullmatch(r"/[A-Za-z0-9_-]+/?", text) or re.fullmatch(r"[A-Z][A-Z0-9_]{2,15}", text):
+        return True
+    # A lone lower-case English word of any length (``cancelled``,
+    # ``operations``) is vocabulary; project names are the exception and are
+    # usually short, which the first rule already accepts as generic too.
+    if re.fullmatch(r"[a-z]{9,12}", text) and not any(c in text for c in "._-/"):
+        return True
+    return text.rstrip("/").lower() in GENERIC_ENTITY_STOPLIST
+
+
+def is_self_link(record) -> bool:
+    """True when a hallway record joins two spellings of one entity."""
+    if not isinstance(record, dict):
+        return False
+    a, b = record.get("entity_a"), record.get("entity_b")
+    if a is None or b is None:
+        return False
+    return entity_spelling_key(a) == entity_spelling_key(b)
+
+
+def canonical_entities(entities: list[str]) -> list[str]:
+    """One spelling per entity, in first-seen order.
+
+    The structural extractor records a file as both its path and its
+    basename, so a drawer's entity list holds ``src/main.zig`` and
+    ``main.zig`` side by side. Pairing those raw spellings wrote a hallway
+    from the entity to itself and four copies of every real association
+    (``ChatStore`` × ``RootView`` under each spelling combination). The
+    shortest spelling wins, so hallways read ``ChatStore ↔ RootView``.
+    """
+    chosen: dict[str, str] = {}
+    for entity in entities:
+        key = entity_spelling_key(entity)
+        current = chosen.get(key)
+        if current is None or len(entity) < len(current):
+            chosen[key] = entity
+    return list(chosen.values())
 
 
 def _parse_entities(value) -> list[str]:
@@ -291,8 +393,14 @@ def compute_hallways_for_wing(
     # 2. Walk drawers, counting entity-pair co-occurrence + tracking rooms.
     # pair_counts: {(entity_a, entity_b): count} — keys always sorted to
     # canonicalize the (a, b) vs (b, a) symmetry.
+    # Pairs are keyed by spelling key, not raw spelling: the structural
+    # extractor records a file as both path and basename, and one drawer may
+    # say ``ChatStore.swift`` where the next says ``ChatStore``. ``display``
+    # remembers the shortest spelling seen wing-wide so the materialized
+    # record reads ``ChatStore ↔ RootView``.
     pair_counts: dict[tuple[str, str], int] = defaultdict(int)
     pair_rooms: dict[tuple[str, str], set[str]] = defaultdict(set)
+    display: dict[str, str] = {}
 
     for meta in metadatas:
         if not isinstance(meta, dict):
@@ -300,7 +408,12 @@ def compute_hallways_for_wing(
         # Sentinel drawers carry no real content — skip them.
         if meta.get("is_sentinel"):
             continue
-        entities = _parse_entities(meta.get("entities"))
+        entities = []
+        for spelling in canonical_entities(_parse_entities(meta.get("entities"))):
+            key = entity_spelling_key(spelling)
+            if key not in display or len(spelling) < len(display[key]):
+                display[key] = spelling
+            entities.append(key)
         if len(entities) < 2:
             # Need at least 2 entities for a pair to exist.
             continue
@@ -312,7 +425,10 @@ def compute_hallways_for_wing(
         # pairs without repetition.
         for a, b in combinations(entities, 2):
             # Canonicalize order so (Aya, Lumi) and (Lumi, Aya) are the
-            # same key. Skip self-pairs defensively.
+            # same key. Skip self-pairs, including the same entity under two
+            # spellings (``main.zig`` / ``src/main.zig``): the structural
+            # extractor records both the path and the basename, and a
+            # hallway between them is an entity paired with itself.
             if a == b:
                 continue
             key = tuple(sorted([a, b]))
@@ -340,7 +456,14 @@ def compute_hallways_for_wing(
         # order would silently miss the lookup and lose its accumulated
         # dynamics on every recompute. Per PR #1578 review
         # (gemini-code-assist, HIGH priority).
-        key = tuple(sorted([h.get("entity_a"), h.get("entity_b")]))
+        key = tuple(
+            sorted(
+                [
+                    entity_spelling_key(str(h.get("entity_a"))),
+                    entity_spelling_key(str(h.get("entity_b"))),
+                ]
+            )
+        )
         # Only copy the fields the dynamics layer cares about; everything
         # else is recomputed deterministically from the drawer set.
         existing_dynamics_lookup[key] = {
@@ -353,7 +476,7 @@ def compute_hallways_for_wing(
         count = pair_counts[key]
         if count < min_count:
             continue
-        entity_a, entity_b = key
+        entity_a, entity_b = sorted((display[key[0]], display[key[1]]))
         rooms = sorted(pair_rooms.get(key, set()))
         room_summary = ", ".join(rooms[:3]) if rooms else "(no room tags)"
         if len(rooms) > 3:
@@ -395,6 +518,66 @@ def list_hallways(wing: Optional[str] = None, config=None) -> list[dict]:
     if wing is None:
         return list(all_hallways)
     return [h for h in all_hallways if h.get("wing") == wing]
+
+
+def prune_spelling_hallways(config=None, apply: bool = False) -> dict:
+    """Find (and with ``apply``) remove hallways that older mines wrote per spelling.
+
+    Two defects, one cause: before :func:`canonical_entities` the miner paired
+    raw spellings, so every code wing has ``main.zig ↔ src/main.zig``
+    (an entity joined to itself) and four copies of ``ChatStore ↔ RootView``
+    (one per spelling combination). Self-links are dropped; of each variant
+    group the record with the highest co-occurrence count survives under
+    its shortest spellings and the rest are dropped. Only the sidecar file
+    is touched, never a drawer. ``removed`` is 0 on a dry run.
+    """
+    hallways = _load_hallways(config)
+    self_links = [h for h in hallways if is_self_link(h)]
+    groups: dict[tuple, list[dict]] = {}
+    for h in hallways:
+        if not isinstance(h, dict) or is_self_link(h):
+            continue
+        a, b = str(h.get("entity_a")), str(h.get("entity_b"))
+        key = (str(h.get("wing") or ""), *sorted((entity_spelling_key(a), entity_spelling_key(b))))
+        groups.setdefault(key, []).append(h)
+    duplicates: list[dict] = []
+    kept: list[dict] = []
+    for members in groups.values():
+        if len(members) == 1:
+            kept.append(members[0])
+            continue
+        members.sort(key=lambda h: -int(h.get("co_occurrence_count") or 0))
+        survivor = dict(members[0])
+        spellings_a = canonical_entities([str(m.get("entity_a")) for m in members])
+        spellings_b = canonical_entities([str(m.get("entity_b")) for m in members])
+        if len(spellings_a) == 1 and len(spellings_b) == 1:
+            survivor["entity_a"], survivor["entity_b"] = spellings_a[0], spellings_b[0]
+            survivor["id"] = _hallway_id(
+                survivor["wing"], survivor["entity_a"], survivor["entity_b"]
+            )
+        kept.append(survivor)
+        duplicates.extend(members[1:])
+
+    by_wing: dict[str, int] = {}
+    for h in self_links + duplicates:
+        wing = str(h.get("wing") or "?")
+        by_wing[wing] = by_wing.get(wing, 0) + 1
+    self_links.sort(key=lambda h: -int(h.get("co_occurrence_count") or 0))
+    duplicates.sort(key=lambda h: -int(h.get("co_occurrence_count") or 0))
+    sample = [f"{h.get('entity_a')} ↔ {h.get('entity_b')}" for h in (self_links + duplicates)[:10]]
+    doomed = len(self_links) + len(duplicates)
+    removed = 0
+    if apply and doomed:
+        _save_hallways(kept, config)
+        removed = doomed
+    return {
+        "total": len(hallways),
+        "self_links": len(self_links),
+        "duplicates": len(duplicates),
+        "by_wing": dict(sorted(by_wing.items(), key=lambda kv: -kv[1])),
+        "sample": sample,
+        "removed": removed,
+    }
 
 
 def delete_hallway(hallway_id: str, config=None) -> bool:

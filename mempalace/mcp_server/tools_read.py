@@ -870,13 +870,31 @@ def tool_delete_tunnel(tunnel_id: str):
     return delete_tunnel(tunnel_id)
 
 
-def tool_list_hallways(wing: str = None):
-    """List within-wing hallway records, optionally filtered by wing."""
+def tool_list_hallways(wing: str = None, limit: int = 100, offset: int = 0):
+    """List within-wing hallway records, strongest first, one page at a time.
+
+    A palace of any size holds hundreds of thousands of hallways; returning
+    them all in one response closed the MCP connection. The page is sorted by
+    co-occurrence count so the first page is the one worth reading.
+    """
     try:
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
-    return list_hallways(wing)
+    try:
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        return {"error": "limit and offset must be integers"}
+    rows = sorted(list_hallways(wing), key=lambda h: -int(h.get("co_occurrence_count") or 0))
+    page = rows[offset : offset + limit]
+    return {
+        "hallways": page,
+        "total": len(rows),
+        "count": len(page),
+        "offset": offset,
+        "limit": limit,
+    }
 
 
 def tool_delete_hallway(hallway_id: str):

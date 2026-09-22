@@ -210,6 +210,75 @@ def test_openai_compat_resolves_url_with_existing_v1():
     assert captured["url"] == "http://h:1234/v1/chat/completions"
 
 
+def test_openai_compat_think_false_sends_reasoning_effort_none():
+    captured = {}
+
+    def fake_urlopen(req, *, timeout):
+        captured["body"] = json.loads(req.data)
+        return _mock_openai_response('{"ok": true}')
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        p = OpenAICompatProvider(model="x", endpoint="http://h")
+        p.classify("s", "u", think=False)
+        assert captured["body"]["reasoning_effort"] == "none"
+        p.classify("s", "u")
+        assert "reasoning_effort" not in captured["body"]
+
+
+def test_openai_compat_retries_without_reasoning_effort_on_400():
+    from urllib.error import HTTPError
+
+    bodies = []
+
+    def fake_urlopen(req, *, timeout):
+        body = json.loads(req.data)
+        bodies.append(body)
+        if "reasoning_effort" in body:
+            raise HTTPError(req.full_url, 400, "unknown field", hdrs=None, fp=None)
+        return _mock_openai_response('{"ok": true}')
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        p = OpenAICompatProvider(model="x", endpoint="http://h")
+        assert p.classify("s", "u", think=False).text == '{"ok": true}'
+    assert len(bodies) == 2 and "reasoning_effort" not in bodies[1]
+
+
+def test_openai_compat_empty_content_after_length_cutoff_names_the_cause():
+    mock = MagicMock()
+    payload = {"choices": [{"finish_reason": "length", "message": {"content": ""}}]}
+    mock.read.return_value = json.dumps(payload).encode()
+    mock.__enter__.return_value = mock
+    mock.__exit__.return_value = False
+    with patch("mempalace.llm_client.urlopen", return_value=mock):
+        p = OpenAICompatProvider(model="x", endpoint="http://h")
+        with pytest.raises(LLMError, match="finish_reason=length"):
+            p.classify("s", "u")
+
+
+def _models_response(ids):
+    mock = MagicMock()
+    mock.read.return_value = json.dumps({"data": [{"id": i} for i in ids]}).encode()
+    mock.__enter__.return_value = mock
+    mock.__exit__.return_value = False
+    return mock
+
+
+def test_openai_compat_auto_model_follows_the_served_model():
+    with patch("mempalace.llm_client.urlopen", return_value=_models_response(["qwen3.8-27b"])):
+        p = OpenAICompatProvider(model="auto", endpoint="http://h:1")
+        assert p.check_available() == (True, "ok")
+        assert p.model == "qwen3.8-27b"
+
+
+def test_openai_compat_check_names_served_models_on_mismatch():
+    with patch("mempalace.llm_client.urlopen", return_value=_models_response(["other"])):
+        p = OpenAICompatProvider(model="gone", endpoint="http://h:1")
+        ok, msg = p.check_available()
+    assert not ok and "served: other" in msg and "auto" in msg
+    with patch("mempalace.llm_client.urlopen", return_value=_models_response([])):
+        assert OpenAICompatProvider(model="x", endpoint="http://h:1").check_available()[0]
+
+
 def test_openai_compat_requires_endpoint():
     p = OpenAICompatProvider(model="x")
     with pytest.raises(LLMError, match="requires --llm-endpoint"):
@@ -346,6 +415,15 @@ def test_ollama_provider_default_endpoint_is_local():
         f"Default OllamaProvider endpoint must be local; got "
         f"is_external_service={p.is_external_service} for endpoint={p.endpoint}"
     )
+
+
+def test_single_label_lan_hostname_is_local():
+    from mempalace.llm_client import _endpoint_is_local
+
+    assert _endpoint_is_local("http://x870e-9950x3d:8010")
+    assert _endpoint_is_local("http://gpu-box:11434/v1")
+    assert not _endpoint_is_local("https://api.openai.com")
+    assert not _endpoint_is_local("http://gpu-box.example.com:8010")
 
 
 def test_openai_compat_provider_localhost_endpoint_is_local():

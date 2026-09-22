@@ -508,3 +508,107 @@ class TestHallwayDynamicsIntegration:
         )
         assert after[0]["access_count"] == 33
         assert after[0]["stability"] == 1.9
+
+
+# ── entity spellings (audit repair session, 2026-09-20) ──────────────────────
+
+
+class TestEntitySpellings:
+    def test_spelling_key_collapses_paths_and_extensions(self):
+        key = hallways_mod.entity_spelling_key
+        assert key("main.zig") == key("src/main.zig") == key("/Users/x/p/src/main.zig")
+        assert key("mcp_server") == key("mcp_server.py")
+        assert key("device.zig") == key("src\\wireguard\\device.zig")
+        assert key("ChatStore") != key("ChatStore.send")
+        assert key("MemPalace") != key("github.com")
+
+    def test_canonical_entities_keeps_shortest_spelling_first_seen_order(self):
+        out = hallways_mod.canonical_entities(
+            ["src/main.zig", "RootView.swift", "main.zig", "RootView", "swim.zig"]
+        )
+        assert out == ["main.zig", "RootView", "swim.zig"]
+
+    def test_miner_pairs_canonical_spellings_only(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        col = _fake_collection(
+            [
+                {
+                    "wing": "w",
+                    "room": "technical",
+                    "entities": "ChatStore;ChatStore.swift;RootView;RootView.swift",
+                },
+                {"wing": "w", "room": "technical", "entities": "ChatStore.swift;RootView"},
+            ]
+        )
+        created = hallways_mod.compute_hallways_for_wing("w", col=col, min_count=2)
+        assert [(h["entity_a"], h["entity_b"]) for h in created] == [("ChatStore", "RootView")]
+        assert created[0]["co_occurrence_count"] == 2
+
+    def test_prune_spellings_drops_self_links_and_merges_variants(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        records = [
+            {
+                "id": "1",
+                "wing": "w",
+                "entity_a": "main.zig",
+                "entity_b": "src/main.zig",
+                "co_occurrence_count": 400,
+            },
+            {
+                "id": "2",
+                "wing": "w",
+                "entity_a": "ChatStore",
+                "entity_b": "RootView",
+                "co_occurrence_count": 240,
+            },
+            {
+                "id": "3",
+                "wing": "w",
+                "entity_a": "ChatStore.swift",
+                "entity_b": "RootView.swift",
+                "co_occurrence_count": 218,
+            },
+            {
+                "id": "4",
+                "wing": "w",
+                "entity_a": "ChatStore.swift",
+                "entity_b": "RootView",
+                "co_occurrence_count": 221,
+            },
+            {
+                "id": "5",
+                "wing": "w",
+                "entity_a": "codec.zig",
+                "entity_b": "swim.zig",
+                "co_occurrence_count": 195,
+            },
+            {
+                "id": "6",
+                "wing": "other",
+                "entity_a": "ChatStore.swift",
+                "entity_b": "RootView",
+                "co_occurrence_count": 3,
+            },
+        ]
+        hallways_mod._save_hallways(records)
+
+        dry = hallways_mod.prune_spelling_hallways(apply=False)
+        assert dry["self_links"] == 1
+        assert dry["duplicates"] == 2
+        assert dry["removed"] == 0
+        assert dry["by_wing"] == {"w": 3}
+        assert dry["sample"][0] == "main.zig ↔ src/main.zig"
+        assert len(hallways_mod.list_hallways()) == 6  # dry run touched nothing
+
+        applied = hallways_mod.prune_spelling_hallways(apply=True)
+        assert applied["removed"] == 3
+        left = {(h["wing"], h["entity_a"], h["entity_b"]): h for h in hallways_mod.list_hallways()}
+        assert set(left) == {
+            ("w", "ChatStore", "RootView"),
+            ("w", "codec.zig", "swim.zig"),
+            ("other", "ChatStore.swift", "RootView"),  # lone record: untouched
+        }
+        # The survivor keeps the highest count and gets the shortest spellings + a matching id.
+        survivor = left[("w", "ChatStore", "RootView")]
+        assert survivor["co_occurrence_count"] == 240
+        assert survivor["id"] == hallways_mod._hallway_id("w", "ChatStore", "RootView")
