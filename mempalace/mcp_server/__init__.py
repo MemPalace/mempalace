@@ -25,6 +25,7 @@ Tools (read):
 Tools (write):
   mempalace_add_drawer      — file verbatim content into a wing/room
   mempalace_delete_drawer   — remove a drawer by ID
+  mempalace_delete_drawers  — remove many drawers by ID in one call (bulk)
   mempalace_delete_by_source — bulk-remove all drawers mined from one source_file
 
 Tools (maintenance):

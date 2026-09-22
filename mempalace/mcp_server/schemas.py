@@ -445,6 +445,29 @@ TOOLS = {
         },
         "handler": tool_delete_drawer,
     },
+    "mempalace_delete_drawers": {
+        "description": (
+            "Delete many drawers by ID in one call — the bulk form of "
+            "mempalace_delete_drawer. Each ID removes the whole logical group "
+            "including its chunk rows, exactly as the singular tool does. "
+            "Irreversible. A missing ID is reported per item in `results` and "
+            "counted in `errors` instead of failing the batch; the response is "
+            "always a `results` list plus `deleted`/`errors` totals (max 500 "
+            "IDs per call), so the shape never depends on the input."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "drawer_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "One or more drawer IDs to delete (max 500)",
+                },
+            },
+            "required": ["drawer_ids"],
+        },
+        "handler": tool_delete_drawers,
+    },
     "mempalace_mine": {
         "description": (
             "Mine a directory into the palace — the MCP equivalent of `mempalace mine`. "
@@ -546,6 +569,30 @@ TOOLS = {
             "required": ["drawer_id"],
         },
         "handler": tool_get_drawer,
+    },
+    "mempalace_get_drawers": {
+        "description": (
+            "Fetch many drawers by ID in one call — the bulk form of "
+            "mempalace_get_drawer for a caller that already holds a list of IDs. "
+            "Each ID resolves through the same logical/chunk resolution as the "
+            "singular tool and returns the same per-drawer payload; an ID that "
+            "does not resolve is reported per item in `results` and counted in "
+            "`errors` instead of failing the batch. The response is always a "
+            "`results` list, even for one ID (max 500 per call), so the shape "
+            "never depends on the input."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "drawer_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "One or more drawer IDs to fetch (max 500)",
+                },
+            },
+            "required": ["drawer_ids"],
+        },
+        "handler": tool_get_drawers,
     },
     "mempalace_list_drawers": {
         "description": "List drawers with pagination. Optional wing/room filter and since/before date filter on filed_at (since inclusive, before exclusive; drawers without a parseable filed_at are excluded when a date bound is set). Returns IDs, wings, rooms, content previews, and total matching count for pagination.",
