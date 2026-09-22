@@ -214,49 +214,59 @@ class _LocalServer:
 
     def __init__(self):
         self._module = None
+        self._load_error: BaseException | None = None
 
     @property
     def loaded(self) -> bool:
         return self._module is not None
 
     def load(self):
+        if self._load_error is not None:
+            raise self._load_error
         if self._module is None:
             logger.warning(
                 "MemPalace hub unavailable; serving this session locally. "
                 "Loading the local storage stack (this process will grow)."
             )
-            mcp_server = _import_server()
+            try:
+                mcp_server = _import_server()
 
-            # Importing the server installs its stdio protection: os.dup2(2, 1)
-            # plus sys.stdout = sys.stderr, so stray library prints cannot
-            # corrupt JSON-RPC. That also redirects *our* responses to stderr —
-            # fd 1 itself is moved, so holding a reference to the old object is
-            # not enough. _restore_stdout undoes both levels, exactly as the
-            # server's own stdio loop does before it starts answering.
-            mcp_server._restore_stdout()
-            if hasattr(sys.stdout, "reconfigure"):
-                try:
-                    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-                except (AttributeError, OSError):
-                    pass
+                # Importing the server installs its stdio protection: os.dup2(2, 1)
+                # plus sys.stdout = sys.stderr, so stray library prints cannot
+                # corrupt JSON-RPC. That also redirects *our* responses to stderr —
+                # fd 1 itself is moved, so holding a reference to the old object is
+                # not enough. _restore_stdout undoes both levels, exactly as the
+                # server's own stdio loop does before it starts answering.
+                mcp_server._restore_stdout()
+                if hasattr(sys.stdout, "reconfigure"):
+                    try:
+                        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+                    except (AttributeError, OSError):
+                        pass
 
-            # This path never runs the server's main(), so apply the flags main()
-            # would have applied. After the stdout restore: a refused flag raises,
-            # and the proxy keeps answering over stdout.
-            args = mcp_server._parse_args(sys.argv[1:])
-            mcp_server._apply_server_flags(
-                palace=args.palace, backend=args.backend, read_only=args.read_only
-            )
+                # This path never runs the server's main(), so apply the flags main()
+                # would have applied. After the stdout restore: a refused flag raises,
+                # and the proxy keeps answering over stdout.
+                args = mcp_server._parse_args(sys.argv[1:])
+                mcp_server._apply_server_flags(
+                    palace=args.palace, backend=args.backend, read_only=args.read_only
+                )
 
-            for start in (
-                mcp_server._start_idle_exit_watchdog,
-                mcp_server._start_write_stall_watchdog,
-            ):
-                try:
-                    start()
-                except Exception:
-                    logger.debug("local service %s failed to start", start, exc_info=True)
-            self._module = mcp_server
+                for start in (
+                    mcp_server._start_idle_exit_watchdog,
+                    mcp_server._start_write_stall_watchdog,
+                ):
+                    try:
+                        start()
+                    except Exception:
+                        logger.debug("local service %s failed to start", start, exc_info=True)
+                self._module = mcp_server
+            except BaseException as exc:
+                # The server's own import dups stdout before it can fail, and a
+                # failed import drops the module without closing that dup.
+                # Remember the failure so the next request does not dup again.
+                self._load_error = exc
+                raise
         return self._module
 
 

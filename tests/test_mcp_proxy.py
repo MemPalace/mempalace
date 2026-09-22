@@ -568,3 +568,21 @@ def test_local_fallback_restores_stdout_before_a_flag_can_be_refused(monkeypatch
         mcp_proxy._LocalServer().load()
 
     assert restored == [True]
+
+
+def test_a_failed_local_load_is_not_retried(monkeypatch):
+    calls = []
+
+    def explode():
+        calls.append("import")
+        raise RuntimeError("import failed")
+
+    monkeypatch.setattr(mcp_proxy, "_import_server", explode)
+    server = mcp_proxy._LocalServer()
+
+    with pytest.raises(RuntimeError, match="import failed"):
+        server.load()
+    with pytest.raises(RuntimeError, match="import failed"):
+        server.load()
+
+    assert calls == ["import"]
