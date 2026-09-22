@@ -180,6 +180,20 @@ def test_propose_rooms_parses_fenced_json_slugs_names_and_records_exemplars():
     assert len(provider.calls) == 1  # inline assignments: no follow-up call
 
 
+def test_propose_rooms_asks_again_when_inline_assignments_are_partial():
+    # One valid label out of four samples is not enough to build centroids on.
+    provider = FakeProvider(
+        '{"rooms": [{"name": "releases", "description": "d"}, {"name": "bug-fixes", "description": "d"}], '
+        '"assignments": [{"excerpt": 1, "room": "releases"}]}',
+        follow_up='{"assignments": [{"excerpt": 1, "room": "releases"}, {"excerpt": 2, "room": "bug-fixes"}, '
+        '{"excerpt": 3, "room": "bug-fixes"}, {"excerpt": 4, "room": "releases"}]}',
+    )
+    samples = sample_drawers(FakeCollection(_rows()), "w", n=4)
+    rs = propose_rooms("w", samples, provider)
+    assert len(provider.calls) == 2
+    assert sum(len(r.exemplars) for r in rs.rooms) == len(samples)
+
+
 def test_propose_rooms_asks_again_when_assignments_are_missing():
     provider = FakeProvider(
         '{"rooms": [{"name": "releases", "description": "d"}, {"name": "bug-fixes", "description": "d"}]}',

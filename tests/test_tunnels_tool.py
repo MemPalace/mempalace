@@ -169,3 +169,37 @@ def test_propose_skips_existing_links_and_covers_unlinked_wings_first():
     assert [(r["entity"], r["strength"]) for r in plan["tunnels"]] == [("ChatStore", 12)]
     plan = propose_tunnels(hallways, WINGS, max_tunnels=2, existing_tunnels=existing)
     assert [r["entity"] for r in plan["tunnels"]] == ["Q", "ChatStore"]
+
+
+def test_prune_keeps_two_links_that_swap_rooms_between_the_same_wings():
+    tunnels = [
+        {"source": {"wing": "a", "room": "x"}, "target": {"wing": "b", "room": "y"}},
+        {"source": {"wing": "a", "room": "y"}, "target": {"wing": "b", "room": "x"}},
+        {"source": {"wing": "b", "room": "y"}, "target": {"wing": "a", "room": "x"}},  # dup of 1st
+    ]
+    kept, report = prune_tunnels(tunnels, {"a", "b"})
+    assert report["duplicates"] == 1 and len(kept) == 2
+
+
+def test_prune_and_propose_normalize_wing_spellings():
+    tunnels = [
+        {
+            "source": {"wing": "acme-app", "room": "entity:X"},
+            "target": {"wing": "b", "room": "entity:X"},
+        }
+    ]
+    kept, report = prune_tunnels(tunnels, {"acme_app", "b"})
+    assert report["dangling"] == 0 and len(kept) == 1
+    hallways = [
+        {"wing": "acme-app", "entity_a": "Rope", "entity_b": "Q", "co_occurrence_count": 9},
+        {"wing": "b", "entity_a": "Rope", "entity_b": "Q", "co_occurrence_count": 9},
+    ]
+    plan = propose_tunnels(hallways, {"acme_app", "b"})
+    assert sorted(r["entity"] for r in plan["tunnels"]) == ["Q", "Rope"]
+
+
+def test_load_proposal_rejects_non_object_rows(tmp_path):
+    cfg = MempalaceConfig(palace_path=str(tmp_path))
+    save_proposal(cfg, {"tunnels": ["not a row"]})
+    with pytest.raises(ValueError, match="not an object"):
+        load_proposal(cfg)

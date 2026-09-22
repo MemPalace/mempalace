@@ -21,7 +21,11 @@ def cmd_audit(args):
     if not as_json and not quiet and sys.stderr.isatty():
         progress = terminal_progress(sys.stderr)
     try:
-        report = audit_palace(palace_path=palace_path, progress=progress)
+        report = audit_palace(
+            palace_path=palace_path,
+            progress=progress,
+            explicit_palace=bool(getattr(args, "palace", None)) or None,
+        )
     except (FileNotFoundError, RuntimeError) as exc:
         print(f"\n  {exc}")
         print("  Run `mempalace mine <dir>` first, or pass --palace <path>.")

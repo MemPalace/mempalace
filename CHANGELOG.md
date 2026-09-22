@@ -10,6 +10,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **`mempalace audit` detects mixed wings on the ChromaDB backend too, and
+  counts only the drawer collection.** The mixed-wing reader used to exist for
+  the sqlite_exact layout alone and grouped every row of the shared
+  `documents` table, closets included; both backends now expose one
+  collection-scoped `(wing, source_file, n)` reader.
+- **`kg normalize --yes` rewrites each fact in one transaction, addressed by
+  the triple id the plan recorded.** A fact closed or replaced while the plan
+  sat under review is left alone and reported as stale instead of being
+  resurrected; the apply runs under the palace writer lock; and a palace chosen
+  with `--palace` never falls back to the home knowledge graph.
+- **An interrupted `wings split` or `rooms apply` finishes on re-run.** Each
+  batch is one backend write and a row is only ever wholly in its old or its new
+  place; both commands plan over the rows still to move, so the same command
+  again moves exactly the remainder and a completed run is a no-op.
+- **A single-label LLM hostname is local only when it resolves to a private
+  address.** `http://gpu-box` on the LAN needs no consent; a bare label that a
+  search domain expands to a public host, or that does not resolve, is
+  external and needs `--accept-external-llm`.
 - **Hallway writers hold the hallway-file lock from load to save.** A mine's
   recompute, `hallways --rebuild`, `--prune-spellings` and `delete_hallway`
   each loaded, edited and saved the whole file unlocked, so the later save
@@ -116,9 +134,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `tunnels propose` writes the strongest cross-wing links to
   `<palace>/tunnels/proposal.json` for review and `--yes` creates them;
   `tunnels prune` removes generic, dangling and duplicate-spelling tunnels.
-  `mempalace audit` scores tunnels on quality (70%) with traversal as a
-  secondary signal (30%), so the layer can be improved by tooling rather than
-  only by use.
+  `mempalace audit` scores the layer as quality × coverage (see the entry
+  above), so it can be improved by tooling rather than only by use.
 - **`mempalace kg normalize` maps one-off predicates onto a closed
   vocabulary.** Agents filing facts one at a time invent a predicate per fact
   (51 of 57 on the maintainers' palace), so `mempalace_kg_query` cannot find

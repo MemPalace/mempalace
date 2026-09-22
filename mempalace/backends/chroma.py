@@ -1670,6 +1670,51 @@ def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Opti
         return None
 
 
+def sqlite_wing_source_counts(palace_path: str, collection_name: str) -> Optional[list[tuple]]:
+    """Grouped ``(wing, source_file, n)`` for transcript-mined drawers from
+    ``chroma.sqlite3``, scoped to ``collection_name``; ``None`` when sqlite
+    cannot serve it. Same contract as the sqlite_exact reader: only rows
+    whose ``source_file`` is a Claude Code projects path or a Codex sessions
+    path, which is what the audit's mixed-wing check and ``wings split`` use.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        conn = open_palace_reader(db_path)
+        try:
+            conn.execute("PRAGMA busy_timeout = 3000")
+            if (
+                conn.execute(
+                    "SELECT 1 FROM collections WHERE name = ?", (collection_name,)
+                ).fetchone()
+                is None
+            ):
+                return None
+            return conn.execute(
+                """
+                SELECT
+                    COALESCE(wm.string_value, '') AS wing,
+                    sm.string_value AS source_file,
+                    COUNT(*) AS n
+                FROM embeddings e
+                JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
+                JOIN collections c ON s.collection = c.id
+                JOIN embedding_metadata sm ON sm.id = e.id AND sm.key = 'source_file'
+                LEFT JOIN embedding_metadata wm ON wm.id = e.id AND wm.key = 'wing'
+                WHERE c.name = ?
+                  AND (sm.string_value LIKE '%.claude%projects%'
+                       OR sm.string_value LIKE '%.codex%sessions%')
+                GROUP BY wing, source_file
+                """,
+                (collection_name,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
 def _metadata_value_columns(conn) -> list[str]:
     """Value columns actually present on ``embedding_metadata``.
 

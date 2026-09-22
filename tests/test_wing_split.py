@@ -236,3 +236,35 @@ def test_main_dispatches_wings(monkeypatch):
     monkeypatch.setattr("sys.argv", ["mempalace", "wings", "split", "--wing", "w", "--yes"])
     cli.main()
     assert seen["wings_action"] == "split" and seen["wing"] == "w" and seen["yes"]
+
+
+def test_apply_split_resumes_after_an_interrupted_batch(monkeypatch):
+    """A crash mid-split leaves rows wholly in one wing; a re-run moves the rest."""
+    import mempalace.wing_split as ws
+
+    monkeypatch.setattr(ws, "_UPDATE_BATCH", 1)
+    col = FakeCollection(_rows())
+    plan = plan_split(col, "convos", ["portal"])
+    plan["projects"]["p--photoapp"]["target"] = "convos"
+
+    real_update = col.update
+    calls = {"n": 0}
+
+    def flaky_update(**kw):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise KeyboardInterrupt
+        return real_update(**kw)
+
+    monkeypatch.setattr(col, "update", flaky_update)
+    with pytest.raises(KeyboardInterrupt):
+        apply_split(col, plan)
+    moved = lambda: [r["id"] for r in col.rows.values() if "last_modified" in r["meta"]]  # noqa: E731
+    assert len(moved()) == 1
+
+    monkeypatch.setattr(col, "update", real_update)
+    second = apply_split(col, plan)
+    assert second["moved"] == 1  # only the remainder
+    assert len(moved()) == 2
+    assert all(col.rows[i]["meta"]["wing"] == "portal" for i in moved())
+    assert apply_split(col, plan)["moved"] == 0  # completed split is a no-op

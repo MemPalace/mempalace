@@ -195,6 +195,10 @@ def load_normalize_plan(config: MempalaceConfig) -> dict:
     if not isinstance(rows, list):
         raise ValueError("normalize plan has no facts list")
     for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError(f"plan row is not an object: {row!r}")
+        if not str(row.get("id") or "").strip():
+            raise ValueError(f"plan row is missing 'id': {row}")
         for key in ("subject", "old_predicate", "old_object", "predicate", "object"):
             if not str(row.get(key) or "").strip():
                 raise ValueError(f"plan row is missing {key!r}: {row}")
@@ -204,20 +208,28 @@ def load_normalize_plan(config: MempalaceConfig) -> dict:
 
 
 def apply_normalize(kg, plan: dict, at: Optional[str] = None) -> dict:
-    """Close each old fact and open its rewrite at one shared instant."""
+    """Close each old fact and open its rewrite at one shared instant.
+
+    Each row is one ``KnowledgeGraph.rewrite`` call, addressed by the
+    triple id the plan recorded: one transaction per fact, and a fact that
+    was closed or replaced while the plan sat under review is left alone
+    and counted in ``stale`` instead of being resurrected.
+    """
     boundary = at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    applied = skipped = 0
+    applied = skipped = stale = 0
     for row in plan["facts"]:
         if row["old_predicate"] == row["predicate"] and row["old_object"] == row["object"]:
             skipped += 1
             continue
-        kg.invalidate(row["subject"], row["old_predicate"], row["old_object"], ended=boundary)
-        kg.add_triple(
-            row["subject"],
+        new_id = kg.rewrite(
+            str(row["id"]),
             row["predicate"],
             row["object"],
-            valid_from=boundary,
+            at=boundary,
             source_file="mempalace kg normalize",
         )
-        applied += 1
-    return {"applied": applied, "skipped": skipped, "boundary": boundary}
+        if new_id is None:
+            stale += 1
+        else:
+            applied += 1
+    return {"applied": applied, "skipped": skipped, "stale": stale, "boundary": boundary}

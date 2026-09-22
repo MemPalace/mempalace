@@ -44,6 +44,28 @@ logger = logging.getLogger("mempalace_llm")
 _LOCALHOST_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
+def _resolves_private(host: str) -> bool:
+    """True when every address ``host`` resolves to stays on the user's network."""
+    import ipaddress
+    import socket
+
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, OSError, UnicodeError):
+        return False
+    addresses = {info[4][0] for info in infos if info and info[4]}
+    if not addresses:
+        return False
+    for raw in addresses:
+        try:
+            addr = ipaddress.ip_address(raw.split("%", 1)[0])
+        except ValueError:
+            return False
+        if not (addr.is_private or addr.is_loopback or addr.is_link_local):
+            return False
+    return True
+
+
 def _endpoint_is_local(url: Optional[str]) -> bool:
     """Return True if ``url``'s hostname is on the user's machine or
     private network.
@@ -77,10 +99,13 @@ def _endpoint_is_local(url: Optional[str]) -> bool:
     # so it can only resolve through the LAN: mDNS, the router's DNS, a hosts
     # file, or a search domain the user configured. It is the user's own
     # network by construction, the same as ``.local``.
-    # ``urlparse`` strips the brackets from an IPv6 literal, so a dotless
-    # host may still be a public address; only a name qualifies.
+    # A single-label hostname (``gpu-box``) usually names a LAN machine, but
+    # a resolver search domain can expand it to anything, so the name shape
+    # proves nothing: resolve it and require every address to be private,
+    # loopback or link-local. Unresolvable or public means external, and
+    # the user can still opt in with the explicit consent flag.
     if "." not in host and ":" not in host:
-        return True
+        return _resolves_private(host)
     if host.startswith("10."):
         return True
     if host.startswith("192.168."):

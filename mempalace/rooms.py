@@ -378,7 +378,11 @@ def propose_rooms(
     room_set = RoomSet.from_dict({"wing": wing, "rooms": raw_rooms[:max_rooms]})
     if existing:
         snap_to_existing(room_set, existing)
-    if not _record_exemplars(room_set, samples, assignments):
+    # The follow-up call runs unless the first answer labelled most of the
+    # sample: one stray assignment out of sixty must not skip it, or the
+    # centroids are built from a single drawer.
+    attached = _record_exemplars(room_set, samples, assignments)
+    if attached < max(1, math.ceil(0.8 * len(samples))):
         follow_up = provider.classify(
             _ASSIGN_SYSTEM,
             _assign_user_prompt(wing, room_set, samples),
@@ -583,7 +587,15 @@ def plan_rooms(
 
 
 def apply_plan(col, plan: RoomPlan, progress=None) -> int:
-    """Write the planned ``room`` changes in batches; returns rows updated."""
+    """Write the planned ``room`` changes in batches; returns rows updated.
+
+    Each batch is one backend write and a drawer is only ever wholly in its
+    old room or wholly in its new one. An interrupted apply leaves the
+    already-moved drawers classified and the rest where they were; running
+    ``rooms apply`` again plans only over drawers still in ``from_rooms``,
+    so it finishes the remainder and a completed apply is a no-op. Only
+    ``room`` metadata changes; content is never rewritten.
+    """
     stamp = datetime.now(timezone.utc).isoformat()
     done = 0
     for start in range(0, len(plan.changes), _UPDATE_BATCH):

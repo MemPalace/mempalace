@@ -49,10 +49,18 @@ def room_spelling_key(room: str) -> str:
 
 
 def _link_key(wing_a: str, wing_b: str, room_a: str, room_b: str) -> tuple:
-    """One key per (wing pair, entity) regardless of spelling or direction."""
-    return (
-        tuple(sorted((_norm_wing(wing_a), _norm_wing(wing_b)))),
-        tuple(sorted((room_spelling_key(room_a), room_spelling_key(room_b)))),
+    """One key per link regardless of spelling or direction.
+
+    Each endpoint stays a ``(wing, room)`` pair and the two pairs are sorted
+    together, so ``A/x -> B/y`` and ``A/y -> B/x`` are two links, not one.
+    """
+    return tuple(
+        sorted(
+            (
+                (_norm_wing(wing_a), room_spelling_key(room_a)),
+                (_norm_wing(wing_b), room_spelling_key(room_b)),
+            )
+        )
     )
 
 
@@ -82,7 +90,7 @@ def propose_tunnels(
     """
     from .palace_graph import ENTITY_TUNNEL_MIN_COUNT, entity_tunnel_candidates
 
-    wings = set(existing_wings)
+    wings = {_norm_wing(str(w)) for w in existing_wings}
     known = set()
     for t in existing_tunnels or []:
         if isinstance(t, dict):
@@ -94,7 +102,10 @@ def propose_tunnels(
     )
     rows = []
     for entity, per_wing in candidates.items():
-        present = [(w, disp, n) for w, (disp, n) in per_wing.items() if disp in wings]
+        # ``per_wing`` is keyed by normalized wing; membership must be too, or
+        # a hallway wing spelled ``foo-bar`` next to a drawer wing ``foo_bar``
+        # silently loses its links.
+        present = [(w, disp, n) for w, (disp, n) in per_wing.items() if w in wings]
         present.sort(key=lambda t: -t[2])
         room = f"entity:{entity}"
         for i in range(len(present)):
@@ -173,6 +184,8 @@ def load_proposal(config: MempalaceConfig) -> dict:
     if not isinstance(rows, list) or not rows:
         raise ValueError("tunnel proposal has no tunnels")
     for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError(f"proposal row is not an object: {row!r}")
         for key in ("entity", "wing_a", "wing_b"):
             if not str(row.get(key) or "").strip():
                 raise ValueError(f"proposal row is missing {key!r}: {row}")
@@ -227,10 +240,11 @@ def prune_tunnels(tunnels: list, existing_wings: Iterable[str]) -> tuple[list, d
                 break
         if not bad:
             pair = _tunnel_link_key(t)
-            if pair in seen:
-                duplicates += 1
-                bad = True
-            seen.add(pair)
+            if pair is not None:
+                if pair in seen:
+                    duplicates += 1
+                    bad = True
+                seen.add(pair)
         if not bad:
             kept.append(t)
     report = {

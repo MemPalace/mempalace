@@ -1806,3 +1806,32 @@ def test_sqlite_exact_metadata_only_update_keeps_document_embedding_and_fts(tmp_
     hits = col.lexical_search(query="rareterm", n_results=5, where={"wing": "target"}).hits
     assert [hit.id for hit in hits] == ["a"]
     assert col.lexical_search(query="rareterm", n_results=5, where={"wing": "w"}).hits == []
+
+
+def test_sqlite_wing_source_counts_is_scoped_to_the_collection(tmp_path):
+    """Drawers and closets share one table; the audit must not count closets."""
+    from mempalace.backends.sqlite_exact import sqlite_wing_source_counts
+
+    backend, drawers = _collection(tmp_path, name="mempalace_drawers")
+    palace = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    closets = backend.get_collection(
+        palace=palace, collection_name="mempalace_closets", create=True
+    )
+    src = "/Users/me/.claude/projects/-Users-me-dev-thing/s.jsonl"
+    meta = {"wing": "convos", "room": "technical", "source_file": src}
+    drawers.add(
+        ids=["a", "b"], documents=["x", "y"], metadatas=[meta, meta], embeddings=[[1.0, 0.0]] * 2
+    )
+    drawers.add(
+        ids=["c"],
+        documents=["z"],
+        metadatas=[{"wing": "convos", "room": "technical", "source_file": "notes.md"}],
+        embeddings=[[1.0, 0.0]],
+    )
+    closets.add(ids=["k"], documents=["idx"], metadatas=[meta], embeddings=[[1.0, 0.0]])
+
+    rows = sqlite_wing_source_counts(str(tmp_path), "mempalace_drawers")
+    assert rows == [("convos", src, 2)]  # not 3: the closet is another collection
+    assert sqlite_wing_source_counts(str(tmp_path), "mempalace_closets") == [("convos", src, 1)]
+    assert sqlite_wing_source_counts(str(tmp_path), "nope") is None
+    assert sqlite_wing_source_counts(str(tmp_path / "missing"), "mempalace_drawers") is None

@@ -421,11 +421,29 @@ def test_ollama_provider_default_endpoint_is_local():
     )
 
 
-def test_single_label_lan_hostname_is_local():
+def test_single_label_hostname_is_local_only_when_it_resolves_privately(monkeypatch):
+    import socket
+
     from mempalace.llm_client import _endpoint_is_local
 
+    def fake_getaddrinfo(host, *a, **k):
+        table = {
+            "gpu-box": [("192.168.1.20",), ("fe80::1%en0",)],
+            "llm": [("8.8.8.8",)],
+            "mixed": [("10.0.0.5",), ("8.8.8.8",)],
+        }
+        if host not in table:
+            raise socket.gaierror("no such host")
+        return [(None, None, None, None, addr) for addr in table[host]]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
     assert _endpoint_is_local("http://gpu-box:8010")
     assert _endpoint_is_local("http://gpu-box:11434/v1")
+    # A search domain can expand a bare label to a public host: external.
+    assert not _endpoint_is_local("http://llm:8010/v1")
+    assert not _endpoint_is_local("http://mixed:8010/v1")
+    # Unresolvable is external too; the consent flag remains the override.
+    assert not _endpoint_is_local("http://nowhere:8010/v1")
     # An IPv6 literal is dotless too, but it is an address, not a LAN name.
     assert not _endpoint_is_local("http://[2001:db8::1]:8010/v1")
     assert _endpoint_is_local("http://[::1]:8010/v1")

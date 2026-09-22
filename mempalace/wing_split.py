@@ -288,6 +288,13 @@ def apply_split(
     search keeps its index boosts after the split. Hallway records for the
     source wing are dropped since they are keyed by wing; rebuild them with
     ``mempalace hallways --rebuild`` or the next mine.
+
+    Interruption: rows move in batches, each batch one backend write, and a
+    row is only ever wholly in its old wing or wholly in its new one. The
+    loop reads the rows *currently* in the source wing, so running the same
+    plan again after a crash or Ctrl-C moves exactly the remainder (drawers,
+    then closets, then the hallway drop) and a completed split is a no-op.
+    Nothing is deleted and no content is rewritten at any point.
     """
     wing = plan["wing"]
     targets = {key: entry["target"] for key, entry in plan["projects"].items()}
@@ -299,13 +306,17 @@ def apply_split(
 
     hallways_dropped = 0
     if moved:
-        from .hallways import _load_hallways, _save_hallways
+        from .hallways import _hallway_file_lock, _load_hallways, _save_hallways
 
-        records = _load_hallways(config)
-        kept = [h for h in records if not (isinstance(h, dict) and h.get("wing") == wing)]
-        hallways_dropped = len(records) - len(kept)
-        if hallways_dropped:
-            _save_hallways(kept, config)
+        # Under the hallway-file lock: the palace lock this command holds does
+        # not serialize with a concurrent `hallways --rebuild` or
+        # `--prune-spellings`, which take only the per-sidecar lock.
+        with _hallway_file_lock(config):
+            records = _load_hallways(config)
+            kept = [h for h in records if not (isinstance(h, dict) and h.get("wing") == wing)]
+            hallways_dropped = len(records) - len(kept)
+            if hallways_dropped:
+                _save_hallways(kept, config)
 
     return {
         "moved": moved,

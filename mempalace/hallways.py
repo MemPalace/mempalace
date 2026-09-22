@@ -623,13 +623,17 @@ def _prune_spelling_hallways_locked(config, apply: bool) -> dict:
             continue
         members.sort(key=lambda h: -int(h.get("co_occurrence_count") or 0))
         survivor = dict(members[0])
-        spellings_a = canonical_entities([str(m.get("entity_a")) for m in members])
-        spellings_b = canonical_entities([str(m.get("entity_b")) for m in members])
-        if len(spellings_a) == 1 and len(spellings_b) == 1:
-            survivor["entity_a"], survivor["entity_b"] = spellings_a[0], spellings_b[0]
-            survivor["id"] = _hallway_id(
-                survivor["wing"], survivor["entity_a"], survivor["entity_b"]
-            )
+        # Variants may arrive with reversed endpoints (``a ↔ b`` and
+        # ``b.py ↔ a``), so canonicalize per entity key across both columns
+        # rather than per column, then keep the survivor's own orientation.
+        by_key: dict[str, list[str]] = {}
+        for m in members:
+            for ent in (str(m.get("entity_a")), str(m.get("entity_b"))):
+                by_key.setdefault(entity_spelling_key(ent), []).append(ent)
+        shortest = {k: canonical_entities(v)[0] for k, v in by_key.items()}
+        survivor["entity_a"] = shortest[entity_spelling_key(survivor["entity_a"])]
+        survivor["entity_b"] = shortest[entity_spelling_key(survivor["entity_b"])]
+        survivor["id"] = _hallway_id(survivor["wing"], survivor["entity_a"], survivor["entity_b"])
         kept.append(survivor)
         duplicates.extend(members[1:])
 

@@ -147,5 +147,9 @@ def cmd_rooms(args):
         if not plan.changes:
             print("  Nothing to change.")
             return
-        done = apply_plan(col, plan)
+        try:
+            done = apply_plan(col, plan)
+        except KeyboardInterrupt:
+            print("\n  Interrupted. Drawers already moved stay moved; re-run to finish the rest.")
+            raise
         print(f"  Moved {done} drawers. Run `mempalace audit` to see the new rooms score.")

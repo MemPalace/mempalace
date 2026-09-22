@@ -79,7 +79,13 @@ def cmd_wings(args):
             closets_col = get_closets_collection(palace_path, create=False)
         except Exception:
             closets_col = None
-        result = apply_split(col, plan, config=config, closets_col=closets_col)
+        try:
+            result = apply_split(col, plan, config=config, closets_col=closets_col)
+        except KeyboardInterrupt:
+            print(
+                "\n  Interrupted. Rows already moved stay moved; re-run --yes to finish the rest."
+            )
+            raise
     print(
         f"\n  Moved {result['moved']} drawers into {len(result['per_target'])} wings and "
         f"{result['closets_moved']} closets; {result['skipped']} skipped; "

@@ -612,3 +612,32 @@ class TestEntitySpellings:
         survivor = left[("w", "ChatStore", "RootView")]
         assert survivor["co_occurrence_count"] == 240
         assert survivor["id"] == hallways_mod._hallway_id("w", "ChatStore", "RootView")
+
+    def test_prune_spellings_canonicalizes_reversed_variants(self, tmp_path, monkeypatch):
+        """``a ↔ b.py`` and ``b ↔ a.py`` are one association with swapped columns;
+        the survivor must still end up under the shortest spelling of each."""
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        hallways_mod._save_hallways(
+            [
+                {
+                    "id": "1",
+                    "wing": "w",
+                    "entity_a": "src/store.py",
+                    "entity_b": "view",
+                    "co_occurrence_count": 50,
+                },
+                {
+                    "id": "2",
+                    "wing": "w",
+                    "entity_a": "view.py",
+                    "entity_b": "store",
+                    "co_occurrence_count": 40,
+                },
+            ]
+        )
+        applied = hallways_mod.prune_spelling_hallways(apply=True)
+        assert applied["removed"] == 1
+        (survivor,) = hallways_mod.list_hallways()
+        assert (survivor["entity_a"], survivor["entity_b"]) == ("store", "view")
+        assert survivor["co_occurrence_count"] == 50
+        assert survivor["id"] == hallways_mod._hallway_id("w", "store", "view")

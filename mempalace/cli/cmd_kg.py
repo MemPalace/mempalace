@@ -13,23 +13,21 @@ def cmd_kg(args):
         save_normalize_plan,
     )
     from ..knowledge_graph import KnowledgeGraph
+    from ..palace import mine_palace_lock
     from ..palace_audit import resolve_kg_path
 
     action = getattr(args, "kg_action", None)
     if action != "normalize":
         print("usage: mempalace kg normalize [--vocabulary a,b,c] [--yes]")
         sys.exit(2)
-    palace_path = (
-        os.path.expanduser(args.palace)
-        if getattr(args, "palace", None)
-        else MempalaceConfig().palace_path
-    )
+    explicit = bool(getattr(args, "palace", None))
+    palace_path = os.path.expanduser(args.palace) if explicit else MempalaceConfig().palace_path
     config = MempalaceConfig(palace_path=palace_path)
     raw = getattr(args, "vocabulary", None)
     vocabulary = (
         tuple(v.strip().lower() for v in raw.split(",") if v.strip()) if raw else DEFAULT_VOCABULARY
     )
-    kg_path = resolve_kg_path(palace_path)
+    kg_path = resolve_kg_path(palace_path, explicit=explicit)
     if not os.path.isfile(kg_path):
         print(f"  No knowledge graph at {kg_path}.")
         sys.exit(1)
@@ -66,8 +64,13 @@ def cmd_kg(args):
     except ValueError as exc:
         print(f"  Plan is invalid: {exc}")
         sys.exit(1)
-    result = apply_normalize(kg, plan)
+    # The same cross-process writer lock the other repair commands hold: the
+    # graph's own lock is process-local, and a running hub or another CLI
+    # must not interleave fact writes with the rewrites.
+    with mine_palace_lock(config.palace_path):
+        result = apply_normalize(kg, plan)
     print(
         f"  Rewrote {result['applied']} fact(s) at {result['boundary']}; "
-        f"{result['skipped']} unchanged. Old wordings remain valid before that instant."
+        f"{result['skipped']} unchanged, {result['stale']} no longer open (left alone). "
+        "Old wordings remain valid before that instant."
     )

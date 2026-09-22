@@ -81,6 +81,51 @@ def test_apply_normalize_supersedes_at_one_boundary_and_keeps_history(kg):
     assert off_vocabulary_facts(kg, DEFAULT_VOCABULARY)[0]["predicate"] == "appearance_default"
 
 
+def test_apply_normalize_leaves_a_fact_closed_since_planning_alone(kg):
+    _seed(kg)
+    facts = off_vocabulary_facts(kg, DEFAULT_VOCABULARY)
+    plan = plan_normalize(
+        facts,
+        FakeProvider(
+            '{"facts": [{"index": 1, "predicate": "status", "object": "deployed commit fc81c6f6"}]}'
+        ),
+    )
+    # Someone closed the fact while the plan sat under review.
+    kg.invalidate("weatherstation", "deployed_commit", "fc81c6f6", ended="2026-09-20T00:00:00Z")
+    result = apply_normalize(kg, plan, at="2026-09-21T00:00:00Z")
+    assert result == {"applied": 0, "skipped": 0, "stale": 1, "boundary": "2026-09-21T00:00:00Z"}
+    now = {(t["predicate"], t["object"]) for t in kg.query_entity("weatherstation")}
+    assert ("status", "deployed commit fc81c6f6") not in now  # not resurrected
+
+
+def test_kg_rewrite_is_one_transaction(kg, monkeypatch):
+    _seed(kg)
+    fact = off_vocabulary_facts(kg, DEFAULT_VOCABULARY)[0]
+    real_conn = kg._conn
+
+    class Boom:
+        def __init__(self, conn):
+            self._c = conn
+
+        def __enter__(self):
+            return self._c.__enter__()
+
+        def __exit__(self, *a):
+            return self._c.__exit__(*a)
+
+        def execute(self, sql, *args):
+            if sql.lstrip().startswith("INSERT INTO triples"):
+                raise RuntimeError("disk full")
+            return self._c.execute(sql, *args)
+
+    monkeypatch.setattr(kg, "_conn", lambda: Boom(real_conn()))
+    with pytest.raises(RuntimeError):
+        kg.rewrite(fact["id"], "status", "x", at="2026-09-21T00:00:00Z")
+    monkeypatch.setattr(kg, "_conn", real_conn)
+    # The close was rolled back with the failed insert: the fact is still open.
+    assert [f["id"] for f in off_vocabulary_facts(kg, DEFAULT_VOCABULARY)][0] == fact["id"]
+
+
 def test_plan_round_trip_and_validation(tmp_path):
     cfg = MempalaceConfig(palace_path=str(tmp_path))
     plan = {
@@ -112,7 +157,9 @@ def test_cmd_kg_normalize_plan_then_apply(tmp_path, kg, monkeypatch, capsys):
     _seed(kg)
     palace = tmp_path / "palace"
     palace.mkdir()
-    monkeypatch.setattr("mempalace.palace_audit.resolve_kg_path", lambda p: kg.db_path)
+    monkeypatch.setattr(
+        "mempalace.palace_audit.resolve_kg_path", lambda p, explicit=False: kg.db_path
+    )
     monkeypatch.setattr("mempalace.knowledge_graph.KnowledgeGraph", lambda db_path=None: kg)
     provider = FakeProvider(
         '{"facts": [{"index": 1, "predicate": "status", "object": "deployed commit fc81c6f6"}, '

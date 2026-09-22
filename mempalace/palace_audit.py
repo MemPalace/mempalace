@@ -39,7 +39,7 @@ from .backends._inproc_sqlite import open_reader as open_palace_reader
 from .config import MempalaceConfig, normalize_wing_name
 from .hallways import entity_spelling_key, is_generic_entity, is_self_link, list_hallways
 from .palace_graph import _load_tunnels
-from .tunnels_tool import room_spelling_key
+from .tunnels_tool import _tunnel_link_key
 
 # Rooms the transcript classifier falls back to. A drawer in one of these
 # rooms is findable by search, not by walking the palace.
@@ -144,17 +144,14 @@ def _read_wing_room_counts_from_collection(
     return {w: dict(r) for w, r in counts.items()}
 
 
-def _read_wing_project_mix(config: MempalaceConfig) -> Optional[dict[str, dict]]:
-    """``{wing: {"projects": n, "drawers": n, "top": [(key, n), ...]}}`` from sqlite.
+def _wing_source_counts_reader(config: MempalaceConfig):
+    """The backend's ``(wing, source_file, n)`` reader, or ``None``.
 
-    Groups drawers by the project key their transcript path carries. Reads
-    the same sqlite file as the grouped counts; ``None`` on a backend the
-    audit cannot read directly.
+    Resolved from configuration like ``sqlite_grouped_counts_reader``, never
+    by sniffing the palace directory; both in-tree sqlite layouts are served
+    (the ChromaDB metadata database and the sqlite_exact / rust_exact file),
+    each scoped to the drawer collection so closets are not counted twice.
     """
-    import sqlite3
-
-    from .wing_split import project_key, resolve_target
-
     try:
         from .palace import resolve_backend_name
 
@@ -163,31 +160,34 @@ def _read_wing_project_mix(config: MempalaceConfig) -> Optional[dict[str, dict]]
         )
     except Exception:
         return None
-    if backend in {"sqlite_exact", "rust_exact"}:
-        from .backends.sqlite_exact import _DB_FILENAME as db_name
+    if backend == "chroma":
+        from .backends.chroma import sqlite_wing_source_counts
 
-        sql = (
-            "SELECT json_extract(metadata_json, '$.wing'), "
-            "json_extract(metadata_json, '$.source_file'), COUNT(*) FROM documents "
-            "WHERE json_extract(metadata_json, '$.source_file') LIKE '%.claude%projects%' "
-            "OR json_extract(metadata_json, '$.source_file') LIKE '%.codex%sessions%' "
-            "GROUP BY 1, 2"
-        )
-    else:
-        return None
-    db_path = os.path.join(config.palace_path, db_name)
-    if not os.path.isfile(db_path):
+        return sqlite_wing_source_counts
+    if backend in {"sqlite_exact", "rust_exact"}:
+        from .backends.sqlite_exact import sqlite_wing_source_counts
+
+        return sqlite_wing_source_counts
+    return None
+
+
+def _read_wing_project_mix(config: MempalaceConfig) -> Optional[dict[str, dict]]:
+    """``{wing: {"projects": n, "drawers": n, "top": [(key, n), ...]}}`` from sqlite.
+
+    Groups drawers by the project key their transcript path carries, read
+    from the backend's sqlite file scoped to the drawer collection; ``None``
+    on a backend the audit cannot read directly.
+    """
+    from .wing_split import project_key, resolve_target
+
+    reader = _wing_source_counts_reader(config)
+    if reader is None:
         return None
     try:
-        # One door for Python reads of the palace database: the in-process
-        # lock keeps this read from dropping Chroma's file locks or racing
-        # one of its commits when the audit runs inside the MCP server.
-        conn = open_palace_reader(db_path, timeout=2.0)
-        try:
-            rows = conn.execute(sql).fetchall()
-        finally:
-            conn.close()
-    except (sqlite3.Error, ValueError):
+        rows = reader(config.palace_path, config.collection_name)
+    except Exception:
+        return None
+    if rows is None:
         return None
     per_wing: dict[str, Counter] = defaultdict(Counter)
     drawers: Counter = Counter()
@@ -213,17 +213,20 @@ def _read_wing_project_mix(config: MempalaceConfig) -> Optional[dict[str, dict]]
     }
 
 
-def resolve_kg_path(palace_path: str) -> str:
-    """Prefer the palace-local knowledge graph, else the legacy home path.
+def resolve_kg_path(palace_path: str, explicit: bool = False) -> str:
+    """The knowledge graph that belongs to ``palace_path``.
 
-    Mirrors the MCP server: ``--palace`` puts the graph inside the palace,
-    the default install keeps it at ``~/.mempalace``. The audit must not
-    create either file, so the choice is made on existence alone.
+    Mirrors the MCP server: a palace chosen with ``--palace`` (``explicit``)
+    keeps its graph inside the palace and never falls back to the home
+    graph, so ``audit`` cannot report and ``kg normalize --yes`` cannot
+    rewrite an unrelated default graph. The default palace prefers a
+    palace-local file and otherwise uses the legacy ``~/.mempalace`` path.
+    Neither file is created here.
     """
     from .knowledge_graph import DEFAULT_KG_PATH
 
     local = os.path.join(palace_path, "knowledge_graph.sqlite3")
-    if os.path.isfile(local):
+    if explicit or os.path.isfile(local):
         return local
     return DEFAULT_KG_PATH
 
@@ -420,21 +423,14 @@ def _analyze_tunnels(
             ):
                 bad = True
                 dangling += 1
-        pair = (
-            tuple(sorted((str(source.get("wing") or ""), str(target.get("wing") or "")))),
-            tuple(
-                sorted(
-                    (
-                        room_spelling_key(str(source.get("room") or "")),
-                        room_spelling_key(str(target.get("room") or "")),
-                    )
-                )
-            ),
-        )
-        if pair in seen_pairs:
-            bad = True
-            duplicates += 1
-        seen_pairs.add(pair)
+        # Same key `tunnels prune` uses: endpoints stay paired, wings
+        # normalized, rooms keyed by entity spelling.
+        pair = _tunnel_link_key(t)
+        if pair is not None:
+            if pair in seen_pairs:
+                bad = True
+                duplicates += 1
+            seen_pairs.add(pair)
         if bad:
             artifacts += 1
         else:
@@ -686,8 +682,14 @@ def audit_palace(
     palace_path: Optional[str] = None,
     config: Optional[MempalaceConfig] = None,
     progress=None,
+    explicit_palace: Optional[bool] = None,
 ) -> dict:
     """Run every read-only check and return the report as a dict.
+
+    ``explicit_palace`` says whether the caller chose the palace (``--palace``
+    or ``MEMPALACE_PALACE_PATH``); its knowledge graph then lives inside the
+    palace and the legacy home graph is never read for it. When omitted, a
+    palace path other than the default counts as explicit.
 
     ``progress(step, detail)`` is called before and after each reader — the
     hallway sidecar alone can be tens of megabytes, and a caller on a terminal
@@ -712,6 +714,11 @@ def audit_palace(
     palace_path = config.palace_path
     if not os.path.isdir(palace_path):
         raise FileNotFoundError(f"palace not found at {palace_path}")
+    if explicit_palace is None:
+        from .config import DEFAULT_PALACE_PATH
+
+        explicit_palace = os.path.realpath(palace_path) != os.path.realpath(DEFAULT_PALACE_PATH)
+    explicit = explicit_palace
 
     source = "sqlite"
 
@@ -734,7 +741,7 @@ def audit_palace(
     hallway_records = step("hallways", lambda: list_hallways(config=config), lambda h: str(len(h)))
     kg = step(
         "knowledge graph",
-        lambda: _read_kg(resolve_kg_path(palace_path)),
+        lambda: _read_kg(resolve_kg_path(palace_path, explicit=explicit)),
         lambda k: f"{k['triples']} facts" if k else "no file",
     )
 
