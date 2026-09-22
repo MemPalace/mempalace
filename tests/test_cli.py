@@ -2413,6 +2413,36 @@ def test_cmd_repair_holds_the_palace_lock_before_extracting(mock_config_cls, tmp
 
 
 @patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_confirms_after_releasing_the_palace_lock(mock_config_cls, tmp_path):
+    """The confirmation prompt waits on stdin, so it must not hold the lease."""
+    palace_dir, backend = _legacy_repair_palace(tmp_path)
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=False)
+    events = []
+
+    def spy_extract(collection, total, batch_size):
+        events.append("extract")
+        return ["id1", "id2"], ["doc1", "doc2"], [{"wing": "a"}, {"wing": "b"}]
+
+    def spy_confirm(*_args, **_kwargs):
+        events.append("confirm")
+        return True
+
+    with (
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=backend),
+        patch("mempalace.palace.mine_palace_lock", _LockSpy(events)),
+        patch("mempalace.repair._extract_drawers", spy_extract),
+        patch("mempalace.migrate.confirm_destructive_action", spy_confirm),
+    ):
+        cmd_repair(args)
+
+    assert events.index("confirm") > events.index("unlock")
+    assert events[events.index("confirm") + 1] == "lock"
+    assert "extract" in events[events.index("confirm") :]
+
+
+@patch("mempalace.cli.MempalaceConfig")
 def test_cmd_repair_refuses_to_extract_when_the_lock_is_taken(mock_config_cls, tmp_path, capsys):
     """Contention must be reported before any work, not ten minutes into it."""
     palace_dir, backend = _legacy_repair_palace(tmp_path)
