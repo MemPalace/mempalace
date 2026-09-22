@@ -27,6 +27,7 @@ set -uo pipefail
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 PROXY_URL="${PROXY_URL:-http://127.0.0.1:8766}"
+PROXY_TOKEN="${PROXY_TOKEN:-}"  # bearer token when the proxy sets INBOUND_TOKEN
 UPSTREAM_HOST="${UPSTREAM_HOST:-}"
 UPSTREAM_SSH="${UPSTREAM_SSH:-}"
 SSH_KEY="${SSH_KEY:-}"
@@ -51,7 +52,9 @@ notify() {
 
 check_proxy_health() {
     local response
-    response=$(curl -s --max-time 10 "${PROXY_URL}/health" 2>/dev/null)
+    local auth=()
+    if [[ -n "$PROXY_TOKEN" ]]; then auth=(-H "Authorization: Bearer $PROXY_TOKEN"); fi
+    response=$(curl -s --max-time 10 "${PROXY_URL}/health" "${auth[@]}" 2>/dev/null)
     if [[ -z "$response" ]]; then
         log "FAIL: Proxy /health no response"
         return 1
@@ -81,9 +84,11 @@ except:
 
 check_mcp_tools() {
     local count
+    local auth=()
+    if [[ -n "$PROXY_TOKEN" ]]; then auth=(-H "Authorization: Bearer $PROXY_TOKEN"); fi
     count=$(curl -s --max-time 15 "${PROXY_URL}/mcp" \
         -X POST \
-        -H "Content-Type: application/json" \
+        -H "Content-Type: application/json" "${auth[@]}" \
         -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' 2>/dev/null | \
         python3 -c "import sys,json; r=json.load(sys.stdin); print(len(r.get('result',{}).get('tools',[])))" 2>/dev/null)
 

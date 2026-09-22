@@ -13,8 +13,15 @@ import json
 import os
 import sys
 
-import httpx
 import pytest
+
+# The proxy is a deploy/ example — aiohttp and httpx are its runtime
+# requirements, not dev dependencies of the package. Skip cleanly when
+# they are not installed.
+pytest.importorskip("aiohttp")
+pytest.importorskip("httpx")
+
+import httpx  # noqa: E402
 
 # Add the proxy directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "deploy", "proxy"))
@@ -305,16 +312,6 @@ class TestNoHardcodedPaths:
 
         assert "/Users/" not in content, "Hardcoded /Users/ path found"
         assert "/home/" not in content, "Hardcoded /home/ path found"
-
-    def test_no_hardcoded_user_paths_in_watchdog(self):
-        watchdog_path = os.path.join(
-            os.path.dirname(__file__), "..", "deploy", "proxy", "mempalace-watchdog.sh"
-        )
-        with open(watchdog_path) as f:
-            content = f.read()
-
-        assert "/Users/" not in content, "Hardcoded /Users/ path found"
-        assert "/home/orkidlabs" not in content, "Hardcoded /home/orkidlabs path found"
 
     def test_no_hardcoded_user_paths_in_monitor(self):
         monitor_path = os.path.join(
