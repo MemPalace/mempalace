@@ -205,6 +205,17 @@ GENERIC_ENTITY_STOPLIST = frozenset(
     logger middleware services component components hooks context styles style
     theme globals setup init __init__ repository entity entities interfaces
     interface enums enum validators validator
+    cargo.toml cargo.lock go.mod go.sum gemfile gemfile.lock setup.py setup.cfg
+    uv.lock poetry.lock yarn.lock pnpm-lock.yaml package-lock.json roadmap.md
+    contributing.md security.md license.md code_of_conduct.md todo.md notes.md
+    .eslintrc .prettierrc vite.config.ts next.config.js tailwind.config.js
+    webpack.config.js jest.config.js vitest.config.ts vercel.json fly.toml procfile
+    created_by updated_by deleted_at deleted_by user_id primary_key foreign_key
+    is_active is_deleted read_text write_text
+    changedetectionstrategy changedetectionstrategy.onpush changedetectionstrategy.eager
+    changedetectorref oninit ondestroy onchanges injectable ngmodule httpclient
+    formsmodule commonmodule usestate useeffect usememo usecallback useref
+    usecontext usereducer
     """.split()
 )
 

@@ -83,6 +83,8 @@ def test_generic_entity_heuristic():
         assert is_generic_entity(name), name
     for name in ("pathlib.Path", "page.evaluate", "console.log", "os.path.join", "np.array"):
         assert is_generic_entity(name), name
+    for name in ("Cargo.toml", "ROADMAP.md", "ChangeDetectionStrategy.OnPush", "created_by"):
+        assert is_generic_entity(name), name
     # A project's own file or qualified symbol still passes.
     for name in ("ChatStore.swift", "swim.zig", "wing_split.py", "eosio.token", "store.baseURL"):
         assert not is_generic_entity(name), name
