@@ -4,23 +4,33 @@
 # Watches a staging directory for new files and runs the full
 # MemPalace ingest pipeline:
 #
-#   preprocess → mine → verify → compress → gzip → archive
+#   stage (verbatim) → mine → verify → compress → archive → clear
 #
 # When files arrive and stabilize (no writes for DEBOUNCE_SECONDS):
-#   1. Claim an immutable batch snapshot.
-#   2. Preprocess only the claimed files (strip boilerplate, split >4000 lines).
-#   3. Mine processed files into the palace.
-#   4. Verify a sample of mined content is searchable.
+#   1. Claim an immutable batch snapshot (size, mtime, sha256 per file) and
+#      copy every claimed file into a private work dir, verifying hashes.
+#   2. Stage VERBATIM copies into a per-batch mine dir. MemPalace stores
+#      content verbatim — the only transformation is splitting files over
+#      MAX_LINES into numbered parts on line boundaries. Unprocessable
+#      files (dotfiles, binary extensions, generated dirs) are skipped.
+#   3. Mine the batch dir into the palace. The batch dir is keyed by the
+#      batch content hash, so mined source_file paths are unique per
+#      batch: a later batch's same-named file can never purge an earlier
+#      batch's drawers, and a retry of the same batch re-mines in place.
+#   4. Verify each mined file is searchable under its own source_file.
 #   5. Compress: run mempalace compress (AAAK dialect).
-#   6. Gzip original files from the batch snapshot and move to archive/YYYY-MM-DD_HHMMSS/.
-#   7. Write manifest with checksums + file list.
-#   8. Clear only the claimed batch from staging (ready for next batch).
+#   6. Archive ONLY the files that were actually mined: gzip the verified
+#      work copies into archive/YYYY-MM-DD_HHMMSS/ via atomic rename.
+#      Skipped files are never archived — the archive means "this content
+#      is in the palace".
+#   7. Quarantine skipped files under staging/.mp_quarantine/<batch_id>/
+#      (moved, never deleted) and clear mined files by moving them into
+#      the private work dir — never unlinking a live staging path.
 #
-# The batch snapshot is captured after the debounce period completes.  Every
-# later destructive phase (archive, clear) operates on that exact snapshot and
-# verifies that each file is still the same file (size, mtime, sha256) before
-# acting on it.  Files that arrive after the snapshot remain in staging for the
-# next run.
+# The batch snapshot is captured after the debounce period completes. Every
+# later phase operates on that exact snapshot and verifies that each file
+# is still the same file (size, mtime, sha256) before acting on it. Files
+# that arrive after the snapshot remain in staging for the next run.
 #
 # Usage:
 #   ./staging_watcher.sh /path/to/staging /path/to/palace
@@ -37,7 +47,7 @@ PALACE_PATH="${2:-${PALACE_PATH:-$HOME/.mempalace/palace}}"
 # Normalize STAGING_DIR to an absolute, slash-free-tailing path so we can
 # safely derive archive names by stripping the prefix from file paths.
 STAGING_DIR=$(cd "$STAGING_DIR" && pwd)
-ARCHIVE_DIR="${ARCHIVE_DIR:-$STAGING_DIR/../archive}"
+ARCHIVE_DIR="${ARCHIVE_DIR:-$HOME/.mempalace/archive}"
 MEMPALACE_BIN="${MEMPALACE_BIN:-mempalace}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 PREPROCESS_SCRIPT="$(dirname "$0")/preprocess_staging.py"
@@ -47,11 +57,17 @@ LOG_FILE="$LOG_DIR/staging-watcher.log"
 DEBOUNCE_SECONDS="${DEBOUNCE_SECONDS:-30}"
 MIN_FILES="${MIN_FILES:-1}"
 MAX_LINES="${MAX_LINES:-4000}"
+# Agent tag recorded on mined drawers.
+MINE_AGENT="${MINE_AGENT:-staging-watcher}"
 # Work directory and snapshot live OUTSIDE the watched staging tree so the
 # watcher never sees its own private files as a new batch.
 WORK_ROOT="${WORK_ROOT:-$(mktemp -d -t mempalace-batch-XXXXXX)}"
 BATCH_SNAPSHOT="${BATCH_SNAPSHOT:-$WORK_ROOT/.batch_snapshot}"
-BATCH_WORK="${BATCH_WORK:-$WORK_ROOT/.batch_work}"
+BATCH_ID=""
+BATCH_DIR=""
+WORK_ORIG=""
+MINE_DIR=""
+RETIRED_DIR=""
 
 mkdir -p "$LOG_DIR" "$ARCHIVE_DIR" "$STAGING_DIR"
 
@@ -59,14 +75,17 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
 }
 
-# List all files that should participate in the batch.  Excludes dotfiles,
-# .DS_Store, *.tmp, mempalace.yaml, and anything inside a processed/ tree.
+# List all files that should participate in the batch. Excludes dotfiles and
+# dot-directories at any depth (covers .mp_quarantine and the watcher's own
+# namespaced dirs), .DS_Store, *.tmp, and mempalace.yaml. No name-based
+# exclusions on ordinary directories — a user dir named "processed" is
+# content like any other.
 find_batch_files() {
     local target="${1:-$STAGING_DIR}"
     find "$target" -type f \
+        ! -path '*/.*' \
         ! -name '.DS_Store' ! -name '*.tmp' \
-        ! -name 'mempalace.yaml' ! -path '*/processed/*' \
-        ! -name '.batch_manifest' ! -name '.batch_snapshot' \
+        ! -name 'mempalace.yaml' \
         2>/dev/null
 }
 
@@ -101,8 +120,9 @@ count_files() {
     find_batch_files "$STAGING_DIR" | wc -l
 }
 
-# Write a TSV snapshot of the current staging tree to stdout.
-# Columns: relative_path size mtime sha256 (all paths are relative to target).
+# Write a snapshot of the current staging tree to stdout.
+# Columns: relative_path <US> size <US> mtime <US> sha256 (unit separator
+# so paths with spaces and tabs do not break parsing).
 snapshot_staging() {
     local target="${1:-$STAGING_DIR}"
     local f rel size mtime hash
@@ -111,18 +131,14 @@ snapshot_staging() {
         size=$(file_size "$f")
         mtime=$(file_mtime "$f")
         hash=$(file_sha256 "$f")
-        # Use the field separator 0x1F (Unit Separator) so paths with spaces
-        # and tabs do not break parsing.
         printf '%s\x1f%s\x1f%s\x1f%s\n' "$rel" "$size" "$mtime" "$hash"
     done < <(find "$target" -type f \
+        ! -path '*/.*' \
         ! -name '.DS_Store' ! -name '*.tmp' \
-        ! -name 'mempalace.yaml' ! -path '*/processed/*' \
-        ! -name '.batch_snapshot' ! -name '.batch_manifest' \
+        ! -name 'mempalace.yaml' \
         -print0 | sort -z)
 }
 
-# Return a single hash that represents the current state of the staging tree.
-# Any change to file count, paths, sizes, or mtimes produces a different hash.
 # Hash stdin with sha256.  Tries sha256sum then shasum -a 256.
 # Fails closed (returns empty) if neither is available.
 hash_stdin() {
@@ -134,6 +150,8 @@ hash_stdin() {
     printf '%s' "$hash"
 }
 
+# Return a single hash that represents the current state of the staging tree.
+# Any change to file count, paths, sizes, or mtimes produces a different hash.
 fingerprint_staging() {
     local target="${1:-$STAGING_DIR}"
     local fp
@@ -154,6 +172,12 @@ wait_for_stable() {
     local current_count
     while [[ $stable -lt $DEBOUNCE_SECONDS ]]; do
         current_fingerprint=$(fingerprint_staging "$STAGING_DIR")
+        # A missing sha256 tool yields the sentinel — never compare it
+        # against last_fingerprint or an error string looks "stable".
+        if [[ "$current_fingerprint" == "ERROR_NO_SHA256" || -z "$current_fingerprint" ]]; then
+            sleep 5
+            continue
+        fi
         current_count=$(count_files)
         if [[ "$current_fingerprint" == "$last_fingerprint" && "$current_count" -ge $MIN_FILES ]]; then
             stable=$((stable + 5))
@@ -167,6 +191,10 @@ wait_for_stable() {
 
 # Capture an immutable snapshot of the current stable batch and persist it.
 # The snapshot is the source of truth for archive and clear operations.
+# BATCH_ID is content-addressed (the snapshot fingerprint), so retrying the
+# same file set re-uses the same mine paths — the miner purges by
+# source_file, which makes a retry an idempotent replace instead of a
+# duplicate insert.
 claim_batch() {
     local snapshot
     snapshot=$(snapshot_staging "$STAGING_DIR")
@@ -175,23 +203,32 @@ claim_batch() {
         return 1
     fi
     printf '%s\n' "$snapshot" > "$BATCH_SNAPSHOT"
-    # Create the private work directory outside the watched tree.
-    rm -rf "$BATCH_WORK" 2>/dev/null || true
-    mkdir -p "$BATCH_WORK"
-    # Copy ALL claimed files into BATCH_WORK with sha256 verification.
-    # This gives archive_files an immutable copy that cannot be raced by
-    # a producer replacing the live staging file.
+
+    local fp
+    fp=$(printf '%s' "$snapshot" | hash_stdin)
+    if [[ -z "$fp" ]]; then
+        log "Claim FAILED: no sha256 tool available for batch id"
+        return 1
+    fi
+    BATCH_ID="${fp:0:16}"
+    BATCH_DIR="$WORK_ROOT/batch-$BATCH_ID"
+    WORK_ORIG="$BATCH_DIR/orig"
+    MINE_DIR="$BATCH_DIR/mine"
+    RETIRED_DIR="$BATCH_DIR/retired"
+    mkdir -p "$WORK_ORIG" "$MINE_DIR" "$RETIRED_DIR"
+
+    # Copy ALL claimed files into the batch work dir with sha256 verification.
+    # This gives later phases an immutable copy that cannot be raced by a
+    # producer replacing the live staging file.
     local line
     while IFS= read -r line; do
         parse_snapshot_line "$line"
         local rel_path="$_rel"
         local expected_hash="$_hash"
         [[ -z "$rel_path" ]] && continue
-        [[ "$rel_path" == .DS_Store || "$rel_path" == mempalace.yaml ]] && continue
-        [[ "$rel_path" == .batch_snapshot || "$rel_path" == .batch_manifest ]] && continue
         local src="$STAGING_DIR/$rel_path"
         [[ ! -e "$src" ]] && continue
-        local dst="$BATCH_WORK/$rel_path"
+        local dst="$WORK_ORIG/$rel_path"
         mkdir -p "$(dirname "$dst")"
         cp -p "$src" "$dst"
         local copied_hash
@@ -201,7 +238,7 @@ claim_batch() {
             rm -f "$dst"
         fi
     done < "$BATCH_SNAPSHOT"
-    log "Claimed batch: $(grep -c '^' "$BATCH_SNAPSHOT" 2>/dev/null || wc -l < "$BATCH_SNAPSHOT") files -> $BATCH_SNAPSHOT"
+    log "Claimed batch $BATCH_ID: $(wc -l < "$BATCH_SNAPSHOT" | xargs) files -> $BATCH_SNAPSHOT"
     return 0
 }
 
@@ -215,37 +252,37 @@ parse_snapshot_line() {
     _hash=$(printf '%s' "$line" | cut -d $'\x1f' -f4)
 }
 
+# Stage verified work copies into MINE_DIR — verbatim bytes, splitting only.
+# Writes $BATCH_DIR/mined.manifest (orig<US>mined pairs) and skipped.manifest.
 preprocess_staging() {
-    local file_count
-    file_count=$(count_files)
-    log "Preprocessing $file_count files (strip boilerplate, split >$MAX_LINES lines)..."
+    log "Staging batch $BATCH_ID for mining (verbatim; split >$MAX_LINES lines)..."
 
-    local extra_args=()
-    if [[ -s "$BATCH_SNAPSHOT" ]]; then
-        extra_args=(--batch-snapshot "$BATCH_SNAPSHOT" --work-dir "$BATCH_WORK")
-    fi
-
-    if "$PYTHON_BIN" "$PREPROCESS_SCRIPT" "$STAGING_DIR" --max-lines "$MAX_LINES" "${extra_args[@]}" >> "$LOG_FILE" 2>&1; then
-        local processed_count
-        processed_count=$(find "$STAGING_DIR/processed" -type f ! -name 'mempalace.yaml' 2>/dev/null | wc -l)
-        # Copy mempalace.yaml into processed/ so the miner uses correct wing routing
-        cp "$STAGING_DIR/mempalace.yaml" "$STAGING_DIR/processed/mempalace.yaml" 2>/dev/null || true
-        log "Preprocess complete: $processed_count output files"
+    if "$PYTHON_BIN" "$PREPROCESS_SCRIPT" "$STAGING_DIR" \
+        --work-dir "$WORK_ORIG" --batch-snapshot "$BATCH_SNAPSHOT" \
+        --out-dir "$MINE_DIR" --batch-id "$BATCH_ID" \
+        --manifest "$BATCH_DIR/mined.manifest" \
+        --skip-manifest "$BATCH_DIR/skipped.manifest" \
+        --max-lines "$MAX_LINES" >> "$LOG_FILE" 2>&1; then
+        local mined_count
+        mined_count=$(wc -l < "$BATCH_DIR/mined.manifest" 2>/dev/null | xargs)
+        # Copy mempalace.yaml into the mine dir so the miner uses correct
+        # wing routing (the miner skips the file itself by name).
+        cp "$STAGING_DIR/mempalace.yaml" "$MINE_DIR/mempalace.yaml" 2>/dev/null || true
+        log "Stage complete: $mined_count mine-ready file(s)"
         return 0
     else
         local exit_code=$?
-        log "Preprocess FAILED (exit $exit_code)"
+        log "Stage FAILED (exit $exit_code)"
         return $exit_code
     fi
 }
 
 mine_processed() {
-    local processed_dir="$STAGING_DIR/processed"
     local file_count
-    file_count=$(find "$processed_dir" -type f ! -name 'mempalace.yaml' 2>/dev/null | wc -l)
+    file_count=$(find "$MINE_DIR" -type f ! -name 'mempalace.yaml' 2>/dev/null | wc -l)
 
     if [[ "$file_count" -eq 0 ]]; then
-        log "Mine: no processed files to mine — skipping"
+        log "Mine: no staged files to mine — skipping"
         return 0
     fi
 
@@ -266,10 +303,10 @@ mine_processed() {
         log "Mine: previous mining finished — proceeding"
     fi
 
-    log "Mining $file_count processed files..."
+    log "Mining $file_count staged files..."
 
-    if "$MEMPALACE_BIN" --palace "$PALACE_PATH" mine "$processed_dir" \
-        --agent devin --max-chunks-per-file 500 \
+    if "$MEMPALACE_BIN" --palace "$PALACE_PATH" mine "$MINE_DIR" \
+        --agent "$MINE_AGENT" --max-chunks-per-file 500 \
         >> "$LOG_FILE" 2>&1; then
         log "Mine complete ($file_count files)"
         return 0
@@ -280,36 +317,28 @@ mine_processed() {
     fi
 }
 
-build_batch_manifest() {
-    local processed_dir="$STAGING_DIR/processed"
-    local manifest="$STAGING_DIR/.batch_manifest"
-    find "$processed_dir" -type f ! -name 'mempalace.yaml' -print > "$manifest" 2>/dev/null
-    log "Built batch manifest with $(wc -l < "$manifest" 2>/dev/null | xargs) processed files"
-}
-
 verify_mined() {
-    local processed_dir="$STAGING_DIR/processed"
-    local manifest="$STAGING_DIR/.batch_manifest"
+    local manifest="$BATCH_DIR/mined.manifest"
 
     if [[ ! -s "$manifest" ]]; then
-        log "Verify FAILED: batch manifest is empty or missing"
+        # Nothing was mined — nothing to verify. Quarantine still runs so
+        # unprocessable files stop re-triggering the batch.
+        log "Verify: manifest empty (nothing mined) — skipping search checks"
+        return 0
+    fi
+
+    log "Verify: checking searchability of mined files under $MINE_DIR"
+
+    if ! "$PYTHON_BIN" "$VERIFY_SCRIPT" \
+        --palace "$PALACE_PATH" \
+        --manifest "$manifest" --mine-dir "$MINE_DIR" \
+        --snapshot "$BATCH_SNAPSHOT" --work-dir "$WORK_ORIG" \
+        --all >> "$LOG_FILE" 2>&1; then
+        log "Verify FAILED: one or more mined files are not searchable"
         return 1
     fi
 
-    log "Verify: checking searchability of all processed files against $manifest"
-
-    local snapshot_arg=()
-    if [[ -s "$BATCH_SNAPSHOT" ]]; then
-        snapshot_arg=(--snapshot "$BATCH_SNAPSHOT")
-    fi
-
-    if ! "$PYTHON_BIN" "$VERIFY_SCRIPT" "$PALACE_PATH" "$manifest" "$manifest" "$MEMPALACE_BIN" "${snapshot_arg[@]}" \
-        >> "$LOG_FILE" 2>&1; then
-        log "Verify FAILED: one or more processed files are not searchable"
-        return 1
-    fi
-
-    log "Verify: all processed files are searchable and in the current batch"
+    log "Verify: all mined files are searchable under this batch's source paths"
     return 0
 }
 
@@ -321,6 +350,14 @@ compress_palace() {
         log "Compress FAILED (exit $?) — continuing (non-fatal)"
     fi
     return 0
+}
+
+# Iterate the ORIG rel paths that produced mined output (col 1 of the mined
+# manifest, deduplicated — a split file appears once per part).
+mined_orig_rels() {
+    local manifest="$BATCH_DIR/mined.manifest"
+    [[ -s "$manifest" ]] || return 0
+    cut -d $'\x1f' -f1 "$manifest" | sort -u
 }
 
 archive_files() {
@@ -337,56 +374,34 @@ archive_files() {
     {
         echo "# MemPalace Archive Manifest"
         echo "# Batch: $batch_date"
+        echo "# Batch ID: $BATCH_ID"
         echo "# Mined: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
         echo "# Palace: $PALACE_PATH"
-        echo "# Pipeline: preprocess -> mine -> verify -> compress -> gzip -> archive"
+        echo "# Pipeline: stage -> mine -> verify -> compress -> gzip -> archive"
         echo ""
     } > "$manifest"
 
-    # Use the claimed batch snapshot when available.  If it does not exist,
-    # fall back to the current staging tree for direct function testing and
-    # legacy callers.
-    local snapshot_file="$BATCH_SNAPSHOT"
-    if [[ ! -s "$snapshot_file" ]]; then
-        snapshot_file="$STAGING_DIR/.batch_snapshot"
-        if [[ ! -s "$snapshot_file" ]]; then
-            snapshot_staging "$STAGING_DIR" > "$snapshot_file"
-        fi
-    fi
-
     local file_count=0
-    local line
-    while IFS= read -r line; do
-        parse_snapshot_line "$line"
-        local rel_path="$_rel"
-        local expected_size="$_size"
-        local expected_mtime="$_mtime"
-        local expected_hash="$_hash"
-
+    local rel_path
+    while IFS= read -r rel_path; do
         [[ -z "$rel_path" ]] && continue
-        [[ "$rel_path" == .DS_Store || "$rel_path" == mempalace.yaml ]] && continue
-        [[ "$rel_path" == .batch_snapshot || "$rel_path" == .batch_manifest ]] && continue
 
-        # Use the immutable work copy from claim_batch when available;
-        # fall back to the live staging tree for direct function testing
-        # and legacy callers that bypass claim_batch.
-        local file="$BATCH_WORK/$rel_path"
+        # Archive the verified work copy — the live staging file may have
+        # been replaced since the claim.
+        local file="$WORK_ORIG/$rel_path"
         if [[ ! -e "$file" ]]; then
-            file="$STAGING_DIR/$rel_path"
-        fi
-
-        if [[ ! -e "$file" ]]; then
-            log "Archive SKIP: $rel_path no longer exists"
+            log "Archive SKIP: $rel_path has no verified work copy"
             continue
         fi
 
-        local current_size current_mtime current_hash
+        local expected_hash current_size current_mtime current_hash
+        expected_hash=$(grep -F "$rel_path" "$BATCH_SNAPSHOT" | head -1 | cut -d $'\x1f' -f4)
         current_size=$(file_size "$file")
         current_mtime=$(file_mtime "$file")
         current_hash=$(file_sha256 "$file")
 
-        if [[ "$current_size" != "$expected_size" || "$current_mtime" != "$expected_mtime" || "$current_hash" != "$expected_hash" ]]; then
-            log "Archive SKIP: $rel_path changed since batch was claimed (size/mtime/hash)"
+        if [[ -n "$expected_hash" && "$current_hash" != "$expected_hash" ]]; then
+            log "Archive SKIP: $rel_path work copy no longer matches snapshot"
             continue
         fi
 
@@ -420,18 +435,12 @@ archive_files() {
         echo "" >> "$manifest"
 
         file_count=$((file_count + 1))
-    done < "$snapshot_file"
+    done < <(mined_orig_rels)
 
     if [[ $file_count -eq 0 ]]; then
-        log "Archive FAILED: no files to archive"
+        log "Archive: no mined files to archive"
         rm -rf "$batch_archive_tmp"
-        return 1
-    fi
-
-    if [[ ! -s "$manifest" ]]; then
-        log "Archive FAILED: manifest is empty or missing"
-        rm -rf "$batch_archive_tmp"
-        return 1
+        return 0
     fi
 
     if ! mv "$batch_archive_tmp" "$batch_archive"; then
@@ -443,53 +452,71 @@ archive_files() {
     log "Archived $file_count files to $batch_archive"
 }
 
+# Move skipped (unprocessable) files out of the scan set, preserving them
+# under staging/.mp_quarantine/<batch_id>/ — moved, never deleted.
+quarantine_skipped() {
+    local skip_manifest="$BATCH_DIR/skipped.manifest"
+    [[ -s "$skip_manifest" ]] || return 0
+
+    local moved=0
+    local line rel_path
+    while IFS= read -r line; do
+        rel_path="${line%%$'\x1f'*}"
+        [[ -z "$rel_path" ]] && continue
+        local file="$STAGING_DIR/$rel_path"
+        [[ ! -e "$file" ]] && continue
+
+        # Only quarantine the file we actually claimed — a file that changed
+        # since the snapshot is a new drop and stays for re-evaluation.
+        local expected_hash current_hash
+        expected_hash=$(grep -F "$rel_path" "$BATCH_SNAPSHOT" | head -1 | cut -d $'\x1f' -f4)
+        current_hash=$(file_sha256 "$file")
+        if [[ -n "$expected_hash" && "$current_hash" != "$expected_hash" ]]; then
+            log "Quarantine SKIP: $rel_path changed since claim — leaving in staging"
+            continue
+        fi
+
+        local dst="$STAGING_DIR/.mp_quarantine/$BATCH_ID/$rel_path"
+        mkdir -p "$(dirname "$dst")"
+        mv "$file" "$dst"
+        moved=$((moved + 1))
+    done < "$skip_manifest"
+
+    [[ $moved -gt 0 ]] && log "Quarantined $moved unprocessable file(s) to staging/.mp_quarantine/$BATCH_ID/"
+    return 0
+}
+
 clear_staging() {
-    # Delete only the files listed in the batch snapshot and verify identity
-    # before deleting.  Files that arrived after the snapshot or that changed
-    # while the pipeline ran are left for the next batch.
-    local snapshot_file="$BATCH_SNAPSHOT"
-    if [[ ! -s "$snapshot_file" ]]; then
-        snapshot_file="$STAGING_DIR/.batch_snapshot"
-    fi
+    # Clear only files that were actually mined (they are now safely in the
+    # palace AND archived). Verify the live file still matches the snapshot,
+    # then MOVE it into the private work dir rather than unlinking a live
+    # staging path — mv is atomic with respect to path replacement, so a
+    # producer that swapped the file mid-pipeline loses nothing.
+    local rel_path
+    while IFS= read -r rel_path; do
+        [[ -z "$rel_path" ]] && continue
 
-    if [[ -s "$snapshot_file" ]]; then
-        local line
-        while IFS= read -r line; do
-            parse_snapshot_line "$line"
-            local rel_path="$_rel"
-            local expected_size="$_size"
-            local expected_mtime="$_mtime"
-            local expected_hash="$_hash"
+        local file="$STAGING_DIR/$rel_path"
+        if [[ ! -e "$file" ]]; then
+            continue
+        fi
 
-            [[ -z "$rel_path" ]] && continue
-            [[ "$rel_path" == .DS_Store || "$rel_path" == mempalace.yaml ]] && continue
-            [[ "$rel_path" == .batch_snapshot || "$rel_path" == .batch_manifest ]] && continue
+        local expected_hash current_hash
+        expected_hash=$(grep -F "$rel_path" "$BATCH_SNAPSHOT" | head -1 | cut -d $'\x1f' -f4)
+        current_hash=$(file_sha256 "$file")
 
-            local file="$STAGING_DIR/$rel_path"
-            if [[ ! -e "$file" ]]; then
-                continue
-            fi
+        if [[ -n "$expected_hash" && "$current_hash" == "$expected_hash" ]]; then
+            local dst="$RETIRED_DIR/$rel_path"
+            mkdir -p "$(dirname "$dst")"
+            mv "$file" "$dst"
+        else
+            log "Clear SKIP: $rel_path changed since batch was claimed, leaving for next run"
+        fi
+    done < <(mined_orig_rels)
 
-            local current_size current_mtime current_hash
-            current_size=$(file_size "$file")
-            current_mtime=$(file_mtime "$file")
-            current_hash=$(file_sha256 "$file")
-
-            if [[ "$current_size" == "$expected_size" && "$current_mtime" == "$expected_mtime" && "$current_hash" == "$expected_hash" ]]; then
-                rm -f "$file"
-            else
-                log "Clear SKIP: $rel_path changed since batch was claimed, leaving for next run"
-            fi
-        done < "$snapshot_file"
-    fi
-
-    rm -rf "$STAGING_DIR/processed" 2>/dev/null || true
-    rm -f "$STAGING_DIR/.batch_snapshot" 2>/dev/null || true
-    rm -f "$STAGING_DIR/.batch_manifest" 2>/dev/null || true
-    find "$STAGING_DIR" -mindepth 1 -type d -empty -not -path "*/processed" -delete 2>/dev/null || true
-    # Clean up the private work directory outside the watched tree.
-    rm -rf "$BATCH_WORK" 2>/dev/null || true
-    rm -f "$BATCH_SNAPSHOT" 2>/dev/null || true
+    # Remove empty dirs left behind — excluding the quarantine tree.
+    find "$STAGING_DIR" -mindepth 1 -type d -empty \
+        -not -path "*/.mp_quarantine*" -delete 2>/dev/null || true
     log "Staging cleared (ready for next batch)"
 }
 
@@ -502,25 +529,17 @@ process_batch() {
     fi
 
     if ! preprocess_staging; then
-        log "ABORT: preprocess failed — files left for retry"
-        rm -rf "$BATCH_WORK" 2>/dev/null || true
-        rm -f "$BATCH_SNAPSHOT" 2>/dev/null || true
+        log "ABORT: staging failed — files left for retry"
         return 1
     fi
 
     if ! mine_processed; then
         log "ABORT: mine failed — files left for retry"
-        rm -rf "$BATCH_WORK" 2>/dev/null || true
-        rm -f "$BATCH_SNAPSHOT" 2>/dev/null || true
         return 1
     fi
 
-    build_batch_manifest
-
     if ! verify_mined; then
         log "ABORT: verify failed — files left for inspection"
-        rm -rf "$BATCH_WORK" 2>/dev/null || true
-        rm -f "$BATCH_SNAPSHOT" 2>/dev/null || true
         return 1
     fi
 
@@ -528,17 +547,12 @@ process_batch() {
 
     if ! archive_files; then
         log "ABORT: archive failed — files left for inspection"
-        rm -rf "$BATCH_WORK" 2>/dev/null || true
-        rm -f "$BATCH_SNAPSHOT" 2>/dev/null || true
         return 1
     fi
 
-    if ! clear_staging; then
-        log "ABORT: clear_staging failed — archive is at $ARCHIVE_DIR but staging may be dirty"
-        rm -rf "$BATCH_WORK" 2>/dev/null || true
-        rm -f "$BATCH_SNAPSHOT" 2>/dev/null || true
-        return 1
-    fi
+    quarantine_skipped
+
+    clear_staging
 
     log "=== Batch complete ==="
     return 0
@@ -551,7 +565,7 @@ if [[ -z "${STAGING_WATCHER_TEST_MODE:-}" ]]; then
     log "Watching: $STAGING_DIR"
     log "Archive: $ARCHIVE_DIR"
     log "Palace: $PALACE_PATH"
-    log "Pipeline: preprocess -> mine -> verify -> compress -> gzip -> archive"
+    log "Pipeline: stage -> mine -> verify -> compress -> gzip -> archive"
     log "Debounce: ${DEBOUNCE_SECONDS}s, Max lines: $MAX_LINES"
 
     while true; do
@@ -559,9 +573,9 @@ if [[ -z "${STAGING_WATCHER_TEST_MODE:-}" ]]; then
             sleep 10
         done
 
-        log "Files detected — waiting for stable period..."
+        log "Detected $(count_files) files — waiting for stabilization..."
         wait_for_stable
+
         process_batch
-        sleep 5
     done
 fi

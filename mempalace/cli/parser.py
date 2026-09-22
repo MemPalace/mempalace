@@ -310,8 +310,6 @@ def main():
     )
     p_search.add_argument("--wing", default=None, help="Limit to one project")
     p_search.add_argument("--room", default=None, help="Limit to one room")
-    p_search.add_argument("--source-file", default=None, help="Limit to one source file")
-    p_search.add_argument("--json", action="store_true", help="Output machine-readable JSON")
     p_search.add_argument("--results", type=int, default=5, help="Number of results")
     p_search.add_argument(
         "--since",

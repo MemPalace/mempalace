@@ -16,11 +16,9 @@ def cmd_search(args):
             palace_path=palace_path,
             wing=args.wing,
             room=args.room,
-            source_file=getattr(args, "source_file", None),
             n_results=args.results,
             since=args.since,
             before=args.before,
-            json_output=getattr(args, "json", False),
         )
     except SearchError:
         sys.exit(1)

@@ -1,428 +1,276 @@
-"""Tests for tools/preprocess_staging.py — boilerplate stripping and file splitting."""
+"""Tests for tools/preprocess_staging.py — verbatim batch staging.
 
-import hashlib
+MemPalace stores content verbatim, full stop. These tests pin that
+contract: the only permitted transformations are structural filtering
+(unprocessable inputs) and line-boundary splitting of oversized files.
+No byte of file content may be rewritten.
+"""
+
 import sys
-import textwrap
 from pathlib import Path
 
-# tools/ is not a package — add to path for import
-_TOOLS_DIR = Path(__file__).resolve().parent.parent / "tools"
-sys.path.insert(0, str(_TOOLS_DIR))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
 import preprocess_staging as pp  # noqa: E402
 
 
-# ── should_skip ──────────────────────────────────────────────────────────
+def _run(staging, **kw):
+    kw.setdefault("max_lines", 4000)
+    return pp.preprocess_directory(str(staging), **kw)
 
 
-def test_skip_dotfiles():
-    assert pp.should_skip(Path(".DS_Store")) is True
-    assert pp.should_skip(Path(".gitignore")) is True
-    assert pp.should_skip(Path(".hidden_file.py")) is True
+def _staged_bytes(staging, mined_rel, out_dir=None):
+    root = Path(out_dir) if out_dir else staging
+    return (root / mined_rel).read_bytes()
 
 
-def test_skip_binary_extensions():
-    assert pp.should_skip(Path("image.png")) is True
-    assert pp.should_skip(Path("data.db")) is True
-    assert pp.should_skip(Path("archive.zip")) is True
+# ── Filters ─────────────────────────────────────────────────────────────────
 
 
-def test_skip_node_modules():
-    assert pp.should_skip(Path("node_modules/react/index.js")) is True
-    assert pp.should_skip(Path("project/target/debug/binary")) is True
+def test_skip_dotfiles(tmp_path):
+    staging = tmp_path
+    (staging / ".hidden").write_bytes(b"secret\n")
+    mined, skipped = _run(staging, batch_id="b1")
+    assert mined == []
+    assert skipped[0][0] == ".hidden"
 
 
-def test_skip_mempalace_yaml():
-    assert pp.should_skip(Path("mempalace.yaml")) is True
-    assert pp.should_skip(Path("mempal.yaml")) is True
+def test_skip_binary_extensions(tmp_path):
+    (tmp_path / "data.pdf").write_bytes(b"%PDF fake\n")
+    mined, skipped = _run(tmp_path, batch_id="b1")
+    assert mined == []
+    assert skipped[0][0] == "data.pdf"
 
 
-def test_processable_files_not_skipped():
-    assert pp.should_skip(Path("script.py")) is False
-    assert pp.should_skip(Path("README.md")) is False
-    assert pp.should_skip(Path("config.json")) is False
-    assert pp.should_skip(Path("query.sql")) is False
+def test_skip_node_modules(tmp_path):
+    d = tmp_path / "node_modules" / "pkg"
+    d.mkdir(parents=True)
+    (d / "index.js").write_bytes(b"module.exports = {}\n")
+    mined, skipped = _run(tmp_path, batch_id="b1")
+    assert mined == []
+    assert skipped[0][0] == "node_modules/pkg/index.js"
 
 
-# ── strip_block_patterns ─────────────────────────────────────────────────
+def test_skip_mempalace_yaml(tmp_path):
+    (tmp_path / "mempalace.yaml").write_bytes(b"wing: x\n")
+    mined, skipped = _run(tmp_path, batch_id="b1")
+    assert mined == []
 
 
-def test_strip_system_info_block():
-    text = "Before\n<system_info>secret stuff</system_info>\nAfter"
-    result = pp.strip_block_patterns(text)
-    assert "secret stuff" not in result
-    assert "Before" in result
-    assert "After" in result
+def test_processed_dir_is_ordinary_content(tmp_path):
+    """A user dir literally named 'processed' is NOT special-cased."""
+    d = tmp_path / "processed"
+    d.mkdir()
+    (d / "notes.md").write_bytes(b"user notes in a dir named processed\n")
+    mined, _ = _run(tmp_path, batch_id="b1")
+    assert [m[0] for m in mined] == ["processed/notes.md"]
 
 
-def test_strip_available_skills_block():
-    text = "<available_skills>big list</available_skills>\ncontent"
-    result = pp.strip_block_patterns(text)
-    assert "big list" not in result
-    assert "content" in result
+def test_processable_files_not_skipped(tmp_path):
+    for name in ("a.md", "b.txt", "c.py", "d.rs"):
+        (tmp_path / name).write_bytes(b"content for " + name.encode() + b"\n")
+    mined, _ = _run(tmp_path, batch_id="b1")
+    assert sorted(m[0] for m in mined) == ["a.md", "b.txt", "c.py", "d.rs"]
 
 
-def test_strip_multiple_blocks():
-    text = (
-        "<system_info>SECRET_A</system_info>"
-        "<additional_metadata>SECRET_B</additional_metadata>"
-        "real content"
+# ── Verbatim contract ───────────────────────────────────────────────────────
+
+
+def test_license_header_preserved_verbatim(tmp_path):
+    content = b"# SPDX-License-Identifier: MIT\n# Copyright (c) 2024 X\n\ncode()\n"
+    (tmp_path / "a.py").write_bytes(content)
+    mined, _ = _run(tmp_path, batch_id="b1")
+    out = tmp_path / ".mp_processed" / "b1" / "a.py"
+    assert out.read_bytes() == content
+
+
+def test_system_info_block_preserved_verbatim(tmp_path):
+    content = (
+        b"<system-information>\nOS: darwin\n</system-information>\n"
+        b"<available_skills>\nskill\n</available_skills>\n"
+        b"real content\n"
     )
-    result = pp.strip_block_patterns(text)
-    assert "SECRET_A" not in result
-    assert "SECRET_B" not in result
-    assert "real content" in result
+    (tmp_path / "a.md").write_bytes(content)
+    _run(tmp_path, batch_id="b1")
+    assert (tmp_path / ".mp_processed" / "b1" / "a.md").read_bytes() == content
 
 
-# ── strip_license_headers ────────────────────────────────────────────────
+def test_part_number_lines_preserved(tmp_path):
+    content = b"Part 1 of 3\nline\nPart 2 of 3\nmore\n"
+    (tmp_path / "a.md").write_bytes(content)
+    _run(tmp_path, batch_id="b1")
+    assert (tmp_path / ".mp_processed" / "b1" / "a.md").read_bytes() == content
 
 
-def test_strip_spdx_license():
-    text = textwrap.dedent("""\
-        // SPDX-License-Identifier: MIT
-        // This is licensed under MIT
-        actual_code();
-    """)
-    result = pp.strip_license_headers(text)
-    assert "SPDX" not in result
-    assert "actual_code();" in result
+def test_repeated_lines_preserved(tmp_path):
+    content = b"same\nsame\nsame\n"
+    (tmp_path / "a.md").write_bytes(content)
+    _run(tmp_path, batch_id="b1")
+    assert (tmp_path / ".mp_processed" / "b1" / "a.md").read_bytes() == content
 
 
-def test_strip_apache_block_comment():
-    text = textwrap.dedent("""\
-        /*
-         * Licensed under the Apache License, Version 2.0
-         * you may not use this file except in compliance with the License.
-         */
-        fn main() {}
-    """)
-    result = pp.strip_license_headers(text)
-    assert "Apache License" not in result
-    assert "fn main() {}" in result
+def test_xml_blocks_preserved(tmp_path):
+    content = b"<file_view>\n<line>1|x</line>\n</file_view>\n"
+    (tmp_path / "a.md").write_bytes(content)
+    _run(tmp_path, batch_id="b1")
+    assert (tmp_path / ".mp_processed" / "b1" / "a.md").read_bytes() == content
 
 
-def test_strip_copyright_line():
-    text = "Copyright (c) 2024 Test Corp\nreal_content();"
-    result = pp.strip_license_headers(text)
-    assert "Copyright" not in result
-    assert "real_content();" in result
+def test_crlf_bytes_preserved(tmp_path):
+    """No newline translation — CRLF input must be CRLF in the staged copy."""
+    content = b"line one\r\nline two\r\n"
+    (tmp_path / "a.txt").write_bytes(content)
+    _run(tmp_path, batch_id="b1")
+    assert (tmp_path / ".mp_processed" / "b1" / "a.txt").read_bytes() == content
 
 
-def test_preserve_non_license_block_comments():
-    text = textwrap.dedent("""\
-        /*
-         * This is a regular comment, not a license.
-         */
-        int main() { return 0; }
-    """)
-    result = pp.strip_license_headers(text)
-    assert "regular comment" in result
-    assert "int main" in result
+def test_non_utf8_bytes_preserved(tmp_path):
+    """Bytes that are not valid UTF-8 must not be lossy-decoded."""
+    content = b"valid\n\xff\xfe invalid utf8 \x80\n"
+    (tmp_path / "a.bin.md").write_bytes(content)
+    _run(tmp_path, batch_id="b1")
+    assert (tmp_path / ".mp_processed" / "b1" / "a.bin.md").read_bytes() == content
 
 
-# ── strip_tool_noise ─────────────────────────────────────────────────────
+def test_output_never_overwrites_source(tmp_path):
+    """Staging writes go to .mp_processed — the source file is untouched."""
+    content = b"original\n"
+    src = tmp_path / "a.md"
+    src.write_bytes(content)
+    _run(tmp_path, batch_id="b1")
+    assert src.read_bytes() == content
 
 
-def test_strip_tool_confirmations():
-    text = "Todos have been modified successfully\nreal content\nSuccessfully wrote 42 bytes"
-    result = pp.strip_tool_noise(text)
-    assert "Todos" not in result
-    assert "Successfully wrote" not in result
-    assert "real content" in result
-
-
-def test_strip_file_view_tags():
-    text = '<file-view path="/tmp/test.py">\ncontent\n<ref_file file="/tmp/x" />'
-    result = pp.strip_tool_noise(text)
-    assert "<file-view" not in result
-    assert "<ref_file" not in result
-    assert "content" in result
-
-
-# ── dedup_consecutive ────────────────────────────────────────────────────
-
-
-def test_dedup_consecutive_lines():
-    text = "hello\nhello\nhello\nworld\nworld\nfoo"
-    result = pp.dedup_consecutive(text)
-    lines = result.split("\n")
-    assert lines.count("hello") == 1
-    assert lines.count("world") == 1
-    assert lines.count("foo") == 1
-
-
-def test_dedup_preserves_non_consecutive():
-    text = "hello\nworld\nhello"
-    result = pp.dedup_consecutive(text)
-    assert result.count("hello") == 2
-
-
-def test_dedub_preserves_blank_lines():
-    text = "\n\n\ncontent"
-    result = pp.dedup_consecutive(text)
-    # Blank lines are not deduped (only non-empty consecutive dups)
-    assert "content" in result
-
-
-# ── strip_excessive_blank_lines ──────────────────────────────────────────
-
-
-def test_collapse_blank_lines():
-    text = "a\n\n\n\n\n\n\nb"
-    result = pp.strip_excessive_blank_lines(text)
-    # 5+ blank lines should collapse to max 2
-    assert result.count("\n") <= 4  # "a\n\n\nb" = 3 newlines max
-    assert "a" in result
-    assert "b" in result
-
-
-def test_preserve_two_blank_lines():
-    text = "a\n\n\nb"
-    result = pp.strip_excessive_blank_lines(text)
-    # Two blank lines should be preserved
-    assert "\n\n\n" in result
-
-
-# ── process_content ──────────────────────────────────────────────────────
-
-
-def test_process_content_full_pipeline():
-    text = textwrap.dedent("""\
-        <system_info>hidden</system_info>
-        // SPDX-License-Identifier: MIT
-        Todos have been modified successfully
-
-        actual_content();
-        actual_content();
-    """)
-    result = pp.process_content(text)
-    assert "hidden" not in result
-    assert "SPDX" not in result
-    assert "Todos" not in result
-    # Dedup: only one "actual_content();" line
-    assert result.count("actual_content();") == 1
-
-
-# ── split_file ───────────────────────────────────────────────────────────
+# ── Splitting ───────────────────────────────────────────────────────────────
 
 
 def test_no_split_when_under_limit(tmp_path):
-    content = "line\n" * 100
-    out = pp.split_file(Path("test.py"), content, max_lines=4000, output_dir=tmp_path)
-    assert len(out) == 1
-    assert out[0].name == "test.py"
-    assert out[0].read_text() == content
+    (tmp_path / "a.md").write_bytes(b"\n".join(b"line" for _ in range(100)))
+    mined, _ = _run(tmp_path, batch_id="b1", max_lines=4000)
+    assert mined == [("a.md", "a.md")]
 
 
 def test_split_when_over_limit(tmp_path):
-    content = "line\n" * 10000
-    out = pp.split_file(Path("test.py"), content, max_lines=4000, output_dir=tmp_path)
-    assert len(out) == 3  # 10000 / 4000 = 3 parts (4000 + 4000 + 2000)
-    assert "part001" in out[0].name
-    assert "part002" in out[1].name
-    assert "part003" in out[2].name
-    # Total lines preserved (trailing newline adds one empty string element)
-    total_lines = sum(len(f.read_text().split("\n")) for f in out)
-    assert total_lines == 10001  # 10000 "line\n" = 10000 lines + trailing ""
+    lines = [f"line{i}".encode() for i in range(4500)]
+    (tmp_path / "big.md").write_bytes(b"\n".join(lines))
+    mined, _ = _run(tmp_path, batch_id="b1", max_lines=2000)
+    mined_rels = sorted(m[1] for m in mined)
+    assert mined_rels == [
+        "big__part001_of_003.md",
+        "big__part002_of_003.md",
+        "big__part003_of_003.md",
+    ]
+
+
+def test_split_parts_reassemble_byte_exact(tmp_path):
+    """Parts must carry the original bytes — split on boundaries, no edits."""
+    content = b"\n".join(f"row {i}".encode() for i in range(5000))
+    (tmp_path / "big.txt").write_bytes(content)
+    _run(tmp_path, batch_id="b1", max_lines=2000)
+    out = tmp_path / ".mp_processed" / "b1"
+    parts = sorted(p for p in out.iterdir() if "__part" in p.name)
+    reassembled = b"\n".join(p.read_bytes() for p in parts)
+    assert reassembled == content
 
 
 def test_split_preserves_extension(tmp_path):
-    content = "x\n" * 5000
-    out = pp.split_file(Path("script.rs"), content, max_lines=4000, output_dir=tmp_path)
-    assert all(f.suffix == ".rs" for f in out)
+    (tmp_path / "big.py").write_bytes(b"x = 1\n" * 5000)
+    mined, _ = _run(tmp_path, batch_id="b1", max_lines=2000)
+    assert all(m[1].endswith(".py") for m in mined)
 
 
-# ── preprocess_directory ─────────────────────────────────────────────────
+# ── Directory staging ───────────────────────────────────────────────────────
 
 
-def test_preprocess_directory_strips_and_writes(tmp_path):
+def test_preserves_subdirectories(tmp_path):
+    (tmp_path / "projA").mkdir()
+    (tmp_path / "projB").mkdir()
+    (tmp_path / "projA" / "notes.md").write_bytes(b"# A\n\ncontent\n")
+    (tmp_path / "projB" / "notes.md").write_bytes(b"# B\n\nother\n")
+    mined, _ = _run(tmp_path, batch_id="b1")
+    assert sorted(m[1] for m in mined) == ["projA/notes.md", "projB/notes.md"]
+    out = tmp_path / ".mp_processed" / "b1"
+    assert (out / "projA" / "notes.md").read_bytes() == b"# A\n\ncontent\n"
+
+
+def test_batch_ids_isolate_same_named_files(tmp_path):
+    """Two batches staging different 'notes.md' files must not collide."""
+    (tmp_path / "notes.md").write_bytes(b"batch one content\n")
+    _run(tmp_path, batch_id="b1")
+    (tmp_path / "notes.md").write_bytes(b"batch two content\n")
+    _run(tmp_path, batch_id="b2")
+    b1 = tmp_path / ".mp_processed" / "b1" / "notes.md"
+    b2 = tmp_path / ".mp_processed" / "b2" / "notes.md"
+    assert b1.read_bytes() == b"batch one content\n"
+    assert b2.read_bytes() == b"batch two content\n"
+
+
+def test_dry_run_writes_nothing(tmp_path):
+    (tmp_path / "a.md").write_bytes(b"content\n")
+    mined, _ = _run(tmp_path, batch_id="b1", dry_run=True)
+    assert mined == [("a.md", "a.md")]
+    assert not (tmp_path / ".mp_processed").exists()
+
+
+def test_empty_file_skipped(tmp_path):
+    (tmp_path / "empty.md").write_bytes(b"   \n\n")
+    mined, skipped = _run(tmp_path, batch_id="b1")
+    assert mined == []
+    assert skipped == [("empty.md", "empty")]
+
+
+# ── Batch-snapshot / work-dir mode ──────────────────────────────────────────
+
+
+def _snapshot_line(rel, content):
+    import hashlib
+
+    sha = hashlib.sha256(content).hexdigest()
+    return f"{rel}\x1f{len(content)}\x1f0\x1f{sha}"
+
+
+def test_work_dir_mode_stages_verified_copies(tmp_path):
     staging = tmp_path / "staging"
+    work = tmp_path / "work"
+    out = tmp_path / "mine"
     staging.mkdir()
-    (staging / "test.py").write_text(
-        "// SPDX-License-Identifier: MIT\n"
-        "# Copyright (c) 2024 Test Corp\n"
-        "def real_function():\n"
-        "    print('hello world')\n"
-        "    return True\n",
-        encoding="utf-8",
+    work.mkdir()
+    content = b"claimed bytes\n"
+    (work / "a.md").write_bytes(content)
+    snap = tmp_path / "snap"
+    snap.write_text(_snapshot_line("a.md", content) + "\n")
+    mined, _ = _run(
+        staging, work_dir=str(work), snapshot=str(snap), out_dir=str(out), batch_id="b1"
     )
-
-    stats = pp.preprocess_directory(str(staging), max_lines=4000)
-
-    assert stats["processed"] == 1
-    assert stats["output_files"] == 1
-    processed_file = staging / "processed" / "test.py"
-    assert processed_file.exists()
-    content = processed_file.read_text()
-    assert "SPDX" not in content
-    assert "Copyright" not in content
-    assert "real_function" in content
+    assert mined == [("a.md", "a.md")]
+    assert (out / "a.md").read_bytes() == content
 
 
-def test_preprocess_directory_splits_large_file(tmp_path):
+def test_work_dir_mode_rejects_hash_mismatch(tmp_path):
     staging = tmp_path / "staging"
+    work = tmp_path / "work"
     staging.mkdir()
-    # Use unique lines so dedup doesn't collapse them
-    (staging / "big.txt").write_text("".join(f"line {i}\n" for i in range(10000)), encoding="utf-8")
-
-    stats = pp.preprocess_directory(str(staging), max_lines=4000)
-
-    assert stats["processed"] == 1
-    assert stats["split"] == 1
-    assert stats["output_files"] == 3
-    processed_dir = staging / "processed"
-    files = list(processed_dir.iterdir())
-    assert len(files) == 3
-
-
-def test_preprocess_directory_skips_binaries(tmp_path):
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    (staging / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n")
-    (staging / "code.py").write_text(
-        "def hello_world():\n    print('hello world')\n    return True\n",
-        encoding="utf-8",
+    work.mkdir()
+    (work / "a.md").write_bytes(b"NOT the claimed bytes\n")
+    snap = tmp_path / "snap"
+    snap.write_text(_snapshot_line("a.md", b"claimed bytes\n") + "\n")
+    mined, skipped = _run(
+        staging, work_dir=str(work), snapshot=str(snap), out_dir=str(tmp_path / "m")
     )
-
-    stats = pp.preprocess_directory(str(staging), max_lines=4000)
-
-    assert stats["processed"] == 1
-    assert stats["skipped"] >= 1
-    # Only code.py should be in processed/
-    processed = list((staging / "processed").iterdir())
-    assert len(processed) == 1
-    assert processed[0].name == "code.py"
+    assert mined == []
+    assert skipped == [("a.md", "hash_mismatch")]
 
 
-def test_preprocess_directory_dry_run(tmp_path):
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    (staging / "test.py").write_text("print('hello')\n", encoding="utf-8")
-
-    stats = pp.preprocess_directory(str(staging), max_lines=4000, dry_run=True)
-
-    assert stats["processed"] == 0  # dry run doesn't write
-    assert not (staging / "processed").exists()
-
-
-def test_preprocess_directory_preserves_mempalace_yaml(tmp_path):
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    (staging / "mempalace.yaml").write_text("wing: test\n", encoding="utf-8")
-    (staging / "code.py").write_text("print('hello')\n", encoding="utf-8")
-
-    pp.preprocess_directory(str(staging), max_lines=4000)
-
-    # mempalace.yaml should NOT be in processed/
-    processed = list((staging / "processed").iterdir())
-    assert all(f.name != "mempalace.yaml" for f in processed)
-
-
-def test_preprocess_directory_cleans_processed_tree_between_runs(tmp_path):
-    """A failed batch with nested processed/ trees must be fully removed."""
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    (staging / "code.py").write_text("print('hello')\n", encoding="utf-8")
-
-    # Simulate a previous failed run that created nested processed/processed/.
-    old_processed = staging / "processed" / "processed"
-    old_processed.mkdir(parents=True)
-    (old_processed / "stale.md").write_text("stale\n", encoding="utf-8")
-
-    pp.preprocess_directory(str(staging), max_lines=4000)
-
-    # The old nested tree should be gone.
-    assert not (staging / "processed" / "processed" / "stale.md").exists()
-    # The new run should only contain the real output.
-    processed_files = list((staging / "processed").rglob("*"))
-    assert any(f.name == "code.py" for f in processed_files)
-
-
-def test_preprocess_directory_excludes_processed_descendants(tmp_path):
-    """Files inside any processed/ directory must not be re-preprocessed."""
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    (staging / "real.py").write_text(
-        "x = 1\ny = 2\nz = 3\ndef main():\n    print('hello')\n",
-        encoding="utf-8",
+def test_manifests_written(tmp_path):
+    (tmp_path / "ok.md").write_bytes(b"fine\n")
+    (tmp_path / "bad.jsonl").write_bytes(b"{}\n")
+    manifest = tmp_path / "mined.manifest"
+    skip = tmp_path / "skipped.manifest"
+    _run(
+        tmp_path,
+        batch_id="b1",
+        manifest_path=str(manifest),
+        skip_manifest_path=str(skip),
     )
-
-    pre_existing = staging / "processed" / "leftover"
-    pre_existing.mkdir(parents=True)
-    (pre_existing / "leftover.py").write_text("y = 2\n", encoding="utf-8")
-
-    stats = pp.preprocess_directory(str(staging), max_lines=4000)
-
-    # The leftover inside processed/ must not be counted or re-output.
-    assert stats["processed"] == 1
-    assert not (staging / "processed" / "processed").exists()
-
-
-def test_preprocess_directory_empty_content_skipped(tmp_path):
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    (staging / "empty.py").write_text("\n\n\n", encoding="utf-8")
-    (staging / "real.py").write_text(
-        "def real_function():\n    print('hello world')\n    return True\n",
-        encoding="utf-8",
-    )
-
-    stats = pp.preprocess_directory(str(staging), max_lines=4000)
-
-    assert stats["processed"] == 1
-    processed = list((staging / "processed").iterdir())
-    assert len(processed) == 1
-    assert processed[0].name == "real.py"
-
-
-def test_preprocess_directory_respects_batch_snapshot(tmp_path):
-    """Only files listed in the batch snapshot are preprocessed."""
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    (staging / "claimed.py").write_text("x = 1\ny = 2\nz = 3\n", encoding="utf-8")
-    (staging / "late.py").write_text("a = 1\nb = 2\nc = 3\n", encoding="utf-8")
-
-    content = "x = 1\ny = 2\nz = 3\n"
-    # Use binary mode to avoid Windows \n -> \r\n conversion which would
-    # change the sha256 hash.
-    (staging / "claimed.py").write_bytes(content.encode("utf-8"))
-    (staging / "late.py").write_bytes("a = 1\nb = 2\nc = 3\n".encode("utf-8"))
-
-    sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    size = len(content.encode("utf-8"))
-
-    snapshot = staging / ".batch_snapshot"
-    # Unit-separator-delimited: rel\x1fsize\x1fmtime\x1fsha256
-    snapshot.write_bytes(f"claimed.py\x1f{size}\x1f0\x1f{sha256}\n".encode("utf-8"))
-
-    stats = pp.preprocess_directory(str(staging), max_lines=4000, batch_snapshot=snapshot)
-
-    assert stats["processed"] == 1
-    assert (staging / "processed" / "claimed.py").exists()
-    assert not (staging / "processed" / "late.py").exists()
-
-
-def test_batch_snapshot_rejects_modified_source(tmp_path):
-    """A file modified after the snapshot is claimed is not mined in that batch."""
-    staging = tmp_path / "staging"
-    staging.mkdir()
-
-    original_content = "x = 1\ny = 2\nz = 3\n"
-    # Use binary mode to avoid Windows \n -> \r\n conversion.
-    (staging / "claimed.py").write_bytes(original_content.encode("utf-8"))
-
-    sha256 = hashlib.sha256(original_content.encode("utf-8")).hexdigest()
-    size = len(original_content.encode("utf-8"))
-    snapshot = staging / ".batch_snapshot"
-    snapshot.write_bytes(f"claimed.py\x1f{size}\x1f0\x1f{sha256}\n".encode("utf-8"))
-
-    # Simulate a producer modifying the file after the batch was claimed.
-    (staging / "claimed.py").write_bytes("x = 999\n".encode("utf-8"))
-
-    stats = pp.preprocess_directory(str(staging), max_lines=4000, batch_snapshot=snapshot)
-
-    assert stats["processed"] == 0
-    assert stats["skipped"] == 1
-    assert not (staging / "processed" / "claimed.py").exists()
-    # The live source remains available for a later stable run.
-    assert (staging / "claimed.py").exists()
+    assert manifest.read_text() == "ok.md\x1fok.md\n"
+    assert skip.read_text() == "bad.jsonl\x1ffiltered\n"
