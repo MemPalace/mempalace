@@ -121,19 +121,22 @@ an explicit yes per drawer, then use `mempalace_delete_drawer`.
 
 ### 3e. Tunnels (`tunnels`)
 
-The score is 70% quality (no generic tokens, no dangling wings, no
-duplicate spellings) and 30% traversal. If `tunnels.artifacts` is non-zero,
-ask:
+The score is quality × coverage. Quality: no generic tokens, no dangling
+wings, no duplicate spellings. Coverage: the share of *linkable* wings
+(wings that share a strong entity with another wing) that a sound tunnel
+reaches; `tunnels.unlinked_wings` lists the rest. If `tunnels.artifacts` is
+non-zero, ask:
 
 > 5 of 28 tunnels link generic tokens or a wing that no longer exists.
 > 1. Run `mempalace tunnels prune` then `--yes` (Recommended)
 > 2. Keep them
 
-If the palace has few or no tunnels, offer `mempalace tunnels propose`: it
-ranks entities shared between wings by the weaker side of the link and
-writes a plan; show the user the top rows, let them delete any, then
-`--yes`. Traversal only rises with use (`mempalace_follow_tunnels`,
-`mempalace_traverse`); say so and move on.
+If `tunnels.unlinked_wings` is non-empty, offer `mempalace tunnels propose`:
+it skips links that already exist, gives every unlinked wing its strongest
+link first, then fills by strength, and writes a plan; show the user the
+top rows, let them delete any, then `--yes`. Traversal
+(`tunnels.never_traversed`) is reported but not scored: every call to
+`mempalace_follow_tunnels` records the crossing, so it rises with use.
 
 ### 3f. Hallways (`hallways`)
 

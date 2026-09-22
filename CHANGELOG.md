@@ -10,6 +10,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **Hook-ingested transcripts file under the project wing.** The Stop and
+  PreCompact hooks mined every Claude Code transcript with `--wing sessions`,
+  so a palace grew one flat `sessions/technical` pile next to its project
+  wings. Ingest now derives the wing the way the diary already did: the
+  session's `cwd` first (git worktrees collapse to their project), the encoded
+  project folder second; a session started in the home directory goes to
+  `mac_workstation` / `windows_workstation` / `linux_workstation`. Existing
+  `sessions` wings move with `mempalace wings split --wing sessions`.
+- **Generic source files and library references are no longer entities for
+  tunnels.** `app.js`, `model.ts`, `mod.rs`, `pathlib.Path`, `page.evaluate`
+  and the like exist in every repo of their language; `is_generic_entity`
+  drops a bare file name whose stem is a generic word and a dotted name whose
+  first segment is a runtime, standard-library or test-framework namespace.
+- **Following a tunnel now records the traversal.** `mempalace_follow_tunnels`
+  potentiates every tunnel it crosses (`access_count`, `strength`,
+  `last_activated`) under the tunnel-file lock, best-effort, so a read never
+  fails on a write. Until now `dynamics.potentiate()` had no caller: every
+  tunnel in every palace reported `access_count: 0` forever. A `--read-only`
+  server or a peer without the writer lock skips the write.
+- **`mempalace audit` scores tunnels as quality × coverage.** Coverage is the
+  share of linkable wings (wings that share a strong entity with another wing
+  by the hallways) that a sound tunnel reaches; `tunnels.unlinked_wings` names
+  the rest. Traversal is reported but no longer scored, since it could only be
+  raised by use. `mempalace tunnels propose` skips links that already exist and
+  gives every unlinked wing its strongest link before filling by strength, so
+  one round raises coverage as far as the hallways allow.
 - **`mempalace audit` scores how well organized a palace is.** `status` says
   what is filed; `audit` says whether an agent could find it by walking the
   palace. It scores five layers 0–100 and lists concrete findings: the share of

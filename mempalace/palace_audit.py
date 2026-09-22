@@ -371,14 +371,18 @@ def _analyze_naming(
     }
 
 
-def _analyze_tunnels(tunnels: list[dict], wings: Optional[set] = None) -> dict:
-    """Quality first, traversal second.
+def _analyze_tunnels(
+    tunnels: list[dict], wings: Optional[set] = None, hallways: Optional[list] = None
+) -> dict:
+    """Quality and coverage; traversal is reported, not scored.
 
     An artifact tunnel links a generic token, points at a wing that no
     longer exists, or duplicates another tunnel between the same two wings
-    under a different spelling of the same entity. Traversal
-    (``access_count``) is a secondary signal: it can only be raised by use,
-    so it must not be the whole score.
+    under a different spelling of the same entity. Coverage is the share of
+    *linkable* wings — wings that share a strong entity with another wing
+    according to the hallways — that at least one sound tunnel touches;
+    ``mempalace tunnels propose`` raises it. Traversal (``access_count``)
+    only rises when an agent follows a tunnel, so it is informational.
     """
     total = len(tunnels)
     kinds: Counter = Counter()
@@ -388,6 +392,7 @@ def _analyze_tunnels(tunnels: list[dict], wings: Optional[set] = None) -> dict:
     duplicates = 0
     seen_pairs: set = set()
     artifacts = 0
+    tunneled_wings: set = set()
     records = sorted(
         (t for t in tunnels if isinstance(t, dict)),
         key=lambda t: -int(t.get("access_count") or 0),
@@ -426,6 +431,25 @@ def _analyze_tunnels(tunnels: list[dict], wings: Optional[set] = None) -> dict:
         seen_pairs.add(pair)
         if bad:
             artifacts += 1
+        else:
+            for end in (source, target):
+                w = str(end.get("wing") or "").strip()
+                if w:
+                    tunneled_wings.add(normalize_wing_name(w) or w)
+    linkable: dict[str, str] = {}
+    if hallways:
+        from .palace_graph import entity_tunnel_candidates
+
+        for per_wing in entity_tunnel_candidates(hallways).values():
+            present = {
+                w: disp
+                for w, (disp, _n) in per_wing.items()
+                if wings is None or disp in wings or w in wings
+            }
+            if len(present) >= 2:
+                linkable.update(present)
+    unlinked = sorted(disp for w, disp in linkable.items() if w not in tunneled_wings)
+    coverage = 1.0 if not linkable else 1.0 - len(unlinked) / len(linkable)
     return {
         "total": total,
         "by_kind": dict(kinds),
@@ -436,6 +460,9 @@ def _analyze_tunnels(tunnels: list[dict], wings: Optional[set] = None) -> dict:
         "duplicates": duplicates,
         "artifacts": artifacts,
         "artifact_share": round(artifacts / total, 4) if total else 0.0,
+        "linkable_wings": len(linkable),
+        "unlinked_wings": unlinked,
+        "coverage": round(coverage, 4),
     }
 
 
@@ -511,9 +538,13 @@ def _score(rooms: dict, naming: dict, tunnels: dict, hallways: dict, kg: Optiona
         len(naming["wing_drift"]) + len(naming["room_drift"]) + len(naming["mixed_wings"])
     )
     scores["naming"] = _clamp(100 - 10 * drift_groups) if rooms["wings"] else None
+    # Quality × coverage: `tunnels prune` raises the first factor, `tunnels
+    # propose` the second. Traversal is not scored — it only rises with use.
+    # A palace whose wings share nothing (or has a single wing) has no
+    # tunnel layer to score.
     scores["tunnels"] = (
-        _clamp(70 * (1 - tunnels["artifact_share"]) + 30 * (1 - tunnels["never_traversed_share"]))
-        if tunnels["total"]
+        _clamp(100 * (1 - tunnels["artifact_share"]) * tunnels["coverage"])
+        if tunnels["total"] or tunnels["linkable_wings"]
         else None
     )
     scores["hallways"] = (
@@ -597,14 +628,21 @@ def _findings(rooms, naming, tunnels, hallways, kg) -> list[dict]:
             f"({tunnels['dangling_endpoints']} dangling endpoints, {tunnels['duplicates']} "
             f"duplicate spellings, generic tokens below); run `mempalace tunnels prune`.",
         )
+    if tunnels["unlinked_wings"]:
+        add(
+            "tunnels",
+            f"{len(tunnels['unlinked_wings'])} of {tunnels['linkable_wings']} wings share "
+            f"entities with another wing but no tunnel reaches them: "
+            f"{_name_list(tunnels['unlinked_wings'])}; run `mempalace tunnels propose`.",
+        )
+    elif not tunnels["total"]:
+        add("tunnels", "No tunnels; run `mempalace tunnels propose` to link related wings.")
     if tunnels["total"] and tunnels["never_traversed_share"] >= 0.9:
         add(
             "tunnels",
             f"{tunnels['never_traversed']} of {tunnels['total']} tunnels have never been "
-            "traversed (secondary signal; use mempalace_follow_tunnels / traverse).",
+            "followed (not scored; mempalace_follow_tunnels records each crossing).",
         )
-    if not tunnels["total"]:
-        add("tunnels", "No tunnels; run `mempalace tunnels propose` to link related wings.")
     if tunnels["generic_entities"]:
         add(
             "tunnels",
@@ -701,7 +739,7 @@ def audit_palace(
         lambda m: f"{len(m)} transcript wings" if m is not None else "n/a",
     )
     naming = _analyze_naming(wing_rooms, project_mix)
-    tunnels = _analyze_tunnels(tunnel_records, wings=set(wing_rooms))
+    tunnels = _analyze_tunnels(tunnel_records, wings=set(wing_rooms), hallways=hallway_records)
     hallways = _analyze_hallways(hallway_records)
 
     return {

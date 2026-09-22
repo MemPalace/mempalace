@@ -201,23 +201,58 @@ GENERIC_ENTITY_STOPLIST = frozenset(
     tsconfig.json pyproject.toml requirements.txt readme readme.md changelog.md
     license .env .gitignore makefile lib src dist build node_modules
     created_at updated_at id name type value data result results error errors
+    mod types routes router store page layout schema schemas models constants
+    logger middleware services component components hooks context styles style
+    theme globals setup init __init__ repository entity entities interfaces
+    interface enums enum validators validator
+    """.split()
+)
+
+# Source files whose stem is a generic word: ``app.js``, ``model.ts``,
+# ``mod.rs``, ``main.py`` exist in most repos of that language and link
+# nothing when two wings share one.
+_SOURCE_EXTENSIONS = frozenset(
+    """
+    js mjs cjs ts tsx jsx py rs go rb php java kt swift cs c cc cpp h hpp zig
+    css scss html vue svelte sql sh
+    """.split()
+)
+
+# ``pathlib.Path``, ``page.evaluate``, ``console.log``: the first segment is a
+# runtime, standard library or test-framework namespace, so the qualified
+# name is vocabulary every project in that language shares.
+_LIBRARY_NAMESPACES = frozenset(
+    """
+    os sys json re pathlib subprocess asyncio typing datetime time logging math
+    random collections itertools functools shutil io tempfile unittest pytest
+    np numpy pd pandas plt torch tf document window console process page
+    browser navigator locator expect react vue angular fs path http https crypto
+    util express next localstorage sessionstorage self this cls super
     """.split()
 )
 
 
 def is_generic_entity(name: str) -> bool:
     """A name that identifies no project: a short lower-case word (``content``,
-    ``thinking``), a harness tool (``WebFetch``), a generic noun (``Server``)
-    or a file every repo has (``compose.yml``).
+    ``thinking``), a harness tool (``WebFetch``), a generic noun (``Server``),
+    a file every repo has (``compose.yml``, ``app.js``) or a library
+    reference (``pathlib.Path``).
 
-    Symbols (``ChatStore``), qualified names (``store.baseURL``) and project
-    names pass; the boundary with a short lower-case project name is fuzzy
-    by construction. Cross-wing ubiquity is judged separately, where the
-    wing counts are known.
+    Symbols (``ChatStore``), qualified project names (``store.baseURL``) and
+    project names pass; the boundary with a short lower-case project name is
+    fuzzy by construction. Cross-wing ubiquity is judged separately, where
+    the wing counts are known.
     """
     text = str(name).strip()
     if _GENERIC_ENTITY_RE.fullmatch(text):
         return True
+    if "/" not in text and "." in text:
+        head, _, tail = text.rpartition(".")
+        if tail.lower() in _SOURCE_EXTENSIONS and head.lower() in GENERIC_ENTITY_STOPLIST:
+            return True
+        first = text.split(".", 1)[0].lower()
+        if first in _LIBRARY_NAMESPACES and tail.lower() not in _SOURCE_EXTENSIONS:
+            return True
     # A bare single-segment path (``/app``, ``/model``) or a shouting constant
     # (``MESSAGES``, ``TEMPLATES``) is structure every project has.
     if re.fullmatch(r"/[A-Za-z0-9_-]+/?", text) or re.fullmatch(r"[A-Z][A-Z0-9_]{2,15}", text):

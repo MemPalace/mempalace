@@ -30,7 +30,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 from .config import MempalaceConfig, normalize_wing_name
-from .dynamics import initialize_dynamics_fields
+from .dynamics import initialize_dynamics_fields, potentiate
 from .palace import get_collection as _get_palace_collection
 from .palace import mine_lock
 from .backends.base import BaseCollection
@@ -785,11 +785,42 @@ def delete_tunnel(tunnel_id: str):
     return {"deleted": tunnel_id}
 
 
-def follow_tunnels(wing: str, room: str, col=None, config=None):
+def record_tunnel_traversal(tunnel_ids, config=None) -> int:
+    """Potentiate the tunnels an agent just followed; returns how many.
+
+    This is the only place a tunnel's ``access_count`` / ``strength`` rises,
+    so a palace where nothing ever calls it shows every tunnel as never
+    traversed. Best-effort: a lock or write failure is logged and the read
+    that triggered it still returns.
+    """
+    wanted = {t for t in tunnel_ids if t}
+    if not wanted:
+        return 0
+    touched = 0
+    try:
+        with mine_lock(_get_tunnel_file(config)):
+            tunnels = _load_tunnels(config)
+            for t in tunnels:
+                if isinstance(t, dict) and t.get("id") in wanted:
+                    initialize_dynamics_fields(t)
+                    potentiate(t)
+                    touched += 1
+            if touched:
+                _save_tunnels(tunnels, config)
+    except Exception:
+        logger.debug("Recording tunnel traversal failed", exc_info=True)
+        return 0
+    return touched
+
+
+def follow_tunnels(wing: str, room: str, col=None, config=None, record: bool = True):
     """Follow explicit tunnels from a room — returns connected drawers.
 
     Given a location (wing/room), finds all tunnels leading from or to it,
-    and optionally fetches the connected drawer content.
+    and optionally fetches the connected drawer content. Following a tunnel
+    is a traversal: unless ``record`` is off (a read-only server, a peer
+    that does not hold the writer lock), each tunnel crossed is
+    potentiated so navigation weights and the audit reflect real use.
     """
     # Fall back to raw ``wing`` so an empty/whitespace query string still
     # produces a value to compare with; ``_normalize_wing`` returns ``None``
@@ -797,7 +828,7 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
     # mempalace.yaml slug (underscore) and an explicit ``--wing`` slug
     # (verbatim) both resolve through the same comparison.
     norm_wing = _normalize_wing(wing) or wing
-    tunnels = _load_tunnels()
+    tunnels = _load_tunnels(config)
     connections = []
 
     for t in tunnels:
@@ -846,6 +877,9 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
                         c["drawer_preview"] = drawer_map[did][:300]
             except Exception:
                 logger.debug("Drawer preview hydration failed", exc_info=True)
+
+    if record and connections:
+        record_tunnel_traversal([c["tunnel_id"] for c in connections], config)
 
     return connections
 

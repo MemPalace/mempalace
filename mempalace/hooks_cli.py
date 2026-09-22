@@ -1159,6 +1159,7 @@ def _ingest_transcript(transcript_path: str):
         _log_hook_write_blocked(routing, "transcript ingest")
         return
 
+    wing = _ingest_wing(str(path))
     try:
         if routing.use_daemon:
             try:
@@ -1167,7 +1168,7 @@ def _ingest_transcript(transcript_path: str):
                     {
                         "source": str(path),
                         "mode": "convos",
-                        "wing": "sessions",
+                        "wing": wing,
                         "agent": "mempalace",
                     },
                     dedupe_key=_daemon_mine_dedupe_key(str(path), "convos"),
@@ -1192,10 +1193,10 @@ def _ingest_transcript(transcript_path: str):
                 "--mode",
                 "convos",
                 "--wing",
-                "sessions",
+                wing,
             ]
         )
-        _log(f"Transcript ingest started: {path.name}")
+        _log(f"Transcript ingest started: {path.name} -> {wing}")
     except OSError:
         pass
     except Exception as exc:
@@ -1270,15 +1271,16 @@ def _safe_wing_slug(name: str) -> str:
     return slug or "sessions"
 
 
-def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
-    """Read ``cwd`` from the first JSONL line that records it.
+def _cwd_from_jsonl(transcript_path: str) -> Optional[str]:
+    """The session's working directory, from the first JSONL line that has one.
 
     Claude Code stores the absolute working directory on most message
     types (tool_use, tool_result, user/assistant turns), but not all
-    (e.g. queue-operation lines lack it). Scan up to 200 lines to find
-    the first record that includes a non-empty cwd, then derive the
-    wing from its leaf path segment. Returns ``None`` if the file is
-    unreadable, empty, or contains no cwd.
+    (e.g. queue-operation lines lack it). Scans up to 200 lines. Returns
+    the path with forward slashes and no trailing slash, with a git
+    worktree under ``<project>/.claude/worktrees/`` collapsed to
+    ``<project>``, or ``None`` if the file is unreadable, empty, or
+    records no cwd.
     """
     try:
         path = Path(transcript_path).expanduser()
@@ -1307,12 +1309,49 @@ def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
                 _wt_marker = "/.claude/worktrees/"
                 if _wt_marker in cwd_norm:
                     cwd_norm = cwd_norm.split(_wt_marker, 1)[0]
-                project = cwd_norm.rsplit("/", 1)[-1]
-                if project:
-                    return f"wing_{_safe_wing_slug(project)}"
+                return cwd_norm
     except OSError:
         pass
     return None
+
+
+def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
+    """``wing_<project>`` from the transcript's cwd leaf, or ``None``."""
+    cwd_norm = _cwd_from_jsonl(transcript_path)
+    if not cwd_norm:
+        return None
+    project = cwd_norm.rsplit("/", 1)[-1]
+    if project:
+        return f"wing_{_safe_wing_slug(project)}"
+    return None
+
+
+def _workstation_wing() -> str:
+    """Wing for sessions started in the home directory, per machine."""
+    if sys.platform == "darwin":
+        return "mac_workstation"
+    if sys.platform.startswith("win"):
+        return "windows_workstation"
+    return "linux_workstation"
+
+
+def _ingest_wing(transcript_path: str) -> str:
+    """Wing for a hook-ingested transcript: the project the session ran in.
+
+    Same derivation the diary uses (cwd first, encoded project folder
+    second) without the ``wing_`` prefix, so a session in
+    ``~/dev/mempalace`` files into ``mempalace`` next to everything else
+    about that project instead of a flat ``sessions`` wing that
+    ``mempalace audit`` then flags. A session started in the home directory
+    belongs to no project and goes to the machine's workstation wing.
+    """
+    cwd_norm = _cwd_from_jsonl(transcript_path)
+    if cwd_norm:
+        home = str(Path.home()).replace("\\", "/").rstrip("/")
+        if cwd_norm.lower() == home.lower():
+            return _workstation_wing()
+    wing = _wing_from_transcript_path(transcript_path)
+    return wing[len("wing_") :] if wing.startswith("wing_") else wing
 
 
 def _wing_from_transcript_path(transcript_path: str) -> str:

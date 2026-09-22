@@ -78,6 +78,14 @@ def test_generic_entity_heuristic():
         and is_generic_entity("cancelled")
     )
     assert not is_generic_entity("eosio.token") and not is_generic_entity("imervista_user")
+    # Generic source-file stems and library references link nothing.
+    for name in ("app.js", "model.ts", "mod.rs", "main.py", "index.tsx", "repository.ts"):
+        assert is_generic_entity(name), name
+    for name in ("pathlib.Path", "page.evaluate", "console.log", "os.path.join", "np.array"):
+        assert is_generic_entity(name), name
+    # A project's own file or qualified symbol still passes.
+    for name in ("ChatStore.swift", "swim.zig", "wing_split.py", "eosio.token", "store.baseURL"):
+        assert not is_generic_entity(name), name
 
 
 # ── analyses on synthetic counts ────────────────────────────────────────────
@@ -359,7 +367,7 @@ def test_audit_palace_end_to_end(fake_palace):
     assert "liquid-llm / liquid_llm" in joined
     assert "thinking" in joined
     assert "main.zig" not in joined  # samples live in --json, not findings
-    assert "never been traversed" in joined
+    assert "never been followed" in joined
     # Findings come out grouped by layer, in layer order.
     layers = [f["layer"] for f in report["findings"]]
     assert layers == sorted(
@@ -524,3 +532,69 @@ def test_main_dispatches_audit(monkeypatch):
     assert seen["command"] == "audit"
     assert seen["json"] is True
     assert seen["fail_under"] == 50
+
+
+def test_analyze_tunnels_coverage_counts_linkable_wings_without_a_sound_tunnel():
+    hallways = [
+        {"wing": "a", "entity_a": "ChatStore", "entity_b": "RootView", "co_occurrence_count": 40},
+        {"wing": "b", "entity_a": "ChatStore", "entity_b": "Bridge", "co_occurrence_count": 12},
+        {"wing": "c", "entity_a": "swim.zig", "entity_b": "codec.zig", "co_occurrence_count": 9},
+        {"wing": "d", "entity_a": "swim.zig", "entity_b": "Mesh", "co_occurrence_count": 8},
+        {"wing": "lonely", "entity_a": "Solo", "entity_b": "Alone", "co_occurrence_count": 99},
+    ]
+    good = {
+        "kind": "entity",
+        "access_count": 0,
+        "source": {"wing": "a", "room": "entity:ChatStore"},
+        "target": {"wing": "b", "room": "entity:ChatStore"},
+    }
+    dangling = {
+        "kind": "entity",
+        "source": {"wing": "c", "room": "entity:swim.zig"},
+        "target": {"wing": "gone", "room": "entity:swim.zig"},
+    }
+    out = _analyze_tunnels(
+        [good, dangling], wings={"a", "b", "c", "d", "lonely"}, hallways=hallways
+    )
+    assert out["linkable_wings"] == 4  # lonely shares nothing
+    assert out["unlinked_wings"] == ["c", "d"]  # the dangling tunnel covers nothing
+    assert out["coverage"] == pytest.approx(0.5)
+
+    # No hallways: nothing is linkable, coverage is full.
+    assert _analyze_tunnels([good])["coverage"] == 1.0
+    assert _analyze_tunnels([good])["linkable_wings"] == 0
+
+
+def test_score_tunnels_is_quality_times_coverage_and_never_traversal():
+    from mempalace.palace_audit import _score
+
+    rooms = {"total_drawers": 10, "generic_share": 0.0, "wings": ["a"]}
+    naming = {"wing_drift": [], "room_drift": [], "mixed_wings": []}
+    hallways = {"total": 0, "top_artifact_share": 0.0}
+
+    def tunnels(**kw):
+        base = {
+            "total": 10,
+            "artifact_share": 0.0,
+            "never_traversed_share": 1.0,
+            "coverage": 1.0,
+            "linkable_wings": 4,
+        }
+        base.update(kw)
+        return base
+
+    assert _score(rooms, naming, tunnels(), hallways, None)["tunnels"] == 100
+    assert _score(rooms, naming, tunnels(coverage=0.5), hallways, None)["tunnels"] == 50
+    assert (
+        _score(rooms, naming, tunnels(artifact_share=0.2, coverage=0.5), hallways, None)["tunnels"]
+        == 40
+    )
+    # No tunnels but wings that could be linked: 0, not n/a.
+    assert _score(rooms, naming, tunnels(total=0, coverage=0.0), hallways, None)["tunnels"] == 0
+    # No tunnels and nothing linkable: the layer is empty.
+    assert (
+        _score(rooms, naming, tunnels(total=0, coverage=1.0, linkable_wings=0), hallways, None)[
+            "tunnels"
+        ]
+        is None
+    )

@@ -145,3 +145,27 @@ def test_cmd_tunnels_propose_prune_and_dispatch(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr("sys.argv", ["mempalace", "tunnels", "prune", "--yes"])
     cli.main()
     assert seen["tunnels_action"] == "prune" and seen["yes"]
+
+
+def test_propose_skips_existing_links_and_covers_unlinked_wings_first():
+    existing = [
+        {
+            "source": {"wing": "meshguard", "room": "entity:swim.zig"},
+            "target": {"wing": "wormdb", "room": "entity:swim.zig"},
+        }
+    ]
+    plan = propose_tunnels(HALLWAYS, WINGS, existing_tunnels=existing)
+    rows = [(r["entity"], r["wing_a"], r["wing_b"]) for r in plan["tunnels"]]
+    assert rows == [("ChatStore", "liquid_llm", "mempalace-ts")]
+    assert plan["candidates"] == 1
+
+    # Coverage first: with one slot, a wing pair nobody reaches beats a
+    # stronger link between wings that already have a tunnel.
+    hallways = HALLWAYS + [
+        {"wing": "meshguard", "entity_a": "Rope", "entity_b": "Q", "co_occurrence_count": 500},
+        {"wing": "wormdb", "entity_a": "Rope", "entity_b": "Q", "co_occurrence_count": 500},
+    ]
+    plan = propose_tunnels(hallways, WINGS, max_tunnels=1, existing_tunnels=existing)
+    assert [(r["entity"], r["strength"]) for r in plan["tunnels"]] == [("ChatStore", 12)]
+    plan = propose_tunnels(hallways, WINGS, max_tunnels=2, existing_tunnels=existing)
+    assert [r["entity"] for r in plan["tunnels"]] == ["Q", "ChatStore"]

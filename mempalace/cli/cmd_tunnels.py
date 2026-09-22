@@ -59,10 +59,13 @@ def cmd_tunnels(args):
 
     if not apply:
         plan = propose_tunnels(
-            list_hallways(config=config), wings, max_tunnels=getattr(args, "max", 60) or 60
+            list_hallways(config=config),
+            wings,
+            max_tunnels=getattr(args, "max", 60) or 60,
+            existing_tunnels=_load_tunnels(config),
         )
         if not plan["tunnels"]:
-            print("  No shared entities strong enough to propose a tunnel.")
+            print("  No shared entities strong enough to propose a tunnel that does not exist.")
             return
         path = save_proposal(config, plan)
         print(

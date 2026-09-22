@@ -914,4 +914,6 @@ def tool_follow_tunnels(wing: str, room: str):
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
-    return follow_tunnels(wing, room, col=col)
+    # Following a tunnel records the traversal; a read-only server or a
+    # peer without the writer lock must not write the tunnel file.
+    return follow_tunnels(wing, room, col=col, record=not (_READ_ONLY or _MCP_WRITER_READ_ONLY))

@@ -1018,3 +1018,53 @@ class TestEntityTunnelFilters:
         created = palace_graph.entity_tunnels_for_wing("a", hallways, max_per_wing=5)
         names = sorted(t["source"]["room"] for t in created)
         assert names == ["entity:Sym0", "entity:Sym1", "entity:Sym2", "entity:Sym3", "entity:Sym4"]
+
+
+class TestTraversalRecording:
+    def test_follow_tunnels_potentiates_each_tunnel_crossed(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        palace_graph.create_tunnel("wing_code", "auth", "wing_people", "users", label="x")
+        palace_graph.create_tunnel("wing_code", "auth", "wing_ops", "oncall", label="y")
+        palace_graph.create_tunnel("wing_docs", "readme", "wing_ops", "oncall", label="z")
+
+        before = {t["id"]: t for t in palace_graph._load_tunnels()}
+        assert all(t["access_count"] == 0 for t in before.values())
+
+        out = palace_graph.follow_tunnels("wing_code", "auth")
+        assert len(out) == 2
+
+        after = {t["id"]: t for t in palace_graph._load_tunnels()}
+        crossed = {c["tunnel_id"] for c in out}
+        for tid, t in after.items():
+            if tid in crossed:
+                assert t["access_count"] == 1
+                assert t["strength"] > before[tid]["strength"]
+            else:
+                assert t["access_count"] == 0
+
+        palace_graph.follow_tunnels("wing_code", "auth")
+        assert all(
+            t["access_count"] == 2 for t in palace_graph._load_tunnels() if t["id"] in crossed
+        )
+
+    def test_follow_tunnels_record_off_leaves_file_untouched(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        palace_graph.create_tunnel("wing_code", "auth", "wing_people", "users", label="x")
+        out = palace_graph.follow_tunnels("wing_code", "auth", record=False)
+        assert len(out) == 1
+        assert palace_graph._load_tunnels()[0]["access_count"] == 0
+
+    def test_record_failure_never_breaks_the_read(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        palace_graph.create_tunnel("wing_code", "auth", "wing_people", "users", label="x")
+        monkeypatch.setattr(
+            palace_graph, "_save_tunnels", lambda *a, **k: (_ for _ in ()).throw(OSError("ro"))
+        )
+        out = palace_graph.follow_tunnels("wing_code", "auth")
+        assert len(out) == 1
+        assert palace_graph.record_tunnel_traversal([out[0]["tunnel_id"]]) == 0
+
+    def test_record_ignores_unknown_ids(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        assert palace_graph.record_tunnel_traversal([]) == 0
+        assert palace_graph.record_tunnel_traversal(["nope"]) == 0
