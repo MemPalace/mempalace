@@ -2261,6 +2261,120 @@ def test_mine_plumbs_max_chunks_per_file_to_process_file(tmp_path):
     assert captured["max_chunks_per_file"] == 0
 
 
+def test_mine_plumbs_symbol_header_prefix_to_process_file(tmp_path):
+    """``mine(symbol_header_prefix=cb)`` reaches ``process_file`` as
+    kwarg=cb. Guards the wiring ``mine -> _mine_impl -> process_file``."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=1)
+    palace_path = project_root / "palace"
+
+    def my_header(chunk, source_file, chunk_index):
+        return ""
+
+    captured = {}
+
+    def fake_process_file(*args, **kwargs):
+        captured["symbol_header_prefix"] = kwargs.get("symbol_header_prefix")
+        return (1, "general", None)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path), symbol_header_prefix=my_header)
+
+    assert captured["symbol_header_prefix"] is my_header
+
+
+def test_mine_default_symbol_header_prefix_is_none_at_process_file(tmp_path):
+    """The default ``mine(...)`` call (no ``symbol_header_prefix``) reaches
+    ``process_file`` with ``symbol_header_prefix=None`` — current behavior is
+    preserved when the caller does not opt in."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=1)
+    palace_path = project_root / "palace"
+
+    captured = {}
+
+    def fake_process_file(*args, **kwargs):
+        captured["symbol_header_prefix"] = kwargs.get("symbol_header_prefix", "MISSING")
+        return (1, "general", None)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path))
+
+    assert captured["symbol_header_prefix"] is None
+
+
+def test_process_file_forwards_symbol_header_prefix_to_chunk_text(tmp_path):
+    """``process_file`` forwards its ``symbol_header_prefix`` kwarg to
+    ``chunk_text`` unchanged, completing the ``process_file -> chunk_text``
+    link of the wiring."""
+    from unittest.mock import patch
+
+    from mempalace.miner import process_file
+
+    src = tmp_path / "f.py"
+    src.write_text("def fn():\n    print('hi')\n" * 40)
+
+    def my_header(chunk, source_file, chunk_index):
+        return ""
+
+    captured = {}
+
+    def fake_chunk_text(*args, **kwargs):
+        captured["symbol_header_prefix"] = kwargs.get("symbol_header_prefix")
+        return []
+
+    with patch("mempalace.miner.chunk_text", side_effect=fake_chunk_text):
+        process_file(
+            filepath=src,
+            project_path=tmp_path,
+            collection=None,
+            wing="w",
+            rooms=[{"name": "general", "description": "g"}],
+            agent="test",
+            dry_run=True,
+            symbol_header_prefix=my_header,
+        )
+
+    assert captured["symbol_header_prefix"] is my_header
+
+
+def test_chunk_text_symbol_header_prefix_prepends_header():
+    """When supplied, the callback's non-empty return is prepended to each
+    chunk with a blank-line separator; an empty return is a per-chunk no-op."""
+    from mempalace.miner import chunk_text
+
+    content = "\n".join(f"line {i}" for i in range(1, 401))
+
+    def header(chunk, source_file, chunk_index):
+        return f"HDR:{chunk_index}"
+
+    enriched = chunk_text(
+        content, "/x.py", chunk_size=800, chunk_overlap=80, symbol_header_prefix=header
+    )
+    assert enriched, "should produce chunks"
+    for c in enriched:
+        assert c["content"].startswith(f"HDR:{c['chunk_index']}\n\n")
+
+
+def test_chunk_text_default_none_byte_identical_to_no_kwarg():
+    """``symbol_header_prefix=None`` (the default) yields byte-identical
+    chunk content to the no-kwarg call — fully backward-compatible."""
+    from mempalace.miner import chunk_text
+
+    content = "\n".join(f"line {i}" for i in range(1, 401))
+    baseline = chunk_text(content, "/x.py", chunk_size=800, chunk_overlap=80)
+    with_default = chunk_text(
+        content, "/x.py", chunk_size=800, chunk_overlap=80, symbol_header_prefix=None
+    )
+    assert [c["content"] for c in with_default] == [c["content"] for c in baseline]
+
+
 def test_mine_arbitrary_exception_prints_summary_and_reraises(tmp_path, capsys):
     """A non-KeyboardInterrupt exception mid-mine must surface a summary
     banner before propagating, so users don't see a silent exit-0 with no
