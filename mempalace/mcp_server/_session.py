@@ -96,6 +96,18 @@ def _adopt_opened_collection(raw):
     return ChromaCollection(raw, palace_path=_config.palace_path, backend=backend)
 
 
+def _backend_replaced_client():
+    """Whether the backend no longer caches the client ``_client_cache`` holds, or there is none.
+
+    A rebuild closes that client and every collection taken from it. A non-Chroma
+    backend has no client, so this is always True there and the caller gets its
+    cached collection back.
+    """
+    if _client_cache is None:
+        return True
+    return _chroma_backend()._clients.get(_config.palace_path) is not _client_cache
+
+
 def _get_collection(create=False):
     """Return the configured backend collection, caching handles between calls.
 

@@ -312,6 +312,95 @@ class TestDeleteDrawers:
         assert result["results"][1]["drawer_id"] == "drawer_missing_none"
         assert "not found" in result["results"][1]["error"].lower()
 
+    def test_palace_gone_mid_batch_is_an_error_slot(self, monkeypatch, config, collection, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        ids = [
+            mcp_server.tool_add_drawer(wing="test", room="bulk_del", content=f"kept drawer {i}")[
+                "drawer_id"
+            ]
+            for i in range(3)
+        ]
+        col = mcp_server._get_collection()
+        missing = {"error": "Chroma database missing", "details": "gone", "hint": "repair"}
+
+        def handles():
+            # The batch resolve sees the palace, the reopen for the second id does
+            # not, and the retry for the third sees it again. A failed open leaves
+            # no cached collection behind, as ``_get_collection`` does.
+            yield col
+            monkeypatch.setattr(mcp_server, "_collection_open_error", missing)
+            monkeypatch.setattr(mcp_server, "_collection_cache", None)
+            yield None
+            monkeypatch.setattr(mcp_server, "_collection_open_error", None)
+            monkeypatch.setattr(mcp_server, "_collection_cache", col)
+            yield col
+
+        taken = handles()
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: next(taken))
+        # Only the second id finds the client replaced.
+        replaced = iter([False, True, False])
+        monkeypatch.setattr(mcp_server, "_backend_replaced_client", lambda: next(replaced))
+
+        result = mcp_server.tool_delete_drawers(ids)
+
+        assert (result["deleted"], result["errors"]) == (2, 1), result
+        assert result["results"][1] == {"drawer_id": ids[1], "error": "Chroma database missing"}
+        assert collection.get(ids=ids, include=[])["ids"] == [ids[1]]
+
+    def test_does_not_look_the_client_up_again_for_every_id(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        from mempalace.palace import get_closets_collection
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        sources = [f"s{i}.md" for i in range(4)]
+        ids = [
+            mcp_server.tool_add_drawer(
+                wing="test", room="bulk_del", content=f"probe drawer {i}", source_file=source
+            )["drawer_id"]
+            for i, source in enumerate(sources)
+        ]
+        get_closets_collection(palace_path, create=True).add(
+            ids=[f"closet_{source}" for source in sources],
+            documents=["topic: probes"] * len(sources),
+            metadatas=[{"source_file": source} for source in sources],
+        )
+        probes, lookups = [], []
+        real_get_client = mcp_server._get_client
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: probes.append(1))
+        monkeypatch.setattr(
+            mcp_server, "_get_client", lambda: (lookups.append(1), real_get_client())[1]
+        )
+
+        result = mcp_server.tool_delete_drawers(ids)
+
+        assert [item["closets_deleted"] for item in result["results"]] == [1, 1, 1, 1], result
+        # Each purge opens the closets without a rebuild, so only the call's first take
+        # looks the client up or probes the index.
+        assert len(lookups) <= 1, f"{len(lookups)} client lookups for {len(ids)} ids"
+        assert len(probes) <= 1, f"{len(probes)} HNSW capacity probes for {len(ids)} ids"
+
+    def test_batch_resolve_failure_deletes_one_id_at_a_time(
+        self, monkeypatch, config, collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        ids = [
+            mcp_server.tool_add_drawer(wing="test", room="bulk_del", content=f"fallback {i}")[
+                "drawer_id"
+            ]
+            for i in range(2)
+        ]
+
+        def resolve_fails(col, drawer_ids):
+            raise RuntimeError("batch resolve failed")
+
+        monkeypatch.setattr(mcp_server, "_bulk_drawer_records", resolve_fails)
+
+        result = mcp_server.tool_delete_drawers(ids + ["drawer_missing_none"])
+
+        assert (result["deleted"], result["errors"]) == (2, 1), result
+        assert collection.get(ids=ids, include=[])["ids"] == []
+
     def test_oversized_input_fails_before_any_delete(self, monkeypatch, config, collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         added = mcp_server.tool_add_drawer(

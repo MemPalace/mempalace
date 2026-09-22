@@ -1468,7 +1468,14 @@ def tool_delete_drawers(drawer_ids: list):
     errors = 0
     for drawer_id in drawer_ids:
         try:
-            if found is None:
+            # A delete that purges closets opens them through the backend, and a rebuild there
+            # closes the client ``col`` came from. Take the collection again when that happened,
+            # or when another caller has already taken it again from the rebuilt client.
+            if not col or col is not _collection_cache or _backend_replaced_client():
+                col = _get_collection()
+            if not col:
+                outcome = {"success": False, "error": _collection_error_or_no_palace()["error"]}
+            elif found is None:
                 outcome = _delete_resolved_drawer(col, drawer_id, bulk=True)
             else:
                 record = found.get(drawer_id)

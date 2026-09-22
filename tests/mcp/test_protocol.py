@@ -1068,6 +1068,101 @@ class TestCacheInvalidation:
         assert get_closets_collection(palace_path, create=False).get(include=[])["ids"] == []
         assert mcp_server.tool_get_drawer("drawer_update_race")["content"] == new_content
 
+    def test_bulk_delete_goes_on_after_a_closet_purge_rebuilds_the_client(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """A bulk delete must keep deleting after a closet purge rebuilds the client.
+
+        Each id's delete opens its source's closets through the backend to purge
+        them. If the palace changed, that open rebuilds the client and closes the
+        one the drawers handle came from, so the next id cannot go on using that
+        handle.
+        """
+        from mempalace import mcp_server
+        from mempalace.palace import get_closets_collection
+
+        sources = ["a.md", "b.md", "c.md"]
+        ids = [f"drawer_bulk_race_{i}" for i in range(len(sources))]
+        for drawer_id, source in zip(ids, sources):
+            _write_drawer_from_another_process(
+                palace_path, drawer_id, f"{source} is about lighthouses", source_file=source
+            )
+        _patch_mcp_server(monkeypatch, config, kg)
+        get_closets_collection(palace_path, create=True).add(
+            ids=[f"closet_{source}" for source in sources],
+            documents=["topic: lighthouses"] * len(sources),
+            metadatas=[{"source_file": source} for source in sources],
+        )
+
+        real_purge = mcp_server._purge_source_closets
+        built = _count_client_builds(monkeypatch)
+        per_purge = []
+
+        def purge_after_an_external_change(*args, **kwargs):
+            _move_mtime_forward(os.path.join(palace_path, "chroma.sqlite3"), 60)
+            before = len(built)
+            purged = real_purge(*args, **kwargs)
+            per_purge.append(len(built) - before)
+            return purged
+
+        monkeypatch.setattr(mcp_server, "_purge_source_closets", purge_after_an_external_change)
+
+        result = mcp_server.tool_delete_drawers(ids)
+        outside_purges = len(built) - sum(per_purge)
+
+        assert (result["deleted"], result["errors"]) == (3, 0), result
+        # Taking the collection again reuses the client a purge rebuilt; the only other
+        # build allowed is the call's first take.
+        assert per_purge == [1, 1, 1], per_purge
+        assert outside_purges <= 1, f"{outside_purges} client build(s) outside the purges"
+        assert [item["closets_deleted"] for item in result["results"]] == [1, 1, 1]
+        assert get_closets_collection(palace_path, create=False).get(include=[])["ids"] == []
+        for drawer_id in ids:
+            assert mcp_server.tool_get_drawer(drawer_id) == {
+                "error": f"Drawer not found: {drawer_id}"
+            }
+
+    def test_bulk_delete_goes_on_when_another_caller_took_the_rebuilt_client_first(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """A handle is judged by the client it came from, not by the server's cached client.
+
+        Under HTTP a caller that takes no lock (the node profile behind
+        ``/sync/version_vector`` and ``mempalace_mesh_peers``) can take the collection
+        between two ids, after a purge rebuilt the client. The server's cached client is
+        then the new one, while the loop's handle still belongs to the closed one.
+        """
+        from mempalace import mcp_server
+        from mempalace.palace import get_closets_collection
+
+        sources = ["a.md", "b.md", "c.md"]
+        ids = [f"drawer_bulk_adopt_{i}" for i in range(len(sources))]
+        for drawer_id, source in zip(ids, sources):
+            _write_drawer_from_another_process(
+                palace_path, drawer_id, f"{source} is about lighthouses", source_file=source
+            )
+        _patch_mcp_server(monkeypatch, config, kg)
+        get_closets_collection(palace_path, create=True).add(
+            ids=[f"closet_{source}" for source in sources],
+            documents=["topic: lighthouses"] * len(sources),
+            metadatas=[{"source_file": source} for source in sources],
+        )
+        real_purge = mcp_server._purge_source_closets
+
+        def purge_then_another_caller_takes_the_collection(*args, **kwargs):
+            _move_mtime_forward(os.path.join(palace_path, "chroma.sqlite3"), 60)
+            purged = real_purge(*args, **kwargs)
+            assert mcp_server._get_collection() is not None
+            return purged
+
+        monkeypatch.setattr(
+            mcp_server, "_purge_source_closets", purge_then_another_caller_takes_the_collection
+        )
+
+        result = mcp_server.tool_delete_drawers(ids)
+
+        assert (result["deleted"], result["errors"]) == (3, 0), result
+
     def test_get_client_does_not_reprobe_an_unchanged_palace(
         self, monkeypatch, config, palace_path, kg
     ):

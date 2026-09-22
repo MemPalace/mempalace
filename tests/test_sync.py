@@ -3669,6 +3669,89 @@ class TestMinedFilesystemIdentity(_IdentityRows):
         assert report["removed_closets"] == 5, report
         assert self._closets_left(palace_path) == []
 
+    def test_the_closet_purge_survives_a_rebuild_in_the_closets_open(
+        self, tmp_dir, palace_path, monkeypatch
+    ):
+        """Which sources are empty is asked before the closets are opened.
+
+        The open goes through the backend. If the palace changed on disk, it
+        rebuilds the client and closes the one the drawers handle came from, so
+        asked afterwards every source would read as unsettled and keep its
+        closets, and no later pass comes back for them. The rows are written
+        from another process: a client left open here would keep chromadb's
+        System running and the closed handle answering.
+        """
+        import json
+        import subprocess
+        import sys
+
+        from mempalace import sync as sync_mod
+
+        repo = Path(tmp_dir) / "repo"
+        repo.mkdir()
+        neighbour = repo / "neighbour.py"
+        neighbour.write_text("# still here\n")
+        gone = [repo / f"gone{i}.py" for i in range(2)]
+        rows = {
+            "mempalace_drawers": [["d_neighbour", str(neighbour)]]
+            + [[f"d_gone{i}", str(path)] for i, path in enumerate(gone)],
+            "mempalace_closets": [[f"closet_gone{i}", str(path)] for i, path in enumerate(gone)],
+        }
+        writer = (
+            "import json, sys\n"
+            "import chromadb\n"
+            "client = chromadb.PersistentClient(path=sys.argv[1])\n"
+            "for name, entries in json.loads(sys.argv[2]).items():\n"
+            "    col = client.get_or_create_collection(name, metadata={'hnsw:space': 'cosine'})\n"
+            "    col.add(\n"
+            "        ids=[e[0] for e in entries],\n"
+            "        documents=[f'doc {i}' for i in range(len(entries))],\n"
+            "        embeddings=[[float(i + 1), 0.0, 0.0] for i in range(len(entries))],\n"
+            "        metadatas=[\n"
+            "            {'wing': 'demo', 'room': 'src', 'source_file': e[1], 'chunk_index': 0,\n"
+            "             'added_by': 'miner', 'filed_at': '2026-08-23T00:00:00'}\n"
+            "            for e in entries\n"
+            "        ],\n"
+            "    )\n"
+            "client.close()\n"
+        )
+        written = subprocess.run(
+            [sys.executable, "-c", writer, palace_path, json.dumps(rows)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+        assert written.returncode == 0, written.stderr
+
+        built = []
+        real_client = chromadb.PersistentClient
+
+        def counting_client(*args, **kwargs):
+            built.append(1)
+            return real_client(*args, **kwargs)
+
+        monkeypatch.setattr(chromadb, "PersistentClient", counting_client)
+        real_get_closets = sync_mod.get_closets_collection
+        rebuilt = []
+
+        def closets_after_an_external_change(*args, **kwargs):
+            db = os.path.join(palace_path, "chroma.sqlite3")
+            st = os.stat(db)
+            os.utime(db, (st.st_atime, st.st_mtime + 60))
+            before = len(built)
+            closets = real_get_closets(*args, **kwargs)
+            rebuilt.append(len(built) - before)
+            return closets
+
+        monkeypatch.setattr(sync_mod, "get_closets_collection", closets_after_an_external_change)
+
+        report = self._run(palace_path, repo, dry_run=False)
+
+        assert rebuilt == [1], rebuilt
+        assert (report["removed_drawers"], report["removed_closets"]) == (2, 2), report
+        assert self._closets_left(palace_path) == []
+
     def test_an_identity_a_backend_hands_back_as_a_number_still_matches(self, tmp_dir, palace_path):
         """What a drawer holds is whatever its backend gave back. The miner
         writes a string, and one that round-trips metadata through JSON may

@@ -647,7 +647,7 @@ def _sources_holding_nothing(col, batch: list) -> list:
     return [source for source in batch if source not in holding]
 
 
-def _purge_emptied_closets(col, closets_col, removable_sources) -> int:
+def _purge_emptied_closets(col, palace_path, removable_sources) -> int:
     """Delete the closets of every source this pass left holding no drawer.
 
     The verdict is per drawer, so one source can have a drawer removed and
@@ -676,6 +676,15 @@ def _purge_emptied_closets(col, closets_col, removable_sources) -> int:
     for start in range(0, len(ordered), _IN_CLAUSE_LIMIT):
         emptied.extend(_sources_holding_nothing(col, ordered[start : start + _IN_CLAUSE_LIMIT]))
     if not emptied:
+        return 0
+
+    # Opened only after the drawers have answered: the open goes through the
+    # backend, and a rebuild there closes the client ``col`` came from. So the
+    # question is asked even when there turns out to be no closets collection.
+    try:
+        closets_col = get_closets_collection(palace_path, create=False)
+    except Exception as exc:
+        logger.warning("Closet purge skipped (collection unavailable): %s", exc)
         return 0
 
     # Batched because the list itself binds one variable per entry, so a pass
@@ -962,17 +971,7 @@ def sync_palace(
             return report
 
         report["removed_drawers"] = _delete_in_batches(col, removable_ids, batch_size, wal_log)
-
-        closets_removed = 0
-        try:
-            closets_col = get_closets_collection(palace_path, create=False)
-        except Exception as exc:
-            # No collection to purge from, so the probe below would be asking
-            # a question whose answer nothing could use.
-            logger.warning("Closet purge skipped (collection unavailable): %s", exc)
-        else:
-            closets_removed = _purge_emptied_closets(col, closets_col, removable_sources)
-        report["removed_closets"] = closets_removed
+        report["removed_closets"] = _purge_emptied_closets(col, palace_path, removable_sources)
     return report
 
 
