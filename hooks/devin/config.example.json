@@ -7,12 +7,12 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "mcp_call_tool",
+        "matcher": "mcp",
         "hooks": [
           {
             "type": "command",
             "command": "python3 ~/.devin/hooks/mcp_validate.py",
-            "timeout": 30
+            "timeout": 2
           }
         ]
       }
