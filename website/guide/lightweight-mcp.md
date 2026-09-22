@@ -12,7 +12,7 @@ claude mcp add mempalace-light -- mempalace-light-mcp
 codex mcp add mempalace-light -- mempalace-light-mcp
 ```
 
-Side-by-side with the existing 45-tool server: keep `mempalace` pointing at `mempalace-mcp`, and register the 3-tool server as `mempalace-light`.
+Side-by-side with the existing 47-tool server: keep `mempalace` pointing at `mempalace-mcp`, and register the 3-tool server as `mempalace-light`.
 
 ### With Custom Palace Path
 ```bash

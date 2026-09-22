@@ -157,6 +157,18 @@ Delete a drawer by ID. Irreversible.
 
 ---
 
+### `mempalace_delete_drawers`
+
+Delete many drawers by ID in one call. Irreversible. Each ID is removed the same way as `mempalace_delete_drawer`: a logical drawer id removes the whole group, including its chunk rows, and a physical chunk id removes that one row. A missing ID is an item in `results` and is counted in `errors`; the rest of the batch still runs. An accepted call is 1 to 500 IDs and always returns `results`, including a one-ID call. An empty list or more than 500 IDs is rejected and deletes nothing.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `drawer_ids` | array of strings | **Yes** | Drawer IDs to delete (1 to 500) |
+
+**Returns:** `{ results, count, deleted, errors }` for an accepted call. Each result is `{ drawer_id, deleted_ids, chunks_deleted, closets_deleted }` or `{ drawer_id, error }`. A rejected call returns `{ error }`.
+
+---
+
 ### `mempalace_mine`
 
 Mine a directory into the palace — the MCP equivalent of `mempalace mine`. `mode='convos'` also accepts a single conversation file. Wraps the same in-process miners the CLI uses; runs synchronously and returns the miner's summary as `output`. The palace write lock is automatic — a concurrent mine returns a structured already-running error. Orphan cleanup is separate (see `mempalace_sync`).
@@ -218,6 +230,18 @@ Fetch a single drawer by ID — returns full content and metadata.
 | `drawer_id` | string | **Yes** | ID of the drawer to fetch |
 
 **Returns:** `{ drawer_id, content, wing, room, metadata }` where `metadata.source_file`, when present, is the basename only — the absolute path written by the miners is reduced before the dict is returned to MCP clients.
+
+---
+
+### `mempalace_get_drawers`
+
+Fetch many drawers by ID in one call. Each ID resolves the same way as `mempalace_get_drawer`: a logical id reassembles the chunk group, and a physical chunk id returns that row. A hit is that same payload. A missing ID is an item in `results` and is counted in `errors`; the rest of the batch still returns. An accepted call is 1 to 500 IDs and always returns `results`, including a one-ID call. An empty list or more than 500 IDs is rejected and does not read the palace.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `drawer_ids` | array of strings | **Yes** | Drawer IDs to fetch (1 to 500) |
+
+**Returns:** `{ results, count, errors }` for an accepted call. A rejected call returns `{ error }`.
 
 ---
 

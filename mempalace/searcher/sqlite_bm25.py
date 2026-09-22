@@ -141,7 +141,7 @@ def _bm25_only_via_sqlite(
         return "".join(clauses), params
 
     try:
-        conn = connect_sqlite_read(db_path)
+        conn = open_palace_reader(db_path)
     except sqlite3.Error as e:
         return _search_error_result(f"sqlite open failed: {e}")
 

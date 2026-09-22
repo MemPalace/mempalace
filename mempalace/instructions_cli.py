@@ -89,7 +89,7 @@ def render_shared_brain_rules(host: str, harness: str, project: str, mcp: str = 
     wrapped in HTML-comment markers so a later re-render can replace the
     block in place.
 
-    ``mcp`` selects tool names: ``full`` (default, the 45-tool server) or ``light``
+    ``mcp`` selects tool names: ``full`` (default, the 47-tool server) or ``light``
     (palace_query / palace_exec / palace_coordinate). Prose is identical;
     only the tool tokens change.
     """

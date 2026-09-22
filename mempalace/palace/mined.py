@@ -146,8 +146,17 @@ def file_already_mined(
         return False
 
 
+# Above this many candidate files, one filtered get costs more round trips
+# than a full paginated scan, so the scoped path below stops paying off.
+_PREFETCH_SCOPE_THRESHOLD = 50
+
+
 def prefetch_mined_set(
-    collection, extract_mode: Optional[str] = None, source_fingerprints: bool = False
+    collection,
+    extract_mode: Optional[str] = None,
+    source_files: Optional[list] = None,
+    *,
+    source_fingerprints: bool = False,
 ) -> dict[str, Optional[Union[float, str]]]:
     """Pre-fetch source_file -> stored source_mtime for files already mined
     at the current NORMALIZE_VERSION, in one bulk pass instead of one
@@ -184,44 +193,81 @@ def prefetch_mined_set(
     `collection.get(where={"source_file": X})` costs ~2s on a 150k-drawer
     palace, making a 2000-file sweep take >1h of pure skip-checking. This
     helper drops that to a single paginated scan plus O(1) lookups.
+
+    When `source_files` is given and holds at most `_PREFETCH_SCOPE_THRESHOLD`
+    paths, the caller already knows the only source_file values that could
+    possibly match, so a paged `where={"source_file": {"$in": ...}}` get()
+    replaces the full-collection scan. On a one-file mine of a 660k-drawer
+    palace that mtime scan was about 42% of the mine; the content-hash scan
+    was the rest, and it stays unscoped because a stored hash can be several
+    comma-joined values. Above the threshold, or when source_files is
+    omitted, the behaviour is unchanged: a bulk sweep still benefits more
+    from one full scan than from many filtered queries.
     """
     # Per source_file: per source-state group → count + optional chunk_total.
     # A source is only "mined" once some group is complete.
     groups: dict[str, dict] = {}
-    try:
+
+    def _absorb(meta):
+        meta = meta or {}
+        src = meta.get("source_file")
+        if not src:
+            return
+        if not _metadata_matches_extract_mode(meta, extract_mode):
+            return
+        # Same default as file_already_mined: missing version == 1
+        version = meta.get("normalize_version", 1)
+        if version < NORMALIZE_VERSION:
+            return
+        if source_fingerprints:
+            state_key = meta.get("source_fingerprint")
+        else:
+            stored_mtime = meta.get("source_mtime")
+            state_key = float(stored_mtime) if stored_mtime is not None else None
+        entry = groups.setdefault(src, {}).setdefault(state_key, {"count": 0, "chunk_total": None})
+        entry["count"] += 1
+        chunk_total = meta.get("chunk_total")
+        if chunk_total is not None:
+            try:
+                entry["chunk_total"] = int(chunk_total)
+            except (TypeError, ValueError):
+                pass
+
+    def _scan_all():
         total = collection.count()
         offset = 0
         while offset < total:
             batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
             for meta in batch["metadatas"]:
-                meta = meta or {}
-                src = meta.get("source_file")
-                if not src:
-                    continue
-                if not _metadata_matches_extract_mode(meta, extract_mode):
-                    continue
-                # Same default as file_already_mined: missing version == 1
-                version = meta.get("normalize_version", 1)
-                if version < NORMALIZE_VERSION:
-                    continue
-                if source_fingerprints:
-                    state_key = meta.get("source_fingerprint")
-                else:
-                    stored_mtime = meta.get("source_mtime")
-                    state_key = float(stored_mtime) if stored_mtime is not None else None
-                entry = groups.setdefault(src, {}).setdefault(
-                    state_key, {"count": 0, "chunk_total": None}
-                )
-                entry["count"] += 1
-                chunk_total = meta.get("chunk_total")
-                if chunk_total is not None:
-                    try:
-                        entry["chunk_total"] = int(chunk_total)
-                    except (TypeError, ValueError):
-                        pass
+                _absorb(meta)
             if not batch["ids"]:
                 break
             offset += len(batch["ids"])
+
+    try:
+        if source_files is not None and len(source_files) <= _PREFETCH_SCOPE_THRESHOLD:
+            if source_files:
+                try:
+                    offset = 0
+                    while True:
+                        scoped = collection.get(
+                            where={"source_file": {"$in": list(source_files)}},
+                            include=["metadatas"],
+                            limit=1000,
+                            offset=offset,
+                        )
+                        ids = scoped.get("ids") or []
+                        for meta in scoped.get("metadatas") or []:
+                            _absorb(meta)
+                        if len(ids) < 1000:
+                            break
+                        offset += len(ids)
+                except Exception:
+                    logger.warning("prefetch_mined_set: scoped fetch failed; scanning")
+                    groups.clear()
+                    _scan_all()
+        else:
+            _scan_all()
     except Exception:
         logger.warning("prefetch_mined_set: partial fetch, %d source groups loaded", len(groups))
 
@@ -266,6 +312,21 @@ def prefetch_content_hashes(
     the ones that didn't. Only the first source_file seen for a given
     (wing, hash) pair is kept — good enough to detect and skip a repeat,
     the point is not to track every alias.
+
+    Deliberately NOT scoped by candidate source_files the way
+    prefetch_mined_set is: a stored `content_hash` can hold several
+    comma-joined hashes (one privacy-export bundle drawer covers several
+    conversations), so a `where`-filtered query can only match a document
+    whose entire stored value equals one candidate hash and would silently
+    miss any bundle row. An incomplete result here is worse than none,
+    because a caller reading the returned dict has no way to tell "no
+    duplicate" from "the query couldn't see this row". Narrowing this scan
+    correctly needs either a schema change (one hash per metadata field
+    instead of a joined list) or a second index; out of scope for the fix
+    that scoped prefetch_mined_set. See test_mine_convos_skips_same_content_
+    under_new_filename and test_mine_convos_skips_same_conversation_within_
+    re_exported_bundle, which a source_files-scoped or skipped version of
+    this function broke.
     """
     hashes: dict[tuple[str, str], str] = {}
     try:

@@ -6,7 +6,13 @@ import pytest
 
 from mempalace import convo_miner
 from mempalace import normalize as normalize_module
-from mempalace.palace import get_collection
+from mempalace._source_state import source_fingerprint
+from mempalace.palace import (
+    NORMALIZE_VERSION,
+    file_already_mined,
+    get_collection,
+    prefetch_mined_set,
+)
 
 
 _INITIAL = (
@@ -248,3 +254,163 @@ def test_legacy_mtime_only_rows_upgrade_once_then_skip(tmp_path, monkeypatch):
 
     _mine(source, palace)
     assert normalizations == 1, "an unchanged verified source should skip subsequent normalization"
+
+
+def test_scoped_prefetch_preserves_fingerprints_and_legacy_metadata(collection, tmp_path):
+    source = tmp_path / "verified.txt"
+    legacy = tmp_path / "legacy.txt"
+    source.write_text("verified conversation", encoding="utf-8")
+    legacy.write_text("legacy conversation", encoding="utf-8")
+    fingerprint = source_fingerprint(source.stat())
+    common = {"normalize_version": NORMALIZE_VERSION, "source_mtime": source.stat().st_mtime}
+    collection.add(
+        ids=["verified", "legacy", "general", "sweep", "outside"],
+        documents=["stored conversation"] * 5,
+        metadatas=[
+            {
+                **common,
+                "source_file": str(source),
+                "extract_mode": "exchange",
+                "source_fingerprint": fingerprint,
+            },
+            {
+                **common,
+                "source_file": str(legacy),
+                "source_mtime": legacy.stat().st_mtime,
+                "ingest_mode": "convos",
+            },
+            {
+                **common,
+                "source_file": str(source),
+                "extract_mode": "general",
+                "source_fingerprint": "other-mode-snapshot",
+            },
+            {**common, "source_file": "sweep.txt", "ingest_mode": "sweep"},
+            {**common, "source_file": "outside.txt", "extract_mode": "exchange"},
+        ],
+    )
+    sources = [str(source), str(legacy), "sweep.txt"]
+
+    assert prefetch_mined_set(
+        collection, extract_mode="exchange", source_files=sources, source_fingerprints=True
+    ) == {str(source): fingerprint, str(legacy): None}
+    assert prefetch_mined_set(
+        collection, extract_mode="general", source_files=sources, source_fingerprints=True
+    ) == {str(source): "other-mode-snapshot"}
+    assert prefetch_mined_set(collection, extract_mode="exchange", source_files=sources) == {
+        str(source): source.stat().st_mtime,
+        str(legacy): legacy.stat().st_mtime,
+    }
+    assert file_already_mined(
+        collection, str(source), extract_mode="exchange", check_source_fingerprint=True
+    )
+    assert not file_already_mined(
+        collection, str(legacy), extract_mode="exchange", check_source_fingerprint=True
+    )
+    assert not file_already_mined(
+        collection, str(source), extract_mode="general", check_source_fingerprint=True
+    )
+    assert file_already_mined(collection, str(legacy), extract_mode="exchange", check_mtime=True)
+
+
+def test_scoped_prefetch_keeps_paginated_snapshot_groups_separate(collection, tmp_path):
+    source = tmp_path / "session.txt"
+    source.write_text("first source snapshot", encoding="utf-8")
+    before = source.stat()
+    old_fingerprint = source_fingerprint(before)
+    source.write_text("first source snapshot, with an appended turn", encoding="utf-8")
+    os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+    fingerprint = source_fingerprint(source.stat())
+    assert source.stat().st_mtime_ns == before.st_mtime_ns
+    assert fingerprint != old_fingerprint
+
+    common = {
+        "normalize_version": NORMALIZE_VERSION,
+        "source_file": str(source),
+        "source_mtime": before.st_mtime,
+        "extract_mode": "exchange",
+        "chunk_total": 1001,
+    }
+    collection.add(
+        ids=[f"chunk-{i}" for i in range(1001)],
+        documents=["stored exchange"] * 1001,
+        metadatas=[
+            {**common, "source_fingerprint": old_fingerprint if i < 500 else fingerprint}
+            for i in range(1001)
+        ],
+    )
+
+    def prefetched():
+        return prefetch_mined_set(
+            collection,
+            extract_mode="exchange",
+            source_files=[str(source)],
+            source_fingerprints=True,
+        )
+
+    assert prefetched() == {}, "partial generations must not combine into a complete source"
+    assert not file_already_mined(
+        collection, str(source), extract_mode="exchange", check_source_fingerprint=True
+    )
+
+    collection.add(
+        ids=[f"remaining-{i}" for i in range(500)],
+        documents=["recovered exchange"] * 500,
+        metadatas=[{**common, "source_fingerprint": fingerprint}] * 500,
+    )
+    assert prefetched() == {str(source): fingerprint}
+    assert file_already_mined(
+        collection, str(source), extract_mode="exchange", check_source_fingerprint=True
+    )
+
+
+@pytest.mark.parametrize("source_fingerprints", [False, True], ids=["mtime", "fingerprint"])
+def test_scoped_prefetch_retry_does_not_double_count_partial_page(
+    collection, tmp_path, source_fingerprints
+):
+    source = tmp_path / "interrupted.txt"
+    source.write_text("source with a partially filed generation", encoding="utf-8")
+    fingerprint = source_fingerprint(source.stat())
+    common = {
+        "normalize_version": NORMALIZE_VERSION,
+        "extract_mode": "exchange",
+        "source_mtime": source.stat().st_mtime,
+        "source_fingerprint": fingerprint,
+    }
+    collection.add(
+        ids=[f"partial-{i}" for i in range(1000)] + ["unrelated"],
+        documents=["stored exchange"] * 1001,
+        metadatas=[{**common, "source_file": str(source), "chunk_total": 1500}] * 1000
+        + [{**common, "source_file": "unrelated.txt"}],
+    )
+    rejected_pages = []
+
+    class RejectSecondScopedPage:
+        def count(self):
+            return collection.count()
+
+        def get(self, **kwargs):
+            where = kwargs.get("where", {})
+            if isinstance(where.get("source_file"), dict) and kwargs.get("offset", 0):
+                rejected_pages.append(kwargs["offset"])
+                raise RuntimeError("scoped pagination temporarily unavailable")
+            return collection.get(**kwargs)
+
+    mined = prefetch_mined_set(
+        RejectSecondScopedPage(),
+        extract_mode="exchange",
+        source_files=[str(source)],
+        source_fingerprints=source_fingerprints,
+    )
+    assert rejected_pages, "the failure must occur after a real first scoped page"
+    expected = fingerprint if source_fingerprints else source.stat().st_mtime
+    assert mined == {"unrelated.txt": expected}, (
+        "retrying a full scan must not count the first scoped page twice"
+    )
+    assert not file_already_mined(
+        collection,
+        str(source),
+        extract_mode="exchange",
+        check_mtime=True,
+        check_source_fingerprint=source_fingerprints,
+    )
