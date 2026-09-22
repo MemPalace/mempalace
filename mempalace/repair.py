@@ -50,7 +50,7 @@ from .backends.chroma import ChromaBackend, hnsw_capacity_status
 # sqlite_read_uri stays in this module's namespace: callers and tests reach the
 # read-only URI through repair. Connections to chroma.sqlite3 go through
 # backends._inproc_sqlite, which opens them with connect_sqlite_read under the
-# palace's in-process lock (#2302).
+# palace's in-process lock.
 from .config import connect_sqlite_read, sqlite_read_uri  # noqa: F401
 from .backends._inproc_sqlite import open_reader as open_palace_reader
 from .backends._inproc_sqlite import open_writer as open_palace_writer

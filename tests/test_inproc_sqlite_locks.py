@@ -1,4 +1,4 @@
-"""Python ``sqlite3`` readers must not break Chroma's SQLite in the same process (#2302).
+"""Python ``sqlite3`` readers must not break Chroma's SQLite in the same process.
 
 ChromaDB opens ``chroma.sqlite3`` through its own statically linked SQLite, so
 the fast paths that read the file through Python's ``sqlite3`` are a second
@@ -333,3 +333,81 @@ def test_chroma_reopen_keeps_python_reads_current(tmp_path):
     with contextlib.closing(sqlite3.connect(db)) as fresh:
         assert fresh.execute("select count(*) from embeddings").fetchone() == (3,)
     backend.close()
+
+
+def test_a_busy_anchor_stays_open(tmp_path, monkeypatch):
+    """Closing the anchor after a busy prime drops this process's POSIX locks."""
+    db = tmp_path / "chroma.sqlite3"
+    _make_db(db, rows=1)
+    closed = []
+
+    class _Conn:
+        def execute(self, _sql):
+            raise sqlite3.OperationalError("database is locked")
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(_inproc_sqlite, "connect_sqlite_read", lambda *_args, **_kwargs: _Conn())
+    key = _inproc_sqlite._key(str(db))
+
+    _inproc_sqlite._ensure_anchor(str(db), key)
+    _inproc_sqlite._ensure_anchor(str(db), key)
+
+    assert closed == []
+    anchor = _inproc_sqlite._anchors[key]
+    assert anchor.primed is False
+
+
+def test_lock_holder_blocks_a_wal_checkpoint_until_released(tmp_path):
+    db = tmp_path / "chroma.sqlite3"
+    _make_db(db, rows=1)
+    with contextlib.closing(sqlite3.connect(db)) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+
+    checkpoint = (
+        "import sqlite3, sys\n"
+        "conn = sqlite3.connect(sys.argv[1], timeout=0)\n"
+        "conn.execute('INSERT INTO t VALUES (-1)')\n"
+        "conn.commit()\n"
+        "busy, _log, _ckpt = conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()\n"
+        "print('busy' if busy else 'done')\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _inproc_sqlite._HOLD_SCRIPT, str(db)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdout is not None
+    try:
+        assert proc.stdout.readline().strip() == "ready"
+        # The insert creates a WAL frame while the holder is a reader. Truncate
+        # has to reset -shm, which it cannot do until that reader exits.
+        assert _run(checkpoint, db) == "busy"
+    finally:
+        if proc.stdin is not None:
+            proc.stdin.close()
+        proc.wait(timeout=5)
+
+    assert proc.returncode == 0
+    assert _run(checkpoint, db) == "done"
+
+
+def test_open_reader_keeps_a_holder_until_release(tmp_path, monkeypatch):
+    monkeypatch.setattr(_inproc_sqlite, "_HOLD_LOCKS", True)
+    monkeypatch.setattr(_inproc_sqlite, "_ANCHORED", False)
+    db = tmp_path / "chroma.sqlite3"
+    _make_db(db, rows=1)
+
+    reader = _inproc_sqlite.open_reader(db)
+    reader.close()
+    holder = _inproc_sqlite._holders[_inproc_sqlite._key(str(db))]
+    assert holder.ready
+    assert holder.alive()
+
+    _inproc_sqlite.release(db)
+
+    assert _inproc_sqlite._key(str(db)) not in _inproc_sqlite._holders
+    assert not holder.alive()
