@@ -2047,6 +2047,56 @@ class TestStripNoiseRemovesSystemChrome:
             assert tag not in out, f"{tag} leaked into output"
             assert "Real." in out
 
+    def test_strips_block_with_blank_lines_in_body(self):
+        # Regression: a task-notification carrying a subagent's multi-paragraph
+        # result (blank lines inside the block) leaked wholesale into drawers
+        # because the old body pattern refused to cross blank lines.
+        text = (
+            "> User:\n"
+            "<task-notification>\n"
+            "<task-id>abc123</task-id>\n"
+            "<result># Report\n"
+            "\n"
+            "Paragraph one.\n"
+            "\n"
+            "Paragraph two.</result>\n"
+            "</task-notification>\n"
+            "> Real message."
+        )
+        out = strip_noise(text)
+        assert "task-notification" not in out
+        assert "Paragraph one" not in out
+        assert "Real message." in out
+
+    def test_dangling_open_tag_does_not_merge_with_later_block(self):
+        # A line-anchored dangling open tag must not merge with a later
+        # complete block of the same tag and eat the real content between.
+        text = (
+            "<system-reminder>dangling, never closed\n"
+            "> User: real content here\n"
+            "\n"
+            "<system-reminder>complete block</system-reminder>\n"
+            "> Tail."
+        )
+        out = strip_noise(text)
+        assert "real content here" in out
+        assert "Tail." in out
+        assert "complete block" not in out
+
+    def test_strips_indented_slash_command_chrome(self):
+        # Claude Code emits slash-command chrome with indented tags; the line
+        # anchor must tolerate leading whitespace, and command-args is noise too.
+        text = (
+            "<command-name>/model</command-name>\n"
+            "            <command-message>model</command-message>\n"
+            "            <command-args></command-args>\n"
+            "> Real message."
+        )
+        out = strip_noise(text)
+        for tag in ("command-name", "command-message", "command-args"):
+            assert tag not in out, f"{tag} leaked"
+        assert "Real message." in out
+
     def test_collapses_excessive_blank_lines(self):
         text = "line one\n\n\n\n\n\nline two"
         out = strip_noise(text)
