@@ -95,5 +95,27 @@ def cmd_tunnels(args):
     except ValueError as exc:
         print(f"  Proposal is invalid: {exc}")
         sys.exit(1)
-    created = apply_proposal(plan, config=config)
-    print(f"  Created or refreshed {created} tunnels.")
+    # The plan was written for review, so a wing may have been renamed, split
+    # or removed since. `create_tunnel` does not validate entity endpoints, so
+    # a stale row would be written as a tunnel the audit then counts as an
+    # artifact. Drop those rows instead of creating them.
+    from ..config import normalize_wing_name
+
+    known = {normalize_wing_name(w) or w for w in wings}
+    fresh = [
+        row
+        for row in plan["tunnels"]
+        if {
+            normalize_wing_name(row["wing_a"]) or row["wing_a"],
+            normalize_wing_name(row["wing_b"]) or row["wing_b"],
+        }
+        <= known
+    ]
+    stale = len(plan["tunnels"]) - len(fresh)
+    if not fresh:
+        print(f"  Every proposed tunnel names a wing that no longer exists ({stale} rows).")
+        print("  Re-run `mempalace tunnels propose` against the current wings.")
+        sys.exit(1)
+    created = apply_proposal({**plan, "tunnels": fresh}, config=config)
+    note = f" Skipped {stale} row(s) naming a wing that no longer exists." if stale else ""
+    print(f"  Created or refreshed {created} tunnels.{note}")

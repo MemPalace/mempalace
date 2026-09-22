@@ -18,9 +18,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   two files is left on its own.
 - **`rooms apply` moves the closet layer with the drawers.** A closet is one
   record per wing, room and source file, and search passes the same room
-  filter to closets, so a reclassified drawer lost its index boost. Each
-  closet follows the room most of its drawers moved to, and a source whose
-  drawers split across rooms is reported.
+  filter to closets, so a reclassified drawer lost its index boost. A closet
+  follows its source only when every drawer of that source and room moved to
+  one room; a source that split, or only partly moved, keeps its closet where
+  it is and is reported, since one record cannot index two rooms.
+- **`tunnels propose --yes` drops rows naming a wing that no longer exists.**
+  The plan is written for review, so a wing can be split or renamed in the
+  meantime; entity tunnels skip endpoint validation, so those rows became
+  tunnels the audit immediately counted as artifacts.
 - **A normalized fact keeps its confidence and provenance.** `kg normalize`
   opened the successor with confidence 1.0 and no source, overstating
   certainty and cutting the fact off from the drawer it came from.

@@ -672,6 +672,44 @@ class TestSameNamedFilesStayApart:
         )
         assert is_self_link({"entity_a": "main.zig", "entity_b": "src/main.zig"})
 
+    def test_miner_counts_two_same_named_files_as_two_entities(self, tmp_path, monkeypatch):
+        """One drawer naming both files must not count one pair twice."""
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        col = _fake_collection(
+            [
+                {
+                    "wing": "w",
+                    "room": "technical",
+                    "entities": "src/models/user.py;tests/models/user.py;Router",
+                },
+                {
+                    "wing": "w",
+                    "room": "technical",
+                    "entities": "src/models/user.py;Router",
+                },
+            ]
+        )
+        created = hallways_mod.compute_hallways_for_wing("w", col=col, min_count=1)
+        pairs = {(h["entity_a"], h["entity_b"]): h["co_occurrence_count"] for h in created}
+        assert pairs == {
+            ("Router", "src/models/user.py"): 2,
+            ("Router", "tests/models/user.py"): 1,
+            ("src/models/user.py", "tests/models/user.py"): 1,
+        }
+
+    def test_miner_still_unifies_one_file_spelled_two_ways(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        col = _fake_collection(
+            [
+                {"wing": "w", "room": "r", "entities": "src/main.zig;Router"},
+                {"wing": "w", "room": "r", "entities": "main.zig;Router"},
+            ]
+        )
+        created = hallways_mod.compute_hallways_for_wing("w", col=col, min_count=1)
+        assert [(h["entity_a"], h["entity_b"], h["co_occurrence_count"]) for h in created] == [
+            ("Router", "main.zig", 2)
+        ]
+
     def test_prune_keeps_both_files_hallways(self, tmp_path, monkeypatch):
         _use_tmp_hallway_file(monkeypatch, tmp_path)
         hallways_mod._save_hallways(

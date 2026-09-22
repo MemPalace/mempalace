@@ -203,3 +203,31 @@ def test_load_proposal_rejects_non_object_rows(tmp_path):
     save_proposal(cfg, {"tunnels": ["not a row"]})
     with pytest.raises(ValueError, match="not an object"):
         load_proposal(cfg)
+
+
+def test_cmd_tunnels_apply_skips_rows_naming_a_wing_that_is_gone(tmp_path, monkeypatch, capsys):
+    """A plan sits under review; a wing may be split or renamed meanwhile."""
+    import mempalace.cli as cli
+
+    cfg = MempalaceConfig(palace_path=str(tmp_path))
+    save_proposal(
+        cfg,
+        {
+            "tunnels": [
+                {"entity": "X", "wing_a": "a", "wing_b": "gone", "strength": 9},
+                {"entity": "Y", "wing_a": "a", "wing_b": "b", "strength": 8},
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        "mempalace.palace_graph.sqlite_grouped_counts_reader",
+        lambda config: lambda path, name: [("r", w, "", 1) for w in ("a", "b")],
+    )
+    created = []
+    monkeypatch.setattr(
+        "mempalace.palace_graph.create_tunnel", lambda **kw: created.append(kw["label"])
+    )
+    cli.cmd_tunnels(Namespace(tunnels_action="propose", palace=str(tmp_path), yes=True, max=60))
+    out = capsys.readouterr().out
+    assert created == ["shared entity: Y"]
+    assert "Skipped 1 row" in out

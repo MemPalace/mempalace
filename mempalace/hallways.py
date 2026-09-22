@@ -422,6 +422,31 @@ def _hallway_id(wing: str, entity_a: str, entity_b: str) -> str:
     return f"hallway_{wing}_{a}_{b}_{suffix}"
 
 
+def _wing_file_keys(metadatas) -> dict[str, str]:
+    """Map every spelling seen in the wing to the file it names.
+
+    The value is the shortest spelling of that file, which is both the key
+    pairs are counted under and the spelling the record is materialized
+    with. Clustering is wing-wide, not per drawer: one drawer saying
+    ``ChatStore.swift`` and the next saying ``ChatStore`` are one file, while
+    ``src/models/user.py`` and ``tests/models/user.py`` stay two files even
+    though they share a basename (:func:`_spelling_clusters`).
+    """
+    by_base: dict[str, set[str]] = defaultdict(set)
+    for meta in metadatas:
+        if not isinstance(meta, dict) or meta.get("is_sentinel"):
+            continue
+        for spelling in _parse_entities(meta.get("entities")):
+            by_base[entity_spelling_key(spelling)].add(spelling)
+    mapping: dict[str, str] = {}
+    for spellings in by_base.values():
+        for cluster in _spelling_clusters(sorted(spellings)):
+            canonical = min(cluster, key=len)
+            for spelling in cluster:
+                mapping[spelling] = canonical
+    return mapping
+
+
 def compute_hallways_for_wing(
     wing: str,
     col=None,
@@ -518,14 +543,14 @@ def compute_hallways_for_wing(
     # 2. Walk drawers, counting entity-pair co-occurrence + tracking rooms.
     # pair_counts: {(entity_a, entity_b): count} — keys always sorted to
     # canonicalize the (a, b) vs (b, a) symmetry.
-    # Pairs are keyed by spelling key, not raw spelling: the structural
-    # extractor records a file as both path and basename, and one drawer may
-    # say ``ChatStore.swift`` where the next says ``ChatStore``. ``display``
-    # remembers the shortest spelling seen wing-wide so the materialized
-    # record reads ``ChatStore ↔ RootView``.
+    # Pairs are keyed by the file an entity names, resolved wing-wide by
+    # ``_wing_file_keys``: the structural extractor records a file as both
+    # path and basename and one drawer may say ``ChatStore.swift`` where the
+    # next says ``ChatStore``, so the key is the shortest spelling of that
+    # file and the record reads ``ChatStore ↔ RootView``.
     pair_counts: dict[tuple[str, str], int] = defaultdict(int)
     pair_rooms: dict[tuple[str, str], set[str]] = defaultdict(set)
-    display: dict[str, str] = {}
+    file_keys = _wing_file_keys(metadatas)
 
     for meta in metadatas:
         if not isinstance(meta, dict):
@@ -535,10 +560,12 @@ def compute_hallways_for_wing(
             continue
         entities = []
         for spelling in canonical_entities(_parse_entities(meta.get("entities"))):
-            key = entity_spelling_key(spelling)
-            if key not in display or len(spelling) < len(display[key]):
-                display[key] = spelling
-            entities.append(key)
+            # The file this spelling names, not its basename: two files
+            # sharing a name must not merge into one entity here either,
+            # or one drawer naming both counts the same pair twice.
+            canonical = file_keys.get(spelling, spelling)
+            if canonical not in entities:
+                entities.append(canonical)
         if len(entities) < 2:
             # Need at least 2 entities for a pair to exist.
             continue
@@ -587,8 +614,8 @@ def compute_hallways_for_wing(
             key = tuple(
                 sorted(
                     [
-                        entity_spelling_key(str(h.get("entity_a"))),
-                        entity_spelling_key(str(h.get("entity_b"))),
+                        file_keys.get(str(h.get("entity_a")), str(h.get("entity_a"))),
+                        file_keys.get(str(h.get("entity_b")), str(h.get("entity_b"))),
                     ]
                 )
             )
@@ -606,7 +633,7 @@ def compute_hallways_for_wing(
             count = pair_counts[key]
             if count < min_count:
                 continue
-            entity_a, entity_b = sorted((display[key[0]], display[key[1]]))
+            entity_a, entity_b = key
             rooms = sorted(pair_rooms.get(key, set()))
             room_summary = ", ".join(rooms[:3]) if rooms else "(no room tags)"
             if len(rooms) > 3:

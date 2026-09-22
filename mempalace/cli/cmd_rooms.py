@@ -163,7 +163,7 @@ def cmd_rooms(args):
         note = f" {closets['moved']} closets followed."
         if closets["ambiguous"]:
             note += (
-                f" {closets['ambiguous']} drawers came from a source whose drawers split "
-                "across rooms; re-mine that source for exact closets."
+                f" {closets['ambiguous']} drawers came from a source that only partly moved, "
+                "so its closet stayed put; re-mine that source for exact closets."
             )
         print(f"  Moved {done} drawers.{note} Run `mempalace audit` to see the new rooms score.")

@@ -493,9 +493,11 @@ class RoomPlan:
     wing: str
     total: int
     changes: list[tuple[str, str, str]]  # (drawer_id, old_room, new_room)
-    # {(source_file, old_room): {new_room: drawers moved}} — the closet layer
-    # is keyed per source file and room, so `rekey_closets` needs this to
-    # follow the drawers.
+    # {(source_file, room): {new_room or "": drawers}} — every drawer of the
+    # wing counted under the room it started in, with "" for the ones that
+    # did not move. The closet layer is keyed per source file and room, so
+    # `rekey_closets` needs the stayers too: a closet may only follow a
+    # source whose drawers *all* moved to one room.
     source_moves: dict
     kept: int
     below_threshold: int
@@ -558,24 +560,34 @@ def plan_rooms(
         for row, (room, confidence) in zip(batch, decider.decide(batch)):
             total += 1
             old = str(row["metadata"].get("room") or "")
+            source = str(row["metadata"].get("source_file") or "")
+
+            def stayed():
+                """Record a drawer that keeps its room, for the closet layer."""
+                if source:
+                    source_moves.setdefault((source, old), Counter())[""] += 1
+
             if from_rooms is not None and old not in from_rooms:
                 kept += 1
                 per_room[old] = per_room.get(old, 0) + 1
+                stayed()
                 continue
             if not room:
                 missing += 1
                 per_room[old] = per_room.get(old, 0) + 1
+                stayed()
                 continue
             if confidence < threshold:
                 below += 1
                 per_room[old] = per_room.get(old, 0) + 1
+                stayed()
                 continue
             per_room[room] = per_room.get(room, 0) + 1
             if room == old:
                 kept += 1
+                stayed()
             else:
                 changes.append((row["id"], old, room))
-                source = str(row["metadata"].get("source_file") or "")
                 if source:
                     source_moves.setdefault((source, old), Counter())[room] += 1
                 bucket = examples.setdefault(room, [])
@@ -609,10 +621,14 @@ def rekey_closets(closets_col, plan: RoomPlan) -> dict:
     A closet is one record per ``(wing, room, source_file)`` and search
     passes the *same* wing/room filter to the closet collection, so after a
     reclassification a closet left on the old room stops boosting the
-    drawers it indexes — in the new room they rank without it. Each closet
-    follows the room most of its drawers moved to; when a source's drawers
-    split across rooms the rest cannot be represented by one record and are
-    counted in ``ambiguous`` (re-mining that source rebuilds them exactly).
+    drawers it indexes — in the new room they rank without it.
+
+    A closet follows its source only when *every* drawer of that source and
+    room moved, and to one room: it indexes the whole source, so moving it
+    while some of those drawers stayed put would take the boost away from
+    the ones that stayed. Sources that split, or that only partly moved,
+    are counted in ``ambiguous`` and left alone; re-mining such a source
+    rebuilds its closets exactly.
 
     Only ``room`` metadata is rewritten, never the record id, which is what
     ``wings split`` does for ``wing``.
@@ -622,10 +638,13 @@ def rekey_closets(closets_col, plan: RoomPlan) -> dict:
     targets: dict[tuple[str, str], str] = {}
     ambiguous = 0
     for (source, old_room), counts in plan.source_moves.items():
-        winner, n = max(sorted(counts.items()), key=lambda kv: kv[1])
-        targets[(source, old_room)] = winner
-        if len(counts) > 1:
-            ambiguous += sum(counts.values()) - n
+        rooms = {r: n for r, n in counts.items() if r}
+        if not rooms:
+            continue  # nothing of this source moved
+        if len(rooms) > 1 or counts.get(""):
+            ambiguous += sum(rooms.values())
+            continue
+        targets[(source, old_room)] = next(iter(rooms))
     ids: list[str] = []
     metas: list[dict] = []
     stamp = datetime.now(timezone.utc).isoformat()

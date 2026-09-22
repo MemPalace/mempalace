@@ -525,11 +525,40 @@ def test_rekey_closets_follows_the_drawers_and_reports_splits():
         ]
     )
     report = rekey_closets(closets, plan)
-    # s1 split 2 releases / 1 bug-fixes: the closet follows the majority and
-    # the minority is reported, since one record cannot carry two rooms.
-    assert closets.rows["k1"]["meta"]["room"] == "releases"
+    # s1 split across two rooms, so its closet cannot represent both and stays
+    # put; s2 moved wholly, so its closet follows.
+    assert closets.rows["k1"]["meta"]["room"] == "technical"
     assert closets.rows["k2"]["meta"]["room"] == "bug-fixes"
     assert closets.rows["k3"]["meta"]["room"] == "decisions"  # other room: untouched
     assert closets.rows["k4"]["meta"]["room"] == "technical"  # other wing: untouched
-    assert report == {"moved": 2, "ambiguous": 1}
+    assert report == {"moved": 1, "ambiguous": 3}
     assert rekey_closets(None, plan) == {"moved": 0, "ambiguous": 0}
+
+
+def test_rekey_closets_leaves_a_source_whose_drawers_only_partly_moved():
+    """A closet indexes the whole source: moving it would strand the stayers."""
+    from mempalace.rooms import rekey_closets
+
+    rows = [
+        {
+            "id": "a",
+            "meta": {"wing": "w", "room": "technical", "source_file": "s1"},
+            "doc": "cut the release",
+            "emb": [1.0, 0.0],
+        },
+        # Below the threshold, so it stays in technical.
+        {
+            "id": "b",
+            "meta": {"wing": "w", "room": "technical", "source_file": "s1"},
+            "doc": "unrelated",
+            "emb": [0.71, 0.71],
+        },
+    ]
+    col = FakeCollection(rows)
+    plan = plan_rooms(col, "w", EmbeddingRoomDecider(_room_set(), FakeEmbed()), threshold=0.9)
+    apply_plan(col, plan)
+    closets = FakeCollection(
+        [{"id": "k", "meta": {"wing": "w", "room": "technical", "source_file": "s1"}}]
+    )
+    assert rekey_closets(closets, plan) == {"moved": 0, "ambiguous": 1}
+    assert closets.rows["k"]["meta"]["room"] == "technical"
