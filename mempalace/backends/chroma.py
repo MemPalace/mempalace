@@ -3397,7 +3397,7 @@ class ChromaBackend(BaseBackend):
             _close_client(self._clients.pop(path, None))
             self._freshness.pop(path, None)
             # Without its stat record the next open cannot see a change on disk, so
-            # re-arm the HNSW pre-checks for it (#1573).
+            # re-arm the HNSW pre-checks for it.
             ChromaBackend._quarantined_paths.discard(path)
 
     def close(self) -> None:

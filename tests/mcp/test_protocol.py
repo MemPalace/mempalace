@@ -917,7 +917,7 @@ class TestCacheInvalidation:
     def test_own_writes_and_searches_do_not_rebuild_the_client(
         self, monkeypatch, config, palace_path, kg
     ):
-        """The server's own activity must not reload the index (#2535).
+        """The server's own activity must not reload the index.
 
         Filing a drawer writes chroma.sqlite3 and every search opens its
         collections, which writes it too. None of that is somebody else's
@@ -946,7 +946,7 @@ class TestCacheInvalidation:
         assert built == [], f"the server's own activity rebuilt the client {len(built)} time(s)"
 
     def test_external_write_rebuilds_the_client_once(self, monkeypatch, config, palace_path, kg):
-        """A write by another process must still force a rebuild (#2002, #2535).
+        """A write by another process must still force a rebuild.
 
         Absorbing it would keep serving the pre-write HNSW segment. The rebuild
         must also be the only one: filing and searching after it go on using
@@ -1002,7 +1002,7 @@ class TestCacheInvalidation:
     def test_search_after_a_server_read_sees_a_drawer_another_process_wrote(
         self, monkeypatch, config, palace_path, kg
     ):
-        """Search must answer from the palace as it is after a peer's write (#608).
+        """Search must answer from the palace as it is after a peer's write.
 
         ``check_duplicate`` opens the client through ``_get_client``. When that
         kept a client of its own, reopening it also closed the search path's
@@ -1462,7 +1462,7 @@ class TestCacheInvalidation:
         """The retry must not reopen the collection on the client that just failed.
 
         It drops chromadb's System cache, re-runs ``quarantine_stale_hnsw`` on the
-        palace and only then builds the new client (#1322).
+        palace and only then builds the new client.
         """
         import chromadb
         from chromadb.api.client import Client
@@ -1763,7 +1763,7 @@ class TestStructuredErrors:
 
     def test_tool_reconnect_rearms_quarantine_gate(self, monkeypatch):
         """``tool_reconnect`` must clear the per-process quarantine gate so
-        HNSW safety checks re-run on the next open (#1573), even when closing
+        HNSW safety checks re-run on the next open, even when closing
         the backend's handles fails."""
         from mempalace import mcp_server
         from mempalace import palace as palace_module
@@ -1789,7 +1789,7 @@ class TestStructuredErrors:
 
     def test_get_client_rearms_quarantine_on_reconnect(self, monkeypatch, config, palace_path, kg):
         """A reconnect through ``_get_client`` must prepare the palace with the quarantine
-        gate cleared, so HNSW safety checks re-run (#1573)."""
+        gate cleared, so HNSW safety checks re-run."""
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server
         from mempalace.backends.chroma import ChromaBackend
@@ -1824,7 +1824,7 @@ class TestStructuredErrors:
     def test_quarantine_gate_is_rearmed_after_the_backend_client_was_closed(
         self, monkeypatch, config, palace_path, kg, first_open
     ):
-        """The next open after a closed backend client must re-run the HNSW checks (#1573).
+        """The next open after a closed backend client must re-run the HNSW checks.
 
         A mine's closing integrity check, a cache reset and writer promotion all
         close the backend's client, which drops its stat record. The next open,
@@ -1911,7 +1911,7 @@ class TestStructuredErrors:
     ):
         """The capacity probe must see a changed palace before ``_get_client`` reopens it.
 
-        #1222: an undersized segment can crash the server while it loads.
+        An undersized segment can crash the server while it loads.
         """
         import chromadb
 

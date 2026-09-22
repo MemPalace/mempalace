@@ -63,7 +63,7 @@ def _get_client():
     if _client_cache is None or inode_changed or mtime_changed:
         # Run the HNSW capacity probe BEFORE chromadb opens the segment --
         # if the index is severely undersized, segment load can segfault
-        # the whole MCP server (#1222). The probe reads sqlite, the
+        # the whole MCP server. The probe reads sqlite, the
         # metadata pickle and the header.bin prefix; it never loads the index.
         _refresh_vector_disabled_flag()
     backend = _chroma_backend()
@@ -86,7 +86,7 @@ def _adopt_opened_collection(raw):
 
     ``_pin_hnsw_threads`` writes chroma.sqlite3, so the open itself moves the
     mtime the backend compares against. ``backend=`` makes writes through the
-    wrapper re-baseline it too (#2307). A write by another process that lands
+    wrapper re-baseline it too. A write by another process that lands
     during the open is absorbed into the new stamp, as it is for the backend's
     own opens (see ``ChromaBackend._restamp``).
     """

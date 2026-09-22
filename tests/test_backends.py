@@ -2350,7 +2350,7 @@ def test_chroma_backend_resets_system_cache_on_inode_change(tmp_path, monkeypatc
 
 def test_chroma_backend_drain_rearms_quarantine_for_every_dropped_palace(tmp_path, monkeypatch):
     """A drain forgets every palace's stat record, so each of them must re-run
-    the HNSW pre-checks on its next open, not only the palace that changed (#1573)."""
+    the HNSW pre-checks on its next open, not only the palace that changed."""
     from chromadb.api.client import SharedSystemClient
 
     changed, other = str(tmp_path / "changed"), str(tmp_path / "other")
