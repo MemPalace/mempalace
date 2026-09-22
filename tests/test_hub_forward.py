@@ -388,6 +388,7 @@ class TestForwardSearchToHub:
                 results=8,
                 since="2026-08-01",
                 before="2026-09-01",
+                expand_wings=True,
             )
             assert cli._forward_search_to_hub(args, palace) is True
             (request,) = hub.requests

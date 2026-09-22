@@ -3,7 +3,9 @@ if __name__ != "mempalace.searcher":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.searcher")
 
 
-def _expand_wing_list(query, palace_path, col, expand_wings, wing, room, source_file, thin):
+def _expand_wing_list(
+    query, palace_path, expand_wings, wing, room, source_file, thin, collection_name=None
+):
     """Score wings for additive expansion when the baseline is thin and
     unfiltered. Returns the wing list or ``None`` when expansion should
     not fire."""
@@ -11,8 +13,82 @@ def _expand_wing_list(query, palace_path, col, expand_wings, wing, room, source_
         return None
     from mempalace.wing_affinity import expand_wings as _score_expand
 
-    bound_cfg = MempalaceConfig(palace_path=palace_path)
-    return _score_expand(query, col=col, config=bound_cfg) or None
+    bound_cfg = MempalaceConfig(palace_path=palace_path, collection_name=collection_name)
+    return _score_expand(query, config=bound_cfg) or None
+
+
+def _cli_expand_wings(
+    hits,
+    *,
+    query,
+    palace_path,
+    n_results,
+    since,
+    before,
+    wing,
+    room,
+    expand_wings,
+    col,
+    baseline_ids,
+):
+    """Append cross-wing expansion hits to the CLI baseline in place.
+
+    Baseline hits keep their slots and their hybrid-rank order; expansion
+    hits fill only slots the baseline left empty — re-sorting the merged
+    pool by raw distance would undo the hybrid re-rank and can evict
+    far-vector exact matches. Returns a notice string or None.
+    """
+    if not expand_wings or wing or room or len(hits) >= n_results:
+        return None
+    # The caller's collection is the expansion target — a non-default
+    # collection must not be scored or searched against the default.
+    collection_name = (
+        getattr(col, "name", None) or MempalaceConfig(palace_path=palace_path).collection_name
+    )
+    try:
+        expanded = search_memories(
+            query=query,
+            palace_path=palace_path,
+            n_results=n_results,
+            since=since,
+            before=before,
+            collection_name=collection_name,
+            expand_wings=True,
+        )
+    except Exception:
+        return None
+    info = expanded.get("wing_expansion") or {}
+    sm_hits = expanded.get("results") or []
+    if not info.get("applied") or not sm_hits:
+        return None
+    seen_text = {h["text"] for h in hits}
+    added = 0
+    for h in sm_hits:
+        if len(hits) >= n_results:
+            break
+        did = h.get("drawer_id")
+        if (did and did in baseline_ids) or h.get("text") in seen_text:
+            continue
+        hits.append(
+            {
+                "id": did,
+                "text": h.get("text", ""),
+                "distance": h.get("distance", 0.0),
+                "bm25_score": h.get("bm25_score", 0.0),
+                "metadata": {
+                    "wing": h.get("wing"),
+                    "room": h.get("room"),
+                    "source_file": h.get("source_path") or h.get("source_file"),
+                    "drawer_id": did,
+                },
+            }
+        )
+        added += 1
+    if not added:
+        return None
+    return (
+        f"  Wing expansion: added {added} hit(s) from wing(s): {', '.join(info.get('wings', []))}"
+    )
 
 
 def _print_search_results_bm25_only(
@@ -24,7 +100,8 @@ def _print_search_results_bm25_only(
     stop_words: frozenset = frozenset(),
     since_dt=None,
     before_dt=None,
-    expand_wings: bool = True,
+    expand_wings: bool = False,
+    collection_name=None,
 ) -> None:
     """CLI fallback printer for when HNSW divergence fences off vector search.
 
@@ -56,9 +133,17 @@ def _print_search_results_bm25_only(
     hits = result.get("results", [])
 
     # Additive wing expansion on a thin baseline: query each relevant
-    # wing's BM25 slice and merge — baseline hits are never removed.
+    # wing's BM25 slice and append — baseline hits keep their slots and
+    # order; expansion hits only fill slots the baseline left empty.
     expanded_into = _expand_wing_list(
-        query, palace_path, None, expand_wings, wing, room, None, len(hits) < n_results
+        query,
+        palace_path,
+        expand_wings,
+        wing,
+        room,
+        None,
+        len(hits) < n_results,
+        collection_name=collection_name,
     )
     if expanded_into:
         seen = {h.get("drawer_id") for h in hits}
@@ -83,9 +168,10 @@ def _print_search_results_bm25_only(
                 if did is not None:
                     seen.add(did)
                 added.append(h)
-        if added:
-            hits = sorted(hits + added, key=lambda h: -(h.get("bm25_score") or 0.0))[:n_results]
+        merged = (hits + added)[:n_results]
+        if len(merged) > len(hits):
             print(f"  Wing expansion: added hits from wing(s): {', '.join(expanded_into)}\n")
+        hits = merged
 
     print(
         "\n  NOTICE: vector search disabled — HNSW index has diverged from SQLite.\n"
@@ -131,7 +217,7 @@ def search(
     since: str = None,
     before: str = None,
     collection=None,
-    expand_wings: bool = True,
+    expand_wings: bool = False,
 ):
     """
     Search the palace. Returns verbatim drawer content.
@@ -180,6 +266,7 @@ def search(
                 since_dt=since_dt,
                 before_dt=before_dt,
                 expand_wings=expand_wings,
+                collection_name=MempalaceConfig(palace_path=palace_path).collection_name,
             )
 
         col = _open_collection_or_explain(palace_path, opener=get_collection, read_only=True)
@@ -264,54 +351,20 @@ def search(
 
     # Additive wing expansion on a thin, unfiltered baseline: delegate to
     # search_memories so CLI expansion shares one implementation with the
-    # MCP path, then merge its extra hits into the CLI baseline — baseline
-    # hits are never removed, only appended to and re-ranked.
-    expanded_notice = None
-    thin = len(hits) < n_results or (hits and hits[0]["distance"] > _THIN_TOP_EFFECTIVE_DISTANCE)
-    wings_to_try = _expand_wing_list(query, palace_path, col, expand_wings, wing, room, None, thin)
-    if wings_to_try:
-        try:
-            expanded = search_memories(
-                query=query,
-                palace_path=palace_path,
-                n_results=n_results,
-                since=since,
-                before=before,
-                expand_wings=True,
-            )
-        except Exception:
-            expanded = {}
-        info = expanded.get("wing_expansion") or {}
-        sm_hits = expanded.get("results") or []
-        if info.get("applied") and sm_hits:
-            seen_ids = set(_first_or_empty(results, "ids"))
-            seen_text = {h["text"] for h in hits}
-            added = 0
-            for h in sm_hits:
-                did = h.get("drawer_id")
-                if (did and did in seen_ids) or h.get("text") in seen_text:
-                    continue
-                hits.append(
-                    {
-                        "id": did,
-                        "text": h.get("text", ""),
-                        "distance": h.get("distance", 0.0),
-                        "bm25_score": h.get("bm25_score", 0.0),
-                        "metadata": {
-                            "wing": h.get("wing"),
-                            "room": h.get("room"),
-                            "source_file": h.get("source_path") or h.get("source_file"),
-                            "drawer_id": did,
-                        },
-                    }
-                )
-                added += 1
-            if added:
-                hits = sorted(hits, key=lambda h: h["distance"])[:n_results]
-                expanded_notice = (
-                    f"  Wing expansion: added {added} hit(s) "
-                    f"from wing(s): {', '.join(info.get('wings', []))}"
-                )
+    # MCP path — wing scoring happens exactly once, inside that call.
+    expanded_notice = _cli_expand_wings(
+        hits,
+        query=query,
+        palace_path=palace_path,
+        n_results=n_results,
+        since=since,
+        before=before,
+        wing=wing,
+        room=room,
+        expand_wings=expand_wings,
+        col=col,
+        baseline_ids=set(_first_or_empty(results, "ids")),
+    )
 
     if expanded_notice:
         print(f"\n{expanded_notice}")

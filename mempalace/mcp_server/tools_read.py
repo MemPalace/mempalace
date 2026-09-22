@@ -561,7 +561,7 @@ def tool_search(
     context: str = None,
     candidate_strategy: str = "vector",
     cli_compatible: bool = False,
-    expand_wings: bool = True,
+    expand_wings: bool = False,
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:

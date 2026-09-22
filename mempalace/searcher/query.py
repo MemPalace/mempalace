@@ -140,21 +140,18 @@ def _closet_boosts(closets_col, *, query: str, n_results: int, where: dict) -> d
     return boosts
 
 
-# Cross-wing expansion: a baseline whose best hit sits above this
-# effective_distance is a weak answer — expansion tries to do better.
-_THIN_TOP_EFFECTIVE_DISTANCE = 1.0
-
-
 def _baseline_is_thin(hits: list, n_results: int) -> bool:
-    """True when the baseline under-served the query: fewer hits than asked
-    for, or a top hit whose effective distance marks it as a weak match."""
-    if len(hits) < n_results:
-        return True
-    top = hits[0]
-    score = top.get("effective_distance")
-    if score is None:
-        score = top.get("distance", 9.9)
-    return score > _THIN_TOP_EFFECTIVE_DISTANCE
+    """True when the baseline under-served the query by count — fewer hits
+    than asked for. Expansion is strictly slot-filling (baseline hits keep
+    their slots and order), so a full baseline has no empty slots and
+    expansion could never append: count is the only honest gate, and it
+    also skips the wing-scoring + scoped-query work that a full-but-weak
+    baseline would waste. Thin baselines arise from post-filtered pools
+    (date windows, distance thresholds) or corpora smaller than n_results —
+    wing-scoped queries re-run the same pipeline over a subset whose
+    candidate pool is not truncated the same way, which is where the added
+    recall actually comes from."""
+    return len(hits) < n_results
 
 
 def _bm25_baseline_is_thin(hits: list, n_results: int) -> bool:
@@ -169,18 +166,21 @@ def _expand_result_dict(
     wings_to_try: list,
     fetch_wing,
     n_results: int,
-    rank_key,
 ) -> dict:
-    """Merge wing-scoped results into a finished result dict.
+    """Append wing-scoped results to a finished result dict.
 
-    Additive only: baseline hits are never removed. Dedupes on
-    ``drawer_id``, re-ranks the merged pool, cuts to ``n_results``, and
-    annotates ``wing_expansion`` with exactly what was applied.
+    Strictly additive and order-preserving: baseline hits keep their slots
+    and their order (the baseline was ranked by ``_hybrid_rank``; merging
+    pools and re-sorting by ``effective_distance`` would compare scores
+    computed on different scales and can evict the best baseline hit).
+    Expansion hits are deduped on ``drawer_id``/text and appended after the
+    baseline until ``n_results`` is filled — they only ever occupy slots the
+    baseline left empty. ``added`` counts only hits that survive the cut.
     """
     hits = result.get("results") or []
     seen = {h.get("drawer_id") for h in hits if isinstance(h, dict)}
     seen_text = {h.get("text") for h in hits if isinstance(h, dict)}
-    added = []
+    candidates = []
     for w in wings_to_try:
         try:
             extra = fetch_wing(w)
@@ -196,14 +196,15 @@ def _expand_result_dict(
             if did is not None:
                 seen.add(did)
             seen_text.add(h.get("text"))
-            added.append(h)
-    merged = hits + added
-    merged.sort(key=rank_key)
-    result["results"] = merged[:n_results]
+            candidates.append(h)
+    merged = hits + candidates
+    surviving = merged[:n_results]
+    added = len(surviving) - len(hits)
+    result["results"] = surviving
     result["wing_expansion"] = {
-        "applied": bool(added),
+        "applied": added > 0,
         "wings": wings_to_try,
-        "added": len(added),
+        "added": max(added, 0),
     }
     return result
 
@@ -221,7 +222,6 @@ def _maybe_expand_across_wings(
     source_file,
     n_results: int,
     fetch_wing,
-    rank_key,
     thin_check,
 ) -> dict:
     """Thin-gated additive wing expansion on a finished result dict.
@@ -238,11 +238,13 @@ def _maybe_expand_across_wings(
 
     from mempalace.wing_affinity import expand_wings as _score_expand
 
-    # Bind affinity scoring to the actual search target: the opened
-    # collection for graph signals, a config carrying this palace and
-    # collection for palace-level files.
+    # Bind affinity scoring to the actual search target via the config
+    # alone: build_graph's warm cache is keyed on (palace_path,
+    # collection_name) and the sqlite fast path serves it — one metadata
+    # read, shared by find_tunnels/build_graph inside the scorer. Passing
+    # ``col`` here would bypass both and force a full metadata scan.
     bound_cfg = MempalaceConfig(palace_path=palace_path, collection_name=collection_name)
-    wings = _score_expand(query, col=drawers_col, config=bound_cfg)
+    wings = _score_expand(query, config=bound_cfg)
     if not wings:
         return result
     return _expand_result_dict(
@@ -250,7 +252,6 @@ def _maybe_expand_across_wings(
         wings_to_try=wings,
         fetch_wing=fetch_wing,
         n_results=n_results,
-        rank_key=rank_key,
     )
 
 
@@ -268,7 +269,7 @@ def search_memories(
     candidate_strategy: str = "vector",
     collection_name: str = None,
     lang: Optional[str] = None,
-    expand_wings: bool = True,
+    expand_wings: bool = False,
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
 
@@ -323,12 +324,13 @@ def search_memories(
               When ``max_distance > 0.0`` is also set, BM25-only candidates
               are admitted only if their stored embeddings can be loaded and
               their computed vector distance satisfies that threshold.
-        expand_wings: When True (default) and no wing/room/source_file
-            filter is given, a thin baseline triggers additive cross-wing
-            expansion: the most structurally relevant wings (passive
-            same-room connections, hallways, room names) get their own
-            scoped queries and their hits merge, dedupe, and rerank into
-            the baseline — which is never filtered or reduced.
+        expand_wings: Opt-in (default False). When True and no
+            wing/room/source_file filter is given, a thin baseline triggers
+            additive cross-wing expansion: the most structurally relevant
+            wings (passive same-room connections, hallways, room names) get
+            their own scoped queries and their deduped hits append after
+            the baseline, filling only slots the baseline left empty —
+            baseline hits keep their slots and order.
         lang: Locale code for BM25 stop-word filtering (opt-in). When
             omitted, reads ``MempalaceConfig().lang_explicit`` — returns an
             empty set unless the user has set ``MEMPALACE_LANG`` /
@@ -384,7 +386,6 @@ def search_memories(
                 since_dt=since_dt,
                 before_dt=before_dt,
             ),
-            rank_key=lambda h: -(h.get("bm25_score") or 0.0),
             thin_check=lambda hits: _bm25_baseline_is_thin(hits, n_results),
         )
 
@@ -576,11 +577,6 @@ def search_memories(
             collection_name=collection_name,
             lang=lang,
             expand_wings=False,
-        ),
-        rank_key=lambda h: (
-            h.get("effective_distance")
-            if h.get("effective_distance") is not None
-            else h.get("distance", 9.9)
         ),
         thin_check=lambda h: _baseline_is_thin(h, n_results),
     )

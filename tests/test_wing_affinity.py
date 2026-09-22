@@ -1,10 +1,12 @@
 """Tests for wing_affinity.py and additive cross-wing search expansion.
 
 Expansion contract (see #2341 review): the unfiltered baseline search is
-always preserved. When the baseline is thin — fewer hits than requested,
-or a weak top hit — the most structurally relevant wings get their own
-scoped queries and their hits merge, dedupe, and rerank into the
-baseline. Expansion can never remove a baseline hit.
+always preserved — hits keep their slots AND their order. When the
+baseline is thin — fewer hits than requested, or a weak top hit — the
+most structurally relevant wings get their own scoped queries and their
+deduped hits append after the baseline, filling only empty slots.
+Expansion is opt-in (`expand_wings=True`); it can never remove, reorder,
+or demote a baseline hit.
 """
 
 import json
@@ -165,25 +167,19 @@ def _seed_expansion_palace(palace_path, wing_names=("alpha", "beta"), collection
     return col
 
 
-def _always_thin(monkeypatch):
-    """Force the thin-baseline gate open regardless of hit quality."""
-    monkeypatch.setattr(searcher, "_THIN_TOP_EFFECTIVE_DISTANCE", -1.0)
-
-
 def _result_ids(result):
     return {h.get("drawer_id") for h in result.get("results", [])}
 
 
 class TestAdditiveExpansion:
-    def test_baseline_hit_never_removed_by_expansion(self, tmp_path, monkeypatch):
+    def test_baseline_hit_never_removed_by_expansion(self, tmp_path):
         """Reviewer regression: wings A/B/C score structurally but the best
         semantic drawer sits in wing D — expansion must not remove D."""
         palace = str(tmp_path / "palace")
         _seed_expansion_palace(palace)
-        _always_thin(monkeypatch)
 
-        baseline = search_memories(_QUERY, palace, n_results=3, expand_wings=False)
-        expanded = search_memories(_QUERY, palace, n_results=3, expand_wings=True)
+        baseline = search_memories(_QUERY, palace, n_results=50, expand_wings=False)
+        expanded = search_memories(_QUERY, palace, n_results=50, expand_wings=True)
 
         assert "delta_zebra" in _result_ids(baseline), "baseline must find the D hit"
         assert "delta_zebra" in _result_ids(expanded), "expansion must not drop the D hit"
@@ -193,52 +189,56 @@ class TestAdditiveExpansion:
 
         info = expanded.get("wing_expansion")
         assert info is not None
-        assert info["applied"] is True
-        assert info["added"] >= 1
+        # Baseline hits are appended-first and the seeded corpus is smaller
+        # than n_results, so expansion ran (wings scored) but may add 0 —
+        # every drawer is already in the unfiltered baseline.
         assert set(info["wings"]) <= {"alpha", "beta"}
+        assert info["added"] >= 0
 
-    def test_expansion_disabled_flag(self, tmp_path, monkeypatch):
+    def test_expansion_disabled_flag(self, tmp_path):
         palace = str(tmp_path / "palace")
         _seed_expansion_palace(palace)
-        _always_thin(monkeypatch)
 
-        result = search_memories(_QUERY, palace, n_results=3, expand_wings=False)
+        result = search_memories(_QUERY, palace, n_results=50, expand_wings=False)
         assert "wing_expansion" not in result
 
-    def test_explicit_filters_skip_expansion(self, tmp_path, monkeypatch):
+    def test_explicit_filters_skip_expansion(self, tmp_path):
         """A caller that names a wing/room/source_file asked for exactly
         that scope — expansion must not silently widen it."""
         palace = str(tmp_path / "palace")
         _seed_expansion_palace(palace)
-        _always_thin(monkeypatch)
 
-        result = search_memories(_QUERY, palace, n_results=3, wing="alpha")
+        result = search_memories(_QUERY, palace, n_results=50, wing="alpha", expand_wings=True)
         assert "wing_expansion" not in result
         assert all(h["wing"] == "alpha" for h in result["results"])
 
-    def test_healthy_baseline_skips_expansion(self, tmp_path, monkeypatch):
-        """Enough hits at a good top score → expansion never fires."""
+    def test_healthy_baseline_skips_expansion(self, tmp_path):
+        """A baseline that fills n_results has no empty slots — expansion
+        never fires."""
         palace = str(tmp_path / "palace")
         _seed_expansion_palace(palace)
-        # Threshold so strict no hit ever reads as weak, and len(hits)
-        # meets n_results, so neither thin condition holds.
-        monkeypatch.setattr(searcher, "_THIN_TOP_EFFECTIVE_DISTANCE", 99.0)
 
-        result = search_memories(_QUERY, palace, n_results=3)
+        result = search_memories(_QUERY, palace, n_results=3, expand_wings=True)
         assert "wing_expansion" not in result
 
-    def test_union_strategy_expands_with_same_scope(self, tmp_path, monkeypatch):
+    def test_union_strategy_expands_with_same_scope(self, tmp_path):
         """candidate_strategy='union' routes wing-scoped expansion through
-        the same candidate merge as the baseline."""
+        the same candidate merge as the baseline — and union's BM25-only
+        hits carry distance=None, which must not crash the thin check
+        (igorls's max_distance=0 TypeError repro)."""
         palace = str(tmp_path / "palace")
         _seed_expansion_palace(palace)
-        _always_thin(monkeypatch)
 
         result = search_memories(
-            _QUERY, palace, n_results=3, candidate_strategy="union", expand_wings=True
+            _QUERY,
+            palace,
+            n_results=50,
+            candidate_strategy="union",
+            max_distance=0,
+            expand_wings=True,
         )
         info = result.get("wing_expansion")
-        assert info is not None and info["applied"] is True
+        assert info is not None
         assert set(info["wings"]) <= {"alpha", "beta"}
         assert "delta_zebra" in _result_ids(result)
 
@@ -302,7 +302,7 @@ class TestAdditiveExpansion:
         )
         assert set(wings_cfg) <= {"xray", "yankee"}
 
-    def test_sequential_palace_isolation(self, tmp_path, monkeypatch):
+    def test_sequential_palace_isolation(self, tmp_path):
         """Two palaces searched in one process: the second search must not
         be served the first palace's graph from the warm cache."""
         from mempalace.palace_graph import invalidate_graph_cache
@@ -311,10 +311,9 @@ class TestAdditiveExpansion:
         palace_b = str(tmp_path / "palace_b")
         _seed_expansion_palace(palace_a)
         _seed_expansion_palace(palace_b, wing_names=("omega1", "omega2"))
-        _always_thin(monkeypatch)
 
-        first = search_memories(_QUERY, palace_a, n_results=3, expand_wings=True)
-        second = search_memories(_QUERY, palace_b, n_results=3, expand_wings=True)
+        first = search_memories(_QUERY, palace_a, n_results=50, expand_wings=True)
+        second = search_memories(_QUERY, palace_b, n_results=50, expand_wings=True)
         invalidate_graph_cache()
 
         first_wings = set((first.get("wing_expansion") or {}).get("wings") or [])
@@ -346,7 +345,7 @@ class TestAdditiveExpansion:
         assert "omega1" in wings_b
         assert "alpha" not in wings_b
 
-    def test_explicit_tunnels_json_not_read(self, tmp_path, monkeypatch):
+    def test_explicit_tunnels_json_not_read(self, tmp_path):
         """Expansion uses passive same-room connections only — an explicit
         tunnels.json record pointing at an unrelated wing must not pull
         that wing into the expansion set."""
@@ -379,25 +378,97 @@ class TestAdditiveExpansion:
                 ],
                 f,
             )
-        _always_thin(monkeypatch)
-
-        result = search_memories(_QUERY, palace, n_results=3, expand_wings=True)
+        result = search_memories(_QUERY, palace, n_results=50, expand_wings=True)
         info = result.get("wing_expansion")
         assert info is not None
         assert "quarantine" not in (info["wings"] or [])
 
-    def test_expansion_error_falls_back_to_baseline(self, tmp_path, monkeypatch):
+    def test_expansion_error_falls_back_to_baseline(self, tmp_path):
         """A wing-scoped expansion query failing must not lose the
         baseline — the merged result still contains every baseline hit."""
         palace = str(tmp_path / "palace")
         _seed_expansion_palace(palace)
-        _always_thin(monkeypatch)
 
-        baseline = search_memories(_QUERY, palace, n_results=3, expand_wings=False)
+        baseline = search_memories(_QUERY, palace, n_results=50, expand_wings=False)
         with (
             patch("mempalace.wing_affinity.build_graph", side_effect=RuntimeError("graph boom")),
             patch("mempalace.wing_affinity.find_tunnels", side_effect=RuntimeError("tunnels boom")),
         ):
-            result = search_memories(_QUERY, palace, n_results=3, expand_wings=True)
+            result = search_memories(_QUERY, palace, n_results=50, expand_wings=True)
         assert "error" not in result
         assert _result_ids(baseline) <= _result_ids(result)
+
+
+class TestAppendOnlyMerge:
+    """Merge semantics: baseline keeps slots and order; expansion fills
+    only slots the baseline left empty. No re-sort of the merged pool —
+    baseline effective_distance and expansion scores are different scales."""
+
+    def test_baseline_keeps_top_slot_when_added_hit_scores_better(self):
+        """igorls regression: an expansion hit scoring better than the
+        baseline must still append after it — no re-rank eviction."""
+        result = {
+            "results": [
+                {"drawer_id": "b1", "text": "b1 text", "effective_distance": 0.9},
+                {"drawer_id": "b2", "text": "b2 text", "effective_distance": 0.95},
+            ]
+        }
+
+        def fetch(_wing):
+            return {"results": [{"drawer_id": "x1", "text": "x1 text", "effective_distance": 0.01}]}
+
+        out = searcher._expand_result_dict(
+            result, wings_to_try=["w"], fetch_wing=fetch, n_results=5
+        )
+        ids = [h["drawer_id"] for h in out["results"]]
+        assert ids == ["b1", "b2", "x1"], "baseline order must be preserved exactly"
+        assert out["wing_expansion"]["added"] == 1
+
+    def test_added_counts_only_surviving_hits(self):
+        """added = hits that survive the n_results cut, not candidates seen."""
+        result = {
+            "results": [
+                {"drawer_id": "b1", "text": "b1 text", "effective_distance": 0.9},
+                {"drawer_id": "b2", "text": "b2 text", "effective_distance": 0.95},
+            ]
+        }
+
+        def fetch(_wing):
+            return {"results": [{"drawer_id": f"x{i}", "text": f"x{i} text"} for i in range(5)]}
+
+        out = searcher._expand_result_dict(
+            result, wings_to_try=["w"], fetch_wing=fetch, n_results=3
+        )
+        assert len(out["results"]) == 3
+        assert out["wing_expansion"]["added"] == 1, "only one slot was empty"
+        assert out["results"][-1]["drawer_id"] == "x0"
+
+    def test_baseline_not_extended_past_n_results(self):
+        """A full baseline never gains expansion hits beyond n_results."""
+        result = {"results": [{"drawer_id": f"b{i}", "text": f"b{i} text"} for i in range(3)]}
+        out = searcher._expand_result_dict(
+            result,
+            wings_to_try=["w"],
+            fetch_wing=lambda w: {"results": [{"drawer_id": "x", "text": "x"}]},
+            n_results=3,
+        )
+        assert len(out["results"]) == 3
+        assert out["wing_expansion"]["added"] == 0
+        assert out["wing_expansion"]["applied"] is False
+
+    def test_thin_check_is_count_only(self):
+        """Thin = fewer hits than requested. Union-mode BM25-only hits
+        carry distance=None — a count-based check can never TypeError on
+        them (igorls's max_distance=0 crash repro)."""
+        assert searcher._baseline_is_thin([{"distance": None, "bm25_score": 1.4}], 5) is True
+        assert searcher._baseline_is_thin([{"distance": None}] * 5, 5) is False
+        assert searcher._baseline_is_thin([], 5) is True
+
+    def test_expansion_opt_in_by_default(self, tmp_path):
+        """Expansion is off unless the caller asks: a thin baseline with no
+        expand_wings argument returns no wing_expansion envelope."""
+        palace = str(tmp_path / "palace")
+        _seed_expansion_palace(palace)
+
+        result = search_memories(_QUERY, palace, n_results=50)
+        assert "wing_expansion" not in result

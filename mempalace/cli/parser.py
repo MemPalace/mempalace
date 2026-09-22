@@ -326,13 +326,14 @@ def main():
         help="Only drawers filed strictly before this ISO date/datetime (exclusive)",
     )
     p_search.add_argument(
-        "--no-expand-wings",
+        "--expand-wings",
         dest="expand_wings",
-        action="store_false",
-        default=True,
+        action="store_true",
+        default=False,
         help=(
-            "Disable additive cross-wing expansion on thin unfiltered "
-            "searches (baseline hits are never removed when enabled)"
+            "Enable additive cross-wing expansion on thin unfiltered "
+            "searches (opt-in; expansion hits only fill slots the "
+            "baseline leaves empty)"
         ),
     )
 

@@ -2,10 +2,10 @@
 
 Given a search query, computes a relevance score for each wing in the
 palace using existing structural signals. ``search_memories`` uses these
-scores for additive cross-wing expansion: when an unfiltered baseline
-comes back thin, the best-scoring wings get their own scoped queries and
-their hits merge into the baseline pool — the baseline itself is never
-filtered or reduced.
+scores for opt-in additive cross-wing expansion: when an unfiltered
+baseline returns fewer hits than requested, the best-scoring wings get
+their own scoped queries and their deduped hits append after the
+baseline — baseline hits keep their slots and their order.
 
 The scoring is query-time only — no writes to the KG, no sidecar tables,
 no synthetic facts.
@@ -20,11 +20,11 @@ Structural signals used:
    query tokens matching entity names boost the wing holding them.
 3. **Room name token overlap** within the same graph.
 
-Target isolation: pass ``col`` (the already-opened search collection) so
-graph signals derive from the exact search target; ``config`` must be
-bound to the target's ``palace_path``/``collection_name`` so the palace
-files read are the right ones. ``build_graph``'s warm cache is keyed on
-that identity, and an explicit ``col`` bypasses it entirely.
+Target isolation: ``config`` must be bound to the target's
+``palace_path``/``collection_name`` — ``build_graph``'s warm cache is
+keyed on that identity and the sqlite fast path serves it. Passing an
+explicit ``col`` bypasses the cache and forces a full metadata scan, so
+callers should prefer the config-keyed path.
 """
 
 from __future__ import annotations

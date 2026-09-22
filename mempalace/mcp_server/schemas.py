@@ -342,11 +342,9 @@ TOOLS = {
                 "expand_wings": {
                     "type": "boolean",
                     "description": (
-                        "When true (default) and no wing/room/source_file filter is set, "
-                        "a thin baseline triggers additive cross-wing expansion: the most "
-                        "structurally relevant wings are queried separately and their hits "
-                        "merge into the results (baseline hits are never removed). Set false "
-                        "to disable expansion."
+                        "Opt-in (default false). On a thin unfiltered baseline, also "
+                        "query the most structurally related wings and append their "
+                        "deduped hits after the baseline's."
                     ),
                 },
                 "context": {

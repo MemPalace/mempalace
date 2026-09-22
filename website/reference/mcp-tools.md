@@ -70,7 +70,7 @@ Semantic search. Returns verbatim drawer content with similarity scores.
 | `room` | string | No | Filter by room |
 | `since` | string | No | Include drawers filed on or after this ISO date/datetime |
 | `before` | string | No | Include drawers filed strictly before this ISO date/datetime |
-| `expand_wings` | boolean | No | When true (default) and no wing/room/source_file filter is set, a thin baseline triggers additive cross-wing expansion — structurally related wings are queried separately and their hits merge in. Baseline hits are never removed. |
+| `expand_wings` | boolean | No | Opt-in (default false). When true and no wing/room/source_file filter is set, a thin baseline triggers additive cross-wing expansion — structurally related wings are queried separately and their deduped hits append after the baseline, filling only slots the baseline left empty. |
 
 **Returns:** `{ query, filters, results: [{ text, wing, room, source_file, similarity }] }`
 
@@ -78,8 +78,9 @@ When expansion fires, the response includes `wing_expansion`:
 `{ applied, wings, added }` — the wings queried and how many hits were
 merged in. Expansion uses structural signals only (rooms appearing in
 multiple wings, hallway entity overlap, room-name token overlap); it
-never reads or writes `tunnels.json`, and it cannot remove or reorder
-below any baseline hit — it only appends and re-ranks candidates.
+never reads or writes `tunnels.json`. Baseline hits keep their slots and
+their order — expansion hits only append into slots the baseline left
+empty, and `added` counts only hits that survive the result cut.
 
 Each hit also includes date provenance: `filed_at` (equal to legacy `created_at`),
 legacy `authored_at`, `authored_at_source`, `content_date`, and
