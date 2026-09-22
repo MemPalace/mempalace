@@ -56,11 +56,11 @@ After each action, say exactly what changed, in numbers.
 For each group, show the spellings and their drawer counts from `rooms`
 data, then ask:
 
-> Wings `liquid-llm` (31 drawers) and `liquid_llm` (158 drawers) are one
+> Wings `acme-app` (31 drawers) and `acme_app` (158 drawers) are one
 > project. Which should survive?
-> 1. Merge into `liquid_llm` (Recommended: the larger one, and the
+> 1. Merge into `acme_app` (Recommended: the larger one, and the
 >    underscore form matches how `init` normalizes names)
-> 2. Merge into `liquid-llm`
+> 2. Merge into `acme-app`
 > 3. Keep both (they are different things)
 
 To merge: list the drawers in the losing wing with `mempalace_list_drawers`
@@ -95,9 +95,9 @@ each wing's count.
 These are **not scored** because siblings like `mempalace` / `mempalace-ts`
 are often legitimately separate. Ask per pair:
 
-> `incognita` (2 drawers) and `incognita_game` (36 drawers): same project?
-> 1. Yes, merge into `incognita_game` (Recommended: keeps the fuller wing)
-> 2. Yes, merge into `incognita`
+> `arcade` (2 drawers) and `arcade_game` (36 drawers): same project?
+> 1. Yes, merge into `arcade_game` (Recommended: keeps the fuller wing)
+> 2. Yes, merge into `arcade`
 > 3. No, separate projects
 
 Merge as in 3a. Accept "no" without argument.

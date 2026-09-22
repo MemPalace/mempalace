@@ -70,7 +70,7 @@ def _endpoint_is_local(url: Optional[str]) -> bool:
         return True
     if host.endswith(".local"):
         return True
-    # A single-label hostname (``x870e-9950x3d``, ``gpu-box``) has no domain,
+    # A single-label hostname (``gpu-box``, ``gpu-box``) has no domain,
     # so it can only resolve through the LAN: mDNS, the router's DNS, a hosts
     # file, or a search domain the user configured. It is the user's own
     # network by construction, the same as ``.local``.

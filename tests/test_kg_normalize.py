@@ -18,8 +18,8 @@ from tests.test_rooms import FakeProvider
 
 
 def _seed(kg):
-    kg.add_triple("pollstergraph", "deployed_commit", "fc81c6f6", valid_from="2026-08-12")
-    kg.add_triple("LiquidLLM", "appearance_default", "dark", valid_from="2026-08-19")
+    kg.add_triple("weatherstation", "deployed_commit", "fc81c6f6", valid_from="2026-08-12")
+    kg.add_triple("AcmeApp", "appearance_default", "dark", valid_from="2026-08-19")
     kg.add_triple("Igor", "works_on", "mempalace", valid_from="2026-01-01")
     kg.add_triple("old", "gone_predicate", "x", valid_from="2026-01-01", valid_to="2026-02-01")
 
@@ -28,8 +28,8 @@ def test_off_vocabulary_facts_lists_only_open_foreign_predicates(kg):
     _seed(kg)
     facts = off_vocabulary_facts(kg, DEFAULT_VOCABULARY)
     assert [(f["subject"], f["predicate"]) for f in facts] == [
-        ("pollstergraph", "deployed_commit"),
-        ("LiquidLLM", "appearance_default"),
+        ("weatherstation", "deployed_commit"),
+        ("AcmeApp", "appearance_default"),
     ]
 
 
@@ -46,7 +46,7 @@ def test_plan_normalize_keeps_vocabulary_rows_and_rejects_others(kg):
     assert plan["facts"] == [
         {
             "id": facts[0]["id"],
-            "subject": "pollstergraph",
+            "subject": "weatherstation",
             "old_predicate": "deployed_commit",
             "old_object": "fc81c6f6",
             "predicate": "status",
@@ -70,12 +70,12 @@ def test_apply_normalize_supersedes_at_one_boundary_and_keeps_history(kg):
     assert result["applied"] == 1
     now = {
         (t["predicate"], t["object"])
-        for t in kg.query_entity("pollstergraph", as_of="2026-09-22T00:00:00Z")
+        for t in kg.query_entity("weatherstation", as_of="2026-09-22T00:00:00Z")
     }
     assert ("status", "deployed commit fc81c6f6") in now
     assert ("deployed_commit", "fc81c6f6") not in now
     before = {
-        (t["predicate"], t["object"]) for t in kg.query_entity("pollstergraph", as_of="2026-08-20")
+        (t["predicate"], t["object"]) for t in kg.query_entity("weatherstation", as_of="2026-08-20")
     }
     assert ("deployed_commit", "fc81c6f6") in before
     assert off_vocabulary_facts(kg, DEFAULT_VOCABULARY)[0]["predicate"] == "appearance_default"

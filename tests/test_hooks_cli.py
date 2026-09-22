@@ -2662,8 +2662,8 @@ def test_ingest_wing_uses_the_project_from_cwd(tmp_path):
 def test_ingest_wing_collapses_worktrees_and_hyphens(tmp_path):
     from mempalace.hooks_cli import _ingest_wing
 
-    path = _write_transcript_with_cwd(tmp_path, "/Users/me/dev/liquid-llm/.claude/worktrees/x")
-    assert _ingest_wing(path) == "liquid_llm"
+    path = _write_transcript_with_cwd(tmp_path, "/Users/me/dev/acme-app/.claude/worktrees/x")
+    assert _ingest_wing(path) == "acme_app"
 
 
 def test_ingest_wing_home_directory_sessions_go_to_the_workstation(tmp_path, monkeypatch):

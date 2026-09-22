@@ -41,7 +41,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   palace. It scores five layers 0–100 and lists concrete findings: the share of
   drawers in generic rooms (`technical`, `architecture`, `planning`, `general`,
   `problems`), wings whose rooms are flat, wing and room names that are one
-  name spelled two ways (`liquid-llm` / `liquid_llm`, `release-3.6.0` /
+  name spelled two ways (`acme-app` / `acme_app`, `release-3.6.0` /
   `release_3_6_0`), stub wings, tunnels that were never traversed or link
   generic entity names, hallways that link an entity to its own file or path
   spelling (`main.zig` ↔ `src/main.zig`), and knowledge-graph predicates used
@@ -94,7 +94,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   transcript path encodes (Claude Code project directories, including
   subagent transcripts and Claude/Codex worktrees; Codex rollouts via the
   `cwd` in the file when it is readable), resolves each to an existing wing
-  whose name the key ends with (`p--rioblocks-bentokit` → `bentokit`) or a
+  whose name the key ends with (`p--acme-portal` → `portal`) or a
   derived name, and writes `<palace>/wings/split-<wing>.json` for review;
   `--yes` re-keys drawers and their closets under the palace lock and drops
   the split wing's hallway records. `mempalace audit` now flags a wing that

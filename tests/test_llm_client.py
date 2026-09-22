@@ -420,7 +420,7 @@ def test_ollama_provider_default_endpoint_is_local():
 def test_single_label_lan_hostname_is_local():
     from mempalace.llm_client import _endpoint_is_local
 
-    assert _endpoint_is_local("http://x870e-9950x3d:8010")
+    assert _endpoint_is_local("http://gpu-box:8010")
     assert _endpoint_is_local("http://gpu-box:11434/v1")
     assert not _endpoint_is_local("https://api.openai.com")
     assert not _endpoint_is_local("http://gpu-box.example.com:8010")

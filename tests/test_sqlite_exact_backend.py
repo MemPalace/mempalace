@@ -942,12 +942,12 @@ def test_search_closets_use_lexical_not_vector_on_sqlite_exact(tmp_path, monkeyp
     closets = get_closets_collection(str(tmp_path), create=True)
     drawers.add(
         ids=["d1"],
-        documents=["meshguard trust path"],
+        documents=["meshkit trust path"],
         metadatas=[{"source_file": "a.md", "wing": "w", "room": "r", "chunk_index": 0}],
     )
     closets.add(
         ids=["c1"],
-        documents=["topic|meshguard|→d1"],
+        documents=["topic|meshkit|→d1"],
         metadatas=[{"source_file": "a.md", "wing": "w"}],
     )
 
@@ -968,7 +968,7 @@ def test_search_closets_use_lexical_not_vector_on_sqlite_exact(tmp_path, monkeyp
     monkeypatch.setattr(SQLiteExactCollection, "query", wrapped_query)
     monkeypatch.setattr(SQLiteExactCollection, "lexical_search", wrapped_lex)
 
-    result = search_memories("meshguard", str(tmp_path), n_results=1)
+    result = search_memories("meshkit", str(tmp_path), n_results=1)
     assert "error" not in result
     assert called["lex"] == 1
     assert called["query"] == 0
@@ -1640,10 +1640,8 @@ def test_hybrid_search_keeps_closet_boost_under_writer_lease(tmp_path, monkeypat
     backend, drawers = _collection(tmp_path)
     closets = backend.get_collection(str(tmp_path), "mempalace_closets", create=True)
     meta = {"source_file": "fixture.md", "wing": "project", "room": "notes", "chunk_index": 0}
-    drawers.add(
-        ids=["a"], documents=["meshguard memory"], metadatas=[meta], embeddings=[[1.0, 0.0]]
-    )
-    closets.add(ids=["c"], documents=["meshguard index"], metadatas=[meta], embeddings=[[1.0, 0.0]])
+    drawers.add(ids=["a"], documents=["meshkit memory"], metadatas=[meta], embeddings=[[1.0, 0.0]])
+    closets.add(ids=["c"], documents=["meshkit index"], metadatas=[meta], embeddings=[[1.0, 0.0]])
     backend.close()
     monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", backend_name)
     monkeypatch.setattr(
@@ -1664,7 +1662,7 @@ with mine_palace_lock(sys.argv[1]):
     )
     try:
         assert holder.stdout.readline().strip() == "ready"
-        result = search_memories("meshguard", str(tmp_path), n_results=1)
+        result = search_memories("meshkit", str(tmp_path), n_results=1)
         assert "error" not in result
         assert result["results"][0]["matched_via"] == "drawer+closet"
         assert result["results"][0]["closet_boost"] > 0

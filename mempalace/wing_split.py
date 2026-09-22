@@ -39,7 +39,7 @@ _UPDATE_BATCH = 500
 _CLAUDE_PROJECTS_RE = re.compile(r"[/\\]\.claude[/\\]projects[/\\]([^/\\]+)[/\\]")
 _CODEX_SESSIONS_RE = re.compile(r"[/\\]\.codex[/\\]sessions[/\\]")
 # Path segments after which the project name starts when no existing wing
-# matches: ``-Users-igorls-dev-liquid-llm`` → ``liquid-llm``.
+# matches: ``-Users-me-dev-acme-app`` → ``acme-app``.
 _ROOT_MARKERS = ("dev", "projects", "claude-projects", "src", "repos", "code", "work")
 
 
@@ -71,7 +71,7 @@ def project_key(source_file: Optional[str]) -> Optional[str]:
     """The project identifier a transcript path carries, or ``None``.
 
     Claude Code encodes the working directory in the path
-    (``.claude/projects/-Users-igorls-dev-mempalace/<session>.jsonl``,
+    (``.claude/projects/-Users-me-dev-mempalace/<session>.jsonl``,
     subagent transcripts nest below it); the encoded segment is the key.
     Codex rollouts carry no project in the path; the key is the basename of
     the ``cwd`` in the file when the file is on this machine.
@@ -98,10 +98,10 @@ def resolve_target(key: str, existing_wings: Iterable[str]) -> tuple[str, str]:
     """``(target_wing, how)`` for a project key.
 
     ``how`` is ``"existing"`` when the key ends with an existing wing's name
-    at a segment boundary (longest match wins: ``p--rioblocks-bentokit`` →
-    ``bentokit``, ``P--ecce-nfs-e`` → ``nfs_e``), otherwise ``"derived"``
+    at a segment boundary (longest match wins: ``p--acme-portal`` →
+    ``portal``, ``P--org-invoices`` → ``invoices``), otherwise ``"derived"``
     with a name taken from the key after the last root marker
-    (``-Users-igorls-dev-liquid-llm`` → ``liquid_llm``) or, without one,
+    (``-Users-me-dev-acme-app`` → ``acme_app``) or, without one,
     after the leading drive and user segments.
     """
     lowered = key.lower().strip("-")

@@ -16,7 +16,7 @@ from mempalace.tunnels_tool import (
 
 HALLWAYS = [
     {
-        "wing": "liquid_llm",
+        "wing": "acme_app",
         "entity_a": "ChatStore",
         "entity_b": "RootView",
         "co_occurrence_count": 240,
@@ -28,30 +28,30 @@ HALLWAYS = [
         "co_occurrence_count": 12,
     },
     {
-        "wing": "meshguard",
+        "wing": "meshkit",
         "entity_a": "swim.zig",
         "entity_b": "codec.zig",
         "co_occurrence_count": 195,
     },
-    {"wing": "wormdb", "entity_a": "swim.zig", "entity_b": "MeshGuard", "co_occurrence_count": 40},
+    {"wing": "ringdb", "entity_a": "swim.zig", "entity_b": "MeshKit", "co_occurrence_count": 40},
     {
-        "wing": "liquid_llm",
+        "wing": "acme_app",
         "entity_a": "content",
         "entity_b": "RootView",
         "co_occurrence_count": 90,
     },
-    {"wing": "wormdb", "entity_a": "content", "entity_b": "MeshGuard", "co_occurrence_count": 80},
+    {"wing": "ringdb", "entity_a": "content", "entity_b": "MeshKit", "co_occurrence_count": 80},
     {"wing": "gone", "entity_a": "swim.zig", "entity_b": "X", "co_occurrence_count": 999},
 ]
-WINGS = {"liquid_llm", "mempalace-ts", "meshguard", "wormdb"}
+WINGS = {"acme_app", "mempalace-ts", "meshkit", "ringdb"}
 
 
 def test_propose_ranks_by_weaker_side_and_drops_generic_and_missing_wings():
     plan = propose_tunnels(HALLWAYS, WINGS)
     rows = [(r["entity"], r["wing_a"], r["wing_b"], r["strength"]) for r in plan["tunnels"]]
     assert rows == [
-        ("swim.zig", "meshguard", "wormdb", 40),
-        ("ChatStore", "liquid_llm", "mempalace-ts", 12),
+        ("swim.zig", "meshkit", "ringdb", 40),
+        ("ChatStore", "acme_app", "mempalace-ts", 12),
     ]
     assert plan["candidates"] == 2
     assert propose_tunnels(HALLWAYS, WINGS, max_tunnels=1)["tunnels"][0]["entity"] == "swim.zig"
@@ -84,28 +84,28 @@ def test_prune_removes_generic_dangling_and_duplicate_spellings():
     tunnels = [
         {
             "access_count": 3,
-            "source": {"wing": "liquid_llm", "room": "entity:ChatStore"},
+            "source": {"wing": "acme_app", "room": "entity:ChatStore"},
             "target": {"wing": "mempalace-ts", "room": "entity:ChatStore"},
         },
         {
             "access_count": 0,
             "source": {"wing": "mempalace-ts", "room": "entity:ChatStore.swift"},
-            "target": {"wing": "liquid_llm", "room": "entity:ChatStore.swift"},
+            "target": {"wing": "acme_app", "room": "entity:ChatStore.swift"},
         },
         {
             "access_count": 0,
-            "source": {"wing": "liquid_llm", "room": "entity:content"},
-            "target": {"wing": "wormdb", "room": "entity:content"},
+            "source": {"wing": "acme_app", "room": "entity:content"},
+            "target": {"wing": "ringdb", "room": "entity:content"},
         },
         {
             "access_count": 0,
-            "source": {"wing": "meshguard", "room": "entity:swim.zig"},
+            "source": {"wing": "meshkit", "room": "entity:swim.zig"},
             "target": {"wing": "gone", "room": "entity:swim.zig"},
         },
         {
             "access_count": 0,
-            "source": {"wing": "meshguard", "room": "decisions"},
-            "target": {"wing": "wormdb", "room": "decisions"},
+            "source": {"wing": "meshkit", "room": "decisions"},
+            "target": {"wing": "ringdb", "room": "decisions"},
         },
     ]
     kept, report = prune_tunnels(tunnels, WINGS)
@@ -133,7 +133,7 @@ def test_cmd_tunnels_propose_prune_and_dispatch(tmp_path, monkeypatch, capsys):
     assert "proposing the strongest 2" in out and "Plan saved" in out
     cli.cmd_tunnels(Namespace(tunnels_action="propose", yes=True, max=60, **ns))
     assert "Created or refreshed 2 tunnels" in capsys.readouterr().out
-    pg.create_tunnel("liquid_llm", "entity:content", "wormdb", "entity:content", kind="entity")
+    pg.create_tunnel("acme_app", "entity:content", "ringdb", "entity:content", kind="entity")
     cli.cmd_tunnels(Namespace(tunnels_action="prune", yes=False, **ns))
     assert "1 of 3 tunnels are artifacts" in capsys.readouterr().out
     cli.cmd_tunnels(Namespace(tunnels_action="prune", yes=True, **ns))
@@ -150,20 +150,20 @@ def test_cmd_tunnels_propose_prune_and_dispatch(tmp_path, monkeypatch, capsys):
 def test_propose_skips_existing_links_and_covers_unlinked_wings_first():
     existing = [
         {
-            "source": {"wing": "meshguard", "room": "entity:swim.zig"},
-            "target": {"wing": "wormdb", "room": "entity:swim.zig"},
+            "source": {"wing": "meshkit", "room": "entity:swim.zig"},
+            "target": {"wing": "ringdb", "room": "entity:swim.zig"},
         }
     ]
     plan = propose_tunnels(HALLWAYS, WINGS, existing_tunnels=existing)
     rows = [(r["entity"], r["wing_a"], r["wing_b"]) for r in plan["tunnels"]]
-    assert rows == [("ChatStore", "liquid_llm", "mempalace-ts")]
+    assert rows == [("ChatStore", "acme_app", "mempalace-ts")]
     assert plan["candidates"] == 1
 
     # Coverage first: with one slot, a wing pair nobody reaches beats a
     # stronger link between wings that already have a tunnel.
     hallways = HALLWAYS + [
-        {"wing": "meshguard", "entity_a": "Rope", "entity_b": "Q", "co_occurrence_count": 500},
-        {"wing": "wormdb", "entity_a": "Rope", "entity_b": "Q", "co_occurrence_count": 500},
+        {"wing": "meshkit", "entity_a": "Rope", "entity_b": "Q", "co_occurrence_count": 500},
+        {"wing": "ringdb", "entity_a": "Rope", "entity_b": "Q", "co_occurrence_count": 500},
     ]
     plan = propose_tunnels(hallways, WINGS, max_tunnels=1, existing_tunnels=existing)
     assert [(r["entity"], r["strength"]) for r in plan["tunnels"]] == [("ChatStore", 12)]

@@ -10,8 +10,8 @@ the detail the old predicate carried folded into the object.
 Two steps, like ``rooms``:
 
 * **plan** — the LLM proposes, per off-vocabulary fact, the target predicate
-  and the rewritten object (``(pollstergraph, deployed_commit, fc81c6f6)`` →
-  ``(pollstergraph, status, "deployed commit fc81c6f6 on staging")``). The
+  and the rewritten object (``(weatherstation, deployed_commit, fc81c6f6)`` →
+  ``(weatherstation, status, "deployed commit fc81c6f6 on staging")``). The
   plan is written to ``<palace>/kg/normalize.json`` for review; any row can
   be edited or dropped.
 * **apply** — for each row, the old fact is closed and the new one opened at

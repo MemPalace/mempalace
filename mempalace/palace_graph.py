@@ -1066,7 +1066,7 @@ ENTITY_TUNNEL_MIN_COUNT = 3
 ENTITY_TUNNEL_MAX_PER_WING = 25
 # An entity present in more wings than this share of all wings (and in more
 # than ENTITY_TUNNEL_UBIQUITY_MIN_WINGS) is vocabulary, not a link: ``Server``
-# shows up in every project, ``block_num`` in the two Hyperion ones.
+# shows up in every project, ``block_num`` in the two chain-indexer ones.
 ENTITY_TUNNEL_UBIQUITY_SHARE = 0.25
 ENTITY_TUNNEL_UBIQUITY_MIN_WINGS = 3
 

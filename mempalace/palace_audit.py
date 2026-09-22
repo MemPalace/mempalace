@@ -8,7 +8,7 @@ layers that each have a known failure mode:
   (``technical``, ``architecture``, ``planning``, ``general``, ``problems``),
   so the room layer stops carrying information.
 * **naming** — wings and rooms drift into near-duplicate spellings
-  (``liquid-llm`` / ``liquid_llm``, ``release-3.6.0`` / ``release_3_6_0``).
+  (``acme-app`` / ``acme_app``, ``release-3.6.0`` / ``release_3_6_0``).
 * **tunnels** — auto-generated entity tunnels on generic tokens that nobody
   ever traverses.
 * **hallways** — entity co-occurrence links between an entity and its own
@@ -80,8 +80,8 @@ def drift_key(name: str) -> str:
 def _wing_prefix_pairs(wings: list[str]) -> list[tuple[str, str]]:
     """Pairs where one wing is the other plus a suffix at a separator.
 
-    ``incognita`` / ``incognita_game`` and ``pollstergraph`` /
-    ``pollstergraph_global`` are the same project filed twice; ``wing_a`` /
+    ``arcade`` / ``arcade_game`` and ``weatherstation`` /
+    ``weatherstation_global`` are the same project filed twice; ``wing_a`` /
     ``wing_ab`` is not, hence the separator requirement.
     """
     pairs = []

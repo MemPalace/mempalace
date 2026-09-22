@@ -17,21 +17,21 @@ from mempalace.wing_split import (
 )
 from tests.test_rooms import FakeCollection
 
-WINGS = ["bentokit", "nfs_e", "liquid_llm", "mempalace", "mempalace-ts", "bebel_dashboard_ng"]
+WINGS = ["portal", "invoices", "acme_app", "mempalace", "mempalace-ts", "dash_dashboard_ng"]
 
 
 @pytest.mark.parametrize(
     "path, key",
     [
         (
-            r"C:\Users\igorl\.claude\projects\p--rioblocks-bentokit\abc.jsonl",
-            "p--rioblocks-bentokit",
+            r"C:\Users\igorl\.claude\projects\p--acme-portal\abc.jsonl",
+            "p--acme-portal",
         ),
         (
-            "/Users/igorls/.claude/projects/-Users-igorls-dev-mempalace/s/subagents/agent-1.jsonl",
-            "-Users-igorls-dev-mempalace",
+            "/Users/me/.claude/projects/-Users-me-dev-mempalace/s/subagents/agent-1.jsonl",
+            "-Users-me-dev-mempalace",
         ),
-        ("/Users/igorls/dev/bentokit/CHANGELOG.md", None),
+        ("/Users/me/dev/portal/CHANGELOG.md", None),
         ("", None),
         (None, None),
     ],
@@ -45,37 +45,36 @@ def test_project_key_reads_codex_cwd_when_file_exists(tmp_path):
     session.mkdir(parents=True)
     f = session / "rollout-x.jsonl"
     f.write_text(
-        json.dumps({"type": "session_meta", "payload": {"cwd": "/Users/igorls/dev/simpleos"}})
-        + "\n"
+        json.dumps({"type": "session_meta", "payload": {"cwd": "/Users/me/dev/walletapp"}}) + "\n"
     )
-    assert project_key(str(f)) == "simpleos"
+    assert project_key(str(f)) == "walletapp"
     assert project_key(str(session / "missing.jsonl")) is None
 
 
 @pytest.mark.parametrize(
     "key, target, how",
     [
-        ("p--rioblocks-bentokit", "bentokit", "existing"),
-        ("P--ecce-nfs-e", "nfs_e", "existing"),
-        ("-Users-igorls-dev-liquid-llm", "liquid_llm", "existing"),
+        ("p--acme-portal", "portal", "existing"),
+        ("P--org-invoices", "invoices", "existing"),
+        ("-Users-me-dev-acme-app", "acme_app", "existing"),
         (
-            "-Users-igorls-dev-mempalace-ts",
+            "-Users-me-dev-mempalace-ts",
             "mempalace-ts",
             "existing",
         ),  # longest match, not mempalace
-        ("p--UAM-bebel-dashboard-ng", "bebel_dashboard_ng", "existing"),
-        ("-Users-igorls-dev-vaulta-rfp", "vaulta_rfp", "derived"),
+        ("p--UAM-dash-dashboard-ng", "dash_dashboard_ng", "existing"),
+        ("-Users-me-dev-ledger-rfp", "ledger_rfp", "derived"),
         (
             "c--Users-igorl-Claude-Projects-gemma-cerebras-hackathon",
             "gemma_cerebras_hackathon",
             "derived",
         ),
-        ("-home-igorls-matchos", "matchos", "derived"),
-        ("p--afterpic", "afterpic", "derived"),
+        ("-home-me-matcher", "matcher", "derived"),
+        ("p--photoapp", "photoapp", "derived"),
         ("P--MemPalace-mempalace-ts--claude-worktrees-agent-ae3c", "mempalace-ts", "existing"),
-        ("-Users-igorls-dev-mempalace--claude-worktrees-review-pr-1696", "mempalace", "existing"),
-        ("-Users-igorls--codex-worktrees-8c22-mempalace", "mempalace", "existing"),
-        ("-Users-igorls--codex-worktrees-8c22-liquid-llm", "liquid_llm", "existing"),
+        ("-Users-me-dev-mempalace--claude-worktrees-review-pr-1696", "mempalace", "existing"),
+        ("-Users-me--codex-worktrees-8c22-mempalace", "mempalace", "existing"),
+        ("-Users-me--codex-worktrees-8c22-acme-app", "acme_app", "existing"),
     ],
 )
 def test_resolve_target(key, target, how):
@@ -90,7 +89,7 @@ def _rows():
             "meta": {
                 "wing": "convos",
                 "room": "technical",
-                "source_file": cw + "p--rioblocks-bentokit\\1.jsonl",
+                "source_file": cw + "p--acme-portal\\1.jsonl",
             },
         },
         {
@@ -98,7 +97,7 @@ def _rows():
             "meta": {
                 "wing": "convos",
                 "room": "technical",
-                "source_file": cw + "p--rioblocks-bentokit\\2.jsonl",
+                "source_file": cw + "p--acme-portal\\2.jsonl",
             },
         },
         {
@@ -106,25 +105,25 @@ def _rows():
             "meta": {
                 "wing": "convos",
                 "room": "planning",
-                "source_file": cw + "p--afterpic\\1.jsonl",
+                "source_file": cw + "p--photoapp\\1.jsonl",
             },
         },
         {"id": "c1", "meta": {"wing": "convos", "room": "general", "source_file": "notes.md"}},
-        {"id": "z1", "meta": {"wing": "bentokit", "room": "decisions", "source_file": "x"}},
+        {"id": "z1", "meta": {"wing": "portal", "room": "decisions", "source_file": "x"}},
     ]
 
 
 def test_plan_split_groups_and_resolves():
-    plan = plan_split(FakeCollection(_rows()), "convos", ["bentokit", "convos"])
+    plan = plan_split(FakeCollection(_rows()), "convos", ["portal", "convos"])
     assert plan["wing"] == "convos"
-    assert plan["projects"]["p--rioblocks-bentokit"] == {
-        "target": "bentokit",
+    assert plan["projects"]["p--acme-portal"] == {
+        "target": "portal",
         "how": "existing",
         "drawers": 2,
     }
-    assert plan["projects"]["p--afterpic"] == {"target": "afterpic", "how": "derived", "drawers": 1}
+    assert plan["projects"]["p--photoapp"] == {"target": "photoapp", "how": "derived", "drawers": 1}
     assert plan["unresolved"] == 1
-    assert plan_targets(plan) == {"bentokit": 2, "afterpic": 1}
+    assert plan_targets(plan) == {"portal": 2, "photoapp": 1}
 
 
 def test_apply_split_moves_only_planned_drawers_and_drops_hallways(tmp_path, monkeypatch):
@@ -136,7 +135,7 @@ def test_apply_split_moves_only_planned_drawers_and_drops_hallways(tmp_path, mon
     hallways_mod._save_hallways(
         [
             {"id": "h1", "wing": "convos", "entity_a": "a", "entity_b": "b"},
-            {"id": "h2", "wing": "bentokit", "entity_a": "a", "entity_b": "b"},
+            {"id": "h2", "wing": "portal", "entity_a": "a", "entity_b": "b"},
         ]
     )
     col = FakeCollection(_rows())
@@ -156,19 +155,18 @@ def test_apply_split_moves_only_planned_drawers_and_drops_hallways(tmp_path, mon
             },
         ]
     )
-    plan = plan_split(col, "convos", ["bentokit"])
-    plan["projects"]["p--afterpic"]["target"] = "convos"  # user edited: keep afterpic where it is
+    plan = plan_split(col, "convos", ["portal"])
+    plan["projects"]["p--photoapp"]["target"] = "convos"  # user edited: keep photoapp where it is
     result = apply_split(col, plan, closets_col=closets)
     assert result["moved"] == 2
     assert result["closets_moved"] == 1
-    assert closets.rows["k1"]["meta"]["wing"] == "bentokit"
+    assert closets.rows["k1"]["meta"]["wing"] == "portal"
     assert closets.rows["k2"]["meta"]["wing"] == "convos"
-    assert result["per_target"] == {"bentokit": 2}
-    assert result["skipped"] == 2  # afterpic (kept) + notes.md (no key)
+    assert result["per_target"] == {"portal": 2}
+    assert result["skipped"] == 2  # photoapp (kept) + notes.md (no key)
     assert result["hallways_dropped"] == 1
     assert (
-        col.rows["a1"]["meta"]["wing"] == "bentokit"
-        and col.rows["a1"]["meta"]["room"] == "technical"
+        col.rows["a1"]["meta"]["wing"] == "portal" and col.rows["a1"]["meta"]["room"] == "technical"
     )
     assert col.rows["b1"]["meta"]["wing"] == "convos"
     assert set(col.updates[0][1][0]) == {"wing", "last_modified"}
@@ -177,12 +175,12 @@ def test_apply_split_moves_only_planned_drawers_and_drops_hallways(tmp_path, mon
 
 def test_split_plan_round_trip_and_validation(tmp_path):
     cfg = MempalaceConfig(palace_path=str(tmp_path))
-    plan = plan_split(FakeCollection(_rows()), "convos", ["bentokit"])
+    plan = plan_split(FakeCollection(_rows()), "convos", ["portal"])
     path = save_split_plan(cfg, plan)
     assert path == str(tmp_path / "wings" / "split-convos.json")
-    assert load_split_plan(cfg, "convos")["projects"]["p--afterpic"]["target"] == "afterpic"
+    assert load_split_plan(cfg, "convos")["projects"]["p--photoapp"]["target"] == "photoapp"
     data = json.loads((tmp_path / "wings" / "split-convos.json").read_text())
-    data["projects"]["p--afterpic"]["target"] = ""
+    data["projects"]["p--photoapp"]["target"] = ""
     (tmp_path / "wings" / "split-convos.json").write_text(json.dumps(data))
     with pytest.raises(ValueError):
         load_split_plan(cfg, "convos")
@@ -200,7 +198,7 @@ def test_cmd_wings_split_plan_then_apply(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(
         "mempalace.palace_graph.sqlite_grouped_counts_reader",
         lambda config: (
-            lambda path, name: [("decisions", "bentokit", "", 1), ("technical", "convos", "", 3)]
+            lambda path, name: [("decisions", "portal", "", 1), ("technical", "convos", "", 3)]
         ),
     )
     monkeypatch.setattr(
@@ -216,7 +214,7 @@ def test_cmd_wings_split_plan_then_apply(tmp_path, monkeypatch, capsys):
     cli.cmd_wings(Namespace(wings_action="split", palace=str(tmp_path), wing="convos", yes=True))
     out = capsys.readouterr().out
     assert "Moved 3 drawers into 2 wings and 0 closets" in out
-    assert col.rows["b1"]["meta"]["wing"] == "afterpic"
+    assert col.rows["b1"]["meta"]["wing"] == "photoapp"
 
 
 def test_cmd_wings_split_without_plan_exits_1(tmp_path, capsys):

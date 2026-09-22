@@ -29,7 +29,7 @@ from mempalace.palace_audit import (
 @pytest.mark.parametrize(
     "a, b",
     [
-        ("liquid-llm", "liquid_llm"),
+        ("acme-app", "acme_app"),
         ("release-3.6.0", "release_3_6_0"),
         ("concierge-automation", "concierge-automations"),
         ("PR Reviews", "pr_reviews"),
@@ -41,7 +41,7 @@ def test_drift_key_collides_drifted_spellings(a, b):
 
 def test_drift_key_keeps_distinct_names_apart():
     assert drift_key("ops") != drift_key("operations")
-    assert drift_key("incognita") != drift_key("incognita_game")
+    assert drift_key("arcade") != drift_key("arcade_game")
 
 
 @pytest.mark.parametrize(
@@ -49,7 +49,7 @@ def test_drift_key_keeps_distinct_names_apart():
     [
         ("mcp_server", "mcp_server.py"),
         ("main.zig", "src/main.zig"),
-        ("RootView", "Users/x/dev/liquid-llm/RootView.swift"),
+        ("RootView", "Users/x/dev/acme-app/RootView.swift"),
         ("device.zig", "src\\wireguard\\device.zig"),
     ],
 )
@@ -67,7 +67,7 @@ def test_generic_entity_heuristic():
     assert is_generic_entity("thinking")
     assert not is_generic_entity("ChatStore")
     assert not is_generic_entity("store.baseURL")
-    assert not is_generic_entity("pollstergraph")
+    assert not is_generic_entity("weatherstation")
     assert (
         is_generic_entity("WebFetch") and is_generic_entity("Server") and is_generic_entity("lib/")
     )
@@ -77,7 +77,7 @@ def test_generic_entity_heuristic():
         and is_generic_entity("MESSAGES")
         and is_generic_entity("cancelled")
     )
-    assert not is_generic_entity("eosio.token") and not is_generic_entity("imervista_user")
+    assert not is_generic_entity("chain.token") and not is_generic_entity("clientsite_user")
     # Generic source-file stems and library references link nothing.
     for name in ("app.js", "model.ts", "mod.rs", "main.py", "index.tsx", "repository.ts"):
         assert is_generic_entity(name), name
@@ -86,7 +86,7 @@ def test_generic_entity_heuristic():
     for name in ("Cargo.toml", "ROADMAP.md", "ChangeDetectionStrategy.OnPush", "created_by"):
         assert is_generic_entity(name), name
     # A project's own file or qualified symbol still passes.
-    for name in ("ChatStore.swift", "swim.zig", "wing_split.py", "eosio.token", "store.baseURL"):
+    for name in ("ChatStore.swift", "swim.zig", "wing_split.py", "chain.token", "store.baseURL"):
         assert not is_generic_entity(name), name
 
 
@@ -94,11 +94,11 @@ def test_generic_entity_heuristic():
 
 WING_ROOMS = {
     "convos": {"technical": 950, "planning": 40, "decisions": 10},
-    "liquid-llm": {"decisions": 3},
-    "liquid_llm": {"decisions": 4, "diary": 2},
+    "acme-app": {"decisions": 3},
+    "acme_app": {"decisions": 4, "diary": 2},
     "mempalace": {"release-3.6.0": 2, "release_3_6_0": 1, "reviews": 5},
-    "incognita": {"general": 1},
-    "incognita_game": {"design": 8},
+    "arcade": {"general": 1},
+    "arcade_game": {"design": 8},
 }
 
 
@@ -123,10 +123,10 @@ def test_analyze_rooms_empty_palace():
 
 def test_analyze_naming_detects_wing_and_room_drift():
     naming = _analyze_naming(WING_ROOMS)
-    assert naming["wing_drift"] == [["liquid-llm", "liquid_llm"]]
-    assert ["incognita", "incognita_game"] in naming["wing_prefix_pairs"]
+    assert naming["wing_drift"] == [["acme-app", "acme_app"]]
+    assert ["arcade", "arcade_game"] in naming["wing_prefix_pairs"]
     assert any(d["rooms"] == ["release-3.6.0", "release_3_6_0"] for d in naming["room_drift"])
-    assert {t["wing"] for t in naming["tiny_wings"]} == {"liquid-llm", "incognita"}
+    assert {t["wing"] for t in naming["tiny_wings"]} == {"acme-app", "arcade"}
 
 
 def test_analyze_naming_flags_wings_that_mix_source_projects():
@@ -366,7 +366,7 @@ def test_audit_palace_end_to_end(fake_palace):
     assert scores["overall"] == round((3 + 80 + 0 + 50 + 0) / 5)
     assert report["knowledge_graph"]["path"] == str(fake_palace / "knowledge_graph.sqlite3")
     joined = "\n".join(f["text"] for f in report["findings"])
-    assert "liquid-llm / liquid_llm" in joined
+    assert "acme-app / acme_app" in joined
     assert "thinking" in joined
     assert "main.zig" not in joined  # samples live in --json, not findings
     assert "never been followed" in joined
