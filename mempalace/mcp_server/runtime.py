@@ -222,17 +222,10 @@ def _run_stdio_loop() -> None:
         except KeyboardInterrupt:
             break
         except Exception as exc:
-            # Whatever json.loads raises, the line gave no request: invalid JSON,
-            # an integer past Python's digit limit (ValueError) and nesting too
-            # deep to parse (RecursionError) alike, and catching only the decode
-            # errors let the last two end the server. -32700 is JSON-RPC's code
-            # for an error while parsing the JSON text. With no request there is
-            # no id, so it is null per JSON-RPC 2.0 section 5 -- the "never
-            # answer a notification" rule cannot bind when the notification is
-            # exactly what could not be parsed. Staying silent left the client
-            # waiting on a request it had already sent, while the HTTP transport
-            # has answered -32700 all along. The type is logged too: a MemoryError
-            # has no message of its own.
+            # ValueError (digit limit) and RecursionError (nesting) are still
+            # parse failures, so answer -32700 with a null id the way the HTTP
+            # transport does. The type is in the log because MemoryError has
+            # no message of its own.
             logger.error("Server error: %s: %s", type(exc).__name__, exc)
             payload = json.dumps(_json_rpc_parse_error(), ensure_ascii=False)
         else:
