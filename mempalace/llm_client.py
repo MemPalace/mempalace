@@ -24,12 +24,15 @@ normalizes that away from the caller.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
+logger = logging.getLogger("mempalace_llm")
 
 
 # ── External-service heuristic (issue #24 — privacy warning support) ─────
@@ -74,7 +77,9 @@ def _endpoint_is_local(url: Optional[str]) -> bool:
     # so it can only resolve through the LAN: mDNS, the router's DNS, a hosts
     # file, or a search domain the user configured. It is the user's own
     # network by construction, the same as ``.local``.
-    if "." not in host and not host.startswith("["):
+    # ``urlparse`` strips the brackets from an IPv6 literal, so a dotless
+    # host may still be a public address; only a name qualifies.
+    if "." not in host and ":" not in host:
         return True
     if host.startswith("10."):
         return True
@@ -355,9 +360,15 @@ class OpenAICompatProvider(LLMProvider):
                 return False, f"{self.endpoint} lists no models to pick from"
             self.model = models[0]
         elif models and self.model not in models:
-            return False, (
-                f"model {self.model!r} is not served at {self.endpoint}; served: "
-                f"{', '.join(models)} (use --llm-model auto to follow the server)"
+            # A gateway may list only part of what it routes, or spell a model
+            # differently (``llama3.1`` vs ``llama3.1:8b``); the request itself
+            # is the authority, so this is advice, not a refusal.
+            logger.warning(
+                "model %r is not in the list served at %s (%s); continuing. "
+                "Use --llm-model auto to follow the server.",
+                self.model,
+                self.endpoint,
+                ", ".join(models[:8]),
             )
         return True, "ok"
 

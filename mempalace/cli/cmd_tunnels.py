@@ -14,7 +14,8 @@ def _wings_from_sqlite(config, palace_path):
 
 def cmd_tunnels(args):
     from ..hallways import list_hallways
-    from ..palace_graph import _load_tunnels, _save_tunnels
+    from ..palace import mine_lock
+    from ..palace_graph import _get_tunnel_file, _load_tunnels, _save_tunnels
     from ..tunnels_tool import (
         apply_proposal,
         load_proposal,
@@ -41,8 +42,15 @@ def cmd_tunnels(args):
     apply = getattr(args, "yes", False)
 
     if action == "prune":
-        tunnels = _load_tunnels(config)
-        kept, report = prune_tunnels(tunnels, wings)
+        if not apply:
+            kept, report = prune_tunnels(_load_tunnels(config), wings)
+        else:
+            # Load, prune and save under the same lock every tunnel writer
+            # takes, or a mine's create_tunnel in between is silently lost.
+            with mine_lock(_get_tunnel_file(config)):
+                kept, report = prune_tunnels(_load_tunnels(config), wings)
+                if report["removed"]:
+                    _save_tunnels(kept, config)
         print(
             f"  {report['removed']} of {report['total']} tunnels are artifacts: "
             f"{report['generic']} generic tokens, {report['dangling']} dangling endpoints, "
@@ -51,7 +59,6 @@ def cmd_tunnels(args):
         if not report["removed"]:
             return
         if apply:
-            _save_tunnels(kept, config)
             print(f"  Removed {report['removed']}.")
         else:
             print("  Dry run. Re-run with --yes to remove them.")

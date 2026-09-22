@@ -31,13 +31,28 @@ PROPOSAL_SCHEMA_VERSION = 1
 DEFAULT_MAX_TUNNELS = 60
 
 
+def _norm_wing(wing: str) -> str:
+    return normalize_wing_name(wing) or wing
+
+
+def room_spelling_key(room: str) -> str:
+    """``entity:src/main.zig`` and ``entity:main.zig`` key the same.
+
+    ``entity_spelling_key`` takes a basename, so the ``entity:`` prefix must
+    come off first or a path spelling (``entity:src/main.zig`` → ``main``)
+    and a bare one (``entity:main.zig`` → ``entity:main``) never match.
+    """
+    text = str(room or "")
+    if text.startswith("entity:"):
+        return "entity:" + entity_spelling_key(text[len("entity:") :])
+    return entity_spelling_key(text)
+
+
 def _link_key(wing_a: str, wing_b: str, room_a: str, room_b: str) -> tuple:
     """One key per (wing pair, entity) regardless of spelling or direction."""
     return (
-        tuple(
-            sorted((normalize_wing_name(wing_a) or wing_a, normalize_wing_name(wing_b) or wing_b))
-        ),
-        tuple(sorted((entity_spelling_key(room_a), entity_spelling_key(room_b)))),
+        tuple(sorted((_norm_wing(wing_a), _norm_wing(wing_b)))),
+        tuple(sorted((room_spelling_key(room_a), room_spelling_key(room_b)))),
     )
 
 
@@ -184,8 +199,13 @@ def apply_proposal(plan: dict, config: Optional[MempalaceConfig] = None) -> int:
 
 
 def prune_tunnels(tunnels: list, existing_wings: Iterable[str]) -> tuple[list, dict]:
-    """``(kept, report)`` — drop generic, dangling and duplicate-spelling tunnels."""
-    wings = set(existing_wings)
+    """``(kept, report)`` — drop generic, dangling and duplicate-spelling tunnels.
+
+    Wings compare through ``normalize_wing_name`` on both sides, the same
+    way ``follow_tunnels`` resolves them, so a tunnel that still resolves
+    is never counted as dangling.
+    """
+    wings = {_norm_wing(str(w)) for w in existing_wings}
     generic = dangling = duplicates = 0
     kept: list = []
     seen: set = set()
@@ -201,7 +221,7 @@ def prune_tunnels(tunnels: list, existing_wings: Iterable[str]) -> tuple[list, d
                 generic += 1
                 bad = True
                 break
-            if str(end.get("wing") or "") not in wings:
+            if _norm_wing(str(end.get("wing") or "")) not in wings:
                 dangling += 1
                 bad = True
                 break

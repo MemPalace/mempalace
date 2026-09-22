@@ -130,6 +130,8 @@ def _rows():
 def test_slugify_room():
     assert slugify_room("Release Process") == "release-process"
     assert slugify_room("  Bugs & Fixes!! ") == "bugs-fixes"
+    assert slugify_room("Release 3.6.0") == "release-3.6.0"
+    assert slugify_room("..odd..") == "odd"
 
 
 def test_room_set_round_trip_and_validation(tmp_path):
@@ -215,6 +217,19 @@ def test_propose_rooms_snaps_names_to_existing_spellings():
         "releases": 1,
         "technical": 2,
     }
+
+
+def test_snap_to_existing_never_collapses_two_rooms_onto_one_name():
+    from mempalace.rooms import RoomSet, RoomSpec, snap_to_existing
+
+    rs = RoomSet(
+        wing="w",
+        rooms=[RoomSpec("release-3-6-0", "a"), RoomSpec("release_3_6_0", "b"), RoomSpec("x", "c")],
+    )
+    renames = snap_to_existing(rs, ["release-3.6.0"])
+    assert renames == [("release-3-6-0", "release-3.6.0")]
+    assert rs.names() == ["release-3.6.0", "release_3_6_0", "x"]
+    RoomSet.from_dict(rs.to_dict())  # still a valid, unique set
 
 
 def test_propose_rooms_rejects_empty_or_garbage():

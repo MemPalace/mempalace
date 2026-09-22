@@ -128,8 +128,15 @@ class RoomSet:
 
 
 def slugify_room(name: str) -> str:
-    """``Release Process`` → ``release-process``; the LLM does not always obey kebab-case."""
-    slug = re.sub(r"[^a-z0-9]+", "-", str(name).strip().lower()).strip("-")
+    """``Release Process`` → ``release-process``; the LLM does not always obey kebab-case.
+
+    Dots inside a name survive (``release-3.6.0``): ``sanitize_name`` allows
+    them, existing palaces use them for versions, and stripping them here
+    would undo :func:`snap_to_existing` on the next load and recreate the
+    very spelling drift it exists to prevent.
+    """
+    slug = re.sub(r"[^a-z0-9.]+", "-", str(name).strip().lower())
+    slug = re.sub(r"\.{2,}", ".", slug).strip("-.")
     return slug[:60]
 
 
@@ -329,9 +336,18 @@ def snap_to_existing(room_set: RoomSet, existing: Iterable[str]) -> list[tuple[s
 
     by_key = {drift_key(name): name for name in existing}
     renames = []
+    taken = {r.name for r in room_set.rooms}
     for r in room_set.rooms:
         current = by_key.get(drift_key(r.name))
         if current and current != r.name:
+            # Two proposals that both collapse onto one existing spelling
+            # (``release-3-6-0`` and ``release_3_6_0``) must stay distinct,
+            # or the set fails its own uniqueness check at apply time; the
+            # first takes the existing name, the rest keep their own.
+            if current in taken:
+                continue
+            taken.discard(r.name)
+            taken.add(current)
             renames.append((r.name, current))
             r.name = current
     return renames

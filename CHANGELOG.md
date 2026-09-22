@@ -10,6 +10,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **Hallway writers hold the hallway-file lock from load to save.** A mine's
+  recompute, `hallways --rebuild`, `--prune-spellings` and `delete_hallway`
+  each loaded, edited and saved the whole file unlocked, so the later save
+  dropped the earlier one's records. `tunnels prune --yes` takes the tunnel
+  lock the same way.
 - **Hook-ingested transcripts file under the project wing.** The Stop and
   PreCompact hooks mined every Claude Code transcript with `--wing sessions`,
   so a palace grew one flat `sessions/technical` pile next to its project

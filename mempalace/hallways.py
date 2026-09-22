@@ -79,6 +79,19 @@ def _get_hallway_file(config=None) -> str:
     return config.hallway_file
 
 
+def _hallway_file_lock(config=None):
+    """The per-file lock every hallway writer holds from load to save.
+
+    Same mechanism as ``palace_graph.create_tunnel``: without it two
+    concurrent writers (a mine's recompute and ``hallways --prune-spellings``,
+    or two mines of different wings) each load, edit and save the whole
+    file, and the later save drops the earlier one's records.
+    """
+    from .palace import mine_lock
+
+    return mine_lock(_get_hallway_file(config))
+
+
 def _legacy_hallway_file() -> str:
     """The pre-palace-scoped hardcoded path. Kept only for one-time orphan detection."""
     return os.path.join(os.path.expanduser("~"), ".mempalace", "hallways.json")
@@ -497,64 +510,69 @@ def compute_hallways_for_wing(
     #    across recomputes. Without this preservation, every mine wipes
     #    the connection weights accumulated through use — defeating the
     #    living-connection layer entirely.
-    existing = _load_hallways(config)
-    existing_dynamics_lookup: dict = {}
-    for h in existing:
-        if h.get("wing") != wing:
-            continue
-        # Canonicalize the lookup key by sorting the entity pair — must
-        # match the symmetric ID generation in _hallway_id (which also
-        # sorts). Without this, a persisted record with reversed entity
-        # order would silently miss the lookup and lose its accumulated
-        # dynamics on every recompute. Per PR #1578 review
-        # (gemini-code-assist, HIGH priority).
-        key = tuple(
-            sorted(
-                [
-                    entity_spelling_key(str(h.get("entity_a"))),
-                    entity_spelling_key(str(h.get("entity_b"))),
-                ]
+    # Load → materialize → save under the hallway-file lock, or a mine of
+    # another wing in between rewrites the file without this wing's records.
+    with _hallway_file_lock(config):
+        existing = _load_hallways(config)
+        existing_dynamics_lookup: dict = {}
+        for h in existing:
+            if h.get("wing") != wing:
+                continue
+            # Canonicalize the lookup key by sorting the entity pair — must
+            # match the symmetric ID generation in _hallway_id (which also
+            # sorts). Without this, a persisted record with reversed entity
+            # order would silently miss the lookup and lose its accumulated
+            # dynamics on every recompute. Per PR #1578 review
+            # (gemini-code-assist, HIGH priority).
+            key = tuple(
+                sorted(
+                    [
+                        entity_spelling_key(str(h.get("entity_a"))),
+                        entity_spelling_key(str(h.get("entity_b"))),
+                    ]
+                )
             )
-        )
-        # Only copy the fields the dynamics layer cares about; everything
-        # else is recomputed deterministically from the drawer set.
-        existing_dynamics_lookup[key] = {
-            k: h[k] for k in ("strength", "stability", "last_activated", "access_count") if k in h
-        }
+            # Only copy the fields the dynamics layer cares about; everything
+            # else is recomputed deterministically from the drawer set.
+            existing_dynamics_lookup[key] = {
+                k: h[k]
+                for k in ("strength", "stability", "last_activated", "access_count")
+                if k in h
+            }
 
-    created: list[dict] = []
-    created_at = datetime.now(timezone.utc).isoformat()
-    for key in sorted(pair_counts.keys()):
-        count = pair_counts[key]
-        if count < min_count:
-            continue
-        entity_a, entity_b = sorted((display[key[0]], display[key[1]]))
-        rooms = sorted(pair_rooms.get(key, set()))
-        room_summary = ", ".join(rooms[:3]) if rooms else "(no room tags)"
-        if len(rooms) > 3:
-            room_summary += f", +{len(rooms) - 3} more"
-        record = {
-            "id": _hallway_id(wing, entity_a, entity_b),
-            "wing": wing,
-            "entity_a": entity_a,
-            "entity_b": entity_b,
-            "co_occurrence_count": count,
-            "rooms": rooms,
-            "label": f"{entity_a} ↔ {entity_b} (co-occur in {count} drawers across {len(rooms) or 'no'} room{'s' if len(rooms) != 1 else ''}: {room_summary})",
-            "created_at": created_at,
-            "created_by": "auto",
-        }
-        # Apply preserved dynamics if this entity pair existed in the
-        # prior wing snapshot. Then initialize any still-missing fields
-        # (the new-pair case + the legacy-record case both land cleanly).
-        preserved = existing_dynamics_lookup.get(key, {})
-        record.update(preserved)
-        initialize_dynamics_fields(record)
-        created.append(record)
+        created: list[dict] = []
+        created_at = datetime.now(timezone.utc).isoformat()
+        for key in sorted(pair_counts.keys()):
+            count = pair_counts[key]
+            if count < min_count:
+                continue
+            entity_a, entity_b = sorted((display[key[0]], display[key[1]]))
+            rooms = sorted(pair_rooms.get(key, set()))
+            room_summary = ", ".join(rooms[:3]) if rooms else "(no room tags)"
+            if len(rooms) > 3:
+                room_summary += f", +{len(rooms) - 3} more"
+            record = {
+                "id": _hallway_id(wing, entity_a, entity_b),
+                "wing": wing,
+                "entity_a": entity_a,
+                "entity_b": entity_b,
+                "co_occurrence_count": count,
+                "rooms": rooms,
+                "label": f"{entity_a} ↔ {entity_b} (co-occur in {count} drawers across {len(rooms) or 'no'} room{'s' if len(rooms) != 1 else ''}: {room_summary})",
+                "created_at": created_at,
+                "created_by": "auto",
+            }
+            # Apply preserved dynamics if this entity pair existed in the
+            # prior wing snapshot. Then initialize any still-missing fields
+            # (the new-pair case + the legacy-record case both land cleanly).
+            preserved = existing_dynamics_lookup.get(key, {})
+            record.update(preserved)
+            initialize_dynamics_fields(record)
+            created.append(record)
 
-    # 4. Persist — preserve other-wing records, replace this wing's records.
-    preserved_other_wings = [h for h in existing if h.get("wing") != wing]
-    _save_hallways(preserved_other_wings + created, config)
+        # 4. Persist — preserve other-wing records, replace this wing's records.
+        preserved_other_wings = [h for h in existing if h.get("wing") != wing]
+        _save_hallways(preserved_other_wings + created, config)
 
     return created
 
@@ -583,6 +601,11 @@ def prune_spelling_hallways(config=None, apply: bool = False) -> dict:
     its shortest spellings and the rest are dropped. Only the sidecar file
     is touched, never a drawer. ``removed`` is 0 on a dry run.
     """
+    with _hallway_file_lock(config):
+        return _prune_spelling_hallways_locked(config, apply)
+
+
+def _prune_spelling_hallways_locked(config, apply: bool) -> dict:
     hallways = _load_hallways(config)
     self_links = [h for h in hallways if is_self_link(h)]
     groups: dict[tuple, list[dict]] = {}
@@ -634,9 +657,10 @@ def prune_spelling_hallways(config=None, apply: bool = False) -> dict:
 
 def delete_hallway(hallway_id: str, config=None) -> bool:
     """Remove one hallway record by id. Returns True if a record was removed."""
-    hallways = _load_hallways(config)
-    filtered = [h for h in hallways if h.get("id") != hallway_id]
-    if len(filtered) == len(hallways):
-        return False
-    _save_hallways(filtered, config)
+    with _hallway_file_lock(config):
+        hallways = _load_hallways(config)
+        filtered = [h for h in hallways if h.get("id") != hallway_id]
+        if len(filtered) == len(hallways):
+            return False
+        _save_hallways(filtered, config)
     return True

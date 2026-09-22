@@ -270,11 +270,15 @@ def test_openai_compat_auto_model_follows_the_served_model():
         assert p.model == "qwen3.8-27b"
 
 
-def test_openai_compat_check_names_served_models_on_mismatch():
+def test_openai_compat_check_warns_but_passes_on_model_mismatch(caplog):
+    # A gateway's listing may be partial or spelled differently; the request
+    # decides, so a mismatch is a warning that names the served models.
     with patch("mempalace.llm_client.urlopen", return_value=_models_response(["other"])):
         p = OpenAICompatProvider(model="gone", endpoint="http://h:1")
-        ok, msg = p.check_available()
-    assert not ok and "served: other" in msg and "auto" in msg
+        with caplog.at_level("WARNING", logger="mempalace_llm"):
+            ok, msg = p.check_available()
+    assert ok and msg == "ok"
+    assert "other" in caplog.text and "auto" in caplog.text
     with patch("mempalace.llm_client.urlopen", return_value=_models_response([])):
         assert OpenAICompatProvider(model="x", endpoint="http://h:1").check_available()[0]
 
@@ -422,6 +426,9 @@ def test_single_label_lan_hostname_is_local():
 
     assert _endpoint_is_local("http://gpu-box:8010")
     assert _endpoint_is_local("http://gpu-box:11434/v1")
+    # An IPv6 literal is dotless too, but it is an address, not a LAN name.
+    assert not _endpoint_is_local("http://[2001:db8::1]:8010/v1")
+    assert _endpoint_is_local("http://[::1]:8010/v1")
     assert not _endpoint_is_local("https://api.openai.com")
     assert not _endpoint_is_local("http://gpu-box.example.com:8010")
 

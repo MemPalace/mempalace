@@ -904,8 +904,15 @@ def tool_delete_hallway(hallway_id: str):
     return {"deleted": delete_hallway(hallway_id)}
 
 
-def tool_follow_tunnels(wing: str, room: str):
-    """Follow explicit tunnels from a room to see connected drawers in other wings."""
+def tool_follow_tunnels(wing: str, room: str, record: bool = True):
+    """Follow explicit tunnels from a room to see connected drawers in other wings.
+
+    An agent calling this tool is crossing the tunnel, so the traversal is
+    recorded (``access_count`` / ``strength``). Internal callers that only
+    decorate another result, such as the light server's search enrichment,
+    pass ``record=False``: a search hit is not a crossing. A read-only
+    server or a peer without the writer lock never writes the tunnel file.
+    """
     try:
         wing = sanitize_name(wing, "wing")
         room = sanitize_name(room, "room")
@@ -914,6 +921,6 @@ def tool_follow_tunnels(wing: str, room: str):
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
-    # Following a tunnel records the traversal; a read-only server or a
-    # peer without the writer lock must not write the tunnel file.
-    return follow_tunnels(wing, room, col=col, record=not (_READ_ONLY or _MCP_WRITER_READ_ONLY))
+    return follow_tunnels(
+        wing, room, col=col, record=record and not (_READ_ONLY or _MCP_WRITER_READ_ONLY)
+    )

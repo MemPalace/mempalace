@@ -39,6 +39,7 @@ from .backends._inproc_sqlite import open_reader as open_palace_reader
 from .config import MempalaceConfig, normalize_wing_name
 from .hallways import entity_spelling_key, is_generic_entity, is_self_link, list_hallways
 from .palace_graph import _load_tunnels
+from .tunnels_tool import room_spelling_key
 
 # Rooms the transcript classifier falls back to. A drawer in one of these
 # rooms is findable by search, not by walking the palace.
@@ -385,6 +386,7 @@ def _analyze_tunnels(
     only rises when an agent follows a tunnel, so it is informational.
     """
     total = len(tunnels)
+    wings_norm = None if wings is None else {normalize_wing_name(str(w)) or str(w) for w in wings}
     kinds: Counter = Counter()
     never_used = 0
     generic = []
@@ -411,7 +413,11 @@ def _analyze_tunnels(
                     bad = True
                     if name not in generic:
                         generic.append(name)
-            if wings is not None and str(end.get("wing") or "") not in wings:
+            end_wing = str(end.get("wing") or "").strip()
+            if (
+                wings_norm is not None
+                and (normalize_wing_name(end_wing) or end_wing) not in wings_norm
+            ):
                 bad = True
                 dangling += 1
         pair = (
@@ -419,8 +425,8 @@ def _analyze_tunnels(
             tuple(
                 sorted(
                     (
-                        entity_spelling_key(str(source.get("room") or "")),
-                        entity_spelling_key(str(target.get("room") or "")),
+                        room_spelling_key(str(source.get("room") or "")),
+                        room_spelling_key(str(target.get("room") or "")),
                     )
                 )
             ),
