@@ -215,7 +215,13 @@ GENERIC_ENTITY_STOPLIST = frozenset(
     changedetectionstrategy changedetectionstrategy.onpush changedetectionstrategy.eager
     changedetectorref oninit ondestroy onchanges injectable ngmodule httpclient
     formsmodule commonmodule usestate useeffect usememo usecallback useref
-    usecontext usereducer
+    usecontext usereducer afterviewinit routerlink
+    docker-compose python.exe xcode.app assert_eq to_string serde_json
+    transformers.js tool_call tool_calls authored_at memory.used total_bytes
+    tsconfig.app tsconfig.spec failure_scenario
+    db ctx.allocator powershell.exe cmd.exe valueerror typeerror keyerror
+    docker-compose.yaml docker-compose.yml source_file memory.total buffer.from
+    hashmap hashset vec box arc rc
     """.split()
 )
 

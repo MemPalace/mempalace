@@ -761,7 +761,7 @@ _LAYERS = (
     ("overall", "overall", ""),
     ("rooms", "rooms", "drawers outside generic rooms"),
     ("naming", "naming", "wing/room spellings that do not collide"),
-    ("tunnels", "tunnels", "tunnel quality (70%) and traversal (30%)"),
+    ("tunnels", "tunnels", "sound tunnels x linkable wings they reach"),
     ("hallways", "hallways", "strongest hallways that are not spelling artifacts"),
     ("knowledge_graph", "knowledge graph", "predicate reuse across facts"),
 )
