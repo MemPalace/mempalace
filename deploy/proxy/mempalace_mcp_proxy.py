@@ -39,10 +39,11 @@ Environment variables (all have sensible defaults):
 from __future__ import annotations
 
 import asyncio
+import hmac
+import ipaddress
 import json
 import logging
 import os
-import signal
 import sys
 import time
 import uuid
@@ -69,7 +70,10 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 # Inbound request security (Streamable-HTTP / DNS rebinding protection).
 # ALLOWED_ORIGINS: comma-separated list of permitted Origin headers.
 # ALLOWED_HOSTS: comma-separated list of permitted Host headers (no Origin).
-# INBOUND_TOKEN: optional bearer token required for all /mcp endpoints.
+# INBOUND_TOKEN: optional bearer token required for all endpoints. When
+# HOST is non-loopback the proxy refuses to start without one (same rule
+# as the MCP hub) unless PROXY_ALLOW_INSECURE_NO_TOKEN=1 is set for a
+# trusted fronting layer.
 ALLOWED_ORIGINS = frozenset(
     o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()
 )
@@ -450,7 +454,7 @@ def _is_inbound_request_allowed(request: web.Request) -> tuple[bool, int, str]:
     """
     if INBOUND_TOKEN:
         auth = request.headers.get("Authorization", "")
-        if not auth.startswith("Bearer ") or auth[7:] != INBOUND_TOKEN:
+        if not auth.startswith("Bearer ") or not hmac.compare_digest(auth[7:], INBOUND_TOKEN):
             return False, 401, "Unauthorized — invalid or missing inbound token"
 
     origin = request.headers.get("Origin")
@@ -666,8 +670,31 @@ async def handle_mcp_delete(request: web.Request) -> web.Response:
     return web.Response(status=404, text="session not found")
 
 
+def _is_loopback(host: str) -> bool:
+    """True when the bind host is loopback-only (IPv4/IPv6 loopback or localhost)."""
+    h = host.strip().lower()
+    if h in ("localhost", "localhost.localdomain"):
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
+def _truthy(value: str) -> bool:
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
 async def handle_health(request: web.Request) -> web.Response:
-    """Health check — tests both proxy and upstream connectivity."""
+    """Health check — tests both proxy and upstream connectivity.
+
+    Gated by the same inbound policy as /mcp: the payload discloses the
+    upstream URL, so it must not be reachable from an arbitrary Host.
+    """
+    allowed, status, msg = _is_inbound_request_allowed(request)
+    if not allowed:
+        return web.json_response({"error": msg}, status=status)
+
     upstream_ok = False
     upstream_latency = 0.0
     try:
@@ -707,7 +734,12 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 async def handle_metrics(request: web.Request) -> web.Response:
-    """Prometheus-style metrics endpoint."""
+    """Prometheus-style metrics endpoint. Gated like /health — metrics are
+    ops telemetry, not public surface."""
+    allowed, status, msg = _is_inbound_request_allowed(request)
+    if not allowed:
+        return web.Response(text=msg, status=status)
+
     uptime = time.time() - _metrics_start
     lines = [
         "# HELP mempalace_proxy_requests_total Total requests processed",
@@ -763,6 +795,23 @@ async def on_cleanup(app):
 
 
 def main():
+    # Mirror the MCP hub's bind policy: a non-loopback listener without an
+    # inbound token forwards upstream credentials to anyone on the LAN.
+    # PROXY_ALLOW_INSECURE_NO_TOKEN=1 is the explicit opt-out for
+    # deployments behind a trusted fronting layer.
+    if (
+        not _is_loopback(HOST)
+        and not INBOUND_TOKEN
+        and not _truthy(os.environ.get("PROXY_ALLOW_INSECURE_NO_TOKEN", ""))
+    ):
+        log.error(
+            "Refusing non-loopback bind %s without INBOUND_TOKEN. "
+            "Set INBOUND_TOKEN, or PROXY_ALLOW_INSECURE_NO_TOKEN=1 only when a "
+            "trusted fronting layer provides access control.",
+            HOST,
+        )
+        sys.exit(2)
+
     app = web.Application()
     app.router.add_post("/mcp", handle_mcp_post)
     app.router.add_get("/mcp", handle_mcp_get)
@@ -773,31 +822,10 @@ def main():
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
 
-    # Python 3.14 removed the implicit event loop creation in
-    # asyncio.get_event_loop(); use the modern lifecycle to register
-    # signal handlers so the entry point does not crash on startup.
-    async def _setup_signals(runner: web.AppRunner) -> None:
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            try:
-                loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(_shutdown(app, s)))
-            except NotImplementedError:
-                pass  # Windows
-
-    async def _on_startup_with_signals(app: web.Application) -> None:
-        await on_startup(app)
-        await _setup_signals(app._runner)  # type: ignore[attr-defined]
-
-    app.on_startup[:] = []  # replace default
-    app.on_startup.append(_on_startup_with_signals)
-
     log.info(f"MCP streamable-http proxy: {HOST}:{PORT} -> {UPSTREAM_URL}")
+    # web.run_app registers SIGINT/SIGTERM handlers itself; on_cleanup
+    # (which closes the httpx client) runs through its graceful shutdown.
     web.run_app(app, host=HOST, port=PORT, print=None)
-
-
-async def _shutdown(app, sig):
-    log.info(f"Received signal {sig.name}, shutting down...")
-    await close_http_client()
 
 
 if __name__ == "__main__":

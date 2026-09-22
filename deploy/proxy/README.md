@@ -1,39 +1,40 @@
-# MemPalace MCP Proxy — Production Hardening Layer
+# MemPalace MCP Proxy — Streamable-HTTP Bridge (deploy/ example)
 
 MemPalace's `--transport http` mode speaks plain JSON over HTTP
 (`BaseHTTPRequestHandler`, `Connection: close`, no SSE). MCP clients that
-expect the **streamable-http** transport protocol (POST `/mcp` with
+expect the **streamable-HTTP** transport protocol (POST `/mcp` with
 `Mcp-Session-Id`, GET `/mcp` with `text/event-stream`, DELETE `/mcp`)
 cannot connect directly.
 
-This package provides a production-grade proxy that bridges the gap, plus
-the operational tooling to keep it running unattended.
+This package is a **deploy/ example**: a proxy that bridges the gap, plus
+minimal operational tooling. It holds the upstream bearer token and
+forwards requests — treat it as infrastructure glue, not part of the
+MemPalace core.
 
 ## What's Included
 
 | File | Purpose |
 |------|---------|
 | `mempalace_mcp_proxy.py` | Streamable-HTTP proxy with connection pooling, circuit breaker, retry |
-| `mempalace-watchdog.sh` | Auto-restart watchdog (detects hangs, not just crashes) |
 | `mempalace-monitor.sh` | Proactive health monitor with desktop notifications |
 | `com.mempalace.proxy.plist` | macOS launchd template (auto-start + KeepAlive) |
 | `mempalace-proxy.service` | Linux systemd unit for the proxy |
-| `mempalace-watchdog.service` | Linux systemd unit for the watchdog |
 | `proxy.env.example` | Environment file template for systemd |
 
 ## Why This Exists
 
-The core MemPalace server is excellent at storage and retrieval but has
-no operational layer for production deployments:
+The core server already ships Host/Origin/token checks and `/healthz` /
+`/statusz` endpoints. What it lacks is the streamable-HTTP transport
+itself. This example adds that transport plus a small ops layer:
 
-- **No connection pooling** — each request opens a new connection
-- **No retry logic** — a single transient failure kills the request
-- **No circuit breaker** — cascading failures with no protection
-- **No health endpoint** — no way to distinguish "listening" from "working"
-- **No auto-restart** — when the process hangs, it stays hung
-- **No metrics** — no observability for monitoring systems
-
-This package adds all of that without modifying the MemPalace core.
+- **Connection pooling** — one pooled upstream client instead of a new
+  connection per request
+- **Retry with retry-safety classification** — read-only calls may be
+  retried; mutating `tools/call` operations get a single attempt
+- **Circuit breaker** — upstream 5xx failures open the circuit and fail
+  fast instead of hanging
+- **`/health` and `/metrics`** — proxy-level health and Prometheus-style
+  counters for monitoring systems
 
 ## Quick Start
 
@@ -74,7 +75,7 @@ claude mcp add --transport http mempalace http://127.0.0.1:8766/mcp
 # }
 ```
 
-### 4. (Optional) Set up auto-start + watchdog
+### 4. (Optional) Set up auto-start
 
 **macOS:**
 ```bash
@@ -86,15 +87,17 @@ launchctl load ~/Library/LaunchAgents/com.mempalace.proxy.plist
 **Linux (systemd):**
 ```bash
 sudo cp mempalace_mcp_proxy.py /usr/local/bin/
-sudo cp mempalace-watchdog.sh /usr/local/bin/
-sudo chmod +x /usr/local/bin/mempalace_mcp_proxy.py /usr/local/bin/mempalace-watchdog.sh
+sudo chmod +x /usr/local/bin/mempalace_mcp_proxy.py
 sudo cp proxy.env.example /etc/mempalace/proxy.env
 # Edit /etc/mempalace/proxy.env
 sudo cp mempalace-proxy.service /etc/systemd/system/
-sudo cp mempalace-watchdog.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now mempalace-proxy mempalace-watchdog
+sudo systemctl enable --now mempalace-proxy
 ```
+
+To restart the upstream MemPalace server on failure, use the server's own
+unit (`systemctl restart mempalace-server`) — it owns the port, the
+writer lease, and the token configuration.
 
 ### 5. (Optional) Set up proactive monitoring
 
@@ -102,6 +105,9 @@ sudo systemctl enable --now mempalace-proxy mempalace-watchdog
 # Add to crontab (every 5 minutes)
 */5 * * * * /usr/local/bin/mempalace-monitor.sh
 ```
+
+Set `PROXY_TOKEN` if the proxy has `INBOUND_TOKEN` configured — the
+monitor's `/health` and `/mcp` checks carry it as a Bearer token.
 
 ## Endpoints
 
@@ -112,6 +118,26 @@ sudo systemctl enable --now mempalace-proxy mempalace-watchdog
 | DELETE | `/mcp` | Terminate a session |
 | GET | `/health` | Health check — tests upstream with actual `tools/list` call |
 | GET | `/metrics` | Prometheus-style metrics (counters, gauges) |
+
+All endpoints enforce the inbound policy below — `/health` and `/metrics`
+are not public surface (the health payload discloses the upstream URL).
+
+## Inbound Security
+
+The proxy attaches the upstream token to every forwarded request, so the
+proxy itself must not be open to arbitrary callers.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ALLOWED_HOSTS` | `127.0.0.1[:PORT], localhost[:PORT], HOST` | Host header allowlist. Checked **independently of Origin** — a DNS-rebinding page cannot pair a foreign Host with a matching Origin. |
+| `ALLOWED_ORIGINS` | (empty) | Origin allowlist for browser clients. An Origin equal to `http(s)://<Host>` is also accepted once Host passes. |
+| `INBOUND_TOKEN` | (empty) | Bearer token required on all endpoints. Compared with `hmac.compare_digest`. |
+| `PROXY_ALLOW_INSECURE_NO_TOKEN` | unset | Opt-out that permits a non-loopback bind with no token — only behind a trusted fronting layer. |
+
+**Non-loopback binds require `INBOUND_TOKEN`.** With `HOST=0.0.0.0` and no
+token (and no opt-out), the proxy refuses to start — the same rule the
+MCP hub applies. The Host allowlist alone only stops browsers; a plain
+`curl` can send any Host header it likes.
 
 ## Configuration
 
@@ -129,32 +155,19 @@ hardcoded paths.
 | `SESSION_TTL` | `1800` | Session expiry (seconds) |
 | `LOG_LEVEL` | `INFO` | Log level (DEBUG/INFO/WARNING/ERROR) |
 
+## Retry Safety
+
+Retries apply only to requests proven read-only. A mutating `tools/call`
+(add/update/delete/diary/…) gets exactly one attempt — if the upstream
+commits and the response is lost, the proxy never replays the mutation.
+Unknown or unparseable-as-safe shapes default to single-attempt.
+
 ## Circuit Breaker
 
-The proxy includes a circuit breaker to prevent cascading failures:
-
-- **3 consecutive failures** → circuit opens (requests fail fast with 503)
-- **30 seconds** → circuit transitions to half-open
-- **Next request** → probe; success closes the circuit, failure reopens it
-
-This means if your MemPalace server goes down, the proxy doesn't hang
-for 120 seconds on every request — it fails immediately, letting your
-MCP client handle the error gracefully.
-
-## Watchdog
-
-The watchdog (`mempalace-watchdog.sh`) complements systemd's
-`Restart=on-failure` by also catching **hangs** — situations where the
-process is alive but not responding to JSON-RPC. This happens when:
-
-- The embedding model gets stuck loading
-- The storage backend (ChromaDB/Qdrant) deadlocks
-- The HTTP handler thread is blocked
-
-The watchdog sends an actual `tools/list` JSON-RPC call and checks for
-a valid response. If it fails, it kills and restarts the server.
-
-Rate limiting: max 5 restarts per hour, 60s cooldown between restarts.
+- **3 consecutive upstream failures** (including JSON-bodied 5xx) →
+  circuit opens, requests fail fast with 503
+- **30 seconds** → half-open probe; success closes, failure reopens
+- Upstream HTTP status is preserved in both JSON and SSE responses
 
 ## Metrics
 
@@ -172,10 +185,10 @@ mempalace_proxy_uptime_seconds 3600.0
 mempalace_proxy_circuit_state{state="closed"} 0
 ```
 
-Scrape with Prometheus or check manually:
+Scrape with Prometheus or check manually (subject to the inbound policy):
 
 ```bash
-curl http://127.0.0.1:8766/metrics
+curl -H "Host: 127.0.0.1:8766" http://127.0.0.1:8766/metrics
 ```
 
 ## Architecture
@@ -185,6 +198,7 @@ MCP Client (Claude/Devin/etc.)
     │
     │  streamable-HTTP (POST/GET/DELETE /mcp)
     │  Mcp-Session-Id, text/event-stream
+    │  Host/Origin/INBOUND_TOKEN checks
     ▼
 ┌──────────────────────┐
 │   MCP Proxy (:8766)  │
@@ -200,7 +214,7 @@ MCP Client (Claude/Devin/etc.)
 └──────────┼───────────┘
            │
            │  plain JSON HTTP (POST /mcp)
-           │  Connection: close
+           │  Connection: close, Bearer UPSTREAM_TOKEN
            ▼
 ┌──────────────────────┐
 │  MemPalace (:8765)   │
@@ -244,11 +258,6 @@ If the intended feature is light MCP over HTTP, that requires
 integration with the light dispatcher and an end-to-end test asserting
 the three-tool catalog and correct dispatch. That is out of scope for
 this PR.
-
-**Deploying the watchdog can affect the light MCP path** because the
-watchdog manages the same upstream hub process. If you use both paths,
-ensure the watchdog's `MEMPALACE_START_CMD` matches your server's
-launch configuration.
 
 ## License
 
