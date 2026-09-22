@@ -1,272 +1,164 @@
 #!/usr/bin/env python3
-"""Verify a mined sample is searchable and belongs to the current batch.
+"""Verify that mined batch files are actually searchable in the palace.
 
-Called by staging_watcher.sh after ``mempalace mine`` to fail closed on:
-  - search command errors
-  - blank/empty search output
-  - unusable sample (cannot extract a stable snippet)
-  - search hits that point outside the current batch manifest
-  - source files that were skipped by the miner (e.g. oversized)
+Two checks, both fail-closed:
 
-The script requires a machine-readable JSON response from
-``mempalace search --json`` and checks the returned ``source_file`` against
-the batch manifest before destructive cleanup may proceed.
+  1. Content integrity — sha256 of each claimed work copy still matches
+     the batch snapshot. With verbatim staging the mined file is a byte
+     copy, so this is exact on every platform (no text-mode newline
+     translation ever touches the bytes).
 
-When a batch snapshot is provided, the script also verifies that each
-file's current sha256 matches the snapshot, ensuring that a stale
-previously-indexed version cannot satisfy verification for a new version
-that was never mined.
+  2. Searchability — for each mined file (or a sample), extract a
+     snippet and query the palace through mempalace.searcher directly.
+     The ``source_file`` filter pins the search to that exact mined
+     path, so a hit proves this batch's file — not a same-named file
+     from an earlier batch — is retrievable. No CLI flags required.
+
+Usage:
+    python tools/verify_mined.py --palace /path/to/palace \
+        --manifest mined.manifest --mine-dir /work/mine \
+        --snapshot .batch_snapshot --work-dir /work/orig [--all]
 """
 
-from __future__ import annotations
-
+import argparse
 import hashlib
-import json
-import re
-import subprocess
 import sys
 from pathlib import Path
 
-
-def extract_snippet(sample_file: Path) -> str:
-    """Extract a stable, unique-ish snippet from the first lines of a file."""
-    try:
-        text = sample_file.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return ""
-
-    # Same logic as staging_watcher.sh: first 20 non-blank, non-comment lines
-    for line in text.split("\n")[:20]:
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        # Remove punctuation/cruft and collapse whitespace
-        snippet = re.sub(r"[^a-zA-Z0-9 ]", " ", line)
-        snippet = re.sub(r"\s+", " ", snippet).strip()
-        if len(snippet) >= 10:
-            return snippet
-    return ""
+_SNAPSHOT_SEP = "\x1f"
+_SNIPPET_LEN = 120
+_SNIPPET_MIN = 10
 
 
-def extract_tail_snippet(sample_file: Path) -> str:
-    """Extract a snippet from the LAST 20 lines of a file.
-
-    This catches the case where version A was previously indexed and version
-    B at the same path was skipped (e.g. oversized).  If A and B share the
-    same opening lines but differ at the end, the tail snippet will not
-    match A's indexed content.
-    """
-    try:
-        text = sample_file.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return ""
-
-    lines = text.split("\n")
-    for line in reversed(lines[-20:]):
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        snippet = re.sub(r"[^a-zA-Z0-9 ]", " ", line)
-        snippet = re.sub(r"\s+", " ", snippet).strip()
-        if len(snippet) >= 10:
-            return snippet
-    return ""
+def _repo_root():
+    return Path(__file__).resolve().parent.parent
 
 
-def file_sha256(path: Path) -> str:
-    """Return the hex SHA-256 of a file."""
+def _sha256(path):
     h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
 
 
-def load_manifest(manifest_file: Path) -> set[str]:
-    """Load the batch manifest as a set of processed file paths."""
-    paths = set()
-    if not manifest_file.exists():
-        return paths
-    for line in manifest_file.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line:
-            paths.add(line)
-    return paths
+def load_snapshot(path):
+    entries = {}
+    for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
+        parts = line.split(_SNAPSHOT_SEP)
+        if len(parts) >= 4:
+            entries[parts[0]] = parts[3]
+    return entries
 
 
-def load_snapshot(snapshot_file: Path) -> dict[str, str]:
-    """Load a batch snapshot into a {rel_path: sha256} dict.
+def load_manifest(path):
+    """Mined manifest lines: orig_rel <US> mined_rel. Returns (origs, mined)."""
+    origs, mined = [], []
+    for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
+        parts = line.split(_SNAPSHOT_SEP)
+        if len(parts) == 2:
+            origs.append(parts[0])
+            mined.append(parts[1])
+    return sorted(set(origs)), mined
 
-    Returns an empty dict if the snapshot is missing or unreadable.
-    """
-    result: dict[str, str] = {}
-    if not snapshot_file.exists():
-        return result
+
+def extract_snippet(path):
+    """First meaningful content line, decoded for use as a search query."""
     try:
-        for line in snapshot_file.read_text(encoding="utf-8").splitlines():
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            parts = line.split("\x1f", 3)
-            if len(parts) < 4:
-                continue
-            rel, _size, _mtime, sha256 = parts
-            if rel and sha256:
-                result[rel] = sha256
-    except (OSError, ValueError):
-        pass
-    return result
+        data = Path(path).read_bytes()
+    except OSError:
+        return None
+    for line in data.decode("utf-8", errors="replace").splitlines():
+        s = line.strip()
+        if len(s) >= _SNIPPET_MIN:
+            return s[:_SNIPPET_LEN]
+    return None
 
 
-def run_search(mempalace_bin: str, palace_path: str, query: str, source_file: str) -> dict:
-    """Run a machine-readable mempalace search scoped to a single source file."""
-    cmd = [
-        mempalace_bin,
-        "--palace",
-        palace_path,
-        "search",
-        query,
-        "--source-file",
-        source_file,
-        "--json",
-        "--results",
-        "5",
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
-    return json.loads(result.stdout)
+def _searcher():
+    sys.path.insert(0, str(_repo_root()))
+    from mempalace.searcher import search_memories
+
+    return search_memories
 
 
-def verify_one(
-    palace_path: str,
-    sample_file: Path,
-    manifest: set[str],
-    mempalace_bin: str,
-    expected_sha256: str | None = None,
-) -> bool:
-    """Return True if *sample_file* is searchable and its hits are in *manifest*.
+def check_hashes(orig_rels, snapshot, work_dir):
+    """Every claimed original still matches its snapshot hash."""
+    bad = []
+    for rel in orig_rels:
+        expected = snapshot.get(rel)
+        if expected is None:
+            continue
+        try:
+            actual = _sha256(Path(work_dir) / rel)
+        except OSError:
+            bad.append((rel, "missing work copy"))
+            continue
+        if actual != expected:
+            bad.append((rel, "hash drift"))
+    return bad
 
-    When *expected_sha256* is provided, the file's current content hash must
-    match — this prevents a stale previously-indexed version from satisfying
-    verification for a new version that was never mined.
-    """
-    # If we have an expected sha256, verify the file hasn't changed since
-    # the batch was claimed.  This is necessary but not sufficient: it proves
-    # the file is the same version that was claimed, but not that it was
-    # actually mined.  The search below proves it was mined.
-    if expected_sha256 is not None:
-        current_hash = file_sha256(sample_file)
-        if current_hash != expected_sha256:
-            print(
-                f"verify_mined: {sample_file} sha256 mismatch — file changed since batch was claimed",
-                file=sys.stderr,
+
+def check_searchable(mined_rels, mine_dir, palace_path, sample, search_fn):
+    """Each mined file must return a hit under its own source_file."""
+    targets = mined_rels[:sample] if sample and sample < len(mined_rels) else mined_rels
+    failures = []
+    for rel in targets:
+        mined_path = Path(mine_dir) / rel
+        snippet = extract_snippet(mined_path)
+        if snippet is None:
+            failures.append((rel, "no usable snippet"))
+            continue
+        try:
+            result = search_fn(
+                snippet,
+                str(palace_path),
+                source_file=str(mined_path.resolve()),
+                n_results=1,
             )
-            return False
-
-    snippet = extract_snippet(sample_file)
-    if not snippet:
-        print(
-            f"verify_mined: could not extract a usable snippet from {sample_file}", file=sys.stderr
-        )
-        return False
-
-    if str(sample_file) not in manifest:
-        print(f"verify_mined: {sample_file} not in batch manifest", file=sys.stderr)
-        return False
-
-    try:
-        data = run_search(mempalace_bin, palace_path, snippet, str(sample_file))
-    except subprocess.CalledProcessError as e:
-        print(f"verify_mined: search failed with exit {e.returncode}", file=sys.stderr)
-        return False
-    except json.JSONDecodeError as e:
-        print(f"verify_mined: could not parse search JSON: {e}", file=sys.stderr)
-        return False
-
-    results = data.get("results", [])
-    if not results:
-        print(f"verify_mined: search returned no results for {sample_file}", file=sys.stderr)
-        return False
-
-    for hit in results:
-        hit_source = hit.get("source_file", "")
-        if hit_source and hit_source in manifest:
-            if Path(hit_source).resolve() == sample_file:
-                return True
-
-    print(
-        f"verify_mined: search hit source_file not in batch manifest for {sample_file}",
-        file=sys.stderr,
-    )
-    return False
+        except Exception as e:  # noqa: BLE001 — any search error = unverified
+            failures.append((rel, f"search error: {e}"))
+            continue
+        hits = result.get("results") or []
+        if not hits:
+            failures.append((rel, "no hit under own source_file"))
+    return failures
 
 
-def main() -> int:
-    if len(sys.argv) < 4:
-        print(
-            "usage: verify_mined.py <palace_path> <sample_file|manifest_file> <manifest_file> [mempalace_bin] [--snapshot <snapshot_file>]",
-            file=sys.stderr,
-        )
-        return 2
+def main(argv=None):
+    p = argparse.ArgumentParser(description="Verify mined batch files are searchable.")
+    p.add_argument("--palace", required=True, help="palace directory")
+    p.add_argument("--manifest", required=True, help="mined manifest (orig<US>mined)")
+    p.add_argument("--mine-dir", required=True, help="mine root the manifest paths resolve under")
+    p.add_argument("--snapshot", required=True, help="batch snapshot for hash checks")
+    p.add_argument("--work-dir", required=True, help="verified original work copies")
+    p.add_argument("--sample", type=int, default=0, help="verify only N mined files")
+    p.add_argument("--all", action="store_true", help="verify every mined file")
+    args = p.parse_args(argv)
 
-    palace_path = sys.argv[1]
-    sample_arg = Path(sys.argv[2])
-    manifest_file = Path(sys.argv[3])
-    mempalace_bin = sys.argv[4] if len(sys.argv) > 4 else "mempalace"
-
-    # Optional: --snapshot <file> for sha256 verification
-    snapshot_file: Path | None = None
-    if "--snapshot" in sys.argv:
-        idx = sys.argv.index("--snapshot")
-        if idx + 1 < len(sys.argv):
-            snapshot_file = Path(sys.argv[idx + 1])
-
-    manifest = load_manifest(manifest_file)
-    if not manifest:
-        print("verify_mined: manifest is empty or missing", file=sys.stderr)
+    orig_rels, mined_rels = load_manifest(args.manifest)
+    if not mined_rels:
+        print("verify: manifest lists no mined files", file=sys.stderr)
         return 1
 
-    snapshot_hashes = load_snapshot(snapshot_file) if snapshot_file else {}
+    snapshot = load_snapshot(args.snapshot)
+    bad_hashes = check_hashes(orig_rels, snapshot, args.work_dir)
+    for rel, why in bad_hashes:
+        print(f"verify: HASH FAIL {rel} ({why})", file=sys.stderr)
 
-    # If the second argument is the manifest itself, verify every entry.
-    if sample_arg.resolve() == manifest_file.resolve():
-        failures = 0
-        for item in sorted(manifest):
-            sample_file = Path(item).resolve()
-            if not sample_file.exists():
-                print(f"verify_mined: manifest entry missing on disk: {item}", file=sys.stderr)
-                failures += 1
-                continue
-            # Look up the expected sha256 from the snapshot if available.
-            # The manifest contains processed/ paths; the snapshot contains
-            # original staging paths.  Match by basename.
-            expected_sha256 = None
-            if snapshot_hashes:
-                basename = Path(item).name
-                for rel, sha in snapshot_hashes.items():
-                    if Path(rel).name == basename:
-                        expected_sha256 = sha
-                        break
-            if not verify_one(palace_path, sample_file, manifest, mempalace_bin, expected_sha256):
-                failures += 1
-        if failures:
-            print(f"verify_mined: {failures} manifest entries failed verification", file=sys.stderr)
-            return 1
-        return 0
+    sample = 0 if args.all else (args.sample or min(5, len(mined_rels)))
+    failures = check_searchable(mined_rels, args.mine_dir, args.palace, sample, _searcher())
+    for rel, why in failures:
+        print(f"verify: SEARCH FAIL {rel} ({why})", file=sys.stderr)
 
-    # Backward-compatible single-sample verification.
-    sample_file = sample_arg.resolve()
-    expected_sha256 = None
-    if snapshot_hashes:
-        basename = Path(sample_file).name
-        for rel, sha in snapshot_hashes.items():
-            if Path(rel).name == basename:
-                expected_sha256 = sha
-                break
-    if verify_one(palace_path, sample_file, manifest, mempalace_bin, expected_sha256):
-        return 0
-    return 1
+    if bad_hashes or failures:
+        print(
+            f"verify: FAILED — {len(bad_hashes)} hash, {len(failures)} search",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"verify: OK — {len(mined_rels)} mined file(s), sample {len(mined_rels[:sample])}")
+    return 0
 
 
 if __name__ == "__main__":
