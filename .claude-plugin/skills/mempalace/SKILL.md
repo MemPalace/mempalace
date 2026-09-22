@@ -99,7 +99,7 @@ When shared-brain mode is selected:
   mempalace rules --host <host> --harness <harness> --project <example>
   ```
 
-  Default `--mcp full` matches the 45-tool `mempalace-mcp` server this
+  Default `--mcp full` matches the 47-tool `mempalace-mcp` server this
   skill registers. If the user opted into `mempalace-light-mcp`, re-render
   with `--mcp light` instead. Replace an existing
   `<!-- mempalace-shared-brain -->` block instead of appending a duplicate.

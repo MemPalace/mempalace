@@ -14,6 +14,21 @@ from mempalace import mcp_server
 from mempalace import service
 
 
+class _CountingCollection:
+    """Counts ``get`` calls and forwards everything else to the real collection."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.gets = 0
+
+    def get(self, *args, **kwargs):
+        self.gets += 1
+        return self._inner.get(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 def _patch_mcp_server(monkeypatch, config, kg):
     monkeypatch.setattr(mcp_server, "_config", config)
     monkeypatch.setattr(mcp_server, "_get_kg", lambda: kg)
@@ -164,6 +179,72 @@ class TestGetDrawers:
         assert result["errors"] == 2
         assert all("error" in r for r in result["results"])
 
+    def test_direct_ids_resolve_in_one_read(self, monkeypatch, config, collection, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        ids = []
+        for i in range(3):
+            added = mcp_server.tool_add_drawer(
+                wing="test",
+                room="bulk_get",
+                content=f"direct row {i}",
+            )
+            ids.append(added["drawer_id"])
+        counter = _CountingCollection(mcp_server._get_collection())
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: counter)
+
+        result = mcp_server.tool_get_drawers(ids)
+
+        assert counter.gets == 1
+        assert result["errors"] == 0
+        assert [item["drawer_id"] for item in result["results"]] == ids
+
+    def test_mixed_ids_resolve_in_two_reads(self, monkeypatch, config, collection, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        single = mcp_server.tool_add_drawer(wing="test", room="bulk_get", content="one row")
+        chunked = mcp_server.tool_add_drawer(wing="test", room="bulk_get", content="q" * 2000)
+        assert chunked["chunks"] > 1
+        single_payload = mcp_server.tool_get_drawer(single["drawer_id"])
+        logical_payload = mcp_server.tool_get_drawer(chunked["drawer_id"])
+        chunk_payload = mcp_server.tool_get_drawer(chunked["chunk_ids"][0])
+        counter = _CountingCollection(mcp_server._get_collection())
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: counter)
+
+        result = mcp_server.tool_get_drawers(
+            [
+                single["drawer_id"],
+                chunked["drawer_id"],
+                chunked["chunk_ids"][0],
+                "drawer_missing_none",
+            ]
+        )
+
+        assert counter.gets == 2
+        assert result["errors"] == 1
+        assert result["results"][0] == single_payload
+        assert result["results"][1] == logical_payload
+        assert result["results"][2] == chunk_payload
+        assert result["results"][3]["drawer_id"] == "drawer_missing_none"
+
+    def test_payload_error_stays_on_that_item(self, monkeypatch, config, collection, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        first = mcp_server.tool_add_drawer(wing="test", room="bulk_get", content="alpha content")
+        second = mcp_server.tool_add_drawer(wing="test", room="bulk_get", content="beta content")
+        real_payload = mcp_server._drawer_payload
+
+        def boom(record):
+            if record["content"] == "alpha content":
+                raise RuntimeError("bad payload")
+            return real_payload(record)
+
+        monkeypatch.setattr(mcp_server, "_drawer_payload", boom)
+        result = mcp_server.tool_get_drawers([first["drawer_id"], second["drawer_id"]])
+
+        assert result["count"] == 2
+        assert result["errors"] == 1
+        assert result["results"][0]["drawer_id"] == first["drawer_id"]
+        assert "bad payload" in result["results"][0]["error"]
+        assert result["results"][1]["content"] == "beta content"
+
 
 # ── Bulk delete ───────────────────────────────────────────────────────────
 
@@ -246,6 +327,25 @@ class TestDeleteDrawers:
 
         # Nothing was deleted: validation rejects the whole call.
         assert "error" not in mcp_server.tool_get_drawer(added["drawer_id"])
+
+    def test_resolves_many_ids_in_one_read(self, monkeypatch, config, collection, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        ids = []
+        for i in range(3):
+            added = mcp_server.tool_add_drawer(
+                wing="test",
+                room="bulk_del",
+                content=f"delete direct {i}",
+            )
+            ids.append(added["drawer_id"])
+        counter = _CountingCollection(mcp_server._get_collection())
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: counter)
+
+        result = mcp_server.tool_delete_drawers(ids)
+
+        assert counter.gets == 1
+        assert result["deleted"] == 3
+        assert result["errors"] == 0
 
     def test_chunk_id_deletes_one_row_like_the_singular_tool(
         self, monkeypatch, config, collection, kg

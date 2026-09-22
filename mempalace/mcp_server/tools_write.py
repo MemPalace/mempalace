@@ -108,26 +108,31 @@ def _logical_chunk_group(col, drawer_id: str):
         logger.debug("chunk group lookup failed for %s", drawer_id, exc_info=True)
         return None
 
-    ids = _chroma_field(result, "ids", []) or []
-    if not ids:
-        return None
+    return _chunk_group_record(drawer_id, _rows_from_get(result))
 
+
+def _rows_from_get(result):
+    """Normalize a collection ``get`` into ``(index, id, doc, meta)`` rows."""
+    ids = _chroma_field(result, "ids", []) or []
     docs = _chroma_field(result, "documents", []) or []
     metas = _chroma_field(result, "metadatas", []) or []
-
     rows = []
     for idx, chunk_id in enumerate(ids):
         doc = docs[idx] if idx < len(docs) else ""
         meta = _safe_meta(metas[idx] if idx < len(metas) else {})
         rows.append((_chunk_index(meta), chunk_id, doc or "", meta))
+    return rows
 
+
+def _chunk_group_record(drawer_id, rows):
+    """Build one logical-group record from ``(index, id, doc, meta)`` rows."""
+    if not rows:
+        return None
     rows.sort(key=lambda row: (row[0], row[1]))
-
     chunk_ids = [row[1] for row in rows]
     chunk_docs = [row[2] for row in rows]
     chunk_metas = [row[3] for row in rows]
     first_meta = chunk_metas[0] if chunk_metas else {}
-
     return {
         "drawer_id": drawer_id,
         "ids": chunk_ids,
@@ -139,11 +144,84 @@ def _logical_chunk_group(col, drawer_id: str):
     }
 
 
+def _single_record(drawer_id, doc, meta):
+    """Build the one-row record ``_single_drawer_record`` returns."""
+    doc = doc or ""
+    meta = _safe_meta(meta)
+    return {
+        "drawer_id": drawer_id,
+        "ids": [drawer_id],
+        "documents": [doc],
+        "metadatas": [meta],
+        "content": doc,
+        "metadata": meta,
+        "chunked": False,
+    }
+
+
 def _logical_drawer_record(col, drawer_id: str):
     direct = _single_drawer_record(col, drawer_id)
     if direct is not None:
         return direct
     return _logical_chunk_group(col, drawer_id)
+
+
+def _bulk_drawer_records(col, drawer_ids):
+    """Resolve many ids with one direct read and, if needed, one group read.
+
+    A row returned by the direct read wins, so a physical chunk id stays
+    that one row. Ids with no row are matched together on either parent
+    key and assembled the same way as ``_logical_chunk_group``. An id that
+    matches neither read is absent. The caller keeps input order.
+    """
+    unique = list(
+        dict.fromkeys(drawer_id for drawer_id in drawer_ids if isinstance(drawer_id, str))
+    )
+    if not unique:
+        return {}
+
+    found = {}
+    for _index, chunk_id, doc, meta in _rows_from_get(
+        col.get(ids=unique, include=["documents", "metadatas"])
+    ):
+        found[chunk_id] = _single_record(chunk_id, doc, meta)
+
+    missing = [drawer_id for drawer_id in unique if drawer_id not in found]
+    if not missing:
+        return found
+
+    requested = set(missing)
+    grouped = {drawer_id: [] for drawer_id in missing}
+    seen = {drawer_id: set() for drawer_id in missing}
+    try:
+        group_rows = _rows_from_get(
+            col.get(
+                where={"$or": [{key: {"$in": missing}} for key in _PARENT_ID_KEYS]},
+                include=["documents", "metadatas"],
+            )
+        )
+    except Exception:
+        logger.debug("bulk chunk group lookup failed", exc_info=True)
+        return found
+
+    for row in group_rows:
+        meta = row[3]
+        parents = []
+        for key in _PARENT_ID_KEYS:
+            value = meta.get(key)
+            if value in requested and value not in parents:
+                parents.append(value)
+        for parent in parents:
+            if row[1] in seen[parent]:
+                continue
+            seen[parent].add(row[1])
+            grouped[parent].append(row)
+
+    for drawer_id, rows in grouped.items():
+        record = _chunk_group_record(drawer_id, rows)
+        if record is not None:
+            found[drawer_id] = record
+    return found
 
 
 def _drawer_payload(record):
@@ -524,23 +602,15 @@ def tool_add_drawer(
         return outcome
 
 
-def _delete_resolved_drawer(col, drawer_id: str, *, bulk: bool = False):
-    """Delete one drawer the same way the singular delete tool does.
+def _delete_record(col, drawer_id: str, record, *, bulk: bool = False):
+    """Write-ahead, delete, and closet-purge one already resolved record.
 
-    A logical handle removes the whole group, including every chunk row.
-    A physical chunk id removes that one row, because resolution hits the
-    row directly. The write-ahead record is written before the mutation.
     Closets are keyed by ``source_file``, not by drawer id, so a drawer-only
-    delete would leave an index entry quoting text that is now gone; matching
-    closets are purged here. Returns the singular success or not-found dict.
-    A backend failure propagates so the caller can fail one call or one item
-    of a batch. ``bulk`` marks the write-ahead record when this delete is one
-    item of a multi-id call.
+    delete would leave an index entry quoting text that is now gone. Returns
+    the singular success dict. A backend failure propagates so the caller can
+    fail one call or one item of a batch. ``bulk`` marks the write-ahead
+    record when this delete is one item of a multi-id call.
     """
-    record = _logical_drawer_record(col, drawer_id)
-    if record is None:
-        return {"success": False, "error": f"Drawer not found: {drawer_id}"}
-
     details = {
         "drawer_id": drawer_id,
         "deleted_ids": record["ids"],
@@ -574,8 +644,25 @@ def _delete_resolved_drawer(col, drawer_id: str, *, bulk: bool = False):
     }
 
 
+def _delete_resolved_drawer(col, drawer_id: str, *, bulk: bool = False):
+    """Resolve one id and delete it.
+
+    A logical handle removes the whole group, including every chunk row.
+    A physical chunk id removes that one row, because resolution hits the
+    row directly. Returns the singular success or not-found dict.
+    """
+    record = _logical_drawer_record(col, drawer_id)
+    if record is None:
+        return {"success": False, "error": f"Drawer not found: {drawer_id}"}
+    return _delete_record(col, drawer_id, record, bulk=bulk)
+
+
 def tool_delete_drawer(drawer_id: str):
-    """Delete a single logical drawer by ID."""
+    """Delete one drawer by ID.
+
+    A logical handle removes the whole group, including every chunk row.
+    A physical chunk id removes that one row.
+    """
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
@@ -1103,32 +1190,40 @@ def tool_get_drawers(drawer_ids: list):
         return _collection_error_or_no_palace()
 
     try:
-        results = []
-        errors = 0
-        for drawer_id in drawer_ids:
-            try:
-                record = _logical_drawer_record(col, drawer_id)
-            except Exception as e:
-                record = None
-                error = str(e)
-            else:
-                error = None
-            if record is None:
-                errors += 1
-                results.append(
-                    {"drawer_id": drawer_id, "error": error or f"Drawer not found: {drawer_id}"}
-                )
-            else:
-                results.append(_drawer_payload(record))
+        found = _bulk_drawer_records(col, drawer_ids)
+    except Exception:
+        logger.exception("tool_get_drawers batch resolve failed; resolving one id at a time")
+        found = None
 
-        return {
-            "results": results,
-            "count": len(results),
-            "errors": errors,
-        }
-    except Exception as e:
-        logger.exception("tool_get_drawers failed")
-        return {"error": str(e)}
+    results = []
+    errors = 0
+    for drawer_id in drawer_ids:
+        try:
+            if found is None:
+                record = _logical_drawer_record(col, drawer_id)
+            else:
+                record = found.get(drawer_id)
+            error = None
+        except Exception as e:
+            record = None
+            error = str(e)
+        if record is None:
+            errors += 1
+            results.append(
+                {"drawer_id": drawer_id, "error": error or f"Drawer not found: {drawer_id}"}
+            )
+            continue
+        try:
+            results.append(_drawer_payload(record))
+        except Exception as e:
+            errors += 1
+            results.append({"drawer_id": drawer_id, "error": str(e)})
+
+    return {
+        "results": results,
+        "count": len(results),
+        "errors": errors,
+    }
 
 
 def tool_list_drawers(
@@ -1342,11 +1437,11 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 def tool_delete_drawers(drawer_ids: list):
     """Delete many drawers by ID in one call. Irreversible.
 
-    Each id is removed by ``_delete_resolved_drawer``, the same function
-    the singular tool calls. A logical handle removes the whole group. A
-    physical chunk id removes that one row. Per-item results come back in
-    input order. A missing id is an ``error`` slot counted in ``errors``;
-    later ids are still deleted.
+    Ids are resolved together, then each one is removed by ``_delete_record``,
+    the same mutation the singular tool runs. A logical handle removes the
+    whole group. A physical chunk id removes that one row. Per-item results
+    come back in input order. A missing id is an ``error`` slot counted in
+    ``errors``; later ids are still deleted.
 
     A list of 1 to 500 ids returns ``{"results", "count", "deleted", "errors"}``.
     A non-list, an empty list, or more than 500 ids returns ``{"error"}``
@@ -1360,12 +1455,25 @@ def tool_delete_drawers(drawer_ids: list):
     if not col:
         return _collection_error_or_no_palace()
 
+    try:
+        found = _bulk_drawer_records(col, drawer_ids)
+    except Exception:
+        logger.exception("tool_delete_drawers batch resolve failed; deleting one id at a time")
+        found = None
+
     results = []
     deleted = 0
     errors = 0
     for drawer_id in drawer_ids:
         try:
-            outcome = _delete_resolved_drawer(col, drawer_id, bulk=True)
+            if found is None:
+                outcome = _delete_resolved_drawer(col, drawer_id, bulk=True)
+            else:
+                record = found.get(drawer_id)
+                if record is None:
+                    outcome = {"success": False, "error": f"Drawer not found: {drawer_id}"}
+                else:
+                    outcome = _delete_record(col, drawer_id, record, bulk=True)
         except Exception as e:
             errors += 1
             results.append({"drawer_id": drawer_id, "error": str(e)})
