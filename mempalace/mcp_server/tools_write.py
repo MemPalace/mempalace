@@ -524,51 +524,64 @@ def tool_add_drawer(
         return outcome
 
 
+def _delete_resolved_drawer(col, drawer_id: str, *, bulk: bool = False):
+    """Delete one drawer the same way the singular delete tool does.
+
+    A logical handle removes the whole group, including every chunk row.
+    A physical chunk id removes that one row, because resolution hits the
+    row directly. The write-ahead record is written before the mutation.
+    Closets are keyed by ``source_file``, not by drawer id, so a drawer-only
+    delete would leave an index entry quoting text that is now gone; matching
+    closets are purged here. Returns the singular success or not-found dict.
+    A backend failure propagates so the caller can fail one call or one item
+    of a batch. ``bulk`` marks the write-ahead record when this delete is one
+    item of a multi-id call.
+    """
+    record = _logical_drawer_record(col, drawer_id)
+    if record is None:
+        return {"success": False, "error": f"Drawer not found: {drawer_id}"}
+
+    details = {
+        "drawer_id": drawer_id,
+        "deleted_ids": record["ids"],
+        "deleted_meta": record["metadata"],
+        "content_preview": record["content"][:200],
+    }
+    if bulk:
+        details["bulk"] = True
+    _wal_log("delete_drawer", details)
+
+    col.delete(ids=record["ids"])
+    _invalidate_overview_caches()
+
+    source_file = record["metadata"].get("source_file")
+    closets_deleted = _purge_source_closets(source_file, commit=True) if source_file else 0
+
+    logger.info(
+        "Deleted drawer: %s (%s rows, %s closet(s) purged)%s",
+        drawer_id,
+        len(record["ids"]),
+        closets_deleted,
+        " [bulk]" if bulk else "",
+    )
+
+    return {
+        "success": True,
+        "drawer_id": drawer_id,
+        "deleted_ids": record["ids"],
+        "chunks_deleted": len(record["ids"]),
+        "closets_deleted": closets_deleted,
+    }
+
+
 def tool_delete_drawer(drawer_id: str):
     """Delete a single logical drawer by ID."""
-    global _metadata_cache
-
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
 
     try:
-        record = _logical_drawer_record(col, drawer_id)
-        if record is None:
-            return {"success": False, "error": f"Drawer not found: {drawer_id}"}
-
-        _wal_log(
-            "delete_drawer",
-            {
-                "drawer_id": drawer_id,
-                "deleted_ids": record["ids"],
-                "deleted_meta": record["metadata"],
-                "content_preview": record["content"][:200],
-            },
-        )
-
-        col.delete(ids=record["ids"])
-        _invalidate_overview_caches()
-
-        # Closets are keyed by source_file, not drawer_id (#1722), so a
-        # drawer-only delete strands a closet quoting the now-deleted text (#2325).
-        source_file = record["metadata"].get("source_file")
-        closets_deleted = _purge_source_closets(source_file, commit=True) if source_file else 0
-
-        logger.info(
-            "Deleted drawer: %s (%s rows, %s closet(s) purged)",
-            drawer_id,
-            len(record["ids"]),
-            closets_deleted,
-        )
-
-        return {
-            "success": True,
-            "drawer_id": drawer_id,
-            "deleted_ids": record["ids"],
-            "chunks_deleted": len(record["ids"]),
-            "closets_deleted": closets_deleted,
-        }
+        return _delete_resolved_drawer(col, drawer_id)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1037,34 +1050,22 @@ def tool_get_drawer(drawer_id: str):
         return {"error": str(e)}
 
 
-# --- Bulk drawer fetch (#2558) --------------------------------------------
-#
-# ``tool_get_drawers`` fetches many logical drawers in ONE call so a caller
-# that already holds an id list does not pay one round trip, one tool card,
-# and one log line per item. Two design constraints from the issue:
-#
-# * The response shape is uniform — always ``{"results": [...]}`` — so a
-#   caller never has to branch on the shape of the input (the
-#   indistinguishable-shape defect class of #2544).
-# * Partial failure is reported per item. A missing id never fails the whole
-#   batch: its slot carries an ``error`` key, and ``errors`` counts them.
-#
-# The plural form sits beside the singular tool rather than widening its
-# ``drawer_id`` param, so the existing ``mempalace_get_drawer`` schema and
-# response are untouched for current clients.
+# Separate bulk tools sit beside the singular get and delete tools. Their
+# schemas stay array-only, so the singular tools' schemas and responses are
+# unchanged. An accepted call (1 to _BULK_DRAWER_MAX_IDS ids) always returns
+# {"results": [...]} in input order, including a one-id call, and a missing
+# id is an error slot rather than a failed batch. A non-list, an empty list,
+# or a list past the cap is rejected with {"error": ...} before any read or
+# write, so that rejection is a different shape from a batch that ran.
 _BULK_DRAWER_MAX_IDS = 500
 
 
-def tool_get_drawers(drawer_ids: list):
-    """Fetch many logical drawers by ID in one call.
+def _bulk_ids_error(drawer_ids, *, action: str):
+    """Return an error dict when ``drawer_ids`` cannot be processed.
 
-    ``drawer_ids`` is a list of drawer ids (logical or physical chunk ids —
-    the same resolution the singular tool applies via
-    ``_logical_drawer_record``). Each id resolves to a full payload identical
-    to ``tool_get_drawer``'s single-drawer response; an id that does not
-    resolve gets ``{"drawer_id": ..., "error": ...}`` instead. The response
-    is always a list (``results``), even for one id, so the shape never
-    depends on the input.
+    ``action`` is the noun in the oversized-list message ("fetch" or
+    "delete"). Returns None when the list holds 1 to ``_BULK_DRAWER_MAX_IDS``
+    ids.
     """
     if not isinstance(drawer_ids, list):
         return {"error": "drawer_ids must be a list of drawer IDs"}
@@ -1073,10 +1074,29 @@ def tool_get_drawers(drawer_ids: list):
     if len(drawer_ids) > _BULK_DRAWER_MAX_IDS:
         return {
             "error": (
-                f"drawer_ids holds {len(drawer_ids)} ids, but the bulk fetch "
+                f"drawer_ids holds {len(drawer_ids)} ids, but the bulk {action} "
                 f"accepts at most {_BULK_DRAWER_MAX_IDS} per call"
             )
         }
+    return None
+
+
+def tool_get_drawers(drawer_ids: list):
+    """Fetch many drawers by ID in one call.
+
+    Each id resolves the same way as ``tool_get_drawer``: a logical handle
+    reassembles the chunk group, and a physical chunk id returns that row.
+    The payload for a hit is the singular tool's payload. An id that does
+    not resolve is ``{"drawer_id", "error"}`` and is counted in ``errors``;
+    later ids are still fetched.
+
+    A list of 1 to 500 ids returns ``{"results", "count", "errors"}``.
+    A non-list, an empty list, or more than 500 ids returns ``{"error"}``
+    and does not read the palace.
+    """
+    rejected = _bulk_ids_error(drawer_ids, action="fetch")
+    if rejected:
+        return rejected
 
     col = _get_collection()
     if not col:
@@ -1319,35 +1339,22 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         return {"success": False, "error": str(e)}
 
 
-# --- Bulk drawer delete (#2558) --------------------------------------------
-#
-# ``tool_delete_drawers`` deletes many logical drawers in ONE call. Like the
-# bulk fetch it keeps a uniform ``{"results": [...]}`` response and reports
-# partial failure per item: a missing id never aborts the batch. Each item
-# resolves and deletes exactly as the singular ``tool_delete_drawer`` does —
-# the whole logical group including every ``_chunk_NNNNNN`` row, plus the
-# closet purge keyed on ``source_file`` (#2325) — so the bulk path is a loop
-# over the same primitive, not a second delete strategy.
 def tool_delete_drawers(drawer_ids: list):
-    """Delete many logical drawers by ID in one call. Irreversible.
+    """Delete many drawers by ID in one call. Irreversible.
 
-    ``drawer_ids`` is a list of logical (or chunk) drawer ids. Each id is
-    resolved and removed the same way as ``tool_delete_drawer`` — the whole
-    logical group and its chunk rows — and per-item results are returned in
-    input order. A missing id yields an ``error`` slot and is counted in
-    ``errors`` without stopping the remaining deletes.
+    Each id is removed by ``_delete_resolved_drawer``, the same function
+    the singular tool calls. A logical handle removes the whole group. A
+    physical chunk id removes that one row. Per-item results come back in
+    input order. A missing id is an ``error`` slot counted in ``errors``;
+    later ids are still deleted.
+
+    A list of 1 to 500 ids returns ``{"results", "count", "deleted", "errors"}``.
+    A non-list, an empty list, or more than 500 ids returns ``{"error"}``
+    and deletes nothing.
     """
-    if not isinstance(drawer_ids, list):
-        return {"error": "drawer_ids must be a list of drawer IDs"}
-    if not drawer_ids:
-        return {"error": "drawer_ids must not be empty"}
-    if len(drawer_ids) > _BULK_DRAWER_MAX_IDS:
-        return {
-            "error": (
-                f"drawer_ids holds {len(drawer_ids)} ids, but the bulk delete "
-                f"accepts at most {_BULK_DRAWER_MAX_IDS} per call"
-            )
-        }
+    rejected = _bulk_ids_error(drawer_ids, action="delete")
+    if rejected:
+        return rejected
 
     col = _get_collection()
     if not col:
@@ -1358,48 +1365,25 @@ def tool_delete_drawers(drawer_ids: list):
     errors = 0
     for drawer_id in drawer_ids:
         try:
-            record = _logical_drawer_record(col, drawer_id)
-            if record is None:
-                errors += 1
-                results.append({"drawer_id": drawer_id, "error": f"Drawer not found: {drawer_id}"})
-                continue
-
-            _wal_log(
-                "delete_drawer",
-                {
-                    "drawer_id": drawer_id,
-                    "deleted_ids": record["ids"],
-                    "deleted_meta": record["metadata"],
-                    "content_preview": record["content"][:200],
-                    "bulk": True,
-                },
-            )
-
-            col.delete(ids=record["ids"])
-            _invalidate_overview_caches()
-
-            source_file = record["metadata"].get("source_file")
-            closets_deleted = _purge_source_closets(source_file, commit=True) if source_file else 0
-
-            deleted += 1
-            results.append(
-                {
-                    "drawer_id": drawer_id,
-                    "deleted_ids": record["ids"],
-                    "chunks_deleted": len(record["ids"]),
-                    "closets_deleted": closets_deleted,
-                }
-            )
-            logger.info(
-                "Deleted drawer: %s (%s rows, %s closet(s) purged) [bulk]",
-                drawer_id,
-                len(record["ids"]),
-                closets_deleted,
-            )
+            outcome = _delete_resolved_drawer(col, drawer_id, bulk=True)
         except Exception as e:
             errors += 1
             results.append({"drawer_id": drawer_id, "error": str(e)})
             logger.exception("tool_delete_drawers: delete failed for %s", drawer_id)
+            continue
+        if not outcome.get("success"):
+            errors += 1
+            results.append({"drawer_id": drawer_id, "error": outcome["error"]})
+            continue
+        deleted += 1
+        results.append(
+            {
+                "drawer_id": drawer_id,
+                "deleted_ids": outcome["deleted_ids"],
+                "chunks_deleted": outcome["chunks_deleted"],
+                "closets_deleted": outcome["closets_deleted"],
+            }
+        )
 
     return {
         "results": results,

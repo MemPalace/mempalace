@@ -1,10 +1,9 @@
-"""Tests for the bulk drawer tools (mempalace_get_drawers /
-mempalace_delete_drawers) added by #2558.
+"""Tests for the bulk drawer tools (mempalace_get_drawers / mempalace_delete_drawers).
 
-The bulk tools sit alongside the singular get/delete tools (option B in the
-issue) so the existing schemas and responses are untouched. Their response
-shape is uniform — always a ``results`` list, even for one id — and partial
-failure is reported per item: a missing id never fails the batch.
+The bulk tools sit alongside the singular get and delete tools, so the
+existing schemas and responses are untouched. An accepted call always
+returns a ``results`` list, even for one id, and a missing id is an error
+slot rather than a failed batch.
 """
 
 import json
@@ -247,6 +246,77 @@ class TestDeleteDrawers:
 
         # Nothing was deleted: validation rejects the whole call.
         assert "error" not in mcp_server.tool_get_drawer(added["drawer_id"])
+
+    def test_chunk_id_deletes_one_row_like_the_singular_tool(
+        self, monkeypatch, config, collection, kg
+    ):
+        """A physical chunk id removes that row, not the rest of the group.
+
+        That is what the singular delete does: resolution hits the chunk
+        row directly. The logical handle is what removes the whole group.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        first = mcp_server.tool_add_drawer(wing="test", room="bulk_del", content="a" * 2000)
+        second = mcp_server.tool_add_drawer(wing="test", room="bulk_del", content="b" * 2000)
+        assert first["chunks"] > 1
+        assert second["chunks"] > 1
+
+        singular = mcp_server.tool_delete_drawer(first["chunk_ids"][0])
+        bulk = mcp_server.tool_delete_drawers([second["chunk_ids"][0]])
+
+        assert singular["success"] is True
+        assert singular["chunks_deleted"] == 1
+        assert singular["deleted_ids"] == [first["chunk_ids"][0]]
+        assert bulk["deleted"] == 1
+        assert bulk["results"][0]["chunks_deleted"] == 1
+        assert bulk["results"][0]["deleted_ids"] == [second["chunk_ids"][0]]
+
+        for added in (first, second):
+            raw = collection.get(ids=added["chunk_ids"], include=[])
+            remaining = raw.get("ids", []) if isinstance(raw, dict) else raw.ids
+            assert added["chunk_ids"][0] not in list(remaining)
+            assert added["chunk_ids"][1] in list(remaining)
+
+    def test_purges_closets_for_the_deleted_source_only(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        """Bulk delete drops closets for the removed drawer's source file.
+
+        A closet for a different source stays. The count is the number of
+        matching closets removed, the same field the singular delete returns.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.palace import get_closets_collection
+
+        removed = mcp_server.tool_add_drawer(
+            wing="test",
+            room="bulk_del",
+            content="drawer whose source closets should go",
+            source_file="auth.py",
+        )
+        kept = mcp_server.tool_add_drawer(
+            wing="test",
+            room="bulk_del",
+            content="drawer whose source closets should stay",
+            source_file="db.py",
+        )
+        closets = get_closets_collection(palace_path, create=True)
+        closets.add(
+            ids=["closet_auth", "closet_db"],
+            documents=["auth index card", "db index card"],
+            metadatas=[{"source_file": "auth.py"}, {"source_file": "db.py"}],
+        )
+
+        result = mcp_server.tool_delete_drawers([removed["drawer_id"]])
+
+        assert result["deleted"] == 1
+        assert result["results"][0]["closets_deleted"] == 1
+        assert "error" not in mcp_server.tool_get_drawer(kept["drawer_id"])
+
+        # Re-acquire: the purge drops the path-keyed collection cache, so
+        # the handle taken before the call is stale.
+        closets = get_closets_collection(palace_path, create=False)
+        assert closets.get(include=[])["ids"] == ["closet_db"]
 
 
 # ── Protocol dispatch (tools/call with an array argument) ─────────────────
