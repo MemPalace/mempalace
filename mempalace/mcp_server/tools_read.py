@@ -8,6 +8,10 @@ if __name__ != "mempalace.mcp_server":
 _SALIENCE_POTENTIATE_ENV = "MEMPALACE_SALIENCE_POTENTIATE"
 
 
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _tool_status_via_sqlite() -> dict:
     """Pure-sqlite status reader for the #1222 fallback path.
 
@@ -745,7 +749,7 @@ def _maybe_potentiate_search_results(hits: list[dict]) -> None:
     if not col:
         return
 
-    now = datetime.now(timezone.utc)
+    now = _now()
     for drawer_id in _logical_ids_from_search_hits(hits):
         try:
             record = _logical_drawer_record(col, drawer_id)

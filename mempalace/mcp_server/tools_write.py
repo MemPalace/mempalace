@@ -232,7 +232,7 @@ def _drawer_payload(record):
         "content": record["content"],
         "wing": safe_meta.get("wing", ""),
         "room": safe_meta.get("room", ""),
-        "salience": drawer_salience(record["metadata"], now=datetime.now(timezone.utc)),
+        "salience": drawer_salience(record["metadata"], now=_now()),
         "metadata": safe_meta,
     }
 
@@ -1346,7 +1346,7 @@ def tool_drawer_salience(
         )
         drawers = _collapse_drawer_rows(ids, documents, metadatas)
         rows = []
-        now = datetime.now(timezone.utc)
+        now = _now()
         for drawer in drawers:
             rows.append(
                 {
