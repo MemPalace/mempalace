@@ -9,20 +9,21 @@ Covered contracts:
 - bash 3.2 compatibility (no ``mapfile`` / ``readarray``; ``sed -n 'Np'``
   used for line extraction; ``bash -n`` clean).
 - Per-conversation counter increments atomically across ``stop`` calls
-  and emits a ``followup_message`` only on the configured interval.
+  and mines in the background; ``followup_message`` is opt-in via
+  ``MEMPAL_VERBOSE=true``.
 - ``MEMPAL_DISABLE_HOOK=1`` and ``MEMPALACE_HOOKS_AUTO_SAVE=false`` both
   short-circuit every hook to ``{}``.
 - Malformed stdin dumps the payload to a bounded 0600 file and logs a
   warning; the hook still exits 0 with ``{}`` so Cursor proceeds.
 - ``loop_count > 0`` short-circuits the save hook (loop-prevention).
 - A pending-save marker dropped by ``preCompact`` forces a save
-  followup on the very next ``stop`` regardless of the counter.
+  followup on the very next ``stop`` only when ``MEMPAL_VERBOSE`` is on.
 - ``infer_wing_from_cwd`` handles ``/``, trailing slashes, spaces, and
   empty input.
 - The wake hook emits ``additional_context`` referencing the inferred
   wing.
-- The precompact hook drops a pending-save marker and emits the
-  documented ``user_message`` shape.
+- The precompact hook drops a pending-save marker; ``user_message``
+  is verbose-only.
 """
 
 from __future__ import annotations
@@ -339,7 +340,7 @@ class TestSaveHookCounter:
 
     def test_threshold_emits_followup_message(self, tmp_path):
         # Lower the interval to keep the test fast.
-        env = {"MEMPAL_SAVE_INTERVAL": "3"}
+        env = {"MEMPAL_SAVE_INTERVAL": "3", "MEMPAL_VERBOSE": "true"}
         for _ in range(2):
             out, _ = _run_hook(SAVE_HOOK, _stop_payload(), tmp_path, extra_env=env)
             assert json.loads(out) == {}
@@ -356,7 +357,7 @@ class TestSaveHookCounter:
         assert "cursor-ide" in msg, "diary entries must be tagged agent_name=cursor-ide"
 
     def test_threshold_followup_references_inferred_wing(self, tmp_path):
-        env = {"MEMPAL_SAVE_INTERVAL": "1"}
+        env = {"MEMPAL_SAVE_INTERVAL": "1", "MEMPAL_VERBOSE": "true"}
         # workspace_roots[0] = /Users/test/sampleProj -> wing=sampleproj
         out, _ = _run_hook(SAVE_HOOK, _stop_payload(), tmp_path, extra_env=env)
         msg = json.loads(out)["followup_message"]
@@ -382,55 +383,60 @@ class TestSaveHookCounter:
 
 
 class TestSaveHookFollowupSilence:
-    """The Cursor followup_message is ON by default (it is the
-    load-bearing verbatim path because Cursor's transcript is unminable),
-    but users can silence it. These tests lock the opt-out contract.
+    """The Cursor followup_message is silent by default. The background
+    mine is the verbatim path; MEMPAL_VERBOSE=true opts the diary nudge
+    back in. MEMPAL_CURSOR_SILENT is a no-op compatibility alias.
     """
 
-    def test_followup_on_by_default_at_threshold(self, tmp_path):
-        """Sanity baseline: with no silence flag, the threshold emits a
-        followup. Guards against an accidental default flip."""
+    def test_followup_silent_by_default_at_threshold(self, tmp_path):
+        """Sanity baseline: with no verbose flag, the threshold stays
+        silent. Guards against an accidental default flip."""
         env = {"MEMPAL_SAVE_INTERVAL": "1"}
         out, _ = _run_hook(SAVE_HOOK, _stop_payload(), tmp_path, extra_env=env)
-        assert "followup_message" in json.loads(out)
+        assert json.loads(out) == {}
 
     @pytest.mark.parametrize("value", ["1", "true", "yes", "on"])
-    def test_cursor_silent_suppresses_followup(self, value, tmp_path):
+    def test_verbose_true_emits_followup(self, value, tmp_path):
+        env = {"MEMPAL_SAVE_INTERVAL": "1", "MEMPAL_VERBOSE": value}
+        out, _ = _run_hook(SAVE_HOOK, _stop_payload(), tmp_path, extra_env=env)
+        assert "followup_message" in json.loads(out), (
+            f"MEMPAL_VERBOSE={value!r} must emit the followup; got {out!r}"
+        )
+
+    @pytest.mark.parametrize("value", ["1", "true", "yes", "on"])
+    def test_cursor_silent_is_noop_alias(self, value, tmp_path):
         env = {"MEMPAL_SAVE_INTERVAL": "1", "MEMPAL_CURSOR_SILENT": value}
         out, _ = _run_hook(SAVE_HOOK, _stop_payload(), tmp_path, extra_env=env)
         assert json.loads(out) == {}, (
-            f"MEMPAL_CURSOR_SILENT={value!r} must suppress the followup; got {out!r}"
+            f"MEMPAL_CURSOR_SILENT={value!r} is a no-op alias; default stays silent; got {out!r}"
         )
 
     @pytest.mark.parametrize("value", ["false", "0", "no", "off"])
-    def test_verbose_false_suppresses_followup(self, value, tmp_path):
+    def test_verbose_false_stays_silent(self, value, tmp_path):
         env = {"MEMPAL_SAVE_INTERVAL": "1", "MEMPAL_VERBOSE": value}
         out, _ = _run_hook(SAVE_HOOK, _stop_payload(), tmp_path, extra_env=env)
-        assert json.loads(out) == {}, (
-            f"MEMPAL_VERBOSE={value!r} must suppress the followup; got {out!r}"
-        )
+        assert json.loads(out) == {}, f"MEMPAL_VERBOSE={value!r} must stay silent; got {out!r}"
 
-    def test_silenced_followup_still_increments_counter(self, tmp_path):
+    def test_silent_default_still_increments_counter(self, tmp_path):
         """Silence must not disable bookkeeping — the counter still
         advances so cadence is preserved if the user re-enables."""
-        env = {"MEMPAL_SAVE_INTERVAL": "5", "MEMPAL_CURSOR_SILENT": "1"}
+        env = {"MEMPAL_SAVE_INTERVAL": "5"}
         for _ in range(2):
             _run_hook(SAVE_HOOK, _stop_payload(conv="conv-S"), tmp_path, extra_env=env)
         counter = _state_dir(tmp_path) / "cursor_conv-S.count"
         assert counter.exists() and counter.read_text().strip() == "2", (
-            "silenced followup must still maintain the per-conversation counter"
+            "silent default must still maintain the per-conversation counter"
         )
 
-    def test_silenced_pending_marker_emits_empty(self, tmp_path):
-        """A consumed pending marker normally forces a followup; under
-        silence it must emit {} but still clear the marker."""
-        env = {"MEMPAL_CURSOR_SILENT": "1"}
+    def test_pending_marker_emits_empty_by_default(self, tmp_path):
+        """A consumed pending marker only forces a followup in verbose
+        mode; the default must emit {} but still clear the marker."""
         pending = _state_dir(tmp_path) / "cursor_conv-P.pending"
         pending.parent.mkdir(parents=True, exist_ok=True)
         pending.touch()
-        out, _ = _run_hook(SAVE_HOOK, _stop_payload(conv="conv-P"), tmp_path, extra_env=env)
+        out, _ = _run_hook(SAVE_HOOK, _stop_payload(conv="conv-P"), tmp_path)
         assert json.loads(out) == {}
-        assert not pending.exists(), "pending marker must be consumed even when silenced"
+        assert not pending.exists(), "pending marker must be consumed even when silent"
 
 
 # ── save hook: loop-prevention ──────────────────────────────────────
@@ -455,7 +461,7 @@ class TestSaveHookLoopPrevention:
             SAVE_HOOK,
             _stop_payload(loop_count=0),
             tmp_path,
-            extra_env={"MEMPAL_SAVE_INTERVAL": "1"},
+            extra_env={"MEMPAL_SAVE_INTERVAL": "1", "MEMPAL_VERBOSE": "true"},
         )
         assert "followup_message" in json.loads(out)
 
@@ -476,7 +482,7 @@ class TestPendingSaveMarker:
             # SAVE_INTERVAL=1000 ensures the normal counter path would
             # not trigger; the marker is the only reason a followup
             # gets emitted.
-            extra_env={"MEMPAL_SAVE_INTERVAL": "1000"},
+            extra_env={"MEMPAL_SAVE_INTERVAL": "1000", "MEMPAL_VERBOSE": "true"},
         )
         response = json.loads(out)
         assert "followup_message" in response, (
@@ -507,8 +513,17 @@ class TestPendingSaveMarker:
 
 
 class TestPreCompactHook:
-    def test_emits_user_message(self, tmp_path):
+    def test_silent_by_default(self, tmp_path):
         out, _ = _run_hook(PRECOMPACT_HOOK, _precompact_payload(), tmp_path)
+        assert json.loads(out) == {}, f"preCompact user_message is verbose-only; got {out!r}"
+
+    def test_emits_user_message_when_verbose(self, tmp_path):
+        out, _ = _run_hook(
+            PRECOMPACT_HOOK,
+            _precompact_payload(),
+            tmp_path,
+            extra_env={"MEMPAL_VERBOSE": "true"},
+        )
         response = json.loads(out)
         # Cursor's preCompact only accepts user_message; never
         # followup_message or decision.
@@ -528,6 +543,20 @@ class TestPreCompactHook:
         assert "conv=conv-Y" in log
         assert "trigger=auto" in log
 
+    def test_mine_invocation_uses_python_module_and_wing(self):
+        text = PRECOMPACT_HOOK.read_text()
+        assert "-m mempalace mine" in text
+        assert '--wing "$WING"' in text
+        assert "command -v mempalace" not in text
+
+
+class TestSaveHookMinesWithWing:
+    def test_mine_invocation_uses_python_module_and_wing(self):
+        text = SAVE_HOOK.read_text()
+        assert "-m mempalace mine" in text
+        assert '--wing "$WING"' in text
+        assert "command -v mempalace" not in text
+
 
 # ── wake (sessionStart) hook ───────────────────────────────────────
 
@@ -545,6 +574,25 @@ class TestWakeHook:
         assert "mempalace_search" in ctx
         assert "mempalace_diary_read" in ctx
         assert "cursor-ide" in ctx
+
+    def test_workspace_space_and_hyphen_match_normalize_wing_name(self, tmp_path):
+        """safe_str must keep spaces in workspace_roots so infer_wing can
+        emit the same slug as config.normalize_wing_name."""
+        payload = json.dumps(
+            {
+                "conversation_id": "conv-hyphen",
+                "session_id": "conv-hyphen",
+                "hook_event_name": "sessionStart",
+                "is_background_agent": False,
+                "composer_mode": "agent",
+                "workspace_roots": ["/Users/test/My Cool-App"],
+            }
+        )
+        out, _ = _run_hook(WAKE_HOOK, payload, tmp_path)
+        ctx = json.loads(out)["additional_context"]
+        assert "my_cool_app" in ctx, f"expected normalize_wing_name slug; got {ctx!r}"
+        assert "mycool-app" not in ctx
+        assert "mycoolapp" not in ctx
 
     def test_falls_back_to_env_when_workspace_roots_missing(self, tmp_path):
         # Cursor always provides workspace_roots, but the env-var
@@ -615,6 +663,14 @@ class TestInferWing:
 
     def test_spaces_collapsed_to_underscore(self):
         assert _call_infer_wing("/Users/me/my project") == "my_project"
+
+    def test_hyphens_become_underscores(self):
+        # Must match config.normalize_wing_name so mine --wing and
+        # mempalace init land in the same slug.
+        assert _call_infer_wing("/Users/me/My-Cool-App") == "my_cool_app"
+
+    def test_mixed_hyphen_and_space(self):
+        assert _call_infer_wing("/Users/me/My Cool-App") == "my_cool_app"
 
     def test_lowercases_uppercase_basename(self):
         # Cursor on macOS often hands us /Users/<user>/Projects/MyApp.

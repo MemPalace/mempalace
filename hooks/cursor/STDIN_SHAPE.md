@@ -171,14 +171,30 @@ The MemPalace hooks always resolve their sibling `lib/common.sh` via
 script's own loading — only the `command` path in `hooks.json` needs
 to point at the absolute location of the script.
 
-## Transcript file format (out of scope)
+## Transcript file format (observed 2026-09-17)
 
-The format of the file at `transcript_path` is **not documented by
-Cursor** as of the fetch date above. MemPalace deliberately does not
-parse it: the save hook counts `stop` invocations (each one
-corresponds to one assistant turn) and hands the transcript to
-`mempalace mine`, which has its own normaliser layer.
+Cursor does not publish the schema of the file at `transcript_path`.
+The shape below was observed on 2026-09-17 under
+`~/.cursor/projects/<proj>/agent-transcripts/<conv>/<conv>.jsonl`
+(with `subagents/` beside it). `mempalace/normalize.py::_try_cursor_jsonl`
+parses this shape. Unknown block types are ignored; `turn_ended`
+records are skipped.
 
-If you need to consume the transcript directly, probe its shape with
-a throw-away hook that does `cat > /tmp/cursor-transcript-sample.txt`
-and inspect the output — there is no shortcut.
+```json
+{"role": "user", "message": {"content": [{"type": "text", "text": "<user_query>...</user_query>"}]}}
+{"role": "assistant", "message": {"content": [{"type": "text", "text": "..."}, {"type": "tool_use", "name": "Read", "input": {"path": "file.py"}}]}}
+{"type": "turn_ended", "status": "completed"}
+```
+
+Observed facts from six transcripts (13 to 4523 lines, 0 malformed
+lines):
+
+- Top-level key is `role` (`user` / `assistant`), not Claude Code's
+  `type`.
+- User text is wrapped in `<user_query>` and may include injected
+  `<timestamp>`, `<system_reminder>`, `<manually_attached_skills>`,
+  `<dynamic_tool_catalog>`, `<hooks_context>`, `<attached_files>`,
+  and `<system_notification>` blocks.
+- `tool_use.input` is a dict. No `tool_result` blocks were present.
+- The save hook still counts `stop` invocations for cadence; the
+  mine, not the followup, is the verbatim-capture path.

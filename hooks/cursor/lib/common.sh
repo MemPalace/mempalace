@@ -112,6 +112,18 @@ except Exception:
     return 1
 }
 
+# Followup / user_message is opt-in. Silent by default so the
+# background mine stays off the chat window — normalize.py now
+# parses Cursor JSONL. MEMPAL_CURSOR_SILENT is a no-op alias kept
+# so older installs that set it do not change behaviour (already
+# silent).
+mempal_verbose() {
+    case "${MEMPAL_VERBOSE:-}" in
+        1|true|yes|on) return 0 ;;
+    esac
+    return 1
+}
+
 # ── Stdin parser ──────────────────────────────────────────────────────
 #
 # Reads Cursor's hook JSON from $1 and exports:
@@ -137,11 +149,13 @@ mempal_parse_stdin() {
     # would shadow Python's stdin with the heredoc body, leaving
     # ``json.load(sys.stdin)`` to read nothing and silently fail. The
     # parser body deliberately uses only double-quoted Python strings
-    # so the surrounding bash single-quote is safe verbatim, and uses
-    # only the shell-safe character set (alphanumeric, underscore,
-    # dash, slash, dot, tilde) matching the Claude Code hook's
-    # sanitiser so a hostile transcript_path cannot splice
-    # metacharacters into the parsed output.
+    # so the surrounding bash single-quote is safe verbatim. IDs and
+    # status fields use the shell-safe set (alphanumeric, underscore,
+    # dash, slash, dot, tilde). Paths also keep spaces so a workspace
+    # like "/Users/me/my project" still reaches mempal_infer_wing as
+    # two words (it then becomes my_project, matching
+    # config.normalize_wing_name). Callers quote MEMPAL_WORKSPACE and
+    # MEMPAL_TRANSCRIPT; space is not a metacharacter when quoted.
     parsed="$(
         umask 077
         printf '%s' "$input" | "$MEMPAL_PYTHON_BIN" -c '
@@ -149,6 +163,9 @@ import json, re, sys
 
 def safe_str(value):
     return re.sub(r"[^a-zA-Z0-9_/.\-~]", "", str(value or ""))
+
+def safe_path(value):
+    return re.sub(r"[^a-zA-Z0-9_/.\-~ ]", "", str(value or ""))
 
 def safe_int(value):
     try:
@@ -165,14 +182,14 @@ if not isinstance(data, dict):
 
 conv = safe_str(data.get("conversation_id") or data.get("session_id"))
 loop_count = safe_int(data.get("loop_count", 0))
-transcript = safe_str(data.get("transcript_path", ""))
+transcript = safe_path(data.get("transcript_path", ""))
 trigger = safe_str(data.get("trigger", ""))
 status = safe_str(data.get("status", ""))
 
 roots = data.get("workspace_roots") or []
 workspace = ""
 if isinstance(roots, list) and roots:
-    workspace = safe_str(roots[0])
+    workspace = safe_path(roots[0])
 
 print("__MEMPAL_PARSE_OK__")
 print(conv)
@@ -414,10 +431,12 @@ mempal_gc_stale_state() {
 
 # ── Workspace → wing inference ────────────────────────────────────────
 #
-# basename(workspace_root), normalised to [a-z0-9_-]. Edge cases:
+# basename(workspace_root), matching config.normalize_wing_name:
+# lowercase, hyphens and spaces become underscores. Edge cases:
 #   /              → "root"
 #   /path/         → trailing slash stripped, then basename
-#   "/foo bar/"    → "foo_bar" (spaces collapsed to underscores)
+#   "/foo bar/"    → "foo_bar"
+#   "/My-Cool-App" → "my_cool_app"
 #   ""             → "cursor_session"
 #   "C:\\proj"     → "proj" (Windows-style path; basename via tr fallback)
 #
@@ -444,12 +463,12 @@ mempal_infer_wing() {
     case "$base" in
         *\\*) base="${base##*\\}" ;;
     esac
-    # Lowercase + replace anything outside [a-z0-9_-] with underscore.
-    # Collapse runs of underscores so "foo  bar" doesn't become
-    # "foo__bar".
+    # Lowercase + replace anything outside [a-z0-9_] with underscore
+    # so hyphens match config.normalize_wing_name. Collapse runs of
+    # underscores so "foo  bar" / "foo--bar" don't become "foo__bar".
     base="$(printf '%s' "$base" \
         | tr '[:upper:]' '[:lower:]' \
-        | tr -c 'a-z0-9_-' '_' \
+        | tr -c 'a-z0-9_' '_' \
         | tr -s '_' \
         | sed 's/^_//; s/_$//')"
     if [ -z "$base" ]; then
