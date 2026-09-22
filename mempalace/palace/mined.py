@@ -126,9 +126,8 @@ def file_already_mined(
         return False
 
 
-# Above this many candidate files, a single `where`-filtered get() binds
-# more query variables than a full paginated scan costs in round trips, so
-# the scoped path below stops paying off (#2561).
+# Above this many candidate files, one filtered get costs more round trips
+# than a full paginated scan, so the scoped path below stops paying off.
 _PREFETCH_SCOPE_THRESHOLD = 50
 
 
@@ -169,12 +168,13 @@ def prefetch_mined_set(
 
     When `source_files` is given and holds at most `_PREFETCH_SCOPE_THRESHOLD`
     paths, the caller already knows the only source_file values that could
-    possibly match, so a single `where={"source_file": {"$in": ...}}` get()
-    replaces the full-collection scan (#2561: for a one-file hook-triggered
-    mine against a 660k-drawer palace, the full scan was 79% of total mine
-    time). Above the threshold, or when source_files is omitted, the
-    behaviour is unchanged: a bulk sweep still benefits more from one full
-    scan than from many filtered queries.
+    possibly match, so a paged `where={"source_file": {"$in": ...}}` get()
+    replaces the full-collection scan. On a one-file mine of a 660k-drawer
+    palace that mtime scan was about 42% of the mine; the content-hash scan
+    was the rest, and it stays unscoped because a stored hash can be several
+    comma-joined values. Above the threshold, or when source_files is
+    omitted, the behaviour is unchanged: a bulk sweep still benefits more
+    from one full scan than from many filtered queries.
     """
     # Per source_file: per stored_mtime group → count + optional chunk_total.
     # A source is only "mined" once some group is complete.
@@ -202,25 +202,41 @@ def prefetch_mined_set(
             except (TypeError, ValueError):
                 pass
 
+    def _scan_all():
+        total = collection.count()
+        offset = 0
+        while offset < total:
+            batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
+            for meta in batch["metadatas"]:
+                _absorb(meta)
+            if not batch["ids"]:
+                break
+            offset += len(batch["ids"])
+
     try:
         if source_files is not None and len(source_files) <= _PREFETCH_SCOPE_THRESHOLD:
             if source_files:
-                scoped = collection.get(
-                    where={"source_file": {"$in": list(source_files)}},
-                    include=["metadatas"],
-                )
-                for meta in scoped.get("metadatas") or []:
-                    _absorb(meta)
+                try:
+                    offset = 0
+                    while True:
+                        scoped = collection.get(
+                            where={"source_file": {"$in": list(source_files)}},
+                            include=["metadatas"],
+                            limit=1000,
+                            offset=offset,
+                        )
+                        ids = scoped.get("ids") or []
+                        for meta in scoped.get("metadatas") or []:
+                            _absorb(meta)
+                        if len(ids) < 1000:
+                            break
+                        offset += len(ids)
+                except Exception:
+                    logger.warning("prefetch_mined_set: scoped fetch failed; scanning")
+                    groups.clear()
+                    _scan_all()
         else:
-            total = collection.count()
-            offset = 0
-            while offset < total:
-                batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
-                for meta in batch["metadatas"]:
-                    _absorb(meta)
-                if not batch["ids"]:
-                    break
-                offset += len(batch["ids"])
+            _scan_all()
     except Exception:
         logger.warning("prefetch_mined_set: partial fetch, %d source groups loaded", len(groups))
 
@@ -267,7 +283,7 @@ def prefetch_content_hashes(
     the point is not to track every alias.
 
     Deliberately NOT scoped by candidate source_files the way
-    prefetch_mined_set is (#2561): a stored `content_hash` can hold several
+    prefetch_mined_set is: a stored `content_hash` can hold several
     comma-joined hashes (one privacy-export bundle drawer covers several
     conversations), so a `where`-filtered query can only match a document
     whose entire stored value equals one candidate hash and would silently

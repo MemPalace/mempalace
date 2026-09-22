@@ -1086,7 +1086,7 @@ def _mine_convos_impl(
     # source_file-keyed skip above ("mined_mtimes") never recognizes them —
     # this catches the same conversation reappearing at a new path. Not
     # scoped to candidate_source_files: see prefetch_content_hashes's
-    # docstring (#2561) for why that would silently miss bundle rows.
+    # docstring for why that would silently miss bundle rows.
     mined_content_hashes: dict = (
         prefetch_content_hashes(collection, extract_mode=extract_mode)
         if collection is not None

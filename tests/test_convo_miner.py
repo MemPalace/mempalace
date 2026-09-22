@@ -910,7 +910,7 @@ def test_register_file_sentinel_includes_source_mtime():
 
 
 # ---------------------------------------------------------------------------
-# prefetch_mined_set, source_files scoping (#2561)
+# prefetch_mined_set, source_files scoping
 # ---------------------------------------------------------------------------
 
 
@@ -1009,7 +1009,7 @@ def test_prefetch_mined_set_scoped_with_no_candidates_returns_empty_without_erro
 def test_mine_convos_scopes_mined_set_prefetch_to_candidate_files(monkeypatch):
     """The convo miner must actually pass the candidate file list through to
     prefetch_mined_set, not just leave the new parameter unused. It must
-    NOT pass source_files to prefetch_content_hashes (#2561's cross-path
+    NOT pass source_files to prefetch_content_hashes (the cross-path
     dedup test coverage), which stays a full unconditional scan."""
     import mempalace.convo_miner as convo_miner_module
 
