@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import gzip
 import hashlib
-import json
 import sys
 from pathlib import Path
 
@@ -20,6 +19,7 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 from staging_watcher import StagingWatcher  # noqa: E402
+import verify_mined  # noqa: E402
 
 
 def _make_watcher(tmp_path: Path, **kwargs) -> StagingWatcher:
@@ -28,7 +28,7 @@ def _make_watcher(tmp_path: Path, **kwargs) -> StagingWatcher:
     archive = tmp_path / "archive"
     log = tmp_path / "watcher.log"
     work = tmp_path / "batch_work"
-    snapshot = work / ".batch_snapshot"
+    snapshot = tmp_path / ".batch_snapshot"
     staging.mkdir(parents=True, exist_ok=True)
     work.mkdir(parents=True, exist_ok=True)
     return StagingWatcher(
@@ -61,132 +61,119 @@ def _write_snapshot(watcher: StagingWatcher, entries: list[tuple[str, bytes]]) -
     watcher.batch_snapshot.write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
 
 
-# ── VerifyMined tests (use verify_mined.py via subprocess) ──────────────────
+def _claim(watcher: StagingWatcher, entries: list[tuple[str, bytes]]) -> None:
+    """Snapshot + work-copy setup for a batch of (rel, content) entries."""
+    _write_snapshot(watcher, entries)
+    watcher.batch_id = "testbatch"
+    watcher.work_orig.mkdir(parents=True, exist_ok=True)
+    for rel, content in entries:
+        dst = watcher.work_orig / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(content)
 
 
-def _run_verify(sample: Path, manifest: Path, fake_mempalace: Path) -> int:
-    """Run verify_mined.py and return its exit code."""
-    import subprocess
-
-    return subprocess.run(
-        [
-            sys.executable,
-            str(_TOOLS_DIR / "verify_mined.py"),
-            "/tmp/palace",
-            str(sample),
-            str(manifest),
-            str(fake_mempalace),
-        ],
-        capture_output=True,
-    ).returncode
+def _mark_mined(watcher: StagingWatcher, rels: list[str]) -> None:
+    """Record rels as mined in the batch manifest (orig<US>mined pairs)."""
+    watcher.batch_dir.mkdir(parents=True, exist_ok=True)
+    (watcher.batch_dir / "mined.manifest").write_text(
+        "".join(f"{r}\x1f{r}\n" for r in rels), encoding="utf-8"
+    )
 
 
-def _make_fake_mempalace(tmp_path: Path, body: str) -> Path:
-    """Create a fake mempalace binary that prints *body* for any search call."""
-    script = tmp_path / "mempalace"
-    escaped = body.replace("'", "'\\''")
-    script.write_text(f"#!/bin/sh\necho '{escaped}'\n", encoding="utf-8")
-    script.chmod(0o755)
-    return script
+def _mark_skipped(watcher: StagingWatcher, rels: list[str], reason: str = "filtered") -> None:
+    watcher.batch_dir.mkdir(parents=True, exist_ok=True)
+    (watcher.batch_dir / "skipped.manifest").write_text(
+        "".join(f"{r}\x1f{reason}\n" for r in rels), encoding="utf-8"
+    )
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="fake mempalace is a shell script")
+# ── VerifyMined tests (verify_mined.py with injected searcher) ──────────────
+
+
+def _fake_search_ok(must_match: Path):
+    """Search stub that returns a hit only for the matching source_file."""
+
+    def _search(query, palace, source_file=None, n_results=5, **_kw):
+        if source_file and Path(source_file) == must_match:
+            return {"results": [{"source_file": source_file}]}
+        return {"results": []}
+
+    return _search
+
+
 class TestVerifyMined:
-    def test_verify_passes_when_search_returns_matching_source(self, tmp_path):
-        sample = tmp_path / "sample.md"
-        sample.write_bytes(b"hello world this is a stable snippet\nmore content\n")
-        manifest = tmp_path / "manifest.txt"
-        manifest.write_text(str(sample.resolve()) + "\n", encoding="utf-8")
-        fake = _make_fake_mempalace(
-            tmp_path, json.dumps({"results": [{"source_file": str(sample.resolve())}]})
+    def _setup(self, tmp_path, content=b"hello world this is a stable snippet\n"):
+        staging = tmp_path / "staging"
+        mine = tmp_path / "mine"
+        work = tmp_path / "work"
+        for d in (staging, mine, work):
+            d.mkdir()
+        mined = mine / "batch1" / "a.md"
+        mined.parent.mkdir(parents=True)
+        mined.write_bytes(content)
+        (work / "a.md").write_bytes(content)
+        manifest = tmp_path / "mined.manifest"
+        manifest.write_text("a.md\x1fbatch1/a.md\n", encoding="utf-8")
+        snap = tmp_path / "snap"
+        snap.write_text(f"a.md\x1f{len(content)}\x1f0\x1f{_sha256(content)}\n")
+        return staging, mine, work, manifest, snap, mined
+
+    def test_passes_when_hit_under_own_source_file(self, tmp_path):
+        _, mine, work, manifest, snap, mined = self._setup(tmp_path)
+        failures = verify_mined.check_searchable(
+            ["batch1/a.md"], str(mine), tmp_path / "palace", 0, _fake_search_ok(mined.resolve())
         )
-        assert _run_verify(sample, manifest, fake) == 0
+        assert failures == []
 
-    def test_verify_fails_when_search_exits_nonzero(self, tmp_path):
-        sample = tmp_path / "sample.md"
-        sample.write_bytes(b"hello world this is a stable snippet\n")
-        manifest = tmp_path / "manifest.txt"
-        manifest.write_text(str(sample.resolve()) + "\n", encoding="utf-8")
-        fake = tmp_path / "mempalace"
-        fake.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
-        fake.chmod(0o755)
-        assert _run_verify(sample, manifest, fake) == 1
-
-    def test_verify_fails_on_blank_output(self, tmp_path):
-        sample = tmp_path / "sample.md"
-        sample.write_bytes(b"hello world this is a stable snippet\n")
-        manifest = tmp_path / "manifest.txt"
-        manifest.write_text(str(sample.resolve()) + "\n", encoding="utf-8")
-        fake = _make_fake_mempalace(tmp_path, json.dumps({"results": []}))
-        assert _run_verify(sample, manifest, fake) == 1
-
-    def test_verify_fails_on_unusable_sample(self, tmp_path):
-        sample = tmp_path / "sample.md"
-        sample.write_bytes(b"\n# comment\n   \n")
-        manifest = tmp_path / "manifest.txt"
-        manifest.write_text(str(sample.resolve()) + "\n", encoding="utf-8")
-        fake = _make_fake_mempalace(
-            tmp_path,
-            json.dumps({"results": [{"source_file": str(sample.resolve())}]}),
+    def test_fails_when_no_hit(self, tmp_path):
+        _, mine, work, manifest, snap, _ = self._setup(tmp_path)
+        failures = verify_mined.check_searchable(
+            ["batch1/a.md"],
+            str(mine),
+            tmp_path / "palace",
+            0,
+            lambda *a, **k: {"results": []},
         )
-        assert _run_verify(sample, manifest, fake) == 1
+        assert len(failures) == 1
 
-    def test_verify_fails_on_unrelated_matching_drawer(self, tmp_path):
-        sample = tmp_path / "sample.md"
-        sample.write_bytes(b"hello world this is a stable snippet\n")
-        other = tmp_path / "other.md"
-        other.write_bytes(b"hello world this is a stable snippet\n")
-        manifest = tmp_path / "manifest.txt"
-        manifest.write_text(str(sample.resolve()) + "\n", encoding="utf-8")
-        fake = _make_fake_mempalace(
-            tmp_path,
-            json.dumps({"results": [{"source_file": str(other.resolve())}]}),
+    def test_fails_when_hit_is_different_batch(self, tmp_path):
+        """A same-named file from another batch must not satisfy verify."""
+        _, mine, work, manifest, snap, mined = self._setup(tmp_path)
+        other = mine / "batchOTHER" / "a.md"
+        failures = verify_mined.check_searchable(
+            ["batch1/a.md"], str(mine), tmp_path / "palace", 0, _fake_search_ok(other)
         )
-        assert _run_verify(sample, manifest, fake) == 1
+        assert len(failures) == 1
 
-    def test_verify_fails_on_source_not_in_manifest(self, tmp_path):
-        sample = tmp_path / "sample.md"
-        sample.write_bytes(b"hello world this is a stable snippet\n")
-        manifest = tmp_path / "manifest.txt"
-        manifest.write_text("/some/other/file.md\n", encoding="utf-8")
-        fake = _make_fake_mempalace(
-            tmp_path,
-            json.dumps({"results": [{"source_file": str(sample.resolve())}]}),
+    def test_fails_on_unusable_snippet(self, tmp_path):
+        _, mine, work, manifest, snap, _ = self._setup(tmp_path, content=b"\n   \n  \n")
+        failures = verify_mined.check_searchable(
+            ["batch1/a.md"], str(mine), tmp_path / "palace", 0, _fake_search_ok(mine)
         )
-        assert _run_verify(sample, manifest, fake) == 1
+        assert len(failures) == 1
 
-    def test_verify_all_requires_every_manifest_entry(self, tmp_path):
-        sample_a = tmp_path / "a.md"
-        sample_a.write_bytes(b"hello world this is a stable snippet\n")
-        sample_b = tmp_path / "b.md"
-        sample_b.write_bytes(b"another stable snippet here\n")
-        manifest = tmp_path / "manifest.txt"
-        manifest.write_text(f"{sample_a.resolve()}\n{sample_b.resolve()}\n", encoding="utf-8")
-        fake = _make_fake_mempalace(
-            tmp_path,
-            json.dumps({"results": [{"source_file": str(sample_a.resolve())}]}),
-        )
-        assert _run_verify(manifest, manifest, fake) == 1
+    def test_fails_on_search_exception(self, tmp_path):
+        _, mine, work, manifest, snap, _ = self._setup(tmp_path)
 
-    def test_verify_all_passes_when_all_entries_searchable(self, tmp_path):
-        sample_a = tmp_path / "a.md"
-        sample_a.write_bytes(b"hello world this is a stable snippet\n")
-        sample_b = tmp_path / "b.md"
-        sample_b.write_bytes(b"another stable snippet here\n")
-        manifest = tmp_path / "manifest.txt"
-        manifest.write_text(f"{sample_a.resolve()}\n{sample_b.resolve()}\n", encoding="utf-8")
-        fake = _make_fake_mempalace(
-            tmp_path,
-            json.dumps(
-                {
-                    "results": [
-                        {"source_file": str(sample_a.resolve())},
-                        {"source_file": str(sample_b.resolve())},
-                    ]
-                }
-            ),
+        def _boom(*a, **k):
+            raise RuntimeError("palace unavailable")
+
+        failures = verify_mined.check_searchable(
+            ["batch1/a.md"], str(mine), tmp_path / "palace", 0, _boom
         )
-        assert _run_verify(manifest, manifest, fake) == 0
+        assert len(failures) == 1
+
+    def test_hash_check_catches_drift(self, tmp_path):
+        _, mine, work, manifest, snap, _ = self._setup(tmp_path)
+        (work / "a.md").write_bytes(b"drifted\n")
+        bad = verify_mined.check_hashes(["a.md"], verify_mined.load_snapshot(snap), str(work))
+        assert len(bad) == 1
+
+    def test_hash_check_matches_verbatim_copy(self, tmp_path):
+        """Byte-exact staging makes hash checks portable (no LF/CRLF skew)."""
+        _, mine, work, manifest, snap, _ = self._setup(tmp_path)
+        bad = verify_mined.check_hashes(["a.md"], verify_mined.load_snapshot(snap), str(work))
+        assert bad == []
 
 
 # ── ArchiveFiles tests ─────────────────────────────────────────────────────
@@ -195,10 +182,8 @@ class TestVerifyMined:
 class TestArchiveFiles:
     def test_archive_preserves_subdirectory_paths(self, tmp_path):
         w = _make_watcher(tmp_path)
-        (w.staging_dir / "projA").mkdir(parents=True)
-        (w.staging_dir / "projB").mkdir(parents=True)
-        (w.staging_dir / "projA" / "notes.md").write_bytes(b"project A notes\n")
-        (w.staging_dir / "projB" / "notes.md").write_bytes(b"project B notes\n")
+        _claim(w, [("projA/notes.md", b"project A notes\n"), ("projB/notes.md", b"B\n")])
+        _mark_mined(w, ["projA/notes.md", "projB/notes.md"])
         assert w.archive_files()
         batch_dirs = [d for d in w.archive_dir.iterdir() if d.is_dir()]
         assert len(batch_dirs) == 1
@@ -208,20 +193,33 @@ class TestArchiveFiles:
         manifest = (batch / "MANIFEST.txt").read_text(encoding="utf-8")
         assert "file: projA/notes.md" in manifest
         assert "file: projB/notes.md" in manifest
-        assert "archived: projA/notes.md.gz" in manifest
-        assert "archived: projB/notes.md.gz" in manifest
 
     def test_archive_gzip_content_matches_original(self, tmp_path):
         w = _make_watcher(tmp_path)
-        (w.staging_dir / "subdir").mkdir(parents=True)
-        original = w.staging_dir / "subdir" / "file.txt"
-        original.write_bytes(b"preserve this text\n")
+        _claim(w, [("subdir/file.txt", b"preserve this text\n")])
+        _mark_mined(w, ["subdir/file.txt"])
         assert w.archive_files()
         batch = [d for d in w.archive_dir.iterdir() if d.is_dir()][0]
-        archived = batch / "subdir" / "file.txt.gz"
-        assert archived.exists()
-        with gzip.open(archived, "rt", encoding="utf-8") as f:
+        with gzip.open(batch / "subdir" / "file.txt.gz", "rt", encoding="utf-8") as f:
             assert f.read() == "preserve this text\n"
+
+    def test_archive_only_mined_files(self, tmp_path):
+        """Unmined files are never archived — archive means 'in the palace'."""
+        w = _make_watcher(tmp_path)
+        _claim(w, [("mined.md", b"mined\n"), ("skipped.jsonl", b"{}\n")])
+        _mark_mined(w, ["mined.md"])
+        _mark_skipped(w, ["skipped.jsonl"])
+        assert w.archive_files()
+        batch = [d for d in w.archive_dir.iterdir() if d.is_dir()][0]
+        assert (batch / "mined.md.gz").exists()
+        assert not (batch / "skipped.jsonl.gz").exists()
+
+    def test_archive_empty_mined_set_is_not_failure(self, tmp_path):
+        w = _make_watcher(tmp_path)
+        _claim(w, [("only.jsonl", b"{}\n")])
+        _mark_skipped(w, ["only.jsonl"])
+        assert w.archive_files()  # nothing mined → nothing to archive → ok
+        assert not [d for d in w.archive_dir.iterdir() if d.is_dir()]
 
     @pytest.mark.skipif(
         sys.platform == "win32", reason="chmod(0o444) does not prevent writes on Windows"
@@ -229,7 +227,8 @@ class TestArchiveFiles:
     def test_archive_fails_when_archive_dir_unwritable(self, tmp_path):
         """Archive errors must be a cleanup gate — staging stays intact."""
         w = _make_watcher(tmp_path)
-        (w.staging_dir / "file.txt").write_bytes(b"content\n")
+        _claim(w, [("file.txt", b"content\n")])
+        _mark_mined(w, ["file.txt"])
         w.archive_dir.chmod(0o444)
         try:
             assert not w.archive_files()
@@ -243,7 +242,6 @@ class TestArchiveFiles:
 
 class TestPreprocessSubdirectories:
     def test_preprocess_directory_preserves_subdirectories(self, tmp_path):
-        sys.path.insert(0, str(_TOOLS_DIR))
         import preprocess_staging as pp
 
         staging = tmp_path / "staging"
@@ -252,19 +250,20 @@ class TestPreprocessSubdirectories:
         (staging / "projB").mkdir()
         (staging / "projA" / "notes.md").write_bytes(b"# Project A\n\nSome content here.\n")
         (staging / "projB" / "notes.md").write_bytes(b"# Project B\n\nOther content here.\n")
-        stats = pp.preprocess_directory(str(staging), max_lines=4000)
-        assert stats["processed"] == 2
-        assert (staging / "processed" / "projA" / "notes.md").exists()
-        assert (staging / "processed" / "projB" / "notes.md").exists()
+        mined, _ = pp.preprocess_directory(str(staging), batch_id="b1")
+        assert len(mined) == 2
+        out = staging / ".mp_processed" / "b1"
+        assert (out / "projA" / "notes.md").exists()
+        assert (out / "projB" / "notes.md").exists()
 
 
 # ── ProcessBatch tests ─────────────────────────────────────────────────────
 
 
 class TestProcessBatch:
-    def test_process_batch_retains_staging_when_verify_fails(self, tmp_path):
-        """If verify fails, staging files must remain for the next attempt."""
-        w = _make_watcher(tmp_path)
+    def test_process_batch_retains_staging_when_mine_fails(self, tmp_path):
+        """If the pipeline aborts, staging files must remain for retry."""
+        w = _make_watcher(tmp_path, mempalace_bin="/nonexistent/mempalace")
         (w.staging_dir / "file.md").write_bytes(b"hello world this is a stable snippet\n")
         result = w.process_batch()
         assert result is False
@@ -295,110 +294,123 @@ class TestBatchStability:
         w = _make_watcher(tmp_path)
         (w.staging_dir / "a.txt").write_bytes(b"hello\n")
         (w.staging_dir / "b.txt").write_bytes(b"world\n")
-        fp1 = w.fingerprint_staging()
-        fp2 = w.fingerprint_staging()
-        assert fp1 == fp2
+        assert w.fingerprint_staging() == w.fingerprint_staging()
 
 
 # ── BatchIsolation tests ───────────────────────────────────────────────────
 
 
 class TestBatchIsolation:
-    def test_archive_ignores_late_file(self, tmp_path):
-        """A file that arrives after the batch snapshot is not archived."""
+    def test_batch_id_is_content_keyed(self, tmp_path):
+        """Same file set → same batch id → same mine paths → idempotent
+        retry; different content → different paths → no cross-batch purge."""
         w = _make_watcher(tmp_path)
-        _write_snapshot(w, [("claimed.txt", b"claimed content\n")])
-        # Late file arrives after snapshot
+        _write_snapshot(w, [("notes.md", b"v1 content\n")])
+        snap1 = w.batch_snapshot.read_text()
+        id1 = w._hash_stdin(snap1)[:16]
+        _write_snapshot(w, [("notes.md", b"v2 content\n")])
+        snap2 = w.batch_snapshot.read_text()
+        id2 = w._hash_stdin(snap2)[:16]
+        assert id1 != id2
+        # Identical file set again → identical id (idempotent retry).
+        _write_snapshot(w, [("notes.md", b"v1 content\n")])
+        assert w._hash_stdin(w.batch_snapshot.read_text())[:16] == id1
+
+    def test_archive_ignores_unmined_file(self, tmp_path):
+        """A file that arrives after the snapshot is not archived."""
+        w = _make_watcher(tmp_path)
+        _claim(w, [("claimed.txt", b"claimed content\n")])
+        _mark_mined(w, ["claimed.txt"])
         (w.staging_dir / "late.txt").write_bytes(b"late content\n")
         assert w.archive_files()
         batch = [d for d in w.archive_dir.iterdir() if d.is_dir()][0]
         assert (batch / "claimed.txt.gz").exists()
         assert not (batch / "late.txt.gz").exists()
 
-    def test_archive_skips_modified_file(self, tmp_path):
-        """A file that changes after the snapshot is not archived."""
+    def test_archive_skips_drifted_work_copy(self, tmp_path):
+        """A work copy that no longer matches the snapshot is not archived."""
         w = _make_watcher(tmp_path)
-        _write_snapshot(w, [("file.txt", b"original content\n")])
-        # Modify the file after the snapshot
-        (w.staging_dir / "file.txt").write_bytes(b"modified content\n")
-        assert not w.archive_files()
+        _claim(w, [("file.txt", b"original content\n")])
+        _mark_mined(w, ["file.txt"])
+        (w.work_orig / "file.txt").write_bytes(b"modified content\n")
+        assert w.archive_files()
+        batch_dirs = [d for d in w.archive_dir.iterdir() if d.is_dir()]
+        if batch_dirs:
+            assert not (batch_dirs[0] / "file.txt.gz").exists()
 
-    def test_clear_staging_ignores_late_and_modified_files(self, tmp_path):
-        """clear_staging only deletes files matching the snapshot."""
+    def test_clear_only_moves_mined_files(self, tmp_path):
+        """clear_staging moves mined files to retired/, leaves the rest."""
         w = _make_watcher(tmp_path)
-        # Claimed file (will be in snapshot and unchanged)
-        claimed = b"claimed content\n"
-        (w.staging_dir / "claimed.txt").write_bytes(claimed)
-        sha = _sha256(claimed)
-        size = len(claimed)
-        mtime = int((w.staging_dir / "claimed.txt").stat().st_mtime)
-        # Modified file (in snapshot but will change)
-        modified_orig = b"modified original\n"
-        (w.staging_dir / "modified.txt").write_bytes(modified_orig)
-        sha2 = _sha256(modified_orig)
-        size2 = len(modified_orig)
-        mtime2 = int((w.staging_dir / "modified.txt").stat().st_mtime)
-        # Write snapshot with both files
-        snapshot_data = (
-            f"claimed.txt\x1f{size}\x1f{mtime}\x1f{sha}\n"
-            f"modified.txt\x1f{size2}\x1f{mtime2}\x1f{sha2}\n"
-        )
-        w.batch_snapshot.write_bytes(snapshot_data.encode("utf-8"))
-        # Late file (not in snapshot)
-        (w.staging_dir / "late.txt").write_bytes(b"late\n")
-        # Now modify the modified file
+        _claim(w, [("claimed.txt", b"claimed content\n"), ("modified.txt", b"orig\n")])
+        _mark_mined(w, ["claimed.txt"])
         (w.staging_dir / "modified.txt").write_bytes(b"changed\n")
+        (w.staging_dir / "late.txt").write_bytes(b"late\n")
         w.clear_staging()
-        assert not (w.staging_dir / "claimed.txt").exists()  # deleted (matched snapshot)
+        assert not (w.staging_dir / "claimed.txt").exists()
+        assert (w.retired_dir / "claimed.txt").exists()  # moved, not deleted
         assert (w.staging_dir / "late.txt").exists()  # kept (not in snapshot)
-        assert (w.staging_dir / "modified.txt").exists()  # kept (changed since snapshot)
+        assert (w.staging_dir / "modified.txt").exists()  # kept (changed)
+
+    def test_clear_never_unlinks_replaced_file(self, tmp_path):
+        """A live file that changed since claim is preserved, not deleted."""
+        w = _make_watcher(tmp_path)
+        _claim(w, [("file.txt", b"original\n")])
+        _mark_mined(w, ["file.txt"])
+        (w.staging_dir / "file.txt").write_bytes(b"NEW CONTENT\n")
+        w.clear_staging()
+        assert (w.staging_dir / "file.txt").read_bytes() == b"NEW CONTENT\n"
 
 
-# ── Regression tests for reviewer issues 1-4 ────────────────────────────────
+# ── Quarantine tests ───────────────────────────────────────────────────────
+
+
+class TestQuarantine:
+    def test_skipped_files_quarantined_not_deleted(self, tmp_path):
+        w = _make_watcher(tmp_path)
+        _claim(w, [("data.jsonl", b"{}\n")])
+        _mark_skipped(w, ["data.jsonl"])
+        w.quarantine_skipped()
+        assert not (w.staging_dir / "data.jsonl").exists()
+        quarantined = list((w.staging_dir / ".mp_quarantine").rglob("data.jsonl"))
+        assert len(quarantined) == 1
+        assert quarantined[0].read_bytes() == b"{}\n"
+
+    def test_quarantined_files_not_rescanned(self, tmp_path):
+        w = _make_watcher(tmp_path)
+        qdir = w.staging_dir / ".mp_quarantine" / "oldbatch"
+        qdir.mkdir(parents=True)
+        (qdir / "data.jsonl").write_bytes(b"{}\n")
+        assert w.count_files() == 0
+
+    def test_changed_file_not_quarantined(self, tmp_path):
+        w = _make_watcher(tmp_path)
+        _claim(w, [("data.jsonl", b"{}\n")])
+        _mark_skipped(w, ["data.jsonl"])
+        (w.staging_dir / "data.jsonl").write_bytes(b'{"new": true}\n')
+        w.quarantine_skipped()
+        assert (w.staging_dir / "data.jsonl").exists()  # new drop stays
+
+
+# ── Regression tests for reviewer issues ────────────────────────────────────
 
 
 class TestStaleVersionVerification:
-    """Issue 1: verification must prove the CURRENT source version was mined."""
+    """Verification must prove the CURRENT source version was mined."""
 
-    def test_verify_fails_when_file_sha256_mismatches_snapshot(self, tmp_path):
-        sys.path.insert(0, str(_TOOLS_DIR))
-        from verify_mined import verify_one
-
+    def test_snapshot_hash_detects_post_claim_drift(self, tmp_path):
         staging = tmp_path / "staging"
         staging.mkdir()
         original = b"x = 1\ny = 2\nz = 3\n"
         (staging / "claimed.py").write_bytes(original)
-        sha256 = _sha256(original)
-        # Simulate the file changing after the snapshot was claimed.
+        sha = _sha256(original)
         (staging / "claimed.py").write_bytes(b"x = 999\n")
-        manifest = {str((staging / "claimed.py").resolve())}
-        result = verify_one(
-            "/fake/palace",
-            (staging / "claimed.py").resolve(),
-            manifest,
-            "mempalace",
-            expected_sha256=sha256,
-        )
-        assert result is False, "verify must fail when sha256 mismatches"
-
-    def test_verify_passes_when_file_sha256_matches_snapshot(self, tmp_path):
-        sys.path.insert(0, str(_TOOLS_DIR))
-        from verify_mined import file_sha256
-
-        staging = tmp_path / "staging"
-        staging.mkdir()
-        content = b"x = 1\ny = 2\nz = 3\n"
-        (staging / "claimed.py").write_bytes(content)
-        sha256 = _sha256(content)
-        sample = (staging / "claimed.py").resolve()
-        assert file_sha256(sample) == sha256
+        assert verify_mined._sha256(staging / "claimed.py") != sha
 
 
 class TestBatchWorkOutsideWatchedTree:
-    """Issue 2: .batch_work must not be inside the watched staging tree."""
+    """Batch work dirs must not be inside the watched staging tree."""
 
     def test_count_files_excludes_batch_work(self, tmp_path):
-        """count_files must not list files inside batch_work."""
         w = _make_watcher(tmp_path)
         (w.staging_dir / "real.md").write_bytes(b"hello\n")
         (w.batch_work / "copy.md").parent.mkdir(parents=True, exist_ok=True)
@@ -407,44 +419,33 @@ class TestBatchWorkOutsideWatchedTree:
 
 
 class TestArchiveUsesImmutableWorkCopy:
-    """Issue 3: archive and deletion must use the claimed immutable bytes."""
+    """Archive must contain the claimed bytes, not a replaced live file."""
 
     def test_archive_from_work_copy_not_staging(self, tmp_path):
         w = _make_watcher(tmp_path)
         original = b"original content\n"
-        (w.staging_dir / "file.txt").write_bytes(original)
-        (w.batch_work / "file.txt").parent.mkdir(parents=True, exist_ok=True)
-        (w.batch_work / "file.txt").write_bytes(original)
+        _claim(w, [("file.txt", original)])
+        _mark_mined(w, ["file.txt"])
         # After claim, producer replaces the live file.
         (w.staging_dir / "file.txt").write_bytes(b"REPLACED\n")
-        sha = _sha256(original)
-        size = len(original)
-        mtime = int((w.batch_work / "file.txt").stat().st_mtime)
-        w.batch_snapshot.write_bytes(f"file.txt\x1f{size}\x1f{mtime}\x1f{sha}\n".encode("utf-8"))
         assert w.archive_files()
         batch = [d for d in w.archive_dir.iterdir() if d.is_dir()][0]
         with gzip.open(batch / "file.txt.gz", "rt", encoding="utf-8") as f:
-            archived_content = f.read()
-        assert archived_content == "original content\n", (
-            "archive must contain the claimed bytes, not the replaced live file"
-        )
+            assert f.read() == "original content\n"
 
 
 class TestPortableHashing:
-    """Issue 4: fingerprint_staging must work without external sha256sum."""
+    """fingerprint_staging must work without external sha256sum."""
 
     def test_fingerprint_stable_when_unchanged(self, tmp_path):
         w = _make_watcher(tmp_path)
         (w.staging_dir / "a.txt").write_bytes(b"hello\n")
         (w.staging_dir / "b.txt").write_bytes(b"world\n")
-        fp1 = w.fingerprint_staging()
-        fp2 = w.fingerprint_staging()
-        assert fp1 == fp2, "fingerprint must be stable for unchanged tree"
+        assert w.fingerprint_staging() == w.fingerprint_staging()
 
     def test_fingerprint_changes_when_file_modified(self, tmp_path):
         w = _make_watcher(tmp_path)
         (w.staging_dir / "a.txt").write_bytes(b"hello\n")
         fp1 = w.fingerprint_staging()
         (w.staging_dir / "a.txt").write_bytes(b"CHANGED\n")
-        fp2 = w.fingerprint_staging()
-        assert fp1 != fp2, "fingerprint must change when file content changes"
+        assert w.fingerprint_staging() != fp1

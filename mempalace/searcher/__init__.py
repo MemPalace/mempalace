@@ -15,6 +15,7 @@ hide drawers the direct path would have found.
 # this package's globals (the same namespace as the historical module).
 
 import functools
+import json
 import logging
 import math
 import os

@@ -4,17 +4,20 @@
 Watches a staging directory for new files and runs the full MemPalace
 ingest pipeline:
 
-    preprocess → mine → verify → compress → gzip → archive
+    stage (verbatim) → mine → verify → compress → archive → clear
 
 When files arrive and stabilize (no writes for DEBOUNCE_SECONDS):
-  1. Claim an immutable batch snapshot.
-  2. Preprocess only the claimed files (strip boilerplate, split >4000 lines).
-  3. Mine processed files into the palace.
-  4. Verify a sample of mined content is searchable.
+  1. Claim an immutable batch snapshot and copy every claimed file into a
+     private work dir, verifying sha256.
+  2. Stage VERBATIM copies into a per-batch mine dir (content-keyed batch
+     id — the only transformation is splitting files over MAX_LINES).
+  3. Mine the batch dir into the palace.
+  4. Verify mined files are searchable under their own source_file.
   5. Compress: run mempalace compress (AAAK dialect).
-  6. Gzip original files from the batch snapshot and move to archive/.
-  7. Write manifest with checksums + file list.
-  8. Clear only the claimed batch from staging (ready for next batch).
+  6. Archive ONLY mined files: gzip verified work copies to archive/.
+  7. Quarantine skipped files under staging/.mp_quarantine/<batch_id>/
+     and clear mined files by moving them into the work dir — never
+     unlinking a live staging path.
 
 Usage:
     python staging_watcher.py /path/to/staging /path/to/palace
@@ -74,8 +77,9 @@ class StagingWatcher:
             palace_path or os.environ.get("PALACE_PATH", str(Path.home() / ".mempalace/palace"))
         )
         self.archive_dir = Path(
-            archive_dir or os.environ.get("ARCHIVE_DIR", str(self.staging_dir.parent / "archive"))
+            archive_dir or os.environ.get("ARCHIVE_DIR", str(Path.home() / ".mempalace/archive"))
         )
+        self.mine_agent = os.environ.get("MINE_AGENT", "staging-watcher")
         self.mempalace_bin = mempalace_bin or os.environ.get("MEMPALACE_BIN", "mempalace")
         self.python_bin = python_bin or os.environ.get("PYTHON_BIN", sys.executable)
         self.preprocess_script = _TOOLS_DIR / "preprocess_staging.py"
@@ -103,7 +107,17 @@ class StagingWatcher:
         self.batch_snapshot = Path(
             batch_snapshot or os.environ.get("BATCH_SNAPSHOT") or wr / ".batch_snapshot"
         )
-        self.batch_work = Path(batch_work or os.environ.get("BATCH_WORK") or wr / ".batch_work")
+        # Per-batch dirs — claim_batch re-roots them under the batch dir
+        # once the content-keyed batch id is known. A BATCH_WORK override
+        # supplies the batch dir parent for tests.
+        self.batch_id = ""
+        _batch_dir_override = batch_work or os.environ.get("BATCH_WORK")
+        self._batch_dir_overridden = _batch_dir_override is not None
+        self.batch_dir = Path(_batch_dir_override) if _batch_dir_override else wr / "batch-pending"
+        self.work_orig = self.batch_dir / "orig"
+        self.batch_work = self.work_orig  # alias for legacy callers/tests
+        self.mine_dir = self.batch_dir / "mine"
+        self.retired_dir = self.batch_dir / "retired"
 
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
         self.archive_dir.mkdir(parents=True, exist_ok=True)
@@ -147,7 +161,11 @@ class StagingWatcher:
                 continue
             if p.suffix in _EXCLUDED_SUFFIXES:
                 continue
-            if "processed" in p.parts:
+            # Skip dot-prefixed path components relative to the scan root —
+            # covers .mp_quarantine, .mp_processed, .git, and any hidden
+            # user dir. Ordinary dirs named "processed" are content.
+            rel_parts = p.relative_to(target).parts
+            if any(part.startswith(".") for part in rel_parts):
                 continue
             results.append(p)
         return results
@@ -215,11 +233,24 @@ class StagingWatcher:
             self.log("Claim FAILED: no files to batch")
             return False
         self.batch_snapshot.write_text(snapshot, encoding="utf-8")
-        # Create the private work directory outside the watched tree.
-        if self.batch_work.exists():
-            shutil.rmtree(self.batch_work, ignore_errors=True)
-        self.batch_work.mkdir(parents=True, exist_ok=True)
-        # Copy ALL claimed files into BATCH_WORK with sha256 verification.
+        # Content-addressed batch id: retrying the same file set re-uses the
+        # same mine paths, so a retry is an idempotent replace (the miner
+        # purges by source_file), never a duplicate insert. A different file
+        # set yields different paths, so cross-batch purge cannot happen.
+        self.batch_id = self._hash_stdin(snapshot)[:16]
+        # Retire the PREVIOUS batch dir now — its retired/ copy survived one
+        # full batch cycle as post-hoc insurance; the archive holds the
+        # canonical bytes.
+        prev = getattr(self, "_prev_batch_dir", None)
+        if prev is not None and Path(prev).exists():
+            shutil.rmtree(prev, ignore_errors=True)
+        if not self._batch_dir_overridden:
+            self.batch_dir = self.work_root / f"batch-{self.batch_id}"
+        self._prev_batch_dir = self.batch_dir
+        self.work_orig = self.batch_dir / "orig"
+        for d in (self.work_orig, self.mine_dir, self.retired_dir):
+            d.mkdir(parents=True, exist_ok=True)
+        # Copy ALL claimed files into the batch work dir with sha256 verification.
         for line in snapshot.strip().split("\n"):
             rel_path, _size, _mtime, expected_hash = self.parse_snapshot_line(line)
             if not rel_path or rel_path in _EXCLUDED_NAMES:
@@ -227,7 +258,7 @@ class StagingWatcher:
             src = self.staging_dir / rel_path
             if not src.exists():
                 continue
-            dst = self.batch_work / rel_path
+            dst = self.work_orig / rel_path
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
             copied_hash = self.file_sha256(dst)
@@ -235,77 +266,77 @@ class StagingWatcher:
                 self.log(f"Claim SKIP: {rel_path} changed during claim (hash mismatch)")
                 dst.unlink(missing_ok=True)
         count = len([line for line in snapshot.strip().split("\n") if line])
-        self.log(f"Claimed batch: {count} files -> {self.batch_snapshot}")
+        self.log(f"Claimed batch {self.batch_id}: {count} files -> {self.batch_snapshot}")
         return True
 
     # ── Preprocess ─────────────────────────────────────────────────────────
 
     def preprocess_staging(self) -> bool:
-        file_count = self.count_files()
-        self.log(
-            f"Preprocessing {file_count} files (strip boilerplate, split >{self.max_lines} lines)..."
-        )
+        """Stage verified work copies into mine_dir — verbatim, split-only."""
+        self.log(f"Staging batch {self.batch_id} for mining (verbatim; split >{self.max_lines})...")
         cmd = [
             self.python_bin,
             str(self.preprocess_script),
             str(self.staging_dir),
+            "--work-dir",
+            str(self.work_orig),
+            "--batch-snapshot",
+            str(self.batch_snapshot),
+            "--out-dir",
+            str(self.mine_dir),
+            "--batch-id",
+            self.batch_id or "batch",
+            "--manifest",
+            str(self.batch_dir / "mined.manifest"),
+            "--skip-manifest",
+            str(self.batch_dir / "skipped.manifest"),
             "--max-lines",
             str(self.max_lines),
         ]
-        if self.batch_snapshot.exists() and self.batch_snapshot.stat().st_size > 0:
-            cmd.extend(
-                ["--batch-snapshot", str(self.batch_snapshot), "--work-dir", str(self.batch_work)]
-            )
         with self.log_file.open("a", encoding="utf-8") as logf:
             try:
                 result = subprocess.run(cmd, stdout=logf, stderr=logf)
             except FileNotFoundError as e:
-                self.log(f"Preprocess FAILED: {e}")
+                self.log(f"Stage FAILED: {e}")
                 return False
         if result.returncode == 0:
-            processed_dir = self.staging_dir / "processed"
-            processed_count = (
-                len(
-                    [
-                        p
-                        for p in processed_dir.rglob("*")
-                        if p.is_file() and p.name != "mempalace.yaml"
-                    ]
-                )
-                if processed_dir.exists()
+            mined_manifest = self.batch_dir / "mined.manifest"
+            mined_count = (
+                len(mined_manifest.read_text(encoding="utf-8").splitlines())
+                if mined_manifest.exists()
                 else 0
             )
-            # Copy mempalace.yaml into processed/ for wing routing
+            # Copy mempalace.yaml into the mine dir for wing routing (the
+            # miner skips the file itself by name).
             yaml_src = self.staging_dir / "mempalace.yaml"
             if yaml_src.exists():
-                shutil.copy2(yaml_src, processed_dir / "mempalace.yaml")
-            self.log(f"Preprocess complete: {processed_count} output files")
+                shutil.copy2(yaml_src, self.mine_dir / "mempalace.yaml")
+            self.log(f"Stage complete: {mined_count} mine-ready file(s)")
             return True
-        self.log(f"Preprocess FAILED (exit {result.returncode})")
+        self.log(f"Stage FAILED (exit {result.returncode})")
         return False
 
     # ── Mine ───────────────────────────────────────────────────────────────
 
     def mine_processed(self) -> bool:
-        processed_dir = self.staging_dir / "processed"
-        if not processed_dir.exists():
-            self.log("Mine: no processed directory — skipping")
+        if not self.mine_dir.exists():
+            self.log("Mine: no staged directory — skipping")
             return True
         file_count = len(
-            [p for p in processed_dir.rglob("*") if p.is_file() and p.name != "mempalace.yaml"]
+            [p for p in self.mine_dir.rglob("*") if p.is_file() and p.name != "mempalace.yaml"]
         )
         if file_count == 0:
-            self.log("Mine: no processed files to mine — skipping")
+            self.log("Mine: no staged files to mine — skipping")
             return True
-        self.log(f"Mining {file_count} processed files...")
+        self.log(f"Mining {file_count} staged files...")
         cmd = [
             self.mempalace_bin,
             "--palace",
             str(self.palace_path),
             "mine",
-            str(processed_dir),
+            str(self.mine_dir),
             "--agent",
-            "devin",
+            self.mine_agent,
             "--max-chunks-per-file",
             "500",
         ]
@@ -321,43 +352,64 @@ class StagingWatcher:
         self.log(f"Mine FAILED (exit {result.returncode})")
         return False
 
-    # ── Build manifest ─────────────────────────────────────────────────────
+    # ── Mined-set helpers ──────────────────────────────────────────────────
 
-    def build_batch_manifest(self) -> None:
-        processed_dir = self.staging_dir / "processed"
-        manifest = self.staging_dir / ".batch_manifest"
-        files: list[str] = []
-        if processed_dir.exists():
-            for p in sorted(processed_dir.rglob("*")):
-                if p.is_file() and p.name != "mempalace.yaml":
-                    files.append(str(p))
-        manifest.write_text("\n".join(files) + ("\n" if files else ""), encoding="utf-8")
-        self.log(f"Built batch manifest with {len(files)} processed files")
+    def mined_orig_rels(self) -> list[str]:
+        """Original rel paths that produced mined output (manifest col 1,
+        deduplicated — a split file appears once per part)."""
+        manifest = self.batch_dir / "mined.manifest"
+        if not manifest.exists() or manifest.stat().st_size == 0:
+            return []
+        rels = []
+        for line in manifest.read_text(encoding="utf-8").splitlines():
+            parts = line.split("\x1f")
+            if parts and parts[0]:
+                rels.append(parts[0])
+        return sorted(set(rels))
+
+    def skipped_rels(self) -> list[str]:
+        """Rel paths that produced no mined output (skip manifest col 1)."""
+        manifest = self.batch_dir / "skipped.manifest"
+        if not manifest.exists() or manifest.stat().st_size == 0:
+            return []
+        rels = []
+        for line in manifest.read_text(encoding="utf-8").splitlines():
+            parts = line.split("\x1f")
+            if parts and parts[0]:
+                rels.append(parts[0])
+        return rels
 
     # ── Verify ─────────────────────────────────────────────────────────────
 
     def verify_mined(self) -> bool:
-        manifest = self.staging_dir / ".batch_manifest"
+        manifest = self.batch_dir / "mined.manifest"
         if not manifest.exists() or manifest.stat().st_size == 0:
-            self.log("Verify FAILED: batch manifest is empty or missing")
-            return False
-        self.log(f"Verify: checking searchability of all processed files against {manifest}")
+            # Nothing was mined — nothing to verify. Quarantine still runs so
+            # unprocessable files stop re-triggering the batch.
+            self.log("Verify: manifest empty (nothing mined) — skipping search checks")
+            return True
+        self.log(f"Verify: checking searchability of mined files under {self.mine_dir}")
         cmd = [
             self.python_bin,
             str(self.verify_script),
+            "--palace",
             str(self.palace_path),
+            "--manifest",
             str(manifest),
-            str(manifest),
-            str(self.mempalace_bin),
+            "--mine-dir",
+            str(self.mine_dir),
+            "--snapshot",
+            str(self.batch_snapshot),
+            "--work-dir",
+            str(self.work_orig),
+            "--all",
         ]
-        if self.batch_snapshot.exists() and self.batch_snapshot.stat().st_size > 0:
-            cmd.extend(["--snapshot", str(self.batch_snapshot)])
         with self.log_file.open("a", encoding="utf-8") as logf:
             result = subprocess.run(cmd, stdout=logf, stderr=logf)
         if result.returncode == 0:
-            self.log("Verify: all processed files are searchable and in the current batch")
+            self.log("Verify: all mined files are searchable under this batch's source paths")
             return True
-        self.log("Verify FAILED: one or more processed files are not searchable")
+        self.log("Verify FAILED: one or more mined files are not searchable")
         return False
 
     # ── Compress ───────────────────────────────────────────────────────────
@@ -391,46 +443,39 @@ class StagingWatcher:
         manifest_header = (
             f"# MemPalace Archive Manifest\n"
             f"# Batch: {batch_date}\n"
+            f"# Batch ID: {self.batch_id}\n"
             f"# Mined: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
             f"# Palace: {self.palace_path}\n"
-            f"# Pipeline: preprocess -> mine -> verify -> compress -> gzip -> archive\n\n"
+            f"# Pipeline: stage -> mine -> verify -> compress -> gzip -> archive\n\n"
         )
 
-        # Use the claimed batch snapshot when available.
-        snapshot_file = self.batch_snapshot
-        if not snapshot_file.exists() or snapshot_file.stat().st_size == 0:
-            snapshot_file = self.staging_dir / ".batch_snapshot"
-            if not snapshot_file.exists() or snapshot_file.stat().st_size == 0:
-                snapshot_file.write_text(self.snapshot_staging(), encoding="utf-8")
+        # Snapshot hash lookup for the archive integrity check.
+        snapshot_hashes: dict[str, str] = {}
+        if self.batch_snapshot.exists():
+            for line in self.batch_snapshot.read_text(encoding="utf-8").splitlines():
+                rel, _size, _mtime, sha = self.parse_snapshot_line(line)
+                if rel:
+                    snapshot_hashes[rel] = sha
 
         manifest_lines: list[str] = [manifest_header]
         file_count = 0
 
-        for line in snapshot_file.read_text(encoding="utf-8").splitlines():
-            rel_path, expected_size, expected_mtime, expected_hash = self.parse_snapshot_line(line)
-            if not rel_path or rel_path in _EXCLUDED_NAMES:
-                continue
-            # Use the immutable work copy from claim_batch when available;
-            # fall back to the live staging tree for direct function testing.
-            file_path = self.batch_work / rel_path
+        # Archive ONLY files that were actually mined — skipped files are
+        # never archived; the archive means "this content is in the palace".
+        for rel_path in self.mined_orig_rels():
+            # Archive the verified work copy — the live staging file may
+            # have been replaced since the claim.
+            file_path = self.work_orig / rel_path
             if not file_path.exists():
-                file_path = self.staging_dir / rel_path
-            if not file_path.exists():
-                self.log(f"Archive SKIP: {rel_path} no longer exists")
+                self.log(f"Archive SKIP: {rel_path} has no verified work copy")
                 continue
 
             current_size = str(self.file_size(file_path))
-            current_mtime = str(self.file_mtime(file_path))
             current_hash = self.file_sha256(file_path)
 
-            if (
-                current_size != expected_size
-                or current_mtime != expected_mtime
-                or current_hash != expected_hash
-            ):
-                self.log(
-                    f"Archive SKIP: {rel_path} changed since batch was claimed (size/mtime/hash)"
-                )
+            expected_hash = snapshot_hashes.get(rel_path, "")
+            if expected_hash and current_hash != expected_hash:
+                self.log(f"Archive SKIP: {rel_path} work copy no longer matches snapshot")
                 continue
 
             archive_name = batch_archive_tmp / f"{rel_path}.gz"
@@ -463,8 +508,12 @@ class StagingWatcher:
             file_count += 1
 
         if file_count == 0:
-            self.log("Archive FAILED: no files to archive")
-            return False
+            self.log("Archive: no mined files to archive")
+            try:
+                batch_archive_tmp.rmdir()
+            except OSError:
+                shutil.rmtree(batch_archive_tmp, ignore_errors=True)
+            return True
 
         manifest.write_text("".join(manifest_lines), encoding="utf-8")
         if manifest.stat().st_size == 0:
@@ -481,65 +530,86 @@ class StagingWatcher:
         self.log(f"Archived {file_count} files to {batch_archive}")
         return True
 
+    # ── Quarantine ─────────────────────────────────────────────────────────
+
+    def quarantine_skipped(self) -> None:
+        """Move unprocessable files out of the scan set, preserving them
+        under staging/.mp_quarantine/<batch_id>/ — moved, never deleted.
+        A file that changed since the claim is a new drop and stays."""
+        snapshot_hashes: dict[str, str] = {}
+        if self.batch_snapshot.exists():
+            for line in self.batch_snapshot.read_text(encoding="utf-8").splitlines():
+                rel, _s, _m, sha = self.parse_snapshot_line(line)
+                if rel:
+                    snapshot_hashes[rel] = sha
+
+        moved = 0
+        for rel_path in self.skipped_rels():
+            file_path = self.staging_dir / rel_path
+            if not file_path.exists():
+                continue
+            expected_hash = snapshot_hashes.get(rel_path, "")
+            if expected_hash and self.file_sha256(file_path) != expected_hash:
+                self.log(f"Quarantine SKIP: {rel_path} changed since claim — leaving in staging")
+                continue
+            dst = self.staging_dir / ".mp_quarantine" / self.batch_id / rel_path
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            file_path.rename(dst)
+            moved += 1
+        if moved:
+            self.log(
+                f"Quarantined {moved} unprocessable file(s) to "
+                f"staging/.mp_quarantine/{self.batch_id}/"
+            )
+
     # ── Clear staging ──────────────────────────────────────────────────────
 
     def clear_staging(self) -> bool:
-        """Delete only the files listed in the batch snapshot."""
-        snapshot_file = self.batch_snapshot
-        if not snapshot_file.exists() or snapshot_file.stat().st_size == 0:
-            snapshot_file = self.staging_dir / ".batch_snapshot"
+        """Clear only files that were actually mined (now in the palace AND
+        archived). Verify the live file still matches the snapshot, then
+        MOVE it into the private work dir rather than unlinking a live
+        staging path — rename is atomic wrt path replacement, so a producer
+        that swapped the file mid-pipeline loses nothing."""
+        snapshot_hashes: dict[str, str] = {}
+        if self.batch_snapshot.exists():
+            for line in self.batch_snapshot.read_text(encoding="utf-8").splitlines():
+                rel, _s, _m, sha = self.parse_snapshot_line(line)
+                if rel:
+                    snapshot_hashes[rel] = sha
 
-        if snapshot_file.exists() and snapshot_file.stat().st_size > 0:
-            for line in snapshot_file.read_text(encoding="utf-8").splitlines():
-                rel_path, expected_size, expected_mtime, expected_hash = self.parse_snapshot_line(
-                    line
+        for rel_path in self.mined_orig_rels():
+            file_path = self.staging_dir / rel_path
+            if not file_path.exists():
+                continue
+            expected_hash = snapshot_hashes.get(rel_path, "")
+            if expected_hash and self.file_sha256(file_path) == expected_hash:
+                dst = self.retired_dir / rel_path
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                file_path.rename(dst)
+            else:
+                self.log(
+                    f"Clear SKIP: {rel_path} changed since batch was claimed, leaving for next run"
                 )
-                if not rel_path or rel_path in _EXCLUDED_NAMES:
-                    continue
-                file_path = self.staging_dir / rel_path
-                if not file_path.exists():
-                    continue
-                current_size = str(self.file_size(file_path))
-                current_mtime = str(self.file_mtime(file_path))
-                current_hash = self.file_sha256(file_path)
-                if (
-                    current_size == expected_size
-                    and current_mtime == expected_mtime
-                    and current_hash == expected_hash
-                ):
-                    file_path.unlink()
-                else:
-                    self.log(
-                        f"Clear SKIP: {rel_path} changed since batch was claimed, leaving for next run"
-                    )
 
-        # Clean up processed directory and batch metadata.
-        processed_dir = self.staging_dir / "processed"
-        if processed_dir.exists():
-            shutil.rmtree(processed_dir, ignore_errors=True)
-        staging_snapshot = self.staging_dir / ".batch_snapshot"
-        staging_manifest = self.staging_dir / ".batch_manifest"
-        staging_snapshot.unlink(missing_ok=True)
-        staging_manifest.unlink(missing_ok=True)
-        # Remove empty directories (but not the staging root).
+        # Remove empty directories left behind (but not the staging root,
+        # and never the quarantine tree).
         for p in sorted(self.staging_dir.rglob("*"), reverse=True):
             if p.is_dir() and p != self.staging_dir:
+                rel_parts = p.relative_to(self.staging_dir).parts
+                if any(part.startswith(".") for part in rel_parts):
+                    continue
                 try:
                     p.rmdir()
                 except OSError:
                     pass
-        # Clean up the private work directory outside the watched tree.
-        if self.batch_work.exists():
-            shutil.rmtree(self.batch_work, ignore_errors=True)
-        self.batch_snapshot.unlink(missing_ok=True)
         self.log("Staging cleared (ready for next batch)")
         return True
 
     # ── Process batch ──────────────────────────────────────────────────────
 
     def _cleanup_work(self) -> None:
-        if self.batch_work.exists():
-            shutil.rmtree(self.batch_work, ignore_errors=True)
+        if self.batch_dir.exists():
+            shutil.rmtree(self.batch_dir, ignore_errors=True)
         self.batch_snapshot.unlink(missing_ok=True)
 
     def process_batch(self) -> bool:
@@ -548,14 +618,13 @@ class StagingWatcher:
             self.log("ABORT: could not claim batch")
             return False
         if not self.preprocess_staging():
-            self.log("ABORT: preprocess failed — files left for retry")
+            self.log("ABORT: staging failed — files left for retry")
             self._cleanup_work()
             return False
         if not self.mine_processed():
             self.log("ABORT: mine failed — files left for retry")
             self._cleanup_work()
             return False
-        self.build_batch_manifest()
         if not self.verify_mined():
             self.log("ABORT: verify failed — files left for inspection")
             self._cleanup_work()
@@ -565,10 +634,8 @@ class StagingWatcher:
             self.log("ABORT: archive failed — files left for inspection")
             self._cleanup_work()
             return False
-        if not self.clear_staging():
-            self.log("ABORT: clear_staging failed — archive is at but staging may be dirty")
-            self._cleanup_work()
-            return False
+        self.quarantine_skipped()
+        self.clear_staging()
         self.log("=== Batch complete ===")
         return True
 
@@ -580,7 +647,7 @@ class StagingWatcher:
         self.log(f"Watching: {self.staging_dir}")
         self.log(f"Archive: {self.archive_dir}")
         self.log(f"Palace: {self.palace_path}")
-        self.log("Pipeline: preprocess -> mine -> verify -> compress -> gzip -> archive")
+        self.log("Pipeline: stage -> mine -> verify -> compress -> gzip -> archive")
         self.log(f"Debounce: {self.debounce_seconds}s, Max lines: {self.max_lines}")
         while True:
             while self.count_files() < self.min_files:
