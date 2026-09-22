@@ -98,6 +98,28 @@ def test_apply_normalize_leaves_a_fact_closed_since_planning_alone(kg):
     assert ("status", "deployed commit fc81c6f6") not in now  # not resurrected
 
 
+def test_kg_rewrite_keeps_confidence_and_provenance(kg):
+    kg.add_triple(
+        "portal",
+        "deployed_commit",
+        "abc123",
+        valid_from="2026-08-01",
+        confidence=0.6,
+        source_file="notes.md",
+        source_drawer_id="d42",
+        source_closet="c7",
+        adapter_name="convos",
+    )
+    fact = [f for f in off_vocabulary_facts(kg, DEFAULT_VOCABULARY) if f["subject"] == "portal"][0]
+    new_id = kg.rewrite(fact["id"], "status", "deployed commit abc123", at="2026-09-21T00:00:00Z")
+    row = kg._conn().execute("SELECT * FROM triples WHERE id=?", (new_id,)).fetchone()
+    assert row["confidence"] == 0.6
+    assert row["source_file"] == "notes.md"  # still points at the evidence
+    assert row["source_drawer_id"] == "d42"
+    assert row["source_closet"] == "c7"
+    assert row["adapter_name"] == "convos"
+
+
 def test_kg_rewrite_is_one_transaction(kg, monkeypatch):
     _seed(kg)
     fact = off_vocabulary_facts(kg, DEFAULT_VOCABULARY)[0]

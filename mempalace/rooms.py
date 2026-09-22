@@ -32,6 +32,7 @@ import math
 import os
 import random
 import re
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Iterable, Optional, Protocol
@@ -492,6 +493,10 @@ class RoomPlan:
     wing: str
     total: int
     changes: list[tuple[str, str, str]]  # (drawer_id, old_room, new_room)
+    # {(source_file, old_room): {new_room: drawers moved}} — the closet layer
+    # is keyed per source file and room, so `rekey_closets` needs this to
+    # follow the drawers.
+    source_moves: dict
     kept: int
     below_threshold: int
     no_embedding: int
@@ -540,6 +545,7 @@ def plan_rooms(
     ``from_rooms=None`` to reclassify every drawer in the wing.
     """
     changes: list[tuple[str, str, str]] = []
+    source_moves: dict[tuple[str, str], Counter] = {}
     per_room: dict[str, int] = {}
     examples: dict[str, list[tuple[str, float]]] = {}
     total = kept = below = missing = 0
@@ -569,6 +575,9 @@ def plan_rooms(
                 kept += 1
             else:
                 changes.append((row["id"], old, room))
+                source = str(row["metadata"].get("source_file") or "")
+                if source:
+                    source_moves.setdefault((source, old), Counter())[room] += 1
                 bucket = examples.setdefault(room, [])
                 if len(bucket) < _EXAMPLES_PER_ROOM:
                     bucket.append((row["id"], confidence))
@@ -582,8 +591,58 @@ def plan_rooms(
             flush()
     flush()
     return RoomPlan(
-        wing, total, changes, kept, below, missing, dict(sorted(per_room.items())), examples
+        wing,
+        total,
+        changes,
+        source_moves,
+        kept,
+        below,
+        missing,
+        dict(sorted(per_room.items())),
+        examples,
     )
+
+
+def rekey_closets(closets_col, plan: RoomPlan) -> dict:
+    """Follow the drawers with the AAAK index layer; ``{"moved", "ambiguous"}``.
+
+    A closet is one record per ``(wing, room, source_file)`` and search
+    passes the *same* wing/room filter to the closet collection, so after a
+    reclassification a closet left on the old room stops boosting the
+    drawers it indexes — in the new room they rank without it. Each closet
+    follows the room most of its drawers moved to; when a source's drawers
+    split across rooms the rest cannot be represented by one record and are
+    counted in ``ambiguous`` (re-mining that source rebuilds them exactly).
+
+    Only ``room`` metadata is rewritten, never the record id, which is what
+    ``wings split`` does for ``wing``.
+    """
+    if closets_col is None or not plan.source_moves:
+        return {"moved": 0, "ambiguous": 0}
+    targets: dict[tuple[str, str], str] = {}
+    ambiguous = 0
+    for (source, old_room), counts in plan.source_moves.items():
+        winner, n = max(sorted(counts.items()), key=lambda kv: kv[1])
+        targets[(source, old_room)] = winner
+        if len(counts) > 1:
+            ambiguous += sum(counts.values()) - n
+    ids: list[str] = []
+    metas: list[dict] = []
+    stamp = datetime.now(timezone.utc).isoformat()
+    for row in _iter_wing_rows(closets_col, plan.wing, include=["metadatas"]):
+        meta = row["metadata"]
+        key = (str(meta.get("source_file") or ""), str(meta.get("room") or ""))
+        target = targets.get(key)
+        if not target or target == key[1]:
+            continue
+        ids.append(row["id"])
+        metas.append({"room": target, "last_modified": stamp})
+    for start in range(0, len(ids), _UPDATE_BATCH):
+        closets_col.update(
+            ids=ids[start : start + _UPDATE_BATCH],
+            metadatas=metas[start : start + _UPDATE_BATCH],
+        )
+    return {"moved": len(ids), "ambiguous": ambiguous}
 
 
 def apply_plan(col, plan: RoomPlan, progress=None) -> int:

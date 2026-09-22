@@ -295,6 +295,57 @@ def is_generic_entity(name: str) -> bool:
     return text.rstrip("/").lower() in GENERIC_ENTITY_STOPLIST
 
 
+def _dir_segments(entity: str) -> list[str]:
+    """Directory part of a spelling, innermost last: ``src/models/user.py`` → ``["src", "models"]``."""
+    parts = [p for p in str(entity).replace("\\", "/").split("/") if p]
+    return parts[:-1]
+
+
+def same_file_spelling(a: str, b: str) -> bool:
+    """True when two spellings can only be the same file.
+
+    They must share a basename key *and* one path must be a suffix of the
+    other: ``main.zig`` and ``src/main.zig`` are one file, while
+    ``src/models/user.py`` and ``tests/models/user.py`` are two files that
+    happen to share a name. Keying on the basename alone merged their
+    associations and let ``--prune-spellings`` delete one of them.
+    """
+    if entity_spelling_key(a) != entity_spelling_key(b):
+        return False
+    da, db = _dir_segments(a), _dir_segments(b)
+    short, long_ = (da, db) if len(da) <= len(db) else (db, da)
+    return not short or long_[len(long_) - len(short) :] == short
+
+
+def _spelling_clusters(entities: list[str]) -> list[list[str]]:
+    """Group spellings of one basename into the distinct files they name.
+
+    Spellings are bucketed by their directory path. A path that is a suffix
+    of exactly one longer path is the same file and joins it (``main.zig``
+    under ``src/main.zig``); one that could belong to two or more names no
+    file unambiguously and stays on its own rather than merging them
+    (``user.py`` beside ``src/models/user.py`` and ``tests/models/user.py``).
+    """
+    groups: dict[tuple, list[str]] = {}
+    for e in entities:
+        groups.setdefault(tuple(_dir_segments(e)), []).append(e)
+    by_length = sorted(groups, key=len, reverse=True)
+    maximal: list[tuple] = []
+    for dirs in by_length:
+        if not any(len(m) > len(dirs) and m[len(m) - len(dirs) :] == dirs for m in maximal):
+            maximal.append(dirs)
+    clusters: dict[tuple, list[str]] = {m: list(groups[m]) for m in maximal}
+    for dirs in by_length:
+        if dirs in clusters:
+            continue
+        hosts = [m for m in maximal if len(m) > len(dirs) and m[len(m) - len(dirs) :] == dirs]
+        if len(hosts) == 1:
+            clusters[hosts[0]].extend(groups[dirs])
+        else:
+            clusters[dirs] = list(groups[dirs])
+    return list(clusters.values())
+
+
 def is_self_link(record) -> bool:
     """True when a hallway record joins two spellings of one entity."""
     if not isinstance(record, dict):
@@ -302,7 +353,7 @@ def is_self_link(record) -> bool:
     a, b = record.get("entity_a"), record.get("entity_b")
     if a is None or b is None:
         return False
-    return entity_spelling_key(a) == entity_spelling_key(b)
+    return same_file_spelling(str(a), str(b))
 
 
 def canonical_entities(entities: list[str]) -> list[str]:
@@ -315,13 +366,22 @@ def canonical_entities(entities: list[str]) -> list[str]:
     (``ChatStore`` × ``RootView`` under each spelling combination). The
     shortest spelling wins, so hallways read ``ChatStore ↔ RootView``.
     """
-    chosen: dict[str, str] = {}
+    by_key: dict[str, list[str]] = {}
+    order: list[str] = []
     for entity in entities:
         key = entity_spelling_key(entity)
-        current = chosen.get(key)
-        if current is None or len(entity) < len(current):
-            chosen[key] = entity
-    return list(chosen.values())
+        if key not in by_key:
+            by_key[key] = []
+            order.append(key)
+        by_key[key].append(entity)
+    out: list[str] = []
+    for key in order:
+        # Spellings of one basename may name several files (``src/user.py``
+        # and ``tests/user.py``); each cluster keeps its own shortest
+        # spelling instead of collapsing into one entity.
+        for cluster in _spelling_clusters(by_key[key]):
+            out.append(min(cluster, key=len))
+    return out
 
 
 def _parse_entities(value) -> list[str]:
@@ -605,6 +665,49 @@ def prune_spelling_hallways(config=None, apply: bool = False) -> dict:
         return _prune_spelling_hallways_locked(config, apply)
 
 
+def _split_by_file(members: list[dict]) -> list[list[dict]]:
+    """Split one basename group into the distinct file pairs it holds."""
+    if len(members) == 1:
+        return [members]
+    buckets: list[list[dict]] = []
+    for h in members:
+        a, b = str(h.get("entity_a")), str(h.get("entity_b"))
+        for bucket in buckets:
+            ref = bucket[0]
+            ra, rb = str(ref.get("entity_a")), str(ref.get("entity_b"))
+            if (same_file_spelling(a, ra) and same_file_spelling(b, rb)) or (
+                same_file_spelling(a, rb) and same_file_spelling(b, ra)
+            ):
+                bucket.append(h)
+                break
+        else:
+            buckets.append([h])
+    return buckets
+
+
+def _merge_variant_group(members: list[dict], kept: list[dict], duplicates: list[dict]) -> None:
+    """Keep the strongest record of one association under its shortest spellings."""
+    if len(members) == 1:
+        kept.append(members[0])
+        return
+    members.sort(key=lambda h: -int(h.get("co_occurrence_count") or 0))
+    survivor = dict(members[0])
+    # Variants may arrive with reversed endpoints (``a ↔ b`` and ``b.py ↔ a``),
+    # so canonicalize per entity across both columns rather than per column,
+    # then keep the survivor's own orientation.
+    shortest: dict[str, str] = {}
+    for m in members:
+        for ent in (str(m.get("entity_a")), str(m.get("entity_b"))):
+            key = entity_spelling_key(ent)
+            if key not in shortest or len(ent) < len(shortest[key]):
+                shortest[key] = ent
+    survivor["entity_a"] = shortest[entity_spelling_key(survivor["entity_a"])]
+    survivor["entity_b"] = shortest[entity_spelling_key(survivor["entity_b"])]
+    survivor["id"] = _hallway_id(survivor["wing"], survivor["entity_a"], survivor["entity_b"])
+    kept.append(survivor)
+    duplicates.extend(members[1:])
+
+
 def _prune_spelling_hallways_locked(config, apply: bool) -> dict:
     hallways = _load_hallways(config)
     self_links = [h for h in hallways if is_self_link(h)]
@@ -613,29 +716,16 @@ def _prune_spelling_hallways_locked(config, apply: bool) -> dict:
         if not isinstance(h, dict) or is_self_link(h):
             continue
         a, b = str(h.get("entity_a")), str(h.get("entity_b"))
+        # The basename key groups candidates; members are split below into the
+        # distinct files they actually name, so two same-named files in
+        # different directories keep their own hallways.
         key = (str(h.get("wing") or ""), *sorted((entity_spelling_key(a), entity_spelling_key(b))))
         groups.setdefault(key, []).append(h)
     duplicates: list[dict] = []
     kept: list[dict] = []
-    for members in groups.values():
-        if len(members) == 1:
-            kept.append(members[0])
-            continue
-        members.sort(key=lambda h: -int(h.get("co_occurrence_count") or 0))
-        survivor = dict(members[0])
-        # Variants may arrive with reversed endpoints (``a ↔ b`` and
-        # ``b.py ↔ a``), so canonicalize per entity key across both columns
-        # rather than per column, then keep the survivor's own orientation.
-        by_key: dict[str, list[str]] = {}
-        for m in members:
-            for ent in (str(m.get("entity_a")), str(m.get("entity_b"))):
-                by_key.setdefault(entity_spelling_key(ent), []).append(ent)
-        shortest = {k: canonical_entities(v)[0] for k, v in by_key.items()}
-        survivor["entity_a"] = shortest[entity_spelling_key(survivor["entity_a"])]
-        survivor["entity_b"] = shortest[entity_spelling_key(survivor["entity_b"])]
-        survivor["id"] = _hallway_id(survivor["wing"], survivor["entity_a"], survivor["entity_b"])
-        kept.append(survivor)
-        duplicates.extend(members[1:])
+    for candidates in groups.values():
+        for members in _split_by_file(candidates):
+            _merge_variant_group(members, kept, duplicates)
 
     by_wing: dict[str, int] = {}
     for h in self_links + duplicates:

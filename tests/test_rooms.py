@@ -481,3 +481,55 @@ def test_main_dispatches_rooms(monkeypatch):
         and seen["threshold"] == 0.4
         and seen["yes"]
     )
+
+
+def test_rekey_closets_follows_the_drawers_and_reports_splits():
+    from mempalace.rooms import rekey_closets
+
+    rows = [
+        {
+            "id": "a",
+            "meta": {"wing": "w", "room": "technical", "source_file": "s1"},
+            "doc": "cut the release",
+            "emb": [1.0, 0.0],
+        },
+        {
+            "id": "b",
+            "meta": {"wing": "w", "room": "technical", "source_file": "s1"},
+            "doc": "release notes",
+            "emb": [1.0, 0.0],
+        },
+        {
+            "id": "c",
+            "meta": {"wing": "w", "room": "technical", "source_file": "s1"},
+            "doc": "fix the bug",
+            "emb": [0.0, 1.0],
+        },
+        {
+            "id": "d",
+            "meta": {"wing": "w", "room": "technical", "source_file": "s2"},
+            "doc": "fix the bug",
+            "emb": [0.0, 1.0],
+        },
+    ]
+    col = FakeCollection(rows)
+    plan = plan_rooms(col, "w", EmbeddingRoomDecider(_room_set(), FakeEmbed()), threshold=0.75)
+    apply_plan(col, plan)
+
+    closets = FakeCollection(
+        [
+            {"id": "k1", "meta": {"wing": "w", "room": "technical", "source_file": "s1"}},
+            {"id": "k2", "meta": {"wing": "w", "room": "technical", "source_file": "s2"}},
+            {"id": "k3", "meta": {"wing": "w", "room": "decisions", "source_file": "s1"}},
+            {"id": "k4", "meta": {"wing": "other", "room": "technical", "source_file": "s1"}},
+        ]
+    )
+    report = rekey_closets(closets, plan)
+    # s1 split 2 releases / 1 bug-fixes: the closet follows the majority and
+    # the minority is reported, since one record cannot carry two rooms.
+    assert closets.rows["k1"]["meta"]["room"] == "releases"
+    assert closets.rows["k2"]["meta"]["room"] == "bug-fixes"
+    assert closets.rows["k3"]["meta"]["room"] == "decisions"  # other room: untouched
+    assert closets.rows["k4"]["meta"]["room"] == "technical"  # other wing: untouched
+    assert report == {"moved": 2, "ambiguous": 1}
+    assert rekey_closets(None, plan) == {"moved": 0, "ambiguous": 0}

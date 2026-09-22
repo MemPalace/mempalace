@@ -39,6 +39,7 @@ def cmd_rooms(args):
         load_room_set,
         plan_rooms,
         propose_rooms,
+        rekey_closets,
         room_set_path,
         sample_drawers,
         save_room_set,
@@ -139,7 +140,7 @@ def cmd_rooms(args):
             print("\n  Dry run. Re-run with --yes to write the room changes.")
         return
 
-    from ..palace import mine_palace_lock
+    from ..palace import get_closets_collection, mine_palace_lock
 
     with mine_palace_lock(palace_path):
         plan = plan_rooms(col, wing, decider, threshold=threshold, from_rooms=from_rooms)
@@ -152,4 +153,17 @@ def cmd_rooms(args):
         except KeyboardInterrupt:
             print("\n  Interrupted. Drawers already moved stay moved; re-run to finish the rest.")
             raise
-        print(f"  Moved {done} drawers. Run `mempalace audit` to see the new rooms score.")
+        # The closet layer is filtered by the same wing/room as the drawers,
+        # so it has to follow them or the moved drawers lose their boost.
+        try:
+            closets_col = get_closets_collection(palace_path, create=False)
+        except Exception:
+            closets_col = None
+        closets = rekey_closets(closets_col, plan)
+        note = f" {closets['moved']} closets followed."
+        if closets["ambiguous"]:
+            note += (
+                f" {closets['ambiguous']} drawers came from a source whose drawers split "
+                "across rooms; re-mine that source for exact closets."
+            )
+        print(f"  Moved {done} drawers.{note} Run `mempalace audit` to see the new rooms score.")

@@ -512,6 +512,12 @@ class KnowledgeGraph:
         longer open, nothing is written and ``None`` is returned. Returns the
         successor's id otherwise. One SQLite transaction covers both writes,
         so an interruption leaves the original fact open and untouched.
+
+        The successor inherits the original's ``confidence`` and provenance
+        (``source_closet``, ``source_file``, ``source_drawer_id``,
+        ``adapter_name``): rewording a predicate is not new evidence, and a
+        normalized fact must still point at the drawer it came from.
+        ``source_file`` here is only a fallback for an original carrying none.
         """
         if at is None:
             boundary = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -527,7 +533,9 @@ class KnowledgeGraph:
             conn = self._conn()
             with conn:
                 row = conn.execute(
-                    "SELECT subject, valid_from FROM triples WHERE id=? AND valid_to IS NULL",
+                    "SELECT subject, valid_from, confidence, source_closet, source_file, "
+                    "source_drawer_id, adapter_name FROM triples "
+                    "WHERE id=? AND valid_to IS NULL",
                     (triple_id,),
                 ).fetchone()
                 if row is None:
@@ -566,11 +574,11 @@ class KnowledgeGraph:
                         obj_id,
                         boundary,
                         None,
-                        1.0,
-                        None,
-                        source_file,
-                        None,
-                        None,
+                        row["confidence"] if row["confidence"] is not None else 1.0,
+                        row["source_closet"],
+                        row["source_file"] or source_file,
+                        row["source_drawer_id"],
+                        row["adapter_name"],
                     ),
                 )
                 return new_id

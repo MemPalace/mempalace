@@ -641,3 +641,65 @@ class TestEntitySpellings:
         assert (survivor["entity_a"], survivor["entity_b"]) == ("store", "view")
         assert survivor["co_occurrence_count"] == 50
         assert survivor["id"] == hallways_mod._hallway_id("w", "store", "view")
+
+
+class TestSameNamedFilesStayApart:
+    """``src/models/user.py`` and ``tests/models/user.py`` are two files."""
+
+    def test_same_file_spelling_requires_a_suffix_path(self):
+        from mempalace.hallways import same_file_spelling
+
+        assert same_file_spelling("main.zig", "src/main.zig")
+        assert same_file_spelling("b/x.py", "a/b/x.py")
+        assert same_file_spelling("mcp_server", "mcp_server.py")
+        assert not same_file_spelling("src/models/user.py", "tests/models/user.py")
+        assert not same_file_spelling("ChatStore", "RootView")
+
+    def test_canonical_entities_keeps_distinct_files_apart(self):
+        from mempalace.hallways import canonical_entities
+
+        assert canonical_entities(["src/models/user.py", "tests/models/user.py"]) == [
+            "src/models/user.py",
+            "tests/models/user.py",
+        ]
+        assert canonical_entities(["src/main.zig", "main.zig"]) == ["main.zig"]
+
+    def test_hallway_between_two_same_named_files_is_not_a_self_link(self):
+        from mempalace.hallways import is_self_link
+
+        assert not is_self_link(
+            {"entity_a": "src/models/user.py", "entity_b": "tests/models/user.py"}
+        )
+        assert is_self_link({"entity_a": "main.zig", "entity_b": "src/main.zig"})
+
+    def test_prune_keeps_both_files_hallways(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        hallways_mod._save_hallways(
+            [
+                {
+                    "id": "1",
+                    "wing": "w",
+                    "entity_a": "src/models/user.py",
+                    "entity_b": "view",
+                    "co_occurrence_count": 50,
+                },
+                {
+                    "id": "2",
+                    "wing": "w",
+                    "entity_a": "tests/models/user.py",
+                    "entity_b": "view",
+                    "co_occurrence_count": 40,
+                },
+                {
+                    "id": "3",
+                    "wing": "w",
+                    "entity_a": "src/models/user.py",
+                    "entity_b": "view.py",
+                    "co_occurrence_count": 30,
+                },
+            ]
+        )
+        report = hallways_mod.prune_spelling_hallways(apply=True)
+        assert report["removed"] == 1  # only the src/user ↔ view spelling variant
+        left = {(h["entity_a"], h["entity_b"]) for h in hallways_mod.list_hallways()}
+        assert left == {("src/models/user.py", "view"), ("tests/models/user.py", "view")}
