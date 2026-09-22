@@ -689,6 +689,65 @@ def _normalize_envelope(request: dict) -> "tuple[str, dict]":
     return method, params
 
 
+def _dispatch_tool_call(req_id, tool_name: str, tool_args: dict):
+    """Run a tool handler that has cleared every preflight gate."""
+
+    # 'content' is an accepted alias for diary_write's 'entry' (callers often
+    # reuse add_drawer's 'content' name). Map it in here, before dispatch, so a
+    # content-only call still satisfies the required 'entry' param while the
+    # signature-based missing-parameter diagnostic (-32602) keeps working.
+    # 'entry' wins if both are supplied.
+    if tool_name == "mempalace_diary_write" and "content" in tool_args:
+        content_val = tool_args.pop("content")
+        # Only fill from the alias when the caller did not supply 'entry' at
+        # all (or passed it as null). An explicit entry — even "" — wins.
+        if "entry" not in tool_args or tool_args["entry"] is None:
+            tool_args["entry"] = content_val
+    try:
+        with _writer_idle_clock(tool_name), _write_stall_watch(tool_name):
+            result = _decorate_mcp_tool_result(tool_name, TOOLS[tool_name]["handler"](**tool_args))
+
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "content": [
+                    {"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}
+                ]
+            },
+        }
+    except TypeError as e:
+        # Qualname match prevents leaking internal helper/param names raised
+        # inside the handler body — see test_handler_internal_signature_shape_stays_generic.
+        msg = str(e)
+        handler = TOOLS[tool_name]["handler"]
+        handler_qn = getattr(handler, "__qualname__", None) or getattr(handler, "__name__", "")
+        # Qualname can include "<locals>" for nested defs and "<lambda>"
+        # for lambdas — accept Python's TypeError emit verbatim.
+        m_missing = re.match(
+            r"^([\w\.<>]+)\(\) missing \d+ required "
+            r"(?:positional |keyword-only )?arguments?: (.+)$",
+            msg,
+        )
+        if m_missing and m_missing.group(1) == handler_qn:
+            names = re.findall(r"'(\w+)'", m_missing.group(2))
+            if names:
+                quoted = ", ".join(f"'{n}'" for n in names)
+                word = "parameter" if len(names) == 1 else "parameters"
+                logger.debug("Tool %s: missing required %s %s", tool_name, word, quoted)
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32602,
+                        "message": f"Missing required {word} {quoted} for tool {tool_name}",
+                    },
+                }
+        return _internal_tool_error(req_id, tool_name, e)
+    except Exception as exc:
+        return _internal_tool_error(req_id, tool_name, exc)
+
+
 def handle_request(request):
     global _last_request_time
     if not isinstance(request, dict):
@@ -816,66 +875,20 @@ def handle_request(request):
                     "error": {"code": -32602, "message": f"Invalid value for parameter '{key}'"},
                 }
         tool_args.pop("wait_for_previous", None)
-        preflight_error = _mcp_tool_preflight_refusal(req_id, tool_name)
+        preflight_error = _mcp_tool_preflight_refusal(req_id, tool_name, check_writer=False)
         if preflight_error is not None:
             return preflight_error
 
-        # 'content' is an accepted alias for diary_write's 'entry' (callers often
-        # reuse add_drawer's 'content' name). Map it in here, before dispatch, so a
-        # content-only call still satisfies the required 'entry' param while the
-        # signature-based missing-parameter diagnostic (-32602) keeps working.
-        # 'entry' wins if both are supplied.
-        if tool_name == "mempalace_diary_write" and "content" in tool_args:
-            content_val = tool_args.pop("content")
-            # Only fill from the alias when the caller did not supply 'entry' at
-            # all (or passed it as null). An explicit entry — even "" — wins.
-            if "entry" not in tool_args or tool_args["entry"] is None:
-                tool_args["entry"] = content_val
-        try:
-            with _writer_inflight(tool_name), _write_stall_watch(tool_name):
-                result = _decorate_mcp_tool_result(
-                    tool_name, TOOLS[tool_name]["handler"](**tool_args)
-                )
-
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "content": [
-                        {"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}
-                    ]
-                },
-            }
-        except TypeError as e:
-            # Qualname match prevents leaking internal helper/param names raised
-            # inside the handler body — see test_handler_internal_signature_shape_stays_generic.
-            msg = str(e)
-            handler = TOOLS[tool_name]["handler"]
-            handler_qn = getattr(handler, "__qualname__", None) or getattr(handler, "__name__", "")
-            # Qualname can include "<locals>" for nested defs and "<lambda>"
-            # for lambdas — accept Python's TypeError emit verbatim.
-            m_missing = re.match(
-                r"^([\w\.<>]+)\(\) missing \d+ required "
-                r"(?:positional |keyword-only )?arguments?: (.+)$",
-                msg,
-            )
-            if m_missing and m_missing.group(1) == handler_qn:
-                names = re.findall(r"'(\w+)'", m_missing.group(2))
-                if names:
-                    quoted = ", ".join(f"'{n}'" for n in names)
-                    word = "parameter" if len(names) == 1 else "parameters"
-                    logger.debug("Tool %s: missing required %s %s", tool_name, word, quoted)
-                    return {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "error": {
-                            "code": -32602,
-                            "message": f"Missing required {word} {quoted} for tool {tool_name}",
-                        },
-                    }
-            return _internal_tool_error(req_id, tool_name, e)
-        except Exception as exc:
-            return _internal_tool_error(req_id, tool_name, exc)
+        # A held-but-write-idle lease passes the ownership check without a
+        # fresh acquire, so the idle clock can already be past the threshold.
+        # Count the call in flight from that check through dispatch; the clock
+        # itself is refreshed only by a dispatched call (_writer_idle_clock),
+        # so refusals never keep an idle holder alive.
+        with _writer_inflight(tool_name):
+            peer_writer_error = _mcp_peer_writer_refusal(req_id, tool_name)
+            if peer_writer_error is not None:
+                return peer_writer_error
+            return _dispatch_tool_call(req_id, tool_name, tool_args)
 
     # Notifications (missing id) must never get a response
     if req_id is None:
@@ -1199,9 +1212,11 @@ def _writer_inflight(tool_name: str):
     drops the writer lease (and its storage handles) under a running call.
 
     Counts every tool except the HTTP lock-free set (logstream, knowledge
-    graph and process-local tools, none of which touch Chroma); only
-    completed calls to _MUTATING_TOOLS refresh the write-idle clock."""
-    global _MCP_WRITER_INFLIGHT, _last_mutating_time
+    graph and process-local tools, none of which touch Chroma). Counter only:
+    it also spans the peer-writer ownership check, where a refused call must
+    not look like a write, so the idle clock is refreshed separately by
+    _writer_idle_clock around dispatch."""
+    global _MCP_WRITER_INFLIGHT
     if tool_name in _HTTP_LOCK_FREE_TOOLS:
         yield
         return
@@ -1212,7 +1227,17 @@ def _writer_inflight(tool_name: str):
     finally:
         with _MCP_WRITER_STATE_LOCK:
             _MCP_WRITER_INFLIGHT -= 1
-            if tool_name in _MUTATING_TOOLS:
+
+
+@contextlib.contextmanager
+def _writer_idle_clock(tool_name: str):
+    """Refresh the write-idle clock after a dispatched call to _MUTATING_TOOLS."""
+    global _last_mutating_time
+    try:
+        yield
+    finally:
+        if tool_name in _MUTATING_TOOLS and tool_name not in _HTTP_LOCK_FREE_TOOLS:
+            with _MCP_WRITER_STATE_LOCK:
                 _last_mutating_time = time.monotonic()
 
 
