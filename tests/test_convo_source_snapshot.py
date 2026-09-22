@@ -261,6 +261,9 @@ def test_scoped_prefetch_preserves_fingerprints_and_legacy_metadata(collection, 
     legacy = tmp_path / "legacy.txt"
     source.write_text("verified conversation", encoding="utf-8")
     legacy.write_text("legacy conversation", encoding="utf-8")
+    # Keep legacy float metadata exactly representable through the backend.
+    os.utime(source, (1_700_000_000, 1_700_000_000))
+    os.utime(legacy, (1_700_000_000, 1_700_000_000))
     fingerprint = source_fingerprint(source.stat())
     common = {"normalize_version": NORMALIZE_VERSION, "source_mtime": source.stat().st_mtime}
     collection.add(
@@ -370,6 +373,8 @@ def test_scoped_prefetch_retry_does_not_double_count_partial_page(
 ):
     source = tmp_path / "interrupted.txt"
     source.write_text("source with a partially filed generation", encoding="utf-8")
+    # This test checks retry accounting, independent of float round-trip precision.
+    os.utime(source, (1_700_000_000, 1_700_000_000))
     fingerprint = source_fingerprint(source.stat())
     common = {
         "normalize_version": NORMALIZE_VERSION,
@@ -414,3 +419,131 @@ def test_scoped_prefetch_retry_does_not_double_count_partial_page(
         check_mtime=True,
         check_source_fingerprint=source_fingerprints,
     )
+
+
+_REWRITE_INITIAL = (
+    "> Which plan?\nDECISION_OLD: keep the implementation small.\n\n"
+    "> What is the next step?\nCheck the stored conversation after mining completes.\n"
+)
+
+
+def _rows(palace):
+    rows = get_collection(str(palace)).get(include=["documents", "metadatas"])
+    return dict(zip(rows["ids"], zip(rows["documents"], rows["metadatas"])))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX change-time semantics")
+def test_inplace_rewrite_with_same_size_and_restored_mtime_is_remined(tmp_path, monkeypatch):
+    source = tmp_path / "session.txt"
+    source.write_text(_REWRITE_INITIAL, encoding="utf-8")
+    palace = tmp_path / "palace"
+    _mine(source, palace)
+    original_stat = source.stat()
+
+    revised = _REWRITE_INITIAL.replace("DECISION_OLD", "DECISION_NEW")
+    source.write_text(revised, encoding="utf-8")
+    os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    changed_stat = source.stat()
+    assert changed_stat.st_dev == original_stat.st_dev
+    assert changed_stat.st_ino == original_stat.st_ino
+    assert changed_stat.st_size == original_stat.st_size
+    assert changed_stat.st_mtime_ns == original_stat.st_mtime_ns
+    if changed_stat.st_ctime_ns == original_stat.st_ctime_ns:
+        pytest.skip("the filesystem does not expose a distinct inode change time")
+
+    _mine(source, palace)
+    docs = [document for document, _ in _rows(palace).values()]
+    assert any("DECISION_NEW" in doc for doc in docs), (
+        "a same-size rewrite with restored mtime was skipped despite changed source bytes"
+    )
+    assert not any("DECISION_OLD" in doc for doc in docs)
+
+    # Reading alone must not change freshness or force another normalization.
+    source.read_text(encoding="utf-8")
+
+    def unexpected_normalization(*args, **kwargs):
+        pytest.fail("a stable source was normalized again after a read-only access")
+
+    monkeypatch.setattr(convo_miner, "normalize_conversations", unexpected_normalization)
+    _mine(source, palace)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX change-time semantics")
+def test_restored_mtime_rewrite_during_read_preserves_prior_drawers(tmp_path, monkeypatch):
+    source = tmp_path / "session.txt"
+    source.write_text(_REWRITE_INITIAL, encoding="utf-8")
+    palace = tmp_path / "palace"
+    _mine(source, palace)
+    before = _rows(palace)
+
+    # Make a new generation eligible, then rewrite already-consumed bytes
+    # while retaining that generation's inode, length and modification time.
+    pending = _REWRITE_INITIAL.replace("stored conversation", "latest conversation")
+    revised = pending.replace("DECISION_OLD", "DECISION_NEW")
+    source.write_text(pending, encoding="utf-8")
+    pending_stat = source.stat()
+    os.utime(
+        source,
+        ns=(pending_stat.st_atime_ns, pending_stat.st_mtime_ns + 60_000_000_000),
+    )
+    original_stat = source.stat()
+    original_fdopen = normalize_module.os.fdopen
+    changed = False
+    changed_stat = None
+
+    class RewritingReader:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+
+        def read(self, size=-1):
+            nonlocal changed, changed_stat
+            if size != -1 or changed:
+                return self.stream.read(size)
+            prefix = self.stream.read(32)
+            assert "DECISION_OLD" in prefix
+            source.write_text(revised, encoding="utf-8")
+            os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            changed_stat = source.stat()
+            changed = True
+            return prefix + self.stream.read()
+
+    def rewriting_fdopen(fd, *args, **kwargs):
+        file_stat = os.fstat(fd)
+        stream = original_fdopen(fd, *args, **kwargs)
+        if (file_stat.st_dev, file_stat.st_ino) == (
+            original_stat.st_dev,
+            original_stat.st_ino,
+        ):
+            return RewritingReader(stream)
+        return stream
+
+    with monkeypatch.context() as race:
+        race.setattr(normalize_module.os, "fdopen", rewriting_fdopen)
+        _mine(source, palace)
+
+    assert changed, "the source rewrite was not interleaved during the read"
+    assert changed_stat.st_dev == original_stat.st_dev
+    assert changed_stat.st_ino == original_stat.st_ino
+    assert changed_stat.st_size == original_stat.st_size
+    assert changed_stat.st_mtime_ns == original_stat.st_mtime_ns
+    if changed_stat.st_ctime_ns == original_stat.st_ctime_ns:
+        pytest.skip("the filesystem does not expose a distinct inode change time")
+    assert source.read_text(encoding="utf-8") == revised
+    assert _rows(palace) == before, (
+        "a timestamp-preserving rewrite during the read changed the previously filed snapshot"
+    )
+
+    _mine(source, palace)
+    docs = [document for document, _ in _rows(palace).values()]
+    assert any("DECISION_NEW" in doc for doc in docs)
+    assert not any("DECISION_OLD" in doc for doc in docs)
