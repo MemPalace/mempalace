@@ -60,7 +60,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   follows its source only when every drawer of that source and room moved to
   one room; a source that split, or only partly moved, keeps its closet where
   it is and is reported, since one record cannot index two rooms.
-- **`tunnels propose --yes` drops rows naming a wing that no longer exists.**
+- **`tunnels propose --yes` drops rows naming a wing that no longer exists, and
+  rows whose link was created meanwhile under another spelling.**
   The plan is written for review, so a wing can be split or renamed in the
   meantime; entity tunnels skip endpoint validation, so those rows became
   tunnels the audit immediately counted as artifacts.

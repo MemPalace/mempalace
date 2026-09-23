@@ -351,3 +351,18 @@ def test_cmd_wings_split_stops_before_moving_when_closets_fail_to_open(tmp_path,
     with pytest.raises(OSError):
         cli.cmd_wings(Namespace(yes=True, **ns))
     assert col.updates == []  # no drawer moved without its closets
+
+
+def test_load_split_plan_rejects_a_plan_for_another_wing(tmp_path):
+    cfg = MempalaceConfig(palace_path=str(tmp_path))
+    plan = plan_split(FakeCollection(_rows()), "convos", ["portal"])
+    save_split_plan(cfg, plan)
+    # Someone copied the file into another wing's plan slot.
+    import shutil
+
+    from mempalace.wing_split import split_plan_path
+
+    shutil.copy(split_plan_path(cfg, "convos"), split_plan_path(cfg, "other"))
+    with pytest.raises(ValueError, match="not 'other'"):
+        load_split_plan(cfg, "other")
+    assert load_split_plan(cfg, "convos")["wing"] == "convos"

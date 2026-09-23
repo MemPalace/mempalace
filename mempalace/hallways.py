@@ -802,13 +802,23 @@ def _merge_variant_group(members: list[dict], kept: list[dict], duplicates: list
     # Variants may arrive with reversed endpoints (``a ↔ b`` and ``b.py ↔ a``),
     # so canonicalize per entity across both columns rather than per column,
     # then keep the survivor's own orientation.
-    spellings: dict[str, list[str]] = {}
-    for m in members:
-        for ent in (str(m.get("entity_a")), str(m.get("entity_b"))):
-            spellings.setdefault(entity_spelling_key(ent), []).append(ent)
-    chosen = {key: canonical_spelling(v) for key, v in spellings.items()}
-    survivor["entity_a"] = chosen[entity_spelling_key(survivor["entity_a"])]
-    survivor["entity_b"] = chosen[entity_spelling_key(survivor["entity_b"])]
+    # Canonicalize each side on its own, never through the basename: an
+    # association between two files that share one (``src/user.py ↔
+    # tests/user.py``) would otherwise get the same spelling on both sides
+    # and turn into a self-link. Members may be written in either
+    # orientation, so each is aligned to the survivor first.
+    sa, sb = str(survivor["entity_a"]), str(survivor["entity_b"])
+    side_a, side_b = [sa], [sb]
+    for m in members[1:]:
+        ma, mb = str(m.get("entity_a")), str(m.get("entity_b"))
+        if same_file_spelling(ma, sa) and same_file_spelling(mb, sb):
+            side_a.append(ma)
+            side_b.append(mb)
+        elif same_file_spelling(mb, sa) and same_file_spelling(ma, sb):
+            side_a.append(mb)
+            side_b.append(ma)
+    survivor["entity_a"] = canonical_spelling(side_a)
+    survivor["entity_b"] = canonical_spelling(side_b)
     survivor["id"] = _hallway_id(survivor["wing"], survivor["entity_a"], survivor["entity_b"])
     kept.append(survivor)
     duplicates.extend(members[1:])

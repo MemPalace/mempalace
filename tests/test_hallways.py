@@ -828,3 +828,29 @@ class TestDiffAliasesAndEmptyRebuilds:
         col.get.side_effect = OSError("disk I/O error")
         assert hallways_mod.compute_hallways_for_wing("w", col=col) == []
         assert [h["id"] for h in hallways_mod.list_hallways()] == ["old"]
+
+    def test_prune_never_turns_a_two_file_association_into_a_self_link(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        hallways_mod._save_hallways(
+            [
+                {
+                    "id": "1",
+                    "wing": "w",
+                    "entity_a": "src/user.py",
+                    "entity_b": "tests/user.py",
+                    "co_occurrence_count": 9,
+                },
+                {
+                    "id": "2",
+                    "wing": "w",
+                    "entity_a": "repo/src/user.py",
+                    "entity_b": "tests/user.py",
+                    "co_occurrence_count": 4,
+                },
+            ]
+        )
+        report = hallways_mod.prune_spelling_hallways(apply=True)
+        assert report["removed"] == 1
+        (survivor,) = hallways_mod.list_hallways()
+        assert {survivor["entity_a"], survivor["entity_b"]} == {"repo/src/user.py", "tests/user.py"}
+        assert not hallways_mod.is_self_link(survivor)

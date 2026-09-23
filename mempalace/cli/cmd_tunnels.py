@@ -118,4 +118,7 @@ def cmd_tunnels(args):
         sys.exit(1)
     created = apply_proposal({**plan, "tunnels": fresh}, config=config)
     note = f" Skipped {stale} row(s) naming a wing that no longer exists." if stale else ""
-    print(f"  Created or refreshed {created} tunnels.{note}")
+    existing = len(fresh) - created
+    if existing:
+        note += f" {existing} already existed, possibly under another spelling."
+    print(f"  Created {created} tunnels.{note}")

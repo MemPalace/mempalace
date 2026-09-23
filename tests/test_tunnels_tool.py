@@ -73,7 +73,7 @@ def test_proposal_round_trip_apply_and_validation(tmp_path, monkeypatch):
         ("entity:swim.zig", "entity"),
         ("entity:ChatStore", "entity"),
     }
-    assert apply_proposal(loaded) == 2 and len(pg.list_tunnels()) == 2  # idempotent
+    assert apply_proposal(loaded) == 0 and len(pg.list_tunnels()) == 2  # idempotent
     path = tmp_path / "tunnels" / "proposal.json"
     path.write_text(json.dumps({"tunnels": [{"entity": "", "wing_a": "a", "wing_b": "b"}]}))
     with pytest.raises(ValueError):
@@ -132,7 +132,7 @@ def test_cmd_tunnels_propose_prune_and_dispatch(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "proposing the strongest 2" in out and "Plan saved" in out
     cli.cmd_tunnels(Namespace(tunnels_action="propose", yes=True, max=60, **ns))
-    assert "Created or refreshed 2 tunnels" in capsys.readouterr().out
+    assert "Created 2 tunnels" in capsys.readouterr().out
     pg.create_tunnel("acme_app", "entity:content", "ringdb", "entity:content", kind="entity")
     cli.cmd_tunnels(Namespace(tunnels_action="prune", yes=False, **ns))
     assert "1 of 3 tunnels are artifacts" in capsys.readouterr().out
@@ -270,3 +270,25 @@ def test_propose_skips_an_existing_link_under_another_spelling_only():
     # swim.zig is the same file as src/swim.zig: already linked, not proposed.
     plan = propose_tunnels(HALLWAYS, WINGS, existing_tunnels=existing)
     assert "swim.zig" not in {r["entity"] for r in plan["tunnels"]}
+
+
+def test_apply_proposal_skips_a_link_created_meanwhile_under_another_spelling(
+    tmp_path, monkeypatch
+):
+    import mempalace.palace_graph as pg
+
+    tunnel_file = tmp_path / "tunnels.json"
+    monkeypatch.setattr(pg, "_get_tunnel_file", lambda *a, **k: str(tunnel_file))
+    monkeypatch.setattr(pg, "_legacy_tunnel_file", lambda: str(tmp_path / "legacy.json"))
+    plan = {
+        "tunnels": [
+            {"entity": "src/main.py", "wing_a": "a", "wing_b": "b"},
+            {"entity": "Router", "wing_a": "a", "wing_b": "b"},
+            {"entity": "Router", "wing_a": "b", "wing_b": "a"},  # repeats the row above
+        ]
+    }
+    # While the plan waited for review, someone linked the same file.
+    pg.create_tunnel("a", "entity:main.py", "b", "entity:main.py", label="x", kind="entity")
+    assert apply_proposal(plan) == 1
+    rooms = sorted(t["source"]["room"] for t in pg.list_tunnels())
+    assert rooms == ["entity:Router", "entity:main.py"]

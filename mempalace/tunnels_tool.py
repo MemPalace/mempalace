@@ -239,11 +239,29 @@ def load_proposal(config: MempalaceConfig) -> dict:
 
 
 def apply_proposal(plan: dict, config: Optional[MempalaceConfig] = None) -> int:
-    from .palace_graph import create_tunnel
+    """Create the plan's tunnels; returns how many were created.
 
+    The plan sat under review, so the tunnel file is read again here: a row
+    whose link now exists under another spelling (``entity:main.py`` added
+    while the plan says ``entity:src/main.py``) is skipped, as is a row that
+    repeats an earlier row. ``create_tunnel`` dedupes only identical endpoint
+    ids and would write both spellings.
+    """
+    from .palace_graph import _load_tunnels, create_tunnel
+
+    known = LinkIndex()
+    for t in _load_tunnels(config):
+        if isinstance(t, dict):
+            ends = tunnel_endpoints(t)
+            if ends:
+                known.add(ends)
     created = 0
     for row in plan["tunnels"]:
         room = f"entity:{row['entity']}"
+        ends = ((_norm_wing(row["wing_a"]), room), (_norm_wing(row["wing_b"]), room))
+        if known.contains(ends):
+            continue
+        known.add(ends)
         create_tunnel(
             source_wing=row["wing_a"],
             source_room=room,

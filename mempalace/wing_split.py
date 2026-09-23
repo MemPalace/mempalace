@@ -211,6 +211,14 @@ def save_split_plan(config: MempalaceConfig, plan: dict) -> str:
 def load_split_plan(config: MempalaceConfig, wing: str) -> dict:
     with open(split_plan_path(config, wing), encoding="utf-8") as f:
         plan = json.load(f)
+    if not isinstance(plan, dict):
+        raise ValueError("split plan is not an object")
+    # ``apply_split`` re-keys the wing the plan names, so a copied or edited
+    # file naming another wing would move the wrong drawers.
+    if str(plan.get("wing") or "") != wing:
+        raise ValueError(
+            f"plan is for wing {plan.get('wing')!r}, not {wing!r}; re-run without --yes"
+        )
     projects = plan.get("projects")
     if not isinstance(projects, dict) or not projects:
         raise ValueError("split plan has no projects")
