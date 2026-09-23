@@ -297,21 +297,44 @@ def is_generic_entity(name: str) -> bool:
 
 # ``git diff`` prints both sides of a change as ``a/<path>`` and ``b/<path>``,
 # so a transcript that shows a diff names every touched file twice under two
-# fake top-level directories. They are one file, not two.
+# fake top-level directories. The evidence is the pair: ``a/x`` and ``b/x``
+# with the same ``x`` are one file, at any depth, while a lone ``a/x`` may be
+# a real directory named ``a`` and is left alone.
 _GIT_DIFF_PREFIXES = frozenset({"a", "b"})
 
 
-def _dir_segments(entity: str) -> list[str]:
-    """Directory part of a spelling, innermost last: ``src/models/user.py`` → ``["src", "models"]``.
+def _path_parts(entity: str) -> list[str]:
+    return [p for p in str(entity).replace("\\", "/").split("/") if p]
 
-    A leading ``a/`` or ``b/`` from ``git diff`` output is dropped, so
-    ``a/mempalace/cli.py`` and ``b/mempalace/cli.py`` are the same file as
-    ``mempalace/cli.py``.
-    """
-    parts = [p for p in str(entity).replace("\\", "/").split("/") if p]
-    if len(parts) > 2 and parts[0] in _GIT_DIFF_PREFIXES:
-        parts = parts[1:]
-    return parts[:-1]
+
+def _diff_alias(entity: str) -> Optional[tuple[str, str]]:
+    """``("a", "src/x.py")`` for ``a/src/x.py``; ``None`` without a diff prefix."""
+    parts = _path_parts(entity)
+    if len(parts) >= 2 and parts[0] in _GIT_DIFF_PREFIXES:
+        return parts[0], "/".join(parts[1:])
+    return None
+
+
+def _dir_segments(entity: str) -> list[str]:
+    """Directory part of a spelling, innermost last: ``src/models/user.py`` → ``["src", "models"]``."""
+    return _path_parts(entity)[:-1]
+
+
+def _is_diff_pair(a: str, b: str) -> bool:
+    """``a/<path>`` and ``b/<path>`` naming the same ``<path>``."""
+    x, y = _diff_alias(a), _diff_alias(b)
+    return bool(x and y and x[0] != y[0] and x[1] == y[1])
+
+
+def _diff_resolved(entities: list[str]) -> dict[str, str]:
+    """Map each ``a/`` or ``b/`` spelling whose counterpart is present to its path."""
+    aliases = {e: _diff_alias(e) for e in entities}
+    present = {(al[0], al[1]) for al in aliases.values() if al}
+    out: dict[str, str] = {}
+    for e, al in aliases.items():
+        if al and ("b" if al[0] == "a" else "a", al[1]) in present:
+            out[e] = al[1]
+    return out
 
 
 def same_file_spelling(a: str, b: str) -> bool:
@@ -325,6 +348,8 @@ def same_file_spelling(a: str, b: str) -> bool:
     """
     if entity_spelling_key(a) != entity_spelling_key(b):
         return False
+    if _is_diff_pair(a, b):
+        return True
     da, db = _dir_segments(a), _dir_segments(b)
     short, long_ = (da, db) if len(da) <= len(db) else (db, da)
     return not short or long_[len(long_) - len(short) :] == short
@@ -340,12 +365,16 @@ def canonical_spelling(cluster: list[str]) -> str:
     spellings with no directory the shortest reads best (``ChatStore`` over
     ``ChatStore.swift``). Ties break on the text, so the choice is stable.
     """
-
-    def has_diff_prefix(e: str) -> bool:
-        parts = [p for p in str(e).replace("\\", "/").split("/") if p]
-        return len(parts) > 2 and parts[0] in _GIT_DIFF_PREFIXES
-
-    return min(cluster, key=lambda e: (-len(_dir_segments(e)), has_diff_prefix(e), len(e), e))
+    resolved = _diff_resolved(cluster)
+    return min(
+        cluster,
+        key=lambda e: (
+            e in resolved,  # a diff alias only when a real spelling exists
+            -len(_dir_segments(resolved.get(e, e))),
+            len(e),
+            e,
+        ),
+    )
 
 
 def same_association(h1: dict, h2: dict) -> bool:
@@ -376,9 +405,12 @@ def _spelling_clusters(entities: list[str]) -> list[list[str]]:
     :func:`is_self_link` and :func:`same_association` then rightly call
     artifacts. Callers skip spellings that appear in no cluster.
     """
+    # ``a/x`` beside ``b/x`` is one file seen through a diff: bucket both
+    # under ``x``'s directory so they cluster with each other and with ``x``.
+    resolved = _diff_resolved(entities)
     groups: dict[tuple, list[str]] = {}
     for e in entities:
-        groups.setdefault(tuple(_dir_segments(e)), []).append(e)
+        groups.setdefault(tuple(_dir_segments(resolved.get(e, e))), []).append(e)
     by_length = sorted(groups, key=len, reverse=True)
     maximal: list[tuple] = []
     for dirs in by_length:
@@ -639,8 +671,10 @@ def compute_hallways_for_wing(
             if room_str:
                 pair_rooms[key].add(room_str)
 
-    if not pair_counts:
-        return []
+    # No early return on an empty ``pair_counts``: the drawers were read, so
+    # "no pairs" is this wing's real answer and must replace its old records.
+    # Returning here left every stale hallway of the wing in place after a
+    # rebuild that correctly produced none.
 
     # 3. Materialize hallway records for pairs above the threshold.
     #    Before building, load existing records so we can PRESERVE L7

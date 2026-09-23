@@ -778,3 +778,53 @@ class TestMinerAndPruneAgree:
         assert (report["self_links"], report["duplicates"]) == (0, 0)
         audit = _analyze_hallways(hallways_mod.list_hallways())
         assert (audit["self_links"], audit["duplicates"]) == (0, 0)
+
+
+class TestDiffAliasesAndEmptyRebuilds:
+    def test_diff_pairs_collapse_at_any_depth_but_a_lone_prefix_does_not(self):
+        from mempalace.hallways import _spelling_clusters, same_file_spelling
+
+        assert same_file_spelling("a/main.py", "b/main.py")  # root-level diff
+        assert same_file_spelling("a/src/x.py", "b/src/x.py")
+        assert _spelling_clusters(["a/main.py", "b/main.py"]) == [["a/main.py", "b/main.py"]]
+        # A lone a/ may be a real directory named "a": not conflated.
+        assert not same_file_spelling("a/lib/x.py", "c/lib/x.py")
+        assert _spelling_clusters(["a/lib/x.py", "src/lib/x.py"]) == [
+            ["a/lib/x.py"],
+            ["src/lib/x.py"],
+        ]
+
+    def test_root_level_diff_pair_is_never_a_hallway(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        col = _fake_collection(
+            [
+                {"wing": "w", "room": "r", "entities": "a/main.py;b/main.py;Router"},
+                {"wing": "w", "room": "r", "entities": "a/main.py;b/main.py;Router"},
+            ]
+        )
+        created = hallways_mod.compute_hallways_for_wing("w", col=col, min_count=1)
+        assert [(h["entity_a"], h["entity_b"]) for h in created] == [("Router", "a/main.py")]
+        assert hallways_mod.prune_spelling_hallways()["removed"] == 0
+
+    def test_rebuild_with_no_pairs_replaces_the_wings_stale_records(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        hallways_mod._save_hallways(
+            [
+                {"id": "old", "wing": "w", "entity_a": "main.zig", "entity_b": "src/main.zig"},
+                {"id": "keep", "wing": "other", "entity_a": "X", "entity_b": "Y"},
+            ]
+        )
+        # Every drawer now names one file under two spellings: no pair left.
+        col = _fake_collection(
+            [{"wing": "w", "room": "r", "entities": "main.zig;src/main.zig"}] * 3
+        )
+        assert hallways_mod.compute_hallways_for_wing("w", col=col) == []
+        assert [h["id"] for h in hallways_mod.list_hallways()] == ["keep"]
+
+    def test_failed_read_leaves_the_wing_untouched(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        hallways_mod._save_hallways([{"id": "old", "wing": "w", "entity_a": "A", "entity_b": "B"}])
+        col = MagicMock()
+        col.get.side_effect = OSError("disk I/O error")
+        assert hallways_mod.compute_hallways_for_wing("w", col=col) == []
+        assert [h["id"] for h in hallways_mod.list_hallways()] == ["old"]

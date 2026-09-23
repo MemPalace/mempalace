@@ -14,10 +14,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   what the prune would remove.** Records used the shortest spelling, so two
   wings' different `user.py` files met as bare `user.py` and the tunnel builder
   linked them. A file now carries its most qualified path; a symbol still reads
-  as its shortest name. `git diff`'s `a/` and `b/` prefixes collapse to one file,
-  and a bare name that could belong to several files is not used as an entity
+  as its shortest name. `git diff`'s `a/<path>` and `b/<path>` collapse to one file at any
+  depth when both appear, while a lone `a/` is kept as a real directory; a bare name that could belong to several files is not used as an entity
   at all. The audit's duplicate check now matches the prune's, so it never
-  recommends a cleanup that removes nothing. On a real wing the rebuild went
+  recommends a cleanup that removes nothing. A rebuild that finds no pairs now
+  replaces the wing's old records instead of leaving them. On a real wing the rebuild went
   from 79,135 to 66,927 records, and the prune then found no artifacts at all.
 - **`rooms apply` and `wings split` stop, recovery marker kept, when the closet
   collection exists but cannot be opened.** Only a collection that was never
