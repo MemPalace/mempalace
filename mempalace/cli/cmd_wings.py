@@ -73,13 +73,17 @@ def cmd_wings(args):
     report(plan)
     from ..palace import mine_palace_lock
 
+    from ..backends import CollectionNotInitializedError
     from ..palace import get_closets_collection
 
     with mine_palace_lock(palace_path):
         col = get_collection(palace_path, create=False)
+        # Only a closet collection that was never created means "no closets".
+        # Any other failure to open it must stop the command with its
+        # recovery marker kept, or the closet phase is skipped for good.
         try:
             closets_col = get_closets_collection(palace_path, create=False)
-        except Exception:
+        except CollectionNotInitializedError:
             closets_col = None
         # Drawers, then closets, then the hallway drop. A retry that finds no
         # drawer left must still finish the later phases, so the marker says a

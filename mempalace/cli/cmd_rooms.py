@@ -144,6 +144,7 @@ def cmd_rooms(args):
             print("\n  Dry run. Re-run with --yes to write the room changes.")
         return
 
+    from ..backends import CollectionNotInitializedError
     from ..palace import get_closets_collection, mine_palace_lock
 
     with mine_palace_lock(palace_path):
@@ -169,9 +170,12 @@ def cmd_rooms(args):
             raise
         # The closet layer is filtered by the same wing/room as the drawers,
         # so it has to follow them or the moved drawers lose their boost.
+        # Only a closet collection that was never created means "no closets".
+        # Any other failure to open it must stop the command with its
+        # recovery marker kept, or the closet phase is skipped for good.
         try:
             closets_col = get_closets_collection(palace_path, create=False)
-        except Exception:
+        except CollectionNotInitializedError:
             closets_col = None
         moved_closets = rekey_closets_to(closets_col, wing, targets)
         clear_pending_apply(config, wing)

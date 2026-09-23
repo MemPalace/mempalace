@@ -522,11 +522,13 @@ class TestEntitySpellings:
         assert key("ChatStore") != key("ChatStore.send")
         assert key("MemPalace") != key("github.com")
 
-    def test_canonical_entities_keeps_shortest_spelling_first_seen_order(self):
+    def test_canonical_entities_keeps_qualified_files_and_short_symbols(self):
+        # A file keeps its path (it is what tells two same-named files apart
+        # once the record leaves the wing); a symbol keeps its shortest name.
         out = hallways_mod.canonical_entities(
             ["src/main.zig", "RootView.swift", "main.zig", "RootView", "swim.zig"]
         )
-        assert out == ["main.zig", "RootView", "swim.zig"]
+        assert out == ["src/main.zig", "RootView", "swim.zig"]
 
     def test_miner_pairs_canonical_spellings_only(self, tmp_path, monkeypatch):
         _use_tmp_hallway_file(monkeypatch, tmp_path)
@@ -638,9 +640,9 @@ class TestEntitySpellings:
         applied = hallways_mod.prune_spelling_hallways(apply=True)
         assert applied["removed"] == 1
         (survivor,) = hallways_mod.list_hallways()
-        assert (survivor["entity_a"], survivor["entity_b"]) == ("store", "view")
+        assert (survivor["entity_a"], survivor["entity_b"]) == ("src/store.py", "view")
         assert survivor["co_occurrence_count"] == 50
-        assert survivor["id"] == hallways_mod._hallway_id("w", "store", "view")
+        assert survivor["id"] == hallways_mod._hallway_id("w", "src/store.py", "view")
 
 
 class TestSameNamedFilesStayApart:
@@ -662,7 +664,7 @@ class TestSameNamedFilesStayApart:
             "src/models/user.py",
             "tests/models/user.py",
         ]
-        assert canonical_entities(["src/main.zig", "main.zig"]) == ["main.zig"]
+        assert canonical_entities(["src/main.zig", "main.zig"]) == ["src/main.zig"]
 
     def test_hallway_between_two_same_named_files_is_not_a_self_link(self):
         from mempalace.hallways import is_self_link
@@ -707,7 +709,7 @@ class TestSameNamedFilesStayApart:
         )
         created = hallways_mod.compute_hallways_for_wing("w", col=col, min_count=1)
         assert [(h["entity_a"], h["entity_b"], h["co_occurrence_count"]) for h in created] == [
-            ("Router", "main.zig", 2)
+            ("Router", "src/main.zig", 2)
         ]
 
     def test_prune_keeps_both_files_hallways(self, tmp_path, monkeypatch):
@@ -741,3 +743,38 @@ class TestSameNamedFilesStayApart:
         assert report["removed"] == 1  # only the src/user ↔ view spelling variant
         left = {(h["entity_a"], h["entity_b"]) for h in hallways_mod.list_hallways()}
         assert left == {("src/models/user.py", "view"), ("tests/models/user.py", "view")}
+
+
+class TestMinerAndPruneAgree:
+    """Whatever the miner writes, the prune and the audit find nothing to remove."""
+
+    MESSY = [
+        # git diff names every touched file twice, as a/<path> and b/<path>.
+        "a/mempalace/cli.py;b/mempalace/cli.py;cli;Router",
+        "a/mempalace/cli.py;b/mempalace/cli.py;Router;ChatStore",
+        # Two files with one basename, plus a bare name that could be either.
+        "src/models/user.py;tests/models/user.py;user.py;Router",
+        "src/models/user.py;user.py;ChatStore",
+        "tests/models/user.py;Router",
+        # One symbol spelled with and without an extension.
+        "ChatStore.swift;Router",
+        "ChatStore;Router;src/main.zig",
+        "main.zig;Router",
+    ]
+
+    def test_mined_records_contain_no_spelling_artifacts(self, tmp_path, monkeypatch):
+        from mempalace.palace_audit import _analyze_hallways
+
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        col = _fake_collection([{"wing": "w", "room": "r", "entities": e} for e in self.MESSY])
+        created = hallways_mod.compute_hallways_for_wing("w", col=col, min_count=1)
+        names = {n for h in created for n in (h["entity_a"], h["entity_b"])}
+        assert "b/mempalace/cli.py" not in names  # the diff pair is one file
+        assert "user.py" not in names  # ambiguous: identifies no single file
+        assert {"src/models/user.py", "tests/models/user.py"} <= names
+        assert "ChatStore.swift" not in names and "ChatStore" in names
+
+        report = hallways_mod.prune_spelling_hallways(apply=False)
+        assert (report["self_links"], report["duplicates"]) == (0, 0)
+        audit = _analyze_hallways(hallways_mod.list_hallways())
+        assert (audit["self_links"], audit["duplicates"]) == (0, 0)

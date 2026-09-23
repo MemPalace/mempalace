@@ -628,3 +628,44 @@ def test_cmd_rooms_apply_retry_finishes_closets_after_drawers_completed(
     # A completed apply re-run is a no-op.
     cli.cmd_rooms(ns)
     assert "Nothing to change" in capsys.readouterr().out
+
+
+def test_cmd_rooms_apply_keeps_the_marker_when_closets_fail_to_open(tmp_path, monkeypatch, capsys):
+    """Only a never-created closet collection means "no closets"."""
+    import contextlib
+
+    import mempalace.cli as cli
+    from mempalace.backends import CollectionNotInitializedError
+    from mempalace.rooms import pending_apply_path
+
+    cfg = MempalaceConfig(palace_path=str(tmp_path))
+    save_room_set(cfg, _room_set())
+    col = FakeCollection(
+        [
+            {
+                "id": "a",
+                "meta": {"wing": "w", "room": "technical", "source_file": "s1"},
+                "doc": "cut the release",
+                "emb": [1.0, 0.0],
+            }
+        ]
+    )
+    monkeypatch.setattr("mempalace.palace.get_collection", lambda *a, **k: col)
+    monkeypatch.setattr("mempalace.embedding.get_embedding_function", lambda: FakeEmbed())
+    monkeypatch.setattr("mempalace.palace.mine_palace_lock", lambda p: contextlib.nullcontext())
+    ns = Namespace(rooms_action="apply", palace=str(tmp_path), wing="w", threshold=0.75, yes=True)
+
+    def broken(*a, **k):
+        raise OSError("disk I/O error")
+
+    monkeypatch.setattr("mempalace.palace.get_closets_collection", broken)
+    with pytest.raises(OSError):
+        cli.cmd_rooms(ns)
+    assert os.path.isfile(pending_apply_path(cfg, "w"))  # recovery still pending
+
+    def absent(*a, **k):
+        raise CollectionNotInitializedError("mempalace_closets")
+
+    monkeypatch.setattr("mempalace.palace.get_closets_collection", absent)
+    cli.cmd_rooms(ns)
+    assert not os.path.exists(pending_apply_path(cfg, "w"))  # nothing to re-key

@@ -37,7 +37,13 @@ from typing import Optional
 
 from .backends._inproc_sqlite import open_reader as open_palace_reader
 from .config import MempalaceConfig, normalize_wing_name
-from .hallways import entity_spelling_key, is_generic_entity, is_self_link, list_hallways
+from .hallways import (
+    entity_spelling_key,
+    is_generic_entity,
+    is_self_link,
+    list_hallways,
+    same_association,
+)
 from .palace_graph import _load_tunnels
 from .tunnels_tool import LinkIndex, tunnel_endpoints
 
@@ -496,7 +502,7 @@ def _analyze_hallways(hallways: list[dict]) -> dict:
     records = [h for h in hallways if isinstance(h, dict)]
     total = len(hallways)
     self_links = 0
-    seen: set = set()
+    seen: dict[tuple, list[dict]] = {}
     duplicates = 0
     artifacts: set = set()
     sample = []
@@ -505,11 +511,15 @@ def _analyze_hallways(hallways: list[dict]) -> dict:
             self_links += 1
             artifacts.add(id(h))
         else:
-            group = _spelling_group(h)
-            if group in seen:
+            # The basename group only narrows the search; two files that
+            # share a basename are two associations, exactly as the prune
+            # decides, so the audit never flags what the prune would keep.
+            bucket = seen.setdefault(_spelling_group(h), [])
+            if any(same_association(h, prior) for prior in bucket):
                 duplicates += 1
                 artifacts.add(id(h))
-            seen.add(group)
+            else:
+                bucket.append(h)
         if id(h) in artifacts and len(sample) < _SAMPLE_LIMIT:
             sample.append(f"{h.get('entity_a')} ↔ {h.get('entity_b')}")
     top = sorted(records, key=lambda h: -int(h.get("co_occurrence_count") or 0))[:HALLWAY_TOP_N]

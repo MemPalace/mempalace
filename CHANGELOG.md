@@ -10,6 +10,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **Hallway records keep a file's qualified path, and the miner never writes
+  what the prune would remove.** Records used the shortest spelling, so two
+  wings' different `user.py` files met as bare `user.py` and the tunnel builder
+  linked them. A file now carries its most qualified path; a symbol still reads
+  as its shortest name. `git diff`'s `a/` and `b/` prefixes collapse to one file,
+  and a bare name that could belong to several files is not used as an entity
+  at all. The audit's duplicate check now matches the prune's, so it never
+  recommends a cleanup that removes nothing. On a real wing the rebuild went
+  from 79,135 to 66,927 records, and the prune then found no artifacts at all.
+- **`rooms apply` and `wings split` stop, recovery marker kept, when the closet
+  collection exists but cannot be opened.** Only a collection that was never
+  created counts as "no closets"; any other failure used to skip the closet
+  phase and clear the marker, so a retry could not repair it.
 - **An interrupted `rooms apply` or `wings split` finishes every phase on
   retry.** Both write drawers first and their index layers after. Once every
   drawer had moved, a retry found nothing to do and never reached the closet

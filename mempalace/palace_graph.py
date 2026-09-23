@@ -1080,14 +1080,20 @@ def entity_tunnel_candidates(hallways: list, min_count: int = ENTITY_TUNNEL_MIN_
     in more than a quarter of all wings (and in more than three). A tunnel
     on any of them links nothing.
 
-    Spellings of one file merge under its shortest spelling
-    (``ChatStore.swift`` / ``ChatStore``, ``src/main.zig`` / ``main.zig``),
+    Spellings of one entity merge under :func:`canonical_spelling`
+    (``ChatStore.swift`` / ``ChatStore`` → ``ChatStore``, ``src/main.zig`` /
+    ``main.zig`` → ``src/main.zig``),
     resolved across every wing the same way the hallway miner resolves them
     inside one. Two files that only share a basename (``src/models/user.py``
     in one wing, ``tests/fixtures/user.py`` in another) are two entities: a
     tunnel between them would link unrelated code.
     """
-    from .hallways import _spelling_clusters, entity_spelling_key, is_generic_entity
+    from .hallways import (
+        _spelling_clusters,
+        canonical_spelling,
+        entity_spelling_key,
+        is_generic_entity,
+    )
 
     def usable(ent) -> bool:
         return isinstance(ent, str) and bool(ent.strip()) and not is_generic_entity(ent)
@@ -1101,7 +1107,7 @@ def entity_tunnel_candidates(hallways: list, min_count: int = ENTITY_TUNNEL_MIN_
     canonical: dict = {}
     for spellings in spellings_by_base.values():
         for cluster in _spelling_clusters(sorted(spellings)):
-            name = min(cluster, key=len)
+            name = canonical_spelling(cluster)
             for spelling in cluster:
                 canonical[spelling] = name
 
@@ -1119,7 +1125,9 @@ def entity_tunnel_candidates(hallways: list, min_count: int = ENTITY_TUNNEL_MIN_
             ent = h.get(ent_key)
             if not usable(ent):
                 continue
-            key = canonical[ent]
+            key = canonical.get(ent)
+            if key is None:
+                continue  # an ambiguous name: it identifies no single file
             wings = by_key.setdefault(key, {})
             prev = wings.get(wing_norm)
             if prev is None or count > prev[1]:

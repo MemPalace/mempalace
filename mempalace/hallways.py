@@ -295,9 +295,22 @@ def is_generic_entity(name: str) -> bool:
     return text.rstrip("/").lower() in GENERIC_ENTITY_STOPLIST
 
 
+# ``git diff`` prints both sides of a change as ``a/<path>`` and ``b/<path>``,
+# so a transcript that shows a diff names every touched file twice under two
+# fake top-level directories. They are one file, not two.
+_GIT_DIFF_PREFIXES = frozenset({"a", "b"})
+
+
 def _dir_segments(entity: str) -> list[str]:
-    """Directory part of a spelling, innermost last: ``src/models/user.py`` → ``["src", "models"]``."""
+    """Directory part of a spelling, innermost last: ``src/models/user.py`` → ``["src", "models"]``.
+
+    A leading ``a/`` or ``b/`` from ``git diff`` output is dropped, so
+    ``a/mempalace/cli.py`` and ``b/mempalace/cli.py`` are the same file as
+    ``mempalace/cli.py``.
+    """
     parts = [p for p in str(entity).replace("\\", "/").split("/") if p]
+    if len(parts) > 2 and parts[0] in _GIT_DIFF_PREFIXES:
+        parts = parts[1:]
     return parts[:-1]
 
 
@@ -317,14 +330,51 @@ def same_file_spelling(a: str, b: str) -> bool:
     return not short or long_[len(long_) - len(short) :] == short
 
 
+def canonical_spelling(cluster: list[str]) -> str:
+    """The spelling records carry for one entity: its most qualified path first.
+
+    A path is what tells ``src/models/user.py`` from ``tests/fixtures/user.py``
+    once a record leaves its wing, so the spelling with the most directory
+    segments wins; keeping the shortest threw that away and let two unrelated
+    files meet as bare ``user.py`` in the cross-wing tunnel builder. Among
+    spellings with no directory the shortest reads best (``ChatStore`` over
+    ``ChatStore.swift``). Ties break on the text, so the choice is stable.
+    """
+
+    def has_diff_prefix(e: str) -> bool:
+        parts = [p for p in str(e).replace("\\", "/").split("/") if p]
+        return len(parts) > 2 and parts[0] in _GIT_DIFF_PREFIXES
+
+    return min(cluster, key=lambda e: (-len(_dir_segments(e)), has_diff_prefix(e), len(e), e))
+
+
+def same_association(h1: dict, h2: dict) -> bool:
+    """True when two hallway records join the same two entities.
+
+    Either orientation counts (``a ↔ b`` and ``b.py ↔ a``), and each endpoint
+    is compared with :func:`same_file_spelling`, so two files that only share
+    a basename are two associations. Shared by ``--prune-spellings`` and the
+    audit so the audit never recommends a cleanup that removes nothing.
+    """
+    a, b = str(h1.get("entity_a")), str(h1.get("entity_b"))
+    ra, rb = str(h2.get("entity_a")), str(h2.get("entity_b"))
+    return (same_file_spelling(a, ra) and same_file_spelling(b, rb)) or (
+        same_file_spelling(a, rb) and same_file_spelling(b, ra)
+    )
+
+
 def _spelling_clusters(entities: list[str]) -> list[list[str]]:
     """Group spellings of one basename into the distinct files they name.
 
     Spellings are bucketed by their directory path. A path that is a suffix
     of exactly one longer path is the same file and joins it (``main.zig``
-    under ``src/main.zig``); one that could belong to two or more names no
-    file unambiguously and stays on its own rather than merging them
-    (``user.py`` beside ``src/models/user.py`` and ``tests/models/user.py``).
+    under ``src/main.zig``). One that could belong to two or more names no
+    file at all (``user.py`` beside ``src/models/user.py`` and
+    ``tests/models/user.py``) and is left out of every cluster: attributing
+    it to either file would be a guess, and keeping it as an entity of its
+    own would pair it with the very files it might be, which
+    :func:`is_self_link` and :func:`same_association` then rightly call
+    artifacts. Callers skip spellings that appear in no cluster.
     """
     groups: dict[tuple, list[str]] = {}
     for e in entities:
@@ -341,8 +391,7 @@ def _spelling_clusters(entities: list[str]) -> list[list[str]]:
         hosts = [m for m in maximal if len(m) > len(dirs) and m[len(m) - len(dirs) :] == dirs]
         if len(hosts) == 1:
             clusters[hosts[0]].extend(groups[dirs])
-        else:
-            clusters[dirs] = list(groups[dirs])
+        # Two or more hosts: ambiguous, deliberately left out.
     return list(clusters.values())
 
 
@@ -380,7 +429,7 @@ def canonical_entities(entities: list[str]) -> list[str]:
         # and ``tests/user.py``); each cluster keeps its own shortest
         # spelling instead of collapsing into one entity.
         for cluster in _spelling_clusters(by_key[key]):
-            out.append(min(cluster, key=len))
+            out.append(canonical_spelling(cluster))
     return out
 
 
@@ -441,7 +490,7 @@ def _wing_file_keys(metadatas) -> dict[str, str]:
     mapping: dict[str, str] = {}
     for spellings in by_base.values():
         for cluster in _spelling_clusters(sorted(spellings)):
-            canonical = min(cluster, key=len)
+            canonical = canonical_spelling(cluster)
             for spelling in cluster:
                 mapping[spelling] = canonical
     return mapping
@@ -563,7 +612,9 @@ def compute_hallways_for_wing(
             # The file this spelling names, not its basename: two files
             # sharing a name must not merge into one entity here either,
             # or one drawer naming both counts the same pair twice.
-            canonical = file_keys.get(spelling, spelling)
+            canonical = file_keys.get(spelling)
+            if canonical is None:
+                continue  # an ambiguous name: it identifies no single file
             if canonical not in entities:
                 entities.append(canonical)
         if len(entities) < 2:
@@ -698,13 +749,8 @@ def _split_by_file(members: list[dict]) -> list[list[dict]]:
         return [members]
     buckets: list[list[dict]] = []
     for h in members:
-        a, b = str(h.get("entity_a")), str(h.get("entity_b"))
         for bucket in buckets:
-            ref = bucket[0]
-            ra, rb = str(ref.get("entity_a")), str(ref.get("entity_b"))
-            if (same_file_spelling(a, ra) and same_file_spelling(b, rb)) or (
-                same_file_spelling(a, rb) and same_file_spelling(b, ra)
-            ):
+            if same_association(h, bucket[0]):
                 bucket.append(h)
                 break
         else:
@@ -722,14 +768,13 @@ def _merge_variant_group(members: list[dict], kept: list[dict], duplicates: list
     # Variants may arrive with reversed endpoints (``a ↔ b`` and ``b.py ↔ a``),
     # so canonicalize per entity across both columns rather than per column,
     # then keep the survivor's own orientation.
-    shortest: dict[str, str] = {}
+    spellings: dict[str, list[str]] = {}
     for m in members:
         for ent in (str(m.get("entity_a")), str(m.get("entity_b"))):
-            key = entity_spelling_key(ent)
-            if key not in shortest or len(ent) < len(shortest[key]):
-                shortest[key] = ent
-    survivor["entity_a"] = shortest[entity_spelling_key(survivor["entity_a"])]
-    survivor["entity_b"] = shortest[entity_spelling_key(survivor["entity_b"])]
+            spellings.setdefault(entity_spelling_key(ent), []).append(ent)
+    chosen = {key: canonical_spelling(v) for key, v in spellings.items()}
+    survivor["entity_a"] = chosen[entity_spelling_key(survivor["entity_a"])]
+    survivor["entity_b"] = chosen[entity_spelling_key(survivor["entity_b"])]
     survivor["id"] = _hallway_id(survivor["wing"], survivor["entity_a"], survivor["entity_b"])
     kept.append(survivor)
     duplicates.extend(members[1:])

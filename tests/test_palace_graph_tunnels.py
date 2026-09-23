@@ -1089,8 +1089,23 @@ class TestEntityTunnelIdentityAndCap:
             self._h("beta", "ChatStore", "Scheduler"),
         ]
         out = palace_graph.entity_tunnel_candidates(hallways, min_count=1)
-        assert set(out) == {"codec.zig", "ChatStore"}
-        assert set(out["codec.zig"]) == {"alpha", "beta"}
+        assert set(out) == {"src/codec.zig", "ChatStore"}
+        assert set(out["src/codec.zig"]) == {"alpha", "beta"}
+
+    def test_bare_names_in_two_wings_do_not_hide_two_different_files(self):
+        """Records carry the qualified path, so a hallway miner that saw
+        ``src/models/user.py`` and one that saw ``tests/fixtures/user.py`` hand
+        the tunnel builder two distinct files, not two bare ``user.py``."""
+        from mempalace.hallways import canonical_entities
+
+        wing_a = canonical_entities(["src/models/user.py", "user.py"])
+        wing_b = canonical_entities(["tests/fixtures/user.py", "user.py"])
+        assert wing_a == ["src/models/user.py"] and wing_b == ["tests/fixtures/user.py"]
+        hallways = [
+            self._h("alpha", wing_a[0], "Router"),
+            self._h("beta", wing_b[0], "Scheduler"),
+        ]
+        assert palace_graph.entity_tunnel_candidates(hallways, min_count=1) == {}
 
     def test_per_wing_cap_counts_links_not_entities(self, tmp_path, monkeypatch):
         _use_tmp_tunnel_file(monkeypatch, tmp_path)

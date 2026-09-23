@@ -324,3 +324,30 @@ def test_cmd_wings_split_retry_drops_hallways_after_drawers_completed(
     hallways_mod._save_hallways([{"id": "h2", "wing": "convos", "entity_a": "c", "entity_b": "d"}])
     cli.cmd_wings(Namespace(yes=True, **ns))
     assert [h["id"] for h in hallways_mod.list_hallways()] == ["h2"]
+
+
+def test_cmd_wings_split_stops_before_moving_when_closets_fail_to_open(tmp_path, monkeypatch):
+    import contextlib
+
+    import mempalace.cli as cli
+
+    col = FakeCollection(_rows())
+    monkeypatch.setattr("mempalace.palace.get_collection", lambda *a, **k: col)
+    monkeypatch.setattr("mempalace.palace.mine_palace_lock", lambda p: contextlib.nullcontext())
+    monkeypatch.setattr(
+        "mempalace.palace_graph.sqlite_grouped_counts_reader",
+        lambda config: (
+            lambda path, name: [("decisions", "portal", "", 1), ("technical", "convos", "", 3)]
+        ),
+    )
+    monkeypatch.setattr("mempalace.hallways._load_hallways", lambda config=None: [])
+    ns = dict(wings_action="split", palace=str(tmp_path), wing="convos")
+    cli.cmd_wings(Namespace(yes=False, **ns))
+
+    def broken(*a, **k):
+        raise OSError("disk I/O error")
+
+    monkeypatch.setattr("mempalace.palace.get_closets_collection", broken)
+    with pytest.raises(OSError):
+        cli.cmd_wings(Namespace(yes=True, **ns))
+    assert col.updates == []  # no drawer moved without its closets

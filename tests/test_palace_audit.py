@@ -630,3 +630,33 @@ def test_resolve_kg_path_uses_the_home_graph_only_for_the_legacy_default_palace(
     (default_palace / "knowledge_graph.sqlite3").write_text("")
     assert resolve_kg_path(str(default_palace)) == str(default_palace / "knowledge_graph.sqlite3")
     assert resolve_kg_path(str(custom), explicit=True) == str(custom / "knowledge_graph.sqlite3")
+
+
+def test_analyze_hallways_does_not_count_same_named_files_as_duplicates():
+    """The audit and --prune-spellings agree: two files are two associations."""
+    from mempalace.palace_audit import _analyze_hallways
+
+    hallways = [
+        {
+            "wing": "w",
+            "entity_a": "src/models/user.py",
+            "entity_b": "Account",
+            "co_occurrence_count": 9,
+        },
+        {
+            "wing": "w",
+            "entity_a": "tests/models/user.py",
+            "entity_b": "Account",
+            "co_occurrence_count": 5,
+        },
+        # A real spelling variant of the first association.
+        {
+            "wing": "w",
+            "entity_a": "models/user.py",
+            "entity_b": "Account.py",
+            "co_occurrence_count": 3,
+        },
+    ]
+    out = _analyze_hallways(hallways)
+    assert out["duplicates"] == 1
+    assert out["artifact_sample"] == ["models/user.py ↔ Account.py"]
