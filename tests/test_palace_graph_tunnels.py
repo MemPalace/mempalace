@@ -1068,3 +1068,43 @@ class TestTraversalRecording:
         _use_tmp_tunnel_file(monkeypatch, tmp_path)
         assert palace_graph.record_tunnel_traversal([]) == 0
         assert palace_graph.record_tunnel_traversal(["nope"]) == 0
+
+
+class TestEntityTunnelIdentityAndCap:
+    def _h(self, wing, a, b, n=10):
+        return {"wing": wing, "entity_a": a, "entity_b": b, "co_occurrence_count": n}
+
+    def test_same_basename_in_two_wings_is_not_a_shared_entity(self):
+        hallways = [
+            self._h("alpha", "src/models/user.py", "Router"),
+            self._h("beta", "tests/fixtures/user.py", "Scheduler"),
+        ]
+        assert palace_graph.entity_tunnel_candidates(hallways, min_count=1) == {}
+
+    def test_one_file_spelled_two_ways_still_links(self):
+        hallways = [
+            self._h("alpha", "src/codec.zig", "Router"),
+            self._h("beta", "codec.zig", "Scheduler"),
+            self._h("alpha", "ChatStore.swift", "Router"),
+            self._h("beta", "ChatStore", "Scheduler"),
+        ]
+        out = palace_graph.entity_tunnel_candidates(hallways, min_count=1)
+        assert set(out) == {"codec.zig", "ChatStore"}
+        assert set(out["codec.zig"]) == {"alpha", "beta"}
+
+    def test_per_wing_cap_counts_links_not_entities(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        # One entity in three wings is two links from "alpha".
+        hallways = [
+            self._h("alpha", "WebAuthn", "Router", 30),
+            self._h("beta", "WebAuthn", "Scheduler", 20),
+            self._h("gamma", "WebAuthn", "Billing", 10),
+            self._h("delta", "Kiosk", "Router", 1),
+        ]
+        created = palace_graph.entity_tunnels_for_wing(
+            "alpha", hallways, min_count=1, max_per_wing=1
+        )
+        assert len(created) == 1
+        # The strongest link survives the cap: alpha<->beta (weaker side 20).
+        assert {created[0]["source"]["wing"], created[0]["target"]["wing"]} == {"alpha", "beta"}
+        assert len(palace_graph.entity_tunnels_for_wing("alpha", hallways, min_count=1)) == 2

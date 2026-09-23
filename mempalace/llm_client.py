@@ -23,6 +23,7 @@ normalizes that away from the caller.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -44,9 +45,21 @@ logger = logging.getLogger("mempalace_llm")
 _LOCALHOST_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
+# Tailscale and other CGNAT overlays hand out 100.64.0.0/10, which Python's
+# ``is_private`` does not cover; a local LLM reached over one is still the
+# user's own network.
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _is_private_address(addr) -> bool:
+    """Loopback, private (RFC 1918, IPv6 unique-local), link-local or CGNAT."""
+    if addr.is_loopback or addr.is_private or addr.is_link_local:
+        return True
+    return addr.version == 4 and addr in _CGNAT
+
+
 def _resolves_private(host: str) -> bool:
     """True when every address ``host`` resolves to stays on the user's network."""
-    import ipaddress
     import socket
 
     try:
@@ -61,7 +74,7 @@ def _resolves_private(host: str) -> bool:
             addr = ipaddress.ip_address(raw.split("%", 1)[0])
         except ValueError:
             return False
-        if not (addr.is_private or addr.is_loopback or addr.is_link_local):
+        if not _is_private_address(addr):
             return False
     return True
 
@@ -72,11 +85,11 @@ def _endpoint_is_local(url: Optional[str]) -> bool:
 
     Local includes:
       - localhost, 127.0.0.1, ::1
-      - hostnames ending in .local (mDNS/Bonjour)
-      - IPv4 RFC1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-      - IPv4 CGNAT (Tailscale and similar VPN/tunnel networks):
-        100.64.0.0/10 — first octet 100, second octet 64-127 inclusive
-      - IPv6 unique-local addresses (fc00::/7) — fc.../fd... prefixes
+      - IP literals that are loopback, RFC 1918 (10/8, 172.16/12,
+        192.168/16), link-local, IPv6 unique-local (fc00::/7), or CGNAT
+        100.64.0.0/10 (Tailscale and similar overlays)
+      - a single-label or ``.local`` hostname whose every resolved address
+        is one of the above
 
     None / empty / unparseable URLs are treated as local (defensive default —
     no endpoint means no external request can happen yet).
@@ -93,49 +106,23 @@ def _endpoint_is_local(url: Optional[str]) -> bool:
         return True
     if host in _LOCALHOST_HOSTS:
         return True
-    if host.endswith(".local"):
-        return True
-    # A single-label hostname (``gpu-box``, ``gpu-box``) has no domain,
-    # so it can only resolve through the LAN: mDNS, the router's DNS, a hosts
-    # file, or a search domain the user configured. It is the user's own
-    # network by construction, the same as ``.local``.
-    # A single-label hostname (``gpu-box``) usually names a LAN machine, but
-    # a resolver search domain can expand it to anything, so the name shape
-    # proves nothing: resolve it and require every address to be private,
-    # loopback or link-local. Unresolvable or public means external, and
-    # the user can still opt in with the explicit consent flag.
-    if "." not in host and ":" not in host:
+    # An IP literal is judged by its address, never by how the text starts:
+    # ``10.example.com`` or ``fd.example.com`` are public names that merely
+    # begin like a private range, and a prefix test waved them through the
+    # consent gate that guards sending palace content.
+    try:
+        return _is_private_address(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+    # A single-label hostname (``gpu-box``) or an mDNS name (``gpu-box.local``)
+    # usually names a LAN machine, but a resolver search domain, or an office
+    # network that uses ``.local`` for unicast DNS, can point it anywhere, so
+    # the name shape proves nothing: resolve it and require every address to
+    # be private, loopback, link-local or CGNAT. Unresolvable or public means
+    # external, and the user can still opt in with the explicit consent flag.
+    if "." not in host or host.endswith(".local"):
         return _resolves_private(host)
-    if host.startswith("10."):
-        return True
-    if host.startswith("192.168."):
-        return True
-    if host.startswith("172."):
-        # 172.16.0.0 - 172.31.255.255
-        parts = host.split(".")
-        if len(parts) >= 2:
-            try:
-                if 16 <= int(parts[1]) <= 31:
-                    return True
-            except ValueError:
-                pass
-    if host.startswith("100."):
-        # 100.64.0.0/10 — Tailscale CGNAT range. First octet 100, second
-        # octet 64-127 inclusive. Users running a local LLM (LM Studio,
-        # Ollama, etc.) accessible via Tailscale on a 100.x.x.x address
-        # should not trigger the external-API privacy warning.
-        # 100.x.x.x outside this range is regular allocated public space
-        # and remains external.
-        parts = host.split(".")
-        if len(parts) >= 2:
-            try:
-                if 64 <= int(parts[1]) <= 127:
-                    return True
-            except ValueError:
-                pass
-    # IPv6 unique-local addresses fc00::/7 — match leading hex chars
-    if host.startswith("fc") or host.startswith("fd"):
-        return True
+    # Any other domain name is external: DNS can point it anywhere.
     return False
 
 

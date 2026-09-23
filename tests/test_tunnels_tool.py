@@ -231,3 +231,42 @@ def test_cmd_tunnels_apply_skips_rows_naming_a_wing_that_is_gone(tmp_path, monke
     out = capsys.readouterr().out
     assert created == ["shared entity: Y"]
     assert "Skipped 1 row" in out
+
+
+def test_prune_keeps_two_files_that_only_share_a_basename():
+    tunnels = [
+        {
+            "access_count": 1,
+            "source": {"wing": "a", "room": "entity:src/models/user.py"},
+            "target": {"wing": "b", "room": "entity:src/models/user.py"},
+        },
+        {
+            "access_count": 0,
+            "source": {"wing": "a", "room": "entity:tests/fixtures/user.py"},
+            "target": {"wing": "b", "room": "entity:tests/fixtures/user.py"},
+        },
+        # A second spelling of the first file: a real duplicate.
+        {
+            "access_count": 0,
+            "source": {"wing": "b", "room": "entity:models/user.py"},
+            "target": {"wing": "a", "room": "entity:models/user.py"},
+        },
+    ]
+    kept, report = prune_tunnels(tunnels, {"a", "b"})
+    assert report["duplicates"] == 1
+    assert [t["source"]["room"] for t in kept] == [
+        "entity:src/models/user.py",
+        "entity:tests/fixtures/user.py",
+    ]
+
+
+def test_propose_skips_an_existing_link_under_another_spelling_only():
+    existing = [
+        {
+            "source": {"wing": "meshkit", "room": "entity:src/swim.zig"},
+            "target": {"wing": "ringdb", "room": "entity:src/swim.zig"},
+        }
+    ]
+    # swim.zig is the same file as src/swim.zig: already linked, not proposed.
+    plan = propose_tunnels(HALLWAYS, WINGS, existing_tunnels=existing)
+    assert "swim.zig" not in {r["entity"] for r in plan["tunnels"]}

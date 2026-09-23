@@ -445,7 +445,7 @@ def test_single_label_hostname_is_local_only_when_it_resolves_privately(monkeypa
     # Unresolvable is external too; the consent flag remains the override.
     assert not _endpoint_is_local("http://nowhere:8010/v1")
     # An IPv6 literal is dotless too, but it is an address, not a LAN name.
-    assert not _endpoint_is_local("http://[2001:db8::1]:8010/v1")
+    assert not _endpoint_is_local("http://[2606:4700:4700::1111]:8010/v1")
     assert _endpoint_is_local("http://[::1]:8010/v1")
     assert not _endpoint_is_local("https://api.openai.com")
     assert not _endpoint_is_local("http://gpu-box.example.com:8010")
@@ -586,3 +586,62 @@ def test_ollama_api_key_source_is_none():
     p = OllamaProvider(model="gemma4:e4b")
     assert p.api_key is None
     assert p.api_key_source is None
+
+
+def test_private_range_prefixes_in_a_hostname_are_not_private():
+    """A domain that merely starts like a private range is still a domain."""
+    from mempalace.llm_client import _endpoint_is_local
+
+    for url in (
+        "https://10.example.com/v1",
+        "https://192.168.example.com/v1",
+        "https://172.16.example.com/v1",
+        "https://100.64.example.com/v1",
+        "https://fd.example.com/v1",
+        "https://fdroid.example.org/v1",
+        "https://fc-llm.example.net/v1",
+    ):
+        assert not _endpoint_is_local(url), url
+
+
+def test_private_ip_literals_stay_local_and_neighbours_do_not():
+    from mempalace.llm_client import _endpoint_is_local
+
+    for url in (
+        "http://10.0.0.5:8000",
+        "http://172.16.0.1:8000",
+        "http://172.31.255.254:8000",
+        "http://192.168.1.20:11434",
+        "http://100.64.0.1:8000",
+        "http://100.127.255.254:8000",
+        "http://[fd00::1]:8000",
+        "http://[fe80::1]:8000",
+        "http://127.0.0.1:8000",
+    ):
+        assert _endpoint_is_local(url), url
+    for url in (
+        "http://172.32.0.1:8000",
+        "http://100.128.0.1:8000",
+        "http://100.63.255.255:8000",
+        "http://8.8.8.8:8000",
+    ):
+        assert not _endpoint_is_local(url), url
+
+
+def test_dot_local_names_are_resolved_not_trusted(monkeypatch):
+    """Office networks reuse .local for unicast DNS; the suffix proves nothing."""
+    import socket
+
+    from mempalace.llm_client import _endpoint_is_local
+
+    table = {"studio.local": "192.168.1.9", "corp.local": "8.8.8.8"}
+
+    def fake_getaddrinfo(host, *a, **k):
+        if host not in table:
+            raise socket.gaierror("no such host")
+        return [(None, None, None, None, (table[host], 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    assert _endpoint_is_local("http://studio.local:11434")
+    assert not _endpoint_is_local("http://corp.local:11434")
+    assert not _endpoint_is_local("http://gone.local:11434")

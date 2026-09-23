@@ -10,6 +10,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **The external-LLM consent gate judges IP addresses, not how a hostname
+  starts.** `10.example.com`, `fd.example.com` and other names that merely begin
+  like a private range were classified as local, so `rooms propose` and
+  `kg normalize` would send sampled drawer excerpts and facts to them without
+  `--accept-external-llm`. IP literals are now parsed and checked as loopback,
+  private, link-local or CGNAT (100.64.0.0/10); single-label and `.local` names are
+  resolved and must land on such an address; any other dotted name is external.
+- **Cross-wing entity tunnels no longer link two files that only share a
+  basename,** and the per-wing cap now counts links rather than entities. An
+  entity shared by five wings is four links, so a wing could exceed its 25-link
+  budget several times over. `tunnels prune` and the audit match duplicates the
+  same path-aware way, so two distinct files between the same wings are never
+  collapsed into one.
 - **Two files with the same name are no longer treated as one entity.**
   Keying a hallway's endpoints on the basename alone merged
   `src/models/user.py` with `tests/models/user.py` and let

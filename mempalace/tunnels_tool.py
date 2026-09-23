@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from typing import Iterable, Optional
 
 from .config import MempalaceConfig, normalize_wing_name
-from .hallways import entity_spelling_key, is_generic_entity
+from .hallways import entity_spelling_key, is_generic_entity, same_file_spelling
 
 PROPOSAL_SCHEMA_VERSION = 1
 DEFAULT_MAX_TUNNELS = 60
@@ -36,11 +36,15 @@ def _norm_wing(wing: str) -> str:
 
 
 def room_spelling_key(room: str) -> str:
-    """``entity:src/main.zig`` and ``entity:main.zig`` key the same.
+    """Bucket key for a tunnel endpoint room: ``entity:src/main.zig`` and
+    ``entity:main.zig`` share one.
 
     ``entity_spelling_key`` takes a basename, so the ``entity:`` prefix must
     come off first or a path spelling (``entity:src/main.zig`` → ``main``)
-    and a bare one (``entity:main.zig`` → ``entity:main``) never match.
+    and a bare one (``entity:main.zig`` → ``entity:main``) never match. The
+    key is deliberately lossy — ``src/models/user.py`` and
+    ``tests/fixtures/user.py`` share it too — so it only narrows the search;
+    :class:`LinkIndex` decides with :func:`same_file_spelling`.
     """
     text = str(room or "")
     if text.startswith("entity:"):
@@ -64,12 +68,54 @@ def _link_key(wing_a: str, wing_b: str, room_a: str, room_b: str) -> tuple:
     )
 
 
-def _tunnel_link_key(tunnel: dict) -> Optional[tuple]:
+def tunnel_endpoints(tunnel: dict) -> Optional[tuple]:
+    """``((wing, room), (wing, room))`` with wings normalized, or ``None``."""
     source, target = tunnel.get("source") or {}, tunnel.get("target") or {}
     wing_a, wing_b = str(source.get("wing") or ""), str(target.get("wing") or "")
     if not wing_a or not wing_b:
         return None
-    return _link_key(wing_a, wing_b, str(source.get("room") or ""), str(target.get("room") or ""))
+    return (
+        (_norm_wing(wing_a), str(source.get("room") or "")),
+        (_norm_wing(wing_b), str(target.get("room") or "")),
+    )
+
+
+def _rooms_match(a: str, b: str) -> bool:
+    if a.startswith("entity:") and b.startswith("entity:"):
+        return same_file_spelling(a[len("entity:") :], b[len("entity:") :])
+    return room_spelling_key(a) == room_spelling_key(b)
+
+
+class LinkIndex:
+    """The links seen so far, matched the way a reader would.
+
+    Two tunnels are one link when they join the same two wings through the
+    same endpoints, whichever direction they were written and whichever
+    spelling they use (``entity:main.zig`` / ``entity:src/main.zig``). Two
+    files that only share a basename (``src/models/user.py`` and
+    ``tests/fixtures/user.py``) are two links: deduping them as one would
+    delete a real connection.
+    """
+
+    def __init__(self) -> None:
+        self._buckets: dict[tuple, list[tuple]] = {}
+
+    @staticmethod
+    def _bucket(ends: tuple) -> tuple:
+        (wing_a, room_a), (wing_b, room_b) = ends
+        return _link_key(wing_a, wing_b, room_a, room_b)
+
+    def contains(self, ends: tuple) -> bool:
+        (wa, ra), (wb, rb) = ends
+        for (wa2, ra2), (wb2, rb2) in self._buckets.get(self._bucket(ends), []):
+            if wa == wa2 and wb == wb2 and _rooms_match(ra, ra2) and _rooms_match(rb, rb2):
+                return True
+            if wa == wb2 and wb == wa2 and _rooms_match(ra, rb2) and _rooms_match(rb, ra2):
+                return True
+        return False
+
+    def add(self, ends: tuple) -> None:
+        self._buckets.setdefault(self._bucket(ends), []).append(ends)
 
 
 def propose_tunnels(
@@ -91,12 +137,12 @@ def propose_tunnels(
     from .palace_graph import ENTITY_TUNNEL_MIN_COUNT, entity_tunnel_candidates
 
     wings = {_norm_wing(str(w)) for w in existing_wings}
-    known = set()
+    known = LinkIndex()
     for t in existing_tunnels or []:
         if isinstance(t, dict):
-            key = _tunnel_link_key(t)
-            if key:
-                known.add(key)
+            ends = tunnel_endpoints(t)
+            if ends:
+                known.add(ends)
     candidates = entity_tunnel_candidates(
         hallways, min_count=ENTITY_TUNNEL_MIN_COUNT if min_count is None else min_count
     )
@@ -112,7 +158,7 @@ def propose_tunnels(
             for j in range(i + 1, len(present)):
                 _, wing_a, n_a = present[i]
                 _, wing_b, n_b = present[j]
-                if _link_key(wing_a, wing_b, room, room) in known:
+                if known.contains(((_norm_wing(wing_a), room), (_norm_wing(wing_b), room))):
                     continue
                 rows.append(
                     {
@@ -129,7 +175,7 @@ def propose_tunnels(
     # yet, walking rows strongest-first so a wing's first link is its best.
     covered: set = set()
     for t in existing_tunnels or []:
-        if isinstance(t, dict) and _tunnel_link_key(t):
+        if isinstance(t, dict) and tunnel_endpoints(t):
             for end in (t.get("source") or {}, t.get("target") or {}):
                 w = str(end.get("wing") or "")
                 if w:
@@ -221,7 +267,7 @@ def prune_tunnels(tunnels: list, existing_wings: Iterable[str]) -> tuple[list, d
     wings = {_norm_wing(str(w)) for w in existing_wings}
     generic = dangling = duplicates = 0
     kept: list = []
-    seen: set = set()
+    seen = LinkIndex()
     for t in sorted(
         (t for t in tunnels if isinstance(t, dict)),
         key=lambda t: -int(t.get("access_count") or 0),
@@ -239,12 +285,13 @@ def prune_tunnels(tunnels: list, existing_wings: Iterable[str]) -> tuple[list, d
                 bad = True
                 break
         if not bad:
-            pair = _tunnel_link_key(t)
-            if pair is not None:
-                if pair in seen:
+            ends = tunnel_endpoints(t)
+            if ends is not None:
+                if seen.contains(ends):
                     duplicates += 1
                     bad = True
-                seen.add(pair)
+                else:
+                    seen.add(ends)
         if not bad:
             kept.append(t)
     report = {

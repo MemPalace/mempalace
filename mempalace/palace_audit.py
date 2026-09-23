@@ -39,7 +39,7 @@ from .backends._inproc_sqlite import open_reader as open_palace_reader
 from .config import MempalaceConfig, normalize_wing_name
 from .hallways import entity_spelling_key, is_generic_entity, is_self_link, list_hallways
 from .palace_graph import _load_tunnels
-from .tunnels_tool import _tunnel_link_key
+from .tunnels_tool import LinkIndex, tunnel_endpoints
 
 # Rooms the transcript classifier falls back to. A drawer in one of these
 # rooms is findable by search, not by walking the palace.
@@ -395,7 +395,7 @@ def _analyze_tunnels(
     generic = []
     dangling = 0
     duplicates = 0
-    seen_pairs: set = set()
+    seen_pairs = LinkIndex()
     artifacts = 0
     tunneled_wings: set = set()
     records = sorted(
@@ -423,14 +423,16 @@ def _analyze_tunnels(
             ):
                 bad = True
                 dangling += 1
-        # Same key `tunnels prune` uses: endpoints stay paired, wings
-        # normalized, rooms keyed by entity spelling.
-        pair = _tunnel_link_key(t)
-        if pair is not None:
-            if pair in seen_pairs:
+        # Same rule `tunnels prune` uses: endpoints stay paired, wings
+        # normalized, spellings of one file match, two files that only share
+        # a basename do not.
+        ends = tunnel_endpoints(t)
+        if ends is not None:
+            if seen_pairs.contains(ends):
                 bad = True
                 duplicates += 1
-            seen_pairs.add(pair)
+            else:
+                seen_pairs.add(ends)
         if bad:
             artifacts += 1
         else:
