@@ -7,17 +7,19 @@ def cmd_sync(args):
     """Prune drawers whose source files are gitignored, deleted, or moved (#1252)."""
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
 
-    payload = {
-        "dir": args.dir,
-        "root": list(args.root or []),
-        "wing": args.wing,
-        "dry_run": args.dry_run,
-    }
     routing = _resolve_cli_write_routing_or_exit(
         args,
         "sync",
     )
     if routing.use_daemon:
+        # Resolved here, as sync_palace resolves them on the direct route: the
+        # daemon keeps the cwd it was started in.
+        payload = {
+            "dir": os.path.realpath(os.path.expanduser(args.dir)) if args.dir else None,
+            "root": [os.path.realpath(os.path.expanduser(root)) for root in args.root or []],
+            "wing": args.wing,
+            "dry_run": args.dry_run,
+        }
         _submit_daemon_cli_job(
             "sync",
             payload,

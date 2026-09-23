@@ -232,6 +232,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (110k rows/s measured).
 
 ### Bug Fixes
+- **`mempalace sweep` and `mempalace sync` routed to the daemon no longer resolve
+  a relative path against the daemon's working directory.** Both put the path into
+  the job as typed, and the daemon keeps the directory it was started in: a
+  `sweep` run from another directory swept the daemon directory's transcripts, and
+  `sync --apply` removed drawers of the project there. The CLI now resolves the
+  sweep target, the sync project dir and every `--root` before the job is built,
+  following symlinks the way the direct route reads them. A direct `sweep` of a
+  relative file now files its drawers under the absolute path too: `sync` counted
+  a relative `source_file` as having no source and never pruned it. (#2582)
 - **Conversation mining no longer discards text.** In exchange mode (the default
   for `mempalace mine --mode convos`) a line starting with `---` ended the AI
   response, and everything from it to the next user turn was never filed.

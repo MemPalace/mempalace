@@ -329,7 +329,18 @@ def cmd_sweep(args):
     from ..sweeper import sweep, sweep_directory
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    # Resolved here, the way the direct route reads it: the daemon keeps the
+    # cwd it was started in. A file keeps its own name, which becomes its
+    # drawers' source_file as `sweep <dir>` would file it, so only the
+    # directories above it are resolved. A blank target is passed on as typed,
+    # as before: resolving "" (or spaces, on Windows) would give the cwd.
     target = os.path.expanduser(args.target)
+    if target.strip():
+        head, tail = os.path.split(target)
+        if tail in ("", os.curdir, os.pardir):
+            target = os.path.realpath(target)
+        else:
+            target = os.path.join(os.path.realpath(head or os.curdir), tail)
 
     routing = _resolve_cli_write_routing_or_exit(
         args,
