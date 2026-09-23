@@ -1,5 +1,6 @@
 """Tests for mempalace.rooms — closed room sets: propose (LLM) and apply (embedding decider)."""
 
+import os
 import json
 from argparse import Namespace
 
@@ -562,3 +563,68 @@ def test_rekey_closets_leaves_a_source_whose_drawers_only_partly_moved():
     )
     assert rekey_closets(closets, plan) == {"moved": 0, "ambiguous": 1}
     assert closets.rows["k"]["meta"]["room"] == "technical"
+
+
+def test_cmd_rooms_apply_retry_finishes_closets_after_drawers_completed(
+    tmp_path, monkeypatch, capsys
+):
+    """Killed after the drawer phase: the retry has no drawer to move but must
+    still move the closets, from the decisions the first run recorded."""
+    import contextlib
+
+    import mempalace.cli as cli
+    from mempalace.rooms import pending_apply_path
+
+    cfg = MempalaceConfig(palace_path=str(tmp_path))
+    save_room_set(cfg, _room_set())
+    rows = [
+        {
+            "id": "a",
+            "meta": {"wing": "w", "room": "technical", "source_file": "s1"},
+            "doc": "cut the release",
+            "emb": [1.0, 0.0],
+        },
+        {
+            "id": "b",
+            "meta": {"wing": "w", "room": "technical", "source_file": "s2"},
+            "doc": "fix the bug",
+            "emb": [0.0, 1.0],
+        },
+    ]
+    col = FakeCollection(rows)
+    closets = FakeCollection(
+        [
+            {"id": "k1", "meta": {"wing": "w", "room": "technical", "source_file": "s1"}},
+            {"id": "k2", "meta": {"wing": "w", "room": "technical", "source_file": "s2"}},
+        ]
+    )
+    monkeypatch.setattr("mempalace.palace.get_collection", lambda *a, **k: col)
+    monkeypatch.setattr("mempalace.palace.get_closets_collection", lambda *a, **k: closets)
+    monkeypatch.setattr("mempalace.embedding.get_embedding_function", lambda: FakeEmbed())
+    monkeypatch.setattr("mempalace.palace.mine_palace_lock", lambda p: contextlib.nullcontext())
+
+    real_update = closets.update
+
+    def dies(**kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(closets, "update", dies)
+    ns = Namespace(rooms_action="apply", palace=str(tmp_path), wing="w", threshold=0.75, yes=True)
+    with pytest.raises(KeyboardInterrupt):
+        cli.cmd_rooms(ns)
+    assert col.rows["a"]["meta"]["room"] == "releases"  # drawer phase finished
+    assert closets.rows["k1"]["meta"]["room"] == "technical"  # closet phase did not
+    assert os.path.isfile(pending_apply_path(cfg, "w"))
+
+    monkeypatch.setattr(closets, "update", real_update)
+    capsys.readouterr()
+    cli.cmd_rooms(ns)
+    out = capsys.readouterr().out
+    assert "Resuming an interrupted apply" in out and "2 closets followed" in out
+    assert closets.rows["k1"]["meta"]["room"] == "releases"
+    assert closets.rows["k2"]["meta"]["room"] == "bug-fixes"
+    assert not os.path.exists(pending_apply_path(cfg, "w"))
+
+    # A completed apply re-run is a no-op.
+    cli.cmd_rooms(ns)
+    assert "Nothing to change" in capsys.readouterr().out

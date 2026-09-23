@@ -600,3 +600,33 @@ def test_score_tunnels_is_quality_times_coverage_and_never_traversal():
         ]
         is None
     )
+
+
+def test_resolve_kg_path_uses_the_home_graph_only_for_the_legacy_default_palace(
+    tmp_path, monkeypatch
+):
+    import mempalace.config as config_mod
+    import mempalace.knowledge_graph as kg_mod
+    from mempalace.palace_audit import resolve_kg_path
+
+    home = tmp_path / "home"
+    default_palace = home / "palace"
+    default_palace.mkdir(parents=True)
+    home_graph = home / "knowledge_graph.sqlite3"
+    home_graph.write_text("")
+    monkeypatch.setattr(config_mod, "DEFAULT_PALACE_PATH", str(default_palace))
+    monkeypatch.setattr(kg_mod, "DEFAULT_KG_PATH", str(home_graph))
+
+    # The legacy default palace without a local graph uses the home graph...
+    assert resolve_kg_path(str(default_palace)) == str(home_graph)
+    # ...but a custom palace never does, however it was selected
+    # (--palace, MEMPALACE_PALACE_PATH, config.json): no fallback.
+    custom = tmp_path / "custom"
+    custom.mkdir()
+    assert resolve_kg_path(str(custom)) == str(custom / "knowledge_graph.sqlite3")
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(custom))
+    assert resolve_kg_path(str(custom)) == str(custom / "knowledge_graph.sqlite3")
+    # A palace-local graph always wins, and --palace forces the local path.
+    (default_palace / "knowledge_graph.sqlite3").write_text("")
+    assert resolve_kg_path(str(default_palace)) == str(default_palace / "knowledge_graph.sqlite3")
+    assert resolve_kg_path(str(custom), explicit=True) == str(custom / "knowledge_graph.sqlite3")

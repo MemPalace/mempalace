@@ -10,6 +10,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **An interrupted `rooms apply` or `wings split` finishes every phase on
+  retry.** Both write drawers first and their index layers after. Once every
+  drawer had moved, a retry found nothing to do and never reached the closet
+  re-key or the hallway drop. Each command now records that it started, with
+  `rooms apply` also saving its closet decisions from the first, complete plan,
+  and a retry replays the remaining phases. A completed run re-run is still a
+  no-op.
+- **Only the legacy default palace falls back to `~/.mempalace`'s knowledge
+  graph.** A palace chosen with `--palace`, `MEMPALACE_PALACE_PATH` or
+  `config.json` keeps its graph inside itself, so `audit` never reads, and
+  `kg normalize --yes` never rewrites, an unrelated graph.
 - **The external-LLM consent gate judges IP addresses, not how a hostname
   starts.** `10.example.com`, `fd.example.com` and other names that merely begin
   like a private range were classified as local, so `rooms propose` and

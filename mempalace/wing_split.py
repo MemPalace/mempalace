@@ -271,12 +271,18 @@ def _rekey_collection(col, wing: str, targets: dict[str, str], stamp: str, progr
     return moved, per_target, skipped
 
 
+def split_pending_path(config: MempalaceConfig, wing: str) -> str:
+    """Marker that a split of ``wing`` started and has not finished every phase."""
+    return os.path.join(config.palace_path, "wings", f"split-{sanitize_name(wing, 'wing')}.pending")
+
+
 def apply_split(
     col,
     plan: dict,
     config: Optional[MempalaceConfig] = None,
     progress=None,
     closets_col=None,
+    resuming: bool = False,
 ) -> dict:
     """Rewrite ``wing`` for every drawer whose project key is in the plan.
 
@@ -293,8 +299,11 @@ def apply_split(
     row is only ever wholly in its old wing or wholly in its new one. The
     loop reads the rows *currently* in the source wing, so running the same
     plan again after a crash or Ctrl-C moves exactly the remainder (drawers,
-    then closets, then the hallway drop) and a completed split is a no-op.
-    Nothing is deleted and no content is rewritten at any point.
+    then closets, then the hallway drop). ``resuming`` says a previous run
+    started and did not finish: the hallway drop then runs even if no drawer
+    is left to move, because the crash may have come after the drawer phase.
+    A completed split re-run without ``resuming`` changes nothing. Nothing
+    is deleted and no content is rewritten at any point.
     """
     wing = plan["wing"]
     targets = {key: entry["target"] for key, entry in plan["projects"].items()}
@@ -305,7 +314,7 @@ def apply_split(
         closets_moved, _, _ = _rekey_collection(closets_col, wing, targets, stamp)
 
     hallways_dropped = 0
-    if moved:
+    if moved or resuming:
         from .hallways import _hallway_file_lock, _load_hallways, _save_hallways
 
         # Under the hallway-file lock: the palace lock this command holds does

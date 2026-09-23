@@ -9,8 +9,10 @@ def cmd_wings(args):
         plan_split,
         plan_targets,
         save_split_plan,
+        split_pending_path,
         split_plan_path,
     )
+    from datetime import datetime, timezone
 
     action = getattr(args, "wings_action", None)
     if action != "split":
@@ -79,13 +81,26 @@ def cmd_wings(args):
             closets_col = get_closets_collection(palace_path, create=False)
         except Exception:
             closets_col = None
+        # Drawers, then closets, then the hallway drop. A retry that finds no
+        # drawer left must still finish the later phases, so the marker says a
+        # split started; it is removed only after every phase has run.
+        marker = split_pending_path(config, wing)
+        resuming = os.path.exists(marker)
+        if resuming:
+            print("  Resuming an interrupted split: finishing drawers, closets and hallways.")
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write(datetime.now(timezone.utc).isoformat() + "\n")
         try:
-            result = apply_split(col, plan, config=config, closets_col=closets_col)
+            result = apply_split(
+                col, plan, config=config, closets_col=closets_col, resuming=resuming
+            )
         except KeyboardInterrupt:
             print(
                 "\n  Interrupted. Rows already moved stay moved; re-run --yes to finish the rest."
             )
             raise
+        os.remove(marker)
     print(
         f"\n  Moved {result['moved']} drawers into {len(result['per_target'])} wings and "
         f"{result['closets_moved']} closets; {result['skipped']} skipped; "

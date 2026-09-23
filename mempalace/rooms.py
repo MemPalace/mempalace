@@ -615,26 +615,21 @@ def plan_rooms(
     )
 
 
-def rekey_closets(closets_col, plan: RoomPlan) -> dict:
-    """Follow the drawers with the AAAK index layer; ``{"moved", "ambiguous"}``.
+def closet_targets(plan: RoomPlan) -> tuple[dict, int]:
+    """``({(source_file, old_room): new_room}, ambiguous_drawers)`` for ``plan``.
 
     A closet is one record per ``(wing, room, source_file)`` and search
     passes the *same* wing/room filter to the closet collection, so after a
     reclassification a closet left on the old room stops boosting the
-    drawers it indexes — in the new room they rank without it.
+    drawers it indexes.
 
     A closet follows its source only when *every* drawer of that source and
     room moved, and to one room: it indexes the whole source, so moving it
     while some of those drawers stayed put would take the boost away from
-    the ones that stayed. Sources that split, or that only partly moved,
-    are counted in ``ambiguous`` and left alone; re-mining such a source
+    the ones that stayed. Sources that split, or only partly moved, are
+    counted in ``ambiguous`` and left alone; re-mining such a source
     rebuilds its closets exactly.
-
-    Only ``room`` metadata is rewritten, never the record id, which is what
-    ``wings split`` does for ``wing``.
     """
-    if closets_col is None or not plan.source_moves:
-        return {"moved": 0, "ambiguous": 0}
     targets: dict[tuple[str, str], str] = {}
     ambiguous = 0
     for (source, old_room), counts in plan.source_moves.items():
@@ -645,10 +640,23 @@ def rekey_closets(closets_col, plan: RoomPlan) -> dict:
             ambiguous += sum(rooms.values())
             continue
         targets[(source, old_room)] = next(iter(rooms))
+    return targets, ambiguous
+
+
+def rekey_closets_to(closets_col, wing: str, targets: dict) -> int:
+    """Move each matching closet to its target room; returns closets moved.
+
+    Idempotent: a closet already in its target room is left alone, so a
+    retry after an interruption finishes exactly the remainder. Only
+    ``room`` metadata is rewritten, never the record id, which is what
+    ``wings split`` does for ``wing``.
+    """
+    if closets_col is None or not targets:
+        return 0
     ids: list[str] = []
     metas: list[dict] = []
     stamp = datetime.now(timezone.utc).isoformat()
-    for row in _iter_wing_rows(closets_col, plan.wing, include=["metadatas"]):
+    for row in _iter_wing_rows(closets_col, wing, include=["metadatas"]):
         meta = row["metadata"]
         key = (str(meta.get("source_file") or ""), str(meta.get("room") or ""))
         target = targets.get(key)
@@ -661,7 +669,69 @@ def rekey_closets(closets_col, plan: RoomPlan) -> dict:
             ids=ids[start : start + _UPDATE_BATCH],
             metadatas=metas[start : start + _UPDATE_BATCH],
         )
-    return {"moved": len(ids), "ambiguous": ambiguous}
+    return len(ids)
+
+
+def rekey_closets(closets_col, plan: RoomPlan) -> dict:
+    """Follow the drawers with the AAAK index layer; ``{"moved", "ambiguous"}``."""
+    if closets_col is None:
+        return {"moved": 0, "ambiguous": 0}
+    targets, ambiguous = closet_targets(plan)
+    return {"moved": rekey_closets_to(closets_col, plan.wing, targets), "ambiguous": ambiguous}
+
+
+# ── resumable apply ─────────────────────────────────────────────────────────
+#
+# ``rooms apply`` writes drawers, then closets. The drawer phase resumes by
+# itself (a retry plans over the drawers still to move), but once every
+# drawer has moved a retry finds nothing to do and would never reach the
+# closet phase. The first run therefore records its closet decisions here
+# before touching anything, and a retry replays them. The decisions come
+# from the first, complete plan: a retry only sees the drawers left over and
+# cannot tell whether a source was split.
+
+
+def pending_apply_path(config: MempalaceConfig, wing: str) -> str:
+    return os.path.join(
+        config.palace_path, "rooms", f"{sanitize_name(wing, 'wing')}.apply-pending.json"
+    )
+
+
+def save_pending_apply(config: MempalaceConfig, wing: str, targets: dict, ambiguous: int) -> str:
+    path = pending_apply_path(config, wing)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = {
+        "wing": wing,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "ambiguous": int(ambiguous),
+        "closets": [[src, old, new] for (src, old), new in sorted(targets.items())],
+    }
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+    return path
+
+
+def load_pending_apply(config: MempalaceConfig, wing: str) -> Optional[tuple[dict, int]]:
+    """``(targets, ambiguous)`` from an interrupted apply, or ``None``."""
+    path = pending_apply_path(config, wing)
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    targets = {}
+    for row in data.get("closets") or []:
+        if isinstance(row, list) and len(row) == 3 and all(isinstance(x, str) for x in row):
+            targets[(row[0], row[1])] = row[2]
+    return targets, int(data.get("ambiguous") or 0)
+
+
+def clear_pending_apply(config: MempalaceConfig, wing: str) -> None:
+    try:
+        os.remove(pending_apply_path(config, wing))
+    except FileNotFoundError:
+        pass
 
 
 def apply_plan(col, plan: RoomPlan, progress=None) -> int:

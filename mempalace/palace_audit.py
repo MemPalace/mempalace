@@ -216,19 +216,25 @@ def _read_wing_project_mix(config: MempalaceConfig) -> Optional[dict[str, dict]]
 def resolve_kg_path(palace_path: str, explicit: bool = False) -> str:
     """The knowledge graph that belongs to ``palace_path``.
 
-    Mirrors the MCP server: a palace chosen with ``--palace`` (``explicit``)
-    keeps its graph inside the palace and never falls back to the home
-    graph, so ``audit`` cannot report and ``kg normalize --yes`` cannot
-    rewrite an unrelated default graph. The default palace prefers a
-    palace-local file and otherwise uses the legacy ``~/.mempalace`` path.
-    Neither file is created here.
+    A palace-local ``knowledge_graph.sqlite3`` always wins. The legacy
+    ``~/.mempalace/knowledge_graph.sqlite3`` belongs to the legacy default
+    palace (``~/.mempalace/palace``) alone, so it is used only for that
+    palace — whether it was reached by default, ``--palace``,
+    ``MEMPALACE_PALACE_PATH`` or ``config.json``. Any other palace keeps its
+    graph inside itself, so ``audit`` cannot report and ``kg normalize
+    --yes`` cannot rewrite an unrelated graph. ``explicit`` (``--palace``
+    given) forces the palace-local path, as the MCP server does for its
+    flag. Neither file is created here.
     """
+    from .config import DEFAULT_PALACE_PATH
     from .knowledge_graph import DEFAULT_KG_PATH
 
     local = os.path.join(palace_path, "knowledge_graph.sqlite3")
     if explicit or os.path.isfile(local):
         return local
-    return DEFAULT_KG_PATH
+    if os.path.realpath(palace_path) == os.path.realpath(DEFAULT_PALACE_PATH):
+        return DEFAULT_KG_PATH
+    return local
 
 
 def _read_kg(kg_path: str) -> Optional[dict]:
@@ -688,10 +694,8 @@ def audit_palace(
 ) -> dict:
     """Run every read-only check and return the report as a dict.
 
-    ``explicit_palace`` says whether the caller chose the palace (``--palace``
-    or ``MEMPALACE_PALACE_PATH``); its knowledge graph then lives inside the
-    palace and the legacy home graph is never read for it. When omitted, a
-    palace path other than the default counts as explicit.
+    ``explicit_palace`` says the caller passed ``--palace``; see
+    :func:`resolve_kg_path` for which knowledge graph belongs to a palace.
 
     ``progress(step, detail)`` is called before and after each reader — the
     hallway sidecar alone can be tens of megabytes, and a caller on a terminal
@@ -716,11 +720,7 @@ def audit_palace(
     palace_path = config.palace_path
     if not os.path.isdir(palace_path):
         raise FileNotFoundError(f"palace not found at {palace_path}")
-    if explicit_palace is None:
-        from .config import DEFAULT_PALACE_PATH
-
-        explicit_palace = os.path.realpath(palace_path) != os.path.realpath(DEFAULT_PALACE_PATH)
-    explicit = explicit_palace
+    explicit = bool(explicit_palace)
 
     source = "sqlite"
 

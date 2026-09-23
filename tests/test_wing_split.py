@@ -1,5 +1,6 @@
 """Tests for mempalace.wing_split — one wing per source project."""
 
+import os
 import json
 from argparse import Namespace
 
@@ -268,3 +269,58 @@ def test_apply_split_resumes_after_an_interrupted_batch(monkeypatch):
     assert len(moved()) == 2
     assert all(col.rows[i]["meta"]["wing"] == "portal" for i in moved())
     assert apply_split(col, plan)["moved"] == 0  # completed split is a no-op
+
+
+def test_cmd_wings_split_retry_drops_hallways_after_drawers_completed(
+    tmp_path, monkeypatch, capsys
+):
+    """Killed after every drawer moved: the retry moves nothing but must still
+    drop the source wing's stale hallways. A completed split stays a no-op."""
+    import contextlib
+
+    import mempalace.cli as cli
+    import mempalace.hallways as hallways_mod
+    from mempalace.wing_split import split_pending_path
+
+    hallway_file = tmp_path / "hallways.json"
+    monkeypatch.setattr(hallways_mod, "_get_hallway_file", lambda *a, **k: str(hallway_file))
+    monkeypatch.setattr(hallways_mod, "_legacy_hallway_file", lambda: str(tmp_path / "legacy.json"))
+    hallways_mod._save_hallways([{"id": "h1", "wing": "convos", "entity_a": "a", "entity_b": "b"}])
+    col = FakeCollection(_rows())
+    monkeypatch.setattr("mempalace.palace.get_collection", lambda *a, **k: col)
+    monkeypatch.setattr("mempalace.palace.get_closets_collection", lambda *a, **k: None)
+    monkeypatch.setattr("mempalace.palace.mine_palace_lock", lambda p: contextlib.nullcontext())
+    monkeypatch.setattr(
+        "mempalace.palace_graph.sqlite_grouped_counts_reader",
+        lambda config: (
+            lambda path, name: [("decisions", "portal", "", 1), ("technical", "convos", "", 3)]
+        ),
+    )
+    ns = dict(wings_action="split", palace=str(tmp_path), wing="convos")
+    cli.cmd_wings(Namespace(yes=False, **ns))
+
+    real_lock = hallways_mod._hallway_file_lock
+
+    def dies(config=None):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(hallways_mod, "_hallway_file_lock", dies)
+    with pytest.raises(KeyboardInterrupt):
+        cli.cmd_wings(Namespace(yes=True, **ns))
+    cfg = MempalaceConfig(palace_path=str(tmp_path))
+    assert os.path.isfile(split_pending_path(cfg, "convos"))
+    assert [h["id"] for h in hallways_mod.list_hallways()] == ["h1"]  # not dropped yet
+
+    monkeypatch.setattr(hallways_mod, "_hallway_file_lock", real_lock)
+    capsys.readouterr()
+    cli.cmd_wings(Namespace(yes=True, **ns))
+    out = capsys.readouterr().out
+    assert "Resuming an interrupted split" in out
+    assert "Moved 0 drawers" in out and "1 hallway records of convos dropped" in out
+    assert hallways_mod.list_hallways() == []
+    assert not os.path.exists(split_pending_path(cfg, "convos"))
+
+    # A later rebuild of the source wing survives a no-op re-run.
+    hallways_mod._save_hallways([{"id": "h2", "wing": "convos", "entity_a": "c", "entity_b": "d"}])
+    cli.cmd_wings(Namespace(yes=True, **ns))
+    assert [h["id"] for h in hallways_mod.list_hallways()] == ["h2"]

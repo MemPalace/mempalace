@@ -37,9 +37,13 @@ def cmd_rooms(args):
         apply_plan,
         existing_rooms,
         load_room_set,
+        clear_pending_apply,
+        closet_targets,
+        load_pending_apply,
         plan_rooms,
         propose_rooms,
-        rekey_closets,
+        rekey_closets_to,
+        save_pending_apply,
         room_set_path,
         sample_drawers,
         save_room_set,
@@ -145,11 +149,21 @@ def cmd_rooms(args):
     with mine_palace_lock(palace_path):
         plan = plan_rooms(col, wing, decider, threshold=threshold, from_rooms=from_rooms)
         report(plan)
-        if not plan.changes:
-            print("  Nothing to change.")
-            return
+        pending = load_pending_apply(config, wing)
+        if pending is None:
+            if not plan.changes:
+                print("  Nothing to change.")
+                return
+            # Record the closet decisions before the first write, so a retry
+            # after an interruption can finish the closet phase even when no
+            # drawer is left to move.
+            targets, ambiguous = closet_targets(plan)
+            save_pending_apply(config, wing, targets, ambiguous)
+        else:
+            targets, ambiguous = pending
+            print("  Resuming an interrupted apply: finishing drawers, then closets.")
         try:
-            done = apply_plan(col, plan)
+            done = apply_plan(col, plan) if plan.changes else 0
         except KeyboardInterrupt:
             print("\n  Interrupted. Drawers already moved stay moved; re-run to finish the rest.")
             raise
@@ -159,11 +173,12 @@ def cmd_rooms(args):
             closets_col = get_closets_collection(palace_path, create=False)
         except Exception:
             closets_col = None
-        closets = rekey_closets(closets_col, plan)
-        note = f" {closets['moved']} closets followed."
-        if closets["ambiguous"]:
+        moved_closets = rekey_closets_to(closets_col, wing, targets)
+        clear_pending_apply(config, wing)
+        note = f" {moved_closets} closets followed."
+        if ambiguous:
             note += (
-                f" {closets['ambiguous']} drawers came from a source that only partly moved, "
+                f" {ambiguous} drawers came from a source that only partly moved, "
                 "so its closet stayed put; re-mine that source for exact closets."
             )
         print(f"  Moved {done} drawers.{note} Run `mempalace audit` to see the new rooms score.")
