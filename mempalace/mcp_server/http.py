@@ -74,7 +74,10 @@ _HTTP_REQUEST_LOCK = _RWLock()
 _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 _HTTP_ACTIVE_CLIENT_WINDOW_S = 120.0
 
-_HTTP_PROTOCOL_METHODS = frozenset({"initialize", "ping", "tools/list"})
+# MCP 2026-07-28 clients (e.g. Codex with mcp_2026_07_28) probe server/discover
+# before falling back to initialize. It never touches the palace, so it must not
+# queue behind the exclusive lock (under write load that exceeded client timeouts).
+_HTTP_PROTOCOL_METHODS = frozenset({"initialize", "ping", "tools/list", "server/discover"})
 
 # RFC 003 phase 5: logstream tools touch only logstream.sqlite3 (its own WAL
 # database with internal locking) — never Chroma or the KG. Dispatching them
