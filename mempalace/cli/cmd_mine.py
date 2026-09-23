@@ -73,7 +73,9 @@ def cmd_mine(args):
     # direct mine here would be refused. Hand the job to the hub instead —
     # this is how the save hooks keep capturing transcripts on a machine
     # that runs `mempalace serve`.
-    if _mine_args_forwardable(args, include_ignored) and _forward_mine_to_hub(args, palace_path):
+    if _mine_args_forwardable(args, include_ignored) and _forward_mine_to_hub(
+        args, palace_path, include_ignored=include_ignored
+    ):
         return
 
     # --redetect-origin re-runs corpus_origin on the current corpus state

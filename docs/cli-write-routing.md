@@ -44,7 +44,23 @@ Force direct execution:
 
 The flags are mutually exclusive and override environment/config policy.
 
-Background execution:
+### Mining with a running HTTP hub
+
+On the direct route, compatible `mine` commands forward to a running HTTP hub
+for the same palace, since the hub holds its writer lease. Project mining with
+`--include-ignored` preserves the requested project-relative paths through this
+route; other ignored files remain excluded.
+
+This requires a hub advertising the `mine_include_ignored` capability. If a
+running hub is older, the CLI asks you to upgrade MemPalace in the hub's
+environment and restart it before retrying. It does not drop the override,
+submit the mine, or attempt a competing local write. With no live hub, the
+existing local mining behavior remains available.
+
+Other flags the hub cannot express, such as `--no-gitignore`, still use the
+local path. An uncertain hub submission is never replayed locally.
+
+### Background execution
 
     mempalace mine ./project --background
 
