@@ -48,9 +48,13 @@ from chromadb.errors import NotFoundError as ChromaNotFoundError
 from .backends.chroma import ChromaBackend, hnsw_capacity_status
 
 # sqlite_read_uri stays in this module's namespace: callers and tests reach the
-# read-only URI through repair, while the connections themselves now go through
-# connect_sqlite_read.
+# read-only URI through repair. Connections to chroma.sqlite3 go through
+# backends._inproc_sqlite, which opens them with connect_sqlite_read under the
+# palace's in-process lock (#2302).
 from .config import connect_sqlite_read, sqlite_read_uri  # noqa: F401
+from .backends._inproc_sqlite import open_reader as open_palace_reader
+from .backends._inproc_sqlite import open_writer as open_palace_writer
+from .backends._inproc_sqlite import release as release_palace_anchor
 
 
 COLLECTION_NAME = "mempalace_drawers"
@@ -721,7 +725,7 @@ def sqlite_drawer_count(palace_path: str, collection_name: Optional[str] = None)
     if _is_a_named_pipe(sqlite_path) or not os.path.exists(sqlite_path):
         return None
     try:
-        conn = connect_sqlite_read(sqlite_path)
+        conn = open_palace_reader(sqlite_path)
         try:
             row = conn.execute(
                 """
@@ -878,7 +882,7 @@ def _quick_check_errors(sqlite_path: str) -> list[str]:
         # open, so the descriptor would sit there until the cyclic collector
         # ran.
         with closing(
-            connect_sqlite_read(sqlite_path, timeout=_SQLITE_INTEGRITY_BUSY_TIMEOUT_SECONDS)
+            open_palace_reader(sqlite_path, timeout=_SQLITE_INTEGRITY_BUSY_TIMEOUT_SECONDS)
         ) as conn:
             rows = conn.execute("PRAGMA quick_check").fetchall()
     except (sqlite3.Error, ValueError) as e:
@@ -1232,7 +1236,7 @@ def maybe_autoheal_fts5_index(palace_path: str, errors: list[str], *, progress=p
     to_restore = checked = unverifiable = unkeyed = 0
     try:
         with mine_palace_lock(palace_path):
-            with closing(sqlite3.connect(sqlite_path, isolation_level=None)) as conn:
+            with closing(open_palace_writer(sqlite_path, isolation_level=None)) as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     to_restore = _fts5_content_rows_to_restore(conn)
@@ -1503,8 +1507,10 @@ def _vacuum_and_rebuild_fts5(
         if strict:
             raise FileNotFoundError(f"recovered palace has no SQLite database: {sqlite_path}")
         return
+    # VACUUM wants the file to itself, and Chroma's handles are closed by now.
+    release_palace_anchor(sqlite_path)
     try:
-        with closing(sqlite3.connect(sqlite_path, isolation_level=None)) as conn:
+        with closing(open_palace_writer(sqlite_path, isolation_level=None)) as conn:
             tables = {
                 r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
             }
@@ -1939,7 +1945,7 @@ def extract_via_sqlite(palace_path: str, collection_name: str) -> Iterator[tuple
     if not os.path.isfile(sqlite_path):
         return
 
-    conn = connect_sqlite_read(sqlite_path)
+    conn = open_palace_reader(sqlite_path)
     try:
         seg_row = conn.execute(
             """
@@ -2654,7 +2660,7 @@ def _detect_poisoned_max_seq_ids(
     If ``segment`` is given, the detection is restricted to that segment id
     (still only returning it if it actually exceeds the threshold).
     """
-    with sqlite3.connect(db_path) as conn:
+    with open_palace_writer(db_path) as conn:
         if segment is not None:
             rows = conn.execute(
                 "SELECT segment_id, seq_id FROM max_seq_id WHERE segment_id = ? AND seq_id > ?",
@@ -2792,7 +2798,7 @@ def repair_max_seq_id(
         sidecar_map = _read_sidecar_seq_ids(from_sidecar)
 
     plan: list[tuple[str, int, int]] = []
-    with sqlite3.connect(db_path) as conn:
+    with open_palace_writer(db_path) as conn:
         cur = conn.cursor()
         for seg_id, old_val in poisoned:
             if from_sidecar:
@@ -2852,7 +2858,7 @@ def repair_max_seq_id(
 
     _close_chroma_handles(palace_path)
 
-    with sqlite3.connect(db_path) as conn:
+    with open_palace_writer(db_path) as conn:
         conn.execute("BEGIN")
         try:
             conn.executemany(

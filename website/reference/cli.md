@@ -212,7 +212,7 @@ mempalace rules --host mac --harness claude --project myapp
 mempalace rules --host windows --harness grok --project mempalace --mcp light
 ```
 
-`--mcp full` (default) names the 45-tool `mempalace-mcp` tools.
+`--mcp full` (default) names the 47-tool `mempalace-mcp` tools.
 `--mcp light` names the 3-tool triad. Prose is identical.
 
 ## `mempalace logstream`

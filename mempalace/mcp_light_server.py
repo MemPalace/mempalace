@@ -1050,7 +1050,11 @@ def main():
             continue
         try:
             req = json.loads(line)
-        except json.JSONDecodeError:
+        except Exception as exc:
+            # A line json.loads rejects is skipped, as invalid JSON always was. An
+            # integer past the digit limit or nesting too deep to parse raises
+            # something else, and used to end the server.
+            logger.error("Skipped a line json.loads rejected: %s: %s", type(exc).__name__, exc)
             continue
         try:
             resp = dispatch_light_stdio_request(req)

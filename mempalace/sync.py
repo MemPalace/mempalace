@@ -62,6 +62,35 @@ def _resolve_project_root(source_file: Path, project_roots: list) -> Optional[Pa
     return None
 
 
+def _matcher_under_current_identity(directory: Path, matcher_cache: dict):
+    """One directory's ``.gitignore`` matcher, cached under the identity the
+    directory answered with as well as under its path.
+
+    A directory's rules are read once per identity it answers with and
+    reused. Keyed by path alone, a rule read while a volume answered at that
+    path would go on deciding sources read after the volume left, and the
+    directory underneath may carry no such rule. So the identity is read
+    before the file is, on every call: a cache hit is then a hit for the
+    directory answering now. It is read once more after the file, and an
+    entry read across a change is dropped, so an entry names the directory
+    its rule came from. The source read across that change is decided by the
+    reading ``_classify_under_identity`` takes around its verdict. Two
+    changes inside the one read are not seen, as they are not by that
+    reading either. A directory that answers with no identity shares one
+    entry, since nothing separates its readings.
+    """
+    identity = directory_identity(directory)
+    by_path = matcher_cache.setdefault(identity, {})
+    if directory in by_path:
+        return by_path[directory]
+    matcher = load_gitignore_matcher(directory, by_path)
+    if directory_identity(directory) != identity:
+        # The directory changed while its rule was read: the entry names
+        # neither directory. The source's own reading decides this one.
+        by_path.pop(directory, None)
+    return matcher
+
+
 def _ancestor_matchers(source_file: Path, root: Path, matcher_cache: dict) -> list:
     """Build the ancestor-chain matcher list, root → file's parent.
 
@@ -75,12 +104,12 @@ def _ancestor_matchers(source_file: Path, root: Path, matcher_cache: dict) -> li
     except ValueError:
         return matchers
     cursor = root
-    matcher = load_gitignore_matcher(cursor, matcher_cache)
+    matcher = _matcher_under_current_identity(cursor, matcher_cache)
     if matcher is not None:
         matchers.append(matcher)
     for part in parts[:-1]:
         cursor = cursor / part
-        matcher = load_gitignore_matcher(cursor, matcher_cache)
+        matcher = _matcher_under_current_identity(cursor, matcher_cache)
         if matcher is not None:
             matchers.append(matcher)
     return matchers
@@ -266,7 +295,9 @@ def _mined_directory_still_answers(recorded: object, answering: Optional[str]) -
     drawers are decided by corroboration alone, exactly as on ``develop``.
 
     Both arguments belong to different things: ``recorded`` is this drawer's,
-    ``answering`` is the directory's right now, read once per source.
+    ``answering`` is the directory's right now, read once per source: the
+    reading taken after the corroboration, or the one taken on both sides of
+    a ``gitignored`` reading, which is ``None`` where the two disagreed.
     """
     # Both sides are read as the number an inode is before either is judged.
     # Judging the value as it arrived would split one identity in two: a zero
@@ -293,6 +324,13 @@ def _classify_drawer(
     the file is not at its path, which is not yet a reason to remove the
     drawer; ``sync_palace`` decides that, and settles every ``absent`` into
     ``missing`` or ``unresolved`` once the whole pass is done.
+
+    ``gitignored`` is read from whatever answers at the path: the path
+    answers, and a rule found above it ignores it. Whether that is the
+    directory the drawer was mined from is ``_classify_under_identity``'s
+    reading, taken on both sides of this call. A drawer carrying an identity
+    that reading cannot match is kept as ``unresolved``, and one carrying
+    none is decided by the rule alone.
     """
     # Defensive: main loop filters registry rows; this guards direct callers.
     if _is_registry_row(meta, drawer_id):
@@ -330,6 +368,29 @@ def _classify_drawer(
         return "gitignored"
 
     return "kept"
+
+
+def _classify_under_identity(
+    meta: dict, matcher_cache: dict, project_roots: list, drawer_id: str = ""
+) -> tuple[str, Optional[str]]:
+    """``_classify_drawer`` with the directory's identity read on both sides.
+
+    Returns the bucket and, for ``gitignored``, the identity the directory
+    answered with before and after the reading, or ``None`` when the two
+    readings disagree. The directory is the one ``source_file`` names, as
+    the miner recorded it; a path that is not absolute is classified as it
+    is, since ``_classify_drawer`` answers ``no_source`` for it.
+    """
+    source_file = (meta or {}).get("source_file")
+    if not source_file or not Path(source_file).is_absolute():
+        return _classify_drawer(meta, matcher_cache, project_roots, drawer_id), None
+    directory = os.path.dirname(source_file)
+    before = directory_identity(directory)
+    bucket = _classify_drawer(meta, matcher_cache, project_roots, drawer_id)
+    if bucket != "gitignored":
+        return bucket, None
+    after = directory_identity(directory)
+    return bucket, (after if after == before else None)
 
 
 def _iter_drawer_metadata(col, wing: Optional[str]):
@@ -649,8 +710,10 @@ def sync_palace(
     dry_run=False to actually delete drawers and matching closets.
 
     Only ``gitignored`` and ``missing`` are removed. A source file this
-    could not establish as deleted lands in ``unresolved`` and is counted,
-    printed and kept: an unmounted volume must not be read as a deletion.
+    could not establish as deleted, or as ignored by a rule of the directory
+    it was mined from, lands in ``unresolved`` and is counted, printed and
+    kept: an unmounted volume must not be read as a deletion, and a volume's
+    rule must not be read as the project's.
 
     A file that is not at its path reaches ``missing`` only when the palace
     can still see a source file of its own in that same directory. A
@@ -686,6 +749,22 @@ def sync_palace(
     out of that state on purpose, since a stranded drawer and a drawer a
     volume is holding are the same reading, and nothing here can prune one
     kind without pruning the other.
+
+    A ``gitignored`` verdict is read the same way: the path answers and a
+    rule found above it ignores it, both taken from whatever answers there,
+    so a drawer carrying an identity is removed only when the directory
+    answered with that inode before and after the rule was read. Otherwise
+    it is kept as ``unresolved``: the rule then cannot be placed in the
+    directory the file was mined from, which is what a volume mounted over
+    that directory looks like when it carries a file of the same name and a
+    rule that names it. A drawer carrying no identity is removed by the rule
+    alone, as before. The last two limits above hold here too, with the
+    window being the whole reading between the two identity readings rather
+    One more is the symlink: the identity compared is that of the directory
+    ``source_file`` names, as the miner recorded it, while the rule is read
+    along the resolved path, so for a source that is a symlink into another
+    directory the rule is read in a directory that is not above the one
+    compared, and a volume over it is not seen.
 
     ``wing`` scopes the corroboration as well as the scan, since only that
     wing's drawers are read. A wing-scoped run therefore keeps what a run
@@ -735,8 +814,9 @@ def sync_palace(
             roots = _auto_detect_project_roots(col, wing)
 
         matcher_cache: dict = {}
-        # Same source_file → same verdict holds because mine_palace_lock
-        # blocks concurrent writers and the loop is synchronous.
+        # Same source_file → same verdict, and the identity it was formed
+        # under, holds because mine_palace_lock blocks concurrent writers and
+        # the loop is synchronous.
         classification_cache: dict = {}
 
         # Candidate witnesses per directory, and the drawers whose source
@@ -754,14 +834,21 @@ def sync_palace(
             source_file = meta.get("source_file")
 
             registry_row = _is_registry_row(meta, drawer_id)
+            verdict_identity = None
             if registry_row:
                 bucket = "kept"
             elif source_file and source_file in classification_cache:
-                bucket = classification_cache[source_file]
+                bucket, verdict_identity = classification_cache[source_file]
             else:
-                bucket = _classify_drawer(meta, matcher_cache, roots, drawer_id)
+                # Read on both sides of the classification, as around the
+                # corroboration below: only two readings that agree say which
+                # directory the rule was read in. ``sync_palace``'s docstring
+                # says why.
+                bucket, verdict_identity = _classify_under_identity(
+                    meta, matcher_cache, roots, drawer_id
+                )
                 if source_file:
-                    classification_cache[source_file] = bucket
+                    classification_cache[source_file] = (bucket, verdict_identity)
 
             if bucket == "absent":
                 not_there.append((drawer_id, source_file, meta.get("source_dir_ino")))
@@ -774,6 +861,15 @@ def sync_palace(
             # hundred times would be the whole cost of this pass.
             if source_file and not registry_row and bucket in ("kept", "gitignored"):
                 live_dirs.setdefault(os.path.dirname(source_file), {})[source_file] = None
+
+            # The verdict belongs to the source, the recorded identity to this
+            # drawer, as in the corroboration below. The file stays a witness
+            # for its directory whatever is decided here: it is there, and the
+            # corroboration reads the identity for itself.
+            if bucket == "gitignored" and not _mined_directory_still_answers(
+                meta.get("source_dir_ino"), verdict_identity
+            ):
+                bucket = "unresolved"
 
             counts[bucket] += 1
             if bucket == "unresolved":

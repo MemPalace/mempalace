@@ -14,12 +14,15 @@ from mempalace.convo_miner import (
     _resolve_wing,
     mine_convos,
 )
+from mempalace import palace
 from mempalace.palace import (
     NORMALIZE_VERSION,
     MineAlreadyRunning,
     file_already_mined,
     prefetch_mined_set,
 )
+
+_PREFETCH_SCOPE_THRESHOLD = palace._PREFETCH_SCOPE_THRESHOLD
 
 
 def test_convo_mining():
@@ -902,6 +905,145 @@ def test_register_file_sentinel_includes_source_mtime():
         assert str(tiny_file) in mined
         assert mined[str(tiny_file)] is not None
         assert abs(mined[str(tiny_file)] - os.path.getmtime(tiny_file)) < 0.001
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# prefetch_mined_set, source_files scoping
+# ---------------------------------------------------------------------------
+
+
+def _seed_two_source_drawer(col, source, mtime):
+    meta = {
+        "wing": "test",
+        "room": "general",
+        "source_file": source,
+        "chunk_index": 0,
+        "extract_mode": "exchange",
+        "normalize_version": NORMALIZE_VERSION,
+        "source_mtime": mtime,
+    }
+    col.upsert(
+        ids=[f"drawer_{abs(hash(source))}"],
+        documents=[f"content for {source}"],
+        metadatas=[meta],
+    )
+
+
+def test_prefetch_mined_set_scoped_matches_unscoped_for_a_named_file():
+    """Below the threshold, passing source_files must return the exact same
+    entry a full unscoped scan would for a file the caller actually names.
+    The scoped where-query must not silently drop or alter what it does see."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+        _seed_two_source_drawer(col, "/fake/a.txt", 1_700_000_000.0)
+        _seed_two_source_drawer(col, "/fake/b.txt", 1_700_000_100.0)
+
+        unscoped = prefetch_mined_set(col, extract_mode="exchange")
+        scoped = prefetch_mined_set(col, extract_mode="exchange", source_files=["/fake/a.txt"])
+
+        assert scoped == {"/fake/a.txt": unscoped["/fake/a.txt"]}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_prefetch_mined_set_scoped_omits_files_outside_source_files():
+    """The scoped where-query must actually narrow the result, not just
+    accept the parameter and still scan everything."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+        _seed_two_source_drawer(col, "/fake/only.txt", 1_700_000_000.0)
+        _seed_two_source_drawer(col, "/fake/other.txt", 1_700_000_100.0)
+
+        scoped = prefetch_mined_set(col, extract_mode="exchange", source_files=["/fake/only.txt"])
+
+        assert "/fake/only.txt" in scoped
+        assert "/fake/other.txt" not in scoped
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_prefetch_mined_set_falls_back_to_full_scan_above_threshold():
+    """A source_files list longer than the scoping threshold must still
+    find a drawer whose path is not even in that list. The fallback to a
+    full unscoped scan must actually run, not just skip the scoped path."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+        _seed_two_source_drawer(col, "/fake/not_in_list.txt", 1_700_000_000.0)
+
+        oversized_list = [f"/fake/other_{i}.txt" for i in range(_PREFETCH_SCOPE_THRESHOLD + 1)]
+        mined = prefetch_mined_set(col, extract_mode="exchange", source_files=oversized_list)
+
+        assert "/fake/not_in_list.txt" in mined
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_prefetch_mined_set_scoped_with_no_candidates_returns_empty_without_error():
+    """An empty source_files list (e.g. a dry run over zero new files) must
+    short-circuit to an empty dict rather than issue a where={"$in": []}
+    query or fall through to a full scan."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+        _seed_two_source_drawer(col, "/fake/a.txt", 1_700_000_000.0)
+
+        mined = prefetch_mined_set(col, extract_mode="exchange", source_files=[])
+        assert mined == {}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_mine_convos_scopes_mined_set_prefetch_to_candidate_files(monkeypatch):
+    """The convo miner must actually pass the candidate file list through to
+    prefetch_mined_set, not just leave the new parameter unused. It must
+    NOT pass source_files to prefetch_content_hashes (the cross-path
+    dedup test coverage), which stays a full unconditional scan."""
+    import mempalace.convo_miner as convo_miner_module
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        convo_path = Path(tmpdir) / "session.txt"
+        convo_path.write_text(
+            "> What is the plan?\nStart with the schema, then the API.\n\n"
+            "> Any risks?\nMigration ordering is the main one.\n"
+        )
+        palace_path = os.path.join(tmpdir, "palace")
+
+        seen = {}
+        real_prefetch_mined_set = convo_miner_module.prefetch_mined_set
+        real_prefetch_content_hashes = convo_miner_module.prefetch_content_hashes
+
+        def _spy_mined_set(collection, extract_mode=None, source_files=None):
+            seen["mined_set_source_files"] = source_files
+            return real_prefetch_mined_set(
+                collection, extract_mode=extract_mode, source_files=source_files
+            )
+
+        def _spy_content_hashes(collection, extract_mode=None):
+            seen["content_hashes_called"] = True
+            return real_prefetch_content_hashes(collection, extract_mode=extract_mode)
+
+        monkeypatch.setattr(convo_miner_module, "prefetch_mined_set", _spy_mined_set)
+        monkeypatch.setattr(convo_miner_module, "prefetch_content_hashes", _spy_content_hashes)
+
+        mine_convos(tmpdir, palace_path, wing="test")
+
+        resolved = str(convo_path.resolve())
+        assert seen["mined_set_source_files"] == [resolved]
+        assert seen["content_hashes_called"] is True
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 

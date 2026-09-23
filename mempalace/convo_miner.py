@@ -1072,14 +1072,21 @@ def _mine_convos_impl(
     # 2000-file sweep used to spend >1h just deciding to skip.
     # prefetch_mined_set() does the same decisions in a single scan; loop
     # body becomes an O(1) dict lookup + a cheap local mtime comparison.
+    candidate_source_files = [str(f) for f in files]
     mined_mtimes: dict = (
-        prefetch_mined_set(collection, extract_mode=extract_mode) if collection is not None else {}
+        prefetch_mined_set(
+            collection, extract_mode=extract_mode, source_files=candidate_source_files
+        )
+        if collection is not None
+        else {}
     )
     # content_hash -> source_file for transcripts already filed. Repeated
     # exports from Claude/ChatGPT commonly land under a new filename each
     # run even when the conversation itself is unchanged, so the
     # source_file-keyed skip above ("mined_mtimes") never recognizes them —
-    # this catches the same conversation reappearing at a new path.
+    # this catches the same conversation reappearing at a new path. Not
+    # scoped to candidate_source_files: see prefetch_content_hashes's
+    # docstring for why that would silently miss bundle rows.
     mined_content_hashes: dict = (
         prefetch_content_hashes(collection, extract_mode=extract_mode)
         if collection is not None

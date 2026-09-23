@@ -445,6 +445,32 @@ TOOLS = {
         },
         "handler": tool_delete_drawer,
     },
+    "mempalace_delete_drawers": {
+        "description": (
+            "Delete many drawers by ID in one call — the bulk form of "
+            "mempalace_delete_drawer. Each ID is removed the same way as the "
+            "singular tool: a logical drawer id removes the whole group, "
+            "including its chunk rows, and a physical chunk id removes that "
+            "one row. Irreversible. A missing ID is an item in `results` and "
+            "is counted in `errors`; the rest of the batch still runs. An "
+            "accepted call (1 to 500 IDs) always returns `results` plus "
+            "`deleted`/`errors` totals, including a one-ID call. An empty "
+            "list, a non-list, or more than 500 IDs is rejected with `error` "
+            "and deletes nothing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "drawer_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "One or more drawer IDs to delete (max 500)",
+                },
+            },
+            "required": ["drawer_ids"],
+        },
+        "handler": tool_delete_drawers,
+    },
     "mempalace_mine": {
         "description": (
             "Mine a directory into the palace — the MCP equivalent of `mempalace mine`. "
@@ -546,6 +572,32 @@ TOOLS = {
             "required": ["drawer_id"],
         },
         "handler": tool_get_drawer,
+    },
+    "mempalace_get_drawers": {
+        "description": (
+            "Fetch many drawers by ID in one call — the bulk form of "
+            "mempalace_get_drawer for a caller that already holds a list of IDs. "
+            "Each ID resolves the same way as the singular tool (a logical id "
+            "reassembles the chunk group; a physical chunk id returns that row) "
+            "and returns the same per-drawer payload. An ID that does not "
+            "resolve is an item in `results` and is counted in `errors`; the "
+            "rest of the batch still returns. An accepted call (1 to 500 IDs) "
+            "always returns `results`, including a one-ID call. An empty list, "
+            "a non-list, or more than 500 IDs is rejected with `error` and "
+            "does not read the palace."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "drawer_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "One or more drawer IDs to fetch (max 500)",
+                },
+            },
+            "required": ["drawer_ids"],
+        },
+        "handler": tool_get_drawers,
     },
     "mempalace_list_drawers": {
         "description": "List drawers with pagination. Optional wing/room filter and since/before date filter on filed_at (since inclusive, before exclusive; drawers without a parseable filed_at are excluded when a date bound is set). Returns IDs, wings, rooms, content previews, and total matching count for pagination.",

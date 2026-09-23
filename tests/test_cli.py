@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from mempalace.palace import MineAlreadyRunning
 from mempalace.cli import (
     cmd_compress,
     cmd_hook,
@@ -2344,3 +2345,129 @@ def test_cmd_repair_rebuild_index_alias_uses_sqlite_archive(mock_config_cls, tmp
         archive_existing_dest=True,
         dry_run=False,
     )
+
+
+class _LockSpy:
+    """Records lock enter/exit around the real context manager machinery."""
+
+    def __init__(self, events):
+        self._events = events
+
+    def __call__(self, palace_path):
+        return self
+
+    def __enter__(self):
+        self._events.append("lock")
+        return None
+
+    def __exit__(self, *exc):
+        self._events.append("unlock")
+        return False
+
+
+def _legacy_repair_palace(tmp_path):
+    """A tiny on-disk palace plus the mock collection the legacy repair reads."""
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    col = MagicMock()
+    col.count.return_value = 2
+    col.get.return_value = {
+        "ids": ["id1", "id2"],
+        "documents": ["doc1", "doc2"],
+        "metadatas": [{"wing": "a"}, {"wing": "b"}],
+    }
+    backend = _mock_backend_for(col=col, new_col=col)
+    backend.create_collection.side_effect = [col, col]
+    return palace_dir, backend
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_holds_the_palace_lock_before_extracting(mock_config_cls, tmp_path):
+    """The legacy repair used to extract every drawer and copy the whole palace
+    backup with no ``mine_palace_lock`` held, so a hook miner starting inside
+    that window made the rebuild abort with ``MineAlreadyRunning`` minutes later
+    and the work was thrown away (#2562). ``rebuild_index`` and
+    ``rebuild_from_sqlite`` both take the lease up front; this pins the same
+    contract on the third entry point."""
+    palace_dir, backend = _legacy_repair_palace(tmp_path)
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=True)
+
+    events = []
+
+    def spy_extract(collection, total, batch_size):
+        events.append("extract")
+        return ["id1", "id2"], ["doc1", "doc2"], [{"wing": "a"}, {"wing": "b"}]
+
+    with (
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=backend),
+        patch("mempalace.palace.mine_palace_lock", _LockSpy(events)),
+        patch("mempalace.repair._extract_drawers", spy_extract),
+    ):
+        cmd_repair(args)
+
+    assert events[:2] == ["lock", "extract"], events
+    assert events[-1] == "unlock", events
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_confirms_after_releasing_the_palace_lock(mock_config_cls, tmp_path):
+    """The confirmation prompt waits on stdin, so it must not hold the lease."""
+    palace_dir, backend = _legacy_repair_palace(tmp_path)
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=False)
+    events = []
+
+    def spy_extract(collection, total, batch_size):
+        events.append("extract")
+        return ["id1", "id2"], ["doc1", "doc2"], [{"wing": "a"}, {"wing": "b"}]
+
+    def spy_confirm(*_args, **_kwargs):
+        events.append("confirm")
+        return True
+
+    with (
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=backend),
+        patch("mempalace.palace.mine_palace_lock", _LockSpy(events)),
+        patch("mempalace.repair._extract_drawers", spy_extract),
+        patch("mempalace.migrate.confirm_destructive_action", spy_confirm),
+    ):
+        cmd_repair(args)
+
+    assert events.index("confirm") > events.index("unlock")
+    assert events[events.index("confirm") + 1] == "lock"
+    assert "extract" in events[events.index("confirm") :]
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_refuses_to_extract_when_the_lock_is_taken(mock_config_cls, tmp_path, capsys):
+    """Contention must be reported before any work, not ten minutes into it."""
+    palace_dir, backend = _legacy_repair_palace(tmp_path)
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=True)
+
+    extracted = []
+
+    def deny(palace_path):
+        raise MineAlreadyRunning("mine pid 4242 holds this palace")
+
+    def spy_extract(collection, total, batch_size):
+        extracted.append("extract")
+        return ["id1", "id2"], ["doc1", "doc2"], [{"wing": "a"}, {"wing": "b"}]
+
+    with (
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=backend),
+        patch("mempalace.palace.mine_palace_lock", deny),
+        patch("mempalace.repair._extract_drawers", spy_extract),
+    ):
+        with pytest.raises(SystemExit) as exit_info:
+            cmd_repair(args)
+
+    assert extracted == []
+    assert exit_info.value.code not in (0, None)
+    out = capsys.readouterr().out
+    assert "4242" in out or "lock" in out.lower()

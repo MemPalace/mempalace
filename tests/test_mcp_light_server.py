@@ -9,6 +9,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+from _mcp_server_helpers import _UNLOADABLE_JSON_KINDS, _unloadable_json_line
+
 from mempalace import mcp_light_server, mcp_server
 from mempalace.palace_graph import invalidate_graph_cache
 
@@ -912,3 +915,29 @@ def test_light_server_applies_the_flags_it_shares_with_the_full_server(monkeypat
     assert mcp_server._READ_ONLY is True
     assert os.environ["MEMPALACE_BACKEND"] == "sqlite_exact"
     assert mcp_server._resolve_kg_path() == str(palace / "knowledge_graph.sqlite3")
+
+
+@pytest.mark.parametrize("kind", _UNLOADABLE_JSON_KINDS)
+def test_a_line_json_loads_rejects_does_not_end_the_light_server(monkeypatch, tmp_path, kind):
+    """json.loads raises RecursionError or ValueError here, not JSONDecodeError,
+    and either one used to end the server; the next request has to be served."""
+    from _mcp_server_helpers import _keep_server_command_line_state
+
+    _keep_server_command_line_state(monkeypatch)
+    for name in (
+        "_maybe_eager_warmup_embedder",
+        "_start_idle_exit_watchdog",
+        "_start_write_stall_watchdog",
+    ):
+        monkeypatch.setattr(mcp_server, name, lambda: None)
+    monkeypatch.setattr(mcp_light_server, "_restore_stdout", lambda: None)
+    lines = [_unloadable_json_line(kind), '{"jsonrpc": "2.0", "id": 2, "method": "ping"}']
+    monkeypatch.setattr(sys, "stdin", io.StringIO("".join(line + "\n" for line in lines)))
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "argv", ["mempalace-light-mcp", "--palace", str(tmp_path / "palace")])
+
+    mcp_light_server.main()
+
+    responses = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+    assert [response.get("id") for response in responses] == [2]

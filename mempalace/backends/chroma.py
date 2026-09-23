@@ -21,7 +21,9 @@ import chromadb
 from chromadb.config import Settings as _ChromaSettings
 from chromadb.errors import NotFoundError as _ChromaNotFoundError
 
-from ..config import connect_sqlite_read
+from ._inproc_sqlite import open_reader as open_palace_reader
+from ._inproc_sqlite import open_writer as open_palace_writer
+from ._inproc_sqlite import palace_db_lock
 from ._magic import has_sqlite_magic
 from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
@@ -848,7 +850,7 @@ def _vector_segment_id(palace_path: str, collection_name: str) -> Optional[str]:
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = connect_sqlite_read(db_path)
+        conn = open_palace_reader(db_path)
         try:
             row = conn.execute(
                 """
@@ -1015,7 +1017,7 @@ def _read_sync_threshold(
         return 1000
 
     try:
-        connection = connect_sqlite_read(db_path)
+        connection = open_palace_reader(db_path)
         try:
             try:
                 row = connection.execute(
@@ -1070,7 +1072,7 @@ def _collection_has_sync_threshold_metadata(
         return False
 
     try:
-        connection = connect_sqlite_read(db_path)
+        connection = open_palace_reader(db_path)
         try:
             try:
                 row = connection.execute(
@@ -1511,7 +1513,7 @@ def _sqlite_embedding_count(palace_path: str, collection_name: str) -> Optional[
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = connect_sqlite_read(db_path)
+        conn = open_palace_reader(db_path)
         try:
             row = conn.execute(
                 """
@@ -1572,7 +1574,7 @@ def _sqlite_wing_room_counts(
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = connect_sqlite_read(db_path)
+        conn = open_palace_reader(db_path)
         try:
             # Wait out a transient writer/checkpoint lock rather than falling
             # straight back to the expensive vector-index path (#1681).
@@ -1629,7 +1631,7 @@ def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Opti
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = connect_sqlite_read(db_path)
+        conn = open_palace_reader(db_path)
         try:
             conn.execute("PRAGMA busy_timeout = 3000")
             if (
@@ -1731,7 +1733,7 @@ def sqlite_list_id_metadata(
     if filters is None:
         return None
     try:
-        conn = connect_sqlite_read(db_path)
+        conn = open_palace_reader(db_path)
         try:
             conn.execute("PRAGMA busy_timeout = 3000")
             if (
@@ -1844,7 +1846,7 @@ def sqlite_documents_for_ids(
     wanted = [str(i) for i in ids]
     docs: dict[str, str] = {}
     try:
-        conn = connect_sqlite_read(db_path)
+        conn = open_palace_reader(db_path)
         try:
             conn.execute("PRAGMA busy_timeout = 3000")
             segments = [
@@ -2113,7 +2115,7 @@ def _fix_blob_seq_ids(palace_path: str) -> None:
     if os.path.isfile(marker):
         return
     try:
-        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+        with contextlib.closing(open_palace_writer(db_path)) as conn:
             try:
                 rows = conn.execute(
                     "SELECT rowid, seq_id FROM embeddings WHERE typeof(seq_id) = 'blob'"
@@ -2169,7 +2171,7 @@ def _fix_missing_collection_type(palace_path: str) -> None:
     marker = os.path.join(palace_path, _COLLECTION_TYPE_MARKER)
     if os.path.isfile(marker):
         return
-    conn = sqlite3.connect(db_path)
+    conn = open_palace_writer(db_path)
     try:
         try:
             rows = conn.execute("SELECT id, config_json_str FROM collections").fetchall()
@@ -2317,7 +2319,12 @@ class ChromaCollection(BaseCollection):
         # Late import — palace.py imports ChromaBackend from this module.
         from ..palace import mine_palace_lock
 
-        with mine_palace_lock(self._palace_path):
+        # palace_db_lock keeps this process's Python sqlite3 readers out of the
+        # write: fcntl locks never conflict within one process (#2302).
+        with (
+            mine_palace_lock(self._palace_path),
+            palace_db_lock(os.path.join(self._palace_path, "chroma.sqlite3")),
+        ):
             try:
                 yield
             finally:
@@ -2686,7 +2693,7 @@ class ChromaCollection(BaseCollection):
         # rowid, embedding_id is the user-facing drawer id.
         public_ids: dict[int, str] = {}
         try:
-            conn = connect_sqlite_read(db_path)
+            conn = open_palace_reader(db_path)
             conn.row_factory = sqlite3.Row
         except sqlite3.Error:
             logger.debug("Chroma lexical sqlite open failed", exc_info=True)
@@ -3027,6 +3034,15 @@ class ChromaBackend(BaseBackend):
             _close_client(client)
 
     def _client(self, palace_path: str):
+        """Return a cached ``PersistentClient`` (see :meth:`_client_locked`).
+
+        Opening, closing and replacing the client all write to
+        ``chroma.sqlite3``, so they run under :func:`palace_db_lock` (#2302).
+        """
+        with palace_db_lock(os.path.join(palace_path, "chroma.sqlite3")):
+            return self._client_locked(palace_path)
+
+    def _client_locked(self, palace_path: str):
         """Return a cached ``PersistentClient``, rebuilding on inode/mtime change.
 
         Handles the palace-rebuild case (repair/nuke/purge) by invalidating the
@@ -3204,8 +3220,9 @@ class ChromaBackend(BaseBackend):
         Quarantines HNSW segments on first open and after any detected
         disk change. See :attr:`_quarantined_paths` for the gate logic.
         """
-        ChromaBackend._prepare_palace_for_open(palace_path)
-        return chromadb.PersistentClient(path=palace_path, settings=_CLIENT_SETTINGS)
+        with palace_db_lock(os.path.join(palace_path, "chroma.sqlite3")):
+            ChromaBackend._prepare_palace_for_open(palace_path)
+            return chromadb.PersistentClient(path=palace_path, settings=_CLIENT_SETTINGS)
 
     @staticmethod
     def backend_version() -> str:
@@ -3248,62 +3265,64 @@ class ChromaBackend(BaseBackend):
             except (OSError, NotImplementedError):
                 pass
 
-        client = self._client(palace_path)
+        # Collection opens and creates write to chroma.sqlite3 (#2302).
+        with palace_db_lock(os.path.join(palace_path, "chroma.sqlite3")):
+            client = self._client(palace_path)
 
-        if caller_vectors:
-            # Passing None explicitly prevents Chroma's client default EF.
-            ef_kwargs = {
-                "embedding_function": None,
-            }
-        else:
-            ef = self._resolve_embedding_function()
-            ef_kwargs = (
-                {
-                    "embedding_function": ef,
+            if caller_vectors:
+                # Passing None explicitly prevents Chroma's client default EF.
+                ef_kwargs = {
+                    "embedding_function": None,
                 }
-                if ef is not None
-                else {}
-            )
+            else:
+                ef = self._resolve_embedding_function()
+                ef_kwargs = (
+                    {
+                        "embedding_function": ef,
+                    }
+                    if ef is not None
+                    else {}
+                )
 
-        if create:
-            try:
-                collection = client.get_collection(collection_name, **ef_kwargs)
-            except _ChromaNotFoundError:
-                if caller_vectors:
-                    collection = client.create_collection(
-                        collection_name,
-                        schema=_caller_vector_schema(options),
-                        embedding_function=None,
-                    )
-                else:
-                    collection = client.create_collection(
-                        collection_name,
-                        metadata=_hnsw_creation_metadata(options),
-                        **ef_kwargs,
-                    )
-            except ValueError as e:
-                explanation = self._explain_ef_mismatch(e, palace_path)
-                if explanation:
-                    raise ValueError(explanation) from e
-                raise
-        else:
-            try:
-                collection = client.get_collection(collection_name, **ef_kwargs)
-            except _ChromaNotFoundError as e:
-                raise CollectionNotInitializedError(palace_path) from e
-            except ValueError as e:
-                explanation = self._explain_ef_mismatch(e, palace_path)
-                if explanation:
-                    raise ValueError(explanation) from e
-                raise
-        if caller_vectors:
-            _require_caller_vector_collection(collection)
-        else:
-            _pin_hnsw_threads(collection)
-        # Our own client construction and collection open just wrote to
-        # chroma.sqlite3; re-baseline so the next _client() call does not read
-        # that as an external change and rebuild the client.
-        self._restamp(palace_path)
+            if create:
+                try:
+                    collection = client.get_collection(collection_name, **ef_kwargs)
+                except _ChromaNotFoundError:
+                    if caller_vectors:
+                        collection = client.create_collection(
+                            collection_name,
+                            schema=_caller_vector_schema(options),
+                            embedding_function=None,
+                        )
+                    else:
+                        collection = client.create_collection(
+                            collection_name,
+                            metadata=_hnsw_creation_metadata(options),
+                            **ef_kwargs,
+                        )
+                except ValueError as e:
+                    explanation = self._explain_ef_mismatch(e, palace_path)
+                    if explanation:
+                        raise ValueError(explanation) from e
+                    raise
+            else:
+                try:
+                    collection = client.get_collection(collection_name, **ef_kwargs)
+                except _ChromaNotFoundError as e:
+                    raise CollectionNotInitializedError(palace_path) from e
+                except ValueError as e:
+                    explanation = self._explain_ef_mismatch(e, palace_path)
+                    if explanation:
+                        raise ValueError(explanation) from e
+                    raise
+            if caller_vectors:
+                _require_caller_vector_collection(collection)
+            else:
+                _pin_hnsw_threads(collection)
+            # Our own client construction and collection open just wrote to
+            # chroma.sqlite3; re-baseline so the next _client() call does not read
+            # that as an external change and rebuild the client.
+            self._restamp(palace_path)
         wrapped = ChromaCollection(
             collection,
             palace_path=palace_path,
@@ -3323,8 +3342,9 @@ class ChromaBackend(BaseBackend):
         path = palace.local_path if isinstance(palace, PalaceRef) else palace
         if path is None:
             return
-        _close_client(self._clients.pop(path, None))
-        self._freshness.pop(path, None)
+        with palace_db_lock(os.path.join(path, "chroma.sqlite3")):
+            _close_client(self._clients.pop(path, None))
+            self._freshness.pop(path, None)
 
     def close(self) -> None:
         self._drain_clients()
@@ -3366,8 +3386,9 @@ class ChromaBackend(BaseBackend):
 
     def delete_collection(self, palace_path: str, collection_name: str) -> None:
         """Delete ``collection_name`` from the palace at ``palace_path``."""
-        self._client(palace_path).delete_collection(collection_name)
-        self._restamp(palace_path)
+        with palace_db_lock(os.path.join(palace_path, "chroma.sqlite3")):
+            self._client(palace_path).delete_collection(collection_name)
+            self._restamp(palace_path)
 
     def create_collection(
         self, palace_path: str, collection_name: str, hnsw_space: str = "cosine"
@@ -3375,12 +3396,13 @@ class ChromaBackend(BaseBackend):
         """Create (not get-or-create) ``collection_name`` with the given HNSW space."""
         ef = self._resolve_embedding_function()
         ef_kwargs = {"embedding_function": ef} if ef is not None else {}
-        collection = self._client(palace_path).create_collection(
-            collection_name,
-            metadata=_hnsw_creation_metadata({"hnsw_space": hnsw_space}),
-            **ef_kwargs,
-        )
-        self._restamp(palace_path)
+        with palace_db_lock(os.path.join(palace_path, "chroma.sqlite3")):
+            collection = self._client(palace_path).create_collection(
+                collection_name,
+                metadata=_hnsw_creation_metadata({"hnsw_space": hnsw_space}),
+                **ef_kwargs,
+            )
+            self._restamp(palace_path)
         return ChromaCollection(collection, palace_path=palace_path, backend=self)
 
 

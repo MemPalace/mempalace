@@ -87,7 +87,7 @@ class TestRenderSharedBrainRules:
         assert "<PROJECT>" not in rendered
         assert "windows:grok:<project>" in rendered
         assert "windows:grok:mempalace" in rendered
-        # The default names the 45-tool server the plugins and skills register.
+        # The default names the full mempalace-mcp server the plugins and skills register.
         assert "mempalace_event_list" in rendered
         assert "palace_coordinate EVENT LIST" not in rendered
 

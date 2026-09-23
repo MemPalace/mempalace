@@ -13,6 +13,7 @@ commands do not cold-load a private copy of a large HNSW index per process.
 
 import argparse
 import builtins
+import http.client
 import json
 import os
 import threading
@@ -949,6 +950,60 @@ class TestStdioProxy:
         assert local_calls == [], "a mutating call must never be replayed locally"
         assert response["error"]["code"] == -32000
         assert "hub" in response["error"]["message"]
+
+    @pytest.mark.parametrize(
+        "error",
+        [http.client.IncompleteRead(b'{"jsonrpc": '), http.client.BadStatusLine("x")],
+        ids=["answer-cut-off", "bad-status-line"],
+    )
+    def test_hub_answer_that_broke_off_is_a_failed_hub_call(
+        self, proxied_palace, fake_hub, monkeypatch, error
+    ):
+        """The hub got both calls: the write is not replayed, the read is served here."""
+        from mempalace import mcp_server
+
+        local_calls = self._local_sentinel(monkeypatch)
+        _register_hub(proxied_palace, fake_hub)
+        self._disown_record(proxied_palace)
+
+        def broken_off(*a):
+            raise error
+
+        monkeypatch.setattr(mcp_server, "_forward_request_to_hub", broken_off)
+        write = {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {"name": "mempalace_add_drawer", "arguments": {"content": "x"}},
+        }
+        read = {"jsonrpc": "2.0", "id": 3, "method": "tools/list"}
+
+        assert mcp_server._dispatch_stdio_request(write)["error"]["code"] == -32000
+        assert local_calls == [], "a mutating call must never be replayed locally"
+        assert mcp_server._dispatch_stdio_request(read)["result"] == "local"
+        assert local_calls == [read]
+
+    @pytest.mark.parametrize("tool", ["mempalace_memories_filed_away", "mempalace_hook_settings"])
+    def test_a_call_that_changes_state_outside_the_palace_is_not_replayed(
+        self, proxied_palace, monkeypatch, tool
+    ):
+        """memories_filed_away consumes the hook checkpoint, hook_settings writes
+        config.json: once the hub may have run either, a local rerun is wrong."""
+        from mempalace import mcp_server
+
+        local_calls = self._local_sentinel(monkeypatch)
+        self._register_dead_hub(proxied_palace)
+        request = {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {"name": tool, "arguments": {}},
+        }
+
+        response = mcp_server._dispatch_stdio_request(request)
+
+        assert local_calls == [], "a call that changes state was replayed locally"
+        assert response["error"]["code"] == -32000
 
     def test_unreachable_hub_notification_returns_none(self, proxied_palace, monkeypatch):
         from mempalace import mcp_server
