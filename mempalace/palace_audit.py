@@ -42,7 +42,7 @@ from .hallways import (
     is_generic_entity,
     is_self_link,
     list_hallways,
-    same_association,
+    association_groups,
 )
 from .palace_graph import _load_tunnels
 from .tunnels_tool import LinkIndex, tunnel_endpoints
@@ -487,41 +487,36 @@ def _analyze_tunnels(
 HALLWAY_TOP_N = 100
 
 
-def _spelling_group(h: dict) -> tuple:
-    a, b = str(h.get("entity_a")), str(h.get("entity_b"))
-    return (str(h.get("wing") or ""), *sorted((entity_spelling_key(a), entity_spelling_key(b))))
-
-
 def _analyze_hallways(hallways: list[dict]) -> dict:
     """Self-links and spelling-variant duplicates, overall and among the strongest.
 
     Both come from pairing raw entity spellings at mine time. A duplicate is
-    any record beyond the first in a ``(wing, key_a, key_b)`` group, so a
-    real association counted under four spellings scores three artifacts.
+    any record beyond the strongest in one :func:`association_groups` group,
+    so a real association counted under four spellings scores three
+    artifacts, and two files that merely share a basename score none.
     """
     records = [h for h in hallways if isinstance(h, dict)]
     total = len(hallways)
-    self_links = 0
-    seen: dict[tuple, list[dict]] = {}
-    duplicates = 0
+
+    def strength(h: dict) -> int:
+        return -int(h.get("co_occurrence_count") or 0)
+
     artifacts: set = set()
-    sample = []
-    for h in sorted(records, key=lambda h: -int(h.get("co_occurrence_count") or 0)):
-        if is_self_link(h):
-            self_links += 1
-            artifacts.add(id(h))
-        else:
-            # The basename group only narrows the search; two files that
-            # share a basename are two associations, exactly as the prune
-            # decides, so the audit never flags what the prune would keep.
-            bucket = seen.setdefault(_spelling_group(h), [])
-            if any(same_association(h, prior) for prior in bucket):
-                duplicates += 1
-                artifacts.add(id(h))
-            else:
-                bucket.append(h)
-        if id(h) in artifacts and len(sample) < _SAMPLE_LIMIT:
-            sample.append(f"{h.get('entity_a')} ↔ {h.get('entity_b')}")
+    self_link_records = [h for h in records if is_self_link(h)]
+    artifacts.update(id(h) for h in self_link_records)
+    # The prune's own grouping: every record past the strongest in a group
+    # is a duplicate, and nothing else is.
+    duplicates = 0
+    for group in association_groups([h for h in records if not is_self_link(h)]):
+        group.sort(key=strength)
+        duplicates += len(group) - 1
+        artifacts.update(id(h) for h in group[1:])
+    self_links = len(self_link_records)
+    sample = [
+        f"{h.get('entity_a')} ↔ {h.get('entity_b')}"
+        for h in sorted(records, key=strength)
+        if id(h) in artifacts
+    ][:_SAMPLE_LIMIT]
     top = sorted(records, key=lambda h: -int(h.get("co_occurrence_count") or 0))[:HALLWAY_TOP_N]
     top_artifacts = sum(1 for h in top if id(h) in artifacts)
     return {

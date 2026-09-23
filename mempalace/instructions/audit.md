@@ -194,7 +194,8 @@ Run `mempalace wings split --wing <wing>`, show the plan's targets (edit
 derived names in the JSON with the user: strip organisation prefixes, send
 home-directory sessions to a machine wing), then `--yes`. Applying needs the
 palace lock, so the MCP server must be stopped for the seconds it takes.
-Afterwards run `mempalace hallways --rebuild`.
+Afterwards, while the server is still stopped, run `mempalace hallways
+--rebuild`: it needs the palace lock too, because it scans drawers.
 
 Then ask per flat wing (`rooms.flat_wings`, largest first):
 

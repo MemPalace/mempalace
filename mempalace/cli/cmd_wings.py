@@ -71,12 +71,10 @@ def cmd_wings(args):
         print(f"  Plan at {split_plan_path(config, wing)} is invalid: {exc}")
         sys.exit(1)
     report(plan)
-    from ..palace import mine_palace_lock
-
     from ..backends import CollectionNotInitializedError
     from ..palace import get_closets_collection
 
-    with mine_palace_lock(palace_path):
+    with _repair_lock(palace_path):
         col = get_collection(palace_path, create=False)
         # Only a closet collection that was never created means "no closets".
         # Any other failure to open it must stop the command with its

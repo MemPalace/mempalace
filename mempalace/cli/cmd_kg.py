@@ -13,7 +13,6 @@ def cmd_kg(args):
         save_normalize_plan,
     )
     from ..knowledge_graph import KnowledgeGraph
-    from ..palace import mine_palace_lock
     from ..palace_audit import resolve_kg_path
 
     action = getattr(args, "kg_action", None)
@@ -67,7 +66,7 @@ def cmd_kg(args):
     # The same cross-process writer lock the other repair commands hold: the
     # graph's own lock is process-local, and a running hub or another CLI
     # must not interleave fact writes with the rewrites.
-    with mine_palace_lock(config.palace_path):
+    with _repair_lock(config.palace_path):
         result = apply_normalize(kg, plan)
     print(
         f"  Rewrote {result['applied']} fact(s) at {result['boundary']}; "

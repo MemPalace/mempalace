@@ -145,9 +145,9 @@ def cmd_rooms(args):
         return
 
     from ..backends import CollectionNotInitializedError
-    from ..palace import get_closets_collection, mine_palace_lock
+    from ..palace import get_closets_collection
 
-    with mine_palace_lock(palace_path):
+    with _repair_lock(palace_path):
         plan = plan_rooms(col, wing, decider, threshold=threshold, from_rooms=from_rooms)
         report(plan)
         pending = load_pending_apply(config, wing)

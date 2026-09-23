@@ -1,5 +1,6 @@
 """Tests for the `hallways` CLI command."""
 
+import pytest
 from argparse import Namespace
 
 import mempalace.hallways as hallways_mod
@@ -112,9 +113,43 @@ def test_rebuild_recomputes_every_wing(monkeypatch, capsys):
             calls.append(wing) or [{"id": 1}] * (2 if wing == "a" else 1)
         ),
     )
+    import contextlib
+
+    locked = []
+
+    @contextlib.contextmanager
+    def fake_lock(path):
+        locked.append(path)
+        calls.append("<lock>")
+        yield
+
+    monkeypatch.setattr("mempalace.palace.mine_palace_lock", fake_lock)
     cmd_hallways(Namespace(wing=None, limit=50, rebuild=True, palace="/p"))
     out = capsys.readouterr().out
+    # Scan and replace run under the palace writer lock, serialized with mines.
+    assert locked == ["/p"] and calls[0] == "<lock>"
+    calls.remove("<lock>")
     assert calls == ["a", "b"]
     assert "Rebuilt 3 hallways across 2 wing(s)." in out
     cmd_hallways(Namespace(wing="a", limit=50, rebuild=True, palace="/p"))
     assert calls[-1] == "a"
+
+
+def test_rebuild_refuses_cleanly_when_the_palace_is_held(monkeypatch, capsys):
+    import contextlib
+
+    from mempalace.palace import MineAlreadyRunning
+
+    monkeypatch.setattr("mempalace.palace.get_collection", lambda *a, **k: object())
+
+    @contextlib.contextmanager
+    def held(path):
+        raise MineAlreadyRunning(f"palace {path} is held by PID 42 (hub)")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr("mempalace.palace.mine_palace_lock", held)
+    with pytest.raises(SystemExit) as exc:
+        cmd_hallways(Namespace(wing="a", limit=50, rebuild=True, palace="/p"))
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "held by PID 42" in err and "Traceback" not in err

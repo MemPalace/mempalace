@@ -854,3 +854,45 @@ class TestDiffAliasesAndEmptyRebuilds:
         (survivor,) = hallways_mod.list_hallways()
         assert {survivor["entity_a"], survivor["entity_b"]} == {"repo/src/user.py", "tests/user.py"}
         assert not hallways_mod.is_self_link(survivor)
+
+
+class TestAmbiguousRecordsNeverBridgeFiles:
+    RECORDS = [
+        # The ambiguous bare record comes first and is strongest, so a greedy
+        # pairwise grouping would have pulled both files into its group.
+        {
+            "id": "0",
+            "wing": "w",
+            "entity_a": "user.py",
+            "entity_b": "Account",
+            "co_occurrence_count": 50,
+        },
+        {
+            "id": "1",
+            "wing": "w",
+            "entity_a": "src/user.py",
+            "entity_b": "Account",
+            "co_occurrence_count": 9,
+        },
+        {
+            "id": "2",
+            "wing": "w",
+            "entity_a": "tests/user.py",
+            "entity_b": "Account",
+            "co_occurrence_count": 5,
+        },
+    ]
+
+    def test_prune_keeps_both_files_associations(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        hallways_mod._save_hallways([dict(r) for r in self.RECORDS])
+        report = hallways_mod.prune_spelling_hallways(apply=True)
+        assert report["removed"] == 0
+        left = {(h["entity_a"], h["entity_b"]) for h in hallways_mod.list_hallways()}
+        assert ("src/user.py", "Account") in left and ("tests/user.py", "Account") in left
+
+    def test_audit_agrees_with_the_prune(self):
+        from mempalace.palace_audit import _analyze_hallways
+
+        out = _analyze_hallways([dict(r) for r in self.RECORDS])
+        assert (out["self_links"], out["duplicates"]) == (0, 0)

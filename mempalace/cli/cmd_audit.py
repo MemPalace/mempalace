@@ -40,3 +40,23 @@ def cmd_audit(args):
     overall = report["scores"]["overall"]
     if threshold is not None and overall is not None and overall < threshold:
         sys.exit(2)
+
+
+@contextlib.contextmanager
+def _repair_lock(palace_path):
+    """The palace writer lock for a repair command, refused cleanly.
+
+    ``rooms apply``, ``wings split``, ``kg normalize`` and ``hallways
+    --rebuild`` write while holding ``mine_palace_lock``. When a mine or a
+    running MCP hub already holds it, say who holds it on one line and exit
+    1, the way ``mempalace mine`` does, instead of raising a traceback.
+    """
+    from ..palace import MineAlreadyRunning, mine_palace_lock
+
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(mine_palace_lock(palace_path))
+        except MineAlreadyRunning as exc:
+            print(f"mempalace: {exc}", file=sys.stderr)
+            sys.exit(1)
+        yield

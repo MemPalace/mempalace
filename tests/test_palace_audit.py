@@ -636,27 +636,17 @@ def test_analyze_hallways_does_not_count_same_named_files_as_duplicates():
     """The audit and --prune-spellings agree: two files are two associations."""
     from mempalace.palace_audit import _analyze_hallways
 
+    def rec(a, b, n):
+        return {"wing": "w", "entity_a": a, "entity_b": b, "co_occurrence_count": n}
+
     hallways = [
-        {
-            "wing": "w",
-            "entity_a": "src/models/user.py",
-            "entity_b": "Account",
-            "co_occurrence_count": 9,
-        },
-        {
-            "wing": "w",
-            "entity_a": "tests/models/user.py",
-            "entity_b": "Account",
-            "co_occurrence_count": 5,
-        },
-        # A real spelling variant of the first association.
-        {
-            "wing": "w",
-            "entity_a": "models/user.py",
-            "entity_b": "Account.py",
-            "co_occurrence_count": 3,
-        },
+        rec("src/models/user.py", "Account", 9),
+        rec("tests/models/user.py", "Account", 5),
+        # A real spelling variant: only src/models/user.py can be this file.
+        rec("repo/src/models/user.py", "Account.py", 3),
+        # Ambiguous: could be either file, so it duplicates neither.
+        rec("models/user.py", "Account", 2),
     ]
     out = _analyze_hallways(hallways)
     assert out["duplicates"] == 1
-    assert out["artifact_sample"] == ["models/user.py ↔ Account.py"]
+    assert out["artifact_sample"] == ["repo/src/models/user.py ↔ Account.py"]

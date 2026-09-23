@@ -377,21 +377,6 @@ def canonical_spelling(cluster: list[str]) -> str:
     )
 
 
-def same_association(h1: dict, h2: dict) -> bool:
-    """True when two hallway records join the same two entities.
-
-    Either orientation counts (``a ↔ b`` and ``b.py ↔ a``), and each endpoint
-    is compared with :func:`same_file_spelling`, so two files that only share
-    a basename are two associations. Shared by ``--prune-spellings`` and the
-    audit so the audit never recommends a cleanup that removes nothing.
-    """
-    a, b = str(h1.get("entity_a")), str(h1.get("entity_b"))
-    ra, rb = str(h2.get("entity_a")), str(h2.get("entity_b"))
-    return (same_file_spelling(a, ra) and same_file_spelling(b, rb)) or (
-        same_file_spelling(a, rb) and same_file_spelling(b, ra)
-    )
-
-
 def _spelling_clusters(entities: list[str]) -> list[list[str]]:
     """Group spellings of one basename into the distinct files they name.
 
@@ -402,7 +387,7 @@ def _spelling_clusters(entities: list[str]) -> list[list[str]]:
     ``tests/models/user.py``) and is left out of every cluster: attributing
     it to either file would be a guess, and keeping it as an entity of its
     own would pair it with the very files it might be, which
-    :func:`is_self_link` and :func:`same_association` then rightly call
+    :func:`is_self_link` and :func:`association_groups` then rightly call
     artifacts. Callers skip spellings that appear in no cluster.
     """
     # ``a/x`` beside ``b/x`` is one file seen through a diff: bucket both
@@ -777,19 +762,45 @@ def prune_spelling_hallways(config=None, apply: bool = False) -> dict:
         return _prune_spelling_hallways_locked(config, apply)
 
 
-def _split_by_file(members: list[dict]) -> list[list[dict]]:
-    """Split one basename group into the distinct file pairs it holds."""
-    if len(members) == 1:
-        return [members]
-    buckets: list[list[dict]] = []
-    for h in members:
-        for bucket in buckets:
-            if same_association(h, bucket[0]):
-                bucket.append(h)
-                break
-        else:
-            buckets.append([h])
-    return buckets
+def association_groups(records: list[dict]) -> list[list[dict]]:
+    """Group hallway records that are one association, per wing.
+
+    Each endpoint is mapped to the file it names using the wing's own
+    spellings (:func:`_spelling_clusters`), so two files that share a
+    basename are two entities, and a bare name that could be either of them
+    belongs to no file. A record with such an ambiguous endpoint is a group
+    of its own: comparing it pairwise let it match both files and bridge
+    their records into one group, and the prune then deleted a real
+    association. Self-links are expected to be filtered out first.
+
+    Shared by ``--prune-spellings`` and ``mempalace audit`` so the audit never
+    reports a duplicate the prune would keep.
+    """
+    by_wing: dict[str, list[dict]] = defaultdict(list)
+    for h in records:
+        if isinstance(h, dict):
+            by_wing[str(h.get("wing") or "")].append(h)
+    groups: list[list[dict]] = []
+    for members in by_wing.values():
+        spellings: dict[str, set[str]] = defaultdict(set)
+        for h in members:
+            for e in (str(h.get("entity_a")), str(h.get("entity_b"))):
+                spellings[entity_spelling_key(e)].add(e)
+        cluster_of: dict[str, tuple] = {}
+        for key, names in spellings.items():
+            for i, cluster in enumerate(_spelling_clusters(sorted(names))):
+                for e in cluster:
+                    cluster_of[e] = (key, i)
+        buckets: dict[tuple, list[dict]] = {}
+        for h in members:
+            ca = cluster_of.get(str(h.get("entity_a")))
+            cb = cluster_of.get(str(h.get("entity_b")))
+            if ca is None or cb is None:
+                groups.append([h])
+                continue
+            buckets.setdefault(tuple(sorted((ca, cb))), []).append(h)
+        groups.extend(buckets.values())
+    return groups
 
 
 def _merge_variant_group(members: list[dict], kept: list[dict], duplicates: list[dict]) -> None:
@@ -827,21 +838,11 @@ def _merge_variant_group(members: list[dict], kept: list[dict], duplicates: list
 def _prune_spelling_hallways_locked(config, apply: bool) -> dict:
     hallways = _load_hallways(config)
     self_links = [h for h in hallways if is_self_link(h)]
-    groups: dict[tuple, list[dict]] = {}
-    for h in hallways:
-        if not isinstance(h, dict) or is_self_link(h):
-            continue
-        a, b = str(h.get("entity_a")), str(h.get("entity_b"))
-        # The basename key groups candidates; members are split below into the
-        # distinct files they actually name, so two same-named files in
-        # different directories keep their own hallways.
-        key = (str(h.get("wing") or ""), *sorted((entity_spelling_key(a), entity_spelling_key(b))))
-        groups.setdefault(key, []).append(h)
+    candidates = [h for h in hallways if isinstance(h, dict) and not is_self_link(h)]
     duplicates: list[dict] = []
     kept: list[dict] = []
-    for candidates in groups.values():
-        for members in _split_by_file(candidates):
-            _merge_variant_group(members, kept, duplicates)
+    for members in association_groups(candidates):
+        _merge_variant_group(members, kept, duplicates)
 
     by_wing: dict[str, int] = {}
     for h in self_links + duplicates:

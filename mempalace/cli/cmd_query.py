@@ -113,11 +113,16 @@ def cmd_hallways(args):
                 print("  --rebuild without --wing needs a sqlite-readable palace.")
                 sys.exit(1)
             wings = sorted({str(r[1]) for r in rows if r[1]})
+        # Scan and replace under the palace writer lock, like the other repair
+        # commands: the hallway-file lock alone lets a mine add drawers and
+        # save a newer snapshot between this scan and its save, which would
+        # then be overwritten with stale results.
         total = 0
-        for w in wings:
-            created = compute_hallways_for_wing(w, col=col, config=config)
-            total += len(created)
-            print(f"  {w:<36} {len(created):>7} hallways")
+        with _repair_lock(palace_path):
+            for w in wings:
+                created = compute_hallways_for_wing(w, col=col, config=config)
+                total += len(created)
+                print(f"  {w:<36} {len(created):>7} hallways")
         print(f"  Rebuilt {total} hallways across {len(wings)} wing(s).")
         return
     if getattr(args, "prune_spellings", False):
