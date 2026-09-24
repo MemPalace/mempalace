@@ -2284,6 +2284,26 @@ def _close_client(client) -> None:
         logger.debug("client.close() unavailable or failed", exc_info=True)
 
 
+# The ``chroma.sqlite3`` stat that this process's own client opens and writes
+# last left each palace at, keyed by the exact path string the client was built
+# with. ChromaBackend and the MCP server's session client both record here.
+# Chroma keys its System (and the live HNSW segment) by that same string, so a
+# write through one of them is already in the memory the other reads. Without
+# the shared record each read the other's footprint as an external change, and
+# a server alternating search with other tools rebuilt a client, reloading the
+# whole index, on every switch.
+_OWN_DB_STAMPS: dict[str, tuple[int, float]] = {}
+
+
+def _note_own_db_stamp(palace_path: str, stamp: tuple) -> None:
+    if stamp != (0, 0.0):
+        _OWN_DB_STAMPS[palace_path] = stamp
+
+
+def _is_own_db_stamp(palace_path: str, stamp: tuple) -> bool:
+    return stamp != (0, 0.0) and _OWN_DB_STAMPS.get(palace_path) == stamp
+
+
 def _clear_chroma_system_cache() -> None:
     """Drop Chroma's process-global ``SharedSystemClient`` cache.
 
@@ -3130,6 +3150,16 @@ class ChromaBackend(BaseBackend):
             and cached_mtime != 0.0
             and abs(current_mtime - cached_mtime) > 0.01
         )
+        if (
+            cached is not None
+            and mtime_changed
+            and not inode_changed
+            and _is_own_db_stamp(palace_path, (current_inode, current_mtime))
+        ):
+            # Written by another client in this process for the same path,
+            # which shares our Chroma System: nothing to reload.
+            self._freshness[palace_path] = (current_inode, current_mtime)
+            mtime_changed = False
 
         if cached is None or inode_changed or mtime_changed or mtime_appeared:
             # Drop the per-process quarantine gate so the HNSW pre-checks
@@ -3162,6 +3192,7 @@ class ChromaBackend(BaseBackend):
             # chroma.sqlite3 lazily, so the stat captured before the call
             # may still be (0, 0.0) on first open.
             self._freshness[palace_path] = self._db_stat(palace_path)
+            _note_own_db_stamp(palace_path, self._freshness[palace_path])
         return cached
 
     def _restamp(self, palace_path: str) -> None:
@@ -3197,6 +3228,7 @@ class ChromaBackend(BaseBackend):
         """
         if palace_path in self._freshness:
             self._freshness[palace_path] = self._db_stat(palace_path)
+            _note_own_db_stamp(palace_path, self._freshness[palace_path])
 
     # ------------------------------------------------------------------
     # Public static helpers (legacy; prefer :meth:`get_collection`)

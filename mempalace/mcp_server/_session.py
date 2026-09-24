@@ -3,6 +3,44 @@ if __name__ != "mempalace.mcp_server":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.mcp_server")
 
 
+def _stat_palace_db() -> tuple:
+    """Return ``(st_ino, st_mtime)`` of the palace's chroma.sqlite3, or ``(0, 0.0)``."""
+    try:
+        st = os.stat(os.path.join(_config.palace_path, "chroma.sqlite3"))
+    except OSError:
+        return 0, 0.0
+    return st.st_ino, st.st_mtime
+
+
+def _restamp_palace_db() -> None:
+    """Re-baseline the freshness stat after this session's own writes.
+
+    Building the client, opening the collection, and every write move
+    chroma.sqlite3's mtime. ``_get_client`` compares against the stat taken
+    before those writes, so it read the session's own footprint as an external
+    change and rebuilt the client, reloading the whole HNSW index, on nearly
+    every call. Same fix as ``ChromaBackend._restamp`` (#2307): record the
+    stat after our own writes, so a later difference is someone else's. A
+    write from another process that lands during our own operation is absorbed
+    the same way there and picked up on the next change.
+    """
+    global _palace_db_inode, _palace_db_mtime
+    if _client_cache is None:
+        return
+    _palace_db_inode, _palace_db_mtime = _stat_palace_db()
+    _note_own_db_stamp(_config.palace_path, (_palace_db_inode, _palace_db_mtime))
+
+
+class _SessionFreshness:
+    """Stands in for ``ChromaCollection``'s owning backend so the session's own
+    writes re-baseline its freshness stat (see :func:`_restamp_palace_db`)."""
+
+    @staticmethod
+    def _restamp(palace_path: str) -> None:
+        if palace_path == _config.palace_path:
+            _restamp_palace_db()
+
+
 def _get_client():
     """Return a ChromaDB PersistentClient, reconnecting if the database changed on disk.
 
@@ -52,6 +90,16 @@ def _get_client():
 
     inode_changed = current_inode != 0 and current_inode != _palace_db_inode
     mtime_changed = current_mtime != 0.0 and abs(current_mtime - _palace_db_mtime) > 0.01
+    if (
+        _client_cache is not None
+        and mtime_changed
+        and not inode_changed
+        and _is_own_db_stamp(_config.palace_path, (current_inode, current_mtime))
+    ):
+        # Written by ChromaBackend in this process for the same path, which
+        # shares our Chroma System: nothing to reload (see _OWN_DB_STAMPS).
+        _palace_db_mtime = current_mtime
+        mtime_changed = False
 
     if _client_cache is None or inode_changed or mtime_changed:
         # Run the HNSW capacity probe BEFORE chromadb opens the segment --
@@ -74,8 +122,9 @@ def _get_client():
         _collection_cache_palace = None
         _collection_open_error = None
         _invalidate_overview_caches()
-        _palace_db_inode = current_inode
-        _palace_db_mtime = current_mtime
+        # Stat again: constructing the client just wrote to chroma.sqlite3.
+        _palace_db_inode, _palace_db_mtime = _stat_palace_db()
+        _note_own_db_stamp(_config.palace_path, (_palace_db_inode, _palace_db_mtime))
     return _client_cache
 
 
@@ -258,7 +307,10 @@ def _get_collection(create=False):
                         **ef_kwargs,
                     )
                 _pin_hnsw_threads(raw)
-                _collection_cache = ChromaCollection(raw, palace_path=_config.palace_path)
+                _collection_cache = ChromaCollection(
+                    raw, palace_path=_config.palace_path, backend=_SessionFreshness
+                )
+                _restamp_palace_db()
                 _collection_cache_backend = "chroma"
                 _collection_cache_palace = _config.palace_path
                 _collection_open_error = None
@@ -268,7 +320,10 @@ def _get_collection(create=False):
                 ef_kwargs = {"embedding_function": ef} if ef is not None else {}
                 raw = client.get_collection(_config.collection_name, **ef_kwargs)
                 _pin_hnsw_threads(raw)
-                _collection_cache = ChromaCollection(raw, palace_path=_config.palace_path)
+                _collection_cache = ChromaCollection(
+                    raw, palace_path=_config.palace_path, backend=_SessionFreshness
+                )
+                _restamp_palace_db()
                 _collection_cache_backend = "chroma"
                 _collection_cache_palace = _config.palace_path
                 _collection_open_error = None
