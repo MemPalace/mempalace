@@ -270,6 +270,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `count()`, which on a fresh Chroma client loads the whole HNSW segment while
   holding the GIL and stalls every thread in the process. It ran on every
   CLI search the hub forwarded. It now reads one row from `chroma.sqlite3`.
+- **Mining no longer rescans the whole palace with quadratic paging.** Every
+  conversation mine, a hook's one-file mine included, scanned every drawer for
+  content hashes, and bulk mines scanned them again for mined files, both by
+  paging `get(limit, offset)`. Chroma turns that `offset` into SQL `OFFSET`,
+  which steps over every skipped row, so a scan grew with the square of the
+  palace (154 s on a 360k-drawer palace), and each began with a `count()` that
+  loads the whole vector index. Chroma now streams just the keys these checks
+  read from `chroma.sqlite3` in one pass, and the content-hash scan reads only
+  drawers that carry a hash: under 10 ms and 1.6 s on that palace.
+  `get_all_metadata`, behind the status and graph fallbacks, uses the same pass.
+- **A mine on the HTTP hub no longer blocks every other request until it
+  ends.** The hub ran a forwarded mine under its exclusive lock for the whole
+  run, so status, search, and wake-up waited for all of it. The mine still runs
+  exclusively, but between files it hands the lock to the requests queued
+  behind it, then takes it back; a second mine still waits for the first.
 - **`mempalace wake-up` reads its recent drawers from `chroma.sqlite3`.**
   Chroma's `get` loads the whole index even for a metadata read, so waking up
   a ten-drawer wing loaded every vector in the palace, and the window was the
