@@ -962,6 +962,35 @@ def test_chroma_get_recent_honours_include_projection(tmp_path):
     assert got.metadatas == []
 
 
+def test_chroma_get_all_metadata_reads_sqlite_in_one_pass(tmp_path, monkeypatch):
+    """Same list the base implementation pages out (order, typed values, None
+    for a drawer without metadata), without Chroma's OFFSET paging."""
+    from mempalace.backends.base import BaseCollection
+
+    col = _recent_palace(tmp_path)
+    expected = BaseCollection.get_all_metadata(col)
+
+    def _no_chroma_get(**_kwargs):
+        raise AssertionError("Chroma get() pages with SQL OFFSET")
+
+    monkeypatch.setattr(col._collection, "get", _no_chroma_get)
+    assert col.get_all_metadata() == expected
+    assert expected[-1] is None  # the "bare" drawer
+
+
+def test_chroma_iter_metadata_projects_keys_and_requires_a_key(tmp_path):
+    col = _recent_palace(tmp_path)
+    rows = list(col.iter_metadata(["wing", "flag"]))
+    assert len(rows) == 200  # the bare drawer has neither key
+    assert all(set(row) == {"wing", "flag"} for row in rows)
+    assert isinstance(rows[0]["flag"], bool)
+    dated = list(col.iter_metadata(["filed_at"], require_key="filed_at"))
+    holding = [m for m in col.get_all_metadata() if m and isinstance(m.get("filed_at"), str)]
+    assert len(dated) == len(holding) > 0  # an empty string is still a string value
+    assert col.iter_metadata(["wing"], require_key="missing_key") is not None
+    assert list(col.iter_metadata(["wing"], require_key="missing_key")) == []
+
+
 def test_chroma_backend_accepts_palace_ref_kwarg(tmp_path):
     palace_path = tmp_path / "palace"
     backend = ChromaBackend()

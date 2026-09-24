@@ -15,7 +15,7 @@ import time
 from collections import defaultdict
 from numbers import Integral
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 import chromadb
 from chromadb.config import Settings as _ChromaSettings
@@ -1889,6 +1889,64 @@ def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Opti
         return None
 
 
+def _sqlite_iter_metadata(
+    conn,
+    collection_name: str,
+    keys: Optional[Iterable[str]],
+    require_key: Optional[str],
+) -> Iterator[Optional[dict]]:
+    """Stream each drawer's metadata from an open chroma.sqlite3 connection, in row order.
+
+    With ``keys``, only those keys are read, and a drawer that has none of
+    them is skipped. With ``keys=None``, every non-internal key is read and a
+    drawer without metadata yields ``None``, the way Chroma's ``get`` returns
+    it. ``require_key`` limits the scan to drawers holding a string value
+    under that key, found through the ``(key, string_value)`` index. Chroma's
+    own paging is a SQL ``OFFSET``, which re-walks every skipped row, so a
+    full pass that way is quadratic in the number of drawers.
+    """
+    scope = """
+        SELECT e.id FROM embeddings e
+        JOIN segments s ON e.segment_id = s.id
+        JOIN collections c ON s.collection = c.id
+        WHERE c.name = ?
+    """
+    params: list = [collection_name]
+    if require_key is not None:
+        scope += """ AND e.id IN (SELECT r.id FROM embedding_metadata r
+                     WHERE r.key = ? AND r.string_value IS NOT NULL)"""
+        params.append(require_key)
+    columns = "m.key, m.string_value, m.int_value, m.float_value, m.bool_value"
+    if keys is not None:
+        keys = list(keys)
+        sql = f"""
+            SELECT m.id, {columns} FROM embedding_metadata m
+            WHERE m.key IN ({",".join("?" * len(keys))}) AND m.id IN ({scope})
+            ORDER BY m.id
+        """
+        cursor = conn.execute(sql, [*keys, *params])
+    else:
+        sql = f"""
+            SELECT ids.id, {columns} FROM ({scope}) ids
+            LEFT JOIN embedding_metadata m ON m.id = ids.id AND m.key NOT LIKE 'chroma:%'
+            ORDER BY ids.id
+        """
+        cursor = conn.execute(sql, params)
+    current_id = None
+    current: Optional[dict] = None
+    for row_id, key, sval, ival, fval, bval in cursor:
+        if row_id != current_id:
+            if current_id is not None:
+                yield current
+            current_id, current = row_id, None
+        if key is not None:
+            if current is None:
+                current = {}
+            current[key] = _sqlite_metadata_value(sval, ival, fval, bval)
+    if current_id is not None:
+        yield current
+
+
 def sqlite_wing_source_counts(palace_path: str, collection_name: str) -> Optional[list[tuple]]:
     """Grouped ``(wing, source_file, n)`` for transcript-mined drawers from
     ``chroma.sqlite3``, scoped to ``collection_name``; ``None`` when sqlite
@@ -2888,6 +2946,50 @@ class ChromaCollection(BaseCollection):
 
     def count(self):
         return self._collection.count()
+
+    def iter_metadata(
+        self, keys: Optional[Iterable[str]] = None, *, require_key: Optional[str] = None
+    ) -> Optional[Iterator[Optional[dict]]]:
+        """Stream every drawer's metadata from chroma.sqlite3 in one linear pass.
+
+        ``keys`` and ``require_key`` narrow the read (see
+        :func:`_sqlite_iter_metadata`). Returns ``None`` when this collection
+        has no palace path or no database file, so the caller can page through
+        :meth:`get` instead. A read error raises from the iterator.
+        """
+        if self._palace_path is None:
+            return None
+        db_path = os.path.join(self._palace_path, "chroma.sqlite3")
+        if not os.path.isfile(db_path):
+            return None
+        name = self._collection.name
+
+        def rows():
+            conn = open_palace_reader(db_path)
+            try:
+                yield from _sqlite_iter_metadata(conn, name, keys, require_key)
+            finally:
+                conn.close()
+
+        return rows()
+
+    def get_all_metadata(self, where: Optional[dict] = None) -> list[dict]:
+        """Every drawer's metadata in one pass over chroma.sqlite3 (#1796).
+
+        The base implementation pages ``get(limit, offset)``, and Chroma turns
+        ``offset`` into SQL ``OFFSET``, which steps over every skipped row, so
+        that pass is quadratic: on a 360k-drawer palace one page cost 81 ms at
+        offset 0 and 717 ms at offset 359k. A ``where`` filter still goes
+        through the base implementation.
+        """
+        if where is None:
+            rows = self.iter_metadata()
+            if rows is not None:
+                try:
+                    return list(rows)
+                except sqlite3.Error:
+                    logger.debug("sqlite metadata scan failed; paging instead", exc_info=True)
+        return super().get_all_metadata(where=where)
 
     def get_recent(
         self,
