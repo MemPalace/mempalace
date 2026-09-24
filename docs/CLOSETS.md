@@ -51,7 +51,7 @@ Closets are stored in the `mempalace_closets` ChromaDB collection alongside `mem
 Closets are a ranking signal, never a gate. An earlier design searched closets first and fell back to drawers; it was replaced because weak closets (regex extraction over narrative text) hid drawers that direct search would have found.
 
 ```
-Query → vector search over mempalace_drawers (always runs; the floor)
+Query → vector search over mempalace_drawers (the floor; see the fallback below)
          ↓
     closet search over mempalace_closets → best closet rank per source file
          ↓
@@ -72,6 +72,8 @@ The boost is keyed by **source file**, not by the drawer IDs in the pointer line
 Every hit carries `matched_via`: `"drawer"` for a plain vector hit, `"drawer+closet"` when a closet boosted it. Boosted hits also carry `closet_boost` and a `closet_preview` field showing the closet line that matched. `similarity` is always the raw vector score; the boost changes only the ordering (`effective_distance`).
 
 With no closets (palace created before this feature, or a conversation-only palace), search is plain drawer search plus the BM25 re-rank. Closets are created on the next project mine.
+
+The pipeline above is the normal path. When the vector index is disabled (the capacity probe found the HNSW segment diverged from `chroma.sqlite3`, #1222), search never opens either collection: it runs a BM25-only search straight from `chroma.sqlite3`'s full-text index, with no vector step and no closet boost.
 
 ## Limits
 
