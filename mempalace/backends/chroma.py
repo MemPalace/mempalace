@@ -1565,6 +1565,192 @@ def _sqlite_collection_has_rows(palace_path: str, collection_name: str) -> Optio
         return None
 
 
+def _string_equalities(where: Optional[dict]) -> Optional[list[tuple[str, str]]]:
+    """``where`` as ``[(key, value), ...]`` string equalities, or ``None``.
+
+    Accepts ``None``, ``{"k": "v"}``, ``{"k": {"$eq": "v"}}`` and an ``$and``
+    of those. ``None`` means the filter has another shape (or a non-string
+    value), which the sqlite readers below do not evaluate.
+    """
+    if not where:
+        return []
+    if set(where) == {"$and"}:
+        clauses = where["$and"]
+        if not isinstance(clauses, list):
+            return None
+        pairs: list[tuple[str, str]] = []
+        for clause in clauses:
+            sub = _string_equalities(clause) if isinstance(clause, dict) else None
+            if sub is None or len(sub) != 1:
+                return None
+            pairs.extend(sub)
+        return pairs
+    if len(where) != 1:
+        return None
+    key, value = next(iter(where.items()))
+    if key.startswith("$"):
+        return None
+    if isinstance(value, dict) and set(value) == {"$eq"}:
+        value = value["$eq"]
+    if not isinstance(value, str):
+        return None
+    return [(key, value)]
+
+
+def _sqlite_metadata_value(sval, ival, fval, bval):
+    if sval is not None:
+        return sval
+    if bval is not None:
+        return bool(bval)
+    if ival is not None:
+        return ival
+    return fval
+
+
+# Filters matching at most this many rows are read whole and ordered in Python
+# (see _sqlite_recent_records); larger ones walk the order_field index.
+_RECENT_FILTER_DRIVEN_MAX = 200_000
+
+
+def _sqlite_recent_records(
+    palace_path: str,
+    collection_name: str,
+    *,
+    limit: int,
+    equalities: list[tuple[str, str]],
+    order_field: str,
+) -> Optional[list[tuple[str, str, Optional[dict]]]]:
+    """``(id, document, metadata)`` for the newest ``limit`` records, from chroma.sqlite3.
+
+    Newest first by ``order_field`` as text, records without a non-empty string
+    value last in storage order: the order :func:`recency_sort_key` defines.
+    ``equalities`` filter on string metadata. ``None`` when the database is
+    missing or the read fails, so the caller can fall back to Chroma.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    filter_sql = "".join(
+        " AND EXISTS (SELECT 1 FROM embedding_metadata w"
+        " WHERE w.id = e.id AND w.key = ? AND w.string_value = ?)"
+        for _ in equalities
+    )
+    filter_params = [part for pair in equalities for part in pair]
+    scope_sql = """
+        FROM embeddings e
+        JOIN segments s ON e.segment_id = s.id
+        JOIN collections c ON s.collection = c.id
+    """
+    try:
+        conn = open_palace_reader(db_path)
+        try:
+            # Walking the order_field index and testing the filter on each row
+            # finds `limit` matches fast when the filter is dense, but reads the
+            # whole collection for a sparse one (a ten-drawer wing). Size the
+            # filter from its index first and, when it is small, read just the
+            # matching rows and order them here.
+            sizes = [
+                conn.execute(
+                    "SELECT COUNT(*) FROM embedding_metadata WHERE key = ? AND string_value = ?",
+                    pair,
+                ).fetchone()[0]
+                for pair in equalities
+            ]
+            filter_driven = bool(sizes) and min(sizes) <= _RECENT_FILTER_DRIVEN_MAX
+            if filter_driven:
+                drive = sizes.index(min(sizes))
+                drive_key, drive_value = equalities[drive]
+                rest = equalities[:drive] + equalities[drive + 1 :]
+                rest_sql = "".join(
+                    " AND EXISTS (SELECT 1 FROM embedding_metadata w2"
+                    " WHERE w2.id = w.id AND w2.key = ? AND w2.string_value = ?)"
+                    for _ in rest
+                )
+                rows = conn.execute(
+                    f"""
+                    SELECT w.id, o.string_value
+                    FROM embedding_metadata w
+                    CROSS JOIN embeddings e ON e.id = w.id
+                    JOIN segments s ON e.segment_id = s.id
+                    JOIN collections c ON s.collection = c.id
+                    LEFT JOIN embedding_metadata o ON o.id = w.id AND o.key = ?
+                    WHERE w.key = ? AND w.string_value = ? AND c.name = ?
+                    {rest_sql}
+                    """,
+                    (
+                        order_field,
+                        drive_key,
+                        drive_value,
+                        collection_name,
+                        *[part for pair in rest for part in pair],
+                    ),
+                ).fetchall()
+                rows.sort(key=lambda r: r[0])
+                dated = [r for r in rows if isinstance(r[1], str) and r[1]]
+                dated.sort(key=lambda r: r[1], reverse=True)
+                undated = [r for r in rows if not (isinstance(r[1], str) and r[1])]
+                row_ids = [r[0] for r in (dated + undated)[:limit]]
+            else:
+                row_ids = [
+                    r[0]
+                    for r in conn.execute(
+                        f"""
+                        SELECT e.id {scope_sql}
+                        JOIN embedding_metadata o ON o.id = e.id
+                        WHERE c.name = ? AND o.key = ? AND o.string_value > ''
+                        {filter_sql}
+                        ORDER BY o.string_value DESC, e.id
+                        LIMIT ?
+                        """,
+                        (collection_name, order_field, *filter_params, limit),
+                    )
+                ]
+            # The filter-driven branch already ordered the undated rows.
+            if len(row_ids) < limit and not filter_driven:
+                row_ids += [
+                    r[0]
+                    for r in conn.execute(
+                        f"""
+                        SELECT e.id {scope_sql}
+                        WHERE c.name = ?
+                        AND NOT EXISTS (SELECT 1 FROM embedding_metadata o
+                            WHERE o.id = e.id AND o.key = ? AND o.string_value > '')
+                        {filter_sql}
+                        ORDER BY e.id
+                        LIMIT ?
+                        """,
+                        (collection_name, order_field, *filter_params, limit - len(row_ids)),
+                    )
+                ]
+            records: dict[int, list] = {}
+            for start in range(0, len(row_ids), 500):
+                chunk = row_ids[start : start + 500]
+                marks = ",".join("?" * len(chunk))
+                for row_id, embedding_id in conn.execute(
+                    f"SELECT id, embedding_id FROM embeddings WHERE id IN ({marks})", chunk
+                ):
+                    records[row_id] = [embedding_id, "", None]
+                for row_id, key, sval, ival, fval, bval in conn.execute(
+                    "SELECT id, key, string_value, int_value, float_value, bool_value"
+                    f" FROM embedding_metadata WHERE id IN ({marks})",
+                    chunk,
+                ):
+                    record = records.get(row_id)
+                    if record is None:
+                        continue
+                    if key == "chroma:document":
+                        record[1] = sval or ""
+                    elif not key.startswith("chroma:"):
+                        if record[2] is None:
+                            record[2] = {}
+                        record[2][key] = _sqlite_metadata_value(sval, ival, fval, bval)
+            return [tuple(records[row_id]) for row_id in row_ids if row_id in records]
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
 def _sqlite_wing_room_counts(
     palace_path: str, collection_name: str
 ) -> Optional[tuple[int, dict[str, dict[str, int]]]]:
@@ -2702,6 +2888,54 @@ class ChromaCollection(BaseCollection):
 
     def count(self):
         return self._collection.count()
+
+    def get_recent(
+        self,
+        *,
+        limit: int,
+        where: Optional[dict] = None,
+        order_field: str = "filed_at",
+        include: Optional[list[str]] = None,
+    ) -> GetResult:
+        """Newest ``limit`` records by ``order_field``, read from chroma.sqlite3.
+
+        Chroma's ``get`` loads the collection's whole HNSW segment before it
+        answers, even for a metadata-only read, so the base implementation's
+        paged ``get`` loaded every vector in the palace to pick a few recent
+        drawers: ``mempalace wake-up`` for a ten-drawer wing loaded millions.
+        This reads the ordered window from the metadata tables instead, which
+        also makes the window exact rather than whatever ``get`` paged first.
+        ``where`` made of string equalities (what Layer 1 passes) is evaluated
+        in sqlite; any other filter, or a database the read cannot reach, goes
+        through the base implementation.
+        """
+        equalities = _string_equalities(where)
+        spec = _IncludeSpec.resolve(include, default_distances=False)
+        records = None
+        if (
+            limit > 0
+            and self._palace_path is not None
+            and equalities is not None
+            and not spec.embeddings
+        ):
+            _validate_where(where)
+            records = _sqlite_recent_records(
+                self._palace_path,
+                self._collection.name,
+                limit=limit,
+                equalities=equalities,
+                order_field=order_field,
+            )
+        if records is None:
+            return super().get_recent(
+                limit=limit, where=where, order_field=order_field, include=include
+            )
+        return GetResult(
+            ids=[record_id for record_id, _, _ in records],
+            documents=[document for _, document, _ in records] if spec.documents else [],
+            metadatas=[metadata for _, _, metadata in records] if spec.metadatas else [],
+            embeddings=None,
+        )
 
     def lexical_search(
         self,

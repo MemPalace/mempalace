@@ -876,6 +876,92 @@ def test_base_get_recent_default_accepts_dict_shaped_get():
     assert _recent(_DictCollection(), limit=5).documents == ["newer", "older"]
 
 
+def _recent_palace(tmp_path):
+    """A Chroma collection whose recency order has ties, undated rows, typed
+    metadata, a sparse wing, and a record with no metadata at all."""
+    import random
+
+    palace = tmp_path / "palace"
+    col = ChromaBackend().get_collection(
+        palace=PalaceRef(id=str(palace), local_path=str(palace)),
+        collection_name="mempalace_drawers",
+        create=True,
+    )
+    rng = random.Random(5)
+    ids, docs, metas, vecs = [], [], [], []
+    for i in range(200):
+        meta = {
+            "wing": "rare" if i % 50 == 0 else rng.choice(["a", "b"]),
+            "room": rng.choice(["x", "y"]),
+            "n": i,
+            "f": i / 3,
+            "flag": i % 3 == 0,
+        }
+        roll = rng.random()
+        if roll < 0.7:
+            meta["filed_at"] = f"2026-09-{rng.randint(1, 9):02d}T00:00:00"
+        elif roll < 0.85:
+            meta["filed_at"] = ""
+        ids.append(f"d{i}")
+        docs.append(f"doc {i}")
+        metas.append(meta)
+        vecs.append([rng.random() for _ in range(4)])
+    col.add(ids=ids, documents=docs, metadatas=metas, embeddings=vecs)
+    col.add(ids=["bare"], documents=["no metadata"], embeddings=[[0.1] * 4])
+    return col
+
+
+@pytest.mark.parametrize("filter_driven", [True, False], ids=["filter_driven", "order_driven"])
+def test_chroma_get_recent_matches_exact_order_from_sqlite(tmp_path, monkeypatch, filter_driven):
+    """The sqlite window is the true newest ``limit``: the base default's
+    order over the whole matching set, cut to ``limit``, and never a Chroma
+    ``get`` (which loads the whole HNSW segment first)."""
+    from mempalace.backends.base import BaseCollection
+
+    col = _recent_palace(tmp_path)
+    monkeypatch.setattr(chroma_module, "_RECENT_FILTER_DRIVEN_MAX", 10**9 if filter_driven else 0)
+    wheres = [
+        None,
+        {"wing": "a"},
+        {"wing": "rare"},
+        {"$and": [{"room": "x"}, {"wing": {"$eq": "b"}}]},
+        {"wing": "missing"},
+    ]
+    exact = {
+        repr(where): BaseCollection.get_recent(col, limit=10_000, where=where) for where in wheres
+    }
+
+    def _no_chroma_get(**_kwargs):
+        raise AssertionError("Chroma get() loads the HNSW segment")
+
+    monkeypatch.setattr(col._collection, "get", _no_chroma_get)
+    for where in wheres:
+        full = exact[repr(where)]
+        for limit in (1, 3, 25, 120, 1000):
+            got = col.get_recent(limit=limit, where=where)
+            assert got.ids == full.ids[:limit], (where, limit)
+            assert got.documents == full.documents[:limit], (where, limit)
+            assert got.metadatas == full.metadatas[:limit], (where, limit)
+
+
+def test_chroma_get_recent_falls_back_for_filters_sqlite_does_not_evaluate(tmp_path):
+    from mempalace.backends.base import BaseCollection
+
+    col = _recent_palace(tmp_path)
+    where = {"n": {"$gte": 150}}
+    assert chroma_module._string_equalities(where) is None
+    got = col.get_recent(limit=5, where=where)
+    assert got.ids == BaseCollection.get_recent(col, limit=5, where=where).ids
+    assert all(meta["n"] >= 150 for meta in got.metadatas)
+
+
+def test_chroma_get_recent_honours_include_projection(tmp_path):
+    col = _recent_palace(tmp_path)
+    got = col.get_recent(limit=3, include=["documents"])
+    assert len(got.ids) == 3 and len(got.documents) == 3
+    assert got.metadatas == []
+
+
 def test_chroma_backend_accepts_palace_ref_kwarg(tmp_path):
     palace_path = tmp_path / "palace"
     backend = ChromaBackend()
