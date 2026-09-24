@@ -15,7 +15,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Assistant replies use `---` as a markdown rule all the time, so any Claude Code
   session with one lost the rest of that reply. Text before the first user turn
   was skipped the same way, and an exchange or paragraph at or below the minimum
-  chunk size (30 characters by default, e.g. `> ok`) was dropped as noise. A `---` is now part of the response, text
+  chunk size (30 characters by default, e.g. `> ok`) was dropped as noise, as
+  was a whole transcript that short. A `---` is now part of the response, text
   before the first turn is filed as its own drawer, and a unit that small joins
   the previous drawer (or becomes its own drawer when that one is full). Units
   larger than the chunk size are now split after the last whitespace in the back

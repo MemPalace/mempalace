@@ -119,6 +119,17 @@ class TestChunkExchanges:
         assert chunks[0]["content"].endswith("it maps rooms.\n> ok")
         assert chunks[1]["content"].startswith("> and the tests?")
 
+    def test_tiny_exchange_keeps_the_blank_line_before_it(self):
+        """Joining a small unit to the previous drawer keeps the separator that
+        stood between them in the source, not a single newline."""
+        content = (
+            "> what should we name the module?\nCall it palace_graph, it maps rooms.\n\n"
+            "> ok\n"
+            "> and the tests?\nMirror the module name under tests/ as usual.\n"
+        )
+        chunks = chunk_exchanges(content)
+        assert chunks[0]["content"].endswith("it maps rooms.\n\n> ok")
+
     def test_every_word_survives(self):
         """No input word is lost across exchange, preamble, rule, and tiny units."""
         content = (

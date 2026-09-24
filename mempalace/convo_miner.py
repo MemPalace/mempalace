@@ -135,9 +135,9 @@ def file_conversation_exchange(
         "ingest_mode": "convos",
         "extract_mode": "exchange",
         "normalize_version": NORMALIZE_VERSION,
-        # Not produced by the chunker, but without the stamp the mined-set
-        # check reads this row as stale and a later mine of the same file
-        # would purge it.
+        # Not produced by the chunker. Stamped so the version checks treat a
+        # live row exactly as they did before the field existed; the separate
+        # source_mtime rule is unchanged.
         "convo_chunker_version": CONVO_CHUNKER_VERSION,
         "id_recipe": ID_RECIPE,
         # Same directory identity a mined drawer carries, so ``sync`` decides
@@ -352,12 +352,18 @@ def _chunk_by_exchange(lines: list, chunk_size: int, min_chunk_size: int) -> lis
     """
     chunks = []
     i = 0
+    # Separator between the previous unit and the next one as it stood in the
+    # source: the newline ending that unit plus the blank lines trimmed off it.
+    # A unit small enough to join the previous drawer is joined with it.
+    gap = "\n"
 
     preamble = []
     while i < len(lines) and not lines[i].strip().startswith(">"):
         preamble.append(lines[i])
         i += 1
-    _emit_bounded(chunks, "\n".join(preamble).strip("\n"), chunk_size, min_chunk_size)
+    raw_preamble = "\n".join(preamble)
+    _emit_bounded(chunks, raw_preamble.strip("\n"), chunk_size, min_chunk_size)
+    gap = "\n" * (len(raw_preamble) - len(raw_preamble.rstrip("\n")) + 1)
 
     while i < len(lines):
         user_turn = lines[i].strip()
@@ -373,10 +379,12 @@ def _chunk_by_exchange(lines: list, chunk_size: int, min_chunk_size: int) -> lis
         # Join on newline (not space) so line structure, blank lines, and
         # indentation reach the drawer unchanged. Trim only trailing blank
         # lines produced by the loop stopping at the next `>` turn.
-        ai_response = "\n".join(ai_lines).rstrip("\n")
+        raw_response = "\n".join(ai_lines)
+        ai_response = raw_response.rstrip("\n")
         content = f"{user_turn}\n{ai_response}" if ai_response else user_turn
 
-        _emit_bounded(chunks, content, chunk_size, min_chunk_size)
+        _emit_bounded(chunks, content, chunk_size, min_chunk_size, joiner=gap)
+        gap = "\n" * (len(raw_response) - len(ai_response) + 1)
 
     return chunks
 
@@ -392,9 +400,10 @@ def _emit_bounded(
 
     Nothing but whitespace is ever dropped. A unit whose stripped length is
     at or below ``min_chunk_size`` is too small to be a useful drawer on its
-    own, so it is appended to the previous drawer (joined by ``joiner``, the
-    separator it had in the source) when that still fits in ``chunk_size``,
-    and emitted as its own drawer otherwise.
+    own, so it is appended to the previous drawer (joined by ``joiner``,
+    which callers pass as the separator that stood between the two units in
+    the source) when that still fits in ``chunk_size``, and emitted as its
+    own drawer otherwise.
     """
     if not content.strip():
         return
@@ -996,7 +1005,6 @@ def _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=None
 def _normalize_convo_conversations(
     filepath: Path,
     source_file: str,
-    cfg_min_chunk_size: int,
     collection,
     wing: str,
     agent: str,
@@ -1005,8 +1013,9 @@ def _normalize_convo_conversations(
 ) -> Optional[list]:
     """Normalize a transcript file into its individual conversations,
     registering it as filed when there's nothing worth mining. Returns None
-    when the caller should skip the file (normalize failed, or normalized
-    content is too short to chunk).
+    when the caller should skip the file (normalize failed, or the normalized
+    content is only whitespace). A short transcript is still mined: the
+    chunker keeps text below the min chunk size rather than dropping it.
 
     Kept as separate conversations rather than joined into one string so
     dedup can hash and skip per conversation — a Claude.ai privacy export
@@ -1024,8 +1033,7 @@ def _normalize_convo_conversations(
             _register_file(collection, source_file, wing, agent, extract_mode)
         return None
 
-    total_len = sum(len(c.strip()) for c in conversations)
-    if not conversations or total_len < cfg_min_chunk_size:
+    if not any(c.strip() for c in conversations):
         if not dry_run:
             _register_file(collection, source_file, wing, agent, extract_mode)
         return None
@@ -1157,7 +1165,6 @@ def _mine_convos_impl(
         conversations = _normalize_convo_conversations(
             filepath,
             source_file,
-            cfg_min_chunk_size,
             collection,
             wing,
             agent,

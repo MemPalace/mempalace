@@ -48,7 +48,7 @@ def test_convo_mining():
 
 
 def test_mine_convos_does_not_reprocess_short_files(capsys):
-    """Files below MIN_CHUNK_SIZE get a sentinel so they are skipped on re-run."""
+    """A file shorter than MIN_CHUNK_SIZE is filed, not dropped, and skipped on re-run."""
     tmpdir = tempfile.mkdtemp()
     try:
         # A file too short to produce any chunks
@@ -66,6 +66,8 @@ def test_mine_convos_does_not_reprocess_short_files(capsys):
         client = chromadb.PersistentClient(path=palace_path)
         col = client.get_collection("mempalace_drawers")
         assert file_already_mined(col, resolved_file)
+        stored = col.get(where={"source_file": resolved_file}, include=["documents"])
+        assert "hi" in stored["documents"]
 
         # Second run -- file should be skipped
         mine_convos(tmpdir, palace_path, wing="test")
