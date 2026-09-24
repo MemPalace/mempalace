@@ -1249,6 +1249,13 @@ _ENCODED_PARENT_PREFIXES = (
     "Documents-",
 )
 
+# Git worktree parents that belong to the enclosing project, not to the
+# ephemeral worktree: Claude Code's own ``.claude/worktrees/`` plus the common
+# hand-rolled ``<project>/.worktrees/`` layout. Encoded forms are how the same
+# paths look once Claude Code flattens ``/`` and ``.`` to ``-``.
+_WORKTREE_CWD_MARKERS = ("/.claude/worktrees/", "/.worktrees/")
+_WORKTREE_ENCODED_MARKERS = ("-claude-worktrees-", "--worktrees-")
+
 
 def _safe_wing_slug(name: str) -> str:
     """Normalize a project directory name into a wing slug ``sanitize_name`` accepts.
@@ -1301,12 +1308,14 @@ def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
                 cwd_norm = cwd.replace("\\", "/").rstrip("/")
                 if not cwd_norm:
                     continue
-                # A cwd inside "<project>/.claude/worktrees/<wt>" (a git
-                # worktree) belongs to <project>, not the ephemeral worktree
-                # directory -- otherwise every worktree spawns its own wing.
-                _wt_marker = "/.claude/worktrees/"
-                if _wt_marker in cwd_norm:
-                    cwd_norm = cwd_norm.split(_wt_marker, 1)[0]
+                # A cwd inside "<project>/.claude/worktrees/<wt>" or
+                # "<project>/.worktrees/<wt>" (a git worktree) belongs to
+                # <project>, not the ephemeral worktree directory --
+                # otherwise every worktree spawns its own wing.
+                for _wt_marker in _WORKTREE_CWD_MARKERS:
+                    if _wt_marker in cwd_norm:
+                        cwd_norm = cwd_norm.split(_wt_marker, 1)[0]
+                        break
                 project = cwd_norm.rsplit("/", 1)[-1]
                 if project:
                     return f"wing_{_safe_wing_slug(project)}"
@@ -1355,11 +1364,13 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
     if match:
         encoded = match.group(1)
         # "<project>/.claude/worktrees/<wt>" flattens to "-<project>--claude-worktrees-<wt>"
-        # here; collapse it to <project> like _wing_from_jsonl_cwd already does for cwd,
-        # or every worktree spawns its own wing.
-        _wt_marker = "-claude-worktrees-"
-        if _wt_marker in encoded:
-            encoded = encoded.split(_wt_marker, 1)[0]
+        # and "<project>/.worktrees/<wt>" to "-<project>--worktrees-<wt>" here; collapse
+        # both to <project> like _wing_from_jsonl_cwd already does for cwd, or every
+        # worktree spawns its own wing.
+        for _wt_marker in _WORKTREE_ENCODED_MARKERS:
+            if _wt_marker in encoded:
+                encoded = encoded.split(_wt_marker, 1)[0]
+                break
         # Strip platform user-home prefix so the wing isn't dominated by
         # /Users/<user>/ or /home/<user>/.
         m = re.match(r"(?:Users|home)-[^-]+-(.+)", encoded)
