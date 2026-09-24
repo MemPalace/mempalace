@@ -48,6 +48,38 @@ class TestReadTools:
         assert result["total_drawers"] == 0
         assert result["wings"] == {}
 
+    def test_status_distinguishes_missing_readable_and_corrupt_relationship_files(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        from mempalace import mcp_server
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        hallway_file = Path(config.hallway_file)
+        tunnel_file = Path(config.tunnel_file)
+
+        assert mcp_server.tool_status()["relationship_storage"] == {
+            "hallways": "missing",
+            "tunnels": "missing",
+        }
+
+        hallway_file.write_text('{"hallways": []}', encoding="utf-8")
+        tunnel_file.write_text("[]", encoding="utf-8")
+        assert mcp_server.tool_status()["relationship_storage"] == {
+            "hallways": "readable",
+            "tunnels": "readable",
+        }
+
+        hallway_file.write_text("{", encoding="utf-8")
+        tunnel_file.write_text("{}", encoding="utf-8")
+        assert mcp_server.tool_status()["relationship_storage"] == {
+            "hallways": "unreadable",
+            "tunnels": "unreadable",
+        }
+        assert mcp_server.tool_list_hallways() == []
+        assert mcp_server.tool_list_tunnels() == []
+
     def test_status_with_data(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_status
