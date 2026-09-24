@@ -429,8 +429,9 @@ def canonical_entities(entities: list[str]) -> list[str]:
     basename, so a drawer's entity list holds ``src/main.zig`` and
     ``main.zig`` side by side. Pairing those raw spellings wrote a hallway
     from the entity to itself and four copies of every real association
-    (``ChatStore`` × ``RootView`` under each spelling combination). The
-    shortest spelling wins, so hallways read ``ChatStore ↔ RootView``.
+    (``ChatStore`` × ``RootView`` under each spelling combination). Each
+    entity keeps its :func:`canonical_spelling`, so hallways read
+    ``ChatStore ↔ RootView``.
     """
     by_key: dict[str, list[str]] = {}
     order: list[str] = []
@@ -443,7 +444,7 @@ def canonical_entities(entities: list[str]) -> list[str]:
     out: list[str] = []
     for key in order:
         # Spellings of one basename may name several files (``src/user.py``
-        # and ``tests/user.py``); each cluster keeps its own shortest
+        # and ``tests/user.py``); each cluster keeps its own canonical
         # spelling instead of collapsing into one entity.
         for cluster in _spelling_clusters(by_key[key]):
             out.append(canonical_spelling(cluster))
@@ -491,7 +492,7 @@ def _hallway_id(wing: str, entity_a: str, entity_b: str) -> str:
 def _wing_file_keys(metadatas) -> dict[str, str]:
     """Map every spelling seen in the wing to the file it names.
 
-    The value is the shortest spelling of that file, which is both the key
+    The value is the file's :func:`canonical_spelling`, which is both the key
     pairs are counted under and the spelling the record is materialized
     with. Clustering is wing-wide, not per drawer: one drawer saying
     ``ChatStore.swift`` and the next saying ``ChatStore`` are one file, while
@@ -612,7 +613,7 @@ def compute_hallways_for_wing(
     # Pairs are keyed by the file an entity names, resolved wing-wide by
     # ``_wing_file_keys``: the structural extractor records a file as both
     # path and basename and one drawer may say ``ChatStore.swift`` where the
-    # next says ``ChatStore``, so the key is the shortest spelling of that
+    # next says ``ChatStore``, so the key is the canonical spelling of that
     # file and the record reads ``ChatStore ↔ RootView``.
     pair_counts: dict[tuple[str, str], int] = defaultdict(int)
     pair_rooms: dict[tuple[str, str], set[str]] = defaultdict(set)
@@ -755,7 +756,7 @@ def prune_spelling_hallways(config=None, apply: bool = False) -> dict:
     (an entity joined to itself) and four copies of ``ChatStore ↔ RootView``
     (one per spelling combination). Self-links are dropped; of each variant
     group the record with the highest co-occurrence count survives under
-    its shortest spellings and the rest are dropped. Only the sidecar file
+    its canonical spellings and the rest are dropped. Only the sidecar file
     is touched, never a drawer. ``removed`` is 0 on a dry run.
     """
     with _hallway_file_lock(config):
@@ -804,7 +805,7 @@ def association_groups(records: list[dict]) -> list[list[dict]]:
 
 
 def _merge_variant_group(members: list[dict], kept: list[dict], duplicates: list[dict]) -> None:
-    """Keep the strongest record of one association under its shortest spellings."""
+    """Keep the strongest record of one association under its canonical spellings."""
     if len(members) == 1:
         kept.append(members[0])
         return
