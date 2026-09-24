@@ -27,6 +27,7 @@ the pipeline: it returns the same ``(room, probability)`` pairs.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -697,13 +698,42 @@ def pending_apply_path(config: MempalaceConfig, wing: str) -> str:
     )
 
 
-def save_pending_apply(config: MempalaceConfig, wing: str, targets: dict, ambiguous: int) -> str:
+def apply_inputs(
+    config: MempalaceConfig, wing: str, threshold: float, from_rooms: Optional[Iterable[str]]
+) -> dict:
+    """Everything besides the palace that decides a room apply's plan.
+
+    Recorded with the pending apply, so a retry that would plan differently
+    (another threshold, other source rooms, an edited room set) is refused
+    instead of finishing the first run's closet phase against a different
+    set of drawer moves.
+    """
+    try:
+        with open(room_set_path(config, wing), "rb") as f:
+            room_set_sha256 = hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        room_set_sha256 = None
+    return {
+        "threshold": float(threshold),
+        "from_rooms": None if from_rooms is None else sorted(from_rooms),
+        "room_set_sha256": room_set_sha256,
+    }
+
+
+def save_pending_apply(
+    config: MempalaceConfig,
+    wing: str,
+    targets: dict,
+    ambiguous: int,
+    inputs: Optional[dict] = None,
+) -> str:
     path = pending_apply_path(config, wing)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {
         "wing": wing,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "ambiguous": int(ambiguous),
+        "inputs": inputs,
         "closets": [[src, old, new] for (src, old), new in sorted(targets.items())],
     }
     tmp = path + ".tmp"
@@ -713,8 +743,13 @@ def save_pending_apply(config: MempalaceConfig, wing: str, targets: dict, ambigu
     return path
 
 
-def load_pending_apply(config: MempalaceConfig, wing: str) -> Optional[tuple[dict, int]]:
-    """``(targets, ambiguous)`` from an interrupted apply, or ``None``."""
+def load_pending_apply(
+    config: MempalaceConfig, wing: str
+) -> Optional[tuple[dict, int, Optional[dict]]]:
+    """``(targets, ambiguous, inputs)`` from an interrupted apply, or ``None``.
+
+    ``inputs`` is ``None`` for a marker written before inputs were recorded.
+    """
     path = pending_apply_path(config, wing)
     if not os.path.isfile(path):
         return None
@@ -724,7 +759,8 @@ def load_pending_apply(config: MempalaceConfig, wing: str) -> Optional[tuple[dic
     for row in data.get("closets") or []:
         if isinstance(row, list) and len(row) == 3 and all(isinstance(x, str) for x in row):
             targets[(row[0], row[1])] = row[2]
-    return targets, int(data.get("ambiguous") or 0)
+    inputs = data.get("inputs")
+    return targets, int(data.get("ambiguous") or 0), inputs if isinstance(inputs, dict) else None
 
 
 def clear_pending_apply(config: MempalaceConfig, wing: str) -> None:

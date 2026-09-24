@@ -32,6 +32,28 @@ def _rooms_llm_provider(args):
     return candidate
 
 
+def _refuse_mismatched_resume(config, wing, recorded, current):
+    """Stop a retry whose plan would differ from the interrupted apply's."""
+    from ..rooms import pending_apply_path
+
+    print(f"  An interrupted apply for {wing} is pending, planned with different options.")
+    if recorded.get("room_set_sha256") != current.get("room_set_sha256"):
+        print("  The room set has changed since that apply started.")
+    else:
+        rooms = recorded.get("from_rooms")
+        from_flag = " --from all" if rooms is None else f" --from {','.join(rooms)}"
+        print(
+            "  Finish it first with the same options:\n"
+            f"    mempalace rooms apply --wing {wing} --threshold {recorded.get('threshold')}"
+            f"{from_flag} --yes"
+        )
+    print(
+        f"  Or delete {pending_apply_path(config, wing)} to abandon its closet phase; the "
+        "drawers it moved stay moved, and re-mining their sources rebuilds the closets."
+    )
+    sys.exit(1)
+
+
 def cmd_rooms(args):
     from ..rooms import (
         DEFAULT_THRESHOLD,
@@ -40,6 +62,7 @@ def cmd_rooms(args):
         apply_plan,
         existing_rooms,
         load_room_set,
+        apply_inputs,
         clear_pending_apply,
         closet_targets,
         load_pending_apply,
@@ -151,9 +174,12 @@ def cmd_rooms(args):
     from ..palace import get_closets_collection
 
     with _repair_lock(palace_path):
+        inputs = apply_inputs(config, wing, threshold, from_rooms)
+        pending = load_pending_apply(config, wing)
+        if pending is not None and pending[2] is not None and pending[2] != inputs:
+            _refuse_mismatched_resume(config, wing, pending[2], inputs)
         plan = plan_rooms(col, wing, decider, threshold=threshold, from_rooms=from_rooms)
         report(plan)
-        pending = load_pending_apply(config, wing)
         if pending is None:
             if not plan.changes:
                 print("  Nothing to change.")
@@ -162,9 +188,9 @@ def cmd_rooms(args):
             # after an interruption can finish the closet phase even when no
             # drawer is left to move.
             targets, ambiguous = closet_targets(plan)
-            save_pending_apply(config, wing, targets, ambiguous)
+            save_pending_apply(config, wing, targets, ambiguous, inputs)
         else:
-            targets, ambiguous = pending
+            targets, ambiguous, _ = pending
             print("  Resuming an interrupted apply: finishing drawers, then closets.")
         try:
             done = apply_plan(col, plan) if plan.changes else 0

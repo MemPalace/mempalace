@@ -670,6 +670,97 @@ def test_cmd_rooms_apply_retry_finishes_closets_after_drawers_completed(
     assert "Nothing to change" in capsys.readouterr().out
 
 
+def test_cmd_rooms_apply_refuses_to_resume_with_different_options(tmp_path, monkeypatch, capsys):
+    """The pending closet targets come from the first run's plan. A retry that
+    would plan differently must not finish that closet phase against other
+    drawer moves; it stops and names the options that finish the first run."""
+    import contextlib
+
+    import mempalace.cli as cli
+    from mempalace.rooms import pending_apply_path
+
+    cfg = MempalaceConfig(palace_path=str(tmp_path))
+    save_room_set(cfg, _room_set())
+    col = FakeCollection(
+        [
+            {
+                "id": "a",
+                "meta": {"wing": "w", "room": "technical", "source_file": "s1"},
+                "doc": "cut the release",
+                "emb": [1.0, 0.0],
+            }
+        ]
+    )
+    closets = FakeCollection(
+        [{"id": "k1", "meta": {"wing": "w", "room": "technical", "source_file": "s1"}}]
+    )
+    monkeypatch.setattr("mempalace.palace.get_collection", lambda *a, **k: col)
+    monkeypatch.setattr("mempalace.palace.get_closets_collection", lambda *a, **k: closets)
+    monkeypatch.setattr("mempalace.embedding.get_embedding_function", lambda: FakeEmbed())
+    monkeypatch.setattr("mempalace.palace.mine_palace_lock", lambda p: contextlib.nullcontext())
+
+    real_update = closets.update
+
+    def dies(**kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(closets, "update", dies)
+    first = Namespace(
+        rooms_action="apply", palace=str(tmp_path), wing="w", threshold=0.75, yes=True
+    )
+    with pytest.raises(KeyboardInterrupt):
+        cli.cmd_rooms(first)
+    monkeypatch.setattr(closets, "update", real_update)
+    capsys.readouterr()
+
+    other = Namespace(rooms_action="apply", palace=str(tmp_path), wing="w", threshold=0.9, yes=True)
+    with pytest.raises(SystemExit) as exc:
+        cli.cmd_rooms(other)
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "--threshold 0.75" in out
+    assert closets.rows["k1"]["meta"]["room"] == "technical"
+    assert os.path.isfile(pending_apply_path(cfg, "w"))
+
+    # An edited room set is refused too, without offering flags that cannot help.
+    room_set_file = tmp_path / "rooms" / "w.json"
+    room_set_file.write_text(room_set_file.read_text().replace("releases", "shipping"))
+    with pytest.raises(SystemExit):
+        cli.cmd_rooms(first)
+    assert "room set has changed" in capsys.readouterr().out
+
+
+def test_cmd_rooms_apply_resumes_a_marker_written_before_inputs_were_recorded(
+    tmp_path, monkeypatch, capsys
+):
+    import contextlib
+
+    import mempalace.cli as cli
+    from mempalace.rooms import pending_apply_path
+
+    cfg = MempalaceConfig(palace_path=str(tmp_path))
+    save_room_set(cfg, _room_set())
+    col = FakeCollection([])
+    closets = FakeCollection(
+        [{"id": "k1", "meta": {"wing": "w", "room": "technical", "source_file": "s1"}}]
+    )
+    monkeypatch.setattr("mempalace.palace.get_collection", lambda *a, **k: col)
+    monkeypatch.setattr("mempalace.palace.get_closets_collection", lambda *a, **k: closets)
+    monkeypatch.setattr("mempalace.embedding.get_embedding_function", lambda: FakeEmbed())
+    monkeypatch.setattr("mempalace.palace.mine_palace_lock", lambda p: contextlib.nullcontext())
+    marker = pending_apply_path(cfg, "w")
+    os.makedirs(os.path.dirname(marker), exist_ok=True)
+    with open(marker, "w", encoding="utf-8") as f:
+        json.dump({"wing": "w", "ambiguous": 0, "closets": [["s1", "technical", "releases"]]}, f)
+
+    cli.cmd_rooms(
+        Namespace(rooms_action="apply", palace=str(tmp_path), wing="w", threshold=0.9, yes=True)
+    )
+    assert "Resuming an interrupted apply" in capsys.readouterr().out
+    assert closets.rows["k1"]["meta"]["room"] == "releases"
+    assert not os.path.exists(marker)
+
+
 def test_cmd_rooms_apply_keeps_the_marker_when_closets_fail_to_open(tmp_path, monkeypatch, capsys):
     """Only a never-created closet collection means "no closets"."""
     import contextlib
