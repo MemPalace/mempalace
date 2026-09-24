@@ -879,7 +879,27 @@ def test_wing_from_transcript_path_fallback_collapses_worktree():
     assert _wing_from_transcript_path(non_worktree_path) == "wing_gsd_core"
 
 
+def test_wing_from_transcript_path_fallback_collapses_dot_worktrees():
+    """``<project>/.worktrees/<wt>`` flattens to ``--worktrees-<wt>``; before the
+    fix the fallback kept the worktree slug, so every branch got its own wing."""
+    worktree_path = "/Users/u/.claude/projects/-Users-u-dev-webui-app--worktrees-737-list-table-drop-unused/x.jsonl"
+    assert _wing_from_transcript_path(worktree_path) == "wing_webui_app"
+
+
 # --- _wing_from_transcript_path: cwd-from-JSONL primary path ---
+
+
+def test_wing_from_transcript_path_cwd_collapses_dot_worktrees(tmp_path):
+    """A cwd inside ``<project>/.worktrees/<wt>`` files under <project>, same as
+    ``.claude/worktrees/``."""
+    project_dir = tmp_path / "-Users-me-dev-webui-app--worktrees-42-fix-login"
+    project_dir.mkdir()
+    transcript = project_dir / "session.jsonl"
+    transcript.write_text(
+        '{"type":"user","cwd":"/Users/me/dev/webui-app/.worktrees/42-fix-login","content":"hi"}\n',
+        encoding="utf-8",
+    )
+    assert _wing_from_transcript_path(str(transcript)) == "wing_webui_app"
 
 
 def test_wing_from_transcript_path_uses_cwd_from_jsonl(tmp_path):
