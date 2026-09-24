@@ -218,6 +218,34 @@ def test_cmd_wings_split_plan_then_apply(tmp_path, monkeypatch, capsys):
     assert col.rows["b1"]["meta"]["wing"] == "photoapp"
 
 
+def test_cmd_wings_split_dry_run_keeps_the_plan_of_an_interrupted_split(
+    tmp_path, monkeypatch, capsys
+):
+    """Mid-split, re-planning would see only the drawers not yet moved and
+    replace the plan being followed, hand-edited targets included."""
+    from pathlib import Path
+
+    import mempalace.cli as cli
+    from mempalace.config import MempalaceConfig
+    from mempalace.wing_split import split_pending_path, split_plan_path
+
+    cfg = MempalaceConfig(palace_path=str(tmp_path))
+    plan_file = Path(split_plan_path(cfg, "convos"))
+    plan_file.parent.mkdir(parents=True, exist_ok=True)
+    plan_file.write_text('{"edited": "by hand"}')
+    marker = Path(split_pending_path(cfg, "convos"))
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("2026-09-24T00:00:00+00:00\n")
+
+    def no_planning(*a, **k):
+        raise AssertionError("a pending split must not be re-planned")
+
+    monkeypatch.setattr("mempalace.palace.get_collection", no_planning)
+    cli.cmd_wings(Namespace(wings_action="split", palace=str(tmp_path), wing="convos", yes=False))
+    assert "was interrupted" in capsys.readouterr().out
+    assert plan_file.read_text() == '{"edited": "by hand"}'
+
+
 def test_cmd_wings_split_without_plan_exits_1(tmp_path, capsys):
     import mempalace.cli as cli
 

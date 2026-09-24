@@ -50,6 +50,15 @@ def cmd_wings(args):
             print(f"    ... {len(plan_targets(plan)) - 25} more targets in the plan file")
 
     if not getattr(args, "yes", False):
+        if os.path.exists(split_pending_path(config, wing)):
+            # Re-planning now would see only the drawers not yet moved and
+            # overwrite the plan the interrupted split is following, edited
+            # targets included, so the rest would split by different targets.
+            print(
+                f"  A split of {wing} was interrupted. Its plan at "
+                f"{split_plan_path(config, wing)} is kept as is; re-run with --yes to finish it."
+            )
+            return
         col = get_collection(palace_path, create=False, read_only=True)
         plan = plan_split(col, wing, existing_wings())
         if not plan["projects"]:
