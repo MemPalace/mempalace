@@ -1532,6 +1532,39 @@ def _sqlite_embedding_count(palace_path: str, collection_name: str) -> Optional[
         return None
 
 
+def _sqlite_collection_has_rows(palace_path: str, collection_name: str) -> Optional[bool]:
+    """Whether ``collection_name`` holds any drawer, read from chroma.sqlite3.
+
+    ``Collection.count()`` on a freshly built client loads the whole HNSW
+    segment while holding the GIL, which on a multi-million-drawer palace
+    stalls every thread in the process for seconds. This answers the same
+    empty-or-not question with one indexed row. ``None`` when the database
+    is missing or unreadable, so callers can fall back to ``count()``.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        conn = open_palace_reader(db_path)
+        try:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM embeddings e
+                JOIN segments s ON e.segment_id = s.id
+                JOIN collections c ON s.collection = c.id
+                WHERE c.name = ?
+                LIMIT 1
+                """,
+                (collection_name,),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
 def _sqlite_wing_room_counts(
     palace_path: str, collection_name: str
 ) -> Optional[tuple[int, dict[str, dict[str, int]]]]:
