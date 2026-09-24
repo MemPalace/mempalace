@@ -162,6 +162,11 @@ class LLMProvider:
         # uses this to gate the consent prompt — stray env-resolved keys
         # require explicit user confirmation.
         self.api_key_source = api_key_source
+        # Set by a caller whose consent gate has passed for an external
+        # endpoint (`rooms propose` / `kg normalize` with
+        # --accept-external-llm). Until then an env-resolved key is withheld
+        # from an external endpoint's model listing; see served_models().
+        self.external_use_accepted = False
 
     def classify(
         self,
@@ -347,7 +352,11 @@ class OpenAICompatProvider(LLMProvider):
     def served_models(self) -> list[str]:
         """Model ids the endpoint lists; ``[]`` when it cannot be read."""
         req = Request(self._models_url())
-        if self.api_key and (self.api_key_source != "env" or not self.is_external_service):
+        if self.api_key and (
+            self.api_key_source != "env"
+            or not self.is_external_service
+            or self.external_use_accepted
+        ):
             req.add_header("Authorization", f"Bearer {self.api_key}")
         with urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read())

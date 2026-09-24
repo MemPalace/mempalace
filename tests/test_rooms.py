@@ -467,6 +467,46 @@ def test_cmd_rooms_propose_refuses_external_without_consent(tmp_path, monkeypatc
     assert "EXTERNAL" in capsys.readouterr().out
 
 
+def test_cmd_rooms_consent_lets_the_availability_check_use_an_env_key(
+    tmp_path, monkeypatch, capsys
+):
+    """--accept-external-llm covers a key from OPENAI_API_KEY: the requests
+    after it send that key, so the availability check must be allowed to."""
+    import mempalace.cli as cli
+
+    seen = {}
+
+    class External(FakeProvider):
+        endpoint = "https://api.example.com"
+        api_key_source = "env"
+
+        @property
+        def is_external_service(self):
+            return True
+
+        def check_available(self):
+            seen["accepted"] = getattr(self, "external_use_accepted", False)
+            return False, "stop here"
+
+    monkeypatch.setattr(cli, "get_provider", lambda **kw: External("{}"))
+    args = Namespace(
+        rooms_action="propose",
+        palace=str(tmp_path),
+        wing="w",
+        sample=3,
+        seed=0,
+        max_rooms=8,
+        llm_provider="openai-compat",
+        llm_model="m",
+        llm_endpoint="https://api.example.com",
+        llm_api_key=None,
+        accept_external_llm=True,
+    )
+    with pytest.raises(SystemExit):
+        cli.cmd_rooms(args)
+    assert seen["accepted"] is True
+
+
 def test_main_dispatches_rooms(monkeypatch):
     import mempalace.cli as cli
 

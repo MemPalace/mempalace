@@ -22,6 +22,9 @@ def _rooms_llm_provider(args):
             )
             sys.exit(1)
         print(f"  Sending {getattr(args, 'sample', 0)} excerpts to EXTERNAL {provider_name}.")
+        # Consent covers the key too: the requests that follow send it anyway,
+        # so the availability check may use a key taken from OPENAI_API_KEY.
+        candidate.external_use_accepted = True
     ok, msg = candidate.check_available()
     if not ok:
         print(f"  LLM unavailable ({provider_name}/{provider_model}): {msg}")

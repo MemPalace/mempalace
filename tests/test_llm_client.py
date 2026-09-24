@@ -645,3 +645,29 @@ def test_dot_local_names_are_resolved_not_trusted(monkeypatch):
     assert _endpoint_is_local("http://studio.local:11434")
     assert not _endpoint_is_local("http://corp.local:11434")
     assert not _endpoint_is_local("http://gone.local:11434")
+
+
+def _served_models_request(monkeypatch, *, accepted):
+    """The Request an openai-compat model listing sends, for an env-resolved key
+    and an external endpoint."""
+    monkeypatch.setenv("OPENAI_API_KEY", "env-key")
+    listing = MagicMock()
+    listing.read.return_value = json.dumps({"data": [{"id": "m"}]}).encode()
+    listing.__enter__.return_value = listing
+    listing.__exit__.return_value = False
+    p = OpenAICompatProvider(model="auto", endpoint="https://api.example.com")
+    assert p.api_key_source == "env" and p.is_external_service
+    p.external_use_accepted = accepted
+    with patch("mempalace.llm_client.urlopen", return_value=listing) as opened:
+        assert p.served_models() == ["m"]
+    return opened.call_args[0][0]
+
+
+def test_served_models_withholds_env_key_from_external_endpoint_without_consent(monkeypatch):
+    request = _served_models_request(monkeypatch, accepted=False)
+    assert request.get_header("Authorization") is None
+
+
+def test_served_models_sends_env_key_once_external_use_is_accepted(monkeypatch):
+    request = _served_models_request(monkeypatch, accepted=True)
+    assert request.get_header("Authorization") == "Bearer env-key"
