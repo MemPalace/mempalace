@@ -92,12 +92,16 @@ def _sqlite_taxonomy():
     GROUP BY so status does not page every metadata row.
     """
     global _taxonomy_cache, _taxonomy_cache_time
-    now = time.time()
     cache_key = (_config.palace_path, _config.collection_name)
+    # Taken before the query, so a write that lands during it invalidates.
+    fingerprint = _palace_db_fingerprint()
     if (
         _taxonomy_cache is not None
         and _taxonomy_cache[0] == cache_key
-        and (now - _taxonomy_cache_time) < _TAXONOMY_CACHE_TTL
+        and (
+            (fingerprint is not None and _taxonomy_cache[2] == fingerprint)
+            or (time.time() - _taxonomy_cache_time) < _TAXONOMY_CACHE_TTL
+        )
     ):
         return _taxonomy_cache[1]
     counts = None
@@ -133,8 +137,11 @@ def _sqlite_taxonomy():
             rkey = _norm(room)
             dest[rkey] = dest.get(rkey, 0) + n
     result = total, normalized
-    _taxonomy_cache = (cache_key, result)
-    _taxonomy_cache_time = now
+    _taxonomy_cache = (cache_key, result, fingerprint)
+    # Stamp once the query is done: stamped at the start, a query slower than
+    # the TTL (a full GROUP BY on a multi-million-drawer palace) stored an
+    # entry that had already expired, so every status call re-ran it.
+    _taxonomy_cache_time = time.time()
     return result
 
 
@@ -246,11 +253,26 @@ def _graph_sqlite_reader():
 
 
 def _chroma_room_wing_hall_counts():
+    global _graph_rows_cache
     if not _config.palace_path:
         return None
     from ..backends.chroma import sqlite_room_wing_hall_counts
 
-    return sqlite_room_wing_hall_counts(_config.palace_path, _config.collection_name)
+    # Same full GROUP BY as the status taxonomy; reuse it while chroma.sqlite3
+    # has not been written (see _palace_db_fingerprint).
+    cache_key = (_config.palace_path, _config.collection_name)
+    fingerprint = _palace_db_fingerprint()
+    if (
+        fingerprint is not None
+        and _graph_rows_cache is not None
+        and _graph_rows_cache[0] == cache_key
+        and _graph_rows_cache[2] == fingerprint
+    ):
+        return _graph_rows_cache[1]
+    rows = sqlite_room_wing_hall_counts(_config.palace_path, _config.collection_name)
+    if rows is not None and fingerprint is not None:
+        _graph_rows_cache = (cache_key, rows, fingerprint)
+    return rows
 
 
 def tool_status():

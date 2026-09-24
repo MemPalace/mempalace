@@ -499,6 +499,7 @@ _METADATA_CACHE_TTL = 5.0  # seconds
 _taxonomy_cache = None
 _taxonomy_cache_time = 0.0
 _TAXONOMY_CACHE_TTL = 5.0  # seconds — same idea as the palace-graph cache
+_graph_rows_cache = None
 _MAX_RESULTS = 100  # upper bound for search/list limit params
 _DIARY_READ_PAGE_SIZE = 1000
 
@@ -506,26 +507,48 @@ _DIARY_READ_PAGE_SIZE = 1000
 def _invalidate_overview_caches():
     """Drop status/list_wings taxonomy and metadata page caches after writes."""
     global _metadata_cache, _metadata_cache_time, _taxonomy_cache, _taxonomy_cache_time
+    global _graph_rows_cache
     _metadata_cache = None
     _metadata_cache_time = 0
     _taxonomy_cache = None
     _taxonomy_cache_time = 0.0
+    _graph_rows_cache = None
+
+
+def _palace_db_fingerprint():
+    """A stat of chroma.sqlite3 that changes with every committed write, or None.
+
+    chromadb keeps chroma.sqlite3 in rollback-journal mode (see
+    ``backends.chroma``), so a commit from any process rewrites the main file.
+    Counts grouped from the file cannot change while this value holds, which
+    lets overview caches outlive their TTL on a palace nobody is writing to.
+    ``None`` for other backends (sqlite_exact writes through a WAL, so the main
+    file's stat would miss commits) and when the file cannot be stat'ed.
+    """
+    if not _is_chroma_backend():
+        return None
+    try:
+        st = os.stat(os.path.join(_config.palace_path, "chroma.sqlite3"))
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
 
 
 def _get_cached_metadata(col, where=None):
     """Return cached metadata if fresh, else fetch and cache."""
     global _metadata_cache, _metadata_cache_time
-    now = time.time()
     if (
         where is None
         and _metadata_cache is not None
-        and (now - _metadata_cache_time) < _METADATA_CACHE_TTL
+        and (time.time() - _metadata_cache_time) < _METADATA_CACHE_TTL
     ):
         return _metadata_cache
     result = _fetch_all_metadata(col, where=where)
     if where is None:
         _metadata_cache = result
-        _metadata_cache_time = now
+        # Stamp once the fetch is done: stamped at the start, a fetch slower
+        # than the TTL stored an entry that had already expired.
+        _metadata_cache_time = time.time()
     return result
 
 
