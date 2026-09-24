@@ -253,6 +253,31 @@ def _chroma_room_wing_hall_counts():
     return sqlite_room_wing_hall_counts(_config.palace_path, _config.collection_name)
 
 
+def _relationship_file_state(path: str, *, hallway: bool) -> str:
+    """Report whether a list read can distinguish empty data from a bad file."""
+    try:
+        with open(path, encoding="utf-8") as source:
+            data = json.load(source)
+    except FileNotFoundError:
+        return "missing"
+    except (OSError, UnicodeError, ValueError):
+        return "unreadable"
+    if hallway and isinstance(data, dict):
+        data = data.get("hallways")
+    return "readable" if isinstance(data, list) else "unreadable"
+
+
+def _with_relationship_storage(result: dict) -> dict:
+    """Add content-free sidecar state to every status response path."""
+    if not isinstance(result, dict):
+        return result
+    result["relationship_storage"] = {
+        "hallways": _relationship_file_state(_config.hallway_file, hallway=True),
+        "tunnels": _relationship_file_state(_config.tunnel_file, hallway=False),
+    }
+    return result
+
+
 def tool_status():
     _ensure_sqlite_integrity_status()
     if _sqlite_integrity_errors:
@@ -262,7 +287,7 @@ def tool_status():
             result["sqlite_integrity_failed"] = True
             result["error"] = "SQLite integrity check failed"
             result["partial"] = True
-        return result
+        return _with_relationship_storage(result)
 
     # Run the safe sqlite/pickle probe before we touch chromadb. In the
     # #1222 failure mode, opening the persistent client to call .count()
@@ -272,7 +297,7 @@ def tool_status():
     _refresh_vector_disabled_flag()
 
     if _vector_disabled:
-        return _tool_status_via_sqlite()
+        return _with_relationship_storage(_tool_status_via_sqlite())
 
     # Fast path: tally wing/room straight from sqlite so overview tools stay
     # responsive on large palaces instead of cold-loading the HNSW index or
@@ -288,21 +313,23 @@ def tool_status():
             wings[w] = wings.get(w, 0) + sum(room_counts.values())
             for r, n in room_counts.items():
                 rooms[r] = rooms.get(r, 0) + n
-        return {
-            "total_drawers": total,
-            "wings": wings,
-            "rooms": rooms,
-            "protocol": PALACE_PROTOCOL,
-            "aaak_dialect": AAAK_SPEC,
-            "backend": _selected_backend_name(),
-        }
+        return _with_relationship_storage(
+            {
+                "total_drawers": total,
+                "wings": wings,
+                "rooms": rooms,
+                "protocol": PALACE_PROTOCOL,
+                "aaak_dialect": AAAK_SPEC,
+                "backend": _selected_backend_name(),
+            }
+        )
 
     # Use create=True only when a palace DB already exists on disk -- this
     # bootstraps the ChromaDB collection on a valid-but-empty palace without
     # accidentally creating a palace in a non-existent directory (#830).
     col = _get_collection(create=db_exists)
     if not col:
-        return _collection_error_or_no_palace()
+        return _with_relationship_storage(_collection_error_or_no_palace())
     count = col.count()
     wings = {}
     rooms = {}
@@ -360,7 +387,7 @@ def tool_status():
         logger.exception("tool_status metadata fetch failed")
         result["error"] = str(e)
         result["partial"] = True
-    return result
+    return _with_relationship_storage(result)
 
 
 # ── AAAK Dialect Spec ─────────────────────────────────────────────────────────
