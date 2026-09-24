@@ -36,6 +36,7 @@ from .palace import (
     get_collection,
     mine_lock,
     mine_palace_lock,
+    mine_yield_point,
     purge_file_closets,
     upsert_closet_lines,
 )
@@ -2343,6 +2344,7 @@ def _mine_impl(
 
     try:
         for i, filepath in enumerate(files, 1):
+            mine_yield_point()
             try:
                 drawers, room, skip_reason = process_file(
                     filepath=filepath,

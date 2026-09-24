@@ -3233,3 +3233,17 @@ def test_a_directory_that_cannot_be_statted_still_mines(tmp_path, monkeypatch):
 
     assert col.metadatas, "a directory with no identity stopped the mine"
     assert all("source_dir_ino" not in m for m in col.metadatas), col.metadatas
+
+
+def test_project_mine_reaches_a_yield_point_before_each_file(tmp_path):
+    from mempalace.palace import mine_yield_hook
+
+    project_root = tmp_path / "proj"
+    for n in range(3):
+        write_file(project_root / "backend" / f"mod{n}.py", f"def f{n}():\n    return {n}\n" * 20)
+    with open(project_root / "mempalace.yaml", "w") as f:
+        yaml.dump({"wing": "proj", "rooms": [{"name": "backend", "description": "code"}]}, f)
+    calls: list = []
+    with mine_yield_hook(lambda: calls.append(1)):
+        mine(str(project_root), str(tmp_path / "palace"))
+    assert len(calls) == 3

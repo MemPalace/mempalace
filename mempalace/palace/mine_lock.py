@@ -274,3 +274,32 @@ def _maybe_reap_stale_mine_locks() -> None:
         reap_stale_mine_locks()
     except Exception:
         logger.debug("Opportunistic mine-lock reap failed", exc_info=True)
+
+
+# Set per thread by a host that runs a whole mine behind its own lock (the HTTP
+# hub holds its exclusive request lock) and can let other requests through
+# between files instead of making them wait for the entire mine.
+_MINE_YIELD = threading.local()
+
+
+@contextlib.contextmanager
+def mine_yield_hook(fn):
+    """Call ``fn`` at every :func:`mine_yield_point` reached in this thread."""
+    previous = getattr(_MINE_YIELD, "fn", None)
+    _MINE_YIELD.fn = fn
+    try:
+        yield
+    finally:
+        _MINE_YIELD.fn = previous
+
+
+def mine_yield_point() -> None:
+    """Mark a file boundary in a mine.
+
+    No file is half-written and no per-file lock is held here, so a host that
+    serializes the mine may briefly hand its lock to waiting requests. A no-op
+    unless :func:`mine_yield_hook` is active in this thread.
+    """
+    fn = getattr(_MINE_YIELD, "fn", None)
+    if fn is not None:
+        fn()
