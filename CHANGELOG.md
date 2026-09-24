@@ -232,6 +232,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (110k rows/s measured).
 
 ### Bug Fixes
+- **Conversation mining no longer discards text.** In exchange mode (the default
+  for `mempalace mine --mode convos`) a line starting with `---` ended the AI
+  response, and everything from it to the next user turn was never filed.
+  Assistant replies use `---` as a markdown rule all the time, so any Claude Code
+  session with one lost the rest of that reply. Text before the first user turn
+  was skipped the same way, and an exchange or paragraph at or below the minimum
+  chunk size (30 characters by default, e.g. `> ok`) was dropped as noise, as
+  was a whole transcript that short. A `---` is now part of the response, text
+  before the first turn is filed as its own drawer, and a unit that small joins
+  the previous drawer (or becomes its own drawer when that one is full). Units
+  larger than the chunk size are now split after the last whitespace in the back
+  half of the window, not mid-word. Exchange drawers now carry
+  `convo_chunker_version`, and drawers without the current one count as stale,
+  so the next `mempalace mine --mode convos` re-mines existing conversation
+  files once and recovers the lost text. Project files are not re-mined.
+
 - **The legacy `mempalace repair` no longer runs without the palace lease, so a
   hook miner can no longer destroy a repair that is already half done.**
   `cmd_repair` extracted every drawer and copied the whole palace to

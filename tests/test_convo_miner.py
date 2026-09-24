@@ -16,6 +16,7 @@ from mempalace.convo_miner import (
 )
 from mempalace import palace
 from mempalace.palace import (
+    CONVO_CHUNKER_VERSION,
     NORMALIZE_VERSION,
     MineAlreadyRunning,
     file_already_mined,
@@ -47,7 +48,7 @@ def test_convo_mining():
 
 
 def test_mine_convos_does_not_reprocess_short_files(capsys):
-    """Files below MIN_CHUNK_SIZE get a sentinel so they are skipped on re-run."""
+    """A file shorter than MIN_CHUNK_SIZE is filed, not dropped, and skipped on re-run."""
     tmpdir = tempfile.mkdtemp()
     try:
         # A file too short to produce any chunks
@@ -65,6 +66,8 @@ def test_mine_convos_does_not_reprocess_short_files(capsys):
         client = chromadb.PersistentClient(path=palace_path)
         col = client.get_collection("mempalace_drawers")
         assert file_already_mined(col, resolved_file)
+        stored = col.get(where={"source_file": resolved_file}, include=["documents"])
+        assert "hi" in stored["documents"]
 
         # Second run -- file should be skipped
         mine_convos(tmpdir, palace_path, wing="test")
@@ -204,6 +207,58 @@ def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
         for meta in rebuilt["metadatas"]:
             assert meta.get("normalize_version") == NORMALIZE_VERSION
         del col, client
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_mine_convos_rebuilds_drawers_from_older_chunker(capsys):
+    """Exchange drawers from an older chunker revision are rebuilt on the next
+    mine, which recovers text the old chunker discarded (here: everything
+    after a ``---`` rule inside a response)."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        convo_path = Path(tmpdir) / "chat.txt"
+        convo_path.write_text(
+            "> How do we release?\nFreeze the branch.\n\n---\n\n"
+            "AFTER_RULE_MARKER tag and publish.\n\n"
+            "> Rollback?\nYank the release and repoint latest.\n\n"
+            "> Changelog?\nCurate it by theme.\n"
+        )
+        palace_path = os.path.join(tmpdir, "palace")
+        mine_convos(tmpdir, palace_path, wing="test")
+        capsys.readouterr()
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        resolved = str(convo_path.resolve())
+        first_pass = col.get(where={"source_file": resolved})
+        for meta in first_pass["metadatas"]:
+            assert meta["convo_chunker_version"] == CONVO_CHUNKER_VERSION
+
+        # Simulate drawers written by the v1 chunker, which lost the marker.
+        col.update(
+            ids=list(first_pass["ids"]),
+            documents=["V1 CHUNK"] * len(first_pass["ids"]),
+            metadatas=[{**m, "convo_chunker_version": 1} for m in first_pass["metadatas"]],
+        )
+        del col, client
+
+        mine_convos(tmpdir, palace_path, wing="test")
+        out = capsys.readouterr().out
+        assert "Files skipped (already filed): 0" in out
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        rebuilt = col.get(where={"source_file": resolved})
+        assert all("V1 CHUNK" not in d for d in rebuilt["documents"])
+        assert any("AFTER_RULE_MARKER" in d for d in rebuilt["documents"])
+        for meta in rebuilt["metadatas"]:
+            assert meta["convo_chunker_version"] == CONVO_CHUNKER_VERSION
+        del col, client
+
+        # Current drawers are skipped again (only mined files are listed).
+        mine_convos(tmpdir, palace_path, wing="test")
+        assert "chat.txt" not in capsys.readouterr().out
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -765,6 +820,7 @@ def test_prefetch_mined_set_none_for_drawer_without_stored_mtime():
                     "chunk_index": 0,
                     "extract_mode": "exchange",
                     "normalize_version": 999,  # force >= current version
+                    "convo_chunker_version": 999,
                 }
             ],
         )
@@ -796,6 +852,7 @@ def test_prefetch_mined_set_omits_incomplete_chunk_total_group():
                     "chunk_index": 0,
                     "extract_mode": "exchange",
                     "normalize_version": NORMALIZE_VERSION,
+                    "convo_chunker_version": CONVO_CHUNKER_VERSION,
                     "source_mtime": mtime,
                     "chunk_total": 3,
                 },
@@ -806,6 +863,7 @@ def test_prefetch_mined_set_omits_incomplete_chunk_total_group():
                     "chunk_index": 1,
                     "extract_mode": "exchange",
                     "normalize_version": NORMALIZE_VERSION,
+                    "convo_chunker_version": CONVO_CHUNKER_VERSION,
                     "source_mtime": mtime,
                     "chunk_total": 3,
                 },
@@ -828,6 +886,7 @@ def test_prefetch_mined_set_omits_incomplete_chunk_total_group():
                     "chunk_index": 2,
                     "extract_mode": "exchange",
                     "normalize_version": NORMALIZE_VERSION,
+                    "convo_chunker_version": CONVO_CHUNKER_VERSION,
                     "source_mtime": mtime,
                     "chunk_total": 3,
                 }
@@ -922,6 +981,7 @@ def _seed_two_source_drawer(col, source, mtime):
         "chunk_index": 0,
         "extract_mode": "exchange",
         "normalize_version": NORMALIZE_VERSION,
+        "convo_chunker_version": CONVO_CHUNKER_VERSION,
         "source_mtime": mtime,
     }
     col.upsert(
@@ -1094,6 +1154,17 @@ def test_file_conversation_exchange_extra_metadata_cannot_clobber_canonical():
     assert meta["filed_at"] != "1970-01-01"
     # Non-colliding extras still land.
     assert meta["source"] == "hermes"
+
+
+def test_file_conversation_exchange_stamps_current_chunker_version():
+    """A live exchange must read as current to the mined-set check, or a
+    later mine of the same source would purge it as stale."""
+    from mempalace.convo_miner import file_conversation_exchange
+
+    col = _RecordingCollection()
+    file_conversation_exchange(col, **_exchange_kwargs())
+    meta = col.upserts[0]["metadatas"][0]
+    assert meta["convo_chunker_version"] == CONVO_CHUNKER_VERSION
 
 
 def test_file_conversation_exchange_invalid_wing_falls_back_to_wing_general():
