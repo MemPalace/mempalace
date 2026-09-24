@@ -19,7 +19,12 @@ from mempalace.miner import (
     scan_project,
     status,
 )
-from mempalace.palace import NORMALIZE_VERSION, file_already_mined, prefetch_mined_set
+from mempalace.palace import (
+    CONVO_CHUNKER_VERSION,
+    NORMALIZE_VERSION,
+    file_already_mined,
+    prefetch_mined_set,
+)
 
 
 def write_file(path: Path, content: str):
@@ -892,6 +897,7 @@ def test_file_already_mined_scopes_convo_extract_mode():
                     "source_file": source_file,
                     "extract_mode": "exchange",
                     "normalize_version": NORMALIZE_VERSION,
+                    "convo_chunker_version": CONVO_CHUNKER_VERSION,
                 }
             ],
         )
@@ -915,6 +921,42 @@ def test_file_already_mined_scopes_convo_extract_mode():
 
         assert file_already_mined(col, source_file, extract_mode="general") is True
         assert source_file in prefetch_mined_set(col, extract_mode="general")
+    finally:
+        del col, client
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_convo_chunker_version_only_gates_the_exchange_scope():
+    """An older chunker revision makes exchange rows stale, while project
+    rows (no extract_mode) never carry the field and stay current."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        os.makedirs(palace_path)
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+        chat = os.path.join(tmpdir, "chat.jsonl")
+        project = os.path.join(tmpdir, "notes.md")
+        col.add(
+            ids=["old_exchange", "project"],
+            documents=["exchange drawer", "project drawer"],
+            metadatas=[
+                {
+                    "source_file": chat,
+                    "extract_mode": "exchange",
+                    "normalize_version": NORMALIZE_VERSION,
+                    "convo_chunker_version": CONVO_CHUNKER_VERSION - 1,
+                },
+                {"source_file": project, "normalize_version": NORMALIZE_VERSION},
+            ],
+        )
+
+        assert file_already_mined(col, chat, extract_mode="exchange") is False
+        assert chat not in prefetch_mined_set(col, extract_mode="exchange")
+        assert file_already_mined(col, project) is True
+        assert project in prefetch_mined_set(col)
     finally:
         del col, client
         shutil.rmtree(tmpdir, ignore_errors=True)

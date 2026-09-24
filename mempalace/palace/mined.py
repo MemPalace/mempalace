@@ -26,6 +26,20 @@ def _metadata_matches_extract_mode(meta: dict, extract_mode: Optional[str]) -> b
     return extract_mode == "exchange" and meta.get("ingest_mode") in (None, "convos")
 
 
+def _meta_is_current(meta: dict, extract_mode: Optional[str]) -> bool:
+    """True when a drawer was filed by the current pipeline for its scope.
+
+    Pre-v2 drawers have no ``normalize_version`` and count as stale. In the
+    exchange scope a missing ``convo_chunker_version`` is stale too, so a
+    chunker fix re-mines conversation files without touching project files.
+    """
+    if meta.get("normalize_version", 1) < NORMALIZE_VERSION:
+        return False
+    if extract_mode == "exchange":
+        return meta.get("convo_chunker_version", 1) >= CONVO_CHUNKER_VERSION
+    return True
+
+
 def file_already_mined(
     collection,
     source_file: str,
@@ -37,7 +51,9 @@ def file_already_mined(
     Returns False (so the file gets re-mined) when:
       - no drawers exist for this source_file
       - the stored `normalize_version` is missing or older than the current
-        schema (triggers silent rebuild after a normalization upgrade)
+        schema (triggers silent rebuild after a normalization upgrade), or,
+        for extract_mode="exchange", the stored `convo_chunker_version` is
+        missing or older than CONVO_CHUNKER_VERSION
       - `check_mtime=True` and the file's mtime differs from the stored one
 
     When check_mtime=True (used by the project miner, and by the convo
@@ -98,9 +114,7 @@ def file_already_mined(
                     meta, extract_mode
                 ):
                     continue
-                # Pre-v2 drawers have no version field — treat them as stale.
-                stored_version = meta.get("normalize_version", 1)
-                if stored_version < NORMALIZE_VERSION:
+                if not _meta_is_current(meta, extract_mode):
                     continue
                 if not check_mtime:
                     return True
@@ -187,9 +201,7 @@ def prefetch_mined_set(
             return
         if not _metadata_matches_extract_mode(meta, extract_mode):
             return
-        # Same default as file_already_mined: missing version == 1
-        version = meta.get("normalize_version", 1)
-        if version < NORMALIZE_VERSION:
+        if not _meta_is_current(meta, extract_mode):
             return
         stored_mtime = meta.get("source_mtime")
         mtime_key = float(stored_mtime) if stored_mtime is not None else None
@@ -312,8 +324,7 @@ def prefetch_content_hashes(
                     continue
                 if not _metadata_matches_extract_mode(meta, extract_mode):
                     continue
-                version = meta.get("normalize_version", 1)
-                if version < NORMALIZE_VERSION:
+                if not _meta_is_current(meta, extract_mode):
                     continue
                 for content_hash in content_hash_field.split(","):
                     key = (wing, content_hash)
