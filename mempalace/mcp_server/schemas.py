@@ -374,6 +374,26 @@ TOOLS = {
         },
         "handler": tool_check_duplicate,
     },
+    "mempalace_find_duplicates": {
+        "description": "Read-only duplicate audit. Returns connected clusters of near-duplicate logical drawers with pairwise cosine distances; never returns raw vectors or content.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "wing": {"type": "string", "description": "Filter by wing (optional)"},
+                "room": {"type": "string", "description": "Filter by room (optional)"},
+                "threshold": {
+                    "type": "number",
+                    "description": "Cosine distance threshold (default 0.15). Lower is stricter.",
+                },
+                "max_clusters": {
+                    "type": "integer",
+                    "description": "Maximum number of duplicate clusters to return (optional)",
+                    "minimum": 1,
+                },
+            },
+        },
+        "handler": tool_find_duplicates,
+    },
     "mempalace_add_drawer": {
         "description": "File verbatim content into the palace. Checks for duplicates first.",
         "input_schema": {
