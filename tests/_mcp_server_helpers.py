@@ -40,6 +40,7 @@ def _patch_mcp_server(monkeypatch, config, kg):
     monkeypatch.setattr(mcp_server, "_get_kg", lambda *a, **kw: kg)
     monkeypatch.setattr(mcp_server, "_taxonomy_cache", None)
     monkeypatch.setattr(mcp_server, "_taxonomy_cache_time", 0.0)
+    monkeypatch.setattr(mcp_server, "_graph_rows_cache", None)
     from mempalace.palace_graph import invalidate_graph_cache
 
     invalidate_graph_cache()

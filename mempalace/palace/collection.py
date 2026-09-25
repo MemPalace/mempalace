@@ -20,6 +20,40 @@ def clear_validated_embedder_identity(palace_path: Optional[str] = None) -> None
         _VALIDATED_IDENTITY.discard(key)
 
 
+def _collection_has_rows(collection, palace_path, collection_name) -> Optional[bool]:
+    """Whether ``collection`` holds any drawer; ``None`` when that is unknown.
+
+    For Chroma this reads one row from chroma.sqlite3 instead of calling
+    ``count()``: on a freshly built client ``count()`` loads the whole HNSW
+    segment while holding the GIL, so on a large palace this bookkeeping check
+    stalled every thread in the process, and loaded the full index for a
+    wake-up that reads ten drawers. Other backends, and a Chroma database the
+    read cannot reach, fall back to ``count()``.
+    """
+    from ..backends.chroma import ChromaCollection, _sqlite_collection_has_rows
+
+    inner = collection._inner if isinstance(collection, EmbeddingCollection) else collection
+    if isinstance(inner, ChromaCollection):
+        has_rows = _sqlite_collection_has_rows(str(palace_path), str(collection_name))
+        if has_rows is not None:
+            return has_rows
+    # Preflight HNSW divergence before touching count(): count() on a diverged
+    # segment can raise chromadb's rust-level PanicException or hard-segfault
+    # (#1222), which no try/except can catch. This bookkeeping-only check
+    # skips itself on a diverged palace instead.
+    try:
+        from ..backends.chroma import hnsw_capacity_status
+
+        if hnsw_capacity_status(str(palace_path), str(collection_name)).get("diverged"):
+            return None
+    except Exception:
+        pass
+    try:
+        return collection.count() > 0
+    except Exception:
+        return None
+
+
 def _enforce_embedder_identity(
     collection,
     palace_path,
@@ -92,36 +126,14 @@ def _enforce_embedder_identity(
         return
 
     if state == "unknown" and stored is None:
-        # Preflight HNSW divergence before touching count(): this is the
-        # universal chokepoint every tool passes through via
-        # get_collection(), and count() on a diverged segment can raise
-        # chromadb's rust-level pyo3_runtime.PanicException or hard-segfault
-        # (#1222) -- neither of which the except Exception below can catch,
-        # since a native crash takes the whole process down regardless of
-        # any Python try/except. A diverged palace must never reach count()
-        # here; this bookkeeping-only identity check simply skips itself
-        # (count treated as unknown, matching the except-Exception fallback
-        # already below) rather than risk the read.
-        try:
-            from ..backends.chroma import hnsw_capacity_status
-
-            diverged = hnsw_capacity_status(str(palace_path), str(collection_name)).get("diverged")
-        except Exception:
-            diverged = False
-        if diverged:
-            count = None
-        else:
-            try:
-                count = collection.count()
-            except Exception:
-                count = None
-        if count == 0:
+        has_rows = _collection_has_rows(collection, palace_path, collection_name)
+        if has_rows is False:
             if create:
                 try:
                     collection.set_embedder_identity(current)
                 except Exception:
                     logger.debug("embedder-identity record failed", exc_info=True)
-        elif count:
+        elif has_rows:
             warnings.warn(
                 f"palace collection {collection_name!r} has no recorded embedder "
                 f"identity; assuming the current model {model_name!r}. Run "

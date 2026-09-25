@@ -255,6 +255,52 @@ def _dedupe_rendered_hits(
     return unique
 
 
+def _fold_copies_across_sources(hits: list, source_of, ref_of) -> list:
+    """Fold hits whose text is identical but comes from different source files.
+
+    Backups, autosaves, recovered copies, and re-exports put the same passage
+    in several files, and each copy took a result slot of its own, so one
+    passage could fill a whole page while distinct memories fell off it. The
+    best-ranked copy stays and lists the others under ``also_in``
+    (``ref_of(hit)`` for each), so no copy is hidden; the freed slots go to
+    the next distinct passages because the caller cuts to ``n_results`` after
+    this. Repeats within one source file stay separate hits: a transcript can
+    say the same thing twice, at different times.
+    """
+    kept = []
+    first_by_text: dict = {}
+    for hit in hits:
+        text = hit.get("text")
+        source = source_of(hit)
+        if not isinstance(text, str) or not text.strip() or not source:
+            kept.append(hit)
+            continue
+        first = first_by_text.get(text)
+        if first is None:
+            first_by_text[text] = hit
+            kept.append(hit)
+        elif source_of(first) == source:
+            kept.append(hit)
+        else:
+            first.setdefault("also_in", []).append(ref_of(hit))
+    return kept
+
+
+def _search_hit_source(hit: dict):
+    return hit.get("_source_file_full") or hit.get("source_path")
+
+
+def _search_hit_ref(hit: dict) -> dict:
+    """What ``also_in`` records for a folded copy of a search hit."""
+    return {
+        "drawer_id": hit.get("drawer_id"),
+        "source_file": hit.get("source_file"),
+        "source_path": _search_hit_source(hit),
+        "wing": hit.get("wing"),
+        "room": hit.get("room"),
+    }
+
+
 # Strategy dispatch — keeps search_memories' branch count under the
 # project's complexity ceiling (C901 max-complexity=25). New strategies
 # register here.
@@ -358,7 +404,9 @@ def _finalize_candidate_hits(
         metric=_metric_for_collection(drawers_col),
         stop_words=stop_words,
     )
-    hits = _dedupe_rendered_hits(ranked)[:n_results]
+    hits = _fold_copies_across_sources(
+        _dedupe_rendered_hits(ranked), _search_hit_source, _search_hit_ref
+    )[:n_results]
 
     for hit in hits:
         hit.pop("_sort_key", None)

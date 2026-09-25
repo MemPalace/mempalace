@@ -40,6 +40,51 @@ def _meta_is_current(meta: dict, extract_mode: Optional[str]) -> bool:
     return True
 
 
+# Every metadata key the mined-set checks below read.
+_MINED_SCAN_KEYS = (
+    "source_file",
+    "source_mtime",
+    "chunk_total",
+    "extract_mode",
+    "ingest_mode",
+    "normalize_version",
+    "convo_chunker_version",
+    "content_hash",
+    "wing",
+)
+
+
+def _iter_collection_metadata(collection, keys, require_key=None):
+    """Every drawer's metadata for the whole-collection scans below.
+
+    Chroma streams it from chroma.sqlite3 in one linear pass, reading only
+    ``keys``. Paging ``get(limit, offset)`` costs a SQL ``OFFSET`` per page,
+    which re-walks every skipped row, and ``count()`` on a fresh client loads
+    the whole HNSW index first: on a 360k-drawer palace one such scan took
+    138 s, and it grows with the square of the palace. Other backends page as
+    before; ``require_key`` is then only a hint the caller re-checks.
+    """
+    from ..backends.chroma import ChromaCollection
+
+    inner = collection._inner if isinstance(collection, EmbeddingCollection) else collection
+    if isinstance(inner, ChromaCollection):
+        rows = inner.iter_metadata(keys, require_key=require_key)
+        if rows is not None:
+            return rows
+    return _paged_metadata(collection)
+
+
+def _paged_metadata(collection):
+    total = collection.count()
+    offset = 0
+    while offset < total:
+        batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
+        yield from batch["metadatas"]
+        if not batch["ids"]:
+            break
+        offset += len(batch["ids"])
+
+
 def file_already_mined(
     collection,
     source_file: str,
@@ -215,15 +260,8 @@ def prefetch_mined_set(
                 pass
 
     def _scan_all():
-        total = collection.count()
-        offset = 0
-        while offset < total:
-            batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
-            for meta in batch["metadatas"]:
-                _absorb(meta)
-            if not batch["ids"]:
-                break
-            offset += len(batch["ids"])
+        for meta in _iter_collection_metadata(collection, _MINED_SCAN_KEYS):
+            _absorb(meta)
 
     try:
         if source_files is not None and len(source_files) <= _PREFETCH_SCOPE_THRESHOLD:
@@ -311,28 +349,25 @@ def prefetch_content_hashes(
     """
     hashes: dict[tuple[str, str], str] = {}
     try:
-        total = collection.count()
-        offset = 0
-        while offset < total:
-            batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
-            for meta in batch["metadatas"]:
-                meta = meta or {}
-                content_hash_field = meta.get("content_hash")
-                src = meta.get("source_file")
-                wing = meta.get("wing")
-                if not content_hash_field or not src or not wing:
-                    continue
-                if not _metadata_matches_extract_mode(meta, extract_mode):
-                    continue
-                if not _meta_is_current(meta, extract_mode):
-                    continue
-                for content_hash in content_hash_field.split(","):
-                    key = (wing, content_hash)
-                    if content_hash and key not in hashes:
-                        hashes[key] = src
-            if not batch["ids"]:
-                break
-            offset += len(batch["ids"])
+        # Only drawers carrying a content_hash can match, and on Chroma the
+        # (key, string_value) index finds them without reading the rest.
+        for meta in _iter_collection_metadata(
+            collection, _MINED_SCAN_KEYS, require_key="content_hash"
+        ):
+            meta = meta or {}
+            content_hash_field = meta.get("content_hash")
+            src = meta.get("source_file")
+            wing = meta.get("wing")
+            if not content_hash_field or not src or not wing:
+                continue
+            if not _metadata_matches_extract_mode(meta, extract_mode):
+                continue
+            if not _meta_is_current(meta, extract_mode):
+                continue
+            for content_hash in content_hash_field.split(","):
+                key = (wing, content_hash)
+                if content_hash and key not in hashes:
+                    hashes[key] = src
     except Exception:
         logger.warning("prefetch_content_hashes: partial fetch, %d hashes loaded", len(hashes))
     return hashes

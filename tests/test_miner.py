@@ -962,6 +962,56 @@ def test_convo_chunker_version_only_gates_the_exchange_scope():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_prefetch_scans_read_chroma_sqlite_instead_of_paging(tmp_path, monkeypatch):
+    """Both whole-collection prefetches stream chroma.sqlite3: Chroma's
+    count() loads the HNSW index and its get(offset) paging is quadratic."""
+    from mempalace.backends.chroma import ChromaCollection
+    from mempalace.palace import get_collection, prefetch_content_hashes
+
+    col = get_collection(str(tmp_path / "palace"), create=True)
+    current = {
+        "wing": "w",
+        "extract_mode": "exchange",
+        "ingest_mode": "convos",
+        "normalize_version": NORMALIZE_VERSION,
+        "convo_chunker_version": CONVO_CHUNKER_VERSION,
+    }
+    col.add(
+        ids=["a0", "a1", "b0", "stale"],
+        documents=["a zero", "a one", "b zero", "old"],
+        embeddings=[[0.1, 0.2], [0.2, 0.1], [0.3, 0.3], [0.4, 0.1]],
+        metadatas=[
+            {
+                **current,
+                "source_file": "/a",
+                "source_mtime": 1.0,
+                "chunk_total": 2,
+                "content_hash": "ha",
+            },
+            {**current, "source_file": "/a", "source_mtime": 1.0, "chunk_total": 2},
+            {
+                **current,
+                "source_file": "/b",
+                "source_mtime": 2.0,
+                "chunk_total": 1,
+                "content_hash": "hb",
+            },
+            {**current, "source_file": "/c", "convo_chunker_version": 1, "content_hash": "hc"},
+        ],
+    )
+
+    def _no_paging(*_a, **_k):
+        raise AssertionError("paged through Chroma instead of reading chroma.sqlite3")
+
+    monkeypatch.setattr(ChromaCollection, "count", _no_paging)
+    monkeypatch.setattr(ChromaCollection, "get", _no_paging)
+    assert prefetch_mined_set(col, extract_mode="exchange") == {"/a": 1.0, "/b": 2.0}
+    assert prefetch_content_hashes(col, extract_mode="exchange") == {
+        ("w", "ha"): "/a",
+        ("w", "hb"): "/b",
+    }
+
+
 def test_file_already_mined_extract_mode_paginates_large_sources():
     source_file = "/tmp/long-chat.jsonl"
     metadatas = [
@@ -3183,3 +3233,17 @@ def test_a_directory_that_cannot_be_statted_still_mines(tmp_path, monkeypatch):
 
     assert col.metadatas, "a directory with no identity stopped the mine"
     assert all("source_dir_ino" not in m for m in col.metadatas), col.metadatas
+
+
+def test_project_mine_reaches_a_yield_point_before_each_file(tmp_path):
+    from mempalace.palace import mine_yield_hook
+
+    project_root = tmp_path / "proj"
+    for n in range(3):
+        write_file(project_root / "backend" / f"mod{n}.py", f"def f{n}():\n    return {n}\n" * 20)
+    with open(project_root / "mempalace.yaml", "w") as f:
+        yaml.dump({"wing": "proj", "rooms": [{"name": "backend", "description": "code"}]}, f)
+    calls: list = []
+    with mine_yield_hook(lambda: calls.append(1)):
+        mine(str(project_root), str(tmp_path / "palace"))
+    assert len(calls) == 3

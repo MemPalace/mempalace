@@ -692,6 +692,125 @@ with mine_palace_lock(sys.argv[1]):
         assert "error" in result
 
 
+class TestOverviewCaches:
+    """Status and graph counts run a full GROUP BY over chroma.sqlite3, which
+    takes minutes on a multi-million-drawer palace, so they must not re-run
+    it while nothing has written to the file."""
+
+    @staticmethod
+    def _seed(monkeypatch, config, collection, kg):
+        collection.add(
+            ids=["d1", "d2"],
+            documents=["first drawer", "second drawer"],
+            metadatas=[
+                {"wing": "wing_a", "room": "room_x", "hall": "h"},
+                {"wing": "wing_b", "room": "room_x", "hall": "h"},
+            ],
+        )
+        _patch_mcp_server(monkeypatch, config, kg)
+
+    @staticmethod
+    def _spy(monkeypatch, name, delay=0.0):
+        import time
+
+        from mempalace.backends import chroma
+
+        calls: list[int] = []
+        real = getattr(chroma, name)
+
+        def spy(*args, **kwargs):
+            if delay:
+                time.sleep(delay)
+            calls.append(1)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(chroma, name, spy)
+        return calls
+
+    @staticmethod
+    def _touch_db_as_peer(palace_path):
+        db = os.path.join(palace_path, "chroma.sqlite3")
+        mtime = os.stat(db).st_mtime + 10.0
+        os.utime(db, (mtime, mtime))
+
+    def test_taxonomy_outlives_ttl_while_db_is_unwritten(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        from mempalace import mcp_server
+
+        self._seed(monkeypatch, config, collection, kg)
+        calls = self._spy(monkeypatch, "_sqlite_wing_room_counts")
+
+        first = mcp_server._sqlite_taxonomy()
+        monkeypatch.setattr(mcp_server, "_taxonomy_cache_time", 0.0)  # TTL long gone
+        assert mcp_server._sqlite_taxonomy() == first
+        assert len(calls) == 1
+
+    def test_taxonomy_recounts_after_the_db_changes(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        from mempalace import mcp_server
+
+        self._seed(monkeypatch, config, collection, kg)
+        calls = self._spy(monkeypatch, "_sqlite_wing_room_counts")
+
+        mcp_server._sqlite_taxonomy()
+        self._touch_db_as_peer(palace_path)
+        monkeypatch.setattr(mcp_server, "_taxonomy_cache_time", 0.0)
+        mcp_server._sqlite_taxonomy()
+        assert len(calls) == 2
+
+    def test_taxonomy_recounts_a_changed_db_inside_the_ttl(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        """A peer commit inside the 5 s TTL must not return the previous totals.
+
+        The fingerprint is the invalidation key when it can be read. The TTL
+        only covers a palace whose file stat is unavailable.
+        """
+        from mempalace import mcp_server
+
+        self._seed(monkeypatch, config, collection, kg)
+        calls = self._spy(monkeypatch, "_sqlite_wing_room_counts")
+
+        mcp_server._sqlite_taxonomy()
+        self._touch_db_as_peer(palace_path)
+        mcp_server._sqlite_taxonomy()
+        assert len(calls) == 2
+
+    def test_taxonomy_slower_than_ttl_is_still_cached(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        """The TTL runs from when the query finished. Stamped at the start, a
+        query slower than the TTL stored an entry that had already expired."""
+        from mempalace import mcp_server
+
+        self._seed(monkeypatch, config, collection, kg)
+        monkeypatch.setattr(mcp_server, "_palace_db_fingerprint", lambda: None)
+        monkeypatch.setattr(mcp_server, "_TAXONOMY_CACHE_TTL", 0.2)
+        calls = self._spy(monkeypatch, "_sqlite_wing_room_counts", delay=0.3)
+
+        mcp_server._sqlite_taxonomy()
+        mcp_server._sqlite_taxonomy()
+        assert len(calls) == 1
+
+    def test_graph_stats_rows_cached_until_the_db_changes(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        from mempalace import mcp_server
+
+        self._seed(monkeypatch, config, collection, kg)
+        calls = self._spy(monkeypatch, "sqlite_room_wing_hall_counts")
+
+        first = mcp_server.tool_graph_stats()
+        assert mcp_server.tool_graph_stats() == first
+        assert len(calls) == 1
+
+        self._touch_db_as_peer(palace_path)
+        mcp_server.tool_graph_stats()
+        assert len(calls) == 2
+
+
 # ── Regression: None-metadata safety (issue #1426) ──────────────────────
 
 

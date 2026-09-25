@@ -248,6 +248,73 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   so the next `mempalace mine --mode convos` re-mines existing conversation
   files once and recovers the lost text. Project files are not re-mined.
 
+- **The MCP server no longer reloads the whole vector index on almost every
+  call.** The session's Chroma client recorded `chroma.sqlite3`'s timestamp
+  before its own client build, collection open, and writes moved it, so the
+  next call took the server's own footprint for another process's write,
+  rebuilt the client, and reloaded the HNSW index. Search (through
+  `ChromaBackend`) and the other tools (through the session) also took each
+  other's writes for external ones. Both now record the stat they leave the
+  file at. A write from another process still rebuilds the client (#2002). On
+  a 100k-drawer palace a tool call's collection open went from 70-130 ms and
+  +15 MB of RSS to 0.3 ms.
+- **`mempalace_status`, `list_wings`, taxonomy, and `graph_stats` no longer
+  recount the whole palace on every call.** The 5 s count cache was stamped
+  before its query ran, so any count slower than 5 s, as on a
+  multi-million-drawer palace, was cached already expired. `graph_stats` had
+  no cache at all. The Chroma caches now stay valid until `chroma.sqlite3`
+  changes, and the TTL runs from when the count finished. Repeated status
+  calls on a 360k-drawer palace went from 8-12 s each to about 1 ms.
+- **Opening a palace with no recorded embedder no longer loads every vector.**
+  To tell an empty collection from a populated one, the identity check called
+  `count()`, which on a fresh Chroma client loads the whole HNSW segment while
+  holding the GIL and stalls every thread in the process. It ran on every
+  CLI search the hub forwarded. It now reads one row from `chroma.sqlite3`.
+- **Mining no longer rescans the whole palace with quadratic paging.** Every
+  conversation mine, a hook's one-file mine included, scanned every drawer for
+  content hashes, and bulk mines scanned them again for mined files, both by
+  paging `get(limit, offset)`. Chroma turns that `offset` into SQL `OFFSET`,
+  which steps over every skipped row, so a scan grew with the square of the
+  palace (154 s on a 360k-drawer palace), and each began with a `count()` that
+  loads the whole vector index. Chroma now streams just the keys these checks
+  read from `chroma.sqlite3` in one pass, and the content-hash scan reads only
+  drawers that carry a hash: under 10 ms and 1.6 s on that palace.
+  `get_all_metadata`, behind the status and graph fallbacks, uses the same pass.
+- **The BM25-only search fallback finds the drawers that actually contain a
+  name.** With the vector index disabled, search picks BM25 candidates from
+  `chroma.sqlite3`'s trigram full-text index, where `aven` also matches inside
+  `haven't` and `Avenue`. It took the first 500 matches in storage order, the
+  oldest substring hits, and returned them even when they scored 0, so a search
+  for a name answered with `haven't`, `New Haven`, and `Avenue`. Candidates are
+  now read in full-text rank order, whole-word matches first. A wing, room, or
+  source filter matching few drawers reads just those drawers (6.4 s to under
+  10 ms for a ten-drawer wing on a 360k-drawer palace), and stop words stay out
+  of the full-text query.
+- **Search no longer returns every copy of a passage as a separate result.**
+  Backups, autosaves, and re-exports put the same text under several files, and
+  each copy took a result slot. The best-ranked copy now stands for all of them
+  and lists the others under `also_in` (the CLI prints `Also in: ...`), and the
+  freed slots go to the next distinct passages. Repeats within one file stay
+  separate.
+- **A mine on the HTTP hub no longer blocks every other request until it
+  ends.** The hub ran a forwarded mine under its exclusive lock for the whole
+  run, so status, search, and wake-up waited for all of it. The mine still runs
+  exclusively, but between files it hands the lock to the requests queued
+  behind it, then takes it back; a second mine still waits for the first.
+- **`mempalace wake-up` reads its recent drawers from `chroma.sqlite3`.**
+  Chroma's `get` loads the whole index even for a metadata read, so waking up
+  a ten-drawer wing loaded every vector in the palace, and the window was the
+  first page Chroma returned rather than the newest drawers. On a
+  360k-drawer palace wake-up went from 0.8-8.8 s at up to 920 MB to about
+  0.5 s at 238 MB. The read stays on the metadata segment, so a vector-segment
+  row cannot come back as an empty drawer. Chroma advertises
+  `supports_recency_order` for that exact window.
+- **A write from another process reconnects every Chroma client in this one.**
+  Search and the other tools share one in-memory index. The client that
+  noticed the write rebuilt and recorded the new file stat; the other treated
+  that stat as its own write and kept reading the index the rebuild had
+  discarded. Both clients now drop together. `mempalace_status` also recounts
+  as soon as the palace file changes, including inside its 5 second cache.
 - **The legacy `mempalace repair` no longer runs without the palace lease, so a
   hook miner can no longer destroy a repair that is already half done.**
   `cmd_repair` extracted every drawer and copied the whole palace to
