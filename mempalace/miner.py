@@ -326,14 +326,20 @@ class GitignoreMatcher:
 
     @classmethod
     def from_dir(cls, dir_path: Path):
-        gitignore_path = dir_path / ".gitignore"
-        if not gitignore_path.is_file():
-            return None
-
-        try:
-            lines = gitignore_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except Exception:
-            return None
+        # At a repository root, git also applies the per-clone, never-committed
+        # ``info/exclude`` rules (where in-repo worktree paths usually live).
+        # They sit below .gitignore in precedence, so they are parsed first.
+        lines = []
+        git_dir = _git_common_dir(dir_path)
+        sources = [git_dir / "info" / "exclude"] if git_dir else []
+        sources.append(dir_path / ".gitignore")
+        for source in sources:
+            if not source.is_file():
+                continue
+            try:
+                lines.extend(source.read_text(encoding="utf-8", errors="replace").splitlines())
+            except Exception:
+                continue
 
         rules = cls._parse_rules(lines)
         if not rules:
@@ -418,6 +424,44 @@ class GitignoreMatcher:
             return matches(path_index + 1, pattern_index + 1)
 
         return matches(0, 0)
+
+
+def _read_gitdir_file(dot_git: Path):
+    """Return the gitdir a ``.git`` file points to (worktrees, submodules)."""
+    try:
+        first_line = dot_git.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+    except (OSError, IndexError):
+        return None
+    if not first_line.startswith("gitdir:"):
+        return None
+    gitdir = Path(first_line[len("gitdir:") :].strip())
+    return gitdir if gitdir.is_absolute() else dot_git.parent / gitdir
+
+
+def _git_common_dir(dir_path: Path):
+    """Return the git common dir of a repository rooted at ``dir_path``, if any."""
+    dot_git = dir_path / ".git"
+    if dot_git.is_dir():
+        return dot_git
+    if not dot_git.is_file():
+        return None
+    gitdir = _read_gitdir_file(dot_git)
+    if gitdir is None:
+        return None
+    try:
+        commondir = (gitdir / "commondir").read_text(encoding="utf-8").strip()
+    except OSError:
+        return gitdir
+    return gitdir / commondir
+
+
+def is_linked_worktree(dir_path: Path) -> bool:
+    """True when ``dir_path`` is a ``git worktree`` checkout (not a submodule)."""
+    dot_git = dir_path / ".git"
+    if not dot_git.is_file():
+        return False
+    gitdir = _read_gitdir_file(dot_git)
+    return gitdir is not None and (gitdir / "commondir").is_file()
 
 
 def load_gitignore_matcher(dir_path: Path, cache: dict):
@@ -2119,7 +2163,8 @@ def scan_project(
             d
             for d in dirs
             if is_force_included(root_path / d, project_path, include_paths)
-            or not should_skip_dir(d)
+            # A worktree checkout inside the project is a full duplicate of it.
+            or not (should_skip_dir(d) or is_linked_worktree(root_path / d))
         ]
         if respect_gitignore and active_matchers:
             dirs[:] = [

@@ -528,6 +528,58 @@ def test_scan_project_skip_dirs_still_apply_without_override():
         shutil.rmtree(tmpdir)
 
 
+def test_scan_project_respects_git_info_exclude(tmp_path):
+    """.git/info/exclude is honoured like a root .gitignore (#2599)."""
+    write_file(tmp_path / ".git" / "info" / "exclude", "# local\nscratch/\n*.txt\n")
+    write_file(tmp_path / ".gitignore", "!keep.txt\n")
+    write_file(tmp_path / "src" / "app.py", "print('app')\n" * 20)
+    write_file(tmp_path / "scratch" / "notes.md", "# scratch\n" * 20)
+    write_file(tmp_path / "debug.txt", "debug\n" * 20)
+    write_file(tmp_path / "keep.txt", "keep\n" * 20)
+
+    # .gitignore takes precedence over info/exclude, as in git.
+    assert scanned_files(tmp_path) == ["keep.txt", "src/app.py"]
+    assert "scratch/notes.md" in scanned_files(tmp_path, respect_gitignore=False)
+
+
+def test_scan_project_respects_git_info_exclude_from_linked_worktree(tmp_path):
+    """A linked worktree reads info/exclude from the main repo's common dir."""
+    common_dir = tmp_path / "main" / ".git"
+    write_file(common_dir / "info" / "exclude", "scratch/\n")
+    worktree_gitdir = common_dir / "worktrees" / "wt"
+    write_file(worktree_gitdir / "commondir", "../..\n")
+    worktree = tmp_path / "wt"
+    write_file(worktree / ".git", f"gitdir: {worktree_gitdir.as_posix()}\n")
+    write_file(worktree / "src" / "app.py", "print('app')\n" * 20)
+    write_file(worktree / "scratch" / "notes.md", "# scratch\n" * 20)
+
+    assert scanned_files(worktree) == ["src/app.py"]
+
+
+def test_scan_project_skips_worktree_checkouts(tmp_path):
+    """In-repo worktree checkouts are duplicates of the tree and are not mined (#2599)."""
+    write_file(tmp_path / ".git" / "HEAD", "ref: refs/heads/main\n")
+    write_file(tmp_path / "src" / "app.py", "print('app')\n" * 20)
+
+    # Conventional .worktrees/ directory is skipped outright.
+    write_file(tmp_path / ".worktrees" / "feature" / "src" / "app.py", "print('app')\n" * 20)
+
+    # A linked worktree anywhere else is recognised by its .git file.
+    gitdir = tmp_path / ".git" / "worktrees" / "fix"
+    write_file(gitdir / "commondir", "../..\n")
+    checkout = tmp_path / ".claude" / "worktrees" / "fix"
+    write_file(checkout / ".git", f"gitdir: {gitdir.as_posix()}\n")
+    write_file(checkout / "src" / "app.py", "print('app')\n" * 20)
+    write_file(tmp_path / ".claude" / "notes.md", "# notes\n" * 20)
+
+    # A submodule also has a .git file, but is not a worktree and is still mined.
+    write_file(tmp_path / ".git" / "modules" / "lib" / "HEAD", "abc\n")
+    write_file(tmp_path / "vendor" / "lib" / ".git", "gitdir: ../../.git/modules/lib\n")
+    write_file(tmp_path / "vendor" / "lib" / "lib.py", "print('lib')\n" * 20)
+
+    assert scanned_files(tmp_path) == [".claude/notes.md", "src/app.py", "vendor/lib/lib.py"]
+
+
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason="symlink creation requires elevated privileges on Windows",
