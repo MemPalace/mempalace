@@ -95,13 +95,20 @@ def _sqlite_taxonomy():
     cache_key = (_config.palace_path, _config.collection_name)
     # Taken before the query, so a write that lands during it invalidates.
     fingerprint = _palace_db_fingerprint()
+    # A readable chroma.sqlite3 changes stat on every commit, so a different
+    # fingerprint recounts even inside the TTL. The TTL is only the fallback
+    # for backends whose file stat misses commits (sqlite_exact's WAL) and
+    # for a palace whose file cannot be stat'ed.
+    fingerprint_matches = (
+        _taxonomy_cache is not None
+        and fingerprint is not None
+        and _taxonomy_cache[2] == fingerprint
+    )
+    ttl_fresh = fingerprint is None and (time.time() - _taxonomy_cache_time) < _TAXONOMY_CACHE_TTL
     if (
         _taxonomy_cache is not None
         and _taxonomy_cache[0] == cache_key
-        and (
-            (fingerprint is not None and _taxonomy_cache[2] == fingerprint)
-            or (time.time() - _taxonomy_cache_time) < _TAXONOMY_CACHE_TTL
-        )
+        and (fingerprint_matches or ttl_fresh)
     ):
         return _taxonomy_cache[1]
     counts = None

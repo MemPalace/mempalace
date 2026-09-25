@@ -760,6 +760,24 @@ class TestOverviewCaches:
         mcp_server._sqlite_taxonomy()
         assert len(calls) == 2
 
+    def test_taxonomy_recounts_a_changed_db_inside_the_ttl(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        """A peer commit inside the 5 s TTL must not return the previous totals.
+
+        The fingerprint is the invalidation key when it can be read. The TTL
+        only covers a palace whose file stat is unavailable.
+        """
+        from mempalace import mcp_server
+
+        self._seed(monkeypatch, config, collection, kg)
+        calls = self._spy(monkeypatch, "_sqlite_wing_room_counts")
+
+        mcp_server._sqlite_taxonomy()
+        self._touch_db_as_peer(palace_path)
+        mcp_server._sqlite_taxonomy()
+        assert len(calls) == 2
+
     def test_taxonomy_slower_than_ttl_is_still_cached(
         self, monkeypatch, config, palace_path, collection, kg
     ):

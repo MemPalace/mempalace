@@ -31,6 +31,48 @@ def _restamp_palace_db() -> None:
     _note_own_db_stamp(_config.palace_path, (_palace_db_inode, _palace_db_mtime))
 
 
+def _drop_session_client_for_system_reset() -> None:
+    """Close the session client before the shared Chroma System is dropped.
+
+    Search goes through ``ChromaBackend`` and the other tools through this
+    client. Both share Chroma's process-wide System. When one of them sees a
+    peer write it clears that System; the client left open keeps the discarded
+    segment, and the fresh stat the reset records would look like a write this
+    process made itself. Registered with
+    :func:`mempalace.backends.chroma.register_before_system_cache_reset`.
+
+    Does not clear the System again, and does not move the recorded stat: the
+    next ``_get_client`` reopens onto the System the other owner just built.
+    """
+    global \
+        _client_cache, \
+        _collection_cache, \
+        _collection_cache_backend, \
+        _collection_cache_palace, \
+        _collection_open_error
+    cached = _client_cache
+    _client_cache = None
+    _collection_cache = None
+    _collection_cache_backend = None
+    _collection_cache_palace = None
+    _collection_open_error = None
+    _invalidate_overview_caches()
+    if cached is None:
+        return
+    try:
+        close = getattr(cached, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        logger.debug(
+            "Failed to close session Chroma client before system reset",
+            exc_info=True,
+        )
+
+
+register_before_system_cache_reset(_drop_session_client_for_system_reset)
+
+
 class _SessionFreshness:
     """Stands in for ``ChromaCollection``'s owning backend so the session's own
     writes re-baseline its freshness stat (see :func:`_restamp_palace_db`)."""
@@ -61,6 +103,7 @@ def _get_client():
         _collection_open_error, \
         _palace_db_inode, \
         _palace_db_mtime, \
+        _client_system_generation, \
         _metadata_cache, \
         _metadata_cache_time
     if not _is_chroma_backend():
@@ -90,24 +133,33 @@ def _get_client():
 
     inode_changed = current_inode != 0 and current_inode != _palace_db_inode
     mtime_changed = current_mtime != 0.0 and abs(current_mtime - _palace_db_mtime) > 0.01
+    # A client opened before the last system reset is not reading the segment
+    # a peer write rebuilt, even when the new stat was recorded as our own.
+    client_is_current = (
+        _client_cache is not None and _client_system_generation == chroma_system_generation()
+    )
     if (
-        _client_cache is not None
+        client_is_current
         and mtime_changed
         and not inode_changed
-        and _is_own_db_stamp(_config.palace_path, (current_inode, current_mtime))
+        and _is_own_db_stamp(
+            _config.palace_path,
+            (current_inode, current_mtime),
+            generation=_client_system_generation,
+        )
     ):
-        # Written by ChromaBackend in this process for the same path, which
-        # shares our Chroma System: nothing to reload (see _OWN_DB_STAMPS).
+        # Written through the System this client was opened on (see
+        # _OWN_DB_STAMPS). Nothing to reload.
         _palace_db_mtime = current_mtime
         mtime_changed = False
 
-    if _client_cache is None or inode_changed or mtime_changed:
+    if _client_cache is None or inode_changed or mtime_changed or not client_is_current:
         # Run the HNSW capacity probe BEFORE chromadb opens the segment --
         # if the index is severely undersized, segment load can segfault
         # the whole MCP server (#1222). The probe is pure sqlite +
         # metadata read; never touches the HNSW binary files.
         _refresh_vector_disabled_flag()
-        if inode_changed or mtime_changed:
+        if client_is_current and (inode_changed or mtime_changed):
             ChromaBackend._quarantined_paths.discard(_config.palace_path)
             # #2002: a peer process changed chroma.sqlite3 on disk. chromadb
             # caches its System (and the live HNSW segment) keyed by path, so
@@ -116,6 +168,11 @@ def _get_client():
             # persisted count backwards. Drop chromadb's shared cache first so
             # make_client() rebuilds the segment from the on-disk state.
             _force_chroma_cache_reset()
+        elif _client_cache is not None:
+            # Another owner already reset the shared System and this client
+            # is the one it left behind. Reopen onto the System it built;
+            # clearing again would discard that System too.
+            _drop_session_client_for_system_reset()
         _client_cache = ChromaBackend.make_client(_config.palace_path)
         _collection_cache = None
         _collection_cache_backend = None
@@ -124,6 +181,7 @@ def _get_client():
         _invalidate_overview_caches()
         # Stat again: constructing the client just wrote to chroma.sqlite3.
         _palace_db_inode, _palace_db_mtime = _stat_palace_db()
+        _client_system_generation = chroma_system_generation()
         _note_own_db_stamp(_config.palace_path, (_palace_db_inode, _palace_db_mtime))
     return _client_cache
 

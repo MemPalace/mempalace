@@ -306,7 +306,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   a ten-drawer wing loaded every vector in the palace, and the window was the
   first page Chroma returned rather than the newest drawers. On a
   360k-drawer palace wake-up went from 0.8-8.8 s at up to 920 MB to about
-  0.5 s at 238 MB.
+  0.5 s at 238 MB. The read stays on the metadata segment, so a vector-segment
+  row cannot come back as an empty drawer. Chroma advertises
+  `supports_recency_order` for that exact window.
+- **A write from another process reconnects every Chroma client in this one.**
+  Search and the other tools share one in-memory index. The client that
+  noticed the write rebuilt and recorded the new file stat; the other treated
+  that stat as its own write and kept reading the index the rebuild had
+  discarded. Both clients now drop together. `mempalace_status` also recounts
+  as soon as the palace file changes, including inside its 5 second cache.
 - **The legacy `mempalace repair` no longer runs without the palace lease, so a
   hook miner can no longer destroy a repair that is already half done.**
   `cmd_repair` extracted every drawer and copied the whole palace to

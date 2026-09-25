@@ -1704,7 +1704,7 @@ def _sqlite_collection_has_rows(palace_path: str, collection_name: str) -> Optio
                 FROM embeddings e
                 JOIN segments s ON e.segment_id = s.id
                 JOIN collections c ON s.collection = c.id
-                WHERE c.name = ?
+                WHERE c.name = ? AND s.scope = 'METADATA'
                 LIMIT 1
                 """,
                 (collection_name,),
@@ -1787,9 +1787,13 @@ def _sqlite_recent_records(
         for _ in equalities
     )
     filter_params = [part for pair in equalities for part in pair]
+    # METADATA only. A VECTOR-segment row (HNSW bookkeeping, or a future
+    # chroma that stores one) is not a drawer; joining it returns a ghost
+    # with empty document and metadata. Same predicate as the other sqlite
+    # readers and repair.extract_via_sqlite.
     scope_sql = """
         FROM embeddings e
-        JOIN segments s ON e.segment_id = s.id
+        JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
         JOIN collections c ON s.collection = c.id
     """
     try:
@@ -1822,7 +1826,7 @@ def _sqlite_recent_records(
                     SELECT w.id, o.string_value
                     FROM embedding_metadata w
                     CROSS JOIN embeddings e ON e.id = w.id
-                    JOIN segments s ON e.segment_id = s.id
+                    JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
                     JOIN collections c ON s.collection = c.id
                     LEFT JOIN embedding_metadata o ON o.id = w.id AND o.key = ?
                     WHERE w.key = ? AND w.string_value = ? AND c.name = ?
@@ -2058,7 +2062,7 @@ def _sqlite_iter_metadata(
     """
     scope = """
         SELECT e.id FROM embeddings e
-        JOIN segments s ON e.segment_id = s.id
+        JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
         JOIN collections c ON s.collection = c.id
         WHERE c.name = ?
     """
@@ -2714,54 +2718,99 @@ def _close_client(client) -> None:
 
 # The ``chroma.sqlite3`` stat that this process's own client opens and writes
 # last left each palace at, keyed by the exact path string the client was built
-# with. ChromaBackend and the MCP server's session client both record here.
+# with, plus the :data:`_SYSTEM_GENERATION` that client was opened on.
+# ChromaBackend and the MCP server's session client both record here.
 # Chroma keys its System (and the live HNSW segment) by that same string, so a
 # write through one of them is already in the memory the other reads. Without
 # the shared record each read the other's footprint as an external change, and
 # a server alternating search with other tools rebuilt a client, reloading the
 # whole index, on every switch.
-_OWN_DB_STAMPS: dict[str, tuple[int, float]] = {}
+#
+# The generation is what keeps that shortcut from hiding a stale client. A peer
+# write resets the shared System and then records the fresh stat. The client
+# that was not the one to notice still holds the segment the reset discarded;
+# the new stat would otherwise look like a write it can trust.
+_OWN_DB_STAMPS: dict[str, tuple[tuple[int, float], int]] = {}
+_SYSTEM_GENERATION = 0
+_BEFORE_SYSTEM_CACHE_RESET: list = []
+_clearing_system_cache = False
+
+
+def chroma_system_generation() -> int:
+    """Generation of the process-wide Chroma System cache.
+
+    Increments each time :func:`_clear_chroma_system_cache` drops the cache.
+    A client opened at an older generation is reading a discarded segment.
+    """
+    return _SYSTEM_GENERATION
+
+
+def register_before_system_cache_reset(callback) -> None:
+    """Run ``callback`` before the shared Chroma System cache is dropped.
+
+    ``clear_system_cache`` forgets Chroma's maps without stopping Systems.
+    Every client this module does not itself own has to be closed while those
+    maps still resolve. The callback must not call
+    :func:`_clear_chroma_system_cache`.
+    """
+    if callback not in _BEFORE_SYSTEM_CACHE_RESET:
+        _BEFORE_SYSTEM_CACHE_RESET.append(callback)
 
 
 def _note_own_db_stamp(palace_path: str, stamp: tuple) -> None:
     if stamp != (0, 0.0):
-        _OWN_DB_STAMPS[palace_path] = stamp
+        _OWN_DB_STAMPS[palace_path] = (stamp, _SYSTEM_GENERATION)
 
 
-def _is_own_db_stamp(palace_path: str, stamp: tuple) -> bool:
-    return stamp != (0, 0.0) and _OWN_DB_STAMPS.get(palace_path) == stamp
+def _is_own_db_stamp(palace_path: str, stamp: tuple, *, generation: int) -> bool:
+    """True when ``stamp`` is a write this process made on ``generation``'s System."""
+    return stamp != (0, 0.0) and _OWN_DB_STAMPS.get(palace_path) == (stamp, generation)
 
 
-def _clear_chroma_system_cache() -> None:
+def _clear_chroma_system_cache() -> bool:
     """Drop Chroma's process-global ``SharedSystemClient`` cache.
 
-    ``clear_system_cache()`` replaces Chroma's system and refcount maps without
-    calling ``System.stop()``. Callers must close every client they own before
-    invoking this helper, while Chroma can still resolve those maps.
+    Closes clients registered with :func:`register_before_system_cache_reset`
+    first. ``clear_system_cache()`` replaces Chroma's system and refcount maps
+    without calling ``System.stop()``, so a client still open keeps the segment
+    the reset discarded and a later write can persist that stale index over
+    the peer's (#2002).
 
-    Chroma caches its ``System`` (and the live HNSW segment) keyed by path. A
-    bare ``chromadb.PersistentClient(path=...)`` reopen reuses that cached
-    System, so after a peer or rebuild changes ``chroma.sqlite3`` on disk we
-    would rebuild against stale in-memory state and could persist an outdated
-    index over the on-disk changes -- the same data-loss class as #2002,
-    reached through :meth:`ChromaBackend._client` instead of
-    ``mcp_server._get_client``.
+    Returns whether Chroma's clear ran. The generation advances either way: a
+    caller that already closed its client must not treat the following reopen
+    as the same System.
 
     The clear is process-global because Chroma exposes no public per-path
-    eviction primitive. It runs only on the external inode/mtime-change branch,
-    never on the steady-state hot path.
+    eviction primitive. It runs only when a peer or rebuild changed the palace
+    on disk, never on the steady-state hot path.
     """
+    global _SYSTEM_GENERATION, _clearing_system_cache
+    if _clearing_system_cache:
+        return False
+    _clearing_system_cache = True
     try:
-        from chromadb.api.client import SharedSystemClient
+        for callback in list(_BEFORE_SYSTEM_CACHE_RESET):
+            try:
+                callback()
+            except Exception:
+                logger.debug("Chroma system-reset hook failed", exc_info=True)
+        cleared = True
+        try:
+            from chromadb.api.client import SharedSystemClient
 
-        clear = getattr(SharedSystemClient, "clear_system_cache", None)
-        if callable(clear):
-            clear()
-    except Exception:
-        logger.debug(
-            "Failed to clear chromadb SharedSystemClient cache",
-            exc_info=True,
-        )
+            clear = getattr(SharedSystemClient, "clear_system_cache", None)
+            if callable(clear):
+                clear()
+        except Exception:
+            logger.debug(
+                "Failed to clear chromadb SharedSystemClient cache",
+                exc_info=True,
+            )
+            cleared = False
+        _SYSTEM_GENERATION += 1
+        return cleared
+    finally:
+        _clearing_system_cache = False
 
 
 class ChromaCollection(BaseCollection):
@@ -3161,6 +3210,11 @@ class ChromaCollection(BaseCollection):
         ``where`` made of string equalities (what Layer 1 passes) is evaluated
         in sqlite; any other filter, or a database the read cannot reach, goes
         through the base implementation.
+
+        String equalities and an unfiltered read are the true top ``limit``
+        at any collection size, which is why :class:`ChromaBackend` advertises
+        ``supports_recency_order``. A filter this path cannot evaluate keeps
+        the base implementation's approximate window.
         """
         equalities = _string_equalities(where)
         spec = _IncludeSpec.resolve(include, default_distances=False)
@@ -3526,6 +3580,7 @@ class ChromaBackend(BaseBackend):
             "supports_metadata_filters",
             "supports_contains_fast",
             "supports_lexical_search",
+            "supports_recency_order",
             "local_mode",
         }
     )
@@ -3535,6 +3590,8 @@ class ChromaBackend(BaseBackend):
         self._clients: dict[str, Any] = {}
         # palace_path -> (inode, mtime) of chroma.sqlite3 at cache time.
         self._freshness: dict[str, tuple[int, float]] = {}
+        # palace_path -> system generation the cached client was opened on.
+        self._system_generation: dict[str, int] = {}
         self._closed = False
 
     @staticmethod
@@ -3615,6 +3672,7 @@ class ChromaBackend(BaseBackend):
         clients = list(self._clients.values())
         self._clients.clear()
         self._freshness.clear()
+        self._system_generation.clear()
         for client in clients:
             _close_client(client)
 
@@ -3658,6 +3716,7 @@ class ChromaBackend(BaseBackend):
         if cached is not None and not os.path.isfile(db_path):
             _close_client(self._clients.pop(palace_path, None))
             self._freshness.pop(palace_path, None)
+            self._system_generation.pop(palace_path, None)
             cached = None
             cached_inode, cached_mtime = 0, 0.0
 
@@ -3670,14 +3729,20 @@ class ChromaBackend(BaseBackend):
             and cached_mtime != 0.0
             and abs(current_mtime - cached_mtime) > 0.01
         )
+        opened_generation = self._system_generation.get(palace_path, -1)
         if (
             cached is not None
             and mtime_changed
             and not inode_changed
-            and _is_own_db_stamp(palace_path, (current_inode, current_mtime))
+            and _is_own_db_stamp(
+                palace_path,
+                (current_inode, current_mtime),
+                generation=opened_generation,
+            )
         ):
-            # Written by another client in this process for the same path,
-            # which shares our Chroma System: nothing to reload.
+            # Written by another client in this process on the same System:
+            # nothing to reload. A stamp recorded after that System was
+            # dropped belongs to the replacement client.
             self._freshness[palace_path] = (current_inode, current_mtime)
             mtime_changed = False
 
@@ -3712,6 +3777,7 @@ class ChromaBackend(BaseBackend):
             # chroma.sqlite3 lazily, so the stat captured before the call
             # may still be (0, 0.0) on first open.
             self._freshness[palace_path] = self._db_stat(palace_path)
+            self._system_generation[palace_path] = _SYSTEM_GENERATION
             _note_own_db_stamp(palace_path, self._freshness[palace_path])
         return cached
 
@@ -3942,6 +4008,7 @@ class ChromaBackend(BaseBackend):
         with palace_db_lock(os.path.join(path, "chroma.sqlite3")):
             _close_client(self._clients.pop(path, None))
             self._freshness.pop(path, None)
+            self._system_generation.pop(path, None)
 
     def close(self) -> None:
         self._drain_clients()

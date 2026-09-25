@@ -1352,6 +1352,35 @@ class TestClientFreshness:
         assert len(calls) == 1
         assert col.get(ids=["peer_drawer"])["ids"] == ["peer_drawer"]
 
+    def test_backend_peer_reconnect_drops_the_session_client(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """The client that did not see the peer write must not keep the old index.
+
+        Search reconnects through ChromaBackend and records the fresh stat.
+        The session client shares that System; treating the new stat as its
+        own write left it reading the segment the reset had discarded.
+        """
+        from mempalace import mcp_server
+        from mempalace.palace import get_collection as palace_get_collection
+
+        self._open(monkeypatch, config, palace_path, kg)
+        session_client = mcp_server._get_client()
+        palace_get_collection(config.palace_path, create=False).get(limit=1)
+
+        subprocess.run([sys.executable, "-c", _PEER_WRITE, config.palace_path], check=True)
+
+        # The backend notices first and resets the shared System.
+        assert palace_get_collection(config.palace_path, create=False).get(ids=["peer_drawer"])[
+            "ids"
+        ] == ["peer_drawer"]
+        assert mcp_server._get_client() is not session_client
+        assert mcp_server._get_collection().get(ids=["peer_drawer"])["ids"] == ["peer_drawer"]
+        # The session reopen must not have discarded the backend's fresh System.
+        assert palace_get_collection(config.palace_path, create=False).get(ids=["peer_drawer"])[
+            "ids"
+        ] == ["peer_drawer"]
+
 
 class TestStructuredErrors:
     """Verify that _internal_tool_error and MineAlreadyRunning return

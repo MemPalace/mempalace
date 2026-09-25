@@ -1116,6 +1116,8 @@ _collection_cache_palace = None
 _collection_open_error = None
 _palace_db_inode = 0  # inode of chroma.sqlite3 at cache time
 _palace_db_mtime = 0.0  # mtime of chroma.sqlite3 at cache time
+# System generation the session client was opened on. -1 until the first open.
+_client_system_generation = -1
 
 
 def _is_transient_index_error(result) -> bool:
@@ -1184,14 +1186,10 @@ def _force_chroma_cache_reset() -> None:
             logger.debug(
                 "Failed to close MCP-local Chroma client during cache reset", exc_info=True
             )
-    try:
-        from chromadb.api.client import SharedSystemClient
-
-        clear_system_cache = getattr(SharedSystemClient, "clear_system_cache", None)
-        if callable(clear_system_cache):
-            clear_system_cache()
-    except Exception:
-        logger.debug("Failed to clear Chroma shared system cache during cache reset", exc_info=True)
+    # Hook closes any session client this reset did not already drop, and the
+    # generation advances so the reopen is not treated as the same System.
+    if not _clear_chroma_system_cache():
+        logger.debug("Failed to clear Chroma shared system cache during cache reset")
 
 
 # ── Vector-search disabled flag (#1222) ──────────────────────────────────

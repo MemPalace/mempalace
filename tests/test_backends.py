@@ -962,6 +962,71 @@ def test_chroma_get_recent_honours_include_projection(tmp_path):
     assert got.metadatas == []
 
 
+def test_chroma_advertises_exact_recency_order():
+    assert "supports_recency_order" in ChromaBackend.capabilities
+
+
+def _insert_vector_segment_ghost(palace: Path) -> None:
+    """A VECTOR-segment embeddings row with drawer-shaped metadata.
+
+    Current chromadb stores drawers on the METADATA segment only. A row on
+    the VECTOR segment must not come back from the sqlite readers.
+    """
+    conn = sqlite3.connect(palace / "chroma.sqlite3")
+    try:
+        vector_id = conn.execute("SELECT id FROM segments WHERE scope = 'VECTOR'").fetchone()[0]
+        cursor = conn.execute(
+            "INSERT INTO embeddings (segment_id, embedding_id, seq_id) VALUES (?, 'ghost', 99)",
+            (vector_id,),
+        )
+        row_id = cursor.lastrowid
+        conn.executemany(
+            "INSERT INTO embedding_metadata (id, key, string_value) VALUES (?, ?, ?)",
+            [
+                (row_id, "chroma:document", "ghost doc"),
+                (row_id, "filed_at", "2099-01-01T00:00:00"),
+                (row_id, "wing", "vector-only"),
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("filter_driven", [True, False], ids=["filter_driven", "order_driven"])
+def test_chroma_sqlite_readers_skip_vector_segment_rows(tmp_path, monkeypatch, filter_driven):
+    palace = tmp_path / "palace"
+    ref = PalaceRef(id=str(palace), local_path=str(palace))
+    backend = ChromaBackend()
+    try:
+        col = backend.get_collection(palace=ref, collection_name="mempalace_drawers", create=True)
+        col.add(
+            ids=["real"],
+            documents=["real doc"],
+            embeddings=[[0.1, 0.2, 0.3, 0.4]],
+            metadatas=[{"wing": "a", "filed_at": "2020-01-01T00:00:00"}],
+        )
+    finally:
+        backend.close()
+    _insert_vector_segment_ghost(palace)
+
+    monkeypatch.setattr(chroma_module, "_RECENT_FILTER_DRIVEN_MAX", 10**9 if filter_driven else 0)
+    backend = ChromaBackend()
+    try:
+        col = backend.get_collection(palace=ref, collection_name="mempalace_drawers", create=False)
+        recent = col.get_recent(limit=10)
+        assert recent.ids == ["real"]
+        assert recent.documents == ["real doc"]
+        scoped = col.get_recent(limit=10, where={"wing": "vector-only"})
+        assert scoped.ids == []
+        metas = col.get_all_metadata()
+        assert len(metas) == 1
+        assert metas[0]["wing"] == "a"
+        assert metas[0]["filed_at"] == "2020-01-01T00:00:00"
+    finally:
+        backend.close()
+
+
 def test_chroma_get_all_metadata_reads_sqlite_in_one_pass(tmp_path, monkeypatch):
     """Same list the base implementation pages out (order, typed values, None
     for a drawer without metadata), without Chroma's OFFSET paging."""
