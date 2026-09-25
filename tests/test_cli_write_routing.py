@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import errno
+import json
 import os
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -372,6 +374,252 @@ def test_cmd_sweep_prefer_submits_daemon_job(tmp_path):
     assert submit.call_args.args[0] == "sweep"
     assert submit.call_args.args[1] == {
         "target": str(tmp_path / "session.jsonl"),
+    }
+
+
+def _symlink_or_skip(target, link):
+    """Skip only where creating a symlink is refused, as tests/test_backups.py
+    does; any other failure is a bug in the test and must not become a skip."""
+    try:
+        os.symlink(target, link, target_is_directory=os.path.isdir(target))
+    except NotImplementedError as exc:
+        pytest.skip(f"symlinks are unavailable here: {exc}")
+    except OSError as exc:
+        if os.name != "nt" and exc.errno not in (errno.EPERM, errno.EACCES):
+            raise
+        pytest.skip(f"symlink creation not permitted for this user: {exc}")
+
+
+def _link_to_real_sub(cwd):
+    """``link`` -> ``real/sub`` inside ``cwd``: on disk ``link/..`` is
+    ``real``, while a lexical normalizer would read it as ``cwd``."""
+    if os.name == "nt":
+        pytest.skip("Windows collapses '..' before it reads a link, on every route")
+    os.makedirs(os.path.join(cwd, "real", "sub"))
+    _symlink_or_skip(os.path.join(cwd, "real", "sub"), os.path.join(cwd, "link"))
+
+
+@pytest.mark.parametrize(
+    ("target", "base", "parts"),
+    [
+        ("session.jsonl", "cwd", ("session.jsonl",)),
+        (".", "cwd", ()),
+        ("~/session.jsonl", "home", ("session.jsonl",)),
+        ("link/../session.jsonl", "real", ("session.jsonl",)),
+    ],
+)
+def test_cmd_sweep_daemon_resolves_relative_target_against_caller_cwd(
+    tmp_path,
+    monkeypatch,
+    target,
+    base,
+    parts,
+):
+    """The daemon keeps the cwd it was started in, so a relative target has
+    to be resolved here, against the caller's cwd, before it enters the job,
+    and resolved the way the direct route reads it: through a symlink first,
+    then ``..``."""
+
+    home = str(tmp_path / "home")
+    monkeypatch.setenv("HOME", home)
+    monkeypatch.setenv("USERPROFILE", home)
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    bases = {"cwd": cwd, "home": home, "real": os.path.join(cwd, "real")}
+    if base == "real":
+        _link_to_real_sub(cwd)
+    args = _args(palace=str(tmp_path / "palace"), target=target)
+
+    with (
+        patch(
+            "mempalace.cli._resolve_cli_write_routing_or_exit",
+            return_value=_route(WriteRoutingPolicy.PREFER),
+        ),
+        patch(
+            "mempalace.cli._submit_daemon_cli_job",
+        ) as submit,
+    ):
+        cli.cmd_sweep(args)
+
+    assert submit.call_args.args[1] == {"target": os.path.join(bases[base], *parts)}
+
+
+def test_cmd_sweep_keeps_a_linked_transcript_under_its_own_name(tmp_path, monkeypatch):
+    """Only the directories above a file target are resolved: a transcript
+    reached through a symlink keeps the name it was given, which is the name
+    ``sweep <dir>`` files it under, not its target's."""
+
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    os.makedirs(os.path.join(cwd, "store"))
+    os.makedirs(os.path.join(cwd, "sessions"))
+    stored = os.path.join(cwd, "store", "abc.jsonl")
+    open(stored, "w").close()
+    _symlink_or_skip(stored, os.path.join(cwd, "sessions", "linked.jsonl"))
+    args = _args(palace=str(tmp_path / "palace"), target="sessions/linked.jsonl")
+
+    with (
+        patch(
+            "mempalace.cli._resolve_cli_write_routing_or_exit",
+            return_value=_route(WriteRoutingPolicy.PREFER),
+        ),
+        patch(
+            "mempalace.cli._submit_daemon_cli_job",
+        ) as submit,
+    ):
+        cli.cmd_sweep(args)
+
+    assert submit.call_args.args[1] == {"target": os.path.join(cwd, "sessions", "linked.jsonl")}
+
+
+def test_cmd_sweep_direct_files_drawers_under_an_absolute_source_file(
+    tmp_path,
+    monkeypatch,
+):
+    """``sync`` counts a relative ``source_file`` as having no source and
+    never prunes it, so the direct route files the same absolute path the
+    daemon route does."""
+
+    import chromadb
+
+    record = {
+        "type": "user",
+        "timestamp": "2026-04-18T10:00:05Z",
+        "sessionId": "abc",
+        "uuid": "u-1",
+        "message": {"role": "user", "content": "What's the capital of France?"},
+    }
+    (tmp_path / "session.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
+    palace = tmp_path / "palace"
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    args = _args(palace=str(palace), target="session.jsonl")
+
+    with patch(
+        "mempalace.cli._resolve_cli_write_routing_or_exit",
+        return_value=_route(WriteRoutingPolicy.DIRECT),
+    ):
+        cli.cmd_sweep(args)
+
+    client = chromadb.PersistentClient(path=str(palace))
+    try:
+        metas = client.get_collection("mempalace_drawers").get(include=["metadatas"])["metadatas"]
+    finally:
+        # Windows keeps chromadb's files locked until close() (see conftest).
+        client.close()
+    assert [m["source_file"] for m in metas] == [os.path.join(cwd, "session.jsonl")]
+
+
+@pytest.mark.parametrize("target", ["", "   "])
+@pytest.mark.parametrize(
+    "policy",
+    [
+        WriteRoutingPolicy.DIRECT,
+        WriteRoutingPolicy.PREFER,
+    ],
+)
+def test_cmd_sweep_blank_target_is_not_read_as_the_cwd(
+    tmp_path,
+    monkeypatch,
+    policy,
+    target,
+):
+    """A blank target (say ``"$TRANSCRIPTS"`` with the variable unset) is
+    passed on as typed and refused: resolving "" (or spaces, on Windows) would
+    give the caller's cwd and sweep that directory."""
+
+    monkeypatch.chdir(tmp_path)
+    args = _args(palace=str(tmp_path / "palace"), target=target)
+
+    with (
+        patch(
+            "mempalace.cli._resolve_cli_write_routing_or_exit",
+            return_value=_route(policy),
+        ),
+        patch(
+            "mempalace.cli._submit_daemon_cli_job",
+        ) as submit,
+        patch(
+            "mempalace.sweeper.sweep_directory",
+        ) as direct_sweep_directory,
+    ):
+        if policy is WriteRoutingPolicy.DIRECT:
+            with pytest.raises(SystemExit) as exc:
+                cli.cmd_sweep(args)
+            assert exc.value.code == 1
+        else:
+            cli.cmd_sweep(args)
+
+    direct_sweep_directory.assert_not_called()
+    if policy is WriteRoutingPolicy.PREFER:
+        # The daemon refuses a blank target itself (``run_sweep``).
+        assert submit.call_args.args[1] == {"target": target}
+
+
+@pytest.mark.parametrize(
+    ("directory", "base", "want_dir"),
+    [
+        ("proj", "cwd", ("proj",)),
+        ("~/proj", "home", ("proj",)),
+        ("link/../proj", "real", ("proj",)),
+        (None, None, None),
+    ],
+)
+def test_cmd_sync_daemon_resolves_relative_dirs_against_caller_cwd(
+    tmp_path,
+    monkeypatch,
+    directory,
+    base,
+    want_dir,
+):
+    """Same as the sweep target: the project dir and every --root are
+    resolved against the caller's cwd, and an omitted dir stays omitted
+    instead of becoming the cwd."""
+
+    home = str(tmp_path / "home")
+    monkeypatch.chdir(tmp_path)
+    cwd = os.getcwd()
+    bases = {"cwd": cwd, "home": home, "real": os.path.join(cwd, "real")}
+    roots, want_roots = (
+        ["other", ".", "~/extra"],
+        [os.path.join(cwd, "other"), cwd, os.path.join(home, "extra")],
+    )
+    if base == "real":
+        _link_to_real_sub(cwd)
+        roots.append("link/../more")
+        want_roots.append(os.path.join(cwd, "real", "more"))
+    args = _args(
+        palace=str(tmp_path / "palace"),
+        dir=directory,
+        root=roots,
+        wing=None,
+        dry_run=False,
+    )
+
+    with (
+        patch(
+            "mempalace.cli._resolve_cli_write_routing_or_exit",
+            return_value=_route(WriteRoutingPolicy.PREFER),
+        ),
+        patch(
+            "mempalace.cli._submit_daemon_cli_job",
+        ) as submit,
+        patch(
+            "mempalace.sync.sync_palace",
+        ) as direct_sync,
+    ):
+        # Set only now: patching ``mempalace.sync`` may import ``miner`` for the
+        # first time, and it reads HOME at import.
+        monkeypatch.setenv("HOME", home)
+        monkeypatch.setenv("USERPROFILE", home)
+        cli.cmd_sync(args)
+
+    direct_sync.assert_not_called()
+    assert submit.call_args.args[1] == {
+        "dir": None if want_dir is None else os.path.join(bases[base], *want_dir),
+        "root": want_roots,
+        "wing": None,
+        "dry_run": False,
     }
 
 
