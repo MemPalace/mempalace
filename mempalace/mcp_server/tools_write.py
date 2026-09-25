@@ -1376,10 +1376,10 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 
         # A closet quotes the source file, not the stored drawer, so it only
         # goes stale on a content change; wing/room alone leaves it correct (#2325).
-        closets_deleted = 0
-        source_file = old_meta.get("source_file")
-        if content is not None and source_file:
-            closets_deleted = _purge_source_closets(source_file, commit=True)
+        # Purge after the drawer write, as the delete tools do: the purge opens
+        # the closets through the backend, and a rebuild there closes the client
+        # ``col`` came from.
+        source_file = old_meta.get("source_file") if content is not None else None
 
         chunk_size = max(1, int(getattr(_config, "chunk_size", 800) or 800))
         should_chunk = bool(record.get("chunked")) or len(new_doc) > chunk_size
@@ -1400,6 +1400,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 col.delete(ids=stale_ids)
 
             _invalidate_overview_caches()
+            closets_deleted = _purge_source_closets(source_file, commit=True) if source_file else 0
 
             logger.info("Updated drawer: %s (%s rows)", drawer_id, len(chunk_ids))
 
@@ -1420,6 +1421,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 
         col.update(**update_kwargs)
         _invalidate_overview_caches()
+        closets_deleted = _purge_source_closets(source_file, commit=True) if source_file else 0
 
         logger.info("Updated drawer: %s", drawer_id)
 
@@ -1466,7 +1468,14 @@ def tool_delete_drawers(drawer_ids: list):
     errors = 0
     for drawer_id in drawer_ids:
         try:
-            if found is None:
+            # A delete that purges closets opens them through the backend, and a rebuild there
+            # closes the client ``col`` came from. Take the collection again when that happened,
+            # or when another caller has already taken it again from the rebuilt client.
+            if not col or col is not _collection_cache or _backend_replaced_client():
+                col = _get_collection()
+            if not col:
+                outcome = {"success": False, "error": _collection_error_or_no_palace()["error"]}
+            elif found is None:
                 outcome = _delete_resolved_drawer(col, drawer_id, bulk=True)
             else:
                 record = found.get(drawer_id)

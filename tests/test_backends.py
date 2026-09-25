@@ -2348,6 +2348,52 @@ def test_chroma_backend_resets_system_cache_on_inode_change(tmp_path, monkeypatc
         backend.close()
 
 
+def test_chroma_backend_drain_rearms_quarantine_for_every_dropped_palace(tmp_path, monkeypatch):
+    """A drain forgets every palace's stat record, so each of them must re-run
+    the HNSW pre-checks on its next open, not only the palace that changed."""
+    from chromadb.api.client import SharedSystemClient
+
+    changed, other = str(tmp_path / "changed"), str(tmp_path / "other")
+    for palace in (changed, other):
+        os.makedirs(palace)
+        (Path(palace) / "chroma.sqlite3").write_text("")
+
+    for name in (
+        "_fix_missing_collection_type",
+        "_fix_blob_seq_ids",
+        "quarantine_invalid_hnsw_metadata",
+        "quarantine_stale_hnsw",
+    ):
+        monkeypatch.setattr(f"mempalace.backends.chroma.{name}", lambda path, *a, **k: [])
+    monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
+    monkeypatch.setattr(SharedSystemClient, "clear_system_cache", lambda: None)
+
+    class DummyClient:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "mempalace.backends.chroma.chromadb.PersistentClient",
+        lambda path, settings=None: DummyClient(),
+    )
+
+    backend = ChromaBackend()
+    stats = {changed: (1, 1.0), other: (1, 1.0)}
+    monkeypatch.setattr(backend, "_db_stat", lambda path: stats[path])
+
+    try:
+        backend._client(changed)
+        backend._client(other)
+        assert ChromaBackend._quarantined_paths == {changed, other}
+
+        stats[changed] = (1, 2.0)
+        backend._client(changed)
+
+        assert other not in ChromaBackend._quarantined_paths
+    finally:
+        backend.close()
+
+
 def test_explain_ef_mismatch_recognizes_chromadb_conflict():
     """When ChromaDB rejects a collection read due to an EF-name mismatch
     (user changed MEMPALACE_EMBEDDING_MODEL on an existing palace), the

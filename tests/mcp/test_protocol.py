@@ -813,8 +813,378 @@ class TestHandleRequest:
 # ── Read Tools ──────────────────────────────────────────────────────────
 
 
+def _count_client_builds(monkeypatch):
+    """Count ``chromadb.PersistentClient`` constructions from here on."""
+    import chromadb
+
+    built = []
+    real = chromadb.PersistentClient
+
+    def counting(*args, **kwargs):
+        built.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(chromadb, "PersistentClient", counting)
+    return built
+
+
+def _move_mtime_forward(db_file, seconds):
+    st = os.stat(db_file)
+    os.utime(db_file, (st.st_atime, st.st_mtime + seconds))
+
+
+def _touch_after_own_opens_and_writes(monkeypatch, db_file):
+    """Make this process's own collection opens and upserts move chroma.sqlite3's mtime.
+
+    They move it by milliseconds, which a filesystem with coarse timestamps may
+    not record at all. Push it forward by 2 s, FAT32's resolution, after every
+    collection open (``_pin_hnsw_threads`` runs at the end of both open paths,
+    before any re-stamp) and after every upsert, so these tests do not depend
+    on a finer timestamp resolution.
+    """
+    from chromadb.api.models.Collection import Collection
+
+    from mempalace import mcp_server
+    from mempalace.backends import chroma as chroma_module
+
+    real_pin = chroma_module._pin_hnsw_threads
+    real_upsert = Collection.upsert
+
+    def pin_and_touch(collection):
+        real_pin(collection)
+        _move_mtime_forward(db_file, 2)
+
+    def upsert_and_touch(self, *args, **kwargs):
+        result = real_upsert(self, *args, **kwargs)
+        _move_mtime_forward(db_file, 2)
+        return result
+
+    monkeypatch.setattr(chroma_module, "_pin_hnsw_threads", pin_and_touch)
+    monkeypatch.setattr(mcp_server, "_pin_hnsw_threads", pin_and_touch)
+    monkeypatch.setattr(Collection, "upsert", upsert_and_touch)
+
+
+def _write_drawer_from_another_process(palace_path, drawer_id, text, **metadata):
+    """Upsert a drawer and its vector from a separate Python process.
+
+    Creates the drawers collection if the palace has none. Then push
+    chroma.sqlite3's mtime forward, so the change is unambiguous on filesystems
+    with coarse timestamps.
+    """
+    from mempalace.backends.chroma import ChromaBackend
+
+    embedding = ChromaBackend._resolve_embedding_function()([text])[0]
+    peer = (
+        "import json, sys\n"
+        "import chromadb\n"
+        "path, drawer_id, text = sys.argv[1], sys.argv[2], sys.argv[3]\n"
+        "vector, metadata = json.loads(sys.argv[4]), json.loads(sys.argv[5])\n"
+        "client = chromadb.PersistentClient(path=path)\n"
+        "try:\n"
+        "    col = client.get_collection('mempalace_drawers')\n"
+        "except Exception:\n"
+        "    col = client.create_collection(\n"
+        "        'mempalace_drawers', metadata={'hnsw:space': 'cosine'}\n"
+        "    )\n"
+        "col.upsert(ids=[drawer_id], documents=[text], embeddings=[vector], metadatas=[metadata])\n"
+        "client.close()\n"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            peer,
+            palace_path,
+            drawer_id,
+            text,
+            json.dumps([float(x) for x in embedding]),
+            json.dumps({"wing": "w", "room": "r", **metadata}),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    assert result.returncode == 0, (
+        f"peer write failed: rc={result.returncode}; stderr={result.stderr!r}"
+    )
+    _move_mtime_forward(os.path.join(palace_path, "chroma.sqlite3"), 60)
+
+
 class TestCacheInvalidation:
     """Tests for _get_collection inode/mtime cache invalidation logic."""
+
+    def test_own_writes_and_searches_do_not_rebuild_the_client(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """The server's own activity must not reload the index.
+
+        Filing a drawer writes chroma.sqlite3 and every search opens its
+        collections, which writes it too. None of that is somebody else's
+        write, so none of it may rebuild the chromadb client: after a rebuild
+        the next query reads the HNSW index from disk again.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        _touch_after_own_opens_and_writes(monkeypatch, os.path.join(palace_path, "chroma.sqlite3"))
+
+        # Warm both paths: filing goes through _get_collection, search through
+        # palace.get_collection.
+        assert mcp_server.tool_add_drawer("w", "r", "a first drawer about lighthouses")["success"]
+        mcp_server.tool_search(query="lighthouses")
+        built = _count_client_builds(monkeypatch)
+
+        for i in range(3):
+            content = f"drawer {i} about glaciers and moraines"
+            assert mcp_server.tool_add_drawer("w", "r", content)["success"] is True
+            assert "error" not in mcp_server.tool_check_duplicate(content)
+            assert "error" not in mcp_server.tool_search(query=f"glaciers {i}")
+
+        assert built == [], f"the server's own activity rebuilt the client {len(built)} time(s)"
+
+    def test_external_write_rebuilds_the_client_once(self, monkeypatch, config, palace_path, kg):
+        """A write by another process must still force a rebuild.
+
+        Absorbing it would keep serving the pre-write HNSW segment. The rebuild
+        must also be the only one: filing and searching after it go on using
+        the rebuilt client.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        db_file = os.path.join(palace_path, "chroma.sqlite3")
+        _touch_after_own_opens_and_writes(monkeypatch, db_file)
+
+        assert mcp_server.tool_add_drawer("w", "r", "a first drawer about lighthouses")["success"]
+        mcp_server.tool_search(query="lighthouses")
+        built = _count_client_builds(monkeypatch)
+
+        # Model another process's write: the mtime moves well past the epsilon.
+        _move_mtime_forward(db_file, 60)
+
+        assert "error" not in mcp_server.tool_check_duplicate("a first drawer about lighthouses")
+        assert len(built) == 1, "a write by another process did not rebuild the client"
+        assert mcp_server.tool_add_drawer("w", "r", "a second drawer about deserts")["success"]
+        assert "error" not in mcp_server.tool_search(query="deserts")
+        assert len(built) == 1, f"rebuilt {len(built)} times for one external write"
+
+    def test_check_duplicate_sees_a_drawer_another_process_wrote(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """After an external write, the MCP tools must reopen the collection on the rebuilt client.
+
+        A handle kept from before the rebuild belongs to the client the backend
+        closed. It errors, or, while another client still holds that chromadb
+        System (this test's setup client does), answers from an HNSW segment that
+        never saw the other process's vectors.
+        """
+        from mempalace import mcp_server
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+
+        assert mcp_server.tool_add_drawer("w", "r", "a first drawer about lighthouses")["success"]
+        assert mcp_server.tool_check_duplicate("a first drawer about lighthouses")["is_duplicate"]
+
+        peer_text = "a peer process filed this drawer about volcanic basalt columns"
+        _write_drawer_from_another_process(palace_path, "drawer_peer_written", peer_text)
+
+        result = mcp_server.tool_check_duplicate(peer_text)
+        assert "error" not in result, result
+        assert "drawer_peer_written" in [m["id"] for m in result["matches"]], result
+
+    def test_search_after_a_server_read_sees_a_drawer_another_process_wrote(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Search must answer from the palace as it is after a peer's write.
+
+        ``check_duplicate`` opens the client through ``_get_client``. When that
+        kept a client of its own, reopening it also closed the search path's
+        client and dropped its stat record. The next search then reopened the
+        palace without comparing the stat and attached to the chromadb System
+        the server's client still held, whose HNSW segment was loaded before the
+        other process wrote.
+        """
+        from mempalace import mcp_server
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        _touch_after_own_opens_and_writes(monkeypatch, os.path.join(palace_path, "chroma.sqlite3"))
+
+        assert mcp_server.tool_add_drawer("w", "r", "a first drawer about lighthouses")["success"]
+        assert "error" not in mcp_server.tool_search(query="lighthouses")
+        assert mcp_server.tool_check_duplicate("a first drawer about lighthouses")["is_duplicate"]
+
+        peer_text = "a peer process filed this drawer about volcanic basalt columns"
+        _write_drawer_from_another_process(palace_path, "drawer_peer_written", peer_text)
+
+        result = mcp_server.tool_search(query=peer_text)
+        assert "error" not in result, result
+        assert "drawer_peer_written" in [r["drawer_id"] for r in result["results"]], result
+
+    @pytest.mark.parametrize(
+        "new_content", ["corrected text", "B" * 1800], ids=["plain", "chunked"]
+    )
+    def test_update_drawer_is_written_before_the_closet_purge_reopens_the_palace(
+        self, monkeypatch, config, palace_path, kg, new_content
+    ):
+        """A content update must not stop halfway when the closet purge rebuilds the client.
+
+        The purge opens the closets through the backend. If the palace changed, that
+        open rebuilds the client and closes the one the drawers handle came from.
+        """
+        from mempalace import mcp_server
+        from mempalace.palace import get_closets_collection
+
+        _write_drawer_from_another_process(
+            palace_path, "drawer_update_race", "original text about lighthouses", source_file="n.md"
+        )
+        _patch_mcp_server(monkeypatch, config, kg)
+        get_closets_collection(palace_path, create=True).add(
+            ids=["closet_update_race"],
+            documents=["topic: lighthouses"],
+            metadatas=[{"source_file": "n.md"}],
+        )
+
+        real_purge = mcp_server._purge_source_closets
+
+        def purge_after_an_external_change(*args, **kwargs):
+            _move_mtime_forward(os.path.join(palace_path, "chroma.sqlite3"), 60)
+            return real_purge(*args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_purge_source_closets", purge_after_an_external_change)
+
+        result = mcp_server.tool_update_drawer("drawer_update_race", content=new_content)
+
+        assert result["success"] is True, result
+        assert result["closets_deleted"] == 1
+        assert get_closets_collection(palace_path, create=False).get(include=[])["ids"] == []
+        assert mcp_server.tool_get_drawer("drawer_update_race")["content"] == new_content
+
+    def test_bulk_delete_goes_on_after_a_closet_purge_rebuilds_the_client(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """A bulk delete must keep deleting after a closet purge rebuilds the client.
+
+        Each id's delete opens its source's closets through the backend to purge
+        them. If the palace changed, that open rebuilds the client and closes the
+        one the drawers handle came from, so the next id cannot go on using that
+        handle.
+        """
+        from mempalace import mcp_server
+        from mempalace.palace import get_closets_collection
+
+        sources = ["a.md", "b.md", "c.md"]
+        ids = [f"drawer_bulk_race_{i}" for i in range(len(sources))]
+        for drawer_id, source in zip(ids, sources):
+            _write_drawer_from_another_process(
+                palace_path, drawer_id, f"{source} is about lighthouses", source_file=source
+            )
+        _patch_mcp_server(monkeypatch, config, kg)
+        get_closets_collection(palace_path, create=True).add(
+            ids=[f"closet_{source}" for source in sources],
+            documents=["topic: lighthouses"] * len(sources),
+            metadatas=[{"source_file": source} for source in sources],
+        )
+
+        real_purge = mcp_server._purge_source_closets
+        built = _count_client_builds(monkeypatch)
+        per_purge = []
+
+        def purge_after_an_external_change(*args, **kwargs):
+            _move_mtime_forward(os.path.join(palace_path, "chroma.sqlite3"), 60)
+            before = len(built)
+            purged = real_purge(*args, **kwargs)
+            per_purge.append(len(built) - before)
+            return purged
+
+        monkeypatch.setattr(mcp_server, "_purge_source_closets", purge_after_an_external_change)
+
+        result = mcp_server.tool_delete_drawers(ids)
+        outside_purges = len(built) - sum(per_purge)
+
+        assert (result["deleted"], result["errors"]) == (3, 0), result
+        # Taking the collection again reuses the client a purge rebuilt; the only other
+        # build allowed is the call's first take.
+        assert per_purge == [1, 1, 1], per_purge
+        assert outside_purges <= 1, f"{outside_purges} client build(s) outside the purges"
+        assert [item["closets_deleted"] for item in result["results"]] == [1, 1, 1]
+        assert get_closets_collection(palace_path, create=False).get(include=[])["ids"] == []
+        for drawer_id in ids:
+            assert mcp_server.tool_get_drawer(drawer_id) == {
+                "error": f"Drawer not found: {drawer_id}"
+            }
+
+    def test_bulk_delete_goes_on_when_another_caller_took_the_rebuilt_client_first(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """A handle is judged by the client it came from, not by the server's cached client.
+
+        Under HTTP a caller that takes no lock (the node profile behind
+        ``/sync/version_vector`` and ``mempalace_mesh_peers``) can take the collection
+        between two ids, after a purge rebuilt the client. The server's cached client is
+        then the new one, while the loop's handle still belongs to the closed one.
+        """
+        from mempalace import mcp_server
+        from mempalace.palace import get_closets_collection
+
+        sources = ["a.md", "b.md", "c.md"]
+        ids = [f"drawer_bulk_adopt_{i}" for i in range(len(sources))]
+        for drawer_id, source in zip(ids, sources):
+            _write_drawer_from_another_process(
+                palace_path, drawer_id, f"{source} is about lighthouses", source_file=source
+            )
+        _patch_mcp_server(monkeypatch, config, kg)
+        get_closets_collection(palace_path, create=True).add(
+            ids=[f"closet_{source}" for source in sources],
+            documents=["topic: lighthouses"] * len(sources),
+            metadatas=[{"source_file": source} for source in sources],
+        )
+        real_purge = mcp_server._purge_source_closets
+
+        def purge_then_another_caller_takes_the_collection(*args, **kwargs):
+            _move_mtime_forward(os.path.join(palace_path, "chroma.sqlite3"), 60)
+            purged = real_purge(*args, **kwargs)
+            assert mcp_server._get_collection() is not None
+            return purged
+
+        monkeypatch.setattr(
+            mcp_server, "_purge_source_closets", purge_then_another_caller_takes_the_collection
+        )
+
+        result = mcp_server.tool_delete_drawers(ids)
+
+        assert (result["deleted"], result["errors"]) == (3, 0), result
+
+    def test_get_client_does_not_reprobe_an_unchanged_palace(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """``_get_client`` probes HNSW capacity only when the palace changed or it has no client.
+
+        Every ``_get_collection`` call on an existing chroma palace goes through
+        ``_get_client``.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        assert mcp_server._get_collection() is not None
+        mcp_server._get_client()
+
+        probes = []
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: probes.append(1))
+        mcp_server._get_client()
+        mcp_server._get_client()
+
+        assert probes == []
 
     def test_mtime_change_invalidates_cache(self, monkeypatch, config, palace_path, kg):
         """When mtime changes, the cached collection should be replaced."""
@@ -829,16 +1199,22 @@ class TestCacheInvalidation:
         col1 = mcp_server._get_collection()
         assert col1 is not None
 
-        # Simulate an external write changing the mtime
-        old_mtime = mcp_server._palace_db_mtime
-        monkeypatch.setattr(mcp_server, "_palace_db_mtime", old_mtime - 10.0)
+        # Model an external write: the mtime moves well past the epsilon
+        _move_mtime_forward(os.path.join(palace_path, "chroma.sqlite3"), 60)
 
-        # _get_collection should detect the mtime drift and reconnect
+        # _get_collection should detect the change and reopen the collection
         col2 = mcp_server._get_collection()
         assert col2 is not None
+        assert col2 is not col1
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Windows refuses to replace chroma.sqlite3 while the client holds it open",
+    )
     def test_inode_change_invalidates_cache(self, monkeypatch, config, palace_path, kg):
         """When inode changes (file replaced), the cached collection should be replaced."""
+        import shutil
+
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server
 
@@ -849,11 +1225,17 @@ class TestCacheInvalidation:
         col1 = mcp_server._get_collection()
         assert col1 is not None
 
-        # Simulate a rebuild that changes the inode
-        monkeypatch.setattr(mcp_server, "_palace_db_inode", 99999)
+        # Swap in a copy of chroma.sqlite3: copy2 keeps content and mtime, so only
+        # the inode changes
+        db_file = os.path.join(palace_path, "chroma.sqlite3")
+        inode_before = os.stat(db_file).st_ino
+        shutil.copy2(db_file, db_file + ".swap")
+        os.replace(db_file + ".swap", db_file)
+        assert os.stat(db_file).st_ino != inode_before
 
         col2 = mcp_server._get_collection()
         assert col2 is not None
+        assert col2 is not col1
 
     @pytest.mark.skipif(
         sys.platform == "win32",
@@ -878,19 +1260,21 @@ class TestCacheInvalidation:
         if os.path.isfile(db_file):
             os.remove(db_file)
 
-        make_client_calls = []
+        import chromadb
 
-        def fail_if_make_client_called(path):
-            make_client_calls.append(path)
+        client_builds = []
+
+        def fail_if_client_built(*args, **kwargs):
+            client_builds.append(kwargs.get("path", args[0] if args else None))
             raise AssertionError("_get_collection(create=False) should not open missing Chroma DB")
 
-        monkeypatch.setattr(mcp_server.ChromaBackend, "make_client", fail_if_make_client_called)
+        monkeypatch.setattr(chromadb, "PersistentClient", fail_if_client_built)
 
         # Cache should be invalidated; _get_collection returns None
         # because the backend can't open a missing DB without create=True
         assert mcp_server._get_collection() is None
         # The key assertion: the old cached collection was dropped
-        assert make_client_calls == []
+        assert client_builds == []
         assert mcp_server._collection_cache is None
         assert mcp_server._palace_db_inode == 0
         assert mcp_server._palace_db_mtime == 0.0
@@ -1167,6 +1551,61 @@ class TestCacheInvalidation:
         assert attempts["count"] == 2
         assert col is None
 
+    def test_get_collection_retries_a_failed_open_on_a_new_client(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """The retry must not reopen the collection on the client that just failed.
+
+        It drops chromadb's System cache, re-runs ``quarantine_stale_hnsw`` on the
+        palace and only then builds the new client.
+        """
+        import chromadb
+        from chromadb.api.client import Client
+        from chromadb.api.shared_system_client import SharedSystemClient
+
+        from mempalace import mcp_server
+        from mempalace.backends import chroma as chroma_module
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        assert mcp_server._get_collection() is not None
+        assert config.palace_path in chroma_module.ChromaBackend._quarantined_paths
+        monkeypatch.setattr(mcp_server, "_collection_cache", None)
+
+        events = []
+        real_clear = SharedSystemClient.clear_system_cache
+        real_client = chromadb.PersistentClient
+        real_quarantine = chroma_module.quarantine_stale_hnsw
+        real_get_collection = Client.get_collection
+
+        def counting_clear():
+            events.append("clear")
+            real_clear()
+
+        def counting_client(*args, **kwargs):
+            events.append("construct")
+            return real_client(*args, **kwargs)
+
+        def counting_quarantine(*args, **kwargs):
+            events.append("quarantine")
+            return real_quarantine(*args, **kwargs)
+
+        def fail_once(self, *args, **kwargs):
+            if "failed" not in events:
+                events.append("failed")
+                raise RuntimeError("simulated stale handle")
+            return real_get_collection(self, *args, **kwargs)
+
+        monkeypatch.setattr(SharedSystemClient, "clear_system_cache", counting_clear)
+        monkeypatch.setattr(chromadb, "PersistentClient", counting_client)
+        monkeypatch.setattr(chroma_module, "quarantine_stale_hnsw", counting_quarantine)
+        monkeypatch.setattr(Client, "get_collection", fail_once)
+
+        assert mcp_server._get_collection() is not None
+        assert events.count("failed") == 1
+        assert events[events.index("failed") + 1 :] == ["clear", "quarantine", "construct"]
+
 
 class TestImportKillSwitchSafety:
     """Importing mcp_server must not recreate ~/.mempalace (#1676).
@@ -1419,8 +1858,10 @@ class TestStructuredErrors:
 
     def test_tool_reconnect_rearms_quarantine_gate(self, monkeypatch):
         """``tool_reconnect`` must clear the per-process quarantine gate so
-        HNSW safety checks re-run on the next open (#1573)."""
+        HNSW safety checks re-run on the next open, even when closing
+        the backend's handles fails."""
         from mempalace import mcp_server
+        from mempalace import palace as palace_module
         from mempalace.backends.chroma import ChromaBackend
 
         palace_path = "/test/palace/quarantine_rearm"
@@ -1428,6 +1869,12 @@ class TestStructuredErrors:
         monkeypatch.setattr(ChromaBackend, "_quarantined_paths", gate)
         monkeypatch.setattr(mcp_server, "_config", type("C", (), {"palace_path": palace_path})())
         monkeypatch.setattr(mcp_server, "_get_collection", lambda: None)
+        monkeypatch.setattr(mcp_server, "_collection_cache_backend", None)
+
+        def backend_unavailable(*_args, **_kwargs):
+            raise RuntimeError("backend unavailable")
+
+        monkeypatch.setattr(palace_module, "get_backend_for_palace", backend_unavailable)
 
         mcp_server.tool_reconnect()
 
@@ -1436,8 +1883,8 @@ class TestStructuredErrors:
         )
 
     def test_get_client_rearms_quarantine_on_reconnect(self, monkeypatch, config, palace_path, kg):
-        """``_get_client`` must clear the quarantine gate before calling
-        ``make_client`` so HNSW safety checks re-run on reconnect (#1573)."""
+        """A reconnect through ``_get_client`` must prepare the palace with the quarantine
+        gate cleared, so HNSW safety checks re-run."""
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server
         from mempalace.backends.chroma import ChromaBackend
@@ -1449,36 +1896,79 @@ class TestStructuredErrors:
 
         assert config.palace_path in ChromaBackend._quarantined_paths
 
-        old_mtime = mcp_server._palace_db_mtime
-        monkeypatch.setattr(mcp_server, "_palace_db_mtime", old_mtime - 10.0)
+        # Model a peer writer: move chroma.sqlite3's mtime well past the epsilon.
+        _move_mtime_forward(os.path.join(palace_path, "chroma.sqlite3"), 60)
 
-        quarantine_calls: list[str] = []
+        gate_armed_at_prepare: list[bool] = []
         original_prepare = ChromaBackend._prepare_palace_for_open
 
         @staticmethod
         def spy_prepare(path):
-            quarantine_calls.append(path)
+            gate_armed_at_prepare.append(path not in ChromaBackend._quarantined_paths)
             original_prepare(path)
 
         monkeypatch.setattr(ChromaBackend, "_prepare_palace_for_open", spy_prepare)
 
         mcp_server._get_client()
 
-        assert len(quarantine_calls) == 1, (
-            "_get_client should call _prepare_palace_for_open on reconnect"
+        assert gate_armed_at_prepare == [True], (
+            "the palace was not prepared exactly once with the quarantine gate cleared on reconnect"
         )
+
+    @pytest.mark.parametrize("first_open", ["get_client", "search"])
+    def test_quarantine_gate_is_rearmed_after_the_backend_client_was_closed(
+        self, monkeypatch, config, palace_path, kg, first_open
+    ):
+        """The next open after a closed backend client must re-run the HNSW checks.
+
+        A mine's closing integrity check, a cache reset and writer promotion all
+        close the backend's client, which drops its stat record. The next open,
+        from either path, then has nothing to compare and cannot see a change.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+        from mempalace.backends.chroma import ChromaBackend
+        from mempalace.palace import get_backend_for_palace
+
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+
+        mcp_server._get_collection()
+        assert config.palace_path in ChromaBackend._quarantined_paths
+
+        get_backend_for_palace(config.palace_path).close_palace(config.palace_path)
+        _move_mtime_forward(os.path.join(palace_path, "chroma.sqlite3"), 60)
+
+        gate_armed_at_prepare: list[bool] = []
+        original_prepare = ChromaBackend._prepare_palace_for_open
+
+        @staticmethod
+        def spy_prepare(path):
+            gate_armed_at_prepare.append(path not in ChromaBackend._quarantined_paths)
+            original_prepare(path)
+
+        monkeypatch.setattr(ChromaBackend, "_prepare_palace_for_open", spy_prepare)
+
+        if first_open == "search":
+            assert "error" not in mcp_server.tool_search(query="anything")
+        else:
+            mcp_server._get_client()
+
+        assert gate_armed_at_prepare == [True]
 
     def test_get_client_resets_chroma_system_cache_on_reconnect(
         self, monkeypatch, config, palace_path, kg
     ):
         """``_get_client`` must clear chromadb's path-keyed System/HNSW cache
-        (via ``_force_chroma_cache_reset``) *before* calling ``make_client`` on an
-        inode/mtime reconnect. Otherwise chromadb hands back the stale in-memory
-        HNSW segment, which persists its outdated index over a peer writer's
+        *before* it constructs the replacement client on an inode/mtime
+        reconnect. Otherwise chromadb hands back the stale in-memory HNSW
+        segment, which persists its outdated index over a peer writer's
         on-disk changes, driving the persisted count backwards (#2002)."""
+        import chromadb
+        from chromadb.api.shared_system_client import SharedSystemClient
+
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server
-        from mempalace.backends.chroma import ChromaBackend
 
         _client, _col = _get_collection(palace_path, create=True)
         del _client
@@ -1486,32 +1976,67 @@ class TestStructuredErrors:
         # Prime the cache.
         mcp_server._get_collection()
 
-        # Simulate a peer writer touching chroma.sqlite3 on disk.
-        old_mtime = mcp_server._palace_db_mtime
-        monkeypatch.setattr(mcp_server, "_palace_db_mtime", old_mtime - 10.0)
+        # Model a peer writer: move chroma.sqlite3's mtime well past the epsilon.
+        _move_mtime_forward(os.path.join(palace_path, "chroma.sqlite3"), 60)
 
         order: list[str] = []
-        real_reset = mcp_server._force_chroma_cache_reset
-        real_make = ChromaBackend.make_client
+        real_clear = SharedSystemClient.clear_system_cache
+        real_client = chromadb.PersistentClient
 
-        def spy_reset():
-            order.append("reset")
-            real_reset()
+        def spy_clear():
+            order.append("clear")
+            real_clear()
 
-        @staticmethod
-        def spy_make(path):
-            order.append("make_client")
-            return real_make(path)
+        def spy_client(*args, **kwargs):
+            order.append("construct")
+            return real_client(*args, **kwargs)
 
-        monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", spy_reset)
-        monkeypatch.setattr(ChromaBackend, "make_client", spy_make)
+        monkeypatch.setattr(SharedSystemClient, "clear_system_cache", spy_clear)
+        monkeypatch.setattr(chromadb, "PersistentClient", spy_client)
 
         mcp_server._get_client()
 
-        assert order == ["reset", "make_client"], (
+        assert order == ["clear", "construct"], (
             "_get_client must reset chromadb's system cache BEFORE reopening the "
             "client on a staleness reconnect (#2002)"
         )
+
+    def test_get_client_runs_capacity_probe_before_reopening(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """The capacity probe must see a changed palace before ``_get_client`` reopens it.
+
+        An undersized segment can crash the server while it loads.
+        """
+        import chromadb
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+
+        mcp_server._get_collection()
+        _move_mtime_forward(os.path.join(palace_path, "chroma.sqlite3"), 60)
+
+        order: list[str] = []
+        real_probe = mcp_server._refresh_vector_disabled_flag
+        real_client = chromadb.PersistentClient
+
+        def spy_probe():
+            order.append("probe")
+            real_probe()
+
+        def spy_client(*args, **kwargs):
+            order.append("construct")
+            return real_client(*args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", spy_probe)
+        monkeypatch.setattr(chromadb, "PersistentClient", spy_client)
+
+        mcp_server._get_client()
+
+        assert order == ["probe", "construct"]
 
     def test_call_kg_retries_after_concurrent_close(self, monkeypatch):
         """A KG closed mid-handler must trigger a one-shot retry with a fresh

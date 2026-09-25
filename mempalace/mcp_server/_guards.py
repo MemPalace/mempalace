@@ -1212,10 +1212,10 @@ _vector_capacity_status: Optional[dict] = None
 def _refresh_vector_disabled_flag() -> None:
     """Re-run the HNSW capacity probe and update the module-level flag.
 
-    Called from :func:`_get_client` whenever the client cache is rebuilt
-    (first open or palace replacement). Cheap — pure sqlite + pickle
-    read, no chromadb interaction. Never raises: a probe that crashes
-    would defeat the point.
+    Runs at startup, in the tools that read the flag, and from :func:`_get_client`
+    when it has no client yet or chroma.sqlite3 changed since its last call.
+    Cheap: sqlite, the metadata pickle, the header.bin prefix and file sizes, no
+    chromadb interaction. Never raises: a probe that crashes would defeat the point.
     """
     global _vector_disabled, _vector_disabled_reason, _vector_capacity_status
     if not _is_chroma_backend():
