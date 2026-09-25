@@ -28,6 +28,7 @@ from ..backends import (
     CollectionNotInitializedError,
     PalaceNotFoundError,
     PalaceRef,
+    collection_supports_facets,
     detect_backend_for_path,
     detect_backends_for_path,
     get_backend,
