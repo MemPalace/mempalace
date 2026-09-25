@@ -144,6 +144,8 @@ def execute_job(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
             return run_sync(payload)
         if kind == "sweep":
             return run_sweep(payload)
+        if kind == "import":
+            return run_import(payload)
         if kind == "diary_write":
             return run_diary_write(payload)
         if kind == "mcp_tool":
@@ -434,6 +436,71 @@ def run_sweep(payload: dict[str, Any]) -> dict[str, Any]:
         "kind": "sweep",
         "target": target,
         "result": result,
+        "exit_code": 0,
+    }
+
+
+@_restores_palace_env
+def run_import(payload: dict[str, Any]) -> dict[str, Any]:
+    """Merge a JSONL palace export through the daemon worker.
+
+    Import is idempotent by drawer id — a re-run skips every drawer already
+    filed — so a job the daemon re-queues after a crash cannot duplicate
+    content. A ``dry_run`` payload parses the export without opening the palace,
+    here exactly as on the direct path.
+    """
+
+    palace_path = os.path.abspath(
+        os.path.expanduser(payload.get("palace_path") or MempalaceConfig().palace_path)
+    )
+    os.environ["MEMPALACE_PALACE_PATH"] = palace_path
+    _apply_backend(payload.get("backend"))
+
+    input_raw = payload.get("input_dir")
+    if not isinstance(input_raw, str) or not input_raw.strip():
+        return {
+            "success": False,
+            "error": "import source must be a non-empty path",
+            "exit_code": 2,
+        }
+
+    # The daemon's cwd is not the caller's, so a relative source would resolve
+    # against the wrong directory; the CLI sends an absolute path (#2467).
+    if not os.path.isabs(input_raw):
+        return {
+            "success": False,
+            "error": f"import source must be an absolute path: {input_raw}",
+            "exit_code": 2,
+        }
+
+    from .daemon import LOCK_REFUSAL_ERROR_CLASS
+    from .importer import import_palace
+    from .palace import MineAlreadyRunning
+
+    try:
+        stats = import_palace(palace_path, input_raw, dry_run=bool(payload.get("dry_run")))
+    except MineAlreadyRunning as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "error_class": LOCK_REFUSAL_ERROR_CLASS,
+            "exit_code": 1,
+        }
+    except ValueError as exc:
+        print(f"  ERROR: {exc}", file=sys.stderr)
+        return {"success": False, "error": str(exc), "exit_code": 1}
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": f"import failed: {exc}",
+            "exit_code": 1,
+        }
+
+    return {
+        "success": True,
+        "kind": "import",
+        "input_dir": input_raw,
+        "result": stats,
         "exit_code": 0,
     }
 

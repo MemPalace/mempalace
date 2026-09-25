@@ -14,6 +14,7 @@ FRAGMENTS = (
     "_hub",
     "cmd_mine",
     "cmd_sync",
+    "cmd_export",
     "cmd_query",
     "cmd_update",
     "cmd_coord",
