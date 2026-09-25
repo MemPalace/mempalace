@@ -730,6 +730,50 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     return _hnsw_metadata_marker_intact(seg_dir)
 
 
+def _wal_unreplayable_count(db_path: str, segment_id: str) -> "int | None":
+    """Embeddings the write-ahead queue can no longer replay into this segment.
+
+    Quarantine renames a segment so Chroma rebuilds it from `embeddings_queue`.
+    chromadb 1.5.x purges that queue, so the rebuild replays only from the purge
+    watermark: every embedding written below it is absent from the new index
+    while its `embedding_metadata` row survives. That is why `collection.count()`
+    keeps reporting the full total and an unfiltered search keeps returning
+    confident neighbours over whatever remains (#2510).
+
+    Returns None when the figure cannot be measured. The caller must treat that
+    as "nothing to report", never as "nothing was lost".
+    """
+    try:
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            collection = conn.execute(
+                "SELECT collection FROM segments WHERE id = ?", (segment_id,)
+            ).fetchone()
+            if not collection or collection[0] is None:
+                return None
+            # No `typeof` guard on seq_id: SQLite's storage-class order puts
+            # every blob after every integer, so a 0.6.x BLOB seq_id can never
+            # satisfy `< <floor>` and is excluded by the comparison itself.
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM embeddings e
+                JOIN segments s ON e.segment_id = s.id
+                WHERE s.collection = ?
+                  AND e.seq_id < (
+                      SELECT MIN(seq_id) FROM embeddings_queue
+                      WHERE topic LIKE '%' || ?
+                  )
+                """,
+                (collection[0], collection[0]),
+            ).fetchone()
+    except sqlite3.Error:
+        logger.debug("Could not measure WAL coverage for %s", segment_id, exc_info=True)
+        return None
+    if not row or row[0] is None:
+        return None
+    return int(row[0])
+
+
 def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> list[str]:
     """Rename HNSW segment dirs that look unsafe to open.
 
@@ -834,6 +878,25 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
                 reason,
                 target,
             )
+            # The rebuild replays from `embeddings_queue`, and chromadb purges
+            # it. Whatever was written below the purge watermark cannot come
+            # back on its own, and nothing else says so: the metadata rows
+            # survive, so the count and unfiltered search both stay plausible.
+            # The documents and metadata stay in SQLite and `mempalace repair`
+            # re-embeds from them, so this is a recoverable state that only
+            # needs to stop being silent (#2510).
+            unreplayable = _wal_unreplayable_count(db_path, name)
+            if unreplayable:
+                logger.error(
+                    "Quarantine of %s leaves %d embedding(s) the write-ahead queue "
+                    "can no longer replay: the rebuilt index will be short by that "
+                    "much while collection.count() and unfiltered search still look "
+                    "healthy. The old index is kept in %s, but nothing reads it back; "
+                    "run `mempalace repair` to re-embed the drawers from SQLite.",
+                    seg_dir,
+                    unreplayable,
+                    target,
+                )
         except OSError:
             logger.exception("Failed to quarantine corrupt HNSW segment %s", seg_dir)
 
