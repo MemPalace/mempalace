@@ -1344,3 +1344,18 @@ def test_mine_convos_dry_run_single_file_does_not_scan_siblings(
     assert "[DRY RUN] selected.txt" in output
     assert "sibling.txt" not in output
     assert not palace_path.exists()
+
+
+def test_mine_convos_reaches_a_yield_point_before_each_file(tmp_path, capsys):
+    """The hub hands its lock to waiting requests at these points (between
+    files), so a long mine no longer blocks every read until it ends."""
+    from mempalace.palace import mine_yield_hook
+
+    src = tmp_path / "convos"
+    src.mkdir()
+    for n in range(3):
+        (src / f"chat{n}.txt").write_text(f"> question {n}?\nanswer {n} with enough words.\n" * 3)
+    calls: list = []
+    with mine_yield_hook(lambda: calls.append(1)):
+        mine_convos(str(src), str(tmp_path / "palace"), wing="test")
+    assert len(calls) == 3

@@ -270,6 +270,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `count()`, which on a fresh Chroma client loads the whole HNSW segment while
   holding the GIL and stalls every thread in the process. It ran on every
   CLI search the hub forwarded. It now reads one row from `chroma.sqlite3`.
+- **Mining no longer rescans the whole palace with quadratic paging.** Every
+  conversation mine, a hook's one-file mine included, scanned every drawer for
+  content hashes, and bulk mines scanned them again for mined files, both by
+  paging `get(limit, offset)`. Chroma turns that `offset` into SQL `OFFSET`,
+  which steps over every skipped row, so a scan grew with the square of the
+  palace (154 s on a 360k-drawer palace), and each began with a `count()` that
+  loads the whole vector index. Chroma now streams just the keys these checks
+  read from `chroma.sqlite3` in one pass, and the content-hash scan reads only
+  drawers that carry a hash: under 10 ms and 1.6 s on that palace.
+  `get_all_metadata`, behind the status and graph fallbacks, uses the same pass.
+- **The BM25-only search fallback finds the drawers that actually contain a
+  name.** With the vector index disabled, search picks BM25 candidates from
+  `chroma.sqlite3`'s trigram full-text index, where `aven` also matches inside
+  `haven't` and `Avenue`. It took the first 500 matches in storage order, the
+  oldest substring hits, and returned them even when they scored 0, so a search
+  for a name answered with `haven't`, `New Haven`, and `Avenue`. Candidates are
+  now read in full-text rank order, whole-word matches first. A wing, room, or
+  source filter matching few drawers reads just those drawers (6.4 s to under
+  10 ms for a ten-drawer wing on a 360k-drawer palace), and stop words stay out
+  of the full-text query.
+- **Search no longer returns every copy of a passage as a separate result.**
+  Backups, autosaves, and re-exports put the same text under several files, and
+  each copy took a result slot. The best-ranked copy now stands for all of them
+  and lists the others under `also_in` (the CLI prints `Also in: ...`), and the
+  freed slots go to the next distinct passages. Repeats within one file stay
+  separate.
+- **A mine on the HTTP hub no longer blocks every other request until it
+  ends.** The hub ran a forwarded mine under its exclusive lock for the whole
+  run, so status, search, and wake-up waited for all of it. The mine still runs
+  exclusively, but between files it hands the lock to the requests queued
+  behind it, then takes it back; a second mine still waits for the first.
 - **`mempalace wake-up` reads its recent drawers from `chroma.sqlite3`.**
   Chroma's `get` loads the whole index even for a metadata read, so waking up
   a ten-drawer wing loaded every vector in the palace, and the window was the
