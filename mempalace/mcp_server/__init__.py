@@ -80,6 +80,7 @@ from urllib.parse import urlparse  # noqa: E402
 
 from ..config import (  # noqa: E402
     MempalaceConfig,
+    normalize_wing_name,
     sanitize_kg_value,
     sanitize_name,
     sanitize_content,

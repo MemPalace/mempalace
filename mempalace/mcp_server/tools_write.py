@@ -464,7 +464,7 @@ def tool_add_drawer(
     """
     global _metadata_cache
     try:
-        wing = sanitize_name(wing, "wing")
+        wing = normalize_wing_name(sanitize_name(wing, "wing"))
         room = sanitize_name(room, "room")
         content = sanitize_content(content)
         if source_file:
@@ -1346,7 +1346,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 
         if wing is not None:
             try:
-                wing = sanitize_name(wing, "wing")
+                wing = normalize_wing_name(sanitize_name(wing, "wing"))
             except ValueError as e:
                 return {"success": False, "error": str(e)}
             if wing.lower() != str(old_meta.get("wing") or "").lower():

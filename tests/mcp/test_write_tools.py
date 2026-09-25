@@ -148,6 +148,46 @@ class TestWriteTools:
         assert result["room"] == "test_room"
         assert result["drawer_id"].startswith("drawer_test_wing_test_room_")
 
+    def test_add_drawer_canonicalizes_wing_like_the_miners(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Regression #2579: the MCP write path must canonicalize wing names
+        with ``normalize_wing_name`` (lower, ``-``/space → ``_``) like the
+        miner / graph / migration code, so a drawer written as
+        ``virtual-species`` lands under ``virtual_species`` instead of
+        re-fragmenting the wing on every write."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        result = tool_add_drawer(
+            wing="virtual-species",
+            room="test_room",
+            content="A drawer that must land in the canonical wing slug.",
+        )
+        assert result["success"] is True
+        stored = col.get(ids=[result["drawer_id"]], include=["metadatas"])
+        assert stored["metadatas"], stored
+        assert stored["metadatas"][0]["wing"] == "virtual_species"
+
+    def test_add_drawer_non_string_wing_is_validation_error_not_crash(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Regression for Copilot review on #2581: normalization must not run
+        before the type check. A non-string wing previously produced
+        AttributeError out of ``normalize_wing_name``; it must remain the
+        stable ``wing must be a non-empty string`` validation error."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        for bad in (None, 123, b"bytes"):
+            result = tool_add_drawer(wing=bad, room="r", content="c")
+            assert result["success"] is False
+            assert "wing must be a non-empty string" in result["error"]
+
     def test_add_drawer_duplicate_detection(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         _client, _col = _get_collection(palace_path, create=True)
