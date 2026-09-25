@@ -280,6 +280,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   read from `chroma.sqlite3` in one pass, and the content-hash scan reads only
   drawers that carry a hash: under 10 ms and 1.6 s on that palace.
   `get_all_metadata`, behind the status and graph fallbacks, uses the same pass.
+- **The BM25-only search fallback finds the drawers that actually contain a
+  name.** With the vector index disabled, search picks BM25 candidates from
+  `chroma.sqlite3`'s trigram full-text index, where `aven` also matches inside
+  `haven't` and `Avenue`. It took the first 500 matches in storage order, the
+  oldest substring hits, and returned them even when they scored 0, so a search
+  for a name answered with `haven't`, `New Haven`, and `Avenue`. Candidates are
+  now read in full-text rank order, whole-word matches first. A wing, room, or
+  source filter matching few drawers reads just those drawers (6.4 s to under
+  10 ms for a ten-drawer wing on a 360k-drawer palace), and stop words stay out
+  of the full-text query.
+- **Search no longer returns every copy of a passage as a separate result.**
+  Backups, autosaves, and re-exports put the same text under several files, and
+  each copy took a result slot. The best-ranked copy now stands for all of them
+  and lists the others under `also_in` (the CLI prints `Also in: ...`), and the
+  freed slots go to the next distinct passages. Repeats within one file stay
+  separate.
 - **A mine on the HTTP hub no longer blocks every other request until it
   ends.** The hub ran a forwarded mine under its exclusive lock for the whole
   run, so status, search, and wake-up waited for all of it. The mine still runs
