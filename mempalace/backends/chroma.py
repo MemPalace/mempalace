@@ -623,7 +623,7 @@ def _fts_tokens(query: str, stop_words: frozenset = frozenset()) -> list[str]:
     return [t for t in terms if t not in stop_words] or terms
 
 
-def _whole_words_first(rows, query: str, limit: Optional[int]) -> list[int]:
+def _whole_words_first(rows, query_tokens: Iterable[str], limit: Optional[int]) -> list[int]:
     """Row ids from ``(row_id, text)`` pairs, whole-word matches first.
 
     The whole-word BM25 re-rank scores a drawer by the query words it
@@ -631,7 +631,7 @@ def _whole_words_first(rows, query: str, limit: Optional[int]) -> list[int]:
     only contain a query term inside another word keep the places left over:
     they still carry near misses such as ``vectors`` for ``vector``.
     """
-    words = set(_tokenize(query))
+    words = set(query_tokens)
     whole: list[int] = []
     partial: list[int] = []
     for row_id, text in rows:
@@ -686,7 +686,7 @@ def _fts_candidate_rows(
         """,
         (" OR ".join(tokens), collection_name, *filter_params, _FTS_SCAN_CAP),
     )
-    return _whole_words_first(rows, query, limit)
+    return _whole_words_first(rows, tokens, limit)
 
 
 def _filtered_candidate_rows(
@@ -755,7 +755,7 @@ def _filtered_candidate_rows(
         lowered = text.lower()
         if any(token in lowered for token in tokens):
             matching.append((row_id, text))
-    return _whole_words_first(matching, query, limit)
+    return _whole_words_first(matching, tokens, limit)
 
 
 def _coerce_metadata_value(value: Any) -> Any:

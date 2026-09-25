@@ -17,7 +17,9 @@ import time
 import pytest
 
 from mempalace.backends.chroma import (
+    _fts_tokens,
     _hnsw_element_count,
+    _whole_words_first,
     _vector_segment_id,
     hnsw_capacity_status,
     reset_hnsw_capacity_cache,
@@ -1310,3 +1312,9 @@ def test_bm25_fallback_leaves_stop_words_out_of_the_candidate_query(tmp_path):
     assert out["results"][0]["text"] == "lantern notes from the evening"
     only_stop = _bm25_only_via_sqlite("the", str(tmp_path), n_results=3, stop_words=stop)
     assert only_stop["results"]
+
+
+def test_whole_word_candidate_pick_ignores_stop_words_when_terms_present():
+    tokens = _fts_tokens("the lantern", frozenset({"the"}))
+    rows = [(1, "the lanternfish was cataloged"), (2, "lantern notes from the evening")]
+    assert _whole_words_first(rows, tokens, limit=1) == [2]
