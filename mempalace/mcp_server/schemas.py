@@ -248,13 +248,24 @@ TOOLS = {
         "handler": tool_delete_tunnel,
     },
     "mempalace_list_hallways": {
-        "description": "List within-wing hallway records (entity-to-entity co-occurrence links built at mine time). Optionally filter by wing.",
+        "description": "List within-wing hallway records (entity-to-entity co-occurrence links built at mine time), strongest first, paged. Optionally filter by wing. Returns {hallways, total, count, offset, limit}.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "wing": {
                     "type": "string",
                     "description": "Filter hallways by wing",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Page size (default 100, max 500)",
+                    "minimum": 1,
+                    "maximum": 500,
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Offset for pagination (default 0)",
+                    "minimum": 0,
                 },
             },
         },

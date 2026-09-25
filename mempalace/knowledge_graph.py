@@ -491,6 +491,98 @@ class KnowledgeGraph:
                 )
                 return triple_id
 
+    def rewrite(
+        self,
+        triple_id: str,
+        predicate: str,
+        obj: str,
+        at: str = None,
+        source_file: str = None,
+    ):
+        """Close the open fact ``triple_id`` and open its rewrite in one transaction.
+
+        The successor keeps the subject, takes ``predicate`` and ``obj`` and
+        opens at the same instant the original closes, so an as-of query
+        before the boundary still returns the original wording. Unlike
+        :meth:`supersede` the predicate may change, which is what
+        ``mempalace kg normalize`` needs.
+
+        Addressed by the triple's ``id`` so that a fact closed or replaced
+        after a plan was written is not resurrected: if ``triple_id`` is no
+        longer open, nothing is written and ``None`` is returned. Returns the
+        successor's id otherwise. One SQLite transaction covers both writes,
+        so an interruption leaves the original fact open and untouched.
+
+        The successor inherits the original's ``confidence`` and provenance
+        (``source_closet``, ``source_file``, ``source_drawer_id``,
+        ``adapter_name``): rewording a predicate is not new evidence, and a
+        normalized fact must still point at the drawer it came from.
+        ``source_file`` here is only a fallback for an original carrying none.
+        """
+        if at is None:
+            boundary = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        elif _is_date_only_temporal(at):
+            boundary = f"{at}T00:00:00Z"
+        else:
+            boundary = at
+        boundary = sanitize_iso_temporal(boundary, "at")
+        pred = str(predicate).lower().replace(" ", "_")
+        obj_id = self._entity_id(obj)
+
+        with self._lock:
+            conn = self._conn()
+            with conn:
+                row = conn.execute(
+                    "SELECT subject, valid_from, confidence, source_closet, source_file, "
+                    "source_drawer_id, adapter_name FROM triples "
+                    "WHERE id=? AND valid_to IS NULL",
+                    (triple_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                valid_from = row["valid_from"]
+                if valid_from is not None and _temporal_end_key(boundary) < _temporal_start_key(
+                    valid_from
+                ):
+                    raise ValueError(
+                        f"at={boundary!r} is before valid_from={valid_from!r}; "
+                        "an inverted interval would be invisible to every KG query"
+                    )
+                sub_id = row["subject"]
+                conn.execute(
+                    "INSERT OR IGNORE INTO entities (id, name) VALUES (?, ?)", (obj_id, obj)
+                )
+                conn.execute("UPDATE triples SET valid_to=? WHERE id=?", (boundary, triple_id))
+                existing = conn.execute(
+                    "SELECT id FROM triples "
+                    "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
+                    (sub_id, pred, obj_id),
+                ).fetchone()
+                if existing:
+                    return existing["id"]
+                new_id = make_triple_id(sub_id, pred, obj_id, boundary, datetime.now().isoformat())
+                conn.execute(
+                    """INSERT INTO triples (
+                        id, subject, predicate, object, valid_from, valid_to,
+                        confidence, source_closet, source_file,
+                        source_drawer_id, adapter_name
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        new_id,
+                        sub_id,
+                        pred,
+                        obj_id,
+                        boundary,
+                        None,
+                        row["confidence"] if row["confidence"] is not None else 1.0,
+                        row["source_closet"],
+                        row["source_file"] or source_file,
+                        row["source_drawer_id"],
+                        row["adapter_name"],
+                    ),
+                )
+                return new_id
+
     # ── Query operations ──────────────────────────────────────────────────
 
     def query_entity(self, name: str, as_of: str = None, direction: str = "outgoing"):

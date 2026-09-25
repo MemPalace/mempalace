@@ -870,13 +870,31 @@ def tool_delete_tunnel(tunnel_id: str):
     return delete_tunnel(tunnel_id)
 
 
-def tool_list_hallways(wing: str = None):
-    """List within-wing hallway records, optionally filtered by wing."""
+def tool_list_hallways(wing: str = None, limit: int = 100, offset: int = 0):
+    """List within-wing hallway records, strongest first, one page at a time.
+
+    A palace of any size holds hundreds of thousands of hallways; returning
+    them all in one response closed the MCP connection. The page is sorted by
+    co-occurrence count so the first page is the one worth reading.
+    """
     try:
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
-    return list_hallways(wing)
+    try:
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        return {"error": "limit and offset must be integers"}
+    rows = sorted(list_hallways(wing), key=lambda h: -int(h.get("co_occurrence_count") or 0))
+    page = rows[offset : offset + limit]
+    return {
+        "hallways": page,
+        "total": len(rows),
+        "count": len(page),
+        "offset": offset,
+        "limit": limit,
+    }
 
 
 def tool_delete_hallway(hallway_id: str):
@@ -886,8 +904,15 @@ def tool_delete_hallway(hallway_id: str):
     return {"deleted": delete_hallway(hallway_id)}
 
 
-def tool_follow_tunnels(wing: str, room: str):
-    """Follow explicit tunnels from a room to see connected drawers in other wings."""
+def tool_follow_tunnels(wing: str, room: str, record: bool = True):
+    """Follow explicit tunnels from a room to see connected drawers in other wings.
+
+    An agent calling this tool is crossing the tunnel, so the traversal is
+    recorded (``access_count`` / ``strength``). Internal callers that only
+    decorate another result, such as the light server's search enrichment,
+    pass ``record=False``: a search hit is not a crossing. A read-only
+    server or a peer without the writer lock never writes the tunnel file.
+    """
     try:
         wing = sanitize_name(wing, "wing")
         room = sanitize_name(room, "room")
@@ -896,4 +921,6 @@ def tool_follow_tunnels(wing: str, room: str):
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
-    return follow_tunnels(wing, room, col=col)
+    return follow_tunnels(
+        wing, room, col=col, record=record and not (_READ_ONLY or _MCP_WRITER_READ_ONLY)
+    )

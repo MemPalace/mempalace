@@ -8,6 +8,7 @@ from mempalace import convo_miner
 from mempalace import normalize as normalize_module
 from mempalace._source_state import source_fingerprint
 from mempalace.palace import (
+    CONVO_CHUNKER_VERSION,
     NORMALIZE_VERSION,
     file_already_mined,
     get_collection,
@@ -265,7 +266,11 @@ def test_scoped_prefetch_preserves_fingerprints_and_legacy_metadata(collection, 
     os.utime(source, (1_700_000_000, 1_700_000_000))
     os.utime(legacy, (1_700_000_000, 1_700_000_000))
     fingerprint = source_fingerprint(source.stat())
-    common = {"normalize_version": NORMALIZE_VERSION, "source_mtime": source.stat().st_mtime}
+    common = {
+        "normalize_version": NORMALIZE_VERSION,
+        "convo_chunker_version": CONVO_CHUNKER_VERSION,
+        "source_mtime": source.stat().st_mtime,
+    }
     collection.add(
         ids=["verified", "legacy", "general", "sweep", "outside"],
         documents=["stored conversation"] * 5,
@@ -329,6 +334,7 @@ def test_scoped_prefetch_keeps_paginated_snapshot_groups_separate(collection, tm
 
     common = {
         "normalize_version": NORMALIZE_VERSION,
+        "convo_chunker_version": CONVO_CHUNKER_VERSION,
         "source_file": str(source),
         "source_mtime": before.st_mtime,
         "extract_mode": "exchange",
@@ -378,6 +384,7 @@ def test_scoped_prefetch_retry_does_not_double_count_partial_page(
     fingerprint = source_fingerprint(source.stat())
     common = {
         "normalize_version": NORMALIZE_VERSION,
+        "convo_chunker_version": CONVO_CHUNKER_VERSION,
         "extract_mode": "exchange",
         "source_mtime": source.stat().st_mtime,
         "source_fingerprint": fingerprint,

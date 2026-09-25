@@ -4,6 +4,7 @@ All ChromaDB access is mocked — no real database needed.
 """
 
 import json
+import pytest
 import os
 from unittest.mock import MagicMock, patch
 
@@ -449,3 +450,26 @@ def test_2288_graph_stats_preserve_room_names_and_count_room_instances():
         "matlab-drive",
         "octopus",
     }
+
+
+class TestChromaWingSourceCounts:
+    def test_reader_groups_transcript_sources_per_wing(self, tmp_path):
+        chromadb = pytest.importorskip("chromadb")
+        from mempalace.backends.chroma import sqlite_wing_source_counts
+
+        client = chromadb.PersistentClient(path=str(tmp_path))
+        col = client.get_or_create_collection("mempalace_drawers")
+        src = "/Users/me/.claude/projects/-Users-me-dev-thing/s.jsonl"
+        col.add(
+            ids=["a", "b", "c"],
+            documents=["x", "y", "z"],
+            metadatas=[
+                {"wing": "convos", "source_file": src},
+                {"wing": "convos", "source_file": src},
+                {"wing": "convos", "source_file": "notes.md"},
+            ],
+            embeddings=[[1.0, 0.0]] * 3,
+        )
+        rows = sqlite_wing_source_counts(str(tmp_path), "mempalace_drawers")
+        assert rows == [("convos", src, 2)]
+        assert sqlite_wing_source_counts(str(tmp_path), "other") is None
