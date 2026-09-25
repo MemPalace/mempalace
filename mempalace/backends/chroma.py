@@ -730,6 +730,41 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     return _hnsw_metadata_marker_intact(seg_dir)
 
 
+def _clear_segment_watermark(db_path: str, segment_id: str) -> None:
+    """Delete the ``max_seq_id`` watermark row for a quarantined segment.
+
+    Chroma persists one sync watermark per segment (``max_seq_id.segment_id``
+    is the primary key, ``seq_id`` the watermark). Renaming a segment
+    directory out of the palace without clearing its row makes Chroma treat
+    the fresh, empty rebuild as already synced through the old watermark, so
+    the rebuild the quarantine is meant to force never replays anything below
+    it (#2428): ``collection.count()`` keeps reporting the full total while
+    filtered queries fail or return an incomplete index.
+
+    Only the row is deleted — the BLOB format chromadb writes into
+    ``max_seq_id`` is left untouched (see ``_fix_blob_seq_ids``).
+
+    If ``db_path`` does not exist (quarantine_invalid_hnsw_metadata can run on
+    a palace before Chroma has created ``chroma.sqlite3``), this is a no-op:
+    there is no watermark to clear, and opening the writer would create an
+    empty database file Chroma has not asked for.
+    """
+    if not os.path.isfile(db_path):
+        return
+    try:
+        with contextlib.closing(open_palace_writer(db_path)) as conn:
+            conn.execute(
+                "DELETE FROM max_seq_id WHERE segment_id = ?",
+                (segment_id,),
+            )
+            conn.commit()
+    except sqlite3.Error:
+        logger.exception(
+            "Failed to clear max_seq_id watermark for quarantined segment %s",
+            segment_id,
+        )
+
+
 def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> list[str]:
     """Rename HNSW segment dirs that look unsafe to open.
 
@@ -828,6 +863,10 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
         try:
             os.rename(seg_dir, target)
             moved.append(target)
+            # The directory name is the segment UUID; drop its watermark so
+            # Chroma replays the rebuild from 0 instead of treating the fresh
+            # index as synced through the quarantined segment's seq (#2428).
+            _clear_segment_watermark(db_path, os.path.basename(seg_dir))
             logger.warning(
                 "Quarantined corrupt HNSW segment %s (%s); renamed to %s",
                 seg_dir,
@@ -2035,6 +2074,7 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
     out of the way before ``PersistentClient`` opens so Chroma can rebuild
     cleanly instead of touching known-bad metadata.
     """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
     try:
         entries = os.listdir(palace_path)
     except OSError:
@@ -2115,6 +2155,10 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
         try:
             os.rename(seg_dir, target)
             moved.append(target)
+            # Same watermark handling as quarantine_stale_hnsw: without
+            # clearing the row, Chroma would consider the empty rebuild
+            # synced through the quarantined segment's seq (#2428).
+            _clear_segment_watermark(db_path, os.path.basename(seg_dir))
             logger.warning("Quarantined invalid HNSW metadata in %s: %s", seg_dir, reason)
         except OSError:
             logger.exception("Failed to quarantine invalid HNSW metadata in %s", seg_dir)
