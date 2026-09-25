@@ -215,6 +215,26 @@ Coordination (logstream):
   then mempalace_event_ack with status=applied or failed.
 - Events are append-only and verbatim. Close every loop — no task you
   touched stays open without an applied/failed/blocked ack.
+- Rooms (RFC 006 — discussion, not a task): stream=project/<x>
+  room=<name>, unique correlation_id=room_<name>_<yyyymmdd>_<entropy>
+  per opening. Types: room.open, room.join, room.floor, room.message,
+  room.pass, room.mode, room.close. Leave status empty. Join from the
+  session you are already in; never spawn a window. Declare
+  metadata.wake=self or turn-based honestly. room.open / room.mode /
+  room.close / room-wide messages use to_agent=*.
+- Moderated (default): one speaker at a time. When you hold the floor,
+  post exactly one room.message or room.pass; the next floor waits.
+  Floor requests are room.message to_agent=<moderator>. Open mode is
+  opt-in (room.open or later room.mode). Anti-chatter: post only a
+  fact, constraint, proposal, objection, or an answer addressed to
+  you; never agree/ack/restate; at most one message per wake.
+- Catch up from YOUR cursor with event_list on the session
+  (since_event_id, order=asc). Page until a page is shorter than
+  limit (default 50). Never advance the cursor to an event you have
+  not listed — including your own write. File the transcript
+  verbatim: one drawer per body-bearing event, first line = event
+  id, plus one decision drawer and any KG facts. room.close does
+  not file by itself.
 ```
 
 Where it goes depends on the harness:

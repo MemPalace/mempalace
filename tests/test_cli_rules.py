@@ -65,6 +65,20 @@ class TestSharedBrainRulesTemplate:
         assert "<PROJECT>" in content
         assert "<AGENT_ID>" not in content
 
+    def test_snippet_carries_rooms_rules(self):
+        """Rooms live in the pinned snippet so `mempalace rules` emits them.
+        A section only in coordination-protocol.md outside the fence is
+        invisible to agents."""
+        content = SHARED_BRAIN_RULES_FILE.read_text(encoding="utf-8")
+        for needle in (
+            "room.open",
+            "room.floor",
+            "room.close",
+            "to_agent=*",
+            "correlation_id=room_",
+        ):
+            assert needle in content, f"snippet missing {needle!r}"
+
     def test_watcher_triggers_are_imperative_and_enumerated(self):
         """A capability-conditional watcher rule ('if your harness can...')
         reads as optional and agents skip it. Declared-idle chat plus an
