@@ -33,6 +33,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from .user_agent import USER_AGENT
+
 logger = logging.getLogger("mempalace_llm")
 
 
@@ -206,12 +208,22 @@ class LLMProvider:
 
 def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
     """POST JSON and return the parsed response. Raises LLMError on any failure."""
-    req = Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json", **headers},
-    )
     try:
+        # ``User-Agent`` is set AFTER ``**headers`` so callers cannot accidentally
+        # shadow the WAF-bypass with a per-provider override. Callers that
+        # genuinely need a different UA should change ``USER_AGENT`` itself.
+        # ``Request()`` is inside the try block because it validates the URL eagerly
+        # and raises ``ValueError`` on malformed input; that needs to be wrapped as
+        # ``LLMError`` for the docstring contract.
+        req = Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                **headers,
+                "User-Agent": USER_AGENT,
+            },
+        )
         with urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
     except HTTPError as e:
@@ -221,10 +233,12 @@ def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
         except Exception:
             pass
         raise LLMError(f"HTTP {e.code} from {url}: {detail or e.reason}") from e
-    except (URLError, OSError) as e:
-        raise LLMError(f"Cannot reach {url}: {e}") from e
+    # JSONDecodeError is a subclass of ValueError; must come BEFORE the broader
+    # ValueError catch so malformed responses still classify as "Malformed".
     except json.JSONDecodeError as e:
         raise LLMError(f"Malformed response from {url}: {e}") from e
+    except (URLError, OSError, ValueError) as e:
+        raise LLMError(f"Cannot reach {url}: {e}") from e
 
 
 # ==================== OLLAMA ====================
@@ -251,9 +265,13 @@ class OllamaProvider(LLMProvider):
 
     def check_available(self) -> tuple[bool, str]:
         try:
-            with urlopen(f"{self.endpoint}/api/tags", timeout=5) as resp:
+            req = Request(f"{self.endpoint}/api/tags", headers={"User-Agent": USER_AGENT})
+            with urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read())
-        except (URLError, HTTPError, OSError, json.JSONDecodeError) as e:
+        # ValueError covers an endpoint that Request() rejects, such as one
+        # without a scheme, and a body that is not JSON: JSONDecodeError and
+        # UnicodeDecodeError are ValueError subclasses.
+        except (URLError, HTTPError, OSError, ValueError) as e:
             return False, f"Cannot reach Ollama at {self.endpoint}: {e}"
         names = {m.get("name", "") for m in data.get("models", []) or []}
         # Ollama tags may or may not include ':latest' — accept either form
@@ -351,7 +369,7 @@ class OpenAICompatProvider(LLMProvider):
 
     def served_models(self) -> list[str]:
         """Model ids the endpoint lists; ``[]`` when it cannot be read."""
-        req = Request(self._models_url())
+        req = Request(self._models_url(), headers={"User-Agent": USER_AGENT})
         if self.api_key and (
             self.api_key_source != "env"
             or not self.is_external_service
