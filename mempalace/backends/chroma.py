@@ -957,6 +957,18 @@ def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
     pickle_path = os.path.join(palace_path, segment_id, "index_metadata.pickle")
     if not os.path.isfile(pickle_path):
         return None
+    id_to_label = _hnsw_id_to_label(pickle_path)
+    return None if id_to_label is None else len(id_to_label)
+
+
+def _hnsw_id_to_label(pickle_path: str) -> Optional[dict]:
+    """Return the ``id_to_label`` mapping inside a segment metadata pickle.
+
+    ``None`` when the file cannot be unpickled or does not carry the
+    mapping. Shared by :func:`_hnsw_element_count`, which needs only its
+    size, and :func:`_hnsw_indexed_ids`, which needs the drawer ids
+    themselves, so both read the pickle the same guarded way.
+    """
     try:
         pd = _SafePersistentDataUnpickler.load(pickle_path)
         # ChromaDB serializes PersistentData differently across versions:
@@ -967,12 +979,31 @@ def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
             id_to_label = pd.get("id_to_label")
         else:
             id_to_label = getattr(pd, "id_to_label", None)
-        if isinstance(id_to_label, dict):
-            return len(id_to_label)
-        return None
+        return id_to_label if isinstance(id_to_label, dict) else None
     except Exception:
-        logger.debug("_hnsw_element_count failed for %s", pickle_path, exc_info=True)
+        logger.debug("_hnsw_id_to_label failed for %s", pickle_path, exc_info=True)
         return None
+
+
+def _hnsw_indexed_ids(palace_path: str, segment_id: str) -> Optional[set]:
+    """Drawer ids the flushed HNSW metadata holds, for coverage accounting.
+
+    An absent pickle returns the **empty set**, not ``None``: a segment
+    that has never flushed holds zero indexed ids, and that is a measured
+    zero rather than an unknown. :func:`searchable_coverage` needs the two
+    apart, because "nothing flushed yet" is the ordinary state of every
+    palace below its ``hnsw:sync_threshold`` and must not stop the
+    measurement (#2514).
+
+    ``None`` is reserved for a pickle that is there but unreadable, where
+    counting zero flushed ids would understate coverage and raise a false
+    alarm on a palace that is fine.
+    """
+    pickle_path = os.path.join(palace_path, segment_id, "index_metadata.pickle")
+    if not os.path.isfile(pickle_path):
+        return set()
+    id_to_label = _hnsw_id_to_label(pickle_path)
+    return None if id_to_label is None else set(id_to_label)
 
 
 # Divergence threshold: chromadb's HNSW flushes asynchronously, so HNSW
@@ -1530,6 +1561,207 @@ def _sqlite_embedding_count(palace_path: str, collection_name: str) -> Optional[
             conn.close()
     except sqlite3.Error:
         return None
+
+
+#: Ceiling on how many drawer ids :func:`searchable_coverage` will hold in
+#: memory. The measurement materializes the live ids and the two searchable
+#: id sets; a palace past this cap gets an unmeasured verdict rather than a
+#: diagnostic command that allocates without bound.
+_SEARCHABLE_COVERAGE_MAX_IDS = 1_000_000
+
+#: Coverage at or above this reads as "every drawer accounted for". The
+#: remaining margin absorbs a drawer written or deleted while the three
+#: reads below run, which is a one-row discrepancy, not a lost corpus.
+_SEARCHABLE_COVERAGE_ALERT = 0.99
+
+
+def _sqlite_embedding_ids(palace_path: str, collection_name: str) -> Optional[set]:
+    """Live drawer ids for ``collection_name``, or ``None`` when unreadable.
+
+    The same join :func:`_sqlite_embedding_count` counts over, returning the
+    ids instead of the total so the two can never disagree about what "live"
+    means. Gives up past :data:`_SEARCHABLE_COVERAGE_MAX_IDS` rather than
+    materializing an unbounded set.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        conn = connect_sqlite_read(db_path)
+        try:
+            cursor = conn.execute(
+                """
+                SELECT e.embedding_id
+                FROM embeddings e
+                JOIN segments s ON e.segment_id = s.id
+                JOIN collections c ON s.collection = c.id
+                WHERE c.name = ?
+                """,
+                (collection_name,),
+            )
+            ids = set()
+            for (embedding_id,) in cursor:
+                ids.add(embedding_id)
+                if len(ids) > _SEARCHABLE_COVERAGE_MAX_IDS:
+                    return None
+            return ids
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
+def _wal_pending_ids(palace_path: str, collection_name: str) -> Optional[set]:
+    """Drawer ids still carrying a vector in chroma's write-ahead log.
+
+    Chroma replays ``embeddings_queue`` into the in-memory HNSW index when
+    it opens a collection, so a row here is as searchable as one in the
+    flushed index — that is why a palace below its ``hnsw:sync_threshold``
+    answers queries correctly with no index on disk at all.
+
+    Scoped by topic: the queue is one table for the whole palace, and the
+    topic ends with the collection's own uuid, so drawers and closets do
+    not count toward each other. ``None`` on any sqlite error, including a
+    schema without the columns this reads — an unscoped count would be
+    worse than no measurement.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        conn = connect_sqlite_read(db_path)
+        try:
+            row = conn.execute(
+                "SELECT id FROM collections WHERE name = ?",
+                (collection_name,),
+            ).fetchone()
+            if not row or not row[0]:
+                return None
+            cursor = conn.execute(
+                """
+                SELECT DISTINCT id
+                FROM embeddings_queue
+                WHERE vector IS NOT NULL
+                  AND topic LIKE ?
+                """,
+                (f"%/{row[0]}",),
+            )
+            ids = set()
+            for (queued_id,) in cursor:
+                ids.add(queued_id)
+                if len(ids) > _SEARCHABLE_COVERAGE_MAX_IDS:
+                    return None
+            return ids
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
+def searchable_coverage(
+    palace_path: str, collection_name: str = "mempalace_drawers"
+) -> dict[str, Any]:
+    """Share of live drawers that vector search can actually reach (#2514).
+
+    :func:`hnsw_capacity_status` measures the flushed index against sqlite,
+    which leaves it with nothing to say whenever ``index_metadata.pickle``
+    is absent — the ordinary state of every palace holding fewer records
+    than its ``hnsw:sync_threshold``, since chroma writes that pickle only
+    when a compaction fires. A healthy sub-threshold palace and one that
+    lost its index therefore report the identical ``status: unknown``.
+
+    This measures the thing the pickle was standing in for. A drawer is
+    searchable when its vector is **either** flushed into HNSW **or** still
+    pending in the write-ahead log, so::
+
+        coverage = |live ids ∩ (flushed ids ∪ pending ids)| / |live ids|
+
+    The union matters: chroma purges the queue as it compacts, so after a
+    flush the vectors are split across the two sets and neither alone
+    describes a healthy palace. So does the *set* union rather than the sum
+    of the two counts — a re-upserted drawer sits in both sets, and a sum
+    lets that overlap paper over a genuine gap, which would leave the
+    meter unable to go red.
+
+    Returns a dict with ``coverage`` (``None`` when it could not be
+    measured), ``live_count``, ``covered_count``, ``flushed_count``,
+    ``pending_count``, ``unsearchable_count``, ``degraded`` and
+    ``message``. Never raises. ``flushed_count`` and ``pending_count``
+    partition ``covered_count``: a drawer in both sets counts as flushed,
+    so the two always add up to the drawers search can reach.
+
+    Not called from :func:`hnsw_capacity_status`: that probe runs ahead of
+    every search, duplicate check and status call, and reading three id
+    sets is far past its budget. This is for ``repair-status``, where an
+    operator has asked a question and the answer is worth the read.
+
+    Reads live ids first, then the queue, then the pickle. A drawer written
+    during the measurement lands outside the live set and is ignored; one
+    flushed and purged mid-run was in the pickle before its queue row went,
+    so the later read still sees it. Only a drawer *deleted* mid-run can
+    show as uncovered, by one row, which is what the
+    :data:`_SEARCHABLE_COVERAGE_ALERT` margin is for.
+    """
+    out: dict[str, Any] = {
+        "coverage": None,
+        "live_count": None,
+        "covered_count": None,
+        "flushed_count": None,
+        "pending_count": None,
+        "unsearchable_count": None,
+        "degraded": False,
+        "message": "",
+    }
+    try:
+        live_ids = _sqlite_embedding_ids(palace_path, collection_name)
+        if live_ids is None:
+            # Only now worth a second query: the caller needs to know whether
+            # the read failed or the palace is simply past the id ceiling.
+            live_count = _sqlite_embedding_count(palace_path, collection_name)
+            if live_count is not None and live_count > _SEARCHABLE_COVERAGE_MAX_IDS:
+                out["live_count"] = live_count
+                out["message"] = (
+                    f"searchable coverage not measured: {live_count:,} drawers is past the "
+                    f"{_SEARCHABLE_COVERAGE_MAX_IDS:,}-id ceiling this check holds in memory"
+                )
+            else:
+                out["message"] = "searchable coverage unavailable: could not read the drawer ids"
+            return out
+        out["live_count"] = len(live_ids)
+        if not live_ids:
+            return out
+
+        pending_ids = _wal_pending_ids(palace_path, collection_name)
+        if pending_ids is None:
+            out["message"] = "searchable coverage unavailable: could not read the write log"
+            return out
+
+        segment_id = _vector_segment_id(palace_path, collection_name)
+        flushed_ids = None if segment_id is None else _hnsw_indexed_ids(palace_path, segment_id)
+        if flushed_ids is None:
+            out["message"] = "searchable coverage unavailable: could not read the flushed index"
+            return out
+
+        flushed_live = live_ids & flushed_ids
+        searchable = flushed_live | (live_ids & pending_ids)
+        # A re-upserted drawer sits in both sets; counting it under flushed
+        # only keeps the two buckets a partition of ``covered_count``.
+        out["flushed_count"] = len(flushed_live)
+        out["pending_count"] = len(searchable) - len(flushed_live)
+        out["covered_count"] = len(searchable)
+        out["unsearchable_count"] = len(live_ids) - len(searchable)
+        out["coverage"] = len(searchable) / len(live_ids)
+        if out["coverage"] < _SEARCHABLE_COVERAGE_ALERT:
+            out["degraded"] = True
+            out["message"] = (
+                f"{out['unsearchable_count']:,} of {out['live_count']:,} drawers are in "
+                "neither the flushed HNSW index nor the pending write log, so vector "
+                "search cannot return them"
+            )
+    except Exception:
+        logger.debug("searchable_coverage failed", exc_info=True)
+        out["message"] = "searchable coverage probe raised; skipping"
+    return out
 
 
 def _sqlite_wing_room_counts(

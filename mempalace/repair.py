@@ -45,7 +45,7 @@ from typing import Callable, Iterator, Optional
 
 from chromadb.errors import NotFoundError as ChromaNotFoundError
 
-from .backends.chroma import ChromaBackend, hnsw_capacity_status
+from .backends.chroma import ChromaBackend, hnsw_capacity_status, searchable_coverage
 
 # sqlite_read_uri stays in this module's namespace: callers and tests reach the
 # read-only URI through repair. Connections to chroma.sqlite3 go through
@@ -2499,6 +2499,22 @@ def _rebuild_from_sqlite_locked(
     return counts
 
 
+def _capacity_with_coverage(palace_path: str, collection_name: str) -> dict:
+    """Capacity verdict for one collection, plus its searchable coverage.
+
+    The two probes answer different questions and neither subsumes the
+    other. ``hnsw_capacity_status`` compares the flushed index against
+    sqlite and goes quiet when there is no flushed index to compare;
+    ``searchable_coverage`` counts the drawers a query can actually reach,
+    which it can do whether or not a flush has ever happened (#2514).
+
+    Merged into one dict rather than mutating the capacity verdict, which
+    is cached and shared with every other caller of that probe.
+    """
+    capacity = hnsw_capacity_status(palace_path, collection_name)
+    return dict(capacity, searchable=searchable_coverage(palace_path, collection_name))
+
+
 def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
     """Read-only health check: compare sqlite vs HNSW element counts.
 
@@ -2512,6 +2528,21 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
     The check itself never opens a chromadb client and never imports
     hnswlib — it reads ``chroma.sqlite3`` and ``index_metadata.pickle``
     directly via :func:`mempalace.backends.chroma.hnsw_capacity_status`.
+
+    That comparison has nothing to say about a palace whose index has
+    never been flushed, which is every palace holding fewer records than
+    its ``hnsw:sync_threshold``. Each collection therefore also carries a
+    ``searchable`` sub-dict from
+    :func:`mempalace.backends.chroma.searchable_coverage`, counting the
+    live drawers that are either flushed or pending replay — the number
+    that separates a healthy unflushed palace from one that has lost its
+    index, which ``status`` alone reports identically as ``unknown``
+    (#2514). ``flush_unreachable`` reaches the operator as its own line
+    for the same reason.
+
+    ``status`` itself is deliberately unchanged: MCP gates vector search
+    on it globally, so widening what it can say is a behaviour change for
+    every consumer, not a diagnostic addition.
 
     Returns the capacity-status dict (also printed), or a one-key dict in its
     place: ``status="unknown"`` when no palace directory is reachable at the
@@ -2574,10 +2605,11 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
         print("  Palace is initialized but empty (no drawers yet).\n")
         return {"status": "empty", "message": "palace has no drawers yet"}
 
-    drawers = hnsw_capacity_status(palace_path, collection_name)
-    closets = hnsw_capacity_status(palace_path, CLOSETS_COLLECTION_NAME)
+    drawers = _capacity_with_coverage(palace_path, collection_name)
+    closets = _capacity_with_coverage(palace_path, CLOSETS_COLLECTION_NAME)
 
     for label, info in (("drawers", drawers), ("closets", closets)):
+        coverage = info["searchable"]
         print(f"\n  [{label}]")
         if info["sqlite_count"] is None:
             print("    sqlite count:   (unreadable)")
@@ -2589,10 +2621,40 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
             print(f"    hnsw count:     {info['hnsw_count']:,}")
         if info["divergence"] is not None:
             print(f"    divergence:     {info['divergence']:,}")
+        if coverage["coverage"] is not None:
+            print(
+                f"    searchable:     {coverage['covered_count']:,} / "
+                f"{coverage['live_count']:,} drawers ({coverage['coverage'] * 100:.1f}%) - "
+                f"{coverage['flushed_count']:,} flushed + "
+                f"{coverage['pending_count']:,} pending replay"
+            )
         marker = "DIVERGED" if info["diverged"] else info["status"].upper()
         print(f"    status:         {marker}")
+        # The flag says the index can never be built at this collection size,
+        # which is benign on its own — the write log still answers queries.
+        # It reaches the operator as its own line rather than only as prose
+        # inside note:, so a health check can tell it from a real fault
+        # without parsing English (#2514).
+        if info.get("flush_unreachable"):
+            print("    flush:          unreachable at this collection size")
         if info["message"]:
             print(f"    note:           {info['message']}")
+        if coverage["message"]:
+            # Hangs under the searchable line when there is one, and stands in
+            # for it when the coverage could not be measured at all.
+            gutter = "                " if coverage["coverage"] is not None else "searchable:     "
+            print(f"    {gutter}{coverage['message']}")
+
+    for label, info in (("drawers", drawers), ("closets", closets)):
+        if info["searchable"]["degraded"]:
+            print(
+                f"\n  {info['searchable']['unsearchable_count']:,} {label} are in neither the "
+                "flushed HNSW index nor the\n"
+                "  pending write log. Vector search cannot return them, and no amount of\n"
+                "  waiting will flush them in. Rebuild the index from SQLite, which still\n"
+                "  holds every drawer:\n"
+                "\n      mempalace repair --mode from-sqlite --archive-existing"
+            )
 
     if drawers["diverged"] or closets["diverged"]:
         print(
