@@ -517,6 +517,37 @@ _HNSW_MISSING_METADATA_DATA_FLOOR = 1024
 _HNSW_MIN_BYTES_PER_ELEMENT = 256
 
 
+def _hnsw_rust_payload_is_complete(seg_dir: str) -> bool:
+    """Return whether a pickle-free segment is a finished v1 HNSW payload.
+
+    A missing pickle is normally a sub-threshold index or a torn persist.
+    Accept it only when ``header.bin`` is the known v1 layout with possible
+    counts and ``length.bin`` is a float table large enough for those counts.
+    Anything else, including a header that merely unpacks, falls through to
+    the missing-pickle guard.
+    """
+    required = ("header.bin", "data_level0.bin", "length.bin", "link_lists.bin")
+    try:
+        if not all(os.path.isfile(os.path.join(seg_dir, name)) for name in required):
+            return False
+        length_size = os.path.getsize(os.path.join(seg_dir, "length.bin"))
+    except OSError:
+        return False
+
+    header = _read_hnsw_binary_header(seg_dir)
+    if header is None or header.get("persistence_version") != _HNSW_PERSISTENCE_VERSION:
+        return False
+    if _hnsw_binary_header_has_impossible_counts(header):
+        return False
+
+    count = int(header["cur_element_count"])
+    if length_size % 4 != 0 or length_size < count * 4:
+        return False
+
+    ratio = _hnsw_link_to_data_ratio(seg_dir)
+    return ratio is not None and ratio <= _HNSW_LINK_TO_DATA_MAX_RATIO
+
+
 def _hnsw_capacity_ceiling_from_payload(palace_path: str, segment_id: str) -> Optional[int]:
     """Upper bound on the elements a segment's payload could hold, or None.
 
@@ -688,14 +719,13 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     ``0x2e`` (the protocol/terminator byte sequence chromadb serializes
     with).
 
-    When metadata is missing, the segment is either *never-persisted*
-    (sub-threshold: fewer records than ``batch_size``, so chromadb never
-    triggered ``_persist()``) or *partially flushed* (persist started but
-    crashed).  The two are distinguished by ``link_lists.bin``: chromadb
-    writes link data during persist, so an empty/absent ``link_lists.bin``
-    together with absent metadata means no persist was ever attempted.
-    Note: ``data_level0.bin`` is pre-allocated at index creation and its
-    size does not indicate actual record count.
+    When metadata is missing, the segment may be a finished v1 payload
+    (valid header and a length table that covers its element count), a
+    *never-persisted* segment (sub-threshold: fewer records than
+    ``batch_size``), or a *partially flushed* segment (persist started but
+    crashed).  A header that merely unpacks is not finished.  For every
+    other layout, an empty/absent ``link_lists.bin`` together with absent
+    metadata still means no persist was attempted.
 
     Deliberately format-sniffs only; never deserializes. Deserialization
     can execute arbitrary code, and the byte-sniff is sufficient to
@@ -715,6 +745,9 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     meta_path = os.path.join(seg_dir, "index_metadata.pickle")
 
     if not os.path.isfile(meta_path):
+        if _hnsw_rust_payload_is_complete(seg_dir):
+            return True
+
         link_path = os.path.join(seg_dir, "link_lists.bin")
         try:
             link_has_data = os.path.isfile(link_path) and os.path.getsize(link_path) > 0
