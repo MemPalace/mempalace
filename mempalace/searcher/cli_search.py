@@ -66,6 +66,7 @@ def _print_search_results_bm25_only(
         source = Path(hit.get("source_file", "?")).name
 
         print(f"  [{i}] {wing_name} / {room_name}")
+        print(f"      Drawer: {hit.get('drawer_id') or '?'}")
         print(f"      Source: {source}")
         print(f"      Match:  bm25={bm25}  (vector disabled)")
         print()
@@ -170,11 +171,15 @@ def search(
     docs = _first_or_empty(results, "documents")
     metas = _first_or_empty(results, "metadatas")
     dists = _first_or_empty(results, "distances")
+    # The stored IDs travel alongside the documents so each printed hit can
+    # name the drawer it came from — that id is what ``mempalace_get_drawer``
+    # takes to re-open the verbatim content.
+    stored_ids = _aligned_query_ids(results, len(docs))
 
     if date_window_active:
         kept = [
-            (doc, meta, dist)
-            for doc, meta, dist in zip(docs, metas, dists)
+            (doc, meta, dist, stored_id)
+            for doc, meta, dist, stored_id in zip(docs, metas, dists, stored_ids)
             if filed_at_in_window((meta or {}).get("filed_at"), since_dt, before_dt)
         ]
         # Keep the whole in-window pool here; the hybrid re-rank below must
@@ -183,6 +188,7 @@ def search(
         docs = [k[0] for k in kept]
         metas = [k[1] for k in kept]
         dists = [k[2] for k in kept]
+        stored_ids = [k[3] for k in kept]
 
     if not docs:
         print(f'\n  No results found for: "{query}"')
@@ -198,8 +204,15 @@ def search(
     # see via `mempalace_search`.
     metric = _metric_for_collection(col)
     hits = [
-        {"text": doc or "", "distance": float(dist), "metadata": meta or {}}
-        for doc, meta, dist in zip(docs, metas, dists)
+        {
+            "text": doc or "",
+            "distance": float(dist),
+            "metadata": meta or {},
+            # Resolve chunk hits to their parent id, same as the MCP path, so
+            # the printed id fetches the WHOLE entry rather than one chunk.
+            "drawer_id": _result_drawer_id(meta, stored_id),
+        }
+        for doc, meta, dist, stored_id in zip(docs, metas, dists, stored_ids)
     ]
     vector_weight, bm25_weight = _resolve_hybrid_rank_weights()
     hits = _hybrid_rank(
@@ -236,6 +249,7 @@ def search(
         room_name = meta.get("room", "?")
 
         print(f"  [{i}] {wing_name} / {room_name}")
+        print(f"      Drawer: {hit.get('drawer_id') or '?'}")
         print(f"      Source: {source}")
         print(f"      Match:  {metric}_sim={vec_sim}  bm25={bm25}")
         print()

@@ -805,6 +805,116 @@ class TestSearchCLI:
         mock_probe.assert_not_called()
         mock_open.assert_called_once_with(fake_palace_path, opener=get_collection, read_only=True)
 
+    def test_search_prints_drawer_id_for_each_hit(self, fake_palace_path, capsys):
+        """Each printed hit names its drawer, so a CLI reader can re-open the
+        verbatim content by id instead of guessing from wing/room/source."""
+        mock_col = MagicMock()
+        mock_col.metadata = {"hnsw:space": "cosine"}
+        mock_col.query.return_value = {
+            "ids": [["drawer_abc123"]],
+            "documents": [["a matching doc"]],
+            "metadatas": [[{"source_file": "a.md", "wing": "w", "room": "r"}]],
+            "distances": [[0.1]],
+        }
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            search("anything", fake_palace_path)
+
+        assert "Drawer: drawer_abc123" in capsys.readouterr().out
+
+    def test_search_prints_parent_id_for_chunk_hits(self, fake_palace_path, capsys):
+        """A chunk hit must print the logical-group id (#2185) — the id that
+        fetches the WHOLE entry, not the one chunk that matched."""
+        mock_col = MagicMock()
+        mock_col.metadata = {"hnsw:space": "cosine"}
+        mock_col.query.return_value = {
+            "ids": [["drawer_parent_1_chunk_3"]],
+            "documents": [["a matching doc"]],
+            "metadatas": [
+                [
+                    {
+                        "source_file": "a.md",
+                        "wing": "w",
+                        "room": "r",
+                        "parent_drawer_id": "drawer_parent_1",
+                    }
+                ]
+            ],
+            "distances": [[0.1]],
+        }
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            search("anything", fake_palace_path)
+
+        out = capsys.readouterr().out
+        assert "Drawer: drawer_parent_1\n" in out
+        assert "drawer_parent_1_chunk_3" not in out
+
+    def test_search_keeps_drawer_ids_aligned_across_window_filter(self, fake_palace_path, capsys):
+        """The window filter drops rows from the middle of the pool. IDs have
+        to be filtered alongside the documents, or every surviving hit gets
+        labelled with some other drawer's id."""
+        mock_col = MagicMock()
+        mock_col.metadata = {"hnsw:space": "cosine"}
+        mock_col.query.return_value = {
+            "ids": [["drawer_old", "drawer_in_window"]],
+            "documents": [["older filler text", "quixotic zephyr baseline report"]],
+            "metadatas": [
+                [
+                    {
+                        "source_file": "old.md",
+                        "wing": "w",
+                        "room": "r",
+                        "filed_at": "2025-01-01T00:00:00",
+                    },
+                    {
+                        "source_file": "new.md",
+                        "wing": "w",
+                        "room": "r",
+                        "filed_at": "2026-01-10T00:00:00",
+                    },
+                ]
+            ],
+            "distances": [[0.1, 0.2]],
+        }
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            search("quixotic zephyr baseline", fake_palace_path, since="2026-01-01")
+
+        out = capsys.readouterr().out
+        assert "Drawer: drawer_in_window" in out
+        assert "drawer_old" not in out
+
+    def test_bm25_fallback_prints_drawer_id(self, fake_palace_path, capsys):
+        """The vector-disabled printer mirrors the vector path's output shape,
+        so it reports the drawer id too."""
+        bm25_result = {
+            "query": "anything",
+            "filters": {},
+            "total_before_filter": 1,
+            "results": [
+                {
+                    "drawer_id": "drawer_bm25_1",
+                    "text": "diary entry that matches the query",
+                    "wing": "wing_test",
+                    "room": "diary",
+                    "source_file": "test.jsonl",
+                    "bm25_score": 1.5,
+                    "distance": None,
+                }
+            ],
+            "fallback": "bm25_only_via_sqlite",
+            "fallback_reason": "vector_search_disabled",
+        }
+        with (
+            patch("mempalace.searcher.resolve_backend_name", return_value="chroma"),
+            patch(
+                "mempalace.backends.chroma.hnsw_capacity_status",
+                return_value={"diverged": True, "message": "test divergence"},
+            ),
+            patch("mempalace.searcher._bm25_only_via_sqlite", return_value=bm25_result),
+        ):
+            search("anything", fake_palace_path)
+
+        assert "Drawer: drawer_bm25_1" in capsys.readouterr().out
+
 
 # ── _tokenize stop-word filter ─────────────────────────────────────────
 
