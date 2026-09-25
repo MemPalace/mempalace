@@ -246,7 +246,7 @@ def sweep(
     """
     collection = get_collection(palace_path, create=True)
 
-    # Optional taxonomy (#1207, #1979): when a wing is given, swept drawers are
+    # Optional taxonomy: when a wing is given, swept drawers are
     # classified under wing/room like ``mine --wing`` (room defaults to the
     # miners' fallback room "general") so message-level catch-up is searchable
     # instead of stranded as ``?/?`` in status and search. With no wing we stamp

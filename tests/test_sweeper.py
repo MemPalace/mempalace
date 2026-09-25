@@ -524,7 +524,7 @@ class TestSweptDrawersCarryTheirDirectory:
 
 
 class TestSweeperTaxonomy:
-    """#1207 / #1979: `sweep` can classify drawers under a wing/room so
+    """`sweep` can classify drawers under a wing/room so
     message-level catch-up drawers are searchable next to `mine` drawers
     instead of being stranded as ``?/?`` in status and search."""
 
@@ -620,7 +620,7 @@ class TestSweeperTaxonomy:
         )
 
     def test_sweep_with_wing_still_records_the_directory(self, mock_claude_jsonl, tmp_path):
-        """Taxonomy and the directory identity (#2320) land on the same drawer,
+        """Taxonomy and the directory identity land on the same drawer,
         so ``sync`` still decides a classified swept drawer by the same reading
         as a mined one. Each key is covered on its own, above and in
         ``TestSweptDrawersCarryTheirDirectory``; this pins the pair."""
