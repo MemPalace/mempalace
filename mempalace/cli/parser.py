@@ -609,6 +609,13 @@ def main():
         action="store_true",
         help="Show what would change without modifying the palace",
     )
+    p_migrate_wings.add_argument(
+        "--rename",
+        action="append",
+        default=[],
+        metavar="OLD=NEW",
+        help="Rename or consolidate a wing; repeat for multiple mappings",
+    )
     p_migrate_wings.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
 
     p_hallways = sub.add_parser("hallways", help="List entity hallways (associative graph)")

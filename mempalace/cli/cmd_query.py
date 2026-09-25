@@ -78,12 +78,21 @@ def cmd_migrate(args):
 def cmd_migrate_wings(args):
     """Normalize legacy wing names (strip leading/trailing separators)."""
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    from ..config import sanitize_name
     from ..migrate import migrate_wing_names
+
+    explicit_renames = {}
+    for rename in getattr(args, "rename", ()):
+        if "=" not in rename:
+            raise SystemExit("--rename must use OLD=NEW")
+        old, new = rename.split("=", 1)
+        explicit_renames[sanitize_name(old, "source wing")] = sanitize_name(new, "target wing")
 
     migrate_wing_names(
         palace_path=palace_path,
         dry_run=args.dry_run,
         confirm=getattr(args, "yes", False),
+        explicit_renames=explicit_renames,
     )
 
 
