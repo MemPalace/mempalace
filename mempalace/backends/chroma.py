@@ -607,6 +607,157 @@ def _bm25_scores(
     return scores
 
 
+# Most full-text matches the candidate pickers below read, best-ranked first.
+_FTS_SCAN_CAP = 50_000
+# A metadata filter matching at most this many drawers is evaluated by reading
+# those drawers' text instead of ranking the whole full-text match set.
+_FTS_FILTER_DRIVEN_MAX = 20_000
+
+
+def _fts_tokens(query: str, stop_words: frozenset = frozenset()) -> list[str]:
+    """Query terms the trigram index can match: three or more characters.
+
+    Stop words are dropped unless the query holds nothing else.
+    """
+    terms = [t for t in _tokenize(query) if len(t) >= 3]
+    return [t for t in terms if t not in stop_words] or terms
+
+
+def _whole_words_first(rows, query_tokens: Iterable[str], limit: Optional[int]) -> list[int]:
+    """Row ids from ``(row_id, text)`` pairs, whole-word matches first.
+
+    The whole-word BM25 re-rank scores a drawer by the query words it
+    contains, so drawers holding one as a whole word go first. Drawers that
+    only contain a query term inside another word keep the places left over:
+    they still carry near misses such as ``vectors`` for ``vector``.
+    """
+    words = set(query_tokens)
+    whole: list[int] = []
+    partial: list[int] = []
+    for row_id, text in rows:
+        if words.intersection(_tokenize(text)):
+            whole.append(int(row_id))
+            if limit is not None and len(whole) >= limit:
+                break
+        elif limit is None or len(partial) < limit:
+            partial.append(int(row_id))
+    picked = whole + partial
+    return picked if limit is None else picked[:limit]
+
+
+def _fts_candidate_rows(
+    conn,
+    collection_name: str,
+    query: str,
+    *,
+    limit: Optional[int],
+    filter_sql: str = "",
+    filter_params: Iterable = (),
+    stop_words: frozenset = frozenset(),
+) -> list[int]:
+    """Row ids of the full-text matches most worth ranking, best first.
+
+    ``chroma.sqlite3``'s full-text index uses the trigram tokenizer, so a
+    query term matches inside other words: ``aven`` hits ``haven't`` and
+    ``Avenue``, and a short name can have tens of thousands of such matches.
+    Taking the first ``limit`` matches in storage order handed the whole-word
+    BM25 re-rank the oldest substring hits, so the drawers that actually say
+    ``Aven`` never reached it. Matches are read in FTS rank order (documents
+    matching more query terms first), at most ``_FTS_SCAN_CAP`` of them, and
+    picked by :func:`_whole_words_first`. ``filter_sql`` is appended to the
+    WHERE clause and may refer to ``embedding_fulltext_search.rowid``.
+    ``stop_words`` are left out of the full-text query: they match nearly
+    every drawer and would make the ranking score the whole palace.
+    """
+    tokens = _fts_tokens(query, stop_words)
+    if not tokens:
+        return []
+    rows = conn.execute(
+        f"""
+        SELECT embedding_fulltext_search.rowid, embedding_fulltext_search.string_value
+        FROM embedding_fulltext_search
+        JOIN embeddings e ON e.id = embedding_fulltext_search.rowid
+        JOIN segments s ON e.segment_id = s.id
+        JOIN collections c ON s.collection = c.id
+        WHERE embedding_fulltext_search MATCH ? AND c.name = ?
+        {filter_sql}
+        ORDER BY embedding_fulltext_search.rank
+        LIMIT ?
+        """,
+        (" OR ".join(tokens), collection_name, *filter_params, _FTS_SCAN_CAP),
+    )
+    return _whole_words_first(rows, tokens, limit)
+
+
+def _filtered_candidate_rows(
+    conn,
+    collection_name: str,
+    query: str,
+    *,
+    limit: Optional[int],
+    equalities: list[tuple[str, str]],
+    filter_sql: str = "",
+    filter_params: Iterable = (),
+    stop_words: frozenset = frozenset(),
+) -> Optional[list[int]]:
+    """:func:`_fts_candidate_rows` for a filter that matches few drawers.
+
+    Ranking every full-text match and testing the filter on each took seconds
+    for a ten-drawer wing, because the match set is the whole palace for a
+    common term. When the smallest of ``equalities`` (string metadata
+    equalities, checked by one count on the ``(key, string_value)`` index)
+    matches at most ``_FTS_FILTER_DRIVEN_MAX`` drawers, this reads just those
+    drawers' text, keeps the ones the trigram index would match (any term of
+    three or more characters as a case-insensitive substring), newest first,
+    and picks by :func:`_whole_words_first`. ``filter_sql`` must hold every
+    filter and may refer to ``e.id``. ``None`` when the filter is too broad.
+    """
+    tokens = _fts_tokens(query, stop_words)
+    if not tokens or not equalities:
+        return None
+    sizes = [
+        conn.execute(
+            "SELECT COUNT(*) FROM embedding_metadata WHERE key = ? AND string_value = ?", pair
+        ).fetchone()[0]
+        for pair in equalities
+    ]
+    if min(sizes) > _FTS_FILTER_DRIVEN_MAX:
+        return None
+    key, value = equalities[sizes.index(min(sizes))]
+    row_ids = [
+        row[0]
+        for row in conn.execute(
+            f"""
+            SELECT e.id FROM embedding_metadata w
+            CROSS JOIN embeddings e ON e.id = w.id
+            JOIN segments s ON e.segment_id = s.id
+            JOIN collections c ON s.collection = c.id
+            WHERE w.key = ? AND w.string_value = ? AND c.name = ?
+            {filter_sql}
+            ORDER BY e.id DESC
+            """,
+            (key, value, collection_name, *filter_params),
+        )
+    ]
+    texts: dict[int, str] = {}
+    for start in range(0, len(row_ids), 500):
+        chunk = row_ids[start : start + 500]
+        texts.update(
+            conn.execute(
+                "SELECT id, string_value FROM embedding_metadata"
+                f" WHERE key = 'chroma:document' AND id IN ({','.join('?' * len(chunk))})",
+                chunk,
+            ).fetchall()
+        )
+    matching = []
+    for row_id in row_ids:
+        text = texts.get(row_id) or ""
+        lowered = text.lower()
+        if any(token in lowered for token in tokens):
+            matching.append((row_id, text))
+    return _whole_words_first(matching, tokens, limit)
+
+
 def _coerce_metadata_value(value: Any) -> Any:
     if isinstance(value, bool):
         return int(value)
