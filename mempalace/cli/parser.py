@@ -325,6 +325,17 @@ def main():
         default=None,
         help="Only drawers filed strictly before this ISO date/datetime (exclusive)",
     )
+    p_search.add_argument(
+        "--expand-wings",
+        dest="expand_wings",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable additive cross-wing expansion on thin unfiltered "
+            "searches (opt-in; expansion hits only fill slots the "
+            "baseline leaves empty)"
+        ),
+    )
 
     # compress
     p_compress = sub.add_parser(
