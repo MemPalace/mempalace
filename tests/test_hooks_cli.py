@@ -505,7 +505,7 @@ def test_stop_hook_saves_silently_at_interval(tmp_path):
         transcript,
         [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
     )
-    save_result = {"count": 15, "themes": ["hooks", "notifications"]}
+    save_result = {"drawers_filed": 1, "messages_folded": 15, "themes": ["hooks", "notifications"]}
     with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result) as mock_save:
         result = _capture_hook_output(
             hook_stop,
@@ -513,7 +513,7 @@ def test_stop_hook_saves_silently_at_interval(tmp_path):
             state_dir=tmp_path,
         )
     # Saves silently — systemMessage notification with themes, no block
-    assert result["systemMessage"].startswith("\u2726 15 memories woven into the palace")
+    assert result["systemMessage"].startswith("\u2726 1 checkpoint saved")
     assert "hooks" in result["systemMessage"]
     # tmp_path has no "-Projects-" segment, so _wing_from_transcript_path falls back to "wing_sessions"
     mock_save.assert_called_once_with(
@@ -530,7 +530,7 @@ def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
         transcript,
         [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
     )
-    save_result = {"count": 15, "themes": []}
+    save_result = {"drawers_filed": 1, "messages_folded": 15, "themes": []}
     with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result) as mock_save:
         _capture_hook_output(
             hook_stop,
@@ -555,7 +555,7 @@ def test_stop_hook_tracks_save_point(tmp_path):
     }
 
     # First call saves silently with systemMessage notification
-    save_result = {"count": 15, "themes": ["hooks"]}
+    save_result = {"drawers_filed": 1, "messages_folded": 15, "themes": ["hooks"]}
     with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result):
         result = _capture_hook_output(hook_stop, data, state_dir=tmp_path)
     assert "systemMessage" in result
@@ -621,7 +621,8 @@ def test_stop_hook_files_checkpoint_under_harness_agent(tmp_path, harness, expec
         [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
     )
     with patch(
-        "mempalace.hooks_cli._save_diary_direct", return_value={"count": 5, "themes": []}
+        "mempalace.hooks_cli._save_diary_direct",
+        return_value={"drawers_filed": 1, "messages_folded": 5, "themes": []},
     ) as mock_save:
         _capture_hook_output(
             hook_stop,
@@ -655,7 +656,7 @@ def test_stop_hook_checkpoint_visible_to_diary_read(monkeypatch, config, palace_
 
     agent = _diary_agent_for_harness("claude-code")
     res = _save_diary_direct(str(transcript), "sess1", wing="wing_.claude", agent_name=agent)
-    assert res["count"] > 0
+    assert res["drawers_filed"] > 0
 
     visible = tool_diary_read(agent_name="claude")
     assert visible.get("total", 0) >= 1
@@ -688,7 +689,8 @@ def test_save_diary_direct_daemon_opt_in_submits_job(tmp_path):
                         agent_name="claude",
                     )
 
-    assert result["count"] == 3
+    assert result["drawers_filed"] == 1
+    assert result["messages_folded"] == 3
     mock_submit.assert_called_once()
     assert mock_submit.call_args.args[0] == "diary_write"
     payload = mock_submit.call_args.args[1]
@@ -737,7 +739,7 @@ def test_save_diary_daemon_lock_deferral_does_not_stall_the_hook(tmp_path):
     # The hook must ask the daemon to hand a parked job straight back.
     assert mock_submit.call_args.kwargs["stop_on_lock_deferral"] is True
 
-    assert result["count"] == 0  # nothing filed yet -- the daemon still owes the write
+    assert result["drawers_filed"] == 0  # nothing filed yet -- the daemon still owes the write
     assert not (tmp_path / "last_checkpoint").exists()  # and it must not be acked
 
     logged = " ".join(str(c.args[0]) for c in mock_log.call_args_list)
@@ -1885,7 +1887,7 @@ def test_stop_hook_oserror_on_last_save_read(tmp_path):
     )
     # Write invalid content to last save file
     (tmp_path / "test_last_save").write_text("not_a_number")
-    save_result = {"count": 15, "themes": ["testing"]}
+    save_result = {"drawers_filed": 1, "messages_folded": 15, "themes": ["testing"]}
     with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result):
         result = _capture_hook_output(
             hook_stop,
@@ -1893,7 +1895,7 @@ def test_stop_hook_oserror_on_last_save_read(tmp_path):
             state_dir=tmp_path,
         )
     assert "systemMessage" in result
-    assert "15 memories" in result["systemMessage"]
+    assert "1 checkpoint saved" in result["systemMessage"]
 
 
 def test_stop_hook_oserror_on_write(tmp_path):
@@ -1907,7 +1909,7 @@ def test_stop_hook_oserror_on_write(tmp_path):
     def bad_write_text(*args, **kwargs):
         raise OSError("disk full")
 
-    save_result = {"count": 15, "themes": []}
+    save_result = {"drawers_filed": 1, "messages_folded": 15, "themes": []}
     with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
         with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result):
             with patch.object(Path, "write_text", bad_write_text):
@@ -2073,7 +2075,7 @@ def test_stop_hook_enabled_by_default(tmp_path):
         transcript,
         [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
     )
-    save_result = {"count": 3, "themes": ["auto-save"]}
+    save_result = {"drawers_filed": 1, "messages_folded": 3, "themes": ["auto-save"]}
     with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
         mock_cfg_cls.return_value.hooks_auto_save = True
         mock_cfg_cls.return_value.hook_silent_save = True
@@ -2089,7 +2091,7 @@ def test_stop_hook_enabled_by_default(tmp_path):
                 state_dir=tmp_path,
             )
     assert "systemMessage" in result
-    assert "3 memories" in result["systemMessage"]
+    assert "1 checkpoint saved" in result["systemMessage"]
 
 
 def test_precompact_hook_disabled_by_config(tmp_path):
@@ -2210,7 +2212,8 @@ def test_stop_hook_rejects_injected_stop_hook_active(tmp_path):
         [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
     )
     with patch(
-        "mempalace.hooks_cli._save_diary_direct", return_value={"count": 1, "themes": []}
+        "mempalace.hooks_cli._save_diary_direct",
+        return_value={"drawers_filed": 1, "messages_folded": 1, "themes": []},
     ) as mock_save:
         _capture_hook_output(
             hook_stop,
@@ -2290,7 +2293,7 @@ def test_session_end_uses_detached_paths_not_sync_mine(tmp_path):
         with (
             patch(
                 "mempalace.hooks_cli._save_diary_direct",
-                return_value={"count": 3, "themes": ["exit"]},
+                return_value={"drawers_filed": 1, "messages_folded": 3, "themes": ["exit"]},
             ) as mock_save,
             patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
             patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto,
@@ -2344,7 +2347,7 @@ def test_session_end_defaults_to_saving_when_config_unreadable(tmp_path):
         with (
             patch(
                 "mempalace.hooks_cli._save_diary_direct",
-                return_value={"count": 1, "themes": []},
+                return_value={"drawers_filed": 1, "messages_folded": 1, "themes": []},
             ) as mock_save,
             patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
             patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto,
@@ -2474,7 +2477,7 @@ def test_session_end_accepts_full_sessionend_payload(tmp_path):
         with (
             patch(
                 "mempalace.hooks_cli._save_diary_direct",
-                return_value={"count": 1, "themes": []},
+                return_value={"drawers_filed": 1, "messages_folded": 1, "themes": []},
             ),
             patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
             patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto,
