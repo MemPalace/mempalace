@@ -1244,3 +1244,69 @@ def test_capacity_status_tolerates_small_palace_stub(tmp_path):
     info = hnsw_capacity_status(str(tmp_path), COLLECTION)
     assert info["diverged"] is False
     assert info["flush_unreachable"] is False
+
+
+def test_bm25_fallback_finds_whole_word_matches_behind_substring_hits(tmp_path):
+    """The trigram index matches ``aven`` inside ``haven't`` and ``Avenue``.
+    Taking the first 500 matches in storage order handed the re-rank only
+    those older substring hits, so the drawers that say Aven never reached it
+    and the results were zero-score noise."""
+    seg = "seg-bm25-substring"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=seg)
+    noise = [
+        (
+            f"I haven't walked down the Avenue in New Haven, entry {i}",
+            {"wing": "w", "room": "r", "source_file": f"/x/noise{i}.md"},
+            f"n-{i}",
+        )
+        for i in range(600)
+    ]
+    named = [
+        (
+            f"Aven said the wake sequence starts with the lantern, entry {i}",
+            {"wing": "w", "room": "r", "source_file": f"/x/aven{i}.md"},
+            f"a-{i}",
+        )
+        for i in range(3)
+    ]
+    _seed_drawers(str(tmp_path), seg, noise + named)
+
+    out = _bm25_only_via_sqlite("Aven", str(tmp_path), n_results=5)
+    top = [r["text"] for r in out["results"][:3]]
+    assert all(text.startswith("Aven said") for text in top), top
+    assert out["results"][0]["bm25_score"] > 0
+
+
+def test_bm25_fallback_still_returns_substring_near_misses(tmp_path):
+    """Whole-word matches go first, but substring-only matches still fill the
+    candidate set: a query for ``vector`` still finds a drawer that only says
+    ``vectors``."""
+    seg = "seg-bm25-near-miss"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=seg)
+    _seed_drawers(
+        str(tmp_path),
+        seg,
+        [("the vectors are rebuilt nightly", {"wing": "w", "room": "r"}, "v-1")],
+    )
+    out = _bm25_only_via_sqlite("vector", str(tmp_path), n_results=5)
+    assert [r["text"] for r in out["results"]] == ["the vectors are rebuilt nightly"]
+    scoped = _bm25_only_via_sqlite("vector", str(tmp_path), wing="w", n_results=5)
+    assert [r["text"] for r in scoped["results"]] == ["the vectors are rebuilt nightly"]
+
+
+def test_bm25_fallback_leaves_stop_words_out_of_the_candidate_query(tmp_path):
+    """A stop word matches nearly every drawer, so it would fill the candidate
+    set on its own; it is dropped unless the query has nothing else."""
+    seg = "seg-bm25-stop-words"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=seg)
+    filler = [
+        (f"the weather was the same as the day before, {i}", {"wing": "w", "room": "r"}, f"f-{i}")
+        for i in range(600)
+    ]
+    target = [("lantern notes from the evening", {"wing": "w", "room": "r"}, "t-1")]
+    _seed_drawers(str(tmp_path), seg, target + filler)
+    stop = frozenset({"the"})
+    out = _bm25_only_via_sqlite("the lantern", str(tmp_path), n_results=3, stop_words=stop)
+    assert out["results"][0]["text"] == "lantern notes from the evening"
+    only_stop = _bm25_only_via_sqlite("the", str(tmp_path), n_results=3, stop_words=stop)
+    assert only_stop["results"]
