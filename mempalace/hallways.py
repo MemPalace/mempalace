@@ -517,7 +517,7 @@ def _wing_file_keys(metadatas) -> dict[str, str]:
 def compute_hallways_for_wing(
     wing: str,
     col=None,
-    min_count: int = 2,
+    min_count: int | None = None,
     config=None,
 ) -> list[dict]:
     """Compute entity-pair hallways for one wing.
@@ -549,9 +549,14 @@ def compute_hallways_for_wing(
             didn't supply a backing store, so nothing to compute against).
             Tests pass a controlled MagicMock.
         min_count: minimum co-occurrence count required to materialize a
-            hallway between two entities. Default 2 — single co-occurrences
-            are noise (entities mentioned together once in one drawer);
-            two or more is a real signal. Clamped to ``>=1``.
+            hallway between two entities. Pass an explicit ``None`` (the
+            default) — or omit the arg — to resolve it from config:
+            ``MEMPALACE_KG_HALLWAY_MIN_COUNT`` env first, then the
+            ``hallway_min_count`` config-file value, then the historical
+            default of ``2`` (single co-occurrences are noise — entities named
+            together once in one drawer; two or more is a real signal). An
+            explicitly supplied integer is honoured verbatim, clamped to
+            ``>=1``.
         config: Optional ``MempalaceConfig`` selecting the palace-scoped
             hallway sidecar. Callers using an explicit palace path must pass
             the matching config so derived graph state cannot leak into the
@@ -565,7 +570,22 @@ def compute_hallways_for_wing(
         logger.debug("compute_hallways_for_wing: no collection provided for %s", wing)
         return []
 
-    min_count = max(1, int(min_count))
+    # Resolve the min_count threshold: honour an explicit value, otherwise
+    # fall back to config (env > file > historical default 2). This is the
+    # single source of truth for the within-wing hallway threshold, so callers
+    # that omit the arg and production callers that rely on the default resolve
+    # it identically via MempalaceConfig.hallway_min_count — mirroring the
+    # topic_tunnel_min_count convention while keeping backward compat (an
+    # unconfigured corpus still gets min_count=2, so existing hallways are
+    # byte-identical).
+    threshold: int
+    if min_count is None:
+        from .config import MempalaceConfig
+
+        threshold = (config or MempalaceConfig()).hallway_min_count
+    else:
+        threshold = min_count
+    min_count = max(1, int(threshold))
 
     # 1. Query drawers for this wing: scoped to the wing server-side AND
     #    paginated. An unbounded get(where={"wing": wing}) binds one SQL

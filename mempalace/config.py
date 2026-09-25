@@ -1553,6 +1553,36 @@ class MempalaceConfig:
         return max(1, parsed)
 
     @property
+    def hallway_min_count(self):
+        """Minimum co-occurrence count required to materialize a within-wing
+        hallway between two entities.
+
+        Mirrors :attr:`topic_tunnel_min_count` (same env > file > default
+        resolution and ``>=1`` floor), but for the within-wing hallway
+        primitive (``mempalace.hallways.compute_hallways_for_wing``) rather
+        than the cross-wing topic tunnels. Default is ``2`` — a single
+        co-occurrence is noise (two entities named together once in one drawer
+        is not a real link); two or more is a real signal. Bump to ``3+`` if
+        your corpus has loosely-associated entity pairs you don't want linked.
+        Reads ``MEMPALACE_KG_HALLWAY_MIN_COUNT`` env first, then the
+        ``hallway_min_count`` config-file value, then ``2``. Clamped to ``>=1``.
+        """
+        env_val = os.environ.get("MEMPALACE_KG_HALLWAY_MIN_COUNT")
+        if env_val:
+            try:
+                parsed = int(env_val)
+                if parsed >= 1:
+                    return parsed
+            except ValueError:
+                pass
+        cfg_val = self._file_config.get("hallway_min_count")
+        try:
+            parsed = int(cfg_val) if cfg_val is not None else 2
+        except (TypeError, ValueError):
+            parsed = 2
+        return max(1, parsed)
+
+    @property
     def max_backups(self) -> int:
         """Number of timestamped palace backups to retain before pruning.
 
