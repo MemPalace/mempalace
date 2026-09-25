@@ -689,6 +689,65 @@ def _normalize_envelope(request: dict) -> "tuple[str, dict]":
     return method, params
 
 
+def _dispatch_tool_call(req_id, tool_name: str, tool_args: dict):
+    """Run a tool handler that has cleared every preflight gate."""
+
+    # 'content' is an accepted alias for diary_write's 'entry' (callers often
+    # reuse add_drawer's 'content' name). Map it in here, before dispatch, so a
+    # content-only call still satisfies the required 'entry' param while the
+    # signature-based missing-parameter diagnostic (-32602) keeps working.
+    # 'entry' wins if both are supplied.
+    if tool_name == "mempalace_diary_write" and "content" in tool_args:
+        content_val = tool_args.pop("content")
+        # Only fill from the alias when the caller did not supply 'entry' at
+        # all (or passed it as null). An explicit entry — even "" — wins.
+        if "entry" not in tool_args or tool_args["entry"] is None:
+            tool_args["entry"] = content_val
+    try:
+        with _writer_idle_clock(tool_name), _write_stall_watch(tool_name):
+            result = _decorate_mcp_tool_result(tool_name, TOOLS[tool_name]["handler"](**tool_args))
+
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "content": [
+                    {"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}
+                ]
+            },
+        }
+    except TypeError as e:
+        # Qualname match prevents leaking internal helper/param names raised
+        # inside the handler body — see test_handler_internal_signature_shape_stays_generic.
+        msg = str(e)
+        handler = TOOLS[tool_name]["handler"]
+        handler_qn = getattr(handler, "__qualname__", None) or getattr(handler, "__name__", "")
+        # Qualname can include "<locals>" for nested defs and "<lambda>"
+        # for lambdas — accept Python's TypeError emit verbatim.
+        m_missing = re.match(
+            r"^([\w\.<>]+)\(\) missing \d+ required "
+            r"(?:positional |keyword-only )?arguments?: (.+)$",
+            msg,
+        )
+        if m_missing and m_missing.group(1) == handler_qn:
+            names = re.findall(r"'(\w+)'", m_missing.group(2))
+            if names:
+                quoted = ", ".join(f"'{n}'" for n in names)
+                word = "parameter" if len(names) == 1 else "parameters"
+                logger.debug("Tool %s: missing required %s %s", tool_name, word, quoted)
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32602,
+                        "message": f"Missing required {word} {quoted} for tool {tool_name}",
+                    },
+                }
+        return _internal_tool_error(req_id, tool_name, e)
+    except Exception as exc:
+        return _internal_tool_error(req_id, tool_name, exc)
+
+
 def handle_request(request):
     global _last_request_time
     if not isinstance(request, dict):
@@ -816,66 +875,20 @@ def handle_request(request):
                     "error": {"code": -32602, "message": f"Invalid value for parameter '{key}'"},
                 }
         tool_args.pop("wait_for_previous", None)
-        preflight_error = _mcp_tool_preflight_refusal(req_id, tool_name)
+        preflight_error = _mcp_tool_preflight_refusal(req_id, tool_name, check_writer=False)
         if preflight_error is not None:
             return preflight_error
 
-        # 'content' is an accepted alias for diary_write's 'entry' (callers often
-        # reuse add_drawer's 'content' name). Map it in here, before dispatch, so a
-        # content-only call still satisfies the required 'entry' param while the
-        # signature-based missing-parameter diagnostic (-32602) keeps working.
-        # 'entry' wins if both are supplied.
-        if tool_name == "mempalace_diary_write" and "content" in tool_args:
-            content_val = tool_args.pop("content")
-            # Only fill from the alias when the caller did not supply 'entry' at
-            # all (or passed it as null). An explicit entry — even "" — wins.
-            if "entry" not in tool_args or tool_args["entry"] is None:
-                tool_args["entry"] = content_val
-        try:
-            with _write_stall_watch(tool_name):
-                result = _decorate_mcp_tool_result(
-                    tool_name, TOOLS[tool_name]["handler"](**tool_args)
-                )
-
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "content": [
-                        {"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}
-                    ]
-                },
-            }
-        except TypeError as e:
-            # Qualname match prevents leaking internal helper/param names raised
-            # inside the handler body — see test_handler_internal_signature_shape_stays_generic.
-            msg = str(e)
-            handler = TOOLS[tool_name]["handler"]
-            handler_qn = getattr(handler, "__qualname__", None) or getattr(handler, "__name__", "")
-            # Qualname can include "<locals>" for nested defs and "<lambda>"
-            # for lambdas — accept Python's TypeError emit verbatim.
-            m_missing = re.match(
-                r"^([\w\.<>]+)\(\) missing \d+ required "
-                r"(?:positional |keyword-only )?arguments?: (.+)$",
-                msg,
-            )
-            if m_missing and m_missing.group(1) == handler_qn:
-                names = re.findall(r"'(\w+)'", m_missing.group(2))
-                if names:
-                    quoted = ", ".join(f"'{n}'" for n in names)
-                    word = "parameter" if len(names) == 1 else "parameters"
-                    logger.debug("Tool %s: missing required %s %s", tool_name, word, quoted)
-                    return {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "error": {
-                            "code": -32602,
-                            "message": f"Missing required {word} {quoted} for tool {tool_name}",
-                        },
-                    }
-            return _internal_tool_error(req_id, tool_name, e)
-        except Exception as exc:
-            return _internal_tool_error(req_id, tool_name, exc)
+        # A held-but-write-idle lease passes the ownership check without a
+        # fresh acquire, so the idle clock can already be past the threshold.
+        # Count the call in flight from that check through dispatch; the clock
+        # itself is refreshed only by a dispatched call (_writer_idle_clock),
+        # so refusals never keep an idle holder alive.
+        with _writer_inflight(tool_name):
+            peer_writer_error = _mcp_peer_writer_refusal(req_id, tool_name)
+            if peer_writer_error is not None:
+                return peer_writer_error
+            return _dispatch_tool_call(req_id, tool_name, tool_args)
 
     # Notifications (missing id) must never get a response
     if req_id is None:
@@ -1178,6 +1191,93 @@ def _start_write_stall_watchdog() -> None:
                 os._exit(_WRITE_STALL_EXIT_CODE)
 
     t = threading.Thread(target=_watchdog, name="mcp-write-stall-watchdog", daemon=True)
+    t.start()
+
+
+def _writer_idle_release_secs() -> float:
+    """Writer-lease idle-release threshold in seconds (0 = disabled)."""
+    raw = os.environ.get(_MCP_WRITER_IDLE_MINUTES_ENV, "")
+    if raw:
+        try:
+            minutes = float(raw)
+        except ValueError:
+            return _MCP_WRITER_IDLE_MINUTES_DEFAULT * 60
+        return max(0.0, minutes) * 60
+    return _MCP_WRITER_IDLE_MINUTES_DEFAULT * 60
+
+
+@contextlib.contextmanager
+def _writer_inflight(tool_name: str):
+    """Track chroma-touching tool calls so the idle-release watchdog never
+    drops the writer lease (and its storage handles) under a running call.
+
+    Counts every tool except the HTTP lock-free set (logstream, knowledge
+    graph and process-local tools, none of which touch Chroma). Counter only:
+    it also spans the peer-writer ownership check, where a refused call must
+    not look like a write, so the idle clock is refreshed separately by
+    _writer_idle_clock around dispatch."""
+    global _MCP_WRITER_INFLIGHT
+    if tool_name in _HTTP_LOCK_FREE_TOOLS:
+        yield
+        return
+    with _MCP_WRITER_STATE_LOCK:
+        _MCP_WRITER_INFLIGHT += 1
+    try:
+        yield
+    finally:
+        with _MCP_WRITER_STATE_LOCK:
+            _MCP_WRITER_INFLIGHT -= 1
+
+
+@contextlib.contextmanager
+def _writer_idle_clock(tool_name: str):
+    """Refresh the write-idle clock after a dispatched call to _MUTATING_TOOLS."""
+    global _last_mutating_time
+    try:
+        yield
+    finally:
+        if tool_name in _MUTATING_TOOLS and tool_name not in _HTTP_LOCK_FREE_TOOLS:
+            with _MCP_WRITER_STATE_LOCK:
+                _last_mutating_time = time.monotonic()
+
+
+def _maybe_release_idle_writer(idle_secs: float) -> bool:
+    """Release the writer lease if held, write-idle past idle_secs, and no
+    chroma-touching call is in flight. Returns True when released."""
+    with _MCP_WRITER_STATE_LOCK:
+        if _MCP_WRITER_LOCK_CM is None or _MCP_WRITER_INFLIGHT > 0:
+            return False
+        idle = time.monotonic() - _last_mutating_time
+        if idle < idle_secs:
+            return False
+        logger.info(
+            "writer lease idle for %.1f min (limit %.1f min); releasing so "
+            "peer sessions can write.",
+            idle / 60,
+            idle_secs / 60,
+        )
+        _release_mcp_writer_lock_unlocked()
+        return True
+
+
+def _start_writer_idle_release_watchdog() -> None:
+    """Drop an idle writer lease so peer sessions stop seeing read-only
+    refusals. Set MEMPALACE_MCP_WRITER_IDLE_MINUTES=0 to disable (lease held
+    until process exit)."""
+    timeout = _writer_idle_release_secs()
+    if timeout <= 0:
+        return
+    check_interval = min(30.0, timeout / 4)
+
+    def _watchdog() -> None:
+        while True:
+            time.sleep(check_interval)
+            try:
+                _maybe_release_idle_writer(timeout)
+            except Exception:
+                logger.exception("writer idle-release check failed")
+
+    t = threading.Thread(target=_watchdog, name="mcp-writer-idle-release", daemon=True)
     t.start()
 
 
