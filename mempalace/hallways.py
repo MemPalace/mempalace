@@ -740,12 +740,69 @@ def compute_hallways_for_wing(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def list_hallways(wing: Optional[str] = None, config=None) -> list[dict]:
-    """List hallway records. Filter by ``wing`` if specified."""
+def _hallway_sort_key(hallway: dict) -> int | float:
+    """Sort key for strongest-first ordering: the co-occurrence count.
+
+    Records missing a count (or carrying a non-numeric one) sort last, so a
+    bounded/truncated answer is always the most-connected slice first (#2327).
+    """
+    count = hallway.get("co_occurrence_count", 0)
+    if isinstance(count, bool) or not isinstance(count, (int, float)):
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            return 0
+    return count
+
+
+def list_hallways(
+    wing: Optional[str] = None,
+    config=None,
+    limit: Optional[int] = None,
+    sort: bool = False,
+) -> list[dict]:
+    """List hallway records. Filter by ``wing`` if specified.
+
+    By default the records are returned in store (file) order — the order
+    in which they were written by the miner. This preserves the
+    first-seen-wins contract that downstream consumers such as
+    ``entity_tunnels_for_wing`` rely on: the record order there decides
+    which raw-wing display form wins a tie for a normalized wing, and
+    sorting by strength would silently change that on wing renames.
+
+    Pass ``sort=True`` for strongest-first ordering (highest
+    ``co_occurrence_count`` first) so a capped answer is always the most
+    useful slice — this is what ``tool_list_hallways`` needs before it
+    applies its limit (#2327).
+
+    When ``limit`` is given (a non-negative integer), only that many
+    records are returned; when it is ``None`` (the default) the full
+    matching set is returned.
+
+    Returns a plain list; callers that need the full-match count and an
+    explicit truncation signal (e.g. ``tool_list_hallways``) wrap the result
+    in a ``{rows, total, truncated}`` envelope.
+    """
     all_hallways = _load_hallways(config)
-    if wing is None:
-        return list(all_hallways)
-    return [h for h in all_hallways if h.get("wing") == wing]
+    if wing is not None:
+        all_hallways = [h for h in all_hallways if h.get("wing") == wing]
+    if sort:
+        all_hallways = sorted(all_hallways, key=_hallway_sort_key, reverse=True)
+    if limit is not None:
+        # ``bool`` is a subclass of ``int`` and ``int(True)`` would silently
+        # coerce it to ``1`` — reject it *before* the ``int()`` coercion below
+        # can hide it. Coerce once (accepting numeric strings), then range-check
+        # the coerced value so negatives and non-numbers raise a clean error.
+        if isinstance(limit, bool):
+            raise ValueError("limit must be a non-negative integer")
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            raise ValueError("limit must be a non-negative integer") from None
+        if limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        all_hallways = all_hallways[:limit]
+    return all_hallways
 
 
 def prune_spelling_hallways(config=None, apply: bool = False) -> dict:

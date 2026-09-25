@@ -300,6 +300,78 @@ class TestHallwayQuery:
         assert len(result) == 1
         assert result[0]["id"] == "h1"
 
+    def test_list_hallways_file_order_by_default(self, tmp_path, monkeypatch):
+        """The miner calls ``list_hallways(config=...)`` with no ``sort`` and
+        relies on store (file) order so ``entity_tunnels_for_wing``'s
+        first-seen display map picks the first-seen raw-wing casing, not the
+        highest-count one. Seed two records for the *same* normalized wing
+        (``winga``) with different co-occurrence counts AND different raw
+        casings, written to the store in a known file order where the
+        LOWEST-count record is first. ``list_hallways()`` (no ``sort``) must
+        preserve that file order — the highest-count record must NOT jump to
+        the front. This is the pre-PR contract the unconditional-sort
+        regression at #2429 broke.
+        """
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        hallways_mod._save_hallways(
+            [
+                # file order: LOW count, lowercase casing — first in the store
+                {
+                    "id": "h_low",
+                    "wing": "winga",
+                    "entity_a": "E",
+                    "entity_b": "F",
+                    "co_occurrence_count": 1,
+                    "rooms": ["room1"],
+                },
+                # HIGHER count, different raw casing — second in the store
+                {
+                    "id": "h_high",
+                    "wing": "WingA",
+                    "entity_a": "E",
+                    "entity_b": "G",
+                    "co_occurrence_count": 99,
+                    "rooms": ["room2"],
+                },
+            ]
+        )
+        result = hallways_mod.list_hallways()
+        assert [r["id"] for r in result] == ["h_low", "h_high"], (
+            "list_hallways() with no sort must return store (file) order, not strongest-first"
+        )
+
+    def test_list_hallways_sort_flag_strongest_first(self, tmp_path, monkeypatch):
+        """``sort=True`` is the explicit strongest-first path the MCP read
+        tool (``tool_list_hallways``) uses before it applies its limit
+        (#2327). Same mixed-casing seed as the file-order test; the
+        highest-co-occurrence record must come first.
+        """
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        hallways_mod._save_hallways(
+            [
+                {
+                    "id": "h_low",
+                    "wing": "winga",
+                    "entity_a": "E",
+                    "entity_b": "F",
+                    "co_occurrence_count": 1,
+                    "rooms": ["room1"],
+                },
+                {
+                    "id": "h_high",
+                    "wing": "WingA",
+                    "entity_a": "E",
+                    "entity_b": "G",
+                    "co_occurrence_count": 99,
+                    "rooms": ["room2"],
+                },
+            ]
+        )
+        result = hallways_mod.list_hallways(sort=True)
+        assert [r["id"] for r in result] == ["h_high", "h_low"], (
+            "list_hallways(sort=True) must return strongest-first"
+        )
+
     def test_delete_hallway_removes_record(self, tmp_path, monkeypatch):
         _use_tmp_hallway_file(monkeypatch, tmp_path)
         hallways_mod._save_hallways(
