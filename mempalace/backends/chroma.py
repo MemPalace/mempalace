@@ -2365,7 +2365,7 @@ class ChromaCollection(BaseCollection):
         from ..palace import mine_palace_lock
 
         # palace_db_lock keeps this process's Python sqlite3 readers out of the
-        # write: fcntl locks never conflict within one process (#2302).
+        # write: fcntl locks never conflict within one process.
         with (
             mine_palace_lock(self._palace_path),
             palace_db_lock(os.path.join(self._palace_path, "chroma.sqlite3")),
@@ -3082,7 +3082,7 @@ class ChromaBackend(BaseBackend):
         """Return a cached ``PersistentClient`` (see :meth:`_client_locked`).
 
         Opening, closing and replacing the client all write to
-        ``chroma.sqlite3``, so they run under :func:`palace_db_lock` (#2302).
+        ``chroma.sqlite3``, so they run under :func:`palace_db_lock`.
         """
         with palace_db_lock(os.path.join(palace_path, "chroma.sqlite3")):
             return self._client_locked(palace_path)
@@ -3310,7 +3310,7 @@ class ChromaBackend(BaseBackend):
             except (OSError, NotImplementedError):
                 pass
 
-        # Collection opens and creates write to chroma.sqlite3 (#2302).
+        # Collection opens and creates write to chroma.sqlite3.
         with palace_db_lock(os.path.join(palace_path, "chroma.sqlite3")):
             client = self._client(palace_path)
 

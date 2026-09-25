@@ -4,7 +4,7 @@ ChromaDB 1.5+ opens ``chroma.sqlite3`` through the SQLite statically linked
 into ``chromadb_rust_bindings``. mempalace's fast paths (status, taxonomy,
 ``list_drawers``, BM25, the integrity gate, repair) open the same file through
 Python's ``sqlite3``: a second, independent SQLite library in the same
-process. Two consequences, both measured on Linux (#2302):
+process. Two consequences, both measured on Linux:
 
 1. POSIX fcntl locks belong to the (process, inode) pair. When a Python
    connection closes its descriptor, the kernel drops every lock the process
@@ -51,8 +51,12 @@ This module is the one door for that access.
   ``integrity_check`` said ``ok``.
 * Everywhere else connections open and close per call, still under the lock.
   Windows locks belong to a handle, so a close never drops another handle's
-  locks. POSIX platforms without OFD locks (macOS) keep the cross-process
-  exposure described in (1).
+  locks. POSIX platforms without OFD locks (macOS) keep the same promise with
+  a short-lived helper process: its read transaction is another process's
+  SHARED lock, so it conflicts with Chroma where an in-process fcntl lock
+  would not, and closing a connection in this process cannot drop it. The
+  in-process anchor is installed only after that helper is holding, so
+  Chroma cannot recreate ``-wal``/``-shm`` under a parked wal-index.
 """
 
 from __future__ import annotations
@@ -62,6 +66,7 @@ import os
 import sqlite3
 import stat
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -90,17 +95,94 @@ _F_OFD_SETLK = (
 )
 
 # Whether readers keep an anchor on the database. Module-level so tests can pin
-# either path.
+# either path. OFD locks are what make that anchor safe against Chroma
+# replacing the wal-index; without them the anchor waits for the helper below.
 _ANCHORED = _F_OFD_SETLK is not None
+
+# POSIX without OFD locks cannot park a descriptor without also letting Chroma
+# recreate the wal-index. A helper process holds the cross-process SHARED lock
+# instead. Tests pin this off when they need the plain open.
+_HOLD_LOCKS = os.name == "posix" and not _ANCHORED
 
 # A guard that conflicts is somebody's short EXCLUSIVE or DMS recovery. Retry
 # briefly, then serve the read and try again on the next one.
 _GUARD_ATTEMPTS = 3
 _GUARD_RETRY_SECONDS = 0.002
+_HOLDER_READY_SECONDS = 2.0
 
 _registry_lock = threading.Lock()
 _locks: dict[str, threading.RLock] = {}
 _anchors: dict[str, "_Anchor"] = {}
+_holders: dict[str, "_Holder"] = {}
+
+# Self-contained: the helper must not import this package. Importing
+# mempalace.backends pulls Chroma into the process whose only job is to hold
+# a read transaction open.
+_HOLD_SCRIPT = """
+import os, sqlite3, sys
+from urllib.request import pathname2url
+
+db_path = sys.argv[1]
+uri = "file:" + pathname2url(db_path) + "?mode=ro"
+
+def open_conn():
+    # Same sidecar rule as connect_sqlite_read. A WAL file with no sidecars
+    # cannot be opened mode=ro on Apple's SQLite; every other file can.
+    if not os.path.exists(db_path + "-wal") and not os.path.exists(db_path + "-shm"):
+        try:
+            with open(db_path, "rb") as handle:
+                header = handle.read(19)
+        except OSError:
+            header = b""
+        if (
+            len(header) == 19
+            and header[:16] == b"SQLite format 3\\x00"
+            and header[18] == 2
+        ):
+            return sqlite3.connect(db_path, timeout=0.0)
+    return sqlite3.connect(uri, uri=True, timeout=0.0)
+
+try:
+    conn = open_conn()
+except sqlite3.Error:
+    sys.stdout.write("failed\\n")
+    sys.stdout.flush()
+    raise SystemExit(0)
+
+def prime():
+    # A deferred transaction takes no lock until it reads. schema_version in
+    # autocommit locks and releases immediately, which leaves the helper holding
+    # nothing. Read inside the transaction so SHARED (and, in WAL mode, the
+    # -shm DMS lock) stays until this process exits.
+    if not conn.in_transaction:
+        conn.execute("BEGIN")
+    conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+
+def report(line):
+    sys.stdout.write(line + "\\n")
+    sys.stdout.flush()
+
+try:
+    prime()
+except sqlite3.Error:
+    report("busy")
+else:
+    report("ready")
+    sys.stdin.read()
+    raise SystemExit(0)
+
+while True:
+    if sys.stdin.readline() == "":
+        raise SystemExit(0)
+    try:
+        prime()
+    except sqlite3.Error:
+        report("busy")
+    else:
+        report("ready")
+        sys.stdin.read()
+        raise SystemExit(0)
+"""
 
 
 def _key(db_path: str) -> str:
@@ -171,6 +253,7 @@ class _Anchor:
         "db_guarded",
         "shm_guarded",
         "shm_ino",
+        "primed",
     )
 
     def __init__(self, conn: sqlite3.Connection, ident: tuple[int, int]):
@@ -181,6 +264,9 @@ class _Anchor:
         self.db_guarded = False
         self.shm_guarded = False
         self.shm_ino: Optional[int] = None
+        # False until schema_version has succeeded. A failed prime must not
+        # close the connection: that close drops this process's POSIX locks.
+        self.primed = False
 
     def stale(self, db_path: str) -> bool:
         """True when the wal-index this anchor mapped is no longer on disk."""
@@ -261,12 +347,149 @@ def _guard(anchor: _Anchor, db_path: str) -> None:
         logger.debug("OFD guard for %s not taken yet; retrying on the next read", db_path)
 
 
+class _Holder:
+    """A child process whose read transaction outlives this process's closes."""
+
+    __slots__ = ("proc", "ident", "ready", "shm_ino")
+
+    def __init__(self, proc: subprocess.Popen, ident: tuple[int, int]):
+        self.proc = proc
+        self.ident = ident
+        self.ready = False
+        self.shm_ino: Optional[int] = None
+
+    def alive(self) -> bool:
+        return self.proc.poll() is None
+
+    def stale(self, db_path: str) -> bool:
+        if self.shm_ino is None:
+            return False
+        try:
+            return os.stat(db_path + "-shm").st_ino != self.shm_ino
+        except OSError:
+            return True
+
+
+def _read_holder_line(proc: subprocess.Popen) -> str:
+    """One stdout line from the helper, or ``""`` when it does not answer."""
+    box: list = []
+
+    def _read() -> None:
+        stream = proc.stdout
+        if stream is None:
+            box.append("")
+            return
+        try:
+            box.append(stream.readline())
+        except Exception:
+            box.append("")
+
+    thread = threading.Thread(target=_read, daemon=True)
+    thread.start()
+    thread.join(_HOLDER_READY_SECONDS)
+    if not box:
+        return ""
+    return str(box[0] or "").strip()
+
+
+def _stop_holder(holder: _Holder, *, wait: bool) -> None:
+    proc = holder.proc
+    stdin = proc.stdin
+    if stdin is not None and not stdin.closed:
+        try:
+            stdin.close()
+        except OSError:
+            pass
+    if not wait:
+        return
+    try:
+        proc.wait(timeout=_HOLDER_READY_SECONDS)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=_HOLDER_READY_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _start_holder(db_path: str, ident: tuple[int, int]) -> Optional[_Holder]:
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _HOLD_SCRIPT, db_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        logger.debug("could not start the lock holder for %s", db_path, exc_info=True)
+        return None
+    holder = _Holder(proc, ident)
+    status = _read_holder_line(proc)
+    if status == "ready":
+        holder.ready = True
+        try:
+            holder.shm_ino = os.stat(db_path + "-shm").st_ino
+        except OSError:
+            holder.shm_ino = None
+        return holder
+    if status == "busy" and proc.poll() is None:
+        # The open already touched the database. Leave the process up so its
+        # close cannot run, and ask it to prime again on the next read.
+        return holder
+    _stop_holder(holder, wait=True)
+    return None
+
+
+def _ensure_holder(db_path: str, key: str) -> None:
+    """Hold SHARED from another process before this process opens the file.
+
+    Caller holds the key's lock. A holder that is not ready yet is kept: the
+    next read nudges it. Replacing the database or its wal-index starts a new
+    holder, which is allowed to exit because the inode it locked is gone.
+    """
+    try:
+        st = os.stat(db_path)
+    except (OSError, ValueError):
+        return
+    if not stat.S_ISREG(st.st_mode):
+        return
+    ident = (st.st_dev, st.st_ino)
+    holder = _holders.get(key)
+    if holder is not None and (
+        not holder.alive() or holder.ident != ident or holder.stale(db_path)
+    ):
+        _holders.pop(key, None)
+        _stop_holder(holder, wait=True)
+        holder = None
+    if holder is None:
+        started = _start_holder(db_path, ident)
+        if started is None:
+            return
+        _holders[key] = started
+        return
+    if holder.ready or holder.proc.stdin is None:
+        return
+    try:
+        holder.proc.stdin.write("\n")
+        holder.proc.stdin.flush()
+    except OSError:
+        return
+    if _read_holder_line(holder.proc) == "ready":
+        holder.ready = True
+        try:
+            holder.shm_ino = os.stat(db_path + "-shm").st_ino
+        except OSError:
+            holder.shm_ino = None
+
+
 def _ensure_anchor(db_path: str, key: str) -> None:
     """Keep an anchor on ``db_path`` before a per-call connection opens it.
 
     Caller holds the key's lock. Best effort: a database the anchor cannot read
-    is reported by the per-call open that follows, and a busy one is anchored on
-    a later read.
+    is reported by the per-call open that follows, and a busy one stays open
+    and is primed on a later read. Closing that connection is what drops this
+    process's POSIX locks, so a failed prime never closes it.
     """
     try:
         st = os.stat(db_path)
@@ -289,13 +512,17 @@ def _ensure_anchor(db_path: str, key: str) -> None:
             conn = connect_sqlite_read(db_path, timeout=0.0, check_same_thread=False)
         except (sqlite3.Error, ValueError):
             return
-        try:
-            conn.execute("PRAGMA schema_version").fetchone()
-        except sqlite3.Error:
-            conn.close()
-            return
         anchor = _anchors[key] = _Anchor(conn, ident)
 
+    if not anchor.primed:
+        try:
+            anchor.conn.execute("PRAGMA schema_version").fetchone()
+        except sqlite3.Error:
+            return
+        anchor.primed = True
+
+    if _F_OFD_SETLK is None:
+        return
     try:
         _guard(anchor, db_path)
     except sqlite3.Error:
@@ -322,7 +549,14 @@ def open_reader(db_path, *, timeout: Optional[float] = None) -> PalaceSqliteConn
     lock = _lock_for_key(key)
     lock.acquire()
     try:
-        if _ANCHORED:
+        if _HOLD_LOCKS:
+            _ensure_holder(db_path, key)
+        # The in-process anchor parks descriptors so a per-call close does not
+        # drop Chroma's locks. Without OFD locks that anchor is only safe once
+        # another process is already holding SHARED, which stops Chroma from
+        # recreating the wal-index underneath it.
+        holder = _holders.get(key)
+        if _ANCHORED or (holder is not None and holder.ready):
             _ensure_anchor(db_path, key)
         kwargs = {} if timeout is None else {"timeout": timeout}
         conn = connect_sqlite_read(db_path, **kwargs)
@@ -362,24 +596,37 @@ def release(db_path) -> None:
         anchor = _anchors.pop(key, None)
         if anchor is not None:
             anchor.discard()
+        holder = _holders.pop(key, None)
+        if holder is not None:
+            _stop_holder(holder, wait=True)
 
 
 def release_all() -> None:
-    """Close every anchor. Tests and shutdown only (see :func:`release`)."""
+    """Close every anchor and lock holder. Tests and shutdown only (see :func:`release`)."""
     with _registry_lock:
         anchors = list(_anchors.values())
+        holders = list(_holders.values())
         _anchors.clear()
+        _holders.clear()
     for anchor in anchors:
         anchor.discard()
+    for holder in holders:
+        _stop_holder(holder, wait=True)
 
 
 def _reset_after_fork_in_child() -> None:
     # SQLite connections must not cross fork(); the child starts empty and
     # leaves the inherited descriptors alone (closing them would drop locks).
-    global _registry_lock, _locks, _anchors
+    # The helper belongs to the parent: drop this process's pipe dup and do
+    # not signal the helper to exit.
+    global _registry_lock, _locks, _anchors, _holders
+    holders = list(_holders.values())
     _registry_lock = threading.Lock()
     _locks = {}
     _anchors = {}
+    _holders = {}
+    for holder in holders:
+        _stop_holder(holder, wait=False)
 
 
 if hasattr(os, "register_at_fork"):
