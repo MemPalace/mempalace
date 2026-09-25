@@ -10,6 +10,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **Generic hook harness adapters in `hooks_cli`.** `mempalace hook run --harness` accepts `claude-code`, `codex`, `grok`, `copilot`, `dsh`, `auto`, or any other token. Payload parsing uses camelCase/snake_case aliases (`sessionId` / `session_id`, `cwd` / `workspaceRoot`, Copilot `stopReason` / `transcriptPath`). Grok sessions without `transcript_path` resolve to `~/.grok/sessions/<urlencoded-cwd>/<id>/chat_history.jsonl` and count real `prompt_index` user turns (or `<user_query>` when compaction omits the index). Live Stop counts `events.jsonl` `turn_started` when `chat_history.jsonl` is still unflushed and defers the diary write until the history file appears. Copilot sessions resolve to `~/.copilot/session-state/<id>/events.jsonl` (`COPILOT_HOME` overrides the root) and count `user.message` events. `--harness auto` detects Grok from `GROK_SESSION_ID` / `GROK_HOOK_EVENT`, Copilot from `COPILOT_HOME` / `stopReason` / a `session-state` transcript path. Plugin wrappers default to `claude-code` and honor `MEMPALACE_HOOK_HARNESS`. Grok install is `examples/grok/hooks.json` (`Stop` / `SessionEnd` / `PreCompact` with `--harness grok` and explicit timeouts). Silent Grok Stop emits `{}` rather than Claude's `systemMessage`. Stop fires with a `subagentType`/`agentType` or a non-`end_turn` `reason` are skipped so Grok's session-end Stop does not double-save.
+
 - **`hallways --rebuild` holds the palace writer lock,** so a mine cannot save
   a newer snapshot between the rebuild's scan and its save. It, `rooms apply`,
   `wings split` and `kg normalize --yes` now report a held palace on one line
@@ -232,6 +234,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (110k rows/s measured).
 
 ### Bug Fixes
+
+- **Generic hook adapters no longer split Claude worktree diaries, double-spawn Grok waiters, skip Grok SessionEnd, or mis-detect Copilot.** `_wing_from_cwd` collapses `<project>/.claude/worktrees/<wt>` to the parent project so Stop files with `#2388` instead of `wing_<worktree>`. A deferred Grok Stop writes `{session}_last_save` when the waiter starts, so turn 16 does not spawn another. Grok SessionEnd waits up to 5s for `chat_history.jsonl` before giving up on the final flush. `examples/copilot/hooks.json` includes `powershell` so Windows Copilot CLI actually runs the commands. `--harness auto` reads a Claude snake_case envelope before `COPILOT_HOME`, and a path that merely ends in `events.jsonl` is no longer Copilot.
+
 - **Conversation mining no longer discards text.** In exchange mode (the default
   for `mempalace mine --mode convos`) a line starting with `---` ended the AI
   response, and everything from it to the next user turn was never filed.
