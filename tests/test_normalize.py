@@ -458,6 +458,120 @@ def test_codex_jsonl_payload_not_dict():
     assert result is not None
 
 
+# Current Codex (paginated history) records turns as item_completed items
+# instead of user_message / agent_message events (#2589).
+_CODEX_META = json.dumps({"type": "session_meta", "payload": {}})
+
+
+def _codex_legacy(role, text):
+    kind = "user_message" if role == "user" else "agent_message"
+    return json.dumps({"type": "event_msg", "payload": {"type": kind, "message": text}})
+
+
+def _codex_item(item):
+    return json.dumps({"type": "event_msg", "payload": {"type": "item_completed", "item": item}})
+
+
+def _codex_user_item(text):
+    block = {"type": "text", "text": text, "text_elements": []}
+    return _codex_item({"type": "UserMessage", "id": "u", "content": [block]})
+
+
+def _codex_agent_item(text):
+    block = {"type": "Text", "text": text}
+    return _codex_item(
+        {"type": "AgentMessage", "id": "a", "content": [block], "phase": "final_answer"}
+    )
+
+
+def test_codex_jsonl_item_completed_reads_the_same_turns_as_the_legacy_shape():
+    legacy = [_CODEX_META, _codex_legacy("user", "hello"), _codex_legacy("assistant", "hi there")]
+    items = [_CODEX_META, _codex_user_item("hello"), _codex_agent_item("hi there")]
+
+    result = _try_codex_jsonl("\n".join(items))
+    assert result is not None
+    assert result == _try_codex_jsonl("\n".join(legacy))
+
+
+def test_codex_jsonl_item_completed_skips_items_that_are_not_messages():
+    lines = [
+        _CODEX_META,
+        _codex_user_item("run the tests"),
+        _codex_item(
+            {"type": "Reasoning", "id": "r", "summary_text": ["REASONING"], "raw_content": []}
+        ),
+        _codex_item(
+            {
+                "type": "CommandExecution",
+                "id": "c",
+                "command": "pytest",
+                "aggregated_output": "COMMAND OUTPUT",
+            }
+        ),
+        _codex_agent_item("all green"),
+    ]
+    legacy = [
+        _CODEX_META,
+        _codex_legacy("user", "run the tests"),
+        _codex_legacy("assistant", "all green"),
+    ]
+
+    result = _try_codex_jsonl("\n".join(lines))
+    assert result == _try_codex_jsonl("\n".join(legacy))
+    assert "REASONING" not in result
+    assert "COMMAND OUTPUT" not in result
+
+
+def test_codex_jsonl_item_text_is_its_text_blocks_joined():
+    user = {
+        "type": "UserMessage",
+        "id": "u",
+        "content": [
+            {"type": "text", "text": "look at ", "text_elements": []},
+            {"type": "local_image", "path": "/tmp/screen.png"},
+            {"type": "text", "text": "this screenshot", "text_elements": []},
+        ],
+    }
+    result = _try_codex_jsonl(
+        "\n".join([_CODEX_META, _codex_item(user), _codex_agent_item("done")])
+    )
+
+    assert "> look at this screenshot" in result
+    assert "screen.png" not in result
+
+
+def test_codex_jsonl_reads_both_shapes_in_file_order():
+    lines = [
+        _CODEX_META,
+        _codex_legacy("user", "first question"),
+        _codex_legacy("assistant", "first answer"),
+        _codex_user_item("second question"),
+        _codex_agent_item("second answer"),
+    ]
+    result = _try_codex_jsonl("\n".join(lines))
+
+    order = [
+        result.index(t)
+        for t in ("first question", "first answer", "second question", "second answer")
+    ]
+    assert order == sorted(order)
+    assert result.count("second answer") == 1
+
+
+def test_codex_item_completed_rollout_is_not_returned_raw(tmp_path):
+    rollout = tmp_path / "rollout-2026-09-24T10-00-00-0199.jsonl"
+    rollout.write_text(
+        "\n".join([_CODEX_META, _codex_user_item("hello"), _codex_agent_item("hi there")]) + "\n",
+        encoding="utf-8",
+    )
+
+    conversations = normalize_conversations(str(rollout))
+
+    assert len(conversations) == 1
+    assert conversations[0].startswith("> hello")
+    assert "item_completed" not in conversations[0]
+
+
 # ── _try_gemini_jsonl ──────────────────────────────────────────────────
 #
 # Gemini CLI sessions live at ``~/.gemini/tmp/<project_hash>/chats/`` as

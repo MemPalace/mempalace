@@ -232,6 +232,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (110k rows/s measured).
 
 ### Bug Fixes
+- **Current Codex CLI sessions are read as conversations again.** Codex now
+  records a thread's turns as `item_completed` events carrying `UserMessage`
+  and `AgentMessage` items instead of `user_message` / `agent_message` events.
+  The Codex parser found no turns in such a rollout, so the whole raw JSONL file
+  was mined as one conversation and chunked into drawers of JSON (#2589). Both
+  shapes are now read, in file order; other items such as reasoning and command
+  executions are still skipped.
 - **Conversation mining no longer discards text.** In exchange mode (the default
   for `mempalace mine --mode convos`) a line starting with `---` ended the AI
   response, and everything from it to the next user turn was never filed.

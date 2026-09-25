@@ -360,12 +360,49 @@ def _try_claude_code_jsonl(content: str) -> Optional[str]:
     return None
 
 
+# The turn items that carry the conversation, and the role each speaks for.
+_CODEX_MESSAGE_ITEMS = {"UserMessage": "user", "AgentMessage": "assistant"}
+
+
+def _codex_item_turn(item) -> Optional[tuple]:
+    """(role, text) of a completed UserMessage or AgentMessage item, else None.
+
+    The text is in the item's content blocks: ``{"type": "text"}`` for a user
+    message and ``{"type": "Text"}`` for an agent message. Other blocks, such
+    as images, carry no text. The blocks are joined without a separator, as
+    Codex joins them (``UserMessageItem::message`` in codex-rs).
+    """
+    if not isinstance(item, dict):
+        return None
+    role = _CODEX_MESSAGE_ITEMS.get(item.get("type"))
+    content = item.get("content")
+    if role is None or not isinstance(content, list):
+        return None
+    text = "".join(
+        block["text"]
+        for block in content
+        if isinstance(block, dict)
+        and str(block.get("type", "")).lower() == "text"
+        and isinstance(block.get("text"), str)
+    ).strip()
+    return (role, text) if text else None
+
+
 def _try_codex_jsonl(content: str) -> Optional[str]:
     """OpenAI Codex CLI sessions (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl).
 
-    Uses only event_msg entries (user_message / agent_message) which represent
-    the canonical conversation turns. response_item entries are skipped because
-    they include synthetic context injections and duplicate the real messages.
+    Uses only event_msg entries, which carry the canonical conversation turns
+    in one of two shapes, depending on the thread's history mode:
+
+    - legacy: ``{"type": "user_message" | "agent_message", "message": ...}``;
+    - paginated, what current Codex writes: ``{"type": "item_completed",
+      "item": {"type": "UserMessage" | "AgentMessage", "content": [...]}}``.
+
+    Codex records each turn in one shape only (codex-rs/rollout/src/policy.rs),
+    so both are read, in file order, without counting a turn twice. Other item
+    types (Reasoning, CommandExecution, ...) are skipped. response_item entries
+    are skipped because they include synthetic context injections and
+    duplicate the real messages.
     """
     lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
     messages = []
@@ -391,6 +428,12 @@ def _try_codex_jsonl(content: str) -> Optional[str]:
             continue
 
         payload_type = payload.get("type", "")
+        if payload_type == "item_completed":
+            turn = _codex_item_turn(payload.get("item"))
+            if turn is not None:
+                messages.append(turn)
+            continue
+
         msg = payload.get("message")
         if not isinstance(msg, str):
             continue
