@@ -619,6 +619,188 @@ class TestSweeperTaxonomy:
             "taxonomy changed the drawer id or cursor logic."
         )
 
+    @pytest.fixture(params=["chroma", "sqlite_exact"])
+    def backend(self, request, monkeypatch):
+        """Chroma merges the metadata an upsert brings into the stored row;
+        sqlite_exact replaces the row's metadata with it."""
+        monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", request.param)
+        if request.param == "sqlite_exact":
+            import mempalace.backends.embedding_wrapper as embedding_wrapper
+
+            monkeypatch.setattr(
+                embedding_wrapper, "_embed_texts", lambda texts: [[1.0, 0.0] for _ in texts]
+            )
+        return request.param
+
+    def test_resweep_keeps_the_wing_and_room_a_drawer_was_moved_to(
+        self, mock_claude_jsonl, tmp_path, backend
+    ):
+        """A session's last message sits at its cursor, so every re-sweep writes
+        that drawer again. A move made after the sweep (``rooms apply``,
+        ``wings split``) must survive it, as it does for the messages below the
+        cursor, which a re-sweep skips."""
+        from mempalace.palace import get_collection
+        from mempalace.sweeper import sweep
+
+        palace_path = str(tmp_path / "palace")
+        sweep(str(mock_claude_jsonl), palace_path, wing="proj")
+        col = get_collection(palace_path, create=False)
+        ids = col.get(include=[])["ids"]
+        col.update(ids=ids, metadatas=[{"wing": "api", "room": "pricing"} for _ in ids])
+
+        again = sweep(str(mock_claude_jsonl), palace_path, wing="proj")
+
+        # The drawer at the cursor went through the write again.
+        assert (again["drawers_added"], again["drawers_already_present"]) == (0, 1)
+        metas = get_collection(palace_path, create=False).get(include=["metadatas"])["metadatas"]
+        assert [(m.get("wing"), m.get("room")) for m in metas] == [("api", "pricing")] * 4
+
+    def test_resweep_under_another_wing_classifies_only_what_it_adds(
+        self, mock_claude_jsonl, tmp_path, backend
+    ):
+        """``--wing`` classifies the messages a sweep adds; the ones the palace
+        already holds keep their wing and room, the one at the cursor too."""
+        from mempalace.palace import get_collection
+        from mempalace.sweeper import sweep
+
+        palace_path = str(tmp_path / "palace")
+        sweep(str(mock_claude_jsonl), palace_path, wing="first", room="chat")
+        later = {
+            "type": "user",
+            "timestamp": "2026-04-18T10:02:00Z",
+            "sessionId": "abc",
+            "uuid": "u-3",
+            "message": {"role": "user", "content": "And of Italy?"},
+        }
+        with mock_claude_jsonl.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(later) + "\n")
+
+        again = sweep(str(mock_claude_jsonl), palace_path, wing="second")
+
+        assert (again["drawers_added"], again["drawers_already_present"]) == (1, 1)
+        got = get_collection(palace_path, create=False).get(include=["metadatas"])
+        placed = {m["message_uuid"]: (m.get("wing"), m.get("room")) for m in got["metadatas"]}
+        assert placed == {
+            "u-1": ("first", "chat"),
+            "a-1": ("first", "chat"),
+            "u-2": ("first", "chat"),
+            "a-2": ("first", "chat"),
+            "u-3": ("second", "general"),
+        }
+
+    def test_resweep_with_wing_leaves_an_unclassified_drawer_unclassified(
+        self, mock_claude_jsonl, tmp_path, backend
+    ):
+        """A wing given on a later run does not reach the messages an earlier,
+        unclassified run already filed, the one at the cursor included: a
+        re-sweep never changes where a stored drawer sits."""
+        from mempalace.palace import get_collection
+        from mempalace.sweeper import sweep
+
+        palace_path = str(tmp_path / "palace")
+        sweep(str(mock_claude_jsonl), palace_path)
+
+        again = sweep(str(mock_claude_jsonl), palace_path, wing="proj", room="chat")
+
+        assert (again["drawers_added"], again["drawers_already_present"]) == (0, 1)
+        metas = get_collection(palace_path, create=False).get(include=["metadatas"])["metadatas"]
+        assert len(metas) == 4
+        for m in metas:
+            assert "wing" not in m and "room" not in m, f"a stored drawer was reclassified: {m}"
+
+    def test_resweep_pairs_each_stored_placement_with_its_own_drawer(self, tmp_path, backend):
+        """A message the palace lacks can come before stored ones in a batch (a
+        partial ingest at the cursor timestamp). Each stored drawer keeps its
+        own wing and room, and the new one gets this run's."""
+        from mempalace.palace import get_collection
+        from mempalace.sweeper import sweep
+
+        lines = [
+            {
+                "type": "user",
+                "timestamp": "2026-04-18T11:00:00Z",
+                "sessionId": "s-tie",
+                "uuid": f"u-{i}",
+                "message": {"role": "user", "content": f"msg {i}"},
+            }
+            for i in range(3)
+        ]
+        jsonl_path = tmp_path / "tied.jsonl"
+        jsonl_path.write_text("\n".join(json.dumps(x) for x in lines[1:]) + "\n")
+        palace_path = str(tmp_path / "palace")
+        sweep(str(jsonl_path), palace_path, wing="first")
+        col = get_collection(palace_path, create=False)
+        got = col.get(include=["metadatas"])
+        col.update(
+            ids=got["ids"], metadatas=[{"room": m["message_uuid"]} for m in got["metadatas"]]
+        )
+        jsonl_path.write_text("\n".join(json.dumps(x) for x in lines) + "\n")
+
+        again = sweep(str(jsonl_path), palace_path, wing="second")
+
+        assert (again["drawers_added"], again["drawers_already_present"]) == (1, 2)
+        got = get_collection(palace_path, create=False).get(include=["metadatas"])
+        placed = {m["message_uuid"]: (m.get("wing"), m.get("room")) for m in got["metadatas"]}
+        assert placed == {
+            "u-0": ("second", "general"),
+            "u-1": ("first", "u-1"),
+            "u-2": ("first", "u-2"),
+        }
+
+    def test_failed_preflight_still_sweeps_and_says_what_it_risks(
+        self, mock_claude_jsonl, tmp_path, monkeypatch, caplog
+    ):
+        """When the existence check fails the sweep still writes every message,
+        counts each as added, and warns that a stored drawer may lose its place."""
+        import logging
+
+        import mempalace.sweeper as sweeper
+
+        real_get_collection = sweeper.get_collection
+
+        class FailingIdsGet:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def get(self, **kwargs):
+                if kwargs.get("ids") is not None:
+                    raise RuntimeError("injected")
+                return self._inner.get(**kwargs)
+
+        monkeypatch.setattr(
+            sweeper,
+            "get_collection",
+            lambda *a, **k: FailingIdsGet(real_get_collection(*a, **k)),
+        )
+        palace_path = str(tmp_path / "palace")
+        with caplog.at_level(logging.WARNING, logger="mempalace.sweeper"):
+            result = sweeper.sweep(str(mock_claude_jsonl), palace_path, wing="proj")
+
+        assert (result["drawers_added"], result["drawers_already_present"]) == (4, 0)
+        assert "may lose the wing and room it has" in caplog.text
+
+    def test_resweep_without_wing_keeps_the_wing_a_drawer_has(
+        self, mock_claude_jsonl, tmp_path, backend
+    ):
+        """A sweep with no ``--wing`` stamps no taxonomy, and it must not strip
+        the one a drawer already carries either. On sqlite_exact the rewrite of
+        the drawer at the cursor replaces its metadata, so the sweeper carries
+        the wing and room over itself."""
+        from mempalace.palace import get_collection
+        from mempalace.sweeper import sweep
+
+        palace_path = str(tmp_path / "palace")
+        sweep(str(mock_claude_jsonl), palace_path, wing="proj", room="chat")
+
+        again = sweep(str(mock_claude_jsonl), palace_path)
+
+        assert (again["drawers_added"], again["drawers_already_present"]) == (0, 1)
+        metas = get_collection(palace_path, create=False).get(include=["metadatas"])["metadatas"]
+        assert [(m.get("wing"), m.get("room")) for m in metas] == [("proj", "chat")] * 4
+
     def test_sweep_with_wing_still_records_the_directory(self, mock_claude_jsonl, tmp_path):
         """Taxonomy and the directory identity land on the same drawer,
         so ``sync`` still decides a classified swept drawer by the same reading
