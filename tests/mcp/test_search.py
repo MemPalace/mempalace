@@ -408,6 +408,52 @@ class TestSearchTool:
         assert "results" in result
         assert result.get("index_recovered") is True
 
+    def test_search_retries_and_recovers_on_wide_survivor_partial_failure(
+        self, monkeypatch, config, kg
+    ):
+        """#2462 (igorls): wide unfiltered pool returns 0 in-scope rows but
+        the narrow path would still succeed.
+
+        The MCP initial call (``allow_narrow=False``) sees the filtered query
+        fail, the wide unfiltered pool succeed with only out-of-scope rows,
+        so the helper raises (per the 0-survivor rule) and
+        ``_is_transient_index_error()`` engages the #1315 cache-reset.
+
+        The post-reset retry (``allow_narrow=True``) is where the narrow
+        path finally lands, and the caller gets ``index_recovered: True``.
+
+        This is the partial-survivor case igorls called out in the
+        2026-09-19 review: the old code short-circuited the retry with
+        a thin result and never set ``index_recovered``.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        calls = {"n": 0}
+
+        def fake_search(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # Initial call: allow_narrow=False, 0 survivors → error dict.
+                # The "Error finding id" text triggers _is_transient_index_error.
+                return {
+                    "error": "Search error: Error executing plan: Internal error: Error finding id"
+                }
+            # Post-reset retry: allow_narrow=True, recovers.
+            return {"results": [{"text": "ok", "wing": "w", "room": "r"}]}
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+        monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", lambda: None)
+        monkeypatch.setattr(mcp_server.time, "sleep", lambda _: None)
+
+        result = mcp_server.tool_search(query="anything", wing="w")
+
+        # 2 calls: initial (raise) → reset → retry (recover).
+        assert calls["n"] == 2
+        # The recovery flag is set after a successful post-reset attempt.
+        assert "results" in result
+        assert result.get("index_recovered") is True
+
     def test_search_retry_preserves_collection_name(self, monkeypatch, config, kg):
         """Retry path must query the same configured collection both times."""
         _patch_mcp_server(monkeypatch, config, kg)

@@ -34,7 +34,7 @@ def _open_search_collection(palace_path: str, collection_name: str):
 
 
 def _query_drawers_with_filter_fallback(
-    drawers_col, dkwargs, query, n_results, wing, room, source_file=None
+    drawers_col, dkwargs, query, n_results, wing, room, source_file=None, allow_narrow=True
 ):
     """Run the filtered drawer query, falling back to an unfiltered query plus a
     Python-side post-filter when ChromaDB raises on the filtered query.
@@ -44,7 +44,21 @@ def _query_drawers_with_filter_fallback(
     drawers are ingested via two different paths (e.g. bulk import vs MCP tool
     calls), leaving the vector index inconsistent with the metadata store. We
     retry unfiltered (over-fetching) and re-apply the wing/room/source_file filter in Python.
-    See #1245 / #1035.
+    The unfiltered retry is progressive — wide recall width first, then the
+    narrow ``n_results`` width (``allow_narrow``) — because on convos-mined
+    wings the wide pool can re-hit the same stale pointer (#1082), while the
+    narrow width stays out of the stale region the CLI's filtered query uses.
+    See #1245 / #1035 / #1082.
+
+    ``allow_narrow`` gates the last-resort narrow retry. The MCP *initial* call
+    passes ``allow_narrow=False``: on a transient (#1315 flush-window) index the
+    narrow unfiltered top-N is dominated by other wings, so even a partial
+    survivor set there would short-circuit ``tool_search``'s cache-reset +
+    retry and hand the caller a thin result without ``index_recovered``. With
+    the narrow width blocked the helper raises the captured index error,
+    ``_is_transient_index_error()`` engages the #1315 reset, and the
+    post-reset attempt (``allow_narrow=True``) runs last. The CLI path and the
+    post-reset MCP attempt keep the narrow fallback (``allow_narrow=True``).
     """
     where = dkwargs.get("where")
     try:
@@ -56,37 +70,106 @@ def _query_drawers_with_filter_fallback(
             "Filtered search failed (%s); falling back to unfiltered + post-filter",
             filter_err,
         )
-        raw = drawers_col.query(
-            query_texts=[query],
-            n_results=min(n_results * 15, 500),
-            include=["documents", "metadatas", "distances"],
-        )
-        raw_docs = _first_or_empty(raw, "documents")
-        raw_ids = _aligned_query_ids(raw, len(raw_docs))
-        fids, fdocs, fmetas, fdists = [], [], [], []
-        for stored_drawer_id, doc, meta, dist in zip(
-            raw_ids,
-            raw_docs,
-            _first_or_empty(raw, "metadatas"),
-            _first_or_empty(raw, "distances"),
-        ):
-            meta = meta or {}
-            if wing and meta.get("wing") != wing:
+        # The filtered query tripped a stale HNSW pointer. Retry unfiltered,
+        # but progressively: first at the wide recall width (broadest), then
+        # narrow back to ``n_results`` — the width the CLI requests for its
+        # own filtered query and which demonstrably stays out of the stale
+        # region a convos-mined wing's cluster sits in (#1082). The wide width
+        # alone was not enough: at ``n_results * 15`` breadth the convos
+        # cluster IS in the top pool, so the unfiltered retry re-hit the same
+        # pointer and surfaced the raw "Error finding id" to the caller.
+        # Re-raising the last failure keeps the give-up path identical for a
+        # genuinely broken index, and (with ``allow_narrow`` blocked) lets the
+        # MCP transient-index recovery engage instead of a partial survivor
+        # set short-circuiting it.
+        if allow_narrow:
+            candidate_widths = (min(n_results * 15, 500), n_results)
+        else:
+            candidate_widths = (min(n_results * 15, 500),)
+        last_err = filter_err
+        for candidate_n in candidate_widths:
+            try:
+                raw = drawers_col.query(
+                    query_texts=[query],
+                    n_results=candidate_n,
+                    include=["documents", "metadatas", "distances"],
+                )
+            except Exception as candidate_err:
+                last_err = candidate_err
                 continue
-            if room and meta.get("room") != room:
-                continue
-            if source_file and meta.get("source_file") != source_file:
-                continue
-            fids.append(stored_drawer_id)
-            fdocs.append(doc)
-            fmetas.append(meta)
-            fdists.append(dist)
-        return {
-            "ids": [fids],
-            "documents": [fdocs],
-            "metadatas": [fmetas],
-            "distances": [fdists],
-        }
+            raw_docs = _first_or_empty(raw, "documents")
+            raw_ids = _aligned_query_ids(raw, len(raw_docs))
+            fids, fdocs, fmetas, fdists = [], [], [], []
+            for stored_drawer_id, doc, meta, dist in zip(
+                raw_ids,
+                raw_docs,
+                _first_or_empty(raw, "metadatas"),
+                _first_or_empty(raw, "distances"),
+            ):
+                meta = meta or {}
+                if wing and meta.get("wing") != wing:
+                    continue
+                if room and meta.get("room") != room:
+                    continue
+                if source_file and meta.get("source_file") != source_file:
+                    continue
+                fids.append(stored_drawer_id)
+                fdocs.append(doc)
+                fmetas.append(meta)
+                fdists.append(dist)
+            # Signal degraded recovery: this path is only reached after the
+            # filtered query failed.  The unfiltered pool spans all wings, so
+            # on a large palace the wing/room/source_file post-filter may
+            # keep far fewer rows than ``candidate_n`` requested.  Reporting
+            # pool size vs survivors is the "recovery ran but may be thin"
+            # signal; without it the user sees "no results" with no
+            # indication that a fallback path executed at all.
+            logger.warning(
+                "Filter-fallback (unfiltered + post-filter) after a filtered "
+                "failure at width=%d: unfiltered pool=%d row(s), %d row(s) "
+                "survived the wing/room/source_file post-filter (wing=%r "
+                "room=%r source_file=%r); the unfiltered pool spans all "
+                "wings, so recovered results may be thin or empty.",
+                candidate_n,
+                len(raw_docs),
+                len(fids),
+                wing,
+                room,
+                source_file,
+            )
+            if fids:
+                # The last-resort recovery surfaced real rows in the requested
+                # scope — return them. (Recovery ran via the degraded unfiltered
+                # path, but the caller gets usable matches.)
+                return {
+                    "ids": [fids],
+                    "documents": [fdocs],
+                    "metadatas": [fmetas],
+                    "distances": [fdists],
+                }
+            # No rows survived the wing/room/source_file post-filter at this
+            # candidate width. Returning an empty result would hand the caller
+            # a success with an ``error``-free dict, so the upstream
+            # ``_is_transient_index_error()`` check (which drives the ``#1315``
+            # cache-reset + retry in ``tool_search``) sees ``False`` and the
+            # reset never runs — the wing-filtered query that succeeds on
+            # ``develop`` after a cache reset is never attempted, and the
+            # caller sees ``results: []`` instead of ``index_recovered: true``.
+            # Surface the last captured index error instead so that recovery
+            # path engages. This is the same outcome ``develop`` produces when
+            # the filtered + wide unfiltered retries both raise: the caller's
+            # ``_is_transient_index_error`` sees the ``"Error finding id"`` /
+            # ``"internal error"`` text, forces a Chroma cache reset, sleeps,
+            # and retries the (wing-filtered) query, which then recovers.
+            raise last_err
+
+        # Every candidate width (filtered + unfiltered at each n) raised.
+        # Surface the last captured index error so the caller's
+        # ``_is_transient_index_error()`` sees a transient signal and the
+        # cache-reset + retry recovery path can engage — not an empty
+        # ``error``-free success dict, which would short-circuit it and
+        # leave the caller looking like "no results" instead of index-recovered.
+        raise last_err
 
 
 def _backend_capabilities(col) -> frozenset:
@@ -154,6 +237,7 @@ def search_memories(
     candidate_strategy: str = "vector",
     collection_name: str = None,
     lang: Optional[str] = None,
+    allow_narrow: bool = True,
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
 
@@ -214,6 +298,12 @@ def search_memories(
             ``MEMPAL_LANG`` or ``config.json["lang"]``. Palaces without an
             explicit language skip filtering entirely, preserving pre-PR
             byte-identical scoring.
+        allow_narrow: When True (default), the filter-fallback helper may
+            retry the drawer query at the narrow ``n_results`` width.
+            Pass False for the *initial* MCP call: with the narrow width
+            blocked, a partial survivor set there would short-circuit the
+            #1315 cache-reset + retry in ``tool_search``.  The post-reset
+            retry and the CLI path keep ``allow_narrow=True`` via default.
     """
     # Validate the strategy eagerly so invalid values fail the same way
     # regardless of whether the call routes through the vector path or
@@ -269,7 +359,14 @@ def search_memories(
         if where:
             dkwargs["where"] = where
         drawer_results = _query_drawers_with_filter_fallback(
-            drawers_col, dkwargs, query, n_results, wing, room, source_file
+            drawers_col,
+            dkwargs,
+            query,
+            n_results,
+            wing,
+            room,
+            source_file,
+            allow_narrow=allow_narrow,
         )
     except Exception as e:
         return _search_error_result(f"Search error: {e}")
