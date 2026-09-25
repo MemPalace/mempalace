@@ -340,13 +340,18 @@ def cmd_sweep(args):
     # in); flag the no-op rather than dropping the value silently. The sweeper
     # treats a blank value as unset, and so does this check. It runs before
     # the route is taken, so a daemon-routed sweep warns the same way.
-    if (args.room or "").strip() and not (args.wing or "").strip():
+    wing = getattr(args, "wing", None)
+    room = getattr(args, "room", None)
+    if (room or "").strip() and not (wing or "").strip():
         print("  WARNING: --room is ignored without --wing.", file=sys.stderr)
+    # A sweep that names no wing or room passes none on, so it reaches the
+    # daemon and the sweeper with the arguments it had before the flags.
+    taxonomy = {key: value for key, value in (("wing", wing), ("room", room)) if value is not None}
 
     if routing.use_daemon:
         _submit_daemon_cli_job(
             "sweep",
-            {"target": target, "wing": args.wing, "room": args.room},
+            {"target": target, **taxonomy},
             args,
             background=bool(getattr(args, "background", False)),
             auto_start=routing.decision.auto_start_daemon,
@@ -354,14 +359,14 @@ def cmd_sweep(args):
         return
 
     if os.path.isfile(target):
-        result = sweep(target, palace_path, wing=args.wing, room=args.room)
+        result = sweep(target, palace_path, **taxonomy)
         print(
             f"  Swept {target}: +{result['drawers_added']} new, "
             f"{result['drawers_already_present']} already present, "
             f"{result['drawers_skipped']} skipped (< cursor)."
         )
     elif os.path.isdir(target):
-        result = sweep_directory(target, palace_path, wing=args.wing, room=args.room)
+        result = sweep_directory(target, palace_path, **taxonomy)
         print(
             f"  Swept {result['files_succeeded']}/{result['files_attempted']} "
             f"files from {target}: +{result['drawers_added']} new, "

@@ -372,8 +372,8 @@ def run_sweep(payload: dict[str, Any]) -> dict[str, Any]:
         }
 
     target = os.path.abspath(os.path.expanduser(target_raw))
-    wing = payload.get("wing")
-    room = payload.get("room")
+    # Only the wing and room a job names are passed on, as the CLI builds it.
+    taxonomy = {key: payload[key] for key in ("wing", "room") if payload.get(key) is not None}
 
     from .daemon import LOCK_REFUSAL_ERROR_CLASS
     from .palace import MineAlreadyRunning
@@ -381,14 +381,14 @@ def run_sweep(payload: dict[str, Any]) -> dict[str, Any]:
 
     try:
         if os.path.isfile(target):
-            result = sweep(target, palace_path, wing=wing, room=room)
+            result = sweep(target, palace_path, **taxonomy)
             print(
                 f" Swept {target}: +{result['drawers_added']} new, "
                 f"{result['drawers_already_present']} already present, "
                 f"{result['drawers_skipped']} skipped (< cursor)."
             )
         elif os.path.isdir(target):
-            result = sweep_directory(target, palace_path, wing=wing, room=room)
+            result = sweep_directory(target, palace_path, **taxonomy)
             print(
                 f" Swept {result['files_succeeded']}/"
                 f"{result['files_attempted']} files from {target}: "

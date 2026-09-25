@@ -350,8 +350,6 @@ def test_cmd_sweep_prefer_submits_daemon_job(tmp_path):
     args = _args(
         palace=str(tmp_path / "palace"),
         target=str(tmp_path / "session.jsonl"),
-        wing=None,
-        room=None,
     )
 
     with (
@@ -374,8 +372,6 @@ def test_cmd_sweep_prefer_submits_daemon_job(tmp_path):
     assert submit.call_args.args[0] == "sweep"
     assert submit.call_args.args[1] == {
         "target": str(tmp_path / "session.jsonl"),
-        "wing": None,
-        "room": None,
     }
 
 
@@ -496,8 +492,6 @@ def test_service_run_sweep_file(tmp_path):
     sweep.assert_called_once_with(
         str(target),
         str(palace.resolve()),
-        wing=None,
-        room=None,
     )
     assert result["success"] is True
     assert result["exit_code"] == 0
