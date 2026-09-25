@@ -3,6 +3,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
+use std::io::Read;
 use std::path::Path;
 use thiserror::Error;
 
@@ -117,6 +118,34 @@ pub struct VectorIndex {
     rooms: Vec<Option<String>>,
 }
 
+/// True for a WAL database whose `-wal`/`-shm` sidecars are both absent.
+///
+/// Byte 18 of the SQLite header is the file format write version: 1 for a
+/// rollback journal, 2 for WAL. Mirrors Python's `config._is_wal_without_sidecars`
+/// (#2490, #2521): on SQLite builds where a read-only connection may not create
+/// the shared-memory index WAL needs — Apple's system library, which macOS
+/// system tools link — such a database fails `SQLITE_CANTOPEN` unless opened
+/// read-write. The sidecars are absent exactly when no writer holds the
+/// database open, so this describes a healthy, cleanly checkpointed palace.
+fn is_wal_without_sidecars(path: &Path) -> bool {
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        if Path::new(&sidecar).exists() {
+            return false;
+        }
+    }
+    let handle = match std::fs::File::open(path) {
+        Ok(handle) => handle,
+        Err(_) => return false,
+    };
+    let mut header = [0u8; 19];
+    match handle.take(19).read_exact(&mut header) {
+        Ok(()) => header[..16] == *b"SQLite format 3\0" && header[18] == 2,
+        Err(_) => false,
+    }
+}
+
 impl VectorIndex {
     pub fn new(dim: usize) -> Self {
         Self {
@@ -163,10 +192,16 @@ impl VectorIndex {
         db_path: P,
         collection_name: Option<&str>,
     ) -> Result<Self, MemPalaceError> {
-        let conn = Connection::open_with_flags(
-            db_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        )?;
+        let path = db_path.as_ref();
+        // A WAL database without sidecars cannot be read through a read-only
+        // connection on every SQLite build; mirror config.connect_sqlite_read
+        // and take a normal open, which creates the sidecars (#2521).
+        let flags = if is_wal_without_sidecars(path) {
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+        } else {
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+        } | OpenFlags::SQLITE_OPEN_URI;
+        let conn = Connection::open_with_flags(path, flags)?;
         conn.execute_batch(
             "PRAGMA busy_timeout=5000;
              PRAGMA mmap_size=1073741824;
@@ -531,6 +566,53 @@ mod tests {
         )
         .unwrap();
         assert!(VectorIndex::load_from_sqlite(&path, None).is_err());
+    }
+
+    fn seeded_db(path: &Path, wal: bool) {
+        let conn = Connection::open(path).unwrap();
+        if wal {
+            conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        }
+        conn.execute_batch("CREATE TABLE collections(id INTEGER, name TEXT, dimension INTEGER);
+            CREATE TABLE documents(id TEXT, embedding BLOB, wing TEXT, room TEXT, collection_id INTEGER);
+            INSERT INTO collections VALUES(1, 'mempalace_drawers', 2);
+            INSERT INTO documents VALUES('a', x'0000803f00000000', NULL, NULL, 1);")
+            .unwrap();
+        // Dropping the last connection checkpoints the WAL and removes both
+        // sidecars — the ordinary on-disk state #2521 trips over.
+        drop(conn);
+    }
+
+    #[test]
+    fn wal_database_without_sidecars_is_detected_and_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.sqlite3");
+        seeded_db(&path, true);
+        assert!(!std::fs::metadata(format!("{}-wal", path.display())).is_ok());
+        assert!(!std::fs::metadata(format!("{}-shm", path.display())).is_ok());
+        assert!(is_wal_without_sidecars(&path));
+        let index = VectorIndex::load_from_sqlite(&path, None).unwrap();
+        assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn read_only_is_kept_for_journal_databases_and_live_wal_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("journal.sqlite3");
+        seeded_db(&journal, false);
+        assert!(!is_wal_without_sidecars(&journal));
+
+        let wal = dir.path().join("wal-sidecar.sqlite3");
+        seeded_db(&wal, true);
+        assert!(is_wal_without_sidecars(&wal));
+        std::fs::write(format!("{}-wal", wal.display()), []).unwrap();
+        // A present sidecar means a writer may hold the database; read-only
+        // stays correct there, so the probe must not switch to read-write.
+        assert!(!is_wal_without_sidecars(&wal));
+
+        let junk = dir.path().join("not-a-db.sqlite3");
+        std::fs::write(&junk, b"tiny").unwrap();
+        assert!(!is_wal_without_sidecars(&junk));
     }
 
     #[test]
