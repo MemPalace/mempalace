@@ -190,6 +190,22 @@ def get_palace_cursor(collection, session_id: str) -> Optional[str]:
 
 # ── Sweep ────────────────────────────────────────────────────────────
 
+_PLACEMENT_KEYS = ("wing", "room")
+
+
+def _placement(metadata: Optional[dict]) -> dict:
+    """The wing and room a stored drawer is filed under, keys it lacks left out."""
+    return {
+        key: metadata[key] for key in _PLACEMENT_KEYS if metadata and metadata.get(key) is not None
+    }
+
+
+def _with_placement(metadata: dict, placement: dict) -> dict:
+    """``metadata`` for rewriting a stored drawer: its own wing and room, not this run's."""
+    kept = {key: value for key, value in metadata.items() if key not in _PLACEMENT_KEYS}
+    kept.update(placement)
+    return kept
+
 
 def _drawer_id_for_message(session_id: str, message_uuid: str) -> str:
     """Deterministic drawer ID so upserts at the same message are no-ops.
@@ -201,7 +217,13 @@ def _drawer_id_for_message(session_id: str, message_uuid: str) -> str:
     return f"sweep_{session_id}_{message_uuid}"
 
 
-def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None) -> dict:
+def sweep(
+    jsonl_path: str,
+    palace_path: str,
+    source_label: Optional[str] = None,
+    wing: Optional[str] = None,
+    room: Optional[str] = None,
+) -> dict:
     """Ingest every user/assistant message not already represented.
 
     For each message in the jsonl:
@@ -215,17 +237,43 @@ def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None)
         `get(ids=...)` and counted as "already present", not "added").
       - Else, upsert a drawer with deterministic ID so reruns dedupe.
 
+    Args:
+        source_label: Value stored as each drawer's ``source_file`` metadata
+            (defaults to ``jsonl_path``).
+        wing: When set, classify the drawers this sweep adds under this wing
+            like ``mine --wing`` so they leave the ``?/?`` bucket;
+            blank/whitespace is treated as unset. When unset, they get no
+            wing/room metadata, the historical unclassified behavior. Either
+            way a drawer already in the palace keeps the wing and room it has,
+            including one moved since it was swept. A classified drawer is in
+            scope for ``sync --wing <wing>`` like a mined one: its
+            ``source_file`` takes part in root auto-detection and it can be
+            pruned as gitignored or missing.
+        room: Room for the drawers this sweep adds when ``wing`` is set;
+            defaults to the miners' fallback room ``"general"``. Ignored when
+            ``wing`` is unset.
+
     Returns ``{drawers_added, drawers_already_present, drawers_skipped,
     drawers_upserted, cursor_by_session}``:
 
     * ``drawers_added`` — rows that did not exist before this sweep.
     * ``drawers_already_present`` — rows whose deterministic ID was
-      already in the palace and got rewritten idempotently.
+      already in the palace; they are rewritten and keep their wing and room.
     * ``drawers_skipped`` — records skipped by the cursor (strictly
       earlier than what's already stored).
     * ``drawers_upserted`` — total writes = added + already_present.
     """
     collection = get_collection(palace_path, create=True)
+
+    # Optional taxonomy: when a wing is given, the drawers this sweep adds are
+    # classified under wing/room like ``mine --wing`` (room defaults to the
+    # miners' fallback room "general") so message-level catch-up is searchable
+    # instead of stranded as ``?/?`` in status and search. With no wing we stamp
+    # nothing, preserving the historical unclassified behavior for existing callers.
+    wing = (wing or "").strip() or None
+    room = (room or "").strip() or None
+    taxonomy = {"wing": wing, "room": room or "general"} if wing else {}
+
     cursors: dict = {}
 
     drawers_added = 0
@@ -258,25 +306,41 @@ def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None)
         unique_docs = [deduped[drawer_id][0] for drawer_id in unique_ids]
         unique_metas = [deduped[drawer_id][1] for drawer_id in unique_ids]
 
-        # Pre-flight: which unique IDs are already present?
+        # Pre-flight: which unique IDs are already present, and where are they
+        # filed? A re-sweep writes the drawer at each session's cursor again.
+        # That drawer keeps the wing and room it has: this run's taxonomy is
+        # for the messages it adds, and a move made since (rooms apply, wings
+        # split) must outlive the rewrite. Chroma merges stored keys back on
+        # its own; the other backends (sqlite_exact, pgvector, qdrant, milvus)
+        # replace a row's metadata on upsert.
         try:
             existing = collection.get(
                 ids=unique_ids,
-                include=[],
+                include=["metadatas"],
             )
             # Chroma returns a dict; typed backends return GetResult - the
             # compatibility shim makes .get("ids") work on both.
-            present = set(existing.get("ids") or [])
+            existing_ids = existing.get("ids") or []
+            existing_metas = existing.get("metadatas") or [None] * len(existing_ids)
+            placed = {
+                drawer_id: _placement(metadata)
+                for drawer_id, metadata in zip(existing_ids, existing_metas)
+            }
         except Exception as exc:
             logger.warning(
                 "sweeper: existence pre-check failed (%s); "
                 "counting all unique batch rows as new "
-                "(metric may over-count on reruns).",
+                "(metric may over-count on reruns, and a drawer already "
+                "filed may lose the wing and room it has).",
                 exc,
             )
-            present = set()
+            placed = {}
 
-        new_count = sum(1 for drawer_id in unique_ids if drawer_id not in present)
+        unique_metas = [
+            _with_placement(metadata, placed[drawer_id]) if drawer_id in placed else metadata
+            for drawer_id, metadata in zip(unique_ids, unique_metas)
+        ]
+        new_count = sum(1 for drawer_id in unique_ids if drawer_id not in placed)
         already_count = len(unique_ids) - new_count
 
         collection.upsert(
@@ -316,6 +380,7 @@ def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None)
             "source_file": source_label or jsonl_path,
             "filed_at": datetime.now().isoformat(),
             "ingest_mode": "sweep",
+            **taxonomy,
         }
         # The directory this drawer's ``source_file`` sits in, so ``sync``
         # decides a swept drawer by the same reading as a mined one (#2320).
@@ -340,8 +405,16 @@ def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None)
     }
 
 
-def sweep_directory(dir_path: str, palace_path: str) -> dict:
+def sweep_directory(
+    dir_path: str,
+    palace_path: str,
+    wing: Optional[str] = None,
+    room: Optional[str] = None,
+) -> dict:
     """Sweep every .jsonl file in a directory (recursive).
+
+    ``wing`` / ``room`` are forwarded unchanged to each file's :func:`sweep`
+    call, so a whole directory is classified under one wing in a single run.
 
     Returns aggregated summary across all files. ``files_attempted``
     includes files that raised, so the count reflects discovery rather
@@ -380,7 +453,7 @@ def sweep_directory(dir_path: str, palace_path: str) -> dict:
             print(f"  SKIP: {f.name} (not a regular file)", file=sys.stderr)
             continue
         try:
-            result = sweep(str(f), palace_path, source_label=str(f))
+            result = sweep(str(f), palace_path, source_label=str(f), wing=wing, room=room)
         except Exception as exc:
             logger.error("sweeper: sweep failed on %s: %s", f, exc)
             print(f"  WARNING: sweep failed on {f}: {exc}", file=sys.stderr)
