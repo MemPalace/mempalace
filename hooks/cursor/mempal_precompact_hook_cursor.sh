@@ -95,7 +95,7 @@ mempal_log "preCompact" "$MEMPAL_CONV_ID" \
 if command -v mempalace >/dev/null 2>&1; then
     if mempal_is_valid_transcript "$MEMPAL_TRANSCRIPT" \
         && [ -f "$MEMPAL_TRANSCRIPT" ]; then
-        mempalace mine "$(dirname "$MEMPAL_TRANSCRIPT")" --mode convos \
+        MEMPALACE_CLI_ROUTING_SCOPE=hooks mempalace mine "$(dirname "$MEMPAL_TRANSCRIPT")" --mode convos \
             >> "$MEMPAL_CURSOR_LOG" 2>&1 || \
             mempal_log "preCompact" "$MEMPAL_CONV_ID" \
                 "WARN: mempalace mine convos returned non-zero"
@@ -104,7 +104,7 @@ if command -v mempalace >/dev/null 2>&1; then
             "skipping invalid transcript path: $MEMPAL_TRANSCRIPT"
     fi
     if [ -n "$MEMPAL_DIR" ] && [ -d "$MEMPAL_DIR" ]; then
-        mempalace mine "$MEMPAL_DIR" --mode projects \
+        MEMPALACE_CLI_ROUTING_SCOPE=hooks mempalace mine "$MEMPAL_DIR" --mode projects \
             >> "$MEMPAL_CURSOR_LOG" 2>&1 || \
             mempal_log "preCompact" "$MEMPAL_CONV_ID" \
                 "WARN: mempalace mine projects returned non-zero"

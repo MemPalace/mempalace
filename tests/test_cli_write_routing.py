@@ -10,6 +10,7 @@ import pytest
 from mempalace import cli, service
 from mempalace.cli_write_routing import (
     CliWriteRouting,
+    _cli_routing_scope,
     add_cli_write_routing_flags,
     resolve_cli_write_routing,
 )
@@ -209,6 +210,102 @@ def test_parser_flags_are_mutually_exclusive():
 
     with pytest.raises(SystemExit):
         parser.parse_args(["--daemon", "--direct"])
+
+
+class _ScopeRecordingConfig:
+    """Records which write-routing scope was requested, unlike
+    ``_RoutingConfig`` above which hard-asserts ``scope == "cli"``."""
+
+    def __init__(self, policy: WriteRoutingPolicy):
+        self._policy = policy
+        self.requested_scopes: list[str] = []
+        self.palace_path = "/tmp/palace"
+
+    def resolve_write_routing(self, scope: str) -> ResolvedWriteRoutingPolicy:
+        self.requested_scopes.append(scope)
+        return ResolvedWriteRoutingPolicy(policy=self._policy, source="test")
+
+
+class TestCliRoutingScopeSelection:
+    """Shell hooks shell out to ``mempalace mine`` instead of writing through
+    ``mempalace.hooks_cli``, so ``resolve_cli_write_routing`` must resolve the
+    caller-selected scope, not a hardcoded ``"cli"``, or a hooks policy is
+    silently ignored for every shell-hook-triggered mine."""
+
+    def test_defaults_to_cli_scope_when_env_unset(self, monkeypatch):
+        monkeypatch.delenv("MEMPALACE_CLI_ROUTING_SCOPE", raising=False)
+        assert _cli_routing_scope() == "cli"
+
+    def test_reads_hooks_scope_from_env(self, monkeypatch):
+        monkeypatch.setenv("MEMPALACE_CLI_ROUTING_SCOPE", "hooks")
+        assert _cli_routing_scope() == "hooks"
+
+    def test_is_case_insensitive(self, monkeypatch):
+        monkeypatch.setenv("MEMPALACE_CLI_ROUTING_SCOPE", "HOOKS")
+        assert _cli_routing_scope() == "hooks"
+
+    def test_unrecognized_value_fails_closed(self, monkeypatch):
+        monkeypatch.setenv("MEMPALACE_CLI_ROUTING_SCOPE", "bogus")
+        with pytest.raises(WriteRoutingError):
+            _cli_routing_scope()
+
+    def test_resolve_cli_write_routing_queries_cli_scope_by_default(self, monkeypatch):
+        monkeypatch.delenv("MEMPALACE_CLI_ROUTING_SCOPE", raising=False)
+        config = _ScopeRecordingConfig(WriteRoutingPolicy.DIRECT)
+        with patch(
+            "mempalace.cli_write_routing.MempalaceConfig",
+            return_value=config,
+        ):
+            resolve_cli_write_routing(_args(), operation="mine")
+
+        assert config.requested_scopes == ["cli"]
+
+    def test_resolve_cli_write_routing_queries_hooks_scope_for_shell_hooks(self, monkeypatch):
+        monkeypatch.setenv("MEMPALACE_CLI_ROUTING_SCOPE", "hooks")
+        config = _ScopeRecordingConfig(WriteRoutingPolicy.DIRECT)
+        with patch(
+            "mempalace.cli_write_routing.MempalaceConfig",
+            return_value=config,
+        ):
+            resolve_cli_write_routing(_args(), operation="mine")
+
+        assert config.requested_scopes == ["hooks"]
+
+    def test_hooks_require_does_not_cold_start(self, monkeypatch):
+        monkeypatch.setenv("MEMPALACE_CLI_ROUTING_SCOPE", "hooks")
+        config = _ScopeRecordingConfig(WriteRoutingPolicy.REQUIRE)
+        with (
+            patch("mempalace.cli_write_routing.MempalaceConfig", return_value=config),
+            patch("mempalace.cli_write_routing._daemon_already_running", return_value=False),
+        ):
+            with pytest.raises(WriteRoutingError):
+                resolve_cli_write_routing(_args(), operation="mine")
+
+    def test_hooks_scope_does_not_reroute_other_commands(self, monkeypatch):
+        monkeypatch.setenv("MEMPALACE_CLI_ROUTING_SCOPE", "hooks")
+        config = _ScopeRecordingConfig(WriteRoutingPolicy.DIRECT)
+        with patch(
+            "mempalace.cli_write_routing.MempalaceConfig",
+            return_value=config,
+        ):
+            resolve_cli_write_routing(_args(), operation="sweep")
+
+        assert config.requested_scopes == ["cli"]
+
+    def test_explicit_daemon_flag_bypasses_scope_selection_entirely(self, monkeypatch):
+        """--daemon/--direct short-circuit before any config lookup, so the
+        routing scope must never matter when an explicit flag is present."""
+        monkeypatch.setenv("MEMPALACE_CLI_ROUTING_SCOPE", "hooks")
+        with patch(
+            "mempalace.cli_write_routing.MempalaceConfig",
+        ) as config:
+            routing = resolve_cli_write_routing(
+                _args(daemon=True),
+                operation="mine",
+            )
+
+        config.assert_not_called()
+        assert routing.use_daemon is True
 
 
 def _mine_args(tmp_path, **overrides):

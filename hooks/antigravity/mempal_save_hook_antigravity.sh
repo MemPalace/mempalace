@@ -226,7 +226,7 @@ mempal_log "stop" "$CONVERSATION_ID" "TRIGGERING SAVE wing=$WING transcript_dir=
 mempal_log "stop" "$CONVERSATION_ID" "spawning background mine wing=$WING transcript_dir=$TRANSCRIPT_DIR"
 (
     if "$MEMPAL_PYTHON_BIN" -m mempalace --version >/dev/null 2>&1; then
-        "$MEMPAL_PYTHON_BIN" -m mempalace mine "$TRANSCRIPT_DIR" \
+        MEMPALACE_CLI_ROUTING_SCOPE=hooks "$MEMPAL_PYTHON_BIN" -m mempalace mine "$TRANSCRIPT_DIR" \
             --mode convos \
             --wing "$WING" \
             >> "$MEMPAL_AGY_LOG" 2>&1 < /dev/null
