@@ -958,7 +958,14 @@ def test_register_file_sentinel_includes_source_mtime():
         client = chromadb.PersistentClient(path=palace_path)
         col = client.get_or_create_collection("mempalace_drawers")
 
-        _register_file(col, str(tiny_file), "test", "mempalace", "exchange")
+        _register_file(
+            col,
+            str(tiny_file),
+            "test",
+            "mempalace",
+            "exchange",
+            source_metadata={"source_mtime": tiny_file.stat().st_mtime},
+        )
 
         mined = prefetch_mined_set(col, extract_mode="exchange")
         assert str(tiny_file) in mined
@@ -1086,10 +1093,16 @@ def test_mine_convos_scopes_mined_set_prefetch_to_candidate_files(monkeypatch):
         real_prefetch_mined_set = convo_miner_module.prefetch_mined_set
         real_prefetch_content_hashes = convo_miner_module.prefetch_content_hashes
 
-        def _spy_mined_set(collection, extract_mode=None, source_files=None):
+        def _spy_mined_set(
+            collection, extract_mode=None, source_files=None, *, source_fingerprints=False
+        ):
             seen["mined_set_source_files"] = source_files
+            seen["mined_set_source_fingerprints"] = source_fingerprints
             return real_prefetch_mined_set(
-                collection, extract_mode=extract_mode, source_files=source_files
+                collection,
+                extract_mode=extract_mode,
+                source_files=source_files,
+                source_fingerprints=source_fingerprints,
             )
 
         def _spy_content_hashes(collection, extract_mode=None):
@@ -1103,6 +1116,7 @@ def test_mine_convos_scopes_mined_set_prefetch_to_candidate_files(monkeypatch):
 
         resolved = str(convo_path.resolve())
         assert seen["mined_set_source_files"] == [resolved]
+        assert seen["mined_set_source_fingerprints"] is True
         assert seen["content_hashes_called"] is True
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
