@@ -532,6 +532,14 @@ TOOLS = {
                         "Ignored by other modes."
                     ),
                 },
+                "include_ignored": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Project-relative paths to scan even if ignored, matching CLI "
+                        "--include-ignored. Projects mode only; default: []."
+                    ),
+                },
             },
             "required": ["source"],
         },
