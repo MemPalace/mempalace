@@ -1151,6 +1151,34 @@ class MempalaceConfig:
         """Mapping of hall names to keyword lists."""
         return self._file_config.get("hall_keywords", DEFAULT_HALL_KEYWORDS)
 
+    @property
+    def status_protocol(self):
+        """Operator-supplied status protocol text, or ``None`` to use the
+        built-in default (``PALACE_PROTOCOL`` in the MCP server).
+
+        Lets an operator add to the "protocol" field returned by
+        ``mempalace_status`` without a code change: set the
+        ``MEMPALACE_STATUS_PROTOCOL`` env, or ``status_protocol`` in
+        ``config.json``. Mirrors the ``topic_wings`` / ``hall_keywords``
+        pattern — env takes precedence over the config file, and a missing
+        or blank value resolves to ``None`` so the consumer falls back to
+        the built-in text. A whitespace-only env var counts as unset, so it
+        falls through to the config file instead of masking it. Kept
+        intentionally light here so the config layer doesn't reach into the
+        MCP server module to read ``PALACE_PROTOCOL``.
+        """
+        env_val = os.environ.get("MEMPALACE_STATUS_PROTOCOL")
+        if env_val is not None:
+            env_stripped = env_val.strip()
+            if env_stripped:
+                return env_stripped
+            # Blank / whitespace-only env is treated as unset: keep reading.
+        file_val = self._file_config.get("status_protocol")
+        if isinstance(file_val, str):
+            value = file_val.strip()
+            return value or None
+        return None
+
     @staticmethod
     def _try_coerce_int(value, minimum=None):
         """Coerce a raw config value to int, or ``None`` if it cannot be a
@@ -1767,6 +1795,14 @@ class MempalaceConfig:
                 "collection_name": DEFAULT_COLLECTION_NAME,
                 "topic_wings": DEFAULT_TOPIC_WINGS,
                 "hall_keywords": DEFAULT_HALL_KEYWORDS,
+                # Operator may set a custom `mempalace_status` protocol text
+                # (see ``MempalaceConfig.status_protocol``). Written as null so
+                # the default ``PALACE_PROTOCOL`` in the MCP server is used
+                # unless an operator overrides it here or via the
+                # ``MEMPALACE_STATUS_PROTOCOL`` env var. We do not inline the
+                # constant here — see the analogous comment above about
+                # chunking parameters.
+                "status_protocol": None,
             }
             with open(self._config_file, "w", encoding="utf-8") as f:
                 json.dump(default_config, f, indent=2)

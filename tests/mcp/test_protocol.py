@@ -2097,3 +2097,52 @@ def test_wal_dir_nests_under_config_dir():
 
     assert wal._WAL_FILE.parent.parent == mcp_server._config.config_dir
     assert wal._WAL_FILE.parent.name == "wal"
+
+
+class TestStatusProtocolOverride:
+    """#2451 — the protocol text `mempalace_status` returns must be
+    operator-configurable (config.json `status_protocol` or the
+    `MEMPALACE_STATUS_PROTOCOL` env), falling back to the built-in
+    `PALACE_PROTOCOL` when unset. These drive the real handler down the
+    fast sqlite path so no on-disk palace is required.
+    """
+
+    def _force_fast_path(self, monkeypatch):
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+        monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+        monkeypatch.setattr(mcp_server, "_sqlite_taxonomy", lambda: (2, {"wing_a": {"room_b": 2}}))
+        monkeypatch.setattr(mcp_server, "_selected_backend_name", lambda: "chroma")
+
+    def test_handler_returns_override_protocol_from_config(self, tmp_path, monkeypatch):
+        """A file-config override is APPENDED to the built-in protocol — the
+        built-in text survives and the operator text is added after it."""
+        from mempalace import mcp_server
+        from mempalace.config import MempalaceConfig
+
+        (tmp_path / "config.json").write_text(
+            json.dumps({"status_protocol": "E2E OVERRIDE TEXT"}), encoding="utf-8"
+        )
+        cfg = MempalaceConfig(config_dir=str(tmp_path))
+        monkeypatch.setattr(mcp_server, "_config", cfg)
+        self._force_fast_path(monkeypatch)
+
+        result = mcp_server.tool_status()
+        # Append, not replace: built-in text is always present...
+        assert result["protocol"].startswith(mcp_server.PALACE_PROTOCOL)
+        # ...and the operator override text is layered on after it.
+        assert "E2E OVERRIDE TEXT" in result["protocol"]
+
+    def test_handler_returns_default_protocol_when_unset(self, tmp_path, monkeypatch):
+        """Without an override the built-in PALACE_PROTOCOL is preserved —
+        backward compatible with every existing status consumer."""
+        from mempalace import mcp_server
+        from mempalace.config import MempalaceConfig
+
+        cfg = MempalaceConfig(config_dir=str(tmp_path))  # no status_protocol key
+        monkeypatch.setattr(mcp_server, "_config", cfg)
+        self._force_fast_path(monkeypatch)
+
+        result = mcp_server.tool_status()
+        assert result["protocol"] == mcp_server.PALACE_PROTOCOL
