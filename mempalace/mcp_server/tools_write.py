@@ -416,6 +416,55 @@ def _collapse_drawer_rows(ids, documents, metadatas):
     return drawers
 
 
+def count_drawer_rows(ids, documents, metadatas) -> DrawerCount:
+    """Count one fetched row set as logical drawers plus physical rows.
+
+    A missing ``chunks`` key counts as 0: ``_collapse_drawer_rows`` only sets it
+    on grouped drawers, so an unchunked single carries none.
+    """
+    collapsed = _collapse_drawer_rows(ids, documents, metadatas)
+    chunks = 0
+    for drawer in collapsed:
+        chunks += int(drawer.get("chunks") or 0)
+    return DrawerCount(drawers=len(collapsed), chunks=chunks, rows=len(ids))
+
+
+def tally_drawer_rows(ids, metadatas):
+    """Group a fetched row set by wing/room, counted in logical drawers and rows.
+
+    The client-side counterpart of the sqlite fast path, and deliberately the same
+    rule: a row's logical drawer is its parent when it has one, else the row
+    itself, so a chunked drawer counts once however many chunks it occupies. A row
+    is grouped under its own wing/room, which chunk rows inherit from their parent
+    when they are written.
+
+    Wing/room normalization matches the fast path: a missing key reads as
+    ``"unknown"``, while an explicitly empty value stays empty.
+    """
+    groups: dict = {}
+    for idx, drawer_id in enumerate(ids):
+        meta = _safe_meta(metadatas[idx] if idx < len(metadatas) else {})
+        parent = _logical_parent_id(meta)
+        wing = meta.get("wing")
+        room = meta.get("room")
+        key = (
+            "unknown" if wing in (None, "?") else str(wing),
+            "unknown" if room in (None, "?") else str(room),
+        )
+        entry = groups.setdefault(key, {"logical": set(), "chunks": 0, "rows": 0})
+        entry["logical"].add(parent or drawer_id)
+        entry["rows"] += 1
+        if parent:
+            entry["chunks"] += 1
+
+    tally: dict = {}
+    for (wing, room), entry in groups.items():
+        tally.setdefault(wing, {})[room] = DrawerCount(
+            drawers=len(entry["logical"]), chunks=entry["chunks"], rows=entry["rows"]
+        )
+    return tally
+
+
 def _build_chunk_rows(drawer_id: str, content: str, meta: dict, chunk_size: int):
     chunk_size = max(1, int(chunk_size or 1))
 
@@ -1004,11 +1053,15 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
     where = {"source_file": source_file}
     try:
         # Paginated to survive palaces larger than the 10k get() truncation.
-        metas = _fetch_all_metadata(col, where=where)
+        # Ids are fetched alongside the metadata so the match can be counted in
+        # logical drawers: a chunked drawer is one drawer however many rows it
+        # occupies, so this agrees with list_drawers for the same source.
+        ids, _documents, metas = _fetch_drawer_rows(col, where=where, include=["metadatas"])
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-    match_count = len(metas)
+    count = count_drawer_rows(ids, [], metas)
+    match_count = count.drawers
     # Distinct (wing, room) pairs so the caller sees where the hits live.
     sample = []
     seen = set()
@@ -1033,6 +1086,8 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
             "dry_run": True,
             "source_file": source_file,
             "match_count": match_count,
+            "match_chunks": count.chunks,
+            "match_rows": count.rows,
             "closet_match_count": closet_match_count,
             "sample": sample,
             "hint": (
@@ -1077,6 +1132,8 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
             "dry_run": False,
             "source_file": source_file,
             "deleted": match_count,
+            "deleted_chunks": count.chunks,
+            "deleted_rows": count.rows,
             "closets_deleted": closets_deleted,
         }
     except Exception as e:

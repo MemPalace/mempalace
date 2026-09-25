@@ -509,7 +509,9 @@ def _node_profile() -> dict:
     try:
         col = _get_collection(create=False)
         if col is not None:
-            drawers = col.count()
+            # Logical drawers: the profile is read as "how many drawers does
+            # this replica hold", so a physical row count overstates it.
+            drawers = getattr(logical_drawer_count(col), "drawers", None)
             roles.append("replica")
     except Exception:
         logger.debug("node profile: drawer count unavailable", exc_info=True)

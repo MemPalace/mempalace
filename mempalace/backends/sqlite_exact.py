@@ -30,7 +30,9 @@ from .base import (
     BaseBackend,
     BaseCollection,
     CollectionNotInitializedError,
+    DRAWER_COUNT_ZERO,
     DimensionMismatchError,
+    DrawerCount,
     GetResult,
     HealthStatus,
     LexicalHit,
@@ -328,10 +330,10 @@ def _cosine_distances(
 
 def sqlite_wing_room_counts(
     palace_path: str, collection_name: str
-) -> Optional[tuple[int, dict[str, dict[str, int]]]]:
+) -> Optional[tuple[DrawerCount, dict[str, dict[str, DrawerCount]]]]:
     """Tally drawers by wing/room from ``sqlite_exact.sqlite3`` without paging.
 
-    Returns ``(total, {wing: {room: count}})`` or ``None`` when the read
+    Returns ``(total, {wing: {room: DrawerCount}})`` or ``None`` when the read
     cannot be trusted. ``None``/missing wing-or-room values are stored as
     ``"?"`` so ``mcp_server._sqlite_taxonomy`` can map them to ``"unknown"``.
     """
@@ -350,18 +352,27 @@ def sqlite_wing_room_counts(
             if row is None:
                 return None
             collection_id = int(row[0])
-            total_row = conn.execute(
-                "SELECT COUNT(*) FROM documents WHERE collection_id = ?",
-                (collection_id,),
-            ).fetchone()
-            total = int(total_row[0]) if total_row and total_row[0] is not None else 0
-            wing_rooms: dict[str, dict[str, int]] = {}
+            wing_rooms: dict[str, dict[str, DrawerCount]] = {}
             locus = _documents_has_locus_columns(conn)
             wing_expr = "wing" if locus else "json_extract(metadata_json, '$.wing')"
             room_expr = "room" if locus else "json_extract(metadata_json, '$.room')"
-            for wing, room, n in conn.execute(
+            # A row's logical drawer is its parent when it has one, else the row
+            # itself. Counting DISTINCT logical ids keeps a chunked drawer from
+            # being counted once per chunk, which is what the chroma fast path
+            # does too — otherwise the two backends disagree on the same palace.
+            for wing, room, drawers, chunks, row_count in conn.execute(
                 f"""
-                SELECT {wing_expr}, {room_expr}, COUNT(*)
+                SELECT {wing_expr}, {room_expr},
+                       COUNT(DISTINCT COALESCE(
+                           json_extract(metadata_json, '$.parent_drawer_id'),
+                           json_extract(metadata_json, '$.parent_entry_id'),
+                           id)),
+                       SUM(CASE WHEN json_extract(metadata_json, '$.parent_drawer_id')
+                                      IS NOT NULL
+                                  OR json_extract(metadata_json, '$.parent_entry_id')
+                                      IS NOT NULL
+                                THEN 1 ELSE 0 END),
+                       COUNT(*)
                 FROM documents
                 WHERE collection_id = ?
                 GROUP BY 1, 2
@@ -370,8 +381,13 @@ def sqlite_wing_room_counts(
             ):
                 wkey = "?" if wing is None else str(wing)
                 rkey = "?" if room is None else str(room)
+                count = DrawerCount(drawers=int(drawers), chunks=int(chunks), rows=int(row_count))
                 dest = wing_rooms.setdefault(wkey, {})
-                dest[rkey] = dest.get(rkey, 0) + int(n)
+                dest[rkey] = dest.get(rkey, DRAWER_COUNT_ZERO) + count
+            total = DRAWER_COUNT_ZERO
+            for room_counts in wing_rooms.values():
+                for count in room_counts.values():
+                    total = total + count
             return total, wing_rooms
         finally:
             conn.close()
