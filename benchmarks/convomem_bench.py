@@ -34,9 +34,9 @@ from datetime import datetime
 
 import chromadb
 
-from mempalace.user_agent import USER_AGENT
-
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from mempalace.user_agent import USER_AGENT
 
 HF_BASE = "https://huggingface.co/datasets/Salesforce/ConvoMem/resolve/main/core_benchmark/evidence_questions"
 
