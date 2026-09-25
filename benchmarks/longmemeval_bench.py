@@ -39,12 +39,12 @@ from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
 
-from mempalace.user_agent import USER_AGENT
-
 import chromadb
 
 # Add mempal to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from mempalace.user_agent import USER_AGENT
 
 
 # =============================================================================
