@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **`mempalace sweep` files what it sweeps under a wing and room when asked.**
+  `--wing` classifies the drawers a sweep adds, as `mine --wing` does, and
+  `--room` defaults to `general`, so message-level catch-up shows under that
+  wing in `status` and `search --wing` instead of as `?/?`. A drawer the palace
+  already holds keeps its wing and room, so a re-sweep does not undo
+  `rooms apply` or `wings split`. Both flags reach a sweep routed to the
+  daemon; a daemon started before the upgrade drops them until it is
+  restarted. (#1207, #1979)
+
 ---
 
 ## [3.11.0] — 2026-10-02
