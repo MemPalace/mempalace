@@ -210,7 +210,7 @@ def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
     """POST JSON and return the parsed response. Raises LLMError on any failure."""
     try:
         # ``User-Agent`` is set AFTER ``**headers`` so callers cannot accidentally
-        # shadow the WAF-bypass with a per-provider override (#1570). Callers that
+        # shadow the WAF-bypass with a per-provider override. Callers that
         # genuinely need a different UA should change ``USER_AGENT`` itself.
         # ``Request()`` is inside the try block because it validates the URL eagerly
         # and raises ``ValueError`` on malformed input; that needs to be wrapped as
@@ -268,10 +268,9 @@ class OllamaProvider(LLMProvider):
             req = Request(f"{self.endpoint}/api/tags", headers={"User-Agent": USER_AGENT})
             with urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read())
-        # ValueError covers both malformed endpoints (Request() validates URLs
-        # eagerly now that we pass it explicitly) and JSONDecodeError on the
-        # response body (JSONDecodeError is a ValueError subclass). The prior
-        # bare-string urlopen path wrapped URL-validation failures as URLError.
+        # ValueError covers an endpoint that Request() rejects, such as one
+        # without a scheme, and a body that is not JSON: JSONDecodeError and
+        # UnicodeDecodeError are ValueError subclasses.
         except (URLError, HTTPError, OSError, ValueError) as e:
             return False, f"Cannot reach Ollama at {self.endpoint}: {e}"
         names = {m.get("name", "") for m in data.get("models", []) or []}
