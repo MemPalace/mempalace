@@ -26,6 +26,20 @@ def _metadata_matches_extract_mode(meta: dict, extract_mode: Optional[str]) -> b
     return extract_mode == "exchange" and meta.get("ingest_mode") in (None, "convos")
 
 
+def _meta_is_current(meta: dict, extract_mode: Optional[str]) -> bool:
+    """True when a drawer was filed by the current pipeline for its scope.
+
+    Pre-v2 drawers have no ``normalize_version`` and count as stale. In the
+    exchange scope a missing ``convo_chunker_version`` is stale too, so a
+    chunker fix re-mines conversation files without touching project files.
+    """
+    if meta.get("normalize_version", 1) < NORMALIZE_VERSION:
+        return False
+    if extract_mode == "exchange":
+        return meta.get("convo_chunker_version", 1) >= CONVO_CHUNKER_VERSION
+    return True
+
+
 def file_already_mined(
     collection,
     source_file: str,
@@ -37,7 +51,9 @@ def file_already_mined(
     Returns False (so the file gets re-mined) when:
       - no drawers exist for this source_file
       - the stored `normalize_version` is missing or older than the current
-        schema (triggers silent rebuild after a normalization upgrade)
+        schema (triggers silent rebuild after a normalization upgrade), or,
+        for extract_mode="exchange", the stored `convo_chunker_version` is
+        missing or older than CONVO_CHUNKER_VERSION
       - `check_mtime=True` and the file's mtime differs from the stored one
 
     When check_mtime=True (used by the project miner, and by the convo
@@ -98,9 +114,7 @@ def file_already_mined(
                     meta, extract_mode
                 ):
                     continue
-                # Pre-v2 drawers have no version field — treat them as stale.
-                stored_version = meta.get("normalize_version", 1)
-                if stored_version < NORMALIZE_VERSION:
+                if not _meta_is_current(meta, extract_mode):
                     continue
                 if not check_mtime:
                     return True
@@ -126,8 +140,13 @@ def file_already_mined(
         return False
 
 
+# Above this many candidate files, one filtered get costs more round trips
+# than a full paginated scan, so the scoped path below stops paying off.
+_PREFETCH_SCOPE_THRESHOLD = 50
+
+
 def prefetch_mined_set(
-    collection, extract_mode: Optional[str] = None
+    collection, extract_mode: Optional[str] = None, source_files: Optional[list] = None
 ) -> dict[str, Optional[float]]:
     """Pre-fetch source_file -> stored source_mtime for files already mined
     at the current NORMALIZE_VERSION, in one bulk pass instead of one
@@ -160,41 +179,76 @@ def prefetch_mined_set(
     `collection.get(where={"source_file": X})` costs ~2s on a 150k-drawer
     palace, making a 2000-file sweep take >1h of pure skip-checking. This
     helper drops that to a single paginated scan plus O(1) lookups.
+
+    When `source_files` is given and holds at most `_PREFETCH_SCOPE_THRESHOLD`
+    paths, the caller already knows the only source_file values that could
+    possibly match, so a paged `where={"source_file": {"$in": ...}}` get()
+    replaces the full-collection scan. On a one-file mine of a 660k-drawer
+    palace that mtime scan was about 42% of the mine; the content-hash scan
+    was the rest, and it stays unscoped because a stored hash can be several
+    comma-joined values. Above the threshold, or when source_files is
+    omitted, the behaviour is unchanged: a bulk sweep still benefits more
+    from one full scan than from many filtered queries.
     """
     # Per source_file: per stored_mtime group → count + optional chunk_total.
     # A source is only "mined" once some group is complete.
     groups: dict[str, dict] = {}
-    try:
+
+    def _absorb(meta):
+        meta = meta or {}
+        src = meta.get("source_file")
+        if not src:
+            return
+        if not _metadata_matches_extract_mode(meta, extract_mode):
+            return
+        if not _meta_is_current(meta, extract_mode):
+            return
+        stored_mtime = meta.get("source_mtime")
+        mtime_key = float(stored_mtime) if stored_mtime is not None else None
+        entry = groups.setdefault(src, {}).setdefault(mtime_key, {"count": 0, "chunk_total": None})
+        entry["count"] += 1
+        chunk_total = meta.get("chunk_total")
+        if chunk_total is not None:
+            try:
+                entry["chunk_total"] = int(chunk_total)
+            except (TypeError, ValueError):
+                pass
+
+    def _scan_all():
         total = collection.count()
         offset = 0
         while offset < total:
             batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
             for meta in batch["metadatas"]:
-                meta = meta or {}
-                src = meta.get("source_file")
-                if not src:
-                    continue
-                if not _metadata_matches_extract_mode(meta, extract_mode):
-                    continue
-                # Same default as file_already_mined: missing version == 1
-                version = meta.get("normalize_version", 1)
-                if version < NORMALIZE_VERSION:
-                    continue
-                stored_mtime = meta.get("source_mtime")
-                mtime_key = float(stored_mtime) if stored_mtime is not None else None
-                entry = groups.setdefault(src, {}).setdefault(
-                    mtime_key, {"count": 0, "chunk_total": None}
-                )
-                entry["count"] += 1
-                chunk_total = meta.get("chunk_total")
-                if chunk_total is not None:
-                    try:
-                        entry["chunk_total"] = int(chunk_total)
-                    except (TypeError, ValueError):
-                        pass
+                _absorb(meta)
             if not batch["ids"]:
                 break
             offset += len(batch["ids"])
+
+    try:
+        if source_files is not None and len(source_files) <= _PREFETCH_SCOPE_THRESHOLD:
+            if source_files:
+                try:
+                    offset = 0
+                    while True:
+                        scoped = collection.get(
+                            where={"source_file": {"$in": list(source_files)}},
+                            include=["metadatas"],
+                            limit=1000,
+                            offset=offset,
+                        )
+                        ids = scoped.get("ids") or []
+                        for meta in scoped.get("metadatas") or []:
+                            _absorb(meta)
+                        if len(ids) < 1000:
+                            break
+                        offset += len(ids)
+                except Exception:
+                    logger.warning("prefetch_mined_set: scoped fetch failed; scanning")
+                    groups.clear()
+                    _scan_all()
+        else:
+            _scan_all()
     except Exception:
         logger.warning("prefetch_mined_set: partial fetch, %d source groups loaded", len(groups))
 
@@ -239,6 +293,21 @@ def prefetch_content_hashes(
     the ones that didn't. Only the first source_file seen for a given
     (wing, hash) pair is kept — good enough to detect and skip a repeat,
     the point is not to track every alias.
+
+    Deliberately NOT scoped by candidate source_files the way
+    prefetch_mined_set is: a stored `content_hash` can hold several
+    comma-joined hashes (one privacy-export bundle drawer covers several
+    conversations), so a `where`-filtered query can only match a document
+    whose entire stored value equals one candidate hash and would silently
+    miss any bundle row. An incomplete result here is worse than none,
+    because a caller reading the returned dict has no way to tell "no
+    duplicate" from "the query couldn't see this row". Narrowing this scan
+    correctly needs either a schema change (one hash per metadata field
+    instead of a joined list) or a second index; out of scope for the fix
+    that scoped prefetch_mined_set. See test_mine_convos_skips_same_content_
+    under_new_filename and test_mine_convos_skips_same_conversation_within_
+    re_exported_bundle, which a source_files-scoped or skipped version of
+    this function broke.
     """
     hashes: dict[tuple[str, str], str] = {}
     try:
@@ -255,8 +324,7 @@ def prefetch_content_hashes(
                     continue
                 if not _metadata_matches_extract_mode(meta, extract_mode):
                     continue
-                version = meta.get("normalize_version", 1)
-                if version < NORMALIZE_VERSION:
+                if not _meta_is_current(meta, extract_mode):
                     continue
                 for content_hash in content_hash_field.split(","):
                     key = (wing, content_hash)

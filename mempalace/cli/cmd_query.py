@@ -96,10 +96,58 @@ def cmd_hallways(args):
         if getattr(args, "palace", None)
         else MempalaceConfig().palace_path
     )
-    rows = list_hallways(
-        getattr(args, "wing", None),
-        config=MempalaceConfig(palace_path=palace_path),
-    )
+    config = MempalaceConfig(palace_path=palace_path)
+    if getattr(args, "rebuild", False):
+        from ..hallways import compute_hallways_for_wing
+        from ..palace import get_collection
+        from ..palace_graph import sqlite_grouped_counts_reader
+
+        col = get_collection(palace_path, create=False, read_only=True)
+        wing_filter = getattr(args, "wing", None)
+        if wing_filter:
+            wings = [wing_filter]
+        else:
+            reader = sqlite_grouped_counts_reader(config)
+            rows = reader(palace_path, config.collection_name) if reader else None
+            if rows is None:
+                print("  --rebuild without --wing needs a sqlite-readable palace.")
+                sys.exit(1)
+            wings = sorted({str(r[1]) for r in rows if r[1]})
+        # Scan and replace under the palace writer lock, like the other repair
+        # commands: the hallway-file lock alone lets a mine add drawers and
+        # save a newer snapshot between this scan and its save, which would
+        # then be overwritten with stale results.
+        total = 0
+        with _repair_lock(palace_path):
+            for w in wings:
+                created = compute_hallways_for_wing(w, col=col, config=config)
+                total += len(created)
+                print(f"  {w:<36} {len(created):>7} hallways")
+        print(f"  Rebuilt {total} hallways across {len(wings)} wing(s).")
+        return
+    if getattr(args, "prune_spellings", False):
+        from ..hallways import prune_spelling_hallways
+
+        apply = getattr(args, "yes", False)
+        report = prune_spelling_hallways(config=config, apply=apply)
+        doomed = report["self_links"] + report["duplicates"]
+        print(
+            f"  {doomed} of {report['total']} hallways are spelling artifacts: "
+            f"{report['self_links']} self-links, {report['duplicates']} duplicate spellings."
+        )
+        for wing, n in list(report["by_wing"].items())[:8]:
+            print(f"    {wing}: {n}")
+        for label in report["sample"][:5]:
+            print(f"    e.g. {label}")
+        if not doomed:
+            return
+        if apply:
+            print(f"  Removed {report['removed']}.")
+        else:
+            print("  Dry run. Re-run with --yes to remove them.")
+        return
+
+    rows = list_hallways(getattr(args, "wing", None), config=config)
     if not rows:
         print("No hallways yet -- they are built from drawer entities when you mine.")
         return

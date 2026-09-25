@@ -19,7 +19,12 @@ from mempalace.miner import (
     scan_project,
     status,
 )
-from mempalace.palace import NORMALIZE_VERSION, file_already_mined, prefetch_mined_set
+from mempalace.palace import (
+    CONVO_CHUNKER_VERSION,
+    NORMALIZE_VERSION,
+    file_already_mined,
+    prefetch_mined_set,
+)
 
 
 def write_file(path: Path, content: str):
@@ -892,6 +897,7 @@ def test_file_already_mined_scopes_convo_extract_mode():
                     "source_file": source_file,
                     "extract_mode": "exchange",
                     "normalize_version": NORMALIZE_VERSION,
+                    "convo_chunker_version": CONVO_CHUNKER_VERSION,
                 }
             ],
         )
@@ -915,6 +921,42 @@ def test_file_already_mined_scopes_convo_extract_mode():
 
         assert file_already_mined(col, source_file, extract_mode="general") is True
         assert source_file in prefetch_mined_set(col, extract_mode="general")
+    finally:
+        del col, client
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_convo_chunker_version_only_gates_the_exchange_scope():
+    """An older chunker revision makes exchange rows stale, while project
+    rows (no extract_mode) never carry the field and stay current."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        os.makedirs(palace_path)
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+        chat = os.path.join(tmpdir, "chat.jsonl")
+        project = os.path.join(tmpdir, "notes.md")
+        col.add(
+            ids=["old_exchange", "project"],
+            documents=["exchange drawer", "project drawer"],
+            metadatas=[
+                {
+                    "source_file": chat,
+                    "extract_mode": "exchange",
+                    "normalize_version": NORMALIZE_VERSION,
+                    "convo_chunker_version": CONVO_CHUNKER_VERSION - 1,
+                },
+                {"source_file": project, "normalize_version": NORMALIZE_VERSION},
+            ],
+        )
+
+        assert file_already_mined(col, chat, extract_mode="exchange") is False
+        assert chat not in prefetch_mined_set(col, extract_mode="exchange")
+        assert file_already_mined(col, project) is True
+        assert project in prefetch_mined_set(col)
     finally:
         del col, client
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -2991,3 +3033,153 @@ def test_mine_limit_summary_counts(tmp_path, capsys):
     assert "Files processed: 2" in out
     assert "Drawers filed: 6" in out
     assert "(limit: 2 new)" in out
+
+
+def test_process_file_records_the_directory_it_mined_from(tmp_path, monkeypatch):
+    """Every drawer carries the inode of the directory its source was read
+    from, which is the directory ``sync`` asks about later. Without it, sync
+    cannot tell a witness in that directory from a witness on a volume
+    mounted there since (#2320)."""
+    from mempalace import miner
+    from mempalace import source_identity as si
+
+    class FakeCol:
+        def __init__(self):
+            self.metadatas: list = []
+
+        def get(self, *args, **kwargs):
+            return {"ids": []}
+
+        def delete(self, *args, **kwargs):
+            pass
+
+        def upsert(self, documents, ids, metadatas):
+            self.metadatas.extend(metadatas)
+
+    project = tmp_path / "proj"
+    (project / "sub").mkdir(parents=True)
+    source = project / "sub" / "src.py"
+    source.write_text("print('hello')\n" * 20, encoding="utf-8")
+    chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3)]
+    col = FakeCol()
+    monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: chunks)
+    monkeypatch.setattr(miner, "detect_hall", lambda content: "code")
+    monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda content: "")
+
+    miner.process_file(
+        source,
+        project,
+        col,
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+    )
+
+    recorded = si.directory_identity(source.parent)
+    assert recorded is not None
+    # The directory the file lives in, not the root of the mine: that is the
+    # directory sync stats when it forms the verdict.
+    assert recorded != si.directory_identity(project)
+    assert col.metadatas, "nothing was filed"
+    assert all(m["source_dir_ino"] == recorded for m in col.metadatas), col.metadatas
+    # Nothing was written into the tree the README promises stays untouched.
+    assert sorted(p.name for p in project.iterdir()) == ["sub"]
+    assert sorted(p.name for p in source.parent.iterdir()) == ["src.py"]
+
+
+def test_recording_the_directory_writes_nothing_into_the_project(tmp_path):
+    """Taking the identity is a ``stat``, so neither pass leaves a mark.
+
+    ``README.md`` promises mining never writes to the source tree, and both of
+    its container recipes mount the source read-only, so a marker file would
+    have made this unusable there. A dry run and a real one are both checked,
+    and the real one has to come back with the identity actually recorded, or
+    this would pass against a tree where nothing takes it.
+    """
+    from mempalace import miner
+    from mempalace import source_identity as si
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = project / "src.py"
+    source.write_text("print('hello')\n" * 20, encoding="utf-8")
+    before = sorted(p.name for p in project.iterdir())
+
+    class FakeCol:
+        def __init__(self):
+            self.metadatas: list = []
+
+        def get(self, *args, **kwargs):
+            return {"ids": []}
+
+        def delete(self, *args, **kwargs):
+            pass
+
+        def upsert(self, ids=None, documents=None, metadatas=None, **kwargs):
+            self.metadatas.extend(metadatas or [])
+
+    def run(dry_run):
+        col = FakeCol()
+        miner.process_file(
+            source,
+            project,
+            col,
+            "wing",
+            [{"name": "general", "description": "General"}],
+            "agent",
+            dry_run,
+        )
+        assert sorted(p.name for p in project.iterdir()) == before, "the mine wrote into the source"
+        return col
+
+    assert not run(dry_run=True).metadatas, "a dry run filed a drawer"
+
+    expected = si.directory_identity(project)
+    assert expected is not None, "the filesystem reports no inode to record"
+    filed = run(dry_run=False).metadatas
+    assert filed, "the real pass filed nothing, so it proves nothing about the stamp"
+    assert all(m.get("source_dir_ino") == expected for m in filed), filed
+
+
+def test_a_directory_that_cannot_be_statted_still_mines(tmp_path, monkeypatch):
+    """A directory that answers no inode records no identity and files its
+    drawers anyway; those are then decided by corroboration alone, as before."""
+    from mempalace import miner
+
+    class FakeCol:
+        def __init__(self):
+            self.metadatas: list = []
+
+        def get(self, *args, **kwargs):
+            return {"ids": []}
+
+        def delete(self, *args, **kwargs):
+            pass
+
+        def upsert(self, documents, ids, metadatas):
+            self.metadatas.extend(metadatas)
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = project / "src.py"
+    source.write_text("print('hello')\n" * 20, encoding="utf-8")
+    chunks = [{"content": "chunk " * 40, "chunk_index": 0}]
+    col = FakeCol()
+    monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: chunks)
+    monkeypatch.setattr(miner, "detect_hall", lambda content: "code")
+    monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda content: "")
+    monkeypatch.setattr(miner, "source_directory_identity", lambda *a, **k: None)
+
+    miner.process_file(
+        source,
+        project,
+        col,
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+    )
+
+    assert col.metadatas, "a directory with no identity stopped the mine"
+    assert all("source_dir_ino" not in m for m in col.metadatas), col.metadatas

@@ -204,7 +204,8 @@ def _enrich_search_results(res: Dict[str, Any]) -> Dict[str, Any]:
     top_room = top_item.get("room")
     if top_wing and top_room:
         try:
-            tunnel_res = mcp_server.tool_follow_tunnels(top_wing, top_room)
+            # Decoration of a search hit, not an agent crossing the tunnel.
+            tunnel_res = mcp_server.tool_follow_tunnels(top_wing, top_room, record=False)
             if isinstance(tunnel_res, dict) and tunnel_res.get("error"):
                 connections = []
             elif isinstance(tunnel_res, list):
@@ -1015,17 +1016,11 @@ def main():
     parser.add_argument("--read-only", action="store_true", help="Run in read-only mode")
     args = parser.parse_args()
 
-    if args.palace:
-        mcp_server._config.palace_path = args.palace
-        os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(args.palace)
+    mcp_server._apply_server_flags(
+        palace=args.palace, backend=args.backend, read_only=args.read_only
+    )
     if args.collection:
         mcp_server._config.collection_name = args.collection
-    if args.backend:
-        backend_name = str(args.backend).strip().lower()
-        os.environ["MEMPALACE_BACKEND_EXPLICIT"] = backend_name
-        os.environ["MEMPALACE_BACKEND"] = backend_name
-    if args.read_only:
-        mcp_server._READ_ONLY = True
 
     # Run stdio protocol loop with lightweight dispatcher
     _restore_stdout()
@@ -1056,7 +1051,11 @@ def main():
             continue
         try:
             req = json.loads(line)
-        except json.JSONDecodeError:
+        except Exception as exc:
+            # A line json.loads rejects is skipped, as invalid JSON always was. An
+            # integer past the digit limit or nesting too deep to parse raises
+            # something else, and used to end the server.
+            logger.error("Skipped a line json.loads rejected: %s: %s", type(exc).__name__, exc)
             continue
         try:
             resp = dispatch_light_stdio_request(req)

@@ -14,12 +14,16 @@ from mempalace.convo_miner import (
     _resolve_wing,
     mine_convos,
 )
+from mempalace import palace
 from mempalace.palace import (
+    CONVO_CHUNKER_VERSION,
     NORMALIZE_VERSION,
     MineAlreadyRunning,
     file_already_mined,
     prefetch_mined_set,
 )
+
+_PREFETCH_SCOPE_THRESHOLD = palace._PREFETCH_SCOPE_THRESHOLD
 
 
 def test_convo_mining():
@@ -44,7 +48,7 @@ def test_convo_mining():
 
 
 def test_mine_convos_does_not_reprocess_short_files(capsys):
-    """Files below MIN_CHUNK_SIZE get a sentinel so they are skipped on re-run."""
+    """A file shorter than MIN_CHUNK_SIZE is filed, not dropped, and skipped on re-run."""
     tmpdir = tempfile.mkdtemp()
     try:
         # A file too short to produce any chunks
@@ -62,6 +66,8 @@ def test_mine_convos_does_not_reprocess_short_files(capsys):
         client = chromadb.PersistentClient(path=palace_path)
         col = client.get_collection("mempalace_drawers")
         assert file_already_mined(col, resolved_file)
+        stored = col.get(where={"source_file": resolved_file}, include=["documents"])
+        assert "hi" in stored["documents"]
 
         # Second run -- file should be skipped
         mine_convos(tmpdir, palace_path, wing="test")
@@ -201,6 +207,58 @@ def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
         for meta in rebuilt["metadatas"]:
             assert meta.get("normalize_version") == NORMALIZE_VERSION
         del col, client
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_mine_convos_rebuilds_drawers_from_older_chunker(capsys):
+    """Exchange drawers from an older chunker revision are rebuilt on the next
+    mine, which recovers text the old chunker discarded (here: everything
+    after a ``---`` rule inside a response)."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        convo_path = Path(tmpdir) / "chat.txt"
+        convo_path.write_text(
+            "> How do we release?\nFreeze the branch.\n\n---\n\n"
+            "AFTER_RULE_MARKER tag and publish.\n\n"
+            "> Rollback?\nYank the release and repoint latest.\n\n"
+            "> Changelog?\nCurate it by theme.\n"
+        )
+        palace_path = os.path.join(tmpdir, "palace")
+        mine_convos(tmpdir, palace_path, wing="test")
+        capsys.readouterr()
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        resolved = str(convo_path.resolve())
+        first_pass = col.get(where={"source_file": resolved})
+        for meta in first_pass["metadatas"]:
+            assert meta["convo_chunker_version"] == CONVO_CHUNKER_VERSION
+
+        # Simulate drawers written by the v1 chunker, which lost the marker.
+        col.update(
+            ids=list(first_pass["ids"]),
+            documents=["V1 CHUNK"] * len(first_pass["ids"]),
+            metadatas=[{**m, "convo_chunker_version": 1} for m in first_pass["metadatas"]],
+        )
+        del col, client
+
+        mine_convos(tmpdir, palace_path, wing="test")
+        out = capsys.readouterr().out
+        assert "Files skipped (already filed): 0" in out
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        rebuilt = col.get(where={"source_file": resolved})
+        assert all("V1 CHUNK" not in d for d in rebuilt["documents"])
+        assert any("AFTER_RULE_MARKER" in d for d in rebuilt["documents"])
+        for meta in rebuilt["metadatas"]:
+            assert meta["convo_chunker_version"] == CONVO_CHUNKER_VERSION
+        del col, client
+
+        # Current drawers are skipped again (only mined files are listed).
+        mine_convos(tmpdir, palace_path, wing="test")
+        assert "chat.txt" not in capsys.readouterr().out
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -762,6 +820,7 @@ def test_prefetch_mined_set_none_for_drawer_without_stored_mtime():
                     "chunk_index": 0,
                     "extract_mode": "exchange",
                     "normalize_version": 999,  # force >= current version
+                    "convo_chunker_version": 999,
                 }
             ],
         )
@@ -793,6 +852,7 @@ def test_prefetch_mined_set_omits_incomplete_chunk_total_group():
                     "chunk_index": 0,
                     "extract_mode": "exchange",
                     "normalize_version": NORMALIZE_VERSION,
+                    "convo_chunker_version": CONVO_CHUNKER_VERSION,
                     "source_mtime": mtime,
                     "chunk_total": 3,
                 },
@@ -803,6 +863,7 @@ def test_prefetch_mined_set_omits_incomplete_chunk_total_group():
                     "chunk_index": 1,
                     "extract_mode": "exchange",
                     "normalize_version": NORMALIZE_VERSION,
+                    "convo_chunker_version": CONVO_CHUNKER_VERSION,
                     "source_mtime": mtime,
                     "chunk_total": 3,
                 },
@@ -825,6 +886,7 @@ def test_prefetch_mined_set_omits_incomplete_chunk_total_group():
                     "chunk_index": 2,
                     "extract_mode": "exchange",
                     "normalize_version": NORMALIZE_VERSION,
+                    "convo_chunker_version": CONVO_CHUNKER_VERSION,
                     "source_mtime": mtime,
                     "chunk_total": 3,
                 }
@@ -907,6 +969,146 @@ def test_register_file_sentinel_includes_source_mtime():
 
 
 # ---------------------------------------------------------------------------
+# prefetch_mined_set, source_files scoping
+# ---------------------------------------------------------------------------
+
+
+def _seed_two_source_drawer(col, source, mtime):
+    meta = {
+        "wing": "test",
+        "room": "general",
+        "source_file": source,
+        "chunk_index": 0,
+        "extract_mode": "exchange",
+        "normalize_version": NORMALIZE_VERSION,
+        "convo_chunker_version": CONVO_CHUNKER_VERSION,
+        "source_mtime": mtime,
+    }
+    col.upsert(
+        ids=[f"drawer_{abs(hash(source))}"],
+        documents=[f"content for {source}"],
+        metadatas=[meta],
+    )
+
+
+def test_prefetch_mined_set_scoped_matches_unscoped_for_a_named_file():
+    """Below the threshold, passing source_files must return the exact same
+    entry a full unscoped scan would for a file the caller actually names.
+    The scoped where-query must not silently drop or alter what it does see."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+        _seed_two_source_drawer(col, "/fake/a.txt", 1_700_000_000.0)
+        _seed_two_source_drawer(col, "/fake/b.txt", 1_700_000_100.0)
+
+        unscoped = prefetch_mined_set(col, extract_mode="exchange")
+        scoped = prefetch_mined_set(col, extract_mode="exchange", source_files=["/fake/a.txt"])
+
+        assert scoped == {"/fake/a.txt": unscoped["/fake/a.txt"]}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_prefetch_mined_set_scoped_omits_files_outside_source_files():
+    """The scoped where-query must actually narrow the result, not just
+    accept the parameter and still scan everything."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+        _seed_two_source_drawer(col, "/fake/only.txt", 1_700_000_000.0)
+        _seed_two_source_drawer(col, "/fake/other.txt", 1_700_000_100.0)
+
+        scoped = prefetch_mined_set(col, extract_mode="exchange", source_files=["/fake/only.txt"])
+
+        assert "/fake/only.txt" in scoped
+        assert "/fake/other.txt" not in scoped
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_prefetch_mined_set_falls_back_to_full_scan_above_threshold():
+    """A source_files list longer than the scoping threshold must still
+    find a drawer whose path is not even in that list. The fallback to a
+    full unscoped scan must actually run, not just skip the scoped path."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+        _seed_two_source_drawer(col, "/fake/not_in_list.txt", 1_700_000_000.0)
+
+        oversized_list = [f"/fake/other_{i}.txt" for i in range(_PREFETCH_SCOPE_THRESHOLD + 1)]
+        mined = prefetch_mined_set(col, extract_mode="exchange", source_files=oversized_list)
+
+        assert "/fake/not_in_list.txt" in mined
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_prefetch_mined_set_scoped_with_no_candidates_returns_empty_without_error():
+    """An empty source_files list (e.g. a dry run over zero new files) must
+    short-circuit to an empty dict rather than issue a where={"$in": []}
+    query or fall through to a full scan."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+        _seed_two_source_drawer(col, "/fake/a.txt", 1_700_000_000.0)
+
+        mined = prefetch_mined_set(col, extract_mode="exchange", source_files=[])
+        assert mined == {}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_mine_convos_scopes_mined_set_prefetch_to_candidate_files(monkeypatch):
+    """The convo miner must actually pass the candidate file list through to
+    prefetch_mined_set, not just leave the new parameter unused. It must
+    NOT pass source_files to prefetch_content_hashes (the cross-path
+    dedup test coverage), which stays a full unconditional scan."""
+    import mempalace.convo_miner as convo_miner_module
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        convo_path = Path(tmpdir) / "session.txt"
+        convo_path.write_text(
+            "> What is the plan?\nStart with the schema, then the API.\n\n"
+            "> Any risks?\nMigration ordering is the main one.\n"
+        )
+        palace_path = os.path.join(tmpdir, "palace")
+
+        seen = {}
+        real_prefetch_mined_set = convo_miner_module.prefetch_mined_set
+        real_prefetch_content_hashes = convo_miner_module.prefetch_content_hashes
+
+        def _spy_mined_set(collection, extract_mode=None, source_files=None):
+            seen["mined_set_source_files"] = source_files
+            return real_prefetch_mined_set(
+                collection, extract_mode=extract_mode, source_files=source_files
+            )
+
+        def _spy_content_hashes(collection, extract_mode=None):
+            seen["content_hashes_called"] = True
+            return real_prefetch_content_hashes(collection, extract_mode=extract_mode)
+
+        monkeypatch.setattr(convo_miner_module, "prefetch_mined_set", _spy_mined_set)
+        monkeypatch.setattr(convo_miner_module, "prefetch_content_hashes", _spy_content_hashes)
+
+        mine_convos(tmpdir, palace_path, wing="test")
+
+        resolved = str(convo_path.resolve())
+        assert seen["mined_set_source_files"] == [resolved]
+        assert seen["content_hashes_called"] is True
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # file_conversation_exchange — canonical single-exchange write path
 # ---------------------------------------------------------------------------
 
@@ -952,6 +1154,17 @@ def test_file_conversation_exchange_extra_metadata_cannot_clobber_canonical():
     assert meta["filed_at"] != "1970-01-01"
     # Non-colliding extras still land.
     assert meta["source"] == "hermes"
+
+
+def test_file_conversation_exchange_stamps_current_chunker_version():
+    """A live exchange must read as current to the mined-set check, or a
+    later mine of the same source would purge it as stale."""
+    from mempalace.convo_miner import file_conversation_exchange
+
+    col = _RecordingCollection()
+    file_conversation_exchange(col, **_exchange_kwargs())
+    meta = col.upserts[0]["metadatas"][0]
+    assert meta["convo_chunker_version"] == CONVO_CHUNKER_VERSION
 
 
 def test_file_conversation_exchange_invalid_wing_falls_back_to_wing_general():

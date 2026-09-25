@@ -379,6 +379,53 @@ def sqlite_wing_room_counts(
         return None
 
 
+def sqlite_wing_source_counts(palace_path: str, collection_name: str) -> Optional[list[tuple]]:
+    """Grouped ``(wing, source_file, n)`` for transcript-mined drawers, or ``None``.
+
+    Scoped to ``collection_name``: drawers and closets share the
+    ``documents`` table, and counting both would double every project.
+    Only rows whose ``source_file`` sits under a Claude Code projects
+    directory or a Codex sessions directory are returned; that is what
+    ``mempalace audit`` needs to see whether one wing mixes several
+    projects, and what ``wings split`` plans over.
+    """
+    db_path = os.path.join(palace_path, _DB_FILENAME)
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        db_uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True)
+        try:
+            conn.execute("PRAGMA busy_timeout=2000")
+            row = conn.execute(
+                "SELECT id FROM collections WHERE name = ?", (collection_name,)
+            ).fetchone()
+            if row is None:
+                return None
+            wing_expr = (
+                "wing"
+                if _documents_has_locus_columns(conn)
+                else "json_extract(metadata_json, '$.wing')"
+            )
+            return list(
+                conn.execute(
+                    f"""
+                    SELECT {wing_expr}, json_extract(metadata_json, '$.source_file'), COUNT(*)
+                    FROM documents
+                    WHERE collection_id = ?
+                      AND (json_extract(metadata_json, '$.source_file') LIKE '%.claude%projects%'
+                           OR json_extract(metadata_json, '$.source_file') LIKE '%.codex%sessions%')
+                    GROUP BY 1, 2
+                    """,
+                    (int(row[0]),),
+                )
+            )
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
 def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Optional[list[tuple]]:
     """Grouped ``(room, wing, hall, n, last_date)`` rows, or ``None``.
 
@@ -749,6 +796,29 @@ class SQLiteExactCollection(BaseCollection):
                 raise ValueError(f"{label} length {len(value)} does not match ids length {n}")
         with self._cursor(write=True) as cur:
             collection_id = self._collection_id(cur)
+            if documents is None and embeddings is None:
+                # Metadata-only update (a wing or room move): merge the JSON
+                # and leave the document, its embedding and its FTS row alone.
+                # Rewriting the FTS row per drawer made a 240k-row wing split
+                # run at ~1k rows/min; this path is one UPDATE per row.
+                now = _utcnow()
+                params = []
+                for idx, doc_id in enumerate(ids):
+                    row = cur.execute(
+                        "SELECT metadata_json FROM documents WHERE collection_id = ? AND id = ?",
+                        (collection_id, doc_id),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    meta = _json_loads(row[0])
+                    meta.update(metadatas[idx] or {})
+                    params.append((_json_dumps(meta), now, collection_id, doc_id))
+                cur.executemany(
+                    "UPDATE documents SET metadata_json = ?, updated_at = ? "
+                    "WHERE collection_id = ? AND id = ?",
+                    params,
+                )
+                return
             updates = []
             for idx, doc_id in enumerate(ids):
                 row = cur.execute(
@@ -784,7 +854,8 @@ class SQLiteExactCollection(BaseCollection):
                     """,
                     (doc, _json_dumps(meta), emb_blob, dim, _utcnow(), collection_id, doc_id),
                 )
-                self._replace_fts(cur, collection_id, doc_id, doc)
+                if documents is not None:
+                    self._replace_fts(cur, collection_id, doc_id, doc)
 
     def _rows(
         self,

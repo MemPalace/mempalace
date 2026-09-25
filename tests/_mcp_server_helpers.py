@@ -1,8 +1,33 @@
-"""Shared helpers for tests/mcp/ (split from test_mcp_server.py)."""
+"""Shared helpers for the MCP server tests (split from test_mcp_server.py)."""
 
+import json
 import os
+import sys
 
 import pytest
+
+
+# Lines json.loads rejects with something other than JSONDecodeError.
+_UNLOADABLE_JSON_KINDS = ["nesting-too-deep-to-parse", "number-past-the-digit-limit"]
+
+
+def _unloadable_json_line(kind):
+    """A stdio line json.loads rejects with RecursionError or ValueError."""
+    if kind == "nesting-too-deep-to-parse":
+        line = "[" * 100000
+        rejected_with = RecursionError
+    else:
+        limit = getattr(sys, "get_int_max_str_digits", lambda: 0)()
+        if not limit:
+            pytest.skip("this interpreter has no integer digit limit")
+        line = '{"jsonrpc":"2.0","id":1,"method":"ping","x":' + "1" * (limit + 1) + "}"
+        rejected_with = ValueError
+    with pytest.raises(rejected_with) as rejected:
+        json.loads(line)
+    # JSONDecodeError is a ValueError too: a line that turned into plain invalid
+    # JSON would test nothing the narrow catch missed.
+    assert not isinstance(rejected.value, json.JSONDecodeError), rejected.value
+    return line
 
 
 def _patch_mcp_server(monkeypatch, config, kg):
@@ -18,6 +43,32 @@ def _patch_mcp_server(monkeypatch, config, kg):
     from mempalace.palace_graph import invalidate_graph_cache
 
     invalidate_graph_cache()
+
+
+def _keep_server_command_line_state(monkeypatch):
+    """Undo, after the test, whatever the server's command-line flags set.
+
+    Running an entry point applies its flags to process-wide state on purpose,
+    and a test that runs one must not leave them behind for the rest of the
+    session. The flags' environment variables start the test unset.
+    """
+    from mempalace import mcp_server
+
+    for name in (
+        "_args",
+        "_READ_ONLY",
+        "_palace_flag_given",
+        "_STALE_LIBRARY_WATCHED_DISTS",
+        "_STARTUP_DIST_STATE",
+        "_STARTUP_DIST_VERSIONS",
+        "_STARTUP_DIST_ERRORS",
+    ):
+        monkeypatch.setattr(mcp_server, name, getattr(mcp_server, name))
+    for name in ("MEMPALACE_PALACE_PATH", "MEMPALACE_BACKEND", "MEMPALACE_BACKEND_EXPLICIT"):
+        # delenv() of an unset variable records nothing, so a value the entry
+        # point sets would outlive the test. Setting it first records "unset".
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
 
 
 def _unexpected_client_read(*_a, **_k):

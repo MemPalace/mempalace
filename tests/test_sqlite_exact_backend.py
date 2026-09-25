@@ -942,12 +942,12 @@ def test_search_closets_use_lexical_not_vector_on_sqlite_exact(tmp_path, monkeyp
     closets = get_closets_collection(str(tmp_path), create=True)
     drawers.add(
         ids=["d1"],
-        documents=["meshguard trust path"],
+        documents=["meshkit trust path"],
         metadatas=[{"source_file": "a.md", "wing": "w", "room": "r", "chunk_index": 0}],
     )
     closets.add(
         ids=["c1"],
-        documents=["topic|meshguard|→d1"],
+        documents=["topic|meshkit|→d1"],
         metadatas=[{"source_file": "a.md", "wing": "w"}],
     )
 
@@ -968,7 +968,7 @@ def test_search_closets_use_lexical_not_vector_on_sqlite_exact(tmp_path, monkeyp
     monkeypatch.setattr(SQLiteExactCollection, "query", wrapped_query)
     monkeypatch.setattr(SQLiteExactCollection, "lexical_search", wrapped_lex)
 
-    result = search_memories("meshguard", str(tmp_path), n_results=1)
+    result = search_memories("meshkit", str(tmp_path), n_results=1)
     assert "error" not in result
     assert called["lex"] == 1
     assert called["query"] == 0
@@ -1640,10 +1640,8 @@ def test_hybrid_search_keeps_closet_boost_under_writer_lease(tmp_path, monkeypat
     backend, drawers = _collection(tmp_path)
     closets = backend.get_collection(str(tmp_path), "mempalace_closets", create=True)
     meta = {"source_file": "fixture.md", "wing": "project", "room": "notes", "chunk_index": 0}
-    drawers.add(
-        ids=["a"], documents=["meshguard memory"], metadatas=[meta], embeddings=[[1.0, 0.0]]
-    )
-    closets.add(ids=["c"], documents=["meshguard index"], metadatas=[meta], embeddings=[[1.0, 0.0]])
+    drawers.add(ids=["a"], documents=["meshkit memory"], metadatas=[meta], embeddings=[[1.0, 0.0]])
+    closets.add(ids=["c"], documents=["meshkit index"], metadatas=[meta], embeddings=[[1.0, 0.0]])
     backend.close()
     monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", backend_name)
     monkeypatch.setattr(
@@ -1664,7 +1662,7 @@ with mine_palace_lock(sys.argv[1]):
     )
     try:
         assert holder.stdout.readline().strip() == "ready"
-        result = search_memories("meshguard", str(tmp_path), n_results=1)
+        result = search_memories("meshkit", str(tmp_path), n_results=1)
         assert "error" not in result
         assert result["results"][0]["matched_via"] == "drawer+closet"
         assert result["results"][0]["closet_boost"] > 0
@@ -1785,3 +1783,55 @@ def test_exact_query_retries_entire_batch_across_all_engines(
     finally:
         peer.close()
         backend.close()
+
+
+def test_sqlite_exact_metadata_only_update_keeps_document_embedding_and_fts(tmp_path):
+    """A wing/room move must not touch the document, its vector or its FTS row (#audit split)."""
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b"],
+        documents=["rareterm alpha note", "plain beta note"],
+        metadatas=[{"wing": "w", "room": "r", "keep": 1}, {"wing": "w", "room": "r"}],
+        embeddings=[[1, 0], [0, 1]],
+    )
+    col.update(
+        ids=["a", "missing"], metadatas=[{"wing": "target", "last_modified": "t"}, {"wing": "x"}]
+    )
+
+    got = col.get(ids=["a"], include=["documents", "metadatas", "embeddings"])
+    assert got["documents"] == ["rareterm alpha note"]
+    assert got["metadatas"][0] == {"wing": "target", "room": "r", "keep": 1, "last_modified": "t"}
+    assert list(got["embeddings"][0]) == [1.0, 0.0]
+    # The FTS row survived untouched and the new wing filter finds it.
+    hits = col.lexical_search(query="rareterm", n_results=5, where={"wing": "target"}).hits
+    assert [hit.id for hit in hits] == ["a"]
+    assert col.lexical_search(query="rareterm", n_results=5, where={"wing": "w"}).hits == []
+
+
+def test_sqlite_wing_source_counts_is_scoped_to_the_collection(tmp_path):
+    """Drawers and closets share one table; the audit must not count closets."""
+    from mempalace.backends.sqlite_exact import sqlite_wing_source_counts
+
+    backend, drawers = _collection(tmp_path, name="mempalace_drawers")
+    palace = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    closets = backend.get_collection(
+        palace=palace, collection_name="mempalace_closets", create=True
+    )
+    src = "/Users/me/.claude/projects/-Users-me-dev-thing/s.jsonl"
+    meta = {"wing": "convos", "room": "technical", "source_file": src}
+    drawers.add(
+        ids=["a", "b"], documents=["x", "y"], metadatas=[meta, meta], embeddings=[[1.0, 0.0]] * 2
+    )
+    drawers.add(
+        ids=["c"],
+        documents=["z"],
+        metadatas=[{"wing": "convos", "room": "technical", "source_file": "notes.md"}],
+        embeddings=[[1.0, 0.0]],
+    )
+    closets.add(ids=["k"], documents=["idx"], metadatas=[meta], embeddings=[[1.0, 0.0]])
+
+    rows = sqlite_wing_source_counts(str(tmp_path), "mempalace_drawers")
+    assert rows == [("convos", src, 2)]  # not 3: the closet is another collection
+    assert sqlite_wing_source_counts(str(tmp_path), "mempalace_closets") == [("convos", src, 1)]
+    assert sqlite_wing_source_counts(str(tmp_path), "nope") is None
+    assert sqlite_wing_source_counts(str(tmp_path / "missing"), "mempalace_drawers") is None

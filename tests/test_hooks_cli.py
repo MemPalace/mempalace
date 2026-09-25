@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 from hypothesis import given
@@ -445,6 +445,15 @@ def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None):
     type(mock_config).hook_silent_save = PropertyMock(return_value=True)
     type(mock_config).hook_desktop_toast = PropertyMock(return_value=False)
     patches.append(patch("mempalace.config.MempalaceConfig", return_value=mock_config))
+    # A Stop or PreCompact hook spawns the transcript ingest through
+    # ``_spawn_mine``, and a real child here outlives the test that started
+    # it: it holds the palace's writer lease, and the next test file to ask
+    # for one is refused with "Peer MCP writer active". Nothing in this file
+    # asserts on a real mine. A test that asserts on the spawn installs its
+    # own stand-in before calling this helper, so only put one here when the
+    # attribute is still the real ``Popen``.
+    if not isinstance(hooks_cli_mod.subprocess.Popen, Mock):
+        patches.append(patch("mempalace.hooks_cli.subprocess.Popen"))
     with contextlib.ExitStack() as stack:
         for p in patches:
             stack.enter_context(p)
@@ -2675,3 +2684,81 @@ def test_regular_file_at_palace_root_treated_as_absent(tmp_path, monkeypatch):
     # The stray file is left untouched; we never try to convert it.
     assert fake_root.is_file()
     assert fake_root.read_text() == "oops, this is a file not a directory"
+
+
+# --- _ingest_wing: hook-ingested transcripts file under the project wing ---
+
+
+def _write_transcript_with_cwd(tmp_path, cwd, name="s.jsonl"):
+    path = tmp_path / ".claude" / "projects" / "-Users-me-dev-thing" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        json.dumps({"type": "queue-operation"}),
+        json.dumps({"type": "user", "cwd": cwd, "message": {"content": "hi"}}),
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def test_ingest_wing_uses_the_project_from_cwd(tmp_path):
+    from mempalace.hooks_cli import _ingest_wing
+
+    path = _write_transcript_with_cwd(tmp_path, "/Users/me/dev/mempalace")
+    assert _ingest_wing(path) == "mempalace"
+
+
+def test_ingest_wing_collapses_worktrees_and_hyphens(tmp_path):
+    from mempalace.hooks_cli import _ingest_wing
+
+    path = _write_transcript_with_cwd(tmp_path, "/Users/me/dev/acme-app/.claude/worktrees/x")
+    assert _ingest_wing(path) == "acme_app"
+
+
+def test_ingest_wing_home_directory_sessions_go_to_the_workstation(tmp_path, monkeypatch):
+    from mempalace import hooks_cli
+
+    monkeypatch.setattr(hooks_cli.Path, "home", classmethod(lambda cls: Path("/Users/me")))
+    path = _write_transcript_with_cwd(tmp_path, "/Users/me/")
+    monkeypatch.setattr(hooks_cli.sys, "platform", "darwin")
+    assert hooks_cli._ingest_wing(path) == "mac_workstation"
+    monkeypatch.setattr(hooks_cli.sys, "platform", "win32")
+    assert hooks_cli._ingest_wing(path) == "windows_workstation"
+    monkeypatch.setattr(hooks_cli.sys, "platform", "linux")
+    assert hooks_cli._ingest_wing(path) == "linux_workstation"
+
+
+def test_ingest_wing_falls_back_to_the_encoded_folder_then_sessions(tmp_path):
+    from mempalace.hooks_cli import _ingest_wing
+
+    path = tmp_path / ".claude" / "projects" / "-Users-me-dev-thing" / "no-cwd.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"type": "queue-operation"}) + "\n", encoding="utf-8")
+    assert _ingest_wing(str(path)) == "thing"
+    assert _ingest_wing("/some/random/path.jsonl") == "sessions"
+
+
+def test_ingest_transcript_passes_the_project_wing_to_mine(tmp_path, monkeypatch):
+    from mempalace import hooks_cli
+
+    path = _write_transcript_with_cwd(tmp_path, "/Users/me/dev/mempalace")
+    Path(path).write_text(Path(path).read_text() + "x" * 200, encoding="utf-8")
+    monkeypatch.setattr(hooks_cli, "_validate_transcript_path", lambda p: Path(p))
+    monkeypatch.setattr(hooks_cli, "MempalaceConfig", lambda: None)
+
+    class Routing:
+        blocked = False
+        use_daemon = False
+
+    monkeypatch.setattr(hooks_cli, "_current_hook_write_routing", lambda: Routing())
+    spawned = []
+    monkeypatch.setattr(hooks_cli, "_spawn_mine", lambda cmd: spawned.append(cmd))
+    hooks_cli._ingest_transcript(path)
+    assert spawned and spawned[0][-2:] == ["--wing", "mempalace"]
+
+    Routing.use_daemon = True
+    jobs = []
+    monkeypatch.setattr(
+        hooks_cli, "_submit_daemon_job", lambda kind, payload, **kw: jobs.append(payload)
+    )
+    hooks_cli._ingest_transcript(path)
+    assert jobs and jobs[0]["wing"] == "mempalace"

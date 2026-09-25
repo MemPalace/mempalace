@@ -31,7 +31,8 @@ from ..backends import (
     PalaceNotFoundError,
     UnsupportedCapabilityError,
 )
-from ..config import MempalaceConfig, connect_sqlite_read
+from ..backends._inproc_sqlite import open_reader as open_palace_reader
+from ..config import MempalaceConfig
 from ..date_window import filed_at_in_window, parse_window
 from ..i18n import _canonical_lang, get_stopwords
 from ..palace import (
