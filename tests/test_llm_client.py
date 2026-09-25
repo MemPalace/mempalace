@@ -89,8 +89,8 @@ def test_http_post_json_malformed_response():
 
 
 def test_http_post_json_sends_user_agent_header():
-    """Cloudflare-fronted endpoints WAF-block the default Python-urllib UA
-    with bare 403 before auth (#1570). Verify every POST carries the
+    """Some Cloudflare-fronted endpoints WAF-block the default Python-urllib UA
+    with a bare 403 before auth. Verify every POST carries the
     explicit MemPalace UA so the runtime classify() path works through
     Cloudflare without manual config."""
     captured = {}
@@ -169,7 +169,7 @@ def test_ollama_check_available_unreachable():
 
 def test_ollama_check_available_malformed_endpoint_returns_false_not_raise():
     """``Request()`` validates URLs eagerly and raises ``ValueError`` on bad
-    input. The probe must surface as ``(False, msg)``, not propagate (#1570).
+    input. The probe must surface as ``(False, msg)``, not propagate.
     No mock: exercises the real ``Request()`` validation path."""
     p = OllamaProvider(model="x", endpoint="not-a-url")
     ok, msg = p.check_available()
@@ -180,7 +180,7 @@ def test_ollama_check_available_malformed_endpoint_returns_false_not_raise():
 def test_ollama_check_available_sends_user_agent():
     """Ollama is usually localhost, but users running it behind a reverse
     proxy (Tailscale gateway, nginx fronting a remote box, ...) can still
-    hit CF-style WAFs. Send an explicit UA so the probe survives (#1570)."""
+    hit CF-style WAFs. Send an explicit UA so the probe survives."""
     captured = {}
     tags = {"models": [{"name": "gemma4:e4b"}]}
     mock = MagicMock()
@@ -356,10 +356,10 @@ def test_openai_compat_sends_authorization_when_key_present():
 
 
 def test_openai_compat_check_available_sends_user_agent():
-    """#1570: Cloudflare-fronted openai-compat endpoints (Workers AI, AI
-    Gateway, Together, ...) WAF-block the default ``Python-urllib/*`` UA
-    with bare 403 before auth. Verify ``check_available`` sets an explicit
-    UA so the probe surfaces 401 / 200 instead of getting blackholed."""
+    """Some Cloudflare-fronted openai-compat endpoints (Together, AI Gateway)
+    WAF-block the default ``Python-urllib/*`` UA with a bare 403 before auth.
+    The ``/v1/models`` request behind ``check_available`` (``served_models()``)
+    must carry an explicit UA so the probe surfaces 401 / 200 instead of that 403."""
     captured = {}
 
     def fake_urlopen(req, *, timeout):
@@ -375,8 +375,7 @@ def test_openai_compat_check_available_sends_user_agent():
 
 def test_openai_compat_check_available_malformed_endpoint_returns_false_not_raise():
     """Mirror of the Ollama variant: ``Request()`` raises ``ValueError`` on
-    malformed endpoint and ``check_available`` must wrap it as ``(False, msg)``
-    (#1570 / gemini-code-assist finding on PR #1577)."""
+    malformed endpoint and ``check_available`` must wrap it as ``(False, msg)``."""
     p = OpenAICompatProvider(model="x", endpoint="not-a-url")
     ok, msg = p.check_available()
     assert ok is False
@@ -386,8 +385,7 @@ def test_openai_compat_check_available_malformed_endpoint_returns_false_not_rais
 def test_http_post_json_malformed_url_raises_llm_error_not_value_error():
     """``Request()`` validates URLs eagerly and raises ``ValueError`` on
     malformed input. The function's docstring promises ``LLMError`` on any
-    failure, so ``ValueError`` must be wrapped (#1570 / gemini-code-assist
-    finding on PR #1577)."""
+    failure, so ``ValueError`` must be wrapped."""
     with pytest.raises(LLMError, match="Cannot reach"):
         _http_post_json("not-a-url", {}, {}, timeout=5)
 
@@ -395,7 +393,7 @@ def test_http_post_json_malformed_url_raises_llm_error_not_value_error():
 @pytest.mark.parametrize("hdr_casing", ["User-Agent", "user-agent", "USER-AGENT", "User-agent"])
 def test_http_post_json_caller_cannot_override_user_agent(hdr_casing):
     """Callers passing ``User-Agent`` in ``headers`` (any casing) MUST NOT
-    shadow the WAF-bypass default (#1570). urllib normalises header keys via
+    shadow the WAF-bypass default. urllib normalises header keys via
     ``str.capitalize`` on insert, so all four casings collapse to the same
     storage key and our dict-merge order must win regardless."""
     captured = {}
@@ -496,7 +494,7 @@ def test_anthropic_classify_sends_user_agent():
     """``AnthropicProvider.classify`` routes through ``_http_post_json``
     and inherits the WAF-bypass UA. ``api.anthropic.com`` is itself
     Cloudflare-fronted, so a future Anthropic-specific refactor must
-    not regress UA propagation (#1570)."""
+    not regress UA propagation."""
     captured = {}
 
     def fake_urlopen(req, *, timeout):

@@ -176,10 +176,10 @@ class TestCallLLM:
         assert "authorization" not in captured_headers
 
     def test_sends_user_agent_header(self):
-        """#1570: closet regeneration POSTs through the same OpenAI-compat
-        path as the main LLM client. Cloudflare-fronted endpoints WAF-block
-        ``Python-urllib/*`` before auth, so set the explicit MemPalace UA
-        for parity with ``mempalace.llm_client._http_post_json``."""
+        """Closet regeneration builds its own urllib request to the same kind of
+        OpenAI-compatible endpoint as the LLM client. A WAF that blocks
+        ``Python-urllib/*`` before auth blocks it too, so it sends the explicit
+        MemPalace UA, like ``mempalace.llm_client._http_post_json``."""
         cfg = LLMConfig(endpoint="http://localhost:11434/v1", model="llama3:8b")
         captured_headers = {}
 
