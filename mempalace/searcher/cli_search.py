@@ -67,6 +67,7 @@ def _print_search_results_bm25_only(
 
         print(f"  [{i}] {wing_name} / {room_name}")
         print(f"      Source: {source}")
+        _print_also_in(hit)
         print(f"      Match:  bm25={bm25}  (vector disabled)")
         print()
         for line in (hit.get("text", "") or "").strip().split("\n"):
@@ -75,6 +76,31 @@ def _print_search_results_bm25_only(
         print(f"  {'-' * 56}")
 
     print()
+
+
+def _cli_hit_source(hit: dict):
+    return (hit.get("metadata") or {}).get("source_file")
+
+
+def _cli_hit_ref(hit: dict) -> dict:
+    meta = hit.get("metadata") or {}
+    source = meta.get("source_file")
+    return {
+        "source_file": Path(source).name if source else "?",
+        "source_path": source,
+        "wing": meta.get("wing"),
+        "room": meta.get("room"),
+    }
+
+
+def _print_also_in(hit: dict) -> None:
+    """Name the other files holding this exact passage (folded copies)."""
+    copies = hit.get("also_in") or []
+    if not copies:
+        return
+    names = ", ".join(c.get("source_file") or "?" for c in copies[:5])
+    more = f" and {len(copies) - 5} more" if len(copies) > 5 else ""
+    print(f"      Also in: {names}{more}")
 
 
 def search(
@@ -153,9 +179,9 @@ def search(
             # The window is a post-filter (ChromaDB can't range-compare
             # string metadata), so widen the fetch the same way the
             # programmatic path does and trim back after filtering.
-            "n_results": _candidate_pool_size(n_results, date_window_active)
-            if date_window_active
-            else n_results,
+            # Over-fetch so copies folded below leave room for the next
+            # distinct passages, and so a date window has survivors to keep.
+            "n_results": _candidate_pool_size(n_results, date_window_active),
             "include": ["documents", "metadatas", "distances"],
         }
         if where:
@@ -210,10 +236,9 @@ def search(
         metric=metric,
         stop_words=stop_words,
     )
-    if date_window_active:
-        # The widened fetch exists only to survive the window filter; the
-        # display contract stays "top n_results", now cut AFTER the re-rank.
-        hits = hits[:n_results]
+    # The display contract stays "top n_results", cut after the re-rank and
+    # after copies of one passage from different files fold into one result.
+    hits = _fold_copies_across_sources(hits, _cli_hit_source, _cli_hit_ref)[:n_results]
 
     print(f"\n{'=' * 60}")
     print(f'  Results for: "{query}"')
@@ -237,6 +262,7 @@ def search(
 
         print(f"  [{i}] {wing_name} / {room_name}")
         print(f"      Source: {source}")
+        _print_also_in(hit)
         print(f"      Match:  {metric}_sim={vec_sim}  bm25={bm25}")
         print()
         # Print the verbatim text, indented

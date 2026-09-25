@@ -346,7 +346,7 @@ def _bm25_only_via_sqlite(
         c["bm25_score"] = round(raw, 3)
         c["_score"] = (raw / max_bm25) if max_bm25 > 0 else 0.0
     candidates.sort(key=lambda c: c["_score"], reverse=True)
-    hits = candidates[:n_results]
+    hits = _fold_copies_across_sources(candidates, _search_hit_source, _search_hit_ref)[:n_results]
     for h in hits:
         h.pop("_score", None)
         # Strip internal fields by default so the public BM25-only fallback
