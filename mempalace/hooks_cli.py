@@ -1229,8 +1229,10 @@ def _parse_harness_input(data: dict, harness: str) -> dict:
         sys.exit(1)
     raw_transcript_path = data.get("transcript_path", "")
     transcript_path = "" if raw_transcript_path is None else str(raw_transcript_path)
+    raw_session_id = data.get("session_id", "unknown")
+    session_id = "unknown" if raw_session_id is None else str(raw_session_id)
     return {
-        "session_id": _sanitize_session_id(str(data.get("session_id", "unknown"))),
+        "session_id": _sanitize_session_id(session_id),
         "stop_hook_active": data.get("stop_hook_active", False),
         "transcript_path": transcript_path,
     }

@@ -1865,6 +1865,13 @@ def test_parse_harness_input_normalizes_null_transcript_path():
     assert result["transcript_path"] == ""
 
 
+def test_parse_harness_input_normalizes_null_session_id():
+    result = _parse_harness_input(
+        {"session_id": None, "transcript_path": "/tmp/t.jsonl"}, "claude-code"
+    )
+    assert result["session_id"] == "unknown"
+
+
 def test_parse_harness_input_valid():
     result = _parse_harness_input(
         {
