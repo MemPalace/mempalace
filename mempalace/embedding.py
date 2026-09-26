@@ -54,6 +54,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import shutil
 import threading
 from typing import Optional
 
@@ -285,6 +286,78 @@ _EMBEDDINGGEMMA_BATCH_SIZE = 32
 # actually computes (see _embeddinggemma_session_is_healthy).
 _EMBEDDINGGEMMA_WITNESS = "mempalace embedding provider health check"
 
+# huggingface_hub >= 1.32 stores cache blobs in content-sharded subdirectories
+# (hub/blobs/<2 hex>/<sha>), so a snapshot's model file and its external-data
+# sibling are symlinks into two different real directories. onnxruntime >= 1.30
+# validates that a model's external data resolves inside the model's own
+# directory and refuses the load otherwise (#2601). Both files are hardlinked —
+# no copy, no second 300 MB — into a private directory placed beside the
+# models--* trees, where HF's own cache tooling does not look, and the session
+# is built from there.
+_HF_BLOBS_DIRNAME = "blobs"
+_EXTERNAL_DATA_DIRNAME = "mempalace-onnx-external-data"
+
+
+def _hf_hub_root(real_blob_path: str) -> Optional[str]:
+    """Return the HF hub directory holding a sharded cache blob, or None."""
+    parts = real_blob_path.split(os.sep)
+    for i in range(len(parts) - 1, 0, -1):
+        if parts[i] == _HF_BLOBS_DIRNAME:
+            return os.sep.join(parts[:i]) or os.sep
+    return None
+
+
+def _link_or_copy(src: str, dst: str) -> None:
+    """Hardlink src onto dst, copying if this filesystem refuses the link."""
+    tmp = dst + ".tmp"
+    try:
+        os.link(src, tmp)
+    except OSError:
+        shutil.copyfile(src, tmp)
+    os.replace(tmp, dst)
+
+
+def _co_locate_external_data(model_path: str, data_path: str) -> str:
+    """Return a loadable path for model_path with its external data alongside.
+
+    Returns model_path untouched when the two files already share a real
+    directory, or when the cache layout is not the sharded one this exists for:
+    guessing at an unfamiliar layout risks loading the wrong bytes.
+    """
+    model_real = os.path.realpath(model_path)
+    data_real = os.path.realpath(data_path)
+    if os.path.dirname(model_real) == os.path.dirname(data_real):
+        return model_path
+    hub = _hf_hub_root(model_real) or _hf_hub_root(data_real)
+    if hub is None:
+        return model_path
+    key = hashlib.sha1(f"{model_real}\n{data_real}".encode("utf-8")).hexdigest()[:16]
+    target_dir = os.path.join(hub, _EXTERNAL_DATA_DIRNAME, key)
+    target_model = os.path.join(target_dir, os.path.basename(model_path))
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        # Named by the snapshot paths, not the blobs' own sha filenames: the
+        # model's protobuf refers to its external data by this exact name.
+        for src, name in (
+            (model_real, os.path.basename(model_path)),
+            (data_real, os.path.basename(data_path)),
+        ):
+            dst = os.path.join(target_dir, name)
+            if os.path.exists(dst) and os.path.getsize(dst) == os.path.getsize(src):
+                continue
+            _link_or_copy(src, dst)
+    except OSError as exc:
+        logger.warning(
+            "Could not co-locate EmbeddingGemma external data under %s (%s) — "
+            "loading from the snapshot path instead, which onnxruntime >= 1.30 "
+            "may reject: %s",
+            target_dir,
+            type(exc).__name__,
+            exc,
+        )
+        return model_path
+    return target_model
+
 
 def _sanitize_embeddinggemma_input_ids(tokenizer, input_ids, np):
     """Replace tokenizer-only IDs that the text ONNX model cannot embed."""
@@ -432,10 +505,13 @@ class EmbeddinggemmaONNX:
             model_path = hf_hub_download(
                 _EMBEDDINGGEMMA_REPO, subfolder="onnx", filename=_EMBEDDINGGEMMA_ONNX
             )
-            hf_hub_download(
+            data_path = hf_hub_download(
                 _EMBEDDINGGEMMA_REPO, subfolder="onnx", filename=_EMBEDDINGGEMMA_ONNX + "_data"
             )
             tok_path = hf_hub_download(_EMBEDDINGGEMMA_REPO, filename="tokenizer.json")
+            # Both downloads above are symlinks into the blob store; on a
+            # sharded store they resolve apart and ORT rejects the model (#2601).
+            model_path = _co_locate_external_data(model_path, data_path)
 
             session = ort.InferenceSession(
                 model_path,
