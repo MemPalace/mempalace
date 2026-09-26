@@ -315,6 +315,35 @@ class KnowledgeGraph:
                 if existing:
                     return existing["id"]  # Already exists and still valid
 
+                # An identical closed assertion is a replay, not a new fact.
+                # The open-row check above only deduplicates open triples, so
+                # retrying a historical (closed) assertion after an
+                # interruption used to insert a second row with a new ID.
+                # Different intervals or provenance stay distinguishable.
+                if valid_to is not None:
+                    replayed = conn.execute(
+                        """SELECT id FROM triples
+                        WHERE subject=? AND predicate=? AND object=?
+                          AND valid_from IS ? AND valid_to IS ?
+                          AND confidence IS ? AND source_closet IS ?
+                          AND source_file IS ? AND source_drawer_id IS ?
+                          AND adapter_name IS ?""",
+                        (
+                            sub_id,
+                            pred,
+                            obj_id,
+                            valid_from,
+                            valid_to,
+                            confidence,
+                            source_closet,
+                            source_file,
+                            source_drawer_id,
+                            adapter_name,
+                        ),
+                    ).fetchone()
+                    if replayed:
+                        return replayed["id"]  # Identical closed assertion already stored
+
                 triple_id = make_triple_id(
                     sub_id, pred, obj_id, valid_from, datetime.now().isoformat()
                 )
