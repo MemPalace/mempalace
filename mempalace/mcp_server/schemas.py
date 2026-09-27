@@ -295,7 +295,11 @@ TOOLS = {
         "handler": tool_follow_tunnels,
     },
     "mempalace_search": {
-        "description": "Semantic search. Returns verbatim drawer content with similarity scores. IMPORTANT: 'query' must contain ONLY search keywords. Use 'context' for background. Results with cosine distance > max_distance are filtered out.",
+        "description": (
+            "Search past-session memories. Returns matching drawers. "
+            "Not for the current conversation — if it happened in this "
+            "session, answer from context instead."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1074,6 +1078,29 @@ TOOLS = {
         "handler": tool_patch_submit,
     },
 }
+
+# MCP ToolAnnotations.readOnlyHint for clients that hide mutating tools
+# (plan modes, read-only subagents). Server --read-only still uses
+# _READ_ONLY_REFUSED_TOOLS; memories_filed_away stays refused there
+# because it consumes the checkpoint ack file.
+for _read_only_name in (
+    "mempalace_status",
+    "mempalace_list_wings",
+    "mempalace_list_rooms",
+    "mempalace_get_taxonomy",
+    "mempalace_get_aaak_spec",
+    "mempalace_search",
+    "mempalace_check_duplicate",
+    "mempalace_get_drawer",
+    "mempalace_get_drawers",
+    "mempalace_list_drawers",
+    "mempalace_diary_read",
+    "mempalace_memories_filed_away",
+    "mempalace_kg_query",
+    "mempalace_kg_timeline",
+    "mempalace_kg_stats",
+):
+    TOOLS[_read_only_name]["read_only"] = True
 
 
 SUPPORTED_PROTOCOL_VERSIONS = [

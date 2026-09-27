@@ -10,6 +10,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **Read-only MCP tools advertise `annotations.readOnlyHint`.** Fifteen
+  inspection tools (`status`, `list_wings`, `list_rooms`, `get_taxonomy`,
+  `get_aaak_spec`, `search`, `check_duplicate`, `get_drawer`, `get_drawers`,
+  `list_drawers`, `diary_read`, `memories_filed_away`, `kg_query`,
+  `kg_timeline`, `kg_stats`) set `read_only: true` in the catalog so plan
+  modes and read-only subagents can admit memory search without a
+  host-side allowlist. Server `--read-only` still hides and refuses
+  `memories_filed_away` because it consumes the checkpoint ack.
+- **`mempalace_search` description is scoped to past sessions** (under
+  200 characters) so small models and schema-pruning harnesses do not
+  call it for referents from the current conversation.
+
 - **`hallways --rebuild` holds the palace writer lock,** so a mine cannot save
   a newer snapshot between the rebuild's scan and its save. It, `rooms apply`,
   `wings split` and `kg normalize --yes` now report a held palace on one line
