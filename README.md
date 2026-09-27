@@ -215,6 +215,7 @@ Select with `--backend <name>`, `MEMPALACE_BACKEND=<name>`, or
 # Mine content into the palace
 mempalace mine ~/projects/myapp                    # project files
 mempalace mine ~/.claude/projects/ --mode convos   # Claude Code sessions (scope with --wing per project)
+mempalace mine ~/.workbuddy/projects/ --mode convos  # WorkBuddy sessions
 
 # Search
 mempalace search "why did we switch to GraphQL"
@@ -310,7 +311,7 @@ system prompt:
 
 ## Auto-save hooks
 
-Auto-save hooks for **Claude Code, Codex CLI, and Cursor IDE** save
+Auto-save hooks for **Claude Code, Codex CLI, WorkBuddy, and Cursor IDE** save
 periodically and before context compression:
 
 - Claude Code + Codex →

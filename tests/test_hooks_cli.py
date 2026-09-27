@@ -2714,3 +2714,167 @@ def test_ingest_transcript_passes_the_project_wing_to_mine(tmp_path, monkeypatch
     )
     hooks_cli._ingest_transcript(path)
     assert jobs and jobs[0]["wing"] == "mempalace"
+
+
+# --- WorkBuddy harness support --------------------------------------------
+#
+# WorkBuddy (Tencent's CodeBuddy-derived CLI) records transcripts under
+# ``~/.workbuddy/projects/<encoded-cwd>/<session>.jsonl``. Two things differ
+# from Claude Code and both break the hook silently if unhandled:
+#
+#   1. ``cwd`` is a per-session workspace folder (``.../WorkBuddy/2026-09-13-11-04-25``),
+#      not a stable project root, so the PRIMARY cwd strategy mints one wing
+#      per workspace instance.
+#   2. ``role`` and ``content`` sit at the top level of each row instead of
+#      being nested under ``message``, so ``_count_human_messages`` counts
+#      zero exchanges and the stop hook never reaches ``SAVE_INTERVAL``.
+
+
+def test_workbuddy_path_folds_into_single_wing():
+    """A date-stamped WorkBuddy workspace folder must not mint its own wing.
+
+    Without the WorkBuddy branch the PRIMARY cwd strategy returns the leaf of
+    the workspace directory (e.g. ``wing_2026_09_13_11_04_25``), producing one
+    wing per session — measured by ``tools/bench-workbuddy-hooks.py``. The wing
+    is derived from ``_diary_agent_for_harness("workbuddy")``, so it carries
+    the harness's own agent name rather than a hardcoded project.
+    """
+    path = "/home/me/.workbuddy/projects/c-Users-me-WorkBuddy-2026-09-13-11-04-25/503661eb.jsonl"
+    assert _wing_from_transcript_path(path) == "wing_workbuddy"
+
+
+def test_workbuddy_path_windows_backslash_form():
+    """WorkBuddy on Windows writes backslash paths; the marker check must
+    normalize separators first (same tolerance as the Claude Code branches)."""
+    path = (
+        "C:\\Users\\me\\.workbuddy\\projects\\c-Users-me-WorkBuddy-2026-09-21-14-58-58\\abc.jsonl"
+    )
+    assert _wing_from_transcript_path(path) == "wing_workbuddy"
+
+
+def test_workbuddy_two_workspaces_share_one_wing():
+    """Every workspace instance of the same harness must land in the same wing,
+    or project-scoped queries fragment across hundreds of date-named wings."""
+    early = "/home/me/.workbuddy/projects/c-Users-me-WorkBuddy-2026-08-05-12-40-27/a.jsonl"
+    late = "/home/me/.workbuddy/projects/c-Users-me-WorkBuddy-2026-09-27-14-25-41/b.jsonl"
+    assert _wing_from_transcript_path(early) == _wing_from_transcript_path(late)
+
+
+def test_workbuddy_branch_is_scoped_to_workbuddy_paths():
+    """The WorkBuddy branch must not capture Claude Code transcripts."""
+    claude = "/home/me/.claude/projects/-Users-me-code-myproject/session.jsonl"
+    assert _wing_from_transcript_path(claude) == "wing_myproject"
+    # And the encoding marker alone must not match without the projects dir.
+    assert _wing_from_transcript_path("/tmp/.workbuddy/other/x.jsonl") == "wing_sessions"
+
+
+def test_count_human_messages_reads_top_level_role(tmp_path):
+    """WorkBuddy puts ``role`` / ``content`` at the row top level."""
+    transcript = tmp_path / "wb.jsonl"
+    rows = [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "yo"}],
+        },
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "again"}]},
+        {"type": "function_call", "content": []},
+    ]
+    transcript.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    assert _count_human_messages(str(transcript)) == 2
+
+
+def test_count_human_messages_workbuddy_string_content(tmp_path):
+    """A bare-string ``content`` row counts the same as a block list."""
+    transcript = tmp_path / "wb.jsonl"
+    transcript.write_text(json.dumps({"role": "user", "content": "plain string"}) + "\n")
+    assert _count_human_messages(str(transcript)) == 1
+
+
+def test_count_human_messages_workbuddy_client_slash_command_filtered(tmp_path):
+    """A WorkBuddy client slash-command row carries ``<command-message>`` in its
+    content and must be excluded, mirroring the Claude Code branch."""
+    transcript = tmp_path / "wb.jsonl"
+    rows = [
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "<command-message>x</command-message>"}],
+        },
+        {"role": "user", "content": [{"type": "input_text", "text": "real question"}]},
+    ]
+    transcript.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    assert _count_human_messages(str(transcript)) == 1
+
+
+def test_count_human_messages_claude_shape_unchanged(tmp_path):
+    """The nested ``message.role`` shape must still count — the WorkBuddy
+    branch is an ``elif``, not a replacement."""
+    transcript = tmp_path / "cc.jsonl"
+    rows = [
+        {"type": "user", "message": {"role": "user", "content": "hello"}},
+        {"type": "assistant", "message": {"role": "assistant", "content": "hi"}},
+    ]
+    transcript.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    assert _count_human_messages(str(transcript)) == 1
+
+
+def test_workbuddy_is_a_supported_harness():
+    """``hook run --harness workbuddy`` must not be rejected up front."""
+    assert "workbuddy" in hooks_cli_mod.SUPPORTED_HARNESSES
+
+
+def test_workbuddy_diary_agent_follows_existing_convention():
+    """A newly supported harness reads under its own name, like codex and dsh.
+
+    Only ``claude-code`` maps to a different diary identity (``claude``); every
+    other harness — including the newly added ``workbuddy`` — returns its own
+    name so checkpoints stay discoverable via ``mempalace_diary_read``.
+    """
+    assert hooks_cli_mod._diary_agent_for_harness("workbuddy") == "workbuddy"
+    # Existing harnesses must be untouched.
+    assert hooks_cli_mod._diary_agent_for_harness("claude-code") == "claude"
+    assert hooks_cli_mod._diary_agent_for_harness("codex") == "codex"
+    assert hooks_cli_mod._diary_agent_for_harness("dsh") == "dsh"
+
+
+def test_diary_agent_env_override_aligns_with_backfill(monkeypatch):
+    """A harness whose transcripts were ingested under a different ``--agent``
+    can align live checkpoints with the backfill via the per-harness override,
+    instead of splitting one person into two searchable agents."""
+    monkeypatch.setenv("MEMPALACE_AGENT_WORKBUDDY", "mei")
+    assert hooks_cli_mod._diary_agent_for_harness("workbuddy") == "mei"
+
+
+def test_diary_agent_env_override_reaches_the_wing_name(monkeypatch):
+    """The override must flow through to the wing, or the checkpoint lands in a
+    different wing than the backfilled drawers."""
+    monkeypatch.setenv("MEMPALACE_AGENT_WORKBUDDY", "mei")
+    path = "/home/me/.workbuddy/projects/c-Users-me-WorkBuddy-2026-09-13-11-04-25/a.jsonl"
+    assert _wing_from_transcript_path(path) == "wing_mei"
+
+
+def test_diary_agent_env_override_is_per_harness(monkeypatch):
+    """Setting one harness's override must not leak into another's identity."""
+    monkeypatch.setenv("MEMPALACE_AGENT_CODEX", "someone-else")
+    assert hooks_cli_mod._diary_agent_for_harness("codex") == "someone-else"
+    assert hooks_cli_mod._diary_agent_for_harness("workbuddy") == "workbuddy"
+    assert hooks_cli_mod._diary_agent_for_harness("claude-code") == "claude"
+
+
+def test_diary_agent_env_override_ignores_blank(monkeypatch):
+    """An empty or whitespace-only value must fall back to the harness name,
+    not produce an empty agent identity."""
+    monkeypatch.setenv("MEMPALACE_AGENT_WORKBUDDY", "   ")
+    assert hooks_cli_mod._diary_agent_for_harness("workbuddy") == "workbuddy"
+
+
+def test_diary_agent_default_is_unchanged_without_override(monkeypatch):
+    """No override set — every existing harness keeps its documented identity."""
+    monkeypatch.delenv("MEMPALACE_AGENT_WORKBUDDY", raising=False)
+    monkeypatch.delenv("MEMPALACE_AGENT_CODEX", raising=False)
+    monkeypatch.delenv("MEMPALACE_AGENT_DSH", raising=False)
+    assert hooks_cli_mod._diary_agent_for_harness("claude-code") == "claude"
+    assert hooks_cli_mod._diary_agent_for_harness("codex") == "codex"
+    assert hooks_cli_mod._diary_agent_for_harness("dsh") == "dsh"
+    assert hooks_cli_mod._diary_agent_for_harness("workbuddy") == "workbuddy"
