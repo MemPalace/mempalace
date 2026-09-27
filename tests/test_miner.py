@@ -1491,6 +1491,106 @@ def test_process_file_purges_closets_even_when_all_chunks_filtered_out(tmp_path,
     )
 
 
+def test_mine_purges_stale_drawers_when_source_shrinks_below_min_chunk_size_2608(tmp_path):
+    """A previously mined source that shrinks below min_chunk_size must still
+    enter the normal purge path (#2608). Otherwise stale drawers/closets for
+    OLD_SENTINEL remain searchable even though chunk_text() now yields no
+    chunks."""
+    from mempalace.palace import get_closets_collection, get_collection
+
+    root = tmp_path
+    project_root = root / "proj"
+    project_root.mkdir()
+    source = project_root / "notes.md"
+    source.write_text("OLD_SENTINEL " + ("long enough to mine. " * 6), encoding="utf-8")
+    write_file(project_root / "mempalace.yaml", "wing: test_project\nrooms:\n  - name: general\n")
+    palace_path = root / "palace"
+
+    mine(str(project_root), str(palace_path))
+
+    drawers = get_collection(str(palace_path))
+    closets = get_closets_collection(str(palace_path))
+    where = {"source_file": str(source)}
+    assert drawers.get(where=where)["ids"]
+    assert closets.get(where=where)["ids"]
+
+    source.write_text("short", encoding="utf-8")
+    os.utime(source, (source.stat().st_atime + 10, source.stat().st_mtime + 10))
+    mine(str(project_root), str(palace_path))
+
+    drawers = get_collection(str(palace_path))
+    closets = get_closets_collection(str(palace_path))
+    assert drawers.get(where=where)["ids"] == []
+    assert closets.get(where=where)["ids"] == []
+
+
+def test_process_file_new_short_file_still_files_no_drawers_2608(tmp_path):
+    """New content below min_chunk_size still produces zero drawers (#2608)."""
+    from mempalace import miner
+
+    class FakeCol:
+        def get(self, *args, **kwargs):
+            return {"ids": []}
+
+        def delete(self, *args, **kwargs):
+            pass
+
+        def upsert(self, documents, ids, metadatas):
+            raise AssertionError("short files should not upsert drawers")
+
+    root = tmp_path
+    source = root / "short.md"
+    source.write_text("short", encoding="utf-8")
+
+    drawers, room, skip_reason = miner.process_file(
+        source,
+        root,
+        FakeCol(),
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+    )
+
+    assert (drawers, room, skip_reason) == (0, "general", None)
+
+
+def test_process_file_default_min_chunk_size_boundary_2608(tmp_path):
+    """Default min_chunk_size boundary stays real: 49 chars skips, 50 files (#2608)."""
+    from mempalace import miner
+
+    class FakeCol:
+        def __init__(self):
+            self.upserted = 0
+
+        def get(self, *args, **kwargs):
+            return {"ids": []}
+
+        def delete(self, *args, **kwargs):
+            pass
+
+        def upsert(self, documents, ids, metadatas):
+            self.upserted += len(documents)
+
+    root = tmp_path
+    short = root / "short.md"
+    exact = root / "exact.md"
+    short.write_text("x" * 49, encoding="utf-8")
+    exact.write_text("x" * 50, encoding="utf-8")
+    rooms = [{"name": "general", "description": "General"}]
+
+    short_col = FakeCol()
+    exact_col = FakeCol()
+
+    short_drawers, _, _ = miner.process_file(short, root, short_col, "wing", rooms, "agent", False)
+    exact_drawers, _, _ = miner.process_file(exact, root, exact_col, "wing", rooms, "agent", False)
+
+    assert short_drawers == 0
+    assert short_col.upserted == 0
+    assert exact_drawers >= 1
+    assert exact_col.upserted >= 1
+
+
 def test_file_already_mined_detects_incomplete_multi_batch_remine():
     """A crash between upsert batches must not be mistaken for 'fully
     mined' (#21). process_file stamps every chunk's metadata with
