@@ -1243,21 +1243,19 @@ def _diary_agent_for_harness(harness: str) -> str:
     returning the harness name keeps a newly supported harness discoverable
     instead of silently invisible again.
 
-    A harness whose transcripts were previously ingested under a different
-    ``--agent`` can override the identity per harness, so live checkpoints
-    land beside the backfill instead of splitting one person into two
-    searchable agents. Set ``MEMPALACE_AGENT_<HARNESS>`` (upper-cased,
-    non-alphanumerics to ``_``) to the agent name the backfill used — e.g.
-    ``MEMPALACE_AGENT_WORKBUDDY=mei``. Unset means "use the harness name",
-    which keeps the default behaviour for every existing harness.
+    A deployment can override the identity per harness, so checkpoints are filed
+    under whichever agent name that deployment's readers query, rather than
+    inheriting the harness name. Set ``MEMPALACE_AGENT_<HARNESS>`` (upper-cased,
+    non-alphanumerics to ``_``) to that agent name — e.g.
+    ``MEMPALACE_AGENT_WORKBUDDY=mei``. The check runs first, so it can also
+    override the ``claude-code`` → ``claude`` default. Unset means "use the
+    default identity", which keeps every existing harness's behaviour unchanged.
     """
-    if harness == "claude-code":
-        return "claude"
     override_key = "MEMPALACE_AGENT_" + re.sub(r"[^A-Za-z0-9]+", "_", harness).upper()
     override = os.environ.get(override_key, "").strip()
     if override:
         return override
-    return harness
+    return "claude" if harness == "claude-code" else harness
 
 
 def _parse_harness_input(data: dict, harness: str) -> dict:

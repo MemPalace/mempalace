@@ -2730,6 +2730,19 @@ def test_ingest_transcript_passes_the_project_wing_to_mine(tmp_path, monkeypatch
 #      zero exchanges and the stop hook never reaches ``SAVE_INTERVAL``.
 
 
+@pytest.fixture(autouse=True)
+def _clear_harness_agent_overrides(monkeypatch):
+    """Keep the harness-identity expectations hermetic.
+
+    Several tests below assert the *default* identity for a harness. A machine
+    that exports ``MEMPALACE_AGENT_<HARNESS>`` (exactly the setup the override
+    exists to serve) would otherwise fail them for the wrong reason. Tests that
+    want an override set it themselves; this only clears the ambient value.
+    """
+    for key in ("MEMPALACE_AGENT_WORKBUDDY", "MEMPALACE_AGENT_CODEX", "MEMPALACE_AGENT_DSH"):
+        monkeypatch.delenv(key, raising=False)
+
+
 def test_workbuddy_path_folds_into_single_wing():
     """A date-stamped WorkBuddy workspace folder must not mint its own wing.
 
@@ -2819,6 +2832,25 @@ def test_count_human_messages_claude_shape_unchanged(tmp_path):
     assert _count_human_messages(str(transcript)) == 1
 
 
+def test_count_human_messages_mixed_shapes_no_double_count(tmp_path):
+    """A transcript that mixes both row shapes must still count each turn once.
+
+    The two branches are mutually exclusive by construction (``elif``), but that
+    is an argument, not a guard. A WorkBuddy transcript can carry both shapes —
+    a row with a nested ``message`` and a row with a top-level ``role`` — and
+    the two branches must never both claim the same row. This pins the guard.
+    """
+    transcript = tmp_path / "mixed.jsonl"
+    rows = [
+        {"type": "user", "message": {"role": "user", "content": "nested turn"}},
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "top"}]},
+        {"role": "user", "content": "top string turn"},
+        {"type": "assistant", "message": {"role": "assistant", "content": "reply"}},
+    ]
+    transcript.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    assert _count_human_messages(str(transcript)) == 3
+
+
 def test_workbuddy_is_a_supported_harness():
     """``hook run --harness workbuddy`` must not be rejected up front."""
     assert "workbuddy" in hooks_cli_mod.SUPPORTED_HARNESSES
@@ -2844,6 +2876,18 @@ def test_diary_agent_env_override_aligns_with_backfill(monkeypatch):
     instead of splitting one person into two searchable agents."""
     monkeypatch.setenv("MEMPALACE_AGENT_WORKBUDDY", "mei")
     assert hooks_cli_mod._diary_agent_for_harness("workbuddy") == "mei"
+
+
+def test_diary_agent_env_override_also_wins_over_the_claude_code_default(monkeypatch):
+    """The override is checked before the ``claude-code`` → ``claude`` mapping.
+
+    Otherwise ``MEMPALACE_AGENT_CLAUDE_CODE`` would be silently ignored while the
+    docstring promised every harness could be overridden.
+    """
+    monkeypatch.setenv("MEMPALACE_AGENT_CLAUDE_CODE", "mei")
+    assert hooks_cli_mod._diary_agent_for_harness("claude-code") == "mei"
+    # Other harnesses are unaffected by that key.
+    assert hooks_cli_mod._diary_agent_for_harness("workbuddy") == "workbuddy"
 
 
 def test_diary_agent_env_override_reaches_the_wing_name(monkeypatch):

@@ -23,9 +23,14 @@ Usage::
         --upstream <clean tree> --patched <tree under review> \\
         [--workbuddy-root DIR]
 
-Nothing is written; JSON goes to stdout. These corpora are live conversation
-stores, so counts drift between runs: every file's input hash is recorded, and a
-file whose bytes changed between the two passes is excluded from the comparison.
+Nothing is written; JSON goes to stdout. The script needs a corpus of ``.jsonl``
+transcripts (defaults to the WorkBuddy store, overridable with
+``--workbuddy-root``) and two trees that can be imported — a reviewer without a
+WorkBuddy install can point ``--workbuddy-root`` at any directory of transcripts
+to exercise the two trees against a corpus of their own. These corpora are live
+conversation stores, so counts drift between runs: every file's input hash is
+recorded, and a file whose bytes changed between the two passes is excluded from
+the comparison.
 """
 
 from __future__ import annotations
@@ -140,7 +145,11 @@ def main() -> None:
 
     root = Path(args.workbuddy_root)
     if not root.is_dir():
-        raise SystemExit(f"no such directory: {root}")
+        raise SystemExit(
+            f"corpus directory not found: {root}\n"
+            "Point --workbuddy-root at any directory of .jsonl transcripts; the "
+            "WorkBuddy store is only the default."
+        )
     files = sorted(root.rglob("*.jsonl"))
 
     up = run_worker(args.upstream, args.workbuddy_root)

@@ -10,6 +10,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **The stop hook supports WorkBuddy.** Its transcripts put `role`/`content` at
+  the row top level instead of nesting them under `message`, so
+  `_count_human_messages` counted zero exchanges and the save hook never reached
+  `SAVE_INTERVAL` — a WorkBuddy session silently never saved. A WorkBuddy
+  session also minted a wing per session, because its `cwd` is a disposable
+  date-stamped workspace folder rather than a project root; every session of a
+  harness now files under that harness's agent wing (`wing_workbuddy` by
+  default). `MEMPALACE_AGENT_<HARNESS>` lets a deployment choose the diary
+  agent name those checkpoints are filed under.
 - **`hallways --rebuild` holds the palace writer lock,** so a mine cannot save
   a newer snapshot between the rebuild's scan and its save. It, `rooms apply`,
   `wings split` and `kg normalize --yes` now report a held palace on one line
