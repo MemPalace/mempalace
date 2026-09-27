@@ -16,7 +16,7 @@ import hashlib
 import logging
 import stat
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Optional
 
@@ -44,6 +44,13 @@ from .palace import (
     prefetch_content_hashes,
     prefetch_mined_set,
 )
+
+# Plausible window for an epoch-millisecond ``timestamp``: 2001-09-09 through
+# 2100-01-01. Guards the numeric branch of ``_extract_authored_at`` so a bare
+# ``1`` or a seconds-precision epoch is skipped instead of being read as
+# milliseconds and silently dated to 1970.
+_EPOCH_MS_MIN = 1_000_000_000_000
+_EPOCH_MS_MAX = 4_102_444_800_000
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -641,12 +648,14 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
 def _extract_authored_at(filepath):
     """Most-recent message timestamp in a transcript, used as the drawer's authored date.
 
-    Both Claude Code and Codex JSONL transcripts carry a top-level ISO-8601
-    ``timestamp`` on each line. We take the max so ``authored_at`` reflects when the
-    content was actually written, independent of when it was mined (``filed_at``).
-    This restores chronology: a session from days ago keeps its real date even when
-    re-mined today, instead of every drawer collapsing to ingest time. Returns None
-    for formats without per-line timestamps (e.g. plain ``.md``).
+    Claude Code and Codex JSONL transcripts carry a top-level ISO-8601 ``timestamp``
+    on each line. WorkBuddy transcripts carry the same field as an epoch-millisecond
+    integer instead, so both shapes are accepted and normalised to ISO-8601. We take
+    the max so ``authored_at`` reflects when the content was actually written,
+    independent of when it was mined (``filed_at``). This restores chronology: a
+    session from days ago keeps its real date even when re-mined today, instead of
+    every drawer collapsing to ingest time. Returns None for formats without
+    per-line timestamps (e.g. plain ``.md``).
     """
     path = Path(filepath)
     if path.suffix != ".jsonl":
@@ -664,8 +673,32 @@ def _extract_authored_at(filepath):
                     continue
                 # ISO-8601 timestamps are strings; guard against a non-string
                 # ``timestamp`` so a malformed line can't raise TypeError on compare.
-                if isinstance(ts, str) and (latest is None or ts > latest):
-                    latest = ts
+                if isinstance(ts, str):
+                    if latest is None or ts > latest:
+                        latest = ts
+                elif isinstance(ts, (int, float)) and not isinstance(ts, bool):
+                    # Epoch milliseconds (WorkBuddy). Convert to the same ISO-8601
+                    # shape the string branch produces so the max comparison below
+                    # stays comparable -- a raw int would never beat an ISO string.
+                    #
+                    # Bounded deliberately: a bare ``1`` or a seconds-precision
+                    # epoch would otherwise be read as milliseconds and land in
+                    # 1970, which is worse than admitting we don't know the time.
+                    # Anything outside this range is skipped rather than guessed
+                    # at, keeping the old "unrecognised shape -> None" contract.
+                    if not (_EPOCH_MS_MIN <= ts <= _EPOCH_MS_MAX):
+                        continue
+                    try:
+                        iso = (
+                            datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime(
+                                "%Y-%m-%dT%H:%M:%S.%f"
+                            )[:-3]
+                            + "Z"
+                        )
+                    except (OverflowError, OSError, ValueError):
+                        continue
+                    if latest is None or iso > latest:
+                        latest = iso
     except OSError:
         return None
     return latest
@@ -834,6 +867,10 @@ def _is_ai_tool_path(path: Path) -> bool:
       - the consecutive segment pair ``.claude/projects`` (Claude Code).
         ``.claude`` alone is NOT matched — that is the settings/config dir,
         not a conversation source.
+      - the consecutive segment pair ``.workbuddy/projects`` (WorkBuddy).
+        ``.workbuddy`` alone is NOT matched, for the same reason: the agent
+        home holds non-conversation state (session heartbeats, config)
+        beside the transcript tree.
 
     Used by ``_resolve_wing`` to default the destination wing to
     ``wing_api`` when the user hasn't passed an explicit ``--wing``.
@@ -849,6 +886,9 @@ def _is_ai_tool_path(path: Path) -> bool:
         return True
     for i in range(len(parts) - 1):
         if parts[i] == ".claude" and parts[i + 1] == "projects":
+            return True
+    for i in range(len(parts) - 1):
+        if parts[i] == ".workbuddy" and parts[i + 1] == "projects":
             return True
     return False
 

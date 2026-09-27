@@ -2,6 +2,7 @@
 
 import contextlib
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +11,7 @@ from mempalace.convo_miner import (
     _emit_bounded,
     _extract_authored_at,
     _file_chunks_locked,
+    _is_ai_tool_path,
     _source_file_delete_ids,
     chunk_exchanges,
     detect_convo_room,
@@ -1141,3 +1143,60 @@ def test_mine_convos_passes_the_directory_it_read_from(tmp_path, monkeypatch):
     convo_miner.mine_convos(str(transcripts), str(tmp_path / "palace"))
 
     assert seen.get("source_dir_ino") == si.directory_identity(transcripts)
+
+
+class TestWorkBuddyPaths:
+    """``.workbuddy/projects`` must be recognised as a transcript root.
+
+    Without it the wing resolver falls back to the file's own name, so a
+    user's 123 transcripts become 115 single-file wings instead of one.
+    """
+
+    def test_workbuddy_projects_path_is_recognised(self):
+        assert _is_ai_tool_path(Path("/home/me/.workbuddy/projects/abc/session.jsonl")) is True
+
+    def test_workbuddy_projects_path_windows_form(self):
+        assert (
+            _is_ai_tool_path(Path(r"C:\Users\me\.workbuddy\projects\c-me-abc\session.jsonl"))
+            is True
+        )
+
+    def test_workbuddy_home_alone_is_not_a_transcript_root(self):
+        """``.workbuddy`` on its own holds non-conversation state (heartbeats,
+        config) beside the transcript tree — only the ``projects`` child marks
+        a conversation."""
+        assert _is_ai_tool_path(Path("/home/me/.workbuddy/sessions/session.jsonl")) is False
+
+    def test_claude_and_codex_roots_unchanged(self):
+        assert _is_ai_tool_path(Path("/home/me/.claude/projects/-home-me-app/x.jsonl")) is True
+        assert _is_ai_tool_path(Path("/home/me/notes.txt")) is False
+
+
+class TestExtractAuthoredAtEpochMs:
+    """WorkBuddy's ``timestamp`` is an epoch-millisecond integer, not ISO."""
+
+    def test_epoch_milliseconds_are_accepted(self, tmp_path):
+        f = tmp_path / "wb.jsonl"
+        f.write_text('{"timestamp": 1789268666044}\n')
+        assert _extract_authored_at(f) == "2026-09-13T03:04:26.044Z"
+
+    def test_latest_of_several_epoch_values_wins(self, tmp_path):
+        f = tmp_path / "wb.jsonl"
+        f.write_text('{"timestamp": 1789268666044}\n{"timestamp": 1789268700000}\n')
+        assert _extract_authored_at(f) == "2026-09-13T03:05:00.000Z"
+
+    def test_epoch_below_plausible_window_is_ignored(self, tmp_path):
+        """A bare ``1`` or a seconds-precision epoch would land in 1970.
+        Skipping is better than silently dating the session wrongly."""
+        f = tmp_path / "wb.jsonl"
+        f.write_text('{"timestamp": 1}\n{"timestamp": 1234567890}\n')
+        assert _extract_authored_at(f) is None
+
+    def test_epoch_above_plausible_window_is_ignored(self, tmp_path):
+        f = tmp_path / "wb.jsonl"
+        f.write_text('{"timestamp": 99999999999999999}\n')
+        assert _extract_authored_at(f) is None
+
+    def test_iso_string_still_wins_over_epoch(self, tmp_path):
+        f = tmp_path / "wb.jsonl"
+        f.write_text('{"timestamp": 1789268666044}\n{"timestamp": "2099-01-01T00:00:00.000Z"}\n')
