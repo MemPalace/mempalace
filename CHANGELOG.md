@@ -15,6 +15,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   PID 6704 (/path/mempalace-mcp)); ...`), `error.data` carries `holder` plus a
   hint to stop that process or run a hub, and `mempalace_status` reports
   `writer: {role, holder}` so an agent can diagnose without failing a write.
+  The holder parse anchors on the lock message's fixed suffix, so a
+  semicolon in the palace path is not treated as the delimiter.
   Setup failures still do not claim contention.
 
 - **A `known_entities.json` write no longer appears to hang on Windows when the

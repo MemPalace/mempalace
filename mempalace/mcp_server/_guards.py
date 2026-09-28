@@ -192,7 +192,12 @@ _PEER_WRITER_HINT = (
     "Stop the holder, or run one hub (`mempalace serve`) so stdio sessions "
     "proxy instead of competing for the writer lease."
 )
-_HELD_BY_RE = re.compile(r"is held by (.+?)(?:;|$)")
+# palace_lock always appends this suffix. The holder identity in front of
+# it is argv[:3] and can legally contain ';', so the parse must not stop
+# at the first semicolon.
+_HELD_BY_RE = re.compile(
+    r"is held by (.+); wait for it to finish or stop the holder before retrying$"
+)
 
 _MUTATING_TOOLS = frozenset(
     {
@@ -473,8 +478,11 @@ def _holder_from_lock_error(exc: BaseException) -> str:
     """Extract the lock-holder identity from ``MineAlreadyRunning``.
 
     ``palace_lock`` formats the body as ``palace <path> is held by <holder>;
-    wait...``. Tests and older raise sites may pass a bare string; those
-    become the holder as-is so diagnostics never invent a PID.
+    wait for it to finish or stop the holder before retrying``. The holder
+    is PID plus ``sys.argv[:3]`` (the palace path), so it can contain
+    ``;``. Parse by that fixed suffix, not the first semicolon. Tests and
+    older raise sites may pass a bare string; those become the holder
+    as-is so diagnostics never invent a PID.
     """
 
     text = str(exc).strip()

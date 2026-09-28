@@ -71,13 +71,35 @@ def test_contention_then_setup_failure_has_fresh_diagnostic(isolated_writer, mon
 
 def test_status_reports_read_only_peer_holder(isolated_writer, monkeypatch):
     def busy(*args, **kwargs):
-        raise palace.MineAlreadyRunning("palace /tmp/p is held by PID 42 (mempalace-mcp); wait")
+        raise palace.MineAlreadyRunning(
+            "palace /tmp/p is held by PID 42 (mempalace-mcp); "
+            "wait for it to finish or stop the holder before retrying"
+        )
 
     monkeypatch.setattr(palace, "mine_palace_lock", busy)
     mcp._mcp_peer_writer_refusal(1, "mempalace_add_drawer")
     status = mcp._mcp_writer_status_payload()
     assert status["role"] == "read_only_peer"
     assert status["holder"] == "PID 42 (mempalace-mcp)"
+
+
+def test_holder_from_lock_error_keeps_semicolon_in_palace_path():
+    """sys.argv[:3] includes the palace path, which can legally contain ';'."""
+    text = (
+        "palace /home/user/my;evil-suffix-that-should-not-be-lost is held by "
+        "PID 7 (mempalace mine /home/user/my;evil-suffix-that-should-not-be-lost); "
+        "wait for it to finish or stop the holder before retrying"
+    )
+    assert mcp._holder_from_lock_error(palace.MineAlreadyRunning(text)) == (
+        "PID 7 (mempalace mine /home/user/my;evil-suffix-that-should-not-be-lost)"
+    )
+
+
+def test_holder_from_lock_error_falls_back_on_synthetic_text():
+    assert (
+        mcp._holder_from_lock_error(palace.MineAlreadyRunning("held by pid 999"))
+        == "held by pid 999"
+    )
 
 
 def test_lock_setup_error_does_not_claim_contention(isolated_writer, monkeypatch):
