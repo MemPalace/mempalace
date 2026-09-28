@@ -494,8 +494,37 @@ def cmd_logstream(args):
         ls.close()
 
 
-def _codex_task_runner(workspace: Path, prompt: str) -> tuple[list[str], dict]:
-    return ["codex", "exec", "--cd", str(workspace), prompt], {}
+def _resolve_codex_executable(path=None) -> str:
+    import shutil
+
+    if path:
+        candidate = os.path.expanduser(path)
+        executable = shutil.which(candidate)
+        if executable is None and Path(candidate).is_file():
+            executable = str(Path(candidate).resolve())
+        if executable is None:
+            raise ValueError(f"codex executable not found at {candidate!r}")
+        return executable
+    if shutil.which("codex") is None:
+        raise ValueError("codex executable not found on PATH; pass --codex-path")
+    return "codex"
+
+
+def _codex_task_runner(
+    workspace: Path,
+    prompt: str,
+    *,
+    executable=None,
+    model=None,
+    config=(),
+) -> tuple[list[str], dict]:
+    command = [_resolve_codex_executable(executable), "exec", "--cd", str(workspace)]
+    if model is not None:
+        command.extend(["-m", model])
+    for setting in config:
+        command.extend(["-c", setting])
+    command.append(prompt)
+    return command, {}
 
 
 def _claude_task_runner(workspace: Path, prompt: str) -> tuple[list[str], dict]:
@@ -637,7 +666,19 @@ def cmd_task(args):
                 _logstream_fail(str(exc), as_json)
 
             prompt = task_handoff(correlation_id, agent)
-            command, runner_kwargs = runner_adapter(workspace, prompt)
+            try:
+                if args.runner == "codex":
+                    command, runner_kwargs = runner_adapter(
+                        workspace,
+                        prompt,
+                        executable=getattr(args, "codex_path", None),
+                        model=getattr(args, "codex_model", None),
+                        config=getattr(args, "codex_config", None) or (),
+                    )
+                else:
+                    command, runner_kwargs = runner_adapter(workspace, prompt)
+            except (ValueError, OSError) as exc:
+                _logstream_fail(str(exc), as_json)
             print(f"Launching {correlation_id} with {args.runner} as {agent}")
             # Release the SQLite handle before the child connects back to the
             # same logstream. The child owns its own process lifetime and MCP

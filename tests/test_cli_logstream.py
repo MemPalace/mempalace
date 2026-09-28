@@ -287,6 +287,87 @@ class TestTaskCli:
         ]
         assert f"Launching {correlation_id} with codex as windows-codex" in capsys.readouterr().out
 
+    def test_launch_passes_codex_model_config_and_executable(
+        self, palace_path, tmp_path, capsys, monkeypatch
+    ):
+        base_commit = _task_workspace(tmp_path)
+        cmd_task(_task_create_args(palace_path, base_commit=base_commit, json=True))
+        created = json.loads(capsys.readouterr().out)
+        correlation_id = created["task"]["correlation_id"]
+        executable = tmp_path.parent / "codex-test"
+        executable.write_text("runner", encoding="utf-8")
+        calls = []
+        real_run = subprocess.run
+
+        def fake_run(command, **kwargs):
+            if command[0] == "git":
+                return real_run(command, **kwargs)
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        cmd_task(
+            SimpleNamespace(
+                palace=palace_path,
+                task_action="launch",
+                correlation_id=correlation_id,
+                runner="codex",
+                workspace=str(tmp_path),
+                agent=None,
+                codex_path=str(executable),
+                codex_model="gpt-6-sol",
+                codex_config=[
+                    'model_reasoning_effort="max"',
+                    "default_permissions=:danger-full-access",
+                ],
+                json=False,
+            )
+        )
+
+        prompt = created["handoff"]
+        assert calls == [
+            (
+                [
+                    str(executable),
+                    "exec",
+                    "--cd",
+                    str(tmp_path.resolve()),
+                    "-m",
+                    "gpt-6-sol",
+                    "-c",
+                    'model_reasoning_effort="max"',
+                    "-c",
+                    "default_permissions=:danger-full-access",
+                    prompt,
+                ],
+                {"check": False},
+            )
+        ]
+
+    def test_launch_rejects_missing_codex_executable(self, palace_path, tmp_path, capsys):
+        base_commit = _task_workspace(tmp_path)
+        cmd_task(_task_create_args(palace_path, base_commit=base_commit, json=True))
+        correlation_id = json.loads(capsys.readouterr().out)["task"]["correlation_id"]
+
+        with pytest.raises(SystemExit) as exc:
+            cmd_task(
+                SimpleNamespace(
+                    palace=palace_path,
+                    task_action="launch",
+                    correlation_id=correlation_id,
+                    runner="codex",
+                    workspace=str(tmp_path),
+                    agent=None,
+                    codex_path=str(tmp_path.parent / "missing-codex"),
+                    codex_model=None,
+                    codex_config=[],
+                    json=True,
+                )
+            )
+
+        assert exc.value.code == 1
+        assert "codex executable not found" in json.loads(capsys.readouterr().out)["error"]
+
     def test_launch_refuses_a_workspace_at_the_wrong_base_commit(
         self, palace_path, tmp_path, capsys, monkeypatch
     ):
