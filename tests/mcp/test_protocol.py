@@ -1248,6 +1248,61 @@ col.add(ids=["peer_drawer"], documents=["from a peer"], embeddings=[[0.5] * 4],
 """
 
 
+def _seed_drawer_from_another_process(palace_path, drawer_id, text, **metadata):
+    """Upsert a drawer, with the vector this process's embedder gives ``text``,
+    from a separate Python process.
+
+    A client the test process built itself and left open would keep the old
+    System alive after a reset and let a closed handle go on answering.
+    """
+    from mempalace.backends.chroma import ChromaBackend
+
+    embedding = ChromaBackend._resolve_embedding_function()([text])[0]
+    peer = (
+        "import json, sys\n"
+        "import chromadb\n"
+        "path, drawer_id, text = sys.argv[1], sys.argv[2], sys.argv[3]\n"
+        "vector, metadata = json.loads(sys.argv[4]), json.loads(sys.argv[5])\n"
+        "client = chromadb.PersistentClient(path=path)\n"
+        "col = client.get_or_create_collection(\n"
+        "    'mempalace_drawers', metadata={'hnsw:space': 'cosine'}\n"
+        ")\n"
+        "col.upsert(ids=[drawer_id], documents=[text], embeddings=[vector], metadatas=[metadata])\n"
+        "client.close()\n"
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            peer,
+            palace_path,
+            drawer_id,
+            text,
+            json.dumps([float(x) for x in embedding]),
+            json.dumps({"wing": "w", "room": "r", **metadata}),
+        ],
+        check=True,
+        timeout=120,
+    )
+
+
+def _purge_after_a_peer_write(monkeypatch, palace_path):
+    """Move chroma.sqlite3's mtime as a peer's write would, right before every
+    closet purge; returns the source each purge was called for, in order."""
+    from mempalace import mcp_server
+
+    real = mcp_server._purge_source_closets
+    purged = []
+
+    def purge(source_file, *args, **kwargs):
+        purged.append(source_file)
+        _touch_db_as_peer(palace_path)
+        return real(source_file, *args, **kwargs)
+
+    monkeypatch.setattr(mcp_server, "_purge_source_closets", purge)
+    return purged
+
+
 class TestClientFreshness:
     """The session client is rebuilt for another process's writes only.
 
@@ -1380,6 +1435,251 @@ class TestClientFreshness:
         assert palace_get_collection(config.palace_path, create=False).get(ids=["peer_drawer"])[
             "ids"
         ] == ["peer_drawer"]
+
+    def test_session_collection_keeps_working_after_the_backend_resets(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """A tool keeps the session's collection across its own backend opens.
+
+        When one of those opens notices a peer's write it resets the shared
+        System, which closes the session client the handle came from.
+        """
+        from mempalace import mcp_server
+        from mempalace.backends import chroma as chroma_module
+        from mempalace.palace import get_collection as palace_get_collection
+
+        _seed_drawer_from_another_process(
+            palace_path, "held", "a drawer about tides", source_file="t.md"
+        )
+        _patch_mcp_server(monkeypatch, config, kg)
+        col = mcp_server._get_collection()
+        assert col.get(ids=["held"])["ids"] == ["held"]
+        palace_get_collection(config.palace_path, create=False).get(limit=1)
+
+        before = chroma_module.chroma_system_generation()
+        _touch_db_as_peer(config.palace_path)
+        # The backend notices first and resets the shared System.
+        palace_get_collection(config.palace_path, create=False).get(limit=1)
+        assert chroma_module.chroma_system_generation() > before
+
+        assert col.get(ids=["held"])["ids"] == ["held"]
+        col.delete(ids=["held"])
+        assert mcp_server._get_collection().count() == 0
+
+    def test_session_collection_opened_while_another_owner_resets_still_works(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """A reset can land after the session built its client and before the
+        handle exists; the handle must still know which client it came from."""
+        from mempalace import mcp_server
+        from mempalace.backends import chroma as chroma_module
+
+        _seed_drawer_from_another_process(
+            palace_path, "opened", "a drawer about tides", source_file="t.md"
+        )
+        _patch_mcp_server(monkeypatch, config, kg)
+        real_pin = mcp_server._pin_hnsw_threads
+        resets = []
+
+        def pin_while_another_owner_resets(collection):
+            real_pin(collection)
+            if not resets:
+                resets.append(1)
+                chroma_module._clear_chroma_system_cache()
+
+        monkeypatch.setattr(mcp_server, "_pin_hnsw_threads", pin_while_another_owner_resets)
+        col = mcp_server._get_collection()
+
+        assert resets == [1]
+        assert col.get(ids=["opened"])["ids"] == ["opened"]
+
+    def test_session_read_runs_again_when_another_request_resets_during_it(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """A hub runs read tools side by side. One that notices a peer's write
+        resets the System just as another enters a read on the same session
+        collection, before chromadb starts it; that read runs again instead of
+        failing."""
+        from chromadb.api.models.Collection import Collection
+
+        from mempalace import mcp_server
+        from mempalace.backends import chroma as chroma_module
+
+        _seed_drawer_from_another_process(
+            palace_path, "read_me", "a drawer about tides", source_file="t.md"
+        )
+        _patch_mcp_server(monkeypatch, config, kg)
+        col = mcp_server._get_collection()
+        real_get = Collection.get
+        attempts = []
+
+        def get_as_another_request_resets(self, *args, **kwargs):
+            if not attempts:
+                chroma_module._clear_chroma_system_cache()
+            try:
+                result = real_get(self, *args, **kwargs)
+            except Exception:
+                attempts.append("raised")
+                raise
+            attempts.append("ok")
+            return result
+
+        monkeypatch.setattr(Collection, "get", get_as_another_request_resets)
+
+        assert col.get(ids=["read_me"])["ids"] == ["read_me"]
+        assert attempts == ["raised", "ok"]
+
+    def test_session_handle_does_not_follow_a_palace_switch(
+        self, monkeypatch, config, palace_path, kg, tmp_dir
+    ):
+        """A handle stays on the palace it was opened on: after a reset it will
+        not reopen on another palace the server was pointed at meanwhile."""
+        from mempalace import mcp_server
+        from mempalace.backends import chroma as chroma_module
+        from mempalace.config import MempalaceConfig
+
+        _seed_drawer_from_another_process(
+            palace_path, "in_a", "a drawer about tides", source_file="a.md"
+        )
+        other = os.path.join(tmp_dir, "palace_b")
+        os.makedirs(other)
+        _seed_drawer_from_another_process(
+            other, "in_b", "a drawer about harbors", source_file="b.md"
+        )
+        _patch_mcp_server(monkeypatch, config, kg)
+        col = mcp_server._get_collection()
+        assert col.get(ids=["in_a"])["ids"] == ["in_a"]
+
+        config_b = os.path.join(tmp_dir, "config_b")
+        os.makedirs(config_b)
+        with open(os.path.join(config_b, "config.json"), "w") as f:
+            json.dump({"palace_path": other}, f)
+        monkeypatch.setattr(mcp_server, "_config", MempalaceConfig(config_dir=config_b))
+        chroma_module._clear_chroma_system_cache()
+
+        with pytest.raises(RuntimeError, match="cannot reopen"):
+            col.upsert(ids=["stray"], documents=["must not land in the other palace"])
+        assert mcp_server._get_collection().get(ids=["stray"])["ids"] == []
+
+    def test_session_handle_reports_why_it_cannot_reopen(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """When the session cannot take its collection again after a reset, the
+        held handle fails with the reason the session recorded."""
+        from mempalace import mcp_server
+        from mempalace.backends import chroma as chroma_module
+
+        _seed_drawer_from_another_process(
+            palace_path, "held", "a drawer about tides", source_file="t.md"
+        )
+        _patch_mcp_server(monkeypatch, config, kg)
+        col = mcp_server._get_collection()
+        monkeypatch.setattr(mcp_server, "_collection_open_error", None)
+
+        def cannot_open(create=False):
+            # As the real one does: record why, then answer None.
+            mcp_server._collection_open_error = {
+                "error": "Chroma database missing",
+                "details": "moved away by the test",
+            }
+            return None
+
+        monkeypatch.setattr(mcp_server, "_get_collection", cannot_open)
+        chroma_module._clear_chroma_system_cache()
+
+        with pytest.raises(RuntimeError, match="Chroma database missing moved away by the test"):
+            col.get(ids=["held"])
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Windows holds chroma.sqlite3 open while chromadb has it, blocking the rename",
+    )
+    def test_session_handle_fails_at_once_when_its_database_is_gone(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """A held handle whose palace database went missing after a reset fails
+        without resetting the System again: the reset ``_get_collection`` runs
+        for a missing database would make the call run a second time."""
+        from mempalace import mcp_server
+        from mempalace.backends import chroma as chroma_module
+
+        _seed_drawer_from_another_process(
+            palace_path, "held", "a drawer about tides", source_file="t.md"
+        )
+        _patch_mcp_server(monkeypatch, config, kg)
+        col = mcp_server._get_collection()
+        chroma_module._clear_chroma_system_cache()
+        db = os.path.join(palace_path, "chroma.sqlite3")
+        os.rename(db, db + ".moved")
+        generation = chroma_module.chroma_system_generation()
+
+        with pytest.raises(RuntimeError, match="Chroma database missing"):
+            col.get(ids=["held"])
+        assert chroma_module.chroma_system_generation() == generation
+
+    @pytest.mark.parametrize(
+        "new_content", ["corrected text", "B" * 1800], ids=["plain", "chunked"]
+    )
+    def test_update_drawer_is_written_when_its_closet_purge_notices_a_peer(
+        self, monkeypatch, config, palace_path, kg, new_content
+    ):
+        """The closet purge opens the closets through the backend; if that open
+        resets the System, the update still lands and the closets stay purged."""
+        from mempalace import mcp_server
+        from mempalace.backends import chroma as chroma_module
+        from mempalace.palace import get_closets_collection
+
+        _seed_drawer_from_another_process(
+            palace_path, "updated", "original text about lighthouses", source_file="n.md"
+        )
+        _patch_mcp_server(monkeypatch, config, kg)
+        get_closets_collection(palace_path, create=True).add(
+            ids=["closet_n"], documents=["topic: lighthouses"], metadatas=[{"source_file": "n.md"}]
+        )
+        purges = _purge_after_a_peer_write(monkeypatch, config.palace_path)
+        before = chroma_module.chroma_system_generation()
+
+        result = mcp_server.tool_update_drawer("updated", content=new_content)
+
+        assert purges == ["n.md"]
+        assert chroma_module.chroma_system_generation() > before
+        assert result["success"] is True, result
+        if len(new_content) > 800:
+            assert result.get("chunks", 1) > 1, result
+        assert result["closets_deleted"] == 1
+        assert get_closets_collection(palace_path, create=False).get(include=[])["ids"] == []
+        assert mcp_server.tool_get_drawer("updated")["content"] == new_content
+
+    def test_bulk_delete_goes_on_when_its_closet_purges_notice_peers(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Every id's delete purges its source's closets through the backend."""
+        from mempalace import mcp_server
+        from mempalace.backends import chroma as chroma_module
+        from mempalace.palace import get_closets_collection
+
+        sources = ["a.md", "b.md", "c.md"]
+        ids = [f"bulk_{i}" for i in range(len(sources))]
+        for drawer_id, source in zip(ids, sources):
+            _seed_drawer_from_another_process(
+                palace_path, drawer_id, f"{source} is about lighthouses", source_file=source
+            )
+        _patch_mcp_server(monkeypatch, config, kg)
+        get_closets_collection(palace_path, create=True).add(
+            ids=[f"closet_{source}" for source in sources],
+            documents=["topic: lighthouses"] * len(sources),
+            metadatas=[{"source_file": source} for source in sources],
+        )
+        purges = _purge_after_a_peer_write(monkeypatch, config.palace_path)
+        before = chroma_module.chroma_system_generation()
+
+        result = mcp_server.tool_delete_drawers(ids)
+
+        assert purges == sources
+        assert chroma_module.chroma_system_generation() > before
+        assert (result["deleted"], result["errors"]) == (3, 0), result
+        assert get_closets_collection(palace_path, create=False).get(include=[])["ids"] == []
+        assert mcp_server._get_collection().get(ids=ids)["ids"] == []
 
 
 class TestStructuredErrors:

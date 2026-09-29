@@ -232,6 +232,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (110k rows/s measured).
 
 ### Bug Fixes
+- **A collection handle keeps working after a Chroma System reset.** A reset
+  closes the session's and every backend's clients, and a handle taken before
+  the reset failed with `'RustBindingsAPI' object has no attribute 'bindings'`:
+  a hub mine skipped changed files, and `update_drawer`, `delete_drawers` and
+  `sync --apply` could stop halfway. The handle now reopens after a reset, and a
+  call that a finished reset cut off runs once more. (#2622)
 - **`mempalace sweep` and `mempalace sync` routed to the daemon no longer resolve
   a relative path against the daemon's working directory.** Both put the path into
   the job as typed, and the daemon keeps the directory it was started in: a
