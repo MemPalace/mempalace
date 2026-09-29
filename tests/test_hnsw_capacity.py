@@ -10,15 +10,19 @@ from __future__ import annotations
 
 import os
 import pickle
+import shutil
 import sqlite3
 import time
 
 import pytest
 
 from mempalace.backends.chroma import (
+    _fts_tokens,
     _hnsw_element_count,
+    _whole_words_first,
     _vector_segment_id,
     hnsw_capacity_status,
+    reset_hnsw_capacity_cache,
 )
 from mempalace.searcher import _bm25_only_via_sqlite
 
@@ -287,9 +291,9 @@ def test_capacity_status_quiet_for_empty_palace(tmp_path):
 def test_capacity_status_tolerates_lag_under_large_sync_threshold(tmp_path):
     """Regression for the PR #1191 / PR #1227 conflict.
 
-    Palaces created via mempalace's _HNSW_BLOAT_GUARD (sync_threshold=
-    50_000) naturally accumulate up to ~50K queued entries between
-    flushes. The pickle-vs-sqlite probe must scale its tolerance to
+    A palace carrying a large sync_threshold (50_000) naturally accumulates
+    up to ~50K queued entries between flushes. The pickle-vs-sqlite probe
+    must scale its tolerance to
     ``2 × sync_threshold`` so this expected lag is not flagged as
     corruption — otherwise vector search disables for ~80% of the
     write cycle on any actively-mined ≥100K palace.
@@ -695,3 +699,691 @@ def test_capacity_status_ok_with_stale_metadata_under_explicit_threshold(tmp_pat
     assert info["threshold"] == 4
     assert info["status"] == "ok"
     assert info["diverged"] is False
+
+
+# ── Probe result cache (#1471) ────────────────────────────────────────
+
+
+class TestCapacityProbeCache:
+    """The probe is re-used while the files it reads are untouched.
+
+    Every search, duplicate check and status call runs the probe, and each
+    run costs four sqlite connections plus a full unpickle of the segment
+    metadata. Caching it is only safe if any on-disk change re-probes
+    immediately — a stale "ok" would walk a diverged segment straight into
+    the #1222 segfault the probe exists to prevent.
+    """
+
+    # Cache isolation comes from conftest's suite-wide ``_reset_mcp_cache``,
+    # which clears every module-level palace cache between tests — the same
+    # place ChromaBackend._quarantined_paths and the MCP client cache are reset.
+
+    @pytest.fixture
+    def probe_runs(self, monkeypatch):
+        """Record every call that reaches the uncached probe."""
+        from mempalace.backends import chroma as chroma_mod
+
+        calls: list[tuple[str, str]] = []
+        real = chroma_mod._hnsw_capacity_status_uncached
+
+        def counting(palace_path, collection_name="mempalace_drawers"):
+            calls.append((palace_path, collection_name))
+            return real(palace_path, collection_name)
+
+        monkeypatch.setattr(chroma_mod, "_hnsw_capacity_status_uncached", counting)
+        return calls
+
+    @staticmethod
+    def _balanced_palace(tmp_path, seg="seg-cache"):
+        _seed_chroma_db(str(tmp_path), sqlite_count=20_000, segment_id=seg)
+        _write_pickle(str(tmp_path), seg, hnsw_count=19_900)
+        return seg
+
+    def test_unchanged_palace_probes_once(self, tmp_path, probe_runs):
+        self._balanced_palace(tmp_path)
+        first = hnsw_capacity_status(str(tmp_path), COLLECTION)
+        second = hnsw_capacity_status(str(tmp_path), COLLECTION)
+        third = hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert len(probe_runs) == 1
+        assert first == second == third
+        assert first["status"] == "ok"
+
+    def test_pickle_rewrite_reprobes_and_reports_divergence(self, tmp_path, probe_runs):
+        """The #1222 guard must not go blind behind the cache."""
+        seg = self._balanced_palace(tmp_path)
+        assert hnsw_capacity_status(str(tmp_path), COLLECTION)["diverged"] is False
+
+        # The segment loses almost every element — exactly the state that
+        # segfaults chromadb once a query touches it.
+        _write_pickle(str(tmp_path), seg, hnsw_count=2_000)
+
+        after = hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert len(probe_runs) == 2, "a rewritten pickle must re-run the probe"
+        assert after["diverged"] is True
+        assert after["hnsw_count"] == 2_000
+
+    def test_sqlite_write_reprobes(self, tmp_path, probe_runs):
+        seg = self._balanced_palace(tmp_path)
+        hnsw_capacity_status(str(tmp_path), COLLECTION)
+
+        db_path = os.path.join(str(tmp_path), "chroma.sqlite3")
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(
+                """INSERT INTO embeddings (id, segment_id, embedding_id, seq_id)
+                   VALUES (?, ?, ?, ?)""",
+                (999_999, seg, "d-extra", b"\x00\x00\x00\x00\x00\x00\x00\x01"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        after = hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert len(probe_runs) == 2
+        assert after["sqlite_count"] == 20_001
+
+    def test_wal_sidecar_write_reprobes(self, tmp_path, probe_runs):
+        """Under WAL a writer leaves chroma.sqlite3's own mtime untouched.
+
+        chromadb 1.5.x uses ``journal_mode=delete``, so this models the palace
+        being opened in WAL mode by something else rather than today's default.
+        """
+        self._balanced_palace(tmp_path)
+        hnsw_capacity_status(str(tmp_path), COLLECTION)
+
+        db_path = os.path.join(str(tmp_path), "chroma.sqlite3")
+        before = os.stat(db_path)
+        with open(db_path + "-wal", "wb") as f:
+            f.write(b"\x00" * 4096)
+        assert os.stat(db_path).st_mtime_ns == before.st_mtime_ns, (
+            "precondition: the main DB file must be untouched by this write"
+        )
+
+        hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert len(probe_runs) == 2, "a WAL-only write must still invalidate"
+
+    def test_cache_is_keyed_by_collection(self, tmp_path, probe_runs):
+        """repair.status probes drawers and closets against the same palace."""
+        self._balanced_palace(tmp_path)
+        drawers = hnsw_capacity_status(str(tmp_path), COLLECTION)
+        closets = hnsw_capacity_status(str(tmp_path), "mempalace_closets")
+
+        assert len(probe_runs) == 2
+        assert drawers["sqlite_count"] == 20_000
+        # The closets collection does not exist in this palace, so its verdict
+        # must not be the drawers verdict served from a palace-only key.
+        assert closets["sqlite_count"] != 20_000
+
+    def test_reset_forces_a_reprobe(self, tmp_path, probe_runs):
+        self._balanced_palace(tmp_path)
+        hnsw_capacity_status(str(tmp_path), COLLECTION)
+        hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert len(probe_runs) == 1
+
+        reset_hnsw_capacity_cache()
+        hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert len(probe_runs) == 2
+
+    def test_caller_mutation_does_not_corrupt_the_cache(self, tmp_path, probe_runs):
+        """mcp_server parks the verdict in a module global; keep them isolated.
+
+        Both directions matter: the dict handed to the caller that ran the
+        probe must not be the stored one, and neither must the dict handed to
+        every later caller served from the cache.
+        """
+        self._balanced_palace(tmp_path)
+        first = hnsw_capacity_status(str(tmp_path), COLLECTION)
+        first["diverged"] = "tampered-by-prober"
+        first["message"] = "tampered-by-prober"
+
+        second = hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert second["diverged"] is False
+        assert second["message"] != "tampered-by-prober"
+
+        # A cache hit must hand out a copy too, or this caller poisons the
+        # verdict every later reader sees.
+        second["diverged"] = "tampered-by-reader"
+        second["message"] = "tampered-by-reader"
+
+        third = hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert len(probe_runs) == 1
+        assert third["diverged"] is False
+        assert third["message"] != "tampered-by-reader"
+
+    def test_write_during_the_probe_is_not_cached(self, tmp_path, monkeypatch):
+        """A verdict that pins to neither disk state must not be reused."""
+        from mempalace.backends import chroma as chroma_mod
+
+        self._balanced_palace(tmp_path)
+        db_path = os.path.join(str(tmp_path), "chroma.sqlite3")
+        real = chroma_mod._hnsw_capacity_status_uncached
+        runs: list[int] = []
+
+        def racing(palace_path, collection_name="mempalace_drawers"):
+            result = real(palace_path, collection_name)
+            runs.append(1)
+            if len(runs) == 1:
+                # Land a write after the probe read, before it returns.
+                with open(db_path + "-wal", "wb") as f:
+                    f.write(b"\x01" * 2048)
+            return result
+
+        monkeypatch.setattr(chroma_mod, "_hnsw_capacity_status_uncached", racing)
+
+        hnsw_capacity_status(str(tmp_path), COLLECTION)
+        hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert len(runs) == 2, "a palace written mid-probe must not be cached"
+
+        # The second probe ran without a racing write, so caching resumes.
+        hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert len(runs) == 2, "a quiet palace must be cached again afterwards"
+
+    def test_verdict_is_not_reused_past_the_age_ceiling(self, tmp_path, probe_runs, monkeypatch):
+        """Backstop for filesystems whose timestamps are too coarse to notice."""
+        from mempalace.backends import chroma as chroma_mod
+
+        self._balanced_palace(tmp_path)
+        clock = [1_000.0]
+        monkeypatch.setattr(chroma_mod.time, "monotonic", lambda: clock[0])
+
+        hnsw_capacity_status(str(tmp_path), COLLECTION)
+        clock[0] += chroma_mod._CAPACITY_CACHE_MAX_AGE_SECONDS / 2
+        hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert len(probe_runs) == 1, "still inside the ceiling: serve the cached verdict"
+
+        clock[0] += chroma_mod._CAPACITY_CACHE_MAX_AGE_SECONDS
+        hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert len(probe_runs) == 2, "past the ceiling: re-probe even with identical files"
+
+    def test_probe_still_never_raises_on_an_unstattable_path(self):
+        """The probe's stated contract is "never raises"; caching must keep it.
+
+        A palace path with an embedded null byte makes ``os.stat`` raise
+        ``ValueError`` rather than ``OSError``, which a signature helper that
+        only caught ``OSError`` would let escape.
+        """
+        result = hnsw_capacity_status("\x00bad", COLLECTION)
+        assert result["status"] == "unknown"
+        assert result["diverged"] is False
+
+    def test_first_probe_runs_even_when_process_uptime_is_tiny(
+        self, tmp_path, probe_runs, monkeypatch
+    ):
+        """The withdrawn PR #1756 skipped its very first probe.
+
+        That TTL compared ``time.monotonic()`` against a timestamp initialised
+        to ``0.0``, so on a process younger than the TTL the comparison said
+        "probed recently" before any probe had run. Here the age check is
+        reachable only through an existing cache entry, so a cold cache always
+        probes no matter what the clock reads.
+        """
+        from mempalace.backends import chroma as chroma_mod
+
+        self._balanced_palace(tmp_path)
+        monkeypatch.setattr(chroma_mod.time, "monotonic", lambda: 0.5)
+
+        info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert len(probe_runs) == 1
+        assert info["status"] == "ok"
+        assert info["sqlite_count"] == 20_000
+
+    def test_first_flush_after_an_unknown_verdict_is_noticed(self, tmp_path, probe_runs):
+        """The common lifecycle: a fresh palace has no pickle until it flushes."""
+        seg = "seg-firstflush"
+        _seed_chroma_db(str(tmp_path), sqlite_count=20_000, segment_id=seg)
+
+        unflushed = hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert unflushed["status"] == "unknown"
+        assert unflushed["hnsw_count"] is None
+
+        # The first flush writes a brand-new file in a sibling segment dir and
+        # never touches chroma.sqlite3's own mtime.
+        _write_pickle(str(tmp_path), seg, hnsw_count=2_000)
+
+        after = hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert len(probe_runs) == 2, "the first flush must invalidate an 'unknown' verdict"
+        assert after["hnsw_count"] == 2_000
+        assert after["diverged"] is True
+
+    def test_segment_replacement_is_noticed(self, tmp_path, probe_runs):
+        """A dropped-and-recreated collection lands on a new VECTOR segment."""
+        old_seg = self._balanced_palace(tmp_path, seg="seg-old")
+        assert hnsw_capacity_status(str(tmp_path), COLLECTION)["segment_id"] == old_seg
+
+        new_seg = "seg-new"
+        db_path = os.path.join(str(tmp_path), "chroma.sqlite3")
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute("UPDATE segments SET id = ? WHERE scope = 'VECTOR'", (new_seg,))
+            conn.execute("UPDATE embeddings SET segment_id = ?", (new_seg,))
+            conn.commit()
+        finally:
+            conn.close()
+        _write_pickle(str(tmp_path), new_seg, hnsw_count=19_900)
+
+        moved = hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert moved["segment_id"] == new_seg
+
+        # The verdict must now track the NEW segment's pickle, not the old one.
+        _write_pickle(str(tmp_path), new_seg, hnsw_count=2_000)
+        runs_before = len(probe_runs)
+        diverged = hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert len(probe_runs) == runs_before + 1
+        assert diverged["diverged"] is True
+
+    def test_palace_removal_is_noticed(self, tmp_path, probe_runs):
+        """A palace deleted underneath a live server must not stay "ok"."""
+        palace = tmp_path / "palace"
+        palace.mkdir()
+        _seed_chroma_db(str(palace), sqlite_count=20_000, segment_id="seg-gone")
+        _write_pickle(str(palace), "seg-gone", hnsw_count=19_900)
+        assert hnsw_capacity_status(str(palace), COLLECTION)["status"] == "ok"
+
+        shutil.rmtree(palace)
+
+        gone = hnsw_capacity_status(str(palace), COLLECTION)
+        assert len(probe_runs) == 2
+        assert gone["status"] == "unknown"
+        assert gone["diverged"] is False
+
+    def test_cache_never_exceeds_the_bound_at_any_point(self, tmp_path):
+        """Check the peak, not just the size left over at the end.
+
+        The final size after the clear-and-refill cycle is small whatever the
+        threshold comparison is, so asserting on it alone would pass with an
+        off-by-one bound.
+        """
+        from mempalace.backends import chroma as chroma_mod
+
+        peak = 0
+        for i in range(chroma_mod._CAPACITY_CACHE_MAX_ENTRIES + 5):
+            palace = tmp_path / f"palace-{i}"
+            palace.mkdir()
+            _seed_chroma_db(str(palace), sqlite_count=10, segment_id=f"seg-{i}")
+            hnsw_capacity_status(str(palace), COLLECTION)
+            peak = max(peak, len(chroma_mod._capacity_cache))
+
+        assert peak <= chroma_mod._CAPACITY_CACHE_MAX_ENTRIES
+
+    def test_concurrent_probes_are_safe_and_agree(self, tmp_path):
+        """The cache is deliberately lock-free; a racing miss must stay benign."""
+        import concurrent.futures
+
+        self._balanced_palace(tmp_path)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            verdicts = list(
+                pool.map(lambda _: hnsw_capacity_status(str(tmp_path), COLLECTION), range(32))
+            )
+
+        assert all(v["status"] == "ok" for v in verdicts)
+        assert {v["sqlite_count"] for v in verdicts} == {20_000}
+
+    def test_wal_mode_palace_still_gets_cache_hits(self, tmp_path, probe_runs):
+        """A WAL-mode palace must not invalidate its own cache on every call.
+
+        sqlite restamps the ``-shm`` WAL index every time a connection opens
+        the database, read-only included. A signature covering ``-shm`` would
+        therefore change under the probe's own reads, so the cache would miss
+        100% of the time on exactly the palaces this fix is meant to speed up.
+        """
+        self._balanced_palace(tmp_path)
+        db_path = os.path.join(str(tmp_path), "chroma.sqlite3")
+        conn = sqlite3.connect(db_path)
+        try:
+            mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        finally:
+            conn.close()
+        assert mode == "wal", "precondition: the palace must really be in WAL mode"
+
+        # The first reads settle the WAL file itself, which legitimately moves
+        # the signature; what matters is that it then stops moving.
+        for _ in range(2):
+            hnsw_capacity_status(str(tmp_path), COLLECTION)
+        settled = len(probe_runs)
+
+        for _ in range(4):
+            assert hnsw_capacity_status(str(tmp_path), COLLECTION)["status"] == "ok"
+
+        assert len(probe_runs) == settled, (
+            "reads alone must not keep invalidating the verdict on a WAL palace"
+        )
+
+    def test_pickle_rewrite_during_probe_is_not_cached(self, tmp_path):
+        """A pickle rewrite landing mid-probe must not be pinned as fresh.
+
+        The probe reads ``index_metadata.pickle`` partway through, then makes
+        two more sqlite calls. If the fingerprint were snapshotted only after
+        the probe returned, a rewrite that lands in that window would be
+        recorded as "unchanged" while the verdict still reflected the pre-write
+        file — the exact #1222 blindness the probe exists to prevent. We drive
+        the writer from ``_read_sync_threshold``, which the probe calls strictly
+        after the pickle read and strictly before it returns.
+        """
+        from mempalace.backends import chroma as chroma_mod
+
+        seg = "seg-race"
+        _seed_chroma_db(str(tmp_path), sqlite_count=20_000, segment_id=seg)
+        _write_pickle(str(tmp_path), seg, hnsw_count=19_900)  # healthy
+
+        real_rst = chroma_mod._read_sync_threshold
+        fired = []
+
+        def racing(pp, cn):
+            if not fired:
+                fired.append(1)
+                _write_pickle(str(tmp_path), seg, hnsw_count=2_000)  # collapse
+            return real_rst(pp, cn)
+
+        try:
+            chroma_mod._read_sync_threshold = racing
+            hnsw_capacity_status(str(tmp_path), COLLECTION)  # races, must not cache
+        finally:
+            chroma_mod._read_sync_threshold = real_rst
+
+        # No further writes: a later caller must see the collapsed truth, not a
+        # cached "ok" from the raced probe.
+        served = hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert served["hnsw_count"] == 2_000
+        assert served["diverged"] is True
+
+    def test_locked_database_verdict_is_not_cached(self, tmp_path, probe_runs):
+        """A probe that could not read sqlite must not pin a false 'unknown'."""
+        from mempalace.backends import chroma as chroma_mod
+
+        self._balanced_palace(tmp_path)
+
+        real_count = chroma_mod._sqlite_embedding_count
+        locked = []
+
+        def flaky_count(pp, cn):
+            if not locked:
+                locked.append(1)
+                return None  # simulate "database is locked" swallowed to None
+            return real_count(pp, cn)
+
+        try:
+            chroma_mod._sqlite_embedding_count = flaky_count
+            first = hnsw_capacity_status(str(tmp_path), COLLECTION)
+        finally:
+            chroma_mod._sqlite_embedding_count = real_count
+
+        assert first["sqlite_count"] is None  # the locked read
+        # The lock cleared; the next call must re-probe rather than serve the
+        # cached "could not read" verdict.
+        second = hnsw_capacity_status(str(tmp_path), COLLECTION)
+        assert len(probe_runs) == 2
+        assert second["sqlite_count"] == 20_000
+
+    def test_reset_during_probe_is_not_resurrected(self, tmp_path, probe_runs):
+        """A reset landing while a probe runs must win — the entry stays gone.
+
+        ``tool_reconnect`` clears the cache to force a fresh read; a probe that
+        started earlier must not repopulate the very entry the reset dropped.
+        """
+        from mempalace.backends import chroma as chroma_mod
+
+        self._balanced_palace(tmp_path)
+        real = chroma_mod._hnsw_capacity_status_uncached
+
+        def reset_midway(pp, cn="mempalace_drawers"):
+            result = real(pp, cn)
+            reset_hnsw_capacity_cache()  # a concurrent tool_reconnect
+            return result
+
+        try:
+            chroma_mod._hnsw_capacity_status_uncached = reset_midway
+            hnsw_capacity_status(str(tmp_path), COLLECTION)
+        finally:
+            chroma_mod._hnsw_capacity_status_uncached = real
+
+        assert chroma_mod._capacity_cache == {}, "the in-flight probe resurrected a reset entry"
+
+
+# ── Stranded indexes: no pickle, and it is not flush-lag ──────────────
+#
+# Two shapes where index_metadata.pickle is absent for a reason that will
+# never resolve, both previously reported as ordinary "metadata has not
+# been flushed; leaving vector search enabled".
+#
+# 1. UNREACHABLE THRESHOLD. Chroma compacts its write buffer into HNSW,
+#    and only then writes the pickle, once the buffer reaches
+#    hnsw:sync_threshold. Collections created before the default dropped
+#    still carry the old large value, so one that never grows past it
+#    never builds an index at all. Observed on a real palace: a closets
+#    collection sat at 13,284 records against sync_threshold 50,000 for
+#    three months, so it never flushed, its segment therefore failed the
+#    health check, and it was re-quarantined every session - 32 snapshots.
+#
+# 2. REPLACEMENT STUB. After a quarantine Chroma creates a fresh segment
+#    sized for ~100 elements. That stub has no pickle either, so treating
+#    "no pickle" as unconditionally inconclusive left the #1222 fallback
+#    disarmed against an index holding 100 slots while sqlite held 183,198
+#    rows. Filtered queries failed with "Error finding id"; unfiltered ones
+#    silently degraded to BM25.
+#
+# A segment with no data_level0.bin at all is still genuinely fresh and
+# stays "unknown".
+
+
+def _write_stub_payload(palace: str, segment_id: str, data_size: int) -> None:
+    seg_dir = os.path.join(palace, segment_id)
+    os.makedirs(seg_dir, exist_ok=True)
+    with open(os.path.join(seg_dir, "data_level0.bin"), "wb") as f:
+        f.write(b"\0" * data_size)
+    with open(os.path.join(seg_dir, "link_lists.bin"), "wb") as f:
+        f.write(b"")
+
+
+def test_capacity_status_flags_unreachable_sync_threshold(tmp_path):
+    """A collection below its own threshold can never flush."""
+    seg = "seg-unreachable"
+    _seed_chroma_db(str(tmp_path), sqlite_count=13_284, segment_id=seg, sync_threshold=50_000)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    # Deliberately not "diverged": those records are still reachable through
+    # Chroma's brute-force buffer, so routing every search to BM25 would make
+    # retrieval worse. The defect is that nothing surfaced the condition.
+    assert info["flush_unreachable"] is True
+    assert info["diverged"] is False
+    assert "sync_threshold" in info["message"]
+    assert "50,000" in info["message"]
+    assert "will not resolve on its own" in info["message"]
+
+
+def test_capacity_status_reachable_threshold_stays_unknown(tmp_path):
+    """A collection larger than its threshold is simply not flushed yet."""
+    seg = "seg-reachable"
+    _seed_chroma_db(str(tmp_path), sqlite_count=60_000, segment_id=seg, sync_threshold=50_000)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["flush_unreachable"] is False
+    assert info["status"] == "unknown"
+    assert "leaving vector search enabled" in info["message"]
+
+
+def test_capacity_status_unreachable_ignored_once_pickle_exists(tmp_path):
+    """A flushed index is healthy regardless of how it got there."""
+    seg = "seg-flushed"
+    _seed_chroma_db(str(tmp_path), sqlite_count=13_284, segment_id=seg, sync_threshold=50_000)
+    _write_pickle(str(tmp_path), seg, hnsw_count=13_284)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["status"] == "ok"
+    assert info["diverged"] is False
+    assert info["flush_unreachable"] is False
+
+
+def test_capacity_status_flags_stub_payload_against_large_sqlite(tmp_path):
+    """100-slot replacement stub standing in for a lost 183k index."""
+    seg = "seg-stub"
+    _seed_chroma_db(str(tmp_path), sqlite_count=183_198, segment_id=seg, sync_threshold=1_000)
+    _write_stub_payload(str(tmp_path), seg, data_size=167_600)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["status"] == "diverged"
+    assert info["diverged"] is True
+    assert "repair" in info["message"].lower()
+
+
+def test_capacity_status_still_unknown_when_no_payload_written(tmp_path):
+    """No data_level0.bin at all is a fresh segment, not a stub."""
+    seg = "seg-nopayload"
+    _seed_chroma_db(str(tmp_path), sqlite_count=10_000, segment_id=seg, sync_threshold=1_000)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["status"] == "unknown"
+    assert info["diverged"] is False
+    assert "leaving vector search enabled" in info["message"]
+
+
+def test_capacity_status_tolerates_small_palace_stub(tmp_path):
+    """A stub beside a small sqlite is a young palace, not corruption."""
+    seg = "seg-small"
+    _seed_chroma_db(str(tmp_path), sqlite_count=120, segment_id=seg, sync_threshold=1_000)
+    _write_stub_payload(str(tmp_path), seg, data_size=167_600)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["diverged"] is False
+    assert info["flush_unreachable"] is False
+
+
+def test_bm25_fallback_finds_whole_word_matches_behind_substring_hits(tmp_path):
+    """The trigram index matches ``aven`` inside ``haven't`` and ``Avenue``.
+    Taking the first 500 matches in storage order handed the re-rank only
+    those older substring hits, so the drawers that say Aven never reached it
+    and the results were zero-score noise."""
+    seg = "seg-bm25-substring"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=seg)
+    noise = [
+        (
+            f"I haven't walked down the Avenue in New Haven, entry {i}",
+            {"wing": "w", "room": "r", "source_file": f"/x/noise{i}.md"},
+            f"n-{i}",
+        )
+        for i in range(600)
+    ]
+    named = [
+        (
+            f"Aven said the wake sequence starts with the lantern, entry {i}",
+            {"wing": "w", "room": "r", "source_file": f"/x/aven{i}.md"},
+            f"a-{i}",
+        )
+        for i in range(3)
+    ]
+    _seed_drawers(str(tmp_path), seg, noise + named)
+
+    out = _bm25_only_via_sqlite("Aven", str(tmp_path), n_results=5)
+    top = [r["text"] for r in out["results"][:3]]
+    assert all(text.startswith("Aven said") for text in top), top
+    assert out["results"][0]["bm25_score"] > 0
+
+
+def test_bm25_fallback_still_returns_substring_near_misses(tmp_path):
+    """Whole-word matches go first, but substring-only matches still fill the
+    candidate set: a query for ``vector`` still finds a drawer that only says
+    ``vectors``."""
+    seg = "seg-bm25-near-miss"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=seg)
+    _seed_drawers(
+        str(tmp_path),
+        seg,
+        [("the vectors are rebuilt nightly", {"wing": "w", "room": "r"}, "v-1")],
+    )
+    out = _bm25_only_via_sqlite("vector", str(tmp_path), n_results=5)
+    assert [r["text"] for r in out["results"]] == ["the vectors are rebuilt nightly"]
+    scoped = _bm25_only_via_sqlite("vector", str(tmp_path), wing="w", n_results=5)
+    assert [r["text"] for r in scoped["results"]] == ["the vectors are rebuilt nightly"]
+
+
+def test_bm25_fallback_leaves_stop_words_out_of_the_candidate_query(tmp_path):
+    """A stop word matches nearly every drawer, so it would fill the candidate
+    set on its own; it is dropped unless the query has nothing else."""
+    seg = "seg-bm25-stop-words"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=seg)
+    filler = [
+        (f"the weather was the same as the day before, {i}", {"wing": "w", "room": "r"}, f"f-{i}")
+        for i in range(600)
+    ]
+    target = [("lantern notes from the evening", {"wing": "w", "room": "r"}, "t-1")]
+    _seed_drawers(str(tmp_path), seg, target + filler)
+    stop = frozenset({"the"})
+    out = _bm25_only_via_sqlite("the lantern", str(tmp_path), n_results=3, stop_words=stop)
+    assert out["results"][0]["text"] == "lantern notes from the evening"
+    only_stop = _bm25_only_via_sqlite("the", str(tmp_path), n_results=3, stop_words=stop)
+    assert only_stop["results"]
+
+
+def test_whole_word_candidate_pick_ignores_stop_words_when_terms_present():
+    tokens = _fts_tokens("the lantern", frozenset({"the"}))
+    rows = [(1, "the lanternfish was cataloged"), (2, "lantern notes from the evening")]
+    assert _whole_words_first(rows, tokens, limit=1) == [2]
+
+
+def _fts_conn(rows):
+    """In-memory chroma-shaped FTS store: ``rows`` is [(rowid, text), ...]."""
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE collections (id TEXT, name TEXT);
+        CREATE TABLE segments (id TEXT, collection TEXT);
+        CREATE TABLE embeddings (id INTEGER PRIMARY KEY, segment_id TEXT);
+        CREATE VIRTUAL TABLE embedding_fulltext_search USING fts5(string_value, tokenize='trigram');
+        INSERT INTO collections VALUES ('c', 'drawers');
+        INSERT INTO segments VALUES ('s', 'c');
+        """
+    )
+    conn.executemany("INSERT INTO embeddings VALUES (?, 's')", ((rid,) for rid, _ in rows))
+    conn.executemany(
+        "INSERT INTO embedding_fulltext_search(rowid, string_value) VALUES (?, ?)", rows
+    )
+    return conn
+
+
+def test_fts_candidates_reach_a_name_ranked_past_the_scan_cap():
+    """50,009 higher-ranked substring hits (``Avenue``) and one drawer that says
+    ``Aven``: the ranked window of 50,000 misses it, the continuation finds it."""
+    from mempalace.backends.chroma import _FTS_SCAN_CAP, _fts_candidate_rows
+
+    noise = [(i, "Avenue Avenue Avenue") for i in range(1, _FTS_SCAN_CAP + 10)]
+    target = _FTS_SCAN_CAP + 10
+    conn = _fts_conn(noise + [(target, "Aven " + "quiet lantern room " * 20)])
+    picked = _fts_candidate_rows(conn, "drawers", "Aven", limit=5)
+    assert picked[0] == target
+    assert not picked.truncated
+
+
+def test_fts_candidates_reach_the_oldest_lowest_ranked_name(monkeypatch):
+    import mempalace.backends.chroma as chroma
+
+    monkeypatch.setattr(chroma, "_FTS_SCAN_CAP", 50)
+    rows = [(1, "Aven " + "quiet lantern room " * 20)]
+    rows += [(i, "Avenue Avenue Avenue") for i in range(2, 70)]
+    picked = chroma._fts_candidate_rows(_fts_conn(rows), "drawers", "Aven", limit=5)
+    assert picked[0] == 1
+
+
+def test_fts_candidates_say_when_the_continuation_budget_ran_out(monkeypatch):
+    import mempalace.backends.chroma as chroma
+
+    monkeypatch.setattr(chroma, "_FTS_SCAN_CAP", 50)
+    monkeypatch.setattr(chroma, "_FTS_CONTINUATION_BUDGET", 60)
+    rows = [(1, "Aven " + "quiet lantern room " * 20)]
+    rows += [(i, "Avenue Avenue Avenue") for i in range(2, 200)]
+    picked = chroma._fts_candidate_rows(_fts_conn(rows), "drawers", "Aven", limit=5)
+    assert 1 not in picked
+    assert picked.truncated
+
+
+def test_bm25_fallback_reports_truncated_candidates(tmp_path, monkeypatch):
+    import mempalace.backends.chroma as chroma
+
+    monkeypatch.setattr(chroma, "_FTS_SCAN_CAP", 20)
+    monkeypatch.setattr(chroma, "_FTS_CONTINUATION_BUDGET", 25)
+    seg = "seg-bm25-truncated"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=seg)
+    named = [("Aven " + "quiet lantern room " * 20, {"wing": "w", "room": "r"}, "a-0")]
+    noise = [(f"Avenue Avenue Avenue {i}", {"wing": "w", "room": "r"}, f"n-{i}") for i in range(80)]
+    _seed_drawers(str(tmp_path), seg, named + noise)
+    out = _bm25_only_via_sqlite("Aven", str(tmp_path), n_results=5)
+    assert out["candidates_truncated"] is True

@@ -12,10 +12,12 @@ from _backend_conformance import assert_partition_isolation
 from mempalace.backends import PalaceRef
 from mempalace.backends.chroma import ChromaBackend
 from mempalace.backends.sqlite_exact import SQLiteExactBackend
+from mempalace.backends.rust_exact import RustExactBackend
 
 _LOCAL_BACKENDS = [
     pytest.param(ChromaBackend, id="chroma"),
     pytest.param(SQLiteExactBackend, id="sqlite_exact"),
+    pytest.param(RustExactBackend, id="rust_exact"),
 ]
 
 
@@ -41,3 +43,21 @@ def test_local_backends_do_not_claim_namespace_isolation():
     advertise the namespace-isolation capability (RFC 001 isolation contract)."""
     assert "supports_namespace_isolation" not in ChromaBackend.capabilities
     assert "supports_namespace_isolation" not in SQLiteExactBackend.capabilities
+    assert "supports_namespace_isolation" not in RustExactBackend.capabilities
+
+
+@pytest.mark.parametrize("backend_cls", _LOCAL_BACKENDS)
+def test_local_backends_reject_populated_namespace(backend_cls, tmp_path):
+    """RFC 001 section 4.4 no-silent-drop: non-advertising backends MUST raise when
+    PalaceRef.namespace is set rather than accept-and-ignore."""
+    from mempalace.backends.base import UnsupportedCapabilityError
+
+    backend = backend_cls()
+    try:
+        path = tmp_path / "palace"
+        path.mkdir()
+        ref = PalaceRef(id=str(path), local_path=str(path), namespace="tenant-a")
+        with pytest.raises(UnsupportedCapabilityError):
+            backend.get_collection(palace=ref, collection_name="mempalace_drawers", create=True)
+    finally:
+        backend.close()

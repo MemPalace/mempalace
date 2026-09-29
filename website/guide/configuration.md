@@ -15,8 +15,8 @@ Located at `~/.mempalace/config.json`:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `palace_path` | `~/.mempalace/palace` | Where ChromaDB stores your drawers |
-| `collection_name` | `mempalace_drawers` | ChromaDB collection name |
+| `palace_path` | `~/.mempalace/palace` | Where the default local palace stores your drawers |
+| `collection_name` | `mempalace_drawers` | Default backend collection name |
 | `people_map` | `{}` | Entity name → AAAK code mappings |
 | `max_backups` | `10` | How many timestamped palace backups to keep before the oldest are pruned. Applies to `mempalace migrate` (`<palace>.pre-migrate.*`) and `mempalace repair max-seq-id` (`chroma.sqlite3.max-seq-id-backup-*`), which each write a full copy every run. Set to `0` to keep every backup (e.g. when an external retention policy manages cleanup). |
 
@@ -28,12 +28,13 @@ pluggable backend contract, exercised across deliberately different substrates
 store) so the contract is never accidentally shaped around one vendor. Every
 non-default backend is opt-in.
 
-| Backend | Mode | Install | Namespaces | Lexical |
-| ------- | ---- | ------- | :--------: | :-----: |
-| `chroma` _(default)_ | Local (embedded) | bundled | – | ✓ |
-| `sqlite_exact` | Local (exact) | bundled | – | ✓ |
-| `qdrant` | Server (REST) | bundled | ✓ | ✓ |
-| `pgvector` | Server (Postgres) | `mempalace[pgvector]` | ✓ | ✓ |
+| Backend | Mode | Install | Namespaces | Lexical | Configure with |
+| ------- | ---- | ------- | :--------: | :-----: | -------------- |
+| `chroma` _(default)_ | Local (embedded) | bundled | – | ✓ | – |
+| `sqlite_exact` | Local (exact) | bundled | – | ✓ | – |
+| `milvus` | Local (Lite) · Server opt-in | `mempalace[milvus]` | ✓ | ✓ | `MEMPALACE_MILVUS_URI` |
+| `qdrant` | Server (REST) | bundled | ✓ | ✓ | `MEMPALACE_QDRANT_URL` |
+| `pgvector` | Server (Postgres) | `mempalace[pgvector]` | ✓ | ✓ | `MEMPALACE_PGVECTOR_DSN` |
 <!-- New backends add one row here and one `### <Backend>` subsection (with its connection variables) below; keep README's compatibility table in sync. -->
 
 Select a backend with `--backend <name>` on any `mempalace` / `mempalace-mcp`
@@ -62,6 +63,21 @@ Local and built-in (no extra to install). Runs exact cosine over every row — n
 ANN index — so it is the reference for exact-vector correctness checks and small
 palaces. Select with `--backend sqlite_exact`; it has no connection settings.
 
+### Milvus
+
+A Milvus backend using `pymilvus`. Install the optional driver with
+`pip install mempalace[milvus]`. When `MEMPALACE_MILVUS_URI` is unset,
+MemPalace uses per-palace Milvus Lite at `<palace>/milvus.db`; set a server or
+Zilliz Cloud URI to use a shared Milvus deployment.
+
+| Variable | Default | Description |
+| -------- | ------- | ----------- |
+| `MEMPALACE_MILVUS_URI` | per-palace Milvus Lite | Milvus server / Zilliz Cloud URI |
+| `MEMPALACE_MILVUS_TOKEN` | _(none)_ | Token for Milvus server / Zilliz Cloud |
+| `MEMPALACE_MILVUS_DB_NAME` | _(none)_ | Optional Milvus database name |
+| `MEMPALACE_MILVUS_NAMESPACE` | _(none)_ | Collection namespace prefix (tenant isolation) |
+| `MEMPALACE_MILVUS_CONSISTENCY_LEVEL` | `Strong` | Milvus consistency level (`Strong`, `Session`, `Bounded`, `Eventually`) |
+
 ### Qdrant
 
 A networked REST backend. No driver to install — the client uses the Python
@@ -85,6 +101,37 @@ available.
 | -------- | ------- | ----------- |
 | `MEMPALACE_PGVECTOR_DSN` | `postgresql://localhost:5432/mempalace` | Postgres connection string |
 | `MEMPALACE_PGVECTOR_NAMESPACE` | _(none)_ | Schema namespace (tenant isolation) |
+| `MEMPALACE_PGVECTOR_SHARED_NAMESPACE` | _(none)_ | Shared table namespace for one palace spanning several machines |
+
+#### Sharing one palace across machines
+
+Table names normally include a hash of the palace's **local** path, so two
+machines pointed at the same database write to different tables and never see
+each other's memory — with no error to warn you. If you want a laptop, a
+desktop and a server to share one memory store, give every node the same
+shared namespace:
+
+```bash
+export MEMPALACE_PGVECTOR_DSN=postgresql://user:pass@db.internal:5432/mempalace
+export MEMPALACE_PGVECTOR_SHARED_NAMESPACE=fleet
+```
+
+or `"pgvector_shared_namespace": "fleet"` in `config.json`. The local path then
+drops out of the table name and every node resolves the same tables.
+
+- Leave it unset for a single-machine palace — naming is unchanged and existing
+  palaces need no migration.
+- Setting it on a palace that already has data points at *new*, empty tables;
+  MemPalace refuses to open the palace rather than appear to lose data, so
+  choose the namespace before you mine.
+- Every palace that shares a namespace shares its memory, including two palaces
+  on the *same* machine. The setting declares "these are one logical palace", so
+  give anything that must stay separate its own namespace.
+- Allowed characters are letters, digits and `_ - . / :` or spaces; the value is
+  lower-cased and runs of separators fold to a single `_`, so `Team-A`,
+  `team_a` and `team__a` are all the same namespace. Anything else is rejected.
+- It is independent of `MEMPALACE_PGVECTOR_NAMESPACE`: that one still isolates
+  tenants, and the two can be combined.
 
 For an end-to-end deployment that puts a server-mode backend behind the MCP
 server, see [Remote / Team Server](/guide/remote-server).
@@ -156,3 +203,5 @@ python -m mempalace.mcp_server --palace /custom/palace
 | `MEMPAL_DIR` | Directory for auto-mining in hooks |
 | `MEMPALACE_MAX_BACKUPS` | Override `max_backups` retention count (`0` disables pruning) |
 | `MEMPALACE_BACKEND` | Select the storage backend (default `chroma`) — see [Storage backends](#storage-backends) for each backend's connection variables |
+| `MEMPALACE_MCP_WRITER_WAIT_SECONDS` | Seconds a writable HTTP server waits at startup for another process to release the palace writer lease before exiting with status `2` (default `120`; `0` refuses immediately). See [Remote server](/guide/remote-server#operating-notes) |
+| `MEMPALACE_MCP_IDLE_HOURS` | Hours with no MCP request before the server exits by itself (default `8`; `0` disables). See [Remote server](/guide/remote-server#operating-notes) |

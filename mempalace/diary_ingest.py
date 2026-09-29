@@ -34,6 +34,7 @@ from .palace import (
     purge_file_closets,
     upsert_closet_lines,
 )
+from .source_identity import identity_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -62,19 +63,6 @@ def _split_entries(text):
         body = parts[i + 1] if i + 1 < len(parts) else ""
         entries.append((header.strip(), body.strip()))
     return entries
-
-
-def _diary_drawer_id(wing: str, date_str: str) -> str:
-    """Stable, wing-scoped legacy drawer ID (file-level).
-
-    Retained for backwards-compatible cleanup of palaces that ingested
-    diaries before #1539 — those palaces hold one ``drawer_diary_{...}``
-    per file. New drawers use ``_diary_drawer_id_entry`` so each ``##``
-    entry becomes its own drawer (with per-entry character chunking
-    when an entry exceeds ``chunk_size``).
-    """
-    suffix = hashlib.sha256(f"{wing}|{date_str}".encode()).hexdigest()[:24]
-    return f"drawer_diary_{suffix}"
 
 
 def _diary_drawer_id_entry(wing: str, date_str: str, entry_idx: int, entry_chunk_idx: int) -> str:
@@ -190,6 +178,9 @@ def ingest_diaries(
                 "source_session": "daily_diary",
                 "filed_at": now_iso,
             }
+            # Which directory this diary was read from, so ``sync`` decides an
+            # ingested drawer by the same reading as a mined one (#2320).
+            base_meta.update(identity_metadata(source_file))
             if entities:
                 base_meta["entities"] = entities
 

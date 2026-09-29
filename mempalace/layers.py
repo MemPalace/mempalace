@@ -8,12 +8,14 @@ Load only what you need, when you need it.
     Layer 0: Identity       (~100 tokens)   — Always loaded. "Who am I?"
     Layer 1: Essential Story (~500-800)      — Always loaded. Top moments from the palace.
     Layer 2: On-Demand      (~200-500 each)  — Loaded when a topic/wing comes up.
-    Layer 3: Deep Search    (unlimited)      — Full ChromaDB semantic search.
+    Layer 3: Deep Search    (unlimited)      — Full semantic search.
 
 Wake-up cost: ~600-900 tokens (L0+L1). Leaves 95%+ of context free.
 
-Reads directly from ChromaDB (mempalace_drawers)
-and ~/.mempalace/identity.txt.
+Reads through the configured storage backend (ChromaDB default, pluggable)
+via ``palace.get_collection`` and ~/.mempalace/identity.txt. This stack never
+writes, and every open asks for ``read_only=True``; see ``_open_for_read`` for
+which backends honour that.
 """
 
 import os
@@ -22,13 +24,49 @@ from pathlib import Path
 from collections import defaultdict
 
 from .config import MempalaceConfig
-from .palace import get_collection as _get_collection
+from .palace import MineAlreadyRunning, get_collection as _get_collection
 from .searcher import (
     _distance_to_similarity,
     _first_or_empty,
     _metric_for_collection,
     build_where_filter,
 )
+
+
+def _open_for_read(palace_path: str):
+    """Open the drawers collection for a pure read.
+
+    The whole stack below only reads, so it asks for ``read_only=True``. On
+    ``sqlite_exact`` a writable open takes the palace mine lock to initialise its
+    schema, and every one of these call sites runs while some other MemPalace
+    process may legitimately hold that lock — the hub, a daemon, a long mine.
+    The failure was silent and actively misleading: the ``except Exception``
+    around each call turned the lock conflict into "No palace found. Run:
+    mempalace mine <dir>", which invited a re-mine of a perfectly healthy palace.
+
+    ``read_only`` is a request, not a guarantee. Backends that support it open
+    without schema initialization, migrations, or metadata writes, and take no
+    lock. ChromaDB ignores it; its collection open takes no mine lock either,
+    though its client still writes ``chroma.sqlite3``.
+    """
+    return _get_collection(palace_path, create=False, read_only=True)
+
+
+def _read_open_failure(exc: Exception) -> str:
+    """Explain a failed read-open honestly instead of blaming a missing palace.
+
+    A genuinely absent palace keeps the historical wording — callers and tests
+    match on it. Only a lock conflict, which the old wording misreported as a
+    missing palace (inviting a pointless re-mine), gets its own message.
+    """
+    if isinstance(exc, MineAlreadyRunning):
+        return (
+            "## Palace is busy — another MemPalace process holds the write lock.\n"
+            f"{exc}\n"
+            "This backend could not open the palace without that lock; "
+            "stop that process or wait for it to finish."
+        )
+    return "No palace found. Run: mempalace mine <dir>"
 
 
 # ---------------------------------------------------------------------------
@@ -87,28 +125,47 @@ class Layer1:
 
     MAX_DRAWERS = 15  # at most 15 moments in wake-up
     MAX_CHARS = 3200  # hard cap on total L1 text (~800 tokens)
-    MAX_SCAN = 2000  # don't scan more than this for L1 generation
+    MAX_SCAN = 2000  # size of the candidate window pulled for L1 generation
 
     def __init__(self, palace_path: str = None, wing: str = None):
         cfg = MempalaceConfig()
         self.palace_path = palace_path or cfg.palace_path
         self.wing = wing
 
-    def generate(self) -> str:
-        """Pull top drawers from ChromaDB and format as compact L1 text."""
-        try:
-            col = _get_collection(self.palace_path, create=False)
-        except Exception:
-            return "## L1 — No palace found. Run: mempalace mine <dir>"
+    def _fetch_candidates(self, col) -> tuple[list, list]:
+        """Fetch the L1 candidate window: the MAX_SCAN most recently filed drawers.
 
-        # Fetch all drawers in batches to avoid SQLite variable limit (~999)
+        Uses the backend's ``get_recent`` capability, which pushes
+        ``ORDER BY filed_at DESC LIMIT n`` into storage where the backend can
+        (pgvector today) and otherwise falls back to the scan-then-sort default
+        in ``BaseCollection``. That default is what this method used to do
+        inline, so backends without pushdown behave exactly as before.
+
+        Third-party collections predating ``get_recent`` (or any backend error)
+        degrade to the inline paged scan below rather than failing wake-up.
+        """
+        where = {"wing": self.wing} if self.wing else None
+        getter = getattr(col, "get_recent", None)
+        if getter is not None:
+            try:
+                result = getter(
+                    limit=self.MAX_SCAN,
+                    where=where,
+                    order_field="filed_at",
+                    include=["documents", "metadatas"],
+                )
+                return list(result.documents or []), list(result.metadatas or [])
+            except Exception:
+                pass  # capability missing or backend hiccup — page it manually
+
+        # Fetch in batches to avoid SQLite variable limit (~999)
         _BATCH = 500
         docs, metas = [], []
         offset = 0
         while True:
             kwargs = {"include": ["documents", "metadatas"], "limit": _BATCH, "offset": offset}
-            if self.wing:
-                kwargs["where"] = {"wing": self.wing}
+            if where:
+                kwargs["where"] = where
             try:
                 batch = col.get(**kwargs)
             except Exception:
@@ -122,16 +179,40 @@ class Layer1:
             offset += len(batch_docs)
             if len(batch_docs) < _BATCH or len(docs) >= self.MAX_SCAN:
                 break
+        return docs, metas
+
+    def generate(self) -> str:
+        """Pull top drawers from the palace and format as compact L1 text."""
+        try:
+            col = _open_for_read(self.palace_path)
+        except Exception as exc:
+            message = _read_open_failure(exc)
+            return message if message.startswith("## ") else f"## L1 — {message}"
+
+        docs, metas = self._fetch_candidates(col)
 
         if not docs:
             return "## L1 — No memories yet."
 
-        # Score each drawer: prefer high importance, recent filing
+        # Score each drawer: prefer high importance, then most-recent filing.
+        # NOTE: the ingest pipeline (miner, convo_miner, diary, add_drawer)
+        # records provenance metadata — wing/room/source/chunk/filed_at — but
+        # never an evaluative importance/weight field. So `importance` is
+        # absent on virtually every drawer and ties at the default, which used
+        # to collapse the sort to insertion order (oldest first). `filed_at`
+        # is present on every drawer, so it is the *effective* ordering signal:
+        # newest first. This keeps importance as the primary key for the day a
+        # scoring pass populates it, while making the "recent filing" half of
+        # the promise true today with data we already have.
+        # The candidate window this sorts is now the MAX_SCAN *most recently
+        # filed* drawers rather than the first MAX_SCAN the backend happened to
+        # hand back, so on a palace larger than MAX_SCAN the newest drawers are
+        # actually in the running (#1630's known limitation).
         scored = []
         for doc, meta in zip(docs, metas):
             meta = meta or {}
             doc = doc or ""
-            importance = 3
+            importance = 3.0
             # Try multiple metadata keys that might carry weight info
             for key in ("importance", "emotional_weight", "weight"):
                 val = meta.get(key)
@@ -141,11 +222,15 @@ class Layer1:
                     except (ValueError, TypeError):
                         pass
                     break
-            scored.append((importance, meta, doc))
+            # filed_at is an ISO-8601 string; ISO strings sort lexicographically
+            # in chronological order. Coerce to str so a missing/odd value sorts
+            # oldest rather than raising during the comparison.
+            recency = str(meta.get("filed_at") or "")
+            scored.append((importance, recency, meta, doc))
 
-        # Sort by importance descending, take top N
-        scored.sort(key=lambda x: x[0], reverse=True)
-        top = scored[: self.MAX_DRAWERS]
+        # Sort by importance desc, then recency (filed_at) desc; take top N.
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        top = [(imp, meta, doc) for imp, _recency, meta, doc in scored[: self.MAX_DRAWERS]]
 
         # Group by room for readability
         by_room = defaultdict(list)
@@ -203,9 +288,9 @@ class Layer2:
     def retrieve(self, wing: str = None, room: str = None, n_results: int = 10) -> str:
         """Retrieve drawers filtered by wing and/or room."""
         try:
-            col = _get_collection(self.palace_path, create=False)
-        except Exception:
-            return "No palace found."
+            col = _open_for_read(self.palace_path)
+        except Exception as exc:
+            return _read_open_failure(exc)
 
         where = build_where_filter(wing, room)
 
@@ -262,9 +347,9 @@ class Layer3:
     def search(self, query: str, wing: str = None, room: str = None, n_results: int = 5) -> str:
         """Semantic search, returns compact result text."""
         try:
-            col = _get_collection(self.palace_path, create=False)
-        except Exception:
-            return "No palace found."
+            col = _open_for_read(self.palace_path)
+        except Exception as exc:
+            return _read_open_failure(exc)
 
         where = build_where_filter(wing, room)
 
@@ -317,8 +402,11 @@ class Layer3:
     ) -> list:
         """Return raw dicts instead of formatted text."""
         try:
-            col = _get_collection(self.palace_path, create=False)
-        except Exception:
+            col = _open_for_read(self.palace_path)
+        except Exception as exc:
+            # The contract here is a list, so the reason goes to stderr rather
+            # than into a return value a caller would parse as a result row.
+            print(_read_open_failure(exc), file=sys.stderr)
             return []
 
         where = build_where_filter(wing, room)
@@ -439,10 +527,12 @@ class MemoryStack:
 
         # Count drawers
         try:
-            col = _get_collection(self.palace_path, create=False)
+            col = _open_for_read(self.palace_path)
             count = col.count()
             result["total_drawers"] = count
-        except Exception:
+        except Exception as exc:
+            # Zero is indistinguishable from an empty palace, so say why.
+            print(_read_open_failure(exc), file=sys.stderr)
             result["total_drawers"] = 0
 
         return result
@@ -456,7 +546,7 @@ if __name__ == "__main__":
     import json
 
     def usage():
-        print("layers.py — 4-Layer Memory Stack")
+        print("layers.py -- 4-Layer Memory Stack")
         print()
         print("Usage:")
         print("  python layers.py wake-up              Show L0 + L1")
