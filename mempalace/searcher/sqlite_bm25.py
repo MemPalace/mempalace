@@ -61,6 +61,17 @@ def _window_sql_prefilters(since_dt, before_dt) -> list:
     return prefilters
 
 
+def _flag_truncations(result: dict, window_pool_truncated: bool, candidates_truncated: bool):
+    """Mark a fallback result whose candidate pool was cut short."""
+    if window_pool_truncated:
+        result["date_filter_pool_truncated"] = True
+    if candidates_truncated:
+        # A missing whole word was searched for past the ranked window and
+        # the read budget ran out: drawers holding it may not have been seen.
+        result["candidates_truncated"] = True
+    return result
+
+
 def _pick_fts_candidates(
     conn, collection_name, query, *, max_candidates, scope, fts_filter, row_filter, stop_words
 ) -> list[int]:
@@ -185,6 +196,7 @@ def _bm25_only_via_sqlite(
         # shorter than 3 chars (trigram tokenizer can't match them).
         tokens = [t for t in _tokenize(query) if len(t) >= 3]
         candidate_ids: list[int] = []
+        candidates_truncated = False
         use_recency_fallback = not tokens
         if tokens:
             filter_sql, filter_params = _metadata_filter_sql("embedding_fulltext_search.rowid")
@@ -199,6 +211,7 @@ def _bm25_only_via_sqlite(
                     row_filter=_metadata_filter_sql("e.id"),
                     stop_words=stop_words,
                 )
+                candidates_truncated = getattr(candidate_ids, "truncated", False)
             except sqlite3.Error:
                 # FTS5 tokenizer mismatch or syntax error — fall through
                 # to the recency-window selector below.
@@ -364,9 +377,7 @@ def _bm25_only_via_sqlite(
         "fallback": "bm25_only_via_sqlite",
         "fallback_reason": "vector_search_disabled",
     }
-    if window_pool_truncated:
-        result["date_filter_pool_truncated"] = True
-    return result
+    return _flag_truncations(result, window_pool_truncated, candidates_truncated)
 
 
 def _merge_bm25_union_candidates(

@@ -624,6 +624,17 @@ def _fts_tokens(query: str, stop_words: frozenset = frozenset()) -> list[str]:
     return [t for t in terms if t not in stop_words] or terms
 
 
+# When the ranked window above is full but holds fewer whole-word matches than
+# asked for, this many more matches are read in storage order, newest first.
+_FTS_CONTINUATION_BUDGET = 500_000
+
+
+class CandidateRows(list):
+    """Candidate row ids; ``truncated`` when a read budget ran out first."""
+
+    truncated = False
+
+
 def _whole_words_first(rows, query_tokens: Iterable[str], limit: Optional[int]) -> list[int]:
     """Row ids from ``(row_id, text)`` pairs, whole-word matches first.
 
@@ -672,9 +683,8 @@ def _fts_candidate_rows(
     """
     tokens = _fts_tokens(query, stop_words)
     if not tokens:
-        return []
-    rows = conn.execute(
-        f"""
+        return CandidateRows()
+    match_sql = f"""
         SELECT embedding_fulltext_search.rowid, embedding_fulltext_search.string_value
         FROM embedding_fulltext_search
         JOIN embeddings e ON e.id = embedding_fulltext_search.rowid
@@ -682,12 +692,44 @@ def _fts_candidate_rows(
         JOIN collections c ON s.collection = c.id
         WHERE embedding_fulltext_search MATCH ? AND c.name = ?
         {filter_sql}
-        ORDER BY embedding_fulltext_search.rank
-        LIMIT ?
-        """,
-        (" OR ".join(tokens), collection_name, *filter_params, _FTS_SCAN_CAP),
-    )
-    return _whole_words_first(rows, tokens, limit)
+    """
+    params = (" OR ".join(tokens), collection_name, *filter_params)
+    words = set(tokens)
+    ranked = conn.execute(
+        match_sql + " ORDER BY embedding_fulltext_search.rank LIMIT ?",
+        (*params, _FTS_SCAN_CAP),
+    ).fetchall()
+    result = CandidateRows(_whole_words_first(ranked, tokens, limit))
+    if len(ranked) < _FTS_SCAN_CAP:
+        return result
+    text_by_id = {int(row_id): text or "" for row_id, text in ranked}
+    whole = [row_id for row_id in result if words.intersection(_tokenize(text_by_id[row_id]))]
+    if limit is not None and len(whole) >= limit:
+        return result
+    # The ranked window is full and short of whole-word matches: a name can
+    # rank below tens of thousands of substring hits (``Aven`` under
+    # ``Avenue``). Keep reading the rest, newest first, within a budget.
+    seen = text_by_id.keys()
+    extra: list[int] = []
+    read = 0
+    for row_id, text in conn.execute(
+        match_sql + " ORDER BY embedding_fulltext_search.rowid DESC LIMIT ?",
+        (*params, _FTS_CONTINUATION_BUDGET),
+    ):
+        read += 1
+        if int(row_id) in seen or not words.intersection(_tokenize(text)):
+            continue
+        extra.append(int(row_id))
+        if limit is not None and len(whole) + len(extra) >= limit:
+            break
+    else:
+        result.truncated = read >= _FTS_CONTINUATION_BUDGET
+    whole_ids = set(whole)
+    others = [row_id for row_id in result if row_id not in whole_ids]
+    picked = whole + extra + others
+    out = CandidateRows(picked if limit is None else picked[:limit])
+    out.truncated = result.truncated
+    return out
 
 
 def _filtered_candidate_rows(

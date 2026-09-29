@@ -1318,3 +1318,72 @@ def test_whole_word_candidate_pick_ignores_stop_words_when_terms_present():
     tokens = _fts_tokens("the lantern", frozenset({"the"}))
     rows = [(1, "the lanternfish was cataloged"), (2, "lantern notes from the evening")]
     assert _whole_words_first(rows, tokens, limit=1) == [2]
+
+
+def _fts_conn(rows):
+    """In-memory chroma-shaped FTS store: ``rows`` is [(rowid, text), ...]."""
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE collections (id TEXT, name TEXT);
+        CREATE TABLE segments (id TEXT, collection TEXT);
+        CREATE TABLE embeddings (id INTEGER PRIMARY KEY, segment_id TEXT);
+        CREATE VIRTUAL TABLE embedding_fulltext_search USING fts5(string_value, tokenize='trigram');
+        INSERT INTO collections VALUES ('c', 'drawers');
+        INSERT INTO segments VALUES ('s', 'c');
+        """
+    )
+    conn.executemany("INSERT INTO embeddings VALUES (?, 's')", ((rid,) for rid, _ in rows))
+    conn.executemany(
+        "INSERT INTO embedding_fulltext_search(rowid, string_value) VALUES (?, ?)", rows
+    )
+    return conn
+
+
+def test_fts_candidates_reach_a_name_ranked_past_the_scan_cap():
+    """50,009 higher-ranked substring hits (``Avenue``) and one drawer that says
+    ``Aven``: the ranked window of 50,000 misses it, the continuation finds it."""
+    from mempalace.backends.chroma import _FTS_SCAN_CAP, _fts_candidate_rows
+
+    noise = [(i, "Avenue Avenue Avenue") for i in range(1, _FTS_SCAN_CAP + 10)]
+    target = _FTS_SCAN_CAP + 10
+    conn = _fts_conn(noise + [(target, "Aven " + "quiet lantern room " * 20)])
+    picked = _fts_candidate_rows(conn, "drawers", "Aven", limit=5)
+    assert picked[0] == target
+    assert not picked.truncated
+
+
+def test_fts_candidates_reach_the_oldest_lowest_ranked_name(monkeypatch):
+    import mempalace.backends.chroma as chroma
+
+    monkeypatch.setattr(chroma, "_FTS_SCAN_CAP", 50)
+    rows = [(1, "Aven " + "quiet lantern room " * 20)]
+    rows += [(i, "Avenue Avenue Avenue") for i in range(2, 70)]
+    picked = chroma._fts_candidate_rows(_fts_conn(rows), "drawers", "Aven", limit=5)
+    assert picked[0] == 1
+
+
+def test_fts_candidates_say_when_the_continuation_budget_ran_out(monkeypatch):
+    import mempalace.backends.chroma as chroma
+
+    monkeypatch.setattr(chroma, "_FTS_SCAN_CAP", 50)
+    monkeypatch.setattr(chroma, "_FTS_CONTINUATION_BUDGET", 60)
+    rows = [(1, "Aven " + "quiet lantern room " * 20)]
+    rows += [(i, "Avenue Avenue Avenue") for i in range(2, 200)]
+    picked = chroma._fts_candidate_rows(_fts_conn(rows), "drawers", "Aven", limit=5)
+    assert 1 not in picked
+    assert picked.truncated
+
+
+def test_bm25_fallback_reports_truncated_candidates(tmp_path, monkeypatch):
+    import mempalace.backends.chroma as chroma
+
+    monkeypatch.setattr(chroma, "_FTS_SCAN_CAP", 20)
+    monkeypatch.setattr(chroma, "_FTS_CONTINUATION_BUDGET", 25)
+    seg = "seg-bm25-truncated"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=seg)
+    named = [("Aven " + "quiet lantern room " * 20, {"wing": "w", "room": "r"}, "a-0")]
+    noise = [(f"Avenue Avenue Avenue {i}", {"wing": "w", "room": "r"}, f"n-{i}") for i in range(80)]
+    _seed_drawers(str(tmp_path), seg, named + noise)
+    out = _bm25_only_via_sqlite("Aven", str(tmp_path), n_results=5)
+    assert out["candidates_truncated"] is True
