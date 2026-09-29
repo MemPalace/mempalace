@@ -1861,14 +1861,17 @@ def test_cmd_sync_palace_dir_no_db(mock_config_cls, tmp_path, capsys):
 
 
 @patch("mempalace.cli.MempalaceConfig")
-def test_cmd_sync_daemon_background_submits_job(mock_config_cls, capsys):
+def test_cmd_sync_daemon_background_submits_job(mock_config_cls, capsys, tmp_path):
     from mempalace.cli import cmd_sync
 
     mock_config_cls.return_value.palace_path = "/fake/palace"
+    # Absolute on every platform: the payload resolves its paths, and a
+    # rooted "/project" is drive-relative on Windows.
+    project, extra = str(tmp_path / "project"), str(tmp_path / "extra")
     args = argparse.Namespace(
         palace=None,
-        dir="/project",
-        root=["/extra"],
+        dir=project,
+        root=[extra],
         wing="wing_a",
         dry_run=False,
         daemon=True,
@@ -1882,7 +1885,7 @@ def test_cmd_sync_daemon_background_submits_job(mock_config_cls, capsys):
     mock_submit.assert_called_once()
     assert mock_submit.call_args.args[0] == "sync"
     payload = mock_submit.call_args.args[1]
-    assert payload == {"dir": "/project", "root": ["/extra"], "wing": "wing_a", "dry_run": False}
+    assert payload == {"dir": project, "root": [extra], "wing": "wing_a", "dry_run": False}
     assert mock_submit.call_args.kwargs["wait"] is False
     assert "sync-job" in capsys.readouterr().out
 

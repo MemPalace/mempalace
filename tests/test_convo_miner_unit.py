@@ -56,27 +56,101 @@ class TestChunkExchanges:
         max_len = max(len(c["content"]) for c in chunks)
         assert max_len <= CHUNK_SIZE, f"oversized chunk: max_len={max_len}"
 
-    def test_line_group_fallback_drops_sub_min_trailing_group(self):
-        """A trailing line-group whose stripped length is at or below
-        MIN_CHUNK_SIZE must be dropped, not emitted as a tiny drawer."""
+    def test_line_group_fallback_attaches_sub_min_trailing_group(self):
+        """A trailing line-group at or below MIN_CHUNK_SIZE is kept by
+        attaching it to the previous drawer, not emitted as a tiny drawer
+        and not dropped."""
         lines = [f"Line {i}" for i in range(51)]
         content = "\n".join(lines)
         chunks = chunk_exchanges(content)
-        from mempalace.convo_miner import MIN_CHUNK_SIZE
 
-        assert len(chunks) == 2, (
-            f"expected 2 drawers (groups 0-24 and 25-49); got {len(chunks)}; "
-            f"the single-line tail group should drop below MIN_CHUNK_SIZE={MIN_CHUNK_SIZE}"
-        )
+        assert len(chunks) == 2, f"expected groups 0-24 and 25-50; got {len(chunks)}"
+        assert chunks[1]["content"].endswith("Line 49\nLine 50")
 
     def test_empty_content(self):
         chunks = chunk_exchanges("")
         assert chunks == []
 
-    def test_short_content_skipped(self):
+    def test_short_content_kept(self):
+        """Content below MIN_CHUNK_SIZE is still filed verbatim."""
         chunks = chunk_exchanges("> hi\nbye")
-        # Too short to produce chunks (below MIN_CHUNK_SIZE)
-        assert isinstance(chunks, list)
+        assert [c["content"] for c in chunks] == ["> hi\nbye"]
+
+    def test_response_after_horizontal_rule_kept(self):
+        """A ``---`` rule inside an AI response is part of the response.
+        It used to end the response and drop everything up to the next turn."""
+        content = (
+            "> how do we release?\n"
+            "Phase one: freeze the branch.\n\n---\n\n"
+            "Phase two: tag and publish the wheel.\n\n"
+            "> and the rollback?\n"
+            "Yank the release and repoint latest.\n\n"
+            "> changelog?\n"
+            "Curate it by theme.\n"
+        )
+        chunks = chunk_exchanges(content)
+        assert chunks[0]["content"] == (
+            "> how do we release?\n"
+            "Phase one: freeze the branch.\n\n---\n\n"
+            "Phase two: tag and publish the wheel."
+        )
+
+    def test_text_before_first_turn_kept(self):
+        """Text before the first user turn is filed as its own unit."""
+        content = (
+            "Session notes written before the conversation started.\n\n"
+            "> first question here?\nFirst answer with some detail.\n"
+            "> second question here?\nSecond answer with some detail.\n"
+            "> third question here?\nThird answer with some detail.\n"
+        )
+        chunks = chunk_exchanges(content)
+        assert chunks[0]["content"] == "Session notes written before the conversation started."
+        assert chunks[1]["content"].startswith("> first question here?")
+
+    def test_tiny_exchange_attached_to_previous(self):
+        """An exchange at or below MIN_CHUNK_SIZE joins the previous drawer."""
+        content = (
+            "> what should we name the module?\nCall it palace_graph, it maps rooms.\n"
+            "> ok\n"
+            "> and the tests?\nMirror the module name under tests/ as usual.\n"
+        )
+        chunks = chunk_exchanges(content)
+        assert len(chunks) == 2
+        assert chunks[0]["content"].endswith("it maps rooms.\n> ok")
+        assert chunks[1]["content"].startswith("> and the tests?")
+
+    def test_tiny_exchange_keeps_the_blank_line_before_it(self):
+        """Joining a small unit to the previous drawer keeps the separator that
+        stood between them in the source, not a single newline."""
+        content = (
+            "> what should we name the module?\nCall it palace_graph, it maps rooms.\n\n"
+            "> ok\n"
+            "> and the tests?\nMirror the module name under tests/ as usual.\n"
+        )
+        chunks = chunk_exchanges(content)
+        assert chunks[0]["content"].endswith("it maps rooms.\n\n> ok")
+
+    def test_every_word_survives(self):
+        """No input word is lost across exchange, preamble, rule, and tiny units."""
+        content = (
+            "alpha preamble words\n\n"
+            "> bravo question?\ncharlie answer\n\n---\n\ndelta after rule\n"
+            "> ok\n"
+            "> echo question?\n" + "foxtrot " * 150 + "\n"
+        )
+        stored = " ".join(c["content"] for c in chunk_exchanges(content)).split()
+        for word in content.split():
+            assert word in stored, word
+
+    def test_oversized_exchange_split_at_whitespace(self):
+        """Splitting an oversized exchange never cuts a word in two."""
+        content = "> q?\n" + "wordy " * 300 + "\n> q2?\nanswer text here\n> q3?\nanswer text\n"
+        chunks = chunk_exchanges(content)
+        assert sum("wordy" in c["content"] for c in chunks) > 1
+        input_words = set(content.split())
+        for chunk in chunks:
+            assert len(chunk["content"]) <= CHUNK_SIZE
+            assert set(chunk["content"].split()) <= input_words
 
     def test_chunk_size_zero_raises_valueerror(self):
         """Reject chunk_size == 0 explicitly.
@@ -291,13 +365,38 @@ class TestEmitBounded:
         assert chunks[0]["content"] == "a" * 10
         assert chunks[1]["content"] == " " * 10
 
-    def test_whole_content_below_floor_dropped(self):
-        """The floor is applied to the stripped whole content. An all-whitespace
-        input (stripped length 0) or a too-short input is dropped without slicing."""
+    def test_whitespace_only_content_dropped(self):
+        """Whitespace-only input carries no text and produces no drawer."""
         chunks = []
         _emit_bounded(chunks, " " * 100, chunk_size=10, min_chunk_size=5)
-        _emit_bounded(chunks, "ab", chunk_size=10, min_chunk_size=5)
         assert chunks == []
+
+    def test_below_floor_content_kept_on_its_own_without_a_previous_drawer(self):
+        chunks = []
+        _emit_bounded(chunks, "ab", chunk_size=10, min_chunk_size=5)
+        assert chunks == [{"content": "ab", "chunk_index": 0}]
+
+    def test_below_floor_content_attached_with_joiner(self):
+        chunks = [{"content": "first", "chunk_index": 0}]
+        _emit_bounded(chunks, "ab", chunk_size=10, min_chunk_size=5, joiner="\n\n")
+        assert chunks == [{"content": "first\n\nab", "chunk_index": 0}]
+
+    def test_below_floor_content_emitted_alone_when_previous_is_full(self):
+        chunks = [{"content": "x" * 9, "chunk_index": 0}]
+        _emit_bounded(chunks, "ab", chunk_size=10, min_chunk_size=5)
+        assert [c["content"] for c in chunks] == ["x" * 9, "ab"]
+        assert chunks[1]["chunk_index"] == 1
+
+    def test_split_prefers_whitespace_in_back_half(self):
+        chunks = []
+        _emit_bounded(chunks, "aaaaaa bbbb cc", chunk_size=10, min_chunk_size=0)
+        assert [c["content"] for c in chunks] == ["aaaaaa ", "bbbb cc"]
+
+    def test_split_ignores_whitespace_in_front_half(self):
+        """A cut that early would halve the drawer; cut at chunk_size instead."""
+        chunks = []
+        _emit_bounded(chunks, "ab " + "c" * 20, chunk_size=10, min_chunk_size=0)
+        assert [c["content"] for c in chunks] == ["ab ccccccc", "c" * 10, "ccc"]
 
     def test_split_805_chars_at_chunk_size_800_preserves_tail(self):
         """805 chars at chunk_size=800 produces a 5-char tail. With the

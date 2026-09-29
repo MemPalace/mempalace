@@ -245,6 +245,145 @@ class TestPalaceReadsDoNotStarveTheHub:
         write_thread.join(timeout=5)
         assert write_started.is_set()
 
+    @staticmethod
+    def _patch_stepwise_mine(monkeypatch, log, files=3, step_s=0.3):
+        """A mine that reaches mine_yield_point() before each of its files."""
+        from mempalace.palace import mine_yield_point
+
+        started = threading.Event()
+
+        def stepwise_mine(**kwargs):
+            started.set()
+            tag = kwargs.get("source", "mine")
+            for i in range(files):
+                mine_yield_point()
+                log.append((f"{tag}:file{i}:start", time.monotonic()))
+                time.sleep(step_s)
+                log.append((f"{tag}:file{i}:end", time.monotonic()))
+            return {"success": True}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_mine"], "handler", stepwise_mine)
+        return started
+
+    def test_a_read_runs_between_the_files_of_a_mine(self, http_server, monkeypatch):
+        """A hub mine held the exclusive lock for its whole run, so a status
+        call waited for all of it. It now runs between files, never inside one."""
+        port, _ = http_server
+        log: list = []
+        mine_started = self._patch_stepwise_mine(monkeypatch, log)
+
+        def quick_search(**_kwargs):
+            log.append(("search", time.monotonic()))
+            return {"query": "x", "results": []}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", quick_search)
+        mine_thread = threading.Thread(
+            target=lambda: self._call(port, "mempalace_mine", {"source": "m"}, req_id=41)
+        )
+        mine_thread.start()
+        assert mine_started.wait(timeout=2)
+        time.sleep(0.05)  # inside file0
+        self._call(port, "mempalace_search", {"query": "x"}, req_id=42)
+        mine_thread.join(timeout=10)
+        assert not mine_thread.is_alive()
+
+        names = [name for name, _ in log]
+        search_at = names.index("search")
+        assert search_at < names.index("m:file2:end"), "the read waited for the whole mine"
+        assert names[search_at - 1].endswith(":end"), f"read ran inside a file: {names}"
+
+    def test_a_second_mine_waits_for_the_first(self, http_server, monkeypatch):
+        port, _ = http_server
+        log: list = []
+        first_started = self._patch_stepwise_mine(monkeypatch, log, files=2, step_s=0.2)
+        first = threading.Thread(
+            target=lambda: self._call(port, "mempalace_mine", {"source": "a"}, req_id=51)
+        )
+        first.start()
+        assert first_started.wait(timeout=2)
+        second = threading.Thread(
+            target=lambda: self._call(port, "mempalace_mine", {"source": "b"}, req_id=52)
+        )
+        second.start()
+        first.join(timeout=10)
+        second.join(timeout=10)
+        names = [name for name, _ in log]
+        assert names.index("a:file1:end") < names.index("b:file0:start"), names
+
+
+class TestRWLockYield:
+    """_RWLock.yield_write: the handoff a stepwise writer uses between steps."""
+
+    @staticmethod
+    def _in_thread(fn):
+        thread = threading.Thread(target=fn, daemon=True)
+        thread.start()
+        return thread
+
+    def test_queued_reader_runs_before_the_writer_resumes(self):
+        lock = mcp._RWLock()
+        order: list = []
+        lock.acquire_write()
+
+        def reader():
+            with lock.read_lock():
+                order.append("read")
+
+        thread = self._in_thread(reader)
+        time.sleep(0.1)
+        assert order == []  # blocked by the writer
+        lock.yield_write()
+        order.append("writer resumed")
+        thread.join(timeout=2)
+        lock.release_write()
+        assert order == ["read", "writer resumed"]
+
+    def test_queued_writer_takes_its_turn(self):
+        lock = mcp._RWLock()
+        order: list = []
+        lock.acquire_write()
+
+        def writer():
+            with lock:
+                order.append("other writer")
+
+        thread = self._in_thread(writer)
+        time.sleep(0.1)
+        lock.yield_write()
+        order.append("writer resumed")
+        thread.join(timeout=2)
+        lock.release_write()
+        assert order == ["other writer", "writer resumed"]
+
+    def test_no_op_without_waiters_and_for_a_thread_not_holding_it(self):
+        lock = mcp._RWLock()
+        lock.acquire_write()
+        started = time.monotonic()
+        lock.yield_write()
+        assert time.monotonic() - started < 0.05
+        assert lock._writer
+
+        done = threading.Event()
+
+        def stranger():
+            lock.yield_write()
+            done.set()
+
+        self._in_thread(stranger)
+        assert done.wait(timeout=1)
+        assert lock._writer  # still held by this thread
+        lock.release_write()
+
+    def test_readers_still_wait_for_a_queued_writer_outside_a_yield(self):
+        lock = mcp._RWLock()
+        lock.acquire_read()
+        entered = threading.Event()
+        self._in_thread(lock.acquire_write)
+        time.sleep(0.1)  # writer now queued behind our read
+        self._in_thread(lambda: (lock.acquire_read(), entered.set()))
+        assert not entered.wait(timeout=0.2), "writer preference was lost"
+        lock.release_read()
+
 
 def test_healthz_ok(http_server):
     port, _ = http_server

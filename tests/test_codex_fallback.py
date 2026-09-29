@@ -53,7 +53,7 @@ def test_failed_source_is_not_registered_and_can_be_retried(tmp_path, monkeypatc
 
     def read():
         return _normalize_convo_conversations(
-            source, str(source), 30, collection, "test", "agent", "exchange", dry_run
+            source, str(source), collection, "test", "agent", "exchange", dry_run
         )
 
     assert read() is None

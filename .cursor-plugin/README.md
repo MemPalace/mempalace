@@ -46,6 +46,7 @@ This installs the `mempalace` package via `uv tool` or `pip`, initializes a pala
 | `/mempalace-search` | Search your memories across the palace using semantic search                      |
 | `/mempalace-mine`   | Mine projects and conversations into the palace                                   |
 | `/mempalace-status` | Show palace overview — wings, rooms, drawer counts                                |
+| `/mempalace-audit`  | Score palace organization, then a guided repair session                          |
 
 > Cursor commands are global, not plugin-namespaced — that's why each slug is prefixed with `mempalace-` rather than appearing as `/help`, `/init`, etc. This keeps them collision-free with built-in or other-plugin commands.
 

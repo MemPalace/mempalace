@@ -1,6 +1,6 @@
 ---
 name: mempalace
-description: Install, configure, and operate MemPalace, including a private local palace, a shared-brain hub, or a client joining an existing hub. Use for first-time setup, MCP wiring, mining, status, wings, rooms, drawers, shared-brain identity, or logstream readiness.
+description: Install, configure, and operate MemPalace, including a private local palace, a shared-brain hub, or a client joining an existing hub. Use for first-time setup, MCP wiring, mining, status, palace audit and repair, wings, rooms, drawers, shared-brain identity, or logstream readiness.
 ---
 
 # MemPalace Setup
@@ -141,6 +141,27 @@ update plan`. A remote server update is informational on the client: surface it
 naturally and ask the hub operator to prepare and authorize the plan on the
 palace-serving machine. Never use a client-generated plan to upgrade the
 server, and never execute any plan without explicit approval.
+
+## Palace health: audit and repair session
+
+When the user asks how well organized the palace is, whether memory is
+"messy", why a scoped search or wake-up misses things, or invokes
+`/mempalace:audit`, run the audit and then offer a repair session:
+
+```bash
+mempalace instructions audit
+```
+
+Follow the returned instructions. In short: run `mempalace audit --json`
+(read-only, safe while the MCP server is running), present the five layer
+scores and findings, then walk the user through repairs **one structured
+question at a time** with a recommended option first: merging wings and
+rooms spelled two ways, folding stub wings, deleting tunnels on generic
+tokens and self-link hallways, agreeing a knowledge-graph predicate
+vocabulary, and giving flat wings a closed room set with
+`mempalace rooms propose` / `apply`. Moves over deletions, numbers before actions, verbatim content
+always. Re-run the audit at the end and write a diary entry with the
+before and after scores and every decision made.
 
 ## Recalling past work
 
