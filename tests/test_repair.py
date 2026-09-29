@@ -1,7 +1,10 @@
 """Tests for mempalace.repair — scan, prune, and rebuild HNSW index."""
 
+import errno
+import logging
 import os
 import sqlite3
+import sys
 from contextlib import closing
 from unittest.mock import MagicMock, call, patch
 
@@ -10,6 +13,51 @@ import pytest
 from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 from mempalace import repair
+
+# Mirrors the guard test_backups declares; test_non_regular_file_guards carries
+# a root-only variant because every use of it there also carries a marker that
+# excludes Windows (posix_only or needs_fifo). Neither root nor Windows is
+# stopped by a directory's permission bits, so a test that removes them proves
+# nothing there.
+needs_unprivileged_posix = pytest.mark.skipif(
+    os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="directory permission bits gate neither root nor Windows",
+)
+
+needs_posix_path_errno = pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows raises ENOENT where POSIX raises ENOTDIR for a file used as a directory",
+)
+
+needs_posix_filenames = pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows filenames are UTF-16; a byte that is not valid UTF-8 cannot name a directory",
+)
+
+
+needs_posix_symlink_loop_errno = pytest.mark.skipif(
+    os.name == "nt",
+    reason="the loop is proven by errno.ELOOP, which only POSIX specifies for this shape",
+)
+
+
+def _symlink_or_skip(link, target):
+    """Create ``link`` pointing at ``target``, or skip if the platform refuses.
+
+    Same guard test_backups uses, for the same reason (PR #1555 review, Igor):
+    Windows without ``SeCreateSymbolicLinkPrivilege`` raises before any product
+    code runs. On POSIX only a permission refusal becomes a skip, so a test
+    that leaves the name behind still fails; on Windows the errno cannot be
+    relied on, so any ``OSError`` skips.
+    """
+    try:
+        link.symlink_to(target)
+    except NotImplementedError as exc:
+        pytest.skip(f"symlinks are unavailable here: {exc}")
+    except OSError as exc:
+        if os.name != "nt" and exc.errno not in (errno.EPERM, errno.EACCES):
+            raise
+        pytest.skip(f"symlink creation not permitted for this user: {exc}")
 
 
 # ── _get_palace_path ──────────────────────────────────────────────────
@@ -906,6 +954,161 @@ def test_status_default_uses_configured_drawer_collection(tmp_path):
     assert capacity_status.call_args_list[1].args == (str(tmp_path), "mempalace_closets")
 
 
+def _palace_with_a_readable_database(tmp_path, name="palace"):
+    """A palace whose ``chroma.sqlite3`` ``repair.status`` can really count.
+
+    Built through ``ChromaBackend`` rather than a hand-rolled table, because
+    ``sqlite_drawer_count`` joins ``embeddings``/``segments``/``collections``
+    and answers ``None`` for anything else. On a stand-in schema the reported
+    count is ``(unreadable)`` whatever the permissions are, and an assertion
+    about reachability made against one would hold in both worlds.
+    """
+    palace = tmp_path / name
+    palace.mkdir()
+    _seed_palace(palace, repair._drawers_collection_name(), [("d1", "a drawer", {"wing": "w"})])
+    return palace
+
+
+def _reported_drawer_count(printed):
+    """The count printed under ``[drawers]``, or the literal printed in its place.
+
+    Scoped to that block rather than taking the first match: ``status`` prints
+    one ``sqlite count:`` line per collection, so a change of print order would
+    otherwise turn every assertion here into one about closets.
+    """
+    in_drawers = False
+    for line in printed.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_drawers = stripped == "[drawers]"
+        elif in_drawers and "sqlite count:" in line:
+            return line.split("sqlite count:", 1)[1].strip()
+    return None
+
+
+@needs_unprivileged_posix
+def test_status_does_not_call_an_unreachable_palace_uninitialized(tmp_path, capsys):
+    """Losing the right to look is not evidence the palace never had a database.
+
+    ``os.path.isfile`` folds the ``EACCES`` from the directory into False, and
+    the answer built on it — "exists but has no chroma.sqlite3 yet" — is a
+    statement about the palace that nothing measured (#2293).
+
+    The same palace is read twice, once reachable and once not, so the reported
+    count is what separates the two worlds. Without the first half the second
+    proves nothing: a palace whose schema ``sqlite_drawer_count`` cannot read
+    prints ``(unreadable)`` with its permissions untouched.
+    """
+    palace = _palace_with_a_readable_database(tmp_path)
+
+    repair.status(palace_path=str(palace))
+    assert _reported_drawer_count(capsys.readouterr().out) == "1"
+
+    os.chmod(palace, 0o000)
+    try:
+        result = repair.status(palace_path=str(palace))
+    finally:
+        os.chmod(palace, 0o755)
+
+    printed = capsys.readouterr().out
+    assert "has no chroma.sqlite3 yet" not in printed
+    assert result.get("status") != "uninitialized"
+    assert "drawers" in result and "closets" in result
+    assert _reported_drawer_count(printed) == "(unreadable)"
+
+    # Nothing about the database changed between the two reads. Asked of
+    # sqlite directly rather than by calling status a third time, because
+    # hnsw_capacity_status caches a fully-measured verdict per palace and
+    # would serve the first read's answer back without touching the file.
+    with closing(sqlite3.connect(palace / "chroma.sqlite3")) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] == 1
+
+
+def test_status_does_not_call_a_dangling_symlink_uninitialized(tmp_path, capsys):
+    """A name that now points at nothing is damage, not a palace awaiting its
+    first write. ``os.path.isfile`` follows the link and reports False (#2293).
+    """
+    palace = _palace_with_a_readable_database(tmp_path)
+    (palace / "chroma.sqlite3").rename(palace / "moved-away.sqlite3")
+    _symlink_or_skip(palace / "chroma.sqlite3", palace / "gone.sqlite3")
+
+    result = repair.status(palace_path=str(palace))
+
+    printed = capsys.readouterr().out
+    assert "has no chroma.sqlite3 yet" not in printed
+    assert result.get("status") != "uninitialized"
+    assert "drawers" in result and "closets" in result
+    # The read must not bring the link's target into existence.
+    assert not (palace / "gone.sqlite3").exists()
+    assert (palace / "moved-away.sqlite3").stat().st_size > 0
+
+
+@needs_posix_symlink_loop_errno
+def test_status_does_not_call_a_symlink_loop_uninitialized(tmp_path, capsys):
+    """``ELOOP`` is another failure to reach, and reaches the same wrong answer.
+
+    The loop is asserted before the call: a platform that resolves this name
+    some other way would leave the test passing on a state it never built. That
+    ``stat`` is also the one this file makes of ``_is_a_named_pipe``'s failure
+    branch, which answers False and lets the read report the loop.
+    """
+    palace = _palace_with_a_readable_database(tmp_path)
+    (palace / "chroma.sqlite3").rename(palace / "moved-away.sqlite3")
+    _symlink_or_skip(palace / "chroma.sqlite3", palace / "chroma.sqlite3")
+
+    try:
+        os.stat(palace / "chroma.sqlite3")
+    except OSError as exc:
+        if exc.errno != errno.ELOOP:
+            raise
+    else:
+        pytest.fail("the symlink loop was not built: stat() resolved the name")
+
+    result = repair.status(palace_path=str(palace))
+
+    printed = capsys.readouterr().out
+    assert "has no chroma.sqlite3 yet" not in printed
+    assert result.get("status") != "uninitialized"
+    assert "drawers" in result and "closets" in result
+
+
+def test_status_does_not_call_a_directory_named_chroma_sqlite3_uninitialized(tmp_path, capsys):
+    """A directory under that name is damage too, and it reads as damage.
+
+    No special case handles it: ``stat`` succeeds and says "not a FIFO", so it
+    goes to the read like every other state, which reports what it found.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").mkdir()
+
+    result = repair.status(palace_path=str(palace))
+
+    printed = capsys.readouterr().out
+    assert "has no chroma.sqlite3 yet" not in printed
+    assert result.get("status") != "uninitialized"
+    # Not asserting the printed literal: what sqlite says when handed a
+    # directory is its own business and is only measured here on Linux.
+    assert "drawers" in result and "closets" in result
+
+
+def test_status_reads_a_database_reached_through_a_symlink(tmp_path, capsys):
+    """The common legitimate shape must survive the move off ``os.path.isfile``.
+
+    ``isfile`` followed symlinks; absence is now proven with ``lstat``, which
+    does not. A palace whose database lives on another volume and is linked
+    into place has to keep being read, and that is the regression this pins.
+    """
+    palace = _palace_with_a_readable_database(tmp_path)
+    elsewhere = tmp_path / "elsewhere.sqlite3"
+    (palace / "chroma.sqlite3").rename(elsewhere)
+    _symlink_or_skip(palace / "chroma.sqlite3", elsewhere)
+
+    repair.status(palace_path=str(palace))
+
+    assert _reported_drawer_count(capsys.readouterr().out) == "1"
+
+
 @patch("mempalace.repair._copy_file_no_follow")
 @patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_aborts_on_truncation_signal(mock_backend_cls, mock_copy, tmp_path):
@@ -1716,12 +1919,41 @@ def test_sqlite_integrity_errors_returns_empty_for_healthy_db(tmp_path):
     assert repair.sqlite_integrity_errors(str(palace)) == []
 
 
+def test_sqlite_integrity_errors_reads_a_wal_palace_without_sidecars(tmp_path):
+    """A healthy WAL palace nothing holds open must not read as corrupt (#2489).
+
+    chroma removes the ``-wal``/``-shm`` sidecars when its last connection
+    closes cleanly, and a read-only connection may not recreate the index they
+    hold. On SQLite builds that enforce this, the probe failed with "unable to
+    open database file" and the gate then refused every tool.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    db_path = palace / "chroma.sqlite3"
+    setup = sqlite3.connect(str(db_path))
+    setup.execute("PRAGMA journal_mode=WAL")
+    setup.execute("CREATE TABLE t (x INTEGER)")
+    setup.execute("INSERT INTO t VALUES (1)")
+    setup.commit()
+    setup.close()
+    for sidecar in (f"{db_path}-wal", f"{db_path}-shm"):
+        if os.path.exists(sidecar):
+            os.unlink(sidecar)
+
+    assert repair.sqlite_integrity_errors(str(palace)) == []
+
+
 def test_sqlite_integrity_errors_uses_bounded_contention_timeout(tmp_path, monkeypatch):
     """Integrity checks wait out routine writers without a real-time sleep.
 
     Assert the sqlite connection contract directly so this regression test is
     deterministic and does not add the seven-second delay from the original
     proposal to every test run.
+
+    The contract includes the close. ``sqlite3``'s own context manager ends the
+    transaction and leaves the handle open, so the probe wraps the connection in
+    ``closing()`` and the double is shaped the same way: no ``__enter__``, since
+    nothing enters it any more, and a ``close`` that has to be called.
     """
     palace = tmp_path / "palace"
     palace.mkdir()
@@ -1736,20 +1968,21 @@ def test_sqlite_integrity_errors_uses_bounded_contention_timeout(tmp_path, monke
             return [("ok",)]
 
     class _Connection:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
         def execute(self, statement):
             calls.append(("execute", statement))
             return _Result()
+
+        def close(self):
+            calls.append(("close",))
 
     def _connect(database, **kwargs):
         calls.append(("connect", database, kwargs))
         return _Connection()
 
+    # Pin the plain open: on Linux an anchor connection opens first (#2302).
+    from mempalace.backends import _inproc_sqlite
+
+    monkeypatch.setattr(_inproc_sqlite, "_ANCHORED", False)
     monkeypatch.setattr(repair.sqlite3, "connect", _connect)
 
     assert repair.sqlite_integrity_errors(str(palace)) == []
@@ -1763,6 +1996,7 @@ def test_sqlite_integrity_errors_uses_bounded_contention_timeout(tmp_path, monke
             },
         ),
         ("execute", "PRAGMA quick_check"),
+        ("close",),
     ]
     assert repair._SQLITE_INTEGRITY_BUSY_TIMEOUT_SECONDS == 15.0
 
@@ -1777,6 +2011,246 @@ def test_sqlite_integrity_errors_reports_unreadable_sqlite_file(tmp_path):
 
     assert errors
     assert "quick_check failed" in errors[0]
+    assert "named pipe" not in errors[0]
+
+
+def test_sqlite_integrity_status_reports_a_verdict_for_a_healthy_database(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    with closing(sqlite3.connect(palace / "chroma.sqlite3")) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.commit()
+
+    status = repair.sqlite_integrity_status(str(palace))
+
+    assert status.checked is True
+    assert status.errors == ()
+    assert status.reason == ""
+    # frozen=True is only worth stating if the verdict is actually immutable.
+    assert isinstance(hash(status), int)
+
+
+def test_sqlite_integrity_status_reports_no_verdict_when_the_database_is_absent(tmp_path):
+    """An absent database is not a clean one.
+
+    ``sqlite_integrity_errors`` answers ``[]`` here and always has. Callers
+    that read an empty list as "quick_check found nothing wrong" then state a
+    verdict no probe produced, which is what ``checked`` exists to prevent.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    status = repair.sqlite_integrity_status(str(palace))
+
+    assert status.checked is False
+    assert status.errors == ()
+    # The whole string, not a substring: this one is read by an operator through
+    # `mempalace_status` and `/statusz`, so rewording it should have to be a
+    # deliberate edit here rather than a drift nothing notices.
+    assert status.reason == (
+        f"no quick_check ran: {palace / 'chroma.sqlite3'} does not exist, "
+        "so there was no SQLite database to open"
+    )
+    assert repair.sqlite_integrity_errors(str(palace)) == []
+
+
+def test_sqlite_integrity_status_asks_about_absence_once(tmp_path, monkeypatch):
+    """A database that vanishes mid-call must not come back as a clean verdict.
+
+    ``sqlite_integrity_errors`` gates on absence itself, so reaching the probe
+    through it would put the same question twice. A file unlinked between the
+    two would answer ``[]`` the second time, and an empty list beside
+    ``checked=True`` is the clean bill of health this function exists to
+    withhold. Past the gate, only ``_quick_check_errors`` may answer.
+
+    The counter is the point: it fails on the second call rather than on the
+    verdict, so the test names the cause instead of waiting for a race to show
+    the symptom.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    with closing(sqlite3.connect(palace / "chroma.sqlite3")) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.commit()
+
+    real_gate = repair._integrity_target_is_absent
+    asked = []
+
+    def counting_gate(sqlite_path):
+        asked.append(sqlite_path)
+        verdict = real_gate(sqlite_path)
+        if len(asked) == 1:
+            # The file goes away just after the gate reported it present.
+            os.unlink(sqlite_path)
+        return verdict
+
+    monkeypatch.setattr(repair, "_integrity_target_is_absent", counting_gate)
+
+    status = repair.sqlite_integrity_status(str(palace))
+
+    assert len(asked) == 1, f"absence was tested {len(asked)} times: {asked}"
+    assert status.checked is True
+    assert status.errors
+    assert "quick_check failed" in status.errors[0]
+    assert "named pipe" not in status.errors[0]
+
+
+def test_sqlite_integrity_errors_does_not_raise_on_a_path_it_cannot_stat(tmp_path):
+    """A NUL in the path is not proof of absence, and must not escape either.
+
+    ``os.path.exists`` folded ``ValueError`` into False, so callers never had
+    to handle it; ``cli.cmd_repair`` and the post-mine validator still do not.
+    The replacement keeps it inside the function and lets the open attempt
+    speak, as it does for every other unreadable path. The NUL survives that
+    far because ``sqlite_read_uri`` percent-encodes it, so ``sqlite3.connect``
+    is never handed a literal NUL and fails on the path instead.
+    """
+    errors = repair.sqlite_integrity_errors(str(tmp_path) + "\x00nope")
+
+    assert errors
+    assert "quick_check failed" in errors[0]
+    assert "named pipe" not in errors[0]
+
+
+@needs_posix_filenames
+def test_sqlite_integrity_errors_reports_a_path_python_cannot_encode(tmp_path):
+    """A palace under a name that is not valid UTF-8 is answered, not raised.
+
+    POSIX filenames are bytes, and ``os.listdir`` hands such a name back
+    through ``surrogateescape``, so a palace can legitimately live under one.
+    Absence is not proven for it, which routes it to the probe.
+
+    What happens there depends on the interpreter, measured on 3.9, 3.11, 3.12,
+    3.13 and 3.14: up to 3.12 ``pathname2url`` raises ``UnicodeEncodeError``
+    while building the URI, before SQLite is reached, and from 3.13 it
+    percent-encodes the byte and the database opens normally. The first is a
+    ``ValueError`` subclass, and the absence gate's docstring promises callers
+    never see one; ``palace._validate_palace_fts5_after_mine`` and
+    ``cli.cmd_repair`` both call this without a guard, so raising there is a
+    traceback out of ``mempalace mine`` and ``mempalace repair`` on a database
+    sitting right at the end of that path.
+
+    The invariant asserted here is that the call answers. The version-gated
+    half is what pins the ``ValueError`` catch on the versions where it is
+    reachable at all. Filesystems that enforce UTF-8 names cannot hold this
+    palace, so there the state does not exist and the test says so.
+    """
+    palace = os.fsdecode(os.path.join(os.fsencode(str(tmp_path)), b"pal\xff"))
+    try:
+        os.mkdir(os.fsencode(palace))
+    except OSError as exc:
+        # APFS enforces UTF-8 names and refuses this one, so the state cannot be
+        # built there at all: with nothing at the path, `lstat` reports ENOENT,
+        # the gate proves absence, and the probe is never reached. Skip rather
+        # than weaken the assertions, and only for the errno that means the
+        # filesystem rejected the name; anything else is a real failure. Same
+        # shape as `_symlink_or_skip` above, for the same reason.
+        if exc.errno not in (errno.EILSEQ, errno.EINVAL):
+            raise
+        pytest.skip(f"this filesystem will not hold a non-UTF-8 name: {exc}")
+
+    with closing(sqlite3.connect(os.path.join(palace, "chroma.sqlite3"))) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.commit()
+
+    # The database is there and readable; only its name is unencodable, so the
+    # gate cannot prove absence and the path goes to the probe.
+    assert repair._integrity_target_is_absent(os.path.join(palace, "chroma.sqlite3")) is False
+
+    errors = repair.sqlite_integrity_errors(palace)
+
+    assert all("quick_check failed" in error for error in errors)
+    assert not any("named pipe" in error for error in errors)
+    assert repair.sqlite_integrity_status(palace).checked is True
+    if sys.version_info < (3, 13):
+        assert errors, "pathname2url raises here, and the probe has to report that"
+
+
+@needs_posix_path_errno
+def test_sqlite_integrity_status_reports_a_path_component_that_is_a_file(tmp_path):
+    """``ENOTDIR`` proves absence too, and is deliberately not treated as proof.
+
+    A palace path whose parent component is a regular file cannot hold a
+    database, but the check routes it to the open attempt rather than calling
+    it absent, so the operator is told the path is wrong instead of being told
+    there was nothing to check.
+
+    POSIX only: Windows raises ``ENOENT`` for the same path, so there the state
+    is proven absent and reported as no verdict. Both answers are safe, and the
+    difference is the platform's, not the gate's.
+    """
+    not_a_directory = tmp_path / "file"
+    not_a_directory.write_text("x")
+
+    status = repair.sqlite_integrity_status(str(not_a_directory))
+
+    assert status.checked is True
+    assert status.errors
+    assert "quick_check failed" in status.errors[0]
+    assert "named pipe" not in status.errors[0]
+
+
+def test_sqlite_integrity_status_reports_a_dangling_symlink_as_an_error(tmp_path):
+    """A symlink whose target is gone is damage, not an absent database.
+
+    ``os.path.exists`` follows the link and answers False, collapsing this
+    into the same "nothing to check" the empty palace gets.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    _symlink_or_skip(palace / "chroma.sqlite3", palace / "moved-away.sqlite3")
+
+    status = repair.sqlite_integrity_status(str(palace))
+
+    assert status.checked is True
+    assert status.errors
+    assert "quick_check failed" in status.errors[0]
+    assert "named pipe" not in status.errors[0]
+
+
+def test_sqlite_integrity_status_reports_a_directory_named_chroma_sqlite3_as_an_error(tmp_path):
+    """A directory under that name cannot be read as a database, and it is not a named pipe.
+
+    The named-pipe error shares the ``quick_check failed`` prefix these tests
+    check for, so each of them also checks that no pipe is named.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").mkdir()
+
+    status = repair.sqlite_integrity_status(str(palace))
+
+    assert status.checked is True
+    assert len(status.errors) == 1
+    assert "quick_check failed" in status.errors[0]
+    assert "named pipe" not in status.errors[0]
+
+
+@needs_unprivileged_posix
+def test_sqlite_integrity_status_reports_an_unreachable_directory_as_an_error(tmp_path):
+    """Losing the right to look is not evidence that there is nothing to see.
+
+    The database here is intact; only the directory permission stands in the
+    way. ``os.path.exists`` answers False for that too.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    with closing(sqlite3.connect(palace / "chroma.sqlite3")) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.commit()
+
+    # Closed above: an open handle inside the directory would be a second
+    # variable in an experiment about not being able to reach it.
+    os.chmod(palace, 0o000)
+    try:
+        status = repair.sqlite_integrity_status(str(palace))
+    finally:
+        os.chmod(palace, 0o755)
+
+    assert status.checked is True
+    assert status.errors
+    assert "quick_check failed" in status.errors[0]
+    assert "named pipe" not in status.errors[0]
 
 
 @patch("mempalace.repair._copy_file_no_follow")
@@ -2953,6 +3427,81 @@ def test_errors_are_isolated_fts5_classification():
     assert not repair._errors_are_isolated_fts5([fts_new, page])
 
 
+def test_errors_are_isolated_fts5_declines_checksum_mismatch():
+    """`fts5: checksum mismatch` must NOT authorize a rebuild.
+
+    The canonical predicate already declines this; the test pins that it stays
+    declined, because widening the predicate to the whole `fts5:` prefix — the
+    obvious way to cover a new SQLite wording — would accept it.
+
+    It says the index and the content table disagree, not which of the two is
+    damaged, and a rebuild reads FROM content. Measured on SQLite 3.51.2:
+    editing eight bytes inside `%_content` (same length, same token count, so
+    `%_docsize` and the totals record stay valid) produces exactly this
+    message while the inverted index still holds the original token, and
+    single-byte damage to an index leaf produces the same string for nearly
+    every flip that registers at all. Accepting it would rebuild the index
+    from whichever side is damaged and leave quick_check clean either way.
+    """
+    assert not repair._errors_are_isolated_fts5(
+        ['fts5: checksum mismatch for table "embedding_fulltext_search"']
+    )
+    # Nor does it become acceptable next to a wording that is.
+    assert not repair._errors_are_isolated_fts5(
+        [
+            "malformed inverted index for FTS5 table main.embedding_fulltext_search",
+            'fts5: checksum mismatch for table "embedding_fulltext_search"',
+        ]
+    )
+
+
+def test_errors_are_isolated_fts5_rejects_non_fts5_and_probe_failure():
+    """Everything quick_check did not report against the index keeps aborting.
+
+    The probe-failure row matters most: sqlite_integrity_errors returns
+    ``PRAGMA quick_check failed: ...`` when the check could not run at all.
+    Classifying that as an isolated FTS5 fault would rebuild an index over a
+    database whose state was never established, so the match is anchored and
+    a wrapped copy of a known phrasing no longer slips through.
+    """
+    assert not repair._errors_are_isolated_fts5(
+        ["PRAGMA quick_check failed: database disk image is malformed"]
+    )
+    assert not repair._errors_are_isolated_fts5(
+        ["PRAGMA quick_check failed: file is not a database"]
+    )
+    # Anchoring: the probe's own failure carrying a known phrasing inside it.
+    assert not repair._errors_are_isolated_fts5(
+        [
+            "PRAGMA quick_check failed: malformed inverted index for FTS5 table "
+            "main.embedding_fulltext_search"
+        ]
+    )
+    assert not repair._errors_are_isolated_fts5(
+        ['PRAGMA quick_check failed: fts5: corruption found reading blob 1 from table "x"']
+    )
+    # The multi-line b-tree report quick_check emits for page damage.
+    assert not repair._errors_are_isolated_fts5(
+        ["*** in database main ***\nTree 4 page 89 cell 51: Offset 48879 out of range 144..4092"]
+    )
+    assert not repair._errors_are_isolated_fts5(["database disk image is malformed"])
+    # "fts5" has to be the module prefix, not an incidental mention.
+    assert not repair._errors_are_isolated_fts5(["row 3 missing from index fts5_shadow_idx"])
+    # Two more rows real SQLite emits for a damaged chroma palace, neither of
+    # which a rebuild could fix: dropping a shadow table yields the first on
+    # 3.45.1 and the second when the vtable constructor fails without a message
+    # of its own. Both must keep aborting.
+    assert not repair._errors_are_isolated_fts5(
+        [
+            "unable to validate the inverted index for FTS5 table "
+            "main.embedding_fulltext_search: SQL logic error"
+        ]
+    )
+    assert not repair._errors_are_isolated_fts5(
+        ["PRAGMA quick_check failed: vtable constructor failed: embedding_fulltext_search"]
+    )
+
+
 def test_maybe_autoheal_fts5_index_heals_isolated_corruption(tmp_path):
     palace = _make_fts5_palace(tmp_path, corrupt=True)
     sqlite_path = tmp_path / "chroma.sqlite3"
@@ -2980,6 +3529,289 @@ def test_maybe_autoheal_fts5_index_leaves_non_fts5_errors_untouched(tmp_path):
         remaining = repair.maybe_autoheal_fts5_index(palace, page_errors, progress=lambda *_: None)
     assert remaining == page_errors
     lock.assert_not_called()
+
+
+def test_maybe_autoheal_fts5_index_declines_checksum_mismatch_without_writing(tmp_path):
+    """The checksum-mismatch wording must not reach the rebuild.
+
+    Canonical declines this too; the guard pins that no future widening of the
+    predicate lets it through. The wording is passed explicitly rather than
+    read back from quick_check, because the builds measured here produce it
+    only from 3.51.2: that is what makes this hold on a runner linked against
+    any SQLite instead of one.
+    """
+    palace = _make_fts5_palace(tmp_path, corrupt=True)
+    errors = ['fts5: checksum mismatch for table "embedding_fulltext_search"']
+
+    with patch("mempalace.palace.mine_palace_lock") as lock:
+        remaining = repair.maybe_autoheal_fts5_index(palace, errors, progress=lambda *_: None)
+
+    assert remaining == errors
+    lock.assert_not_called()
+
+
+def test_maybe_autoheal_fts5_index_reports_why_it_declined(tmp_path):
+    """Declining used to be silent, which is why this class stayed invisible."""
+    palace = _make_fts5_palace(tmp_path, corrupt=False)
+    page_errors = ["Page 4 of B-tree 12345: database disk image is malformed"]
+
+    messages: list[str] = []
+    with patch("mempalace.palace.mine_palace_lock") as lock:
+        remaining = repair.maybe_autoheal_fts5_index(palace, page_errors, progress=messages.append)
+
+    assert remaining == page_errors
+    lock.assert_not_called()
+    joined = "\n".join(messages)
+    assert "Not auto-healing" in joined
+    # The build that produced the verdict is named, so a bug report carries it.
+    assert sqlite3.sqlite_version in joined
+
+
+def test_maybe_autoheal_fts5_index_does_not_claim_quick_check_reported(tmp_path):
+    """A probe that could not run did not "report an error".
+
+    sqlite_integrity_errors returns ``PRAGMA quick_check failed: ...`` when the
+    check itself raised. A decline message that says quick_check reported
+    something is false there, and a diagnostic that guesses is worth less than
+    none.
+    """
+    palace = _make_fts5_palace(tmp_path, corrupt=False)
+    probe_failure = ["PRAGMA quick_check failed: database disk image is malformed"]
+
+    messages: list[str] = []
+    assert (
+        repair.maybe_autoheal_fts5_index(palace, probe_failure, progress=messages.append)
+        == probe_failure
+    )
+    joined = "\n".join(messages)
+    assert "Not auto-healing" in joined
+    assert "quick_check reported" not in joined
+
+
+def test_maybe_autoheal_fts5_index_explains_a_missing_database(tmp_path):
+    """The accepted-but-no-database path used to return silently too.
+
+    The errors are passed in rather than produced by deleting the file:
+    ``sqlite_integrity_errors`` leaves its connection open, and Windows
+    refuses to unlink a file another handle still holds.
+    """
+    errors = ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
+    assert repair._errors_are_isolated_fts5(errors), "must reach the missing-database branch"
+
+    messages: list[str] = []
+    with patch("mempalace.palace.mine_palace_lock") as lock:
+        remaining = repair.maybe_autoheal_fts5_index(
+            str(tmp_path), errors, progress=messages.append
+        )
+
+    assert remaining == errors
+    lock.assert_not_called()
+    joined = "\n".join(messages)
+    assert "Not auto-healing" in joined
+    assert "not there to rebuild" in joined
+
+
+def test_maybe_autoheal_fts5_index_says_nothing_when_there_is_nothing_to_heal(tmp_path):
+    """An empty error list is not a declined heal, so it must not claim one."""
+    palace = _make_fts5_palace(tmp_path, corrupt=False)
+
+    messages: list[str] = []
+    assert repair.maybe_autoheal_fts5_index(palace, [], progress=messages.append) == []
+    assert messages == []
+
+
+def test_maybe_autoheal_fts5_index_clean_verdict_names_the_sqlite_build(tmp_path):
+    """The heal's own "clean" is a verdict, and nothing else on this path names
+    the build that produced it: a successful heal prints no abort banner.
+
+    #2240 asks for exactly this. A build that cannot detect a given FTS5 fault
+    reports the same clean as one that can, so "quick_check is clean" without a
+    version is the claim the issue says cannot be evaluated.
+    """
+    palace = _make_fts5_palace(tmp_path, corrupt=True)
+    errors = repair.sqlite_integrity_errors(palace)
+
+    messages: list[str] = []
+    assert repair.maybe_autoheal_fts5_index(palace, errors, progress=messages.append) == []
+
+    joined = "\n".join(messages)
+    assert "quick_check is clean" in joined
+    assert sqlite3.sqlite_version in joined
+
+
+def test_maybe_autoheal_fts5_index_dirty_after_rebuild_names_the_sqlite_build(
+    tmp_path, monkeypatch
+):
+    """So does the opposite outcome, and for the reason #2240 raises third:
+    a rebuild issued by one SQLite can leave state another build rejects, so
+    which build rebuilt and re-checked is the fact that makes the verdict
+    actionable.
+
+    The re-check is stubbed rather than reproduced: leaving an index dirty
+    through a real rebuild is the very asymmetry the issue reports and could
+    not be reproduced here.
+    """
+    palace = _make_fts5_palace(tmp_path, corrupt=True)
+    errors = repair.sqlite_integrity_errors(palace)
+    assert repair._errors_are_isolated_fts5(errors), "must reach the rebuild"
+
+    monkeypatch.setattr(repair, "sqlite_integrity_errors", lambda _path: list(errors))
+
+    messages: list[str] = []
+    remaining = repair.maybe_autoheal_fts5_index(palace, errors, progress=messages.append)
+
+    assert remaining == errors
+    joined = "\n".join(messages)
+    assert "did not clear quick_check" in joined
+    assert sqlite3.sqlite_version in joined
+
+
+def test_vacuum_and_rebuild_fts5_strict_clean_verdict_names_the_sqlite_build(tmp_path):
+    """The post-recovery check states a clean verdict too, and it is the only
+    integrity evidence a `--mode from-sqlite` run prints."""
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(sqlite_path))) as conn:
+        conn.execute(
+            "CREATE VIRTUAL TABLE embedding_fulltext_search"
+            " USING fts5(string_value, tokenize='unicode61')"
+        )
+        conn.execute("INSERT INTO embedding_fulltext_search(string_value) VALUES('hello world')")
+        conn.commit()
+
+    messages: list[str] = []
+    repair._vacuum_and_rebuild_fts5(str(tmp_path), strict=True, progress=messages.append)
+
+    joined = "\n".join(messages)
+    assert "quick_check is clean" in joined
+    assert sqlite3.sqlite_version in joined
+
+
+def test_vacuum_and_rebuild_fts5_strict_dirty_verdict_names_the_sqlite_build(tmp_path, monkeypatch):
+    """The failing half of that check names the build too.
+
+    Reaching this branch with a genuinely damaged database is not practical:
+    the rebuild this function runs first leaves quick_check clean whichever
+    side was damaged — the same property that keeps `fts5: checksum mismatch`
+    out of the classifier. The probe is stubbed instead, so what is under test
+    is the message, which a caller renders verbatim.
+    """
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(sqlite_path))) as conn:
+        conn.execute(
+            "CREATE VIRTUAL TABLE embedding_fulltext_search"
+            " USING fts5(string_value, tokenize='unicode61')"
+        )
+        conn.commit()
+
+    real_connect = sqlite3.connect
+
+    class _Rows:
+        def fetchall(self):
+            return [("*** in database main *** Page 4: btreeInitPage() returns error code 11",)]
+
+    class _Conn:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, *args):
+            if sql.strip().lower().startswith("pragma quick_check"):
+                return _Rows()
+            return self._inner.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(repair.sqlite3, "connect", lambda *a, **kw: _Conn(real_connect(*a, **kw)))
+
+    with pytest.raises(sqlite3.DatabaseError) as excinfo:
+        repair._vacuum_and_rebuild_fts5(str(tmp_path), strict=True, progress=lambda _m: None)
+
+    message = str(excinfo.value)
+    assert "post-recovery quick_check failed" in message
+    assert sqlite3.sqlite_version in message
+    assert "btreeInitPage" in message
+
+
+def test_resolve_preflight_dry_run_preview_names_the_sqlite_build(tmp_path):
+    """The accepted preview predicts a heal off the same classifier, so it is
+    worth no more than the build that classified. Both dry-run branches name it
+    or neither is trustworthy."""
+    palace = _make_fts5_palace(tmp_path, corrupt=False)
+    fts_errors = ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
+
+    messages: list[str] = []
+    assert (
+        repair.resolve_repair_preflight_errors(
+            palace, fts_errors, dry_run=True, progress=messages.append
+        )
+        == []
+    )
+
+    joined = "\n".join(messages)
+    assert "DRY RUN" in joined
+    assert sqlite3.sqlite_version in joined
+
+
+def test_resolve_preflight_dry_run_explains_a_declined_heal(tmp_path):
+    """A preview explains the same decision without reading as the run itself.
+
+    Both paths must speak — that is the gap this change closes — but a preview
+    that is byte-for-byte the run it predicts defeats ``--dry-run``: the
+    operator cannot tell from the output whether anything happened.
+    """
+    palace = _make_fts5_palace(tmp_path, corrupt=False)
+    page_errors = ["Page 4 of B-tree 12345: database disk image is malformed"]
+
+    preview: list[str] = []
+    remaining = repair.resolve_repair_preflight_errors(
+        palace, page_errors, dry_run=True, progress=preview.append
+    )
+    real: list[str] = []
+    repair.resolve_repair_preflight_errors(palace, page_errors, dry_run=False, progress=real.append)
+
+    assert remaining == page_errors
+    preview_text = "".join(preview)
+    real_text = "".join(real)
+    assert "DRY RUN" in preview_text
+    assert "DRY RUN" not in real_text
+    assert preview_text != real_text
+    for text in (preview_text, real_text):
+        assert "auto-heal" in text
+        assert "confined" in text
+        assert sqlite3.sqlite_version in text
+
+
+def test_declined_heal_message_renders_as_one_log_record(tmp_path, caplog):
+    """The decline text is shared with ``progress=logger.warning`` (#2240).
+
+    ``_validate_palace_fts5_after_mine`` passes ``logger.warning`` as
+    ``progress`` so the MCP process does not print into its JSON-RPC stream. A
+    message that opens with a newline renders there as a bare
+    ``WARNING:mempalace_mcp:`` header above an empty line, which reads as a
+    truncated record rather than an explanation.
+    """
+    palace = _make_fts5_palace(tmp_path, corrupt=False)
+    page_errors = ["Page 4 of B-tree 12345: database disk image is malformed"]
+
+    logger = logging.getLogger("mempalace_mcp")
+    with caplog.at_level(logging.WARNING, logger="mempalace_mcp"):
+        repair.maybe_autoheal_fts5_index(palace, page_errors, progress=logger.warning)
+
+    assert caplog.records, "the decline must be logged, not swallowed"
+    message = caplog.records[-1].getMessage()
+    assert not message.startswith("\n")
+    assert message.splitlines()[0].strip().startswith("Not auto-healing")
+
+
+def test_print_sqlite_integrity_abort_names_the_sqlite_build(tmp_path, capsys):
+    """A clean-vs-dirty verdict is only as good as the linked SQLite (#2240)."""
+    repair.print_sqlite_integrity_abort(
+        str(tmp_path),
+        ["malformed inverted index for FTS5 table main.embedding_fulltext_search"],
+    )
+    out = capsys.readouterr().out
+    assert sqlite3.sqlite_version in out
+    assert "ABORT: SQLite-layer corruption detected" in out
 
 
 def test_maybe_autoheal_fts5_index_skips_when_palace_is_being_mined(tmp_path):

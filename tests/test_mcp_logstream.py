@@ -1,7 +1,7 @@
 """
 test_mcp_logstream.py — MCP surface tests for the RFC 003 logstream tools.
 
-Covers handle_request dispatch for the seven logstream tools, read-only
+Covers handle_request dispatch for the eight logstream tools, read-only
 mode (hidden from tools/list AND refused at dispatch), the peer-writer
 exemption, the Chroma-integrity-gate exemption, and a cross-thread
 append/wait round trip through the dispatch layer.
@@ -18,6 +18,7 @@ from mempalace import mcp_server
 LOGSTREAM_TOOLS = frozenset(
     {
         "mempalace_event_append",
+        "mempalace_task_create",
         "mempalace_event_list",
         "mempalace_event_wait",
         "mempalace_event_ack",
@@ -29,6 +30,7 @@ LOGSTREAM_TOOLS = frozenset(
 LOGSTREAM_MUTATING = frozenset(
     {
         "mempalace_event_append",
+        "mempalace_task_create",
         "mempalace_event_ack",
         "mempalace_artifact_put",
         "mempalace_patch_submit",
@@ -90,13 +92,71 @@ class TestRegistration:
         assert LOGSTREAM_TOOLS <= mcp_server._SQLITE_INTEGRITY_ALLOWED_TOOLS
 
     def test_mutating_logstream_tools_exempt_from_peer_writer_gate(self):
-        assert LOGSTREAM_MUTATING == mcp_server._PEER_WRITER_EXEMPT_TOOLS
+        # Subset (not equality): the KG tools (#2297) also join the exempt
+        # set, so the logstream family is a *subset* of all peer-writer
+        # exemptions, not the whole thing.
+        assert LOGSTREAM_MUTATING <= mcp_server._PEER_WRITER_EXEMPT_TOOLS
 
 
 # ── Dispatch round trips ──────────────────────────────────────────────────
 
 
 class TestDispatch:
+    def test_task_create_builds_the_same_high_level_handoff_for_remote_clients(
+        self, patched_server
+    ):
+        created = _result(
+            _call(
+                patched_server,
+                "mempalace_task_create",
+                {
+                    "project": "mempalace",
+                    "from_agent": "mac-claude",
+                    "to_agent": "windows-codex",
+                    "goal": "Fix remote task creation.",
+                    "branch": "fix/remote-task",
+                    "base_commit": "abc1234",
+                    "done": "Focused tests pass and a patch is submitted.",
+                },
+            )
+        )
+
+        assert created["success"] is True
+        assert created["task"]["type"] == "task.request"
+        assert created["task"]["correlation_id"].startswith("task_fix_remote_task_creation_")
+        assert created["handoff"].startswith("Open MemPalace task task_fix_remote_task_creation_")
+        assert created["task"]["body"] == (
+            "Goal:\nFix remote task creation.\n\n"
+            "Definition of done:\nFocused tests pass and a patch is submitted.\n\n"
+            "Delivery:\nClose the loop through MemPalace: claim the request, then submit a patch "
+            "with mempalace_patch_submit or reply with blocked/failed evidence."
+        )
+
+    def test_task_create_rejects_a_mutable_base_reference(self, patched_server):
+        created = _result(
+            _call(
+                patched_server,
+                "mempalace_task_create",
+                {
+                    "project": "mempalace",
+                    "from_agent": "mac-claude",
+                    "to_agent": "windows-codex",
+                    "goal": "Fix remote task creation.",
+                    "branch": "fix/remote-task",
+                    "base_commit": "main",
+                    "done": "Focused tests pass and a patch is submitted.",
+                },
+            )
+        )
+
+        assert created == {
+            "success": False,
+            "error": (
+                "task base commit must be a hexadecimal Git object id "
+                "(at least 7 characters), not a branch or tag"
+            ),
+        }
+
     def test_append_then_list(self, patched_server):
         appended = _result(_call(patched_server, "mempalace_event_append", APPEND_ARGS))
         assert appended["success"] is True
@@ -198,6 +258,68 @@ class TestDispatch:
         )
         assert result["timed_out"] is False
         assert result["count"] == 2
+
+    def test_context_aware_order_and_case_insensitivity(self, patched_server):
+        ev1 = _result(
+            _call(
+                patched_server,
+                "mempalace_event_append",
+                dict(APPEND_ARGS, body="first"),
+            )
+        )["event"]
+        ev2 = _result(
+            _call(
+                patched_server,
+                "mempalace_event_append",
+                dict(APPEND_ARGS, body="second"),
+            )
+        )["event"]
+        ev3 = _result(
+            _call(
+                patched_server,
+                "mempalace_event_append",
+                dict(APPEND_ARGS, body="third"),
+            )
+        )["event"]
+
+        # Default without cursor: newest first (order='desc')
+        listed = _result(
+            _call(
+                patched_server,
+                "mempalace_event_list",
+                {"correlation_id": "task_mcp"},
+            )
+        )
+        assert [e["id"] for e in listed["events"]] == [ev3["id"], ev2["id"], ev1["id"]]
+
+        # Default with since_event_id cursor: forward chronological (order='asc')
+        resumed = _result(
+            _call(
+                patched_server,
+                "mempalace_event_list",
+                {"correlation_id": "task_mcp", "since_event_id": ev1["id"]},
+            )
+        )
+        assert [e["id"] for e in resumed["events"]] == [ev2["id"], ev3["id"]]
+
+        # Explicit order overrides default and handles uppercase
+        explicit_asc = _result(
+            _call(
+                patched_server,
+                "mempalace_event_list",
+                {"correlation_id": "task_mcp", "order": "ASC"},
+            )
+        )
+        assert [e["id"] for e in explicit_asc["events"]] == [ev1["id"], ev2["id"], ev3["id"]]
+
+        explicit_desc = _result(
+            _call(
+                patched_server,
+                "mempalace_event_list",
+                {"correlation_id": "task_mcp", "since_event_id": ev1["id"], "order": "DESC"},
+            )
+        )
+        assert [e["id"] for e in explicit_desc["events"]] == [ev3["id"], ev2["id"]]
 
     def test_artifact_put_get_round_trip(self, patched_server):
         patch = "diff --git a/x b/x\n+1\n"
@@ -344,3 +466,86 @@ class TestGateExemptions:
             assert mcp_server._mcp_sqlite_integrity_refusal(1, name) is None, name
         appended = _result(_call(patched_server, "mempalace_event_append", APPEND_ARGS))
         assert appended["success"] is True
+
+
+class TestTopicAndOrderMcp:
+    def test_mcp_tools_schema_has_topic_and_order(self):
+        append_props = mcp_server.TOOLS["mempalace_event_append"]["input_schema"]["properties"]
+        assert "topic" in append_props
+
+        list_props = mcp_server.TOOLS["mempalace_event_list"]["input_schema"]["properties"]
+        assert "topic" in list_props
+        assert "order" in list_props
+        assert "before_event_id" in list_props
+
+        wait_props = mcp_server.TOOLS["mempalace_event_wait"]["input_schema"]["properties"]
+        assert "topic" in wait_props
+
+        ack_props = mcp_server.TOOLS["mempalace_event_ack"]["input_schema"]["properties"]
+        assert "topic" in ack_props
+
+        patch_props = mcp_server.TOOLS["mempalace_patch_submit"]["input_schema"]["properties"]
+        assert "topic" in patch_props
+
+    def test_mcp_topic_and_order_dispatch(self, patched_server):
+        args1 = dict(APPEND_ARGS, topic="feature-x", body="1")
+        args2 = dict(APPEND_ARGS, topic="feature-y", body="2")
+        args3 = dict(APPEND_ARGS, topic="feature-x", body="3")
+
+        e1 = _result(_call(patched_server, "mempalace_event_append", args1))["event"]
+        e2 = _result(_call(patched_server, "mempalace_event_append", args2))["event"]
+        e3 = _result(_call(patched_server, "mempalace_event_append", args3))["event"]
+
+        assert e1["topic"] == "feature-x"
+        assert e2["topic"] == "feature-y"
+
+        # List by topic (defaults to newest-first when no cursor is provided)
+        list_topic_x = _result(
+            _call(patched_server, "mempalace_event_list", {"topic": "feature-x"})
+        )
+        assert [e["id"] for e in list_topic_x["events"]] == [e3["id"], e1["id"]]
+
+        # Explicit order asc
+        list_asc = _result(
+            _call(patched_server, "mempalace_event_list", {"topic": "feature-x", "order": "asc"})
+        )
+        assert [e["id"] for e in list_asc["events"]] == [e1["id"], e3["id"]]
+
+        # List order desc
+        list_desc = _result(_call(patched_server, "mempalace_event_list", {"order": "desc"}))
+        assert [e["id"] for e in list_desc["events"]] == [e3["id"], e2["id"], e1["id"]]
+
+        # List before_event_id
+        list_before = _result(
+            _call(
+                patched_server,
+                "mempalace_event_list",
+                {"before_event_id": e3["id"], "order": "desc"},
+            )
+        )
+        assert [e["id"] for e in list_before["events"]] == [e2["id"], e1["id"]]
+
+        # Ack topic override
+        ack_res = _result(
+            _call(
+                patched_server,
+                "mempalace_event_ack",
+                {"event_id": e1["id"], "from_agent": "windows-codex", "topic": "feature-override"},
+            )
+        )
+        assert ack_res["event"]["topic"] == "feature-override"
+
+        # Patch submit with topic
+        patch_res = _result(
+            _call(
+                patched_server,
+                "mempalace_patch_submit",
+                {
+                    "content": "diff --git a/a b/b\n",
+                    "from_agent": "mac-codex",
+                    "stream": "project/mempalace",
+                    "topic": "feature-patch",
+                },
+            )
+        )
+        assert patch_res["event"]["topic"] == "feature-patch"

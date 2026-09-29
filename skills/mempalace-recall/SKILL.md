@@ -66,8 +66,8 @@ and violates MemPalace's "memory should feel instant" budget.
    independent/coexisting facts.
 
 The full canonical protocol — shared verbatim with the Cursor recall
-rule and the other integrations — lives in
-[`integrations/shared/recall-protocol.md`](../../integrations/shared/recall-protocol.md).
+rule and the other integrations — is published in the
+[MemPalace repository](https://github.com/MemPalace/mempalace/blob/main/integrations/shared/recall-protocol.md).
 
 ## Tool selection
 
@@ -89,8 +89,8 @@ question — not a system prompt or pasted conversation) plus optional
 agent on the shared hub — or waiting for its reply or patch — use the
 logstream tools (`mempalace_event_append`, `mempalace_event_wait`,
 `mempalace_patch_submit`, `mempalace_artifact_get`), not drawers or
-search. The canonical protocol lives in
-[`integrations/shared/coordination-protocol.md`](../../integrations/shared/coordination-protocol.md).
+search. The canonical protocol is published in the
+[MemPalace repository](https://github.com/MemPalace/mempalace/blob/main/integrations/shared/coordination-protocol.md).
 
 ## Unhappy paths
 

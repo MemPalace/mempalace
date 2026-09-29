@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 44 MCP tools.
+Detailed parameter schemas for all 45 MCP tools.
 
 ## Palace — Read Tools
 
@@ -10,9 +10,19 @@ Palace overview: total drawers, wing and room counts, AAAK spec, and memory prot
 
 **Parameters:** None
 
-**Returns:** `{ total_drawers, wings, rooms, protocol, aaak_dialect, sqlite_integrity, library_versions }`
+**Returns:** `{ total_drawers, wings, rooms, protocol, aaak_dialect, sqlite_integrity, library_versions, updates }`
 
 `library_versions` reports the versions this server loaded and whether they still match what is installed on disk. `stale: true` means they no longer match, which happens when the package is upgraded or removed while the server is running; write tools are then refused with error `-32005` until the server is restarted, unless `MEMPALACE_MCP_ALLOW_STALE_LIBRARY=1` is set in its environment, in which case `gate_disabled_by` names that variable. An `unreadable` key lists the distributions the check is not covering — either their installed metadata could not be read, or they could not be resolved at all when the server started — so `stale: false` is never mistaken for "checked and fine" when nothing was checked.
+
+`updates.server` is cached release state for the runtime serving the palace.
+When a local stdio process proxies to a hub, it also adds `updates.client` for
+that proxy's locally installed runtime; a direct HTTP client receives only the
+server scope because it has no local MemPalace process to inspect. Checks are
+disabled by default and refresh in a background thread, so this tool never
+waits on PyPI. An available release is informational only and must be authorized
+by the user before any upgrade commands run. A remote `updates.server` release
+must be planned on the hub host; a client's local plan applies only to
+`updates.client`.
 
 ---
 
@@ -58,8 +68,22 @@ Semantic search. Returns verbatim drawer content with similarity scores.
 | `limit` | integer | No | Max results (default: 5) |
 | `wing` | string | No | Filter by wing |
 | `room` | string | No | Filter by room |
+| `since` | string | No | Include drawers filed on or after this ISO date/datetime |
+| `before` | string | No | Include drawers filed strictly before this ISO date/datetime |
 
 **Returns:** `{ query, filters, results: [{ text, wing, room, source_file, similarity }] }`
+
+Each hit also includes date provenance: `filed_at` (equal to legacy `created_at`),
+legacy `authored_at`, `authored_at_source`, `content_date`, and
+`content_date_source`. `authored_at_source` identifies stored authorship metadata
+(`authored_at`), the historical ingestion-time fallback (`filed_at`), or missing
+evidence (`unknown`). An inferred `content_date` is kept separate; its source is
+`filename`, `frontmatter`, `body`, `mtime`, or `unknown` for unrecorded provenance.
+Missing content dates are `null`. These fields do not change ranking or the
+filing-date semantics of `since`/`before`.
+
+See [date provenance](https://github.com/MemPalace/mempalace/blob/develop/docs/authored-at.md)
+for interpretation and compatibility details.
 
 ---
 
@@ -133,13 +157,25 @@ Delete a drawer by ID. Irreversible.
 
 ---
 
-### `mempalace_mine`
+### `mempalace_delete_drawers`
 
-Mine a directory into the palace — the MCP equivalent of `mempalace mine`. Wraps the same in-process miners the CLI uses; runs synchronously and returns the miner's summary as `output`. The palace write lock is automatic — a concurrent mine returns a structured already-running error. Orphan cleanup is separate (see `mempalace_sync`).
+Delete many drawers by ID in one call. Irreversible. Each ID is removed the same way as `mempalace_delete_drawer`: a logical drawer id removes the whole group, including its chunk rows, and a physical chunk id removes that one row. A missing ID is an item in `results` and is counted in `errors`; the rest of the batch still runs. An accepted call is 1 to 500 IDs and always returns `results`, including a one-ID call. An empty list or more than 500 IDs is rejected and deletes nothing.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `source` | string | **Yes** | Directory to mine |
+| `drawer_ids` | array of strings | **Yes** | Drawer IDs to delete (1 to 500) |
+
+**Returns:** `{ results, count, deleted, errors }` for an accepted call. Each result is `{ drawer_id, deleted_ids, chunks_deleted, closets_deleted }` or `{ drawer_id, error }`. A rejected call returns `{ error }`.
+
+---
+
+### `mempalace_mine`
+
+Mine a directory into the palace — the MCP equivalent of `mempalace mine`. `mode='convos'` also accepts a single conversation file. Wraps the same in-process miners the CLI uses; runs synchronously and returns the miner's summary as `output`. The palace write lock is automatic — a concurrent mine returns a structured already-running error. Orphan cleanup is separate (see `mempalace_sync`).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `source` | string | **Yes** | Directory to mine, or one conversation file with `mode='convos'` |
 | `mode` | string | No | `projects` (code/docs, default), `convos` (chat transcripts), or `extract` (office docs; needs the `mempalace[extract]` extra) |
 | `wing` | string | No | Target wing (default: source directory name) |
 | `agent` | string | No | Recorded on every drawer (default: `mempalace`) |
@@ -177,7 +213,11 @@ Prune drawers whose source files are gitignored, deleted, or moved. Returns a dr
 
 **Returns:** `{ scanned, kept, gitignored, missing, unresolved, no_source, out_of_scope, removed_drawers, removed_closets, dry_run, by_source, unresolved_by_source }`
 
-Only `gitignored` and `missing` are removed. A source file that is not at its path counts as `missing` only while the palace can still see a source file of its own in the same directory: a deletion leaves its neighbours behind, an unmounted volume takes all of them at once. Everything else counts as `unresolved`, which is kept and named in `unresolved_by_source` the way removals are named in `by_source`.
+Only `gitignored` and `missing` are removed. A source file that is not at its path counts as `missing` only while the palace can still see a source file of its own in the same directory, and only while that directory is still the one the missing file was mined from: a deletion leaves its neighbours behind, an unmounted volume takes all of them at once, and a volume or bind mount put in place of that directory has neighbours that never knew the file. Everything else counts as `unresolved`, which is kept and named in `unresolved_by_source` the way removals are named in `by_source`.
+
+Mining records which directory that was by storing its inode on each drawer. A path is only a name: mount something at it and the name resolves to the root of what was mounted, which is a different inode, and unmounting brings the original back. Nothing is written to the source tree for this, so a read-only mount records an identity like any other. Drawers filed before this existed carry none, and are decided by the neighbour rule alone. One volume swapped for another at the same path is not separated, since the root of a filesystem carries a fixed inode for its type. A directory deleted and recreated may come back with a different inode, which keeps the drawers of files that really went. There is no bulk way out of that on purpose, since a drawer stranded that way and a drawer a volume is holding are the same reading: `unresolved_by_source` names the sources, and `mempalace_delete_by_source` removes them one at a time. That tool is blunter than this pass, matching `source_file` exactly and consulting neither the neighbours nor the identity, so read its dry run before applying it.
+
+`removed_closets` counts the closets of the sources this pass left holding no drawer, not of every source a drawer was removed from. Since the verdict is per drawer, a source can lose one and keep another, and purging by source would strand that survivor without the lines that index it. A source whose remaining drawers are in a wing this run did not read keeps its closets for the same reason. The sources it covers are therefore a subset of those named in `by_source`, though the count itself is of closet rows rather than of sources, and a source that kept its closets is not distinguished from one that had none.
 
 ---
 
@@ -190,6 +230,18 @@ Fetch a single drawer by ID — returns full content and metadata.
 | `drawer_id` | string | **Yes** | ID of the drawer to fetch |
 
 **Returns:** `{ drawer_id, content, wing, room, metadata }` where `metadata.source_file`, when present, is the basename only — the absolute path written by the miners is reduced before the dict is returned to MCP clients.
+
+---
+
+### `mempalace_get_drawers`
+
+Fetch many drawers by ID in one call. Each ID resolves the same way as `mempalace_get_drawer`: a logical id reassembles the chunk group, and a physical chunk id returns that row. A hit is that same payload. A missing ID is an item in `results` and is counted in `errors`; the rest of the batch still returns. An accepted call is 1 to 500 IDs and always returns `results`, including a one-ID call. An empty list or more than 500 IDs is rejected and does not read the palace.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `drawer_ids` | array of strings | **Yes** | Drawer IDs to fetch (1 to 500) |
+
+**Returns:** `{ results, count, errors }` for an accepted call. A rejected call returns `{ error }`.
 
 ---
 
@@ -491,17 +543,40 @@ Force a reconnect to the palace database. Use this after external scripts or CLI
 
 ## Agent Coordination Tools (Logstream)
 
-Append-only coordination events and exact artifacts for multi-agent work — see the [Agent Logstream](/concepts/agent-logstream) concept page. Backed by `logstream.sqlite3` in the palace directory, independent of the vector index. In `--read-only` mode the mutating tools (`event_append`, `event_ack`, `artifact_put`, `patch_submit`) are hidden and refused.
+Append-only coordination events and exact artifacts for multi-agent work — see the [Agent Logstream](/concepts/agent-logstream) concept page. Backed by `logstream.sqlite3` in the palace directory, independent of the vector index. In `--read-only` mode the mutating tools (`task_create`, `event_append`, `event_ack`, `artifact_put`, `patch_submit`) are hidden and refused.
+
+### `mempalace_task_create`
+
+Create a complete canonical `task.request` and return the stored event plus a
+short handoff line. This is the preferred task-creation interface for agents
+connected to a remote shared-brain hub; it keeps correlation-id generation,
+body structure, and routing identical to `mempalace task create`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project` | string | **Yes** | Project routing name |
+| `from_agent` | string | **Yes** | Requesting agent identity |
+| `to_agent` | string | **Yes** | Worker agent identity |
+| `goal` | string | **Yes** | Exact verbatim task goal |
+| `branch` | string | **Yes** | Git branch for the work |
+| `base_commit` | string | **Yes** | Immutable hexadecimal commit id the worker must start from; branches and tags are rejected |
+| `done` | string | **Yes** | Exact verbatim definition of done |
+
+**Returns:** `{ success, task, handoff }`. The caller must preview the exact
+task with the user before invoking this immutable append.
+
+---
 
 ### `mempalace_event_append`
 
-Append an immutable coordination event.
+Append an immutable agent-coordination event to the logstream (RFC 003).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `type` | string | **Yes** | Event type, e.g. `task.request`, `task.reply`, `patch.ready` |
 | `stream` | string | **Yes** | Logical stream, e.g. `project/myapp` or `shared_agent_brain` |
 | `room` | string | **Yes** | Sub-channel: `delegation`, `patches`, `reviews`, `status` |
+| `topic` | string | No | Topic to group related work/sub-team, e.g. `auth-v2` |
 | `from_agent` | string | **Yes** | Writer agent identity |
 | `to_agent` | string | No | Target agent, or `*` for broadcast |
 | `correlation_id` | string | No | Task id tying request and reply events together |
@@ -518,19 +593,22 @@ Append an immutable coordination event.
 
 ### `mempalace_event_list`
 
-List events with structured filters, oldest first.
+List events with structured filters.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `stream` | string | No | Filter by stream |
 | `room` | string | No | Filter by room |
+| `topic` | string | No | Filter by topic |
 | `type` | string | No | Filter by event type |
 | `to_agent` | string | No | Filter by target; also matches `*` broadcasts |
 | `from_agent` | string | No | Filter by writer |
 | `correlation_id` | string | No | Filter by correlation id |
 | `status` | string | No | Filter by status |
-| `since_event_id` | string | No | Only events strictly after this id (precise cursor) |
+| `since_event_id` | string | No | Only events strictly after this id in append order (precise forward cursor) |
+| `before_event_id` | string | No | Only events strictly before this id in append order (reverse/historical paging) |
 | `since_created_at` | string | No | Only events at/after this time (inclusive) |
+| `order` | string | No | `desc` (newest first) when `since_event_id` is omitted; `asc` (oldest first) when resuming from `since_event_id`. Explicit `order` always overrides |
 | `limit` | integer | No | Max events (default 50, cap 500) |
 
 **Returns:** `{ events: [...], count }`
@@ -539,7 +617,7 @@ List events with structured filters, oldest first.
 
 ### `mempalace_event_wait`
 
-Block until a matching event exists or the timeout expires (long-poll; max 5 minutes). Accepts the same filters as `event_list` plus:
+Block until a matching event exists or the timeout expires (long-poll; max 5 minutes). Accepts the forward filters `stream`, `room`, `topic`, `type`, `to_agent`, `from_agent`, `correlation_id`, `status`, `since_event_id`, and `since_created_at`, plus:
 
 For live-tail clients that can keep an HTTP connection open, use
 `GET /logstream/stream` SSE instead; `event_wait` is the polling MCP surface.
@@ -555,7 +633,7 @@ For live-tail clients that can keep an HTTP connection open, use
 
 ### `mempalace_event_ack`
 
-Acknowledge an event: appends a new `event.ack` routed back to the original writer, with `correlation_id` copied from the target (falling back to the target's id). Never mutates the target event.
+Acknowledge an event: appends a new `event.ack` routed back to the original writer. It copies `topic` from the target unless overridden, and copies `correlation_id` with the target id as its fallback. It never mutates the target event.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -563,6 +641,7 @@ Acknowledge an event: appends a new `event.ack` routed back to the original writ
 | `from_agent` | string | **Yes** | Acknowledging agent identity |
 | `status` | string | No | e.g. `applied`, `failed` |
 | `body` | string | No | Verbatim ack notes |
+| `topic` | string | No | Topic override (defaults to target event's topic) |
 
 **Returns:** `{ success, event }` — the new ack event.
 
@@ -605,6 +684,7 @@ Convenience: store a patch artifact and append its `patch.ready` event in one ca
 | `from_agent` | string | **Yes** | Submitting agent identity |
 | `stream` | string | **Yes** | Logical stream |
 | `room` | string | No | Sub-channel (default `patches`) |
+| `topic` | string | No | Topic name, e.g. `auth-v2` |
 | `to_agent` | string | No | Target agent or `*` |
 | `correlation_id` | string | No | Task id tying the patch to its request |
 | `branch` | string | No | Git branch |

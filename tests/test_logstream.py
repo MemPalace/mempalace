@@ -751,3 +751,193 @@ class TestWatchCursorFile:
         # Initial checkpoint: raised, so the caller can refuse to start.
         with pytest.raises(OSError):
             write_watch_cursor(target, "evt_abc", required=True)
+
+
+# ── Topic routing, query ordering, and migration ──────────────────────────
+
+
+class TestTopicAndOrder:
+    def test_migration_pre_topic_db(self, palace_path):
+        """Pre-topic database upgrades idempotently and preserves existing rows."""
+        db_path = os.path.join(palace_path, "logstream.sqlite3")
+        conn = sqlite3.connect(db_path)
+        conn.executescript("""
+            CREATE TABLE events (
+                id TEXT PRIMARY KEY,
+                type TEXT NOT NULL,
+                stream TEXT NOT NULL,
+                room TEXT NOT NULL,
+                from_agent TEXT NOT NULL,
+                to_agent TEXT,
+                correlation_id TEXT,
+                branch TEXT,
+                base_commit TEXT,
+                status TEXT,
+                body TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE artifacts (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE event_artifacts (
+                event_id TEXT NOT NULL,
+                artifact_id TEXT NOT NULL,
+                PRIMARY KEY (event_id, artifact_id)
+            );
+            INSERT INTO events (id, type, stream, room, from_agent, created_at)
+            VALUES ('evt_pre_migration', 'task.request', 'project/legacy', 'delegation', 'agent-old', '2026-08-01T12:00:00Z');
+        """)
+        conn.commit()
+        conn.close()
+
+        ls = Logstream(db_path=db_path)
+        try:
+            events = ls.list_events(stream="project/legacy")
+            assert len(events) == 1
+            assert events[0]["id"] == "evt_pre_migration"
+            assert events[0]["topic"] is None
+
+            # Topic column and index exist
+            raw_conn = sqlite3.connect(db_path)
+            cols = {r[1] for r in raw_conn.execute("PRAGMA table_info(events)").fetchall()}
+            assert "topic" in cols
+            indices = {
+                r[1]
+                for r in raw_conn.execute(
+                    "SELECT * FROM sqlite_master WHERE type='index'"
+                ).fetchall()
+            }
+            assert "events_topic_created_idx" in indices
+            raw_conn.close()
+
+            # Appending topic-bearing event works
+            new_evt = _append(ls, topic="auth-upgrade")
+            assert new_evt["topic"] == "auth-upgrade"
+            filtered = ls.list_events(topic="auth-upgrade")
+            assert len(filtered) == 1
+            assert filtered[0]["id"] == new_evt["id"]
+        finally:
+            ls.close()
+
+        # Reopen is idempotent
+        reopened = Logstream(db_path=db_path)
+        try:
+            all_events = reopened.list_events(limit=10)
+            assert len(all_events) == 2
+        finally:
+            reopened.close()
+
+    def test_topic_append_and_list_filtering(self, logstream):
+        e1 = _append(logstream, topic="auth-v2", body="Auth work")
+        e2 = _append(logstream, topic="ui-v2", body="UI work")
+        e3 = _append(logstream, topic=None, body="General work")
+
+        assert e1["topic"] == "auth-v2"
+        assert e2["topic"] == "ui-v2"
+        assert e3["topic"] is None
+
+        auth_events = logstream.list_events(topic="auth-v2")
+        assert [e["id"] for e in auth_events] == [e1["id"]]
+
+        ui_events = logstream.list_events(topic="ui-v2")
+        assert [e["id"] for e in ui_events] == [e2["id"]]
+
+        none_events = logstream.list_events(topic="nonexistent")
+        assert none_events == []
+
+    def test_ack_topic_inheritance_and_override(self, logstream):
+        e = _append(logstream, topic="compiler-team")
+        ack1 = logstream.ack_event(e["id"], from_agent="windows-codex", status="claimed")
+        assert ack1["topic"] == "compiler-team"
+
+        ack2 = logstream.ack_event(
+            e["id"], from_agent="windows-codex", status="claimed", topic="custom-override"
+        )
+        assert ack2["topic"] == "custom-override"
+
+    def test_submit_patch_with_topic(self, logstream):
+        res = logstream.submit_patch(
+            content="diff --git a/a b/b\n",
+            from_agent="agent-a",
+            stream="project/mempalace",
+            topic="fast-path",
+        )
+        assert res["event"]["topic"] == "fast-path"
+        assert logstream.list_events(topic="fast-path")[0]["id"] == res["event"]["id"]
+
+    def test_order_asc_and_desc(self, logstream):
+        e1 = _append(logstream, body="First")
+        e2 = _append(logstream, body="Second")
+        e3 = _append(logstream, body="Third")
+
+        asc = logstream.list_events(order="asc")
+        assert [e["id"] for e in asc] == [e1["id"], e2["id"], e3["id"]]
+
+        desc = logstream.list_events(order="desc")
+        assert [e["id"] for e in desc] == [e3["id"], e2["id"], e1["id"]]
+
+        tail = logstream.list_events(order="desc", limit=2)
+        assert [e["id"] for e in tail] == [e3["id"], e2["id"]]
+
+        with pytest.raises(ValueError, match="order='sideways'"):
+            logstream.list_events(order="sideways")
+
+    def test_since_event_id_cursor_invariance_with_order(self, logstream):
+        e1 = _append(logstream, body="1")
+        e2 = _append(logstream, body="2")
+        e3 = _append(logstream, body="3")
+
+        # since_event_id is strictly after e1 (rowid > e1["rowid"])
+        asc = logstream.list_events(since_event_id=e1["id"], order="asc")
+        assert [e["id"] for e in asc] == [e2["id"], e3["id"]]
+
+        desc = logstream.list_events(since_event_id=e1["id"], order="desc")
+        assert [e["id"] for e in desc] == [e3["id"], e2["id"]]
+
+    def test_before_event_id_filtering(self, logstream):
+        e1 = _append(logstream, body="1")
+        e2 = _append(logstream, body="2")
+        e3 = _append(logstream, body="3")
+
+        before_asc = logstream.list_events(before_event_id=e3["id"], order="asc")
+        assert [e["id"] for e in before_asc] == [e1["id"], e2["id"]]
+
+        before_desc = logstream.list_events(before_event_id=e3["id"], order="desc")
+        assert [e["id"] for e in before_desc] == [e2["id"], e1["id"]]
+
+        with pytest.raises(ValueError, match="before_event_id 'evt_nope' not found"):
+            logstream.list_events(before_event_id="evt_nope")
+
+    def test_watch_topic_spec_and_matching(self):
+        from mempalace.logstream import (
+            event_matches_watch,
+            pushdown_watch_filters,
+            sanitize_watch_spec,
+        )
+
+        spec = sanitize_watch_spec({"topics": {" auth ", "ui "}})
+        assert spec["topics"] == {"auth", "ui"}
+
+        pushdown_single = pushdown_watch_filters({"topics": {"auth"}})
+        assert pushdown_single == {"topic": "auth"}
+
+        pushdown_multi = pushdown_watch_filters({"topics": {"auth", "ui"}})
+        assert "topic" not in pushdown_multi
+
+        event_auth = {"stream": "p", "room": "r", "topic": "auth", "from_agent": "a"}
+        event_ui = {"stream": "p", "room": "r", "topic": "ui", "from_agent": "a"}
+        event_other = {"stream": "p", "room": "r", "topic": "other", "from_agent": "a"}
+        event_none = {"stream": "p", "room": "r", "topic": None, "from_agent": "a"}
+
+        assert event_matches_watch(event_auth, topics={"auth", "ui"}) is True
+        assert event_matches_watch(event_ui, topics={"auth", "ui"}) is True
+        assert event_matches_watch(event_other, topics={"auth", "ui"}) is False
+        assert event_matches_watch(event_none, topics={"auth", "ui"}) is False

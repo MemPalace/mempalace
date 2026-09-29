@@ -88,6 +88,12 @@ assets/             ← logo + brand
    - `bench: add LoCoMo turn-level metrics`
 6. Push to your fork and open a PR against `develop`
 
+## Branching Model
+
+- **Feature and fix PRs should target `develop`.** This is the integration branch where all day-to-day work lands.
+- **`main` is reserved for tagged, stable releases.** Releases are promoted by merging `develop` into `main` (e.g., `v3.7.0`, `v3.6.0`).
+- Only emergency hotfixes should branch directly off — and target — `main`.
+
 ## Code Style
 
 - **Formatting**: [Ruff](https://docs.astral.sh/ruff/) with 100-char line limit (configured in `pyproject.toml`)

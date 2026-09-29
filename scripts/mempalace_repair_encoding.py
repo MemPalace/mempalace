@@ -32,7 +32,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--collection",
-        help=("Collection name; defaults to the configured collection."),
+        help=(
+            "Collection name; defaults to the configured collection. "
+            "When set explicitly, the value targets that store directly "
+            "(bypassing the fail-loud name check), intended for legacy or "
+            "ad-hoc collections created before the guard existed."
+        ),
     )
     parser.add_argument(
         "--page-size",
@@ -178,6 +183,11 @@ def main() -> int:
                 palace_path,
                 collection_name=(collection_name),
                 create=False,
+                # Explicit --collection is an intentional, self-aware choice to
+                # target a specific store (legacy ad-hoc names included) —
+                # opt out of the "fail loud on a mismatched name" rule that
+                # guards the common programmatic-API surface (issue #2347).
+                _skip_name_check=True,
             )
             report = restore_collection(
                 collection,
@@ -214,6 +224,7 @@ def main() -> int:
                     palace_path,
                     collection_name=(collection_name),
                     create=False,
+                    _skip_name_check=True,
                 )
                 report = repair_collection(
                     collection,
@@ -227,6 +238,7 @@ def main() -> int:
                 palace_path,
                 collection_name=(collection_name),
                 create=False,
+                _skip_name_check=True,
             )
             report = repair_collection(
                 collection,

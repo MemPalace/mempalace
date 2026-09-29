@@ -299,6 +299,7 @@ class TestSyncPrimitives:
             "type",
             "stream",
             "room",
+            "topic",
             "from_agent",
             "body",
             "created_at",
@@ -310,6 +311,29 @@ class TestSyncPrimitives:
         ):
             assert copy[key] == event[key], key
         assert ls_b.get_artifact(artifact["id"])["content"] == "payload"
+
+    def test_remote_event_with_and_without_topic(self, ls_a, ls_b):
+        event_topic = _append(ls_a, topic="security-track", body="with topic")
+        event_none = _append(ls_a, topic=None, body="without topic")
+
+        assert ls_b.apply_remote_event(event_topic) is True
+        assert ls_b.apply_remote_event(event_none) is True
+
+        b_topic = ls_b.list_events(topic="security-track")
+        assert len(b_topic) == 1
+        assert b_topic[0]["id"] == event_topic["id"]
+        assert b_topic[0]["topic"] == "security-track"
+
+        all_b = ls_b.list_events(limit=10)
+        by_id = {e["id"]: e for e in all_b}
+        assert by_id[event_none["id"]]["topic"] is None
+
+    def test_remote_event_rejects_invalid_topic(self, ls_a, ls_b):
+        event = _append(ls_a, topic="security")
+        event["topic"] = "security\nforged"
+
+        with pytest.raises(ValueError, match="topic"):
+            ls_b.apply_remote_event(event)
 
 
 # ── Convergence (engine over simulated wire) ─────────────────────────────
@@ -866,6 +890,13 @@ class TestPeerSyncThreadStartup:
     the failure mode is silence, which is why it needs a test.
     """
 
+    @pytest.fixture(autouse=True)
+    def _cleanup_peer_sync_thread(self):
+        from mempalace import mcp_server as mcp
+
+        yield
+        mcp._stop_peer_sync_thread()
+
     def _start(self, tmp_path, monkeypatch, interval="0.05"):
         import threading
 
@@ -874,8 +905,6 @@ class TestPeerSyncThreadStartup:
         monkeypatch.setenv("MEMPALACE_SYNC_INTERVAL", interval)
         monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_path))
 
-        # Compare thread objects, not names: earlier tests in this class
-        # leave their own daemon loop running under the same name.
         before = set(threading.enumerate())
         mcp._start_peer_sync_thread()
         return [
@@ -901,7 +930,7 @@ class TestPeerSyncThreadStartup:
             return []
 
         monkeypatch.setattr("mempalace.logsync.sync_all", _fake_sync_all)
-        monkeypatch.setattr(mcp, "_get_logstream", lambda: object())
+        monkeypatch.setattr(mcp, "_get_logstream", lambda *args, **kwargs: object())
 
         assert self._start(tmp_path, monkeypatch)
 
