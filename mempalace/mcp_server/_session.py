@@ -192,6 +192,37 @@ def _get_client():
     return _client_cache
 
 
+def _reopen_session_collection():
+    """The session's collection, taken again after a reset closed its client.
+
+    A tool that took the collection earlier in its call, or a request running
+    alongside it, still holds the old handle; the handle comes back here
+    instead of failing on the closed client. A missing database fails here at
+    once: ``_get_collection`` resets the System for one, and that reset would
+    make the call run again.
+    """
+    db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        raise RuntimeError(f"Chroma database missing: could not open {db_path}")
+    col = _get_collection()
+    if col is None:
+        failure = _collection_open_error or {}
+        reason = " ".join(part for part in (failure.get("error"), failure.get("details")) if part)
+        raise RuntimeError(reason or "palace collection unavailable")
+    return col
+
+
+def _wrap_session_collection(raw):
+    """The session's handle on ``raw``, able to reopen after a System reset."""
+    return ChromaCollection(
+        raw,
+        palace_path=_config.palace_path,
+        backend=_SessionFreshness,
+        reopen=_reopen_session_collection,
+        generation=_client_system_generation,
+    )
+
+
 def _get_collection(create=False):
     """Return the configured backend collection, caching handles between calls.
 
@@ -517,7 +548,7 @@ def _checked_chroma_collection(raw, *, create):
     """
     from ..palace import _enforce_embedder_identity
 
-    collection = ChromaCollection(raw, palace_path=_config.palace_path, backend=_SessionFreshness)
+    collection = _wrap_session_collection(raw)
     _enforce_embedder_identity(
         collection, _config.palace_path, _config.collection_name, create=create
     )
