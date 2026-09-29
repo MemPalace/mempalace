@@ -5,29 +5,36 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 import mempalace.hooks_cli as hooks_cli_mod
+from mempalace.config import sanitize_name
 from mempalace.hooks_cli import (
     SAVE_INTERVAL,
     _count_human_messages,
     _diary_agent_for_harness,
     _extract_recent_messages,
     _get_mine_targets,
+    _hooks_daemon_enabled,
+    _is_harness_boilerplate,
     _log,
     _maybe_auto_ingest,
     _mempalace_python,
     _mine_already_running,
     _mine_sync,
     _parse_harness_input,
+    _safe_wing_slug,
     _sanitize_session_id,
     _save_diary_direct,
     _validate_transcript_path,
     _wing_from_transcript_path,
     hook_stop,
     hook_session_start,
+    hook_session_end,
     hook_precompact,
     run_hook,
     _claim_mine_slot,
@@ -250,6 +257,168 @@ def test_extract_recent_messages_skips_commands(tmp_path):
     assert msgs[0] == "real msg"
 
 
+def test_extract_recent_messages_skips_harness_boilerplate(tmp_path):
+    """Harness-injected role=user text must not become the checkpoint summary."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {
+                "message": {
+                    "role": "user",
+                    "content": "<local-command-caveat>Caveat: the messages below...",
+                }
+            },
+            {
+                "message": {
+                    "role": "user",
+                    "content": "<task-notification>\n<task-id>abc</task-id>\n",
+                }
+            },
+            {
+                "message": {
+                    "role": "user",
+                    "content": "[SYSTEM NOTIFICATION - NOT USER INPUT] background task done",
+                }
+            },
+            {
+                "message": {
+                    "role": "user",
+                    "content": "Base directory for this skill: /skills/example",
+                }
+            },
+            {"message": {"role": "user", "content": "why is wake-up showing old drawers"}},
+        ],
+    )
+    assert _extract_recent_messages(str(transcript)) == ["why is wake-up showing old drawers"]
+
+
+def test_extract_recent_messages_skips_boilerplate_in_list_content(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "<task-notification>done</...>"}],
+                }
+            },
+            {
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "ship the fix"}],
+                }
+            },
+        ],
+    )
+    assert _extract_recent_messages(str(transcript)) == ["ship the fix"]
+
+
+def test_extract_recent_messages_skips_boilerplate_in_codex_format(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "[SYSTEM NOTIFICATION - NOT USER INPUT] agent finished",
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "review the diff"},
+            },
+        ],
+    )
+    assert _extract_recent_messages(str(transcript)) == ["review the diff"]
+
+
+def test_extract_recent_messages_keeps_text_mentioning_a_marker_word(tmp_path):
+    """Only the literal wrappers are filtered, not ordinary talk about them."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": "the task notification arrived late"}}],
+    )
+    assert _extract_recent_messages(str(transcript)) == ["the task notification arrived late"]
+
+
+def test_extract_recent_messages_keeps_long_message_quoting_a_wrapper(tmp_path):
+    """Regression: a wrapper quoted deep in genuine prose is not boilerplate.
+
+    Taken from a real transcript: a 7.7k-character message that discusses how
+    background events arrive, quoting the literal tag around 5k characters in.
+    Matching the marker anywhere threw the whole message away even though the
+    first 200 characters, the only part the checkpoint keeps, are pure prose.
+    """
+    real_text = (
+        "the deck should keep a persistent watcher instead of polling, so arm one "
+        "now with persistent true and let it idle between runs. "
+    )
+    real_text += "Padding out the body the way a long design message runs on. " * 90
+    real_text += "Its events arrive as <task-notification> messages and wake this loop."
+    assert len(real_text) > 5000
+    assert real_text.index("<task-notification>") > 5000
+
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(transcript, [{"message": {"role": "user", "content": real_text}}])
+
+    msgs = _extract_recent_messages(str(transcript))
+    assert len(msgs) == 1
+    assert msgs[0].startswith("the deck should keep a persistent watcher")
+
+
+def test_extract_recent_messages_skips_additional_harness_wrappers(tmp_path):
+    """Wrappers seen leading real transcripts but missing from the first pass."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {"message": {"role": "user", "content": "<local-command-stdout>Set model to opus"}},
+            {"message": {"role": "user", "content": "<command-name>/dira</command-name>"}},
+            {"message": {"role": "user", "content": "[Request interrupted by user for tool use]"}},
+            {
+                "message": {
+                    "role": "user",
+                    "content": "[Image: original 2880x1458, displayed at 2000x1013.]",
+                }
+            },
+            {"message": {"role": "user", "content": "now wire the checkpoint to the deck"}},
+        ],
+    )
+    assert _extract_recent_messages(str(transcript)) == ["now wire the checkpoint to the deck"]
+
+
+def test_is_harness_boilerplate_is_anchored_to_the_message_opening():
+    """The unit contract: a leading wrapper is boilerplate, a quote is not."""
+    assert _is_harness_boilerplate("<system-reminder>do the thing</system-reminder>")
+    assert _is_harness_boilerplate("   \n <task-notification>done</task-notification>")
+    assert not _is_harness_boilerplate("x" * 400 + "<system-reminder>quoted</system-reminder>")
+
+
+def test_is_harness_boilerplate_keeps_a_wrapper_quoted_inside_the_kept_window():
+    """A quote at offset 20 is inside the 200 characters the checkpoint keeps.
+
+    Bounding the match to a leading window instead of anchoring it is not
+    enough: this message's wrapper sits well inside that window, and every
+    character of it is text the checkpoint would store. Position, not
+    proximity, is what separates an injection from prose about one.
+    """
+    quoted = (
+        "The harness sends <task-notification> blocks to wake the loop, so the "
+        "stop hook has to ignore them when it composes the recent line."
+    )
+    offset = quoted.index("<task-notification>")
+    assert 0 < offset < 200 and len(quoted) < 200  # entirely inside the kept window
+    assert not _is_harness_boilerplate(quoted)
+
+    # ...and the same wrapper genuinely opening the message is still caught.
+    assert _is_harness_boilerplate("<task-notification>" + quoted)
+
+
 def test_extract_recent_messages_missing_file():
     assert _extract_recent_messages("/nonexistent.jsonl") == []
 
@@ -276,6 +445,15 @@ def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None):
     type(mock_config).hook_silent_save = PropertyMock(return_value=True)
     type(mock_config).hook_desktop_toast = PropertyMock(return_value=False)
     patches.append(patch("mempalace.config.MempalaceConfig", return_value=mock_config))
+    # A Stop or PreCompact hook spawns the transcript ingest through
+    # ``_spawn_mine``, and a real child here outlives the test that started
+    # it: it holds the palace's writer lease, and the next test file to ask
+    # for one is refused with "Peer MCP writer active". Nothing in this file
+    # asserts on a real mine. A test that asserts on the spawn installs its
+    # own stand-in before calling this helper, so only put one here when the
+    # attribute is still the real ``Popen``.
+    if not isinstance(hooks_cli_mod.subprocess.Popen, Mock):
+        patches.append(patch("mempalace.hooks_cli.subprocess.Popen"))
     with contextlib.ExitStack() as stack:
         for p in patches:
             stack.enter_context(p)
@@ -405,9 +583,30 @@ def test_diary_agent_for_harness_unknown_falls_back_to_name():
         assert _diary_agent_for_harness(harness) != "session-hook"
 
 
+def test_dsh_harness_is_accepted_and_reads_diary_under_its_own_name():
+    """The DeepSeek Harness plugin drives `hook run --harness dsh`.
+
+    DSH supplies its own transcript (its on-disk session logs are
+    zstd-compressed and unreadable outside the harness), so `dsh` needs nothing
+    beyond being a recognised harness: the same input shape as Claude Code, and
+    a diary identity a `diary_read(agent_name="dsh")` call can actually find.
+    """
+    parsed = hooks_cli_mod._parse_harness_input(
+        {"session_id": "session-x", "transcript_path": "/tmp/t.jsonl"},
+        "dsh",
+    )
+    assert parsed == {
+        "session_id": "session-x",
+        "stop_hook_active": False,
+        "transcript_path": "/tmp/t.jsonl",
+    }
+    assert _diary_agent_for_harness("dsh") == "dsh"
+    assert "dsh" in hooks_cli_mod.SUPPORTED_HARNESSES
+
+
 @pytest.mark.parametrize(
     "harness,expected_agent",
-    [("claude-code", "claude"), ("codex", "codex")],
+    [("claude-code", "claude"), ("codex", "codex"), ("dsh", "dsh")],
 )
 def test_stop_hook_files_checkpoint_under_harness_agent(tmp_path, harness, expected_agent):
     """The Stop hook must file checkpoints under the agent identity that the
@@ -465,6 +664,93 @@ def test_stop_hook_checkpoint_visible_to_diary_read(monkeypatch, config, palace_
     # The legacy identity no longer captures hook checkpoints.
     legacy = tool_diary_read(agent_name="session-hook")
     assert legacy.get("entries") == []
+
+
+def test_save_diary_direct_daemon_opt_in_submits_job(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"message {i}"}} for i in range(3)],
+    )
+    env = {"MEMPALACE_HOOKS_DAEMON": "yes", "MEMPALACE_PALACE_PATH": str(palace_dir)}
+    job = {"id": "job", "state": "succeeded", "result": {"success": True, "entry_id": "e1"}}
+
+    with patch.dict("os.environ", env):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._daemon_available", return_value=True):
+                with patch("mempalace.daemon.submit_job", return_value=job) as mock_submit:
+                    result = _save_diary_direct(
+                        str(transcript),
+                        "sess1",
+                        wing="wing_project",
+                        agent_name="claude",
+                    )
+
+    assert result["count"] == 3
+    mock_submit.assert_called_once()
+    assert mock_submit.call_args.args[0] == "diary_write"
+    payload = mock_submit.call_args.args[1]
+    assert payload["agent_name"] == "claude"
+    assert payload["wing"] == "wing_project"
+    assert payload["topic"] == "checkpoint"
+    assert (tmp_path / "last_checkpoint").exists()
+
+
+def test_save_diary_daemon_lock_deferral_does_not_stall_the_hook(tmp_path):
+    """A refused job is deferred, not failed (#2014), so it is never terminal
+    while the holder lives.
+
+    This path waits on purpose -- a real diary write takes its time -- but it
+    waits for a state that a parked job cannot reach. Without
+    stop_on_lock_deferral it burns its whole 30s timeout on every session stop
+    and then reports a submission failure that never happened: the entry is
+    queued and the daemon files it once the lock frees."""
+    transcript = tmp_path / "t.jsonl"
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"message {i}"}} for i in range(3)],
+    )
+    env = {"MEMPALACE_HOOKS_DAEMON": "yes", "MEMPALACE_PALACE_PATH": str(palace_dir)}
+    parked = {
+        "id": "job-parked",
+        "state": "queued",
+        "error": {
+            "error_class": "LockHeldByOtherProcess",
+            "message": "palace /p is held by PID 999 (mempalace-mcp)",
+        },
+        "result": None,
+    }
+
+    with patch.dict("os.environ", env):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._daemon_available", return_value=True):
+                with patch("mempalace.daemon.submit_job", return_value=parked) as mock_submit:
+                    with patch("mempalace.hooks_cli._log") as mock_log:
+                        result = _save_diary_direct(
+                            str(transcript), "sess1", wing="wing_project", agent_name="claude"
+                        )
+
+    # The hook must ask the daemon to hand a parked job straight back.
+    assert mock_submit.call_args.kwargs["stop_on_lock_deferral"] is True
+
+    assert result["count"] == 0  # nothing filed yet -- the daemon still owes the write
+    assert not (tmp_path / "last_checkpoint").exists()  # and it must not be acked
+
+    logged = " ".join(str(c.args[0]) for c in mock_log.call_args_list)
+    assert "deferred" in logged
+    assert "PID 999" in logged
+    assert "Daemon diary checkpoint failed" not in logged, "a parked job is not a failure"
+
+
+def test_hooks_daemon_enabled_requires_explicit_true():
+    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+        assert _hooks_daemon_enabled() is False
+        mock_cfg_cls.return_value.hook_use_daemon = True
+        assert _hooks_daemon_enabled() is True
 
 
 # --- hook_session_start ---
@@ -579,6 +865,20 @@ def test_wing_from_transcript_path_strips_parent_dir_with_hyphenated_project():
     assert _wing_from_transcript_path(path) == "wing_react_native"
 
 
+def test_wing_from_transcript_path_fallback_collapses_worktree():
+    """Regression: the fallback path (no cwd in the JSONL) left the flattened
+    ``--claude-worktrees-<wt>`` segment in the encoded folder name, giving every
+    worktree its own wing where the primary cwd-based path already collapses
+    it to <project> (#2388)."""
+    worktree_path = (
+        "/Users/u/.claude/projects/"
+        "-Users-u-projects-gsd-core--claude-worktrees-hardcore-wilbur-48691a/x.jsonl"
+    )
+    non_worktree_path = "/Users/u/.claude/projects/-Users-u-projects-gsd-core/x.jsonl"
+    assert _wing_from_transcript_path(worktree_path) == "wing_gsd_core"
+    assert _wing_from_transcript_path(non_worktree_path) == "wing_gsd_core"
+
+
 # --- _wing_from_transcript_path: cwd-from-JSONL primary path ---
 
 
@@ -679,6 +979,84 @@ def test_wing_from_transcript_path_cwd_handles_non_string_cwd(tmp_path):
         encoding="utf-8",
     )
     assert _wing_from_transcript_path(str(transcript)) == "wing_proper_name"
+
+
+# --- _safe_wing_slug: special-character project dirs (e.g. +project) ---
+
+
+def test_safe_wing_slug_strips_leading_plus():
+    """Regression: a ``+``-prefixed folder (e.g. ``+project``) leaked ``+`` into the
+    slug, producing ``wing_+project`` which ``sanitize_name`` rejects — silently
+    breaking diary auto-save for that project."""
+    assert _safe_wing_slug("+project") == "project"
+
+
+def test_safe_wing_slug_replaces_inner_special_chars():
+    assert _safe_wing_slug("foo+bar") == "foo_bar"
+
+
+def test_safe_wing_slug_preserves_space_and_hyphen_behavior():
+    # spaces and hyphens still collapse to underscores (no regression)
+    assert _safe_wing_slug("React Native") == "react_native"
+    assert _safe_wing_slug("claude-code") == "claude_code"
+
+
+def test_safe_wing_slug_preserves_existing_valid_names():
+    """Backward compatibility: a name that already produced a valid wing keeps the
+    same slug, so previously-filed diary entries aren't orphaned (AGENTS.md: never
+    destroy existing data). ``.`` and ``'`` are both accepted by sanitize_name and
+    must survive."""
+    assert _safe_wing_slug("myapp") == "myapp"
+    assert _safe_wing_slug("my.app") == "my.app"
+    assert _safe_wing_slug("v1.2.3") == "v1.2.3"
+    assert _safe_wing_slug("o'brien") == "o'brien"
+
+
+def test_safe_wing_slug_collapses_double_dots():
+    """``..`` must collapse — sanitize_name rejects it as path traversal."""
+    assert _safe_wing_slug("my..app") == "my.app"
+    assert _safe_wing_slug("..hidden..") == "hidden"
+
+
+def test_safe_wing_slug_caps_length_for_sanitize_name():
+    """sanitize_name rejects names over 128 chars; the slug stays short enough that
+    wing_<slug> never trips that limit, even for very long directory names."""
+    slug = _safe_wing_slug("a" * 500)
+    assert len(slug) <= 120
+    sanitize_name(f"wing_{slug}")  # must not raise
+
+
+def test_safe_wing_slug_falls_back_to_sessions_when_empty():
+    # names made entirely of disallowed characters reduce to nothing
+    assert _safe_wing_slug("+") == "sessions"
+    assert _safe_wing_slug("@#$") == "sessions"
+
+
+def test_wing_from_transcript_path_cwd_plus_prefixed_dir(tmp_path):
+    """Reporter's case: a ``+``-prefixed working directory must yield a sanitizable
+    wing (``wing_project``), not the rejected ``wing_+project``."""
+    project_dir = tmp_path / "encoded-dir"
+    project_dir.mkdir()
+    transcript = project_dir / "session.jsonl"
+    transcript.write_text(
+        '{"type":"user","cwd":"/Users/me/code/+project","content":"hi"}\n',
+        encoding="utf-8",
+    )
+    assert _wing_from_transcript_path(str(transcript)) == "wing_project"
+
+
+def test_wing_from_transcript_path_legacy_plus_prefixed_project():
+    """Legacy ``-Projects-<name>`` path with a ``+``-prefixed project folder."""
+    path = "/Users/me/foo/-Projects-+app/session.jsonl"
+    assert _wing_from_transcript_path(path) == "wing_app"
+
+
+@given(st.text(min_size=1, max_size=300))
+def test_safe_wing_slug_always_yields_sanitizable_wing(name):
+    """Property: for ANY non-empty input, ``wing_<slug>`` must pass sanitize_name —
+    the entire contract of the helper (a rejected wing silently breaks auto-save)."""
+    wing = f"wing_{_safe_wing_slug(name)}"
+    assert sanitize_name(wing) == wing
 
 
 # --- _log ---
@@ -788,6 +1166,33 @@ def test_maybe_auto_ingest_with_env(tmp_path):
                     assert cmd[cmd.index("--mode") + 1] == "projects"
 
 
+def test_maybe_auto_ingest_daemon_opt_in_submits_job(tmp_path):
+    """Daemon-enabled hooks submit a background mine instead of spawning one."""
+    mempal_dir = tmp_path / "project"
+    palace_dir = tmp_path / "palace"
+    mempal_dir.mkdir()
+    palace_dir.mkdir()
+    env = {
+        "MEMPAL_DIR": str(mempal_dir),
+        "MEMPALACE_HOOKS_DAEMON": "yes",
+        "MEMPALACE_PALACE_PATH": str(palace_dir),
+    }
+    with patch.dict("os.environ", env):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._daemon_available", return_value=True):
+                with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                    with patch(
+                        "mempalace.daemon.submit_job", return_value={"id": "job"}
+                    ) as mock_submit:
+                        _maybe_auto_ingest()
+
+    mock_popen.assert_not_called()
+    mock_submit.assert_called_once()
+    assert mock_submit.call_args.args[0] == "mine"
+    assert mock_submit.call_args.args[1]["source"] == str(mempal_dir.resolve())
+    assert mock_submit.call_args.kwargs["wait"] is False
+
+
 def test_maybe_auto_ingest_uses_mempalace_python(tmp_path):
     """Spawned mine command uses _mempalace_python(), not bare sys.executable.
 
@@ -821,6 +1226,40 @@ def test_mine_sync_with_env_uses_projects_mode(tmp_path):
                 mock_run.assert_called_once()
                 cmd = mock_run.call_args[0][0]
                 assert cmd[cmd.index("--mode") + 1] == "projects"
+
+
+def test_mine_sync_daemon_lock_deferral_is_not_reported_as_a_failure(tmp_path):
+    """The precompact sync path waits (wait=True, timeout=60) but is documented as
+    living under the harness 30s ceiling, so a job it can never see go terminal is
+    doubly bad here: without stop_on_lock_deferral it burns past the ceiling and
+    then logs a failure for work the daemon still holds and will run."""
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    parked = {
+        "id": "job-parked",
+        "state": "queued",
+        "error": {
+            "error_class": "LockHeldByOtherProcess",
+            "message": "palace /p is held by PID 999 (mempalace-mcp)",
+        },
+        "result": None,
+    }
+    env = {"MEMPAL_DIR": str(mempal_dir), "MEMPALACE_HOOKS_DAEMON": "yes"}
+    with patch.dict("os.environ", env):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._daemon_available", return_value=True):
+                with patch("mempalace.daemon.submit_job", return_value=parked) as mock_submit:
+                    with patch("mempalace.hooks_cli._log") as mock_log:
+                        with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
+                            _mine_sync()
+
+    assert mock_submit.call_args.kwargs["stop_on_lock_deferral"] is True
+    mock_run.assert_not_called()  # the daemon owns it; spawning a mine would double-write
+
+    logged = " ".join(str(c.args[0]) for c in mock_log.call_args_list)
+    assert "deferred" in logged
+    assert "PID 999" in logged
+    assert "Daemon sync mine failed" not in logged, "a parked job is not a failure"
 
 
 def test_mine_sync_uses_mempalace_python(tmp_path):
@@ -968,17 +1407,26 @@ def test_detached_popen_kwargs_posix(monkeypatch):
 
 
 def test_detached_popen_kwargs_windows(monkeypatch):
-    """On Windows, kwargs include creationflags that fully detach the child.
+    """On Windows, the miner child gets a hidden console (CREATE_NO_WINDOW),
+    not a detached/no-console child (DETACHED_PROCESS).
 
-    Without these, the parent hook hangs at session end on Windows because
-    the child's inherited stdout/stderr handles keep the parent's exit
-    blocked (#1268 root cause for the Python hook path).
+    DETACHED_PROCESS gave the child no console at all, which caused any
+    console grandchild it spawned to allocate a fresh *visible* window
+    (#1783). CREATE_NO_WINDOW gives a real-but-invisible console that all
+    descendants inherit, so nothing flashes — while still fixing the
+    #1268 hang (stdin=DEVNULL, close_fds, explicit stdout/stderr redirect,
+    and CREATE_NEW_PROCESS_GROUP for the signal boundary are unchanged).
+    Per the Win32 CreateProcess docs CREATE_NO_WINDOW is ignored when OR'd
+    with DETACHED_PROCESS, so the two must be mutually exclusive.
     """
     from mempalace.hooks_cli import _detached_popen_kwargs
 
     monkeypatch.setattr("mempalace.hooks_cli.os.name", "nt")
-    # Simulate Windows-only Popen flag constants. Patch on the imported
-    # subprocess module within hooks_cli so getattr() picks them up.
+    # Simulate Windows-only Popen flag constants on the imported subprocess
+    # module so getattr() picks them up cross-platform.
+    monkeypatch.setattr(
+        "mempalace.hooks_cli.subprocess.CREATE_NO_WINDOW", 0x08000000, raising=False
+    )
     monkeypatch.setattr(
         "mempalace.hooks_cli.subprocess.DETACHED_PROCESS", 0x00000008, raising=False
     )
@@ -989,7 +1437,10 @@ def test_detached_popen_kwargs_windows(monkeypatch):
     assert kwargs.get("stdin") is subprocess.DEVNULL
     assert kwargs.get("close_fds") is True
     flags = kwargs.get("creationflags", 0)
-    assert flags & 0x00000008, "DETACHED_PROCESS must be set"
+    assert flags & 0x08000000, "CREATE_NO_WINDOW must be set"
+    assert not (flags & 0x00000008), (
+        "DETACHED_PROCESS must NOT be set (it suppresses CREATE_NO_WINDOW)"
+    )
     assert flags & 0x00000200, "CREATE_NEW_PROCESS_GROUP must be set"
 
 
@@ -1114,6 +1565,31 @@ def test_ingest_transcript_uses_detached_kwargs(tmp_path):
                 assert kwargs.get("close_fds") is True
 
 
+def test_ingest_transcript_daemon_opt_in_submits_job(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    transcript.write_text("x" * 200)
+    env = {"MEMPALACE_HOOKS_DAEMON": "yes", "MEMPALACE_PALACE_PATH": str(palace_dir)}
+    with patch.dict("os.environ", env):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._daemon_available", return_value=True):
+                with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                    with patch(
+                        "mempalace.daemon.submit_job", return_value={"id": "job"}
+                    ) as mock_submit:
+                        from mempalace.hooks_cli import _ingest_transcript
+
+                        _ingest_transcript(str(transcript))
+
+    mock_popen.assert_not_called()
+    mock_submit.assert_called_once()
+    payload = mock_submit.call_args.args[1]
+    assert payload["source"] == str(transcript.resolve())
+    assert payload["mode"] == "convos"
+    assert payload["wing"] == "sessions"
+
+
 def test_ingest_transcript_skips_when_target_running(tmp_path):
     """Repeated transcript ingests for the same transcript should dedup."""
     transcript = tmp_path / "session.jsonl"
@@ -1129,7 +1605,7 @@ def test_ingest_transcript_skips_when_target_running(tmp_path):
                     "-m",
                     "mempalace",
                     "mine",
-                    str(transcript.parent),
+                    str(transcript.resolve()),
                     "--mode",
                     "convos",
                     "--wing",
@@ -1494,7 +1970,7 @@ def test_precompact_with_timeout(tmp_path):
     assert result == {}
 
 
-def test_precompact_mines_transcript_dir(tmp_path, monkeypatch):
+def test_precompact_mines_only_active_transcript(tmp_path, monkeypatch):
     """Precompact ingests the active transcript via _ingest_transcript.
 
     With no MEMPAL_DIR, _mine_sync is a no-op; the transcript ingest is
@@ -1518,8 +1994,8 @@ def test_precompact_mines_transcript_dir(tmp_path, monkeypatch):
     mock_run.assert_not_called()
     mock_popen.assert_called_once()
     cmd = mock_popen.call_args[0][0]
-    # Mines the transcript's parent dir as convos, into wing "sessions".
-    assert str(tmp_path) in cmd
+    # Mines only the active transcript as convos, into wing "sessions".
+    assert str(transcript.resolve()) in cmd
     assert cmd[cmd.index("--mode") + 1] == "convos"
     assert cmd[cmd.index("--wing") + 1] == "sessions"
 
@@ -1764,6 +2240,9 @@ def _redirect_palace_root(monkeypatch, tmp_path):
     monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", fake_root)
     monkeypatch.setattr(hooks_cli_mod, "STATE_DIR", fake_root / "hook_state")
     monkeypatch.setattr(hooks_cli_mod, "_state_dir_initialized", False)
+    # The config dir satisfies the kill-switch too (#148); keep it absent so
+    # these tests exercise the "user cleared everything" path.
+    monkeypatch.setattr(hooks_cli_mod, "_config_root", lambda: tmp_path / "absent-config")
     return fake_root
 
 
@@ -1779,6 +2258,284 @@ def test_hook_stop_does_not_create_palace_dir_when_absent(tmp_path, monkeypatch)
         )
     assert json.loads(buf.getvalue() or "{}") == {}
     assert not fake_root.exists()
+
+
+# ── session-end hook (#1341) ──────────────────────────────────────────────
+
+
+def test_run_hook_dispatches_session_end():
+    stdin_data = json.dumps({"session_id": "run-test"})
+    with patch("sys.stdin", io.StringIO(stdin_data)):
+        with patch("mempalace.hooks_cli.hook_session_end") as mock_hook:
+            run_hook("session-end", "claude-code")
+    mock_hook.assert_called_once_with({"session_id": "run-test"}, "claude-code")
+
+
+def test_session_end_uses_detached_paths_not_sync_mine(tmp_path):
+    """SessionEnd must spawn the detached ingest/auto-ingest and NEVER call the
+    synchronous ``_mine_sync``: the foreground SessionEnd budget (~1.5s, which a
+    plugin-provided per-hook timeout cannot raise) would kill a synchronous mine
+    before it saved anything.
+    """
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(3)],
+    )
+    last_save_file = tmp_path / "sess_last_save"
+    last_save_file.write_text("2", encoding="utf-8")
+    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+        mock_cfg_cls.return_value.hooks_auto_save = True
+        mock_cfg_cls.return_value.hook_desktop_toast = False
+        with (
+            patch(
+                "mempalace.hooks_cli._save_diary_direct",
+                return_value={"count": 3, "themes": ["exit"]},
+            ) as mock_save,
+            patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
+            patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto,
+            patch("mempalace.hooks_cli._mine_sync") as mock_sync,
+        ):
+            result = _capture_hook_output(
+                hook_session_end,
+                {"session_id": "sess", "transcript_path": str(transcript)},
+                state_dir=tmp_path,
+            )
+    assert result == {}
+    expected_path = str(transcript.resolve())
+    mock_ingest.assert_called_once_with(expected_path)
+    mock_auto.assert_called_once()
+    mock_sync.assert_not_called()
+    mock_save.assert_called_once_with(
+        expected_path, "sess", wing="wing_sessions", toast=False, agent_name="claude"
+    )
+    # The session is over; its per-session save marker is cleared.
+    assert not last_save_file.exists()
+
+
+def test_session_end_disabled_by_config_clears_marker(tmp_path):
+    last_save_file = tmp_path / "sess_last_save"
+    last_save_file.write_text("15", encoding="utf-8")
+    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+        mock_cfg_cls.return_value.hooks_auto_save = False
+        with (
+            patch("mempalace.hooks_cli._save_diary_direct") as mock_save,
+            patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
+            patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto,
+        ):
+            result = _capture_hook_output(
+                hook_session_end,
+                {"session_id": "sess", "transcript_path": ""},
+                state_dir=tmp_path,
+            )
+    assert result == {}
+    mock_save.assert_not_called()
+    mock_ingest.assert_not_called()
+    mock_auto.assert_not_called()
+    assert not last_save_file.exists()
+
+
+def test_session_end_defaults_to_saving_when_config_unreadable(tmp_path):
+    """A corrupt/unreadable config must not lose the final save: the handler
+    defaults to auto-save on (toasts off) instead of crashing the hook."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(transcript, [{"message": {"role": "user", "content": "hi"}}])
+    with patch("mempalace.hooks_cli.MempalaceConfig", side_effect=RuntimeError("corrupt config")):
+        with (
+            patch(
+                "mempalace.hooks_cli._save_diary_direct",
+                return_value={"count": 1, "themes": []},
+            ) as mock_save,
+            patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
+            patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto,
+        ):
+            result = _capture_hook_output(
+                hook_session_end,
+                {"session_id": "cfg", "transcript_path": str(transcript)},
+                state_dir=tmp_path,
+            )
+    assert result == {}
+    mock_save.assert_called_once()
+    mock_ingest.assert_called_once()
+    mock_auto.assert_called_once()
+
+
+def test_session_end_clears_marker_even_if_capture_raises(tmp_path):
+    """Marker cleanup runs in a ``finally`` so a failing ingest still cleans up
+    and never wedges the per-session marker on."""
+    last_save_file = tmp_path / "boom_last_save"
+    last_save_file.write_text("5", encoding="utf-8")
+    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+        mock_cfg_cls.return_value.hooks_auto_save = True
+        mock_cfg_cls.return_value.hook_desktop_toast = False
+        with (
+            patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
+            patch(
+                "mempalace.hooks_cli._ingest_transcript",
+                side_effect=RuntimeError("boom"),
+            ),
+            patch("mempalace.hooks_cli._output"),
+        ):
+            with pytest.raises(RuntimeError):
+                hook_session_end(
+                    {"session_id": "boom", "transcript_path": str(tmp_path / "x.jsonl")},
+                    "claude-code",
+                )
+    assert not last_save_file.exists()
+
+
+def test_session_end_clears_marker_on_parse_failure(tmp_path):
+    """A non-dict payload makes _parse_harness_input raise, but parsing now runs
+    inside the try, so the finally still clears the default-session marker
+    instead of skipping cleanup entirely."""
+    last_save_file = tmp_path / "unknown_last_save"
+    last_save_file.write_text("5", encoding="utf-8")
+    with (
+        patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
+        patch("mempalace.hooks_cli._output"),
+    ):
+        with pytest.raises(AttributeError):
+            hook_session_end(["not", "a", "dict"], "claude-code")
+    assert not last_save_file.exists()
+
+
+def test_hook_session_end_does_not_create_palace_dir_when_absent(tmp_path, monkeypatch):
+    fake_root = _redirect_palace_root(monkeypatch, tmp_path)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        hook_session_end({"session_id": "absent", "transcript_path": ""}, "claude-code")
+    assert json.loads(buf.getvalue() or "{}") == {}
+    assert not fake_root.exists()
+
+
+def test_session_end_auto_ingest_only_when_no_transcript(tmp_path):
+    """auto_save on but no transcript: project mine still fires, transcript-only
+    paths are skipped, and the marker is still cleared. Guards against wrapping
+    ``_maybe_auto_ingest`` inside the ``if transcript_path`` block by mistake."""
+    last_save_file = tmp_path / "sess_last_save"
+    last_save_file.write_text("3", encoding="utf-8")
+    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+        mock_cfg_cls.return_value.hooks_auto_save = True
+        mock_cfg_cls.return_value.hook_desktop_toast = False
+        with (
+            patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
+            patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto,
+            patch("mempalace.hooks_cli._save_diary_direct") as mock_save,
+            patch("mempalace.hooks_cli._mine_sync") as mock_sync,
+        ):
+            result = _capture_hook_output(
+                hook_session_end,
+                {"session_id": "sess", "transcript_path": ""},
+                state_dir=tmp_path,
+            )
+    assert result == {}
+    mock_auto.assert_called_once()
+    mock_ingest.assert_not_called()
+    mock_save.assert_not_called()
+    mock_sync.assert_not_called()
+    assert not last_save_file.exists()
+
+
+def test_session_end_rejects_invalid_transcript_path(tmp_path):
+    """A traversal / wrong-suffix transcript_path is rejected by the validator:
+    no transcript ingest or diary write fires (the independent project mine
+    still runs), and the per-session marker is still cleared."""
+    last_save_file = tmp_path / "bad_last_save"
+    last_save_file.write_text("5", encoding="utf-8")
+    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+        mock_cfg_cls.return_value.hooks_auto_save = True
+        mock_cfg_cls.return_value.hook_desktop_toast = False
+        with (
+            patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
+            patch("mempalace.hooks_cli._save_diary_direct") as mock_save,
+            patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto,
+        ):
+            result = _capture_hook_output(
+                hook_session_end,
+                {"session_id": "bad", "transcript_path": "../../etc/passwd"},
+                state_dir=tmp_path,
+            )
+    assert result == {}
+    mock_ingest.assert_not_called()
+    mock_save.assert_not_called()
+    mock_auto.assert_called_once()  # project mine is independent of the transcript
+    assert not last_save_file.exists()
+
+
+def test_session_end_accepts_full_sessionend_payload(tmp_path):
+    """The handler tolerates the real Claude Code SessionEnd stdin (reason,
+    hook_event_name, cwd) — extra keys ignored, behavior unchanged. Pins the
+    contract so a future strict-parse or reason-branching regression is caught."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(transcript, [{"message": {"role": "user", "content": "hi"}}])
+    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+        mock_cfg_cls.return_value.hooks_auto_save = True
+        mock_cfg_cls.return_value.hook_desktop_toast = False
+        with (
+            patch(
+                "mempalace.hooks_cli._save_diary_direct",
+                return_value={"count": 1, "themes": []},
+            ),
+            patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
+            patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto,
+            patch("mempalace.hooks_cli._mine_sync") as mock_sync,
+        ):
+            result = _capture_hook_output(
+                hook_session_end,
+                {
+                    "session_id": "sess",
+                    "transcript_path": str(transcript),
+                    "hook_event_name": "SessionEnd",
+                    "reason": "logout",
+                    "cwd": str(tmp_path),
+                },
+                state_dir=tmp_path,
+            )
+    assert result == {}
+    mock_ingest.assert_called_once_with(str(transcript.resolve()))
+    mock_auto.assert_called_once()
+    mock_sync.assert_not_called()
+
+
+def test_session_end_checkpoint_visible_to_diary_read(
+    monkeypatch, config, palace_path, kg, tmp_path
+):
+    """The SessionEnd in-process diary checkpoint is real and discoverable via
+    diary_read (not mocked) — the diary half of #1341's clean-exit capture,
+    mirroring test_stop_hook_checkpoint_visible_to_diary_read."""
+    import chromadb
+
+    from mempalace import mcp_server
+    from mempalace.mcp_server import tool_diary_read
+
+    monkeypatch.setattr(mcp_server, "_config", config)
+    monkeypatch.setattr(mcp_server, "_get_kg", lambda *a, **kw: kg)
+    client = chromadb.PersistentClient(path=palace_path)
+    client.get_or_create_collection("mempalace_drawers", metadata={"hnsw:space": "cosine"})
+    del client
+
+    transcript = tmp_path / "session.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(5)],
+    )
+
+    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+        mock_cfg_cls.return_value.hooks_auto_save = True
+        mock_cfg_cls.return_value.hook_desktop_toast = False
+        # Mock only the detached subprocess mines; run the REAL diary write.
+        with (
+            patch("mempalace.hooks_cli._ingest_transcript"),
+            patch("mempalace.hooks_cli._maybe_auto_ingest"),
+        ):
+            hook_session_end(
+                {"session_id": "sessX", "transcript_path": str(transcript)},
+                "claude-code",
+            )
+
+    visible = tool_diary_read(agent_name="claude")
+    assert visible.get("total", 0) >= 1
+    assert "CHECKPOINT" in visible["entries"][0]["content"]
 
 
 def test_hook_precompact_does_not_create_palace_dir_when_absent(tmp_path, monkeypatch):
@@ -1823,6 +2580,31 @@ def test_existing_dir_proceeds_normally(tmp_path, monkeypatch):
     assert (fake_root / "hook_state" / "hook.log").is_file()
 
 
+def test_config_dir_satisfies_kill_switch_without_legacy_root(tmp_path, monkeypatch):
+    """A fresh install since #148 has its config dir but no ~/.mempalace.
+
+    Before the fix every hook short-circuited on such an install, so a fresh
+    ``mempalace init`` followed by a PreCompact hook filed nothing.
+    """
+    fake_root = _redirect_palace_root(monkeypatch, tmp_path)
+    config_root = tmp_path / "xdg" / "mempalace"
+    config_root.mkdir(parents=True)
+    monkeypatch.setattr(hooks_cli_mod, "_config_root", lambda: config_root)
+
+    assert hooks_cli_mod._palace_root_exists() is True
+    _log("test message")
+    assert (fake_root / "hook_state" / "hook.log").is_file()
+
+
+def test_kill_switch_config_root_follows_config_resolution(tmp_path, monkeypatch):
+    """``_config_root`` resolves the way ``mempalace.config`` does."""
+    config_dir = tmp_path / "explicit-config"
+    config_dir.mkdir()
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(config_dir))
+
+    assert hooks_cli_mod._config_root() == config_dir
+
+
 def test_regular_file_at_palace_root_treated_as_absent(tmp_path, monkeypatch):
     """A regular file at ~/.mempalace must be treated the same as absent.
 
@@ -1834,6 +2616,7 @@ def test_regular_file_at_palace_root_treated_as_absent(tmp_path, monkeypatch):
     fake_root = tmp_path / "file-not-dir"
     fake_root.write_text("oops, this is a file not a directory")
     monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", fake_root)
+    monkeypatch.setattr(hooks_cli_mod, "_config_root", lambda: tmp_path / "absent-config")
     monkeypatch.setattr(hooks_cli_mod, "STATE_DIR", fake_root / "hook_state")
     monkeypatch.setattr(hooks_cli_mod, "_state_dir_initialized", False)
 
@@ -1853,3 +2636,81 @@ def test_regular_file_at_palace_root_treated_as_absent(tmp_path, monkeypatch):
     # The stray file is left untouched; we never try to convert it.
     assert fake_root.is_file()
     assert fake_root.read_text() == "oops, this is a file not a directory"
+
+
+# --- _ingest_wing: hook-ingested transcripts file under the project wing ---
+
+
+def _write_transcript_with_cwd(tmp_path, cwd, name="s.jsonl"):
+    path = tmp_path / ".claude" / "projects" / "-Users-me-dev-thing" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        json.dumps({"type": "queue-operation"}),
+        json.dumps({"type": "user", "cwd": cwd, "message": {"content": "hi"}}),
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def test_ingest_wing_uses_the_project_from_cwd(tmp_path):
+    from mempalace.hooks_cli import _ingest_wing
+
+    path = _write_transcript_with_cwd(tmp_path, "/Users/me/dev/mempalace")
+    assert _ingest_wing(path) == "mempalace"
+
+
+def test_ingest_wing_collapses_worktrees_and_hyphens(tmp_path):
+    from mempalace.hooks_cli import _ingest_wing
+
+    path = _write_transcript_with_cwd(tmp_path, "/Users/me/dev/acme-app/.claude/worktrees/x")
+    assert _ingest_wing(path) == "acme_app"
+
+
+def test_ingest_wing_home_directory_sessions_go_to_the_workstation(tmp_path, monkeypatch):
+    from mempalace import hooks_cli
+
+    monkeypatch.setattr(hooks_cli.Path, "home", classmethod(lambda cls: Path("/Users/me")))
+    path = _write_transcript_with_cwd(tmp_path, "/Users/me/")
+    monkeypatch.setattr(hooks_cli.sys, "platform", "darwin")
+    assert hooks_cli._ingest_wing(path) == "mac_workstation"
+    monkeypatch.setattr(hooks_cli.sys, "platform", "win32")
+    assert hooks_cli._ingest_wing(path) == "windows_workstation"
+    monkeypatch.setattr(hooks_cli.sys, "platform", "linux")
+    assert hooks_cli._ingest_wing(path) == "linux_workstation"
+
+
+def test_ingest_wing_falls_back_to_the_encoded_folder_then_sessions(tmp_path):
+    from mempalace.hooks_cli import _ingest_wing
+
+    path = tmp_path / ".claude" / "projects" / "-Users-me-dev-thing" / "no-cwd.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"type": "queue-operation"}) + "\n", encoding="utf-8")
+    assert _ingest_wing(str(path)) == "thing"
+    assert _ingest_wing("/some/random/path.jsonl") == "sessions"
+
+
+def test_ingest_transcript_passes_the_project_wing_to_mine(tmp_path, monkeypatch):
+    from mempalace import hooks_cli
+
+    path = _write_transcript_with_cwd(tmp_path, "/Users/me/dev/mempalace")
+    Path(path).write_text(Path(path).read_text() + "x" * 200, encoding="utf-8")
+    monkeypatch.setattr(hooks_cli, "_validate_transcript_path", lambda p: Path(p))
+    monkeypatch.setattr(hooks_cli, "MempalaceConfig", lambda: None)
+
+    class Routing:
+        blocked = False
+        use_daemon = False
+
+    monkeypatch.setattr(hooks_cli, "_current_hook_write_routing", lambda: Routing())
+    spawned = []
+    monkeypatch.setattr(hooks_cli, "_spawn_mine", lambda cmd: spawned.append(cmd))
+    hooks_cli._ingest_transcript(path)
+    assert spawned and spawned[0][-2:] == ["--wing", "mempalace"]
+
+    Routing.use_daemon = True
+    jobs = []
+    monkeypatch.setattr(
+        hooks_cli, "_submit_daemon_job", lambda kind, payload, **kw: jobs.append(payload)
+    )
+    hooks_cli._ingest_transcript(path)
+    assert jobs and jobs[0]["wing"] == "mempalace"

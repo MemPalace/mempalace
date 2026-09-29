@@ -39,7 +39,7 @@ import json
 import os
 import sqlite3
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 from .config import sanitize_iso_temporal
@@ -47,6 +47,11 @@ from .ids import make_triple_id
 
 
 DEFAULT_KG_PATH = os.path.expanduser("~/.mempalace/knowledge_graph.sqlite3")
+_MIN_ENTITY_CANDIDATE_LEN = 3
+
+
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _is_date_only_temporal(value: str) -> bool:
@@ -113,6 +118,14 @@ def _temporal_filter_sql(as_of: str) -> tuple[str, list[str]]:
 
     This keeps legacy date-only facts working when callers query with
     canonical UTC datetimes such as '2026-05-06T15:00:00Z'.
+
+    The upper bound is *strict* (``valid_to > as_of``): a fact whose
+    ``valid_to`` equals the query instant has already ended at that instant,
+    so the interval is treated as half-open ``[valid_from, valid_to)``. This
+    is what lets a fact and its successor share a boundary instant without an
+    as-of query returning both. Date-only ``valid_to`` still expands to the
+    end of that day (``T23:59:59Z``), so a standalone date-only fact stays
+    valid through its whole final day exactly as before.
     """
 
     as_of_key = _temporal_start_key(as_of)
@@ -121,7 +134,7 @@ def _temporal_filter_sql(as_of: str) -> tuple[str, list[str]]:
 
     return (
         f" AND (t.valid_from IS NULL OR {valid_from_expr} <= ?) "
-        f"AND (t.valid_to IS NULL OR {valid_to_expr} >= ?)",
+        f"AND (t.valid_to IS NULL OR {valid_to_expr} > ?)",
         [as_of_key, as_of_key],
     )
 
@@ -359,6 +372,217 @@ class KnowledgeGraph:
                     (ended, sub_id, pred, obj_id),
                 )
 
+    def supersede(
+        self,
+        subject: str,
+        predicate: str,
+        old_obj: str,
+        new_obj: str,
+        at: str = None,
+        confidence: float = 1.0,
+        source_closet: str = None,
+        source_file: str = None,
+        source_drawer_id: str = None,
+        adapter_name: str = None,
+    ):
+        """Atomically replace one fact with another at a single shared boundary.
+
+        Closes the currently-open ``(subject, predicate, old_obj)`` triple with
+        ``valid_to = at`` and opens ``(subject, predicate, new_obj)`` with
+        ``valid_from = at`` in one transaction, at a single shared instant.
+        Paired with the half-open upper bound in ``_temporal_filter_sql``, an
+        as-of query at that instant returns only the successor.
+
+        This is the primitive for a value change. Hand-rolling a handover as
+        ``invalidate(ended=D)`` + ``add_triple(valid_from=D)`` with date-only
+        ``D`` leaves two facts sharing the whole day ``D`` (``valid_to`` expands
+        to ``T23:59:59Z`` while ``valid_from`` expands to ``T00:00:00Z``), so an
+        as-of query on ``D`` returns both. ``supersede`` avoids this by writing
+        one identical precise instant to both sides.
+
+        ``at`` defaults to the current UTC instant. A date-only ``at`` is
+        normalized to ``<date>T00:00:00Z`` so both sides carry the same precise
+        value rather than the asymmetric whole-day expansion.
+
+        Returns the new triple's id. If no open ``old_obj`` triple exists the
+        successor is still opened, so ``supersede`` degrades to ``add_triple``.
+        """
+        if at is None:
+            boundary = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        elif _is_date_only_temporal(at):
+            boundary = f"{at}T00:00:00Z"
+        else:
+            boundary = at
+        boundary = sanitize_iso_temporal(boundary, "at")
+
+        sub_id = self._entity_id(subject)
+        old_id = self._entity_id(old_obj)
+        new_id = self._entity_id(new_obj)
+        pred = predicate.lower().replace(" ", "_")
+
+        with self._lock:
+            conn = self._conn()
+            with conn:
+                # Only create entities we actually open a fact for. old_obj is
+                # matched by id in the UPDATE below whether or not its row
+                # exists, so inserting it would just orphan an entity when no
+                # open old fact is present (the degrade-to-add path).
+                for name, eid in ((subject, sub_id), (new_obj, new_id)):
+                    conn.execute(
+                        "INSERT OR IGNORE INTO entities (id, name) VALUES (?, ?)",
+                        (eid, name),
+                    )
+
+                # Reject a boundary that precedes the old fact's start — an
+                # inverted interval would be invisible to every KG query.
+                rows = conn.execute(
+                    "SELECT valid_from FROM triples "
+                    "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
+                    (sub_id, pred, old_id),
+                ).fetchall()
+                for row in rows:
+                    valid_from = row["valid_from"]
+                    if valid_from is not None and _temporal_end_key(boundary) < _temporal_start_key(
+                        valid_from
+                    ):
+                        raise ValueError(
+                            f"at={boundary!r} is before valid_from={valid_from!r}; "
+                            "an inverted interval would be invisible to every KG query"
+                        )
+
+                # Close the open old fact at the shared boundary.
+                conn.execute(
+                    "UPDATE triples SET valid_to=? "
+                    "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
+                    (boundary, sub_id, pred, old_id),
+                )
+
+                # Open the successor at the same instant (idempotent if already open).
+                existing = conn.execute(
+                    "SELECT id FROM triples "
+                    "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
+                    (sub_id, pred, new_id),
+                ).fetchone()
+                if existing:
+                    return existing["id"]
+
+                triple_id = make_triple_id(
+                    sub_id, pred, new_id, boundary, datetime.now().isoformat()
+                )
+                conn.execute(
+                    """INSERT INTO triples (
+                        id, subject, predicate, object, valid_from, valid_to,
+                        confidence, source_closet, source_file,
+                        source_drawer_id, adapter_name
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        triple_id,
+                        sub_id,
+                        pred,
+                        new_id,
+                        boundary,
+                        None,
+                        confidence,
+                        source_closet,
+                        source_file,
+                        source_drawer_id,
+                        adapter_name,
+                    ),
+                )
+                return triple_id
+
+    def rewrite(
+        self,
+        triple_id: str,
+        predicate: str,
+        obj: str,
+        at: str = None,
+        source_file: str = None,
+    ):
+        """Close the open fact ``triple_id`` and open its rewrite in one transaction.
+
+        The successor keeps the subject, takes ``predicate`` and ``obj`` and
+        opens at the same instant the original closes, so an as-of query
+        before the boundary still returns the original wording. Unlike
+        :meth:`supersede` the predicate may change, which is what
+        ``mempalace kg normalize`` needs.
+
+        Addressed by the triple's ``id`` so that a fact closed or replaced
+        after a plan was written is not resurrected: if ``triple_id`` is no
+        longer open, nothing is written and ``None`` is returned. Returns the
+        successor's id otherwise. One SQLite transaction covers both writes,
+        so an interruption leaves the original fact open and untouched.
+
+        The successor inherits the original's ``confidence`` and provenance
+        (``source_closet``, ``source_file``, ``source_drawer_id``,
+        ``adapter_name``): rewording a predicate is not new evidence, and a
+        normalized fact must still point at the drawer it came from.
+        ``source_file`` here is only a fallback for an original carrying none.
+        """
+        if at is None:
+            boundary = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        elif _is_date_only_temporal(at):
+            boundary = f"{at}T00:00:00Z"
+        else:
+            boundary = at
+        boundary = sanitize_iso_temporal(boundary, "at")
+        pred = str(predicate).lower().replace(" ", "_")
+        obj_id = self._entity_id(obj)
+
+        with self._lock:
+            conn = self._conn()
+            with conn:
+                row = conn.execute(
+                    "SELECT subject, valid_from, confidence, source_closet, source_file, "
+                    "source_drawer_id, adapter_name FROM triples "
+                    "WHERE id=? AND valid_to IS NULL",
+                    (triple_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                valid_from = row["valid_from"]
+                if valid_from is not None and _temporal_end_key(boundary) < _temporal_start_key(
+                    valid_from
+                ):
+                    raise ValueError(
+                        f"at={boundary!r} is before valid_from={valid_from!r}; "
+                        "an inverted interval would be invisible to every KG query"
+                    )
+                sub_id = row["subject"]
+                conn.execute(
+                    "INSERT OR IGNORE INTO entities (id, name) VALUES (?, ?)", (obj_id, obj)
+                )
+                conn.execute("UPDATE triples SET valid_to=? WHERE id=?", (boundary, triple_id))
+                existing = conn.execute(
+                    "SELECT id FROM triples "
+                    "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
+                    (sub_id, pred, obj_id),
+                ).fetchone()
+                if existing:
+                    return existing["id"]
+                new_id = make_triple_id(sub_id, pred, obj_id, boundary, datetime.now().isoformat())
+                conn.execute(
+                    """INSERT INTO triples (
+                        id, subject, predicate, object, valid_from, valid_to,
+                        confidence, source_closet, source_file,
+                        source_drawer_id, adapter_name
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        new_id,
+                        sub_id,
+                        pred,
+                        obj_id,
+                        boundary,
+                        None,
+                        row["confidence"] if row["confidence"] is not None else 1.0,
+                        row["source_closet"],
+                        row["source_file"] or source_file,
+                        row["source_drawer_id"],
+                        row["adapter_name"],
+                    ),
+                )
+                return new_id
+
     # ── Query operations ──────────────────────────────────────────────────
 
     def query_entity(self, name: str, as_of: str = None, direction: str = "outgoing"):
@@ -424,6 +648,108 @@ class KnowledgeGraph:
                         }
                     )
 
+            if not results:
+                exact_exists = (
+                    conn.execute("SELECT 1 FROM entities WHERE id = ?", (eid,)).fetchone()
+                    is not None
+                )
+                if not exact_exists:
+                    candidates = self._lookup_entity_candidates(conn, name, eid)
+                    if len(candidates) == 1:
+                        cand_id = candidates[0]["id"]
+                        cand_name = candidates[0]["name"]
+                        results.extend(
+                            self._triples_for_entity(
+                                conn,
+                                cand_id,
+                                cand_name,
+                                direction,
+                                temporal_sql,
+                                temporal_params,
+                            )
+                        )
+
+        return results
+
+    def find_entity_candidates(self, name: str) -> list:
+        """Return token/prefix entity matches for disambiguation (never substring)."""
+        if not name or len(name.strip()) < _MIN_ENTITY_CANDIDATE_LEN:
+            return []
+        eid = self._entity_id(name)
+        with self._lock:
+            return self._lookup_entity_candidates(self._conn(), name, eid)
+
+    def _lookup_entity_candidates(self, conn, name: str, eid: str) -> list:
+        if not name or len(name.strip()) < _MIN_ENTITY_CANDIDATE_LEN:
+            return []
+        name_esc = _escape_like(name.strip())
+        id_esc = _escape_like(eid)
+        rows = conn.execute(
+            "SELECT id, name FROM entities WHERE "
+            "id = ? OR name = ? OR "
+            "name LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\' OR "
+            "id LIKE ? ESCAPE '\\' OR id LIKE ? ESCAPE '\\' OR id LIKE ? ESCAPE '\\' "
+            "LIMIT 5",
+            (
+                eid,
+                name,
+                f"{name_esc} %",
+                f"% {name_esc}",
+                f"% {name_esc} %",
+                f"{id_esc}\\_%",
+                f"%\\_{id_esc}",
+                f"%\\_{id_esc}\\_%",
+            ),
+        ).fetchall()
+        out = []
+        for row in rows:
+            if row["id"] == eid:
+                continue
+            out.append({"id": row["id"], "name": row["name"]})
+        return out
+
+    def _triples_for_entity(
+        self, conn, eid: str, name: str, direction: str, temporal_sql: str, temporal_params: list
+    ) -> list:
+        results = []
+        if direction in ("outgoing", "both"):
+            query = (
+                "SELECT t.*, e.name as obj_name FROM triples t "
+                "JOIN entities e ON t.object = e.id WHERE t.subject = ?" + temporal_sql
+            )
+            for row in conn.execute(query, [eid] + temporal_params).fetchall():
+                results.append(
+                    {
+                        "direction": "outgoing",
+                        "subject": name,
+                        "predicate": row["predicate"],
+                        "object": row["obj_name"],
+                        "valid_from": row["valid_from"],
+                        "valid_to": row["valid_to"],
+                        "confidence": row["confidence"],
+                        "source_closet": row["source_closet"],
+                        "current": row["valid_to"] is None,
+                    }
+                )
+        if direction in ("incoming", "both"):
+            query = (
+                "SELECT t.*, e.name as sub_name FROM triples t "
+                "JOIN entities e ON t.subject = e.id WHERE t.object = ?" + temporal_sql
+            )
+            for row in conn.execute(query, [eid] + temporal_params).fetchall():
+                results.append(
+                    {
+                        "direction": "incoming",
+                        "subject": row["sub_name"],
+                        "predicate": row["predicate"],
+                        "object": name,
+                        "valid_from": row["valid_from"],
+                        "valid_to": row["valid_to"],
+                        "confidence": row["confidence"],
+                        "source_closet": row["source_closet"],
+                        "current": row["valid_to"] is None,
+                    }
+                )
         return results
 
     def query_relationship(self, predicate: str, as_of: str = None):
@@ -461,8 +787,16 @@ class KnowledgeGraph:
                 )
         return results
 
-    def timeline(self, entity_name: str = None):
-        """Get all facts in chronological order, optionally filtered by entity."""
+    def timeline(self, entity_name: str = None, limit: int = 100, offset: int = 0):
+        """Get facts in chronological order, optionally filtered by entity.
+
+        Paginated with ``limit``/``offset`` (same convention as drawer
+        listing); defaults preserve the historical behavior of returning
+        the first 100 facts. Use :meth:`timeline_total` for the full
+        matching count.
+        """
+        limit = max(1, int(limit))
+        offset = max(0, int(offset))
         with self._lock:
             conn = self._conn()
             if entity_name:
@@ -474,20 +808,23 @@ class KnowledgeGraph:
                     JOIN entities s ON t.subject = s.id
                     JOIN entities o ON t.object = o.id
                     WHERE (t.subject = ? OR t.object = ?)
-                    ORDER BY t.valid_from ASC NULLS LAST
-                    LIMIT 100
+                    ORDER BY t.valid_from ASC NULLS LAST, t.id ASC
+                    LIMIT ? OFFSET ?
                 """,
-                    (eid, eid),
+                    (eid, eid, limit, offset),
                 ).fetchall()
             else:
-                rows = conn.execute("""
+                rows = conn.execute(
+                    """
                     SELECT t.*, s.name as sub_name, o.name as obj_name
                     FROM triples t
                     JOIN entities s ON t.subject = s.id
                     JOIN entities o ON t.object = o.id
-                    ORDER BY t.valid_from ASC NULLS LAST
-                    LIMIT 100
-                """).fetchall()
+                    ORDER BY t.valid_from ASC NULLS LAST, t.id ASC
+                    LIMIT ? OFFSET ?
+                """,
+                    (limit, offset),
+                ).fetchall()
 
         return [
             {
@@ -501,7 +838,81 @@ class KnowledgeGraph:
             for r in rows
         ]
 
+    def timeline_total(self, entity_name: str = None) -> int:
+        """Total number of facts a :meth:`timeline` query matches (all pages)."""
+        with self._lock:
+            conn = self._conn()
+            if entity_name:
+                eid = self._entity_id(entity_name)
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM triples WHERE subject = ? OR object = ?",
+                    (eid, eid),
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT COUNT(*) FROM triples").fetchone()
+        return row[0]
+
     # ── Stats ─────────────────────────────────────────────────────────────
+
+    # -- Replication (RFC 004 step 1: read-replica snapshot) ---------------
+
+    _REPLICATION_TABLES = {
+        "entities": ("id", "name", "type", "properties", "created_at"),
+        "triples": (
+            "id",
+            "subject",
+            "predicate",
+            "object",
+            "valid_from",
+            "valid_to",
+            "confidence",
+            "source_closet",
+            "source_file",
+            "source_drawer_id",
+            "adapter_name",
+            "extracted_at",
+        ),
+    }
+
+    def dump_rows(self, table: str, after_rowid: int = 0, limit: int = 500) -> list:
+        """Page KG rows in rowid order for snapshot replication.
+
+        Rows are returned verbatim with a ``_rowid`` pagination cursor.
+        rowid order is deterministic, so pages never skip under concurrent
+        appends (updates in earlier pages are caught by the next full pass).
+        """
+        columns = self._REPLICATION_TABLES.get(table)
+        if columns is None:
+            raise ValueError(f"table must be one of {sorted(self._REPLICATION_TABLES)}")
+        with self._lock:
+            conn = self._conn()
+            rows = conn.execute(
+                f"SELECT rowid, {', '.join(columns)} FROM {table} "
+                "WHERE rowid > ? ORDER BY rowid ASC LIMIT ?",
+                (int(after_rowid), max(1, min(int(limit), 1000))),
+            ).fetchall()
+        return [dict(row) | {"_rowid": row["rowid"]} for row in rows]
+
+    def apply_row(self, table: str, row: dict) -> None:
+        """Fold one replicated KG row in, keyed by id (INSERT OR REPLACE).
+
+        REPLACE makes invalidations (valid_to updates) and entity edits
+        converge on re-pull; rows are never deleted by replication.
+        """
+        columns = self._REPLICATION_TABLES.get(table)
+        if columns is None:
+            raise ValueError(f"table must be one of {sorted(self._REPLICATION_TABLES)}")
+        if not row.get("id"):
+            raise ValueError("replicated row is missing 'id'")
+        values = [row.get(col) for col in columns]
+        with self._lock:
+            conn = self._conn()
+            with conn:
+                conn.execute(
+                    f"INSERT OR REPLACE INTO {table} ({', '.join(columns)}) "
+                    f"VALUES ({', '.join('?' for _ in columns)})",
+                    values,
+                )
 
     def stats(self):
         with self._lock:

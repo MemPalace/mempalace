@@ -18,11 +18,11 @@ from mempalace import ids
 # ── ID_RECIPE constant ─────────────────────────────────────────────────
 
 
-def test_id_recipe_constant_is_v2():
+def test_id_recipe_constant_is_v3():
     """Audit code reads ids.ID_RECIPE to tag new drawers. The constant
-    must be the literal "v2" string; a typo here silently re-introduces
+    must be the literal "v3" string; a typo here silently re-introduces
     the ambiguity v2 was meant to fix."""
-    assert ids.ID_RECIPE == "v2"
+    assert ids.ID_RECIPE == "v3"
 
 
 # ── make_drawer_id_from_chunk ─────────────────────────────────────────
@@ -170,14 +170,16 @@ def test_make_triple_id_does_not_collide_across_iso_datetime_boundary():
 # ── _delimited_sha256 (private helper, smoke test only) ───────────────
 
 
-def test_private_delimited_sha256_uses_pipe_delimiter():
-    """Confirms the implementation actually uses '|' and not ':' — a
-    subtle copy-paste from the diary_ingest precedent or a stale
-    ':' precedent from convo_miner could regress the delimiter without
-    breaking the higher-level tests."""
+def test_private_delimited_sha256_uses_length_prefixing():
     result = ids._delimited_sha256(("a", "b"), 64)
-    expected = hashlib.sha256(b"a|b").hexdigest()
+    expected = hashlib.sha256(b"1:a1:b").hexdigest()
     assert result == expected
+
+    # These tuples collapse to the same raw pipe-joined string:
+    # "a|b|c|d". The v3 length-prefixed recipe must keep them distinct.
+    left = ids._delimited_sha256(("a", "b|c", "d"), 64)
+    right = ids._delimited_sha256(("a|b", "c", "d"), 64)
+    assert left != right
 
 
 def test_private_delimited_sha256_truncation_honoured():

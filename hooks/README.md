@@ -18,6 +18,7 @@ It covers hook wiring, JSONL backup, and one-time backfill.
 | Hook | When It Fires | What Happens |
 |------|--------------|-------------|
 | **Save Hook** | Every 15 human messages | Auto-mines transcript (tool output included), then blocks the AI to save topics/decisions/quotes |
+| **SessionEnd Hook** | Clean session exit | Backgrounds a final transcript mine (when a transcript exists) so short sessions aren't lost; returns immediately so teardown is never delayed. A lightweight diary checkpoint is written in the detached child. |
 | **PreCompact Hook** | Right before context compaction | Auto-mines transcript, then emergency save — forces the AI to save EVERYTHING before losing context |
 
 **Two-layer capture:** Hooks auto-mine the JSONL transcript directly into the palace (capturing raw tool output — Bash results, search findings, build errors). They also block the AI with a reason message telling it to save verbatim tool output and key context. Belt and suspenders — tool output gets stored even if the AI summarizes instead of quoting.
@@ -37,6 +38,13 @@ Add to `.claude/settings.local.json`:
         "timeout": 30
       }]
     }],
+    "SessionEnd": [{
+      "hooks": [{
+        "type": "command",
+        "command": "/absolute/path/to/hooks/mempal_session_end_hook.sh",
+        "timeout": 10
+      }]
+    }],
     "PreCompact": [{
       "hooks": [{
         "type": "command",
@@ -48,9 +56,15 @@ Add to `.claude/settings.local.json`:
 }
 ```
 
+`SessionEnd` runs once on a clean exit and backgrounds its work, so it
+returns instantly and stays within Claude Code's SessionEnd budget. Wired
+through `settings.local.json` (above) the `timeout` can raise that budget;
+the bundled plugin cannot, which is why the hook backgrounds rather than
+mining in the foreground.
+
 Make them executable:
 ```bash
-chmod +x hooks/mempal_save_hook.sh hooks/mempal_precompact_hook.sh
+chmod +x hooks/mempal_save_hook.sh hooks/mempal_session_end_hook.sh hooks/mempal_precompact_hook.sh
 ```
 
 ## Install — Antigravity (Google)
@@ -89,6 +103,13 @@ Add to `.codex/hooks.json`:
   }]
 }
 ```
+
+**Other harnesses:** the clean-exit save runs through the harness-agnostic
+`mempalace hook run --hook session-end` entry point. This release wires it
+for Claude Code. Antigravity exposes no dedicated session-end event (its
+lifecycle hooks are PreToolUse/PostToolUse/PreInvocation/PostInvocation/Stop,
+and MemPalace already saves there via `Stop`); Cursor and Codex can adopt the
+same entry point as a follow-up wherever their own session-end event is available.
 
 ## Configuration
 

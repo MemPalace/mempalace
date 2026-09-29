@@ -161,8 +161,8 @@ fi
 # treating markers older than 1 hour as stale and reclaiming them.
 PENDING_FILE="$MEMPAL_STATE_DIR/antigravity_pending_${CONVERSATION_ID}"
 if [ -f "$PENDING_FILE" ]; then
-    # mtime in epoch seconds (date -r); if stale (> 1 hour), reclaim.
-    if mtime=$(date -r "$PENDING_FILE" '+%s' 2>/dev/null) \
+    # mtime in epoch seconds (portable; BSD/macOS `date -r` takes epoch, not a path).
+    if mtime=$("$MEMPAL_PYTHON_BIN" -c 'import os, sys; print(int(os.path.getmtime(sys.argv[1])))' "$PENDING_FILE" 2>/dev/null) \
        && now=$(date '+%s') \
        && [ -n "$mtime" ] \
        && [ "$((now - mtime))" -lt 3600 ]; then

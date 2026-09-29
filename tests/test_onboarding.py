@@ -210,7 +210,7 @@ def test_generate_aaak_bootstrap_no_relationship(tmp_path):
 def test_hr_prints_line(capsys):
     _hr()
     out = capsys.readouterr().out
-    assert "─" in out
+    assert "-" in out
 
 
 def test_header_prints_banner(capsys):

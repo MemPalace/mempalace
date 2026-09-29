@@ -349,11 +349,10 @@ class TestSaveHookCounter:
             f"third invocation must emit a followup_message; got {response!r}"
         )
         msg = response["followup_message"]
-        # Followup must reference the real MCP tool names (regression
-        # guard against future typos that would silently fail).
-        assert "mempalace_add_drawer" in msg
-        assert "mempalace_check_duplicate" in msg
-        assert "mempalace_diary_write" in msg
+        # Followup must reference the real MCP tool name (regression
+        # guard against future typos that would silently fail). The save
+        # is driven by a single batch checkpoint call.
+        assert "mempalace_checkpoint" in msg
         assert "cursor-ide" in msg, "diary entries must be tagged agent_name=cursor-ide"
 
     def test_threshold_followup_references_inferred_wing(self, tmp_path):

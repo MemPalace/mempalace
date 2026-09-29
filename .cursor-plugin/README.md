@@ -1,6 +1,6 @@
 # MemPalace Cursor Plugin
 
-A Cursor IDE plugin that gives your agent a persistent memory system. Auto-registers the `mempalace-mcp` server (19 MCP tools), ships 5 slash commands, two model-invocable skills (setup/mining/search and a recall protocol), and an optional recall rule.
+A Cursor IDE plugin that gives your agent a persistent memory system. Auto-registers the `mempalace-mcp` server (45 MCP tools), ships 5 slash commands, three model-invocable skills (setup, recall, and logstream tasks), and an optional recall rule.
 
 > Hooks (auto-save + session-start memory recall) are shipped separately under `hooks/cursor/` so the plugin is safe to install in any Cursor workspace without touching the agent loop. See [Hooks](#hooks-optional) below.
 
@@ -46,6 +46,7 @@ This installs the `mempalace` package via `uv tool` or `pip`, initializes a pala
 | `/mempalace-search` | Search your memories across the palace using semantic search                      |
 | `/mempalace-mine`   | Mine projects and conversations into the palace                                   |
 | `/mempalace-status` | Show palace overview — wings, rooms, drawer counts                                |
+| `/mempalace-audit`  | Score palace organization, then a guided repair session                          |
 
 > Cursor commands are global, not plugin-namespaced — that's why each slug is prefixed with `mempalace-` rather than appearing as `/help`, `/init`, etc. This keeps them collision-free with built-in or other-plugin commands.
 
@@ -79,13 +80,15 @@ This plugin ships `mcp.json` at the plugin root, so Cursor auto-loads the `mempa
 
 ```json
 {
-  "mempalace": {
-    "command": "mempalace-mcp"
+  "mcpServers": {
+    "mempalace": {
+      "command": "mempalace-mcp"
+    }
   }
 }
 ```
 
-All 19 MemPalace MCP tools (`mempalace_search`, `mempalace_add_drawer`, `mempalace_diary_write`, `mempalace_check_duplicate`, `mempalace_diary_read`, …) become available to the agent immediately. No manual `~/.cursor/mcp.json` edit required.
+All 45 MemPalace MCP tools (`mempalace_search`, `mempalace_add_drawer`, `mempalace_diary_write`, `mempalace_check_duplicate`, `mempalace_diary_read`, …) become available to the agent immediately. No manual `~/.cursor/mcp.json` edit required.
 
 If the server doesn't appear, confirm `mempalace-mcp` is on the user `$PATH`:
 

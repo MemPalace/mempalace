@@ -163,14 +163,12 @@ _mempal_build_followup() {
 import json, sys
 wing = sys.argv[1] if len(sys.argv) > 1 else "cursor_session"
 msg = (
-    "MemPalace save checkpoint. "
-    "(1) Call mempalace_check_duplicate on the key topics, decisions, "
-    "and verbatim quotes from this session. "
-    "(2) For each non-duplicate, call mempalace_add_drawer (wing="
-    + wing + ", room=<short topic>, content=verbatim quote). "
-    "(3) Call mempalace_diary_write (agent_name=cursor-ide, wing="
-    + wing + ", entry=AAAK-format summary). "
-    "Then stop."
+    "MemPalace save checkpoint. Call mempalace_checkpoint ONCE with: "
+    "items=[{wing: " + wing + ", room: <short topic>, content: <verbatim "
+    "quote>}, ...] for the key topics, decisions, and verbatim quotes from "
+    "this session; and diary={agent_name: cursor-ide, wing: " + wing + ", "
+    "entry: <AAAK-format summary>}. It dedups, files non-duplicates, and "
+    "writes the diary in one call. Then stop."
 )
 print(json.dumps({"followup_message": msg}))
 ' "$WING"

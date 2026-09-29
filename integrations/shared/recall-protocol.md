@@ -30,30 +30,34 @@ question-driven, not reflexive.
 
 1. **On wake-up** (if a session-start hook injected context, honour its wing scoping / `additional_context`): scope recall to the wing inferred from the workspace, then continue.
 2. **Before responding** about people, projects, past events, or prior
-   decisions: call `mempalace_search` first. For relational or temporal
+   decisions: call `palace_query FIND` (or `mempalace_search`) first. For relational or temporal
    facts ("who reported to whom in March", "what was true then"), call
-   `mempalace_kg_query` instead or as well.
+   `palace_query KG` (or `mempalace_kg_query`) instead or as well.
 3. **If unsure** about a fact (name, age, relationship, preference): say
    "let me check the palace" and query. Wrong is worse than slow.
 4. **Return verbatim.** Quote the drawer's exact stored words. Never
    summarize, paraphrase, or lossy-compress what the palace returns —
    that is the whole point of the system.
 5. **After a substantive session**, record continuity with
-   `mempalace_diary_write` (background hooks may already do this — do not
+   `palace_exec DIARY WRITE` or `mempalace_diary_write` (background hooks may already do this — do not
    double-file).
-6. **When a fact changes**, call `mempalace_kg_invalidate` on the old
-   fact, then `mempalace_kg_add` for the new one.
+6. **When a fact changes**, choose the operation that preserves temporal
+   history: use `palace_exec KG SUPERSEDE` (or `mempalace_kg_supersede`) for single-valued replacements
+   (model, employer, owner, address, current status),
+   `palace_exec KG INVALIDATE` (or `mempalace_kg_invalidate`) for facts that ended without replacement,
+   and `palace_exec KG ADD` (or `mempalace_kg_add`) for independent/coexisting facts.
 
 ## Tool selection
 
-| You need | Tool |
-|---|---|
-| Find any memory by meaning | `mempalace_search` (start here) |
-| Relational / time-bound facts about an entity | `mempalace_kg_query` |
-| The chronological story of an entity | `mempalace_kg_timeline` |
-| Recent session continuity | `mempalace_diary_read` |
-| Which wings / rooms exist (when scope unknown) | `mempalace_list_wings`, `mempalace_list_rooms` |
-| Record this session | `mempalace_diary_write` |
+| You need | Light MCP (Preferred) | Full MCP (Legacy) |
+|---|---|---|
+| Find any memory by meaning | `palace_query FIND <terms>` | `mempalace_search` |
+| Relational / time-bound facts about an entity | `palace_query KG <entity>` | `mempalace_kg_query` |
+| Replace a single-valued fact | `palace_exec KG SUPERSEDE` | `mempalace_kg_supersede` |
+| The chronological story of an entity | `palace_query KG TIMELINE <entity>` | `mempalace_kg_timeline` |
+| Recent session continuity | `palace_query DIARY <agent>` | `mempalace_diary_read` |
+| Which wings / rooms exist (when scope unknown) | `palace_query WINGS`, `palace_query ROOMS` | `mempalace_list_wings`, `mempalace_list_rooms` |
+| Record this session | `palace_exec DIARY WRITE` | `mempalace_diary_write` |
 
 `mempalace_search` takes a short natural-language `query` (keywords or a
 question — not a system prompt or pasted conversation) plus optional
@@ -67,9 +71,40 @@ question — not a system prompt or pasted conversation) plus optional
 - **MCP unavailable / tool error.** Surface the error plainly and suggest
   the user verify the server (`mempalace status`, or re-run install).
   Do not silently fall back to guessing from model memory.
+- **Palace index corrupt / compactor error.** When the server returns an
+  error mentioning the HNSW segment writer, a ChromaDB compaction
+  failure, or a stuck "Not connected" state after a write, the on-disk
+  vector index is out of sync with `chroma.sqlite3` — but the drawer rows
+  are intact in SQLite. Recover by rebuilding the index from SQLite, not
+  by re-mining. See "Recovering a corrupt index" below. Do not attempt an
+  in-process repair from the agent; guide the user to run the CLI.
 - **Stale or conflicting facts.** Prefer the knowledge graph's
-  time-valid answer; if a fact has changed, invalidate the old one and
-  add the new one rather than overwriting context silently.
+  time-valid answer. Use `mempalace_kg_supersede` for single-valued replacements,
+  `mempalace_kg_invalidate` for facts that ended without replacement,
+  and `mempalace_kg_add` for independent/coexisting facts.
+
+## Recovering a corrupt index
+
+A ChromaDB compaction failure can leave the drawers HNSW index out of
+sync with `chroma.sqlite3` and wedge the MCP server (every call returns
+"Not connected"). The data is safe in SQLite; rebuild the index from it.
+Guide the user through these CLI steps — never run an in-process rebuild
+from the agent (it can break other live clients):
+
+1. Stop the MCP server (kill the `mempalace-mcp` process, or restart the
+   host editor).
+2. Optional backup of the palace directory (`--archive-existing` already
+   moves the old palace aside, so this is belt-and-suspenders):
+   - macOS / Linux: `cp -a ~/.mempalace/palace ~/.mempalace/palace.bak.$(date +%F)`
+   - Windows (PowerShell): `Copy-Item -Recurse "$env:USERPROFILE\.mempalace\palace" "$env:USERPROFILE\.mempalace\palace.bak"`
+3. Rebuild from SQLite:
+   `mempalace repair --mode from-sqlite --archive-existing --yes`
+4. Verify: `mempalace repair-status` (divergence should read 0).
+5. Restart the MCP server.
+
+Do **not** re-mine from source files to recover: re-mining drops drawers
+added through the MCP server and diary entries, which have no source file
+(see MemPalace issue #1843).
 
 ## Anti-patterns
 
@@ -86,5 +121,10 @@ question — not a system prompt or pasted conversation) plus optional
 
 - [`integrations/openclaw/SKILL.md`](../openclaw/SKILL.md) — the original
   full-protocol skill this is distilled from.
+- [`coordination-protocol.md`](coordination-protocol.md) — the shared-brain
+  companion protocol: when agents delegate work to each other over the
+  hub, they use the logstream (`mempalace_event_append` /
+  `mempalace_event_wait`), not drawers. Recall answers questions;
+  the logstream moves work.
 - MemPalace design principles (verbatim, local-first, never summarize):
   <https://github.com/MemPalace/mempalace>

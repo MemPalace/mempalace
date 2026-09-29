@@ -22,7 +22,7 @@ import hashlib
 # as legacy ``v1`` (pre-delimiter recipe), drawers with ``id_recipe="v2"``
 # are guaranteed collision-safe within the v2 generation. The constant is
 # exported so call sites use ``ids.ID_RECIPE`` rather than a magic string.
-ID_RECIPE: str = "v2"
+ID_RECIPE: str = "v3"
 
 # '|' is reserved in Windows filenames and cannot appear in source paths
 # on any supported platform, making it strictly safer than ':' (which
@@ -49,7 +49,7 @@ def _delimited_sha256(parts: tuple[object, ...], truncate: int) -> str:
     e.g. ``valid_from=None`` joins as the literal string ``"None"`` rather
     than crashing.
     """
-    key = _DELIM.join(str(p) for p in parts).encode()
+    key = "".join(f"{len(part)}:{part}" for part in map(str, parts)).encode()
     return hashlib.sha256(key).hexdigest()[:truncate]
 
 
@@ -106,6 +106,27 @@ def make_convo_sentinel_id(source_file: str, extract_mode: str) -> str:
     Hash input is ``f"{source_file}|{extract_mode}"``.
     """
     return f"_reg_{_delimited_sha256((source_file, extract_mode), _HASH_TRUNC_DRAWER)}"
+
+
+def make_exchange_drawer_id(
+    wing: str, room: str, source_file: str, filed_at: str, content: str
+) -> str:
+    """Drawer ID for a single verbatim conversation exchange.
+
+    Used by live agent integrations (e.g. Hermes) and their backfills via
+    ``convo_miner.file_conversation_exchange``. Hashes the FULL content,
+    not a prefix — prefix hashing collided on common openings ("User: hi
+    can you help me with…") and ChromaDB's upsert silently overwrote the
+    earlier drawer. ``filed_at`` is included so genuinely repeated
+    exchanges stay distinct drawers (verbatim always — repetition is
+    signal, not noise).
+
+    Hash input is ``f"{source_file}|{filed_at}|{content}"``.
+    """
+    return (
+        f"drawer_{wing}_{room}_"
+        f"{_delimited_sha256((source_file, filed_at, content), _HASH_TRUNC_DRAWER)}"
+    )
 
 
 def make_triple_id(

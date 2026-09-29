@@ -124,3 +124,98 @@ def test_add_wraps_bare_string_ids_and_dict_metadatas(monkeypatch):
     # documents / embeddings / ids / metadatas all length-aligned at 1
     assert call["documents"] == ["solo"]
     assert len(call["embeddings"]) == 1
+
+
+def test_facet_counts_forwards_to_inner():
+    """``BaseCollection.facet_counts`` is a concrete method (raises) — Python
+    MRO resolves it on the wrapper subclass before ``__getattr__`` ever fires,
+    so without an explicit forwarder the wrapper would raise
+    ``UnsupportedCapabilityError`` and silently degrade every wrapped backend
+    (qdrant/pgvector/sqlite_exact) to client-side counting in mcp_server."""
+
+    class _Inner:
+        def __init__(self):
+            self.calls = []
+
+        def facet_counts(self, field, where=None, limit=1000):
+            self.calls.append((field, where, limit))
+            return {"alpha": 2, "beta": 1}
+
+    inner = _Inner()
+    out = ew.EmbeddingCollection(inner).facet_counts("wing", where={"wing": "alpha"}, limit=50)
+    assert out == {"alpha": 2, "beta": 1}
+    assert inner.calls == [("wing", {"wing": "alpha"}, 50)]
+
+
+def test_get_all_metadata_forwards_to_inner():
+    """Same MRO-shadow pattern as ``facet_counts``: ``BaseCollection.get_all_
+    metadata`` ships a concrete default that pages through ``self.get()``.
+    Without this forwarder the wrapper runs the base default, the inner
+    backend's overridden ``get_all_metadata`` (e.g. pgvector's
+    ``with_document=False`` fast path from #1892) is unreachable, and every
+    metadata-only fetch transfers the full document column over the wire."""
+
+    class _Inner:
+        def __init__(self):
+            self.calls = []
+
+        def get_all_metadata(self, where=None):
+            self.calls.append(where)
+            return [{"wing": "alpha"}, {"wing": "beta"}]
+
+        # Provide a ``get`` so a missing forwarder would silently succeed via
+        # the BaseCollection default rather than crash — this is exactly the
+        # shape that hid the bug in production. Returning a sentinel here
+        # makes a wrong delegation observable: the test would receive
+        # ``[{"WRONG"}]``, not the inner's real list.
+        def get(self, **_kw):
+            from mempalace.backends.base import GetResult
+
+            return GetResult(ids=["bad"], documents=[""], metadatas=[{"WRONG": True}])
+
+    inner = _Inner()
+    out = ew.EmbeddingCollection(inner).get_all_metadata(where={"wing": "alpha"})
+    assert out == [{"wing": "alpha"}, {"wing": "beta"}]
+    assert inner.calls == [{"wing": "alpha"}]
+
+
+def test_wrapper_forwards_all_concrete_basecollection_methods():
+    """Every concrete (non-abstract) public method on ``BaseCollection`` must
+    be explicitly defined on ``EmbeddingCollection``. Without an override,
+    Python MRO resolves the call to ``BaseCollection``'s default before
+    ``__getattr__`` ever fires, silently shadowing the wrapped backend's real
+    implementation.
+
+    The bug class this catches: any new ``BaseCollection`` method with a
+    concrete default body (raises, returns ``{}``, returns a no-op, pages
+    through ``self.get()``) becomes a silent regression for every wrapped
+    backend the moment a backend overrides it. ``facet_counts`` (#1868) and
+    ``get_all_metadata`` (#1796 / #1892) both hit this; ``lexical_search``
+    would have hit it earlier if the wrapper hadn't been updated by hand.
+
+    If this test fails, add an explicit forwarder on ``EmbeddingCollection``
+    that calls ``self._inner.<name>(...)``."""
+    import inspect
+
+    from mempalace.backends.base import BaseCollection
+    from mempalace.backends.embedding_wrapper import EmbeddingCollection
+
+    concrete: set[str] = set()
+    for name, member in inspect.getmembers(BaseCollection):
+        if name.startswith("_"):
+            continue
+        if isinstance(member, property):
+            if member.fget and not getattr(member.fget, "__isabstractmethod__", False):
+                concrete.add(name)
+            continue
+        if callable(member) and not getattr(member, "__isabstractmethod__", False):
+            concrete.add(name)
+
+    forwarded = set(vars(EmbeddingCollection).keys())
+    missing = sorted(concrete - forwarded)
+    assert not missing, (
+        "EmbeddingCollection must explicitly forward these concrete "
+        "BaseCollection methods (otherwise MRO resolves the call here and "
+        "shadows the inner backend's implementation): "
+        f"{missing}"
+    )

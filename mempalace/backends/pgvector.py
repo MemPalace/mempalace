@@ -16,6 +16,17 @@ Isolation model (RFC 001 isolation contract): one table per
 table name, so this backend advertises ``supports_namespace_isolation`` and
 satisfies the cross-namespace conformance arm.
 
+Shared multi-node databases: the per-palace component of a table name is a
+hash of ``PalaceRef.id``, which is the palace's *local filesystem path*. That
+is the right default (two palaces on one host never collide), but it makes a
+palace shared by several machines shard silently — a laptop at
+``/Users/ada/.mempalace/palace`` and a server at ``/srv/mempalace/palace``
+pointed at one Postgres hash to different prefixes, so each node writes and
+reads its own private tables and no error is ever raised. Setting
+``pgvector_shared_namespace`` (see :func:`_shared_namespace_slug`) replaces
+that path hash with a name every node can agree on, so a fleet converges on
+one set of tables. Unset — the default — nothing changes.
+
 Dependency posture: the live client needs the optional ``psycopg`` dependency
 (``pip install mempalace[pgvector]``), imported lazily so the package imports
 fine without it. CI runs against an in-memory fake client; the live Postgres
@@ -37,6 +48,7 @@ from urllib import parse as urlparse
 
 import numpy as np
 
+from ..config import strip_lone_surrogates
 from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
     BackendClosedError,
@@ -53,16 +65,35 @@ from .base import (
     PalaceNotFoundError,
     PalaceRef,
     QueryResult,
+    UnsupportedCapabilityError,
     UnsupportedFilterError,
     _IncludeSpec,
 )
 
 logger = logging.getLogger(__name__)
 
+
+class _ConnectionLost(Exception):
+    """Internal signal: the server dropped the connection, retry is warranted.
+
+    Never escapes ``_PgVectorClient._execute`` — it is converted to
+    ``BackendError`` there, either after a successful retry never happens or
+    when a second attempt on a fresh connection is dropped too.
+    """
+
+    def __init__(self, cause: Exception):
+        super().__init__(str(cause))
+        self.cause = cause
+
+
 _DEFAULT_DSN = "postgresql://localhost:5432/mempalace"
 _MARKER_FILENAME = "pgvector_backend.json"
 _MAX_IDENTIFIER = 63  # Postgres identifier byte limit.
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
+# Shared-namespace normalization (see _shared_namespace_slug): separators that
+# fold to "_", and the character set the result must then consist of.
+_SHARED_NAMESPACE_SEPARATOR_RE = re.compile(r"[\s\-./:_]+")
+_SHARED_NAMESPACE_RE = re.compile(r"^[a-z0-9_]*[a-z0-9][a-z0-9_]*$")
 # Operators that translate to a JSONB containment predicate and so can be
 # pushed down to SQL. Comparisons, $or and $contains stay on the local exact
 # path (Python filtering), mirroring the Qdrant backend's local fallback.
@@ -70,6 +101,16 @@ _SUPPORTED_OPERATORS = frozenset(
     {"$eq", "$ne", "$in", "$nin", "$and", "$or", "$contains", "$gt", "$gte", "$lt", "$lte"}
 )
 _PUSHDOWN_OPERATORS = frozenset({"$eq", "$ne", "$in", "$nin", "$and"})
+# Bounds for the local-post-filter branch of ``get_recent``. The pushdown
+# branch needs none — SQL does ORDER BY ... LIMIT n and returns exactly n
+# rows. The post-filter branch cannot push the predicate, so it walks the
+# table newest-first in pages and stops as soon as ``limit`` rows match.
+# The page size trades round trips against rows on the wire; the row cap
+# bounds the pathological case (a filter that matches nothing in a large
+# table) so one call can never walk unboundedly.
+_RECENT_SCAN_PAGE_MIN = 500
+_RECENT_SCAN_PAGE_MAX = 5000
+_RECENT_SCAN_ROW_CAP = 50_000
 
 
 def _utcnow() -> str:
@@ -78,6 +119,42 @@ def _utcnow() -> str:
 
 def _json_dumps(obj: Any) -> str:
     return json.dumps(obj or {}, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _strip_nul(value: Any) -> Any:
+    """Recursively strip NUL (0x00) from strings, list/tuple items, and dict keys
+    and values so pgvector can store the result.
+
+    PostgreSQL cannot store NUL in ``text`` or ``jsonb``: psycopg rejects a raw
+    NUL in a text column ("PostgreSQL text fields cannot contain NUL (0x00)
+    bytes"), and a NUL in metadata serializes to a JSON unicode escape that the
+    ``jsonb`` cast rejects ("unsupported Unicode escape sequence"). A single
+    transcript that captured NUL in tool output would otherwise abort the whole
+    mine run (#1829). ChromaDB and the SQLite backend store the byte verbatim,
+    so stripping only here keeps the same inputs ingestible.
+
+    Applied to id, document, and metadata in :meth:`_PgVectorClient.upsert_rows`
+    so the write path never carries a NUL into Postgres. Only ``str`` values are
+    rewritten; the ``int``/``float``/``bool``/``None`` scalars JSON metadata
+    normalizes to pass through unchanged. Stripping is not injective, so two keys
+    (or ids)
+    differing only by a NUL collapse to one (last wins); this does not occur in
+    practice because drawer ids are SHA-256 hashes and metadata keys are fixed
+    field names, so only transcript-derived values are ever actually changed.
+    Unlike ``config.sanitize_content`` (which rejects NUL in user-supplied
+    content), the bulk-mine path strips so one stray byte cannot abort a whole
+    backfill. ``str.replace`` returns the original string when it holds no NUL,
+    so a clean document is not reallocated.
+    """
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {_strip_nul(key): _strip_nul(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_strip_nul(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_nul(item) for item in value)
+    return value
 
 
 def _tokenize(text: str) -> list[str]:
@@ -341,6 +418,90 @@ def _slug(value: str, fallback: str = "palace") -> str:
     return f"{safe[:35]}_{digest}"
 
 
+def _shared_namespace_slug(value: str) -> str:
+    """Normalize a shared-namespace setting into a safe Postgres identifier part.
+
+    ``pgvector_shared_namespace`` names a *logical* palace that several machines
+    share. Its whole contract is that every node derives the same table name
+    from it, so normalization is strict and total:
+
+    * lower-cased — identifiers are quoted by this backend, so ``Fleet`` and
+      ``fleet`` would otherwise be two different tables and re-introduce the
+      silent sharding this setting exists to prevent;
+    * common separators (whitespace, ``-``, ``.``, ``/``, ``:`` and ``_``
+      itself) collapse to a *single* ``_``, and leading/trailing ``_`` are
+      trimmed, so ``atk-fleet``, ``atk fleet``, ``atk__fleet`` and
+      ``atk_fleet`` are one namespace. ``_`` has to fold like every other
+      separator: leaving it alone made ``atk--fleet`` equal ``atk-fleet`` while
+      ``atk__fleet`` stayed distinct, so a doubled underscore in one node's
+      config sharded the fleet silently, which is the exact failure this
+      setting exists to prevent;
+    * anything left outside ``[a-z0-9_]`` — quotes, semicolons, non-ASCII — is
+      **rejected** with ``ValueError``.
+
+    Rejecting rather than scrubbing follows :func:`mempalace.config.sanitize_name`
+    and :func:`mempalace.config.normalize_milvus_consistency_level`, which also
+    raise ``ValueError`` on an unusable setting. It matters more here than it
+    does for :func:`_slug`: scrubbing maps distinct inputs onto one identifier
+    (``"日本"`` and ``"한국"`` both reduce to nothing), and two nodes quietly
+    landing on the same or different tables is exactly the failure this setting
+    is meant to make impossible. A loud error at config time is cheap; silently
+    mismatched fleet memory is not.
+
+    Over-length values are clamped here rather than by :func:`_slug`: 35 chars
+    (trailing ``_`` trimmed) plus a 12-hex digest of the normalized value, which
+    is deterministic across nodes. The clamp is written out instead of delegated
+    so the result never contains a doubled ``_``, which keeps this function
+    idempotent — :class:`_PgVectorConfig` re-normalizes an already-normalized
+    value on every reconstruction, so ``f(f(x)) != f(x)`` would silently move a
+    long namespace onto a second table. The final table name is additionally
+    clamped to Postgres' 63-byte limit by :func:`_pg_identifier`.
+    """
+    if not isinstance(value, str):
+        raise ValueError("pgvector_shared_namespace must be a string")
+    normalized = _SHARED_NAMESPACE_SEPARATOR_RE.sub("_", value.strip().lower()).strip("_")
+    if not normalized or not _SHARED_NAMESPACE_RE.match(normalized):
+        raise ValueError(
+            "pgvector_shared_namespace must contain at least one ASCII letter or "
+            "digit and may only use letters, digits, '_', '-', '.', '/', ':' and "
+            f"spaces (got {value!r})"
+        )
+    if len(normalized) <= 48:
+        return normalized
+    digest = sha256(normalized.encode("utf-8")).hexdigest()[:12]
+    return f"{normalized[:35].rstrip('_')}_{digest}"
+
+
+def _shared_namespace_key(namespace_slug: str, shared_namespace: str) -> str:
+    """Unambiguous table-prefix segment for a shared namespace.
+
+    The prefix is ``_``-joined and both the tenant namespace slug and the shared
+    namespace slug are variable length, so the readable spelling alone does not
+    determine the pair: namespace ``acme`` with shared namespace ``prod_fleet``
+    and namespace ``acme_prod`` with shared namespace ``fleet`` both render
+    ``mempalace_acme_prod_fleet``. Two unrelated tenants would land on one table
+    with no error — the same silent merge this feature exists to prevent, but
+    across the isolation boundary the backend advertises with
+    ``supports_namespace_isolation``.
+
+    A fixed-width digest of the *pair*, with an explicit boundary between the
+    two components, restores the information the join loses. It also keeps a
+    shared namespace from ever colliding with the default per-palace slot: that
+    slot is 16 hex characters, and ``<slug>_<12 hex>`` cannot spell 16 hex
+    characters because ``_`` is not a hex digit.
+
+    ``namespace_slug`` is the *slugged* tenant segment, not the raw setting, so
+    the tenant dimension keeps exactly the identity it has today: two raw
+    namespaces that already slug alike stay one tenant whether or not a shared
+    namespace is set.
+
+    Palaces without a shared namespace keep byte-identical table names, so this
+    costs no migration.
+    """
+    digest = sha256(f"{namespace_slug}\x00{shared_namespace}".encode("utf-8")).hexdigest()[:12]
+    return f"{shared_namespace}_{digest}"
+
+
 def _pg_identifier(name: str) -> str:
     """Clamp an identifier to Postgres' 63-byte limit, hashing the overflow."""
     if len(name.encode("utf-8")) <= _MAX_IDENTIFIER:
@@ -429,8 +590,28 @@ def _where_to_sql(where: Optional[dict], params: list) -> str:
 
 @dataclass(frozen=True)
 class _PgVectorConfig:
+    """Resolved pgvector target.
+
+    ``namespace`` is the tenant dimension (``PalaceRef.namespace`` /
+    ``pgvector_namespace``): it partitions *in addition to* the palace.
+    ``shared_namespace`` is the fleet dimension (``pgvector_shared_namespace``):
+    it *replaces* the per-palace path hash so several machines converge on one
+    set of tables. The two are orthogonal and may be combined.
+
+    ``shared_namespace`` is normalized and validated on construction, so every
+    instance holds a value that is already a safe identifier part.
+    """
+
     dsn: str = _DEFAULT_DSN
     namespace: Optional[str] = None
+    shared_namespace: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.shared_namespace is None:
+            return
+        # frozen dataclass: normalize in place so every construction path
+        # (from_options, _table_name's re-derivation, direct calls) validates.
+        object.__setattr__(self, "shared_namespace", _shared_namespace_slug(self.shared_namespace))
 
     @classmethod
     def from_options(cls, options: Optional[dict] = None) -> "_PgVectorConfig":
@@ -453,9 +634,15 @@ class _PgVectorConfig:
             or os.environ.get("MEMPALACE_PGVECTOR_NAMESPACE")
             or getattr(cfg, "pgvector_namespace", None)
         )
+        shared_namespace = (
+            options.get("shared_namespace")
+            or os.environ.get("MEMPALACE_PGVECTOR_SHARED_NAMESPACE")
+            or getattr(cfg, "pgvector_shared_namespace", None)
+        )
         return cls(
             dsn=str(dsn).strip() or _DEFAULT_DSN,
             namespace=str(namespace).strip() or None if namespace else None,
+            shared_namespace=str(shared_namespace).strip() or None if shared_namespace else None,
         )
 
 
@@ -465,11 +652,10 @@ class _PgVectorClient:
     def __init__(self, config: _PgVectorConfig):
         self._config = config
         self._conn = None
+        self._closed = False
         self._lock = threading.RLock()
 
     def _connect(self):
-        if self._conn is not None and not getattr(self._conn, "closed", False):
-            return self._conn
         try:
             import psycopg
         except ImportError as exc:  # pragma: no cover - exercised only without the extra
@@ -477,31 +663,112 @@ class _PgVectorClient:
                 "pgvector backend requires the optional 'psycopg' dependency; "
                 "install mempalace[pgvector]"
             ) from exc
+        # One client is shared across threads (PgVectorBackend caches a
+        # single instance per config), so the read-create-store on self._conn
+        # must hold the same lock _execute serializes on; unlocked, two
+        # first-connect threads each opened a connection and the loser leaked
+        # unclosed. The RLock makes the _execute -> _connect nesting safe. A
+        # stalled connect blocks peers under the lock the same way any
+        # in-flight query on this single shared connection already does.
+        with self._lock:
+            if self._closed:
+                raise BackendError("pgvector client has been closed")
+            if self._conn is not None and not getattr(self._conn, "closed", False):
+                return self._conn
+            try:
+                self._conn = psycopg.connect(self._config.dsn)
+            except Exception as exc:  # noqa: BLE001 - surface any driver failure uniformly
+                raise BackendError(f"pgvector connection failed: {exc}") from exc
+            return self._conn
+
+    def _discard_connection(self) -> None:
+        """Drop the pooled connection so the next ``_connect`` opens a new one.
+
+        Called only after the server has already dropped its end, so the close
+        is best-effort: the handle is being thrown away either way.
+        """
+        conn, self._conn = self._conn, None
+        if conn is None:
+            return
         try:
-            self._conn = psycopg.connect(self._config.dsn)
-        except Exception as exc:  # noqa: BLE001 - surface any driver failure uniformly
-            raise BackendError(f"pgvector connection failed: {exc}") from exc
-        return self._conn
+            conn.close()
+        except Exception:  # pragma: no cover - closing a dead handle is best effort
+            pass
+
+    @staticmethod
+    def _is_connection_lost(conn, exc: Exception) -> bool:
+        """True when ``exc`` means the server dropped the connection.
+
+        The pooled connection outlives any single query, so a Postgres restart
+        (package upgrade, failover, an operator's ``pg_ctl restart``) leaves a
+        handle that looks alive until the next statement runs on it. That first
+        statement is the one that surfaces the drop; retrying it on a fresh
+        connection is what a short-lived client would have done implicitly.
+
+        Two signals, both required to be about the *connection* rather than the
+        statement:
+
+        * SQLSTATE class ``57`` (operator intervention) — ``57P01`` admin
+          shutdown, ``57P02`` crash shutdown, ``57P03`` cannot connect now.
+        * A driver error raised on a handle psycopg has already marked closed
+          or broken, which is how a mid-query TCP drop arrives (no SQLSTATE,
+          because no server response came back to carry one).
+
+        A statement-level failure — bad SQL, constraint violation, type error —
+        leaves the connection usable and must propagate unchanged: retrying it
+        would run the same failing statement twice and report the second one.
+        """
+        sqlstate = getattr(exc, "sqlstate", None) or getattr(
+            getattr(exc, "diag", None), "sqlstate", None
+        )
+        if isinstance(sqlstate, str) and sqlstate.startswith("57"):
+            return True
+        # ``closed``/``broken`` are psycopg's own view of the handle; consult
+        # them only when no SQLSTATE arrived, so a live connection that merely
+        # rejected the statement is never treated as lost.
+        if sqlstate:
+            return False
+        return bool(getattr(conn, "closed", False) or getattr(conn, "broken", False))
+
+    def _execute_once(self, sql: str, params=None, *, fetch: bool = False, many: bool = False):
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                if many:
+                    cur.executemany(sql, params or [])
+                    rows = None
+                else:
+                    cur.execute(sql, params or [])
+                    rows = cur.fetchall() if fetch else None
+            conn.commit()
+        except Exception as exc:  # noqa: BLE001 - normalize to BackendError
+            try:
+                conn.rollback()
+            except Exception:  # pragma: no cover - rollback best effort
+                pass
+            raise (
+                _ConnectionLost(exc)
+                if self._is_connection_lost(conn, exc)
+                else BackendError(f"pgvector query failed: {exc}")
+            ) from exc
+        return rows
 
     def _execute(self, sql: str, params=None, *, fetch: bool = False, many: bool = False):
-        conn = self._connect()
         with self._lock:
             try:
-                with conn.cursor() as cur:
-                    if many:
-                        cur.executemany(sql, params or [])
-                        rows = None
-                    else:
-                        cur.execute(sql, params or [])
-                        rows = cur.fetchall() if fetch else None
-                conn.commit()
-            except Exception as exc:  # noqa: BLE001 - normalize to BackendError
+                return self._execute_once(sql, params, fetch=fetch, many=many)
+            except _ConnectionLost:
+                # The server dropped the connection out from under a statement
+                # that never ran on it. Reconnect and run it once more; a second
+                # drop is a real outage rather than a stale pooled handle, so it
+                # surfaces as the BackendError callers already expect.
+                self._discard_connection()
                 try:
-                    conn.rollback()
-                except Exception:  # pragma: no cover - rollback best effort
-                    pass
-                raise BackendError(f"pgvector query failed: {exc}") from exc
-        return rows
+                    return self._execute_once(sql, params, fetch=fetch, many=many)
+                except _ConnectionLost as second:
+                    raise BackendError(
+                        f"pgvector query failed after reconnect: {second.cause}"
+                    ) from second.cause
 
     def ping(self) -> None:
         self._execute("SELECT 1", fetch=True)
@@ -570,9 +837,21 @@ class _PgVectorClient:
         )
         params = [
             (
-                row["id"],
-                row["document"],
-                _json_dumps(row.get("metadata")),
+                # Strip both unstorable byte classes Postgres rejects before
+                # binding, so one stray byte in a transcript cannot abort the
+                # whole mine (#1829 NUL, #1833 lone surrogate).
+                #
+                # Order matters for metadata: NUL must be stripped *before*
+                # serialization (json escapes it to \\u0000, which the jsonb cast
+                # rejects), while a lone surrogate must be stripped *after*
+                # serialization (json.dumps(ensure_ascii=False) leaves it raw, so
+                # one pass over the serialized string cleans it without walking
+                # the dict). id/document are plain strings, so the two passes
+                # commute there. ids are NUL- and surrogate-free in practice, so
+                # those passes are defensive no-ops on the ON CONFLICT key.
+                strip_lone_surrogates(_strip_nul(row["id"])),
+                strip_lone_surrogates(_strip_nul(row["document"])),
+                strip_lone_surrogates(_json_dumps(_strip_nul(row.get("metadata")))),
                 _vector_literal(row["embedding"]),
                 row.get("updated_at") or _utcnow(),
             )
@@ -614,14 +893,49 @@ class _PgVectorClient:
         *,
         where: Optional[dict] = None,
         with_embedding: bool = False,
+        with_document: bool = True,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        order_field: Optional[str] = None,
     ) -> list[dict]:
         qi = _quote_identifier(table)
         params: list = []
         where_sql = _where_to_sql(where, params) if where else "TRUE"
-        cols = "id, document, metadata"
+        # Project NULL into the document slot when the caller only needs
+        # metadata (e.g. mempalace_status's wing/room tally). Keeps the
+        # positional _row parser unchanged — document remains record[1] —
+        # while avoiding O(n × document_size) bytes over the wire on remote
+        # pgvector deployments. Follow-up to #1840.
+        cols = "id, document, metadata" if with_document else "id, NULL::text, metadata"
         if with_embedding:
             cols += ", embedding"
         sql = f"SELECT {cols} FROM {qi} WHERE {where_sql}"
+        # Push pagination into SQL when a page is requested. ORDER BY the
+        # primary key gives OFFSET a stable order (an unordered scan may skip
+        # or repeat rows across pages); callers that scroll the whole table
+        # pass neither bound, leaving their SQL unchanged.
+        if order_field is not None:
+            # Newest-first on an ISO-8601 metadata field. ISO-8601 sorts
+            # chronologically as text, so ``metadata->>field DESC`` needs no
+            # timestamp cast (a cast would also fail hard on one malformed
+            # value). NULLS LAST keeps records without the field at the end;
+            # ``id`` breaks ties so the order is total and stable.
+            params.append(order_field)
+            sql += " ORDER BY metadata->>%s DESC NULLS LAST, id"
+            if limit is not None:
+                params.append(int(limit))
+                sql += " LIMIT %s"
+            if offset:
+                params.append(int(offset))
+                sql += " OFFSET %s"
+        elif limit is not None or offset:
+            sql += " ORDER BY id"
+            if limit is not None:
+                params.append(int(limit))
+                sql += " LIMIT %s"
+            if offset:
+                params.append(int(offset))
+                sql += " OFFSET %s"
         rows = self._execute(sql, params, fetch=True)
         return [
             self._row(record, with_embedding=with_embedding, with_distance=False)
@@ -646,6 +960,29 @@ class _PgVectorClient:
     def count_rows(self, table: str) -> int:
         rows = self._execute(f"SELECT count(*) FROM {_quote_identifier(table)}", fetch=True)
         return int(rows[0][0]) if rows and rows[0] else 0
+
+    def facet_counts(
+        self,
+        table: str,
+        *,
+        field: str,
+        where: Optional[dict] = None,
+        limit: int = 1000,
+    ) -> dict[str, int]:
+        qi = _quote_identifier(table)
+        params: list = [field]
+        where_sql = _where_to_sql(where, params) if where else "TRUE"
+        sql = (
+            f"SELECT metadata->>%s AS k, count(*) AS c "
+            f"FROM {qi} WHERE {where_sql} "
+            f"GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT %s"
+        )
+        params.append(int(limit))
+        rows = self._execute(sql, params, fetch=True)
+        # Exclude NULL bucket: matches Qdrant's facet semantics; mcp_server
+        # reconciles missing values into "unknown" via the count diff
+        # (count(*) - sum(facet_values)).
+        return {str(row[0]): int(row[1]) for row in rows if row[0] is not None}
 
     def drop_table(self, table: str) -> None:
         self._execute(f"DROP TABLE IF EXISTS {_quote_identifier(table)}")
@@ -684,7 +1021,12 @@ class _PgVectorClient:
         self._execute(f"ANALYZE {_quote_identifier(table)}")
 
     def close(self) -> None:
+        # Terminal: the only caller is PgVectorBackend.close(), after which
+        # the backend refuses to hand the client out again. Without the flag a
+        # stale reference would silently reconnect and leak a session nobody
+        # can ever close.
         with self._lock:
+            self._closed = True
             if self._conn is not None:
                 try:
                     self._conn.close()
@@ -776,13 +1118,58 @@ class PgVectorCollection(BaseCollection):
                 )
             self._known_dimension = existing_dim or dimension
 
-    def _scroll(self, *, where=None, with_embedding=False) -> list[dict]:
+    def _scroll(
+        self,
+        *,
+        where=None,
+        with_embedding=False,
+        with_document=True,
+        limit=None,
+        offset=None,
+        order_field=None,
+    ) -> list[dict]:
         self._ensure_open()
         if not self._table_exists():
             if self._marker_exists():
                 raise CollectionNotInitializedError(self._collection_name)
             return []
-        return self._client.scroll_rows(self._table, where=where, with_embedding=with_embedding)
+        return self._client.scroll_rows(
+            self._table,
+            where=where,
+            with_embedding=with_embedding,
+            with_document=with_document,
+            limit=limit,
+            offset=offset,
+            order_field=order_field,
+        )
+
+    def get_all_metadata(self, where=None) -> list[dict]:
+        """Single-pass metadata-only fetch — projects out the document column.
+
+        The base implementation pages through ``get(include=["metadatas"])``,
+        which routes here via ``_scroll`` and (pre-this-override) always sent
+        the ``document`` text over the wire even when nothing consumed it.
+        For pgvector deployments where the client is remote (TLS over WAN),
+        that meant ``mempalace_status`` transferred O(n × document_size)
+        bytes per call, dominating wall time. With ``with_document=False``
+        the SELECT replaces document with NULL, dropping the per-row payload
+        to id + metadata for every caller of this method.
+
+        Filtered fetches still need the ``_matches_where`` post-filter for
+        non-pushdown semantics (array/object values where ``metadata @> ...``
+        is broader than the exact match the caller asked for — same
+        correctness contract as #1840's filtered ``get`` path). Since that
+        post-filter only reads ``metadata``, we keep the single-scroll +
+        ``with_document=False`` fast path and just apply the filter locally
+        on the metadata dicts before returning. This extends the wire-byte
+        win to filtered callers as well.
+        """
+        _validate_where(where)
+        pushdown = None if _requires_local_filter(where) else where
+        rows = self._scroll(where=pushdown, with_document=False)
+        if where is None:
+            return [row["metadata"] for row in rows]
+        return [row["metadata"] for row in rows if _matches_where(row["metadata"], where)]
 
     def _rows(
         self,
@@ -1001,16 +1388,186 @@ class PgVectorCollection(BaseCollection):
         include=None,
     ) -> GetResult:
         spec = _IncludeSpec.resolve(include, default_distances=False)
-        rows = self._rows(
-            ids=ids, where=where, where_document=where_document, with_embedding=spec.embeddings
+        # Fast path for the common unfiltered page fetch (e.g.
+        # prefetch_mined_set's sweep): push LIMIT/OFFSET into the scan instead
+        # of fetching the whole table and slicing in Python, which is the
+        # O(rows x pages) cost this avoids. Only the no-filter case is pushed:
+        # the "metadata @> ..." pushdown is broader than the exact
+        # _matches_where re-filter for array/object values, so any filtered get
+        # keeps the full-scan path where that re-filter still runs. ids, where,
+        # where_document and negative bounds all fall through to the unchanged
+        # path below. (The document column is still selected for metadata-only
+        # pages; projecting it out needs the positional _row parser to change,
+        # so it stays a separate follow-up.)
+        push_page = (
+            ids is None
+            and not where
+            and not where_document
+            and (limit is None or limit >= 0)
+            and (offset is None or offset >= 0)
+            and (limit is not None or offset)
         )
-        if ids is not None:
-            by_id = {row["id"]: row for row in rows}
-            rows = [by_id[doc_id] for doc_id in ids if doc_id in by_id]
-        if offset:
-            rows = rows[offset:]
-        if limit is not None:
-            rows = rows[:limit]
+        if push_page:
+            rows = self._scroll(
+                where=None, with_embedding=spec.embeddings, limit=limit, offset=offset
+            )
+        else:
+            rows = self._rows(
+                ids=ids, where=where, where_document=where_document, with_embedding=spec.embeddings
+            )
+            if ids is not None:
+                by_id = {row["id"]: row for row in rows}
+                rows = [by_id[doc_id] for doc_id in ids if doc_id in by_id]
+            if offset:
+                rows = rows[offset:]
+            if limit is not None:
+                rows = rows[:limit]
+        return GetResult(
+            ids=[row["id"] for row in rows],
+            documents=[row["document"] for row in rows] if spec.documents else [],
+            metadatas=[row["metadata"] for row in rows] if spec.metadatas else [],
+            embeddings=[row["embedding"] or [] for row in rows] if spec.embeddings else None,
+        )
+
+    def _scroll_recent_local(self, *, where, limit, order_field, with_embedding, with_document):
+        """Newest-first paged scan with the filter applied in Python.
+
+        Used when ``where`` is not exactly expressible as ``metadata @> ...``
+        ($or, comparisons, ...). The predicate cannot ride along, but the
+        *ordering* still can, so instead of dragging the whole table across
+        the wire to keep ``limit`` rows we walk it newest-first one SQL page
+        at a time and stop at the first page that completes the answer. On
+        the common shape (a filter most rows match) that is a single page.
+
+        Page stability: ``ORDER BY metadata->>field DESC NULLS LAST, id`` is a
+        total order because ``id`` is the primary key, so OFFSET paging is
+        well defined — the same guarantee the existing ``ORDER BY id`` paging
+        in :meth:`_PgVectorClient.scroll_rows` relies on. Concurrent writes
+        can still shift rows across a page boundary: an insert of a newer row
+        pushes one row down and would hand it back twice, which the ``seen``
+        set drops, and a delete pulls one row up and can skip it. That skip
+        window is inherent to OFFSET paging and is unchanged from the
+        pre-existing paged ``get``; a keyset cursor would close it and is a
+        separate change.
+
+        Bounded, not exhaustive: the walk stops after ``_RECENT_SCAN_ROW_CAP``
+        rows, so a filter that matches almost nothing in a huge table returns
+        fewer than ``limit`` rows rather than reading the table. Because the
+        walk is newest-first, what it does return is still the newest matching
+        rows within the newest ``_RECENT_SCAN_ROW_CAP`` records — a much
+        tighter approximation than the base class's storage-order window, but
+        an approximation, unlike the pushdown branch which is exact at any
+        table size.
+        """
+        # ``limit`` is ``int`` in the contract; the ``None`` the caller's
+        # guard tolerates means "no bound", which on this branch is the cap.
+        target = _RECENT_SCAN_ROW_CAP if limit is None else int(limit)
+        page_size = max(_RECENT_SCAN_PAGE_MIN, min(target, _RECENT_SCAN_PAGE_MAX))
+        matched: list[dict] = []
+        seen: set[str] = set()
+        offset = 0
+        scanned = 0
+        while len(matched) < target and scanned < _RECENT_SCAN_ROW_CAP:
+            want = min(page_size, _RECENT_SCAN_ROW_CAP - scanned)
+            page = self._scroll(
+                where=None,
+                with_embedding=with_embedding,
+                with_document=with_document,
+                limit=want,
+                offset=offset or None,
+                order_field=order_field,
+            )
+            if not page:
+                break
+            scanned += len(page)
+            offset += len(page)
+            for row in page:
+                if row["id"] in seen:
+                    continue
+                seen.add(row["id"])
+                if _matches_where(row["metadata"], where):
+                    matched.append(row)
+                    if len(matched) >= target:
+                        break
+            if len(page) < want:
+                break  # short page — end of table
+        return matched[:target]
+
+    def get_recent(self, *, limit, where=None, order_field="filed_at", include=None):
+        """Newest-first fetch with the ordering pushed into SQL.
+
+        The base implementation scans a window in storage order and sorts it
+        locally, so on a collection larger than ``limit`` the genuinely newest
+        records can be missing from the window entirely (#1630). Postgres can
+        do the whole thing: ``ORDER BY metadata->>'filed_at' DESC ... LIMIT n``
+        picks the true top ``limit`` under that ordering at any table size,
+        which is why this backend advertises ``supports_recency_order``.
+
+        Filters that ``metadata @> ...`` cannot express exactly ($or,
+        comparisons, ...) keep the local post-filter contract that ``get``
+        uses, but they do *not* fetch the table to do it: the ordering is
+        still pushed into SQL and :meth:`_scroll_recent_local` walks the
+        result newest-first a page at a time, stopping as soon as ``limit``
+        rows match.
+
+        **This is the one case where ``supports_recency_order`` is weaker than
+        it sounds.** That walk is capped, so a non-pushdown filter matching
+        very little in a very large table returns fewer than ``limit`` records
+        rather than reading the table. The token covers the filters this
+        backend can push down, which is every filter Layer 1 uses (``None`` or
+        ``{"wing": ...}``) and everything built from ``$eq``/``$ne``/``$in``/
+        ``$nin``/``$and``. See :meth:`_scroll_recent_local` for the bound and
+        for what the capped answer still guarantees.
+
+        ``limit=None`` is outside the contract (the signature is ``int``). The
+        pushdown branch treats it as unbounded; the local branch cannot, and
+        treats it as the scan cap.
+
+        Ordering is on the JSON *text* of ``order_field``, matching the text
+        ordering :func:`recency_sort_key` already applies in Layer 1. See that
+        function for what text ordering does and does not promise; this method
+        inherits those limits rather than introducing them. At least three
+        places where the SQL order and ``recency_sort_key`` differ, none of
+        them reachable through anything that writes ``filed_at``:
+
+        * a JSON value that is not a string sorts by its text form here but
+          sorts last there;
+        * an empty string sorts above SQL NULL here but ties with a missing
+          key there;
+        * both ``metadata->>%s`` and the ``id`` tiebreak sort under the
+          database collation, while ``recency_sort_key`` sorts by Python
+          codepoint. Under a collation such as ``en_US.UTF-8`` punctuation is
+          weighted differently, so the two can disagree on timestamps that
+          differ only in punctuation (``+00:00`` against ``Z``). The test
+          double emulates the ordering in Python and so cannot catch this.
+        """
+        if limit is not None and limit <= 0:
+            return GetResult.empty()
+        _validate_where(where)
+        spec = _IncludeSpec.resolve(include, default_distances=False)
+        if _requires_local_filter(where):
+            rows = self._scroll_recent_local(
+                where=where,
+                limit=limit,
+                order_field=order_field,
+                with_embedding=spec.embeddings,
+                # The post-filter reads only ``metadata``, and this branch can
+                # scan far more rows than it returns, so project the document
+                # text out unless the caller actually asked for it (#1840's
+                # wire-byte win). The pushdown branch below is left alone: it
+                # fetches ``limit`` rows, so the projection is worth little
+                # there and not worth changing that path's SQL for. (It would
+                # still pay off for ``limit=None``, which is outside the
+                # contract; fold it in when that path grows a real caller.)
+                with_document=spec.documents,
+            )
+        else:
+            rows = self._scroll(
+                where=where,
+                with_embedding=spec.embeddings,
+                limit=limit,
+                order_field=order_field,
+            )
         return GetResult(
             ids=[row["id"] for row in rows],
             documents=[row["document"] for row in rows] if spec.documents else [],
@@ -1041,6 +1598,26 @@ class PgVectorCollection(BaseCollection):
                 raise CollectionNotInitializedError(self._collection_name)
             return 0
         return self._client.count_rows(self._table)
+
+    def facet_counts(
+        self,
+        field: str,
+        where: Optional[dict] = None,
+        limit: int = 1000,
+    ) -> dict[str, int]:
+        self._ensure_open()
+        # Validate the filter before the existence short-circuit so an
+        # unsupported local-only filter raises even on an unmaterialized
+        # collection — matches the order used by get()/lexical_search() and
+        # qdrant.facet_counts (PR #1868 review).
+        _validate_where(where)
+        if _requires_local_filter(where):
+            raise UnsupportedCapabilityError("facet_counts does not support local-only filters")
+        if not self._table_exists():
+            if self._marker_exists():
+                raise CollectionNotInitializedError(self._collection_name)
+            return {}
+        return self._client.facet_counts(self._table, field=field, where=where, limit=limit)
 
     def lexical_search(self, *, query: str, n_results: int = 10, where: Optional[dict] = None):
         _validate_where(where)
@@ -1139,6 +1716,8 @@ class PgVectorBackend(BaseBackend):
             "supports_embeddings_out",
             "supports_metadata_filters",
             "supports_lexical_search",
+            "supports_metadata_facets",
+            "supports_recency_order",
             "supports_namespace_isolation",
             "supports_server_side_indexes",
             "server_mode",
@@ -1168,10 +1747,32 @@ class PgVectorBackend(BaseBackend):
         return sha256(palace.id.encode("utf-8", errors="surrogatepass")).hexdigest()[:16]
 
     def _table_prefix(self, *, palace: PalaceRef, config: _PgVectorConfig) -> str:
+        """Table-name prefix for one palace: ``mempalace[_<namespace>]_<key>``.
+
+        ``<key>`` is normally :meth:`_palace_hash` — a hash of the palace's local
+        path — which keeps two palaces on one host apart. When
+        ``shared_namespace`` is configured it takes that slot instead, and the
+        prefix stops depending on the local path entirely: every node that sets
+        the same ``pgvector_shared_namespace`` against the same DSN resolves the
+        same tables, which is what makes a fleet share one memory store rather
+        than silently shard into a private table set per machine.
+
+        That substitution is deliberate and opt-in: within one shared namespace,
+        distinct local palace paths are declared to *be* the same logical palace,
+        so the per-palace partition no longer applies to them. Palaces that must
+        stay apart need distinct namespaces (or no shared namespace at all).
+        ``namespace`` — the tenant dimension — still partitions either way, and
+        :func:`_shared_namespace_key` carries a digest of the pair so the
+        variable-length join cannot smear the two dimensions into each other.
+        """
         parts = ["mempalace"]
-        if config.namespace:
-            parts.append(_slug(config.namespace, "namespace"))
-        parts.append(self._palace_hash(palace))
+        namespace_slug = _slug(config.namespace, "namespace") if config.namespace else ""
+        if namespace_slug:
+            parts.append(namespace_slug)
+        if config.shared_namespace:
+            parts.append(_shared_namespace_key(namespace_slug, config.shared_namespace))
+        else:
+            parts.append(self._palace_hash(palace))
         return "_".join(parts)
 
     def _table_name(
@@ -1180,6 +1781,7 @@ class PgVectorBackend(BaseBackend):
         config = _PgVectorConfig(
             dsn=config.dsn,
             namespace=palace.namespace or config.namespace,
+            shared_namespace=config.shared_namespace,
         )
         prefix = self._table_prefix(palace=palace, config=config)
         return _pg_identifier(f"{prefix}_{_slug(collection_name, 'collection')}")
@@ -1200,6 +1802,13 @@ class PgVectorBackend(BaseBackend):
         target.update(
             {
                 "namespace": config.namespace,
+                # Recorded even when a shared namespace displaces it from the
+                # table name, so a marker still identifies the node that wrote
+                # it. Absent from pre-existing markers, "shared_namespace"
+                # compares equal to the unset default, so old markers keep
+                # validating; setting one changes "table_prefix" too and is
+                # correctly reported as a target change.
+                "shared_namespace": config.shared_namespace,
                 "palace_hash": self._palace_hash(palace),
                 "table_prefix": self._table_prefix(palace=palace, config=config),
             }
@@ -1285,9 +1894,12 @@ class PgVectorBackend(BaseBackend):
 
     # ------------------------------------------------------------------
     def _client(self, config: _PgVectorConfig) -> _PgVectorClient:
-        if self._closed:
-            raise BackendClosedError("PgVectorBackend has been closed")
         with self._lock:
+            # Checked under the lock so a client cannot be created and stored
+            # concurrently with close() clearing the registry (mirrors
+            # SQLiteExactBackend._connect).
+            if self._closed:
+                raise BackendClosedError("PgVectorBackend has been closed")
             client = self._clients.get(config)
             if client is None:
                 client = _PgVectorClient(config)
@@ -1298,7 +1910,11 @@ class PgVectorBackend(BaseBackend):
         palace, collection_name, create, options = self._normalize_args(args, kwargs)
         config = _PgVectorConfig.from_options(options)
         if palace.namespace and palace.namespace != config.namespace:
-            config = _PgVectorConfig(dsn=config.dsn, namespace=palace.namespace)
+            config = _PgVectorConfig(
+                dsn=config.dsn,
+                namespace=palace.namespace,
+                shared_namespace=config.shared_namespace,
+            )
         client = self._client(config)
         if palace.local_path:
             marker_path = self._marker_path(palace.local_path)

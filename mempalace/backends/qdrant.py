@@ -24,6 +24,7 @@ from urllib import request as urlrequest
 
 import numpy as np
 
+from ..version import __version__
 from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
     BackendClosedError,
@@ -40,6 +41,7 @@ from .base import (
     PalaceNotFoundError,
     PalaceRef,
     QueryResult,
+    UnsupportedCapabilityError,
     UnsupportedFilterError,
     _IncludeSpec,
 )
@@ -53,6 +55,20 @@ _PAYLOAD_DOCUMENT = "document"
 _PAYLOAD_METADATA = "metadata"
 _POINT_NAMESPACE = uuid.UUID("c06c3fc7-5c14-4dc4-84c2-24a5f72d8dc1")
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
+# Page size for Qdrant's /points/scroll cursor. 4096 (up from the original
+# 256) cuts REST round-trips ~16x for any full-collection walk (#1796).
+# Qdrant's own docs suggest larger scroll batches are safe, and this is well
+# below typical REST payload-size limits for metadata-only (with_vector=False)
+# scrolls such as get_all_metadata().
+#
+# This constant also governs vector-bearing scrolls (with_vector=True), used
+# by _rows()/get() when embeddings are requested and by _query_local_exact()
+# for the $or/$contains local-filter query fallback. At 4096 rows per page,
+# high-dimensional embeddings make those particular responses tens of MB --
+# Qdrant handles it and round-trips still drop overall, but this is a real
+# trade-off, not a metadata-only optimization. (Noted in maintainer review
+# on #1832.)
+_SCROLL_PAGE_SIZE = 4096
 _SUPPORTED_OPERATORS = frozenset(
     {"$eq", "$ne", "$in", "$nin", "$and", "$or", "$contains", "$gt", "$gte", "$lt", "$lte"}
 )
@@ -368,7 +384,10 @@ class _QdrantRESTClient:
         if query:
             url = f"{url}?{urlparse.urlencode(query)}"
         data = None
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": f"mempalace/{__version__}",
+        }
         if self._config.api_key:
             headers["api-key"] = self._config.api_key
         if body is not None:
@@ -480,7 +499,7 @@ class _QdrantRESTClient:
         collection: str,
         *,
         qdrant_filter: Optional[dict] = None,
-        limit: int = 256,
+        limit: int = _SCROLL_PAGE_SIZE,
         offset: Any = None,
         with_vector: bool = False,
     ) -> tuple[list[dict], Any]:
@@ -528,6 +547,38 @@ class _QdrantRESTClient:
         )
         result = response.get("result") or {}
         return int(result.get("count") or 0)
+
+    def facet_counts(
+        self,
+        collection: str,
+        *,
+        field: str,
+        qdrant_filter: Optional[dict] = None,
+        limit: int = 1000,
+    ) -> dict[str, int]:
+        body: dict[str, Any] = {
+            "key": field,
+            "exact": True,
+            "limit": limit,
+        }
+
+        if qdrant_filter:
+            body["filter"] = qdrant_filter
+
+        response = self.request(
+            "POST",
+            f"/collections/{urlparse.quote(collection, safe='')}/facet",
+            body=body,
+        )
+
+        result = response.get("result") or {}
+        hits = result.get("hits") or []
+
+        return {
+            str(hit["value"]): int(hit.get("count") or 0)
+            for hit in hits
+            if hit.get("value") is not None
+        }
 
     def delete_collection(self, collection: str) -> None:
         self.request("DELETE", f"/collections/{urlparse.quote(collection, safe='')}")
@@ -720,6 +771,7 @@ class QdrantCollection(BaseCollection):
         *,
         qdrant_filter: Optional[dict] = None,
         with_vector: bool = False,
+        max_rows: Optional[int] = None,
     ) -> list[dict]:
         self._ensure_open()
         if not self._remote_exists():
@@ -729,14 +781,19 @@ class QdrantCollection(BaseCollection):
         rows = []
         offset = None
         while True:
+            page_limit = _SCROLL_PAGE_SIZE
+            if max_rows is not None:
+                page_limit = min(page_limit, max_rows - len(rows))
             points, offset = self._client.scroll_points(
                 self._remote_collection,
                 qdrant_filter=qdrant_filter,
-                limit=256,
+                limit=page_limit,
                 offset=offset,
                 with_vector=with_vector,
             )
             rows.extend(_payload_row(point) for point in points)
+            if max_rows is not None and len(rows) >= max_rows:
+                return rows[:max_rows]
             if offset is None:
                 return rows
 
@@ -747,14 +804,21 @@ class QdrantCollection(BaseCollection):
         where: Optional[dict] = None,
         where_document: Optional[dict] = None,
         with_vector: bool = False,
+        max_rows: Optional[int] = None,
     ) -> list[dict]:
         _validate_where(where)
         _validate_where(where_document)
-        q_filter = None if _requires_local_filter(where, where_document) else _qdrant_filter(where)
+        local_filter_required = _requires_local_filter(where, where_document)
+        q_filter = None if local_filter_required else _qdrant_filter(where)
         if ids is not None:
             id_filter = {"must": [{"has_id": [_point_id(doc_id) for doc_id in ids]}]}
             q_filter = _combine_filters(q_filter, id_filter)
-        rows = self._scroll_all(qdrant_filter=q_filter, with_vector=with_vector)
+        # Bounding needs qdrant's filter alone to fully decide membership,
+        # and no id lookup (order-independent, needs every match).
+        bounded_rows = None if (ids is not None or local_filter_required) else max_rows
+        rows = self._scroll_all(
+            qdrant_filter=q_filter, with_vector=with_vector, max_rows=bounded_rows
+        )
         rows = [
             row
             for row in rows
@@ -980,11 +1044,13 @@ class QdrantCollection(BaseCollection):
         include=None,
     ) -> GetResult:
         spec = _IncludeSpec.resolve(include, default_distances=False)
+        max_rows = (offset or 0) + limit if limit is not None and ids is None else None
         rows = self._rows(
             ids=ids,
             where=where,
             where_document=where_document,
             with_vector=spec.embeddings,
+            max_rows=max_rows,
         )
         if ids is not None:
             by_id = {row["id"]: row for row in rows}
@@ -998,6 +1064,77 @@ class QdrantCollection(BaseCollection):
             documents=[row["document"] for row in rows] if spec.documents else [],
             metadatas=[row["metadata"] for row in rows] if spec.metadatas else [],
             embeddings=[row["embedding"] or [] for row in rows] if spec.embeddings else None,
+        )
+
+    def get_all_metadata(self, where: Optional[dict] = None) -> list[dict]:
+        """Return every matching record's metadata in one cursor pass (#1796).
+
+        Overrides the default offset-paginated implementation, which would
+        call self.get(limit=, offset=) in a loop -- and since self.get() is
+        backed by a full _scroll_all() materialization, each page of that
+        loop would re-walk the entire collection from the start just to
+        discard everything outside its slice (O(n^2) over collection size).
+
+        Delegates to self._rows(), the same single-scroll-plus-local-filter
+        helper that backs get()/delete(). With ids=None and
+        where_document=None, _rows() reduces to exactly one _scroll_all()
+        pass followed by an unconditional _matches_where() re-check on every
+        row -- the same filter logic get(), delete(), and lexical_search()
+        already use, so this can't independently drift from those call
+        sites. (Maintainer review on #1832: avoid duplicating the filter
+        dance inline.)
+        """
+        rows = self._rows(where=where)
+        return [row["metadata"] for row in rows]
+
+    def get_all_rows(
+        self, where: Optional[dict] = None, include: Optional[list[str]] = None
+    ) -> GetResult:
+        """Every matching row's id plus the requested fields in one cursor pass.
+
+        Same reasoning as :meth:`get_all_metadata` (#1796): the default
+        implementation would call ``get(limit=, offset=)`` in a loop, and each
+        of those calls re-walks the collection from the start (#2452 measured
+        275 s for ``list_drawers`` on 126k drawers). ``_rows()`` already has
+        every id in hand, so hand them back instead of discarding them.
+        """
+        spec = _IncludeSpec.resolve(
+            list(include) if include else ["metadatas"], default_distances=False
+        )
+        rows = self._rows(where=where, with_vector=spec.embeddings)
+        return GetResult(
+            ids=[row["id"] for row in rows],
+            documents=[row["document"] for row in rows] if spec.documents else [],
+            metadatas=[row["metadata"] for row in rows] if spec.metadatas else [],
+            embeddings=[row["embedding"] or [] for row in rows] if spec.embeddings else None,
+        )
+
+    def facet_counts(
+        self,
+        field: str,
+        where: Optional[dict] = None,
+        limit: int = 1000,
+    ) -> dict[str, int]:
+        self._ensure_open()
+        # Validate the filter before the existence short-circuit so an
+        # unsupported local-only filter raises regardless of whether the
+        # collection has been materialized yet — matching the order used by
+        # get()/lexical_search() above (#1835 review).
+        _validate_where(where)
+        if _requires_local_filter(where):
+            raise UnsupportedCapabilityError("facet_counts does not support local-only filters")
+        if not self._remote_exists():
+            if self._marker_exists():
+                raise CollectionNotInitializedError(self._collection_name)
+            return {}
+
+        q_filter = _qdrant_filter(where)
+
+        return self._client.facet_counts(
+            self._remote_collection,
+            field=f"{_PAYLOAD_METADATA}.{field}",
+            qdrant_filter=q_filter,
+            limit=limit,
         )
 
     def delete(self, *, ids=None, where=None):
@@ -1090,6 +1227,7 @@ class QdrantBackend(BaseBackend):
             "supports_embeddings_out",
             "supports_metadata_filters",
             "supports_lexical_search",
+            "supports_metadata_facets",
             "supports_namespace_isolation",
             "server_mode",
         }
