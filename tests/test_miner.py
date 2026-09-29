@@ -3247,3 +3247,100 @@ def test_project_mine_reaches_a_yield_point_before_each_file(tmp_path):
     with mine_yield_hook(lambda: calls.append(1)):
         mine(str(project_root), str(tmp_path / "palace"))
     assert len(calls) == 3
+
+
+def test_metadata_scan_reads_a_schema_without_bool_value():
+    """Older chromadb schemas predate bool_value; the scan reads the columns
+    the table has instead of failing on the missing one."""
+    import sqlite3
+
+    from mempalace.backends.chroma import _sqlite_iter_metadata
+
+    with sqlite3.connect(":memory:") as conn:
+        conn.executescript(
+            """
+            CREATE TABLE collections (id TEXT, name TEXT);
+            CREATE TABLE segments (id TEXT, collection TEXT, scope TEXT);
+            CREATE TABLE embeddings (id INTEGER PRIMARY KEY, segment_id TEXT);
+            CREATE TABLE embedding_metadata
+              (id INTEGER, key TEXT, string_value TEXT, int_value INTEGER, float_value REAL);
+            INSERT INTO collections VALUES ('c', 'drawers');
+            INSERT INTO segments VALUES ('s', 'c', 'METADATA');
+            INSERT INTO embeddings VALUES (1, 's');
+            INSERT INTO embedding_metadata VALUES (1, 'source_file', '/old.md', NULL, NULL);
+            INSERT INTO embedding_metadata VALUES (1, 'chunk_total', NULL, 3, NULL);
+            """
+        )
+        rows = list(_sqlite_iter_metadata(conn, "drawers", ["source_file", "chunk_total"], None))
+    assert rows == [{"source_file": "/old.md", "chunk_total": 3}]
+
+
+def _mined_rows_palace(tmp_path):
+    from mempalace.palace import get_collection
+
+    col = get_collection(str(tmp_path / "palace"), create=True)
+    current = {
+        "wing": "w",
+        "extract_mode": "exchange",
+        "ingest_mode": "convos",
+        "normalize_version": NORMALIZE_VERSION,
+        "convo_chunker_version": CONVO_CHUNKER_VERSION,
+    }
+    col.add(
+        ids=["a", "b"],
+        documents=["a", "b"],
+        embeddings=[[0.1, 0.2], [0.2, 0.1]],
+        metadatas=[
+            {**current, "source_file": "/a", "source_mtime": 1.0, "content_hash": "ha"},
+            {**current, "source_file": "/b", "source_mtime": 2.0, "content_hash": "hb"},
+        ],
+    )
+    return col
+
+
+def test_prefetch_discards_a_failed_fast_scan_and_pages_instead(tmp_path, monkeypatch):
+    """A fast scan that fails after some rows must not leave a partial
+    registry: it reads as "not mined" and "no duplicate"."""
+    from mempalace.backends.chroma import ChromaCollection
+    from mempalace.palace import prefetch_content_hashes
+
+    col = _mined_rows_palace(tmp_path)
+    real = ChromaCollection.iter_metadata
+
+    def breaks_after_one_row(self, keys=None, *, require_key=None):
+        rows = real(self, keys, require_key=require_key)
+
+        def gen():
+            yield next(rows)
+            raise sqlite3.OperationalError("injected mid-scan failure")
+
+        return gen()
+
+    import sqlite3
+
+    monkeypatch.setattr(ChromaCollection, "iter_metadata", breaks_after_one_row)
+    assert prefetch_mined_set(col, extract_mode="exchange") == {"/a": 1.0, "/b": 2.0}
+    assert prefetch_content_hashes(col, extract_mode="exchange") == {
+        ("w", "ha"): "/a",
+        ("w", "hb"): "/b",
+    }
+
+
+def test_prefetch_raises_when_no_complete_scan_is_possible(tmp_path, monkeypatch):
+    import sqlite3
+
+    import mempalace.palace as palace_pkg
+    from mempalace.palace import MinedSetUnavailable, prefetch_content_hashes
+
+    col = _mined_rows_palace(tmp_path)
+
+    def broken(*_a, **_k):
+        yield {"source_file": "/a"}
+        raise sqlite3.OperationalError("injected failure")
+
+    monkeypatch.setattr(palace_pkg, "_fast_collection_metadata", broken)
+    monkeypatch.setattr(palace_pkg, "_paged_metadata", broken)
+    with pytest.raises(MinedSetUnavailable):
+        prefetch_mined_set(col, extract_mode="exchange")
+    with pytest.raises(MinedSetUnavailable):
+        prefetch_content_hashes(col, extract_mode="exchange")

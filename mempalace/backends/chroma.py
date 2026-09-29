@@ -2072,7 +2072,13 @@ def _sqlite_iter_metadata(
         scope += """ AND e.id IN (SELECT r.id FROM embedding_metadata r
                      WHERE r.key = ? AND r.string_value IS NOT NULL)"""
         params.append(require_key)
-    columns = "m.key, m.string_value, m.int_value, m.float_value, m.bool_value"
+    # Older chromadb schemas lack bool_value; select NULL for any value
+    # column the table does not have so the row shape stays fixed.
+    present = set(_metadata_value_columns(conn))
+    columns = "m.key, " + ", ".join(
+        f"m.{col}" if col in present else f"NULL AS {col}"
+        for col in ("string_value", "int_value", "float_value", "bool_value")
+    )
     if keys is not None:
         keys = list(keys)
         sql = f"""
