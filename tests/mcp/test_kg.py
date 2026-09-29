@@ -3,6 +3,7 @@
 import os
 import subprocess
 import sys
+import types
 
 
 from _mcp_server_helpers import (
@@ -584,6 +585,68 @@ class TestKGLazyCache:
         monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_a))
         query_a = mcp_server.tool_kg_query(entity="alice_secret")
         assert query_a.get("count", 0) >= 1, f"tenant A lost its own fact: {query_a}"
+
+
+class TestKGPathResolution:
+    """The MCP writer and the audit reader must agree on one KG file.
+
+    Regression for the XDG-install split: ``_resolve_kg_path()`` used to
+    fall through to ``DEFAULT_KG_PATH`` (``~/.mempalace/...``) whenever
+    ``--palace`` was absent, while ``palace_audit.resolve_kg_path()``
+    looks *inside* the palace.  New installs keep their palace under
+    ``~/.config/mempalace/palace`` (#148), so ``kg_add`` wrote to a file
+    that ``mempalace audit`` never opened — the graph read as ``0 facts``
+    no matter how many facts were filed.
+    """
+
+    def test_kg_path_stays_inside_a_non_legacy_palace(self, tmp_path, monkeypatch):
+        from mempalace import mcp_server
+        from mempalace.knowledge_graph import DEFAULT_KG_PATH
+        from mempalace.palace_audit import resolve_kg_path
+
+        palace = tmp_path / "xdg" / "palace"
+        palace.mkdir(parents=True)
+
+        monkeypatch.setattr(mcp_server, "_palace_flag_given", False)
+        monkeypatch.setattr(
+            mcp_server, "_config", types.SimpleNamespace(palace_path=str(palace))
+        )
+
+        resolved = mcp_server._resolve_kg_path()
+
+        assert resolved == os.path.join(str(palace), "knowledge_graph.sqlite3")
+        assert resolved != DEFAULT_KG_PATH
+        # The reader must land on the very same file.
+        assert os.path.realpath(resolved) == os.path.realpath(resolve_kg_path(str(palace)))
+
+    def test_kg_path_follows_explicit_palace_flag(self, tmp_path, monkeypatch):
+        """``--palace`` keeps forcing the palace-local file (unchanged)."""
+        from mempalace import mcp_server
+
+        palace = tmp_path / "explicit"
+        palace.mkdir()
+
+        monkeypatch.setattr(mcp_server, "_palace_flag_given", True)
+        monkeypatch.setattr(
+            mcp_server, "_config", types.SimpleNamespace(palace_path=str(palace))
+        )
+
+        assert mcp_server._resolve_kg_path() == os.path.join(
+            str(palace), "knowledge_graph.sqlite3"
+        )
+
+    def test_legacy_default_palace_keeps_legacy_kg_path(self, tmp_path, monkeypatch):
+        """A palace at the legacy default still resolves to the legacy file."""
+        from mempalace import mcp_server
+        from mempalace.config import DEFAULT_PALACE_PATH
+        from mempalace.knowledge_graph import DEFAULT_KG_PATH
+
+        monkeypatch.setattr(mcp_server, "_palace_flag_given", False)
+        monkeypatch.setattr(
+            mcp_server, "_config", types.SimpleNamespace(palace_path=DEFAULT_PALACE_PATH)
+        )
+
+        assert mcp_server._resolve_kg_path() == DEFAULT_KG_PATH
 
 
 # ── Structured error codes + MineAlreadyRunning (#1552) ─────────────────
