@@ -204,7 +204,7 @@ def load_membench(data_dir: str, categories=None, topic="movie", limit=0):
         fpath = data_dir / fname
         if not fpath.exists():
             continue
-        with open(fpath) as f:
+        with open(fpath, encoding="utf-8") as f:
             raw = json.load(f)
 
         # Files have two formats:
@@ -321,7 +321,7 @@ def run_membench(
     print(f"  Items:       {len(items)}")
     print(f"  Top-k:       {top_k}")
     print(f"  Mode:        {mode}")
-    print(f"{'─' * 58}\n")
+    print(f"{'-' * 58}\n")
 
     results = []
     by_cat = defaultdict(lambda: {"hit_at_k": 0, "total": 0})
@@ -419,7 +419,7 @@ def run_membench(
     print(f"\n{'=' * 58}\n")
 
     if out_file:
-        with open(out_file, "w") as f:
+        with open(out_file, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2)
         print(f"  Results saved to: {out_file}")
 

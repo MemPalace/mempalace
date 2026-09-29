@@ -95,7 +95,12 @@ The backend can also be set with `--backend milvus` (or `qdrant` /
 
 Prefer Postgres? Install `pip install mempalace[pgvector]`, point
 `MEMPALACE_BACKEND=pgvector` at a database with the `vector` extension, and
-the rest of this guide applies unchanged.
+the rest of this guide applies unchanged. If more than one machine talks to
+that database and they are meant to share one palace, set the same
+`MEMPALACE_PGVECTOR_SHARED_NAMESPACE` on each — without it, pgvector table
+names include each node's local palace path and the nodes silently end up with
+separate tables. See
+[Sharing one palace across machines](/guide/configuration#sharing-one-palace-across-machines).
 
 ## 2. GPU embedding (optional)
 
@@ -132,7 +137,7 @@ Output includes the token and the exact client command. Useful flags:
 | `--port` | `8765` | Listen port |
 | `--backend` | config/env | Storage backend (e.g. `qdrant`) |
 | `--tls-cert` / `--tls-key` | _(none)_ | PEM cert + key to terminate **TLS natively** (server speaks `https`) |
-| `--read-only` | off | Expose recall only — the mutating tools are hidden and refused |
+| `--read-only` | off | Expose recall only — the tools that change state are hidden and refused |
 | `--token` | auto | Use a specific bearer token instead of the generated one |
 | `--allow-insecure` | off | Permit a non-loopback bind with no token (only behind a trusted proxy) |
 
@@ -169,21 +174,73 @@ Other MCP clients use the same two ingredients — the `…/mcp` URL and an
 
 ```bash
 curl https://memory.example.com/healthz        # -> ok
+curl https://memory.example.com/statusz \
+  -H "Authorization: Bearer $MEMPALACE_MCP_HTTP_TOKEN"
 ```
 
 Once connected, all of MemPalace's [MCP tools](/guide/mcp-integration) operate
 against the shared palace — searches and saved memories are visible to the
 whole team.
 
+A shared hub also gives your agents a coordination channel: the
+[agent logstream](/concepts/agent-logstream) lets one agent delegate work
+(`mempalace_event_append`), another long-poll for it
+(`mempalace_event_wait`), and patches move as verified artifacts
+(`mempalace_patch_submit` / `mempalace_artifact_get`) — no human relaying
+messages between machines.
+
 ## Operating notes
 
 - **Mining** still happens via the CLI (`mempalace mine …`) on the server host
-  against the same backend, so the central palace stays populated.
+  against the same backend, so the central palace stays populated. While the
+  server is running it owns the palace's writer lease, so the CLI (and the
+  save hooks, which spawn it) automatically detect the live server and hand
+  the mine to it over HTTP instead of being refused. This needs nothing from
+  you — the server records its endpoint under `~/.mempalace/server/` at
+  startup. Set `MEMPALACE_HUB_FORWARD=0` to force direct mines (they will be
+  refused while the server holds the lease).
 - **One writer-lease per process**: a single `mempalace-mcp --transport http`
   process safely handles concurrent reads and writes. Don't point two server
   processes at the same backend collection.
 - **Health checks**: `GET /healthz` returns `200 ok` without a token, so it
-  works as a load-balancer/Kubernetes liveness probe.
+  works as a load-balancer/Kubernetes liveness probe. For machine-readable
+  server state, `GET /statusz` returns JSON with version, uptime, request
+  counters, SQLite integrity, writer mode, and recent observed MCP clients.
+  `/statusz` follows the bearer-token policy because it exposes operational
+  metadata; it is not a public liveness probe. Probe traffic does **not**
+  count as activity for the idle watchdog below; only MCP requests do.
+- **Waiting for the writer lease**: a writable server that finds another
+  process holding the palace's writer lease (a session's MCP server, a hook
+  mine, a CLI write) waits for it instead of refusing at once, retrying with
+  backoff for `MEMPALACE_MCP_WRITER_WAIT_SECONDS` (default `120`). It logs
+  once when the wait starts. If the lease is still held when the wait runs
+  out, it exits with status `2`, which the systemd template does not restart,
+  so the unit lands in `failed` with the reason in the journal. Set it to `0`
+  to refuse immediately. A backend or lock-directory failure is never waited
+  on.
+- **Idle shutdown**: the server exits by itself once `MEMPALACE_MCP_IDLE_HOURS`
+  have passed with no MCP request (default `8`). That default is there to reap
+  the per-session stdio servers that would otherwise pile up holding ChromaDB
+  and HNSW file handles, which is not the case a dedicated always-on server is
+  in. Set `MEMPALACE_MCP_IDLE_HOURS=0` to disable it, and make sure your
+  supervisor restarts on a *clean* exit (`Restart=always` rather than
+  `Restart=on-failure`), because the watchdog exits `0`.
+- **Fronting proxies (Tailscale, nginx)**: the recommended personal-fleet
+  setup is a loopback bind behind a tailnet-only proxy — nothing touches the
+  physical LAN and the tailnet provides encryption plus device identity:
+
+  ```bash
+  MEMPALACE_MCP_HTTP_TOKEN="$(cat ~/.mempalace/server/<key>/token)" \
+  MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS="yourbox.your-tailnet.ts.net" \
+    mempalace serve --host 127.0.0.1 --port 8765
+  tailscale serve --bg --https=443 http://127.0.0.1:8765
+  ```
+
+  Clients connect to `https://yourbox.your-tailnet.ts.net/mcp` with the same
+  bearer token. `MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS` (comma-separated `host`
+  or `host:port` values) is required because proxies preserve the public
+  name in the `Host` header, which the loopback bind's DNS-rebinding pin
+  would otherwise reject.
 - **Backups** are now your storage backend's responsibility (Milvus / Zilliz
   Cloud backups, Qdrant snapshots, or Postgres backups) rather than a single
   laptop's palace directory.
