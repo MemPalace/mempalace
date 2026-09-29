@@ -90,6 +90,7 @@ def _cli_hit_ref(hit: dict) -> dict:
         "source_path": source,
         "wing": meta.get("wing"),
         "room": meta.get("room"),
+        "chunk_index": meta.get("chunk_index"),
     }
 
 

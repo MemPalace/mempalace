@@ -255,34 +255,44 @@ def _dedupe_rendered_hits(
     return unique
 
 
+# Shorter identical passages are too likely to be coincidence ("Yes.", "ok,
+# ship it") to present as one passage stored in several files.
+_FOLD_MIN_CHARS = 100
+
+
 def _fold_copies_across_sources(hits: list, source_of, ref_of) -> list:
     """Fold hits whose text is identical but comes from different source files.
 
     Backups, autosaves, recovered copies, and re-exports put the same passage
-    in several files, and each copy took a result slot of its own, so one
-    passage could fill a whole page while distinct memories fell off it. The
-    best-ranked copy stays and lists the others under ``also_in``
-    (``ref_of(hit)`` for each), so no copy is hidden; the freed slots go to
-    the next distinct passages because the caller cuts to ``n_results`` after
-    this. Repeats within one source file stay separate hits: a transcript can
-    say the same thing twice, at different times.
+    in several files, and each copy took a result slot of its own. Identical
+    wording is only folded at ``_FOLD_MIN_CHARS`` or more, where coincidence is
+    implausible; it is grouping by identical text, not a verified shared
+    origin, so the kept hit lists every other occurrence under ``also_in``
+    (``ref_of(hit)``, with its chunk position) and none is hidden.
+
+    Occurrence k of a passage in any one file folds into the k-th shown hit
+    for that passage, so a passage a file repeats stays that many hits
+    whatever order the ranking produced. Slots freed here go to the next
+    distinct passages in ``hits``; the caller cuts to ``n_results`` after this
+    and still has only the passages its pool fetched.
     """
     kept = []
-    first_by_text: dict = {}
+    shown_by_text: dict = {}
+    seen_by_text: dict = {}
     for hit in hits:
         text = hit.get("text")
         source = source_of(hit)
-        if not isinstance(text, str) or not text.strip() or not source:
+        if not isinstance(text, str) or len(text.strip()) < _FOLD_MIN_CHARS or not source:
             kept.append(hit)
             continue
-        first = first_by_text.get(text)
-        if first is None:
-            first_by_text[text] = hit
-            kept.append(hit)
-        elif source_of(first) == source:
+        shown = shown_by_text.setdefault(text, [])
+        seen = seen_by_text.setdefault(text, {})
+        occurrence = seen[source] = seen.get(source, 0) + 1
+        if occurrence > len(shown):
+            shown.append(hit)
             kept.append(hit)
         else:
-            first.setdefault("also_in", []).append(ref_of(hit))
+            shown[occurrence - 1].setdefault("also_in", []).append(ref_of(hit))
     return kept
 
 
@@ -298,6 +308,7 @@ def _search_hit_ref(hit: dict) -> dict:
         "source_path": _search_hit_source(hit),
         "wing": hit.get("wing"),
         "room": hit.get("room"),
+        "chunk_index": hit.get("_chunk_index"),
     }
 
 
