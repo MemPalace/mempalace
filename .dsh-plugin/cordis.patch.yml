@@ -1,0 +1,28 @@
+# The MemPalace bundle patch for the DeepSeek Harness.
+#
+# One insert of three rows, each independently disabled or configured from the
+# profile's own cordis.patch.yml. A later patch replaces a row's WHOLE `config`
+# (it does not merge), so an override must restate every key it relies on.
+
+- insert:
+    # Stored memory (`mempalace wake-up` for the project's wing) in the system
+    # prompt of every top-level session, from its first model call.
+    - id: mempalace-recall
+      name: '@mempalace/dsh-plugin/recall'
+
+    # An append-only transcript per session, and MemPalace's own stop,
+    # precompact and session-end hooks run against it.
+    - id: mempalace-autosave
+      name: '@mempalace/dsh-plugin/autosave'
+
+    # The palace, served through the harness's own MCP client by MemPalace's
+    # light MCP server: three PQL tools (palace_query, palace_exec,
+    # palace_coordinate) instead of 45, because DSH re-sends every tool schema
+    # on every model step. The model sees them as mcp__mempalace__<tool>. For
+    # the full 45-tool surface, override this row's command with mempalace-mcp.
+    - id: mempalace-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: mempalace
+        transport: stdio
+        command: mempalace-light-mcp

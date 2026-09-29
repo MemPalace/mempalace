@@ -1,22 +1,43 @@
-import os
 import json
+import os
+import sqlite3
 import tempfile
 
 import pytest
 from mempalace.config import (
     MempalaceConfig,
+    _default_config_dir,
+    connect_sqlite_read,
     normalize_wing_name,
     sanitize_iso_date,
     sanitize_iso_temporal,
     sanitize_kg_value,
     sanitize_name,
+    sqlite_read_uri,
 )
+
+
+def _set_home(monkeypatch, home):
+    """Point HOME and USERPROFILE at ``home`` so Path.home() is consistent
+    on both POSIX and Windows.
+    """
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
 
 
 def test_default_config():
     cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
     assert "palace" in cfg.palace_path
     assert cfg.collection_name == "mempalace_drawers"
+    assert cfg.backend == "chroma"
+
+
+def test_config_dir_property_exposes_resolved_path(tmp_path):
+    """`config_dir` is the public accessor callers outside config.py rely on
+    to derive sibling locations (WAL dir, cache dir, etc.) without reaching
+    into the underscore-prefixed `_config_dir`."""
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.config_dir == tmp_path
 
 
 def test_config_from_file():
@@ -25,6 +46,121 @@ def test_config_from_file():
         json.dump({"palace_path": "/custom/palace"}, f)
     cfg = MempalaceConfig(config_dir=tmpdir)
     assert cfg.palace_path == "/custom/palace"
+
+
+def test_backend_from_config_wins_over_env(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"backend": "sqlite_exact"}, f)
+    monkeypatch.setenv("MEMPALACE_BACKEND", "chroma")
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.backend == "sqlite_exact"
+
+
+def test_backend_from_env_when_config_absent(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMPALACE_BACKEND", "SQLite_Exact")
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.backend == "sqlite_exact"
+
+
+def test_qdrant_config_from_env_and_file(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump(
+            {
+                "qdrant_url": "http://config.example:6333",
+                "qdrant_api_key": "config-key",
+                "qdrant_namespace": "config-ns",
+                "qdrant_timeout": 2,
+            },
+            f,
+        )
+    monkeypatch.setenv("MEMPALACE_QDRANT_URL", "http://env.example:6333")
+    monkeypatch.setenv("MEMPALACE_QDRANT_API_KEY", "env-key")
+    monkeypatch.setenv("MEMPALACE_QDRANT_NAMESPACE", "env-ns")
+    monkeypatch.setenv("MEMPALACE_QDRANT_TIMEOUT", "3.5")
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    assert cfg.qdrant_url == "http://env.example:6333"
+    assert cfg.qdrant_api_key == "env-key"
+    assert cfg.qdrant_namespace == "env-ns"
+    assert cfg.qdrant_timeout == 3.5
+
+
+def test_milvus_config_from_env_and_file(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump(
+            {
+                "milvus_uri": "https://config.example",
+                "milvus_token": "config-token",
+                "milvus_db_name": "config-db",
+                "milvus_namespace": "config-ns",
+                "milvus_consistency_level": "bounded",
+            },
+            f,
+        )
+    monkeypatch.setenv("MEMPALACE_MILVUS_URI", "https://env.example")
+    monkeypatch.setenv("MEMPALACE_MILVUS_TOKEN", "env-token")
+    monkeypatch.setenv("MEMPALACE_MILVUS_DB_NAME", "env-db")
+    monkeypatch.setenv("MEMPALACE_MILVUS_NAMESPACE", "env-ns")
+    monkeypatch.setenv("MEMPALACE_MILVUS_CONSISTENCY_LEVEL", "eventually")
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    assert cfg.milvus_uri == "https://env.example"
+    assert cfg.milvus_token == "env-token"
+    assert cfg.milvus_db_name == "env-db"
+    assert cfg.milvus_namespace == "env-ns"
+    assert cfg.milvus_consistency_level == "Eventually"
+
+
+def test_pgvector_config_from_env_and_file(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump(
+            {
+                "pgvector_dsn": "postgresql://config.example:5432/memdb",
+                "pgvector_namespace": "config-ns",
+                "pgvector_shared_namespace": "config-fleet",
+            },
+            f,
+        )
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.pgvector_dsn == "postgresql://config.example:5432/memdb"
+    assert cfg.pgvector_namespace == "config-ns"
+    assert cfg.pgvector_shared_namespace == "config-fleet"
+
+    monkeypatch.setenv("MEMPALACE_PGVECTOR_DSN", "postgresql://env.example:5432/memdb")
+    monkeypatch.setenv("MEMPALACE_PGVECTOR_NAMESPACE", "env-ns")
+    monkeypatch.setenv("MEMPALACE_PGVECTOR_SHARED_NAMESPACE", "env-fleet")
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    assert cfg.pgvector_dsn == "postgresql://env.example:5432/memdb"
+    assert cfg.pgvector_namespace == "env-ns"
+    assert cfg.pgvector_shared_namespace == "env-fleet"
+
+
+def test_pgvector_shared_namespace_unset_by_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_PGVECTOR_SHARED_NAMESPACE", raising=False)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.pgvector_shared_namespace is None
+
+
+def test_milvus_config_rejects_invalid_consistency_level(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMPALACE_MILVUS_CONSISTENCY_LEVEL", "linearizable")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    with pytest.raises(ValueError, match="milvus_consistency_level"):
+        cfg.milvus_consistency_level
+
+
+def test_set_backend_persists_choice(tmp_path):
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    cfg.set_backend("sqlite_exact")
+
+    reloaded = MempalaceConfig(config_dir=str(tmp_path))
+    assert reloaded.backend == "sqlite_exact"
 
 
 def test_embedding_device_defaults_to_auto(monkeypatch):
@@ -49,6 +185,199 @@ def test_embedding_device_env_overrides_config(tmp_path, monkeypatch):
 
     cfg = MempalaceConfig(config_dir=str(tmp_path))
     assert cfg.embedding_device == "coreml"
+
+
+def test_embedding_threads_defaults_to_half_cpus(monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_THREADS", raising=False)
+    monkeypatch.setattr("os.cpu_count", lambda: 10)
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    # unset / "auto" → half the logical CPUs so a background mine stays tame
+    assert cfg.embedding_threads == 5
+
+
+def test_embedding_threads_auto_keyword(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_THREADS", raising=False)
+    monkeypatch.setattr("os.cpu_count", lambda: 8)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_threads": "auto"}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_threads == 4
+
+
+def test_embedding_threads_positive_value_from_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_THREADS", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_threads": 3}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_threads == 3
+
+
+def test_embedding_threads_zero_means_uncapped(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_THREADS", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_threads": 0}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_threads == 0
+
+
+def test_embedding_threads_env_overrides_config(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_threads": 2}, f)
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_THREADS", "6")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_threads == 6
+
+
+def test_embedding_threads_invalid_falls_back_to_auto(tmp_path, monkeypatch):
+    monkeypatch.setattr("os.cpu_count", lambda: 4)
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_THREADS", "not-a-number")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_threads == 2
+
+
+def test_embeddinggemma_batch_size_defaults_to_module_constant(monkeypatch):
+    from mempalace.embedding import _EMBEDDINGGEMMA_BATCH_SIZE
+
+    monkeypatch.delenv("MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE", raising=False)
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.embeddinggemma_batch_size == _EMBEDDINGGEMMA_BATCH_SIZE
+
+
+def test_embeddinggemma_batch_size_positive_value_from_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embeddinggemma_batch_size": 8}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embeddinggemma_batch_size == 8
+
+
+def test_embeddinggemma_batch_size_env_overrides_config(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embeddinggemma_batch_size": 8}, f)
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE", "4")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embeddinggemma_batch_size == 4
+
+
+def test_embeddinggemma_batch_size_non_positive_falls_back_to_default(tmp_path, monkeypatch):
+    from mempalace.embedding import _EMBEDDINGGEMMA_BATCH_SIZE
+
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE", "0")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embeddinggemma_batch_size == _EMBEDDINGGEMMA_BATCH_SIZE
+
+
+def test_embeddinggemma_batch_size_invalid_falls_back_to_default(tmp_path, monkeypatch):
+    from mempalace.embedding import _EMBEDDINGGEMMA_BATCH_SIZE
+
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE", "not-a-number")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embeddinggemma_batch_size == _EMBEDDINGGEMMA_BATCH_SIZE
+
+
+def _wal_db(tmp_path, name="chroma.sqlite3"):
+    """A WAL database with its sidecars removed, as chroma leaves one behind."""
+    db_path = tmp_path / name
+    setup = sqlite3.connect(str(db_path))
+    setup.execute("PRAGMA journal_mode=WAL")
+    setup.execute("CREATE TABLE t (x INTEGER)")
+    setup.execute("INSERT INTO t VALUES (42)")
+    setup.commit()
+    setup.close()
+    for sidecar in (f"{db_path}-wal", f"{db_path}-shm"):
+        if os.path.exists(sidecar):
+            os.unlink(sidecar)
+    return db_path
+
+
+def test_connect_sqlite_read_reads_a_wal_database_without_sidecars(tmp_path):
+    """A read-only open cannot create the WAL index, so that case takes a normal open.
+
+    Apple's SQLite, which CPython links on macOS, fails the first statement of
+    such a connection with "unable to open database file", and the integrity
+    gate then refused every tool for a healthy palace (#2489).
+    """
+    db_path = _wal_db(tmp_path)
+
+    conn = connect_sqlite_read(str(db_path))
+    try:
+        assert conn.execute("SELECT x FROM t").fetchone()[0] == 42
+        assert conn.execute("PRAGMA quick_check").fetchall() == [("ok",)]
+    finally:
+        conn.close()
+
+
+def test_connect_sqlite_read_takes_a_normal_open_when_the_wal_index_is_missing(tmp_path):
+    """The fallback is a normal open, which is the whole point: it may create the index.
+
+    Asserting the open mode rather than a side effect keeps this meaningful on
+    SQLite builds whose read-only open happens to succeed here.
+    """
+    db_path = _wal_db(tmp_path)
+
+    conn = connect_sqlite_read(str(db_path))
+    try:
+        conn.execute("INSERT INTO t VALUES (1)")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def test_connect_sqlite_read_stays_read_only_for_a_rollback_journal_database(tmp_path):
+    db_path = tmp_path / "chroma.sqlite3"
+    setup = sqlite3.connect(str(db_path))
+    setup.execute("CREATE TABLE t (x INTEGER)")
+    setup.commit()
+    setup.close()
+
+    conn = connect_sqlite_read(str(db_path))
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("INSERT INTO t VALUES (1)")
+    finally:
+        conn.close()
+
+
+def test_connect_sqlite_read_stays_read_only_while_the_sidecars_are_there(tmp_path):
+    """A WAL palace that something else holds open keeps the read-only connection."""
+    db_path = _wal_db(tmp_path)
+    holder = sqlite3.connect(str(db_path))
+    holder.execute("SELECT x FROM t").fetchone()
+    try:
+        assert os.path.exists(f"{db_path}-shm")
+        conn = connect_sqlite_read(str(db_path))
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                conn.execute("INSERT INTO t VALUES (1)")
+        finally:
+            conn.close()
+    finally:
+        holder.close()
+
+
+def test_sqlite_read_uri_opens_path_with_spaces(tmp_path):
+    """sqlite_read_uri must open a read-only DB whose path contains spaces,
+    which a bare f"file:{path}?mode=ro" mis-parses (especially on Windows)."""
+    db_dir = tmp_path / "palace with spaces"
+    db_dir.mkdir()
+    db_path = db_dir / "chroma.sqlite3"
+    setup = sqlite3.connect(str(db_path))
+    setup.execute("CREATE TABLE t (x INTEGER)")
+    setup.execute("INSERT INTO t VALUES (42)")
+    setup.commit()
+    setup.close()
+
+    uri = sqlite_read_uri(str(db_path))
+    assert "%20" in uri  # the space is percent-encoded, not left raw
+
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        assert conn.execute("SELECT x FROM t").fetchone()[0] == 42
+        # mode=ro is still honored through the encoded URI
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("INSERT INTO t VALUES (1)")
+    finally:
+        conn.close()
 
 
 def test_env_override():
@@ -110,11 +439,75 @@ def test_env_path_legacy_alias_normalized():
         del os.environ["MEMPAL_PALACE_PATH"]
 
 
+def test_env_path_mempalace_palace_alias():
+    """#2366: ``MEMPALACE_PALACE`` (the short form the reporter used) is
+    honored for ``palace_path`` with the same abspath+expanduser normalization
+    as ``MEMPALACE_PALACE_PATH`` and legacy ``MEMPAL_PALACE_PATH``. The issue
+    body's exact failing step is ``MEMPALACE_PALACE=/custom/path/palace
+    mempalace status`` — pre-fix this resolved to the hardcoded default.
+    """
+    os.environ.pop("MEMPALACE_PALACE_PATH", None)
+    os.environ.pop("MEMPAL_PALACE_PATH", None)
+    raw = os.path.join("~", "custom", "path", "palace")
+    os.environ["MEMPALACE_PALACE"] = raw
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert ".." not in cfg.palace_path
+        assert cfg.palace_path == os.path.abspath(os.path.expanduser(raw))
+        assert cfg.palace_path.endswith("custom" + os.sep + "path" + os.sep + "palace")
+    finally:
+        del os.environ["MEMPALACE_PALACE"]
+
+
+def test_env_path_primary_wins_over_alias():
+    """Precedence contract: ``MEMPALACE_PALACE_PATH`` (the documented primary)
+    must win over the ``MEMPALACE_PALACE`` alias, which must win over legacy
+    ``MEMPAL_PALACE_PATH``. Guards against the new alias being inserted ahead
+    of the primary and silently overriding it.
+    """
+    os.environ["MEMPALACE_PALACE_PATH"] = "/primary/should/wins"
+    os.environ["MEMPALACE_PALACE"] = "/alias/should/lose"
+    os.environ["MEMPAL_PALACE_PATH"] = "/legacy/should/lose"
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert cfg.palace_path == os.path.abspath("/primary/should/wins")
+    finally:
+        del os.environ["MEMPALACE_PALACE_PATH"]
+        del os.environ["MEMPALACE_PALACE"]
+        del os.environ["MEMPAL_PALACE_PATH"]
+
+
+def test_env_alias_wins_over_legacy():
+    """The ``MEMPALACE_PALACE`` alias outranks legacy ``MEMPAL_PALACE_PATH``
+    (both are newer than the legacy name), even when the legacy name is set.
+    """
+    os.environ.pop("MEMPALACE_PALACE_PATH", None)
+    os.environ["MEMPALACE_PALACE"] = "/alias/wins"
+    os.environ["MEMPAL_PALACE_PATH"] = "/legacy/loses"
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert cfg.palace_path == os.path.abspath("/alias/wins")
+    finally:
+        del os.environ["MEMPALACE_PALACE"]
+        del os.environ["MEMPAL_PALACE_PATH"]
+
+
 def test_init():
     tmpdir = tempfile.mkdtemp()
     cfg = MempalaceConfig(config_dir=tmpdir)
     cfg.init()
     assert os.path.exists(os.path.join(tmpdir, "config.json"))
+    with open(os.path.join(tmpdir, "config.json")) as f:
+        saved = json.load(f)
+    assert "backend" not in saved
+    assert MempalaceConfig(config_dir=tmpdir).backend == "chroma"
+
+
+def test_set_backend_rejects_unknown_backend(tmp_path):
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    with pytest.raises(KeyError):
+        cfg.set_backend("does_not_exist")
 
 
 # --- normalize_wing_name ---
@@ -134,6 +527,16 @@ def test_normalize_wing_name_already_clean():
 
 def test_normalize_wing_name_mixed():
     assert normalize_wing_name("My-Cool App") == "my_cool_app"
+
+
+def test_normalize_wing_name_strips_leading_separator():
+    # Claude Code path-encoded project dirs begin with a separator; the slug
+    # must not start with "_" or sanitize_name / MCP writes would reject it.
+    assert normalize_wing_name("-home-user-linux-book") == "home_user_linux_book"
+
+
+def test_normalize_wing_name_strips_trailing_separator():
+    assert normalize_wing_name("project-") == "project"
 
 
 # --- sanitize_name ---
@@ -351,7 +754,7 @@ def test_iso_temporal_normalizes_plus_zero_offset_to_z():
 # Backs the validated chunk_* properties added in #1024. Every property
 # resolves through ``_validated_chunk_config`` which (a) coerces to int
 # (or falls back to the documented default), (b) enforces the invariants
-# ``chunk_text()`` needs (chunk_size >= 1, chunk_overlap < chunk_size,
+# ``chunk_text()`` needs (chunk_size >= 1, chunk_overlap <= chunk_size // 2,
 # min_chunk_size <= chunk_size). A bad config.json must NEVER hang
 # ingest — repair, don't raise.
 
@@ -413,23 +816,55 @@ def test_chunk_config_zero_chunk_size_falls_back(tmp_path):
 
 
 def test_chunk_config_overlap_at_or_above_size_repaired(tmp_path):
-    """``chunk_overlap >= chunk_size`` is the hang condition; repair to
-    the documented default when the default fits, otherwise to
-    ``chunk_size - 1``."""
+    """``chunk_overlap`` above ``chunk_size // 2`` is the hang condition
+    (#2056); repair to the documented default when it stays at or below
+    half, otherwise clamp to ``chunk_size // 2``. Here the default fits."""
     cfg = _write_config(tmp_path, chunk_size=900, chunk_overlap=900)
     assert cfg.chunk_size == 900
-    # 100 (default) fits inside 900 → use the default.
+    # 100 (default) is at most 900 // 2, so use the default.
     assert cfg.chunk_overlap == 100
-    assert cfg.chunk_overlap < cfg.chunk_size
+    assert cfg.chunk_overlap <= cfg.chunk_size // 2
 
 
 def test_chunk_config_overlap_repair_when_default_doesnt_fit(tmp_path):
-    """Tiny chunk_size where the default overlap (100) wouldn't fit:
-    repair to ``chunk_size - 1`` instead."""
+    """Tiny chunk_size where the default overlap (100) exceeds half the
+    chunk size: clamp to ``chunk_size // 2``, the largest safe overlap."""
     cfg = _write_config(tmp_path, chunk_size=50, chunk_overlap=100)
     assert cfg.chunk_size == 50
-    assert cfg.chunk_overlap == 49  # max(0, chunk_size - 1)
-    assert cfg.chunk_overlap < cfg.chunk_size
+    assert cfg.chunk_overlap == 25  # min(DEFAULT_CHUNK_OVERLAP, chunk_size // 2)
+    assert cfg.chunk_overlap <= cfg.chunk_size // 2
+
+
+def test_chunk_config_overlap_above_half_repaired(tmp_path):
+    """#2056: an overlap between ``chunk_size // 2`` and ``chunk_size`` used
+    to pass validation and could hang the miner on short-line content. It is
+    now repaired down to a safe value."""
+    cfg = _write_config(tmp_path, chunk_size=100, chunk_overlap=80)
+    assert cfg.chunk_size == 100
+    assert cfg.chunk_overlap == 50  # min(100, 100 // 2)
+    assert cfg.chunk_overlap <= cfg.chunk_size // 2
+
+
+def test_chunk_config_overlap_at_half_preserved(tmp_path):
+    """Exactly 50% overlap (``== chunk_size // 2``) is safe and must be kept
+    unchanged."""
+    cfg = _write_config(tmp_path, chunk_size=800, chunk_overlap=400)
+    assert cfg.chunk_size == 800
+    assert cfg.chunk_overlap == 400
+    assert cfg.chunk_overlap <= cfg.chunk_size // 2
+
+
+def test_chunk_config_overlap_repair_odd_size_and_default_equals_half(tmp_path):
+    """Floor-boundary repairs (#2056): odd chunk_size floors ``// 2``, and the
+    case where DEFAULT_CHUNK_OVERLAP (100) equals chunk_size // 2 exactly."""
+    # Odd size: 101 // 2 == 50, so an over-half overlap clamps to min(100, 50).
+    cfg = _write_config(tmp_path, chunk_size=101, chunk_overlap=100)
+    assert cfg.chunk_overlap == 50
+    assert cfg.chunk_overlap <= cfg.chunk_size // 2
+    # DEFAULT_CHUNK_OVERLAP (100) == 200 // 2: repair clamps to exactly 100.
+    cfg2 = _write_config(tmp_path, chunk_size=200, chunk_overlap=180)
+    assert cfg2.chunk_overlap == 100
+    assert cfg2.chunk_overlap <= cfg2.chunk_size // 2
 
 
 def test_chunk_config_min_chunk_size_above_size_repaired(tmp_path):
@@ -530,13 +965,40 @@ def test_chunk_text_rejects_non_positive_chunk_size():
         chunk_text("some content", "src.txt", chunk_size=-1)
 
 
-def test_chunk_text_rejects_overlap_at_or_above_size():
+def test_chunk_text_rejects_overlap_above_half_size():
+    """#2056: chunk_overlap > chunk_size // 2 can loop forever on short-line
+    content, so chunk_text now rejects it fast (not only overlap >= size)."""
     from mempalace.miner import chunk_text
 
+    # overlap >= chunk_size (the original #1024 guard) stays rejected.
     with pytest.raises(ValueError, match="chunk_overlap"):
         chunk_text("some content", "src.txt", chunk_size=100, chunk_overlap=100)
     with pytest.raises(ValueError, match="chunk_overlap"):
         chunk_text("some content", "src.txt", chunk_size=100, chunk_overlap=200)
+    # NEW: overlap strictly above half is now rejected too.
+    with pytest.raises(ValueError, match="chunk_overlap"):
+        chunk_text("some content", "src.txt", chunk_size=100, chunk_overlap=51)
+    with pytest.raises(ValueError, match="chunk_overlap"):
+        chunk_text("some content", "src.txt", chunk_size=50, chunk_overlap=49)
+
+
+def test_chunk_text_overlap_boundary_at_half_size():
+    """The exact safety boundary is ``chunk_size // 2``: overlap == half is
+    accepted and terminates; overlap == half + 1 is rejected because it can
+    loop forever on content whose lines are about half the chunk size (#2056).
+    """
+    from mempalace.miner import chunk_text
+
+    worst = ("x" * 10 + "\n") * 40  # 11-char lines = 20 // 2 + 1
+    # overlap == chunk_size // 2 -> safe, returns a list (does not hang).
+    assert isinstance(chunk_text(worst, "src.txt", 20, 10), list)
+    # overlap == chunk_size // 2 + 1 -> rejected fast (would otherwise hang).
+    with pytest.raises(ValueError, match="chunk_overlap"):
+        chunk_text(worst, "src.txt", 20, 11)
+    # Odd chunk_size floors: 101 // 2 == 50, so 50 is accepted, 51 rejected.
+    assert isinstance(chunk_text("word " * 100, "src.txt", 101, 50), list)
+    with pytest.raises(ValueError, match="chunk_overlap"):
+        chunk_text("word " * 100, "src.txt", 101, 51)
 
 
 def test_chunk_text_rejects_negative_overlap():
@@ -562,3 +1024,474 @@ def test_miner_constants_alias_config_defaults():
     assert CHUNK_SIZE == DEFAULT_CHUNK_SIZE == 800
     assert CHUNK_OVERLAP == DEFAULT_CHUNK_OVERLAP == 100
     assert MIN_CHUNK_SIZE == DEFAULT_MIN_CHUNK_SIZE == 50
+
+
+# --- hooks.auto_save ---
+
+
+def test_hooks_auto_save_default():
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.hooks_auto_save is True
+
+
+def test_hooks_auto_save_from_config():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"hooks": {"auto_save": False}}, f)
+    cfg = MempalaceConfig(config_dir=tmpdir)
+    assert cfg.hooks_auto_save is False
+
+
+def test_hooks_auto_save_env_override_false():
+    os.environ["MEMPALACE_HOOKS_AUTO_SAVE"] = "false"
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert cfg.hooks_auto_save is False
+    finally:
+        del os.environ["MEMPALACE_HOOKS_AUTO_SAVE"]
+
+
+def test_hooks_auto_save_env_override_zero():
+    os.environ["MEMPALACE_HOOKS_AUTO_SAVE"] = "0"
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert cfg.hooks_auto_save is False
+    finally:
+        del os.environ["MEMPALACE_HOOKS_AUTO_SAVE"]
+
+
+def test_hooks_auto_save_env_override_no():
+    os.environ["MEMPALACE_HOOKS_AUTO_SAVE"] = "no"
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert cfg.hooks_auto_save is False
+    finally:
+        del os.environ["MEMPALACE_HOOKS_AUTO_SAVE"]
+
+
+def test_hooks_auto_save_env_override_true():
+    """Env var set to 'true' overrides config file even if config says false."""
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"hooks": {"auto_save": False}}, f)
+    os.environ["MEMPALACE_HOOKS_AUTO_SAVE"] = "true"
+    try:
+        cfg = MempalaceConfig(config_dir=tmpdir)
+        assert cfg.hooks_auto_save is True
+    finally:
+        del os.environ["MEMPALACE_HOOKS_AUTO_SAVE"]
+
+
+def test_hook_use_daemon_default_false(monkeypatch):
+    monkeypatch.delenv("MEMPALACE_HOOKS_DAEMON", raising=False)
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.hook_use_daemon is False
+
+
+def test_hook_use_daemon_from_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_HOOKS_DAEMON", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"hooks": {"daemon": True}}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hook_use_daemon is True
+
+
+def test_hook_use_daemon_string_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_HOOKS_DAEMON", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"hooks": {"daemon": "yes"}}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hook_use_daemon is True
+
+
+def test_hook_use_daemon_env_override(monkeypatch, tmp_path):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"hooks": {"daemon": False}}, f)
+    monkeypatch.setenv("MEMPALACE_HOOKS_DAEMON", "yes")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hook_use_daemon is True
+
+
+# --- max_backups (backup retention) ---
+
+
+def test_max_backups_default(monkeypatch):
+    monkeypatch.delenv("MEMPALACE_MAX_BACKUPS", raising=False)
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.max_backups == 10
+
+
+def test_max_backups_from_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_MAX_BACKUPS", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"max_backups": 3}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.max_backups == 3
+
+
+def test_max_backups_zero_disables(monkeypatch, tmp_path):
+    """0 is a valid, explicit "keep everything" — not garbage."""
+    monkeypatch.delenv("MEMPALACE_MAX_BACKUPS", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"max_backups": 0}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.max_backups == 0
+
+
+def test_max_backups_env_overrides_config(monkeypatch, tmp_path):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"max_backups": 3}, f)
+    monkeypatch.setenv("MEMPALACE_MAX_BACKUPS", "7")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.max_backups == 7
+
+
+@pytest.mark.parametrize("bad", ["abc", "", "-5", "1.5", "true"])
+def test_max_backups_garbage_falls_back_to_default(monkeypatch, tmp_path, bad):
+    """A hand-edited bad value must never crash migrate/repair."""
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"max_backups": bad}, f)
+    monkeypatch.delenv("MEMPALACE_MAX_BACKUPS", raising=False)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.max_backups == 10
+
+
+def test_max_backups_negative_in_config_falls_back(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_MAX_BACKUPS", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"max_backups": -3}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.max_backups == 10
+
+
+def test_max_backups_bad_env_falls_back_to_config(monkeypatch, tmp_path):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"max_backups": 4}, f)
+    monkeypatch.setenv("MEMPALACE_MAX_BACKUPS", "garbage")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.max_backups == 4
+
+
+def test_explicit_palace_path_overrides_env_and_file_config(monkeypatch, tmp_path):
+    configured = tmp_path / "configured" / "palace"
+    explicit = tmp_path / "explicit" / "../explicit" / "palace"
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"palace_path": str(configured)}, f)
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_path / "environment" / "palace"))
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path), palace_path=str(explicit))
+
+    expected = os.path.abspath(os.path.expanduser(str(explicit)))
+    assert cfg.palace_path == expected
+    assert cfg.hallway_file == os.path.join(os.path.dirname(expected), "hallways.json")
+    assert cfg.tunnel_file == os.path.join(os.path.dirname(expected), "tunnels.json")
+
+
+# ── cfg.lang resolution ────────────────────────────────────────────────
+
+
+def test_lang_defaults_to_english():
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.lang == "en"
+
+
+def test_lang_reads_config_file():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"lang": "ja"}, f)
+    cfg = MempalaceConfig(config_dir=tmpdir)
+    assert cfg.lang == "ja"
+
+
+def test_lang_env_var_overrides_file():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"lang": "ja"}, f)
+    os.environ["MEMPALACE_LANG"] = "ru"
+    try:
+        cfg = MempalaceConfig(config_dir=tmpdir)
+        assert cfg.lang == "ru"
+    finally:
+        del os.environ["MEMPALACE_LANG"]
+
+
+def test_lang_falls_back_to_entity_languages_first_entry():
+    """Without explicit lang, use entity_languages[0] so existing configs keep working."""
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"entity_languages": ["ko", "en"]}, f)
+    cfg = MempalaceConfig(config_dir=tmpdir)
+    assert cfg.lang == "ko"
+
+
+def test_lang_strips_whitespace():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"lang": "  fr  "}, f)
+    cfg = MempalaceConfig(config_dir=tmpdir)
+    assert cfg.lang == "fr"
+
+
+# ── cfg.lang_explicit (opt-in signal) ──────────────────────────────────
+
+
+def test_lang_explicit_returns_none_without_user_config():
+    """Default palace has no explicit lang. Opt-in features must see None."""
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.lang_explicit is None
+
+
+def test_lang_explicit_reads_config_file():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"lang": "ja"}, f)
+    cfg = MempalaceConfig(config_dir=tmpdir)
+    assert cfg.lang_explicit == "ja"
+
+
+def test_lang_explicit_env_overrides_file():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"lang": "ja"}, f)
+    os.environ["MEMPALACE_LANG"] = "ru"
+    try:
+        cfg = MempalaceConfig(config_dir=tmpdir)
+        assert cfg.lang_explicit == "ru"
+    finally:
+        del os.environ["MEMPALACE_LANG"]
+
+
+def test_lang_explicit_ignores_entity_languages_fallback():
+    """entity_languages drives cfg.lang for display, but not opt-in lang_explicit."""
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"entity_languages": ["ko", "en"]}, f)
+    cfg = MempalaceConfig(config_dir=tmpdir)
+    assert cfg.lang_explicit is None
+    assert cfg.lang == "ko"  # display-side fallback still works
+
+
+# ── hybrid re-rank blend weights (#2298) ─────────────────────────────────
+# searcher._hybrid_rank used to hardcode 0.6 (vector) / 0.4 (BM25). Those are
+# now configurable via env var > config.json > built-in default, with malformed
+# values silently falling back so a hand-edited config can't take retrieval down.
+
+_HYBRID_VECTOR_ENV = "MEMPALACE_HYBRID_VECTOR_WEIGHT"
+_HYBRID_BM25_ENV = "MEMPALACE_HYBRID_BM25_WEIGHT"
+
+
+def _clear_hybrid_env(monkeypatch) -> None:
+    monkeypatch.delenv(_HYBRID_VECTOR_ENV, raising=False)
+    monkeypatch.delenv(_HYBRID_BM25_ENV, raising=False)
+
+
+def test_hybrid_rank_weights_default_when_unset(tmp_path, monkeypatch):
+    _clear_hybrid_env(monkeypatch)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hybrid_rank_vector_weight == 0.6
+    assert cfg.hybrid_rank_bm25_weight == 0.4
+
+
+def test_hybrid_rank_weights_from_config_file(tmp_path, monkeypatch):
+    _clear_hybrid_env(monkeypatch)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"hybrid_rank_vector_weight": 0.8, "hybrid_rank_bm25_weight": 0.2}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hybrid_rank_vector_weight == 0.8
+    assert cfg.hybrid_rank_bm25_weight == 0.2
+
+
+def test_hybrid_rank_weights_env_overrides_config_file(tmp_path, monkeypatch):
+    # config.json holds 0.8/0.2; env holds 0.9/0.1, which must win for both.
+    # (Leaving one unset would resolve it from config, not env, so both are set
+    # to isolate the env > config precedence for each weight.)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"hybrid_rank_vector_weight": 0.8, "hybrid_rank_bm25_weight": 0.2}, f)
+    monkeypatch.setenv(_HYBRID_VECTOR_ENV, "0.9")
+    monkeypatch.setenv(_HYBRID_BM25_ENV, "0.1")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hybrid_rank_vector_weight == 0.9
+    assert cfg.hybrid_rank_bm25_weight == 0.1
+
+
+@pytest.mark.parametrize("value", ["0.8", "0.2", "  0.5  ", "1e-3", "2"])
+def test_hybrid_rank_weights_accept_numeric_env_values(tmp_path, monkeypatch, value):
+    _clear_hybrid_env(monkeypatch)
+    monkeypatch.setenv(_HYBRID_VECTOR_ENV, value)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hybrid_rank_vector_weight == float(value)
+
+
+@pytest.mark.parametrize("bad", ["not-a-number", "", "nan", "inf", "-0.5"])
+def test_hybrid_rank_weights_malformed_env_falls_back_to_default(tmp_path, monkeypatch, bad):
+    _clear_hybrid_env(monkeypatch)
+    monkeypatch.setenv(_HYBRID_VECTOR_ENV, bad)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hybrid_rank_vector_weight == 0.6
+    assert cfg.hybrid_rank_bm25_weight == 0.4
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [[0.8, 0.2], {"v": 1}, "banana", None, -0.5, 1e400],
+    ids=["list", "dict", "string", "null", "negative", "inf"],
+)
+def test_hybrid_rank_weights_malformed_config_falls_back_to_default(tmp_path, monkeypatch, bad):
+    _clear_hybrid_env(monkeypatch)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"hybrid_rank_vector_weight": bad, "hybrid_rank_bm25_weight": bad}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hybrid_rank_vector_weight == 0.6
+    assert cfg.hybrid_rank_bm25_weight == 0.4
+
+
+# --- XDG Base Directory ---
+
+
+def test_default_config_dir_uses_xdg_when_set(monkeypatch, tmp_path):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    _set_home(monkeypatch, fake_home)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.delenv("MEMPALACE_CONFIG_DIR", raising=False)
+
+    assert _default_config_dir() == xdg / "mempalace"
+
+    cfg = MempalaceConfig()
+    assert cfg.palace_path == str(xdg / "mempalace" / "palace")
+
+
+def test_default_config_dir_falls_back_to_dot_config(monkeypatch, tmp_path):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    _set_home(monkeypatch, fake_home)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("MEMPALACE_CONFIG_DIR", raising=False)
+
+    assert _default_config_dir() == fake_home / ".config" / "mempalace"
+
+
+def test_legacy_mempalace_dir_respected_for_backcompat(monkeypatch, tmp_path):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    legacy = fake_home / ".mempalace"
+    legacy.mkdir()
+    (legacy / "config.json").write_text("{}")
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+
+    _set_home(monkeypatch, fake_home)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.delenv("MEMPALACE_CONFIG_DIR", raising=False)
+
+    assert _default_config_dir() == legacy
+
+    cfg = MempalaceConfig()
+    assert cfg.palace_path == str(legacy / "palace")
+
+
+def test_empty_legacy_dir_does_not_hijack_xdg(monkeypatch, tmp_path):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    (fake_home / ".mempalace").mkdir()
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+
+    _set_home(monkeypatch, fake_home)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.delenv("MEMPALACE_CONFIG_DIR", raising=False)
+
+    assert _default_config_dir() == xdg / "mempalace"
+
+
+def test_bare_palace_dir_does_not_trigger_legacy(monkeypatch, tmp_path):
+    # A bare ~/.mempalace/palace directory (without an actual ChromaDB
+    # store inside) should not be treated as a legacy install -- some
+    # other tool may have created the directory.
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    legacy = fake_home / ".mempalace"
+    legacy.mkdir()
+    (legacy / "palace").mkdir()
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+
+    _set_home(monkeypatch, fake_home)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.delenv("MEMPALACE_CONFIG_DIR", raising=False)
+
+    assert _default_config_dir() == xdg / "mempalace"
+
+
+def test_palace_with_chromadb_triggers_legacy(monkeypatch, tmp_path):
+    # A ~/.mempalace/palace directory that actually contains the ChromaDB
+    # store counts as a real legacy install even without config.json.
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    legacy = fake_home / ".mempalace"
+    legacy.mkdir()
+    palace = legacy / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_bytes(b"")
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+
+    _set_home(monkeypatch, fake_home)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.delenv("MEMPALACE_CONFIG_DIR", raising=False)
+
+    assert _default_config_dir() == legacy
+
+
+def test_mempalace_config_dir_env_overrides_everything(monkeypatch, tmp_path):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    legacy = fake_home / ".mempalace"
+    legacy.mkdir()
+    (legacy / "config.json").write_text("{}")
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    override = tmp_path / "override"
+    override.mkdir()
+
+    _set_home(monkeypatch, fake_home)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(override))
+
+    assert _default_config_dir() == override
+
+    cfg = MempalaceConfig()
+    assert cfg.palace_path == str(override / "palace")
+
+
+def test_empty_xdg_config_home_falls_back_to_dot_config(monkeypatch, tmp_path):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    _set_home(monkeypatch, fake_home)
+    monkeypatch.delenv("MEMPALACE_CONFIG_DIR", raising=False)
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", "")
+    assert _default_config_dir() == fake_home / ".config" / "mempalace"
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", "   ")
+    assert _default_config_dir() == fake_home / ".config" / "mempalace"
+
+
+def test_relative_xdg_config_home_is_ignored(monkeypatch, tmp_path):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    _set_home(monkeypatch, fake_home)
+    monkeypatch.setenv("XDG_CONFIG_HOME", "relative/path")
+    monkeypatch.delenv("MEMPALACE_CONFIG_DIR", raising=False)
+
+    assert _default_config_dir() == fake_home / ".config" / "mempalace"
+
+
+def test_init_writes_xdg_aware_palace_path(tmp_path):
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    cfg.init()
+    with open(tmp_path / "config.json") as f:
+        written = json.load(f)
+    assert written["palace_path"] == str(tmp_path / "palace")

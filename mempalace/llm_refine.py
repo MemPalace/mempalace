@@ -479,6 +479,13 @@ def collect_corpus_text(
     chunks: list[str] = []
     for p in selected:
         try:
+            # ``_walk_prose`` selects by suffix and the stat above reads only
+            # st_mtime, so a FIFO named ``notes.md`` reaches this loop and a
+            # blocking open of one waits for a writer that may never come.
+            # Inside the try: is_file() raises on an unreadable directory,
+            # which the open below already absorbed.
+            if not p.is_file():
+                continue
             with open(p, encoding="utf-8", errors="replace") as f:
                 chunks.append(f.read(max_bytes_per_file))
         except OSError:

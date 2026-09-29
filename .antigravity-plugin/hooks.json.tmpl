@@ -1,0 +1,20 @@
+{
+  "mempalace-save": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "__PLUGIN_DIR__/hooks/mempal_save_hook_antigravity.sh",
+        "timeout": 30
+      }
+    ]
+  },
+  "mempalace-wake": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "__PLUGIN_DIR__/hooks/mempal_wake_hook_antigravity.sh",
+        "timeout": 5
+      }
+    ]
+  }
+}

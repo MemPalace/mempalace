@@ -72,15 +72,20 @@ from typing import Optional, Union
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
+    _validate_palace_fts5_after_mine,
     file_already_mined,
     get_collection,
     mine_lock,
+    mine_yield_point,
 )
 
 # Module-level imports from .miner so tests can patch them via
 # mempalace.format_miner.<name>. Lazy imports inside functions would not
 # expose these as attributes of this module, breaking the test seams.
 from .config import MempalaceConfig, normalize_wing_name
+from .collision_scan import assert_no_collisions
+from .ids import ID_RECIPE, make_drawer_id_from_chunk
+from .source_identity import identity_metadata, source_directory_identity
 from .miner import (
     _compute_topic_tunnels_for_wing,
     chunk_text,
@@ -359,7 +364,7 @@ def extract_text(
         logger.info("skip:unreadable (file gone after scan) %s", p)
         return None, ExtractionStatus.SKIP_UNREADABLE
     except OSError as exc:
-        logger.info("skip:unreadable %s — %s", p, exc)
+        logger.info("skip:unreadable %s -- %s", p, exc)
         return None, ExtractionStatus.SKIP_UNREADABLE
 
     # Fringe Case 5 — empty file. Skip silently.
@@ -430,9 +435,9 @@ def extract_text(
         # Fringe Case 4 vs Case 10: encrypted vs generic crash, by message.
         msg = str(exc)
         if _ENCRYPTED_PATTERNS.search(msg):
-            logger.info("skip:encrypted %s — %s", p, msg[:120])
+            logger.info("skip:encrypted %s -- %s", p, msg[:120])
             return None, ExtractionStatus.SKIP_ENCRYPTED
-        logger.warning("skip:extraction_error %s — %s: %s", p, type(exc).__name__, msg[:200])
+        logger.warning("skip:extraction_error %s -- %s: %s", p, type(exc).__name__, msg[:200])
         return None, ExtractionStatus.SKIP_EXTRACTION_ERROR
 
     # Either transformer can legitimately return None / empty (malformed
@@ -440,7 +445,7 @@ def extract_text(
     # so the caller knows to skip rather than file an empty drawer.
     if not text:
         transformer = "striprtf" if is_rtf else "markitdown"
-        logger.info("skip:extraction_error %s — %s returned None/empty", p, transformer)
+        logger.info("skip:extraction_error %s -- %s returned None/empty", p, transformer)
         return None, ExtractionStatus.SKIP_EXTRACTION_ERROR
 
     return text, ExtractionStatus.OK
@@ -504,7 +509,7 @@ def scan_formats(directory: Union[Path, str]) -> list[Path]:
 
 
 def _print_mine_summary(
-    files: list,
+    files_seen: int,
     files_with_text: int,
     files_skipped: int,
     files_errored: int,
@@ -520,7 +525,7 @@ def _print_mine_summary(
     print(f"\n{'=' * 55}")
     print("  Summary")
     print(f"{'-' * 55}")
-    print(f"  Files seen:        {len(files)}")
+    print(f"  Files seen:        {files_seen}")
     print(f"  Files extracted:   {files_with_text}")
     print(f"  Files skipped:     {files_skipped}")
     print(f"  Files errored:     {files_errored}")
@@ -572,6 +577,10 @@ def _register_file(collection, source_file: str, wing: str, agent: str) -> None:
                     "extract_mode": "format",
                     "normalize_version": NORMALIZE_VERSION,
                     "is_sentinel": True,
+                    # The sentinel names a real source file and ``sync`` reads
+                    # it as an ordinary drawer, so it needs the identity for
+                    # the same reason the file's own drawers do (#2320).
+                    **identity_metadata(source_file),
                 }
             ],
         )
@@ -587,6 +596,8 @@ def _file_chunks_locked(
     room,
     agent,
     source_mtime: Optional[float] = None,
+    content: Optional[str] = None,
+    source_dir_ino: Optional[str] = None,
 ):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
@@ -604,7 +615,19 @@ def _file_chunks_locked(
     """
     # Lazy imports to avoid a module-load cycle (miner.py imports from this
     # module's package, so we defer these helpers until call time).
-    from .miner import _extract_entities_for_metadata, detect_hall
+    from .miner import (
+        _extract_content_date_with_source,
+        _extract_entities_for_metadata,
+        detect_hall,
+    )
+
+    # Tier 6a content-date: extract once per file (not per chunk). Format-mined
+    # files often have date-rich content (RTF/PDF dates in body text, mtimes on
+    # the binary source). Caller may pass ``content`` (full extracted text) for
+    # the body-scan branch; if absent, the helper still uses filename + mtime.
+    file_content_date, file_content_date_source = _extract_content_date_with_source(
+        source_file, content or ""
+    )
 
     drawers_added = 0
     with mine_lock(source_file):
@@ -632,8 +655,7 @@ def _file_chunks_locked(
             batch_ids: list = []
             batch_metas: list = []
             for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                key = (source_file + str(chunk["chunk_index"])).encode()
-                drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256(key).hexdigest()[:24]}"
+                drawer_id = make_drawer_id_from_chunk(wing, room, source_file, chunk["chunk_index"])
                 content = chunk["content"]
                 meta: dict = {
                     "wing": wing,
@@ -646,15 +668,34 @@ def _file_chunks_locked(
                     "extract_mode": "format",
                     "normalize_version": NORMALIZE_VERSION,
                     "hall": detect_hall(content),
+                    "id_recipe": ID_RECIPE,
                 }
                 if source_mtime is not None:
                     meta["source_mtime"] = source_mtime
+                if source_dir_ino:
+                    # Which directory this file was read from, so ``sync``
+                    # can tell a neighbour in the same directory from one on
+                    # a volume mounted there since (#2320).
+                    meta["source_dir_ino"] = source_dir_ino
+                # Tier 6a — propagate line range from chunk dict into drawer
+                # metadata so closet pointers can carry "where in source"
+                # info. Chunks emitted by older code paths without these
+                # keys produce drawers without the keys (graceful fallback).
+                if chunk.get("line_start") is not None:
+                    meta["line_start"] = chunk["line_start"]
+                if chunk.get("line_end") is not None:
+                    meta["line_end"] = chunk["line_end"]
+                # Tier 6a content-date: shared across all chunks of the file.
+                if file_content_date:
+                    meta["content_date"] = file_content_date
+                    meta["content_date_source"] = file_content_date_source
                 entities = _extract_entities_for_metadata(content)
                 if entities:
                     meta["entities"] = entities
                 batch_docs.append(content)
                 batch_ids.append(drawer_id)
                 batch_metas.append(meta)
+            assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
             try:
                 collection.upsert(
                     documents=batch_docs,
@@ -728,7 +769,7 @@ def mine_formats(
     # min_chunk_size) are now threaded through chunk_text below, so users
     # who customized their config see the effect in format-mode mining.
     # Per PR #1555 review (Gemini #3).
-    palace_config = MempalaceConfig()
+    palace_config = MempalaceConfig(palace_path=palace_path)
 
     format_path = Path(format_dir).expanduser().resolve()
     if not wing:
@@ -767,9 +808,11 @@ def mine_formats(
     files: list = []
     collection = None
     total_drawers = 0
+    files_mined = 0
     files_skipped = 0
     files_with_text = 0
     files_errored = 0
+    files_processed = 0
     status_counts: dict = defaultdict(int)
 
     try:
@@ -777,23 +820,24 @@ def mine_formats(
         # ``~/docs`` and relative inputs work consistently. Per PR #1555 review
         # (Copilot #10).
         files = scan_formats(format_path)
-        if limit > 0:
-            files = files[:limit]
 
         print(f"\n{'=' * 55}")
-        print("  MemPalace Mine — Format extraction")
+        print("  MemPalace Mine -- Format extraction")
         print(f"{'=' * 55}")
         print(f"  Wing:    {wing}")
         print(f"  Source:  {format_path}")
-        print(f"  Files:   {len(files)}")
+        limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
+        print(f"  Files:   {len(files)}{limit_suffix}")
         print(f"  Palace:  {palace_path}")
         if dry_run:
-            print("  DRY RUN — nothing will be filed")
+            print("  DRY RUN -- nothing will be filed")
         print(f"{'-' * 55}\n")
 
         collection = get_collection(palace_path) if not dry_run else None
 
         for i, filepath in enumerate(files, 1):
+            mine_yield_point()
+            files_processed = i
             source_file = str(filepath)
 
             # Per-file try/except so one bad file can't crash the whole mine.
@@ -852,8 +896,11 @@ def mine_formats(
                 files_with_text += 1
 
                 if dry_run:
-                    print(f"    [DRY RUN] {filepath.name} → {len(chunks)} drawers")
+                    print(f"    [DRY RUN] {filepath.name} -> {len(chunks)} drawers")
                     total_drawers += len(chunks)
+                    files_mined += 1
+                    if limit > 0 and files_mined >= limit:
+                        break
                     continue
 
                 drawers_added, skipped = _file_chunks_locked(
@@ -864,13 +911,18 @@ def mine_formats(
                     room,
                     agent,
                     source_mtime=source_mtime,
+                    content=text,
+                    source_dir_ino=source_directory_identity(filepath),
                 )
                 if skipped:
                     files_skipped += 1
                     continue
 
                 total_drawers += drawers_added
+                files_mined += 1
                 print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
+                if limit > 0 and files_mined >= limit:
+                    break
             except Exception as exc:
                 # Log and continue — one malformed file shouldn't kill the
                 # whole mine. Mirrors miner.py's per-file recovery.
@@ -909,11 +961,12 @@ def mine_formats(
     else:
         # All files processed without interruption — compute cross-wing topic
         # tunnels linking this wing to others that share confirmed topics.
-        # Mirrors miner.py:1241-1249 exactly: tunnel-compute failures must
-        # never fail a mine, so any exception is logged and skipped quietly.
+        # Mirrors the post-loop tunnel block in miner._mine_impl: tunnel-compute
+        # failures must never fail a mine, so any exception is logged and
+        # skipped quietly.
         if not dry_run:
             try:
-                tunnels_added = _compute_topic_tunnels_for_wing(wing)
+                tunnels_added = _compute_topic_tunnels_for_wing(wing, config=palace_config)
                 if tunnels_added:
                     print(f"\n  Topic tunnels: +{tunnels_added} cross-wing link(s)")
             except Exception as exc:
@@ -926,6 +979,14 @@ def mine_formats(
                     f"\n  WARNING: topic tunnel computation skipped — {exc}",
                     file=sys.stderr,
                 )
+
+            # End-of-mine FTS5 integrity check (#1537). Mirrors _mine_impl;
+            # raises MineValidationError to cmd_mine if PRAGMA quick_check
+            # finds malformed FTS5 rows so a corrupted palace cannot silently
+            # exit Done on the --mode extract path that bypasses _mine_impl.
+            # Sits outside the per-file try/except in the for-loop body, so
+            # caught per-file errors do not mask the integrity result.
+            _validate_palace_fts5_after_mine(palace_path)
     finally:
         # Hook-spawned mines write a PID file that miner.py's
         # _cleanup_mine_pid_file() clears; we mirror that so format-mode
@@ -941,7 +1002,7 @@ def mine_formats(
                 logger.debug("mine_formats: _cleanup_mine_pid_file failed", exc_info=True)
 
     _print_mine_summary(
-        files=files,
+        files_seen=files_processed,
         files_with_text=files_with_text,
         files_skipped=files_skipped,
         files_errored=files_errored,

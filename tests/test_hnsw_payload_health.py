@@ -113,8 +113,11 @@ def test_quarantine_leaves_reasonable_payload_in_place(tmp_path):
     assert seg_dir.exists()
 
 
-def test_segment_health_rejects_zero_byte_link_lists_with_payload(tmp_path):
-    """Regression #1457: real HNSW payload with empty link_lists.bin is corrupt."""
+def test_segment_health_accepts_zero_byte_link_lists_with_valid_pickle(tmp_path):
+    """Regression #1716: an all-layer-0 HNSW index serializes an empty
+    link_lists.bin (level-0 links live in data_level0.bin). With a complete
+    index_metadata.pickle the persist finished, so the segment is healthy —
+    not the partial-flush corruption a missing marker would imply."""
     seg_dir = tmp_path / "11111111-2222-3333-4444-555555555555"
 
     _write_segment(
@@ -124,11 +127,32 @@ def test_segment_health_rejects_zero_byte_link_lists_with_payload(tmp_path):
         write_metadata=True,
     )
 
+    assert _segment_appears_healthy(str(seg_dir))
+
+
+def test_segment_health_rejects_zero_byte_link_lists_with_truncated_pickle(tmp_path):
+    """An empty link_lists.bin with real payload but a truncated metadata
+    envelope is a partial flush, not an all-layer-0 index — still rejected.
+    The completion marker (intact pickle), not link_lists content, is what
+    distinguishes the two."""
+    seg_dir = tmp_path / "11111111-2222-3333-4444-555555555555"
+
+    _write_segment(
+        seg_dir,
+        data_size=2_000,
+        link_size=0,
+        write_metadata=False,
+    )
+    # Persist started (0x80 head) but never wrote the STOP terminator.
+    (seg_dir / "index_metadata.pickle").write_bytes(b"\x80" + b"x" * 20)
+
     assert not _segment_appears_healthy(str(seg_dir))
 
 
-def test_quarantine_catches_zero_byte_link_lists_when_stale(tmp_path):
-    """Regression #1457: stale segments with empty link_lists.bin are quarantined."""
+def test_quarantine_leaves_zero_byte_link_lists_with_valid_pickle(tmp_path):
+    """Regression #1716: a stale all-layer-0 segment with a complete pickle is
+    left in place. Quarantining it spawned the self-perpetuating loop — repair
+    rebuilds the byte-identical empty-link_lists shape and it re-quarantines."""
     palace = tmp_path / "palace"
     palace.mkdir()
 
@@ -150,9 +174,90 @@ def test_quarantine_catches_zero_byte_link_lists_when_stale(tmp_path):
 
     moved = quarantine_stale_hnsw(str(palace), stale_seconds=300)
 
-    assert len(moved) == 1
-    assert not seg_dir.exists()
+    assert moved == []
+    assert seg_dir.exists()
 
-    moved_path = Path(moved[0])
-    assert moved_path.exists()
-    assert moved_path.name.startswith("11111111-2222-3333-4444-555555555555.drift-")
+
+# ── Regression cover for the #1710 cumulative-counter fix ─────────────
+#
+# _missing_dimensionality_appears_recoverable already requires
+# total_elements_added >= len(id_to_label) rather than ==, which is what
+# #1710 corrected: total_elements_added is hnswlib's cumulative add
+# counter and includes elements later deleted or replaced, so it is
+# legitimately greater on any palace that has removed a drawer.
+#
+# That fix landed without tests. These lock the behaviour in from both
+# sides, because the failure it prevents is expensive and silent: a
+# healthy index (183,009 consistent label pairs, 315 MB of vectors) gets
+# renamed to .corrupt over a recoverable missing dimensionality, Chroma
+# creates an empty replacement, and vector search quietly degrades.
+
+
+def _write_pickled_segment(seg_dir: Path, state: dict, *, payload: int = 4096) -> None:
+    import pickle
+
+    seg_dir.mkdir(parents=True, exist_ok=True)
+    (seg_dir / "data_level0.bin").write_bytes(b"\0" * payload)
+    (seg_dir / "link_lists.bin").write_bytes(b"\0" * (payload // 8))
+    with open(seg_dir / "index_metadata.pickle", "wb") as f:
+        pickle.dump(state, f, pickle.HIGHEST_PROTOCOL)
+
+
+def _state(*, labels: int, total: int, dimensionality=None) -> dict:
+    return {
+        "dimensionality": dimensionality,
+        "total_elements_added": total,
+        "max_seq_id": None,
+        "id_to_label": {f"d-{i}": i for i in range(labels)},
+        "label_to_id": {i: f"d-{i}" for i in range(labels)},
+        "id_to_seq_id": {},
+    }
+
+
+def test_missing_dimensionality_recoverable_when_total_exceeds_labels(tmp_path):
+    """Deletions make total_elements_added > label count. Still recoverable."""
+    from mempalace.backends.chroma import _missing_dimensionality_appears_recoverable
+
+    seg_dir = tmp_path / "11111111-2222-3333-4444-555555555555"
+    state = _state(labels=183_009, total=188_220)
+    _write_pickled_segment(seg_dir, state)
+
+    assert _missing_dimensionality_appears_recoverable(state, state["id_to_label"], str(seg_dir))
+
+
+def test_missing_dimensionality_not_recoverable_when_total_below_labels(tmp_path):
+    """total < labels is genuinely impossible - stay unrecoverable."""
+    from mempalace.backends.chroma import _missing_dimensionality_appears_recoverable
+
+    seg_dir = tmp_path / "11111111-2222-3333-4444-555555555555"
+    state = _state(labels=100, total=40)
+    _write_pickled_segment(seg_dir, state)
+
+    assert not _missing_dimensionality_appears_recoverable(
+        state, state["id_to_label"], str(seg_dir)
+    )
+
+
+def test_quarantine_spares_healthy_index_with_cumulative_total(tmp_path):
+    """End-to-end: a post-deletion segment must NOT be quarantined."""
+    from mempalace.backends.chroma import quarantine_invalid_hnsw_metadata
+
+    seg_dir = tmp_path / "11111111-2222-3333-4444-555555555555"
+    _write_pickled_segment(seg_dir, _state(labels=183_009, total=188_220))
+
+    assert quarantine_invalid_hnsw_metadata(str(tmp_path)) == []
+    assert seg_dir.is_dir(), "healthy index was quarantined"
+
+
+def test_quarantine_still_catches_inconsistent_label_maps(tmp_path):
+    """Accepting a cumulative total must not spare a truly broken index."""
+    from mempalace.backends.chroma import quarantine_invalid_hnsw_metadata
+
+    seg_dir = tmp_path / "11111111-2222-3333-4444-555555555555"
+    state = _state(labels=100, total=120)
+    state["label_to_id"] = {i: f"WRONG-{i}" for i in range(100)}
+    _write_pickled_segment(seg_dir, state)
+
+    moved = quarantine_invalid_hnsw_metadata(str(tmp_path))
+    assert len(moved) == 1
+    assert not seg_dir.is_dir()

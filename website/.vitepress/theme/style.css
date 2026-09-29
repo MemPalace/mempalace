@@ -165,8 +165,26 @@
 /* ── Tables ─────────────────────────────────────────────────────────── */
 
 .vp-doc table {
+  display: block;
+  /* Keep VitePress's horizontal scroll for wide tables; `overflow: hidden`
+     here would clip columns that don't fit the content column instead. */
+  overflow-x: auto;
   border-radius: 8px;
-  overflow: hidden;
+}
+
+/* Slightly denser cells so comparison tables fit the content column without a
+   horizontal scrollbar (VitePress default is 8px 16px). */
+.vp-doc td,
+.vp-doc th {
+  padding: 8px 12px;
+}
+
+/* Break only inline-code tokens that genuinely can't fit their column (long
+   description strings), while leaving natural column sizing intact so short
+   identifiers like `palace_path` stay on one line. `overflow-x: auto` above is
+   the safety net for any table still wider than the content column. */
+.vp-doc td code {
+  overflow-wrap: break-word;
 }
 
 .vp-doc th {

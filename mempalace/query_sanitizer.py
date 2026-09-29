@@ -21,6 +21,8 @@ Expected recovery:
 import re
 import logging
 
+from mempalace.config import strip_lone_surrogates
+
 logger = logging.getLogger("mempalace_mcp")
 
 # --- Constants ---
@@ -65,7 +67,9 @@ def sanitize_query(raw_query: str) -> dict:
             "method": "passthrough",
         }
 
-    raw_query = raw_query.strip()
+    # Strip lone surrogates before any further processing so downstream embed
+    # calls don't crash on UTF-8 encode (#1235).
+    raw_query = strip_lone_surrogates(raw_query.strip())
     original_length = len(raw_query)
 
     def _strip_wrapping_quotes(candidate: str) -> str:

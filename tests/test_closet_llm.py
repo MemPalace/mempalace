@@ -8,8 +8,13 @@ These tests don't hit the network. They mock urllib to verify:
 """
 
 import json
+import os
+import subprocess
+import sys
 import tempfile
 from unittest.mock import patch
+
+import pytest
 
 from mempalace.closet_llm import (
     LLMConfig,
@@ -236,6 +241,73 @@ class TestRegenerateClosets:
             result = regenerate_closets(palace)
             assert result["error"] == "missing-config"
             assert any("ENDPOINT" in m for m in result["missing"])
+
+    def test_regen_refuses_before_open_or_llm_when_palace_has_writer(self, tmp_path, monkeypatch):
+        """The non-dry-run operation must contend for process-lifetime palace
+        ownership before it opens sqlite_exact or performs expensive/external
+        work."""
+        from mempalace import closet_llm as closet_llm_mod
+        from mempalace.palace import MineAlreadyRunning
+
+        palace = str(tmp_path / "palace")
+        os.makedirs(palace)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
+        holder_code = """
+import sys
+from mempalace.palace import mine_palace_lock
+with mine_palace_lock(sys.argv[1]):
+    print("ready", flush=True)
+    sys.stdin.read()
+"""
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_code, palace],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=os.environ.copy(),
+        )
+        try:
+            assert holder.stdout is not None
+            assert holder.stdout.readline().strip() == "ready"
+            cfg = LLMConfig(endpoint="http://local/v1", model="m")
+            with (
+                patch.object(
+                    closet_llm_mod,
+                    "get_collection",
+                    side_effect=AssertionError("collection opened before ownership"),
+                ),
+                patch.object(
+                    closet_llm_mod,
+                    "get_closets_collection",
+                    side_effect=AssertionError("closets opened before ownership"),
+                ),
+                patch.object(
+                    closet_llm_mod,
+                    "_call_llm",
+                    side_effect=AssertionError("LLM called before ownership"),
+                ),
+                patch.object(
+                    closet_llm_mod,
+                    "purge_file_closets",
+                    side_effect=AssertionError("delete reached before ownership"),
+                ),
+                patch.object(
+                    closet_llm_mod,
+                    "upsert_closet_lines",
+                    side_effect=AssertionError("upsert reached before ownership"),
+                ),
+            ):
+                with pytest.raises(MineAlreadyRunning):
+                    regenerate_closets(palace, cfg=cfg)
+        finally:
+            if holder.stdin is not None:
+                holder.stdin.close()
+            holder.wait(timeout=10)
+            if holder.returncode != 0:
+                stderr = holder.stderr.read() if holder.stderr is not None else ""
+                pytest.fail(f"lock holder failed with {holder.returncode}: {stderr}")
 
     def test_regen_purges_regex_closets_and_stamps_normalize_version(self, tmp_path):
         """Regression: before the hardening, regex closets for the same

@@ -18,8 +18,10 @@ from mempalace.project_scanner import (
     _collect_manifest_names,
     _merge_detected,
     _parse_cargo,
+    _parse_gradle,
     _parse_gomod,
     _parse_package_json,
+    _parse_pom,
     _parse_pyproject,
     _UnionFind,
     discover_entities,
@@ -80,6 +82,76 @@ def test_parse_gomod(tmp_path):
     f = tmp_path / "go.mod"
     f.write_text("module github.com/user/my-go-mod\n\ngo 1.21\n")
     assert _parse_gomod(f) == "my-go-mod"
+
+
+def test_parse_pom_direct_artifact_id_with_namespace(tmp_path):
+    f = tmp_path / "pom.xml"
+    f.write_text(
+        """<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>parent-artifact</artifactId>
+    <version>1.0.0</version>
+  </parent>
+  <groupId>com.example</groupId>
+  <artifactId>child-artifact</artifactId>
+</project>
+"""
+    )
+    assert _parse_pom(f) == "child-artifact"
+
+
+def test_parse_pom_missing_or_malformed_artifact_id(tmp_path):
+    missing = tmp_path / "missing-pom.xml"
+    missing.write_text("<project><modelVersion>4.0.0</modelVersion></project>")
+    malformed = tmp_path / "bad-pom.xml"
+    malformed.write_text("<project><artifactId>broken")
+
+    assert _parse_pom(missing) is None
+    assert _parse_pom(malformed) is None
+
+
+def test_parse_pom_ignores_non_string_child_tags(tmp_path, monkeypatch):
+    class FakeChild:
+        tag = object()
+        text = "ignored"
+
+    class ArtifactChild:
+        tag = "artifactId"
+        text = "safe-artifact"
+
+    class FakeTree:
+        def getroot(self):
+            return [FakeChild(), ArtifactChild()]
+
+    monkeypatch.setattr("mempalace.project_scanner.ET.parse", lambda _path: FakeTree())
+
+    assert _parse_pom(tmp_path / "pom.xml") == "safe-artifact"
+
+
+def test_parse_gradle_build_reads_sibling_settings(tmp_path):
+    (tmp_path / "settings.gradle").write_text('rootProject.name = "settings-name"\n')
+    f = tmp_path / "build.gradle"
+    f.write_text("plugins { id 'java' }\n")
+
+    assert _parse_gradle(f) == "settings-name"
+
+
+def test_parse_gradle_kotlin_set_syntax(tmp_path):
+    f = tmp_path / "settings.gradle.kts"
+    f.write_text('rootProject.name.set("kotlin-settings-name")\n')
+
+    assert _parse_gradle(f) == "kotlin-settings-name"
+
+
+def test_parse_gradle_falls_back_to_directory_name(tmp_path):
+    project = tmp_path / "gradle-dir-name"
+    project.mkdir()
+    f = project / "build.gradle.kts"
+    f.write_text("plugins { java }\n")
+
+    assert _parse_gradle(f) == "gradle-dir-name"
 
 
 # ── bot filtering ───────────────────────────────────────────────────────
@@ -284,6 +356,95 @@ def test_scan_project_from_pyproject(tmp_path):
     _init_git_repo(tmp_path)
     projects, _ = scan(tmp_path)
     assert any(p.name == "pyproj" for p in projects)
+
+
+def test_scan_project_from_maven_pom(tmp_path):
+    (tmp_path / "pom.xml").write_text(
+        """<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>maven-app</artifactId>
+</project>
+"""
+    )
+    _init_git_repo(tmp_path)
+    projects, _ = scan(tmp_path)
+
+    assert projects[0].name == "maven-app"
+    assert projects[0].manifest == "pom.xml"
+
+
+def test_scan_project_from_gradle_settings_without_git(tmp_path):
+    (tmp_path / "settings.gradle.kts").write_text('rootProject.name = "gradle-root"\n')
+    (tmp_path / "build.gradle.kts").write_text("plugins { java }\n")
+    projects, people = scan(tmp_path)
+
+    assert len(projects) == 1
+    assert projects[0].name == "gradle-root"
+    assert projects[0].manifest == "settings.gradle.kts"
+    assert projects[0].has_git is False
+    assert people == []
+
+
+def test_scan_gradle_subproject_without_git_keeps_manifest_dir(tmp_path):
+    (tmp_path / "settings.gradle").write_text('rootProject.name = "gradle-root"\n')
+    app = tmp_path / "app"
+    app.mkdir()
+    (app / "build.gradle").write_text("plugins { id 'java' }\n")
+
+    projects, _ = scan(tmp_path)
+    by_name = {p.name: p for p in projects}
+
+    assert by_name["gradle-root"].repo_root == tmp_path
+    assert by_name["app"].manifest == "build.gradle"
+    assert by_name["app"].repo_root == app
+
+
+def test_scan_includes_java_subprojects_inside_mixed_git_repo(tmp_path):
+    (tmp_path / "package.json").write_text(json.dumps({"name": "web-root"}))
+    service = tmp_path / "service"
+    service.mkdir()
+    (service / "pom.xml").write_text(
+        """<project>
+  <modelVersion>4.0.0</modelVersion>
+  <artifactId>java-service</artifactId>
+</project>
+"""
+    )
+    worker = tmp_path / "worker"
+    worker.mkdir()
+    (worker / "build.gradle.kts").write_text("plugins { java }\n")
+    _init_git_repo(tmp_path)
+
+    projects, _ = scan(tmp_path)
+    by_name = {p.name: p for p in projects}
+
+    assert by_name["web-root"].manifest == "package.json"
+    assert by_name["java-service"].manifest == "pom.xml"
+    assert by_name["java-service"].repo_root == service
+    assert by_name["worker"].manifest == "build.gradle.kts"
+    assert by_name["worker"].repo_root == worker
+
+
+def test_scan_git_repo_without_root_manifest_keeps_java_subproject_dir(tmp_path):
+    service = tmp_path / "service"
+    service.mkdir()
+    (service / "pom.xml").write_text(
+        """<project>
+  <modelVersion>4.0.0</modelVersion>
+  <artifactId>java-service</artifactId>
+</project>
+"""
+    )
+    _init_git_repo(tmp_path)
+
+    projects, _ = scan(tmp_path)
+    by_name = {p.name: p for p in projects}
+
+    assert by_name[tmp_path.name].manifest is None
+    assert by_name[tmp_path.name].repo_root == tmp_path
+    assert by_name["java-service"].manifest == "pom.xml"
+    assert by_name["java-service"].repo_root == service
 
 
 def test_scan_prefers_root_manifest_with_explicit_priority(tmp_path):

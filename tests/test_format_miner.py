@@ -801,6 +801,36 @@ def test_mine_formats_respects_limit(_mine_formats_mocks):
     assert p_md.call_count == 2
 
 
+def test_mine_formats_limit_skips_already_mined(_mine_formats_mocks):
+    """--limit N counts only new work, not already-mined skips (#1535)."""
+    from unittest.mock import patch
+    from mempalace.format_miner import mine_formats
+
+    tmp = _mine_formats_mocks["tmp_path"]
+    files = []
+    for i in range(6):
+        p = tmp / f"f{i}.pdf"
+        p.write_bytes(b"%PDF-1.4 stub")
+        files.append(p)
+
+    call_idx = 0
+
+    def fake_already_mined(collection, source_file, **kwargs):
+        nonlocal call_idx
+        call_idx += 1
+        return call_idx <= 4
+
+    _mine_formats_mocks["file_already_mined"].side_effect = fake_already_mined
+    with (
+        patch("mempalace.format_miner.scan_formats", return_value=files),
+        patch(
+            "mempalace.format_miner._extract_via_markitdown", return_value="long text " * 50
+        ) as p_md,
+    ):
+        mine_formats(format_dir=str(tmp), palace_path=str(tmp / "palace"), limit=1)
+    assert p_md.call_count == 1
+
+
 def test_mine_formats_wing_defaults_from_directory_name(_mine_formats_mocks):
     """When wing=None, the directory's basename becomes the wing."""
     from unittest.mock import patch
@@ -1128,7 +1158,9 @@ def test_mine_formats_calls_compute_topic_tunnels_after_loop(_mine_formats_mocks
         patch("mempalace.format_miner._compute_topic_tunnels_for_wing", return_value=0) as p_tun,
     ):
         mine_formats(format_dir=str(tmp), palace_path=str(tmp / "palace"), wing="wing_aya")
-    p_tun.assert_called_once_with("wing_aya")
+    p_tun.assert_called_once()
+    assert p_tun.call_args.args == ("wing_aya",)
+    assert p_tun.call_args.kwargs["config"].palace_path == str(tmp / "palace")
 
 
 def test_mine_formats_tunnel_failure_does_not_crash_mine(_mine_formats_mocks):
@@ -1488,13 +1520,16 @@ def test_mine_formats_threads_chunk_size_from_user_config(monkeypatch, tmp_path:
 
     # Inject custom config values via a fake MempalaceConfig.
     class _FakeMempalaceConfig:
+        def __init__(self, **kwargs):
+            self._palace_path = kwargs.get("palace_path", str(tmp_path / "palace"))
+
         chunk_size = 1234
         chunk_overlap = 56
         min_chunk_size = 78
 
         @property
         def palace_path(self):
-            return str(tmp_path / "palace")
+            return self._palace_path
 
     monkeypatch.setattr(format_miner, "MempalaceConfig", _FakeMempalaceConfig)
 
@@ -1521,3 +1556,83 @@ def test_mine_formats_threads_chunk_size_from_user_config(monkeypatch, tmp_path:
         f"chunk_text called without user's min_chunk_size "
         f"(got {call.get('min_chunk_size')}, expected 78). kwargs={call}"
     )
+
+
+def test_file_chunks_locked_stamps_the_source_filesystem_identity(monkeypatch, tmp_path: Path):
+    """Format-mined drawers carry the identity of the filesystem their source
+    was read from, so ``sync`` can tell a neighbour in the same directory from
+    one on a volume mounted there since (#2320)."""
+    import contextlib
+
+    from mempalace import format_miner
+
+    class FakeCol:
+        def __init__(self):
+            self.metadatas: list = []
+
+        def get(self, *args, **kwargs):
+            return {"ids": []}
+
+        def delete(self, *args, **kwargs):
+            pass
+
+        def upsert(self, documents, ids, metadatas):
+            self.metadatas.extend(metadatas)
+
+    col = FakeCol()
+    monkeypatch.setattr(
+        format_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+    )
+    monkeypatch.setattr(format_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+    chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(2)]
+
+    format_miner._file_chunks_locked(
+        col,
+        str(tmp_path / "report.docx"),
+        chunks,
+        "wing",
+        "documents",
+        "agent",
+        source_dir_ino="1000000",
+    )
+
+    assert col.metadatas
+    assert all(m["source_dir_ino"] == "1000000" for m in col.metadatas), col.metadatas
+
+    plain = FakeCol()
+    format_miner._file_chunks_locked(
+        plain, str(tmp_path / "other.docx"), chunks, "wing", "documents", "agent"
+    )
+    assert plain.metadatas
+    assert all("source_dir_ino" not in m for m in plain.metadatas), plain.metadatas
+
+
+def test_mine_formats_passes_the_directory_it_read_from(tmp_path, monkeypatch):
+    """The storing half is covered above; this covers the wiring, so removing
+    the call in ``mine_formats`` cannot pass unnoticed (#2320)."""
+    from mempalace import format_miner
+    from mempalace import source_identity as si
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    target = docs / "report.docx"
+    target.write_bytes(b"not really a docx")
+
+    seen = {}
+
+    def record(*args, **kwargs):
+        seen["source_dir_ino"] = kwargs.get("source_dir_ino")
+        return (0, True)
+
+    monkeypatch.setattr(format_miner, "scan_formats", lambda *a, **k: [target])
+    monkeypatch.setattr(
+        format_miner,
+        "extract_text",
+        lambda *a, **k: ("text " * 200, format_miner.ExtractionStatus.OK),
+    )
+    monkeypatch.setattr(format_miner, "_file_chunks_locked", record)
+    # The stub returns what the real helper returns, so the pass runs to the
+    # end and a failure after the recorded call is a failure of this test.
+    format_miner.mine_formats(str(docs), str(tmp_path / "palace"))
+
+    assert seen.get("source_dir_ino") == si.directory_identity(docs)

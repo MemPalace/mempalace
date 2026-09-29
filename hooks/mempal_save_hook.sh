@@ -79,6 +79,32 @@ if [ -z "$MEMPAL_PYTHON_BIN" ] || [ ! -x "$MEMPAL_PYTHON_BIN" ]; then
     MEMPAL_PYTHON_BIN="$(command -v python3 2>/dev/null || echo python3)"
 fi
 
+# ── Silent mode / opt-out ──────────────────────────────────────────────
+# Set MEMPALACE_HOOKS_AUTO_SAVE=false to disable auto-save blocking entirely.
+# The hook stays installed but passes through without interrupting the session.
+# Can also be set in ~/.mempalace/config.json: {"hooks": {"auto_save": false}}
+if [ -n "$MEMPALACE_HOOKS_AUTO_SAVE" ]; then
+    case "$MEMPALACE_HOOKS_AUTO_SAVE" in
+        false|0|no) echo "{}"; exit 0 ;;
+    esac
+else
+    # Check config.json if env var is not set
+    CONFIG_FILE="$HOME/.mempalace/config.json"
+    if [ -f "$CONFIG_FILE" ]; then
+        AUTO_SAVE=$("$MEMPAL_PYTHON_BIN" -c "
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1]))
+    print(str(cfg.get('hooks', {}).get('auto_save', True)).lower())
+except Exception: print('true')
+" "$CONFIG_FILE" 2>/dev/null)
+        if [ "$AUTO_SAVE" = "false" ]; then
+            echo "{}"
+            exit 0
+        fi
+    fi
+fi
+
 # Read JSON input from stdin
 INPUT=$(cat)
 
@@ -123,21 +149,8 @@ INPUT=$(cat)
 #     ``printf '%s'`` removes the class of bug entirely.
 _mempal_parsed=$(
     umask 077
-    printf '%s' "$INPUT" | "$MEMPAL_PYTHON_BIN" -c "
-import sys, json, re
-data = json.load(sys.stdin)
-sid = data.get('session_id', '')
-sha_raw = data.get('stop_hook_active', False)
-tp = data.get('transcript_path', '')
-# Shell-safe output: only allow alphanumeric, underscore, hyphen, slash, dot, tilde
-safe = lambda s: re.sub(r'[^a-zA-Z0-9_/.\-~]', '', str(s))
-# Coerce stop_hook_active to strict boolean string
-sha = 'True' if sha_raw is True or str(sha_raw).lower() in ('true', '1', 'yes') else 'False'
-print('__MEMPAL_PARSE_OK__')
-print(safe(sid))
-print(sha)
-print(safe(tp))
-" 2>"$STATE_DIR/last_python_err.log"
+    printf '%s' "$INPUT" | "$MEMPAL_PYTHON_BIN" -m mempalace.hook_shell parse-stop \
+        2>"$STATE_DIR/last_python_err.log"
 )
 # The 2> redirect creates the file even when stderr is empty (success).
 # Remove the empty file so the state directory stays clean on the happy
@@ -213,24 +226,10 @@ fi
 # Count human messages in the JSONL transcript
 # SECURITY: Pass transcript path as sys.argv to avoid shell injection via crafted paths
 if [ -f "$TRANSCRIPT_PATH" ]; then
-    EXCHANGE_COUNT=$("$MEMPAL_PYTHON_BIN" - "$TRANSCRIPT_PATH" <<'PYEOF'
-import json, sys
-count = 0
-with open(sys.argv[1]) as f:
-    for line in f:
-        try:
-            entry = json.loads(line)
-            msg = entry.get('message', {})
-            if isinstance(msg, dict) and msg.get('role') == 'user':
-                content = msg.get('content', '')
-                if isinstance(content, str) and '<command-message>' in content:
-                    continue
-                count += 1
-        except:
-            pass
-print(count)
-PYEOF
-2>/dev/null)
+    EXCHANGE_COUNT=$("$MEMPAL_PYTHON_BIN" -m mempalace.hook_shell count-human-messages "$TRANSCRIPT_PATH" 2>/dev/null)
+elif [ -n "$TRANSCRIPT_PATH" ]; then
+    echo "[$(date '+%H:%M:%S')] WARN: transcript_path not found after normalization: $TRANSCRIPT_PATH" >> "$STATE_DIR/hook.log"
+    EXCHANGE_COUNT=0
 else
     EXCHANGE_COUNT=0
 fi
@@ -266,14 +265,14 @@ if [ "$SINCE_LAST" -ge "$SAVE_INTERVAL" ] && [ "$EXCHANGE_COUNT" -gt 0 ]; then
     # MEMPAL_DIR is *additive*, not an override: a user with MEMPAL_DIR
     # pointed at their project still gets the active conversation mined.
     if is_valid_transcript_path "$TRANSCRIPT_PATH" && [ -f "$TRANSCRIPT_PATH" ]; then
-        mempalace mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
+        "$MEMPAL_PYTHON_BIN" -m mempalace mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
             >> "$STATE_DIR/hook.log" 2>&1 &
     elif [ -n "$TRANSCRIPT_PATH" ]; then
         echo "[$(date '+%H:%M:%S')] Skipping invalid transcript path: $TRANSCRIPT_PATH" \
             >> "$STATE_DIR/hook.log"
     fi
     if [ -n "$MEMPAL_DIR" ] && [ -d "$MEMPAL_DIR" ]; then
-        mempalace mine "$MEMPAL_DIR" --mode projects \
+        "$MEMPAL_PYTHON_BIN" -m mempalace mine "$MEMPAL_DIR" --mode projects \
             >> "$STATE_DIR/hook.log" 2>&1 &
     fi
 

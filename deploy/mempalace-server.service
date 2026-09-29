@@ -1,0 +1,64 @@
+# MemPalace remote MCP server — systemd unit template.
+#
+# Install:
+#   sudo useradd --system --home /var/lib/mempalace --shell /usr/sbin/nologin mempalace
+#   sudo install -d -o mempalace -g mempalace -m 750 /var/lib/mempalace /etc/mempalace
+#   sudo cp deploy/server.env.example /etc/mempalace/server.env   # then edit + chmod 600
+#   sudo install -m 600 -o mempalace -g mempalace /etc/mempalace/server.env /etc/mempalace/server.env
+#   # install mempalace into a venv on PATH, or adjust ExecStart to its absolute path
+#   sudo cp deploy/mempalace-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now mempalace-server
+#
+# This binds 0.0.0.0:8765 and requires MEMPALACE_MCP_HTTP_TOKEN (set in the
+# EnvironmentFile). Front it with a TLS-terminating reverse proxy, or set
+# MEMPALACE_MCP_TLS_CERT / _KEY in the EnvironmentFile for native TLS.
+
+[Unit]
+Description=MemPalace remote MCP server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=mempalace
+Group=mempalace
+EnvironmentFile=/etc/mempalace/server.env
+ExecStart=mempalace serve --host 0.0.0.0 --port 8765
+# The idle watchdog exits with status 0, which on-failure reads as an
+# intentional stop, so the server would stay down. server.env disables the
+# watchdog; Restart=always covers a deployment that has not set it.
+Restart=always
+RestartSec=2
+# Status 2 is the writable-startup refusal: another process holds the palace
+# writer lease. That is not transient from this process's side -- it exits
+# before binding and re-acquires nothing on the way back up -- so Restart=always
+# turns it into an unbounded loop that never starts, never gives up, and never
+# reaches `failed`, leaving `systemctl is-active` at `activating` forever with
+# nothing in the unit state saying why (#2500; a field unit reached restart
+# counter 27). systemd's own start limiter does not catch it: each attempt lives
+# about a second, which is under StartLimitBurst=5 per StartLimitIntervalSec=10s
+# at RestartSec=2. Preventing the restart lands the unit in `failed` with the
+# refusal reason in the journal, which is a state an operator can act on.
+# The server first waits up to MEMPALACE_MCP_WRITER_WAIT_SECONDS (default
+# 120) for the lease, so status 2 means that wait ran out.
+RestartPreventExitStatus=2
+
+# --- Hardening ---------------------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+# The palace and any local state live here; everything else is read-only.
+ReadWritePaths=/var/lib/mempalace
+StateDirectory=mempalace
+
+[Install]
+WantedBy=multi-user.target

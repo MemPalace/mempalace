@@ -1,0 +1,20 @@
+{"id": "cal_001", "text": "Könntest du die Einrückung in dieser Python-Datei korrigieren?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_002", "text": "Um wie viel Uhr beginnt das Meeting morgen?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_003", "text": "Die Vorhersage zeigt Regen über das Wochenende.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_004", "text": "Das ist unglaublich!", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_005", "text": "Hallo, Bramble.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_006", "text": "Führen Sie die Tests mit ausführlicher Ausgabe aus.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_007", "text": "Haben Sie kurz Zeit für einen Anruf?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_008", "text": "Vorsicht!", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_009", "text": "Guten Morgen, Team.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_010", "text": "Ich habe gestern den Quartalsabschluss abgeschlossen.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_011", "text": "Zeigen Sie mir den AR-Aging-Bericht.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_012", "text": "Warum ist der Build auf aarch64 fehlgeschlagen?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_013", "text": "Hallo.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_014", "text": "Das Deployment war eine Katastrophe!", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_015", "text": "Die Bestäuber-Erhebung identifizierte sieben heimische Bienenarten.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_016", "text": "Lösche die veralteten Branches vom Remote.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_017", "text": "Hallo, Aria.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_018", "text": "Wow, der Latenzabfall ist riesig!", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_019", "text": "Können Sie das dritte Paper zusammenfassen?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_020", "text": "Der Kontenplan verwendet nun eine vierstellige Hierarchie.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}

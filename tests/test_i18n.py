@@ -159,3 +159,54 @@ def test_direct_address_key_is_singular_string_for_all_locales():
                 f"{lang}: 'direct_address_pattern' must be str, got {type(val).__name__}"
             )
             assert val, f"{lang}: 'direct_address_pattern' is empty"
+
+
+# ── get_stopwords ──────────────────────────────────────────────────────
+
+
+def test_get_stopwords_default_reads_current_language():
+    """Without a lang argument, reads the regex.stop_words of the loaded lang."""
+    from mempalace.i18n import get_stopwords
+
+    load_lang("en")
+    sw = get_stopwords()
+    assert isinstance(sw, set)
+    assert "the" in sw
+    assert "this" in sw
+
+
+def test_get_stopwords_explicit_lang_loads_without_mutating_global():
+    """Passing lang loads that locale directly and does not touch _current_lang."""
+    from mempalace.i18n import current_lang, get_stopwords
+
+    load_lang("en")
+    before = current_lang()
+    ja = get_stopwords("ja")
+    assert current_lang() == before, "get_stopwords(lang=...) must not mutate global state"
+    assert "した" in ja
+    assert "ます" in ja
+
+
+def test_get_stopwords_lowercases_entries():
+    """Regex stop_words are returned lowercased so callers can cheaply match."""
+    from mempalace.i18n import get_stopwords
+
+    en = get_stopwords("en")
+    assert all(w == w.lower() for w in en)
+
+
+def test_get_stopwords_unknown_lang_returns_empty_set():
+    """Unknown locale codes must not crash — return empty set so search degrades cleanly."""
+    from mempalace.i18n import get_stopwords
+
+    assert get_stopwords("xx-YY") == set()
+
+
+def test_get_stopwords_every_locale_has_nonempty_set():
+    """Every shipped locale declares regex.stop_words as a non-empty string."""
+    from mempalace.i18n import available_languages, get_stopwords
+
+    for lang in available_languages():
+        sw = get_stopwords(lang)
+        assert isinstance(sw, set)
+        assert len(sw) > 0, f"{lang}: regex.stop_words missing or empty"

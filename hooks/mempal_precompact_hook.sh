@@ -71,6 +71,29 @@ if [ -z "$MEMPAL_PYTHON_BIN" ] || [ ! -x "$MEMPAL_PYTHON_BIN" ]; then
     MEMPAL_PYTHON_BIN="$(command -v python3 2>/dev/null || echo python3)"
 fi
 
+# ── Silent mode / opt-out ──────────────────────────────────────────────
+# Set MEMPALACE_HOOKS_AUTO_SAVE=false to disable auto-save blocking entirely.
+if [ -n "$MEMPALACE_HOOKS_AUTO_SAVE" ]; then
+    case "$MEMPALACE_HOOKS_AUTO_SAVE" in
+        false|0|no) echo "{}"; exit 0 ;;
+    esac
+else
+    CONFIG_FILE="$HOME/.mempalace/config.json"
+    if [ -f "$CONFIG_FILE" ]; then
+        AUTO_SAVE=$("$MEMPAL_PYTHON_BIN" -c "
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1]))
+    print(str(cfg.get('hooks', {}).get('auto_save', True)).lower())
+except Exception: print('true')
+" "$CONFIG_FILE" 2>/dev/null)
+        if [ "$AUTO_SAVE" = "false" ]; then
+            echo "{}"
+            exit 0
+        fi
+    fi
+fi
+
 # Read JSON input from stdin
 INPUT=$(cat)
 
@@ -96,16 +119,8 @@ INPUT=$(cat)
 # backslashes are not mangled by echo flag parsing.
 _mempal_parsed=$(
     umask 077
-    printf '%s' "$INPUT" | "$MEMPAL_PYTHON_BIN" -c "
-import sys, json, re
-data = json.load(sys.stdin)
-sid = data.get('session_id', '')
-tp = data.get('transcript_path', '')
-safe = lambda s: re.sub(r'[^a-zA-Z0-9_/.\-~]', '', str(s))
-print('__MEMPAL_PARSE_OK__')
-print(safe(sid))
-print(safe(tp))
-" 2>"$STATE_DIR/last_python_err.log"
+    printf '%s' "$INPUT" | "$MEMPAL_PYTHON_BIN" -m mempalace.hook_shell parse-precompact \
+        2>"$STATE_DIR/last_python_err.log"
 )
 # Drop the empty file on success; chmod 600 on failure to mirror
 # last_input.log's privacy contract.
@@ -167,14 +182,14 @@ echo "[$(date '+%H:%M:%S')] PRE-COMPACT triggered for session $SESSION_ID" >> "$
 #   1. TRANSCRIPT_PATH (from Claude Code) → parent dir, --mode convos
 #   2. MEMPAL_DIR → --mode projects
 if is_valid_transcript_path "$TRANSCRIPT_PATH" && [ -f "$TRANSCRIPT_PATH" ]; then
-    mempalace mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
+    "$MEMPAL_PYTHON_BIN" -m mempalace mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
         >> "$STATE_DIR/hook.log" 2>&1
 elif [ -n "$TRANSCRIPT_PATH" ]; then
-    echo "[$(date '+%H:%M:%S')] Skipping invalid transcript path: $TRANSCRIPT_PATH" \
+    echo "[$(date '+%H:%M:%S')] Skipping missing or invalid transcript path after normalization: $TRANSCRIPT_PATH" \
         >> "$STATE_DIR/hook.log"
 fi
 if [ -n "$MEMPAL_DIR" ] && [ -d "$MEMPAL_DIR" ]; then
-    mempalace mine "$MEMPAL_DIR" --mode projects \
+    "$MEMPAL_PYTHON_BIN" -m mempalace mine "$MEMPAL_DIR" --mode projects \
         >> "$STATE_DIR/hook.log" 2>&1
 fi
 

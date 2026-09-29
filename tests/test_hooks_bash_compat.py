@@ -27,6 +27,14 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SAVE_HOOK = REPO_ROOT / "hooks" / "mempal_save_hook.sh"
 PRECOMPACT_HOOK = REPO_ROOT / "hooks" / "mempal_precompact_hook.sh"
+SESSION_END_HOOK = REPO_ROOT / "hooks" / "mempal_session_end_hook.sh"
+PLUGIN_SESSION_END_HOOK = REPO_ROOT / ".claude-plugin" / "hooks" / "mempal-session-end-hook.sh"
+
+_SESSION_END_HOOKS = pytest.mark.parametrize(
+    "hook",
+    [SESSION_END_HOOK, PLUGIN_SESSION_END_HOOK],
+    ids=["user_hook", "plugin_hook"],
+)
 
 # Re-used by every parametrize decorator that runs the same test against
 # both hooks. ``ids=`` keeps pytest output readable (`...[save_hook]`
@@ -322,3 +330,40 @@ class TestFailLoudGuard:
         err_log = tmp_path / ".mempalace" / "hook_state" / "last_python_err.log"
         mode = stat.S_IMODE(err_log.stat().st_mode)
         assert mode == 0o600, f"last_python_err.log mode should be 0600 on failure, got {oct(mode)}"
+
+
+class TestSessionEndWrappers:
+    """The SessionEnd wrappers must background their work — so the foreground
+    beats Claude Code's ~1.5s SessionEnd budget (a plugin-provided per-hook
+    timeout cannot raise it) — and stay bash 3.2-safe like the other hooks."""
+
+    @_SESSION_END_HOOKS
+    def test_bash_syntax_clean(self, hook):
+        p = subprocess.run(["bash", "-n", str(hook)], capture_output=True, text=True)
+        assert p.returncode == 0, f"{hook.name} syntax error: {p.stderr}"
+
+    @_SESSION_END_HOOKS
+    def test_dispatches_session_end_through_cli(self, hook):
+        src = _hook_src_no_comments(hook)
+        # The dispatcher runs ``mempalace hook run "$@"`` in run_mempalace_hook,
+        # and the bottom call supplies the ``--hook session-end --harness`` args
+        # — so the two halves are asserted separately, not as one contiguous string.
+        assert "hook run" in src
+        assert "--hook session-end --harness" in src
+        assert "MEMPALACE_HOOK_HARNESS" in src
+        assert "MEMPAL_PYTHON" in src
+
+    @_SESSION_END_HOOKS
+    def test_backgrounds_then_returns_empty(self, hook):
+        src = _hook_src_no_comments(hook)
+        assert "</dev/null &" in src, f"{hook.name} does not background the worker"
+        assert "disown" in src, f"{hook.name} does not disown the backgrounded worker"
+        assert src.rstrip().endswith("printf '{}'"), (
+            f"{hook.name} must return the empty payload immediately"
+        )
+
+    @_SESSION_END_HOOKS
+    def test_no_bash4_only_builtins(self, hook):
+        src = _hook_src_no_comments(hook)
+        assert "mapfile" not in src, f"{hook.name} uses mapfile (bash 4 only)"
+        assert "readarray" not in src, f"{hook.name} uses readarray (bash 4 only)"
