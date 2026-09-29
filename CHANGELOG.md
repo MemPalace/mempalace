@@ -232,6 +232,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (110k rows/s measured).
 
 ### Bug Fixes
+- **A detached-venv host no longer loses its own dependencies on import.** A
+  standalone interpreter with `PYTHONPATH` pointing at a virtualenv's
+  site-packages, instead of running from that venv's own `bin/python`, made
+  the leaked-`PYTHONPATH` guard report the wrong "own" directory: it kept
+  only entries matching the running interpreter's `sysconfig` `purelib` and
+  `platlib`, so the directory `mempalace` itself (and whatever was installed
+  beside it) actually loaded from was treated as foreign and stripped,
+  breaking the import already in progress. The guard now also keeps the
+  directory this package was actually loaded from. (#2613)
 - **`mempalace sweep` and `mempalace sync` routed to the daemon no longer resolve
   a relative path against the daemon's working directory.** Both put the path into
   the job as typed, and the daemon keeps the directory it was started in: a
