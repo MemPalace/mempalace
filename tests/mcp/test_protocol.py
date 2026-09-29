@@ -1228,6 +1228,160 @@ class TestImportKillSwitchSafety:
             assert wal_file.parent.stat().st_mode & 0o777 == 0o700
 
 
+def _touch_db_as_peer(palace_path):
+    """Move chroma.sqlite3's mtime the way a write from another process would.
+
+    Shifting the recorded stamp instead would leave the file at a stat this
+    process wrote itself, which the client cache rightly treats as its own.
+    """
+    db = os.path.join(palace_path, "chroma.sqlite3")
+    mtime = os.stat(db).st_mtime + 10.0
+    os.utime(db, (mtime, mtime))
+
+
+_PEER_WRITE = """
+import sys, chromadb
+client = chromadb.PersistentClient(path=sys.argv[1])
+col = client.get_collection("mempalace_drawers")
+col.add(ids=["peer_drawer"], documents=["from a peer"], embeddings=[[0.5] * 4],
+        metadatas=[{"wing": "w", "room": "r"}])
+"""
+
+
+class TestClientFreshness:
+    """The session client is rebuilt for another process's writes only.
+
+    Rebuilding reloads the whole HNSW index, so treating this process's own
+    footprint on chroma.sqlite3 as an external change made every call pay it.
+    """
+
+    @staticmethod
+    def _spy_make_client(monkeypatch):
+        from mempalace.backends.chroma import ChromaBackend
+
+        calls: list[str] = []
+        real = ChromaBackend.make_client
+
+        @staticmethod
+        def spy(path):
+            calls.append(path)
+            return real(path)
+
+        monkeypatch.setattr(ChromaBackend, "make_client", spy)
+        return calls
+
+    @staticmethod
+    def _open(monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client, _col
+
+    def test_own_reads_and_writes_keep_the_client(self, monkeypatch, config, palace_path, kg):
+        from mempalace import mcp_server
+
+        self._open(monkeypatch, config, palace_path, kg)
+        calls = self._spy_make_client(monkeypatch)
+
+        col = mcp_server._get_collection()
+        for i in range(3):
+            col.upsert(
+                ids=[f"own_{i}"],
+                documents=[f"own drawer {i}"],
+                embeddings=[[0.1 * (i + 1)] * 4],
+                metadatas=[{"wing": "w", "room": "r"}],
+            )
+            col = mcp_server._get_collection()
+            col.get(limit=1)
+
+        assert len(calls) == 1
+
+    def test_backend_path_in_same_process_keeps_both_clients(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Search opens through ChromaBackend, other tools through the session.
+        Each must accept the other's writes as this process's own."""
+        from mempalace import mcp_server
+        from mempalace.backends.chroma import ChromaBackend
+        from mempalace.palace import get_collection as palace_get_collection
+
+        self._open(monkeypatch, config, palace_path, kg)
+        mcp_server._get_collection().get(limit=1)
+        palace_get_collection(config.palace_path, create=False).get(limit=1)
+
+        calls = self._spy_make_client(monkeypatch)
+        drains: list[int] = []
+        real_drain = ChromaBackend._drain_clients
+
+        def spy_drain(self):
+            drains.append(1)
+            real_drain(self)
+
+        monkeypatch.setattr(ChromaBackend, "_drain_clients", spy_drain)
+
+        for i in range(3):
+            mcp_server._get_collection().upsert(
+                ids=[f"mcp_{i}"],
+                documents=[f"session write {i}"],
+                embeddings=[[0.2 * (i + 1)] * 4],
+                metadatas=[{"wing": "w", "room": "r"}],
+            )
+            palace_get_collection(config.palace_path, create=False).upsert(
+                ids=[f"backend_{i}"],
+                documents=[f"backend write {i}"],
+                embeddings=[[0.3 * (i + 1)] * 4],
+                metadatas=[{"wing": "w", "room": "r"}],
+            )
+
+        assert calls == []
+        assert drains == []
+        assert mcp_server._get_collection().count() == 6
+
+    def test_write_from_another_process_rebuilds_the_client(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """#2002 still holds: a peer's write reopens against the on-disk state."""
+        from mempalace import mcp_server
+
+        self._open(monkeypatch, config, palace_path, kg)
+        mcp_server._get_collection().get(limit=1)
+        calls = self._spy_make_client(monkeypatch)
+
+        subprocess.run([sys.executable, "-c", _PEER_WRITE, config.palace_path], check=True)
+
+        col = mcp_server._get_collection()
+        assert len(calls) == 1
+        assert col.get(ids=["peer_drawer"])["ids"] == ["peer_drawer"]
+
+    def test_backend_peer_reconnect_drops_the_session_client(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """The client that did not see the peer write must not keep the old index.
+
+        Search reconnects through ChromaBackend and records the fresh stat.
+        The session client shares that System; treating the new stat as its
+        own write left it reading the segment the reset had discarded.
+        """
+        from mempalace import mcp_server
+        from mempalace.palace import get_collection as palace_get_collection
+
+        self._open(monkeypatch, config, palace_path, kg)
+        session_client = mcp_server._get_client()
+        palace_get_collection(config.palace_path, create=False).get(limit=1)
+
+        subprocess.run([sys.executable, "-c", _PEER_WRITE, config.palace_path], check=True)
+
+        # The backend notices first and resets the shared System.
+        assert palace_get_collection(config.palace_path, create=False).get(ids=["peer_drawer"])[
+            "ids"
+        ] == ["peer_drawer"]
+        assert mcp_server._get_client() is not session_client
+        assert mcp_server._get_collection().get(ids=["peer_drawer"])["ids"] == ["peer_drawer"]
+        # The session reopen must not have discarded the backend's fresh System.
+        assert palace_get_collection(config.palace_path, create=False).get(ids=["peer_drawer"])[
+            "ids"
+        ] == ["peer_drawer"]
+
+
 class TestStructuredErrors:
     """Verify that _internal_tool_error and MineAlreadyRunning return
     machine-readable structured data (#1552)."""
@@ -1449,8 +1603,7 @@ class TestStructuredErrors:
 
         assert config.palace_path in ChromaBackend._quarantined_paths
 
-        old_mtime = mcp_server._palace_db_mtime
-        monkeypatch.setattr(mcp_server, "_palace_db_mtime", old_mtime - 10.0)
+        _touch_db_as_peer(config.palace_path)
 
         quarantine_calls: list[str] = []
         original_prepare = ChromaBackend._prepare_palace_for_open
@@ -1486,9 +1639,7 @@ class TestStructuredErrors:
         # Prime the cache.
         mcp_server._get_collection()
 
-        # Simulate a peer writer touching chroma.sqlite3 on disk.
-        old_mtime = mcp_server._palace_db_mtime
-        monkeypatch.setattr(mcp_server, "_palace_db_mtime", old_mtime - 10.0)
+        _touch_db_as_peer(config.palace_path)
 
         order: list[str] = []
         real_reset = mcp_server._force_chroma_cache_reset
