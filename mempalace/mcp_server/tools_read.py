@@ -17,7 +17,7 @@ def _tool_status_via_sqlite() -> dict:
     """
     import sqlite3 as _sqlite3
 
-    from ..config import connect_sqlite_read
+    from ..backends._inproc_sqlite import open_reader as open_palace_reader
 
     db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
@@ -28,7 +28,7 @@ def _tool_status_via_sqlite() -> dict:
     rooms: dict = {}
     total = 0
     try:
-        conn = connect_sqlite_read(db_path)
+        conn = open_palace_reader(db_path)
         try:
             row = conn.execute(
                 """
@@ -92,12 +92,23 @@ def _sqlite_taxonomy():
     GROUP BY so status does not page every metadata row.
     """
     global _taxonomy_cache, _taxonomy_cache_time
-    now = time.time()
     cache_key = (_config.palace_path, _config.collection_name)
+    # Taken before the query, so a write that lands during it invalidates.
+    fingerprint = _palace_db_fingerprint()
+    # A readable chroma.sqlite3 changes stat on every commit, so a different
+    # fingerprint recounts even inside the TTL. The TTL is only the fallback
+    # for backends whose file stat misses commits (sqlite_exact's WAL) and
+    # for a palace whose file cannot be stat'ed.
+    fingerprint_matches = (
+        _taxonomy_cache is not None
+        and fingerprint is not None
+        and _taxonomy_cache[2] == fingerprint
+    )
+    ttl_fresh = fingerprint is None and (time.time() - _taxonomy_cache_time) < _TAXONOMY_CACHE_TTL
     if (
         _taxonomy_cache is not None
         and _taxonomy_cache[0] == cache_key
-        and (now - _taxonomy_cache_time) < _TAXONOMY_CACHE_TTL
+        and (fingerprint_matches or ttl_fresh)
     ):
         return _taxonomy_cache[1]
     counts = None
@@ -133,8 +144,11 @@ def _sqlite_taxonomy():
             rkey = _norm(room)
             dest[rkey] = dest.get(rkey, 0) + n
     result = total, normalized
-    _taxonomy_cache = (cache_key, result)
-    _taxonomy_cache_time = now
+    _taxonomy_cache = (cache_key, result, fingerprint)
+    # Stamp once the query is done: stamped at the start, a query slower than
+    # the TTL (a full GROUP BY on a multi-million-drawer palace) stored an
+    # entry that had already expired, so every status call re-ran it.
+    _taxonomy_cache_time = time.time()
     return result
 
 
@@ -246,11 +260,26 @@ def _graph_sqlite_reader():
 
 
 def _chroma_room_wing_hall_counts():
+    global _graph_rows_cache
     if not _config.palace_path:
         return None
     from ..backends.chroma import sqlite_room_wing_hall_counts
 
-    return sqlite_room_wing_hall_counts(_config.palace_path, _config.collection_name)
+    # Same full GROUP BY as the status taxonomy; reuse it while chroma.sqlite3
+    # has not been written (see _palace_db_fingerprint).
+    cache_key = (_config.palace_path, _config.collection_name)
+    fingerprint = _palace_db_fingerprint()
+    if (
+        fingerprint is not None
+        and _graph_rows_cache is not None
+        and _graph_rows_cache[0] == cache_key
+        and _graph_rows_cache[2] == fingerprint
+    ):
+        return _graph_rows_cache[1]
+    rows = sqlite_room_wing_hall_counts(_config.palace_path, _config.collection_name)
+    if rows is not None and fingerprint is not None:
+        _graph_rows_cache = (cache_key, rows, fingerprint)
+    return rows
 
 
 def tool_status():
@@ -870,13 +899,31 @@ def tool_delete_tunnel(tunnel_id: str):
     return delete_tunnel(tunnel_id)
 
 
-def tool_list_hallways(wing: str = None):
-    """List within-wing hallway records, optionally filtered by wing."""
+def tool_list_hallways(wing: str = None, limit: int = 100, offset: int = 0):
+    """List within-wing hallway records, strongest first, one page at a time.
+
+    A palace of any size holds hundreds of thousands of hallways; returning
+    them all in one response closed the MCP connection. The page is sorted by
+    co-occurrence count so the first page is the one worth reading.
+    """
     try:
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
-    return list_hallways(wing)
+    try:
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        return {"error": "limit and offset must be integers"}
+    rows = sorted(list_hallways(wing), key=lambda h: -int(h.get("co_occurrence_count") or 0))
+    page = rows[offset : offset + limit]
+    return {
+        "hallways": page,
+        "total": len(rows),
+        "count": len(page),
+        "offset": offset,
+        "limit": limit,
+    }
 
 
 def tool_delete_hallway(hallway_id: str):
@@ -886,8 +933,15 @@ def tool_delete_hallway(hallway_id: str):
     return {"deleted": delete_hallway(hallway_id)}
 
 
-def tool_follow_tunnels(wing: str, room: str):
-    """Follow explicit tunnels from a room to see connected drawers in other wings."""
+def tool_follow_tunnels(wing: str, room: str, record: bool = True):
+    """Follow explicit tunnels from a room to see connected drawers in other wings.
+
+    An agent calling this tool is crossing the tunnel, so the traversal is
+    recorded (``access_count`` / ``strength``). Internal callers that only
+    decorate another result, such as the light server's search enrichment,
+    pass ``record=False``: a search hit is not a crossing. A read-only
+    server or a peer without the writer lock never writes the tunnel file.
+    """
     try:
         wing = sanitize_name(wing, "wing")
         room = sanitize_name(room, "room")
@@ -896,4 +950,6 @@ def tool_follow_tunnels(wing: str, room: str):
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
-    return follow_tunnels(wing, room, col=col)
+    return follow_tunnels(
+        wing, room, col=col, record=record and not (_READ_ONLY or _MCP_WRITER_READ_ONLY)
+    )
