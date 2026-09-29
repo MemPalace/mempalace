@@ -232,6 +232,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (110k rows/s measured).
 
 ### Bug Fixes
+- **The Stop/PreCompact hook files its diary checkpoint through a live hub,
+  instead of losing it to the writer lease.** A long-lived `mempalace serve`
+  holds the palace writer lease for its whole lifetime, so the save hook's
+  in-process `tool_diary_write` was refused for as long as it ran: every save
+  logged `Diary checkpoint failed: another mine is in progress: ... held by PID
+  <hub>`, and `mempalace_diary_read` had no checkpoints for sessions saved while
+  a hub was running. Transcripts survived only because `cmd_mine` forwards its
+  mine to the hub; the diary path had no such forward. It now sends
+  `mempalace_diary_write` to the same hub over HTTP and falls back to the
+  in-process call only when no hub owns the palace, so a read-only hub, a hub
+  whose listener is down, and `MEMPALACE_HUB_FORWARD=0` all keep the working
+  local write. Because a hub that has taken the request may already have filed
+  it, a hub-side failure is reported rather than retried, and the forwarded
+  path no longer imports the storage stack at all — that import alone is ~77 MB
+  (chromadb ~61 MB of it) in a hook-budgeted process. (#2614)
 - **`mempalace sweep` and `mempalace sync` routed to the daemon no longer resolve
   a relative path against the daemon's working directory.** Both put the path into
   the job as typed, and the daemon keeps the directory it was started in: a

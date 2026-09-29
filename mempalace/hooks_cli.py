@@ -1038,6 +1038,16 @@ def _save_diary_direct(
     the transcript path); a `diary_read` with an empty wing spans every wing
     the agent wrote to, so project-derived wings stay discoverable.
 
+    A live `mempalace serve` hub holds the palace writer lease for its whole
+    lifetime, so an in-process `tool_diary_write` is refused for as long as it
+    runs and the per-save checkpoint is lost (#2614) -- the transcript mine
+    survives only because `cmd_mine` forwards to the hub. The write therefore
+    goes to the hub over HTTP when one is serving this palace, the same way the
+    mine is forwarded, and only falls back to the in-process call when no hub
+    owns it. That fallback also keeps this path free of the ~77 MB
+    `mempalace.mcp_server` import (chromadb alone is ~61 MB of it) in the
+    common hub-backed setup.
+
     Returns {"count": N, "themes": [...]} on success, {"count": 0} on failure.
     A daemon lock deferral also returns {"count": 0}: nothing is filed yet, but
     the entry is queued and the daemon files it once the holder exits, so the
@@ -1109,14 +1119,36 @@ def _save_diary_direct(
             _log(f"Daemon diary checkpoint failed: {result.get('error', job.get('error'))}")
             return {"count": 0}
 
-        from .mcp_server import tool_diary_write
+        from .hub_client import forward_tool_call
 
-        result = tool_diary_write(
-            agent_name=agent_name,
-            entry=entry,
-            topic="checkpoint",
-            wing=wing,
+        handled, result = forward_tool_call(
+            MempalaceConfig().palace_path,
+            "mempalace_diary_write",
+            {
+                "agent_name": agent_name,
+                "entry": entry,
+                "topic": "checkpoint",
+                "wing": wing,
+            },
         )
+        if handled and result is None:
+            # The hub took the request but never answered it in a shape we can
+            # read. The entry may already be filed, so this is not a failure to
+            # retry -- a second write would duplicate the same verbatim content.
+            _log("Diary checkpoint sent to the palace hub, which did not report back")
+            return {"count": 0}
+        if handled:
+            _log("Diary checkpoint forwarded to the palace hub")
+        else:
+            # No hub owns this palace: this process is the only writer.
+            from .mcp_server import tool_diary_write
+
+            result = tool_diary_write(
+                agent_name=agent_name,
+                entry=entry,
+                topic="checkpoint",
+                wing=wing,
+            )
         if result.get("success"):
             _log(f"Diary checkpoint saved: {result.get('entry_id', '?')}")
             # Write state for ack tool to read
