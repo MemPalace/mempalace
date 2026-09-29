@@ -150,7 +150,44 @@ class TestTimeline:
                 "hub", "connects_to", f"spoke_{i}", valid_from=f"2025-01-{(i % 28) + 1:02d}"
             )
         tl = kg.timeline("hub")
-        assert len(tl) == 100  # LIMIT 100 on entity-filtered branch
+        assert len(tl) == 100  # default limit preserves historical behavior
+
+    def test_timeline_pagination_walks_all_facts(self, kg):
+        for i in range(105):
+            kg.add_triple(f"entity_{i}", "relates_to", f"entity_{i + 1}")
+        pages = [kg.timeline(limit=50, offset=o) for o in (0, 50, 100)]
+        assert [len(p) for p in pages] == [50, 50, 5]
+        seen = [(t["subject"], t["predicate"], t["object"]) for page in pages for t in page]
+        assert len(seen) == len(set(seen)) == 105  # disjoint pages, full coverage
+
+    def test_timeline_entity_pagination(self, kg):
+        for i in range(105):
+            kg.add_triple(
+                "hub", "connects_to", f"spoke_{i}", valid_from=f"2025-01-{(i % 28) + 1:02d}"
+            )
+        page = kg.timeline("hub", limit=10, offset=100)
+        assert len(page) == 5
+
+    def test_timeline_total(self, kg):
+        for i in range(105):
+            kg.add_triple(f"entity_{i}", "relates_to", f"entity_{i + 1}")
+        kg.add_triple("hub", "connects_to", "entity_0")
+        assert kg.timeline_total() == 106
+        assert kg.timeline_total("hub") == 1
+
+    def test_timeline_pagination_stable_under_tied_valid_from(self, kg):
+        # All facts share one valid_from; without a unique ORDER BY tiebreaker
+        # SQLite gives no ordering guarantee and pages could overlap or skip.
+        for i in range(30):
+            kg.add_triple(f"e{i}", "relates_to", f"e{i + 1}", valid_from="2026-01-01")
+        pages = [kg.timeline(limit=7, offset=o) for o in range(0, 30, 7)]
+        seen = [(t["subject"], t["object"]) for page in pages for t in page]
+        assert len(seen) == len(set(seen)) == 30  # disjoint pages, full coverage
+        assert seen == [(t["subject"], t["object"]) for t in kg.timeline(limit=30)]
+
+    def test_timeline_clamps_bad_pagination_args(self, kg):
+        kg.add_triple("a", "relates_to", "b")
+        assert len(kg.timeline(limit=0, offset=-5)) == 1  # clamped to limit=1, offset=0
 
 
 class TestWALMode:
@@ -390,3 +427,46 @@ class TestSupersessionBoundary:
         assert self._models(kg, "2026-06-02") == ["A"]
         assert self._models(kg, "2026-06-02T23:00:00Z") == ["A"]
         assert self._models(kg, "2026-06-03") == []
+
+
+class TestCandidateResolution:
+    def test_exact_entity_existence_prevents_fuzzy_fallback(self, kg):
+        # Add Alice Smith with a relationship
+        kg.add_triple("Alice Smith", "works_at", "Acme")
+        # Add exact entity Alice with NO triples
+        kg.add_entity("Alice", entity_type="person")
+
+        # Querying exact entity "Alice" should return empty, NOT attribute Alice Smith's facts
+        res = kg.query_entity("Alice")
+        assert res == []
+
+    def test_nonexistent_entity_uses_candidate_fallback(self, kg):
+        # Add Alice Smith with a relationship
+        kg.add_triple("Alice Smith", "works_at", "Acme")
+
+        # Querying nonexistent entity "Smith" should resolve candidate Alice Smith
+        res = kg.query_entity("Smith")
+        assert len(res) >= 1
+        assert res[0]["subject"] == "Alice Smith"
+        assert res[0]["object"] == "Acme"
+
+    def test_short_token_does_not_merge_entities(self, kg):
+        kg.add_triple("Alice", "knows", "Bob")
+        kg.add_triple("Albert", "knows", "Carol")
+        assert kg.query_entity("a") == []
+        assert kg.query_entity("al") == []
+
+    def test_multiple_candidates_do_not_mix_facts(self, kg):
+        kg.add_triple("Alice Smith", "works_at", "Acme")
+        kg.add_triple("Bob Smith", "works_at", "Globex")
+        res = kg.query_entity("Smith")
+        assert res == []
+        names = {c["name"] for c in kg.find_entity_candidates("Smith")}
+        assert names == {"Alice Smith", "Bob Smith"}
+
+    def test_like_metacharacters_are_literal(self, kg):
+        kg.add_triple("100_percent", "rated", "high")
+        kg.add_triple("Alice", "knows", "Bob")
+        assert kg.query_entity("%") == []
+        assert kg.query_entity("_") == []
+        assert kg.query_entity("100%") == []

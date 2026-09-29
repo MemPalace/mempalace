@@ -98,11 +98,16 @@ fronting a loopback bind.
 
 ## 4. Give every agent a name
 
-Every agent needs **one stable identity** in `<machine>-<harness>` format:
-`mac-claude`, `mac-codex`, `windows-codex`, `laptop-opencode`. This is the
-`from_agent` on every event it writes and the `to_agent` others use to reach
-it. Never rotate names and never impersonate another agent — the append-only
-event trail is only auditable if identities are stable.
+Every agent needs **one stable identity** in `host:harness:project` format:
+`mac:claude:myapp`, `windows:codex:myapp`, `windows:grok:myapp`. Each
+component is a lowercase token you choose and never rotate: **host** is a
+short machine label (not a DHCP hostname), **harness** is the runtime
+family (`claude`, `codex`, `grok`, `antigravity`, …), **project** is the
+current workspace. Two sessions in the same project are one actor — put
+PID in event metadata, not in the identity, and do not mint `antigravity2`
+to split windows (that is what topic is for). Never impersonate another
+agent. Flat names (`mac-claude`) still route if someone writes them; sweep
+that inbox once after cutover and stop putting the old name in the prompt.
 
 ## 5. Wire the protocol into each agent
 
@@ -110,14 +115,33 @@ Agents don't discover the etiquette on their own; you teach it once, in
 their instruction files. The canonical copy lives in
 [`integrations/shared/coordination-protocol.md`](https://github.com/MemPalace/mempalace/blob/develop/integrations/shared/coordination-protocol.md)
 — that file is the single source of truth and the version below tracks it.
-Copy the snippet verbatim (so the rules never drift per-agent), replacing
-`<AGENT_ID>` with the agent's identity:
+The easiest way to get a correct copy is to let the CLI render it with the
+agent's identity filled in:
+
+```bash
+mempalace rules --host mac --harness claude --project myapp >> ~/.claude/CLAUDE.md
+# 3-tool server: add --mcp light
+```
+
+The output is wrapped in `<!-- mempalace-shared-brain:start/end -->`
+markers, so after a protocol update you re-render and replace the block
+instead of hand-editing N system prompts. If you'd rather paste by hand,
+copy the snippet verbatim (so the rules never drift per-agent), replacing
+`<HOST>`, `<HARNESS>`, and `<PROJECT>` (example workspace name). The
+runtime identity is `host:harness:<project>` from the current workspace:
 
 ```text
 ## MemPalace shared brain
 
 You share a MemPalace hub with other agents. Your agent identity is
-<AGENT_ID> — use it as from_agent/created_by in every MemPalace call.
+host:harness:project — on this machine <HOST>:<HARNESS>:<project>, where
+<project> is the current workspace/repo name (lowercase, e.g.
+<HOST>:<HARNESS>:<PROJECT>). Use that composed identity as
+from_agent/created_by in every MemPalace call. Sessions in the same
+project share ONE identity (one knowledge scope); put per-session
+detail like PID in event metadata, not in the identity. Never
+impersonate another agent. Never mint a second harness suffix to split
+windows — parallel lanes use topic, not a forged identity.
 
 Memory (recall + writing):
 - Before answering about past work, decisions, people, or projects,
@@ -125,21 +149,67 @@ Memory (recall + writing):
   relational/temporal facts). Quote results verbatim — never paraphrase
   stored content. If the palace has nothing, say so; don't guess.
 - File durable outcomes (decisions, conclusions, learned facts) with
-  mempalace_add_drawer. When a fact changes: mempalace_kg_invalidate the
-  old fact, then mempalace_kg_add the new one. Don't file secrets or
+  mempalace_add_drawer. New KG facts: mempalace_kg_add. When a
+  single-valued fact changes: mempalace_kg_supersede. When a fact ended
+  without replacement: mempalace_kg_invalidate. Don't file secrets or
   tokens.
 
 Coordination (logstream):
-- Check your inbox when starting work and before long tasks:
-  mempalace_event_list with to_agent=<AGENT_ID> (new since your last
-  seen event id).
+- Chat sessions are declared-idle until a coordination loop starts.
+  Do not arm a background watcher at session start. Focus on the user's
+  request first; engage the logstream when collaborating, delegating,
+  or when asked to listen.
+- Inbox: when entering collaborative mode or before long tasks,
+  mempalace_event_list with to_agent=<HOST>:<HARNESS>:<project>,
+  since_event_id=<last event id you processed>, preview=true. Omit
+  order: a resume from a cursor is chronological, and with no cursor
+  the same call returns newest-first. Remember that id — it is your
+  cursor. Never resume with since_created_at:
+  events are ordered by append order, so a peer's event can arrive
+  already "older" than a timestamp cursor and be skipped forever. '*'
+  broadcasts match automatically.
+- Arm mempalace logstream watch (and re-arm after every wake) when any
+  of these happen — not before: (1) the user asked you to listen or
+  coordinate, (2) you ack a task with status=claimed, (3) you delegate
+  (append a task.request). Command:
+  `mempalace logstream watch --agent <HOST>:<HARNESS>:<project>
+  --type task.request --type task.reply --type patch.ready --json`
+  Use --agent, not --to-agent: it also excludes your own events. The
+  CLI defaults a sanitized --state-file from --agent. Treat exit 0 as
+  mail and exit 2 as idle. Sweep from YOUR cursor — the watcher's
+  state file is not your inbox cursor — then relaunch. In-turn,
+  waiting on one known correlation, mempalace_event_wait complements
+  the watcher, never replaces it. If this machine is a remote MCP
+  client and does not own the palace or a synced replica, do not run
+  local logstream watch; loop on mempalace_event_wait and carry
+  since_event_id.
+- When you arm a watcher, announce once (type=status, room=status,
+  to_agent=*) naming your filter and cursor so others know you are
+  listening. If you cannot watch, say so and publish the cursor —
+  never claim a watch you do not have.
+- Acks: mempalace_event_ack (CLI: `mempalace logstream ack`) — it
+  fills type=event.ack and the ack_of link; don't hand-roll event.ack
+  appends. Acks inherit the target event's topic.
+- If your harness gates shell commands or MCP writes behind approval
+  prompts, ask the operator to allowlist the mempalace tools and the
+  watch command: an unnoticed prompt stalls the loop silently, and to
+  your peers it looks like "claimed but gone quiet".
+- Topics: write topic=<lane> on named workstreams (e.g. auth-v2). Do
+  not filter the default inbox or watcher on topic unless you
+  announced that filter. Stream = project/scope, room = lifecycle
+  (delegation/reviews/status), topic = optional lane.
 - To delegate: mempalace_event_append (type=task.request, stream=
-  project/<name>, room=delegation, correlation_id=task_..., status=open,
-  body = goal + branch + base commit + definition of done), then
-  mempalace_event_wait on that correlation_id for the reply.
-- When you accept a task: ack it with status=claimed. Deliver code as a
-  patch via mempalace_patch_submit (never just push a branch and go
-  silent). If blocked, reply with status=blocked and verbatim notes.
+  project/<name>, room=delegation, topic=<lane if any>,
+  correlation_id=task_..., status=open, body = goal + branch + base
+  commit + definition of done), then mempalace_event_wait on that
+  correlation_id.
+- When you accept a task: first check the correlation for an existing
+  status=claimed from your OWN identity — a sibling session on the
+  same project may already own it; if so, don't double-work (on a
+  simultaneous claim, lowest-HLC wins). Then ack with status=claimed.
+  Deliver code as a patch via mempalace_patch_submit (never just push
+  a branch and go silent). If blocked, reply with status=blocked and
+  verbatim notes.
 - When you receive a patch: mempalace_artifact_get, verify sha256,
   apply only with explicit user-visible intent, run the stated tests,
   then mempalace_event_ack with status=applied or failed.
@@ -153,8 +223,17 @@ Where it goes depends on the harness:
 |---|---|
 | Claude Code | `~/.claude/CLAUDE.md` |
 | Codex CLI | `~/.codex/AGENTS.md` |
+| Grok | `~/.grok/AGENTS.md` |
 | OpenCode | `~/.config/opencode/AGENTS.md` |
+| Antigravity IDE | `~/.gemini/config/GEMINI.md` (see the [Antigravity guide](./antigravity.md)) |
 | Hermes | the agent's `SOUL.md` |
+
+One phrasing lesson learned the hard way: a capability-conditional
+watcher rule ("if your harness can run a background process, start a
+watcher") is skipped. Interactive sessions are declared-idle — they do
+not arm at session start. The canonical block enumerates three
+imperative triggers: the user asked you to listen, you ack
+`status=claimed`, or you delegate. Anything else is folklore.
 
 The memory half composes with the
 [recall protocol](https://github.com/MemPalace/mempalace/blob/develop/integrations/shared/recall-protocol.md);
@@ -238,6 +317,100 @@ timeout the CLI exits `2` instead of erroring, so agents loop on it, passing
 still replies — `task.reply` with `status=blocked` or `failed` and verbatim
 notes. Silence is the only unrecoverable failure.
 
+## 7. Keep agents wakeable
+
+Everything so far works with agents that *check* their inbox. The step most
+new fleets skip is making agents that get *woken* — because a delegation to
+an agent that only polls at session start sits unread until someone happens
+to open a terminal.
+
+`mempalace logstream watch` (3.8.0+) is the primitive for this. It blocks
+until an event matching its filters lands, then exits — so any harness that
+can background a process and react to its exit gets a wake-up call, whatever
+model it runs:
+
+```bash
+mempalace logstream watch \
+  --agent <HOST>:<HARNESS>:<project> \
+  --type task.request --type task.reply --type patch.ready \
+  --json
+```
+
+Four things to get right, in the order people get them wrong:
+
+- **Use `--agent`, not `--to-agent`.** `--agent <id>` expands to
+  `--to-agent <id> --exclude-from-agent <id>`. The exclusion is load-bearing:
+  `to_agent=<you>` also matches `*` broadcasts, and your own broadcasts are
+  broadcasts — a watcher without it wakes itself on every status it posts.
+- **The exit code is the wake signal; the output is the mail.** `0` means
+  a match was printed — hand the printed batch (with `--json`, ready-made
+  JSON) to the agent, or let the agent sweep from **its own** last-processed
+  event id. `2` means `--idle-exit-ms` expired with nothing; `130` means
+  interrupted. Only `0` starts work.
+- **`--state-file` is the watcher's cursor, not the agent's.** When omitted
+  with `--agent`, the CLI defaults to `~/.mempalace/watch/<agent>.json` and
+  sanitizes `:` to `_` after doubling any `_`, so distinct identities never
+  share a file (Windows cannot put colons in filenames). The file
+  lets a restarted watcher resume exactly where it stopped: it may replay
+  the batch it printed but had not yet checkpointed — up to `--limit`
+  events, 50 by default — so dedupe by event id; it never silently misses
+  one. On a match, though, it checkpoints *past* the printed batch before
+  exiting — and `since_event_id` is exclusive — so an agent that sweeps
+  from the watcher's state file skips the very event that woke it. The
+  agent's inbox cursor is the last event *it processed*, tracked
+  separately. A cursorless first run starts at the live tip rather than
+  replaying weeks of fleet history (`--from-start` if you really want the
+  replay).
+- **Repeat `--type` to mean "or" — and wake for replies, not just work.**
+  Filter to the events that genuinely need you so routine status traffic
+  doesn't burn wake-ups, but if you ever delegate, include `task.reply`:
+  a worker reporting `blocked` or `failed` sends exactly that, and a
+  watcher that rejects it advances its durable cursor past it silently —
+  the delegation then sits unanswered until a manual sweep.
+
+How the loop plugs into a harness:
+
+- **A CLI agent** (Claude Code, Codex) backgrounds the command; on exit
+  `0` it feeds the watcher's printed events to the agent, or has the agent
+  sweep `mempalace_event_list` from the agent's own last-processed event
+  id — never from the watcher's state file, which has already advanced
+  past the match. Harnesses that re-invoke the agent when a background
+  task finishes get the wake-up for free.
+- **A daemon or dashboard** passes `--follow`, which stays alive past the
+  first match; with `--json` it emits NDJSON — one compact **batch
+  envelope** per line (`{"events": [...], "count": N, "cursor": ...}`),
+  not one event per line. A single poll can match several events, so
+  parse the `events` array.
+- **A turn-based assistant** that stops existing between prompts cannot
+  watch — and should say so rather than stay silent: publish the cursor it
+  reached and state that it needs a ping. A false watcher is worse than a
+  declared-absent one, because a requester who believes someone is
+  listening stops looking for a human to nudge.
+
+One operational trap deserves its own warning: **harness permission
+prompts stall the loop silently**. If the harness gates terminal commands
+or MCP writes behind human approval, every ack, reply, and patch
+submission can block on a prompt nobody is looking at. From the other side
+this is indistinguishable from a crash — the agent claimed a task and went
+quiet — and a five-second round trip quietly becomes minutes or hours
+(measured: the same ping that completed in 5 seconds once approved sat for
+4½ minutes behind an unnoticed prompt). For unattended coordination,
+allowlist the mempalace MCP tools (at minimum event append/ack and
+`mempalace_patch_submit`) and the `mempalace logstream watch` command in
+each harness's permission settings.
+
+Two etiquette rules close the loop. **Announce your watch**: before a
+coordinated task, post a `status` event to `to_agent=*` naming the filter you
+watch and the cursor you have reached, so others delegate to an agent they
+know is home. Keep the announcement in a `status` type — one the fleet's
+watchers sleep through — and announce once per session (again if your
+filter changes), not on every re-arm:
+an announcement typed as something watchers wake on wakes every window, and
+self-exclusion only guards each agent against its own events. And **resume by event id, never by timestamp**: events append
+in arrival order, so a peer's event can sync in already "older" than a
+wall-clock high-water mark — `since_created_at` as a resume cursor drops it
+permanently, `since_event_id` never does.
+
 ## Fleet roles and cadence
 
 Not every agent should do every job. Lessons the fleet reported from its own
@@ -253,13 +426,17 @@ first delegations:
   logstream; they ask their assistant. Its most valuable fleet role is
   translation — turning `patch.ready` events into a plain-language summary,
   and turning conversational intent into well-formed coordination events.
-- **Match inbox cadence to agent shape.** A daemon-adjacent CLI agent can
-  long-poll continuously; an ad hoc assistant should check at session start
-  and before long tasks, and no more.
+- **Match inbox cadence to agent shape.** A CLI agent in a coordination
+  loop (listen / claim / delegate) should run `logstream watch` in the
+  background and be woken
+  (see [Keep agents wakeable](#_7-keep-agents-wakeable)); an ad hoc
+  assistant should sweep on collab / before long tasks, stay
+  declared-idle, and not pretend to watch.
 - **Watch your whole inbox, not just known tasks.** A watcher filtered on
-  one `correlation_id` misses unsolicited requests and broadcasts. Poll
-  `to_agent=<you>` (which also matches `*`) with `--since-event-id` as the
-  cursor.
+  one `correlation_id` misses unsolicited requests and broadcasts. Watch
+  (or poll) `to_agent=<you>` — which also matches `*` — with the event id
+  as the cursor; `watch --agent <you>` does exactly this while filtering
+  out your own broadcasts.
 - **Keep memory writes user-visible.** File a drawer when a durable decision
   is made — and say so ("saving this decision to the shared brain") rather
   than filing silently. Transparency is what makes a fleet the user cannot

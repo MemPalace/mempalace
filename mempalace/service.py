@@ -73,9 +73,9 @@ READ_TOOLS = frozenset(
         "mempalace_search",
         "mempalace_check_duplicate",
         "mempalace_get_drawer",
+        "mempalace_get_drawers",
         "mempalace_list_drawers",
         "mempalace_diary_read",
-        "mempalace_memories_filed_away",
         "mempalace_kg_query",
         "mempalace_kg_stats",
         "mempalace_kg_timeline",
@@ -88,6 +88,7 @@ WRITE_TOOLS = frozenset(
         "mempalace_checkpoint",
         "mempalace_delete_by_source",
         "mempalace_delete_drawer",
+        "mempalace_delete_drawers",
         "mempalace_update_drawer",
         "mempalace_diary_write",
         "mempalace_kg_add",
@@ -96,6 +97,7 @@ WRITE_TOOLS = frozenset(
         "mempalace_delete_tunnel",
         "mempalace_delete_hallway",
         "mempalace_hook_settings",
+        "mempalace_memories_filed_away",
     }
 )
 
@@ -140,6 +142,8 @@ def execute_job(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
             return run_mine(payload)
         if kind == "sync":
             return run_sync(payload)
+        if kind == "sweep":
+            return run_sweep(payload)
         if kind == "diary_write":
             return run_diary_write(payload)
         if kind == "mcp_tool":
@@ -187,6 +191,73 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
     agent = payload.get("agent") or "mempalace"
     limit = int(payload.get("limit") or 0)
     dry_run = bool(payload.get("dry_run"))
+
+    raw_files = payload.get("files")
+    files = None
+
+    if raw_files is not None:
+        if source_adapter:
+            return {
+                "success": False,
+                "error": ("mine files payload cannot be combined with a source adapter"),
+                "exit_code": 2,
+            }
+
+        if mode != "projects":
+            return {
+                "success": False,
+                "error": "mine files payload is supported only in projects mode",
+                "exit_code": 2,
+            }
+
+        if not isinstance(raw_files, list):
+            return {
+                "success": False,
+                "error": "mine files payload must be a list",
+                "exit_code": 2,
+            }
+
+        if not isinstance(source, str) or not source.strip():
+            return {
+                "success": False,
+                "error": "mine source is required when files are provided",
+                "exit_code": 2,
+            }
+
+        from pathlib import Path
+
+        project_root = Path(source).expanduser().resolve(strict=False)
+        files = []
+
+        for index, raw_file in enumerate(raw_files):
+            if not isinstance(raw_file, str) or not raw_file.strip():
+                return {
+                    "success": False,
+                    "error": (
+                        "mine files payload entries must be non-empty strings; "
+                        f"invalid entry at index {index}"
+                    ),
+                    "exit_code": 2,
+                }
+
+            candidate = Path(raw_file).expanduser()
+            if not candidate.is_absolute():
+                candidate = project_root / candidate
+
+            resolved_file = candidate.resolve(strict=False)
+
+            try:
+                resolved_file.relative_to(project_root)
+            except ValueError:
+                return {
+                    "success": False,
+                    "error": (
+                        f"mine files payload contains a path outside the project root: {raw_file}"
+                    ),
+                    "exit_code": 2,
+                }
+
+            files.append(resolved_file)
 
     if payload.get("redetect_origin") and not source_adapter:
         from .cli import _run_pass_zero
@@ -243,6 +314,7 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
                 respect_gitignore=not bool(payload.get("no_gitignore")),
                 include_ignored=include_ignored,
                 max_chunks_per_file=payload.get("max_chunks_per_file"),
+                files=files,
             )
         else:
             return {"success": False, "error": f"invalid mine mode: {mode}", "exit_code": 2}
@@ -277,6 +349,91 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
         "kind": "mine",
         "mode": result_mode,
         "dry_run": dry_run,
+        "exit_code": 0,
+    }
+
+
+@_restores_palace_env
+def run_sweep(payload: dict[str, Any]) -> dict[str, Any]:
+    """Run transcript sweep through the daemon worker."""
+
+    palace_path = os.path.abspath(
+        os.path.expanduser(payload.get("palace_path") or MempalaceConfig().palace_path)
+    )
+    os.environ["MEMPALACE_PALACE_PATH"] = palace_path
+    _apply_backend(payload.get("backend"))
+
+    target_raw = payload.get("target")
+    if not isinstance(target_raw, str) or not target_raw.strip():
+        return {
+            "success": False,
+            "error": "sweep target must be a non-empty path",
+            "exit_code": 2,
+        }
+
+    target = os.path.abspath(os.path.expanduser(target_raw))
+
+    from .daemon import LOCK_REFUSAL_ERROR_CLASS
+    from .palace import MineAlreadyRunning
+    from .sweeper import sweep, sweep_directory
+
+    try:
+        if os.path.isfile(target):
+            result = sweep(target, palace_path)
+            print(
+                f" Swept {target}: +{result['drawers_added']} new, "
+                f"{result['drawers_already_present']} already present, "
+                f"{result['drawers_skipped']} skipped (< cursor)."
+            )
+        elif os.path.isdir(target):
+            result = sweep_directory(target, palace_path)
+            print(
+                f" Swept {result['files_succeeded']}/"
+                f"{result['files_attempted']} files from {target}: "
+                f"+{result['drawers_added']} new, "
+                f"{result['drawers_already_present']} already present, "
+                f"{result['drawers_skipped']} skipped (< cursor)."
+            )
+        else:
+            return {
+                "success": False,
+                "error": f"Not a file or directory: {target}",
+                "exit_code": 1,
+            }
+    except MineAlreadyRunning as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "error_class": LOCK_REFUSAL_ERROR_CLASS,
+            "exit_code": 1,
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": f"sweep failed: {exc}",
+            "exit_code": 1,
+        }
+
+    failures = result.get("failures") or []
+    if failures:
+        print(
+            f" WARNING: {len(failures)} file(s) failed to sweep - see stderr / logs for details.",
+            file=sys.stderr,
+        )
+        return {
+            "success": False,
+            "kind": "sweep",
+            "target": target,
+            "result": result,
+            "error": f"{len(failures)} file(s) failed to sweep",
+            "exit_code": 2,
+        }
+
+    return {
+        "success": True,
+        "kind": "sweep",
+        "target": target,
+        "result": result,
         "exit_code": 0,
     }
 
@@ -364,6 +521,7 @@ def run_sync(payload: dict[str, Any]) -> dict[str, Any]:
     print(f"  Kept:           {report['kept']}")
     print(f"  Gitignored:     {report['gitignored']}  {removed_suffix}")
     print(f"  Missing:        {report['missing']}  {removed_suffix}")
+    print(f"  Unresolved:     {report['unresolved']}  (kept)")
     print(f"  No source:      {report['no_source']}  (kept)")
     print(f"  Out of scope:   {report['out_of_scope']}  (kept)")
 
@@ -374,6 +532,17 @@ def run_sync(payload: dict[str, Any]) -> dict[str, Any]:
         print(f"\n  {label}:")
         for src, n in top:
             print(f"    {src}  ({n})")
+
+    if report["unresolved"]:
+        print("\n  Unresolved drawers are kept: nothing here could show their source file is gone.")
+        unresolved_sources = report.get("unresolved_by_source") or {}
+        if unresolved_sources:
+            top = sorted(unresolved_sources.items(), key=lambda kv: -kv[1])[:5]
+            for src, n in top:
+                print(f"    {src}  ({n})")
+            rest = len(unresolved_sources) - len(top)
+            if rest:
+                print(f"    and {rest} more source file(s)")
 
     if dry_run:
         if report["gitignored"] + report["missing"] > 0:
@@ -406,6 +575,7 @@ def run_diary_write(payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+@_restores_palace_env
 def run_mcp_tool(payload: dict[str, Any]) -> dict[str, Any]:
     """Execute an MCP tool by name over the daemon queue.
 
@@ -428,11 +598,18 @@ def run_mcp_tool(payload: dict[str, Any]) -> dict[str, Any]:
             "error": f"daemon mcp_tool only accepts write tools; {name!r} is {classification}",
             "exit_code": 2,
         }
-    from .mcp_server import TOOLS
+    from . import mcp_server
 
-    if name not in TOOLS:
+    # A daemon serves the one palace it was started for. Point the server at it
+    # as --palace would, which is also what puts knowledge-graph writes beside
+    # that palace rather than in the per-user default graph. The decorator
+    # restores the environment variable; the server's --palace flag stays raised
+    # for the daemon's lifetime, as it would for a server started with --palace.
+    mcp_server._apply_server_flags(palace=payload.get("palace_path"))
+
+    if name not in mcp_server.TOOLS:
         return {"success": False, "error": f"unknown MCP tool: {name}", "exit_code": 2}
-    result = TOOLS[name]["handler"](**arguments)
+    result = mcp_server.TOOLS[name]["handler"](**arguments)
     if isinstance(result, dict):
         # Several write tools signal failure with a bare {"error": ...} and no
         # explicit success flag (e.g. tool_create_tunnel / tool_delete_tunnel

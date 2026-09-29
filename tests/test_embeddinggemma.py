@@ -514,7 +514,9 @@ def test_concurrent_get_embedding_function_single_instance(monkeypatch):
     instance and each one later loads its own copy of the model.
     """
     monkeypatch.setattr(
-        embedding, "_resolve_providers", lambda device: (["CPUExecutionProvider"], "cpu")
+        embedding,
+        "_resolve_providers",
+        lambda device, model=None: (["CPUExecutionProvider"], "cpu"),
     )
     barrier = threading.Barrier(2)
     instances = [None, None]
@@ -536,7 +538,9 @@ def test_concurrent_get_embedding_function_single_instance(monkeypatch):
 def test_get_embedding_function_dispatches_to_embeddinggemma(monkeypatch):
     """model='embeddinggemma' must build EmbeddinggemmaONNX, not the MiniLM EF."""
     monkeypatch.setattr(
-        embedding, "_resolve_providers", lambda device: (["CPUExecutionProvider"], "cpu")
+        embedding,
+        "_resolve_providers",
+        lambda device, model=None: (["CPUExecutionProvider"], "cpu"),
     )
     ef = embedding.get_embedding_function(device="cpu", model="embeddinggemma")
     assert isinstance(ef, embedding.EmbeddinggemmaONNX)
@@ -556,7 +560,9 @@ def test_cache_key_separates_models(monkeypatch):
 
     monkeypatch.setattr(embedding, "_build_ef_class", lambda: DummyMiniLM)
     monkeypatch.setattr(
-        embedding, "_resolve_providers", lambda device: (["CPUExecutionProvider"], "cpu")
+        embedding,
+        "_resolve_providers",
+        lambda device, model=None: (["CPUExecutionProvider"], "cpu"),
     )
 
     ml = embedding.get_embedding_function(device="cpu", model="minilm")
@@ -582,6 +588,157 @@ def test_missing_deps_raise_helpful_error(monkeypatch):
     ef = embedding.EmbeddinggemmaONNX()
     with pytest.raises(ImportError, match=r"pip install.*mempalace"):
         ef(["anything"])
+
+
+# ---------------------------------------------------------------------------
+# Provider health probe
+#
+# CoreML supports only a fraction of embeddinggemma's quantized graph (~280 of
+# 1647 nodes over 100+ partitions) and returns an all-NaN last_hidden_state
+# without raising — the pooled vector then comes back NaN or all-zero
+# depending on the partitioning. A degenerate vector written to the palace is
+# unrecoverable without a re-embed, so the loader must never hand one out.
+# ---------------------------------------------------------------------------
+
+
+class _ProviderOut:
+    def __init__(self, name):
+        self.name = name
+
+
+def _patch_provider_sensitive_session(monkeypatch, verdict):
+    """Patch InferenceSession with a session whose output depends on providers.
+
+    ``verdict(providers)`` returns ``"ok"``, ``"nan"`` or ``"zeros"``. Returns
+    ``(builds, runs)`` — the provider list of every session constructed, and
+    the provider list of every ``run`` call — so tests can assert both the
+    fallback rebuild and the cost of the probe on the healthy path.
+    """
+    import onnxruntime
+
+    builds: list[list[str]] = []
+    runs: list[list[str]] = []
+
+    class _Session:
+        def __init__(self, providers):
+            self.providers = list(providers)
+
+        def get_outputs(self):
+            return [_ProviderOut("last_hidden_state"), _ProviderOut("sentence_embedding")]
+
+        def run(self, _output_names, feed):
+            runs.append(self.providers)
+            batch, length = feed["input_ids"].shape
+            sent = np.arange(batch * 768, dtype=np.float32).reshape(batch, 768) + 1.0
+            outcome = verdict(self.providers)
+            if outcome == "nan":
+                sent[:] = np.nan
+            elif outcome == "zeros":
+                sent[:] = 0.0
+            last_hidden = np.zeros((batch, length, 768), dtype=np.float32)
+            return [last_hidden, sent]
+
+    def fake_ctor(_model_path, sess_options=None, providers=None):
+        builds.append(list(providers or []))
+        return _Session(providers or [])
+
+    monkeypatch.setattr(onnxruntime, "InferenceSession", fake_ctor)
+    return builds, runs
+
+
+def _accelerator_returns(bad):
+    return lambda providers: bad if providers != ["CPUExecutionProvider"] else "ok"
+
+
+@pytest.mark.parametrize("bad", ["nan", "zeros"])
+def test_degenerate_accelerator_output_falls_back_to_cpu(
+    patched_lazy_load, monkeypatch, caplog, bad
+):
+    """A provider returning NaN or all-zero vectors must be abandoned for CPU.
+
+    Both shapes are real CoreML behaviour on Apple Silicon — which one you get
+    depends on how the graph happens to be partitioned that run.
+    """
+    builds, _ = _patch_provider_sensitive_session(monkeypatch, _accelerator_returns(bad))
+
+    ef = embedding.EmbeddinggemmaONNX(
+        preferred_providers=["CoreMLExecutionProvider", "CPUExecutionProvider"]
+    )
+    out = np.asarray(ef(["texto de prueba"]))
+
+    assert np.isfinite(out).all(), "no NaN/Inf may reach the caller"
+    assert np.linalg.norm(out) > 0.0, "an all-zero vector is as unusable as NaN"
+    assert builds == [
+        ["CoreMLExecutionProvider", "CPUExecutionProvider"],
+        ["CPUExecutionProvider"],
+    ], "the failed session must be rebuilt CPU-only"
+    assert ef._providers == ["CPUExecutionProvider"], "the fallback must be visible on the EF"
+    assert "CoreMLExecutionProvider" in caplog.text and "falling back" in caplog.text
+
+
+def test_healthy_accelerator_is_kept(patched_lazy_load, monkeypatch):
+    """The probe must not punish a provider that works — only reject bad ones."""
+    builds, _ = _patch_provider_sensitive_session(monkeypatch, lambda providers: "ok")
+
+    ef = embedding.EmbeddinggemmaONNX(
+        preferred_providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+    )
+    out = np.asarray(ef(["texto de prueba"]))
+
+    assert np.isfinite(out).all()
+    assert builds == [["CUDAExecutionProvider", "CPUExecutionProvider"]], "no rebuild expected"
+    assert ef._providers == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+
+def test_cpu_only_load_skips_the_probe(patched_lazy_load, monkeypatch):
+    """The default path pays nothing: CPU is the fallback, so probing it buys
+    nothing and would add a forward pass to every cold start."""
+    builds, runs = _patch_provider_sensitive_session(monkeypatch, lambda providers: "ok")
+
+    ef = embedding.EmbeddinggemmaONNX(preferred_providers=["CPUExecutionProvider"])
+    ef(["texto de prueba"])
+
+    assert builds == [["CPUExecutionProvider"]]
+    assert len(runs) == 1, "only the caller's own forward pass"
+
+
+def test_degenerate_cpu_fallback_raises_instead_of_returning_nan(patched_lazy_load, monkeypatch):
+    """With no healthy provider left, fail loudly.
+
+    Verbatim storage is the promise; a palace quietly filled with NaN vectors
+    cannot be searched and cannot be told apart from a healthy one after the
+    fact.
+    """
+    _patch_provider_sensitive_session(monkeypatch, lambda providers: "nan")
+
+    ef = embedding.EmbeddinggemmaONNX(
+        preferred_providers=["CoreMLExecutionProvider", "CPUExecutionProvider"]
+    )
+    with pytest.raises(RuntimeError, match="degenerate"):
+        ef(["texto de prueba"])
+
+
+@pytest.mark.parametrize("device", ["auto", "coreml", "cpu"])
+def test_no_device_setting_can_produce_nan_vectors(patched_lazy_load, monkeypatch, device):
+    """End-to-end regression: no embedding_device may yield NaN for this model.
+
+    Covers both layers at once — auto never selects CoreML, and an explicit
+    coreml is caught by the probe — against a runtime that advertises CoreML
+    and poisons any accelerator session.
+    """
+    monkeypatch.setattr(
+        "onnxruntime.get_available_providers",
+        lambda: ["CoreMLExecutionProvider", "CPUExecutionProvider"],
+    )
+    monkeypatch.setattr(embedding, "_resolve_intra_op_threads", lambda: 0)
+    _patch_provider_sensitive_session(monkeypatch, _accelerator_returns("nan"))
+
+    ef = embedding.get_embedding_function(device=device, model="embeddinggemma")
+    out = np.asarray(ef(["texto de prueba", "otro documento"]))
+
+    assert out.shape == (2, 384)
+    assert np.isfinite(out).all()
+    assert np.allclose(np.linalg.norm(out, axis=1), 1.0)
 
 
 def test_config_embedding_model_env_override(monkeypatch):

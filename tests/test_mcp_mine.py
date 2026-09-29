@@ -130,6 +130,57 @@ def test_convos_mode_files_drawers(monkeypatch, config, tmp_dir):
         del client
 
 
+def test_convos_mode_accepts_a_single_file(monkeypatch, config, tmp_dir):
+    """A lone conversation file is a valid convos source (#2281).
+
+    ``cli.py`` documents the positional as "Directory to mine, or one
+    conversation file with --mode convos", and ``hooks_cli._ingest_transcript``
+    submits exactly one ``.jsonl``. ``cmd_mine`` forwards to the hub whenever one
+    is live, so a directory-only precondition here makes the documented
+    single-file form unreachable in the configuration most users run, and every
+    hook transcript ingest fails.
+    """
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "one-session.txt")
+    _write(
+        src,
+        "> What is memory?\nMemory is persistence.\n\n"
+        "> Why does it matter?\nIt enables continuity across sessions.\n\n"
+        "> How do we build it?\nWith structured verbatim storage.\n",
+    )
+
+    result = mcp_server.tool_mine(source=src, mode="convos", wing="test_one_file")
+    assert result["success"] is True, result.get("error")
+    assert result["mode"] == "convos"
+
+    client = chromadb.PersistentClient(path=config.palace_path)
+    try:
+        col = client.get_collection("mempalace_drawers")
+        assert col.count() >= 2
+    finally:
+        del client
+
+
+def test_projects_mode_still_rejects_a_file(monkeypatch, config, tmp_dir):
+    """Only convos gained the single-file form; projects still needs a tree.
+
+    Guards the relaxation from widening into "any mode, any path" — without
+    this, the fix for #2281 would pass just as well if the precondition were
+    dropped entirely.
+    """
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "notes.md")
+    _write(src, "# Title\n\n" + ("Some real content. " * 40))
+
+    result = mcp_server.tool_mine(source=src, mode="projects")
+    assert result["success"] is False
+    assert "source" in result["error"].lower()
+
+
 def test_stdout_captured_not_leaked_to_fd(monkeypatch, config, tmp_dir, capfd):
     """Miner stdout must land in ``output``, never on the real fd-1 JSON-RPC
     channel. ``tool_mine`` redirects fd 1 around the in-process miner."""

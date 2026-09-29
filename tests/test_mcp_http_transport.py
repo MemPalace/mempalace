@@ -24,6 +24,7 @@ import os
 import socketserver
 import ssl
 import threading
+import time
 
 import pytest
 
@@ -99,11 +100,321 @@ def test_initialize_reports_server_info(http_server):
     assert json.loads(body)["result"]["serverInfo"]["name"] == "mempalace"
 
 
+class TestPalaceReadsDoNotStarveTheHub:
+    """Slow palace reads must not block protocol traffic or other reads."""
+
+    @staticmethod
+    def _request(port, body, timeout=10):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+        try:
+            conn.request(
+                "POST",
+                "/mcp",
+                json.dumps(body),
+                headers={"Content-Type": "application/json"},
+            )
+            response = conn.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            conn.close()
+
+    def _call(self, port, name, arguments, req_id=1, timeout=10):
+        status, payload = self._request(
+            port,
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            },
+            timeout=timeout,
+        )
+        assert status == 200, payload
+        text = payload["result"]["content"][0]["text"]
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return payload["result"]
+
+    @staticmethod
+    def _patch_slow_search(monkeypatch, hold_s=0.7):
+        started = threading.Event()
+
+        def slow_search(**_kwargs):
+            started.set()
+            time.sleep(hold_s)
+            return {"query": "x", "results": []}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", slow_search)
+        return started
+
+    @pytest.mark.parametrize("method", ["initialize", "tools/list"])
+    def test_protocol_method_completes_while_search_holds(self, http_server, monkeypatch, method):
+        port, _ = http_server
+        started = self._patch_slow_search(monkeypatch, hold_s=0.8)
+        errors = []
+
+        def searcher():
+            try:
+                self._call(port, "mempalace_search", {"query": "x"}, req_id=11)
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=searcher)
+        thread.start()
+        assert started.wait(timeout=2)
+        started_at = time.perf_counter()
+        status, payload = self._request(port, {"jsonrpc": "2.0", "id": 1, "method": method})
+        elapsed = time.perf_counter() - started_at
+        thread.join(timeout=5)
+
+        assert not errors, errors
+        assert status == 200
+        if method == "initialize":
+            assert payload["result"]["serverInfo"]["name"] == "mempalace"
+        else:
+            assert "mempalace_search" in {tool["name"] for tool in payload["result"]["tools"]}
+        assert elapsed < 0.4, f"{method} waited on search: {elapsed:.3f}s"
+
+    def test_two_searches_overlap(self, http_server, monkeypatch):
+        port, _ = http_server
+        in_flight = threading.Barrier(2, timeout=3)
+        max_in_flight = {"n": 0}
+        current = {"n": 0}
+        lock = threading.Lock()
+        errors = []
+
+        def slow_search(**_kwargs):
+            with lock:
+                current["n"] += 1
+                max_in_flight["n"] = max(max_in_flight["n"], current["n"])
+            try:
+                in_flight.wait()
+                time.sleep(0.5)
+            finally:
+                with lock:
+                    current["n"] -= 1
+            return {"query": "x", "results": []}
+
+        def run_search(req_id):
+            try:
+                self._call(port, "mempalace_search", {"query": "x"}, req_id=req_id)
+            except Exception as exc:
+                errors.append(exc)
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", slow_search)
+        threads = [threading.Thread(target=run_search, args=(req_id,)) for req_id in (21, 22)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+        assert not errors, errors
+        assert max_in_flight["n"] == 2, "searches stayed serialized on the HTTP lock"
+
+    @pytest.mark.parametrize("tool_name", ["mempalace_add_drawer", "mempalace_memories_filed_away"])
+    def test_state_changes_wait_for_in_flight_search(self, http_server, monkeypatch, tool_name):
+        port, _ = http_server
+        search_started = threading.Event()
+        search_release = threading.Event()
+        write_started = threading.Event()
+
+        def slow_search(**_kwargs):
+            search_started.set()
+            search_release.wait(timeout=5)
+            return {"query": "x", "results": []}
+
+        def state_change(**_kwargs):
+            write_started.set()
+            return {"success": True}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", slow_search)
+        monkeypatch.setitem(mcp.TOOLS[tool_name], "handler", state_change)
+        search_thread = threading.Thread(
+            target=lambda: self._call(port, "mempalace_search", {"query": "x"}, req_id=31)
+        )
+        search_thread.start()
+        assert search_started.wait(timeout=2)
+        write_thread = threading.Thread(target=lambda: self._call(port, tool_name, {}, req_id=32))
+        write_thread.start()
+        time.sleep(0.25)
+        assert not write_started.is_set(), f"{tool_name} ran while a palace read was in flight"
+        search_release.set()
+        search_thread.join(timeout=5)
+        write_thread.join(timeout=5)
+        assert write_started.is_set()
+
+    @staticmethod
+    def _patch_stepwise_mine(monkeypatch, log, files=3, step_s=0.3):
+        """A mine that reaches mine_yield_point() before each of its files."""
+        from mempalace.palace import mine_yield_point
+
+        started = threading.Event()
+
+        def stepwise_mine(**kwargs):
+            started.set()
+            tag = kwargs.get("source", "mine")
+            for i in range(files):
+                mine_yield_point()
+                log.append((f"{tag}:file{i}:start", time.monotonic()))
+                time.sleep(step_s)
+                log.append((f"{tag}:file{i}:end", time.monotonic()))
+            return {"success": True}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_mine"], "handler", stepwise_mine)
+        return started
+
+    def test_a_read_runs_between_the_files_of_a_mine(self, http_server, monkeypatch):
+        """A hub mine held the exclusive lock for its whole run, so a status
+        call waited for all of it. It now runs between files, never inside one."""
+        port, _ = http_server
+        log: list = []
+        mine_started = self._patch_stepwise_mine(monkeypatch, log)
+
+        def quick_search(**_kwargs):
+            log.append(("search", time.monotonic()))
+            return {"query": "x", "results": []}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", quick_search)
+        mine_thread = threading.Thread(
+            target=lambda: self._call(port, "mempalace_mine", {"source": "m"}, req_id=41)
+        )
+        mine_thread.start()
+        assert mine_started.wait(timeout=2)
+        time.sleep(0.05)  # inside file0
+        self._call(port, "mempalace_search", {"query": "x"}, req_id=42)
+        mine_thread.join(timeout=10)
+        assert not mine_thread.is_alive()
+
+        names = [name for name, _ in log]
+        search_at = names.index("search")
+        assert search_at < names.index("m:file2:end"), "the read waited for the whole mine"
+        assert names[search_at - 1].endswith(":end"), f"read ran inside a file: {names}"
+
+    def test_a_second_mine_waits_for_the_first(self, http_server, monkeypatch):
+        port, _ = http_server
+        log: list = []
+        first_started = self._patch_stepwise_mine(monkeypatch, log, files=2, step_s=0.2)
+        first = threading.Thread(
+            target=lambda: self._call(port, "mempalace_mine", {"source": "a"}, req_id=51)
+        )
+        first.start()
+        assert first_started.wait(timeout=2)
+        second = threading.Thread(
+            target=lambda: self._call(port, "mempalace_mine", {"source": "b"}, req_id=52)
+        )
+        second.start()
+        first.join(timeout=10)
+        second.join(timeout=10)
+        names = [name for name, _ in log]
+        assert names.index("a:file1:end") < names.index("b:file0:start"), names
+
+
+class TestRWLockYield:
+    """_RWLock.yield_write: the handoff a stepwise writer uses between steps."""
+
+    @staticmethod
+    def _in_thread(fn):
+        thread = threading.Thread(target=fn, daemon=True)
+        thread.start()
+        return thread
+
+    def test_queued_reader_runs_before_the_writer_resumes(self):
+        lock = mcp._RWLock()
+        order: list = []
+        lock.acquire_write()
+
+        def reader():
+            with lock.read_lock():
+                order.append("read")
+
+        thread = self._in_thread(reader)
+        time.sleep(0.1)
+        assert order == []  # blocked by the writer
+        lock.yield_write()
+        order.append("writer resumed")
+        thread.join(timeout=2)
+        lock.release_write()
+        assert order == ["read", "writer resumed"]
+
+    def test_queued_writer_takes_its_turn(self):
+        lock = mcp._RWLock()
+        order: list = []
+        lock.acquire_write()
+
+        def writer():
+            with lock:
+                order.append("other writer")
+
+        thread = self._in_thread(writer)
+        time.sleep(0.1)
+        lock.yield_write()
+        order.append("writer resumed")
+        thread.join(timeout=2)
+        lock.release_write()
+        assert order == ["other writer", "writer resumed"]
+
+    def test_no_op_without_waiters_and_for_a_thread_not_holding_it(self):
+        lock = mcp._RWLock()
+        lock.acquire_write()
+        started = time.monotonic()
+        lock.yield_write()
+        assert time.monotonic() - started < 0.05
+        assert lock._writer
+
+        done = threading.Event()
+
+        def stranger():
+            lock.yield_write()
+            done.set()
+
+        self._in_thread(stranger)
+        assert done.wait(timeout=1)
+        assert lock._writer  # still held by this thread
+        lock.release_write()
+
+    def test_readers_still_wait_for_a_queued_writer_outside_a_yield(self):
+        lock = mcp._RWLock()
+        lock.acquire_read()
+        entered = threading.Event()
+        self._in_thread(lock.acquire_write)
+        time.sleep(0.1)  # writer now queued behind our read
+        self._in_thread(lambda: (lock.acquire_read(), entered.set()))
+        assert not entered.wait(timeout=0.2), "writer preference was lost"
+        lock.release_read()
+
+
 def test_healthz_ok(http_server):
     port, _ = http_server
     status, body = _get(port, "/healthz")
     assert status == 200
     assert body == b"ok\n"
+
+
+def test_statusz_ok_distinguishes_absent_verdict_from_failed_one(http_server, monkeypatch):
+    """`ok: null` means no integrity verdict exists, not that one came back bad.
+
+    It is the answer for a non-chroma backend (#1931) and for a palace above
+    the startup-probe size limit — the palace in #2240 is about four times the
+    default. Collapsing it with ``bool()`` reported every such server as
+    unhealthy, which is a negative verdict nobody produced.
+    """
+    port, _ = http_server
+
+    monkeypatch.setattr(
+        mcp,
+        "_sqlite_integrity_payload",
+        lambda: {"checked": False, "ok": None, "errors": [], "reason": "probe skipped"},
+    )
+    assert json.loads(_get(port, "/statusz")[1])["ok"] is True
+
+    monkeypatch.setattr(
+        mcp,
+        "_sqlite_integrity_payload",
+        lambda: {"checked": True, "ok": False, "errors": ["malformed inverted index"]},
+    )
+    assert json.loads(_get(port, "/statusz")[1])["ok"] is False
 
 
 def test_statusz_reports_machine_readable_server_and_client_state(http_server, monkeypatch):
@@ -133,6 +444,119 @@ def test_statusz_reports_machine_readable_server_and_client_state(http_server, m
         assert mcp._config.palace_path not in json.dumps(payload)
 
 
+def test_statusz_stays_healthy_when_no_integrity_verdict_exists(http_server, monkeypatch):
+    """An absent verdict is not a failed one.
+
+    A palace with no chroma.sqlite3 yet reports ``ok: None``. Collapsing that
+    with ``bool()`` would tell every monitor that a freshly installed server is
+    unhealthy. Only a probe that reported something turns /statusz red: a dirty
+    quick_check, or a probe that failed to run and recorded why.
+    """
+    monkeypatch.setattr(
+        mcp,
+        "_sqlite_integrity_payload",
+        lambda: {"checked": False, "ok": None, "errors": [], "reason": "no quick_check ran"},
+    )
+    port, _ = http_server
+
+    status, body = _get(port, "/statusz", headers={"User-Agent": "codex-test"})
+
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["ok"] is True
+    assert payload["palace"]["sqlite_integrity"]["checked"] is False
+    assert payload["palace"]["sqlite_integrity"]["ok"] is None
+
+
+def test_statusz_stays_healthy_for_a_real_palace_with_no_database(
+    http_server, monkeypatch, tmp_path
+):
+    """End to end: a real empty palace, the real payload, the real endpoint.
+
+    The two tests around this one substitute the payload, so they pin the
+    health expression and nothing else. This one runs the gate against a
+    directory that genuinely has no chroma.sqlite3 and checks what the
+    endpoint publishes.
+    """
+    monkeypatch.setattr(type(mcp._config), "palace_path", property(lambda self: str(tmp_path)))
+    monkeypatch.setattr(mcp, "_is_chroma_backend", lambda: True)
+    monkeypatch.setattr(mcp, "_selected_backend_name", lambda: "chroma")
+    monkeypatch.setattr(mcp, "_sqlite_integrity_checked", False)
+    monkeypatch.setattr(mcp, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp, "_sqlite_integrity_check_error", "")
+    monkeypatch.setattr(mcp, "_sqlite_integrity_no_verdict_reason", "")
+    port, _ = http_server
+
+    status, body = _get(port, "/statusz", headers={"User-Agent": "codex-test"})
+
+    assert status == 200
+    payload = json.loads(body)
+    integrity = payload["palace"]["sqlite_integrity"]
+    assert integrity["checked"] is False
+    assert integrity["ok"] is None
+    assert "chroma.sqlite3" in integrity["reason"]
+    assert payload["ok"] is True
+
+
+def test_statusz_reports_unhealthy_when_the_payload_has_no_verdict_key(http_server, monkeypatch):
+    """A payload shape without `ok` at all must fail closed, not open.
+
+    All three shapes set the key today, so this pins the default rather than a
+    reachable state: `.get("ok")` alone would answer None and read as healthy.
+    """
+    monkeypatch.setattr(mcp, "_sqlite_integrity_payload", lambda: {"errors": []})
+    port, _ = http_server
+
+    status, body = _get(port, "/statusz", headers={"User-Agent": "codex-test"})
+
+    assert status == 200
+    assert json.loads(body)["ok"] is False
+
+
+def test_statusz_stays_healthy_on_a_non_chroma_backend(http_server, monkeypatch, tmp_path):
+    """#1931's shape reached /statusz as unhealthy until now.
+
+    A non-chroma backend has answered `ok: None` since #1931, and `bool()`
+    turned that into a red endpoint for every such server. This is the case
+    the health flag was already getting wrong, independent of an absent
+    database.
+    """
+    monkeypatch.setattr(type(mcp._config), "palace_path", property(lambda self: str(tmp_path)))
+    monkeypatch.setattr(mcp, "_selected_backend_name", lambda: "qdrant")
+    monkeypatch.setattr(mcp, "_sqlite_integrity_checked", True)
+    monkeypatch.setattr(mcp, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp, "_sqlite_integrity_check_error", "")
+    monkeypatch.setattr(mcp, "_sqlite_integrity_no_verdict_reason", "")
+    port, _ = http_server
+
+    status, body = _get(port, "/statusz", headers={"User-Agent": "codex-test"})
+
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["palace"]["sqlite_integrity"]["ok"] is None
+    assert "qdrant" in payload["palace"]["sqlite_integrity"]["reason"]
+    assert payload["ok"] is True
+
+
+def test_statusz_reports_unhealthy_on_a_dirty_verdict(http_server, monkeypatch):
+    """The case that must still turn /statusz red."""
+    monkeypatch.setattr(
+        mcp,
+        "_sqlite_integrity_payload",
+        lambda: {
+            "checked": True,
+            "ok": False,
+            "errors": ["malformed inverted index for FTS5 table main.embedding_fulltext_search"],
+        },
+    )
+    port, _ = http_server
+
+    status, body = _get(port, "/statusz", headers={"User-Agent": "codex-test"})
+
+    assert status == 200
+    assert json.loads(body)["ok"] is False
+
+
 def test_unknown_path_404(http_server):
     port, _ = http_server
     assert _post(port, "/nope", {"jsonrpc": "2.0", "id": 1, "method": "ping"})[0] == 404
@@ -144,6 +568,47 @@ def test_invalid_json_returns_parse_error(http_server):
     status, body = _post(port, "/mcp", b"{not valid json")
     assert status == 400
     assert json.loads(body)["error"]["code"] == -32700
+
+
+def test_non_string_method_gets_jsonrpc_error(http_server):
+    """A malformed envelope must come back as JSON-RPC, not a dropped socket."""
+    port, _ = http_server
+    status, body = _post(port, "/mcp", {"jsonrpc": "2.0", "id": 3, "method": 123})
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["id"] == 3
+    assert payload["error"]["code"] == -32601
+
+
+def test_dispatch_failure_returns_jsonrpc_error(http_server, monkeypatch):
+    """An unexpected dispatch failure answers -32603 instead of closing the socket."""
+    port, _ = http_server
+
+    def _boom(_request):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(mcp, "_http_dispatch", _boom)
+
+    status, body = _post(port, "/mcp", {"jsonrpc": "2.0", "id": 4, "method": "ping"})
+    assert status == 500
+    payload = json.loads(body)
+    assert payload["id"] == 4
+    assert payload["error"]["code"] == -32603
+    assert "kaboom" not in body.decode("utf-8")
+
+
+def test_dispatch_failure_on_notification_sends_no_body(http_server, monkeypatch):
+    """A notification is owed no response body, a failed one included."""
+    port, _ = http_server
+
+    def _boom(_request):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(mcp, "_http_dispatch", _boom)
+
+    status, body = _post(port, "/mcp", {"jsonrpc": "2.0", "method": "notifications/initialized"})
+    assert status == 500
+    assert body == b""
 
 
 def test_oversized_request_rejected_413(http_server):
@@ -270,6 +735,7 @@ def test_read_only_off_exposes_mutating_tools(http_server):
 
 
 def test_writable_http_refuses_startup_without_writer_lease(monkeypatch):
+    monkeypatch.setenv("MEMPALACE_MCP_WRITER_WAIT_SECONDS", "0")
     monkeypatch.setattr(mcp, "_READ_ONLY", False)
     monkeypatch.setattr(
         mcp,
@@ -286,6 +752,144 @@ def test_writable_http_refuses_startup_without_writer_lease(monkeypatch):
         mcp._run_http_loop()
 
     assert exc_info.value.code == 2
+
+
+class _FakeClock:
+    """Deterministic monotonic clock whose sleep advances time instead of blocking."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _patch_http_startup(monkeypatch, events):
+    monkeypatch.setattr(mcp, "_READ_ONLY", False)
+    monkeypatch.setattr(mcp, "_MCP_WRITER_READ_ONLY", False)
+    monkeypatch.setattr(mcp, "_MCP_WRITER_LOCK_CM", None)
+    monkeypatch.setattr(mcp, "_discard_mcp_storage_handles", lambda: None)
+    monkeypatch.setattr(mcp, "_refresh_vector_disabled_flag", lambda: None)
+    monkeypatch.setattr(mcp, "_start_idle_exit_watchdog", lambda: None)
+    monkeypatch.setattr(mcp, "_start_write_stall_watchdog", lambda: None)
+    monkeypatch.setattr(mcp, "_serve_http", lambda host, port: events.append("serve"))
+
+
+def _contended_then_free(attempts_before_free, events):
+    """Stand-in for _acquire_mcp_writer_lock: a peer holds the lease N times, then frees it."""
+
+    class Lease:
+        def __exit__(self, *exc):
+            return False
+
+    state = {"calls": 0}
+
+    def acquire():
+        state["calls"] += 1
+        events.append("attempt")
+        if state["calls"] <= attempts_before_free:
+            mcp._MCP_WRITER_READ_ONLY = True
+            return False, "another mempalace writer already holds the palace lock"
+        mcp._MCP_WRITER_READ_ONLY = False
+        mcp._MCP_WRITER_LOCK_CM = Lease()
+        return True, ""
+
+    return acquire
+
+
+def test_writable_http_waits_for_a_peer_to_release_the_writer_lease(monkeypatch):
+    """#2500: a transient holder is waited out instead of refusing startup."""
+    events = []
+    clock = _FakeClock()
+    _patch_http_startup(monkeypatch, events)
+    monkeypatch.setenv("MEMPALACE_MCP_WRITER_WAIT_SECONDS", "60")
+    monkeypatch.setattr(mcp, "_acquire_mcp_writer_lock", _contended_then_free(2, events))
+    monkeypatch.setattr(mcp.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(mcp.time, "sleep", clock.sleep)
+
+    mcp._run_http_loop()
+
+    assert events == ["attempt", "attempt", "attempt", "serve"]
+    assert clock.sleeps == [0.5, 1.0], "backoff doubles between attempts"
+
+
+def test_writable_http_exits_2_when_the_writer_lease_wait_runs_out(monkeypatch):
+    events = []
+    clock = _FakeClock()
+    _patch_http_startup(monkeypatch, events)
+    monkeypatch.setenv("MEMPALACE_MCP_WRITER_WAIT_SECONDS", "10")
+    monkeypatch.setattr(mcp, "_acquire_mcp_writer_lock", _contended_then_free(10**6, events))
+    monkeypatch.setattr(mcp.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(mcp.time, "sleep", clock.sleep)
+
+    with pytest.raises(SystemExit) as exc_info:
+        mcp._run_http_loop()
+
+    assert exc_info.value.code == 2
+    assert "serve" not in events
+    assert sum(clock.sleeps) == pytest.approx(10.0), "never sleeps past the configured wait"
+    assert max(clock.sleeps) <= 5.0, "backoff is capped"
+
+
+def test_writable_http_does_not_wait_on_a_writer_setup_failure(monkeypatch):
+    """Waiting cannot fix a backend or lock-directory failure, so it refuses at once."""
+    events = []
+    clock = _FakeClock()
+    _patch_http_startup(monkeypatch, events)
+    monkeypatch.setenv("MEMPALACE_MCP_WRITER_WAIT_SECONDS", "60")
+
+    def setup_failure():
+        events.append("attempt")
+        mcp._MCP_WRITER_READ_ONLY = False
+        return False, "could not acquire MCP peer-writer lock"
+
+    monkeypatch.setattr(mcp, "_acquire_mcp_writer_lock", setup_failure)
+    monkeypatch.setattr(mcp.time, "sleep", clock.sleep)
+
+    with pytest.raises(SystemExit) as exc_info:
+        mcp._run_http_loop()
+
+    assert exc_info.value.code == 2
+    assert events == ["attempt"]
+    assert clock.sleeps == []
+
+
+def test_writer_wait_zero_restores_immediate_refusal(monkeypatch):
+    events = []
+    clock = _FakeClock()
+    _patch_http_startup(monkeypatch, events)
+    monkeypatch.setenv("MEMPALACE_MCP_WRITER_WAIT_SECONDS", "0")
+    monkeypatch.setattr(mcp, "_acquire_mcp_writer_lock", _contended_then_free(1, events))
+    monkeypatch.setattr(mcp.time, "sleep", clock.sleep)
+
+    with pytest.raises(SystemExit) as exc_info:
+        mcp._run_http_loop()
+
+    assert exc_info.value.code == 2
+    assert events == ["attempt"]
+    assert clock.sleeps == []
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("", 120.0),
+        ("45", 45.0),
+        ("0", 0.0),
+        ("-3", 120.0),
+        ("nan", 120.0),
+        ("inf", 120.0),
+        ("soon", 120.0),
+    ],
+)
+def test_writer_wait_seconds_parsing(monkeypatch, raw, expected):
+    monkeypatch.setenv("MEMPALACE_MCP_WRITER_WAIT_SECONDS", raw)
+    assert mcp._writer_wait_seconds() == expected
 
 
 def test_read_only_http_skips_writer_lease(monkeypatch):
