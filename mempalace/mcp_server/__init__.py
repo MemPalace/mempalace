@@ -25,6 +25,7 @@ Tools (read):
 Tools (write):
   mempalace_add_drawer      — file verbatim content into a wing/room
   mempalace_delete_drawer   — remove a drawer by ID
+  mempalace_delete_drawers  — remove many drawers by ID in one call (bulk)
   mempalace_delete_by_source — bulk-remove all drawers mined from one source_file
 
 Tools (maintenance):
@@ -93,8 +94,13 @@ from ..backends.chroma import (  # noqa: E402
     ChromaBackend,
     ChromaCollection,
     _HNSW_WRITE_DEFAULTS,
+    _clear_chroma_system_cache,
+    _is_own_db_stamp,
+    _note_own_db_stamp,
     _pin_hnsw_threads,
+    chroma_system_generation,
     hnsw_capacity_status,
+    register_before_system_cache_reset,
     reset_hnsw_capacity_cache,
 )
 from ..backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
@@ -137,7 +143,7 @@ from ..ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
 # CLI sync path and the daemon service layer can audit writes without importing
 # this module, whose import installs MCP stdio protection (os.dup2(2, 1) and
 # sys.stdout = sys.stderr) that would misroute their output.
-from ..wal import _wal_log  # noqa: E402
+from ..wal import _wal_log, _wal_result  # noqa: E402
 
 _FRAGMENT_DIR = Path(__file__).resolve().parent
 # Load order is a dependency sequence, not a catalog: later files use names

@@ -76,6 +76,7 @@ from .palace import (
     file_already_mined,
     get_collection,
     mine_lock,
+    mine_yield_point,
 )
 
 # Module-level imports from .miner so tests can patch them via
@@ -835,6 +836,7 @@ def mine_formats(
         collection = get_collection(palace_path) if not dry_run else None
 
         for i, filepath in enumerate(files, 1):
+            mine_yield_point()
             files_processed = i
             source_file = str(filepath)
 

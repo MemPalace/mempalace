@@ -16,11 +16,13 @@ Covers:
   2. Filtering/aggregation semantics are byte-for-byte what the offset loop
      produced (extract_mode scope, normalize_version floor, comma-joined
      hashes, first-source-wins, wing-keyed).
-  3. A backend blowing up still yields the documented partial result rather
-     than propagating.
+  3. A backend blowing up raises ``MinedSetUnavailable`` rather than handing
+     back an incomplete map that reads as "no duplicate".
 """
 
-from mempalace.palace import NORMALIZE_VERSION, prefetch_content_hashes
+import pytest
+
+from mempalace.palace import NORMALIZE_VERSION, MinedSetUnavailable, prefetch_content_hashes
 
 
 class FakeCollection:
@@ -122,8 +124,9 @@ def test_extract_mode_none_matches_every_scope():
     assert set(out) == {("sessions", "a"), ("sessions", "b")}
 
 
-def test_backend_failure_returns_partial_instead_of_raising():
+def test_backend_failure_raises_instead_of_returning_partial():
     col = FakeCollection([_meta()], raises=True)
 
-    assert prefetch_content_hashes(col, extract_mode="convos") == {}
+    with pytest.raises(MinedSetUnavailable):
+        prefetch_content_hashes(col, extract_mode="convos")
     assert col.get_all_metadata_calls == 1

@@ -26,6 +26,112 @@ def _metadata_matches_extract_mode(meta: dict, extract_mode: Optional[str]) -> b
     return extract_mode == "exchange" and meta.get("ingest_mode") in (None, "convos")
 
 
+def _meta_is_current(meta: dict, extract_mode: Optional[str]) -> bool:
+    """True when a drawer was filed by the current pipeline for its scope.
+
+    Pre-v2 drawers have no ``normalize_version`` and count as stale. In the
+    exchange scope a missing ``convo_chunker_version`` is stale too, so a
+    chunker fix re-mines conversation files without touching project files.
+    """
+    if meta.get("normalize_version", 1) < NORMALIZE_VERSION:
+        return False
+    if extract_mode == "exchange":
+        return meta.get("convo_chunker_version", 1) >= CONVO_CHUNKER_VERSION
+    return True
+
+
+# Every metadata key the mined-set checks below read.
+_MINED_SCAN_KEYS = (
+    "source_file",
+    "source_mtime",
+    "chunk_total",
+    "extract_mode",
+    "ingest_mode",
+    "normalize_version",
+    "convo_chunker_version",
+    "content_hash",
+    "wing",
+)
+
+
+class MinedSetUnavailable(RuntimeError):
+    """The palace could not be read to learn which sources are already filed.
+
+    Raised instead of returning a partial registry: an incomplete one reads as
+    "not mined yet" and "no duplicate", which cannot be told apart from a
+    complete answer, so a mine would re-file sources or write duplicates blind.
+    """
+
+
+def _fast_collection_metadata(collection, keys, require_key=None):
+    """Chroma's one-pass sqlite metadata stream, or ``None`` for other backends.
+
+    Paging ``get(limit, offset)`` costs a SQL ``OFFSET`` per page, which
+    re-walks every skipped row, and ``count()`` on a fresh client loads the
+    whole HNSW index first: on a 360k-drawer palace one such scan took 138 s,
+    and it grows with the square of the palace.
+    """
+    from ..backends.chroma import ChromaCollection
+
+    inner = collection._inner if isinstance(collection, EmbeddingCollection) else collection
+    if isinstance(inner, ChromaCollection):
+        return inner.iter_metadata(keys, require_key=require_key)
+    return None
+
+
+def _scan_collection_metadata(collection, keys, absorb, reset, require_key=None) -> None:
+    """Feed every drawer's metadata to ``absorb``: completely, or raise.
+
+    The fast sqlite read goes first. If it fails partway, what it gathered is
+    discarded through ``reset`` and the collection is paged instead, where
+    ``require_key`` is only a hint the caller re-checks. If paging fails too,
+    :class:`MinedSetUnavailable` stops the caller.
+    """
+    fast = _fast_collection_metadata(collection, keys, require_key)
+    if fast is not None:
+        try:
+            for meta in fast:
+                absorb(meta)
+            return
+        except Exception:
+            logger.warning(
+                "sqlite metadata scan failed; paging through the collection instead",
+                exc_info=True,
+            )
+            reset()
+    try:
+        for meta in _paged_metadata(collection):
+            absorb(meta)
+    except Exception as exc:
+        raise MinedSetUnavailable(
+            "could not read which sources are already mined; stopping rather than "
+            f"mining against an incomplete registry ({exc!r})"
+        ) from exc
+
+
+def _paged_metadata(collection):
+    # One bulk pass via the backend hook rather than a
+    # ``collection.get(limit=, offset=)`` loop: on backends whose get()
+    # materializes the full result set and Python-slices it (qdrant's
+    # _rows -> _scroll_all), that loop is O(n^2) in collection size, each
+    # page re-walking everything to discard all but its slice (#1796).
+    # BaseCollection.get_all_metadata's default *is* that limit/offset
+    # paging, so backends without an override keep identical behavior.
+    get_all_metadata = getattr(collection, "get_all_metadata", None)
+    if get_all_metadata is not None:
+        yield from get_all_metadata()
+        return
+    # A raw chromadb Collection has no such hook; its offset is real SQL.
+    total = collection.count()
+    offset = 0
+    while offset < total:
+        batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
+        yield from batch["metadatas"]
+        if not batch["ids"]:
+            break
+        offset += len(batch["ids"])
+
+
 def file_already_mined(
     collection,
     source_file: str,
@@ -37,7 +143,9 @@ def file_already_mined(
     Returns False (so the file gets re-mined) when:
       - no drawers exist for this source_file
       - the stored `normalize_version` is missing or older than the current
-        schema (triggers silent rebuild after a normalization upgrade)
+        schema (triggers silent rebuild after a normalization upgrade), or,
+        for extract_mode="exchange", the stored `convo_chunker_version` is
+        missing or older than CONVO_CHUNKER_VERSION
       - `check_mtime=True` and the file's mtime differs from the stored one
 
     When check_mtime=True (used by the project miner, and by the convo
@@ -98,9 +206,7 @@ def file_already_mined(
                     meta, extract_mode
                 ):
                     continue
-                # Pre-v2 drawers have no version field — treat them as stale.
-                stored_version = meta.get("normalize_version", 1)
-                if stored_version < NORMALIZE_VERSION:
+                if not _meta_is_current(meta, extract_mode):
                     continue
                 if not check_mtime:
                     return True
@@ -126,8 +232,13 @@ def file_already_mined(
         return False
 
 
+# Above this many candidate files, one filtered get costs more round trips
+# than a full paginated scan, so the scoped path below stops paying off.
+_PREFETCH_SCOPE_THRESHOLD = 50
+
+
 def prefetch_mined_set(
-    collection, extract_mode: Optional[str] = None
+    collection, extract_mode: Optional[str] = None, source_files: Optional[list] = None
 ) -> dict[str, Optional[float]]:
     """Pre-fetch source_file -> stored source_mtime for files already mined
     at the current NORMALIZE_VERSION, in one bulk pass instead of one
@@ -160,43 +271,67 @@ def prefetch_mined_set(
     `collection.get(where={"source_file": X})` costs ~2s on a 150k-drawer
     palace, making a 2000-file sweep take >1h of pure skip-checking. This
     helper drops that to a single paginated scan plus O(1) lookups.
+
+    When `source_files` is given and holds at most `_PREFETCH_SCOPE_THRESHOLD`
+    paths, the caller already knows the only source_file values that could
+    possibly match, so a paged `where={"source_file": {"$in": ...}}` get()
+    replaces the full-collection scan. On a one-file mine of a 660k-drawer
+    palace that mtime scan was about 42% of the mine; the content-hash scan
+    was the rest, and it stays unscoped because a stored hash can be several
+    comma-joined values. Above the threshold, or when source_files is
+    omitted, the behaviour is unchanged: a bulk sweep still benefits more
+    from one full scan than from many filtered queries.
     """
     # Per source_file: per stored_mtime group → count + optional chunk_total.
     # A source is only "mined" once some group is complete.
     groups: dict[str, dict] = {}
-    try:
-        total = collection.count()
-        offset = 0
-        while offset < total:
-            batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
-            for meta in batch["metadatas"]:
-                meta = meta or {}
-                src = meta.get("source_file")
-                if not src:
-                    continue
-                if not _metadata_matches_extract_mode(meta, extract_mode):
-                    continue
-                # Same default as file_already_mined: missing version == 1
-                version = meta.get("normalize_version", 1)
-                if version < NORMALIZE_VERSION:
-                    continue
-                stored_mtime = meta.get("source_mtime")
-                mtime_key = float(stored_mtime) if stored_mtime is not None else None
-                entry = groups.setdefault(src, {}).setdefault(
-                    mtime_key, {"count": 0, "chunk_total": None}
-                )
-                entry["count"] += 1
-                chunk_total = meta.get("chunk_total")
-                if chunk_total is not None:
-                    try:
-                        entry["chunk_total"] = int(chunk_total)
-                    except (TypeError, ValueError):
-                        pass
-            if not batch["ids"]:
-                break
-            offset += len(batch["ids"])
-    except Exception:
-        logger.warning("prefetch_mined_set: partial fetch, %d source groups loaded", len(groups))
+
+    def _absorb(meta):
+        meta = meta or {}
+        src = meta.get("source_file")
+        if not src:
+            return
+        if not _metadata_matches_extract_mode(meta, extract_mode):
+            return
+        if not _meta_is_current(meta, extract_mode):
+            return
+        stored_mtime = meta.get("source_mtime")
+        mtime_key = float(stored_mtime) if stored_mtime is not None else None
+        entry = groups.setdefault(src, {}).setdefault(mtime_key, {"count": 0, "chunk_total": None})
+        entry["count"] += 1
+        chunk_total = meta.get("chunk_total")
+        if chunk_total is not None:
+            try:
+                entry["chunk_total"] = int(chunk_total)
+            except (TypeError, ValueError):
+                pass
+
+    def _scan_all():
+        _scan_collection_metadata(collection, _MINED_SCAN_KEYS, _absorb, groups.clear)
+
+    if source_files is not None and len(source_files) <= _PREFETCH_SCOPE_THRESHOLD:
+        if source_files:
+            try:
+                offset = 0
+                while True:
+                    scoped = collection.get(
+                        where={"source_file": {"$in": list(source_files)}},
+                        include=["metadatas"],
+                        limit=1000,
+                        offset=offset,
+                    )
+                    ids = scoped.get("ids") or []
+                    for meta in scoped.get("metadatas") or []:
+                        _absorb(meta)
+                    if len(ids) < 1000:
+                        break
+                    offset += len(ids)
+            except Exception:
+                logger.warning("prefetch_mined_set: scoped fetch failed; scanning")
+                groups.clear()
+                _scan_all()
+    else:
+        _scan_all()
 
     mined: dict[str, Optional[float]] = {}
     for src, by_mtime in groups.items():
@@ -239,32 +374,43 @@ def prefetch_content_hashes(
     the ones that didn't. Only the first source_file seen for a given
     (wing, hash) pair is kept — good enough to detect and skip a repeat,
     the point is not to track every alias.
+
+    Deliberately NOT scoped by candidate source_files the way
+    prefetch_mined_set is: a stored `content_hash` can hold several
+    comma-joined hashes (one privacy-export bundle drawer covers several
+    conversations), so a `where`-filtered query can only match a document
+    whose entire stored value equals one candidate hash and would silently
+    miss any bundle row. An incomplete result here is worse than none,
+    because a caller reading the returned dict has no way to tell "no
+    duplicate" from "the query couldn't see this row". Narrowing this scan
+    correctly needs either a schema change (one hash per metadata field
+    instead of a joined list) or a second index; out of scope for the fix
+    that scoped prefetch_mined_set. See test_mine_convos_skips_same_content_
+    under_new_filename and test_mine_convos_skips_same_conversation_within_
+    re_exported_bundle, which a source_files-scoped or skipped version of
+    this function broke.
     """
     hashes: dict[tuple[str, str], str] = {}
-    try:
-        # One bulk pass via the backend hook rather than a
-        # ``collection.get(limit=, offset=)`` loop: on backends whose get()
-        # materializes the full result set and Python-slices it (qdrant's
-        # _rows -> _scroll_all), that loop is O(n^2) in collection size, each
-        # page re-walking everything to discard all but its slice (#1796).
-        # BaseCollection.get_all_metadata's default *is* that limit/offset
-        # paging, so backends without an override keep identical behavior.
-        for meta in collection.get_all_metadata():
-            meta = meta or {}
-            content_hash_field = meta.get("content_hash")
-            src = meta.get("source_file")
-            wing = meta.get("wing")
-            if not content_hash_field or not src or not wing:
-                continue
-            if not _metadata_matches_extract_mode(meta, extract_mode):
-                continue
-            version = meta.get("normalize_version", 1)
-            if version < NORMALIZE_VERSION:
-                continue
-            for content_hash in content_hash_field.split(","):
-                key = (wing, content_hash)
-                if content_hash and key not in hashes:
-                    hashes[key] = src
-    except Exception:
-        logger.warning("prefetch_content_hashes: partial fetch, %d hashes loaded", len(hashes))
+
+    def _absorb(meta):
+        meta = meta or {}
+        content_hash_field = meta.get("content_hash")
+        src = meta.get("source_file")
+        wing = meta.get("wing")
+        if not content_hash_field or not src or not wing:
+            return
+        if not _metadata_matches_extract_mode(meta, extract_mode):
+            return
+        if not _meta_is_current(meta, extract_mode):
+            return
+        for content_hash in content_hash_field.split(","):
+            key = (wing, content_hash)
+            if content_hash and key not in hashes:
+                hashes[key] = src
+
+    # Only drawers carrying a content_hash can match, and on Chroma the
+    # (key, string_value) index finds them without reading the rest.
+    _scan_collection_metadata(
+        collection, _MINED_SCAN_KEYS, _absorb, hashes.clear, require_key="content_hash"
+    )
     return hashes
