@@ -280,6 +280,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   read from `chroma.sqlite3` in one pass, and the content-hash scan reads only
   drawers that carry a hash: under 10 ms and 1.6 s on that palace.
   `get_all_metadata`, behind the status and graph fallbacks, uses the same pass.
+- **A reset of Chroma's shared cache now reopens every client.** Only the MCP
+  session closed its client before the shared System cache was reset. After a
+  reset by the session, repair, or the diary tool, every backend kept its client
+  on the discarded System, and kept returning it while the palace file looked
+  unchanged. Backends are now drained before any reset, and reopen a client
+  opened before one.
+- **A mine stops instead of running against a partial list of what's already
+  mined.** A metadata scan that failed partway returned what it had gathered,
+  with only a warning. That reads as "not mined yet" and "no duplicate", so
+  copies of a transcript could be filed again. A failed fast scan now falls back
+  to a complete paged scan, and the mine stops if that fails too. The fast scan
+  also reads older schemas without `bool_value`.
 - **The BM25-only search fallback finds the drawers that actually contain a
   name.** With the vector index disabled, search picks BM25 candidates from
   `chroma.sqlite3`'s trigram full-text index, where `aven` also matches inside
@@ -289,13 +301,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   now read in full-text rank order, whole-word matches first. A wing, room, or
   source filter matching few drawers reads just those drawers (6.4 s to under
   10 ms for a ten-drawer wing on a 360k-drawer palace), and stop words stay out
-  of the full-text query.
+  of the full-text query. When the first 50,000 ranked matches hold too few
+  whole-word ones, the rest are read newest first, within a budget of 500,000
+  rows. If that budget runs out, the result says so with
+  `candidates_truncated`.
 - **Search no longer returns every copy of a passage as a separate result.**
   Backups, autosaves, and re-exports put the same text under several files, and
-  each copy took a result slot. The best-ranked copy now stands for all of them
-  and lists the others under `also_in` (the CLI prints `Also in: ...`), and the
-  freed slots go to the next distinct passages. Repeats within one file stay
-  separate.
+  each copy took a result slot. Identical text of at least 100 characters now
+  shows once. The best-ranked occurrence lists the others under `also_in`, with
+  each one's file and chunk position (the CLI prints `Also in: ...`). Shorter
+  identical text, such as two unrelated "Yes." drawers, stays separate, and so
+  does a file's own repeats. When the folding leaves a page short, the search
+  widens its candidate pool (up to 500). If it's still short, it says so with
+  `distinct_results_truncated`.
 - **A mine on the HTTP hub no longer blocks every other request until it
   ends.** The hub ran a forwarded mine under its exclusive lock for the whole
   run, so status, search, and wake-up waited for all of it. The mine still runs
