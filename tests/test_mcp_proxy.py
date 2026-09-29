@@ -522,6 +522,7 @@ def test_local_fallback_serves_the_palace_the_proxy_was_started_for(monkeypatch,
     monkeypatch.setattr(mcp_server, "_restore_stdout", lambda: None)
     monkeypatch.setattr(mcp_server, "_start_idle_exit_watchdog", lambda: None)
     monkeypatch.setattr(mcp_server, "_start_write_stall_watchdog", lambda: None)
+    monkeypatch.setattr(mcp_server, "_start_writer_idle_release_watchdog", lambda: None)
     monkeypatch.setattr(sys, "stdout", io.StringIO())
     palace = tmp_path / "palace"
     # --collection is a light-server flag the proxy lets through; the server's

@@ -29,6 +29,7 @@ def _run_loop(monkeypatch, lines):
         "_startup_preflight",
         "_start_idle_exit_watchdog",
         "_start_write_stall_watchdog",
+        "_start_writer_idle_release_watchdog",
         "_maybe_eager_warmup_embedder",
     ):
         monkeypatch.setattr(mcp, name, lambda *a, **k: None)

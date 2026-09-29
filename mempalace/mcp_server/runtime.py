@@ -200,6 +200,7 @@ def _run_stdio_loop() -> None:
     # Idle auto-exit: release ChromaDB file handles from stale servers
     # that outlived their Claude Code session (#1552).
     _start_idle_exit_watchdog()
+    _start_writer_idle_release_watchdog()
 
     # Say so when a chromadb write stops coming back, from a thread the stuck
     # call is not blocking.
@@ -377,6 +378,7 @@ def _run_http_loop() -> None:
         # soon as the process is alive.
         _refresh_vector_disabled_flag()
         _start_idle_exit_watchdog()
+        _start_writer_idle_release_watchdog()
         _start_write_stall_watchdog()
 
         raw_warmup = os.environ.get("MEMPALACE_EAGER_WARMUP", "").strip().lower()
