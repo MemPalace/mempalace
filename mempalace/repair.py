@@ -45,7 +45,7 @@ from typing import Callable, Iterator, Optional
 
 from chromadb.errors import NotFoundError as ChromaNotFoundError
 
-from .backends.chroma import ChromaBackend, hnsw_capacity_status
+from .backends.chroma import ChromaBackend, _clear_chroma_system_cache, hnsw_capacity_status
 
 # sqlite_read_uri stays in this module's namespace: callers and tests reach the
 # read-only URI through repair. Connections to chroma.sqlite3 go through
@@ -2423,13 +2423,9 @@ def _rebuild_from_sqlite_locked(
         # because the cached System still holds the pre-rename schema.
         # Cross-palace mode does not need this and would needlessly
         # invalidate other callers' clients (see docstring warning).
-        try:
-            from chromadb.api.client import SharedSystemClient
-
-            SharedSystemClient.clear_system_cache()
-        except Exception as exc:  # noqa: BLE001
+        if not _clear_chroma_system_cache():
             print(
-                f"  Warning: could not clear chromadb system cache ({exc!r}); "
+                "  Warning: could not clear chromadb system cache; "
                 "in-place rebuild may fail with 'Collection already exists'."
             )
 
@@ -2627,12 +2623,7 @@ def _close_chroma_handles(palace_path: str, backend: "ChromaBackend | None" = No
         closer.close_palace(palace_path)
     except Exception:
         pass
-    try:
-        from chromadb.api.client import SharedSystemClient
-
-        SharedSystemClient.clear_system_cache()
-    except Exception:
-        pass
+    _clear_chroma_system_cache()
     gc.collect()
 
 
