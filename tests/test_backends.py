@@ -660,6 +660,7 @@ def test_chroma_client_rebuild_closes_displaced_client(tmp_path, monkeypatch):
     backend = ChromaBackend()
     backend._clients[str(palace_path)] = _Sentinel()
     backend._freshness[str(palace_path)] = (st.st_ino, st.st_mtime)
+    backend._system_generation[str(palace_path)] = chroma_module.chroma_system_generation()
     # External write forces the rebuild branch.
     os.utime(db_file, (st.st_atime, st.st_mtime + 60))
 
@@ -2608,3 +2609,61 @@ def test_palace_get_collection_uses_configured_collection_name(monkeypatch):
         "collection_name": "custom_drawers",
         "create": False,
     }
+
+
+def test_chroma_client_opened_before_a_system_reset_is_reopened(monkeypatch):
+    """A client from before another owner's System reset reads a discarded
+    segment even when chroma.sqlite3's stat is unchanged. It is reopened, and
+    dropped without close(): Chroma's maps now point at the replacement."""
+    from unittest.mock import patch
+
+    backend = ChromaBackend()
+    key = "/synthetic-palace"
+    closed = []
+
+    class _Old:
+        def close(self):
+            closed.append(1)
+
+    old = _Old()
+    backend._clients[key] = old
+    backend._freshness[key] = (123, 456.0)
+    backend._system_generation[key] = chroma_module.chroma_system_generation()
+    fresh = object()
+    with (
+        patch.object(chroma_module, "_SYSTEM_GENERATION", chroma_module._SYSTEM_GENERATION + 1),
+        patch.object(backend, "_db_stat", return_value=(123, 456.0)),
+        patch.object(chroma_module.os.path, "isfile", return_value=True),
+        patch.object(ChromaBackend, "_prepare_palace_for_open", staticmethod(lambda p: None)),
+        patch.object(chroma_module.chromadb, "PersistentClient", return_value=fresh),
+        patch.object(chroma_module, "_clear_chroma_system_cache") as reset,
+    ):
+        assert backend._client_locked(key) is fresh
+    assert closed == []
+    reset.assert_not_called()  # the reset already happened; no second one
+
+
+def test_chroma_reset_by_another_owner_reopens_backend_and_keeps_its_client(tmp_path):
+    """Two owners on one palace: one resets the shared System (as after a peer
+    write) and reopens. The other must not keep its pre-reset client, and
+    reopening it must not discard the first owner's replacement System."""
+    palace = tmp_path / "palace"
+    ref = PalaceRef(id=str(palace), local_path=str(palace))
+    first, second = ChromaBackend(), ChromaBackend()
+    try:
+        col = first.get_collection(palace=ref, collection_name="mempalace_drawers", create=True)
+        col.add(ids=["a"], documents=["alpha"], embeddings=[[0.1, 0.2, 0.3, 0.4]])
+        stale_client = first._client(str(palace))
+
+        chroma_module._clear_chroma_system_cache()
+        assert first._clients == {}, "reset left the other owner's client open"
+        fresh = second.get_collection(palace=ref, collection_name="mempalace_drawers")
+        assert fresh.count() == 1
+
+        assert first._client(str(palace)) is not stale_client
+        reopened = first.get_collection(palace=ref, collection_name="mempalace_drawers")
+        reopened.add(ids=["b"], documents=["beta"], embeddings=[[0.4, 0.3, 0.2, 0.1]])
+        assert sorted(fresh.get(ids=["a", "b"]).ids) == ["a", "b"]
+    finally:
+        first.close()
+        second.close()

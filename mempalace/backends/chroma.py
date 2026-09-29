@@ -10,6 +10,7 @@ import pickle
 import re
 import shlex
 import sqlite3
+import weakref
 import struct
 import time
 from collections import defaultdict
@@ -3593,6 +3594,7 @@ class ChromaBackend(BaseBackend):
         # palace_path -> system generation the cached client was opened on.
         self._system_generation: dict[str, int] = {}
         self._closed = False
+        _LIVE_BACKENDS.add(self)
 
     @staticmethod
     def _resolve_embedding_function():
@@ -3730,6 +3732,18 @@ class ChromaBackend(BaseBackend):
             and abs(current_mtime - cached_mtime) > 0.01
         )
         opened_generation = self._system_generation.get(palace_path, -1)
+        if cached is not None and opened_generation != _SYSTEM_GENERATION:
+            # Another owner dropped the shared System cache after this client
+            # opened, so it reads a discarded segment. Forget it without
+            # close(): Chroma's maps now resolve this path to the replacement
+            # System, and closing through them could stop the fresh owner's.
+            # The reset already happened, so reopen without another one.
+            self._clients.pop(palace_path, None)
+            self._freshness.pop(palace_path, None)
+            self._system_generation.pop(palace_path, None)
+            cached = None
+            cached_inode, cached_mtime = 0, 0.0
+            mtime_appeared = mtime_changed = inode_changed = False
         if (
             cached is not None
             and mtime_changed
@@ -4068,6 +4082,21 @@ class ChromaBackend(BaseBackend):
             )
             self._restamp(palace_path)
         return ChromaCollection(collection, palace_path=palace_path, backend=self)
+
+
+# Every live ChromaBackend, drained before any reset of the shared System cache
+# (the MCP session, repair, and the diary tool reset it too). Without this a
+# backend kept clients on the discarded System, unclosed while Chroma's maps
+# could still resolve them.
+_LIVE_BACKENDS: "weakref.WeakSet[ChromaBackend]" = weakref.WeakSet()
+
+
+def _drain_live_backends() -> None:
+    for backend in list(_LIVE_BACKENDS):
+        backend._drain_clients()
+
+
+register_before_system_cache_reset(_drain_live_backends)
 
 
 def _normalize_get_collection_args(args, kwargs):
