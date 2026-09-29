@@ -117,3 +117,48 @@ def test_cli_search_prints_the_other_copies(palace_path, collection, capsys):
     out = capsys.readouterr().out
     assert out.count(text) == 1
     assert "Also in: migrations.md" in out
+
+
+def _copies_then_one_distinct(collection, copies=25):
+    ids, docs, metas = [], [], []
+    for i in range(copies):
+        ids.append(f"copy-{i}")
+        docs.append(SAME)
+        metas.append({"wing": "w", "room": "r", "source_file": f"/autosave/{i}.md"})
+    distinct = "An unrelated note about the garden and the rain that came in the evening."
+    ids.append("distinct")
+    docs.append(distinct)
+    metas.append({"wing": "w", "room": "r", "source_file": "/notes/garden.md"})
+    collection.add(ids=ids, documents=docs, metadatas=metas)
+    return distinct
+
+
+def test_search_widens_the_pool_when_copies_fill_it(palace_path, collection):
+    """The first pool (8 for n_results=2) holds only copies of one passage;
+    the search widens until the next distinct passage is reached."""
+    distinct = _copies_then_one_distinct(collection)
+    out = search_memories(SAME, palace_path, n_results=2)
+    texts = [hit["text"] for hit in out["results"]]
+    assert texts == [SAME, distinct]
+    assert len(out["results"][0]["also_in"]) == 24
+    assert not out.get("distinct_results_truncated")
+
+
+def test_search_says_when_copies_left_it_short(palace_path, collection, monkeypatch):
+    import mempalace.searcher as searcher_pkg
+
+    _copies_then_one_distinct(collection)
+    monkeypatch.setattr(searcher_pkg, "_MAX_FOLD_POOL", 8)
+    out = search_memories(SAME, palace_path, n_results=2)
+    assert len(out["results"]) == 1
+    assert out["distinct_results_truncated"] is True
+
+
+def test_cli_search_widens_the_pool_when_copies_fill_it(palace_path, collection, capsys):
+    from mempalace.searcher import search
+
+    distinct = _copies_then_one_distinct(collection)
+    search(SAME, palace_path, n_results=2)
+    out = capsys.readouterr().out
+    assert distinct in out
+    assert "and 19 more" in out  # 24 other files: five named, the rest counted
