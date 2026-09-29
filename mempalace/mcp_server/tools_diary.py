@@ -397,23 +397,9 @@ def tool_reconnect():
         except Exception as exc:
             logger.debug("Failed to close MCP-local Chroma client during reconnect", exc_info=True)
             close_errors.append(f"local Chroma client close failed: {exc}")
-    if _is_chroma_backend():
-        try:
-            from chromadb.api.client import SharedSystemClient
-
-            clear_system_cache = getattr(SharedSystemClient, "clear_system_cache", None)
-            if callable(clear_system_cache):
-                clear_system_cache()
-            else:
-                logger.debug(
-                    "SharedSystemClient.clear_system_cache is unavailable; skipping shared Chroma cache clear during reconnect"
-                )
-        except Exception as exc:
-            logger.debug(
-                "Failed to clear Chroma shared system cache during reconnect",
-                exc_info=True,
-            )
-            close_errors.append(f"shared Chroma cache clear failed: {exc}")
+    if _is_chroma_backend() and not _clear_chroma_system_cache():
+        logger.debug("Failed to clear Chroma shared system cache during reconnect")
+        close_errors.append("shared Chroma cache clear failed")
     _client_cache = None
     _collection_cache = None
     _collection_cache_backend = None
