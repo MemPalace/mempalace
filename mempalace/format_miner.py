@@ -76,6 +76,7 @@ from .palace import (
     file_already_mined,
     get_collection,
     mine_lock,
+    mine_yield_point,
 )
 
 # Module-level imports from .miner so tests can patch them via
@@ -84,6 +85,7 @@ from .palace import (
 from .config import MempalaceConfig, normalize_wing_name
 from .collision_scan import assert_no_collisions
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
+from .source_identity import identity_metadata, source_directory_identity
 from .miner import (
     _compute_topic_tunnels_for_wing,
     chunk_text,
@@ -575,6 +577,10 @@ def _register_file(collection, source_file: str, wing: str, agent: str) -> None:
                     "extract_mode": "format",
                     "normalize_version": NORMALIZE_VERSION,
                     "is_sentinel": True,
+                    # The sentinel names a real source file and ``sync`` reads
+                    # it as an ordinary drawer, so it needs the identity for
+                    # the same reason the file's own drawers do (#2320).
+                    **identity_metadata(source_file),
                 }
             ],
         )
@@ -591,6 +597,7 @@ def _file_chunks_locked(
     agent,
     source_mtime: Optional[float] = None,
     content: Optional[str] = None,
+    source_dir_ino: Optional[str] = None,
 ):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
@@ -665,6 +672,11 @@ def _file_chunks_locked(
                 }
                 if source_mtime is not None:
                     meta["source_mtime"] = source_mtime
+                if source_dir_ino:
+                    # Which directory this file was read from, so ``sync``
+                    # can tell a neighbour in the same directory from one on
+                    # a volume mounted there since (#2320).
+                    meta["source_dir_ino"] = source_dir_ino
                 # Tier 6a — propagate line range from chunk dict into drawer
                 # metadata so closet pointers can carry "where in source"
                 # info. Chunks emitted by older code paths without these
@@ -824,6 +836,7 @@ def mine_formats(
         collection = get_collection(palace_path) if not dry_run else None
 
         for i, filepath in enumerate(files, 1):
+            mine_yield_point()
             files_processed = i
             source_file = str(filepath)
 
@@ -899,6 +912,7 @@ def mine_formats(
                     agent,
                     source_mtime=source_mtime,
                     content=text,
+                    source_dir_ino=source_directory_identity(filepath),
                 )
                 if skipped:
                     files_skipped += 1

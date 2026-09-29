@@ -1247,6 +1247,34 @@ def test_run_mcp_tool_dispatches_write_tool(monkeypatch):
     assert captured["arguments"] == {"x": 1}
 
 
+def test_mcp_tool_knowledge_graph_writes_land_beside_the_daemons_palace(monkeypatch, tmp_path):
+    """A daemon serves the one palace it was started for, so a knowledge-graph
+    tool it runs writes beside that palace, as a server started with
+    ``--palace`` does, and not into the per-user default graph."""
+    from _mcp_server_helpers import _keep_server_command_line_state
+    import mempalace.mcp_server as mcp
+    from mempalace import service
+
+    _keep_server_command_line_state(monkeypatch)
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    # run_server points the whole daemon process at its palace.
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(palace))
+    monkeypatch.setattr(mcp, "_palace_flag_given", False)
+
+    out = service.execute_job(
+        "mcp_tool",
+        {
+            "name": "mempalace_kg_add",
+            "arguments": {"subject": "alice", "predicate": "likes", "object": "tea"},
+            "palace_path": str(palace),
+        },
+    )
+
+    assert out["success"] is True, out
+    assert (palace / "knowledge_graph.sqlite3").is_file()
+
+
 def test_run_diary_write_forwards_args_and_sets_exit_code(monkeypatch):
     import mempalace.mcp_server as mcp
     from mempalace import service
