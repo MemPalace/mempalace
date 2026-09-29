@@ -521,6 +521,55 @@ def test_stop_hook_saves_silently_at_interval(tmp_path):
     )
 
 
+def test_stop_hook_claude_snake_case_without_reason_saves_at_interval(tmp_path):
+    """Claude Stop omits reason. A future reason field must not disable save."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    save_result = {"count": 15, "themes": ["hooks"]}
+    payload = {
+        "session_id": "claude-sess",
+        "stop_hook_active": False,
+        "transcript_path": str(transcript),
+    }
+    assert "reason" not in payload
+    assert "stop_reason" not in payload
+    with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result) as mock_save:
+        result = _capture_hook_output(
+            hook_stop,
+            payload,
+            harness="claude-code",
+            state_dir=tmp_path,
+        )
+    assert "systemMessage" in result
+    mock_save.assert_called_once()
+
+
+def test_stop_hook_claude_non_end_turn_reason_still_saves(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    save_result = {"count": 15, "themes": []}
+    with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result) as mock_save:
+        result = _capture_hook_output(
+            hook_stop,
+            {
+                "session_id": "claude-sess",
+                "stop_hook_active": False,
+                "transcript_path": str(transcript),
+                "reason": "completed",
+            },
+            harness="claude-code",
+            state_dir=tmp_path,
+        )
+    assert "systemMessage" in result
+    mock_save.assert_called_once()
+
+
 def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
     """When transcript path looks like a Claude Code path, wing is derived from it."""
     project_dir = tmp_path / ".claude" / "projects" / "-home-jp-Projects-myproject"
@@ -595,11 +644,10 @@ def test_dsh_harness_is_accepted_and_reads_diary_under_its_own_name():
         {"session_id": "session-x", "transcript_path": "/tmp/t.jsonl"},
         "dsh",
     )
-    assert parsed == {
-        "session_id": "session-x",
-        "stop_hook_active": False,
-        "transcript_path": "/tmp/t.jsonl",
-    }
+    assert parsed["session_id"] == "session-x"
+    assert parsed["stop_hook_active"] is False
+    assert parsed["transcript_path"] == "/tmp/t.jsonl"
+    assert parsed["harness"] == "dsh"
     assert _diary_agent_for_harness("dsh") == "dsh"
     assert "dsh" in hooks_cli_mod.SUPPORTED_HARNESSES
 
@@ -1854,10 +1902,10 @@ def test_get_mine_targets_empty():
 
 
 def test_parse_harness_input_unknown():
-    """Unknown harness should sys.exit(1)."""
-    with pytest.raises(SystemExit) as exc_info:
-        _parse_harness_input({"session_id": "test"}, "unknown-harness")
-    assert exc_info.value.code == 1
+    """Unknown harness tokens parse with generic aliases instead of exiting."""
+    result = _parse_harness_input({"session_id": "test"}, "unknown-harness")
+    assert result["session_id"] == "test"
+    assert result["harness"] == "unknown-harness"
 
 
 def test_parse_harness_input_valid():

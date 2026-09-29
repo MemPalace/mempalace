@@ -33,6 +33,10 @@
 #     "timeout": 30
 #   }]
 #
+# For Grok, do not use this script. Copy examples/grok/hooks.json to
+# ~/.grok/hooks/mempalace.json. This bash hook hardcodes Claude/Codex
+# payloads and never locates ~/.grok/sessions/.../chat_history.jsonl.
+#
 # === HOW IT WORKS ===
 #
 # Claude Code sends JSON on stdin with these fields:
