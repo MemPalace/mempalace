@@ -36,10 +36,12 @@ No vendor lock-in. No hidden dependency on any specific provider. Zero deps
 added to pyproject — uses stdlib urllib.
 """
 
+import contextlib
 import json
 import os
 import re
 import time
+import urllib.parse
 import urllib.request
 import urllib.error
 from datetime import datetime
@@ -50,6 +52,7 @@ from .palace import (
     get_closets_collection,
     get_collection,
     mine_lock,
+    mine_palace_lock,
     purge_file_closets,
     upsert_closet_lines,
 )
@@ -101,6 +104,14 @@ class LLMConfig:
         self.endpoint = (endpoint or os.environ.get("LLM_ENDPOINT", "")).rstrip("/")
         self.key = key or os.environ.get("LLM_KEY", "")
         self.model = model or os.environ.get("LLM_MODEL", "")
+        if self.endpoint:
+            # Privacy-by-architecture: reject file:// and other non-HTTP schemes
+            # so a misconfigured endpoint cannot exfiltrate local files.
+            scheme = urllib.parse.urlparse(self.endpoint).scheme.lower()
+            if scheme not in ("http", "https"):
+                raise ValueError(
+                    f"LLM_ENDPOINT must use http:// or https:// (got scheme {scheme!r})"
+                )
 
     def missing(self) -> list:
         missing = []
@@ -160,6 +171,9 @@ def _call_llm(cfg: LLMConfig, source_file: str, wing: str, room: str, content: s
             parsed = json.loads(text)
             return parsed, payload.get("usage")
         except json.JSONDecodeError:
+            if attempt < 2:
+                time.sleep(2**attempt)
+                continue
             return None, None
         except urllib.error.HTTPError as e:
             # 429 / 503 = retry with backoff
@@ -213,25 +227,59 @@ def regenerate_closets(
         print("or pass --endpoint / --model / --key on the CLI.")
         return {"error": "missing-config", "missing": missing}
 
-    drawers_col = get_collection(palace_path, create=False)
-    closets_col = get_closets_collection(palace_path)
+    # A full regeneration is one long-lived read/LLM/purge/upsert operation.
+    # Acquire ownership before opening either collection or calling the LLM so
+    # a conflicting local writer fails immediately. The palace lock is
+    # process-wide and re-entrant, so daemon/MCP-owned calls compose safely.
+    lease = contextlib.nullcontext() if dry_run else mine_palace_lock(palace_path)
+    with lease:
+        return _regenerate_closets_owned(
+            palace_path,
+            wing=wing,
+            sample=sample,
+            dry_run=dry_run,
+            cfg=cfg,
+        )
+
+
+def _regenerate_closets_owned(
+    palace_path,
+    *,
+    wing,
+    sample,
+    dry_run,
+    cfg: LLMConfig,
+):
+    drawers_col = get_collection(palace_path, create=False, read_only=dry_run)
+    closets_col = None if dry_run else get_closets_collection(palace_path)
 
     total = drawers_col.count()
     if total == 0:
         print("No drawers in palace.")
         return {"processed": 0}
 
-    all_data = drawers_col.get(limit=total, include=["documents", "metadatas"])
-    by_source = {}
-    for doc_id, doc, meta in zip(all_data["ids"], all_data["documents"], all_data["metadatas"]):
-        source = meta.get("source_file", "unknown")
-        w = meta.get("wing", "")
-        if wing and w != wing:
-            continue
-        if source not in by_source:
-            by_source[source] = {"drawer_ids": [], "content": [], "meta": meta}
-        by_source[source]["drawer_ids"].append(doc_id)
-        by_source[source]["content"].append(doc)
+    # Paginate the fetch — a single get(limit=total, ...) blows through
+    # SQLite's SQLITE_MAX_VARIABLE_NUMBER (32766) on large palaces and
+    # crashes inside chromadb (see #802, #850, #1073).
+    by_source: dict = {}
+    batch_size = 5000
+    offset = 0
+    while offset < total:
+        batch = drawers_col.get(limit=batch_size, offset=offset, include=["documents", "metadatas"])
+        ids = batch["ids"]
+        if not ids:
+            break
+        for doc_id, doc, meta in zip(ids, batch["documents"], batch["metadatas"]):
+            meta = meta or {}
+            source = meta.get("source_file", "unknown")
+            w = meta.get("wing", "")
+            if wing and w != wing:
+                continue
+            if source not in by_source:
+                by_source[source] = {"drawer_ids": [], "content": [], "meta": meta}
+            by_source[source]["drawer_ids"].append(doc_id)
+            by_source[source]["content"].append(doc)
+        offset += len(ids)
 
     sources = list(by_source.keys())
     if sample > 0:
@@ -241,7 +289,7 @@ def regenerate_closets(
         f"Regenerating closets for {len(sources)} source files via {cfg.endpoint} ({cfg.model})..."
     )
     if dry_run:
-        print("DRY RUN — no changes will be written")
+        print("DRY RUN - no changes will be written")
 
     processed = 0
     failed = 0
@@ -263,7 +311,7 @@ def regenerate_closets(
         parsed, usage = _call_llm(cfg, source, w, r, content)
         if not parsed:
             failed += 1
-            print(f"  [{i}/{len(sources)}] ✗ {os.path.basename(source)} — LLM failed")
+            print(f"  [{i}/{len(sources)}] [FAIL] {os.path.basename(source)} - LLM failed")
             continue
 
         if usage:
@@ -280,6 +328,7 @@ def regenerate_closets(
         # otherwise a regex closet rebuild mid-regenerate races with our
         # purge+upsert cycle and leaves mixed regex/LLM lines.
         with mine_lock(source):
+            assert closets_col is not None
             purge_file_closets(closets_col, source)
             upsert_closet_lines(
                 closets_col,
@@ -300,7 +349,7 @@ def regenerate_closets(
 
         processed += 1
         n_topics = len(parsed.get("topics", []))
-        print(f"  [{i}/{len(sources)}] ✓ {os.path.basename(source)} — {n_topics} topics")
+        print(f"  [{i}/{len(sources)}] [OK] {os.path.basename(source)} - {n_topics} topics")
 
     print(f"\nDone. {processed} regenerated, {failed} failed.")
     if total_input or total_output:

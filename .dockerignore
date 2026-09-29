@@ -1,0 +1,55 @@
+# Keep the build context lean — only what `uv sync` + the package need.
+
+# VCS
+.git/
+.gitignore
+
+# Python build artifacts / caches
+*.egg-info/
+dist/
+build/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Virtual environments (rebuilt inside the image)
+.venv/
+venv/
+
+# Local config / secrets
+.env
+.env.*
+.envrc
+mempal.yaml
+
+# Editor / OS cruft
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Repo material not needed at runtime
+.devcontainer/
+.github/
+.agents/
+.claude/
+.codex/
+.codex-plugin/
+.claude-plugin/
+benchmarks/
+docs/
+website/
+landing/
+assets/
+examples/
+tests/
+*.md
+!README.md

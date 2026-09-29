@@ -2,6 +2,9 @@
 """
 entity_detector.py — Auto-detect people and projects from file content.
 
+Uses ``from __future__ import annotations`` so PEP 604 union syntax
+(``dict | None``) works on the Python 3.9 baseline.
+
 Two-pass approach:
   Pass 1: scan files, extract entity candidates with signal counts
   Pass 2: score and classify each candidate as person, project, or uncertain
@@ -27,6 +30,9 @@ Usage:
     confirmed = confirm_entities(candidates)  # interactive review
 """
 
+from __future__ import annotations
+
+import json
 import re
 import os
 import functools
@@ -34,6 +40,134 @@ from pathlib import Path
 from collections import defaultdict
 
 from mempalace.i18n import get_entity_patterns
+
+
+# ==================== COCA CONTENT-WORD FILTER (Tier 2 linguistics cleanup) ====================
+#
+# Common English content words that frequently appear capitalized (sentence
+# start, headings, markdown emphasis) but are NOT proper nouns. Filtering
+# these at candidate-extraction time prevents false-positive entity detection
+# of words like "Code", "Brutal", "Phase", "Chat", "Note", "Line", etc.
+#
+# The data file lives at ``mempalace/data/coca_content_words.json``. Loaded
+# once on first call via ``_get_coca_filter``. Matching is case-insensitive:
+# callers must lowercase the candidate before lookup.
+#
+# Tier 3 (planned) will add a known-systems lexicon that protects compound
+# names like "Claude Code" — for now, the multi-word path in
+# ``extract_candidates`` is intentionally NOT filtered, so legitimate
+# compounds remain detectable.
+
+
+@functools.lru_cache(maxsize=1)
+def _get_coca_filter() -> frozenset[str]:
+    """Return the COCA content-word filter set (lowercased).
+
+    Loads ``mempalace/data/coca_content_words.json`` on first call and
+    caches the resulting frozenset. Subsequent calls are O(1). Returns
+    an empty frozenset if the data file is missing or malformed —
+    extraction behavior then degrades gracefully (no filter applied)
+    rather than crashing.
+    """
+    data_path = Path(__file__).parent / "data" / "coca_content_words.json"
+    try:
+        raw = json.loads(data_path.read_text(encoding="utf-8"))
+        words = raw.get("words", [])
+        return frozenset(w.lower() for w in words if isinstance(w, str))
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+        return frozenset()
+
+
+# ==================== KNOWN-SYSTEMS COMPOUND LEXICON (Tier 3 linguistics cleanup) ====================
+#
+# Multi-word product / system names that must be detected atomically — NOT
+# decomposed into their constituent words. When "Claude Code" appears in
+# content, the entity detector counts the compound, not the parts. Without
+# this pre-pass, the single-word loop would split "Claude Code" into
+# "Claude" + "Code", and the COCA filter (Tier 2) would drop "Code" as a
+# content word — leaving "Claude" alone with the wrong attribution.
+#
+# Data file: ``mempalace/data/known_systems.json``. Loaded once on first
+# call via ``_get_known_systems``. Matching is case-insensitive with word
+# boundaries.
+
+
+@functools.lru_cache(maxsize=1)
+def _get_known_systems() -> tuple[tuple[str, "re.Pattern[str]"], ...]:
+    """Return the known-systems compound tuple — pairs of (canonical name,
+    pre-compiled case-insensitive word-bounded regex).
+
+    Loads ``mempalace/data/known_systems.json`` on first call, compiles a
+    regex for each valid compound, and caches the resulting tuple of
+    pairs. Subsequent calls are O(1) and skip both the disk read AND the
+    regex compilation. Returns an empty tuple if the data file is missing
+    or malformed — extraction behavior then degrades gracefully
+    (compounds detected only by the existing multi-word regex) rather
+    than crashing.
+
+    Entries are sorted by length descending so the compound matcher
+    prefers longer matches first (e.g. "Visual Studio Code" wins over
+    a hypothetical "Visual Studio" if both were in the lexicon).
+    """
+    data_path = Path(__file__).parent / "data" / "known_systems.json"
+    try:
+        raw = json.loads(data_path.read_text(encoding="utf-8"))
+        compounds = raw.get("compounds", [])
+        valid = [c for c in compounds if isinstance(c, str) and c.strip()]
+        # Sort by length descending so longest-match-wins during the
+        # pre-pass scan (longer compounds get masked first, so a shorter
+        # compound contained within a longer one doesn't double-count).
+        sorted_compounds = sorted(valid, key=len, reverse=True)
+
+        compiled: list[tuple[str, re.Pattern[str]]] = []
+        for c in sorted_compounds:
+            # Word-boundary, case-insensitive. Compound may contain
+            # hyphens or spaces — re.escape handles special chars; word
+            # boundaries on each side prevent partial-word matches
+            # (e.g. "GPT-4" must not match "GPT-40").
+            pattern = r"(?<!\w)" + re.escape(c) + r"(?!\w)"
+            try:
+                compiled.append((c, re.compile(pattern, re.IGNORECASE)))
+            except re.error:
+                continue
+        return tuple(compiled)
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+        return ()
+
+
+def _apply_known_systems_prepass(text: str) -> tuple[str, dict[str, int]]:
+    """Scan ``text`` for known-systems compounds, return a working copy
+    with matched spans masked to whitespace plus a dict of detected
+    compound counts.
+
+    Returning the counts (instead of mutating a caller-supplied container)
+    lets the three call sites (``extract_candidates`` at init-time,
+    ``palace.build_closet_lines`` at closet construction, and
+    ``miner._extract_entities_for_metadata`` at per-drawer tagging) use
+    whichever container shape they already maintain.
+
+    Compounds are matched case-insensitively with word boundaries; the
+    canonical (lexicon) casing is what gets counted, regardless of how
+    the compound appears in the source text. Regexes are pre-compiled
+    once in ``_get_known_systems`` so this function does no compilation.
+    """
+    compounds = _get_known_systems()
+    if not compounds:
+        return text, {}
+    working = text
+    compound_counts: dict[str, int] = {}
+    for compound, rx in compounds:
+        matches = list(rx.finditer(working))
+        if not matches:
+            continue
+        compound_counts[compound] = compound_counts.get(compound, 0) + len(matches)
+        # Mask matched spans with spaces so the subsequent regex passes
+        # don't re-decompose. Replacing right-to-left keeps earlier
+        # indices stable.
+        for m in reversed(matches):
+            start, end = m.span()
+            working = working[:start] + (" " * (end - start)) + working[end:]
+    return working, compound_counts
 
 
 # ==================== LANGUAGE-AWARE PATTERN LOADING ====================
@@ -81,6 +215,8 @@ PROSE_EXTENSIONS = {
     ".md",
     ".rst",
     ".csv",
+    ".tex",
+    ".bib",
 }
 
 READABLE_EXTENSIONS = {
@@ -113,10 +249,55 @@ SKIP_DIRS = {
     ".next",
     "coverage",
     ".mempalace",
+    ".terraform",
+    "vendor",
+    "target",
+}
+
+# Files whose content is boilerplate prose — poisons entity detection.
+# Matched by stem (case-insensitive), with or without an extension.
+SKIP_FILENAMES = {
+    "license",
+    "licence",
+    "copying",
+    "copyright",
+    "notice",
+    "authors",
+    "patents",
+    "third_party_notices",
+    "third-party-notices",
 }
 
 
 # ==================== CANDIDATE EXTRACTION ====================
+
+
+# Entity-candidate matching is ReDoS-prone: the English candidate pattern's
+# nested alternation (i18n/en.json) backtracks catastrophically on a long
+# unbroken run of printable ASCII (base64, minified JS, hashes, data URIs),
+# pinning a mine on one ~5000-char window for hours (#2063). Such a run is never
+# a name, so it is collapsed to a space before single-word matching. Scope:
+#   * ASCII-only ([!-~]): non-ASCII scripts (CJK, Cyrillic, Devanagari,
+#     accented Latin) are deliberately left untouched — a CJK paragraph is one
+#     unbroken run with no ASCII whitespace, and those locales' candidate
+#     patterns are bounded and never backtrack, so collapsing them would
+#     silently destroy their entity detection.
+#   * The threshold sits above the 20-char cap of the simple-name pattern
+#     ([A-Z][a-z]{1,19}), so no real single-word name is dropped. A CamelCase
+#     code identifier glued inside a long ASCII run (a path/URL/dotted name) is
+#     dropped as noise; whitespace-delimited proper nouns are unaffected.
+_MAX_CANDIDATE_TOKEN_LEN = 24
+_LONG_ASCII_RUN_RX = re.compile(rf"[!-~]{{{_MAX_CANDIDATE_TOKEN_LEN},}}")
+
+
+def _collapse_long_ascii_runs(text: str) -> str:
+    """Collapse a long unbroken run of printable ASCII to a single space (#2063).
+
+    Applied only before single-word candidate matching — the whitespace-delimited
+    multi-word patterns cannot backtrack on such runs. See ``_LONG_ASCII_RUN_RX``
+    for scope and rationale.
+    """
+    return _LONG_ASCII_RUN_RX.sub(" ", text)
 
 
 def extract_candidates(text: str, languages=("en",)) -> dict:
@@ -131,29 +312,50 @@ def extract_candidates(text: str, languages=("en",)) -> dict:
     langs = _normalize_langs(languages)
     patterns = get_entity_patterns(langs)
     stopwords = _get_stopwords(langs)
+    coca_filter = _get_coca_filter()
 
     counts: defaultdict = defaultdict(int)
 
-    # Single-word candidates — one pre-wrapped pattern per language
+    # Tier 3 — known-systems compound pre-pass. Find compound product names
+    # ("Claude Code", "GitHub Copilot", ...) FIRST and mask them out of the
+    # working text so the subsequent single-word + multi-word loops don't
+    # re-decompose them into their constituent tokens.
+    working_text, compound_counts = _apply_known_systems_prepass(text)
+    for compound, n in compound_counts.items():
+        counts[compound] += n
+
+    # Single-word candidates — one pre-wrapped pattern per language.
+    # Collapse long ASCII blobs first (base64/minified) to defuse ReDoS (#2063).
+    candidate_text = _collapse_long_ascii_runs(working_text)
     for wrapped_pat in patterns["candidate_patterns"]:
         try:
             rx = re.compile(wrapped_pat)
         except re.error:
             continue
-        for word in rx.findall(text):
-            if word.lower() in stopwords:
+        for word in rx.findall(candidate_text):
+            wl = word.lower()
+            if wl in stopwords:
+                continue
+            # Tier 2 linguistics cleanup: block common English content words
+            # (Code, Brutal, Phase, Line, Note, ...) from entity candidacy.
+            # Multi-word path below is intentionally not filtered so
+            # compound names like "Claude Code" still get detected.
+            if wl in coca_filter:
                 continue
             if len(word) < 2:
                 continue
             counts[word] += 1
 
-    # Multi-word candidates — one pre-wrapped pattern per language
+    # Multi-word candidates — one pre-wrapped pattern per language.
+    # Runs against the working_text (compounds already masked) so an
+    # unknown two-word phrase like "Jane Smith" still gets caught by
+    # the regex without competing with known compounds.
     for wrapped_pat in patterns["multi_word_patterns"]:
         try:
             rx = re.compile(wrapped_pat)
         except re.error:
             continue
-        for phrase in rx.findall(text):
+        for phrase in rx.findall(working_text):
             if any(w.lower() in stopwords for w in phrase.split()):
                 continue
             counts[phrase] += 1
@@ -193,7 +395,7 @@ def _build_patterns(name: str, languages: tuple = ("en",)) -> dict:
         "person_verbs": _compile_each(sources["person_verb_patterns"]),
         "project_verbs": _compile_each(sources["project_verb_patterns"]),
         "direct": direct_compiled,
-        "versioned": re.compile(rf"\b{n}[-v]\w+", re.IGNORECASE),
+        "versioned": re.compile(rf"\b{n}[-_]v?\d+(?:\.\d+)*\b", re.IGNORECASE),
         "code_ref": re.compile(rf"\b{n}\.(py|js|ts|yaml|yml|json|sh)\b", re.IGNORECASE),
     }
 
@@ -227,12 +429,19 @@ def score_entity(name: str, text: str, lines: list, languages=("en",)) -> dict:
 
     # --- Person signals ---
 
-    # Dialogue markers (strong signal)
+    # Dialogue markers (strong signal).
+    # The bare `^NAME:\s` colon-prefix pattern matches metadata lines like
+    # `Created: 2026-04-21`, so we require >= 2 hits for it to count as dialogue
+    # (real speaker markers repeat; single-line metadata doesn't).
     for rx in patterns["dialogue"]:
         matches = len(rx.findall(text))
-        if matches > 0:
-            person_score += matches * 3
-            person_signals.append(f"dialogue marker ({matches}x)")
+        if matches == 0:
+            continue
+        is_bare_colon = rx.pattern.endswith(r":\s") and not rx.pattern.endswith(r"[:\s]")
+        if is_bare_colon and matches < 2:
+            continue
+        person_score += matches * 3
+        person_signals.append(f"dialogue marker ({matches}x)")
 
     # Person verbs
     for rx in patterns["person_verbs"]:
@@ -328,17 +537,28 @@ def classify_entity(name: str, frequency: int, scores: dict) -> dict:
             signal_categories.add("addressed")
 
     has_two_signal_types = len(signal_categories) >= 2
-    _ = signal_categories - {"pronoun"}  # reserved for future thresholds
+    # Single-category pronoun signal still classifies as person when the
+    # evidence is overwhelming — a diary's main character is referenced
+    # with pronouns, not dialogue markers. Require both: many pronoun hits
+    # AND a high pronoun-to-frequency ratio so common sentence-start words
+    # (Never, Before, etc.) with incidental pronoun proximity don't qualify.
+    pronoun_hits = 0
+    for s in scores["person_signals"]:
+        m = re.search(r"pronoun nearby \((\d+)x\)", s)
+        if m:
+            pronoun_hits = int(m.group(1))
+            break
+    strong_pronoun_signal = pronoun_hits >= 5 and frequency > 0 and pronoun_hits / frequency >= 0.2
 
-    if person_ratio >= 0.7 and has_two_signal_types and ps >= 5:
+    if person_ratio >= 0.7 and (has_two_signal_types and ps >= 5 or strong_pronoun_signal):
         entity_type = "person"
         confidence = min(0.99, 0.5 + person_ratio * 0.5)
         signals = scores["person_signals"] or [f"appears {frequency}x"]
-    elif person_ratio >= 0.7 and (not has_two_signal_types or ps < 5):
-        # Pronoun-only match — downgrade to uncertain
+    elif person_ratio >= 0.7:
+        # Weak single-category person signal — downgrade to uncertain
         entity_type = "uncertain"
         confidence = 0.4
-        signals = scores["person_signals"] + [f"appears {frequency}x — pronoun-only match"]
+        signals = scores["person_signals"] + [f"appears {frequency}x — weak person signal"]
     elif person_ratio <= 0.3:
         entity_type = "project"
         confidence = min(0.99, 0.5 + (1 - person_ratio) * 0.5)
@@ -361,7 +581,12 @@ def classify_entity(name: str, frequency: int, scores: dict) -> dict:
 # ==================== MAIN DETECT ====================
 
 
-def detect_entities(file_paths: list, max_files: int = 10, languages=("en",)) -> dict:
+def detect_entities(
+    file_paths: list,
+    max_files: int = 10,
+    languages=("en",),
+    corpus_origin: dict | None = None,
+) -> dict:
     """
     Scan files and detect entity candidates.
 
@@ -370,12 +595,24 @@ def detect_entities(file_paths: list, max_files: int = 10, languages=("en",)) ->
         max_files: Max files to read (for speed)
         languages: Tuple of language codes whose entity patterns should be
             applied (union). Defaults to ``("en",)``.
+        corpus_origin: Optional corpus-origin context (the dict produced
+            by ``mempalace.corpus_origin`` and persisted to
+            ``<palace>/.mempalace/origin.json`` by ``mempalace init``).
+            When supplied and the corpus is identified as AI-dialogue with
+            known agent persona names, candidates whose name matches an
+            agent persona are moved out of ``people``/``uncertain`` and
+            into a new ``agent_personas`` bucket. Shape:
+            ``{"schema_version": 1, "result": {"agent_persona_names": [...], ...}}``.
 
     Returns:
         {
             "people":   [...entity dicts...],
             "projects": [...entity dicts...],
+            "topics":   [...entity dicts...],
             "uncertain":[...entity dicts...],
+            # Only present when corpus_origin reclassifies at least one
+            # candidate as an agent persona:
+            "agent_personas": [...entity dicts...],
         }
     """
     langs = _normalize_langs(languages)
@@ -391,6 +628,13 @@ def detect_entities(file_paths: list, max_files: int = 10, languages=("en",)) ->
         if files_read >= max_files:
             break
         try:
+            # Decide by file type before opening: ``scan_for_detection``
+            # picks candidates by extension, so a FIFO named ``notes.md``
+            # reaches this loop and a blocking open of one waits in the
+            # kernel for a writer that may never come. ``is_file()`` stats
+            # instead of opening and never blocks.
+            if not Path(filepath).is_file():
+                continue
             with open(filepath, encoding="utf-8", errors="replace") as f:
                 content = f.read(MAX_BYTES_PER_FILE)
             all_text.append(content)
@@ -405,7 +649,10 @@ def detect_entities(file_paths: list, max_files: int = 10, languages=("en",)) ->
     candidates = extract_candidates(combined_text, languages=langs)
 
     if not candidates:
-        return {"people": [], "projects": [], "uncertain": []}
+        return _apply_corpus_origin(
+            {"people": [], "projects": [], "topics": [], "uncertain": []},
+            corpus_origin,
+        )
 
     # Score and classify each candidate
     people = []
@@ -428,11 +675,74 @@ def detect_entities(file_paths: list, max_files: int = 10, languages=("en",)) ->
     projects.sort(key=lambda x: x["confidence"], reverse=True)
     uncertain.sort(key=lambda x: x["frequency"], reverse=True)
 
-    # Cap results to most relevant
-    return {
+    detected = {
         "people": people[:15],
         "projects": projects[:10],
+        "topics": [],
         "uncertain": uncertain[:8],
+    }
+
+    return _apply_corpus_origin(detected, corpus_origin)
+
+
+def _apply_corpus_origin(detected: dict, corpus_origin: dict | None) -> dict:
+    """Reclassify per-candidate buckets using corpus-origin context.
+
+    When the corpus is identified as AI-dialogue with known agent persona
+    names, a candidate whose name case-insensitively matches one of those
+    personas is moved from ``people``/``uncertain`` into an
+    ``agent_personas`` bucket. The candidate's per-entity ``type`` is also
+    rewritten to ``"agent_persona"``.
+
+    No-op when ``corpus_origin`` is ``None`` or contains no usable persona
+    names. Pure: returns a new dict, does not mutate the input.
+    """
+    if not corpus_origin:
+        return detected
+
+    origin_result = corpus_origin.get("result") or {}
+    raw_personas = origin_result.get("agent_persona_names") or []
+    persona_lower = {n.lower() for n in raw_personas if isinstance(n, str)}
+    if not persona_lower:
+        return detected
+
+    agent_personas: list = []
+    new_people: list = []
+    new_uncertain: list = []
+
+    for entity in detected.get("people", []):
+        if entity["name"].lower() in persona_lower:
+            agent_personas.append(_tag_as_persona(entity))
+        else:
+            new_people.append(entity)
+
+    for entity in detected.get("uncertain", []):
+        if entity["name"].lower() in persona_lower:
+            agent_personas.append(_tag_as_persona(entity))
+        else:
+            new_uncertain.append(entity)
+
+    if not agent_personas:
+        return detected
+
+    agent_personas.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+
+    return {
+        **detected,
+        "people": new_people,
+        "uncertain": new_uncertain,
+        "agent_personas": agent_personas,
+    }
+
+
+def _tag_as_persona(entity: dict) -> dict:
+    """Return a new entity dict tagged as agent_persona with provenance signal."""
+    existing_signals = entity.get("signals", [])
+    return {
+        **entity,
+        "type": "agent_persona",
+        "confidence": max(0.95, entity.get("confidence", 0.0)),
+        "signals": ["matched corpus_origin agent_persona_names"] + existing_signals[:2],
     }
 
 
@@ -445,7 +755,7 @@ def _print_entity_list(entities: list, label: str):
         print("    (none detected)")
         return
     for i, e in enumerate(entities):
-        confidence_bar = "●" * int(e["confidence"] * 5) + "○" * (5 - int(e["confidence"] * 5))
+        confidence_bar = "#" * int(e["confidence"] * 5) + "." * (5 - int(e["confidence"] * 5))
         signals_str = ", ".join(e["signals"][:2]) if e["signals"] else ""
         print(f"    {i + 1:2}. {e['name']:20} [{confidence_bar}] {signals_str}")
 
@@ -454,32 +764,48 @@ def confirm_entities(detected: dict, yes: bool = False) -> dict:
     """
     Interactive confirmation step.
     User reviews detected entities, removes wrong ones, adds missing ones.
-    Returns confirmed {people: [names], projects: [names]}
+    Returns confirmed {people: [names], projects: [names], topics: [names]}.
+
+    Topics are not surfaced for interactive review — they come from the
+    LLM-refined ``TOPIC`` bucket and are passed through verbatim. They
+    feed cross-wing tunnel computation at mine time (see
+    ``palace_graph.compute_topic_tunnels``); a wrong topic at worst adds
+    a low-traffic tunnel and never alters drawer storage.
 
     Pass yes=True to auto-accept all detected entities without prompting.
     """
     print(f"\n{'=' * 58}")
-    print("  MemPalace — Entity Detection")
+    print("  MemPalace -- Entity Detection")
     print(f"{'=' * 58}")
     print("\n  Scanned your files. Here's what we found:\n")
 
     _print_entity_list(detected["people"], "PEOPLE")
     _print_entity_list(detected["projects"], "PROJECTS")
 
+    if detected.get("topics"):
+        _print_entity_list(detected["topics"], "TOPICS (cross-wing tunnel signal)")
+
     if detected["uncertain"]:
         _print_entity_list(detected["uncertain"], "UNCERTAIN (need your call)")
 
     confirmed_people = [e["name"] for e in detected["people"]]
     confirmed_projects = [e["name"] for e in detected["projects"]]
+    confirmed_topics = [e["name"] for e in detected.get("topics", [])]
 
     if yes:
         # Auto-accept: include all detected (skip uncertain — ambiguous without user input)
         print(
-            f"\n  Auto-accepting {len(confirmed_people)} people, {len(confirmed_projects)} projects."
+            f"\n  Auto-accepting {len(confirmed_people)} people, "
+            f"{len(confirmed_projects)} projects, "
+            f"{len(confirmed_topics)} topics."
         )
-        return {"people": confirmed_people, "projects": confirmed_projects}
+        return {
+            "people": confirmed_people,
+            "projects": confirmed_projects,
+            "topics": confirmed_topics,
+        }
 
-    print(f"\n{'─' * 58}")
+    print(f"\n{'-' * 58}")
     print("  Options:")
     print("    [enter]  Accept all")
     print("    [edit]   Remove wrong entries or reclassify uncertain")
@@ -494,9 +820,9 @@ def confirm_entities(detected: dict, yes: bool = False) -> dict:
     if choice == "edit":
         # Handle uncertain first
         if detected["uncertain"]:
-            print("\n  Uncertain entities — classify each:")
+            print("\n  Uncertain entities -- classify each:")
             for e in detected["uncertain"]:
-                ans = input(f"    {e['name']} — (p)erson, (r)project, or (s)kip? ").strip().lower()
+                ans = input(f"    {e['name']} -- (p)erson, (r)project, or (s)kip? ").strip().lower()
                 if ans == "p":
                     confirmed_people.append(e["name"])
                 elif ans == "r":
@@ -535,11 +861,14 @@ def confirm_entities(detected: dict, yes: bool = False) -> dict:
     print("  Confirmed:")
     print(f"  People:   {', '.join(confirmed_people) or '(none)'}")
     print(f"  Projects: {', '.join(confirmed_projects) or '(none)'}")
+    if confirmed_topics:
+        print(f"  Topics:   {', '.join(confirmed_topics)}")
     print(f"{'=' * 58}\n")
 
     return {
         "people": confirmed_people,
         "projects": confirmed_projects,
+        "topics": confirmed_topics,
     }
 
 
@@ -560,6 +889,8 @@ def scan_for_detection(project_dir: str, max_files: int = 10) -> list:
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for filename in filenames:
             filepath = Path(root) / filename
+            if filepath.stem.lower() in SKIP_FILENAMES:
+                continue
             ext = filepath.suffix.lower()
             if ext in PROSE_EXTENSIONS:
                 prose_files.append(filepath)

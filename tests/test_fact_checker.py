@@ -19,6 +19,9 @@ Also pins the three feature contracts:
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -260,29 +263,119 @@ class TestCheckTextContract:
 
 
 class TestCLI:
-    def test_exits_nonzero_when_issues_found(self, tmp_path, monkeypatch, capsys):
+    def test_exits_nonzero_when_issues_found(self, tmp_path):
         """The CLI exit code is how shell scripts / hooks know to act —
-        pin it explicitly."""
-        registry = tmp_path / "known_entities.json"
-        registry.write_text(json.dumps({"people": ["Milla", "Mila"]}))
-        from mempalace import fact_checker, miner
+        pin it explicitly.
 
-        monkeypatch.setattr(miner, "_ENTITY_REGISTRY_PATH", str(registry))
-        miner._ENTITY_REGISTRY_CACHE.update({"mtime": None, "names": frozenset(), "raw": {}})
-
-        # Simulate argv: "Mila said hi"
-        monkeypatch.setattr(
-            "sys.argv",
-            ["fact_checker", "Mila said hi", "--palace", str(tmp_path / "palace")],
+        Uses a fresh subprocess so that the already-imported
+        ``mempalace.fact_checker`` module in the test process does not
+        collide with runpy re-executing it as ``__main__``, which produced
+        a spurious RuntimeWarning from <frozen runpy>.
+        """
+        # Place the registry where the subprocess's miner will find it:
+        # $HOME/.mempalace/known_entities.json.  We give the subprocess a
+        # private HOME so we don't touch the developer's real registry.
+        fake_home = tmp_path / "home"
+        mempalace_dir = fake_home / ".mempalace"
+        mempalace_dir.mkdir(parents=True)
+        (mempalace_dir / "known_entities.json").write_text(
+            json.dumps({"people": ["Milla", "Mila"]})
         )
-        with pytest.raises(SystemExit) as excinfo:
-            # Re-exec the __main__ block via runpy.
-            import runpy
 
-            runpy.run_module("mempalace.fact_checker", run_name="__main__")
+        env = {**os.environ, "HOME": str(fake_home), "USERPROFILE": str(fake_home)}
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "mempalace.fact_checker",
+                "Mila said hi",
+                "--palace",
+                str(tmp_path / "palace"),
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
         # Issues found → exit code 1.
-        assert excinfo.value.code == 1
-        out = capsys.readouterr().out
-        assert "similar_name" in out
-        # Silence unused import warning.
-        _ = (MagicMock, patch, fact_checker)
+        assert result.returncode == 1
+        assert "similar_name" in result.stdout
+        # Silence unused import warning (MagicMock, patch still used by
+        # other tests in the class).
+        _ = (MagicMock, patch)
+
+    def test_reconfigures_stdio_to_utf8_on_windows(self):
+        """Windows fact_checker --stdin must decode payload as UTF-8.
+
+        Without this, Python defaults stdio to the system ANSI codepage
+        (cp1252/cp1251/cp950), which mojibakes non-ASCII text before
+        pattern parsing sees it.
+        """
+        import io
+        import sys
+
+        from mempalace.fact_checker import _reconfigure_stdio_utf8_on_windows
+
+        class _ReconfigurableStringIO(io.StringIO):
+            def __init__(self, initial_value=""):
+                super().__init__(initial_value)
+                self.reconfigure_calls = []
+
+            def reconfigure(self, **kwargs):
+                self.reconfigure_calls.append(kwargs)
+
+        stdin = _ReconfigurableStringIO()
+        stdout = _ReconfigurableStringIO()
+        stderr = _ReconfigurableStringIO()
+        with (
+            patch.object(sys, "platform", "win32"),
+            patch.object(sys, "stdin", stdin),
+            patch.object(sys, "stdout", stdout),
+            patch.object(sys, "stderr", stderr),
+        ):
+            _reconfigure_stdio_utf8_on_windows()
+
+        # Per-stream errors policy: stdin uses surrogateescape so a stray
+        # malformed byte from a redirected file does not crash the read,
+        # stdout/stderr use replace so an extracted fact carrying a
+        # surrogate half does not crash mid-print.
+        assert stdin.reconfigure_calls == [{"encoding": "utf-8", "errors": "surrogateescape"}]
+        assert stdout.reconfigure_calls == [{"encoding": "utf-8", "errors": "replace"}]
+        assert stderr.reconfigure_calls == [{"encoding": "utf-8", "errors": "replace"}]
+
+    def test_reconfigure_stdio_is_noop_off_windows(self):
+        """Linux/macOS already default to UTF-8 stdio -- helper must not touch streams."""
+        import io
+        import sys
+
+        from mempalace.fact_checker import _reconfigure_stdio_utf8_on_windows
+
+        class _ReconfigurableStringIO(io.StringIO):
+            def __init__(self):
+                super().__init__()
+                self.reconfigure_calls = []
+
+            def reconfigure(self, **kwargs):
+                self.reconfigure_calls.append(kwargs)
+
+        stdin = _ReconfigurableStringIO()
+        with (
+            patch.object(sys, "platform", "linux"),
+            patch.object(sys, "stdin", stdin),
+        ):
+            _reconfigure_stdio_utf8_on_windows()
+
+        assert stdin.reconfigure_calls == []
+
+    def test_default_palace_resolves_via_mempalace_config(self, tmp_path, monkeypatch):
+        """Without `--palace`, the CLI must fall back to
+        `MempalaceConfig().palace_path`, not a hardcoded `~/.mempalace/palace`.
+        Otherwise XDG-aware config-dir users get a stale legacy default."""
+        fake_config = tmp_path / "xdg_config"
+        fake_config.mkdir()
+        monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(fake_config))
+        monkeypatch.delenv("MEMPALACE_PALACE_PATH", raising=False)
+        monkeypatch.delenv("MEMPAL_PALACE_PATH", raising=False)
+
+        from mempalace.fact_checker import _default_palace_path
+
+        assert _default_palace_path() == str(fake_config / "palace")

@@ -5,20 +5,32 @@ normalize.py — Convert any chat export format to MemPalace transcript format.
 Supported:
     - Plain text with > markers (pass through)
     - Claude.ai JSON export
-    - ChatGPT conversations.json
+    - ChatGPT conversations.json (a single conversation, or the top-level
+      array of them that a real data export ships)
     - Claude Code JSONL (with tool_use/tool_result block capture)
     - OpenAI Codex CLI JSONL
+    - Gemini CLI JSONL (~/.gemini/tmp/<project_hash>/chats/session-*.jsonl)
+    - Pi agent JSONL
+    - Gemini CLI / Google AI Studio JSON sessions (contents / messages / flat list)
+    - Continue.dev session JSON (~/.continue/sessions/*.json)
     - Slack JSON export
     - Plain text (pass through for paragraph chunking)
 
 No API key. No internet. Everything local.
 """
 
+import errno
 import json
 import os
 import re
+import stat
 from pathlib import Path
 from typing import Optional
+
+
+class UnparsedCodexTranscriptError(ValueError):
+    """A recognized Codex rollout did not yield a supported conversation."""
+
 
 # Provenance footer appended to Slack transcript output so downstream consumers
 # know the speaker roles are positionally assigned, not verified.
@@ -109,22 +121,53 @@ def strip_noise(text: str) -> str:
     return text.strip()
 
 
+def _read_transcript_file(filepath: str) -> str:
+    """Read a transcript source file with the same safety checks normalize()
+    and normalize_conversations() both need: no symlinks, regular files only,
+    size-capped, BOM-tolerant.
+    """
+    # O_NONBLOCK keeps the "not a regular file" check below reachable: a
+    # blocking open of a FIFO waits in the kernel for a writer, so the
+    # S_ISREG test never runs. See ``miner._read_text_no_follow``, including
+    # why the EAGAIN branch re-checks the type and retries without the flag.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    if os.path.islink(filepath):
+        raise IOError(f"Could not read {filepath}: symlinked files are skipped")
+    fd = -1
+    try:
+        try:
+            fd = os.open(filepath, flags)
+        except OSError as exc:
+            if exc.errno != errno.EAGAIN or not stat.S_ISREG(os.lstat(filepath).st_mode):
+                raise
+            fd = os.open(filepath, flags & ~getattr(os, "O_NONBLOCK", 0))
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            # Text stays prefix-free: this raise is inside the ``try``, so the
+            # ``except OSError`` below composes "Could not read <path>: ...".
+            raise IOError("not a regular file")
+        if file_stat.st_size > 500 * 1024 * 1024:  # 500 MB safety limit
+            # Prefix-free for the same reason as the branch above.
+            raise IOError(f"file too large ({file_stat.st_size // (1024 * 1024)} MB)")
+        with os.fdopen(fd, "r", encoding="utf-8-sig", errors="replace") as f:
+            fd = -1
+            return f.read()
+    except OSError as e:
+        raise IOError(f"Could not read {filepath}: {e}") from e
+    finally:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def normalize(filepath: str) -> str:
     """
     Load a file and normalize to transcript format if it's a chat export.
     Plain text files pass through unchanged.
     """
-    try:
-        file_size = os.path.getsize(filepath)
-    except OSError as e:
-        raise IOError(f"Could not read {filepath}: {e}")
-    if file_size > 500 * 1024 * 1024:  # 500 MB safety limit
-        raise IOError(f"File too large ({file_size // (1024 * 1024)} MB): {filepath}")
-    try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-    except OSError as e:
-        raise IOError(f"Could not read {filepath}: {e}")
+    content = _read_transcript_file(filepath)
 
     if not content.strip():
         return content
@@ -146,26 +189,111 @@ def normalize(filepath: str) -> str:
     return content
 
 
+def normalize_conversations(filepath: str) -> list:
+    """Like normalize(), but keeps each conversation in a bundle export as a
+    separate string instead of joining them into one.
+
+    A Claude.ai privacy export packs every conversation into a single JSON
+    file, and normalize() joins them with "\\n\\n".join(...) into one blob.
+    That collapses conversation boundaries, so content-hash dedup keyed on
+    the whole file breaks the moment the bundle is re-exported with one new
+    conversation added — the file-level hash changes even though none of
+    the existing conversations did. This returns the pieces un-joined so
+    callers can hash and dedup per conversation instead.
+
+    A ChatGPT data export is a bundle for the same reason: its
+    ``conversations.json`` is an array of conversations, so it splits per
+    conversation too.
+
+    Non-bundle formats (a single Claude Code session, plain text, ...)
+    always normalize to one conversation, so this returns a one-element
+    list for those — identical dedup granularity to before.
+    """
+    content = _read_transcript_file(filepath)
+
+    if not content.strip():
+        return []
+
+    lines = content.split("\n")
+    if sum(1 for line in lines if line.strip().startswith(">")) >= 3:
+        return [content]
+
+    ext = Path(filepath).suffix.lower()
+    if ext in (".json", ".jsonl") or content.strip()[:1] in ("{", "["):
+        split = _try_normalize_json_split(content)
+        if split:
+            return split
+
+    return [content]
+
+
 def _try_normalize_json(content: str) -> Optional[str]:
-    """Try all known JSON chat schemas."""
+    """Try all known JSON chat schemas, joining a multi-conversation bundle
+    into one string. See ``_try_normalize_json_split`` for the unjoined form.
+    """
+    split = _try_normalize_json_split(content)
+    if split is None:
+        return None
+    return "\n\n".join(split)
+
+
+def _try_normalize_json_split(content: str) -> Optional[list]:
+    """Try all known JSON chat schemas, returning each conversation found as
+    a separate list entry (bundle formats) or a single-element list.
+    """
 
     normalized = _try_claude_code_jsonl(content)
     if normalized:
-        return normalized
+        return [normalized]
 
     normalized = _try_codex_jsonl(content)
     if normalized:
-        return normalized
+        return [normalized]
+
+    # A recognized rollout must never become raw JSON text just because its
+    # conversation schema changed (or its first turn is still incomplete).
+    # Keep this outside the parser so additional supported schemas can return
+    # normally without changing the fallback boundary.
+    for line in content.splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict) and entry.get("type") == "session_meta":
+            raise UnparsedCodexTranscriptError(
+                "Codex rollout contains no complete supported conversation; "
+                "refusing raw JSON fallback"
+            )
+
+    normalized = _try_gemini_jsonl(content)
+    if normalized:
+        return [normalized]
+
+    normalized = _try_pi_jsonl(content)
+    if normalized:
+        return [normalized]
 
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
         return None
 
-    for parser in (_try_claude_ai_json, _try_chatgpt_json, _try_slack_json):
+    normalized = _try_gemini_json(data)
+    if normalized:
+        return [normalized]
+
+    split = _try_claude_ai_json_split(data)
+    if split:
+        return split
+
+    split = _try_chatgpt_export_json_split(data)
+    if split:
+        return split
+
+    for parser in (_try_chatgpt_json, _try_continue_json, _try_slack_json):
         normalized = parser(data)
         if normalized:
-            return normalized
+            return [normalized]
 
     return None
 
@@ -280,8 +408,215 @@ def _try_codex_jsonl(content: str) -> Optional[str]:
     return None
 
 
+def _try_gemini_jsonl(content: str) -> Optional[str]:
+    """Gemini CLI sessions (~/.gemini/tmp/<project_hash>/chats/session-*.jsonl).
+
+    Schema (per google-gemini/gemini-cli#15292): a session_metadata record
+    on the first line, then a stream of ``{"type": "user", "content":
+    [{"text": "..."}]}`` and ``{"type": "gemini", "content": [...]}``
+    records, with optional ``message_update`` records carrying token
+    counts only.
+
+    Detection requires a ``session_metadata`` record so this parser does
+    not false-positive against Claude Code or Codex JSONL passed through
+    the dispatch chain. Any ``user``/``gemini`` lines that appear before
+    ``session_metadata`` are discarded — they are treated as preamble
+    noise, not conversational turns. ``message_update`` entries are
+    skipped — they have no message text. Multiple text blocks within a
+    single message's content array are concatenated in order, separated
+    by newlines.
+    """
+    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    messages = []
+    has_session_metadata = False
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+
+        entry_type = entry.get("type", "")
+        if entry_type == "session_metadata":
+            has_session_metadata = True
+            continue
+
+        # Discard everything (including user/gemini turns) until the
+        # session_metadata sentinel has been seen.
+        if not has_session_metadata:
+            continue
+
+        if entry_type not in ("user", "gemini"):
+            # Skips message_update, system events, anything else.
+            continue
+
+        content_blocks = entry.get("content", [])
+        if not isinstance(content_blocks, list):
+            continue
+
+        parts = []
+        for block in content_blocks:
+            if not isinstance(block, dict):
+                continue
+            text = block.get("text", "")
+            if isinstance(text, str) and text.strip():
+                parts.append(text)
+        if not parts:
+            continue
+        joined = "\n".join(parts)
+
+        if entry_type == "user":
+            messages.append(("user", joined))
+        else:  # "gemini"
+            messages.append(("assistant", joined))
+
+    if len(messages) >= 2 and has_session_metadata:
+        return _messages_to_transcript(messages)
+    return None
+
+
+def _try_pi_jsonl(content: str) -> Optional[str]:
+    """Pi agent sessions (~/.config/pi/agent/sessions/{cwd}/{timestamp}_{uuid}.jsonl).
+
+    Pi stores sessions as JSONL with a tree-structured message history.
+    User messages have role "user" with content as string or [{type, text}] blocks.
+    Assistant messages have role "assistant" with content as [{type, text}] blocks
+    (may also include "thinking" blocks which are skipped by _extract_content).
+    Tool results (role "toolResult") are skipped — operational, not conversation.
+
+    Format documented at github.com/badlogic/pi-mono session.md.
+    """
+    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    messages = []
+    has_session_header = False
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+
+        entry_type = entry.get("type", "")
+        if entry_type == "session" and "version" in entry:
+            has_session_header = True
+            continue
+
+        if entry_type != "message":
+            continue
+
+        message = entry.get("message", {})
+        if not isinstance(message, dict):
+            continue
+
+        role = message.get("role", "")
+        text = _extract_content(message.get("content", ""))
+
+        if role == "user" and text:
+            messages.append(("user", text))
+        elif role == "assistant" and text:
+            messages.append(("assistant", text))
+
+    if len(messages) >= 2 and has_session_header:
+        return _messages_to_transcript(messages)
+    return None
+
+
+def _try_gemini_json(data) -> Optional[str]:
+    """Gemini CLI / Google AI Studio JSON sessions.
+
+    Handles three layouts:
+
+    1. **Gemini API contents format** — used by Gemini CLI session files
+       (``~/.gemini/sessions/*.json``):
+       ``{"contents": [{"role": "user", "parts": [{"text": "..."}]}, ...]}``
+
+    2. **Messages wrapper** — exports that wrap the conversation under a
+       ``messages`` key:
+       ``{"messages": [{"role": "user", "content": "..."}, {"role": "model", "content": "..."}]}``
+
+    3. **Flat messages list** — top-level array form:
+       ``[{"role": "user", "content": "..."}, {"role": "model", "content": "..."}]``
+
+    Gemini uses ``"model"`` as the assistant role (not ``"assistant"``).
+    Detection requires at least one ``role="model"`` entry to disambiguate
+    from Claude/ChatGPT exports that use ``"assistant"``. This parser is
+    placed *before* ``_try_claude_ai_json`` in the dispatch chain so that
+    the layout-2 ``{"messages": [...]}`` wrapper does not get silently
+    claimed by the Claude parser, which would drop the model turns.
+    """
+    contents = None
+
+    # Layout 1: {"contents": [...]}
+    if isinstance(data, dict) and "contents" in data:
+        contents = data["contents"]
+    # Layout 2a: {"messages": [...]}
+    elif isinstance(data, dict) and "messages" in data:
+        contents = data["messages"]
+    # Layout 2b: top-level list
+    elif isinstance(data, list):
+        contents = data
+
+    if not isinstance(contents, list) or len(contents) < 2:
+        return None
+
+    messages = []
+    has_model_role = False
+    for item in contents:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role", "")
+
+        # Extract text — try "parts" first (Gemini API), then "content" (flat).
+        text = ""
+        parts = item.get("parts")
+        if isinstance(parts, list):
+            text_parts = []
+            for p in parts:
+                if isinstance(p, str):
+                    text_parts.append(p)
+                elif isinstance(p, dict) and "text" in p:
+                    text_parts.append(p["text"])
+            text = " ".join(text_parts).strip()
+        else:
+            text = _extract_content(item.get("content", ""))
+
+        if not text:
+            continue
+
+        if role == "user":
+            messages.append(("user", text))
+        elif role == "model":
+            messages.append(("assistant", text))
+            has_model_role = True
+        elif role == "assistant":
+            # Defensive: some hand-crafted exports use "assistant" even
+            # for Gemini sessions. Accept but don't flip has_model_role.
+            messages.append(("assistant", text))
+
+    # Disambiguator: must have seen at least one role="model" entry.
+    # This prevents the Gemini parser from claiming Claude/ChatGPT data.
+    if not has_model_role:
+        return None
+
+    if len(messages) >= 2:
+        return _messages_to_transcript(messages)
+    return None
+
+
 def _try_claude_ai_json(data) -> Optional[str]:
     """Claude.ai JSON export: flat messages list or privacy export with chat_messages."""
+    split = _try_claude_ai_json_split(data)
+    if split is None:
+        return None
+    return "\n\n".join(split)
+
+
+def _try_claude_ai_json_split(data) -> Optional[list]:
+    """Same as ``_try_claude_ai_json`` but keeps each conversation in a
+    privacy export as its own list entry instead of joining them.
+    """
     if isinstance(data, dict):
         data = data.get("messages", data.get("chat_messages", []))
     if not isinstance(data, list):
@@ -299,13 +634,13 @@ def _try_claude_ai_json(data) -> Optional[str]:
             if len(messages) >= 2:
                 transcripts.append(_messages_to_transcript(messages))
         if transcripts:
-            return "\n\n".join(transcripts)
+            return transcripts
         return None
 
     # Flat messages list
     messages = _collect_claude_messages(data)
     if len(messages) >= 2:
-        return _messages_to_transcript(messages)
+        return [_messages_to_transcript(messages)]
     return None
 
 
@@ -330,8 +665,14 @@ def _collect_claude_messages(items) -> list:
 
 
 def _try_chatgpt_json(data) -> Optional[str]:
-    """ChatGPT conversations.json with mapping tree."""
-    if not isinstance(data, dict) or "mapping" not in data:
+    """ChatGPT conversations.json with mapping tree.
+
+    Every nested shape is type-checked rather than assumed: this parser is
+    reached from ``_try_chatgpt_export_json_split`` for each element of any
+    top-level JSON array, so it must return None on unrelated payloads that
+    merely carry a ``mapping`` key instead of raising.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("mapping"), dict):
         return None
     mapping = data["mapping"]
     messages = []
@@ -339,6 +680,8 @@ def _try_chatgpt_json(data) -> Optional[str]:
     root_id = None
     fallback_root = None
     for node_id, node in mapping.items():
+        if not isinstance(node, dict):
+            continue
         if node.get("parent") is None:
             if node.get("message") is None:
                 root_id = node_id
@@ -352,22 +695,63 @@ def _try_chatgpt_json(data) -> Optional[str]:
         visited = set()
         while current_id and current_id not in visited:
             visited.add(current_id)
-            node = mapping.get(current_id, {})
+            node = mapping.get(current_id)
+            if not isinstance(node, dict):
+                break
             msg = node.get("message")
-            if msg:
-                role = msg.get("author", {}).get("role", "")
+            if isinstance(msg, dict):
+                author = msg.get("author")
+                role = author.get("role", "") if isinstance(author, dict) else ""
                 content = msg.get("content", {})
-                parts = content.get("parts", []) if isinstance(content, dict) else []
+                parts = content.get("parts") if isinstance(content, dict) else None
+                if not isinstance(parts, list):
+                    parts = []
                 text = " ".join(str(p) for p in parts if isinstance(p, str) and p).strip()
                 if role == "user" and text:
                     messages.append(("user", text))
                 elif role == "assistant" and text:
                     messages.append(("assistant", text))
-            children = node.get("children", [])
-            current_id = children[0] if children else None
+            children = node.get("children")
+            next_id = children[0] if isinstance(children, list) and children else None
+            # Node ids index a dict and a visited set, so anything unhashable
+            # (a nested child object rather than an id) ends the walk.
+            current_id = next_id if isinstance(next_id, str) else None
     if len(messages) >= 2:
         return _messages_to_transcript(messages)
     return None
+
+
+def _try_chatgpt_export_json_split(data) -> Optional[list]:
+    """ChatGPT data export: top-level array of conversation objects.
+
+    The ``conversations.json`` OpenAI ships is an *array*, while
+    ``_try_chatgpt_json`` handles the single conversation object inside it.
+    Without this the whole export falls through to the plain-text path and is
+    chunked as raw JSON: the drawers hold serialized structure sliced at
+    arbitrary offsets, and every speaker turn is gone.
+
+    Each conversation is kept as its own segment rather than concatenated, so
+    per-conversation dedup survives a re-export (see ``normalize_conversations``);
+    the joined form is reached through ``_try_normalize_json``.
+
+    Runs after ``_try_gemini_json`` and ``_try_claude_ai_json_split`` and before
+    the ``_try_chatgpt_json``/``_try_continue_json``/``_try_slack_json`` loop.
+    That position is safe in both directions: Gemini requires a ``role="model"``
+    entry and Claude.ai requires ``chat_messages``/``messages`` on the first
+    element, neither of which a ChatGPT conversation object has, while Slack
+    entries carry no ``mapping`` and Continue.dev sessions are not arrays at
+    all, so this parser declines them and they fall through unchanged.
+    """
+    if not isinstance(data, list):
+        return None
+
+    transcripts = []
+    for convo in data:
+        transcript = _try_chatgpt_json(convo)
+        if transcript:
+            transcripts.append(transcript)
+    # None, not [], so an array of other JSON still reaches the later parsers.
+    return transcripts or None
 
 
 def _try_slack_json(data) -> Optional[str]:
@@ -412,6 +796,61 @@ def _try_slack_json(data) -> Optional[str]:
     return None
 
 
+def _try_continue_json(data) -> Optional[str]:
+    """Continue.dev session JSON (~/.continue/sessions/*.json).
+
+    Sessions contain a ``history`` array of ``{role, content}`` message objects,
+    plus optional metadata (``title``, ``sessionId``, ``dateCreated``).
+    System messages are skipped.  Tool-call messages (role ``tool``) are
+    formatted inline when they contain text content.
+    """
+    if not isinstance(data, dict) or "history" not in data:
+        return None
+    history = data["history"]
+    if not isinstance(history, list):
+        return None
+
+    messages = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role", "")
+        content = item.get("content", "")
+
+        # Extract text from string or list-of-blocks content
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+                elif isinstance(block, str):
+                    parts.append(block)
+            text = "\n".join(p for p in parts if p).strip()
+        elif isinstance(content, str):
+            text = content.strip()
+        else:
+            continue
+
+        if not text:
+            continue
+
+        if role == "user":
+            messages.append(("user", text))
+        elif role == "assistant":
+            messages.append(("assistant", text))
+        elif role == "tool":
+            # Append tool output to the previous assistant turn if possible
+            if messages and messages[-1][0] == "assistant":
+                prev_role, prev_text = messages[-1]
+                messages[-1] = (prev_role, prev_text + "\n" + f"[tool] {text}")
+        # Skip system and other roles
+
+    if len(messages) >= 2:
+        return _messages_to_transcript(messages)
+    return None
+
+
 def _extract_content(content, tool_use_map: dict = None) -> str:
     """Pull text from content — handles str, list of blocks, or dict.
 
@@ -450,6 +889,8 @@ def _format_tool_use(block: dict) -> str:
     """Format a tool_use block into a human-readable one-liner."""
     name = block.get("name", "Unknown")
     inp = block.get("input", {})
+    if isinstance(inp, list):
+        inp = {}
 
     if name == "Bash":
         cmd = inp.get("command", "")

@@ -11,6 +11,9 @@ instead of the real user profile.
 """
 
 import os
+import hashlib
+import math
+import re
 import shutil
 import tempfile
 
@@ -33,17 +36,263 @@ import pytest  # noqa: E402
 from mempalace.config import MempalaceConfig  # noqa: E402
 from mempalace.knowledge_graph import KnowledgeGraph  # noqa: E402
 
+_TEST_EMBED_DIM = 384
+_TEST_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+_REAL_EMBEDDING_TEST_MODULES = {
+    "test_embedding",
+    "test_embedding_api",
+    "test_embeddinggemma",
+}
+
+
+def _stable_test_embedding(text: str) -> list[float]:
+    """Small deterministic embedding for tests that do not test ONNX itself."""
+    vec = [0.0] * _TEST_EMBED_DIM
+    tokens = _TEST_TOKEN_RE.findall((text or "").lower())
+    if not tokens:
+        tokens = [""]
+    for token in tokens:
+        digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+        vec[int.from_bytes(digest[:4], "little") % _TEST_EMBED_DIM] += 1.0
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / norm for v in vec]
+
+
+class _StableTestEmbeddingFunction:
+    @staticmethod
+    def name() -> str:
+        return "default"
+
+    @staticmethod
+    def build_from_config(config):
+        _StableTestEmbeddingFunction.validate_config(config)
+        return _StableTestEmbeddingFunction()
+
+    @staticmethod
+    def validate_config(config) -> None:
+        return
+
+    def get_config(self) -> dict:
+        return {}
+
+    def is_legacy(self) -> bool:
+        return False
+
+    def default_space(self) -> str:
+        return "cosine"
+
+    def supported_spaces(self) -> list[str]:
+        return ["cosine", "l2", "ip"]
+
+    def embed_query(self, input):
+        return self(input=input)
+
+    def __call__(self, input):
+        return [_stable_test_embedding(str(text)) for text in list(input or [])]
+
+
+# Redirect ChromaDB's ONNX model cache back to the real user's cache so tests
+# don't re-download the 79 MB model on every run. The HOME redirect above
+# would otherwise point ONNXMiniLM_L6_V2.DOWNLOAD_PATH at the empty temp dir.
+try:
+    from pathlib import Path  # noqa: E402
+    from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import (  # noqa: E402
+        ONNXMiniLM_L6_V2,
+    )
+
+    _real_home = _original_env.get("USERPROFILE") or _original_env.get("HOME")
+    if _real_home:
+        _real_cache = Path(_real_home) / ".cache" / "chroma" / "onnx_models" / "all-MiniLM-L6-v2"
+        if _real_cache.exists():
+            ONNXMiniLM_L6_V2.DOWNLOAD_PATH = _real_cache
+except ImportError:
+    pass
+
 
 @pytest.fixture(autouse=True)
-def _reset_mcp_cache():
-    """Reset the MCP server's cached ChromaDB client/collection between tests."""
+def _stable_embedding_function_for_tests(request, monkeypatch):
+    """Keep ordinary tests off ChromaDB's native ONNX embedding path.
+
+    Module-sized Windows runs were crashing inside onnxruntime after many raw
+    Chroma add/query calls. The embedding-specific tests opt out below; every
+    other test gets a deterministic in-process EF so it still exercises vector
+    writes/search without loading native ONNX sessions.
+    """
+    module_name = getattr(getattr(request, "module", None), "__name__", "")
+    if module_name in _REAL_EMBEDDING_TEST_MODULES:
+        yield
+        return
+
+    ef = _StableTestEmbeddingFunction()
+
+    import mempalace.backends.chroma as chroma_mod
+    import mempalace.backends.embedding_wrapper as embedding_wrapper
+    import mempalace.embedding as embedding_mod
+    from chromadb.api.types import DefaultEmbeddingFunction
+
+    monkeypatch.setattr(DefaultEmbeddingFunction, "__call__", lambda self, input: ef(input=input))
+    monkeypatch.setattr(
+        DefaultEmbeddingFunction, "embed_query", lambda self, input: ef(input=input)
+    )
+    monkeypatch.setattr(embedding_mod, "get_embedding_function", lambda *_, **__: ef)
+    monkeypatch.setattr(
+        chroma_mod.ChromaBackend, "_resolve_embedding_function", staticmethod(lambda: ef)
+    )
+    monkeypatch.setattr(embedding_wrapper, "_embed_texts", lambda texts: ef(input=list(texts)))
+    yield
+
+
+def _reset_loaded_mcp_writer_state(mcp_server) -> None:
+    """Release process-global MCP writer state between tests.
+
+    The atexit-registration flag is deliberately preserved. Its callback is
+    registered for the lifetime of the Python process, so resetting the flag
+    would allow later writer acquisitions to register duplicate callbacks.
+    """
+    release_writer_lock = getattr(
+        mcp_server,
+        "_release_mcp_writer_lock",
+        None,
+    )
+    try:
+        if callable(release_writer_lock):
+            release_writer_lock()
+    finally:
+        # Normalize status even when the prior test left a failed/read-only
+        # attempt rather than an acquired context manager.
+        for name, value in (
+            ("_MCP_WRITER_LOCK_CM", None),
+            ("_MCP_WRITER_READ_ONLY", False),
+            ("_MCP_WRITER_LOCK_FAILED", False),
+            ("_MCP_WRITER_LOCK_ERROR", ""),
+        ):
+            if hasattr(mcp_server, name):
+                setattr(mcp_server, name, value)
+
+
+@pytest.fixture(autouse=True)
+def _release_palace_anchors():
+    """Close anchor connections on ``chroma.sqlite3`` after each test (#2302).
+
+    On Linux mempalace keeps one idle connection per database inode for the life
+    of the process; across thousands of temporary palaces that would run the
+    test process out of descriptors. Only acts when the module is loaded.
+    """
+    yield
+    import sys
+
+    inproc = sys.modules.get("mempalace.backends._inproc_sqlite")
+    if inproc is not None:
+        inproc.release_all()
+
+
+@pytest.fixture(autouse=True)
+def _reset_mcp_cache(monkeypatch):
+    """Reset cached MCP state between tests without importing mcp_server.
+
+    If mempalace.mcp_server is already imported, release its writer lease,
+    reset writer-status globals, and close/clear its KG and storage caches. If
+    it has not been imported, leave it unloaded so fork/spawn-based tests do
+    not inherit extra Chroma/SQLite state.
+
+    ``monkeypatch`` is an intentional ordering dependency. This fixture must
+    tear down before monkeypatch restores module globals; otherwise a writer
+    context acquired after a test patches ``_MCP_WRITER_LOCK_CM`` can be
+    discarded without its ``__exit__`` method running.
+    """
+    del monkeypatch
 
     def _clear_cache():
         try:
-            from mempalace import mcp_server
+            import sys
 
-            mcp_server._client_cache = None
-            mcp_server._collection_cache = None
+            mcp_server = sys.modules.get("mempalace.mcp_server")
+            if mcp_server is not None:
+                stop_sync = getattr(mcp_server, "_stop_peer_sync_thread", None)
+                if callable(stop_sync):
+                    try:
+                        stop_sync()
+                    except Exception:
+                        pass
+
+                _reset_loaded_mcp_writer_state(mcp_server)
+                for kg in list(getattr(mcp_server, "_kg_by_path", {}).values()):
+                    close = getattr(kg, "close", None)
+                    if close is not None:
+                        try:
+                            close()
+                        except Exception:
+                            pass
+
+                if hasattr(mcp_server, "_kg_by_path"):
+                    mcp_server._kg_by_path.clear()
+
+                for ls in list(getattr(mcp_server, "_logstream_by_path", {}).values()):
+                    close = getattr(ls, "close", None)
+                    if close is not None:
+                        try:
+                            close()
+                        except Exception:
+                            pass
+
+                if hasattr(mcp_server, "_logstream_by_path"):
+                    mcp_server._logstream_by_path.clear()
+
+                # Close (not just dereference) the cached chromadb client so its
+                # rust-side file handles are released; on Windows a bare deref
+                # leaves them locked and leaks across the session (#1128).
+                cached_client = getattr(mcp_server, "_client_cache", None)
+                if cached_client is not None:
+                    close = getattr(cached_client, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception:
+                            pass
+                mcp_server._client_cache = None
+                mcp_server._collection_cache = None
+                if hasattr(mcp_server, "_collection_cache_backend"):
+                    mcp_server._collection_cache_backend = None
+                if hasattr(mcp_server, "_collection_cache_palace"):
+                    mcp_server._collection_cache_palace = None
+                if hasattr(mcp_server, "_collection_open_error"):
+                    mcp_server._collection_open_error = None
+        except AttributeError:
+            pass
+
+        try:
+            # Reset the per-process quarantine gate so tests don't leak
+            # state through ChromaBackend._quarantined_paths, and drop cached
+            # HNSW capacity verdicts (#1471) for the same reason — a test that
+            # reuses a palace path would otherwise inherit the previous test's
+            # verdict.
+            from mempalace.backends.chroma import ChromaBackend, reset_hnsw_capacity_cache
+
+            ChromaBackend._quarantined_paths.clear()
+            reset_hnsw_capacity_cache()
+        except (ImportError, AttributeError):
+            pass
+
+        # Release chromadb clients opened through the backend layer. Many tests
+        # reach the store via palace.get_collection() (sweep, repair, CLI, ...),
+        # which caches one PersistentClient per palace_path on the long-lived
+        # backend singleton and never closes it. chromadb frees the rust-side
+        # SQLite/HNSW file handles only on client.close(); on POSIX the open
+        # handles are harmless, but on Windows they stay locked and accumulate
+        # across the session until a later test's HNSW segment write fails
+        # (#1128 Windows CI). close_palace() closes the client and drops the
+        # handle without marking the backend closed, so it stays reusable.
+        try:
+            from mempalace import palace as _palace
+
+            backend = getattr(_palace, "_DEFAULT_BACKEND", None)
+            clients = getattr(backend, "_clients", None)
+            if clients:
+                for path in list(clients):
+                    try:
+                        backend.close_palace(path)
+                    except Exception:
+                        pass
         except (ImportError, AttributeError):
             pass
 
@@ -104,7 +353,11 @@ def collection(palace_path):
     col = client.get_or_create_collection("mempalace_drawers", metadata={"hnsw:space": "cosine"})
     yield col
     client.delete_collection("mempalace_drawers")
-    del client
+    # close() (not a bare dereference) releases chromadb's rust-side SQLite/HNSW
+    # file handles. On Windows a mere `del` leaves them locked, so the temp
+    # palace cannot be removed and handles leak across the whole test session
+    # until a later test's HNSW write fails (#1128 Windows CI).
+    client.close()
 
 
 @pytest.fixture

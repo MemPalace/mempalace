@@ -2,6 +2,7 @@
 dist/
 build/
 __pycache__/
+.hypothesis/
 *.pyc
 .pytest_cache/
 mempal.yaml
@@ -36,3 +37,13 @@ venv/
 
 # ChromaDB local data
 *.sqlite3-journal
+.envrc
+.review-logs
+
+# Rust & Native build artifacts
+target/
+*.pyd
+*.so
+*.dylib
+*.exe
+

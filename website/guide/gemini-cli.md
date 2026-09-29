@@ -9,22 +9,30 @@ MemPalace works natively with [Gemini CLI](https://github.com/google/gemini-cli)
 
 ## Installation
 
+We recommend [`uv`](https://docs.astral.sh/uv/) — it creates and manages the
+virtual environment for you:
+
 ```bash
 # Clone the repository
 git clone https://github.com/MemPalace/mempalace.git
 cd mempalace
 
-# Create a virtual environment
-python3 -m venv .venv
+# Create the venv and install MemPalace + dependencies
+uv sync
+```
 
-# Install dependencies
+This produces a `.venv/` directory with the project installed in editable
+mode. If you prefer plain pip, the equivalent is:
+
+```bash
+python3 -m venv .venv
 .venv/bin/pip install -e .
 ```
 
 ## Initialize the Palace
 
 ```bash
-.venv/bin/python3 -m mempalace init .
+uv run python -m mempalace init .
 ```
 
 ### Identity and Project Configuration (Optional)
@@ -88,7 +96,7 @@ Once connected, Gemini CLI will automatically:
 
 Mine existing code or docs:
 ```bash
-.venv/bin/python3 -m mempalace mine /path/to/your/project
+uv run python -m mempalace mine /path/to/your/project
 ```
 
 ### Verification

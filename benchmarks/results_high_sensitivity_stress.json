@@ -1,0 +1,163 @@
+{
+  "medgemma1.5-tools": {
+    "model": "medgemma1.5-tools",
+    "total_stress_tests": 7,
+    "sensitivity_pass_rate_pct": 0.0,
+    "mean_reasoning_score_pct": 0.0,
+    "avg_latency_sec": 6.94,
+    "results": [
+      {
+        "test_id": "stress_temporal_active_meds",
+        "dimension": "Temporal Reasoning & Obsolete Filtering",
+        "model": "medgemma1.5-tools",
+        "tool_called": false,
+        "tool_name": null,
+        "tool_args": null,
+        "execution_success": true,
+        "reasoning_accuracy_score": 0.0,
+        "assertions_passed": [],
+        "assertions_failed": [
+          "Empagliflozin",
+          "25mg",
+          "discontinued",
+          "kidney",
+          "eGFR"
+        ],
+        "negative_violations": [],
+        "latency_sec": 13.42,
+        "final_answer": "<unused94>thought The user is asking for specific patient information: 1.  **Current medication regimen:** Metformin. 2.  **Exact active medication regimen:** This implies needing more details than just Metformin. 3.  **Clinical event causing change "
+      },
+      {
+        "test_id": "stress_multihop_allergy_contraindication",
+        "dimension": "Cross-Wing Multi-Hop Inference",
+        "model": "medgemma1.5-tools",
+        "tool_called": true,
+        "tool_name": "palace_query",
+        "tool_args": {
+          "query": {
+            "agent_name": "Patient 1042",
+            "query": "Amoxicillin-Clavulanate"
+          }
+        },
+        "execution_success": false,
+        "reasoning_accuracy_score": 0.0,
+        "assertions_passed": [],
+        "assertions_failed": [
+          "unsafe",
+          "contraindicated",
+          "allergy",
+          "Penicillin",
+          "Doxycycline"
+        ],
+        "negative_violations": [],
+        "latency_sec": 5.37,
+        "final_answer": "<unused94>thought The user wants me to evaluate the safety of prescribing Amoxicillin-Clavulanate for Patient 1042's acute sinus infection based on palace records and find guideline-recommended alternatives.  1.  **Evaluate safety:**     *   Query th"
+      },
+      {
+        "test_id": "stress_needle_haystack_distractor",
+        "dimension": "Distractor Resilience (50 Patients)",
+        "model": "medgemma1.5-tools",
+        "tool_called": true,
+        "tool_name": "palace_query",
+        "tool_args": {
+          "query": "FIND \"eGFR\" AND \"Fasting Glucose\" IN baseline renal panel LIMIT 1"
+        },
+        "execution_success": true,
+        "reasoning_accuracy_score": 0.0,
+        "assertions_passed": [],
+        "assertions_failed": [
+          "104",
+          "96"
+        ],
+        "negative_violations": [],
+        "latency_sec": 6.73,
+        "final_answer": "<unused94>thought The user wants to retrieve the exact eGFR and Fasting Glucose values for Patient 1067 from their baseline renal panel.  1.  **Identify the core entities:** eGFR, Fasting Glucose, baseline renal panel. 2.  **Identify the target patie"
+      },
+      {
+        "test_id": "stress_hallucination_unstored_fact",
+        "dimension": "Hallucination Resistance",
+        "model": "medgemma1.5-tools",
+        "tool_called": true,
+        "tool_name": "palace_query",
+        "tool_args": {
+          "query": "FIND \"Patient 1042\" IN \"CAC score\" IN \"2025 cardiac CT scan\" OR FIND \"Patient 1042\" IN \"Atorvastatin dose\" LIMIT 1"
+        },
+        "execution_success": true,
+        "reasoning_accuracy_score": 0.0,
+        "assertions_passed": [],
+        "assertions_failed": [
+          "no record",
+          "not found",
+          "no cardiac CT",
+          "no Atorvastatin"
+        ],
+        "negative_violations": [],
+        "latency_sec": 9.16,
+        "final_answer": "{\"query\": \"Patient 1042 OR FIND Patient 1042\", \"filters\": {\"wing\": \"Atorvastatin dose\", \"room\": null, \"source_file\": null, \"since\": null, \"before\": null}, \"total_before_filter\": 0, \"results\": [], \"status\": \"no_matching_memories_found\", \"total_found\":"
+      },
+      {
+        "test_id": "stress_implicit_symptom_search",
+        "dimension": "Implicit Semantic Search",
+        "model": "medgemma1.5-tools",
+        "tool_called": false,
+        "tool_name": null,
+        "tool_args": null,
+        "execution_success": true,
+        "reasoning_accuracy_score": 0.0,
+        "assertions_passed": [],
+        "assertions_failed": [
+          "Penicillin",
+          "beta-lactam"
+        ],
+        "negative_violations": [],
+        "latency_sec": 4.2,
+        "final_answer": "<unused94> thought The user is asking to identify a medication class that caused anaphylaxis in a patient based on a previous treatment. The user wants me to search a \"private palace\" to find this information. The \"private palace\" is a hypothetical d"
+      },
+      {
+        "test_id": "stress_pql_multi_constraint_query",
+        "dimension": "Complex PQL Construction",
+        "model": "medgemma1.5-tools",
+        "tool_called": true,
+        "tool_name": "palace_query",
+        "tool_args": {
+          "query": "FIND \"elevated glucose\" IN wing/patient_1042 room/labs LIMIT 3"
+        },
+        "execution_success": true,
+        "reasoning_accuracy_score": 0.0,
+        "assertions_passed": [],
+        "assertions_failed": [
+          "165",
+          "HbA1c",
+          "8.2%"
+        ],
+        "negative_violations": [],
+        "latency_sec": 8.16,
+        "final_answer": "{\"query\": \"elevated glucose room/labs\", \"filters\": {\"wing\": \"wing\", \"room\": \"patient_1042\", \"source_file\": null, \"since\": null, \"before\": null}, \"total_before_filter\": 0, \"results\": [], \"status\": \"no_matching_memories_found\", \"total_found\": 0, \"summa"
+      },
+      {
+        "test_id": "stress_mutation_allergy_update",
+        "dimension": "Mutation & KG Consistency",
+        "model": "medgemma1.5-tools",
+        "tool_called": true,
+        "tool_name": "palace_exec",
+        "tool_args": {
+          "action": "KG ADD",
+          "command": "Patient_1042 -> has_allergy -> Sulfonamides from 2026-09-01"
+        },
+        "execution_success": true,
+        "reasoning_accuracy_score": 0.0,
+        "assertions_passed": [],
+        "assertions_failed": [
+          "added",
+          "Sulfonamides",
+          "Patient_1042"
+        ],
+        "negative_violations": [
+          "error"
+        ],
+        "latency_sec": 1.53,
+        "final_answer": "Ollama error: timed out"
+      }
+    ]
+  }
+}

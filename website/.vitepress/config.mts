@@ -11,6 +11,7 @@ function normalizeBase(base?: string): string {
 
 const docsBase = normalizeBase(process.env.DOCS_BASE || '/')
 const editBranch = process.env.DOCS_EDIT_BRANCH || 'main'
+const gaId = process.env.MEMPALACE_DOCS_GA_ID
 
 export default withMermaid(
   defineConfig({
@@ -20,14 +21,18 @@ export default withMermaid(
 
     head: [
       ['link', { rel: 'icon', href: `${docsBase}mempalace_logo.png` }],
+      ['link', { rel: 'preconnect', href: 'https://api.fontshare.com' }],
+      ['link', { href: 'https://api.fontshare.com/v2/css?f[]=neue-machina@300,400,500,700,800&f[]=satoshi@300,400,500,700&display=swap', rel: 'stylesheet' }],
       ['link', { rel: 'preconnect', href: 'https://fonts.googleapis.com' }],
       ['link', { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: '' }],
-      ['link', { href: 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@300;400;500&family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;0,700;1,300;1,400&family=Geist:wght@300;400;500;600&display=swap', rel: 'stylesheet' }],
+      ['link', { href: 'https://fonts.googleapis.com/css2?family=Onest:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap', rel: 'stylesheet' }],
       ['meta', { property: 'og:title', content: 'MemPalace — AI Memory System' }],
       ['meta', { property: 'og:description', content: '96.6% LongMemEval recall. Zero API calls. Local, free, open source.' }],
       ['meta', { property: 'og:image', content: `${docsBase}mempalace_logo.png` }],
-      ['script', { async: '', src: 'https://www.googletagmanager.com/gtag/js?id=G-PPQE4Z7P1K' }],
-      ['script', {}, `window.dataLayer = window.dataLayer || [];\nfunction gtag(){dataLayer.push(arguments);}\ngtag('js', new Date());\ngtag('config', 'G-PPQE4Z7P1K');`],
+      ...(gaId ? [
+        ['script', { async: '', src: `https://www.googletagmanager.com/gtag/js?id=${encodeURIComponent(gaId)}` }],
+        ['script', {}, `window.dataLayer = window.dataLayer || [];\nfunction gtag(){dataLayer.push(arguments);}\ngtag('js', new Date());\ngtag('config', ${JSON.stringify(gaId)});`],
+      ] as const : []),
     ],
 
     themeConfig: {
@@ -46,15 +51,21 @@ export default withMermaid(
             text: 'Guide',
             items: [
               { text: 'Getting Started', link: '/guide/getting-started' },
+              { text: 'Android / Termux', link: '/guide/termux' },
               { text: 'Mining Your Data', link: '/guide/mining' },
               { text: 'Searching Memories', link: '/guide/searching' },
               { text: 'MCP Integration', link: '/guide/mcp-integration' },
               { text: 'Claude Code Plugin', link: '/guide/claude-code' },
+              { text: 'Claude Code Retention', link: '/guide/claude-code-retention' },
               { text: 'Gemini CLI', link: '/guide/gemini-cli' },
+              { text: 'Antigravity Plugin', link: '/guide/antigravity' },
               { text: 'OpenClaw Skill', link: '/guide/openclaw' },
               { text: 'Local Models', link: '/guide/local-models' },
               { text: 'Auto-Save Hooks', link: '/guide/hooks' },
+              { text: 'Cursor IDE Hooks', link: '/guide/cursor-hooks' },
               { text: 'Configuration', link: '/guide/configuration' },
+              { text: 'Remote / Team Server', link: '/guide/remote-server' },
+              { text: 'Shared Brain', link: '/guide/shared-brain' },
             ],
           },
         ],
@@ -67,6 +78,7 @@ export default withMermaid(
               { text: 'AAAK Dialect', link: '/concepts/aaak-dialect' },
               { text: 'Knowledge Graph', link: '/concepts/knowledge-graph' },
               { text: 'Specialist Agents', link: '/concepts/agents' },
+              { text: 'Agent Logstream', link: '/concepts/agent-logstream' },
               { text: 'Contradiction Detection', link: '/concepts/contradiction-detection' },
             ],
           },

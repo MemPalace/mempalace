@@ -3,6 +3,9 @@
 All ChromaDB access is mocked — no real database needed.
 """
 
+import json
+import pytest
+import os
 from unittest.mock import MagicMock, patch
 
 
@@ -30,6 +33,7 @@ with patch.dict("sys.modules", {"chromadb": MagicMock()}):
         build_graph,
         find_tunnels,
         graph_stats,
+        invalidate_graph_cache,
         traverse,
     )
 
@@ -38,17 +42,82 @@ with patch.dict("sys.modules", {"chromadb": MagicMock()}):
 
 
 class TestBuildGraph:
+    def setup_method(self):
+        invalidate_graph_cache()
+
     def test_empty_collection(self):
         col = _make_fake_collection([])
         nodes, edges = build_graph(col=col)
         assert nodes == {}
         assert edges == []
 
+    def test_backend_collection_walks_metadata_once(self):
+        """A BaseCollection is read through get_all_metadata() (one cursor
+        pass on qdrant, #2452) instead of the limit/offset loop."""
+        # The module-level ``patch.dict(sys.modules, ...)`` above drops the
+        # modules imported while it was active, so a fresh import here would
+        # yield a different BaseCollection class than the one palace_graph
+        # holds; use palace_graph's own reference.
+        BaseCollection = build_graph.__globals__["BaseCollection"]
+
+        class _Col(BaseCollection):
+            def add(self, **kwargs):
+                raise NotImplementedError
+
+            def upsert(self, **kwargs):
+                raise NotImplementedError
+
+            def query(self, **kwargs):
+                raise NotImplementedError
+
+            def delete(self, **kwargs):
+                raise NotImplementedError
+
+            def count(self):
+                return 2
+
+            def get(self, **kwargs):
+                raise AssertionError(
+                    "build_graph must not page through get() on a backend collection"
+                )
+
+            def get_all_metadata(self, where=None):
+                return [
+                    {"room": "auth", "wing": "wing_a", "hall": "h"},
+                    {"room": "auth", "wing": "wing_b", "hall": "h"},
+                ]
+
+        nodes, edges = build_graph(col=_Col())
+
+        assert nodes["auth"]["count"] == 2
+        assert len(edges) == 1
+
     def test_falsy_collection(self):
         """When col is explicitly falsy, build_graph returns empty."""
         nodes, edges = build_graph(col=0)
         assert nodes == {}
         assert edges == []
+
+    def test_none_metadata_does_not_crash(self):
+        """ChromaDB can return None for drawers without metadata (legacy
+        data, partial writes — upstream #1020 territory). build_graph
+        must skip None entries silently rather than crash the whole
+        graph build with AttributeError. Caught 2026-04-25 by
+        palace-daemon's verify-routes.sh smoke test against the
+        canonical 151K palace; /stats was 500-ing on a single None
+        drawer and taking out every consumer of build_graph for the
+        whole call path."""
+        col = _make_fake_collection(
+            [
+                {"room": "auth", "wing": "wing_code", "hall": "security", "date": "2026-01-01"},
+                None,  # legacy / partial-write drawer with no metadata
+                {"room": "auth", "wing": "wing_code", "hall": "security", "date": "2026-01-02"},
+            ]
+        )
+        nodes, edges = build_graph(col=col)
+        # The two real drawers were processed; the None one was skipped.
+        assert "auth" in nodes
+        assert nodes["auth"]["count"] == 2
 
     def test_single_wing_no_edges(self):
         col = _make_fake_collection(
@@ -86,14 +155,15 @@ class TestBuildGraph:
         assert edges[0]["wing_b"] == "wing_project"
         assert edges[0]["hall"] == "databases"
 
-    def test_general_room_excluded(self):
+    def test_general_room_included(self):
         col = _make_fake_collection(
             [
                 {"room": "general", "wing": "wing_code", "hall": "misc", "date": ""},
             ]
         )
         nodes, edges = build_graph(col=col)
-        assert "general" not in nodes
+        assert "general" in nodes
+        assert nodes["general"]["wings"] == ["wing_code"]
 
     def test_missing_wing_excluded(self):
         col = _make_fake_collection(
@@ -114,11 +184,43 @@ class TestBuildGraph:
         nodes, _ = build_graph(col=col)
         assert len(nodes["busy"]["dates"]) <= 5
 
+    def test_cache_returns_same_result(self):
+        """Second call within TTL returns cached nodes without re-scanning.
+
+        The cache intentionally ignores col/config args when warm — this is
+        correct for the MCP server's single-palace use case. Callers that
+        switch collections must call invalidate_graph_cache() first.
+        """
+        col = _make_fake_collection(
+            [{"room": "auth", "wing": "wing_code", "hall": "security", "date": "2026-01-01"}]
+        )
+        nodes1, edges1 = build_graph(col=col)
+        # Second call with a *different* collection — should still return cached result
+        col2 = _make_fake_collection([])
+        nodes2, edges2 = build_graph(col=col2)
+        assert nodes1 == nodes2
+        assert edges1 == edges2
+
+    def test_invalidate_clears_cache(self):
+        """invalidate_graph_cache() forces a fresh scan on next call."""
+        col = _make_fake_collection(
+            [{"room": "auth", "wing": "wing_code", "hall": "security", "date": "2026-01-01"}]
+        )
+        build_graph(col=col)
+        invalidate_graph_cache()
+        col_empty = _make_fake_collection([])
+        nodes, edges = build_graph(col=col_empty)
+        assert nodes == {}
+        assert edges == []
+
 
 # --- traverse ---
 
 
 class TestTraverse:
+    def setup_method(self):
+        invalidate_graph_cache()
+
     def _build_col(self):
         return _make_fake_collection(
             [
@@ -156,6 +258,9 @@ class TestTraverse:
 
 
 class TestFindTunnels:
+    def setup_method(self):
+        invalidate_graph_cache()
+
     def _build_tunnel_col(self):
         return _make_fake_collection(
             [
@@ -192,6 +297,9 @@ class TestFindTunnels:
 
 
 class TestGraphStats:
+    def setup_method(self):
+        invalidate_graph_cache()
+
     def test_empty_graph(self):
         col = _make_fake_collection([])
         stats = graph_stats(col=col)
@@ -242,3 +350,126 @@ class TestFuzzyMatch:
         nodes = {f"room-{i}": {} for i in range(20)}
         result = _fuzzy_match("room", nodes, n=3)
         assert len(result) <= 3
+
+
+# --- sqlite fast path backend gating ---
+
+
+class TestSqliteGroupedCountsReader:
+    """The sqlite graph path must follow configuration, not the filesystem."""
+
+    MAGIC = b"SQLite format 3\x00"
+
+    def _config(self, palace_path):
+        from mempalace.config import MempalaceConfig
+
+        cfg_dir = os.path.join(os.path.dirname(palace_path), "config")
+        os.makedirs(cfg_dir, exist_ok=True)
+        with open(os.path.join(cfg_dir, "config.json"), "w") as f:
+            json.dump({"palace_path": palace_path}, f)
+        return MempalaceConfig(config_dir=cfg_dir)
+
+    def test_chroma_palace_resolves_a_reader(self, tmp_path):
+        from mempalace.backends.chroma import sqlite_room_wing_hall_counts
+        from mempalace.palace_graph import sqlite_grouped_counts_reader
+
+        palace = tmp_path / "palace"
+        palace.mkdir()
+        (palace / "chroma.sqlite3").write_bytes(self.MAGIC)
+        assert (
+            sqlite_grouped_counts_reader(self._config(str(palace))) is sqlite_room_wing_hall_counts
+        )
+
+    def test_missing_database_falls_back_to_the_client(self, tmp_path):
+        """No db file means no fast path — that is how a broken palace still
+        reports a diagnostic instead of an empty graph."""
+        from mempalace.palace_graph import sqlite_grouped_counts_reader
+
+        palace = tmp_path / "palace"
+        palace.mkdir()
+        assert sqlite_grouped_counts_reader(self._config(str(palace))) is None
+
+    def test_mixed_backend_artifacts_do_not_get_sniffed(self, tmp_path):
+        """Two backends' files in one directory is a ``BackendMismatchError``
+        on every normal path; picking one by file order would hide that."""
+        from mempalace.palace_graph import sqlite_grouped_counts_reader
+
+        palace = tmp_path / "palace"
+        palace.mkdir()
+        (palace / "chroma.sqlite3").write_bytes(self.MAGIC)
+        (palace / "sqlite_exact.sqlite3").write_bytes(self.MAGIC)
+        assert sqlite_grouped_counts_reader(self._config(str(palace))) is None
+
+
+def test_2288_grouped_general_room_is_not_filtered():
+    from mempalace.palace_graph import _nodes_edges_from_grouped_rows
+
+    nodes, edges = _nodes_edges_from_grouped_rows(
+        [
+            ("general", "wing_a", "hall_one", 2, "2026-01-01"),
+            ("general", "wing_a", "hall_two", 3, "2026-01-02"),
+            ("general", "wing_b", "hall_one", 1, "2026-01-03"),
+        ]
+    )
+    assert nodes["general"]["wings"] == ["wing_a", "wing_b"]
+    assert nodes["general"]["halls"] == ["hall_one", "hall_two"]
+    assert nodes["general"]["count"] == 6
+    assert len(edges) == 2
+
+
+def test_2288_graph_stats_preserve_room_names_and_count_room_instances():
+    invalidate_graph_cache()
+    col = _make_fake_collection(
+        [
+            {"room": "fact", "wing": "desercion"},
+            {"room": "general", "wing": "desercion-pascual"},
+            {"room": "general", "wing": "desertion"},
+            {"room": "heatstgnn-model-selection", "wing": "desertion"},
+            {"room": "diary", "wing": "desertion"},
+            {"room": "general", "wing": "matlab-drive"},
+            {"room": "documentation", "wing": "octopus"},
+            {"room": "plans", "wing": "octopus"},
+            {"room": "controller", "wing": "octopus"},
+        ]
+    )
+    with patch.dict(
+        graph_stats.__globals__,
+        {"_load_tunnels": lambda config=None: [{"id": "t1"}, {"id": "t2"}]},
+    ):
+        stats = graph_stats(col=col)
+
+    assert stats["total_rooms"] == 7
+    assert stats["total_room_instances"] == 9
+    assert stats["tunnel_rooms"] == stats["passive_tunnel_rooms"] == 1
+    assert stats["explicit_tunnels"] == 2
+    assert stats["total_connections"] == stats["total_edges"] + 2
+    assert set(stats["rooms_per_wing"]) == {
+        "desercion",
+        "desercion-pascual",
+        "desertion",
+        "matlab-drive",
+        "octopus",
+    }
+
+
+class TestChromaWingSourceCounts:
+    def test_reader_groups_transcript_sources_per_wing(self, tmp_path):
+        chromadb = pytest.importorskip("chromadb")
+        from mempalace.backends.chroma import sqlite_wing_source_counts
+
+        client = chromadb.PersistentClient(path=str(tmp_path))
+        col = client.get_or_create_collection("mempalace_drawers")
+        src = "/Users/me/.claude/projects/-Users-me-dev-thing/s.jsonl"
+        col.add(
+            ids=["a", "b", "c"],
+            documents=["x", "y", "z"],
+            metadatas=[
+                {"wing": "convos", "source_file": src},
+                {"wing": "convos", "source_file": src},
+                {"wing": "convos", "source_file": "notes.md"},
+            ],
+            embeddings=[[1.0, 0.0]] * 3,
+        )
+        rows = sqlite_wing_source_counts(str(tmp_path), "mempalace_drawers")
+        assert rows == [("convos", src, 2)]
+        assert sqlite_wing_source_counts(str(tmp_path), "other") is None

@@ -8,8 +8,13 @@ These tests don't hit the network. They mock urllib to verify:
 """
 
 import json
+import os
+import subprocess
+import sys
 import tempfile
 from unittest.mock import patch
+
+import pytest
 
 from mempalace.closet_llm import (
     LLMConfig,
@@ -196,9 +201,33 @@ class TestCallLLM:
                 }
             )
 
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            parsed, usage = _call_llm(cfg, "/tmp/x", "w", "r", "c")
+        with (
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+            patch("mempalace.closet_llm.time.sleep"),
+        ):
+            parsed, _ = _call_llm(cfg, "/tmp/x", "w", "r", "c")
         assert parsed is None
+
+    def test_retries_on_json_decode_error(self):
+        cfg = self._make_cfg()
+        call_count = {"n": 0}
+
+        def fake_urlopen(req, timeout=None):
+            call_count["n"] += 1
+            return _FakeResp(
+                {
+                    "choices": [{"message": {"content": "not json at all"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                }
+            )
+
+        with (
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+            patch("mempalace.closet_llm.time.sleep"),
+        ):
+            parsed, _ = _call_llm(cfg, "/tmp/x", "w", "r", "c")
+        assert parsed is None
+        assert call_count["n"] == 3
 
 
 # ── regenerate_closets error paths ───────────────────────────────────────
@@ -212,6 +241,73 @@ class TestRegenerateClosets:
             result = regenerate_closets(palace)
             assert result["error"] == "missing-config"
             assert any("ENDPOINT" in m for m in result["missing"])
+
+    def test_regen_refuses_before_open_or_llm_when_palace_has_writer(self, tmp_path, monkeypatch):
+        """The non-dry-run operation must contend for process-lifetime palace
+        ownership before it opens sqlite_exact or performs expensive/external
+        work."""
+        from mempalace import closet_llm as closet_llm_mod
+        from mempalace.palace import MineAlreadyRunning
+
+        palace = str(tmp_path / "palace")
+        os.makedirs(palace)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
+        holder_code = """
+import sys
+from mempalace.palace import mine_palace_lock
+with mine_palace_lock(sys.argv[1]):
+    print("ready", flush=True)
+    sys.stdin.read()
+"""
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_code, palace],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=os.environ.copy(),
+        )
+        try:
+            assert holder.stdout is not None
+            assert holder.stdout.readline().strip() == "ready"
+            cfg = LLMConfig(endpoint="http://local/v1", model="m")
+            with (
+                patch.object(
+                    closet_llm_mod,
+                    "get_collection",
+                    side_effect=AssertionError("collection opened before ownership"),
+                ),
+                patch.object(
+                    closet_llm_mod,
+                    "get_closets_collection",
+                    side_effect=AssertionError("closets opened before ownership"),
+                ),
+                patch.object(
+                    closet_llm_mod,
+                    "_call_llm",
+                    side_effect=AssertionError("LLM called before ownership"),
+                ),
+                patch.object(
+                    closet_llm_mod,
+                    "purge_file_closets",
+                    side_effect=AssertionError("delete reached before ownership"),
+                ),
+                patch.object(
+                    closet_llm_mod,
+                    "upsert_closet_lines",
+                    side_effect=AssertionError("upsert reached before ownership"),
+                ),
+            ):
+                with pytest.raises(MineAlreadyRunning):
+                    regenerate_closets(palace, cfg=cfg)
+        finally:
+            if holder.stdin is not None:
+                holder.stdin.close()
+            holder.wait(timeout=10)
+            if holder.returncode != 0:
+                stderr = holder.stderr.read() if holder.stderr is not None else ""
+                pytest.fail(f"lock holder failed with {holder.returncode}: {stderr}")
 
     def test_regen_purges_regex_closets_and_stamps_normalize_version(self, tmp_path):
         """Regression: before the hardening, regex closets for the same
@@ -288,13 +384,189 @@ class TestRegenerateClosets:
         survivors = closets.get(where={"source_file": source}, include=["documents", "metadatas"])
         assert survivors["ids"], "LLM closets should have been written"
         joined = "\n".join(survivors["documents"])
-        assert (
-            "STALE_REGEX_TOPIC" not in joined
-        ), "pre-existing regex closet was not purged before LLM write"
+        assert "STALE_REGEX_TOPIC" not in joined, (
+            "pre-existing regex closet was not purged before LLM write"
+        )
         assert "jwt auth" in joined
         for meta in survivors["metadatas"]:
             assert meta.get("generated_by", "").startswith("llm:")
             assert meta.get("normalize_version") == NORMALIZE_VERSION
+
+    def test_regen_paginates_drawer_fetch(self, tmp_path):
+        """Regression for #1073: drawers_col.get must be paginated at
+        batch_size=5000. A single get(limit=total, ...) on a palace with
+        more than SQLite's SQLITE_MAX_VARIABLE_NUMBER (32766) drawers
+        blows up inside chromadb. Matches the miner.status pattern
+        introduced in #851 (see #802, #850, #1073)."""
+        from mempalace import closet_llm as closet_llm_mod
+
+        palace = str(tmp_path / "palace")
+
+        # Build a fake collection: 12_000 drawers across 3 source files,
+        # enough to force 3 batches of batch_size=5000 (5000 + 5000 + 2000).
+        n_drawers = 12_000
+        ids = [f"d{i:05d}" for i in range(n_drawers)]
+        docs = [f"doc body {i}" for i in range(n_drawers)]
+        metas = [
+            {
+                "wing": "w",
+                "room": "r",
+                "source_file": f"/src/file_{i % 3}.md",
+                "entities": "",
+            }
+            for i in range(n_drawers)
+        ]
+
+        get_calls: list = []
+
+        class FakeDrawersCol:
+            def count(self):
+                return n_drawers
+
+            def get(self, limit=None, offset=0, include=None, **kwargs):
+                get_calls.append({"limit": limit, "offset": offset, "include": include})
+                end = min(offset + (limit or n_drawers), n_drawers)
+                return {
+                    "ids": ids[offset:end],
+                    "documents": docs[offset:end],
+                    "metadatas": metas[offset:end],
+                }
+
+        class FakeClosetsCol:
+            """Accept the purge + upsert calls the success path makes."""
+
+            def get(self, *a, **kw):
+                return {"ids": [], "documents": [], "metadatas": []}
+
+            def delete(self, *a, **kw):
+                return None
+
+            def upsert(self, *a, **kw):
+                return None
+
+        fake_drawers = FakeDrawersCol()
+        fake_closets = FakeClosetsCol()
+
+        def fake_urlopen(req, timeout=None):
+            return _FakeResp(
+                {
+                    "choices": [
+                        {"message": {"content": '{"topics":["t1"],"quotes":[],"summary":""}'}}
+                    ],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                }
+            )
+
+        cfg = LLMConfig(endpoint="http://local/v1", model="m")
+
+        with (
+            patch.object(closet_llm_mod, "get_collection", return_value=fake_drawers),
+            patch.object(closet_llm_mod, "get_closets_collection", return_value=fake_closets),
+            patch.object(closet_llm_mod, "purge_file_closets", return_value=None),
+            patch.object(closet_llm_mod, "upsert_closet_lines", return_value=None),
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+        ):
+            result = regenerate_closets(palace, cfg=cfg, dry_run=True)
+
+        # Three paginated calls: (limit=5000, offset=0), (5000, 5000), (5000, 10000).
+        assert len(get_calls) == 3, f"expected 3 batched fetches, got {len(get_calls)}"
+        for call in get_calls:
+            assert call["limit"] == 5000, (
+                f"batch must be 5000 — got {call['limit']} (would risk SQLITE_MAX_VARIABLE_NUMBER)"
+            )
+            # include must still request both documents and metadatas
+            assert "documents" in call["include"]
+            assert "metadatas" in call["include"]
+        assert [c["offset"] for c in get_calls] == [0, 5000, 10_000]
+
+        # by_source aggregation must be preserved exactly across batches:
+        # 12_000 drawers, 3 source files → 4_000 drawers each.
+        # dry_run=True short-circuits LLM calls but still walks by_source.
+        assert result.get("processed", 0) == 0  # dry_run
+        # Verify no single call tried to pull more than batch_size.
+        assert max(c["limit"] for c in get_calls) <= 5000
+
+    def test_regen_by_source_aggregates_across_batches(self, tmp_path):
+        """Pagination must not change the by_source grouping — drawers for
+        the same source_file split across batches still land in one group."""
+        from mempalace import closet_llm as closet_llm_mod
+
+        palace = str(tmp_path / "palace")
+
+        # 7_500 drawers, alternating between two source files → forces
+        # splits across the 5000/2500 boundary. Each source ends up with
+        # 3_750 drawers after regrouping.
+        n_drawers = 7_500
+        ids = [f"d{i:05d}" for i in range(n_drawers)]
+        docs = [f"body-{i}" for i in range(n_drawers)]
+        metas = [
+            {
+                "wing": "w",
+                "room": "r",
+                "source_file": f"/src/file_{i % 2}.md",
+                "entities": "",
+            }
+            for i in range(n_drawers)
+        ]
+
+        captured_sources: dict = {}
+
+        class FakeDrawersCol:
+            def count(self):
+                return n_drawers
+
+            def get(self, limit=None, offset=0, include=None, **kwargs):
+                end = min(offset + (limit or n_drawers), n_drawers)
+                return {
+                    "ids": ids[offset:end],
+                    "documents": docs[offset:end],
+                    "metadatas": metas[offset:end],
+                }
+
+        class FakeClosetsCol:
+            def get(self, *a, **kw):
+                return {"ids": [], "documents": [], "metadatas": []}
+
+            def delete(self, *a, **kw):
+                return None
+
+            def upsert(self, *a, **kw):
+                return None
+
+        # Hook _call_llm to inspect what regenerate_closets aggregated
+        # per source before the HTTP boundary.
+        real_call_llm = closet_llm_mod._call_llm
+
+        def spying_call_llm(cfg, source_file, wing, room, content):
+            captured_sources[source_file] = content
+            return (
+                {"topics": ["t"], "quotes": [], "summary": ""},
+                {"prompt_tokens": 1, "completion_tokens": 1},
+            )
+
+        cfg = LLMConfig(endpoint="http://local/v1", model="m")
+
+        with (
+            patch.object(closet_llm_mod, "get_collection", return_value=FakeDrawersCol()),
+            patch.object(closet_llm_mod, "get_closets_collection", return_value=FakeClosetsCol()),
+            patch.object(closet_llm_mod, "purge_file_closets", return_value=None),
+            patch.object(closet_llm_mod, "upsert_closet_lines", return_value=None),
+            patch.object(closet_llm_mod, "_call_llm", side_effect=spying_call_llm),
+        ):
+            regenerate_closets(palace, cfg=cfg)
+
+        # Both sources survived the pagination boundary.
+        assert set(captured_sources.keys()) == {"/src/file_0.md", "/src/file_1.md"}
+        # Each source accumulated exactly 3_750 drawer bodies, concatenated
+        # with the "\n\n" separator the regenerate path uses.
+        for source, content in captured_sources.items():
+            assert content.count("\n\n") == 3_749, (
+                f"{source}: expected 3_750 chunks joined (3_749 separators), "
+                f"got {content.count(chr(10) + chr(10)) + 1}"
+            )
+
+        # Silence unused-var lint.
+        assert real_call_llm is not None
 
     def test_regen_uses_basename_not_split_slash(self, tmp_path, monkeypatch):
         """Regression: the old closet_id base used ``source.split('/')[-1]``

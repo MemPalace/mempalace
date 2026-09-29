@@ -1,6 +1,6 @@
 # MCP Integration
 
-MemPalace provides 29 tools through the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/), giving any MCP-compatible AI full read/write access to your palace.
+MemPalace provides 47 tools through the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/), giving any MCP-compatible AI full read/write access to your palace.
 
 ## Setup
 
@@ -16,15 +16,17 @@ mempalace mcp
 
 ```bash
 claude mcp add mempalace -- python -m mempalace.mcp_server
+codex mcp add mempalace -- python -m mempalace.mcp_server
 ```
 
 ### With Custom Palace Path
 
 ```bash
 claude mcp add mempalace -- python -m mempalace.mcp_server --palace /path/to/palace
+codex mcp add mempalace -- python -m mempalace.mcp_server --palace /path/to/palace
 ```
 
-Now your AI has all 29 tools available. Ask it anything:
+Now your AI has all 47 tools available. Ask it anything:
 
 > *"What did we decide about auth last month?"*
 
@@ -35,6 +37,7 @@ Claude calls `mempalace_search` automatically, gets verbatim results, and answer
 MemPalace works with any tool that supports MCP:
 
 - **Claude Code** — native via plugin or manual MCP
+- **Codex CLI** — native via bundled Codex plugin or manual MCP
 - **OpenClaw** — via official skill, see [OpenClaw Skill](/guide/openclaw)
 - **ChatGPT** — via MCP bridge
 - **Cursor** — native MCP support
@@ -88,6 +91,7 @@ This protocol is what turns storage into memory — the AI knows to verify befor
 | `mempalace_kg_query` | Entity relationships with time filtering |
 | `mempalace_kg_add` | Add facts |
 | `mempalace_kg_invalidate` | Mark facts as ended |
+| `mempalace_kg_supersede` | Atomically replace one current fact with another |
 | `mempalace_kg_timeline` | Chronological entity story |
 | `mempalace_kg_stats` | Graph overview |
 

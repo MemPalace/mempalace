@@ -7,7 +7,9 @@ accumulate. This module finds drawers from the same source_file that
 are too similar (cosine distance < threshold), keeps the longest/richest
 version, and deletes the rest.
 
-No API calls — uses ChromaDB's built-in embedding similarity.
+Uses the configured storage backend's similarity search. With the default
+local backends (Chroma, sqlite_exact) this stays on-machine with no external
+calls; with a remote backend (e.g. Qdrant) it issues queries to that backend.
 
 Usage (standalone):
     python -m mempalace.dedup                          # dedup all
@@ -27,7 +29,7 @@ import os
 import time
 from collections import defaultdict
 
-from .backends.chroma import ChromaBackend
+from .palace import get_collection
 
 
 COLLECTION_NAME = "mempalace_drawers"
@@ -48,12 +50,29 @@ def _get_palace_path():
         return os.path.join(os.path.expanduser("~"), ".mempalace", "palace")
 
 
-def get_source_groups(col, min_count=MIN_DRAWERS_TO_CHECK, source_pattern=None, wing=None):
+def get_source_groups(
+    col, min_count=MIN_DRAWERS_TO_CHECK, source_pattern=None, wing=None, palace_path=None
+):
     """Group drawers by source_file, return groups with min_count+ entries.
 
     If wing is specified, only considers drawers in that wing. This catches
     cross-wing duplicates when the same source was mined into multiple wings.
+
+    ``palace_path``, when passed, preflights HNSW divergence before count():
+    a diverged segment can hit the #1222 SIGSEGV/panic class, which a
+    try/except around count() cannot catch. Omitted by existing callers
+    that don't have a palace_path handy (e.g. tests) -- the check is simply
+    skipped in that case, matching this function's pre-existing behavior.
     """
+    if palace_path is not None:
+        from .backends.chroma import hnsw_capacity_status
+
+        capacity_info = hnsw_capacity_status(palace_path, COLLECTION_NAME)
+        if capacity_info.get("diverged"):
+            print(f"\n  HNSW index is diverged: {capacity_info.get('message', '')}")
+            print("  Run `mempalace repair --mode from-sqlite --archive-existing` first.")
+            return {}
+
     total = col.count()
     groups = defaultdict(list)
 
@@ -89,7 +108,7 @@ def dedup_source_group(col, drawer_ids, threshold=DEFAULT_THRESHOLD, dry_run=Tru
     kept = []
     to_delete = []
 
-    for did, doc, meta in items:
+    for did, doc, _meta in items:
         if not doc or len(doc) < 20:
             to_delete.append(did)
             continue
@@ -130,9 +149,9 @@ def dedup_source_group(col, drawer_ids, threshold=DEFAULT_THRESHOLD, dry_run=Tru
 def show_stats(palace_path=None):
     """Show duplication statistics without making changes."""
     palace_path = palace_path or _get_palace_path()
-    col = ChromaBackend().get_collection(palace_path, COLLECTION_NAME)
+    col = get_collection(palace_path, COLLECTION_NAME)
 
-    groups = get_source_groups(col)
+    groups = get_source_groups(col, palace_path=palace_path)
 
     total_drawers = sum(len(ids) for ids in groups.values())
     print(f"\n  Sources with {MIN_DRAWERS_TO_CHECK}+ drawers: {len(groups)}")
@@ -162,17 +181,30 @@ def dedup_palace(
     print("  MemPalace Deduplicator")
     print(f"{'=' * 55}")
 
-    col = ChromaBackend().get_collection(palace_path, COLLECTION_NAME)
+    col = get_collection(palace_path, COLLECTION_NAME)
+
+    # Preflight HNSW divergence before this function's own count() print --
+    # get_source_groups's palace_path guard (added alongside this one) only
+    # covers its own internal count(), not this earlier one. count() on a
+    # diverged segment can hard-crash the process (#1222); a try/except
+    # cannot catch that, so it must never be reached at all when diverged.
+    from .backends.chroma import hnsw_capacity_status
+
+    capacity_info = hnsw_capacity_status(palace_path, COLLECTION_NAME)
+    if capacity_info.get("diverged"):
+        print(f"\n  HNSW index is diverged: {capacity_info.get('message', '')}")
+        print("  Run `mempalace repair --mode from-sqlite --archive-existing` first.")
+        return
 
     print(f"  Palace: {palace_path}")
     print(f"  Drawers: {col.count():,}")
     print(f"  Threshold: {threshold}")
     print(f"  Mode: {'DRY RUN' if dry_run else 'LIVE'}")
-    print(f"{'─' * 55}")
+    print(f"{'-' * 55}")
 
     if wing:
         print(f"  Wing: {wing}")
-    groups = get_source_groups(col, min_count, source_pattern, wing=wing)
+    groups = get_source_groups(col, min_count, source_pattern, wing=wing, palace_path=palace_path)
     print(f"\n  Sources to check: {len(groups)}")
 
     t0 = time.time()
@@ -195,7 +227,7 @@ def dedup_palace(
 
     elapsed = time.time() - t0
 
-    print(f"\n{'─' * 55}")
+    print(f"\n{'-' * 55}")
     print(f"  Done in {elapsed:.1f}s")
     print(
         f"  Drawers: {total_kept + total_deleted:,} → {total_kept:,}  (-{total_deleted:,} removed)"

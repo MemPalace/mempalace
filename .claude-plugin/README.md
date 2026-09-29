@@ -1,6 +1,6 @@
 # MemPalace Claude Code Plugin
 
-A Claude Code plugin that gives your AI a persistent memory system. Mine projects and conversations into a searchable palace backed by ChromaDB, with 19 MCP tools, auto-save hooks, and 5 guided skills.
+A Claude Code plugin that gives your AI a persistent memory system. Mine projects and conversations into a searchable palace backed by ChromaDB, with 45 MCP tools, auto-save hooks, and 5 guided commands.
 
 ## Prerequisites
 
@@ -23,7 +23,7 @@ claude plugin add /path/to/mempalace
 
 ## Post-Install Setup
 
-After installing the plugin, run the init command to complete setup (pip install, MCP configuration, etc.):
+After installing the plugin, run the init command to complete setup (installs the `mempalace` package via `uv tool` or `pip`, configures MCP, etc.):
 
 ```
 /mempalace:init
@@ -38,19 +38,21 @@ After installing the plugin, run the init command to complete setup (pip install
 | `/mempalace:search` | Search your memories across the palace |
 | `/mempalace:mine` | Mine projects and conversations into the palace |
 | `/mempalace:status` | Show palace overview -- wings, rooms, drawer counts |
+| `/mempalace:audit` | Score palace organization, then a guided repair session |
 
 ## Hooks
 
-MemPalace registers two hooks that run automatically:
+MemPalace registers three hooks that run automatically:
 
 - **Stop** -- Saves conversation context every 15 messages.
+- **SessionEnd** -- Runs one final save in the background on a clean exit, so short sessions that never hit the Stop interval or a compaction are still captured.
 - **PreCompact** -- Preserves important memories before context compaction.
 
 Set the `MEMPAL_DIR` environment variable to a directory path to automatically run `mempalace mine` on that directory during each save trigger.
 
 ## MCP Server
 
-The plugin automatically configures a local MCP server with 19 tools for storing, searching, and managing memories. No manual MCP setup is required -- `/mempalace:init` handles everything.
+The plugin automatically configures a local MCP server with 45 tools for storing, searching, managing memories, and coordinating agent tasks. No manual MCP setup is required -- `/mempalace:init` handles everything.
 
 ## Full Documentation
 

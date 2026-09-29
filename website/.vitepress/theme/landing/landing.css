@@ -24,23 +24,23 @@ body.mempalace-active .VPDoc {
 body.mempalace-active { overflow-x: hidden; }
 
 .mempalace-landing {
-  --void:        #05070A;
-  --obsidian:    #0A0D12;
-  --obsidian-2:  #11151C;
-  --ink:         #181D26;
-  --hair:        rgba(158, 216, 255, 0.14);
-  --hair-strong: rgba(158, 216, 255, 0.28);
-  --ice:         #EAF4FF;
-  --ice-dim:     #b8c7d9;
-  --ice-ghost:   rgba(234, 244, 255, 0.56);
-  --prism:       #9ED8FF;
-  --prism-core:  #4AA3FF;
-  --refract:     #A8B5FF;
-  --stellar:     #F3E7B0;
-  --ember:       #E28A6B;
+  --void:        #080C18;
+  --obsidian:    #0F1524;
+  --obsidian-2:  #182033;
+  --ink:         #1C2640;
+  --hair:        rgba(56, 189, 248, 0.14);
+  --hair-strong: rgba(56, 189, 248, 0.28);
+  --ice:         #DBE7F5;
+  --ice-dim:     #8B99B0;
+  --ice-ghost:   rgba(219, 231, 245, 0.56);
+  --prism:       #7DD3FC;
+  --prism-core:  #38BDF8;
+  --refract:     #A78BFA;
+  --stellar:     #FBBF24;
+  --ember:       #FF8B8B;
 
-  --f-display: "Cormorant Garamond", "Times New Roman", serif;
-  --f-body:    "Geist", ui-sans-serif, system-ui, sans-serif;
+  --f-display: "Neue Machina", "Satoshi", sans-serif;
+  --f-body:    "Onest", ui-sans-serif, system-ui, sans-serif;
   --f-mono:    "JetBrains Mono", ui-monospace, monospace;
 
   --measure: 68ch;
@@ -50,7 +50,7 @@ body.mempalace-active { overflow-x: hidden; }
   background: var(--void);
   color: var(--ice);
   font-family: var(--f-body);
-  font-weight: 300;
+  font-weight: 400;
   font-size: 16px;
   line-height: 1.6;
   -webkit-font-smoothing: antialiased;
@@ -60,16 +60,16 @@ body.mempalace-active { overflow-x: hidden; }
   position: relative;
 }
 .mempalace-landing * { box-sizing: border-box; }
-.mempalace-landing ::selection { background: var(--prism-core); color: var(--void); }
+.mempalace-landing ::selection { background: var(--prism-core); color: #080C18; }
 
 .mempalace-landing::before {
   content: "";
   position: fixed; inset: 0;
   pointer-events: none;
   background:
-    radial-gradient(80% 60% at 50% -10%, rgba(74,163,255,0.18), transparent 60%),
-    radial-gradient(40% 40% at 85% 20%, rgba(168,181,255,0.08), transparent 70%),
-    radial-gradient(50% 50% at 15% 80%, rgba(158,216,255,0.06), transparent 70%);
+    radial-gradient(80% 60% at 50% -10%, rgba(56,189,248,0.18), transparent 60%),
+    radial-gradient(40% 40% at 85% 20%, rgba(167,139,250,0.08), transparent 70%),
+    radial-gradient(50% 50% at 15% 80%, rgba(125,211,252,0.06), transparent 70%);
   z-index: 0;
 }
 .mempalace-landing::after {
@@ -153,7 +153,7 @@ body.mempalace-active { overflow-x: hidden; }
   line-height: 0.95;
   color: var(--ice);
 }
-.mempalace-landing .display em { font-style: italic; color: var(--prism); }
+.mempalace-landing .display em { font-style: italic; color: var(--prism-core); }
 .mempalace-landing .lede {
   font-family: var(--f-display);
   /* font-style: italic; */
@@ -237,8 +237,11 @@ body.mempalace-active { overflow-x: hidden; }
   margin: 0 0 1.25rem;
 }
 .mempalace-landing .hero h1 .line { display: block; }
-.mempalace-landing .hero h1 .line-2 { font-style: italic; color: var(--prism); font-weight: 300; }
+.mempalace-landing .hero h1 .line-2 { font-style: normal; font-weight: 400; }
+.mempalace-landing .hero h1 .is-accent { font-style: italic; color: var(--prism-core); font-weight: 300; }
+.mempalace-landing .hero h1 .identity-white { color: #ffffff; }
 .mempalace-landing .hero .lede { margin-bottom: 0; }
+.mempalace-landing .hero .lede .mp-blue { color: var(--prism-core); font-weight: 500; }
 .mempalace-landing .hero-cta {
   display: flex;
   flex-wrap: wrap;

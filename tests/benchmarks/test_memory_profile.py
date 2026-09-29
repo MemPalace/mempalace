@@ -84,8 +84,9 @@ class TestToolStatusMemoryProfile:
 
         cfg = MempalaceConfig(config_dir=str(tmp_path / "cfg"))
         monkeypatch.setattr(cfg, "_file_config", {"palace_path": palace_path})
+        kg = KnowledgeGraph(db_path=str(tmp_path / "kg.sqlite3"))
         monkeypatch.setattr(mcp_mod, "_config", cfg)
-        monkeypatch.setattr(mcp_mod, "_kg", KnowledgeGraph(db_path=str(tmp_path / "kg.sqlite3")))
+        monkeypatch.setattr(mcp_mod, "_get_kg", lambda: kg)
 
         from mempalace.mcp_server import tool_status
 

@@ -27,6 +27,7 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from datetime import datetime, timezone
@@ -34,6 +35,8 @@ from datetime import datetime, timezone
 # Share miner's mtime-cached registry loader so we don't double-read
 # ~/.mempalace/known_entities.json on every check_text call.
 from .miner import _load_known_entities_raw
+
+logger = logging.getLogger("mempalace_mcp")
 
 
 # Narrow detection patterns — parse "X is Y's Z" and "X's Z is Y".
@@ -214,6 +217,7 @@ def _check_kg_contradictions(text: str, palace_path: str) -> list:
         try:
             facts = kg.query_entity(subject, direction="outgoing")
         except Exception:
+            logger.debug("KG lookup failed for subject %r", subject, exc_info=True)
             continue
         if not facts:
             continue
@@ -303,10 +307,38 @@ def _edit_distance(s1: str, s2: str) -> int:
     return prev[-1]
 
 
+def _reconfigure_stdio_utf8_on_windows():
+    """Decode --stdin payload as UTF-8 on Windows.
+
+    Thin wrapper around the shared helper in ``mempalace._stdio``. Mirrors
+    the primary CLI policy: stdout/stderr use ``replace`` because
+    extracted fact text can include surrogate halves round-tripped from
+    filenames -- ``strict`` would raise UnicodeEncodeError mid-print.
+    stdin keeps the default ``surrogateescape``.
+    """
+    from ._stdio import reconfigure_stdio_utf8_on_windows
+
+    reconfigure_stdio_utf8_on_windows(stdout_errors="replace", stderr_errors="replace")
+
+
+def _default_palace_path() -> str:
+    """Resolve the default `--palace` location for the CLI.
+
+    Routes through `MempalaceConfig().palace_path` so XDG-aware config-dir
+    setups (and any `MEMPALACE_PALACE_PATH` override) win over the legacy
+    `~/.mempalace/palace` hardcoding this used to default to.
+    """
+    from .config import MempalaceConfig
+
+    return str(MempalaceConfig().palace_path)
+
+
 if __name__ == "__main__":
     import argparse
     import json
     import sys
+
+    _reconfigure_stdio_utf8_on_windows()
 
     parser = argparse.ArgumentParser(
         description="Check text against known facts in the MemPalace palace.",
@@ -315,7 +347,7 @@ if __name__ == "__main__":
     parser.add_argument("text", nargs="?", help="Text to check (or use --stdin).")
     parser.add_argument(
         "--palace",
-        default=os.path.expanduser("~/.mempalace/palace"),
+        default=_default_palace_path(),
         help="Path to the palace directory.",
     )
     parser.add_argument("--stdin", action="store_true", help="Read text from stdin.")

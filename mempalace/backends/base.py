@@ -1,49 +1,910 @@
-"""Abstract collection interface for MemPalace storage backends."""
+"""Storage backend contract for MemPalace (RFC 001).
+
+This module defines the surface every storage backend must implement:
+
+* ``BaseCollection`` — the per-collection read/write interface, kwargs-only.
+* ``BaseBackend`` — the per-palace factory, addressed by ``PalaceRef``.
+* ``QueryResult`` / ``GetResult`` — typed result dataclasses that replace the
+  Chroma dict shape as the canonical return type.
+* Error classes + ``HealthStatus`` — uniform across backends.
+
+This is the v1 cleanup from RFC 001 §10: full typed results, ``PalaceRef``,
+registry-ready ABC. Embedder injection, maintenance hooks, and the full
+conformance suite land in follow-up PRs.
+"""
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import ClassVar, Optional, Protocol, runtime_checkable
+
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+
+class BackendError(Exception):
+    """Base class for every storage-backend error raised by core."""
+
+
+class PalaceNotFoundError(BackendError, FileNotFoundError):
+    """Raised when ``get_collection(create=False)`` is called on a missing palace.
+
+    Subclass of ``FileNotFoundError`` so legacy callers that catch the latter
+    (pre-#413 seam) keep working unchanged.
+    """
+
+
+class CollectionNotInitializedError(PalaceNotFoundError):
+    """Raised when the palace exists on disk but the requested collection has
+    never been created (e.g. ``init`` ran but ``mine`` has not).
+
+    Distinct from :class:`PalaceNotFoundError`: the palace dir and DB are
+    present and valid, only the collection has not been bootstrapped yet.
+    Subclass of :class:`PalaceNotFoundError` (and therefore
+    :class:`FileNotFoundError`) so legacy callers catching either parent
+    keep working unchanged.
+    """
+
+
+class BackendClosedError(BackendError):
+    """Raised when a backend method is called after ``close()``."""
+
+
+class UnsupportedFilterError(BackendError):
+    """Raised when a where-clause uses an operator the backend does not implement.
+
+    Silent dropping of unknown operators is forbidden by spec (RFC 001 §1.4).
+    """
+
+
+class UnsupportedCapabilityError(BackendError):
+    """Raised when a backend does not implement an optional capability."""
+
+
+class UnsupportedMaintenanceKindError(BackendError):
+    """Raised when ``run_maintenance(kind)`` is called with an unadvertised kind.
+
+    A backend MUST advertise a kind in ``maintenance_kinds`` before it accepts
+    it (RFC 001). Advertising a kind it does not implement is a conformance
+    failure; a kind it has no analogue for MUST be omitted, not no-op'd.
+    """
+
+
+class BackendMismatchError(BackendError):
+    """Raised when a selected backend does not match existing palace artifacts."""
+
+
+class DimensionMismatchError(BackendError):
+    """Raised when the embedding dimension on write does not match the collection."""
+
+
+class EmbedderIdentityMismatchError(BackendError):
+    """Raised when the stored embedder model name differs from the current one."""
+
+
+class EmbedderIdentityUnknownWarning(UserWarning):
+    """Emitted on first open of a collection with no recorded embedder identity.
+
+    Legacy palaces created before identity tracking carry no model name. Per
+    RFC 001 the right behavior is warn-not-fail: the identity is recorded on
+    the next write and subsequent opens become strict.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Value objects
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PalaceRef:
+    """A handle to a palace, consumed by backends.
+
+    ``id`` is always present and is the key backends use to cache handles.
+    ``local_path`` is populated for filesystem-rooted palaces.
+    ``namespace`` is used by server-mode backends for tenant / prefix routing.
+
+    Isolation contract (RFC 001 §2.1, conformance: ``tests/test_backend_conformance.py``)
+    -----------------------------------------------------------------------------------
+    ``id`` is the *required* isolation key. Within a single backend instance:
+
+        A record written for one ``PalaceRef.id`` MUST NOT be returned,
+        modified, or deleted by an operation issued for a different
+        ``PalaceRef.id``. Cross-palace access is a spec violation.
+
+    ``namespace`` is *additional* partitioning, honored only by backends that
+    advertise the ``supports_namespace_isolation`` capability. For those
+    backends the same guarantee extends to namespaces:
+
+        A record written under one ``namespace`` MUST NOT be returned,
+        modified, or deleted by an operation issued under a different
+        ``namespace`` within the same backend instance. Cross-namespace
+        access is a spec violation.
+
+    Backends that do not advertise ``supports_namespace_isolation`` (e.g.
+    path-rooted ``chroma`` / ``sqlite_exact``) MUST NOT silently accept and
+    ignore a populated ``namespace`` — they MUST raise
+    :class:`UnsupportedCapabilityError` (same spirit as
+    :class:`UnsupportedFilterError`). Callers targeting those backends MUST
+    leave ``namespace`` as ``None``. Isolation conformance lives in
+    ``tests/_backend_conformance.py`` (cross-id arm for every backend;
+    same-id / different-namespace arm for advertisers only).
+    """
+
+    id: str
+    local_path: Optional[str] = None
+    namespace: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class EmbedderIdentity:
+    """Identity of the embedder that produced a collection's vectors (RFC 001).
+
+    ``model_name`` is the stable identity persisted alongside a collection and
+    checked on subsequent opens. ``dimension`` is the vector width. A
+    ``dimension`` of ``0`` means *unknown / not probed* — comparisons treat it
+    as "no dimension signal" rather than a real zero-width vector, so a cheap
+    read-path check can compare model names without loading the model.
+    """
+
+    model_name: str
+    dimension: int = 0
+
+
+@dataclass(frozen=True)
+class MaintenanceResult:
+    """Observable outcome of ``run_maintenance(kind)`` (RFC 001).
+
+    Maintenance is *not* fire-and-forget: a backend MUST serialize concurrent
+    same-kind runs and report the outcome so a caller can learn it must not
+    re-trigger. ``status`` is one of:
+
+    * ``"ran"`` — this call performed the maintenance.
+    * ``"already_running"`` — another caller holds the work; this call did
+      nothing and the caller MUST NOT re-trigger (the production index-build
+      wedge: concurrent writers each issuing the build stacked exclusive locks).
+    * ``"noop"`` — nothing needed doing (e.g. the index already exists).
+
+    ``stats`` is free-form per kind (rows analyzed, bytes reclaimed, index
+    build time) for benchmark/operator reporting.
+    """
+
+    kind: str
+    status: str
+    stats: dict = field(default_factory=dict)
+
+
+@runtime_checkable
+class Embedder(Protocol):
+    """Minimal embedder contract (RFC 001, normative for identity checking).
+
+    The fuller embedder RFC (batching/async/pooling) is additive; identity
+    enforcement depends only on these three members.
+    """
+
+    model_name: str
+    dimension: int
+
+    def embed(self, texts: list[str]) -> list[list[float]]: ...
+
+
+def check_embedder_identity(
+    stored: Optional[EmbedderIdentity],
+    current: Optional[EmbedderIdentity],
+    *,
+    force_model_swap: bool = False,
+) -> str:
+    """Three-state embedder-identity check (RFC 001).
+
+    Returns the resolved state and raises on a hard, unforced conflict:
+
+    * ``"unknown"`` — no identity recorded yet (legacy collection), or the
+      current embedder is nameless. The caller warns and records on write.
+    * ``"known_match"`` — stored name (and dimension, when both known) equal
+      the current embedder. Proceed normally.
+    * ``"known_mismatch"`` — names or dimensions differ. Without
+      ``force_model_swap`` this raises (:class:`EmbedderIdentityMismatchError`
+      for a model swap, :class:`DimensionMismatchError` for a width change,
+      which is checked first because mismatched vectors are physically
+      unusable). With ``force_model_swap`` it returns the state so the caller
+      can re-record the identity and log the swap.
+
+    A ``dimension`` of ``0`` on either side means "unknown" and is skipped, so
+    a model-name-only check (cheap read path) still works.
+    """
+    if current is None or not current.model_name:
+        return "unknown"
+    if stored is None:
+        return "unknown"
+
+    dim_conflict = bool(stored.dimension and current.dimension) and (
+        stored.dimension != current.dimension
+    )
+    name_conflict = stored.model_name != current.model_name
+
+    if not dim_conflict and not name_conflict:
+        return "known_match"
+
+    if force_model_swap:
+        return "known_mismatch"
+
+    if dim_conflict:
+        raise DimensionMismatchError(
+            f"collection was built with a {stored.dimension}-dim embedder "
+            f"({stored.model_name!r}) but the current embedder is "
+            f"{current.dimension}-dim ({current.model_name!r}); the stored "
+            "vectors are incompatible. Re-embed the palace to switch models."
+        )
+    raise EmbedderIdentityMismatchError(
+        f"collection was built with embedder {stored.model_name!r} but the "
+        f"current embedder is {current.model_name!r}. Searching across a model "
+        "swap silently degrades recall. Re-embed the palace, or run "
+        "`mempalace palace set-embedder --model <name> --force` to record the "
+        "new identity if you know the vectors are compatible."
+    )
+
+
+@dataclass(frozen=True)
+class HealthStatus:
+    ok: bool
+    detail: str = ""
+
+    @classmethod
+    def healthy(cls, detail: str = "") -> "HealthStatus":
+        return cls(ok=True, detail=detail)
+
+    @classmethod
+    def unhealthy(cls, detail: str) -> "HealthStatus":
+        return cls(ok=False, detail=detail)
+
+
+_TYPED_RESULT_FIELDS = ("ids", "documents", "metadatas", "distances", "embeddings")
+
+
+class _DictCompatMixin:
+    """Transitional dict-protocol access for typed results.
+
+    RFC 001 §1.3 spec is attribute access (``result.ids``). The ``result["ids"]``
+    and ``result.get("ids")`` forms are retained as a migration shim for callers
+    that predate the typed interface and are scheduled for removal in a follow-
+    up cleanup. New code MUST use attribute access.
+    """
+
+    def __getitem__(self, key: str):
+        if key in _TYPED_RESULT_FIELDS:
+            return getattr(self, key)
+        raise KeyError(key)
+
+    def get(self, key: str, default=None):
+        if key in _TYPED_RESULT_FIELDS:
+            val = getattr(self, key, default)
+            return default if val is None else val
+        return default
+
+    def __contains__(self, key: object) -> bool:
+        return key in _TYPED_RESULT_FIELDS and getattr(self, key, None) is not None
+
+
+@dataclass(frozen=True)
+class QueryResult(_DictCompatMixin):
+    """Typed return from ``BaseCollection.query``.
+
+    Outer list dimension = number of query vectors / texts.
+    Inner list dimension = hits per query (may be zero).
+
+    Fields not in ``include=`` at the call site are populated with empty lists
+    of the correct outer shape (never ``None``), except ``embeddings`` which
+    is ``None`` when not requested.
+    """
+
+    ids: list[list[str]]
+    documents: list[list[str]]
+    metadatas: list[list[dict]]
+    distances: list[list[float]]
+    embeddings: Optional[list[list[list[float]]]] = None
+
+    @classmethod
+    def empty(cls, num_queries: int = 1, embeddings_requested: bool = False) -> "QueryResult":
+        """Construct an all-empty result preserving outer dimension.
+
+        When ``embeddings_requested`` is True, ``embeddings`` preserves the outer
+        query dimension with empty hit lists (matching the spec's rule that fields
+        requested via ``include=`` carry the outer shape even when empty). When
+        False, ``embeddings`` stays ``None`` to signal the field was not requested.
+        """
+        empty_outer = [[] for _ in range(num_queries)]
+        return cls(
+            ids=[[] for _ in range(num_queries)],
+            documents=[[] for _ in range(num_queries)],
+            metadatas=[[] for _ in range(num_queries)],
+            distances=[[] for _ in range(num_queries)],
+            embeddings=empty_outer if embeddings_requested else None,
+        )
+
+
+@dataclass(frozen=True)
+class GetResult(_DictCompatMixin):
+    """Typed return from ``BaseCollection.get``."""
+
+    ids: list[str]
+    documents: list[str]
+    metadatas: list[dict]
+    embeddings: Optional[list[list[float]]] = None
+
+    @classmethod
+    def empty(cls) -> "GetResult":
+        return cls(ids=[], documents=[], metadatas=[], embeddings=None)
+
+
+@dataclass(frozen=True)
+class LexicalHit:
+    """One hit from backend lexical candidate search."""
+
+    id: str
+    document: str
+    metadata: dict
+    score: float
+
+
+@dataclass(frozen=True)
+class LexicalResult:
+    """Typed return from ``BaseCollection.lexical_search``."""
+
+    hits: list[LexicalHit]
+
+
+def recency_sort_key(meta: Optional[dict], order_field: str = "filed_at") -> tuple[int, str]:
+    """Sort key for newest-first ordering on an ISO-8601 metadata field.
+
+    Returns ``(1, value)`` for a usable timestamp string and ``(0, "")``
+    otherwise, so that with ``reverse=True`` records missing the field sort
+    last instead of raising on a str/None comparison. Backends that implement
+    :meth:`BaseCollection.get_recent` with a local sort MUST use this key so
+    every backend orders identically.
+
+    This compares the timestamps as *text*, which is chronological only while
+    every value shares one offset representation. It is not a new assumption:
+    Layer 1 has sorted ``filed_at`` as text since #1630 and this key just
+    names the behaviour. It is also not currently true of ``filed_at`` --
+    ``diary_ingest`` writes ``datetime.now(timezone.utc).isoformat()``
+    (``...+00:00``) while every other writer uses ``datetime.now().isoformat()``
+    (naive local), so on a host that is not on UTC the two sort against each
+    other skewed by the local offset. Standardising the writers is a separate
+    change; it needs a migration for palaces that already hold both forms.
+    """
+    value = (meta or {}).get(order_field)
+    if not isinstance(value, str) or not value:
+        return (0, "")
+    return (1, value)
+
+
+def _recency_order(metadatas: list[dict], order_field: str) -> list[int]:
+    """Indices into ``metadatas``, newest first, missing timestamps last."""
+    return sorted(
+        range(len(metadatas)),
+        key=lambda i: recency_sort_key(metadatas[i], order_field),
+        reverse=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Collection contract
+# ---------------------------------------------------------------------------
+
+
+def initialize_last_modified_metadata(metadatas):
+    """Initialize last_modified from filed_at without mutating caller data."""
+    if metadatas is None:
+        return None
+
+    items = [metadatas] if isinstance(metadatas, dict) else list(metadatas)
+    result = []
+
+    for metadata in items:
+        if not isinstance(metadata, dict):
+            result.append(metadata)
+            continue
+
+        updated = dict(metadata)
+        filed_at = updated.get("filed_at")
+
+        if filed_at and not updated.get("last_modified"):
+            updated["last_modified"] = filed_at
+
+        result.append(updated)
+
+    return result
 
 
 class BaseCollection(ABC):
-    """Smallest collection contract the rest of MemPalace relies on."""
+    """Per-collection read/write surface every backend must implement."""
 
     @abstractmethod
     def add(
         self,
         *,
-        documents: List[str],
-        ids: List[str],
-        metadatas: Optional[List[Dict[str, Any]]] = None,
-    ) -> None:
-        raise NotImplementedError
+        documents: list[str],
+        ids: list[str],
+        metadatas: Optional[list[dict]] = None,
+        embeddings: Optional[list[list[float]]] = None,
+    ) -> None: ...
 
     @abstractmethod
     def upsert(
         self,
         *,
-        documents: List[str],
-        ids: List[str],
-        metadatas: Optional[List[Dict[str, Any]]] = None,
+        documents: list[str],
+        ids: list[str],
+        metadatas: Optional[list[dict]] = None,
+        embeddings: Optional[list[list[float]]] = None,
+    ) -> None: ...
+
+    @abstractmethod
+    def query(
+        self,
+        *,
+        query_texts: Optional[list[str]] = None,
+        query_embeddings: Optional[list[list[float]]] = None,
+        n_results: int = 10,
+        where: Optional[dict] = None,
+        where_document: Optional[dict] = None,
+        include: Optional[list[str]] = None,
+    ) -> QueryResult: ...
+
+    @abstractmethod
+    def get(
+        self,
+        *,
+        ids: Optional[list[str]] = None,
+        where: Optional[dict] = None,
+        where_document: Optional[dict] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        include: Optional[list[str]] = None,
+    ) -> GetResult: ...
+
+    @abstractmethod
+    def delete(
+        self,
+        *,
+        ids: Optional[list[str]] = None,
+        where: Optional[dict] = None,
+    ) -> None: ...
+
+    @abstractmethod
+    def count(self) -> int: ...
+
+    # ------------------------------------------------------------------
+    # Optional methods with ABC defaults (spec §1.2)
+    # ------------------------------------------------------------------
+
+    def estimated_count(self) -> int:
+        return self.count()
+
+    def close(self) -> None:
+        return None
+
+    def health(self) -> HealthStatus:
+        return HealthStatus.healthy()
+
+    @property
+    def distance_metric(self) -> str:
+        """The space this collection's ``distances`` are reported in.
+
+        Defaults to the owning backend's declared metric (cosine for all
+        in-tree backends). Collections that can vary per-collection — e.g. a
+        legacy Chroma palace built without ``hnsw:space=cosine`` — override
+        this to report their actual space so core ranking converts correctly.
+        """
+        return "cosine"
+
+    def get_stored_embedder_identity(self) -> Optional[EmbedderIdentity]:
+        """Return the embedder identity recorded for this collection, if any.
+
+        Returns ``None`` when nothing is recorded — a legacy collection, or a
+        backend that does not yet persist identity. Core treats ``None`` as the
+        ``unknown`` state (warn, do not fail). Backends override this and
+        :meth:`set_embedder_identity` against their own metadata store.
+        """
+        return None
+
+    def set_embedder_identity(self, identity: EmbedderIdentity) -> None:
+        """Persist this collection's embedder identity. Default: no-op.
+
+        A backend without an identity slot inherits the no-op default and so
+        stays permanently ``unknown`` (safe — it simply never enforces). The
+        enforcement choke point calls this when recording on first write or
+        on an explicit, forced model swap.
+        """
+        return None
+
+    def effective_embedder_identity(self) -> Optional[EmbedderIdentity]:
+        """The identity of the embedder this collection actually uses.
+
+        For ``server_embedder`` backends that ignore the injected embedder,
+        this reports the server-side embedder so the same identity rules apply
+        (RFC 001). Defaults to ``None`` — the collection is embedded by the
+        injected/core embedder, and the caller supplies the current identity.
+        """
+        return None
+
+    def get_all_metadata(self, where: Optional[dict] = None) -> list[dict]:
+        """Return every matching record's metadata in one logical pass (#1796).
+
+        Default implementation pages through :meth:`get` using
+        ``limit``/``offset`` -- correct for backends with a real server-side
+        cursor (e.g. Chroma's SQL OFFSET), and the same shape callers already
+        relied on before this method existed.
+
+        Backends whose ``get(limit=, offset=)`` is implemented by fully
+        materializing a result set and then Python-slicing it (no true
+        server-side cursor) MUST override this method to walk their native
+        cursor exactly once instead. Calling the default implementation on
+        such a backend is O(n^2) in collection size: each page re-walks the
+        entire collection just to discard everything outside the requested
+        slice. See issue #1796.
+        """
+        all_meta: list[dict] = []
+        offset = 0
+        page_size = 1000
+        while True:
+            kwargs: dict = {"include": ["metadatas"], "limit": page_size, "offset": offset}
+            if where:
+                kwargs["where"] = where
+            batch = self.get(**kwargs)
+            batch_meta = batch.metadatas if hasattr(batch, "metadatas") else batch.get("metadatas")
+            if not batch_meta:
+                break
+            all_meta.extend(batch_meta)
+            if len(batch_meta) < page_size:
+                break
+            offset += len(batch_meta)
+        return all_meta
+
+    def get_all_rows(
+        self, where: Optional[dict] = None, include: Optional[list[str]] = None
+    ) -> GetResult:
+        """Return every matching record -- ids plus the ``include``d fields --
+        in one logical pass (#2452).
+
+        The ids-carrying sibling of :meth:`get_all_metadata`, for callers that
+        need to know *which* rows they got (``list_drawers`` collapses chunk
+        rows into logical drawers by id). ``include`` defaults to
+        ``["metadatas"]``; ``documents``/``metadatas`` come back aligned with
+        ``ids`` when requested and empty otherwise. Same contract as
+        ``get_all_metadata``: the default pages through :meth:`get` with
+        ``limit``/``offset``, and backends without a real server-side cursor
+        MUST override it with a single native walk, or every page re-scans
+        the whole collection (O(n^2)).
+        """
+        include = list(include) if include else ["metadatas"]
+        want_docs = "documents" in include
+        want_meta = "metadatas" in include
+        ids: list[str] = []
+        documents: list = []
+        metadatas: list = []
+        offset = 0
+        page_size = 1000
+        while True:
+            kwargs: dict = {"include": include, "limit": page_size, "offset": offset}
+            if where:
+                kwargs["where"] = where
+            batch = self.get(**kwargs)
+            batch_ids = batch.ids if hasattr(batch, "ids") else batch.get("ids")
+            if not batch_ids:
+                break
+            ids.extend(batch_ids)
+            if want_docs:
+                batch_docs = (
+                    batch.documents if hasattr(batch, "documents") else batch.get("documents")
+                )
+                documents.extend(batch_docs or [])
+            if want_meta:
+                batch_meta = (
+                    batch.metadatas if hasattr(batch, "metadatas") else batch.get("metadatas")
+                )
+                metadatas.extend(batch_meta or [])
+            if len(batch_ids) < page_size:
+                break
+            offset += len(batch_ids)
+        return GetResult(ids=ids, documents=documents, metadatas=metadatas, embeddings=None)
+
+    def get_recent(
+        self,
+        *,
+        limit: int,
+        where: Optional[dict] = None,
+        order_field: str = "filed_at",
+        include: Optional[list[str]] = None,
+    ) -> GetResult:
+        """Return up to ``limit`` records, newest first by ``order_field``.
+
+        ``order_field`` names a metadata key holding an ISO-8601 timestamp
+        string (``filed_at`` for drawers). Ordering is descending on that
+        string; see :func:`recency_sort_key` for what text ordering promises.
+        Records whose value is missing, empty, or not a string sort last.
+
+        The default implementation pages through :meth:`get` in storage order
+        up to ``limit`` records and sorts that window locally. That is exact
+        when the collection holds no more than ``limit`` records matching
+        ``where``, and *approximate* above that: the window is whatever the
+        backend hands back first, so the genuinely newest records can fall
+        outside it (issue #1630's known limitation for Layer 1 wake-up).
+        Backends able to push the ordering into storage MUST override this and
+        advertise the ``supports_recency_order`` capability token. What that
+        token promises, exactly:
+
+        * The returned records really are the top ``limit`` under the ordering
+          above, at any collection size, **whenever the backend can also
+          evaluate ``where`` in storage** (including ``where=None``).
+        * It says nothing about whether that text ordering matches wall-clock
+          order. That is a property of what the writers store, not of the
+          backend.
+        * A filter the backend cannot push into storage has to be evaluated
+          record by record, so a backend MAY bound how far it walks and return
+          fewer than ``limit`` records rather than read the whole collection.
+          A backend that bounds it MUST document the bound on its override.
+          pgvector does; see :meth:`PgVectorCollection._scroll_recent_local`.
+
+        Callers that need the guarantee should check the token rather than
+        assume it, and should read it as covering the filters the backend can
+        push down. The default is always available so no backend breaks.
+
+        ``include`` follows the same contract as :meth:`get`: projections the
+        caller did not ask for come back empty. ``metadatas`` is fetched
+        regardless because the sort reads ``order_field`` from it, but it is
+        only *returned* when requested.
+        """
+        if limit <= 0:
+            return GetResult.empty()
+        include = ["documents", "metadatas"] if include is None else list(include)
+        want_documents = "documents" in include
+        want_metadatas = "metadatas" in include
+        # The local sort needs order_field, so metadatas always come back from
+        # the backend even when the caller projected them out of the result.
+        fetch_include = include if want_metadatas else [*include, "metadatas"]
+
+        ids: list[str] = []
+        documents: list[str] = []
+        metadatas: list[dict] = []
+        offset = 0
+        fetched = 0
+        page_size = min(500, limit)
+        while fetched < limit:
+            kwargs: dict = {"include": fetch_include, "limit": page_size, "offset": offset}
+            if where:
+                kwargs["where"] = where
+            batch = self.get(**kwargs)
+            batch_ids = list(batch.get("ids") or [])
+            batch_docs = list(batch.get("documents") or [])
+            batch_metas = list(batch.get("metadatas") or [])
+            page_len = max(len(batch_ids), len(batch_docs), len(batch_metas))
+            if not page_len:
+                break
+            # Pad the projections the caller did not request so the three
+            # lists stay index-aligned for the sort below.
+            ids.extend(batch_ids or [""] * page_len)
+            documents.extend(batch_docs or [""] * page_len)
+            metadatas.extend(batch_metas or [{}] * page_len)
+            offset += page_len
+            fetched += page_len
+            if page_len < page_size:
+                break
+
+        n = min(len(ids), len(documents), len(metadatas))
+        ids, documents, metadatas = ids[:n], documents[:n], metadatas[:n]
+        order = _recency_order(metadatas, order_field)[:limit]
+        return GetResult(
+            ids=[ids[i] for i in order],
+            documents=[documents[i] for i in order] if want_documents else [],
+            metadatas=[metadatas[i] for i in order] if want_metadatas else [],
+            embeddings=None,
+        )
+
+    def facet_counts(
+        self,
+        field: str,
+        where: Optional[dict] = None,
+        limit: int = 1000,
+    ) -> dict[str, int]:
+        """Return counts for each distinct value of a metadata field."""
+        raise UnsupportedCapabilityError("backend does not support facet_counts")
+
+    def maintenance_state(self) -> dict:
+        """Return a structured snapshot of this collection's maintenance state.
+
+        Free-form per backend (e.g. row count, whether a vector index exists,
+        last-analyze age). Used by benchmark harnesses to record state
+        alongside each latency/recall measurement so an un-analyzed store is
+        not compared against a settled one (RFC 001). Backends should include
+        a JSON-compatible ``consistency_token`` when they can cheaply detect
+        writes that preserve the row count. Defaults to empty.
+        """
+        return {}
+
+    def run_maintenance(self, kind: str) -> "MaintenanceResult":
+        """Run a maintenance ``kind`` and return an observable result (RFC 001).
+
+        Backends advertise supported kinds in ``BaseBackend.maintenance_kinds``
+        and override this. The default supports nothing, so every kind raises
+        :class:`UnsupportedMaintenanceKindError`. Implementations MUST serialize
+        concurrent same-kind runs and report ``already_running`` rather than
+        stacking the work.
+        """
+        raise UnsupportedMaintenanceKindError(f"backend does not support maintenance kind {kind!r}")
+
+    def lexical_search(
+        self,
+        *,
+        query: str,
+        n_results: int = 10,
+        where: Optional[dict] = None,
+    ) -> LexicalResult:
+        raise UnsupportedCapabilityError("backend does not support lexical_search")
+
+    def update(
+        self,
+        *,
+        ids: list[str],
+        documents: Optional[list[str]] = None,
+        metadatas: Optional[list[dict]] = None,
+        embeddings: Optional[list[list[float]]] = None,
     ) -> None:
-        raise NotImplementedError
+        """Default non-atomic update: get + merge + upsert.
+
+        Backends advertising ``supports_update`` MUST override with an atomic
+        single-round-trip implementation.
+        """
+        if documents is None and metadatas is None and embeddings is None:
+            raise ValueError("update requires at least one of documents, metadatas, embeddings")
+
+        n = len(ids)
+        for label, value in (
+            ("documents", documents),
+            ("metadatas", metadatas),
+            ("embeddings", embeddings),
+        ):
+            if value is not None and len(value) != n:
+                raise ValueError(f"{label} length {len(value)} does not match ids length {n}")
+
+        existing = self.get(ids=ids, include=["documents", "metadatas"])
+        by_id = {
+            rid: (existing.documents[i], existing.metadatas[i])
+            for i, rid in enumerate(existing.ids)
+        }
+        merged_docs: list[str] = []
+        merged_metas: list[dict] = []
+        for i, rid in enumerate(ids):
+            prev_doc, prev_meta = by_id.get(rid, ("", {}))
+            merged_docs.append(documents[i] if documents is not None else prev_doc)
+            new_meta = dict(prev_meta or {})
+            if metadatas is not None:
+                new_meta.update(metadatas[i] or {})
+            merged_metas.append(new_meta)
+        self.upsert(
+            documents=merged_docs,
+            ids=list(ids),
+            metadatas=merged_metas,
+            embeddings=embeddings,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Backend contract
+# ---------------------------------------------------------------------------
+
+
+class BaseBackend(ABC):
+    """Long-lived factory serving many palaces (RFC 001 §2).
+
+    Instances are lightweight on construction — no I/O, no network. All
+    connection work is deferred to ``get_collection``. Instances are thread-
+    safe for concurrent ``get_collection`` calls across different palaces.
+
+    Every backend MUST satisfy the per-``PalaceRef.id`` isolation guarantee in
+    :class:`PalaceRef`. Backends that additionally isolate by
+    ``PalaceRef.namespace`` (multi-tenant / hosted deployments) MUST advertise
+    the ``supports_namespace_isolation`` capability token; doing so is a
+    promise to satisfy the cross-namespace guarantee and to pass the namespace
+    arm of the conformance suite. Backends without the token MUST raise
+    :class:`UnsupportedCapabilityError` when ``PalaceRef.namespace`` is
+    non-``None`` rather than silently accept-and-ignore (RFC 001 §4.4).
+    """
+
+    name: ClassVar[str]
+    spec_version: ClassVar[str] = "1.0"
+    capabilities: ClassVar[frozenset[str]] = frozenset()
+    #: The space ``query()`` reports ``distances`` in (RFC 001 §2.1).
+    #: One of ``"cosine"`` | ``"l2"`` | ``"ip"``. The contract for the
+    #: ``distances`` field is *lower = closer* regardless of metric; core
+    #: search converts distance→similarity off this declaration rather than
+    #: assuming cosine. All in-tree backends are cosine today.
+    distance_metric: ClassVar[str] = "cosine"
+    #: Maintenance kinds this backend implements (RFC 001). Reserved names:
+    #: ``"analyze"`` (refresh planner/query statistics), ``"compact"`` (reclaim
+    #: space, rewrite storage), ``"reindex"`` (build/rebuild secondary indexes).
+    #: A backend with no analogue for a kind MUST omit it rather than declare a
+    #: no-op, so a benchmark harness can trust the set. Backends MAY add their
+    #: own kinds. ``run_maintenance`` raises ``UnsupportedMaintenanceKindError``
+    #: for anything not listed here.
+    maintenance_kinds: ClassVar[frozenset[str]] = frozenset()
+
+    def require_namespace_support(self, palace: PalaceRef) -> None:
+        """Raise if ``palace.namespace`` is set but this backend does not isolate by it.
+
+        Call at the start of ``get_collection`` (and any other entry that
+        accepts a :class:`PalaceRef`) so non-advertising backends never
+        silently drop a tenant namespace (RFC 001 §4.4).
+        """
+        if palace.namespace is None:
+            return
+        if "supports_namespace_isolation" not in self.capabilities:
+            raise UnsupportedCapabilityError(
+                f"{type(self).name} does not advertise supports_namespace_isolation; "
+                f"leave PalaceRef.namespace as None (got {palace.namespace!r})"
+            )
 
     @abstractmethod
-    def update(self, **kwargs: Any) -> None:
-        """Update existing records. Must raise if any ID is missing."""
-        raise NotImplementedError
+    def get_collection(
+        self,
+        *,
+        palace: PalaceRef,
+        collection_name: str,
+        create: bool = False,
+        options: Optional[dict] = None,
+    ) -> BaseCollection: ...
 
-    @abstractmethod
-    def query(self, **kwargs: Any) -> Dict[str, Any]:
-        raise NotImplementedError
+    def close_palace(self, palace: PalaceRef) -> None:
+        """Evict cached handles for a single palace. Default: no-op."""
+        return None
 
-    @abstractmethod
-    def get(self, **kwargs: Any) -> Dict[str, Any]:
-        raise NotImplementedError
+    def close(self) -> None:
+        """Shut down the entire backend. Default: no-op."""
+        return None
 
-    @abstractmethod
-    def delete(self, **kwargs: Any) -> None:
-        raise NotImplementedError
+    def health(self, palace: Optional[PalaceRef] = None) -> HealthStatus:
+        return HealthStatus.healthy()
 
-    @abstractmethod
-    def count(self) -> int:
-        raise NotImplementedError
+    # Optional detection hint used by selection priority (RFC 001 §3.3 (4)):
+    @classmethod
+    def detect(cls, path: str) -> bool:  # pragma: no cover - default hook
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Adapter utilities
+# ---------------------------------------------------------------------------
+
+
+# Keys the Chroma ``include=`` parameter accepts.
+_VALID_INCLUDE_KEYS = frozenset({"documents", "metadatas", "distances", "embeddings"})
+
+
+@dataclass
+class _IncludeSpec:
+    """Resolve an ``include=`` parameter with spec-mandated defaults."""
+
+    documents: bool = True
+    metadatas: bool = True
+    distances: bool = True  # only meaningful for query
+    embeddings: bool = False
+
+    @classmethod
+    def resolve(
+        cls, include: Optional[list[str]], *, default_distances: bool = True
+    ) -> "_IncludeSpec":
+        if include is None:
+            return cls(
+                documents=True,
+                metadatas=True,
+                distances=default_distances,
+                embeddings=False,
+            )
+        keys = {k for k in include if k in _VALID_INCLUDE_KEYS}
+        return cls(
+            documents="documents" in keys,
+            metadatas="metadatas" in keys,
+            distances="distances" in keys,
+            embeddings="embeddings" in keys,
+        )

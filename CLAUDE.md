@@ -22,7 +22,7 @@ These are non-negotiable. Every PR, every feature, every refactor must honor the
 - **Verbatim always** — Never summarize, paraphrase, or lossy-compress user data. The system searches the index and returns the original words. If a user said it, we store exactly what they said. This is the foundational promise.
 - **Incremental only** — Append-only ingest after initial build. Never destroy existing data to rebuild. A crash mid-operation must leave the existing palace untouched.
 - **Entity-first** — Everything is keyed by real names with disambiguation by DOB, ID, or context. People matter more than topics.
-- **Local-first, zero API** — All extraction, chunking, and embedding happens on the user's machine. No cloud dependency for memory operations. No API keys required.
+- **Local-first, zero external API by default** — All extraction, chunking, embedding, and LLM-assisted refinement happens on the user's machine by default, using locally-hosted runtimes (Ollama, LM Studio, llama.cpp, vLLM, unsloth studio, etc.). External providers (Anthropic, OpenAI, Google) are supported via BYOK but are never required and never enabled silently. The system never sends user content to a service the user has not explicitly configured. "Local LLM" is not an external API — Ollama and equivalents running on localhost are part of the user's machine. External BYOK is always a deliberate user choice, never a default and never a silent fallback.
 - **Performance budgets** — Hooks under 500ms. Startup injection under 100ms. Memory should feel instant.
 - **Privacy by architecture** — The system physically cannot send your data because it never leaves your machine. No telemetry, no phone-home, no external service dependencies for core operations.
 - **Background everything** — Filing, indexing, timestamps, and pipeline work happen via hooks in the background. Nothing interrupts the user's conversation. Zero tokens spent on bookkeeping in the chat window.
@@ -36,40 +36,40 @@ We do not accept summarization of user content, cloud storage/sync features, tel
 ## Setup
 
 ```bash
-pip install -e ".[dev]"
+uv sync --extra dev   # recommended; or: pip install -e ".[dev]"
 ```
 
 ## Commands
 
 ```bash
 # Run tests
-python -m pytest tests/ -v --ignore=tests/benchmarks
+uv run pytest tests/ -v --ignore=tests/benchmarks
 
 # Run tests with coverage
-python -m pytest tests/ -v --ignore=tests/benchmarks --cov=mempalace --cov-report=term-missing
+uv run pytest tests/ -v --ignore=tests/benchmarks --cov=mempalace --cov-report=term-missing
 
 # Lint
-ruff check .
+uv run ruff check .
 
 # Format
-ruff format .
+uv run ruff format .
 
 # Format check (CI mode)
-ruff format --check .
+uv run ruff format --check .
 ```
 
 ## Project Structure
 
 ```
 mempalace/
-├── mcp_server.py        # MCP server — all read/write tools
-├── cli.py               # CLI dispatcher
+├── mcp_server/          # MCP server package — tools, schemas, protocol, transports
+├── cli/                 # CLI package — commands, parser; public import is still mempalace.cli
 ├── config.py            # Configuration + input validation
 ├── miner.py             # Project file miner
 ├── convo_miner.py       # Conversation transcript miner
-├── searcher.py          # Semantic search (hybrid BM25 + vector)
+├── searcher/            # Hybrid search package; public import is still mempalace.searcher
 ├── knowledge_graph.py   # Temporal entity-relationship graph (SQLite)
-├── palace.py            # Shared palace operations
+├── palace/              # Palace ops package; public import is still mempalace.palace
 ├── palace_graph.py      # Room traversal + cross-wing tunnels
 ├── backends/            # Pluggable storage backends (ChromaDB default)
 │   ├── base.py          # Abstract interface — implement this for new backends
@@ -125,8 +125,9 @@ Knowledge Graph:
 
 ## Key Files for Common Tasks
 
-- **Adding an MCP tool**: `mempalace/mcp_server.py` — add handler function + TOOLS dict entry
-- **Changing search**: `mempalace/searcher.py`
+- **Adding an MCP tool**: handler in `mempalace/mcp_server/tools_*.py` + `TOOLS` entry in `mempalace/mcp_server/schemas.py` (public import path is still `mempalace.mcp_server`)
+- **Adding a CLI command**: handler in `mempalace/cli/cmd_*.py` + argparse in `mempalace/cli/parser.py` (public import path is still `mempalace.cli`)
+- **Changing search**: `mempalace/searcher/` (ranking, sqlite BM25, pipeline, CLI); public import is still `mempalace.searcher`
 - **Modifying mining**: `mempalace/miner.py` (project files) or `mempalace/convo_miner.py` (transcripts)
 - **Adding a storage backend**: subclass `mempalace/backends/base.py`, register in `backends/__init__.py`
 - **Input validation**: `mempalace/config.py` — `sanitize_name()` / `sanitize_content()`

@@ -29,6 +29,7 @@ AI memory system. Store everything, find anything. Local, free, no API key.
 
 ### Palace (write)
 - mempalace_add_drawer -- Add a new memory (drawer)
+- mempalace_checkpoint -- Save a whole session in one call (dedup + file + diary)
 - mempalace_delete_drawer -- Delete a memory (drawer)
 
 ### Knowledge Graph

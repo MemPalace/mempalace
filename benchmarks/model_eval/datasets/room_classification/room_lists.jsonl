@@ -1,0 +1,101 @@
+{"id": "rc_001", "rooms": ["about", "projects/meta-cognition", "projects/embedding-spaces", "skills/python", "daily-logs", "general"]}
+{"id": "rc_002", "rooms": ["projects/embedding-spaces", "projects/topic-clustering", "skills/python", "skills/statistical-tests", "daily-logs", "general"]}
+{"id": "rc_003", "rooms": ["about", "projects/topic-clustering", "skills/python", "skills/statistical-tests", "daily-logs", "general"]}
+{"id": "rc_004", "rooms": ["projects/meta-cognition", "skills/latex", "skills/python", "daily-logs", "general"]}
+{"id": "rc_005", "rooms": ["projects/embedding-spaces", "projects/topic-clustering", "skills/python", "skills/latex", "skills/statistical-tests", "daily-logs", "general"]}
+{"id": "rc_006", "rooms": ["projects/meta-cognition", "skills/python", "skills/statistical-tests", "daily-logs", "general"]}
+{"id": "rc_007", "rooms": ["about", "projects/meta-cognition", "projects/embedding-spaces", "projects/topic-clustering", "skills/latex", "daily-logs", "general"]}
+{"id": "rc_008", "rooms": ["about", "projects/meta-cognition", "skills/python", "daily-logs", "general"]}
+{"id": "rc_009", "rooms": ["projects/embedding-spaces", "projects/topic-clustering", "skills/latex", "skills/statistical-tests", "daily-logs", "general"]}
+{"id": "rc_010", "rooms": ["projects/meta-cognition", "projects/embedding-spaces", "projects/topic-clustering", "skills/statistical-tests", "general"]}
+{"id": "rc_011", "rooms": ["about", "projects/topic-clustering", "skills/python", "skills/statistical-tests", "daily-logs", "general"]}
+{"id": "rc_012", "rooms": ["projects/meta-cognition", "projects/embedding-spaces", "projects/topic-clustering", "skills/latex", "daily-logs", "general"]}
+{"id": "rc_013", "rooms": ["about", "projects/meta-cognition", "skills/python", "daily-logs", "general"]}
+{"id": "rc_014", "rooms": ["projects/embedding-spaces", "skills/python", "skills/statistical-tests", "daily-logs", "general"]}
+{"id": "rc_015", "rooms": ["projects/embedding-spaces", "projects/topic-clustering", "skills/python", "daily-logs", "general"]}
+{"id": "rc_016", "rooms": ["about", "skills/latex", "skills/python", "daily-logs", "general"]}
+{"id": "rc_017", "rooms": ["projects/meta-cognition", "projects/embedding-spaces", "skills/python", "skills/latex", "daily-logs", "general"]}
+{"id": "rc_018", "rooms": ["about", "projects/meta-cognition", "projects/embedding-spaces", "skills/latex", "skills/python", "daily-logs", "general"]}
+{"id": "rc_019", "rooms": ["about", "projects/meta-cognition", "projects/topic-clustering", "skills/statistical-tests", "daily-logs", "general"]}
+{"id": "rc_020", "rooms": ["about", "projects/meta-cognition", "projects/embedding-spaces", "skills/python", "daily-logs", "general"]}
+{"id": "rc_021", "rooms": ["about", "projects/distributed-tracing", "projects/parser-combinators", "skills/rust", "daily-logs", "general"]}
+{"id": "rc_022", "rooms": ["projects/parser-combinators", "projects/type-systems", "skills/ocaml", "skills/rust", "daily-logs", "general"]}
+{"id": "rc_023", "rooms": ["projects/parser-combinators", "projects/type-systems", "skills/ocaml", "skills/llvm", "daily-logs", "general"]}
+{"id": "rc_024", "rooms": ["about", "projects/distributed-tracing", "skills/rust", "skills/ocaml", "daily-logs", "general"]}
+{"id": "rc_025", "rooms": ["projects/type-systems", "projects/parser-combinators", "skills/ocaml", "skills/rust", "general"]}
+{"id": "rc_026", "rooms": ["projects/distributed-tracing", "projects/type-systems", "skills/llvm", "skills/rust", "daily-logs", "general"]}
+{"id": "rc_027", "rooms": ["about", "projects/distributed-tracing", "projects/parser-combinators", "skills/rust", "daily-logs", "general"]}
+{"id": "rc_028", "rooms": ["projects/parser-combinators", "projects/type-systems", "skills/ocaml", "skills/rust", "daily-logs", "general"]}
+{"id": "rc_029", "rooms": ["about", "projects/distributed-tracing", "projects/type-systems", "skills/rust", "daily-logs", "general"]}
+{"id": "rc_030", "rooms": ["about", "projects/distributed-tracing", "projects/parser-combinators", "skills/rust", "daily-logs", "general"]}
+{"id": "rc_031", "rooms": ["projects/distributed-tracing", "projects/parser-combinators", "skills/rust", "skills/llvm", "daily-logs", "general"]}
+{"id": "rc_032", "rooms": ["projects/type-systems", "projects/parser-combinators", "skills/ocaml", "skills/llvm", "daily-logs", "general"]}
+{"id": "rc_033", "rooms": ["projects/distributed-tracing", "skills/llvm", "skills/rust", "daily-logs", "general"]}
+{"id": "rc_034", "rooms": ["projects/distributed-tracing", "projects/parser-combinators", "skills/ocaml", "skills/llvm", "daily-logs", "general"]}
+{"id": "rc_035", "rooms": ["about", "projects/parser-combinators", "skills/ocaml", "skills/llvm", "daily-logs", "general"]}
+{"id": "rc_036", "rooms": ["projects/distributed-tracing", "projects/type-systems", "skills/rust", "skills/ocaml", "daily-logs", "general"]}
+{"id": "rc_037", "rooms": ["projects/distributed-tracing", "projects/parser-combinators", "projects/type-systems", "skills/rust", "skills/ocaml", "daily-logs", "general"]}
+{"id": "rc_038", "rooms": ["projects/parser-combinators", "skills/ocaml", "skills/rust", "daily-logs", "general"]}
+{"id": "rc_039", "rooms": ["about", "projects/parser-combinators", "projects/type-systems", "skills/rust", "general"]}
+{"id": "rc_040", "rooms": ["about", "projects/distributed-tracing", "skills/rust", "skills/llvm", "daily-logs", "general"]}
+{"id": "rc_041", "rooms": ["about", "projects/world-building", "projects/character-arcs", "skills/etymology", "skills/mythology", "daily-logs", "general"]}
+{"id": "rc_042", "rooms": ["projects/world-building", "projects/character-arcs", "projects/dialogue-engine", "skills/narrative-design", "daily-logs", "general"]}
+{"id": "rc_043", "rooms": ["projects/character-arcs", "projects/dialogue-engine", "skills/narrative-design", "daily-logs", "general"]}
+{"id": "rc_044", "rooms": ["about", "projects/world-building", "projects/dialogue-engine", "skills/etymology", "skills/mythology", "daily-logs", "general"]}
+{"id": "rc_045", "rooms": ["projects/world-building", "skills/etymology", "skills/mythology", "daily-logs", "general"]}
+{"id": "rc_046", "rooms": ["projects/world-building", "projects/character-arcs", "skills/etymology", "skills/mythology", "general"]}
+{"id": "rc_047", "rooms": ["about", "projects/world-building", "projects/character-arcs", "skills/narrative-design", "daily-logs", "general"]}
+{"id": "rc_048", "rooms": ["about", "projects/world-building", "projects/character-arcs", "skills/narrative-design", "daily-logs", "general"]}
+{"id": "rc_049", "rooms": ["projects/world-building", "projects/character-arcs", "skills/etymology", "skills/mythology", "general"]}
+{"id": "rc_050", "rooms": ["projects/character-arcs", "projects/dialogue-engine", "skills/narrative-design", "skills/etymology", "daily-logs", "general"]}
+{"id": "rc_051", "rooms": ["projects/world-building", "projects/character-arcs", "skills/narrative-design", "skills/mythology", "skills/etymology", "general"]}
+{"id": "rc_052", "rooms": ["about", "projects/character-arcs", "projects/dialogue-engine", "skills/narrative-design", "daily-logs", "general"]}
+{"id": "rc_053", "rooms": ["projects/world-building", "projects/character-arcs", "skills/narrative-design", "skills/mythology", "daily-logs", "general"]}
+{"id": "rc_054", "rooms": ["projects/world-building", "skills/etymology", "skills/mythology", "skills/narrative-design", "daily-logs", "general"]}
+{"id": "rc_055", "rooms": ["about", "projects/world-building", "projects/character-arcs", "skills/narrative-design", "daily-logs", "general"]}
+{"id": "rc_056", "rooms": ["about", "projects/world-building", "projects/character-arcs", "skills/narrative-design", "general"]}
+{"id": "rc_057", "rooms": ["projects/world-building", "projects/character-arcs", "skills/etymology", "skills/mythology", "daily-logs", "general"]}
+{"id": "rc_058", "rooms": ["about", "projects/character-arcs", "projects/dialogue-engine", "skills/narrative-design", "daily-logs", "general"]}
+{"id": "rc_059", "rooms": ["projects/world-building", "projects/character-arcs", "skills/etymology", "skills/mythology", "general"]}
+{"id": "rc_060", "rooms": ["projects/character-arcs", "projects/dialogue-engine", "skills/narrative-design", "skills/etymology", "daily-logs", "general"]}
+{"id": "rc_061", "rooms": ["about", "projects/pollinator-paths", "projects/native-species", "skills/phenology", "skills/plant-pathology", "daily-logs", "general"]}
+{"id": "rc_062", "rooms": ["projects/pollinator-paths", "projects/native-species", "skills/phenology", "skills/propagation", "daily-logs", "general"]}
+{"id": "rc_063", "rooms": ["about", "projects/soil-microbes", "projects/native-species", "skills/phenology", "daily-logs", "general"]}
+{"id": "rc_064", "rooms": ["projects/pollinator-paths", "projects/soil-microbes", "skills/phenology", "skills/propagation", "daily-logs", "general"]}
+{"id": "rc_065", "rooms": ["projects/pollinator-paths", "projects/native-species", "skills/phenology", "skills/plant-pathology", "general"]}
+{"id": "rc_066", "rooms": ["about", "projects/native-species", "skills/phenology", "skills/plant-pathology", "skills/propagation", "daily-logs", "general"]}
+{"id": "rc_067", "rooms": ["projects/native-species", "projects/pollinator-paths", "skills/propagation", "skills/plant-pathology", "general"]}
+{"id": "rc_068", "rooms": ["projects/pollinator-paths", "projects/soil-microbes", "skills/phenology", "skills/propagation", "daily-logs", "general"]}
+{"id": "rc_069", "rooms": ["about", "projects/pollinator-paths", "projects/soil-microbes", "skills/phenology", "skills/plant-pathology", "general"]}
+{"id": "rc_070", "rooms": ["about", "projects/pollinator-paths", "projects/soil-microbes", "skills/phenology", "skills/plant-pathology", "skills/propagation", "daily-logs", "general"]}
+{"id": "rc_071", "rooms": ["projects/soil-microbes", "projects/pollinator-paths", "skills/phenology", "skills/propagation", "daily-logs", "general"]}
+{"id": "rc_072", "rooms": ["about", "projects/native-species", "projects/pollinator-paths", "skills/phenology", "skills/propagation", "general"]}
+{"id": "rc_073", "rooms": ["projects/pollinator-paths", "projects/native-species", "skills/phenology", "skills/propagation", "daily-logs", "general"]}
+{"id": "rc_074", "rooms": ["projects/native-species", "projects/pollinator-paths", "skills/propagation", "skills/phenology", "general"]}
+{"id": "rc_075", "rooms": ["projects/native-species", "projects/pollinator-paths", "skills/phenology", "skills/propagation", "daily-logs", "general"]}
+{"id": "rc_076", "rooms": ["projects/pollinator-paths", "projects/soil-microbes", "skills/phenology", "skills/propagation", "daily-logs", "general"]}
+{"id": "rc_077", "rooms": ["about", "projects/pollinator-paths", "projects/native-species", "skills/plant-pathology", "skills/phenology", "daily-logs", "general"]}
+{"id": "rc_078", "rooms": ["projects/native-species", "projects/pollinator-paths", "skills/phenology", "skills/propagation", "general"]}
+{"id": "rc_079", "rooms": ["projects/native-species", "skills/phenology", "skills/propagation", "skills/plant-pathology", "daily-logs", "general"]}
+{"id": "rc_080", "rooms": ["about", "projects/pollinator-paths", "projects/native-species", "skills/phenology", "skills/plant-pathology", "general"]}
+{"id": "rc_081", "rooms": ["about", "projects/invoice-parsing", "projects/cashflow-models", "skills/double-entry", "skills/depreciation-rules", "daily-logs", "general"]}
+{"id": "rc_082", "rooms": ["projects/invoice-parsing", "projects/tax-prep", "skills/double-entry", "skills/ifrs", "daily-logs", "general"]}
+{"id": "rc_083", "rooms": ["about", "projects/tax-prep", "projects/cashflow-models", "skills/double-entry", "skills/depreciation-rules", "general"]}
+{"id": "rc_084", "rooms": ["projects/cashflow-models", "projects/invoice-parsing", "skills/double-entry", "skills/ifrs", "daily-logs", "general"]}
+{"id": "rc_085", "rooms": ["projects/invoice-parsing", "skills/double-entry", "skills/depreciation-rules", "skills/ifrs", "general"]}
+{"id": "rc_086", "rooms": ["projects/tax-prep", "projects/cashflow-models", "skills/depreciation-rules", "skills/ifrs", "daily-logs", "general"]}
+{"id": "rc_087", "rooms": ["projects/tax-prep", "projects/invoice-parsing", "skills/double-entry", "skills/ifrs", "daily-logs", "general"]}
+{"id": "rc_088", "rooms": ["about", "projects/cashflow-models", "projects/tax-prep", "skills/double-entry", "skills/ifrs", "daily-logs", "general"]}
+{"id": "rc_089", "rooms": ["about", "projects/invoice-parsing", "projects/tax-prep", "skills/double-entry", "skills/ifrs", "general"]}
+{"id": "rc_090", "rooms": ["projects/cashflow-models", "projects/invoice-parsing", "skills/double-entry", "skills/ifrs", "daily-logs", "general"]}
+{"id": "rc_091", "rooms": ["projects/tax-prep", "projects/cashflow-models", "skills/double-entry", "skills/depreciation-rules", "general"]}
+{"id": "rc_092", "rooms": ["projects/cashflow-models", "projects/invoice-parsing", "skills/double-entry", "skills/depreciation-rules", "skills/ifrs", "daily-logs", "general"]}
+{"id": "rc_093", "rooms": ["projects/invoice-parsing", "projects/tax-prep", "skills/double-entry", "skills/depreciation-rules", "skills/ifrs", "general"]}
+{"id": "rc_094", "rooms": ["projects/invoice-parsing", "projects/cashflow-models", "skills/double-entry", "skills/ifrs", "daily-logs", "general"]}
+{"id": "rc_095", "rooms": ["projects/tax-prep", "projects/cashflow-models", "skills/double-entry", "skills/ifrs", "daily-logs", "general"]}
+{"id": "rc_096", "rooms": ["projects/cashflow-models", "projects/tax-prep", "skills/double-entry", "skills/ifrs", "general"]}
+{"id": "rc_097", "rooms": ["projects/tax-prep", "projects/cashflow-models", "skills/double-entry", "skills/ifrs", "daily-logs", "general"]}
+{"id": "rc_098", "rooms": ["about", "projects/cashflow-models", "projects/tax-prep", "skills/double-entry", "skills/depreciation-rules", "general"]}
+{"id": "rc_099", "rooms": ["about", "projects/invoice-parsing", "projects/tax-prep", "skills/double-entry", "skills/depreciation-rules", "daily-logs", "general"]}
+{"id": "rc_100", "rooms": ["about", "projects/invoice-parsing", "projects/tax-prep", "skills/double-entry", "skills/ifrs", "general"]}
+{"id": "rc_101", "rooms": ["about", "projects/distributed-tracing", "projects/parser-combinators", "skills/rust", "skills/ocaml", "daily-logs", "general"]}

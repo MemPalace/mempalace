@@ -344,7 +344,7 @@ The palace classifies each question into one of 5 halls. Pass 1 searches only wi
 ```bash
 git clone https://github.com/MemPalace/mempalace.git
 cd mempalace
-pip install -e ".[dev]"
+uv sync --extra dev   # or: pip install -e ".[dev]"
 mkdir -p /tmp/longmemeval-data
 curl -fsSL -o /tmp/longmemeval-data/longmemeval_s_cleaned.json \
   https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json
@@ -724,8 +724,8 @@ python benchmarks/longmemeval_bench.py /tmp/longmemeval-data/longmemeval_s_clean
 The question: how much of the 96.6% → 99.4% improvement is the heuristics, and how much would come from just using a better embedding model?
 
 ```bash
-pip install fastembed
-python benchmarks/longmemeval_bench.py /tmp/longmemeval-data/longmemeval_s_cleaned.json \
+uv pip install fastembed   # or: pip install fastembed
+uv run python benchmarks/longmemeval_bench.py /tmp/longmemeval-data/longmemeval_s_cleaned.json \
   --mode raw --embed-model bge-large
 ```
 

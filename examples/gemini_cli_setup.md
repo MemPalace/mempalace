@@ -9,17 +9,24 @@ This guide explains how to set up MemPalace as a permanent memory for the [Gemin
 
 ## 1. Installation
 
-On many Linux systems, installing Python packages globally is restricted. We recommend using a local virtual environment within the MemPalace directory.
+On many Linux systems, installing Python packages globally is restricted. We
+recommend [`uv`](https://docs.astral.sh/uv/), which creates and manages a
+local virtual environment for you.
 
 ```bash
 # Clone the repository (if you haven't already)
 git clone https://github.com/MemPalace/mempalace.git
 cd mempalace
 
-# Create a virtual environment
-python3 -m venv .venv
+# Create the venv and install MemPalace + dependencies in editable mode
+uv sync
+```
 
-# Install dependencies and MemPalace in editable mode
+This produces a `.venv/` directory inside the repo with everything installed.
+If you prefer plain pip:
+
+```bash
+python3 -m venv .venv
 .venv/bin/pip install -e .
 ```
 
@@ -29,7 +36,7 @@ Set up your "Palace" (the database) and configure your identity.
 
 ```bash
 # Initialize the palace in the current directory
-.venv/bin/python3 -m mempalace init .
+uv run python -m mempalace init .
 ```
 
 ### Identity and Wings (Optional but Recommended)
@@ -86,7 +93,7 @@ Once connected, Gemini CLI will automatically:
 ### Manual Mining
 If you want the AI to learn from your existing code or docs immediately, run the "mine" command:
 ```bash
-.venv/bin/python3 -m mempalace mine /path/to/your/project
+uv run python -m mempalace mine /path/to/your/project
 ```
 
 ### Verification
