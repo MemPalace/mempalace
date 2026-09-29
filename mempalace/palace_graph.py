@@ -30,9 +30,10 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 from .config import MempalaceConfig, normalize_wing_name
-from .dynamics import initialize_dynamics_fields
+from .dynamics import initialize_dynamics_fields, potentiate
 from .palace import get_collection as _get_palace_collection
 from .palace import mine_lock
+from .backends.base import BaseCollection
 
 logger = logging.getLogger("mempalace_graph")
 
@@ -66,6 +67,111 @@ _graph_cache_time = 0.0
 _GRAPH_CACHE_TTL = 60.0  # seconds — graph changes less often than metadata
 
 
+def sqlite_grouped_counts_reader(config=None):
+    """Return the backend's grouped-counts function, or ``None``.
+
+    ``None`` means the sqlite path cannot serve this palace and the caller
+    should use the collection — which is also how a missing or unreadable
+    palace keeps reporting a real diagnostic instead of an empty graph.
+
+    The backend is resolved from *configuration*, not by sniffing the palace
+    directory for db files: a directory holding artifacts for two backends is
+    a ``BackendMismatchError`` on every normal path, and sniffing would quietly
+    pick one instead of surfacing that.
+    """
+    config = config or MempalaceConfig()
+    if not config.palace_path:
+        return None
+    try:
+        from .palace import resolve_backend_name
+
+        backend = resolve_backend_name(
+            config.palace_path, explicit=os.environ.get("MEMPALACE_BACKEND_EXPLICIT")
+        )
+        if backend == "chroma":
+            from .backends.chroma import sqlite_room_wing_hall_counts
+
+            db_name = "chroma.sqlite3"
+        elif backend in {"sqlite_exact", "rust_exact"}:
+            from .backends.sqlite_exact import _DB_FILENAME as db_name
+            from .backends.sqlite_exact import sqlite_room_wing_hall_counts
+        else:
+            return None
+        if not os.path.isfile(os.path.join(config.palace_path, db_name)):
+            return None
+        return sqlite_room_wing_hall_counts
+    except Exception:
+        logger.debug("backend resolution for the sqlite graph path failed", exc_info=True)
+    return None
+
+
+def _try_sqlite_nodes_edges(config=None):
+    """Build graph nodes/edges from backend sqlite metadata, no HNSW.
+
+    Returns ``(nodes, edges)`` or ``None`` when the palace is not a sqlite
+    backend we know how to read, so the caller falls back to client paging.
+    """
+    config = config or MempalaceConfig()
+    reader = sqlite_grouped_counts_reader(config)
+    if reader is None:
+        return None
+    try:
+        rows = reader(config.palace_path, config.collection_name)
+    except Exception:
+        logger.debug("sqlite graph path failed; falling back to client paging", exc_info=True)
+        return None
+    if rows is None:
+        return None
+    return _nodes_edges_from_grouped_rows(rows)
+
+
+def _nodes_edges_from_grouped_rows(rows):
+    """Mirror ``build_graph``'s per-drawer filter from grouped rows.
+
+    Rows are ``(room, wing, hall, n)`` with an optional fifth ``last_date``
+    column — backends that cannot supply a date still work, they just leave
+    ``dates`` empty as the client path does for undated drawers.
+    """
+    room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0, "dates": set()})
+    for row in rows:
+        room, wing, hall, n = row[0], row[1], row[2], row[3]
+        last_date = row[4] if len(row) > 4 else ""
+        if not room or not wing:
+            continue
+        node = room_data[str(room)]
+        node["wings"].add(str(wing))
+        if hall:
+            node["halls"].add(str(hall))
+        if last_date:
+            node["dates"].add(str(last_date))
+        node["count"] += int(n)
+    edges = []
+    nodes = {}
+    for room, data in room_data.items():
+        wings = sorted(data["wings"])
+        halls = sorted(data["halls"])
+        nodes[room] = {
+            "wings": wings,
+            "halls": halls,
+            "count": data["count"],
+            "dates": sorted(data["dates"])[-5:] if data["dates"] else [],
+        }
+        if len(wings) >= 2:
+            for i, wa in enumerate(wings):
+                for wb in wings[i + 1 :]:
+                    for hall in halls:
+                        edges.append(
+                            {
+                                "room": room,
+                                "wing_a": wa,
+                                "wing_b": wb,
+                                "hall": hall,
+                                "count": data["count"],
+                            }
+                        )
+    return nodes, edges
+
+
 def invalidate_graph_cache():
     """Clear the graph cache. Called from mcp_server.py on writes."""
     global _graph_cache_nodes, _graph_cache_edges, _graph_cache_time
@@ -85,6 +191,27 @@ def _get_collection(config=None):
         )
     except Exception:
         return None
+
+
+def _iter_all_metadata(col):
+    """Yield every drawer's metadata using the backend's own cursor (#2452).
+
+    ``get_all_metadata`` (#1796) is a single pass on every backend; the
+    offset loop it replaces is O(n^2) on qdrant, where each page re-walks the
+    collection from the start. The loop is kept only for collection objects
+    that predate the contract method.
+    """
+    if isinstance(col, BaseCollection):
+        yield from col.get_all_metadata()
+        return
+    total = col.count()
+    offset = 0
+    while offset < total:
+        batch = col.get(limit=1000, offset=offset, include=["metadatas"])
+        yield from batch["metadatas"]
+        if not batch["ids"]:
+            break
+        offset += len(batch["ids"])
 
 
 def build_graph(col=None, config=None):
@@ -110,42 +237,46 @@ def build_graph(col=None, config=None):
         if _graph_cache_nodes is not None and (now - _graph_cache_time) < _GRAPH_CACHE_TTL:
             return _graph_cache_nodes, _graph_cache_edges
 
+    # Only when the caller did not pass a collection: MCP tools. Tests that
+    # inject ``col=`` keep the client paging path against that collection.
     if col is None:
+        sqlite_graph = _try_sqlite_nodes_edges(config)
+        if sqlite_graph is not None:
+            nodes, edges = sqlite_graph
+            if nodes:
+                with _graph_cache_lock:
+                    _graph_cache_nodes = nodes
+                    _graph_cache_edges = edges
+                    _graph_cache_time = time.time()
+            return nodes, edges
         col = _get_collection(config)
     if not col:
         return {}, []
 
-    total = col.count()
     room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0, "dates": set()})
 
-    offset = 0
-    while offset < total:
-        batch = col.get(limit=1000, offset=offset, include=["metadatas"])
-        for meta in batch["metadatas"]:
-            # ChromaDB can return ``None`` for drawers without metadata
-            # (legacy data, partial writes — upstream #1020 territory).
-            # Skip these silently rather than crash the whole graph
-            # build — a single None drawer shouldn't take down /stats
-            # or any caller of build_graph for the entire palace. Caught
-            # 2026-04-25 by palace-daemon's verify-routes.sh smoke test
-            # against the canonical 151K palace. Closes the same gap as
-            # upstream #999 / fork PR #1094 in a different read path.
-            if meta is None:
-                continue
-            room = meta.get("room", "")
-            wing = meta.get("wing", "")
-            hall = meta.get("hall", "")
-            date = meta.get("date", "")
-            if room and room != "general" and wing:
-                room_data[room]["wings"].add(wing)
-                if hall:
-                    room_data[room]["halls"].add(hall)
-                if date:
-                    room_data[room]["dates"].add(date)
-                room_data[room]["count"] += 1
-        if not batch["ids"]:
-            break
-        offset += len(batch["ids"])
+    for meta in _iter_all_metadata(col):
+        # ChromaDB can return ``None`` for drawers without metadata
+        # (legacy data, partial writes — upstream #1020 territory).
+        # Skip these silently rather than crash the whole graph
+        # build — a single None drawer shouldn't take down /stats
+        # or any caller of build_graph for the entire palace. Caught
+        # 2026-04-25 by palace-daemon's verify-routes.sh smoke test
+        # against the canonical 151K palace. Closes the same gap as
+        # upstream #999 / fork PR #1094 in a different read path.
+        if meta is None:
+            continue
+        room = meta.get("room", "")
+        wing = meta.get("wing", "")
+        hall = meta.get("hall", "")
+        date = meta.get("date", "")
+        if room and wing:
+            room_data[room]["wings"].add(wing)
+            if hall:
+                room_data[room]["halls"].add(hall)
+            if date:
+                room_data[room]["dates"].add(date)
+            room_data[room]["count"] += 1
 
     # Build edges from rooms that span multiple wings
     edges = []
@@ -293,24 +424,37 @@ def find_tunnels(wing_a: str = None, wing_b: str = None, col=None, config=None):
 
 
 def graph_stats(col=None, config=None):
-    """Summary statistics about the palace graph."""
+    """Summary statistics about the palace graph.
+
+    ``total_rooms`` keeps its historical meaning: unique room-name nodes in
+    the passive graph. ``total_room_instances`` counts distinct (wing, room)
+    placements, which is the number users naturally compare with ``status``.
+    Explicit tunnel records are reported separately so the overview does not
+    silently omit agent-created graph connections.
+    """
     nodes, edges = build_graph(col, config)
 
-    tunnel_rooms = sum(1 for n in nodes.values() if len(n["wings"]) >= 2)
+    passive_tunnel_rooms = sum(1 for n in nodes.values() if len(n["wings"]) >= 2)
+    total_room_instances = sum(len(n["wings"]) for n in nodes.values())
+    explicit_tunnel_count = len(_load_tunnels(config))
     wing_counts = Counter()
     for data in nodes.values():
-        for w in data["wings"]:
-            wing_counts[w] += 1
+        for wing in data["wings"]:
+            wing_counts[wing] += 1
 
     return {
         "total_rooms": len(nodes),
-        "tunnel_rooms": tunnel_rooms,
+        "total_room_instances": total_room_instances,
+        "tunnel_rooms": passive_tunnel_rooms,
+        "passive_tunnel_rooms": passive_tunnel_rooms,
+        "explicit_tunnels": explicit_tunnel_count,
         "total_edges": len(edges),
+        "total_connections": len(edges) + explicit_tunnel_count,
         "rooms_per_wing": dict(wing_counts.most_common()),
         "top_tunnels": [
-            {"room": r, "wings": d["wings"], "count": d["count"]}
-            for r, d in sorted(nodes.items(), key=lambda x: -len(x[1]["wings"]))[:10]
-            if len(d["wings"]) >= 2
+            {"room": room, "wings": data["wings"], "count": data["count"]}
+            for room, data in sorted(nodes.items(), key=lambda item: -len(item[1]["wings"]))[:10]
+            if len(data["wings"]) >= 2
         ],
     }
 
@@ -641,11 +785,42 @@ def delete_tunnel(tunnel_id: str):
     return {"deleted": tunnel_id}
 
 
-def follow_tunnels(wing: str, room: str, col=None, config=None):
+def record_tunnel_traversal(tunnel_ids, config=None) -> int:
+    """Potentiate the tunnels an agent just followed; returns how many.
+
+    This is the only place a tunnel's ``access_count`` / ``strength`` rises,
+    so a palace where nothing ever calls it shows every tunnel as never
+    traversed. Best-effort: a lock or write failure is logged and the read
+    that triggered it still returns.
+    """
+    wanted = {t for t in tunnel_ids if t}
+    if not wanted:
+        return 0
+    touched = 0
+    try:
+        with mine_lock(_get_tunnel_file(config)):
+            tunnels = _load_tunnels(config)
+            for t in tunnels:
+                if isinstance(t, dict) and t.get("id") in wanted:
+                    initialize_dynamics_fields(t)
+                    potentiate(t)
+                    touched += 1
+            if touched:
+                _save_tunnels(tunnels, config)
+    except Exception:
+        logger.debug("Recording tunnel traversal failed", exc_info=True)
+        return 0
+    return touched
+
+
+def follow_tunnels(wing: str, room: str, col=None, config=None, record: bool = True):
     """Follow explicit tunnels from a room — returns connected drawers.
 
     Given a location (wing/room), finds all tunnels leading from or to it,
-    and optionally fetches the connected drawer content.
+    and optionally fetches the connected drawer content. Following a tunnel
+    is a traversal: unless ``record`` is off (a read-only server, a peer
+    that does not hold the writer lock), each tunnel crossed is
+    potentiated so navigation weights and the audit reflect real use.
     """
     # Fall back to raw ``wing`` so an empty/whitespace query string still
     # produces a value to compare with; ``_normalize_wing`` returns ``None``
@@ -653,7 +828,7 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
     # mempalace.yaml slug (underscore) and an explicit ``--wing`` slug
     # (verbatim) both resolve through the same comparison.
     norm_wing = _normalize_wing(wing) or wing
-    tunnels = _load_tunnels()
+    tunnels = _load_tunnels(config)
     connections = []
 
     for t in tunnels:
@@ -702,6 +877,9 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
                         c["drawer_preview"] = drawer_map[did][:300]
             except Exception:
                 logger.debug("Drawer preview hydration failed", exc_info=True)
+
+    if record and connections:
+        record_tunnel_traversal([c["tunnel_id"] for c in connections], config)
 
     return connections
 
@@ -884,11 +1062,101 @@ def topic_tunnels_for_wing(
     return created
 
 
+ENTITY_TUNNEL_MIN_COUNT = 3
+ENTITY_TUNNEL_MAX_PER_WING = 25
+# An entity present in more wings than this share of all wings (and in more
+# than ENTITY_TUNNEL_UBIQUITY_MIN_WINGS) is vocabulary, not a link: ``Server``
+# shows up in every project, ``block_num`` in the two chain-indexer ones.
+ENTITY_TUNNEL_UBIQUITY_SHARE = 0.25
+ENTITY_TUNNEL_UBIQUITY_MIN_WINGS = 3
+
+
+def entity_tunnel_candidates(hallways: list, min_count: int = ENTITY_TUNNEL_MIN_COUNT) -> dict:
+    """``{entity: {wing_norm: (display_wing, strength)}}`` for entities in ≥2 wings.
+
+    Strength is the entity's strongest hallway co-occurrence in that wing.
+    Left out: generic tokens (``content``, ``WebFetch``, ``compose.yml``),
+    entities below ``min_count`` in a wing, and ubiquitous entities — present
+    in more than a quarter of all wings (and in more than three). A tunnel
+    on any of them links nothing.
+
+    Spellings of one entity merge under :func:`canonical_spelling`
+    (``ChatStore.swift`` / ``ChatStore`` → ``ChatStore``, ``src/main.zig`` /
+    ``main.zig`` → ``src/main.zig``),
+    resolved across every wing the same way the hallway miner resolves them
+    inside one. Two files that only share a basename (``src/models/user.py``
+    in one wing, ``tests/fixtures/user.py`` in another) are two entities: a
+    tunnel between them would link unrelated code.
+    """
+    from .hallways import (
+        _spelling_clusters,
+        canonical_spelling,
+        entity_spelling_key,
+        is_generic_entity,
+    )
+
+    def usable(ent) -> bool:
+        return isinstance(ent, str) and bool(ent.strip()) and not is_generic_entity(ent)
+
+    spellings_by_base: dict = defaultdict(set)
+    for h in hallways:
+        if isinstance(h, dict):
+            for ent in (h.get("entity_a"), h.get("entity_b")):
+                if usable(ent):
+                    spellings_by_base[entity_spelling_key(ent)].add(ent)
+    canonical: dict = {}
+    for spellings in spellings_by_base.values():
+        for cluster in _spelling_clusters(sorted(spellings)):
+            name = canonical_spelling(cluster)
+            for spelling in cluster:
+                canonical[spelling] = name
+
+    by_key: dict = {}
+    for h in hallways:
+        if not isinstance(h, dict):
+            continue
+        h_wing = h.get("wing")
+        if not isinstance(h_wing, str) or not h_wing.strip():
+            continue
+        wing_norm = normalize_wing_name(h_wing.strip())
+        # A record without a count is hand-made or legacy; it passes the bar.
+        count = int(h["co_occurrence_count"]) if "co_occurrence_count" in h else min_count
+        for ent_key in ("entity_a", "entity_b"):
+            ent = h.get(ent_key)
+            if not usable(ent):
+                continue
+            key = canonical.get(ent)
+            if key is None:
+                continue  # an ambiguous name: it identifies no single file
+            wings = by_key.setdefault(key, {})
+            prev = wings.get(wing_norm)
+            if prev is None or count > prev[1]:
+                wings[wing_norm] = (h_wing, count)
+    all_wings = {
+        normalize_wing_name(str(h.get("wing")).strip())
+        for h in hallways
+        if isinstance(h, dict) and h.get("wing")
+    }
+    ubiquity_cap = max(
+        ENTITY_TUNNEL_UBIQUITY_MIN_WINGS, int(len(all_wings) * ENTITY_TUNNEL_UBIQUITY_SHARE)
+    )
+    out = {}
+    for key, wings in by_key.items():
+        if len(wings) > ubiquity_cap:
+            continue
+        strong = {w: v for w, v in wings.items() if v[1] >= min_count}
+        if len(strong) >= 2:
+            out[key] = strong
+    return out
+
+
 def entity_tunnels_for_wing(
     wing: str,
     hallways: list,
     label_prefix: str = "shared entity",
     config=None,
+    min_count: int = ENTITY_TUNNEL_MIN_COUNT,
+    max_per_wing: int = ENTITY_TUNNEL_MAX_PER_WING,
 ) -> list:
     """Compute entity tunnels involving a single wing.
 
@@ -911,51 +1179,37 @@ def entity_tunnels_for_wing(
         return []
 
     wing_norm = normalize_wing_name(wing.strip())
-
-    # Build: entity -> {normalized_wing -> original_wing_display_name}
-    # Both entity_a and entity_b positions count toward "this entity is
-    # in this wing"; the hallway primitive treats the pair as unordered.
-    entity_wings: dict = {}
-    for h in hallways:
-        if not isinstance(h, dict):
-            continue
-        h_wing = h.get("wing")
-        if not isinstance(h_wing, str) or not h_wing.strip():
-            continue
-        h_wing_norm = normalize_wing_name(h_wing.strip())
-        for ent_key in ("entity_a", "entity_b"):
-            ent = h.get(ent_key)
-            if not isinstance(ent, str) or not ent.strip():
-                continue
-            # setdefault preserves the first-seen display form so the
-            # tunnel endpoint matches the wing name the caller used.
-            entity_wings.setdefault(ent, {}).setdefault(h_wing_norm, h_wing)
-
-    if not entity_wings:
+    candidates = entity_tunnel_candidates(hallways, min_count=min_count)
+    if not candidates:
         return []
 
-    created: list = []
-    # Stable entity order so tunnels materialize deterministically across
-    # runs — matters for tests and for diff-able tunnels.json files.
-    for entity in sorted(entity_wings.keys()):
-        wings_for_entity = entity_wings[entity]
-        if wing_norm not in wings_for_entity:
+    # The cap counts links, not entities: an entity shared by five wings is
+    # four links from this one, and capping entity names let a wing exceed
+    # its budget several times over. Each (entity, other wing) link ranks by
+    # its weaker side; ties break on the names so tunnels.json stays
+    # diff-able across runs.
+    links = []
+    for entity, wings_for_entity in candidates.items():
+        own = wings_for_entity.get(wing_norm)
+        if own is None:
             continue
-        own_wing_display = wings_for_entity[wing_norm]
-        # Stable other-wing order; ``wing_norm`` itself is excluded so an
-        # entity that lives only in this wing produces zero tunnels.
-        other_wings_norm = sorted(w for w in wings_for_entity if w != wing_norm)
-        for other_norm in other_wings_norm:
-            other_display = wings_for_entity[other_norm]
-            room = f"entity:{entity}"
-            tunnel = create_tunnel(
-                source_wing=own_wing_display,
-                source_room=room,
-                target_wing=other_display,
-                target_room=room,
-                label=f"{label_prefix}: {entity}",
-                kind="entity",
-                config=config,
-            )
-            created.append(tunnel)
+        for other_norm, other in wings_for_entity.items():
+            if other_norm != wing_norm:
+                links.append((-min(own[1], other[1]), entity, other_norm))
+    links.sort()
+
+    created: list = []
+    for _, entity, other_norm in links[: max(0, max_per_wing)]:
+        wings_for_entity = candidates[entity]
+        room = f"entity:{entity}"
+        tunnel = create_tunnel(
+            source_wing=wings_for_entity[wing_norm][0],
+            source_room=room,
+            target_wing=wings_for_entity[other_norm][0],
+            target_room=room,
+            label=f"{label_prefix}: {entity}",
+            kind="entity",
+            config=config,
+        )
+        created.append(tunnel)
     return created

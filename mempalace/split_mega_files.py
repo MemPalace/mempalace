@@ -26,15 +26,15 @@ import argparse
 import json
 import os
 import re
+import stat
 from pathlib import Path
 
 HOME = Path.home()
 LUMI_DIR = Path(os.environ.get("MEMPALACE_SOURCE_DIR", str(HOME / "Desktop/transcripts")))
 
 # People we know about (for name detection in content)
-# Loaded from ~/.mempalace/known_names.json if it exists, otherwise generic fallback.
+# Loaded from ~/.mempalace/known_names.json if it exists; no built-in fallback names.
 _KNOWN_NAMES_PATH = HOME / ".mempalace" / "known_names.json"
-_FALLBACK_KNOWN_PEOPLE = ["Alice", "Ben", "Riley", "Max", "Sam", "Devon", "Jordan"]
 _KNOWN_NAMES_CACHE = None
 
 
@@ -60,13 +60,13 @@ def _load_known_names_config(force_reload: bool = False):
 
 
 def _load_known_people() -> list:
-    """Load known names from config file, falling back to a generic list."""
+    """Load known names from config file, or return empty list if not configured."""
     data = _load_known_names_config()
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
         return data.get("names", [])
-    return list(_FALLBACK_KNOWN_PEOPLE)
+    return []
 
 
 KNOWN_PEOPLE = _load_known_people()
@@ -223,6 +223,18 @@ def split_file(filepath, output_dir, dry_run=False):
         if dry_run:
             print(f"  [{i + 1}/{len(boundaries) - 1}] {name}  ({len(chunk)} lines)")
         else:
+            # The gate in ``main`` covers the files the glob listed; this name
+            # is built here, so nothing has vetted it. Opening a pre-existing
+            # FIFO for writing blocks in the kernel until a reader appears.
+            # ``lexists`` rather than ``exists``: the latter follows the link
+            # and so answers False for a DANGLING symlink, and writing through
+            # one creates the target instead — a chunk landing wherever the
+            # link points, outside the output directory entirely.
+            # ``os.path`` rather than ``Path``: neither call can raise, so a
+            # write that fails still fails at ``write_text`` as it always did.
+            if os.path.lexists(out_path) and not os.path.isfile(out_path):
+                print(f"  SKIP: {name} (not a regular file)")
+                continue
             out_path.write_text("".join(chunk), encoding="utf-8")
             print(f"  + {name}  ({len(chunk)} lines)")
 
@@ -272,7 +284,14 @@ def main():
     mega_files = []
     max_scan_size = 500 * 1024 * 1024  # 500 MB
     for f in files:
-        if f.stat().st_size > max_scan_size:
+        file_stat = f.stat()
+        # ``glob`` lists a FIFO named ``x.txt`` like any other match, and
+        # read_text() on one blocks in the kernel until a writer appears.
+        # stat() never blocks, so the type decides before the open does.
+        if not stat.S_ISREG(file_stat.st_mode):
+            print(f"  SKIP: {f.name} (not a regular file)")
+            continue
+        if file_stat.st_size > max_scan_size:
             print(f"  SKIP: {f.name} exceeds {max_scan_size // (1024 * 1024)} MB limit")
             continue
         lines = f.read_text(errors="replace").splitlines(keepends=True)
@@ -285,7 +304,7 @@ def main():
         return
 
     print(f"\n{'=' * 60}")
-    print(f"  Mega-file splitter — {'DRY RUN' if args.dry_run else 'SPLITTING'}")
+    print(f"  Mega-file splitter -- {'DRY RUN' if args.dry_run else 'SPLITTING'}")
     print(f"{'=' * 60}")
     print(f"  Source:      {src_dir}")
     print(f"  Output:      {output_dir or 'same dir as source'}")
@@ -307,9 +326,9 @@ def main():
 
     print(f"{'-' * 60}")
     if args.dry_run:
-        print(f"  DRY RUN — would create {total_written} files from {len(mega_files)} mega-files")
+        print(f"  DRY RUN -- would create {total_written} files from {len(mega_files)} mega-files")
     else:
-        print(f"  Done — created {total_written} files from {len(mega_files)} mega-files")
+        print(f"  Done -- created {total_written} files from {len(mega_files)} mega-files")
     print()
 
 

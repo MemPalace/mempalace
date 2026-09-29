@@ -29,7 +29,7 @@ from collections import defaultdict
 from contextlib import closing
 from datetime import datetime
 
-from .backups import prune_backups
+from .backups import copy_palace_dir, prune_backups
 from .config import MempalaceConfig
 
 
@@ -244,22 +244,43 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
     # A plain count() is not enough: some 0.6.x -> 1.5.x migrated collections
     # are readable but silently drop upsert/delete operations. In that state,
     # migrate must rebuild from SQLite instead of returning "No migration needed."
+    #
+    # Preflight HNSW divergence before touching the collection at all: the
+    # #1222 SIGSEGV/panic class crashes on count() against a diverged
+    # segment, and a native crash can't be caught by the except Exception
+    # below -- a diverged palace must never reach col.count() in the first
+    # place. The already-diverged case degrades to exactly the same
+    # SQLite-extraction path the except branch below already falls back to.
+    from .backends.chroma import hnsw_capacity_status
+
     try:
-        col = ChromaBackend().get_collection(palace_path, "mempalace_drawers")
-        count = col.count()
-
-        if collection_write_roundtrip_works(col):
-            print(f"\n Palace is already readable and writable by chromadb {target_version}.")
-            print(f" {count} drawers found. No migration needed.")
-            return True
-
-        print(
-            f"\n Palace is readable by chromadb {target_version}, but write/delete verification failed."
-        )
-        print(" Rebuilding from SQLite to restore native write/delete behavior...")
+        capacity_info = hnsw_capacity_status(palace_path, "mempalace_drawers")
     except Exception:
-        print(f"\n Palace is NOT readable by chromadb {target_version}.")
+        capacity_info = {}
+
+    if capacity_info.get("diverged"):
+        print(
+            f"\n Palace is NOT readable by chromadb {target_version}: HNSW index diverged from SQLite."
+        )
+        print(f" ({capacity_info.get('message', 'divergence detected')})")
         print(" Extracting from SQLite directly...")
+    else:
+        try:
+            col = ChromaBackend().get_collection(palace_path, "mempalace_drawers")
+            count = col.count()
+
+            if collection_write_roundtrip_works(col):
+                print(f"\n Palace is already readable and writable by chromadb {target_version}.")
+                print(f" {count} drawers found. No migration needed.")
+                return True
+
+            print(
+                f"\n Palace is readable by chromadb {target_version}, but write/delete verification failed."
+            )
+            print(" Rebuilding from SQLite to restore native write/delete behavior...")
+        except Exception:
+            print(f"\n Palace is NOT readable by chromadb {target_version}.")
+            print(" Extracting from SQLite directly...")
 
     # Extract all drawers via raw SQL
     drawers = extract_drawers_from_sqlite(db_path)
@@ -284,7 +305,7 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
             print(f"      ROOM: {room:30} {count:5}")
 
     if dry_run:
-        print("\n  DRY RUN — no changes made.")
+        print("\n  DRY RUN -- no changes made.")
         print(f"  Would migrate {len(drawers)} drawers.")
         return True
 
@@ -295,7 +316,7 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = f"{palace_path}.pre-migrate.{timestamp}"
     print(f"\n  Backing up to {backup_path}...")
-    shutil.copytree(palace_path, backup_path, symlinks=True)
+    copy_palace_dir(palace_path, backup_path, symlinks=True, log=print)
 
     # Enforce backup retention so repeated migrations cannot fill the disk
     # with full-palace copies. The backup we just created is the newest, so
@@ -549,7 +570,7 @@ def migrate_wing_names(palace_path: str, dry_run: bool = False, confirm: bool = 
     topic_renames = _plan_topics_by_wing_renames()
 
     if not d_updates and not c_updates and not topic_renames:
-        print("  All wing names are already normalized — nothing to migrate.")
+        print("  All wing names are already normalized -- nothing to migrate.")
         return False
 
     print("\n  Wing-name migration plan:")
@@ -565,7 +586,7 @@ def migrate_wing_names(palace_path: str, dry_run: bool = False, confirm: bool = 
         print(f"    topics_by_wing: {len(topic_renames)} key(s) re-keyed")
 
     if dry_run:
-        print("\n  DRY RUN — no changes made.\n")
+        print("\n  DRY RUN -- no changes made.\n")
         return True
 
     if not confirm:

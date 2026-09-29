@@ -76,8 +76,11 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _is_server_uri(uri: str) -> bool:
-    normalized = uri.lower()
+def milvus_uri_is_server(uri: Optional[str]) -> bool:
+    """Return whether ``uri`` targets service-managed Milvus storage."""
+    if not uri:
+        return False
+    normalized = uri.strip().lower()
     return normalized.startswith(("http://", "https://", "tcp://", "grpc://"))
 
 
@@ -358,7 +361,7 @@ class MilvusCollection(BaseCollection):
         if score is None:
             return 1.0
         value = float(score)
-        if self._config.uri and _is_server_uri(self._config.uri):
+        if milvus_uri_is_server(self._config.uri):
             return 1.0 - max(-1.0, min(1.0, value))
         return value
 
@@ -976,7 +979,7 @@ class MilvusBackend(BaseBackend):
         collection_name: str,
         config: _MilvusConfig,
     ) -> str:
-        if config.uri and not _is_server_uri(config.uri) and not config.namespace:
+        if config.uri and not milvus_uri_is_server(config.uri) and not config.namespace:
             return _slug(collection_name)
         prefix = self._remote_collection_prefix(palace=palace, config=config)
         return f"{prefix}_{_slug(collection_name)}"
@@ -1059,7 +1062,7 @@ class MilvusBackend(BaseBackend):
             client = self._clients.get(config)
             if client is not None:
                 return client
-            if config.uri and not _is_server_uri(config.uri):
+            if config.uri and not milvus_uri_is_server(config.uri):
                 parent = os.path.dirname(os.path.abspath(config.uri)) or "."
                 os.makedirs(parent, exist_ok=True)
                 try:
@@ -1089,7 +1092,7 @@ class MilvusBackend(BaseBackend):
                     pass
             marker_path = self._marker_path(palace.local_path)
             local_db_exists = bool(
-                config.uri and not _is_server_uri(config.uri) and os.path.exists(config.uri)
+                config.uri and not milvus_uri_is_server(config.uri) and os.path.exists(config.uri)
             )
             if os.path.isfile(marker_path):
                 self._validate_marker_target(palace, config)
