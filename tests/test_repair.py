@@ -2014,6 +2014,88 @@ def test_sqlite_integrity_errors_reports_unreadable_sqlite_file(tmp_path):
     assert "named pipe" not in errors[0]
 
 
+class _ReadOnlyQuickCheck:
+    """Connection stand-in whose ``PRAGMA quick_check`` hits SQLite's write refusal.
+
+    FTS5 validation can need a write on SQLite builds where the read-only probe
+    cannot give one; the refusal reads ``attempt to write a readonly database``
+    although nothing is wrong with the file (#2627).
+    """
+
+    def __init__(self, real):
+        self._real = real
+
+    def execute(self, sql, *args):
+        if sql.strip().lower() == "pragma quick_check":
+            raise sqlite3.OperationalError("attempt to write a readonly database")
+        return self._real.execute(sql, *args)
+
+    def close(self):
+        self._real.close()
+
+
+def _force_read_only_quick_check_refusal(monkeypatch):
+    real_open = repair.open_palace_reader
+    monkeypatch.setattr(
+        repair,
+        "open_palace_reader",
+        lambda *a, **kw: _ReadOnlyQuickCheck(real_open(*a, **kw)),
+    )
+
+
+def test_sqlite_integrity_errors_retries_a_readonly_refusal_on_a_writable_connection(
+    tmp_path, monkeypatch
+):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    with closing(sqlite3.connect(palace / "chroma.sqlite3")) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.commit()
+    _force_read_only_quick_check_refusal(monkeypatch)
+
+    assert repair.sqlite_integrity_errors(str(palace)) == []
+
+
+def test_sqlite_integrity_errors_does_not_call_a_readonly_refusal_corruption(tmp_path, monkeypatch):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    with closing(sqlite3.connect(palace / "chroma.sqlite3")) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.commit()
+    _force_read_only_quick_check_refusal(monkeypatch)
+    real_open_writer = repair.open_palace_writer
+
+    def refusing_writer(*a, **kw):
+        conn = real_open_writer(*a, **kw)
+        return _ReadOnlyQuickCheck(conn)
+
+    monkeypatch.setattr(repair, "open_palace_writer", refusing_writer)
+
+    errors = repair.sqlite_integrity_errors(str(palace))
+
+    assert len(errors) == 1
+    assert "could not run" in errors[0]
+    assert "mode=rw" in errors[0]
+    assert f"SQLite {sqlite3.sqlite_version}" in errors[0]
+    assert "quick_check failed" not in errors[0]
+
+
+def test_print_sqlite_integrity_abort_does_not_recommend_recovery_when_the_probe_could_not_run(
+    tmp_path, capsys
+):
+    errors = [
+        f"quick_check could not run (mode=rw, SQLite {sqlite3.sqlite_version}): "
+        "attempt to write a readonly database"
+    ]
+
+    repair.print_sqlite_integrity_abort(str(tmp_path), errors)
+
+    out = capsys.readouterr().out
+    assert "corruption" not in out
+    assert ".recover" not in out
+    assert "could not run" in out
+
+
 def test_sqlite_integrity_status_reports_a_verdict_for_a_healthy_database(tmp_path):
     palace = tmp_path / "palace"
     palace.mkdir()
