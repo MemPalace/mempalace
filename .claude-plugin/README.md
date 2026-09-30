@@ -38,6 +38,7 @@ After installing the plugin, run the init command to complete setup (installs th
 | `/mempalace:search` | Search your memories across the palace |
 | `/mempalace:mine` | Mine projects and conversations into the palace |
 | `/mempalace:status` | Show palace overview -- wings, rooms, drawer counts |
+| `/mempalace:audit` | Score palace organization, then a guided repair session |
 
 ## Hooks
 

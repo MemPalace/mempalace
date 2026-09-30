@@ -171,6 +171,22 @@ def _reset_loaded_mcp_writer_state(mcp_server) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _release_palace_anchors():
+    """Close anchor connections on ``chroma.sqlite3`` after each test (#2302).
+
+    On Linux mempalace keeps one idle connection per database inode for the life
+    of the process; across thousands of temporary palaces that would run the
+    test process out of descriptors. Only acts when the module is loaded.
+    """
+    yield
+    import sys
+
+    inproc = sys.modules.get("mempalace.backends._inproc_sqlite")
+    if inproc is not None:
+        inproc.release_all()
+
+
+@pytest.fixture(autouse=True)
 def _reset_mcp_cache(monkeypatch):
     """Reset cached MCP state between tests without importing mcp_server.
 

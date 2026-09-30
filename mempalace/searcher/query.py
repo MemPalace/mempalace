@@ -140,6 +140,33 @@ def _closet_boosts(closets_col, *, query: str, n_results: int, where: dict) -> d
     return boosts
 
 
+# Folding copies can leave fewer distinct passages than asked for while the
+# vector pool was full, so more candidates exist. The search then repeats with
+# a pool four times larger, up to _MAX_POOL_SCALE times the normal pool and
+# never past _MAX_FOLD_POOL candidates.
+_MAX_POOL_SCALE = 16
+_MAX_FOLD_POOL = 500
+
+
+def _scaled_pool_limits(limits: tuple, scale: int) -> tuple:
+    if scale <= 1:
+        return limits
+    pool_size, pre_enrichment_limit = limits
+    return (
+        min(pool_size * scale, max(_MAX_FOLD_POOL, pool_size)),
+        min(pre_enrichment_limit * scale, max(_MAX_FOLD_POOL, pre_enrichment_limit)),
+    )
+
+
+def _copies_left_results_short(hits, n_results, candidates_fetched, pool_size) -> bool:
+    """Whether folded copies left the page short while the pool was full."""
+    return (
+        len(hits) < n_results
+        and candidates_fetched >= pool_size
+        and any(hit.get("also_in") for hit in hits)
+    )
+
+
 def _baseline_is_thin(hits: list, n_results: int) -> bool:
     """True when the baseline under-served the query by count — fewer hits
     than asked for. Expansion is strictly slot-filling (baseline hits keep
@@ -270,6 +297,7 @@ def search_memories(
     collection_name: str = None,
     lang: Optional[str] = None,
     expand_wings: bool = False,
+    _pool_scale: int = 1,
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
 
@@ -324,13 +352,6 @@ def search_memories(
               When ``max_distance > 0.0`` is also set, BM25-only candidates
               are admitted only if their stored embeddings can be loaded and
               their computed vector distance satisfies that threshold.
-        expand_wings: Opt-in (default False). When True and no
-            wing/room/source_file filter is given, a thin baseline triggers
-            additive cross-wing expansion: the most structurally relevant
-            wings (passive same-room connections, hallways, room names) get
-            their own scoped queries and their deduped hits append after
-            the baseline, filling only slots the baseline left empty —
-            baseline hits keep their slots and order.
         lang: Locale code for BM25 stop-word filtering (opt-in). When
             omitted, reads ``MempalaceConfig().lang_explicit`` — returns an
             empty set unless the user has set ``MEMPALACE_LANG`` /
@@ -362,32 +383,7 @@ def search_memories(
         stop_words=stop_words,
     )
     if short_circuit is not None:
-        # The vector-disabled/BM25 fallback returns here — expansion applies
-        # on this path too so the fallback scope matches the vector path.
-        return _maybe_expand_across_wings(
-            short_circuit,
-            query=query,
-            palace_path=palace_path,
-            collection_name=collection_name,
-            drawers_col=None,
-            expand_wings=expand_wings,
-            wing=wing,
-            room=room,
-            source_file=source_file,
-            n_results=n_results,
-            fetch_wing=lambda w: _vector_disabled_search(
-                query=query,
-                palace_path=palace_path,
-                wing=w,
-                room=None,
-                n_results=n_results,
-                collection_name=collection_name,
-                stop_words=stop_words,
-                since_dt=since_dt,
-                before_dt=before_dt,
-            ),
-            thin_check=lambda hits: _bm25_baseline_is_thin(hits, n_results),
-        )
+        return short_circuit
 
     drawers_col, open_error = _open_search_collection(palace_path, collection_name)
     if open_error:
@@ -403,10 +399,9 @@ def search_memories(
     # This avoids the "weak-closets regression" where narrative content
     # produces low-signal closets (regex extraction matches few topics)
     # and closet-first routing hides drawers that direct search would find.
-    pool_size, pre_enrichment_limit = _candidate_pool_limits(
-        candidate_strategy,
-        n_results,
-        date_window_active,
+    pool_size, pre_enrichment_limit = _scaled_pool_limits(
+        _candidate_pool_limits(candidate_strategy, n_results, date_window_active),
+        _pool_scale,
     )
     try:
         dkwargs = {
@@ -538,7 +533,8 @@ def search_memories(
     if strategy_error:
         return strategy_error
 
-    result = _search_result_envelope(
+    candidates_fetched = len(_first_or_empty(drawer_results, "documents"))
+    envelope = _search_result_envelope(
         query=query,
         wing=wing,
         room=room,
@@ -546,12 +542,32 @@ def search_memories(
         since=since,
         before=before,
         hits=hits,
-        candidates_fetched=len(_first_or_empty(drawer_results, "documents")),
+        candidates_fetched=candidates_fetched,
         pool_size=pool_size,
         date_window_active=date_window_active,
     )
+    if _copies_left_results_short(hits, n_results, candidates_fetched, pool_size):
+        if _pool_scale < _MAX_POOL_SCALE and pool_size < _MAX_FOLD_POOL:
+            return search_memories(
+                query,
+                palace_path,
+                wing=wing,
+                room=room,
+                source_file=source_file,
+                since=since,
+                before=before,
+                n_results=n_results,
+                max_distance=max_distance,
+                vector_disabled=vector_disabled,
+                candidate_strategy=candidate_strategy,
+                collection_name=collection_name,
+                lang=lang,
+                expand_wings=expand_wings,
+                _pool_scale=_pool_scale * 4,
+            )
+        envelope["distinct_results_truncated"] = True
     return _maybe_expand_across_wings(
-        result,
+        envelope,
         query=query,
         palace_path=palace_path,
         collection_name=collection_name,

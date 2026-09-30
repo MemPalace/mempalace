@@ -48,6 +48,7 @@ The main `$mempalace:mempalace` skill can be invoked with five different subcomm
 | `$mempalace search` | Semantic search across all mined memories |
 | `$mempalace mine` | Mine a project or conversation into your palace |
 | `$mempalace status` | Show palace status, room counts, and health |
+| `$mempalace audit` | Score palace organization, then a guided repair session |
 
 ## Hooks
 
