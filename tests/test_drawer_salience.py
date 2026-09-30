@@ -7,6 +7,7 @@ potentiation must update stored drawer salience safely.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -107,11 +108,147 @@ class TestDrawerDynamicsAdapter:
         }
         assert invalid["strength"] == DEFAULT_STRENGTH
         assert invalid["stability"] == DEFAULT_STABILITY
-        assert invalid["last_activated"] == "not a timestamp"
+        assert invalid["last_activated"] == T0.isoformat()
         assert invalid["access_count"] == 0
+
+    @pytest.mark.parametrize(
+        ("field", "value", "expected"),
+        [
+            ("strength", "unknown", 1.0),
+            ("strength", None, 1.0),
+            ("strength", float("nan"), 1.0),
+            ("strength", float("inf"), 1.0),
+            ("strength", float("-inf"), 1.0),
+            ("strength", -1, 1.0),
+            ("strength", True, 1.0),
+            ("stability", "unknown", 1.0),
+            ("stability", None, 1.0),
+            ("stability", float("nan"), 1.0),
+            ("stability", float("inf"), 1.0),
+            ("stability", float("-inf"), 1.0),
+            ("stability", 0, 1.0),
+            ("stability", -1, 1.0),
+            ("stability", False, 1.0),
+            ("access_count", "unknown", 0),
+            ("access_count", None, 0),
+            ("access_count", float("nan"), 0),
+            ("access_count", float("inf"), 0),
+            ("access_count", float("-inf"), 0),
+            ("access_count", -1, 0),
+            ("access_count", 2.5, 0),
+            ("access_count", True, 0),
+            ("last_activated", "unknown", T0.isoformat()),
+            ("last_activated", None, T0.isoformat()),
+            ("last_activated", float("nan"), T0.isoformat()),
+            ("last_activated", float("inf"), T0.isoformat()),
+            ("last_activated", 37, T0.isoformat()),
+        ],
+    )
+    def test_invalid_optional_fields_default_without_mutating_metadata(
+        self, field, value, expected
+    ):
+        from mempalace.dynamics import drawer_salience
+
+        meta = {"filed_at": T0.isoformat(), field: value, "custom": "keep verbatim"}
+        before = dict(meta)
+
+        salience = drawer_salience(meta, now=T0)
+
+        assert salience[field] == expected
+        assert meta == before
+
+    def test_normalization_warns_without_disclosing_metadata_values(self, caplog):
+        from mempalace.dynamics import drawer_salience
+
+        private_value = "private drawer metadata must not be logged"
+        with caplog.at_level(logging.WARNING):
+            salience = drawer_salience({"strength": private_value}, now=T0)
+
+        assert salience["strength"] == 1.0
+        assert any("strength" in record.message for record in caplog.records)
+        assert private_value not in caplog.text
+
+    def test_valid_numeric_strings_remain_usable(self):
+        from mempalace.dynamics import drawer_salience
+
+        salience = drawer_salience(
+            {
+                "strength": "2.5",
+                "stability": "1.25",
+                "access_count": "7",
+                "last_activated": T0.isoformat(),
+            },
+            now=T0,
+        )
+
+        assert salience == {
+            "strength": 2.5,
+            "stability": 1.25,
+            "last_activated": T0.isoformat(),
+            "access_count": 7,
+        }
+
+    def test_lazy_decay_is_precise_and_does_not_compound_on_reads(self):
+        from mempalace.dynamics import drawer_salience
+
+        meta = {"filed_at": T0.isoformat(), "strength": 1.0, "stability": 1.0}
+        before = dict(meta)
+
+        first = drawer_salience(meta, now=T0 + timedelta(days=1))
+        second = drawer_salience(meta, now=T0 + timedelta(days=2))
+        repeated = drawer_salience(meta, now=T0 + timedelta(days=2))
+
+        assert first["strength"] == pytest.approx(0.36787944117144233, rel=1e-12)
+        assert second["strength"] == pytest.approx(0.1353352832366127, rel=1e-12)
+        assert repeated == second
+        assert meta == before
+
+    @pytest.mark.parametrize(
+        ("milliseconds", "expected"),
+        [(40, 0.9999995370371442), (50, 0.9999994212964637)],
+    )
+    def test_subsecond_decay_retains_precision(self, milliseconds, expected):
+        from mempalace.dynamics import drawer_salience
+
+        salience = drawer_salience(
+            {"filed_at": T0.isoformat()},
+            now=T0 + timedelta(milliseconds=milliseconds),
+        )
+
+        assert salience["strength"] == pytest.approx(expected, rel=0, abs=1e-15)
+
+    def test_valid_stability_is_preserved_exactly(self):
+        from mempalace.dynamics import drawer_salience
+
+        meta = {"filed_at": T0.isoformat(), "stability": 1.123456789012345}
+
+        salience = drawer_salience(meta, now=T0 + timedelta(days=1))
+
+        assert salience["stability"] == 1.123456789012345
+        assert meta == {"filed_at": T0.isoformat(), "stability": 1.123456789012345}
 
 
 class TestDrawerSalienceReadExposure:
+    @pytest.mark.parametrize("field", ["strength", "stability", "access_count"])
+    def test_getters_preserve_verbatim_drawers_with_arbitrary_metadata(
+        self, monkeypatch, config, collection, kg, field
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        content = "Verbatim body\n  preserved spacing — and punctuation!"
+        _add_drawer(collection, "drawer_arbitrary", content, **{field: "unknown"})
+        before = _stored_meta(collection, "drawer_arbitrary")
+
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_now", lambda: T0)
+        single = mcp_server.tool_get_drawer("drawer_arbitrary")
+        bulk = mcp_server.tool_get_drawers(["drawer_arbitrary"])
+
+        assert single["content"] == content
+        assert bulk["errors"] == 0
+        assert bulk["results"][0]["content"] == content
+        assert _stored_meta(collection, "drawer_arbitrary") == before
+
     def test_search_includes_lazy_salience_without_mutating_store(
         self, monkeypatch, config, collection, kg
     ):
@@ -213,6 +350,42 @@ class TestDrawerSalienceTool:
 
 
 class TestPotentiateOnSearch:
+    def test_flag_on_normalizes_optional_fields_before_potentiating(
+        self, monkeypatch, config, collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        content = "Verbatim heliodor body\n  with preserved spacing."
+        _add_drawer(
+            collection,
+            "drawer_invalid_potentiate",
+            content,
+            strength="unknown",
+            stability="unknown",
+            access_count="unknown",
+            last_activated="unknown",
+            custom="untouched",
+        )
+
+        from mempalace import mcp_server
+
+        now = T0 + timedelta(days=1)
+        monkeypatch.setenv("MEMPALACE_SALIENCE_POTENTIATE", "true")
+        monkeypatch.setattr(mcp_server, "_READ_ONLY", False)
+        monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", object())
+        monkeypatch.setattr(mcp_server, "_now", lambda: now)
+
+        result = mcp_server.tool_search(query="heliodor", limit=1, max_distance=0)
+
+        assert result["results"]
+        stored = _stored_meta(collection, "drawer_invalid_potentiate")
+        assert stored["strength"] == pytest.approx(0.4178794411714423, rel=1e-12)
+        assert stored["stability"] == 1.1
+        assert stored["access_count"] == 1
+        assert stored["last_activated"] == now.isoformat()
+        assert stored["filed_at"] == T0.isoformat()
+        assert stored["custom"] == "untouched"
+        assert mcp_server.tool_get_drawer("drawer_invalid_potentiate")["content"] == content
+
     def test_flag_off_search_writes_nothing(self, monkeypatch, config, collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         _add_drawer(collection, "drawer_no_potentiate", "flag off aquamarine target")
