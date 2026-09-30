@@ -7,6 +7,7 @@ slot rather than a failed batch.
 """
 
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -32,6 +33,17 @@ class _CountingCollection:
 def _patch_mcp_server(monkeypatch, config, kg):
     monkeypatch.setattr(mcp_server, "_config", config)
     monkeypatch.setattr(mcp_server, "_get_kg", lambda: kg)
+
+
+@pytest.fixture
+def frozen_salience_clock(monkeypatch):
+    class FilingClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 1, 1, 12, tzinfo=tz)
+
+    monkeypatch.setattr(mcp_server, "datetime", FilingClock)
+    monkeypatch.setattr(mcp_server, "_now", lambda: datetime(2026, 1, 2, 12, tzinfo=timezone.utc))
 
 
 # ── Registration ──────────────────────────────────────────────────────────
@@ -114,7 +126,9 @@ class TestGetDrawers:
             assert r["wing"] == "test"
             assert r["room"] == "bulk_get"
 
-    def test_each_item_matches_the_singular_tool(self, monkeypatch, config, collection, kg):
+    def test_each_item_matches_the_singular_tool(
+        self, monkeypatch, config, collection, kg, frozen_salience_clock
+    ):
         _patch_mcp_server(monkeypatch, config, kg)
         added = mcp_server.tool_add_drawer(
             wing="test",
@@ -130,7 +144,9 @@ class TestGetDrawers:
         assert bulk["count"] == 1
         assert bulk["results"][0] == single
 
-    def test_resolves_chunk_groups_like_singular_tool(self, monkeypatch, config, collection, kg):
+    def test_resolves_chunk_groups_like_singular_tool(
+        self, monkeypatch, config, collection, kg, frozen_salience_clock
+    ):
         _patch_mcp_server(monkeypatch, config, kg)
         # Content well over the default 800-char chunk size splits into a
         # logical group of _chunk_NNNNNN rows.
@@ -198,7 +214,9 @@ class TestGetDrawers:
         assert result["errors"] == 0
         assert [item["drawer_id"] for item in result["results"]] == ids
 
-    def test_mixed_ids_resolve_in_two_reads(self, monkeypatch, config, collection, kg):
+    def test_mixed_ids_resolve_in_two_reads(
+        self, monkeypatch, config, collection, kg, frozen_salience_clock
+    ):
         _patch_mcp_server(monkeypatch, config, kg)
         single = mcp_server.tool_add_drawer(wing="test", room="bulk_get", content="one row")
         chunked = mcp_server.tool_add_drawer(wing="test", room="bulk_get", content="q" * 2000)

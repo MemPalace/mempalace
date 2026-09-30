@@ -60,7 +60,7 @@ Full wing → room → drawer count tree.
 
 ### `mempalace_search`
 
-Semantic search. Returns verbatim drawer content with similarity scores and a lazy-decayed `salience` block. By default this is read-only. If `MEMPALACE_SALIENCE_POTENTIATE=true`, surfaced logical drawers are potentiated best-effort unless the MCP server is read-only or lacks the palace writer lock.
+Semantic search. Returns verbatim drawer content with similarity scores and a lazy-decayed `salience` block, including lexical-only union hits and SQLite fallback results. By default this is read-only. If `MEMPALACE_SALIENCE_POTENTIATE=true`, surfaced logical drawers are potentiated best-effort unless the MCP server is read-only, lacks the palace writer lock, or has disabled vector access. SQLite fallback remains read-only and does not reopen a damaged vector index to update salience.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -272,6 +272,11 @@ List lazy-decayed salience for logical drawers. Chunked drawers are deduped by `
 | `order_by` | string | No | Sort by `strength`, `access_count`, or `last_activated` (default `strength`) |
 
 **Returns:** `{ drawers: [{ id, wing, room, strength, stability, last_activated, access_count }] }`
+
+Salience reads leave stored metadata and drawer content unchanged. Invalid optional
+dynamics values are normalized for calculation rather than preventing content
+retrieval. Strength is computed at read time, so successive reads can differ even
+when no drawer has been updated.
 
 ---
 

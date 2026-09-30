@@ -747,7 +747,7 @@ def tool_search(
 def _can_potentiate_on_search() -> bool:
     if not _truthy_env(_SALIENCE_POTENTIATE_ENV):
         return False
-    if _READ_ONLY:
+    if _READ_ONLY or _vector_disabled:
         return False
     if _MCP_WRITER_LOCK_CM is not None:
         return True
