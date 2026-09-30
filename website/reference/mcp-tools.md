@@ -102,7 +102,7 @@ Check if content already exists in the palace before filing.
 
 ### `mempalace_find_duplicates`
 
-Read-only duplicate audit. Returns connected clusters of near-duplicate logical drawers with pairwise cosine distances — never raw vectors or content. Clusters are the connected components of the "distance < threshold" graph (similarity is symmetric but not transitive). Chunked drawers are deduped by `parent_drawer_id`, and each drawer's own chunks are never reported as duplicates of one another.
+Read-only duplicate audit. Returns connected clusters of near-duplicate logical drawers with pairwise cosine distances — never raw vectors or content. Clusters are the connected components of the "distance < threshold" graph (similarity is symmetric but not transitive). Chunked drawers are deduped by `parent_drawer_id`, falling back to legacy diary `parent_entry_id`, and each drawer's own chunks are never reported as duplicates of one another. When both `wing` and `room` are supplied, both filters apply.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

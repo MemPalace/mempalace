@@ -99,9 +99,10 @@ def get_source_groups(
 
 def _logical_drawer_id(row_id, metadata):
     metadata = metadata if isinstance(metadata, dict) else {}
-    parent_id = metadata.get("parent_drawer_id")
-    if isinstance(parent_id, str) and parent_id.strip():
-        return parent_id
+    for key in ("parent_drawer_id", "parent_entry_id"):
+        parent_id = metadata.get(key)
+        if isinstance(parent_id, str) and parent_id.strip():
+            return parent_id
     return row_id
 
 
@@ -111,6 +112,8 @@ def _scope_where(wing=None, room=None):
         where["wing"] = wing
     if room:
         where["room"] = room
+    if len(where) > 1:
+        return {"$and": [{key: value} for key, value in where.items()]}
     return where or None
 
 
@@ -185,9 +188,10 @@ def find_duplicate_clusters(
     """Return read-only connected components of near-duplicate logical drawers.
 
     Candidate rows are fetched through the backend interface and collapsed by
-    ``parent_drawer_id`` before clustering, so chunks from the same logical
-    drawer never duplicate each other. Neighbor search grows K while the
-    boundary result is still under ``threshold`` and stops at
+    ``parent_drawer_id`` (or legacy ``parent_entry_id``) before clustering, so
+    chunks from the same logical drawer never duplicate each other.
+    Neighbor search grows K while the boundary result is still under
+    ``threshold`` and stops at
     ``min(physical_rows, max_neighbors)``; dense duplicate regions beyond that
     bound are intentionally capped to keep the read-only tool predictable.
     """

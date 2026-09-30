@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock
+
+import pytest
+from chromadb.api.types import validate_where
 
 
 class FakeDuplicateCollection:
@@ -21,6 +25,8 @@ class FakeDuplicateCollection:
     def get(
         self, *, ids=None, where=None, include=None, limit=None, offset=None, where_document=None
     ):
+        if where is not None:
+            validate_where(where)
         self.get_calls.append(
             {
                 "ids": ids,
@@ -44,6 +50,8 @@ class FakeDuplicateCollection:
         }
 
     def query(self, *, query_texts=None, n_results=10, where=None, include=None, **_kwargs):
+        if where is not None:
+            validate_where(where)
         query_doc = query_texts[0]
         query_id = next(row["id"] for row in self.rows.values() if row.get("document") == query_doc)
         self.query_calls.append(
@@ -69,6 +77,8 @@ class FakeDuplicateCollection:
     def _matches(row, where):
         if not where:
             return True
+        if "$and" in where:
+            return all(FakeDuplicateCollection._matches(row, clause) for clause in where["$and"])
         metadata = row.get("metadata", {}) or {}
         return all(metadata.get(key) == value for key, value in where.items())
 
@@ -146,8 +156,50 @@ def test_find_duplicate_clusters_applies_wing_and_room_scope_to_get_and_query():
     result = find_duplicate_clusters(col, wing="w", room="r", threshold=0.15)
 
     assert_cluster_ids(result, [{"a", "b"}])
-    assert col.get_calls[0]["where"] == {"wing": "w", "room": "r"}
-    assert all(call["where"] == {"wing": "w", "room": "r"} for call in col.query_calls)
+    expected_where = {"$and": [{"wing": "w"}, {"room": "r"}]}
+    assert col.get_calls[0]["where"] == expected_where
+    assert all(call["where"] == expected_where for call in col.query_calls)
+
+
+@pytest.mark.parametrize(
+    ("scope", "expected_ids"),
+    [
+        ({"wing": "project", "room": "backend"}, {"a", "b"}),
+        ({"wing": "project"}, {"a", "b", "other-room"}),
+        ({"room": "backend"}, {"a", "b", "other-wing"}),
+        ({}, {"a", "b", "other-room", "other-wing"}),
+    ],
+    ids=["wing-and-room", "wing-only", "room-only", "unscoped"],
+)
+def test_find_duplicate_clusters_scopes_real_chroma_without_mutating_drawers(
+    collection, scope, expected_ids
+):
+    from mempalace.dedup import find_duplicate_clusters
+
+    collection.add(
+        ids=["a", "b", "other-room", "other-wing"],
+        documents=["alpha beta", "alpha beta gamma", "alpha beta", "alpha beta gamma"],
+        metadatas=[
+            {"wing": "project", "room": "backend"},
+            {"wing": "project", "room": "backend"},
+            {"wing": "project", "room": "frontend"},
+            {"wing": "personal", "room": "backend"},
+        ],
+    )
+    before = collection.get(include=["documents", "metadatas"])
+
+    result = find_duplicate_clusters(collection, **scope, threshold=0.25)
+
+    assert_cluster_ids(result, [expected_ids])
+    pair = next(
+        pair for pair in result["clusters"][0]["pairs"] if (pair["a"], pair["b"]) == ("a", "b")
+    )
+    assert pair["distance"] == pytest.approx(0.1835034, abs=1e-6)
+    assert collection.get(include=["documents", "metadatas"]) == before
+    serialized = json.dumps(result)
+    assert "alpha beta" not in serialized
+    assert "documents" not in serialized
+    assert "embeddings" not in serialized
 
 
 def test_find_duplicate_clusters_excludes_self_matches():
@@ -198,6 +250,101 @@ def test_find_duplicate_clusters_does_not_self_cluster_chunks_of_one_logical_dra
     result = find_duplicate_clusters(col, threshold=0.15)
 
     assert result["clusters"] == []
+
+
+@pytest.mark.parametrize(
+    "first_metadata",
+    [
+        {"parent_entry_id": "diary"},
+        {"parent_drawer_id": "diary"},
+        {"parent_drawer_id": "diary", "parent_entry_id": "other-diary"},
+        {"parent_drawer_id": "", "parent_entry_id": "diary"},
+        {"parent_drawer_id": " \t ", "parent_entry_id": "diary"},
+        {"parent_drawer_id": 42, "parent_entry_id": "diary"},
+    ],
+    ids=[
+        "legacy",
+        "mixed",
+        "current-precedence",
+        "blank-current",
+        "whitespace-current",
+        "invalid-current",
+    ],
+)
+def test_find_duplicate_clusters_does_not_self_cluster_legacy_diary(collection, first_metadata):
+    from mempalace.dedup import find_duplicate_clusters
+
+    collection.add(
+        ids=["chunk-0", "chunk-1"],
+        documents=["alpha", "alpha"],
+        metadatas=[first_metadata, {"parent_entry_id": "diary"}],
+    )
+
+    result = find_duplicate_clusters(collection)
+
+    assert result["clusters"] == []
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected_id"),
+    [
+        ({"parent_entry_id": "diary"}, "diary"),
+        ({"parent_drawer_id": "drawer", "parent_entry_id": "diary"}, "drawer"),
+        ({"parent_drawer_id": "", "parent_entry_id": "diary"}, "diary"),
+        ({"parent_drawer_id": " \t ", "parent_entry_id": "diary"}, "diary"),
+        ({"parent_drawer_id": 42, "parent_entry_id": "diary"}, "diary"),
+        ({"parent_drawer_id": "", "parent_entry_id": ""}, "chunk"),
+        ({"parent_drawer_id": 42, "parent_entry_id": 43}, "chunk"),
+    ],
+    ids=[
+        "legacy",
+        "current-precedence",
+        "blank-current",
+        "whitespace-current",
+        "invalid-current",
+        "blank-parents",
+        "invalid-parents",
+    ],
+)
+def test_find_duplicate_clusters_returns_valid_logical_ids_for_legacy_and_regular_drawers(
+    collection, metadata, expected_id
+):
+    from mempalace.dedup import find_duplicate_clusters
+
+    collection.add(
+        ids=["chunk", "regular"],
+        documents=["alpha", "alpha"],
+        metadatas=[metadata, {"wing": "project"}],
+    )
+
+    result = find_duplicate_clusters(collection)
+
+    assert_cluster_ids(result, [{expected_id, "regular"}])
+    assert result["clusters"][0]["pairs"] == [{"a": expected_id, "b": "regular", "distance": 0.0}]
+
+
+def test_find_duplicate_clusters_collapses_mixed_legacy_chunks_between_distinct_drawers(
+    collection,
+):
+    from mempalace.dedup import find_duplicate_clusters
+
+    collection.add(
+        ids=["diary-0", "diary-1", "drawer-0", "drawer-1"],
+        documents=["alpha", "alpha", "alpha", "alpha"],
+        metadatas=[
+            {"parent_entry_id": "diary"},
+            {"parent_drawer_id": "diary"},
+            {"parent_drawer_id": "drawer"},
+            {"parent_entry_id": "drawer"},
+        ],
+    )
+    before = collection.get(include=["documents", "metadatas"])
+
+    result = find_duplicate_clusters(collection)
+
+    assert_cluster_ids(result, [{"diary", "drawer"}])
+    assert result["clusters"][0]["pairs"] == [{"a": "diary", "b": "drawer", "distance": 0.0}]
+    assert collection.get(include=["documents", "metadatas"]) == before
 
 
 def test_find_duplicate_clusters_returns_logical_parent_ids_for_chunked_drawers():
