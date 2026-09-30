@@ -3,6 +3,86 @@ if __name__ != "mempalace.mcp_server":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.mcp_server")
 
 
+def _stat_palace_db() -> tuple:
+    """Return ``(st_ino, st_mtime)`` of the palace's chroma.sqlite3, or ``(0, 0.0)``."""
+    try:
+        st = os.stat(os.path.join(_config.palace_path, "chroma.sqlite3"))
+    except OSError:
+        return 0, 0.0
+    return st.st_ino, st.st_mtime
+
+
+def _restamp_palace_db() -> None:
+    """Re-baseline the freshness stat after this session's own writes.
+
+    Building the client, opening the collection, and every write move
+    chroma.sqlite3's mtime. ``_get_client`` compares against the stat taken
+    before those writes, so it read the session's own footprint as an external
+    change and rebuilt the client, reloading the whole HNSW index, on nearly
+    every call. Same fix as ``ChromaBackend._restamp`` (#2307): record the
+    stat after our own writes, so a later difference is someone else's. A
+    write from another process that lands during our own operation is absorbed
+    the same way there and picked up on the next change.
+    """
+    global _palace_db_inode, _palace_db_mtime
+    if _client_cache is None:
+        return
+    _palace_db_inode, _palace_db_mtime = _stat_palace_db()
+    _note_own_db_stamp(_config.palace_path, (_palace_db_inode, _palace_db_mtime))
+
+
+def _drop_session_client_for_system_reset() -> None:
+    """Close the session client before the shared Chroma System is dropped.
+
+    Search goes through ``ChromaBackend`` and the other tools through this
+    client. Both share Chroma's process-wide System. When one of them sees a
+    peer write it clears that System; the client left open keeps the discarded
+    segment, and the fresh stat the reset records would look like a write this
+    process made itself. Registered with
+    :func:`mempalace.backends.chroma.register_before_system_cache_reset`.
+
+    Does not clear the System again, and does not move the recorded stat: the
+    next ``_get_client`` reopens onto the System the other owner just built.
+    """
+    global \
+        _client_cache, \
+        _collection_cache, \
+        _collection_cache_backend, \
+        _collection_cache_palace, \
+        _collection_open_error
+    cached = _client_cache
+    _client_cache = None
+    _collection_cache = None
+    _collection_cache_backend = None
+    _collection_cache_palace = None
+    _collection_open_error = None
+    _invalidate_overview_caches()
+    if cached is None:
+        return
+    try:
+        close = getattr(cached, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        logger.debug(
+            "Failed to close session Chroma client before system reset",
+            exc_info=True,
+        )
+
+
+register_before_system_cache_reset(_drop_session_client_for_system_reset)
+
+
+class _SessionFreshness:
+    """Stands in for ``ChromaCollection``'s owning backend so the session's own
+    writes re-baseline its freshness stat (see :func:`_restamp_palace_db`)."""
+
+    @staticmethod
+    def _restamp(palace_path: str) -> None:
+        if palace_path == _config.palace_path:
+            _restamp_palace_db()
+
+
 def _get_client():
     """Return a ChromaDB PersistentClient, reconnecting if the database changed on disk.
 
@@ -23,6 +103,7 @@ def _get_client():
         _collection_open_error, \
         _palace_db_inode, \
         _palace_db_mtime, \
+        _client_system_generation, \
         _metadata_cache, \
         _metadata_cache_time
     if not _is_chroma_backend():
@@ -52,14 +133,33 @@ def _get_client():
 
     inode_changed = current_inode != 0 and current_inode != _palace_db_inode
     mtime_changed = current_mtime != 0.0 and abs(current_mtime - _palace_db_mtime) > 0.01
+    # A client opened before the last system reset is not reading the segment
+    # a peer write rebuilt, even when the new stat was recorded as our own.
+    client_is_current = (
+        _client_cache is not None and _client_system_generation == chroma_system_generation()
+    )
+    if (
+        client_is_current
+        and mtime_changed
+        and not inode_changed
+        and _is_own_db_stamp(
+            _config.palace_path,
+            (current_inode, current_mtime),
+            generation=_client_system_generation,
+        )
+    ):
+        # Written through the System this client was opened on (see
+        # _OWN_DB_STAMPS). Nothing to reload.
+        _palace_db_mtime = current_mtime
+        mtime_changed = False
 
-    if _client_cache is None or inode_changed or mtime_changed:
+    if _client_cache is None or inode_changed or mtime_changed or not client_is_current:
         # Run the HNSW capacity probe BEFORE chromadb opens the segment --
         # if the index is severely undersized, segment load can segfault
         # the whole MCP server (#1222). The probe is pure sqlite +
         # metadata read; never touches the HNSW binary files.
         _refresh_vector_disabled_flag()
-        if inode_changed or mtime_changed:
+        if client_is_current and (inode_changed or mtime_changed):
             ChromaBackend._quarantined_paths.discard(_config.palace_path)
             # #2002: a peer process changed chroma.sqlite3 on disk. chromadb
             # caches its System (and the live HNSW segment) keyed by path, so
@@ -68,14 +168,21 @@ def _get_client():
             # persisted count backwards. Drop chromadb's shared cache first so
             # make_client() rebuilds the segment from the on-disk state.
             _force_chroma_cache_reset()
+        elif _client_cache is not None:
+            # Another owner already reset the shared System and this client
+            # is the one it left behind. Reopen onto the System it built;
+            # clearing again would discard that System too.
+            _drop_session_client_for_system_reset()
         _client_cache = ChromaBackend.make_client(_config.palace_path)
         _collection_cache = None
         _collection_cache_backend = None
         _collection_cache_palace = None
         _collection_open_error = None
         _invalidate_overview_caches()
-        _palace_db_inode = current_inode
-        _palace_db_mtime = current_mtime
+        # Stat again: constructing the client just wrote to chroma.sqlite3.
+        _palace_db_inode, _palace_db_mtime = _stat_palace_db()
+        _client_system_generation = chroma_system_generation()
+        _note_own_db_stamp(_config.palace_path, (_palace_db_inode, _palace_db_mtime))
     return _client_cache
 
 
@@ -258,7 +365,10 @@ def _get_collection(create=False):
                         **ef_kwargs,
                     )
                 _pin_hnsw_threads(raw)
-                _collection_cache = ChromaCollection(raw, palace_path=_config.palace_path)
+                _collection_cache = ChromaCollection(
+                    raw, palace_path=_config.palace_path, backend=_SessionFreshness
+                )
+                _restamp_palace_db()
                 _collection_cache_backend = "chroma"
                 _collection_cache_palace = _config.palace_path
                 _collection_open_error = None
@@ -268,7 +378,10 @@ def _get_collection(create=False):
                 ef_kwargs = {"embedding_function": ef} if ef is not None else {}
                 raw = client.get_collection(_config.collection_name, **ef_kwargs)
                 _pin_hnsw_threads(raw)
-                _collection_cache = ChromaCollection(raw, palace_path=_config.palace_path)
+                _collection_cache = ChromaCollection(
+                    raw, palace_path=_config.palace_path, backend=_SessionFreshness
+                )
+                _restamp_palace_db()
                 _collection_cache_backend = "chroma"
                 _collection_cache_palace = _config.palace_path
                 _collection_open_error = None
@@ -444,6 +557,7 @@ _METADATA_CACHE_TTL = 5.0  # seconds
 _taxonomy_cache = None
 _taxonomy_cache_time = 0.0
 _TAXONOMY_CACHE_TTL = 5.0  # seconds — same idea as the palace-graph cache
+_graph_rows_cache = None
 _MAX_RESULTS = 100  # upper bound for search/list limit params
 _DIARY_READ_PAGE_SIZE = 1000
 
@@ -451,26 +565,48 @@ _DIARY_READ_PAGE_SIZE = 1000
 def _invalidate_overview_caches():
     """Drop status/list_wings taxonomy and metadata page caches after writes."""
     global _metadata_cache, _metadata_cache_time, _taxonomy_cache, _taxonomy_cache_time
+    global _graph_rows_cache
     _metadata_cache = None
     _metadata_cache_time = 0
     _taxonomy_cache = None
     _taxonomy_cache_time = 0.0
+    _graph_rows_cache = None
+
+
+def _palace_db_fingerprint():
+    """A stat of chroma.sqlite3 that changes with every committed write, or None.
+
+    chromadb keeps chroma.sqlite3 in rollback-journal mode (see
+    ``backends.chroma``), so a commit from any process rewrites the main file.
+    Counts grouped from the file cannot change while this value holds, which
+    lets overview caches outlive their TTL on a palace nobody is writing to.
+    ``None`` for other backends (sqlite_exact writes through a WAL, so the main
+    file's stat would miss commits) and when the file cannot be stat'ed.
+    """
+    if not _is_chroma_backend():
+        return None
+    try:
+        st = os.stat(os.path.join(_config.palace_path, "chroma.sqlite3"))
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
 
 
 def _get_cached_metadata(col, where=None):
     """Return cached metadata if fresh, else fetch and cache."""
     global _metadata_cache, _metadata_cache_time
-    now = time.time()
     if (
         where is None
         and _metadata_cache is not None
-        and (now - _metadata_cache_time) < _METADATA_CACHE_TTL
+        and (time.time() - _metadata_cache_time) < _METADATA_CACHE_TTL
     ):
         return _metadata_cache
     result = _fetch_all_metadata(col, where=where)
     if where is None:
         _metadata_cache = result
-        _metadata_cache_time = now
+        # Stamp once the fetch is done: stamped at the start, a fetch slower
+        # than the TTL stored an entry that had already expired.
+        _metadata_cache_time = time.time()
     return result
 
 
