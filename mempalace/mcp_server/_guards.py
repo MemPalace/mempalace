@@ -242,11 +242,24 @@ _MUTATING_TOOLS = frozenset(
     }
 )
 
+# Tools exempt from the peer-writer lease.
+#
 # Logstream mutating tools (RFC 003) write only to logstream.sqlite3 — an
 # independent WAL database with no Chroma/HNSW in-memory state — so the
 # peer-writer lease that protects Chroma does not apply to them. Exempting
 # them keeps agent coordination alive while a CLI mine or a peer stdio
-# writer holds the palace lock. They remain in _MUTATING_TOOLS so operator
+# writer holds the palace lock.
+#
+# Knowledge-graph tools (#2297): KnowledgeGraph opens its own
+# knowledge_graph.sqlite3 in WAL mode with its own threading.Lock.
+# None of these paths touch Chroma or the HNSW segment, so the
+# peer-writer lease — which exists to serialise two Chroma
+# PersistentClients against the same palace — has no claim on them.
+# Gate them through the lease and a second session loses the ability
+# to record durable facts for the lifetime of the other session,
+# even though the write is provably safe.
+#
+# All exempted tools remain in _MUTATING_TOOLS so operator
 # read-only mode (--read-only / MEMPALACE_MCP_READ_ONLY) still hides and
 # refuses them.
 _PEER_WRITER_EXEMPT_TOOLS = frozenset(
@@ -256,6 +269,9 @@ _PEER_WRITER_EXEMPT_TOOLS = frozenset(
         "mempalace_event_ack",
         "mempalace_artifact_put",
         "mempalace_patch_submit",
+        "mempalace_kg_add",
+        "mempalace_kg_invalidate",
+        "mempalace_kg_supersede",
     }
 )
 
@@ -1131,6 +1147,8 @@ _collection_cache_palace = None
 _collection_open_error = None
 _palace_db_inode = 0  # inode of chroma.sqlite3 at cache time
 _palace_db_mtime = 0.0  # mtime of chroma.sqlite3 at cache time
+# System generation the session client was opened on. -1 until the first open.
+_client_system_generation = -1
 
 
 def _is_transient_index_error(result) -> bool:
@@ -1199,14 +1217,10 @@ def _force_chroma_cache_reset() -> None:
             logger.debug(
                 "Failed to close MCP-local Chroma client during cache reset", exc_info=True
             )
-    try:
-        from chromadb.api.client import SharedSystemClient
-
-        clear_system_cache = getattr(SharedSystemClient, "clear_system_cache", None)
-        if callable(clear_system_cache):
-            clear_system_cache()
-    except Exception:
-        logger.debug("Failed to clear Chroma shared system cache during cache reset", exc_info=True)
+    # Hook closes any session client this reset did not already drop, and the
+    # generation advances so the reopen is not treated as the same System.
+    if not _clear_chroma_system_cache():
+        logger.debug("Failed to clear Chroma shared system cache during cache reset")
 
 
 # ── Vector-search disabled flag (#1222) ──────────────────────────────────

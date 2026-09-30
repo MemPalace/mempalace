@@ -12,19 +12,29 @@ if __name__ != "mempalace.mcp_server":
 # every other reader. Protocol methods and independent stores bypass this
 # lock; palace reads share it; palace writes take it exclusively.
 class _RWLock:
-    """Writer-preferring readers-writer lock."""
+    """Writer-preferring readers-writer lock that a long writer can yield."""
 
     def __init__(self):
         self._cond = threading.Condition(threading.Lock())
         self._readers = 0
         self._writer = False
+        self._writer_ident = None
         self._waiting_writers = 0
+        self._waiting_readers = 0
+        # True while a yielding writer lets queued readers in (yield_write).
+        self._handoff = False
 
     def acquire_read(self) -> None:
         with self._cond:
-            while self._writer or self._waiting_writers:
-                self._cond.wait()
+            self._waiting_readers += 1
+            try:
+                while self._writer or (self._waiting_writers and not self._handoff):
+                    self._cond.wait()
+            finally:
+                self._waiting_readers -= 1
             self._readers += 1
+            if self._handoff:
+                self._cond.notify_all()
 
     def release_read(self) -> None:
         with self._cond:
@@ -39,13 +49,50 @@ class _RWLock:
                 while self._writer or self._readers:
                     self._cond.wait()
                 self._writer = True
+                self._writer_ident = threading.get_ident()
             finally:
                 self._waiting_writers -= 1
 
     def release_write(self) -> None:
         with self._cond:
             self._writer = False
+            self._writer_ident = None
             self._cond.notify_all()
+
+    def yield_write(self) -> None:
+        """Let the requests queued behind a held write lock run, then take it back.
+
+        For a writer that works in steps, a mine between files. Plain writer
+        preference would keep queued readers out while this writer asks for
+        the lock again, so they are let in first; a queued writer takes its
+        turn as usual. Returns at once when nobody waits, or when the calling
+        thread is not the one holding the write lock.
+        """
+        with self._cond:
+            if not self._writer or self._writer_ident != threading.get_ident():
+                return
+            if not self._waiting_readers and not self._waiting_writers:
+                return
+            self._writer = False
+            self._writer_ident = None
+            self._handoff = True
+            self._cond.notify_all()
+            try:
+                # Until everything queued has had its turn: waiting readers
+                # enter now, and a waiting writer counts as served once it has
+                # taken the lock (its release wakes this loop again).
+                while self._waiting_readers or self._waiting_writers:
+                    self._cond.wait()
+            finally:
+                self._handoff = False
+            self._waiting_writers += 1
+            try:
+                while self._writer or self._readers:
+                    self._cond.wait()
+                self._writer = True
+                self._writer_ident = threading.get_ident()
+            finally:
+                self._waiting_writers -= 1
 
     def read_lock(self):
         lock = self
@@ -71,6 +118,12 @@ class _RWLock:
 
 
 _HTTP_REQUEST_LOCK = _RWLock()
+# Taken before _HTTP_REQUEST_LOCK by a hub mine, so a second mine waits for the
+# first as before even though the first yields the request lock between files.
+_HTTP_MINE_LOCK = threading.Lock()
+# Tools that hold the request lock exclusively for a long run but reach
+# mine_yield_point() between files, where waiting requests may run.
+_HTTP_YIELDING_TOOLS = frozenset({"mempalace_mine"})
 _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 _HTTP_ACTIVE_CLIENT_WINDOW_S = 120.0
 
@@ -383,6 +436,18 @@ def _http_dispatch(request):
 
     if classify_tool(tool_name) == "read":
         with _HTTP_REQUEST_LOCK.read_lock():
+            return handle_request(request)
+    if tool_name in _HTTP_YIELDING_TOOLS:
+        # A mine held the exclusive lock for its whole run, so every other
+        # palace request, status included, waited for all of it. It still runs
+        # exclusively, but hands the lock to waiting requests between files.
+        from ..palace import mine_yield_hook
+
+        with (
+            _HTTP_MINE_LOCK,
+            _HTTP_REQUEST_LOCK,
+            mine_yield_hook(_HTTP_REQUEST_LOCK.yield_write),
+        ):
             return handle_request(request)
     with _HTTP_REQUEST_LOCK:
         return handle_request(request)
