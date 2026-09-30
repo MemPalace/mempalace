@@ -383,7 +383,32 @@ def search_memories(
         stop_words=stop_words,
     )
     if short_circuit is not None:
-        return short_circuit
+        # The vector-disabled/BM25 fallback returns here — expansion applies
+        # on this path too so the fallback scope matches the vector path.
+        return _maybe_expand_across_wings(
+            short_circuit,
+            query=query,
+            palace_path=palace_path,
+            collection_name=collection_name,
+            drawers_col=None,
+            expand_wings=expand_wings,
+            wing=wing,
+            room=room,
+            source_file=source_file,
+            n_results=n_results,
+            fetch_wing=lambda w: _vector_disabled_search(
+                query=query,
+                palace_path=palace_path,
+                wing=w,
+                room=None,
+                n_results=n_results,
+                collection_name=collection_name,
+                stop_words=stop_words,
+                since_dt=since_dt,
+                before_dt=before_dt,
+            ),
+            thin_check=lambda hits: _bm25_baseline_is_thin(hits, n_results),
+        )
 
     drawers_col, open_error = _open_search_collection(palace_path, collection_name)
     if open_error:
