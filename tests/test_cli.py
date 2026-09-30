@@ -131,6 +131,8 @@ def test_cmd_search_calls_search(mock_config_cls):
         room="myroom",
         results=3,
         since="2026-04-01",
+        source_file=None,
+        json=False,
         before=None,
     )
     with patch("mempalace.searcher.search") as mock_search:
@@ -140,9 +142,11 @@ def test_cmd_search_calls_search(mock_config_cls):
             palace_path="/fake/palace",
             wing="mywing",
             room="myroom",
+            source_file=None,
             n_results=3,
             since="2026-04-01",
             before=None,
+            json_output=False,
         )
 
 
