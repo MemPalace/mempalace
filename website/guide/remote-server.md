@@ -76,6 +76,9 @@ export MEMPALACE_QDRANT_URL=http://localhost:6333
 export MEMPALACE_QDRANT_API_KEY=your-qdrant-api-key   # if your Qdrant requires one
 ```
 
+Any secret here can come from a file instead: see
+[Secrets from files](#secrets-from-files).
+
 | Variable | Default | Purpose |
 |---|---|---|
 | `MEMPALACE_BACKEND` | `chroma` | Set to `milvus`, `qdrant`, or `pgvector` to select the backend |
@@ -86,6 +89,7 @@ export MEMPALACE_QDRANT_API_KEY=your-qdrant-api-key   # if your Qdrant requires 
 | `MEMPALACE_MILVUS_CONSISTENCY_LEVEL` | `Strong` | Milvus consistency level |
 | `MEMPALACE_QDRANT_URL` | `http://localhost:6333` | Qdrant REST endpoint |
 | `MEMPALACE_QDRANT_API_KEY` | _(none)_ | Sent as the `api-key` header when set |
+| `MEMPALACE_QDRANT_API_KEY_FILE` | _(none)_ | File holding the API key, instead of `MEMPALACE_QDRANT_API_KEY` |
 | `MEMPALACE_QDRANT_NAMESPACE` | _(none)_ | Optional collection namespace prefix |
 | `MEMPALACE_QDRANT_TIMEOUT` | backend default | REST request timeout (seconds) |
 
@@ -259,7 +263,10 @@ docker compose -f deploy/docker-compose.server.yml --env-file deploy/.env up -d
 
 This brings up a Qdrant container and a MemPalace server running
 `serve --host 0.0.0.0 --backend qdrant`, with a `/healthz` healthcheck and
-persistent volumes. Embeddings stay local to the MemPalace container.
+persistent volumes. Embeddings stay local to the MemPalace container. The
+bearer token reaches the server as a Compose secret, a file under
+`/run/secrets`, so it is not in the container's environment and
+`docker inspect` does not show it.
 
 **systemd:**
 
@@ -267,6 +274,39 @@ persistent volumes. Embeddings stay local to the MemPalace container.
 (`NoNewPrivileges`, `ProtectSystem=strict`, dedicated user) that runs
 `mempalace serve` with its config from `/etc/mempalace/server.env`. Install
 steps are in the file's header comment.
+
+## Secrets from files
+
+The bearer token and the Qdrant API key can be read from a file rather than
+from the environment, so they do not appear in `docker inspect`,
+`docker compose config`, or the process environment:
+
+| Variable | Instead of |
+|---|---|
+| `MEMPALACE_MCP_HTTP_TOKEN_FILE` | `MEMPALACE_MCP_HTTP_TOKEN` |
+| `MEMPALACE_QDRANT_API_KEY_FILE` | `MEMPALACE_QDRANT_API_KEY` |
+
+Each names a file whose contents are the secret; a trailing newline is
+ignored. This is the `_FILE` convention of the official postgres and mysql
+images, and it fits Docker Compose secrets (`/run/secrets/<name>`, which
+`deploy/docker-compose.server.yml` uses for the token) and systemd's
+`LoadCredential=` (`%d/<name>`):
+
+```ini
+# in the [Service] section of the unit
+LoadCredential=mempalace_mcp_http_token:/etc/mempalace/token
+Environment=MEMPALACE_MCP_HTTP_TOKEN_FILE=%d/mempalace_mcp_http_token
+```
+
+Set one form or the other. MemPalace refuses to start when both are set, or
+when the file cannot be read or is empty, rather than falling back to running
+without the secret. An empty value counts as unset. `mempalace serve --token`
+still takes precedence over both, as it does over the variable today.
+
+`mempalace serve` passes a token file on to the server by path, including the
+token it generates for a network-exposed bind, so the token stays out of the
+server process's environment too. A token given with `--token` or as
+`MEMPALACE_MCP_HTTP_TOKEN` is passed as before.
 
 ## See also
 

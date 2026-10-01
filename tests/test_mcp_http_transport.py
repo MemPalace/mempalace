@@ -1261,3 +1261,42 @@ def test_extra_allowed_hosts_default_empty(monkeypatch):
     monkeypatch.delenv("MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS", raising=False)
     allowed = mcp._http_allowed_host_values("127.0.0.1", 8765)
     assert not any("ts.net" in v for v in allowed)
+
+
+def test_bearer_token_read_from_token_file(monkeypatch, tmp_path):
+    """MEMPALACE_MCP_HTTP_TOKEN_FILE supplies the bearer token (#2626)."""
+    token_file = tmp_path / "token"
+    token_file.write_text("file-s3cret\n", encoding="utf-8")
+    monkeypatch.delenv("MEMPALACE_MCP_HTTP_TOKEN", raising=False)
+    monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN_FILE", str(token_file))
+    monkeypatch.setattr(mcp, "_sqlite_integrity_payload", lambda: {"ok": True, "errors": []})
+    httpd = mcp._build_http_server("127.0.0.1", 0)
+    port = httpd.server_address[1]
+    thread = threading.Thread(
+        target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+    )
+    thread.start()
+    try:
+        ping = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        assert _post(port, "/mcp", ping)[0] == 401
+        # The trailing newline in the file is not part of the token.
+        assert _post(port, "/mcp", ping, headers={"Authorization": "Bearer file-s3cret"})[0] == 200
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("both_set", [True, False])
+def test_misconfigured_token_file_fails_before_bind(monkeypatch, tmp_path, both_set):
+    """Both forms set, or an unreadable file, is a startup error, never "no token"."""
+    if both_set:
+        token_file = tmp_path / "token"
+        token_file.write_text("file-s3cret", encoding="utf-8")
+        monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "env-s3cret")
+    else:
+        token_file = tmp_path / "missing"
+        monkeypatch.delenv("MEMPALACE_MCP_HTTP_TOKEN", raising=False)
+    monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN_FILE", str(token_file))
+    with pytest.raises(ValueError, match="MEMPALACE_MCP_HTTP_TOKEN_FILE"):
+        mcp._build_http_server("127.0.0.1", 0)

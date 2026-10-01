@@ -742,6 +742,7 @@ class TestForwardSearchToHub:
             "MEMPALACE_EMBEDDING_MODEL",
             "MEMPALACE_EMBEDDING_API_URL",
             "MEMPALACE_QDRANT_URL",
+            "MEMPALACE_QDRANT_API_KEY_FILE",
         ],
     )
     def test_per_invocation_search_override_is_not_forwardable(self, monkeypatch, env_name):
