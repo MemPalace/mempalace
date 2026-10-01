@@ -24,6 +24,7 @@ from urllib import request as urlrequest
 
 import numpy as np
 
+from ..secret_env import read_secret_env
 from ..version import __version__
 from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
@@ -340,7 +341,7 @@ class _QdrantConfig:
         )
         api_key = (
             options.get("api_key")
-            or os.environ.get("MEMPALACE_QDRANT_API_KEY")
+            or read_secret_env("MEMPALACE_QDRANT_API_KEY")
             or getattr(cfg, "qdrant_api_key", None)
         )
         namespace = (

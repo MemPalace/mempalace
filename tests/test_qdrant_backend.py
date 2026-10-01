@@ -215,6 +215,7 @@ def fake_qdrant(monkeypatch):
     monkeypatch.setattr(qdrant, "_QdrantRESTClient", _FakeQdrantClient)
     monkeypatch.delenv("MEMPALACE_QDRANT_URL", raising=False)
     monkeypatch.delenv("MEMPALACE_QDRANT_API_KEY", raising=False)
+    monkeypatch.delenv("MEMPALACE_QDRANT_API_KEY_FILE", raising=False)
     monkeypatch.delenv("MEMPALACE_QDRANT_NAMESPACE", raising=False)
     monkeypatch.delenv("MEMPALACE_QDRANT_TIMEOUT", raising=False)
     return _FakeQdrantClient
@@ -666,3 +667,27 @@ def test_qdrant_facet_counts_ignores_missing_metadata(tmp_path, fake_qdrant):
     assert collection.facet_counts("wing") == {
         "alpha": 1,
     }
+
+
+def test_qdrant_api_key_from_file(tmp_path, monkeypatch, fake_qdrant):
+    from mempalace.backends.qdrant import _QdrantConfig
+
+    key_file = tmp_path / "qdrant_key"
+    key_file.write_text("file-key\n", encoding="utf-8")
+    monkeypatch.setenv("MEMPALACE_QDRANT_API_KEY_FILE", str(key_file))
+
+    assert _QdrantConfig.from_options({}).api_key == "file-key"
+    # An explicit option still wins, as it does over the env var.
+    assert _QdrantConfig.from_options({"api_key": "option-key"}).api_key == "option-key"
+
+
+def test_qdrant_api_key_and_key_file_together_are_refused(tmp_path, monkeypatch, fake_qdrant):
+    from mempalace.backends.qdrant import _QdrantConfig
+
+    key_file = tmp_path / "qdrant_key"
+    key_file.write_text("file-key", encoding="utf-8")
+    monkeypatch.setenv("MEMPALACE_QDRANT_API_KEY", "env-key")
+    monkeypatch.setenv("MEMPALACE_QDRANT_API_KEY_FILE", str(key_file))
+
+    with pytest.raises(ValueError, match="MEMPALACE_QDRANT_API_KEY_FILE"):
+        _QdrantConfig.from_options({})

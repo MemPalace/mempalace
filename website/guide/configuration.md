@@ -88,6 +88,7 @@ you control.
 | -------- | ------- | ----------- |
 | `MEMPALACE_QDRANT_URL` | `http://localhost:6333` | Qdrant REST endpoint |
 | `MEMPALACE_QDRANT_API_KEY` | _(none)_ | Sent as the `api-key` header when set |
+| `MEMPALACE_QDRANT_API_KEY_FILE` | _(none)_ | File holding the API key, instead of `MEMPALACE_QDRANT_API_KEY` ([details](/guide/remote-server#secrets-from-files)) |
 | `MEMPALACE_QDRANT_NAMESPACE` | _(none)_ | Collection namespace prefix (tenant isolation) |
 | `MEMPALACE_QDRANT_TIMEOUT` | `10.0` | REST request timeout, in seconds |
 

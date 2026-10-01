@@ -31,6 +31,8 @@ import os
 import time
 from pathlib import Path
 
+from .secret_env import SecretEnvError, read_secret_env
+
 logger = logging.getLogger(__name__)
 
 # Bind-address wildcards: a hub bound to "all interfaces" is dialed via
@@ -271,7 +273,13 @@ def load_server_tokens(palace_path: str) -> tuple[str, ...]:
     while an older generated palace credential remains on disk.
     """
     palace_token = _read_server_token_file(palace_path)
-    process_token = os.environ.get(_TOKEN_ENV, "").strip()
+    try:
+        process_token = (read_secret_env(_TOKEN_ENV) or "").strip()
+    except SecretEnvError as exc:
+        # A client-side fallback candidate, not the Hub's own auth: the palace
+        # credential above can still authenticate, so report and drop it.
+        logger.warning("Ignoring the process Hub token: %s", exc)
+        process_token = ""
     candidates = []
     for token in (palace_token, process_token):
         if token and token not in candidates:
