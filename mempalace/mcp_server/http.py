@@ -166,6 +166,11 @@ _SSE_POLL_BASE_S = 0.3
 _SSE_POLL_JITTER_S = 0.4
 _SSE_BATCH_LIMIT = 500
 _HTTP_RECENT_CLIENT_LIMIT = 50
+# Threshold at or above which _http_call_timing also logs the line as
+# "SLOW CALL" at WARNING (0 disables the escalation). Parsed with
+# _write_stall_secs, the same reader as MEMPALACE_MCP_WRITE_STALL_WARN_SECS.
+_HTTP_SLOW_CALL_WARN_ENV = "MEMPALACE_SLOW_CALL_WARN_SECS"
+_HTTP_SLOW_CALL_WARN_DEFAULT = 20.0
 # Host literals that always denote this machine. Used both to decide whether a
 # bind is loopback (skip the network-exposure warning) and to pin the Host
 # header against DNS rebinding when serving on loopback.
@@ -412,12 +417,86 @@ def _sse_max_clients() -> int:
         return _SSE_MAX_CLIENTS_DEFAULT
 
 
+def _http_slow_call_warn_secs() -> float:
+    """Seconds at or above which a palace call is also logged as ``SLOW CALL``.
+
+    Parsed the way ``MEMPALACE_MCP_WRITE_STALL_WARN_SECS`` is (protocol.py), so
+    one malformed value warns and falls back instead of disabling the threshold.
+    """
+    return _write_stall_secs(_HTTP_SLOW_CALL_WARN_ENV, _HTTP_SLOW_CALL_WARN_DEFAULT)
+
+
+@contextlib.contextmanager
+def _http_call_timing(tool_name, mode: str, locks: tuple = ()):
+    """Time one locked palace tool call and log a single line for it (#2620).
+
+    ``locks`` is the tuple of context managers the caller would otherwise enter
+    around the handler — timed *inside* this block so the wait is the time spent
+    queued for the dispatch lock and the run is the handler's own time. Timing
+    them together (wrapping the whole locked region from outside) would report
+    the queue wait as part of the run, which is exactly the distinction the line
+    exists to make: with the writer-preferring dispatch lock a call that queued
+    behind a long writer is otherwise indistinguishable from a slow one.
+
+    Emits one ``CALL <tool> <read|write> wait=<ms> run=<ms> <ok|error>`` line at
+    INFO, and the same line at WARNING as ``SLOW CALL`` once either half reaches
+    ``MEMPALACE_SLOW_CALL_WARN_SECS``. A raised handler still gets its line —
+    with ``error`` — before the exception propagates, so a failing call is
+    visible in the file rather than only as a transport-level 500.
+
+    The lock is released before the line is logged: a logging failure must never
+    be able to hold it, and the run measurement should not include the release.
+    Logging never raises; a diagnostic must not be able to fail the tool call it
+    describes.
+    """
+    warn_secs = _http_slow_call_warn_secs()
+    started = time.monotonic()
+    locked_at = ended = started
+    outcome = "ok"
+    try:
+        with contextlib.ExitStack() as stack:
+            for lock in locks:
+                stack.enter_context(lock)
+            locked_at = time.monotonic()
+            try:
+                yield
+            except BaseException:
+                outcome = "error"
+                raise
+            finally:
+                ended = time.monotonic()
+    finally:
+        # Outside the ExitStack, so the dispatch lock is already released: a
+        # logging failure must never hold it, and the run must not include the
+        # release. A failure while *taking* a lock leaves wait at 0ms, which
+        # says the call never ran rather than inventing a queue time for it.
+        wait_ms = int((locked_at - started) * 1000)
+        run_ms = int((ended - locked_at) * 1000)
+        try:
+            slow = warn_secs > 0 and max(wait_ms, run_ms) >= warn_secs * 1000
+            logger.log(
+                logging.WARNING if slow else logging.INFO,
+                "%sCALL %s %s wait=%dms run=%dms %s",
+                "SLOW " if slow else "",
+                tool_name,
+                mode,
+                wait_ms,
+                run_ms,
+                outcome,
+            )
+        except Exception:  # pragma: no cover - logging must never fail a call
+            logger.debug("call timing log failed", exc_info=True)
+
+
 def _http_dispatch(request):
     """Dispatch one JSON-RPC request with the transport's locking policy.
 
     Protocol methods and independent stores are lock-free. Palace reads share
     the lock; palace writes take it exclusively. Unclassified tools fail
     closed onto the exclusive side.
+
+    Every locked call also logs one timed line (#2620). Lock-free tools take no
+    lock and are not timed.
     """
     # Same envelope trap as handle_request, on a dispatcher added after it: the
     # `or ""` fallback only rescues falsy values, so a truthy non-string method
@@ -435,7 +514,7 @@ def _http_dispatch(request):
     from ..service import classify_tool
 
     if classify_tool(tool_name) == "read":
-        with _HTTP_REQUEST_LOCK.read_lock():
+        with _http_call_timing(tool_name, "read", (_HTTP_REQUEST_LOCK.read_lock(),)):
             return handle_request(request)
     if tool_name in _HTTP_YIELDING_TOOLS:
         # A mine held the exclusive lock for its whole run, so every other
@@ -443,13 +522,14 @@ def _http_dispatch(request):
         # exclusively, but hands the lock to waiting requests between files.
         from ..palace import mine_yield_hook
 
-        with (
+        locks = (
             _HTTP_MINE_LOCK,
             _HTTP_REQUEST_LOCK,
             mine_yield_hook(_HTTP_REQUEST_LOCK.yield_write),
-        ):
+        )
+        with _http_call_timing(tool_name, "write", locks):
             return handle_request(request)
-    with _HTTP_REQUEST_LOCK:
+    with _http_call_timing(tool_name, "write", (_HTTP_REQUEST_LOCK,)):
         return handle_request(request)
 
 
