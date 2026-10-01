@@ -204,7 +204,8 @@ def _enrich_search_results(res: Dict[str, Any]) -> Dict[str, Any]:
     top_room = top_item.get("room")
     if top_wing and top_room:
         try:
-            tunnel_res = mcp_server.tool_follow_tunnels(top_wing, top_room)
+            # Decoration of a search hit, not an agent crossing the tunnel.
+            tunnel_res = mcp_server.tool_follow_tunnels(top_wing, top_room, record=False)
             if isinstance(tunnel_res, dict) and tunnel_res.get("error"):
                 connections = []
             elif isinstance(tunnel_res, list):
@@ -1050,7 +1051,11 @@ def main():
             continue
         try:
             req = json.loads(line)
-        except json.JSONDecodeError:
+        except Exception as exc:
+            # A line json.loads rejects is skipped, as invalid JSON always was. An
+            # integer past the digit limit or nesting too deep to parse raises
+            # something else, and used to end the server.
+            logger.error("Skipped a line json.loads rejected: %s: %s", type(exc).__name__, exc)
             continue
         try:
             resp = dispatch_light_stdio_request(req)

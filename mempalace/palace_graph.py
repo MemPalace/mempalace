@@ -30,7 +30,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 from .config import MempalaceConfig, normalize_wing_name
-from .dynamics import initialize_dynamics_fields
+from .dynamics import initialize_dynamics_fields, potentiate
 from .palace import get_collection as _get_palace_collection
 from .palace import mine_lock
 from .backends.base import BaseCollection
@@ -785,11 +785,42 @@ def delete_tunnel(tunnel_id: str):
     return {"deleted": tunnel_id}
 
 
-def follow_tunnels(wing: str, room: str, col=None, config=None):
+def record_tunnel_traversal(tunnel_ids, config=None) -> int:
+    """Potentiate the tunnels an agent just followed; returns how many.
+
+    This is the only place a tunnel's ``access_count`` / ``strength`` rises,
+    so a palace where nothing ever calls it shows every tunnel as never
+    traversed. Best-effort: a lock or write failure is logged and the read
+    that triggered it still returns.
+    """
+    wanted = {t for t in tunnel_ids if t}
+    if not wanted:
+        return 0
+    touched = 0
+    try:
+        with mine_lock(_get_tunnel_file(config)):
+            tunnels = _load_tunnels(config)
+            for t in tunnels:
+                if isinstance(t, dict) and t.get("id") in wanted:
+                    initialize_dynamics_fields(t)
+                    potentiate(t)
+                    touched += 1
+            if touched:
+                _save_tunnels(tunnels, config)
+    except Exception:
+        logger.debug("Recording tunnel traversal failed", exc_info=True)
+        return 0
+    return touched
+
+
+def follow_tunnels(wing: str, room: str, col=None, config=None, record: bool = True):
     """Follow explicit tunnels from a room — returns connected drawers.
 
     Given a location (wing/room), finds all tunnels leading from or to it,
-    and optionally fetches the connected drawer content.
+    and optionally fetches the connected drawer content. Following a tunnel
+    is a traversal: unless ``record`` is off (a read-only server, a peer
+    that does not hold the writer lock), each tunnel crossed is
+    potentiated so navigation weights and the audit reflect real use.
     """
     # Fall back to raw ``wing`` so an empty/whitespace query string still
     # produces a value to compare with; ``_normalize_wing`` returns ``None``
@@ -797,7 +828,7 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
     # mempalace.yaml slug (underscore) and an explicit ``--wing`` slug
     # (verbatim) both resolve through the same comparison.
     norm_wing = _normalize_wing(wing) or wing
-    tunnels = _load_tunnels()
+    tunnels = _load_tunnels(config)
     connections = []
 
     for t in tunnels:
@@ -846,6 +877,9 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
                         c["drawer_preview"] = drawer_map[did][:300]
             except Exception:
                 logger.debug("Drawer preview hydration failed", exc_info=True)
+
+    if record and connections:
+        record_tunnel_traversal([c["tunnel_id"] for c in connections], config)
 
     return connections
 
@@ -1028,11 +1062,101 @@ def topic_tunnels_for_wing(
     return created
 
 
+ENTITY_TUNNEL_MIN_COUNT = 3
+ENTITY_TUNNEL_MAX_PER_WING = 25
+# An entity present in more wings than this share of all wings (and in more
+# than ENTITY_TUNNEL_UBIQUITY_MIN_WINGS) is vocabulary, not a link: ``Server``
+# shows up in every project, ``block_num`` in the two chain-indexer ones.
+ENTITY_TUNNEL_UBIQUITY_SHARE = 0.25
+ENTITY_TUNNEL_UBIQUITY_MIN_WINGS = 3
+
+
+def entity_tunnel_candidates(hallways: list, min_count: int = ENTITY_TUNNEL_MIN_COUNT) -> dict:
+    """``{entity: {wing_norm: (display_wing, strength)}}`` for entities in ≥2 wings.
+
+    Strength is the entity's strongest hallway co-occurrence in that wing.
+    Left out: generic tokens (``content``, ``WebFetch``, ``compose.yml``),
+    entities below ``min_count`` in a wing, and ubiquitous entities — present
+    in more than a quarter of all wings (and in more than three). A tunnel
+    on any of them links nothing.
+
+    Spellings of one entity merge under :func:`canonical_spelling`
+    (``ChatStore.swift`` / ``ChatStore`` → ``ChatStore``, ``src/main.zig`` /
+    ``main.zig`` → ``src/main.zig``),
+    resolved across every wing the same way the hallway miner resolves them
+    inside one. Two files that only share a basename (``src/models/user.py``
+    in one wing, ``tests/fixtures/user.py`` in another) are two entities: a
+    tunnel between them would link unrelated code.
+    """
+    from .hallways import (
+        _spelling_clusters,
+        canonical_spelling,
+        entity_spelling_key,
+        is_generic_entity,
+    )
+
+    def usable(ent) -> bool:
+        return isinstance(ent, str) and bool(ent.strip()) and not is_generic_entity(ent)
+
+    spellings_by_base: dict = defaultdict(set)
+    for h in hallways:
+        if isinstance(h, dict):
+            for ent in (h.get("entity_a"), h.get("entity_b")):
+                if usable(ent):
+                    spellings_by_base[entity_spelling_key(ent)].add(ent)
+    canonical: dict = {}
+    for spellings in spellings_by_base.values():
+        for cluster in _spelling_clusters(sorted(spellings)):
+            name = canonical_spelling(cluster)
+            for spelling in cluster:
+                canonical[spelling] = name
+
+    by_key: dict = {}
+    for h in hallways:
+        if not isinstance(h, dict):
+            continue
+        h_wing = h.get("wing")
+        if not isinstance(h_wing, str) or not h_wing.strip():
+            continue
+        wing_norm = normalize_wing_name(h_wing.strip())
+        # A record without a count is hand-made or legacy; it passes the bar.
+        count = int(h["co_occurrence_count"]) if "co_occurrence_count" in h else min_count
+        for ent_key in ("entity_a", "entity_b"):
+            ent = h.get(ent_key)
+            if not usable(ent):
+                continue
+            key = canonical.get(ent)
+            if key is None:
+                continue  # an ambiguous name: it identifies no single file
+            wings = by_key.setdefault(key, {})
+            prev = wings.get(wing_norm)
+            if prev is None or count > prev[1]:
+                wings[wing_norm] = (h_wing, count)
+    all_wings = {
+        normalize_wing_name(str(h.get("wing")).strip())
+        for h in hallways
+        if isinstance(h, dict) and h.get("wing")
+    }
+    ubiquity_cap = max(
+        ENTITY_TUNNEL_UBIQUITY_MIN_WINGS, int(len(all_wings) * ENTITY_TUNNEL_UBIQUITY_SHARE)
+    )
+    out = {}
+    for key, wings in by_key.items():
+        if len(wings) > ubiquity_cap:
+            continue
+        strong = {w: v for w, v in wings.items() if v[1] >= min_count}
+        if len(strong) >= 2:
+            out[key] = strong
+    return out
+
+
 def entity_tunnels_for_wing(
     wing: str,
     hallways: list,
     label_prefix: str = "shared entity",
     config=None,
+    min_count: int = ENTITY_TUNNEL_MIN_COUNT,
+    max_per_wing: int = ENTITY_TUNNEL_MAX_PER_WING,
 ) -> list:
     """Compute entity tunnels involving a single wing.
 
@@ -1055,51 +1179,37 @@ def entity_tunnels_for_wing(
         return []
 
     wing_norm = normalize_wing_name(wing.strip())
-
-    # Build: entity -> {normalized_wing -> original_wing_display_name}
-    # Both entity_a and entity_b positions count toward "this entity is
-    # in this wing"; the hallway primitive treats the pair as unordered.
-    entity_wings: dict = {}
-    for h in hallways:
-        if not isinstance(h, dict):
-            continue
-        h_wing = h.get("wing")
-        if not isinstance(h_wing, str) or not h_wing.strip():
-            continue
-        h_wing_norm = normalize_wing_name(h_wing.strip())
-        for ent_key in ("entity_a", "entity_b"):
-            ent = h.get(ent_key)
-            if not isinstance(ent, str) or not ent.strip():
-                continue
-            # setdefault preserves the first-seen display form so the
-            # tunnel endpoint matches the wing name the caller used.
-            entity_wings.setdefault(ent, {}).setdefault(h_wing_norm, h_wing)
-
-    if not entity_wings:
+    candidates = entity_tunnel_candidates(hallways, min_count=min_count)
+    if not candidates:
         return []
 
-    created: list = []
-    # Stable entity order so tunnels materialize deterministically across
-    # runs — matters for tests and for diff-able tunnels.json files.
-    for entity in sorted(entity_wings.keys()):
-        wings_for_entity = entity_wings[entity]
-        if wing_norm not in wings_for_entity:
+    # The cap counts links, not entities: an entity shared by five wings is
+    # four links from this one, and capping entity names let a wing exceed
+    # its budget several times over. Each (entity, other wing) link ranks by
+    # its weaker side; ties break on the names so tunnels.json stays
+    # diff-able across runs.
+    links = []
+    for entity, wings_for_entity in candidates.items():
+        own = wings_for_entity.get(wing_norm)
+        if own is None:
             continue
-        own_wing_display = wings_for_entity[wing_norm]
-        # Stable other-wing order; ``wing_norm`` itself is excluded so an
-        # entity that lives only in this wing produces zero tunnels.
-        other_wings_norm = sorted(w for w in wings_for_entity if w != wing_norm)
-        for other_norm in other_wings_norm:
-            other_display = wings_for_entity[other_norm]
-            room = f"entity:{entity}"
-            tunnel = create_tunnel(
-                source_wing=own_wing_display,
-                source_room=room,
-                target_wing=other_display,
-                target_room=room,
-                label=f"{label_prefix}: {entity}",
-                kind="entity",
-                config=config,
-            )
-            created.append(tunnel)
+        for other_norm, other in wings_for_entity.items():
+            if other_norm != wing_norm:
+                links.append((-min(own[1], other[1]), entity, other_norm))
+    links.sort()
+
+    created: list = []
+    for _, entity, other_norm in links[: max(0, max_per_wing)]:
+        wings_for_entity = candidates[entity]
+        room = f"entity:{entity}"
+        tunnel = create_tunnel(
+            source_wing=wings_for_entity[wing_norm][0],
+            source_room=room,
+            target_wing=wings_for_entity[other_norm][0],
+            target_room=room,
+            label=f"{label_prefix}: {entity}",
+            kind="entity",
+            config=config,
+        )
+        created.append(tunnel)
     return created

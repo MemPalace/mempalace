@@ -9,6 +9,7 @@ light, and losing the hub must still leave a working -- and visibly degraded
 -- session rather than a broken one.
 """
 
+import http.client
 import io
 import json
 import os
@@ -24,7 +25,16 @@ from mempalace import mcp_proxy
 class TestInvocationRouting:
     @pytest.mark.parametrize(
         "argv",
-        [[], ["--transport", "stdio"], ["--transport=stdio"], ["--palace", "/tmp/p"]],
+        [
+            [],
+            ["--transport", "stdio"],
+            ["--transport=stdio"],
+            ["--palace", "/tmp/p"],
+            # The server's parser does not define --collection and skips it, so
+            # it never fails without a value.
+            ["--palace", "/tmp/p", "--collection"],
+            ["--collection", "--palace", "/tmp/p"],
+        ],
     )
     def test_plain_stdio_invocations_can_be_proxied(self, argv):
         assert mcp_proxy._is_plain_stdio_invocation(argv) is True
@@ -39,6 +49,10 @@ class TestInvocationRouting:
             ["--port", "8765"],
             ["--read-only"],
             ["--some-future-flag"],
+            ["--backend"],
+            ["--palace", "/tmp/p", "--backend"],
+            ["--palace", "--backend"],
+            ["--palace", "/tmp/p", "--collection", "--backend"],
         ],
     )
     def test_non_stdio_or_unknown_invocations_go_to_the_full_server(self, argv):
@@ -111,6 +125,24 @@ class _LoadedLocal:
     def load(self):
         self.load_count += 1
         return self.server
+
+
+class _UnimportableLocal:
+    """A local server whose import fails, as a broken install makes it."""
+
+    def __init__(self, error=None):
+        self.error = error or ImportError("chromadb failed to import")
+
+    def load(self):
+        raise self.error
+
+
+# How a storage stack fails to import: a module missing, or chromadb refusing
+# the interpreter's sqlite3, which it raises as a RuntimeError.
+_IMPORT_FAILURES = [
+    ImportError("chromadb failed to import"),
+    RuntimeError("Your system has an unsupported version of sqlite3"),
+]
 
 
 class TestRouting:
@@ -215,9 +247,208 @@ class TestRouting:
         assert server.calls == []
         assert out["error"]["code"] == -32000
 
+    _BROKEN_OFF = [http.client.IncompleteRead(b'{"jsonrpc": '), http.client.BadStatusLine("x")]
+
+    @pytest.mark.parametrize("error", _BROKEN_OFF, ids=["answer-cut-off", "bad-status-line"])
+    def test_a_write_whose_hub_answer_broke_off_is_not_replayed(self, monkeypatch, error):
+        """The hub got the call and may have run it; only its answer is missing."""
+        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: ("http://hub", {}))
+
+        def broken_off(*a):
+            raise error
+
+        monkeypatch.setattr(mcp_proxy, "_forward", broken_off)
+        server = _FakeServer(mutating=True)
+
+        out = mcp_proxy._handle(dict(self._REQUEST), "/p", _LoadedLocal(server))
+
+        assert server.calls == [], "a mutating call was replayed locally"
+        assert out["error"]["message"].startswith("palace hub proxy failed")
+
+    @pytest.mark.parametrize("error", _BROKEN_OFF, ids=["answer-cut-off", "bad-status-line"])
+    def test_a_read_whose_hub_answer_broke_off_is_served_locally(self, monkeypatch, error):
+        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: ("http://hub", {}))
+
+        def broken_off(*a):
+            raise error
+
+        monkeypatch.setattr(mcp_proxy, "_forward", broken_off)
+        server = _FakeServer(mutating=False)
+
+        out = mcp_proxy._handle(dict(self._REQUEST), "/p", _LoadedLocal(server))
+
+        assert server.calls
+        assert "WITHOUT its shared hub" in out["result"]["content"][0]["text"]
+
     def test_hub_forward_kill_switch_disables_proxying(self, monkeypatch):
         monkeypatch.setenv(mcp_proxy._HUB_FORWARD_ENV, "0")
         assert mcp_proxy._hub_target("/p") is None
+
+    def test_refused_backend_is_answered_once_the_hub_is_gone(self, monkeypatch, refused_local):
+        """Without a hub the request has to be served here, and the local server
+        refuses to start. The client is told why instead of waiting for an answer."""
+        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: None)
+
+        out = mcp_proxy._handle(dict(self._REQUEST), "/p", refused_local)
+
+        assert out["id"] == 7
+        assert out["error"]["code"] == -32000
+        assert "unknown backend 'no-such-backend'" in out["error"]["message"]
+
+    @pytest.mark.parametrize("error", _IMPORT_FAILURES, ids=["ImportError", "RuntimeError"])
+    def test_a_local_server_that_cannot_be_imported_is_answered_too(self, monkeypatch, error):
+        """Id 0 on purpose: SDK clients number their requests from 0, initialize first."""
+        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: None)
+
+        out = mcp_proxy._handle({**self._REQUEST, "id": 0}, "/p", _UnimportableLocal(error))
+
+        assert out["id"] == 0
+        assert out["error"]["code"] == -32000
+        assert str(error) in out["error"]["message"]
+
+    def test_refused_backend_leaves_a_notification_unanswered(self, monkeypatch, refused_local):
+        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: None)
+        notification = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+
+        assert mcp_proxy._handle(notification, "/p", refused_local) is None
+
+    def test_failed_hub_call_is_reported_when_the_local_server_is_refused(
+        self, monkeypatch, refused_local
+    ):
+        """The hub may still be running a call that failed mid-flight, so the
+        answer is the hub's failure, which says so."""
+        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: ("http://hub", {}))
+
+        def boom(*a):
+            raise urllib.error.URLError("timed out")
+
+        monkeypatch.setattr(mcp_proxy, "_forward", boom)
+
+        out = mcp_proxy._handle(dict(self._REQUEST), "/p", refused_local)
+
+        assert out["id"] == 7
+        assert out["error"]["code"] == -32000
+        assert out["error"]["message"] == "palace hub proxy failed: <urlopen error timed out>"
+        assert out["error"]["data"]["hub"] == "http://hub"
+        assert "unknown backend 'no-such-backend'" in out["error"]["data"]["local_server"]
+
+    @pytest.mark.parametrize("error", _IMPORT_FAILURES, ids=["ImportError", "RuntimeError"])
+    def test_failed_hub_call_is_reported_when_the_local_server_cannot_be_imported(
+        self, monkeypatch, error
+    ):
+        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: ("http://hub", {}))
+
+        def boom(*a):
+            raise urllib.error.URLError("timed out")
+
+        monkeypatch.setattr(mcp_proxy, "_forward", boom)
+
+        out = mcp_proxy._handle({**self._REQUEST, "id": 0}, "/p", _UnimportableLocal(error))
+
+        assert out["id"] == 0
+        assert out["error"]["message"] == "palace hub proxy failed: <urlopen error timed out>"
+        assert str(error) in out["error"]["data"]["local_server"]
+
+
+@pytest.fixture
+def refused_local(monkeypatch):
+    """The real local server of a proxy started with a --backend it refuses."""
+    from _mcp_server_helpers import _keep_server_command_line_state
+    from mempalace import mcp_server
+
+    _keep_server_command_line_state(monkeypatch)
+    monkeypatch.setattr(mcp_server, "_restore_stdout", lambda: None)
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    monkeypatch.setattr(sys, "argv", ["mempalace-mcp", "--backend", "no-such-backend"])
+    return mcp_proxy._LocalServer()
+
+
+class TestProxyLoop:
+    """Every request that carries an id gets an answer when its handling fails."""
+
+    @staticmethod
+    def _run(monkeypatch, lines, forward):
+        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: ("http://hub", {}))
+        monkeypatch.setattr(mcp_proxy, "_forward", forward)
+        # A path that reaches load() must not start the real server and its
+        # watchdog threads inside the test session.
+        monkeypatch.setattr(mcp_proxy, "_LocalServer", _UnimportableLocal)
+        monkeypatch.setattr(sys, "stdin", io.StringIO("".join(line + "\n" for line in lines)))
+        out = io.StringIO()
+        monkeypatch.setattr(sys, "stdout", out)
+        mcp_proxy._run_proxy_loop("/p")
+        return [json.loads(line) for line in out.getvalue().splitlines()]
+
+    @staticmethod
+    def _echo(base_url, headers, request, palace_path):
+        return {"jsonrpc": "2.0", "id": request["id"], "result": {}}
+
+    _PING = '{"jsonrpc": "2.0", "id": 2, "method": "ping"}'
+
+    @pytest.mark.parametrize(
+        ("line", "rejected_with"),
+        [('{"jsonrpc": "2.0", "id": 1, ', json.JSONDecodeError), ("[" * 100000, RecursionError)],
+        ids=["invalid-json", "nesting-too-deep-to-parse"],
+    )
+    def test_a_line_that_does_not_parse_is_answered_with_a_parse_error(
+        self, monkeypatch, line, rejected_with
+    ):
+        with pytest.raises(rejected_with):
+            json.loads(line)
+
+        out = self._run(monkeypatch, [line, self._PING], self._echo)
+
+        assert out == [
+            {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}},
+            {"jsonrpc": "2.0", "id": 2, "result": {}},
+        ]
+
+    @pytest.mark.parametrize("line", ["[1, 2]", "7", '"ping"', "null"])
+    def test_json_that_is_not_an_object_is_an_invalid_request(self, monkeypatch, line):
+        out = self._run(monkeypatch, [line, self._PING], self._echo)
+
+        assert out == [
+            {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}},
+            {"jsonrpc": "2.0", "id": 2, "result": {}},
+        ]
+
+    @pytest.mark.parametrize("params", [[1], "x"], ids=["list", "string"])
+    def test_the_hub_answer_survives_params_that_are_not_an_object(self, monkeypatch, params):
+        """The full server reads such params as none; so does the proxy's own look at them."""
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params}
+        out = self._run(monkeypatch, [json.dumps(request)], self._echo)
+
+        assert out == [{"jsonrpc": "2.0", "id": 1, "result": {}}]
+
+    @pytest.mark.parametrize("error", [AttributeError("x"), TypeError("x")])
+    def test_a_request_whose_handling_raises_is_answered_and_the_loop_goes_on(
+        self, monkeypatch, error
+    ):
+        """A failure the hub path does not handle, as a bug in it would be."""
+
+        def forward(base_url, headers, request, palace_path):
+            if request["id"] == 0:
+                raise error
+            return self._echo(base_url, headers, request, palace_path)
+
+        request = {"jsonrpc": "2.0", "id": 0, "method": "tools/call", "params": {"name": "x"}}
+        out = self._run(monkeypatch, [json.dumps(request), self._PING], forward)
+
+        assert out == [
+            {"jsonrpc": "2.0", "id": 0, "error": {"code": -32603, "message": "Internal error"}},
+            {"jsonrpc": "2.0", "id": 2, "result": {}},
+        ]
+
+    def test_a_notification_whose_handling_raises_stays_unanswered(self, monkeypatch):
+        def forward(base_url, headers, request, palace_path):
+            if "id" not in request:
+                raise AttributeError("x")
+            return self._echo(base_url, headers, request, palace_path)
+
+        notification = '{"jsonrpc": "2.0", "method": "notifications/initialized"}'
+        out = self._run(monkeypatch, [notification, self._PING], forward)
+
+        assert out == [{"jsonrpc": "2.0", "id": 2, "result": {}}]
 
 
 def test_importing_the_proxy_does_not_import_the_storage_stack():
@@ -235,6 +466,48 @@ def test_importing_the_proxy_does_not_import_the_storage_stack():
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "", f"heavy modules imported by the proxy: {out.stdout.strip()}"
+
+
+def test_a_failed_server_import_leaves_the_proxy_answering_on_stdout():
+    """Importing the server moves fd 1 onto stderr before its first import that
+    can fail. When one does, the proxy still has to answer where the client reads.
+
+    In a subprocess, because the import has to really run and fail, and it moves
+    the process's own fd 1. The control run imports the server the way the proxy
+    did before, and shows where the answer went then.
+    """
+    package_root = os.path.dirname(os.path.dirname(os.path.abspath(mcp_proxy.__file__)))
+
+    def run(before_the_loop):
+        code = (
+            "import io, sys\n"
+            f"sys.path.insert(0, {package_root!r})\n"
+            "sys.modules['chromadb'] = None\n"
+            "from mempalace import mcp_proxy\n"
+            "mcp_proxy._hub_target = lambda p: None\n"
+            f"{before_the_loop}"
+            'sys.stdin = io.StringIO(\'{"jsonrpc": "2.0", "id": 1, "method": "ping"}\\n\')\n'
+            "mcp_proxy._run_proxy_loop('/p')\n"
+        )
+        out = subprocess.run(
+            [sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=120
+        )
+        assert out.returncode == 0, out.stderr
+        return out
+
+    control = run(
+        "def import_server():\n"
+        "    from mempalace import mcp_server\n"
+        "    return mcp_server\n"
+        "mcp_proxy._import_server = import_server\n"
+    )
+    assert control.stdout == ""
+    assert '{"jsonrpc": "2.0", "id": 1, "error": {"code": -32000' in control.stderr
+
+    out = run("")
+    answers = [json.loads(line) for line in out.stdout.splitlines()]
+    assert [answer["id"] for answer in answers] == [1], out.stderr
+    assert "chromadb" in answers[0]["error"]["message"]
 
 
 def test_local_fallback_serves_the_palace_the_proxy_was_started_for(monkeypatch, tmp_path):
@@ -295,3 +568,21 @@ def test_local_fallback_restores_stdout_before_a_flag_can_be_refused(monkeypatch
         mcp_proxy._LocalServer().load()
 
     assert restored == [True]
+
+
+def test_a_failed_local_load_is_not_retried(monkeypatch):
+    calls = []
+
+    def explode():
+        calls.append("import")
+        raise RuntimeError("import failed")
+
+    monkeypatch.setattr(mcp_proxy, "_import_server", explode)
+    server = mcp_proxy._LocalServer()
+
+    with pytest.raises(RuntimeError, match="import failed"):
+        server.load()
+    with pytest.raises(RuntimeError, match="import failed"):
+        server.load()
+
+    assert calls == ["import"]

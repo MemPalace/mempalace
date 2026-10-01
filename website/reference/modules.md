@@ -57,7 +57,7 @@ Argparse-based CLI with subcommands: `init`, `mine`, `split`, `search`, `compres
 
 ### `mcp_server/` — MCP Server
 
-JSON-RPC over stdin/stdout. Implements the MCP protocol with 45 tools covering palace read/write, drawer CRUD, knowledge graph, navigation, tunnels, agent diary, and system operations. Includes the Memory Protocol and AAAK Spec in status responses.
+JSON-RPC over stdin/stdout. Implements the MCP protocol with 47 tools covering palace read/write, drawer CRUD, knowledge graph, navigation, tunnels, agent diary, and system operations. Includes the Memory Protocol and AAAK Spec in status responses.
 
 ### `searcher/` — Semantic Search
 
