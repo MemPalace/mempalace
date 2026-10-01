@@ -841,7 +841,7 @@ def _batch_duplicate_matches_for_records(
     col,
     seed_records: list[dict],
     threshold: float,
-) -> tuple[dict[str, list[dict]], dict | None]:
+) -> tuple[dict[str, list[dict]], Optional[dict]]:
     """Run one batched vector query and map thresholded matches by seed drawer ID.
 
     Queries with the seeds' stored vectors when every seed has one, so no seed
