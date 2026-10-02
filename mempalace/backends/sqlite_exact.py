@@ -215,18 +215,6 @@ def _matches_where(meta: dict, where: Optional[dict]) -> bool:
     return True
 
 
-def _without_registry_sentinels(ids, mat, norms, metas):
-    """Drop convo-miner registry rows from a cached exact-search matrix."""
-    if not any(is_registry_sentinel(meta) for meta in metas):
-        return ids, mat, norms, metas
-    keep = [i for i, meta in enumerate(metas) if not is_registry_sentinel(meta)]
-    if not keep:
-        width = mat.shape[1] if getattr(mat, "ndim", 0) == 2 else 0
-        return [], np.zeros((0, width), dtype=np.float32), np.zeros((0,), dtype=np.float32), []
-    idx = np.asarray(keep, dtype=np.intp)
-    return [ids[i] for i in keep], mat[idx], norms[idx], [metas[i] for i in keep]
-
-
 _FACET_FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CACHED_META_KEYS = frozenset({"wing", "room", "source_file"})
 # Palace loci. VIRTUAL generated columns + one composite index give
@@ -559,7 +547,7 @@ class _SQLiteExactHandle:
         self._vector_cache_data_version: Optional[int] = None
         # Native accelerators share one versioned index per collection across
         # the short-lived wrappers created by application searches.
-        self._native_cache: dict[str, tuple[tuple, Any]] = {}
+        self._native_cache: dict[str, tuple[tuple, Any, frozenset[str]]] = {}
 
 
 class SQLiteExactCollection(BaseCollection):
@@ -1155,10 +1143,8 @@ class SQLiteExactCollection(BaseCollection):
             cached = self._load_all_vectors(cur, collection_id, expected)
             self._handle._vector_cache[collection_id] = cached
         ids, mat, norms, metas = cached
-        # Drop bookkeeping rows in memory. The exclusion is not a caller
-        # scope, so an unfiltered search still returns this cached matrix
-        # instead of scanning metadata_json.
-        ids, mat, norms, metas = _without_registry_sentinels(ids, mat, norms, metas)
+        # Registry rows were excluded when building the cache. Unscoped
+        # searches reuse the same matrix without a full advanced-index copy.
         scope = where_without_registry_exclusion(where)
         if not scope and not where_document:
             return ids, mat, norms
@@ -1200,6 +1186,8 @@ class SQLiteExactCollection(BaseCollection):
         vecs: list[np.ndarray] = []
         metas: list[dict] = []
         for doc_id, blob, wing, room, source_file, ingest_mode in rows:
+            if is_registry_sentinel({"room": room, "ingest_mode": ingest_mode}):
+                continue
             vec = _decode_array(blob)
             if vec is None:
                 continue
