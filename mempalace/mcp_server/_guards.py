@@ -982,9 +982,24 @@ def _mcp_idle_timeout_secs() -> float:
 
 
 def _resolve_kg_path() -> str:
-    if _palace_flag_given:
-        return os.path.join(_config.palace_path, "knowledge_graph.sqlite3")
-    return DEFAULT_KG_PATH
+    """Resolve the knowledge-graph file that belongs to the active palace.
+
+    Mirrors :func:`mempalace.palace_audit.resolve_kg_path` so the MCP
+    writer and the audit / ``kg normalize`` readers always agree on one
+    file.  Without the palace-local preference below, an XDG install
+    (``~/.config/mempalace/palace`` — the default for new installs since
+    #148) sends every ``kg_add`` to the legacy
+    ``~/.mempalace/knowledge_graph.sqlite3`` while ``audit`` keeps looking
+    *inside* the palace, so the graph reads as empty forever.
+    """
+    from ..config import DEFAULT_PALACE_PATH
+
+    local = os.path.join(_config.palace_path, "knowledge_graph.sqlite3")
+    if _palace_flag_given or os.path.isfile(local):
+        return local
+    if os.path.realpath(_config.palace_path) == os.path.realpath(DEFAULT_PALACE_PATH):
+        return DEFAULT_KG_PATH
+    return local
 
 
 def _canonicalize_kg_path(path: str) -> str:

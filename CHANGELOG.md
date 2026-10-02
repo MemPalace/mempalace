@@ -244,6 +244,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (110k rows/s measured).
 
 ### Bug Fixes
+- **The MCP writer and the audit reader now agree on which knowledge-graph file
+  belongs to a palace.** `_resolve_kg_path()` returned `DEFAULT_KG_PATH`
+  (`~/.mempalace/knowledge_graph.sqlite3`) whenever `--palace` was absent, while
+  `palace_audit.resolve_kg_path()` looks *inside* the palace. Since #148 a new install
+  keeps its palace at `~/.config/mempalace/palace`, so `kg_add` filed every fact into the
+  legacy file while `mempalace audit` and `kg normalize` opened a different one: the graph
+  reported `0 facts` and "No knowledge graph file found" however many facts were filed,
+  and those facts sat outside the palace directory, so backing up or moving the palace left
+  them behind. The MCP side now applies the audit's rule — a palace-local file always wins,
+  the legacy path stays reserved for the legacy default palace, and an explicit `--palace`
+  still forces the palace-local file. Palaces at `~/.mempalace/palace` and the `--palace`
+  flag behave exactly as before. An XDG install that already filed facts needs to move
+  `~/.mempalace/knowledge_graph.sqlite3` into its palace by hand; we do not automate that
+  for the same reason the `tunnels.json` move is left to the user.
 - **`mempalace sweep` and `mempalace sync` routed to the daemon no longer resolve
   a relative path against the daemon's working directory.** Both put the path into
   the job as typed, and the daemon keeps the directory it was started in: a
