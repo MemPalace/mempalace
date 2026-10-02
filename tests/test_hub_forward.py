@@ -13,7 +13,9 @@ commands do not cold-load a private copy of a large HNSW index per process.
 
 import argparse
 import builtins
+import contextlib
 import http.client
+import io
 import json
 import os
 import threading
@@ -21,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from mempalace import cli, mcp_proxy, server_registry
+from mempalace import cli, hub_client, mcp_proxy, server_registry
 from mempalace.config import MempalaceConfig
 
 
@@ -172,12 +174,20 @@ class TestServerRegistry:
 class _FakeHub:
     """Minimal /healthz + /mcp endpoint standing in for `mempalace serve`."""
 
-    def __init__(self, mine_result=None, search_result=None, rpc_error=None, required_token=None):
+    def __init__(
+        self,
+        mine_result=None,
+        search_result=None,
+        rpc_error=None,
+        required_token=None,
+        diary_result=None,
+    ):
         self.requests = []
         self.auth_headers = []
         outer = self
 
         mine_result = mine_result or {"success": True, "mode": "convos", "output": "filed 1"}
+        diary_result = diary_result or {"success": True, "entry_id": "diary_1"}
         search_result = search_result or {
             "query": "needle",
             "filters": {"wing": None, "room": None},
@@ -220,7 +230,12 @@ class _FakeHub:
                     payload = {"jsonrpc": "2.0", "id": request.get("id"), "error": rpc_error}
                 else:
                     tool_name = request.get("params", {}).get("name")
-                    tool_result = search_result if tool_name == "mempalace_search" else mine_result
+                    if tool_name == "mempalace_search":
+                        tool_result = search_result
+                    elif tool_name == "mempalace_diary_write":
+                        tool_result = diary_result
+                    else:
+                        tool_result = mine_result
                     payload = {
                         "jsonrpc": "2.0",
                         "id": request.get("id"),
@@ -264,6 +279,19 @@ def _register_hub(palace, hub, read_only=False, capabilities=None, search_config
         capabilities=capabilities,
         search_config_fingerprint=search_config_fingerprint,
     )
+
+
+def _disown_record(palace):
+    """Re-stamp the serverinfo pid so the record looks like another process's
+    hub. ``write_serverinfo`` records our own pid, which a client correctly
+    refuses to dial — that is the "I am the hub" guard, not a missing hub."""
+    path = server_registry.serverinfo_path(palace)
+    record = json.loads(path.read_text())
+    parent_pid = os.getppid()
+    assert parent_pid != os.getpid()
+    assert server_registry._pid_alive(parent_pid)
+    record["pid"] = parent_pid
+    path.write_text(json.dumps(record))
 
 
 class TestForwardMineToHub:
@@ -754,6 +782,274 @@ class TestForwardSearchToHub:
         monkeypatch.setenv("MEMPALACE_LANG", "  ")
         monkeypatch.setenv("MEMPAL_LANG", "")
         assert cli._search_args_forwardable(_search_args()) is True
+
+
+class TestForwardDiaryWriteToHub:
+    """The save-hook diary checkpoint must reach a hub that holds the writer
+    lease (#2614).
+
+    A long-lived ``mempalace serve`` is the palace's only writer, so an
+    in-process ``tool_diary_write`` is refused for as long as it runs and the
+    per-save checkpoint is lost. The transcript mine survives only because
+    ``cmd_mine`` forwards to the hub; the diary path had no such forward.
+    """
+
+    def test_forwards_the_checkpoint_and_returns_the_hub_result(self, isolated_home, fake_hub):
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        _disown_record(palace)
+
+        handled, result = hub_client.forward_tool_call(
+            palace,
+            "mempalace_diary_write",
+            {"agent_name": "claude", "entry": "CHECKPOINT:2026-09-29", "topic": "checkpoint"},
+        )
+
+        assert handled is True
+        assert result == {"success": True, "entry_id": "diary_1"}
+        (request,) = fake_hub.requests
+        assert request["method"] == "tools/call"
+        assert request["params"]["name"] == "mempalace_diary_write"
+        assert request["params"]["arguments"] == {
+            "agent_name": "claude",
+            "entry": "CHECKPOINT:2026-09-29",
+            "topic": "checkpoint",
+        }
+
+    def test_no_hub_leaves_the_write_to_the_caller(self, isolated_home):
+        assert hub_client.forward_tool_call(
+            str(isolated_home / "palace"), "mempalace_diary_write", {"agent_name": "claude"}
+        ) == (False, None)
+
+    def test_read_only_hub_leaves_the_write_to_the_caller(self, isolated_home, fake_hub):
+        # A read-only hub refuses every palace write, so forwarding would turn
+        # a working in-process write into a refusal.
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub, read_only=True)
+        _disown_record(palace)
+        assert hub_client.forward_tool_call(
+            palace, "mempalace_diary_write", {"agent_name": "claude"}
+        ) == (False, None)
+        assert fake_hub.requests == []
+
+    def test_kill_switch_leaves_the_write_to_the_caller(self, isolated_home, fake_hub, monkeypatch):
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        _disown_record(palace)
+        monkeypatch.setenv("MEMPALACE_HUB_FORWARD", "0")
+        assert hub_client.forward_tool_call(
+            palace, "mempalace_diary_write", {"agent_name": "claude"}
+        ) == (False, None)
+        assert fake_hub.requests == []
+
+    def test_unreachable_listener_leaves_the_write_to_the_caller(self, isolated_home):
+        # Bind-then-close: the recorded pid is alive, but nothing is listening.
+        # Without the health probe the write would be handed to a dead socket
+        # and the in-process fallback lost.
+        probe = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+        dead_port = probe.server_address[1]
+        probe.server_close()
+        palace = str(isolated_home / "palace")
+        server_registry.write_serverinfo(
+            palace, host="127.0.0.1", port=dead_port, scheme="http", read_only=False
+        )
+        assert hub_client.forward_tool_call(
+            palace, "mempalace_diary_write", {"agent_name": "claude"}
+        ) == (False, None)
+
+    def test_hub_refusal_is_a_result_not_a_retry_prompt(self, isolated_home):
+        # The hub answered, so the write may already be filed. Reporting it as
+        # a result keeps the caller from filing the same content twice.
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(diary_result={"success": False, "error": "wing already exists"})
+        try:
+            _register_hub(palace, hub)
+            _disown_record(palace)
+            handled, result = hub_client.forward_tool_call(
+                palace, "mempalace_diary_write", {"agent_name": "claude"}
+            )
+            assert handled is True
+            assert result == {"success": False, "error": "wing already exists"}
+        finally:
+            hub.stop()
+
+    def test_jsonrpc_error_becomes_a_failed_result(self, isolated_home):
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(rpc_error={"code": -32003, "message": "read-only server"})
+        try:
+            _register_hub(palace, hub)
+            _disown_record(palace)
+            handled, result = hub_client.forward_tool_call(
+                palace, "mempalace_diary_write", {"agent_name": "claude"}
+            )
+            assert handled is True
+            assert result == {"success": False, "error": "read-only server"}
+        finally:
+            hub.stop()
+
+    def test_unanswered_request_reports_handled_with_no_result(
+        self, isolated_home, fake_hub, monkeypatch
+    ):
+        # A transport failure after the hub was probed may still have been
+        # accepted upstream; `handled=True, result=None` says "do not retry".
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        _disown_record(palace)
+        monkeypatch.setattr(
+            server_registry,
+            "urlopen_with_server_tokens",
+            lambda *a, **kw: (_ for _ in ()).throw(OSError("connection reset")),
+        )
+        assert hub_client.forward_tool_call(
+            palace, "mempalace_diary_write", {"agent_name": "claude"}
+        ) == (True, None)
+
+    def test_retries_process_token_after_stale_palace_token_401(self, isolated_home, monkeypatch):
+        # A hub restarted with an explicit token keeps a generated palace
+        # credential on disk that it no longer accepts. The second local
+        # credential has to be tried or the checkpoint is lost to a 401.
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(required_token="current-token")
+        try:
+            _register_hub(palace, hub)
+            _disown_record(palace)
+            server_registry.server_token_path(palace).write_text("stale-token")
+            monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "current-token")
+
+            handled, result = hub_client.forward_tool_call(
+                palace, "mempalace_diary_write", {"agent_name": "claude"}
+            )
+
+            assert (handled, result) == (True, {"success": True, "entry_id": "diary_1"})
+            assert hub.auth_headers == ["Bearer stale-token", "Bearer current-token"]
+        finally:
+            hub.stop()
+
+    def test_unauthenticated_hub_leaves_the_write_to_the_caller(self, isolated_home):
+        # The auth gate rejects before dispatch, so nothing was written and the
+        # caller's own write is still valid.
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(required_token="actual-token")
+        try:
+            _register_hub(palace, hub)
+            _disown_record(palace)
+            assert hub_client.forward_tool_call(
+                palace, "mempalace_diary_write", {"agent_name": "claude"}
+            ) == (False, None)
+            assert hub.requests == []
+        finally:
+            hub.stop()
+
+    def test_unparsable_response_reports_handled_with_no_result(
+        self, isolated_home, fake_hub, monkeypatch
+    ):
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        _disown_record(palace)
+        monkeypatch.setattr(
+            server_registry,
+            "urlopen_with_server_tokens",
+            lambda *a, **kw: contextlib.closing(io.BytesIO(b'{"jsonrpc":"2.0","id":1}')),
+        )
+        assert hub_client.forward_tool_call(
+            palace, "mempalace_diary_write", {"agent_name": "claude"}
+        ) == (True, None)
+
+    def test_own_hub_is_not_forwarded_to_itself(self, isolated_home):
+        # A stdio server running inside the hub process would otherwise forward
+        # every call to itself over HTTP.
+        palace = str(isolated_home / "palace")
+        server_registry.write_serverinfo(
+            palace, host="127.0.0.1", port=8765, scheme="http", read_only=False
+        )
+        assert hub_client.forward_tool_call(
+            palace, "mempalace_diary_write", {"agent_name": "claude"}
+        ) == (False, None)
+
+    def test_save_hook_checkpoint_is_filed_by_the_live_hub(
+        self, isolated_home, fake_hub, monkeypatch, tmp_path
+    ):
+        """End-to-end #2614: with a hub holding the writer lease, the Stop-hook
+        checkpoint is filed *by the hub*. The reporter saw it refused with
+        "another mine is in progress ... held by PID <hub>" on every save.
+
+        The in-process write is also what pulled ~77 MB of chromadb into a
+        hook-budgeted process, so a forwarded checkpoint must not import the
+        storage stack at all.
+        """
+        from mempalace import hooks_cli
+
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        _disown_record(palace)
+        monkeypatch.setenv("MEMPALACE_PALACE_PATH", palace)
+        monkeypatch.setattr(hooks_cli, "STATE_DIR", tmp_path)
+
+        transcript = tmp_path / "session.jsonl"
+        with open(transcript, "w", encoding="utf-8") as handle:
+            for i in range(3):
+                handle.write(
+                    json.dumps({"message": {"role": "user", "content": f"message {i}"}}) + "\n"
+                )
+
+        real_import = builtins.__import__
+
+        def import_without_storage_stack(name, *args, **kwargs):
+            if name == "mempalace.mcp_server":
+                raise AssertionError("a forwarded checkpoint must not import the storage stack")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", import_without_storage_stack)
+
+        result = hooks_cli._save_diary_direct(
+            str(transcript), "sess1", wing="wing_project", agent_name="claude"
+        )
+
+        assert result["count"] == 3
+        (request,) = fake_hub.requests
+        assert request["params"]["name"] == "mempalace_diary_write"
+        arguments = request["params"]["arguments"]
+        assert arguments["agent_name"] == "claude"
+        assert arguments["wing"] == "wing_project"
+        assert arguments["topic"] == "checkpoint"
+        assert arguments["entry"].startswith("CHECKPOINT:")
+        # The ack marker still advances, so the next save is not re-triggered.
+        assert (tmp_path / "last_checkpoint").exists()
+
+    def test_save_hook_checkpoint_falls_back_in_process_when_no_hub(
+        self, isolated_home, monkeypatch, tmp_path
+    ):
+        from mempalace import hooks_cli
+
+        palace = str(isolated_home / "palace")
+        monkeypatch.setenv("MEMPALACE_PALACE_PATH", palace)
+        monkeypatch.setattr(hooks_cli, "STATE_DIR", tmp_path)
+
+        transcript = tmp_path / "session.jsonl"
+        with open(transcript, "w", encoding="utf-8") as handle:
+            for i in range(3):
+                handle.write(
+                    json.dumps({"message": {"role": "user", "content": f"message {i}"}}) + "\n"
+                )
+
+        written = {}
+
+        def fake_diary_write(**kwargs):
+            written.update(kwargs)
+            return {"success": True, "entry_id": "diary_local"}
+
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "tool_diary_write", fake_diary_write)
+
+        result = hooks_cli._save_diary_direct(
+            str(transcript), "sess1", wing="wing_project", agent_name="claude"
+        )
+
+        assert result["count"] == 3
+        assert written["agent_name"] == "claude"
+        assert written["topic"] == "checkpoint"
+        assert (tmp_path / "last_checkpoint").exists()
 
 
 class TestForwardability:
