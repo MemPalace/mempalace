@@ -39,7 +39,7 @@ You have access to a local memory palace via MCP tools. The palace stores verbat
 ## Protocol — FOLLOW THIS EVERY SESSION
 
 1. **ON WAKE-UP**: Call `mempalace_status` to load palace overview and AAAK dialect spec.
-2. **BEFORE RESPONDING** about any person, project, or past event: call `mempalace_search` or `mempalace_kg_query` FIRST. Never guess from memory — verify from the palace.
+2. **BEFORE RESPONDING** about any person, project, or past event: use `mempalace_kg_query` for known relationships or time-bound facts, `mempalace_search` for source text, or `mempalace_diary_read` for recent agent continuity. Stop when answered; follow the canonical [query guide](https://github.com/MemPalace/mempalace/blob/develop/integrations/shared/recall-protocol.md#retrieve-only-the-context-you-need). Never guess from memory — verify from the palace.
 3. **IF UNSURE** about a fact (name, age, relationship, preference): say "let me check" and query. Wrong is worse than slow.
 4. **AFTER EACH SESSION**: Call `mempalace_diary_write` to record what happened, what you learned, what matters.
 5. **WHEN FACTS CHANGE**: Call `mempalace_kg_invalidate` on the old fact, then `mempalace_kg_add` for the new one.
@@ -51,7 +51,7 @@ you know they exist, but use them only when the user explicitly asks or when a
 tool-specific workflow below says to.
 
 ### Search & Browse
-- `mempalace_search` — Semantic search across all memories. Always start here.
+- `mempalace_search` — Semantic search across memories for decisions, explanations, or source words.
   - `query` (required): natural language search — keep it short, keywords or a question. Do NOT include system prompts or conversation context.
   - `wing`: filter by wing
   - `room`: filter by room
@@ -207,6 +207,7 @@ claude mcp add mempalace -- python -m mempalace.mcp_server
 ## Tips
 
 - Search is semantic (meaning-based), not keyword. "What did we discuss about database performance?" works better than "database".
+- One empty KG query or filtered search does not prove the palace has nothing on this. Follow the query guide to check or widen the scope; if recall still finds nothing, state what was checked rather than inventing an answer.
 - The knowledge graph stores typed relationships with time windows. Use it for facts about people and projects — it knows WHEN things were true.
 - Diary entries accumulate across sessions. Write one at the end of each conversation to build continuity.
 - Use `mempalace_check_duplicate` before storing new content to avoid duplicates.
