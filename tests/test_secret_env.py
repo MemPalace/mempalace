@@ -95,10 +95,10 @@ def test_file_path_is_used_exactly(tmp_path, monkeypatch):
     assert f"{FILE_VAR}={path!r} could not be read" in str(excinfo.value)
 
 
-def test_file_path_is_passed_to_open_untrimmed(monkeypatch):
+@pytest.mark.parametrize("path", ["/run/secrets/token ", " /run/secrets/token"])
+def test_file_path_is_passed_to_open_untrimmed(monkeypatch, path):
     # The test above needs a filesystem that keeps trailing spaces; this one
     # checks the argument handed to open() itself, so it runs on Windows too.
-    path = "/run/secrets/token "
     opened = []
 
     def fake_open(file, mode="r", *args, **kwargs):
