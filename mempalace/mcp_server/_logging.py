@@ -94,10 +94,16 @@ def _init_logging() -> None:
         try:
             file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
             # Pin the format: the embedded path never calls basicConfig, so set
-            # it here instead of relying on logging's default formatter. The
-            # default already renders "%(message)s", but the explicit set makes
-            # both paths identical and independent of that default (#1885 review).
-            file_handler.setFormatter(logging.Formatter("%(message)s"))
+            # it here instead of relying on logging's default formatter.
+            #
+            # Timestamp + level, unlike the stderr handler's bare "%(message)s"
+            # (#2620). The file is the only durable record of an MCP failure the
+            # client never surfaces, and a bare message line cannot be lined up
+            # against a client-side "Request timed out" or ordered against the
+            # per-call timings _http_dispatch writes into the same file. The
+            # stderr path keeps the historical bare form: MCP hosts show it in a
+            # console that already prefixes time and level per record.
+            file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
             # File is a mempalace-only diagnostic stream; keep host / library
             # records out so it stays useful when the handler rides on a
             # host-owned root logger (#1860).
