@@ -3,9 +3,62 @@ if __name__ != "mempalace.cli":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.cli")
 
 
+def _print_search_json_result(result) -> bool:
+    """Emit one structured search response and report whether it succeeded."""
+    import json
+
+    if not isinstance(result, dict) or (
+        not result.get("error") and not isinstance(result.get("results"), list)
+    ):
+        result = {"error": "Unrecognized search response", "results": []}
+    elif result.get("error"):
+        result = {"results": [], **result}
+    print(json.dumps(result))
+    return not bool(result.get("error"))
+
+
+def _cmd_search_json(args, palace_path: str) -> None:
+    """Run programmatic search with the CLI's early Chroma safety fence."""
+    from .. import searcher
+    from ..date_window import parse_window
+
+    try:
+        # Backend/model diagnostics must not precede the JSON document on stdout.
+        with contextlib.redirect_stdout(sys.stderr):
+            parse_window(args.since, args.before)
+            config = MempalaceConfig(palace_path=palace_path)
+            try:
+                backend_name = searcher.resolve_backend_name(palace_path)
+            except (searcher.BackendMismatchError, KeyError):
+                # Let search_memories return its existing backend diagnostic.
+                backend_name = None
+            vector_disabled = backend_name == "chroma" and searcher._hnsw_capacity_diverged(
+                palace_path
+            )
+            result = searcher.search_memories(
+                query=args.query,
+                palace_path=palace_path,
+                wing=args.wing,
+                room=args.room,
+                n_results=args.results,
+                since=args.since,
+                before=args.before,
+                collection_name=config.collection_name,
+                vector_disabled=vector_disabled,
+            )
+    except Exception as exc:
+        result = {"error": str(exc), "results": []}
+    if not _print_search_json_result(result):
+        sys.exit(1)
+
+
 def cmd_search(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     if _search_args_forwardable(args) and _forward_search_to_hub(args, palace_path):
+        return
+
+    if getattr(args, "json", False):
+        _cmd_search_json(args, palace_path)
         return
 
     from ..searcher import search, SearchError
