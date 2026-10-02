@@ -52,8 +52,8 @@ This module is the one door for that access.
 * Everywhere else connections open and close per call, still under the lock.
   Windows locks belong to a handle, so a close never drops another handle's
   locks. POSIX platforms without OFD locks (macOS) keep the same promise with
-  a short-lived helper process: its read transaction is another process's
-  SHARED lock, so it conflicts with Chroma where an in-process fcntl lock
+  a helper process: its WAL read transaction is another process's SHARED
+  lock, so it conflicts with Chroma where an in-process fcntl lock
   would not, and closing a connection in this process cannot drop it. The
   in-process anchor is installed only after that helper is holding, so
   Chroma cannot recreate ``-wal``/``-shm`` under a parked wal-index.
@@ -150,38 +150,59 @@ except sqlite3.Error:
     raise SystemExit(0)
 
 def prime():
-    # A deferred transaction takes no lock until it reads. schema_version in
-    # autocommit locks and releases immediately, which leaves the helper holding
-    # nothing. Read inside the transaction so SHARED (and, in WAL mode, the
-    # -shm DMS lock) stays until this process exits.
-    if not conn.in_transaction:
-        conn.execute("BEGIN")
-    conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    global conn
+    # Read before checking the mode so a new transaction sees any external
+    # DELETE-to-WAL change. Only WAL can keep this transaction: a foreign SHARED
+    # lock in rollback-journal mode blocks every writer's COMMIT.
+    try:
+        if conn is None:
+            conn = open_conn()
+        if not conn.in_transaction:
+            conn.execute("BEGIN")
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        row = conn.execute("PRAGMA journal_mode").fetchone()
+    except sqlite3.Error:
+        if conn is not None:
+            conn.rollback()
+        raise
+    if row and str(row[0]).lower() == "wal":
+        return True
+    # Keep the idle child alive, but release its non-WAL connection. Reopening
+    # on the next read applies the sidecar rule if an external writer switches
+    # to WAL and then removes both sidecars; Apple's SQLite cannot create them
+    # through a connection originally opened mode=ro. Only this child's locks
+    # are affected by the close, never the parent's Chroma locks.
+    conn.rollback()
+    conn.close()
+    conn = None
+    return False
 
 def report(line):
     sys.stdout.write(line + "\\n")
     sys.stdout.flush()
 
 try:
-    prime()
+    holding = prime()
 except sqlite3.Error:
     report("busy")
 else:
-    report("ready")
-    sys.stdin.read()
-    raise SystemExit(0)
+    report("ready" if holding else "idle")
+    if holding:
+        sys.stdin.read()
+        raise SystemExit(0)
 
 while True:
     if sys.stdin.readline() == "":
         raise SystemExit(0)
     try:
-        prime()
+        holding = prime()
     except sqlite3.Error:
         report("busy")
     else:
-        report("ready")
-        sys.stdin.read()
-        raise SystemExit(0)
+        report("ready" if holding else "idle")
+        if holding:
+            sys.stdin.read()
+            raise SystemExit(0)
 """
 
 
@@ -433,9 +454,10 @@ def _start_holder(db_path: str, ident: tuple[int, int]) -> Optional[_Holder]:
         except OSError:
             holder.shm_ino = None
         return holder
-    if status == "busy" and proc.poll() is None:
-        # The open already touched the database. Leave the process up so its
-        # close cannot run, and ask it to prime again on the next read.
+    if status in {"busy", "idle"} and proc.poll() is None:
+        # A busy connection stays open; the next read asks it to prime again.
+        # An idle child reopens with the current sidecar rules on that read,
+        # allowing a later DELETE-to-WAL transition without process churn.
         return holder
     _stop_holder(holder, wait=True)
     return None
