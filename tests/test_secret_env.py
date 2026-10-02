@@ -73,7 +73,8 @@ def test_unreadable_file_is_an_error_not_a_fallback(tmp_path, monkeypatch):
     with pytest.raises(SecretEnvError) as excinfo:
         read_secret_env(NAME)
     assert FILE_VAR in str(excinfo.value)
-    assert str(missing) in str(excinfo.value)
+    # The message shows the path as repr, which doubles Windows backslashes.
+    assert repr(str(missing)) in str(excinfo.value)
 
 
 def test_file_path_is_used_exactly(tmp_path, monkeypatch):
