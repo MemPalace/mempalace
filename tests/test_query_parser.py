@@ -400,6 +400,68 @@ class TestPalaceCoordinateParser:
         assert target == "event_wait"
         assert params["writer"] == "agent2" and "from_agent" not in params
 
+    def test_structured_from_filters_list_and_wait_by_writer(self):
+        action, params = parse_coordinate_input({"action": "event_list", "from": "alice"})
+        assert action == "event_list"
+        assert params["writer"] == "alice"
+        assert "from_agent" not in params
+        assert "from" not in params
+
+        action, params = parse_coordinate_input({"action": "event_wait", "from": "alice"})
+        assert action == "event_wait"
+        assert params["writer"] == "alice"
+        assert "from_agent" not in params
+
+        action, params = parse_coordinate_input(
+            {"action": "inbox", "from": "alice", "writer": "bob"}
+        )
+        assert action == "event_list"
+        assert params["writer"] == "bob"
+        assert "from" not in params
+
+        action, params = parse_coordinate_input(
+            {
+                "action": "event_append",
+                "from": "alice",
+                "type": "status",
+                "stream": "s",
+                "room": "r",
+            }
+        )
+        assert action == "event_append"
+        assert params["from_agent"] == "alice"
+        assert "writer" not in params
+
+        action, params = parse_coordinate_input(
+            {"command": "EVENT LIST correlation:task_1", "from": "alice"}
+        )
+        assert action == "event_list"
+        assert params["writer"] == "alice"
+        assert params["correlation_id"] == "task_1"
+        assert "from_agent" not in params
+
+        action, params = parse_coordinate_input(
+            {"command": "EVENT WAIT correlation:task_1", "from": "alice"}
+        )
+        assert action == "event_wait"
+        assert params["writer"] == "alice"
+        assert "from_agent" not in params
+
+        action, params = parse_coordinate_input(
+            {"command": "EVENT LIST from:bob", "from": "alice", "writer": "carol"}
+        )
+        assert action == "event_list"
+        assert params["writer"] == "carol"
+
+        action, params = parse_coordinate_input(
+            {
+                "command": "EVENT APPEND type:status stream:s room:r from:bob",
+                "from": "alice",
+            }
+        )
+        assert action == "event_append"
+        assert params["from_agent"] == "alice"
+
         target, params = parse_coordinate_input(
             'EVENT ACK id:evt_123 from:agent1 status:applied body:"Done"'
         )

@@ -1252,7 +1252,13 @@ def parse_coordinate_input(input_data: Any, _internal: bool = False) -> Tuple[st
                         if pk == "to":
                             parsed_p["to_agent"] = pv
                         elif pk == "from":
-                            parsed_p["from_agent"] = pv
+                            # 'from' on list/wait is the writer filter. An explicit
+                            # sibling writer wins; elsewhere 'from' is the caller.
+                            if op in ("event_list", "event_wait"):
+                                if "writer" not in params:
+                                    parsed_p["writer"] = pv
+                            else:
+                                parsed_p["from_agent"] = pv
                         elif pk == "base":
                             parsed_p["base_commit"] = pv
                         elif pk == "id" and op == "event_ack":
@@ -1327,8 +1333,14 @@ def parse_coordinate_input(input_data: Any, _internal: bool = False) -> Tuple[st
         elif action in ("ack", "event_ack"):
             action = "event_ack"
 
-        # Alias cleanups
-        if "from" in params and "from_agent" not in params:
+        # Alias cleanups. 'from' on list/wait is the writer filter
+        # (from_agent is the caller's identity). Elsewhere it is the caller.
+        if action in ("event_list", "event_wait"):
+            if "from" in params and "writer" not in params:
+                params["writer"] = params.pop("from")
+            elif "from" in params:
+                params.pop("from")
+        elif "from" in params and "from_agent" not in params:
             params["from_agent"] = params.pop("from")
         elif "from" in params:
             params.pop("from")
