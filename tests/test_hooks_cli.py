@@ -2714,3 +2714,28 @@ def test_ingest_transcript_passes_the_project_wing_to_mine(tmp_path, monkeypatch
     )
     hooks_cli._ingest_transcript(path)
     assert jobs and jobs[0]["wing"] == "mempalace"
+
+
+@pytest.mark.parametrize("hook", [hook_stop, hook_session_end])
+def test_hook_files_the_diary_under_the_ingest_wing(tmp_path, monkeypatch, hook):
+    """One hook fire files its diary and its transcript drawers in one wing (#2299)."""
+    from mempalace import hooks_cli
+
+    path = _write_transcript_with_cwd(tmp_path, "/Users/me/dev/herdmates")
+    with open(path, "a", encoding="utf-8") as f:
+        for i in range(SAVE_INTERVAL):
+            f.write(json.dumps({"message": {"role": "user", "content": f"msg {i}"}}) + "\n")
+    monkeypatch.setattr(hooks_cli, "_maybe_auto_ingest", lambda: None)
+    ingested = []
+    monkeypatch.setattr(hooks_cli, "_ingest_transcript", lambda p: ingested.append(p))
+    with patch(
+        "mempalace.hooks_cli._save_diary_direct", return_value={"count": 1, "themes": []}
+    ) as mock_save:
+        _capture_hook_output(
+            hook,
+            {"session_id": "s", "stop_hook_active": False, "transcript_path": path},
+            state_dir=tmp_path,
+        )
+    assert ingested
+    assert mock_save.call_args.kwargs["wing"] == "herdmates"
+    assert hooks_cli._ingest_wing(ingested[0]) == "herdmates"
