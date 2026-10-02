@@ -152,6 +152,56 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         return {"success": False, "error": str(e)}
 
 
+def _diary_read_response(agent_name: str, entries: list, total: int) -> dict:
+    if total == 0:
+        return {"agent": agent_name, "entries": [], "message": "No diary entries yet."}
+    return {
+        "agent": agent_name,
+        "entries": entries,
+        "total": total,
+        "showing": len(entries),
+    }
+
+
+def _sqlite_diary_read(agent_name: str, last_n: int, wing: str):
+    """Read the requested diary page without cold-loading Chroma's HNSW index.
+
+    ``None`` preserves the collection path for other backends, unavailable
+    databases, unsupported schemas, and records SQLite cannot safely order.
+    This does not cache content or change diary chunk/total semantics.
+    """
+    if not _is_chroma_backend():
+        return None
+    try:
+        from ..backends.chroma import sqlite_diary_rows
+
+        result = sqlite_diary_rows(
+            _config.palace_path,
+            _config.collection_name,
+            agent_name=agent_name,
+            wing=wing,
+            limit=last_n,
+        )
+        if result is None:
+            return None
+        total, rows = result
+        entries = []
+        for _drawer_id, doc, meta in rows:
+            meta = _safe_meta(meta)
+            entries.append(
+                {
+                    "date": meta.get("date", ""),
+                    "timestamp": meta.get("filed_at", ""),
+                    "topic": meta.get("topic", ""),
+                    "content": doc,
+                }
+            )
+        return _diary_read_response(agent_name, entries, total)
+    except Exception:
+        logger.debug("sqlite diary read failed; falling back", exc_info=True)
+        return None
+
+
 def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
     """
     Read an agent's recent diary entries. Returns the last N entries
@@ -175,6 +225,9 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
     except ValueError as e:
         return {"error": str(e)}
     last_n = max(1, min(last_n, 100))
+    result = _sqlite_diary_read(agent_name, last_n, wing)
+    if result is not None:
+        return result
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
@@ -228,15 +281,7 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
             if len(batch_ids) < _DIARY_READ_PAGE_SIZE:
                 break
 
-        if total == 0:
-            return {"agent": agent_name, "entries": [], "message": "No diary entries yet."}
-
-        return {
-            "agent": agent_name,
-            "entries": entries,
-            "total": total,
-            "showing": len(entries),
-        }
+        return _diary_read_response(agent_name, entries, total)
     except Exception:
         logger.exception("diary_read failed")
         return {"error": "Failed to read diary entries"}

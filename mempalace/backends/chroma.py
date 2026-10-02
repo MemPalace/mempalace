@@ -2420,6 +2420,177 @@ def sqlite_documents_for_ids(
     return docs
 
 
+def sqlite_diary_rows(
+    palace_path: str,
+    collection_name: str,
+    *,
+    agent_name: str,
+    wing: str = "",
+    limit: int = 10,
+) -> Optional[tuple[int, list[tuple[str, Optional[str], dict]]]]:
+    """Count physical diary rows and hydrate only the newest ``limit`` rows.
+
+    All reads share one SQLite snapshot. Missing timestamps sort as empty
+    strings, with storage order breaking ties, matching the diary's paged
+    ``Collection.get`` path. Non-string timestamps, an ambiguous collection,
+    or an unavailable schema return ``None`` for that path to handle instead.
+    Queued writes ahead of the metadata watermark also require Chroma's
+    recovery path. A missing stored document remains ``None`` as it does in
+    Chroma's get. ``limit`` is bounded to the diary API's range of 1..100.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path) or not isinstance(limit, int):
+        return None
+    limit = max(1, min(limit, 100))
+    equalities = [("room", "diary"), ("agent", agent_name)]
+    if wing:
+        equalities.append(("wing", wing))
+    try:
+        conn = open_palace_reader(db_path)
+        try:
+            conn.execute("PRAGMA busy_timeout = 3000")
+            conn.execute("BEGIN")
+            collections = conn.execute(
+                "SELECT id FROM collections WHERE name = ?", (collection_name,)
+            ).fetchall()
+            if len(collections) != 1:
+                return None
+            collection_id = collections[0][0]
+            segments = conn.execute(
+                "SELECT id FROM segments WHERE collection = ? AND scope = 'METADATA'",
+                (collection_id,),
+            ).fetchall()
+            if len(segments) != 1:
+                return None
+            segment_id = segments[0][0]
+            watermark = conn.execute(
+                "SELECT seq_id FROM max_seq_id WHERE segment_id = ?", (segment_id,)
+            ).fetchone()
+            suffix = f"/{collection_id}"
+            if watermark is None:
+                # A never-written collection has no watermark. Existing rows
+                # or a queued write make that missing state untrustworthy.
+                if (
+                    conn.execute(
+                        "SELECT 1 FROM embeddings WHERE segment_id = ? LIMIT 1", (segment_id,)
+                    ).fetchone()
+                    or conn.execute(
+                        "SELECT 1 FROM embeddings_queue WHERE substr(topic, -length(?)) = ? LIMIT 1",
+                        (suffix, suffix),
+                    ).fetchone()
+                ):
+                    return None
+                consumed = 0
+            else:
+                consumed = watermark[0]
+                if isinstance(consumed, bytes):
+                    # Older Chroma stored big-endian 8-byte offsets. The
+                    # newer \x11\x11-prefixed format is not that encoding.
+                    if len(consumed) != 8 or consumed.startswith(b"\x11\x11"):
+                        return None
+                    consumed = int.from_bytes(consumed, "big")
+                if not isinstance(consumed, int) or not 0 <= consumed <= (1 << 63) - 1:
+                    return None
+            # Legacy Collection.get backfills queued operations first. Read
+            # only when the metadata segment has already consumed them; the
+            # vector segment's lag does not affect diary text or metadata.
+            if conn.execute(
+                "SELECT 1 FROM embeddings_queue WHERE seq_id > ?"
+                " AND substr(topic, -length(?)) = ? LIMIT 1",
+                (consumed, suffix, suffix),
+            ).fetchone():
+                return None
+            value_columns = _metadata_value_columns(conn)
+            if "string_value" not in value_columns:
+                return None
+
+            # Drive from the smallest indexed metadata equality. Driving from
+            # embeddings instead scans the entire palace for a sparse diary.
+            sizes = [
+                conn.execute(
+                    "SELECT COUNT(*) FROM embedding_metadata WHERE key = ? AND string_value = ?",
+                    pair,
+                ).fetchone()[0]
+                for pair in equalities
+            ]
+            drive = sizes.index(min(sizes))
+            remaining = equalities[:drive] + equalities[drive + 1 :]
+            filters = "".join(
+                " AND EXISTS (SELECT 1 FROM embedding_metadata w"
+                " WHERE w.id = f.id AND w.key = ? AND w.string_value = ?)"
+                for _ in remaining
+            )
+            scope = f"""
+                FROM embedding_metadata f
+                CROSS JOIN embeddings e ON e.id = f.id
+                JOIN segments s ON s.id = e.segment_id
+                LEFT JOIN embedding_metadata stamp ON stamp.id = e.id AND stamp.key = 'filed_at'
+                WHERE f.key = ? AND f.string_value = ?
+                  AND s.collection = ? AND s.scope = 'METADATA'
+                {filters}
+            """
+            params = [
+                *equalities[drive],
+                collection_id,
+                *[part for pair in remaining for part in pair],
+            ]
+            unsupported_timestamp = "(stamp.id IS NOT NULL AND stamp.string_value IS NULL)"
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embedding_metadata_array'"
+            ).fetchone():
+                # The legacy diary response exposes these values unchanged.
+                # Array hydration is not this scalar reader's responsibility;
+                # an array timestamp must not be mistaken for a missing one.
+                unsupported_timestamp += (
+                    " OR EXISTS (SELECT 1 FROM embedding_metadata_array a"
+                    " WHERE a.id = f.id AND a.key IN ('filed_at', 'date', 'topic'))"
+                )
+            total, unsupported = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(CASE WHEN "
+                + unsupported_timestamp
+                + " THEN 1 ELSE 0 END), 0) "
+                + scope,
+                params,
+            ).fetchone()
+            if unsupported:
+                return None
+            selected = conn.execute(
+                "SELECT e.id, e.embedding_id "
+                + scope
+                + " ORDER BY COALESCE(stamp.string_value, '') DESC, e.id LIMIT ?",
+                [*params, limit],
+            ).fetchall()
+            if not selected:
+                return total, []
+
+            records = {row_id: [drawer_id, None, {}] for row_id, drawer_id in selected}
+            for start in range(0, len(selected), 500):
+                row_ids = [row_id for row_id, _ in selected[start : start + 500]]
+                marks = ",".join("?" for _ in row_ids)
+                rows = conn.execute(
+                    f"SELECT id, key, {', '.join(value_columns)} FROM embedding_metadata"
+                    f" WHERE id IN ({marks})",
+                    row_ids,
+                )
+                for row_id, key, *cells in rows:
+                    values = dict(zip(value_columns, cells))
+                    value = _metadata_cell_value(
+                        *(
+                            values.get(col)
+                            for col in ("string_value", "int_value", "float_value", "bool_value")
+                        )
+                    )
+                    if key == "chroma:document":
+                        records[row_id][1] = value
+                    elif key and value is not None:
+                        records[row_id][2][key] = value
+            return total, [tuple(records[row_id]) for row_id, _ in selected]
+        finally:
+            conn.close()
+    except (sqlite3.Error, ValueError):
+        return None
+
+
 def _pin_hnsw_threads(collection) -> None:
     """Best-effort retrofit: pin ``hnsw:num_threads=1`` on an existing collection.
 
