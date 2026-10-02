@@ -36,6 +36,9 @@ def _strip_leaked_pythonpath_from_sys_path() -> None:
     # contain packages built for another Python ABI under the same prefix.
     paths = sysconfig.get_paths()
     own_site_packages = {_norm(os.path.realpath(paths[name])) for name in ("purelib", "platlib")}
+    # Also keep the directory this module itself loaded from (#2613): a detached
+    # venv's own paths otherwise look foreign to sysconfig.
+    own_site_packages.add(_norm(os.path.realpath(os.path.dirname(os.path.dirname(__file__)))))
 
     def _belongs_to_this_environment(path: str) -> bool:
         try:

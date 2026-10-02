@@ -1,12 +1,15 @@
 """__init__-level guards that must take effect before transitive imports."""
 
 import os
+import shutil
 import subprocess
 import sys
 import sysconfig
 import tempfile
 
 import pytest
+
+import mempalace
 
 
 _LEAK_PREFIX = "/__mempalace_leak_test_sentinel__"
@@ -187,3 +190,56 @@ def test_init_strips_foreign_paths_beneath_the_running_prefix(location):
     assert "OWN_PRESENT: True" in result.stdout, diag
     assert "FOREIGN_PRESENT: False" in result.stdout, diag
     assert "DEPENDENCY_IMPORTED: pydantic_core" in result.stdout, diag
+
+
+def test_init_keeps_the_directory_it_was_actually_loaded_from(tmp_path):
+    """A detached venv (a standalone interpreter with PYTHONPATH pointing at
+    a virtualenv's site-packages instead of running from that venv's own
+    bin/python, e.g. a package manager that "activates" purely via
+    PYTHONPATH) makes sysconfig report the wrong "own" paths: this package,
+    and whatever sits beside it, loaded from the PYTHONPATH entry, not from
+    the running interpreter's purelib/platlib (#2613).
+
+    Builds a standalone copy of the real ``mempalace`` package plus a
+    sibling dependency stub under one directory that is NOT on the running
+    interpreter's sysconfig paths, and puts only that directory on
+    PYTHONPATH. A genuinely unrelated directory is included too, as the
+    control: it must still be stripped.
+    """
+    detached = tmp_path / "detached"
+    detached.mkdir()
+    shutil.copytree(
+        os.path.dirname(mempalace.__file__),
+        detached / "mempalace",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    (detached / "dep_stub.py").write_text("IMPORTED = True\n")
+    foreign = tmp_path / "unrelated-foreign-dir"
+    foreign.mkdir()
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(detached) + os.pathsep + str(foreign)
+    code = (
+        "import mempalace, os, sys; "
+        f"detached = {str(detached)!r}; foreign = {str(foreign)!r}; "
+        "norm = lambda p: os.path.normcase(os.path.normpath(os.path.realpath(p))); "
+        "print('LOADED_FROM_DETACHED:', "
+        "norm(os.path.dirname(os.path.dirname(mempalace.__file__))) == norm(detached)); "
+        "print('DETACHED_IN_PATH:', any(norm(p) == norm(detached) for p in sys.path if p)); "
+        "print('FOREIGN_IN_PATH:', any(norm(p) == norm(foreign) for p in sys.path if p)); "
+        "import dep_stub; print('DEP_STUB_IMPORTED:', dep_stub.IMPORTED)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        cwd=tempfile.gettempdir(),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    diag = f"stdout={result.stdout!r}; stderr={result.stderr!r}"
+    assert result.returncode == 0, diag
+    assert "LOADED_FROM_DETACHED: True" in result.stdout, diag
+    assert "DETACHED_IN_PATH: True" in result.stdout, diag
+    assert "FOREIGN_IN_PATH: False" in result.stdout, diag
+    assert "DEP_STUB_IMPORTED: True" in result.stdout, diag
