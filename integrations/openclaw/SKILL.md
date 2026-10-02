@@ -38,10 +38,10 @@ You have access to a local memory palace via MCP tools. The palace stores verbat
 
 ## Protocol — FOLLOW THIS EVERY SESSION
 
-1. **ON WAKE-UP**: Call `mempalace_status` to load palace overview and AAAK dialect spec.
+1. **ON WAKE-UP**: Call `mempalace_status` to load the palace overview and memory protocol. The AAAK reference is available for optional use.
 2. **BEFORE RESPONDING** about any person, project, or past event: call `mempalace_search` or `mempalace_kg_query` FIRST. Never guess from memory — verify from the palace.
 3. **IF UNSURE** about a fact (name, age, relationship, preference): say "let me check" and query. Wrong is worse than slow.
-4. **AFTER EACH SESSION**: Call `mempalace_diary_write` to record what happened, what you learned, what matters.
+4. **AFTER EACH SESSION**: Call `mempalace_diary_write` to record what happened, what you learned, what matters in plain text by default. Use AAAK only when explicitly requested.
 5. **WHEN FACTS CHANGE**: Call `mempalace_kg_invalidate` on the old fact, then `mempalace_kg_add` for the new one.
 
 ## Available Tools
@@ -119,7 +119,7 @@ tool-specific workflow below says to.
   - Checks for duplicates automatically
 - `mempalace_checkpoint` — Save a whole session in one call: dedup each item, file non-duplicates, then write one diary entry
   - `items` (required): array of `{wing, room, content}`; content must be verbatim
-  - `diary`: optional `{agent_name, entry, topic?, wing?}`; entry should use AAAK format
+  - `diary`: optional `{agent_name, entry, topic?, wing?}`; use plain text for `entry` by default, with AAAK optional when explicitly requested
   - `dedup_threshold`: similarity threshold (default 0.9)
   - `added_by`: optional filing agent label (defaults to the diary `agent_name`, else `checkpoint`)
 - `mempalace_update_drawer` — Update an existing drawer's content and/or move it to a different wing/room
@@ -146,9 +146,9 @@ tool-specific workflow below says to.
   - `dry_run`: preview match count and sample (default true)
 
 ### Diary & Session
-- `mempalace_diary_write` — Write a session diary entry
+- `mempalace_diary_write` — Write a session diary entry in plain text by default; AAAK is optional when explicitly requested
   - `agent_name` (required): your name/identifier
-  - `entry` (required): what happened, what you learned, what matters
+  - `entry` (required): what happened, what you learned, what matters; no automatic conversion between plain text and AAAK
   - `topic`: category tag (default "general")
 - `mempalace_diary_read` — Read recent diary entries
   - `agent_name` (required)
@@ -210,7 +210,8 @@ claude mcp add mempalace -- python -m mempalace.mcp_server
 - The knowledge graph stores typed relationships with time windows. Use it for facts about people and projects — it knows WHEN things were true.
 - Diary entries accumulate across sessions. Write one at the end of each conversation to build continuity.
 - Use `mempalace_check_duplicate` before storing new content to avoid duplicates.
-- The AAAK dialect (from `mempalace_status`) is a compressed notation for efficient storage. Read it naturally — expand codes mentally, treat *markers* as emotional context.
+- Use plain text for diary and checkpoint entries by default. AAAK is optional when explicitly requested; supplied entries are stored without automatic format conversion.
+- The AAAK dialect (from `mempalace_status`) is a reference for explicitly requested compressed notation. When reading existing AAAK entries, expand codes mentally and treat *markers* as emotional context.
 
 ## License
 

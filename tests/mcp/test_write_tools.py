@@ -3,6 +3,8 @@
 import json
 from unittest.mock import MagicMock
 
+import pytest
+
 
 from _mcp_server_helpers import (
     _get_collection,
@@ -393,6 +395,36 @@ class TestWriteTools:
         assert result["errors"] == []
         assert all(a["success"] for a in result["added"])
         assert result["diary"]["success"] is True
+
+    @pytest.mark.parametrize("entry_key", ["entry", "content"])
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "  Keep the checkpoint's café, 日本語, and 🙂 intact.\nSecond line.  \n",
+            "SESSION:2026-10-02|PROJ:MPL|ALC→JOR|*warm*|★★★\n",
+        ],
+        ids=["plain-text", "supplied-aaak"],
+    )
+    def test_checkpoint_preserves_supplied_diary_text(
+        self, monkeypatch, config, palace_path, kg, entry, entry_key
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_checkpoint, tool_diary_read, tool_get_drawer
+
+        diary = {"agent_name": "TestAgent", "wing": "project", entry_key: entry}
+        if entry_key == "entry":
+            diary["content"] = "The compatibility alias must not replace the supplied entry."
+
+        result = tool_checkpoint(items=[], diary=diary)
+
+        assert result["errors"] == []
+        assert result["diary"]["success"] is True
+        assert tool_get_drawer(result["diary"]["entry_id"])["content"] == entry
+        read = tool_diary_read(agent_name="TestAgent", wing="project")
+        assert read["total"] == 1
+        assert read["entries"][0]["content"] == entry
 
     def test_checkpoint_skips_semantic_duplicates(self, monkeypatch, config, kg):
         from mempalace import mcp_server

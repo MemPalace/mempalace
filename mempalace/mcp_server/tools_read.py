@@ -393,20 +393,24 @@ def tool_status():
 
 
 # ── AAAK Dialect Spec ─────────────────────────────────────────────────────────
-# Included in status response so the AI learns it on first wake-up call.
+# Included in status responses as an optional reference, including for legacy entries.
 # Also available via mempalace_get_aaak_spec tool.
 
 PALACE_PROTOCOL = """IMPORTANT — MemPalace Memory Protocol:
-1. ON WAKE-UP: Call mempalace_status to load palace overview + AAAK spec.
+1. ON WAKE-UP: Call mempalace_status to load the palace overview and memory protocol. The included AAAK spec is an optional reference for existing entries or explicitly requested diary compression.
 2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.
 3. IF UNSURE about a fact (name, gender, age, relationship): say "let me check" and query the palace. Wrong is worse than slow.
-4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.
+4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters. Use plain text by default; write AAAK only when explicitly requested.
 5. WHEN A SINGLE-VALUED FACT CHANGES (model, employer, address): call mempalace_kg_supersede(subject, predicate, old, new) to replace it atomically at one boundary — do NOT hand-roll invalidate + add, which leaves the old and new values overlapping at the boundary. Use mempalace_kg_invalidate for a fact that simply ended, and mempalace_kg_add to add an independent (possibly concurrent) fact.
 
 This protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory."""
 
-AAAK_SPEC = """AAAK is a compressed memory dialect that MemPalace uses for efficient storage.
+AAAK_SPEC = """AAAK is an optional compressed memory dialect.
 It is designed to be readable by both humans and LLMs without decoding.
+For diary entries, use plain text by default; use AAAK only when explicitly requested.
+Diary entries are stored in the caller-supplied format without automatic conversion.
+Historically reported LongMemEval retrieval R@5: raw 96.6%, AAAK 84.2%.
+These benchmarks compare session retrieval, not diary-specific recall.
 
 FORMAT:
   ENTITIES: 3-letter uppercase codes. ALC=Alice, JOR=Jordan, RIL=Riley, MAX=Max, BEN=Ben.
@@ -422,7 +426,7 @@ EXAMPLE:
   FAM: ALC→♡JOR | 2D(kids): RIL(18,sports) MAX(11,chess+swimming) | BEN(contributor)
 
 Read AAAK naturally — expand codes mentally, treat *markers* as emotional context.
-When WRITING AAAK: use entity codes, mark emotions, keep structure tight."""
+When AAAK is explicitly requested: use entity codes, mark emotions, keep structure tight."""
 
 
 def tool_list_wings():

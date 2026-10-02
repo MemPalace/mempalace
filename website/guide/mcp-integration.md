@@ -50,7 +50,7 @@ When the AI first calls `mempalace_status`, it receives the **Memory Protocol** 
 1. **On wake-up**: Call `mempalace_status` to load the palace overview
 2. **Before responding** about any person, project, or past event: search first, never guess
 3. **If unsure**: Say "let me check" and query the palace
-4. **After each session**: Write diary entries to record what happened
+4. **After each session**: Write diary entries in plain text by default to record what happened; AAAK is optional when explicitly requested
 5. **When facts change**: Invalidate old facts, add new ones
 
 This protocol is what turns storage into memory — the AI knows to verify before speaking.
@@ -116,8 +116,11 @@ This protocol is what turns storage into memory — the AI knows to verify befor
 
 | Tool | What |
 |------|------|
-| `mempalace_diary_write` | Write AAAK diary entry |
+| `mempalace_diary_write` | Write a diary entry in plain text by default; AAAK optional when explicitly requested |
 | `mempalace_diary_read` | Read recent diary entries |
+
+Diary and checkpoint entries are stored without automatic conversion between
+plain text and AAAK. Existing AAAK entries remain readable as written.
 
 ### System
 

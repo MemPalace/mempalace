@@ -32,7 +32,7 @@ TOOLS = {
         "handler": tool_get_taxonomy,
     },
     "mempalace_get_aaak_spec": {
-        "description": "Get the AAAK dialect specification — the compressed memory format MemPalace uses. Call this if you need to read or write AAAK-compressed memories.",
+        "description": "Get the optional AAAK dialect specification. Plain text is the default for diary entries. Call this to read existing AAAK memories or when AAAK compression is explicitly requested.",
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_get_aaak_spec,
     },
@@ -425,13 +425,16 @@ TOOLS = {
                 },
                 "diary": {
                     "type": "object",
-                    "description": "Optional diary entry written after filing: {agent_name, entry, topic?, wing?}. entry is AAAK-format.",
+                    "description": "Optional diary entry written after filing: {agent_name, entry, topic?, wing?}. Use plain text by default; AAAK is optional when explicitly requested. The entry is stored without format conversion.",
                     "properties": {
                         "agent_name": {
                             "type": "string",
                             "description": "Agent name (e.g. cursor-ide)",
                         },
-                        "entry": {"type": "string", "description": "Diary entry in AAAK format"},
+                        "entry": {
+                            "type": "string",
+                            "description": "Diary entry in plain text by default; caller-supplied AAAK is also accepted without format conversion",
+                        },
                         "topic": {"type": "string", "description": "Topic tag (optional)"},
                         "wing": {"type": "string", "description": "Target wing (optional)"},
                     },
@@ -668,7 +671,7 @@ TOOLS = {
         "handler": tool_update_drawer,
     },
     "mempalace_diary_write": {
-        "description": "Write to your personal agent diary in AAAK format. Your observations, thoughts, what you worked on, what matters. Each agent has their own diary with full history. Write in AAAK for compression — e.g. 'SESSION:2026-04-04|built.palace.graph+diary.tools|ALC.req:agent.diaries.in.aaak|★★★'. Use entity codes from the AAAK spec.",
+        "description": "Write to your personal agent diary. Use plain text by default for your observations, thoughts, what you worked on, and what matters. Each agent has their own diary with full history. AAAK is optional when explicitly requested; caller-supplied entries are stored without format conversion.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -678,7 +681,7 @@ TOOLS = {
                 },
                 "entry": {
                     "type": "string",
-                    "description": "Your diary entry in AAAK format — compressed, entity-coded, emotion-marked",
+                    "description": "Your diary entry in plain text by default. Caller-supplied AAAK is also accepted without format conversion.",
                 },
                 "topic": {
                     "type": "string",
@@ -701,7 +704,7 @@ TOOLS = {
         "handler": tool_diary_write,
     },
     "mempalace_diary_read": {
-        "description": "Read your recent diary entries (in AAAK). See what past versions of yourself recorded — your journal across sessions.",
+        "description": "Read your recent diary entries in their stored format, including plain text and existing AAAK entries. See what past versions of yourself recorded — your journal across sessions.",
         "input_schema": {
             "type": "object",
             "properties": {
