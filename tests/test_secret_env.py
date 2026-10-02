@@ -4,6 +4,7 @@ import sys
 
 import pytest
 
+import mempalace.secret_env as secret_env_module
 from mempalace.secret_env import SecretEnvError, read_secret_env, secret_file_env
 
 NAME = "MEMPALACE_TEST_SECRET"
@@ -87,9 +88,28 @@ def test_file_path_is_used_exactly(tmp_path, monkeypatch):
     # The path is not trimmed: a stray space names a different file, and the
     # error shows it (repr) rather than silently opening the trimmed name.
     _secret_file(tmp_path, b"s3cret", name="token")
-    monkeypatch.setenv(FILE_VAR, str(tmp_path / "token") + " ")
-    with pytest.raises(SecretEnvError, match="token ' could not be read"):
+    path = str(tmp_path / "token") + " "
+    monkeypatch.setenv(FILE_VAR, path)
+    with pytest.raises(SecretEnvError) as excinfo:
         read_secret_env(NAME)
+    assert f"{FILE_VAR}={path!r} could not be read" in str(excinfo.value)
+
+
+def test_file_path_is_passed_to_open_untrimmed(monkeypatch):
+    # The test above needs a filesystem that keeps trailing spaces; this one
+    # checks the argument handed to open() itself, so it runs on Windows too.
+    path = "/run/secrets/token "
+    opened = []
+
+    def fake_open(file, mode="r", *args, **kwargs):
+        opened.append((file, mode))
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(secret_env_module, "open", fake_open, raising=False)
+    monkeypatch.setenv(FILE_VAR, path)
+    with pytest.raises(SecretEnvError):
+        read_secret_env(NAME)
+    assert opened == [(path, "rb")]
 
 
 def test_directory_is_an_error(tmp_path, monkeypatch):
