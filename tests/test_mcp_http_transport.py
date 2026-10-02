@@ -312,7 +312,7 @@ class TestPalaceReadsDoNotStarveTheHub:
 
 
 class TestEmbeddingDoesNotHoldTheHttpLock:
-    """Embedding inference must not extend how long unrelated requests wait (#2604)."""
+    """Embedding inference must not extend how long unrelated requests wait."""
 
     @staticmethod
     def _request(port, body, timeout=10):
@@ -475,6 +475,103 @@ class TestEmbeddingDoesNotHoldTheHttpLock:
         search_thread.join(timeout=5)
         write_thread.join(timeout=5)
         assert write_started.is_set()
+
+    def test_cli_compatible_search_keeps_the_request_lock(self, http_server, monkeypatch):
+        """The CLI capture lock is held across embed, so this path must not drop the lease."""
+        port, _ = http_server
+        seen = []
+
+        def cli_search(**_kwargs):
+            from mempalace.embedding import _embedding_section_hook_local
+
+            seen.append(getattr(_embedding_section_hook_local, "hook", None))
+            return {"query": "x", "cli_output": "ok"}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", cli_search)
+        result = self._call(
+            port,
+            "mempalace_search",
+            {"query": "x", "cli_compatible": True},
+            req_id=91,
+        )
+        assert result["cli_output"] == "ok"
+        assert seen == [None]
+
+    def test_plain_search_installs_the_embedding_hook(self, http_server, monkeypatch):
+        port, _ = http_server
+        seen = []
+
+        def plain_search(**_kwargs):
+            from mempalace.embedding import _embedding_section_hook_local
+
+            seen.append(getattr(_embedding_section_hook_local, "hook", None))
+            return {"query": "x", "results": []}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", plain_search)
+        self._call(port, "mempalace_search", {"query": "x"}, req_id=92)
+        assert seen[0] is not None
+
+
+def test_embedding_reacquires_the_request_lock_before_releasing_lifecycle():
+    """Reconnect takes the lifecycle lock first, so it must not win that lock
+    until the embedding request holds its lease again."""
+    entered = threading.Event()
+    release_embed = threading.Event()
+    still_holding = threading.Event()
+    lifecycle_seen = threading.Event()
+    left_request = threading.Event()
+    errors = []
+
+    def embedder():
+        try:
+            with mcp._HTTP_REQUEST_LOCK:
+                with mcp._http_release_request_lock_for_embedding("write"):
+                    entered.set()
+                    assert release_embed.wait(timeout=3)
+                still_holding.set()
+                assert lifecycle_seen.wait(timeout=3)
+            left_request.set()
+        except Exception as exc:
+            errors.append(exc)
+            still_holding.set()
+            left_request.set()
+
+    def reconnect():
+        try:
+            assert entered.wait(timeout=3)
+            with mcp._http_embedding_lifecycle():
+                assert still_holding.is_set()
+                assert mcp._HTTP_REQUEST_LOCK._writer is True
+                lifecycle_seen.set()
+                assert left_request.wait(timeout=3)
+                with mcp._HTTP_REQUEST_LOCK:
+                    assert mcp._HTTP_REQUEST_LOCK._writer is True
+        except Exception as exc:
+            errors.append(exc)
+            lifecycle_seen.set()
+            left_request.set()
+
+    embed_thread = threading.Thread(target=embedder)
+    reconnect_thread = threading.Thread(target=reconnect)
+    embed_thread.start()
+    try:
+        assert entered.wait(timeout=3)
+        reconnect_thread.start()
+        time.sleep(0.2)
+        assert not still_holding.is_set()
+        release_embed.set()
+        embed_thread.join(timeout=5)
+        reconnect_thread.join(timeout=5)
+    finally:
+        release_embed.set()
+        lifecycle_seen.set()
+        left_request.set()
+        embed_thread.join(timeout=5)
+        reconnect_thread.join(timeout=5)
+
+    assert not errors, errors
+    assert still_holding.is_set()
+    assert left_request.is_set()
 
 
 class TestRWLockYield:

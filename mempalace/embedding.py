@@ -63,9 +63,11 @@ from .version import __version__
 logger = logging.getLogger(__name__)
 
 # Optional per-thread hook around embedding inference. The HTTP transport
-# installs a context manager that releases ``_HTTP_REQUEST_LOCK`` only for the
-# model call so embedding latency does not stall unrelated requests (#2604).
-# CLI and stdio leave this unset.
+# installs a context manager that releases its request lock only for the
+# model call, so embedding latency does not stall unrelated requests.
+# CLI and stdio leave this unset. The hook belongs around the explicit
+# embed that runs before a backend write lock — not inside the embedding
+# function Chroma invokes while that lock is held.
 _embedding_section_hook_local = threading.local()
 
 
@@ -86,29 +88,6 @@ def embedding_section():
         return
     with hook():
         yield
-
-
-class _EmbeddingSectionFunction:
-    """Wrap a ChromaDB embedding function so inference goes through :func:`embedding_section`."""
-
-    def __init__(self, inner):
-        self._inner = inner
-
-    def __call__(self, input=None, **kwargs):  # noqa: A002 — ChromaDB EF protocol
-        with embedding_section():
-            if kwargs:
-                if input is not None:
-                    kwargs = dict(kwargs)
-                    kwargs["input"] = input
-                return self._inner(**kwargs)
-            return self._inner(input=input)
-
-    def embed_query(self, input):  # noqa: A002
-        with embedding_section():
-            return self._inner.embed_query(input)
-
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
 
 
 _PROVIDER_MAP = {
@@ -831,9 +810,9 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
         cached = _EF_CACHE.get(cache_key)
         if cached is not None:
             return cached
-        ef = _EmbeddingSectionFunction(
-            OpenAICompatEmbeddingFunction(base_url=url, model=api_model, api_key=api_key)
-        )
+        # Return the concrete function. Chroma accepts only ``__call__(self, input)``,
+        # and callers distinguish backends by type. A proxy breaks both.
+        ef = OpenAICompatEmbeddingFunction(base_url=url, model=api_model, api_key=api_key)
         _EF_CACHE[cache_key] = ef
         logger.info(
             "Embedding function initialized (openai-compat url=%s model=%s)", url, api_model
@@ -862,7 +841,6 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
             ef_cls = _build_ef_class()
             ef = ef_cls(preferred_providers=providers, intra_op_num_threads=threads)
 
-        ef = _EmbeddingSectionFunction(ef)
         _EF_CACHE[cache_key] = ef
     logger.info(
         "Embedding function initialized (model=%s device=%s providers=%s)",

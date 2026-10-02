@@ -126,8 +126,8 @@ _HTTP_MINE_LOCK = threading.Lock()
 _HTTP_YIELDING_TOOLS = frozenset({"mempalace_mine"})
 # Tools whose handler makes one request-local embedding call before an
 # otherwise independent backend operation. Holding ``_HTTP_REQUEST_LOCK``
-# through that inference stalls unrelated requests for the whole model call
-# (#2604). Compound read-modify-write tools stay fully serialized.
+# through that inference stalls unrelated requests for the whole model call.
+# Compound read-modify-write tools stay fully serialized.
 _HTTP_EMBEDDING_RELEASE_TOOLS = frozenset(
     {
         "mempalace_search",
@@ -137,7 +137,10 @@ _HTTP_EMBEDDING_RELEASE_TOOLS = frozenset(
 )
 # Taken while a request has released the request lock mid-embedding so
 # ``mempalace_reconnect`` cannot close backend handles during that window.
+# Reconnect acquires this before the request lock; embedding reacquires the
+# request lock before releasing this one.
 _HTTP_EMBEDDING_LIFECYCLE_LOCK = threading.Lock()
+_http_embedding_lifecycle_tls = threading.local()
 _http_embedding_release_tls = threading.local()
 _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 _HTTP_ACTIVE_CLIENT_WINDOW_S = 120.0
@@ -428,12 +431,63 @@ def _sse_max_clients() -> int:
 
 
 @contextlib.contextmanager
+def _http_embedding_lifecycle():
+    """Hold the embedding lifecycle lock. Reentrant on this thread.
+
+    HTTP dispatch for reconnect acquires this before the request lock. The
+    reconnect tool acquires it again, and that nested enter is a no-op, so
+    stdio (which has no dispatch wrapper) still waits out an embedding window.
+    """
+    if getattr(_http_embedding_lifecycle_tls, "held", False):
+        yield
+        return
+    _HTTP_EMBEDDING_LIFECYCLE_LOCK.acquire()
+    _http_embedding_lifecycle_tls.held = True
+    try:
+        yield
+    finally:
+        _http_embedding_lifecycle_tls.held = False
+        _HTTP_EMBEDDING_LIFECYCLE_LOCK.release()
+
+
+def _call_arguments(request):
+    if not isinstance(request, dict):
+        return None
+    params = request.get("params")
+    if not isinstance(params, dict):
+        return None
+    arguments = params.get("arguments")
+    return arguments if isinstance(arguments, dict) else None
+
+
+def _embedding_release_mode(tool_name, request, access):
+    """Return ``access`` when this call may drop the request lock around inference.
+
+    ``mempalace_search(cli_compatible=True)`` holds the CLI capture lock across
+    its embed. Dropping the request lock there lets a second search keep a read
+    lease while waiting for that capture lock, and a queued writer then stops
+    the first search from taking its lease back.
+    """
+    if tool_name not in _HTTP_EMBEDDING_RELEASE_TOOLS:
+        return None
+    if tool_name == "mempalace_search":
+        arguments = _call_arguments(request)
+        if arguments and arguments.get("cli_compatible"):
+            return None
+    return access
+
+
+@contextlib.contextmanager
 def _http_release_request_lock_for_embedding(mode: str):
     """Release the held request lock only around embedding inference.
 
     ``mode`` is ``"read"`` or ``"write"`` and must match how ``_http_dispatch``
     acquired ``_HTTP_REQUEST_LOCK`` for this request. Nested embedding calls
     on the same thread do not double-release.
+
+    The request lease is taken back before the lifecycle lock is dropped, so
+    reconnect (which takes the lifecycle lock first) cannot close handles in
+    the gap.
     """
     depth = getattr(_http_embedding_release_tls, "depth", 0)
     _http_embedding_release_tls.depth = depth + 1
@@ -445,14 +499,18 @@ def _http_release_request_lock_for_embedding(mode: str):
             _HTTP_REQUEST_LOCK.release_read()
         else:
             _HTTP_REQUEST_LOCK.release_write()
+        _HTTP_EMBEDDING_LIFECYCLE_LOCK.acquire()
         try:
-            with _HTTP_EMBEDDING_LIFECYCLE_LOCK:
-                yield
+            yield
         finally:
+            # Reacquire even when inference raises, then drop the lifecycle
+            # lock. The opposite order lets reconnect in while this request
+            # still does not hold its lease.
             if mode == "read":
                 _HTTP_REQUEST_LOCK.acquire_read()
             else:
                 _HTTP_REQUEST_LOCK.acquire_write()
+            _HTTP_EMBEDDING_LIFECYCLE_LOCK.release()
     finally:
         _http_embedding_release_tls.depth = depth
 
@@ -492,8 +550,9 @@ def _http_dispatch(request):
     from ..service import classify_tool
 
     if classify_tool(tool_name) == "read":
-        if tool_name in _HTTP_EMBEDDING_RELEASE_TOOLS:
-            with _http_embedding_release_installed("read"), _HTTP_REQUEST_LOCK.read_lock():
+        release_mode = _embedding_release_mode(tool_name, request, "read")
+        if release_mode:
+            with _http_embedding_release_installed(release_mode), _HTTP_REQUEST_LOCK.read_lock():
                 return handle_request(request)
         with _HTTP_REQUEST_LOCK.read_lock():
             return handle_request(request)
@@ -509,8 +568,15 @@ def _http_dispatch(request):
             mine_yield_hook(_HTTP_REQUEST_LOCK.yield_write),
         ):
             return handle_request(request)
-    if tool_name in _HTTP_EMBEDDING_RELEASE_TOOLS:
-        with _http_embedding_release_installed("write"), _HTTP_REQUEST_LOCK:
+    if tool_name == "mempalace_reconnect":
+        # Lifecycle before the request lease. An in-flight embed holds the
+        # lifecycle lock across the window where it does not hold the lease,
+        # and takes the lease back before releasing lifecycle.
+        with _http_embedding_lifecycle(), _HTTP_REQUEST_LOCK:
+            return handle_request(request)
+    release_mode = _embedding_release_mode(tool_name, request, "write")
+    if release_mode:
+        with _http_embedding_release_installed(release_mode), _HTTP_REQUEST_LOCK:
             return handle_request(request)
     with _HTTP_REQUEST_LOCK:
         return handle_request(request)

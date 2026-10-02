@@ -18,8 +18,10 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
     ``float(x)`` branch covers embedders that already hand back plain
     sequences.
 
-    Runs under :func:`mempalace.embedding.embedding_section` so the HTTP
-    transport can release ``_HTTP_REQUEST_LOCK`` only around inference (#2604).
+    Runs under :func:`mempalace.embedding.embedding_section` so a transport
+    can release its request lock for this call only. Callers must invoke this
+    before taking a backend write lock: dropping that lock from inside the
+    embedding function Chroma runs during ``add`` deadlocks with the next writer.
     """
     if not texts:
         return []
@@ -27,10 +29,6 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
 
     with embedding_section():
         ef = get_embedding_function()
-        # get_embedding_function already wraps EF in embedding_section; calling
-        # through it again is a no-op nest when the HTTP hook is installed
-        # (depth-tracked there). Keep the outer section so a bare EF still
-        # releases when tests patch get_embedding_function.
         vectors = ef(input=texts)
     return [
         v.tolist() if hasattr(v, "tolist") else [float(x) for x in v]  # numpy | plain sequence

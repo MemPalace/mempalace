@@ -419,6 +419,43 @@ def test_embed_texts_handles_plain_sequence_embedders(monkeypatch):
         assert all(type(x) is float for x in row), f"got {type(row[0])}, not builtin float"
 
 
+def test_collection_add_embeds_before_the_inner_write(monkeypatch):
+    """The request lock may drop during inference. That window has to close
+    before the backend write, which holds the palace lock."""
+    from mempalace.backends.embedding_wrapper import EmbeddingCollection
+    from mempalace.embedding import set_embedding_section_hook
+
+    events = []
+
+    class _Hook:
+        def __enter__(self):
+            events.append("enter")
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("exit")
+            return False
+
+    set_embedding_section_hook(lambda: _Hook())
+    try:
+        monkeypatch.setattr(
+            embedding,
+            "get_embedding_function",
+            lambda device=None, model=None: lambda input: [[0.5, 0.5]],
+        )
+
+        class _Inner:
+            def add(self, *, documents, ids, metadatas=None, embeddings=None):
+                events.append("write")
+                assert embeddings == [[0.5, 0.5]]
+
+        EmbeddingCollection(_Inner()).add(documents=["hello"], ids=["1"])
+    finally:
+        set_embedding_section_hook(None)
+
+    assert events == ["enter", "exit", "write"]
+
+
 def test_embed_texts_short_circuits_on_empty_input(monkeypatch):
     """Empty input must return ``[]`` without constructing an embedding function.
 
