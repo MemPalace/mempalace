@@ -442,6 +442,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Bug Fixes
 
+- **Mining on Qdrant and other non-Chroma backends no longer rescans the
+  palace once per thousand drawers.** Off Chroma's sqlite stream, the content-
+  hash and mined-file scans paged `get(limit=1000, offset=N)`, and Qdrant's
+  `get()` materializes every matching row before slicing, so each page walked
+  the whole collection: 17+ minutes of a pegged core and 800 MB resident on a
+  260k-drawer palace, repeated by every hook-driven mine. The fallback now makes
+  one `get_all_metadata()` pass, 4.1 s on that palace. Backends without an
+  override keep the same offset loop. (#1796)
 - **`sync --apply` no longer removes a drawer whose corroborating neighbour is in a different directory than the one its source was mined from.** #2322 made removal ask for a witness in the same directory, which three mount shapes defeat: a mount point whose lower layer holds a mined file of its own, a volume mounted over a directory the palace already knows a file in, and a bind mount of another directory over one it knows, which is what a container does with `-v /host/elsewhere:/project/sub`. Driven through real `mount` and `umount`, all three removed drawers of files that were on disk the whole time. Mining now records which directory each source was read from, as that directory's inode, and `sync` compares it against the inode answering when the verdict is formed. Nothing is written into the source tree for it, so the read-only mounts the README's container recipes use keep working; `st_dev` could not do it, since a bind mount puts both sides on one filesystem where it is the same number. Ten paths record the identity, and `update_drawer` carries it forward when it refiles a drawer as chunks, so every row `sync` can remove holds one. Four bounds: one volume swapped for another at the same path is not separated, a directory deleted and recreated may answer with a different inode and then keeps the drawers of files that really went, a filesystem reporting no inode of its own gains nothing and reproduces the bug in full, and the `gitignored` removal route is unchanged. An existing palace gains the field only as it is re-mined, which `file_already_mined` decides from the stored mtime. Closets are now purged per source a pass emptied rather than per source it removed a drawer from, so a source that kept one keeps the lines that index it. (#2367)
 - **`sync --apply` no longer removes a drawer because a volume mounted over its
   directory carries a file of the same name and a `.gitignore` that names it.**

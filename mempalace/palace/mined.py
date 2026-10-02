@@ -110,6 +110,18 @@ def _scan_collection_metadata(collection, keys, absorb, reset, require_key=None)
 
 
 def _paged_metadata(collection):
+    # One bulk pass via the backend hook rather than a
+    # ``collection.get(limit=, offset=)`` loop: on backends whose get()
+    # materializes the full result set and Python-slices it (qdrant's
+    # _rows -> _scroll_all), that loop is O(n^2) in collection size, each
+    # page re-walking everything to discard all but its slice (#1796).
+    # BaseCollection.get_all_metadata's default *is* that limit/offset
+    # paging, so backends without an override keep identical behavior.
+    get_all_metadata = getattr(collection, "get_all_metadata", None)
+    if get_all_metadata is not None:
+        yield from get_all_metadata()
+        return
+    # A raw chromadb Collection has no such hook; its offset is real SQL.
     total = collection.count()
     offset = 0
     while offset < total:
