@@ -1080,9 +1080,11 @@ TOOLS = {
 }
 
 # MCP ToolAnnotations.readOnlyHint for clients that hide mutating tools
-# (plan modes, read-only subagents). Server --read-only still uses
-# _READ_ONLY_REFUSED_TOOLS; memories_filed_away stays refused there
-# because it consumes the checkpoint ack file.
+# (plan modes, read-only subagents). Only tools that do not change state
+# belong here. Server --read-only uses the wider _READ_ONLY_REFUSED_TOOLS
+# set: mempalace_memories_filed_away unlinks the checkpoint ack file, so it
+# stays refused there and must not advertise readOnlyHint (MCP default is
+# false when the annotation is omitted).
 for _read_only_name in (
     "mempalace_status",
     "mempalace_list_wings",
@@ -1095,7 +1097,6 @@ for _read_only_name in (
     "mempalace_get_drawers",
     "mempalace_list_drawers",
     "mempalace_diary_read",
-    "mempalace_memories_filed_away",
     "mempalace_kg_query",
     "mempalace_kg_timeline",
     "mempalace_kg_stats",

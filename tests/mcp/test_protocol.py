@@ -682,8 +682,13 @@ class TestHandleRequest:
 
     def test_tools_list_read_only_hint(self):
         """Inspection tools advertise MCP annotations.readOnlyHint so plan
-        modes can admit them without a host-side allowlist."""
-        from mempalace.mcp_server import handle_request
+        modes can admit them without a host-side allowlist.
+
+        mempalace_memories_filed_away unlinks the checkpoint ack file, so it
+        must not advertise the hint (omitted means the MCP default, false).
+        The same rule covers every tool --read-only refuses.
+        """
+        from mempalace.mcp_server import _READ_ONLY_REFUSED_TOOLS, handle_request
 
         expected = {
             "mempalace_status",
@@ -697,19 +702,18 @@ class TestHandleRequest:
             "mempalace_get_drawers",
             "mempalace_list_drawers",
             "mempalace_diary_read",
-            "mempalace_memories_filed_away",
             "mempalace_kg_query",
             "mempalace_kg_timeline",
             "mempalace_kg_stats",
         }
         resp = handle_request({"method": "tools/list", "id": 2, "params": {}})
-        hinted = {
-            t["name"]
-            for t in resp["result"]["tools"]
-            if t.get("annotations", {}).get("readOnlyHint") is True
-        }
+        tools = resp["result"]["tools"]
+        hinted = {t["name"] for t in tools if t.get("annotations", {}).get("readOnlyHint") is True}
         assert hinted == expected
-        mutating = next(t for t in resp["result"]["tools"] if t["name"] == "mempalace_add_drawer")
+        assert hinted.isdisjoint(_READ_ONLY_REFUSED_TOOLS)
+        filed = next(t for t in tools if t["name"] == "mempalace_memories_filed_away")
+        assert filed.get("annotations", {}).get("readOnlyHint") is not True
+        mutating = next(t for t in tools if t["name"] == "mempalace_add_drawer")
         assert "annotations" not in mutating
 
     def test_search_description_is_past_session_scoped(self):
