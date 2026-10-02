@@ -1446,6 +1446,89 @@ def test_update_drawer_chunked_logical_id_rewrites_group(monkeypatch, config, pa
     assert listed["drawers"][0]["drawer_id"] == logical_id
 
 
+class TestMoveDrawers:
+    def _seed(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        tool_add_drawer(wing="w1", room="r1", content="alpha", source_file="bulk/a.md")
+        tool_add_drawer(wing="w1", room="r1", content="beta", source_file="bulk/b.md")
+
+    def test_validation_rejects_non_list_before_mutation(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_list_drawers, tool_move_drawers
+
+        before = tool_list_drawers()["total"]
+        out = tool_move_drawers(drawer_ids="nope", target_wing="x")
+        assert "error" in out
+        assert tool_list_drawers()["total"] == before
+
+    def test_validation_rejects_empty_and_over_cap_and_missing_target(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_move_drawers
+
+        assert "error" in tool_move_drawers(drawer_ids=[], target_wing="x")
+        assert "error" in tool_move_drawers(
+            drawer_ids=[str(i) for i in range(501)], target_wing="x"
+        )
+        assert "error" in tool_move_drawers(drawer_ids=["drawer_x"])
+        assert "error" in tool_move_drawers(drawer_ids=["drawer_x"], target_wing=1)
+        assert "error" in tool_move_drawers(drawer_ids=["drawer_x"], target_room=1)
+
+    def test_mixed_present_missing_in_input_order(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_list_drawers, tool_move_drawers
+
+        ids = [d["drawer_id"] for d in tool_list_drawers(wing="w1", room="r1")["drawers"]]
+        req = [ids[0], "drawer_missing", ids[1]]
+        out = tool_move_drawers(drawer_ids=req, target_wing="w2", target_room="r2")
+        assert out["count"] == 3
+        assert out["moved"] == 2
+        assert out["errors"] == 1
+        assert [r["drawer_id"] for r in out["results"]] == req
+
+    def test_chunked_drawer_moves_all_rows(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_add_drawer, tool_get_drawer, tool_move_drawers
+
+        added = tool_add_drawer(
+            wing="w1", room="r1", content=("x" * 12000), source_file="bulk/chunked.md"
+        )
+        drawer_id = added["drawer_id"]
+        out = tool_move_drawers(drawer_ids=[drawer_id], target_wing="w2", target_room="r2")
+        assert out["moved"] == 1
+        assert len(out["results"][0]["moved_ids"]) >= 2
+        got = tool_get_drawer(drawer_id)
+        assert got["metadata"]["wing"] == "w2"
+        assert got["metadata"]["room"] == "r2"
+
+    def test_target_room_only_keeps_existing_wing(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_list_drawers, tool_move_drawers
+
+        drawer_id = tool_list_drawers(wing="w1", room="r1")["drawers"][0]["drawer_id"]
+        out = tool_move_drawers(drawer_ids=[drawer_id], target_room="r9")
+        item = out["results"][0]
+        assert item["wing"] == "w1"
+        assert item["room"] == "r9"
+
+    def test_target_wing_only_keeps_existing_room(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_list_drawers, tool_move_drawers
+
+        drawer_id = tool_list_drawers(wing="w1", room="r1")["drawers"][0]["drawer_id"]
+        out = tool_move_drawers(drawer_ids=[drawer_id], target_wing="w9")
+        item = out["results"][0]
+        assert item["wing"] == "w9"
+        assert item["room"] == "r1"
+
+
 class TestDeleteBySource:
     """``tool_delete_by_source`` — bulk cleanup of benchmark/test contamination (#1722)."""
 
@@ -1631,307 +1714,6 @@ class TestDeleteBySource:
                 "params": {
                     "name": "mempalace_delete_by_source",
                     "arguments": {"source_file": "results_mempal_hybrid_v4_session_1.jsonl"},
-                },
-            }
-        )
-        content = json.loads(resp["result"]["content"][0]["text"])
-        assert content["dry_run"] is True
-        assert content["match_count"] == 2
-
-
-class TestDeleteDrawers:
-    """``tool_delete_drawers`` — bulk delete by explicit id or by wing/room scope."""
-
-    def _seed(self, monkeypatch, config, palace_path, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
-        _client, _col = _get_collection(palace_path, create=True)
-        del _client
-        from mempalace.mcp_server import tool_add_drawer
-
-        # Two drawers in the doomed scope, one in a scope that must survive.
-        tool_add_drawer(
-            wing="doomed",
-            room="general",
-            content="Bulk-delete target number one, scoped to the doomed wing.",
-            source_file="bulk/doomed.md",
-        )
-        tool_add_drawer(
-            wing="doomed",
-            room="general",
-            content="Bulk-delete target number two, scoped to the doomed wing.",
-            source_file="bulk/doomed.md",
-        )
-        tool_add_drawer(
-            wing="survivor",
-            room="webdesign",
-            content="Real client memory that a scoped delete must not touch.",
-            source_file="bulk/survivor.md",
-        )
-
-    def _seed_closets(self, palace_path):
-        from mempalace.palace import get_closets_collection
-
-        closets_col = get_closets_collection(palace_path, create=True)
-        closets_col.add(
-            ids=["doomed_closet_01", "doomed_closet_02", "survivor_closet_01"],
-            documents=["topic: doomed one", "topic: doomed two", "topic: survivor"],
-            metadatas=[
-                {"source_file": "bulk/doomed.md"},
-                {"source_file": "bulk/doomed.md"},
-                {"source_file": "bulk/survivor.md"},
-            ],
-        )
-        return closets_col
-
-    def test_dry_run_reports_count_without_deleting(self, monkeypatch, config, palace_path, kg):
-        self._seed(monkeypatch, config, palace_path, kg)
-        from mempalace.mcp_server import tool_delete_drawers, tool_status
-
-        result = tool_delete_drawers(wing="doomed")
-        assert result["success"] is True
-        assert result["dry_run"] is True
-        assert result["match_count"] == 2
-        assert {"wing": "doomed", "room": "general"} in result["sample"]
-        # Nothing was removed.
-        assert tool_status()["total_drawers"] == 3
-
-    def test_commit_is_scoped_to_the_selection(self, monkeypatch, config, palace_path, kg):
-        self._seed(monkeypatch, config, palace_path, kg)
-        from mempalace.mcp_server import tool_delete_drawers, tool_status
-
-        result = tool_delete_drawers(wing="doomed", dry_run=False)
-        assert result["success"] is True
-        assert result["deleted"] == 2
-        # The other wing survives.
-        assert tool_status()["total_drawers"] == 1
-
-    def test_room_narrows_the_scope(self, monkeypatch, config, palace_path, kg):
-        self._seed(monkeypatch, config, palace_path, kg)
-        from mempalace.mcp_server import tool_add_drawer, tool_delete_drawers, tool_status
-
-        tool_add_drawer(
-            wing="doomed",
-            room="elsewhere",
-            content="A second room in the same wing, out of scope for this call.",
-            source_file="bulk/elsewhere.md",
-        )
-        result = tool_delete_drawers(wing="doomed", room="general", dry_run=False)
-        assert result["deleted"] == 2
-        # survivor + the out-of-scope room.
-        assert tool_status()["total_drawers"] == 2
-
-    def test_unscoped_call_is_refused(self, monkeypatch, config, palace_path, kg):
-        self._seed(monkeypatch, config, palace_path, kg)
-        from mempalace.mcp_server import tool_delete_drawers, tool_status
-
-        result = tool_delete_drawers()
-        assert result["success"] is False
-        assert "unscoped" in result["error"]
-        assert tool_status()["total_drawers"] == 3
-
-    def test_empty_scope_is_a_noop(self, monkeypatch, config, palace_path, kg):
-        self._seed(monkeypatch, config, palace_path, kg)
-        from mempalace.mcp_server import tool_delete_drawers
-
-        result = tool_delete_drawers(wing="nobody", dry_run=False)
-        assert result["success"] is True
-        assert result["deleted"] == 0
-
-    def test_closets_for_matched_sources_are_purged(self, monkeypatch, config, palace_path, kg):
-        self._seed(monkeypatch, config, palace_path, kg)
-        closets_col = self._seed_closets(palace_path)
-        from mempalace.mcp_server import tool_delete_drawers
-
-        assert len(closets_col.get(include=[])["ids"]) == 3
-        result = tool_delete_drawers(wing="doomed", dry_run=False)
-        assert result["deleted"] == 2
-        assert result["closets_deleted"] == 2
-        # The survivor's closet is untouched.
-        from mempalace.palace import get_closets_collection
-
-        remaining = get_closets_collection(palace_path, create=False)
-        assert remaining.get(include=[])["ids"] == ["survivor_closet_01"]
-
-    def test_explicit_drawer_ids_delete_only_named(self, monkeypatch, config, palace_path, kg):
-        self._seed(monkeypatch, config, palace_path, kg)
-        from mempalace.mcp_server import tool_delete_drawers, tool_list_drawers, tool_status
-
-        listed = tool_list_drawers(wing="doomed", room="general")
-        assert listed["total"] == 2
-        victim = listed["drawers"][0]["drawer_id"]
-
-        result = tool_delete_drawers(drawer_ids=[victim], dry_run=False)
-        assert result["success"] is True
-        assert result["deleted"] == 1
-        assert tool_status()["total_drawers"] == 2
-
-    def test_registered_and_dispatchable(self, monkeypatch, config, palace_path, kg):
-        self._seed(monkeypatch, config, palace_path, kg)
-        from mempalace.mcp_server import handle_request
-
-        # Listed in tools/list
-        listed = handle_request({"method": "tools/list", "id": 1, "params": {}})
-        names = {t["name"] for t in listed["result"]["tools"]}
-        assert "mempalace_delete_drawers" in names
-
-        # Dispatches and defaults to dry-run (no destructive side effect)
-        resp = handle_request(
-            {
-                "method": "tools/call",
-                "id": 2,
-                "params": {
-                    "name": "mempalace_delete_drawers",
-                    "arguments": {"wing": "doomed"},
-                },
-            }
-        )
-        content = json.loads(resp["result"]["content"][0]["text"])
-        assert content["dry_run"] is True
-        assert content["match_count"] == 2
-
-
-class TestMoveDrawers:
-    """``tool_move_drawers`` — bulk re-file by explicit id or by wing/room scope."""
-
-    def _seed(self, monkeypatch, config, palace_path, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
-        _client, _col = _get_collection(palace_path, create=True)
-        del _client
-        from mempalace.mcp_server import tool_add_drawer
-
-        tool_add_drawer(
-            wing="origin",
-            room="general",
-            content="Bulk-move target number one, scoped to the origin wing.",
-            source_file="bulk/moved.md",
-        )
-        tool_add_drawer(
-            wing="origin",
-            room="general",
-            content="Bulk-move target number two, scoped to the origin wing.",
-            source_file="bulk/moved.md",
-        )
-        tool_add_drawer(
-            wing="untouched",
-            room="webdesign",
-            content="Real client memory that a scoped move must not touch.",
-            source_file="bulk/untouched.md",
-        )
-
-    def _seed_closets(self, palace_path):
-        from mempalace.palace import get_closets_collection
-
-        closets_col = get_closets_collection(palace_path, create=True)
-        closets_col.add(
-            ids=["moved_closet_01"],
-            documents=["topic: moved source"],
-            metadatas=[{"source_file": "bulk/moved.md"}],
-        )
-        return closets_col
-
-    def test_dry_run_reports_count_without_moving(self, monkeypatch, config, palace_path, kg):
-        self._seed(monkeypatch, config, palace_path, kg)
-        from mempalace.mcp_server import tool_list_drawers, tool_move_drawers
-
-        result = tool_move_drawers(wing="origin", target_wing="dest")
-        assert result["success"] is True
-        assert result["dry_run"] is True
-        assert result["match_count"] == 2
-        assert result["target_wing"] == "dest"
-        # Still where they were.
-        assert tool_list_drawers(wing="origin", room="general")["total"] == 2
-        assert tool_list_drawers(wing="dest")["total"] == 0
-
-    def test_commit_moves_by_scope(self, monkeypatch, config, palace_path, kg):
-        self._seed(monkeypatch, config, palace_path, kg)
-        from mempalace.mcp_server import tool_list_drawers, tool_move_drawers
-
-        result = tool_move_drawers(
-            wing="origin", target_wing="dest", target_room="archive", dry_run=False
-        )
-        assert result["success"] is True
-        assert result["moved"] == 2
-        assert result["unchanged"] == 0
-        assert tool_list_drawers(wing="dest", room="archive")["total"] == 2
-        assert tool_list_drawers(wing="origin", room="general")["total"] == 0
-        # The other wing is untouched.
-        assert tool_list_drawers(wing="untouched", room="webdesign")["total"] == 1
-
-    def test_requires_a_target(self, monkeypatch, config, palace_path, kg):
-        self._seed(monkeypatch, config, palace_path, kg)
-        from mempalace.mcp_server import tool_move_drawers
-
-        result = tool_move_drawers(wing="origin")
-        assert result["success"] is False
-        assert "target" in result["error"]
-
-    def test_unscoped_call_is_refused(self, monkeypatch, config, palace_path, kg):
-        self._seed(monkeypatch, config, palace_path, kg)
-        from mempalace.mcp_server import tool_move_drawers
-
-        result = tool_move_drawers(target_wing="dest")
-        assert result["success"] is False
-        assert "unscoped" in result["error"]
-
-    def test_rows_already_at_target_are_unchanged(self, monkeypatch, config, palace_path, kg):
-        self._seed(monkeypatch, config, palace_path, kg)
-        from mempalace.mcp_server import tool_move_drawers
-
-        first = tool_move_drawers(wing="origin", target_wing="dest", dry_run=False)
-        assert first["moved"] == 2
-        # Re-running the same move is a no-op, not a rewrite.
-        second = tool_move_drawers(wing="dest", target_wing="dest", dry_run=False)
-        assert second["moved"] == 0
-        assert second["unchanged"] == 2
-
-    def test_closets_are_not_purged_on_a_move(self, monkeypatch, config, palace_path, kg):
-        """A closet quotes the source_file, not the stored drawer, so a wing/room
-        change leaves it correct (#2325) — purging it would discard a
-        still-accurate index entry."""
-        self._seed(monkeypatch, config, palace_path, kg)
-        closets_col = self._seed_closets(palace_path)
-        from mempalace.mcp_server import tool_move_drawers
-
-        assert len(closets_col.get(include=[])["ids"]) == 1
-        result = tool_move_drawers(wing="origin", target_wing="dest", dry_run=False)
-        assert result["moved"] == 2
-        # Still there: a wing/room change leaves a source-keyed closet correct.
-        from mempalace.palace import get_closets_collection
-
-        remaining = get_closets_collection(palace_path, create=False)
-        assert remaining.get(include=[])["ids"] == ["moved_closet_01"]
-
-    def test_explicit_drawer_ids_move_only_named(self, monkeypatch, config, palace_path, kg):
-        self._seed(monkeypatch, config, palace_path, kg)
-        from mempalace.mcp_server import tool_list_drawers, tool_move_drawers
-
-        listed = tool_list_drawers(wing="origin", room="general")
-        assert listed["total"] == 2
-        chosen = listed["drawers"][0]["drawer_id"]
-
-        result = tool_move_drawers(drawer_ids=[chosen], target_room="archive", dry_run=False)
-        assert result["success"] is True
-        assert result["moved"] == 1
-        assert tool_list_drawers(wing="origin", room="archive")["total"] == 1
-        assert tool_list_drawers(wing="origin", room="general")["total"] == 1
-
-    def test_registered_and_dispatchable(self, monkeypatch, config, palace_path, kg):
-        self._seed(monkeypatch, config, palace_path, kg)
-        from mempalace.mcp_server import handle_request
-
-        # Listed in tools/list
-        listed = handle_request({"method": "tools/list", "id": 1, "params": {}})
-        names = {t["name"] for t in listed["result"]["tools"]}
-        assert "mempalace_move_drawers" in names
-
-        # Dispatches and defaults to dry-run (no destructive side effect)
-        resp = handle_request(
-            {
-                "method": "tools/call",
-                "id": 2,
-                "params": {
-                    "name": "mempalace_move_drawers",
-                    "arguments": {"wing": "origin", "target_wing": "dest"},
                 },
             }
         )

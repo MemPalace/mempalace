@@ -159,39 +159,31 @@ Delete a drawer by ID. Irreversible.
 
 ### `mempalace_delete_drawers`
 
-Bulk-delete drawers by explicit `drawer_ids`, or by wing and/or room scope. Refuses an unscoped call. Returns a dry-run match count and a sample of the affected (wing, room) pairs by default; pass `dry_run=false` to commit. Closets quoting a deleted drawer's `source_file` are purged with it (#2325). Irreversible.
+Delete many drawers by ID in one call. Irreversible. Each ID is removed the same way as `mempalace_delete_drawer`: a logical drawer id removes the whole group, including its chunk rows, and a physical chunk id removes that one row. A missing ID is an item in `results` and is counted in `errors`; the rest of the batch still runs. An accepted call is 1 to 500 IDs and always returns `results`, including a one-ID call. An empty list or more than 500 IDs is rejected and deletes nothing.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `drawer_ids` | array of strings | No | Explicit drawer IDs to delete. Takes precedence over wing/room |
-| `wing` | string | No | Scope filter: delete every drawer in this wing |
-| `room` | string | No | Scope filter: delete every drawer in this room |
-| `dry_run` | boolean | No | Preview the match count without deleting; default `true`. Pass `false` to actually delete |
+| `drawer_ids` | array of strings | **Yes** | Drawer IDs to delete (1 to 500) |
 
-**Returns (dry run):** `{ success, dry_run, scope, match_count, match_chunks, match_rows, sample, hint }`
-**Returns (commit):** `{ success, dry_run, scope, deleted, deleted_chunks, deleted_rows, closets_deleted }`
-
-IDs that resolve to nothing are reported in `not_found` (omitted when empty), so one stale id does not fail the batch.
+**Returns:** `{ results, count, deleted, errors }` for an accepted call. Each result is `{ drawer_id, deleted_ids, chunks_deleted, closets_deleted }` or `{ drawer_id, error }`. A rejected call returns `{ error }`.
 
 ---
 
+
+
 ### `mempalace_move_drawers`
 
-Bulk-move drawers to another wing and/or room without touching their content. Scope by explicit `drawer_ids` or by wing and/or room; refuses an unscoped call. Returns a dry-run match count and sample by default; pass `dry_run=false` to commit. Unlike a delete, a move leaves closets alone.
+Move many drawers by ID in one call. Contract matches `mempalace_delete_drawers`: accepted input is 1 to 500 IDs, each ID returns one result in input order, and missing IDs become per-item errors while the batch continues.
+
+At least one target must be provided: `target_wing` and/or `target_room`.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `drawer_ids` | array of strings | No | Explicit drawer IDs to move. Takes precedence over wing/room |
-| `wing` | string | No | Scope filter: move every drawer in this wing |
-| `room` | string | No | Scope filter: move every drawer in this room |
-| `target_wing` | string | No | Destination wing (optional if `target_room` is given) |
-| `target_room` | string | No | Destination room (optional if `target_wing` is given) |
-| `dry_run` | boolean | No | Preview the match count without moving; default `true`. Pass `false` to actually move |
+| `drawer_ids` | array of strings | **Yes** | Drawer IDs to move (1 to 500) |
+| `target_wing` | string | No | Destination wing. If omitted, keeps each drawer's existing wing |
+| `target_room` | string | No | Destination room. If omitted, keeps each drawer's existing room |
 
-**Returns (dry run):** `{ success, dry_run, scope, match_count, match_chunks, match_rows, sample, target_wing, target_room, hint }`
-**Returns (commit):** `{ success, dry_run, scope, moved, unchanged, moved_rows, target_wing, target_room }`
-
-Drawers already at the target are counted in `unchanged` rather than rewritten. `moved` counts logical drawers and `moved_rows` the physical rows they occupy.
+**Returns:** `{ results, count, moved, errors }` for an accepted call. Each result is `{ drawer_id, moved_ids, wing, room }` or `{ drawer_id, error }`. A rejected call returns `{ error }`.
 
 ---
 
@@ -204,7 +196,6 @@ Mine a directory into the palace — the MCP equivalent of `mempalace mine`. `mo
 | `source` | string | **Yes** | Directory to mine, or one conversation file with `mode='convos'` |
 | `mode` | string | No | `projects` (code/docs, default), `convos` (chat transcripts), or `extract` (office docs; needs the `mempalace[extract]` extra) |
 | `wing` | string | No | Target wing (default: source directory name) |
-| `room` | string | No | Target room for projects mode; overrides per-file room routing (default: route each file by folder/filename/content) |
 | `agent` | string | No | Recorded on every drawer (default: `mempalace`) |
 | `limit` | integer | No | Max files to process (0 = all; default 0) |
 | `dry_run` | boolean | No | Report what would be filed without writing (default false) |
@@ -240,7 +231,11 @@ Prune drawers whose source files are gitignored, deleted, or moved. Returns a dr
 
 **Returns:** `{ scanned, kept, gitignored, missing, unresolved, no_source, out_of_scope, removed_drawers, removed_closets, dry_run, by_source, unresolved_by_source }`
 
-Only `gitignored` and `missing` are removed. A source file that is not at its path counts as `missing` only while the palace can still see a source file of its own in the same directory: a deletion leaves its neighbours behind, an unmounted volume takes all of them at once. Everything else counts as `unresolved`, which is kept and named in `unresolved_by_source` the way removals are named in `by_source`.
+Only `gitignored` and `missing` are removed. A source file that is not at its path counts as `missing` only while the palace can still see a source file of its own in the same directory, and only while that directory is still the one the missing file was mined from: a deletion leaves its neighbours behind, an unmounted volume takes all of them at once, and a volume or bind mount put in place of that directory has neighbours that never knew the file. Everything else counts as `unresolved`, which is kept and named in `unresolved_by_source` the way removals are named in `by_source`.
+
+Mining records which directory that was by storing its inode on each drawer. A path is only a name: mount something at it and the name resolves to the root of what was mounted, which is a different inode, and unmounting brings the original back. Nothing is written to the source tree for this, so a read-only mount records an identity like any other. Drawers filed before this existed carry none, and are decided by the neighbour rule alone. One volume swapped for another at the same path is not separated, since the root of a filesystem carries a fixed inode for its type. A directory deleted and recreated may come back with a different inode, which keeps the drawers of files that really went. There is no bulk way out of that on purpose, since a drawer stranded that way and a drawer a volume is holding are the same reading: `unresolved_by_source` names the sources, and `mempalace_delete_by_source` removes them one at a time. That tool is blunter than this pass, matching `source_file` exactly and consulting neither the neighbours nor the identity, so read its dry run before applying it.
+
+`removed_closets` counts the closets of the sources this pass left holding no drawer, not of every source a drawer was removed from. Since the verdict is per drawer, a source can lose one and keep another, and purging by source would strand that survivor without the lines that index it. A source whose remaining drawers are in a wing this run did not read keeps its closets for the same reason. The sources it covers are therefore a subset of those named in `by_source`, though the count itself is of closet rows rather than of sources, and a source that kept its closets is not distinguished from one that had none.
 
 ---
 
@@ -253,6 +248,18 @@ Fetch a single drawer by ID — returns full content and metadata.
 | `drawer_id` | string | **Yes** | ID of the drawer to fetch |
 
 **Returns:** `{ drawer_id, content, wing, room, metadata }` where `metadata.source_file`, when present, is the basename only — the absolute path written by the miners is reduced before the dict is returned to MCP clients.
+
+---
+
+### `mempalace_get_drawers`
+
+Fetch many drawers by ID in one call. Each ID resolves the same way as `mempalace_get_drawer`: a logical id reassembles the chunk group, and a physical chunk id returns that row. A hit is that same payload. A missing ID is an item in `results` and is counted in `errors`; the rest of the batch still returns. An accepted call is 1 to 500 IDs and always returns `results`, including a one-ID call. An empty list or more than 500 IDs is rejected and does not read the palace.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `drawer_ids` | array of strings | **Yes** | Drawer IDs to fetch (1 to 500) |
+
+**Returns:** `{ results, count, errors }` for an accepted call. A rejected call returns `{ error }`.
 
 ---
 
