@@ -1,7 +1,9 @@
-"""Regression tests for the supported hallway-construction off-switch (#2329)."""
+"""Regression tests for disabling hallway construction while preserving stored data."""
 
+import io
 import json
 import logging
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -371,21 +373,236 @@ def test_miners_honor_switch_and_keep_verbatim_drawers(
         assert any(t.get("kind") == "entity" for t in tunnels) is (setting == "default")
 
 
-def test_explicit_cli_rebuild_honors_disabled_construction(tmp_path, monkeypatch, caplog):
+@pytest.mark.parametrize("wing", ["alpha", None])
+def test_explicit_cli_rebuild_honors_disabled_construction(tmp_path, monkeypatch, capsys, wing):
     from mempalace import cli, palace
 
     config = _config(tmp_path, hallways_enabled=False)
     monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(config._config_dir))
     records, _ = _seed_sidecars(config)
     before = Path(config.hallway_file).read_bytes()
-    collection = MagicMock()
-    monkeypatch.setattr(palace, "get_collection", lambda *args, **kwargs: collection)
-    args = SimpleNamespace(palace=config.palace_path, wing="alpha", rebuild=True)
+    backend = MagicMock()
+    reader = MagicMock()
+    lock = MagicMock()
+    compute = MagicMock()
+    monkeypatch.setattr(palace, "get_collection", backend)
+    monkeypatch.setattr(palace_graph, "sqlite_grouped_counts_reader", reader)
+    monkeypatch.setattr(cli, "_repair_lock", lock)
+    monkeypatch.setattr(hallways, "compute_hallways_for_wing", compute)
+    args = SimpleNamespace(palace=config.palace_path, wing=wing, rebuild=True)
 
-    with caplog.at_level(logging.INFO, logger=hallways.logger.name):
-        cli.cmd_hallways(args)
+    cli.cmd_hallways(args)
 
-    collection.get.assert_not_called()
+    backend.assert_not_called()
+    reader.assert_not_called()
+    lock.assert_not_called()
+    compute.assert_not_called()
     assert Path(config.hallway_file).read_bytes() == before
     assert hallways.list_hallways(config=config) == records
-    assert len([r for r in caplog.records if r.name == hallways.logger.name]) == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert len(output.err.strip().splitlines()) == 1
+    assert "disabled" in output.err.lower()
+    assert "stored hallways" in output.err.lower()
+    assert "unchanged" in output.err.lower()
+    assert "Rebuilt" not in output.err
+
+
+@pytest.mark.parametrize("wing", ["alpha", None])
+def test_explicit_cli_rebuild_reports_enabled_results(tmp_path, monkeypatch, capsys, wing):
+    from mempalace import cli, palace
+
+    config = _config(tmp_path)
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(config._config_dir))
+    collection = MagicMock()
+    backend = MagicMock(return_value=collection)
+    grouped_counts = MagicMock(return_value=[(1, "beta"), (2, "alpha")])
+    reader = MagicMock(return_value=grouped_counts)
+    lock = MagicMock(return_value=nullcontext())
+    results = {"alpha": [{"id": "alpha-1"}, {"id": "alpha-2"}], "beta": [{"id": "beta-1"}]}
+    compute = MagicMock(side_effect=lambda wing, **kwargs: results[wing])
+    monkeypatch.setattr(palace, "get_collection", backend)
+    monkeypatch.setattr(palace_graph, "sqlite_grouped_counts_reader", reader)
+    monkeypatch.setattr(cli, "_repair_lock", lock)
+    monkeypatch.setattr(hallways, "compute_hallways_for_wing", compute)
+
+    cli.cmd_hallways(SimpleNamespace(palace=config.palace_path, wing=wing, rebuild=True))
+
+    backend.assert_called_once_with(config.palace_path, create=False, read_only=True)
+    lock.assert_called_once_with(config.palace_path)
+    wings = ["alpha"] if wing else ["alpha", "beta"]
+    assert [call.args[0] for call in compute.call_args_list] == wings
+    for call in compute.call_args_list:
+        assert call.kwargs["col"] is collection
+        assert call.kwargs["config"].hallways_enabled is True
+    if wing:
+        reader.assert_not_called()
+        grouped_counts.assert_not_called()
+    else:
+        reader.assert_called_once()
+        grouped_counts.assert_called_once_with(config.palace_path, config.collection_name)
+    output = capsys.readouterr()
+    for name in wings:
+        assert f"  {name:<36} {len(results[name]):>7} hallways" in output.out
+    total = sum(len(results[name]) for name in wings)
+    assert f"Rebuilt {total} hallways across {len(wings)} wing(s)." in output.out
+    assert output.err == ""
+
+
+def _notice_logging(monkeypatch, request, level):
+    """Control ordinary CLI and configured INFO logging without pytest's handlers."""
+    log_output = io.StringIO()
+    handler = logging.StreamHandler(log_output)
+    root_logger = logging.getLogger()
+    previous_root_level = root_logger.level
+    previous_hallway_level = hallways.logger.level
+    root_logger.setLevel(level)
+    hallways.logger.setLevel(logging.NOTSET)
+
+    def restore_levels():
+        root_logger.setLevel(previous_root_level)
+        hallways.logger.setLevel(previous_hallway_level)
+
+    request.addfinalizer(restore_levels)
+    monkeypatch.setattr(root_logger, "handlers", [handler])
+    monkeypatch.setattr(hallways.logger, "handlers", [])
+    monkeypatch.setattr(hallways.logger, "propagate", True)
+    monkeypatch.setattr(hallways.logger, "disabled", False)
+    return log_output
+
+
+def _mining_source(tmp_path, mode):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    if mode == "project":
+        (source_dir / "app.py").write_text(
+            "def main():\n    print('Keep the exact original words, including café.')\n" * 3,
+            encoding="utf-8",
+        )
+    else:
+        (source_dir / "session.txt").write_text(
+            "> What should we preserve?\n"
+            "Keep the exact original words, including café.\n\n"
+            "> What follows?\n"
+            "Continue mining while hallway construction is disabled.\n",
+            encoding="utf-8",
+        )
+    return source_dir
+
+
+@pytest.mark.parametrize("mode", ["project", "conversation"])
+@pytest.mark.parametrize("logging_level", [logging.WARNING, logging.INFO])
+def test_disabled_post_mine_notice_is_visible_once(
+    tmp_path, monkeypatch, capsys, request, mode, logging_level
+):
+    config = _config(tmp_path, hallways_enabled=False)
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(config._config_dir))
+    source_dir = _mining_source(tmp_path, mode)
+    _seed_sidecars(config)
+    before = Path(config.hallway_file).read_bytes()
+    log_output = _notice_logging(monkeypatch, request, logging_level)
+    if mode == "project":
+        miner.mine(str(source_dir), config.palace_path, wing_override="alpha")
+    else:
+        convo_miner.mine_convos(str(source_dir), config.palace_path, wing="alpha")
+
+    output = capsys.readouterr()
+    assert "Drawers filed: 0" not in output.out
+    assert "hallway construction disabled" not in output.out.lower()
+    logged = log_output.getvalue()
+    notices = output.err.lower().count("hallway construction disabled")
+    notices += logged.lower().count("hallway construction disabled")
+    assert notices == 1
+    if logging_level == logging.WARNING:
+        assert "hallway construction disabled" in output.err.lower()
+        assert "hallway construction disabled" not in logged.lower()
+    else:
+        assert "hallway construction disabled" in logged.lower()
+        assert "hallway construction disabled" not in output.err.lower()
+    assert Path(config.hallway_file).read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "logging_setup, fallback_expected",
+    [
+        ("warning-handler", True),
+        ("null-handler", True),
+        ("disabled-logger", True),
+        ("globally-disabled", True),
+        ("no-propagation", True),
+        ("child-info-root-warning", False),
+    ],
+)
+def test_conversation_notice_survives_unavailable_info_logging(
+    tmp_path, monkeypatch, capsys, request, logging_setup, fallback_expected
+):
+    config = _config(tmp_path, hallways_enabled=False)
+    log_output = _notice_logging(monkeypatch, request, logging.INFO)
+    root_logger = logging.getLogger()
+    if logging_setup == "warning-handler":
+        root_logger.handlers[0].setLevel(logging.WARNING)
+    elif logging_setup == "null-handler":
+        monkeypatch.setattr(root_logger, "handlers", [logging.NullHandler()])
+    elif logging_setup == "disabled-logger":
+        monkeypatch.setattr(hallways.logger, "disabled", True)
+    elif logging_setup == "no-propagation":
+        monkeypatch.setattr(hallways.logger, "propagate", False)
+    elif logging_setup == "child-info-root-warning":
+        root_logger.setLevel(logging.WARNING)
+        hallways.logger.setLevel(logging.INFO)
+
+    previous_disable = root_logger.manager.disable
+    try:
+        if logging_setup == "globally-disabled":
+            logging.disable(logging.INFO)
+        convo_miner._compute_hallways_for_wing_safe("alpha", MagicMock(), 1, config=config)
+    finally:
+        if logging_setup == "globally-disabled":
+            logging.disable(previous_disable)
+
+    output = capsys.readouterr()
+    assert output.out == ""
+    logged = log_output.getvalue()
+    assert (
+        output.err.lower().count("hallway construction disabled")
+        + logged.lower().count("hallway construction disabled")
+        == 1
+    )
+    assert ("hallway construction disabled" in output.err.lower()) is fallback_expected
+    assert ("hallway construction disabled" in logged.lower()) is not fallback_expected
+
+
+@pytest.mark.parametrize("mode", ["project", "conversation"])
+def test_disabled_dry_run_has_no_hallway_notice(tmp_path, monkeypatch, capsys, request, mode):
+    config = _config(tmp_path, hallways_enabled=False)
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(config._config_dir))
+    source_dir = _mining_source(tmp_path, mode)
+    log_output = _notice_logging(monkeypatch, request, logging.INFO)
+    if mode == "project":
+        miner.mine(str(source_dir), config.palace_path, wing_override="alpha", dry_run=True)
+    else:
+        convo_miner.mine_convos(str(source_dir), config.palace_path, wing="alpha", dry_run=True)
+
+    output = capsys.readouterr()
+    assert "DRY RUN" in output.out
+    assert "hallway" not in output.err.lower()
+    assert "hallway construction disabled" not in log_output.getvalue().lower()
+
+
+@pytest.mark.parametrize("logging_level", [logging.WARNING, logging.INFO])
+def test_conversation_without_new_drawers_has_no_hallway_notice(
+    tmp_path, monkeypatch, capsys, request, logging_level
+):
+    config = _config(tmp_path, hallways_enabled=False)
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(config._config_dir))
+    source_dir = _mining_source(tmp_path, "conversation")
+    convo_miner.mine_convos(str(source_dir), config.palace_path, wing="alpha")
+    capsys.readouterr()
+    log_output = _notice_logging(monkeypatch, request, logging_level)
+
+    convo_miner.mine_convos(str(source_dir), config.palace_path, wing="alpha")
+
+    output = capsys.readouterr()
+    assert "Drawers filed: 0" in output.out
+    assert "hallway" not in output.err.lower()
+    assert "hallway construction disabled" not in log_output.getvalue().lower()

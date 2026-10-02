@@ -37,6 +37,7 @@ import json
 import re
 import logging
 import os
+import sys
 import tempfile
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -46,6 +47,29 @@ from typing import Optional
 from .dynamics import initialize_dynamics_fields
 
 logger = logging.getLogger("mempalace_hallways")
+_HALLWAYS_DISABLED_NOTICE = (
+    "Hallway construction disabled (hallways_enabled=false); stored hallways unchanged."
+)
+
+
+def _report_disabled_hallways(config=None) -> None:
+    """Show the post-mine skip notice when INFO logging has no collector."""
+    from .config import MempalaceConfig
+
+    cfg = config if config is not None else MempalaceConfig()
+    if getattr(cfg, "hallways_enabled", True):
+        return
+    if logger.isEnabledFor(logging.INFO):
+        current = logger
+        while current is not None:
+            if any(
+                handler.level <= logging.INFO and not isinstance(handler, logging.NullHandler)
+                for handler in current.handlers
+            ):
+                return
+            current = current.parent if current.propagate else None
+    print(_HALLWAYS_DISABLED_NOTICE, file=sys.stderr)
+
 
 # Persistence target is resolved through ``_get_hallway_file`` below, which
 # mirrors ``palace_graph._get_tunnel_file`` (the 3.3.6 palace-scoped pattern)
@@ -566,7 +590,7 @@ def compute_hallways_for_wing(
 
     cfg = config if config is not None else MempalaceConfig()
     if not getattr(cfg, "hallways_enabled", True):
-        logger.info("Hallway construction disabled (hallways_enabled=false); skipping computation")
+        logger.info(_HALLWAYS_DISABLED_NOTICE)
         return []
 
     if col is None:

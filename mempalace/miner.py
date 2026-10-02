@@ -46,7 +46,7 @@ from .palace import (
 # lives at the end of _mine_impl, alongside the existing
 # ``_compute_topic_tunnels_for_wing`` post-mine block.
 from .collision_scan import assert_no_collisions
-from .hallways import compute_hallways_for_wing
+from .hallways import _report_disabled_hallways, compute_hallways_for_wing
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
 from .source_identity import source_directory_identity
 
@@ -2417,6 +2417,7 @@ def _mine_impl(
                 hallways_created = compute_hallways_for_wing(
                     wing, col=collection, config=graph_config
                 )
+                _report_disabled_hallways(graph_config)
                 if hallways_created:
                     print(f"\n  Hallways: +{len(hallways_created)} within-wing entity link(s)")
             except Exception as e:
