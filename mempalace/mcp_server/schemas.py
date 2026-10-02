@@ -298,7 +298,8 @@ TOOLS = {
         "description": (
             "Search past-session memories. Returns matching drawers. "
             "Not for the current conversation — if it happened in this "
-            "session, answer from context instead."
+            "session, don't search. query is keywords only; use context "
+            "for background."
         ),
         "input_schema": {
             "type": "object",
@@ -1113,7 +1114,9 @@ TOOLS = {
 # belong here. Server --read-only uses the wider _READ_ONLY_REFUSED_TOOLS
 # set: mempalace_memories_filed_away unlinks the checkpoint ack file, so it
 # stays refused there and must not advertise readOnlyHint (MCP default is
-# false when the annotation is omitted).
+# false when the annotation is omitted). mempalace_follow_tunnels writes
+# access_count/strength on the tunnel file, so it stays out of this set
+# even though a --read-only server skips that write.
 for _read_only_name in (
     "mempalace_status",
     "mempalace_list_wings",
@@ -1129,6 +1132,14 @@ for _read_only_name in (
     "mempalace_kg_query",
     "mempalace_kg_timeline",
     "mempalace_kg_stats",
+    "mempalace_traverse",
+    "mempalace_find_tunnels",
+    "mempalace_graph_stats",
+    "mempalace_mesh_peers",
+    "mempalace_list_tunnels",
+    "mempalace_list_hallways",
+    "mempalace_event_list",
+    "mempalace_artifact_get",
 ):
     TOOLS[_read_only_name]["read_only"] = True
 

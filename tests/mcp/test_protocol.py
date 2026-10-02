@@ -705,6 +705,14 @@ class TestHandleRequest:
             "mempalace_kg_query",
             "mempalace_kg_timeline",
             "mempalace_kg_stats",
+            "mempalace_traverse",
+            "mempalace_find_tunnels",
+            "mempalace_graph_stats",
+            "mempalace_mesh_peers",
+            "mempalace_list_tunnels",
+            "mempalace_list_hallways",
+            "mempalace_event_list",
+            "mempalace_artifact_get",
         }
         resp = handle_request({"method": "tools/list", "id": 2, "params": {}})
         tools = resp["result"]["tools"]
@@ -713,6 +721,8 @@ class TestHandleRequest:
         assert hinted.isdisjoint(_READ_ONLY_REFUSED_TOOLS)
         filed = next(t for t in tools if t["name"] == "mempalace_memories_filed_away")
         assert filed.get("annotations", {}).get("readOnlyHint") is not True
+        follow = next(t for t in tools if t["name"] == "mempalace_follow_tunnels")
+        assert follow.get("annotations", {}).get("readOnlyHint") is not True
         mutating = next(t for t in tools if t["name"] == "mempalace_add_drawer")
         assert "annotations" not in mutating
 
@@ -723,6 +733,8 @@ class TestHandleRequest:
         assert len(description) < 200
         assert "past-session" in description
         assert "current conversation" in description
+        assert "keywords only" in description
+        assert "context for background" in description
 
     def test_no_tool_schema_uses_top_level_combinator(self):
         """Anthropic's Messages API rejects a tool whose input schema has a
