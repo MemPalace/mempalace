@@ -389,6 +389,67 @@ def test_claude_code_jsonl_non_dict_entries():
     assert result is not None
 
 
+def _skill_body_entry(text):
+    # Shape Claude Code writes right after the Skill tool runs: the skill's
+    # SKILL.md injected as a user message flagged isMeta, linked to the tool call.
+    return json.dumps(
+        {
+            "type": "user",
+            "isMeta": True,
+            "sourceToolUseID": "toolu_01",
+            "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        }
+    )
+
+
+def test_claude_code_jsonl_skips_injected_skill_body():
+    lines = [
+        json.dumps({"type": "user", "message": {"content": "Plan the migration"}}),
+        _skill_body_entry("Base directory for this skill: /x\n\n# Brainstorming\nSKILL-BODY"),
+        json.dumps({"type": "assistant", "message": {"content": "Here is the plan."}}),
+    ]
+    result = _try_claude_code_jsonl("\n".join(lines))
+    assert result is not None
+    assert "SKILL-BODY" not in result
+    assert "> Plan the migration" in result
+    assert "Here is the plan." in result
+
+
+def test_claude_code_jsonl_keeps_is_meta_without_source_tool():
+    # isMeta alone also marks messages from peer sessions and pasted images;
+    # those are real conversation and must stay.
+    lines = [
+        json.dumps({"type": "user", "message": {"content": "Q"}}),
+        json.dumps(
+            {
+                "type": "user",
+                "isMeta": True,
+                "message": {"content": "Another Claude session sent a message: PEER-MSG"},
+            }
+        ),
+        json.dumps({"type": "assistant", "message": {"content": "A"}}),
+    ]
+    result = _try_claude_code_jsonl("\n".join(lines))
+    assert "PEER-MSG" in result
+
+
+def test_claude_code_jsonl_keeps_source_tool_without_is_meta():
+    lines = [
+        json.dumps({"type": "user", "sourceToolUseID": "toolu_02", "message": {"content": "KEEP"}}),
+        json.dumps({"type": "assistant", "message": {"content": "A"}}),
+    ]
+    result = _try_claude_code_jsonl("\n".join(lines))
+    assert "KEEP" in result
+
+
+def test_claude_code_jsonl_only_skill_bodies_is_not_a_conversation():
+    lines = [
+        _skill_body_entry("SKILL-ONE"),
+        json.dumps({"type": "assistant", "message": {"content": "A"}}),
+    ]
+    assert _try_claude_code_jsonl("\n".join(lines)) is None
+
+
 # ── _try_codex_jsonl ───────────────────────────────────────────────────
 
 
