@@ -1,5 +1,7 @@
 """Tests for ``read_secret_env``: secrets from ``<NAME>_FILE`` or the environment (#2626)."""
 
+import sys
+
 import pytest
 
 from mempalace.secret_env import SecretEnvError, read_secret_env, secret_file_env
@@ -77,6 +79,10 @@ def test_unreadable_file_is_an_error_not_a_fallback(tmp_path, monkeypatch):
     assert repr(str(missing)) in str(excinfo.value)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows drops trailing spaces from a path before opening it",
+)
 def test_file_path_is_used_exactly(tmp_path, monkeypatch):
     # The path is not trimmed: a stray space names a different file, and the
     # error shows it (repr) rather than silently opening the trimmed name.
