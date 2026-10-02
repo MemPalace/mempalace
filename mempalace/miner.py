@@ -2588,8 +2588,16 @@ def _compute_entity_tunnels_for_wing(wing: str, config=None) -> int:
     ``follow_tunnels`` API.
 
     Returns the number of tunnels created or refreshed. Zero means no
-    eligible entity exists in this wing yet (or no hallway records do).
+    eligible entity exists in this wing yet (or no hallway records do), or
+    hallway construction is disabled. Disabling skips the hallway scan and
+    leaves previously stored hallways and tunnels untouched.
     """
+    from .config import MempalaceConfig
+
+    cfg = config if config is not None else MempalaceConfig()
+    if not getattr(cfg, "hallways_enabled", True):
+        return 0
+
     from .hallways import list_hallways
     from .palace_graph import entity_tunnels_for_wing
 

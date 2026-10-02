@@ -555,12 +555,20 @@ def compute_hallways_for_wing(
         config: Optional ``MempalaceConfig`` selecting the palace-scoped
             hallway sidecar. Callers using an explicit palace path must pass
             the matching config so derived graph state cannot leak into the
-            default palace.
+            default palace. When ``hallways_enabled`` is false, skips all
+            computation without reading or changing the stored hallways.
 
     Returns:
         List of hallway dicts created for this wing. Records for other
         wings already on disk are preserved.
     """
+    from .config import MempalaceConfig
+
+    cfg = config if config is not None else MempalaceConfig()
+    if not getattr(cfg, "hallways_enabled", True):
+        logger.info("Hallway construction disabled (hallways_enabled=false); skipping computation")
+        return []
+
     if col is None:
         logger.debug("compute_hallways_for_wing: no collection provided for %s", wing)
         return []

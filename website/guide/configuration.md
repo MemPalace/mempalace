@@ -18,7 +18,40 @@ Located at `~/.mempalace/config.json`:
 | `palace_path` | `~/.mempalace/palace` | Where the default local palace stores your drawers |
 | `collection_name` | `mempalace_drawers` | Default backend collection name |
 | `people_map` | `{}` | Entity name → AAAK code mappings |
+| `hallways_enabled` | `true` | Enable hallway construction and automatic entity-tunnel derivation — see [Hallway construction](#hallway-construction) |
 | `max_backups` | `10` | How many timestamped palace backups to keep before the oldest are pruned. Applies to `mempalace migrate` (`<palace>.pre-migrate.*`) and `mempalace repair max-seq-id` (`chroma.sqlite3.max-seq-id-backup-*`), which each write a full copy every run. Set to `0` to keep every backup (e.g. when an external retention policy manages cleanup). |
+
+## Hallway construction
+
+Hallways are built after mining by default. To skip this work, add
+`"hallways_enabled": false` to `~/.mempalace/config.json`, or set an environment
+override before running MemPalace:
+
+```bash
+export MEMPALACE_KG_HALLWAYS_ENABLED=0
+```
+
+In PowerShell:
+
+```powershell
+$env:MEMPALACE_KG_HALLWAYS_ENABLED = "0"
+```
+
+The setting skips hallway computation and the automatic entity-tunnel scan of
+stored hallways. Existing hallway and tunnel records remain available for
+reading, and mining still stores verbatim drawers and builds topic tunnels.
+Each skipped hallway computation emits one `INFO` log line.
+
+A valid environment override takes precedence over the config file. Both accept
+`true` / `false`, `1` / `0`, `yes` / `no`, and `on` / `off` as strings, ignoring
+case and surrounding whitespace. The config file also accepts JSON booleans;
+use `false` rather than a numeric JSON `0`. An invalid environment value falls
+back to the config file, and an absent or invalid config value defaults to
+enabled.
+
+This also applies to `mempalace hallways --rebuild`. Set
+`MEMPALACE_KG_HALLWAYS_ENABLED=1` to enable construction again, including an
+explicit rebuild.
 
 ## Storage backends
 
@@ -202,6 +235,7 @@ python -m mempalace.mcp_server --palace /custom/palace
 | `MEMPALACE_PALACE_PATH` | Override palace path (same as `--palace`) |
 | `MEMPAL_DIR` | Directory for auto-mining in hooks |
 | `MEMPALACE_MAX_BACKUPS` | Override `max_backups` retention count (`0` disables pruning) |
+| `MEMPALACE_KG_HALLWAYS_ENABLED` | Override `hallways_enabled` (default enabled; `0` skips hallway construction and automatic entity-tunnel derivation) |
 | `MEMPALACE_BACKEND` | Select the storage backend (default `chroma`) — see [Storage backends](#storage-backends) for each backend's connection variables |
 | `MEMPALACE_MCP_WRITER_WAIT_SECONDS` | Seconds a writable HTTP server waits at startup for another process to release the palace writer lease before exiting with status `2` (default `120`; `0` refuses immediately). See [Remote server](/guide/remote-server#operating-notes) |
 | `MEMPALACE_MCP_IDLE_HOURS` | Hours with no MCP request before the server exits by itself (default `8`; `0` disables). See [Remote server](/guide/remote-server#operating-notes) |
