@@ -775,6 +775,7 @@ def tool_mine(
     limit: int = 0,
     dry_run: bool = False,
     extract: str = "exchange",
+    room: str = None,
 ):
     """Mine a directory into the palace — the MCP equivalent of ``mempalace mine``.
 
@@ -818,6 +819,18 @@ def tool_mine(
             "success": False,
             "error": f"invalid mode '{mode}'; expected one of: {', '.join(valid_modes)}",
         }
+
+    # ``room`` overrides per-file room routing. Only the projects miner routes
+    # by folder/filename/content — convos and extract have their own room
+    # semantics — so reject it elsewhere rather than silently ignoring it
+    # (mirroring run_mine's "supported only in projects mode" guard).
+    if room is not None:
+        if mode != "projects":
+            return {"success": False, "error": "mine room is supported only in projects mode"}
+        try:
+            room = sanitize_name(room, "room")
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
 
     src = os.path.expanduser(source) if source else ""
     # convos accepts one conversation file as well as a directory — the CLI has
@@ -864,6 +877,7 @@ def tool_mine(
             agent=agent,
             limit=limit,
             dry_run=dry_run,
+            room=room,
         )
 
     try:
@@ -1436,6 +1450,89 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def tool_move_drawers(drawer_ids: list, target_wing: str = None, target_room: str = None):
+    """Move many drawers by ID in one call.
+
+    The batch contract mirrors ``tool_delete_drawers`` from #2572: a call is
+    accepted only for a drawer-id list of size 1 to ``_BULK_DRAWER_MAX_IDS``;
+    otherwise it returns ``{"error": ...}`` before any read/write. At least one
+    of ``target_wing`` or ``target_room`` must be provided, and each provided
+    target must be a string.
+
+    Results stay in input order. A missing drawer id is an item-level
+    ``{"drawer_id", "error"}`` and increments ``errors``; the batch continues.
+    A success item reports the moved physical ids and the resulting wing/room
+    for that logical drawer: ``{"drawer_id", "moved_ids", "wing", "room"}``.
+
+    ``target_room`` alone keeps each drawer's existing wing; ``target_wing``
+    alone keeps each drawer's existing room. Chunked logical drawers move all
+    chunk rows by reusing ``tool_update_drawer`` internals.
+    """
+    rejected = _bulk_ids_error(drawer_ids, action="move")
+    if rejected:
+        return rejected
+
+    if target_wing is None and target_room is None:
+        return {"error": "At least one target is required: pass target_wing and/or target_room"}
+    if target_wing is not None and not isinstance(target_wing, str):
+        return {"error": "target_wing must be a string"}
+    if target_room is not None and not isinstance(target_room, str):
+        return {"error": "target_room must be a string"}
+
+    col = _get_collection()
+    if not col:
+        return _collection_error_or_no_palace()
+
+    try:
+        found = _bulk_drawer_records(col, drawer_ids)
+    except Exception:
+        logger.exception("tool_move_drawers batch resolve failed; moving one id at a time")
+        found = None
+
+    results = []
+    moved = 0
+    errors = 0
+    for drawer_id in drawer_ids:
+        try:
+            if found is None:
+                record = _logical_drawer_record(col, drawer_id)
+            else:
+                record = found.get(drawer_id)
+            if record is None:
+                errors += 1
+                results.append({"drawer_id": drawer_id, "error": f"Drawer not found: {drawer_id}"})
+                continue
+
+            meta = _safe_meta((record.get("metadatas") or [{}])[0])
+            next_wing = target_wing if target_wing is not None else str(meta.get("wing") or "")
+            next_room = target_room if target_room is not None else str(meta.get("room") or "")
+
+            outcome = tool_update_drawer(drawer_id=drawer_id, wing=next_wing, room=next_room)
+            if not outcome.get("success"):
+                errors += 1
+                results.append(
+                    {"drawer_id": drawer_id, "error": outcome.get("error", "Unknown error")}
+                )
+                continue
+
+            moved += 1
+            moved_ids = outcome.get("chunk_ids") or [outcome.get("drawer_id", drawer_id)]
+            results.append(
+                {
+                    "drawer_id": drawer_id,
+                    "moved_ids": moved_ids,
+                    "wing": outcome.get("wing", next_wing),
+                    "room": outcome.get("room", next_room),
+                }
+            )
+        except Exception as e:
+            errors += 1
+            results.append({"drawer_id": drawer_id, "error": str(e)})
+            logger.exception("tool_move_drawers: move failed for %s", drawer_id)
+
+    return {"results": results, "count": len(results), "moved": moved, "errors": errors}
 
 
 def tool_delete_drawers(drawer_ids: list):

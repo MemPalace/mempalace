@@ -486,6 +486,32 @@ TOOLS = {
         },
         "handler": tool_delete_drawers,
     },
+    "mempalace_move_drawers": {
+        "description": (
+            "Move many drawers by ID in one call. Each logical drawer moves "
+            "with all its chunk rows. Pass target_wing, target_room, or both; "
+            "an omitted target keeps each drawer's current wing or room. A "
+            "missing ID is an item in `results` and is counted in `errors`; "
+            "the rest of the batch still runs. An accepted call (1 to 500 IDs) "
+            "always returns `results` plus `moved`/`errors` totals. An empty "
+            "list, a non-list, more than 500 IDs, or no target is rejected "
+            "with `error` and moves nothing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "drawer_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "One or more drawer IDs to move (max 500)",
+                },
+                "target_wing": {"type": "string", "description": "Destination wing"},
+                "target_room": {"type": "string", "description": "Destination room"},
+            },
+            "required": ["drawer_ids"],
+        },
+        "handler": tool_move_drawers,
+    },
     "mempalace_mine": {
         "description": (
             "Mine a directory into the palace — the MCP equivalent of `mempalace mine`. "
@@ -534,6 +560,13 @@ TOOLS = {
                     "description": (
                         "Convos extraction strategy: exchange (default) or general. "
                         "Ignored by other modes."
+                    ),
+                },
+                "room": {
+                    "type": "string",
+                    "description": (
+                        "Target room for projects mode; overrides per-file room routing "
+                        "(folder/filename/content). Rejected for other modes."
                     ),
                 },
             },

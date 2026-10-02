@@ -1446,6 +1446,89 @@ def test_update_drawer_chunked_logical_id_rewrites_group(monkeypatch, config, pa
     assert listed["drawers"][0]["drawer_id"] == logical_id
 
 
+class TestMoveDrawers:
+    def _seed(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        tool_add_drawer(wing="w1", room="r1", content="alpha", source_file="bulk/a.md")
+        tool_add_drawer(wing="w1", room="r1", content="beta", source_file="bulk/b.md")
+
+    def test_validation_rejects_non_list_before_mutation(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_list_drawers, tool_move_drawers
+
+        before = tool_list_drawers()["total"]
+        out = tool_move_drawers(drawer_ids="nope", target_wing="x")
+        assert "error" in out
+        assert tool_list_drawers()["total"] == before
+
+    def test_validation_rejects_empty_and_over_cap_and_missing_target(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_move_drawers
+
+        assert "error" in tool_move_drawers(drawer_ids=[], target_wing="x")
+        assert "error" in tool_move_drawers(
+            drawer_ids=[str(i) for i in range(501)], target_wing="x"
+        )
+        assert "error" in tool_move_drawers(drawer_ids=["drawer_x"])
+        assert "error" in tool_move_drawers(drawer_ids=["drawer_x"], target_wing=1)
+        assert "error" in tool_move_drawers(drawer_ids=["drawer_x"], target_room=1)
+
+    def test_mixed_present_missing_in_input_order(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_list_drawers, tool_move_drawers
+
+        ids = [d["drawer_id"] for d in tool_list_drawers(wing="w1", room="r1")["drawers"]]
+        req = [ids[0], "drawer_missing", ids[1]]
+        out = tool_move_drawers(drawer_ids=req, target_wing="w2", target_room="r2")
+        assert out["count"] == 3
+        assert out["moved"] == 2
+        assert out["errors"] == 1
+        assert [r["drawer_id"] for r in out["results"]] == req
+
+    def test_chunked_drawer_moves_all_rows(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_add_drawer, tool_get_drawer, tool_move_drawers
+
+        added = tool_add_drawer(
+            wing="w1", room="r1", content=("x" * 12000), source_file="bulk/chunked.md"
+        )
+        drawer_id = added["drawer_id"]
+        out = tool_move_drawers(drawer_ids=[drawer_id], target_wing="w2", target_room="r2")
+        assert out["moved"] == 1
+        assert len(out["results"][0]["moved_ids"]) >= 2
+        got = tool_get_drawer(drawer_id)
+        assert got["metadata"]["wing"] == "w2"
+        assert got["metadata"]["room"] == "r2"
+
+    def test_target_room_only_keeps_existing_wing(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_list_drawers, tool_move_drawers
+
+        drawer_id = tool_list_drawers(wing="w1", room="r1")["drawers"][0]["drawer_id"]
+        out = tool_move_drawers(drawer_ids=[drawer_id], target_room="r9")
+        item = out["results"][0]
+        assert item["wing"] == "w1"
+        assert item["room"] == "r9"
+
+    def test_target_wing_only_keeps_existing_room(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_list_drawers, tool_move_drawers
+
+        drawer_id = tool_list_drawers(wing="w1", room="r1")["drawers"][0]["drawer_id"]
+        out = tool_move_drawers(drawer_ids=[drawer_id], target_wing="w9")
+        item = out["results"][0]
+        assert item["wing"] == "w9"
+        assert item["room"] == "r1"
+
+
 class TestDeleteBySource:
     """``tool_delete_by_source`` — bulk cleanup of benchmark/test contamination (#1722)."""
 

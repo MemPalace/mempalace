@@ -169,6 +169,24 @@ Delete many drawers by ID in one call. Irreversible. Each ID is removed the same
 
 ---
 
+
+
+### `mempalace_move_drawers`
+
+Move many drawers by ID in one call. Contract matches `mempalace_delete_drawers`: accepted input is 1 to 500 IDs, each ID returns one result in input order, and missing IDs become per-item errors while the batch continues.
+
+At least one target must be provided: `target_wing` and/or `target_room`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `drawer_ids` | array of strings | **Yes** | Drawer IDs to move (1 to 500) |
+| `target_wing` | string | No | Destination wing. If omitted, keeps each drawer's existing wing |
+| `target_room` | string | No | Destination room. If omitted, keeps each drawer's existing room |
+
+**Returns:** `{ results, count, moved, errors }` for an accepted call. Each result is `{ drawer_id, moved_ids, wing, room }` or `{ drawer_id, error }`. A rejected call returns `{ error }`.
+
+---
+
 ### `mempalace_mine`
 
 Mine a directory into the palace — the MCP equivalent of `mempalace mine`. `mode='convos'` also accepts a single conversation file. Wraps the same in-process miners the CLI uses; runs synchronously and returns the miner's summary as `output`. The palace write lock is automatic — a concurrent mine returns a structured already-running error. Orphan cleanup is separate (see `mempalace_sync`).

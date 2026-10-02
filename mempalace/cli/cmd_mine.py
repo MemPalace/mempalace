@@ -15,6 +15,7 @@ def cmd_mine(args):
         "source": os.path.abspath(os.path.expanduser(args.dir)),
         "mode": mode,
         "wing": args.wing,
+        "room": getattr(args, "room", None),
         "agent": args.agent,
         "limit": args.limit,
         "dry_run": args.dry_run,

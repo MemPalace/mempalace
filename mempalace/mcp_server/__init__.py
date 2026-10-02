@@ -27,6 +27,7 @@ Tools (write):
   mempalace_delete_drawer   — remove a drawer by ID
   mempalace_delete_drawers  — remove many drawers by ID in one call (bulk)
   mempalace_delete_by_source — bulk-remove all drawers mined from one source_file
+  mempalace_move_drawers    — bulk-move drawers to another wing/room
 
 Tools (maintenance):
   mempalace_reconnect       — force cache invalidation and reconnect after external writes
