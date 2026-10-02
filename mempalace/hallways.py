@@ -37,12 +37,12 @@ import json
 import re
 import logging
 import os
-import tempfile
 from collections import defaultdict
 from datetime import datetime, timezone
 from itertools import combinations
 from typing import Optional
 
+from ._atomic_file import create_temp_file
 from .dynamics import initialize_dynamics_fields
 
 logger = logging.getLogger("mempalace_hallways")
@@ -148,22 +148,32 @@ def _save_hallways(hallways: list[dict], config=None) -> None:
         "schema_version": _SCHEMA_VERSION,
         "hallways": list(hallways),
     }
-    fd, tmp_path = tempfile.mkstemp(prefix=".hallways-", suffix=".tmp", dir=directory)
+    fd, tmp_path = create_temp_file(directory, prefix=".hallways-", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f = os.fdopen(fd, "w", encoding="utf-8")
+        fd = None  # The file object now owns the descriptor, including on write failure.
+        with f:
             json.dump(payload, f, indent=2, ensure_ascii=False)
         try:
             os.chmod(tmp_path, 0o600)
         except OSError:
-            # Non-POSIX systems may not support chmod; not fatal.
-            pass
+            # Windows chmod only sets the read-only attribute, not privacy ACLs.
+            # Keep its historical best-effort behavior; POSIX privacy is required.
+            if os.name != "nt":
+                raise
         os.replace(tmp_path, hallway_file)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+        tmp_path = None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
