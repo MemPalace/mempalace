@@ -515,9 +515,9 @@ def test_stop_hook_saves_silently_at_interval(tmp_path):
     # Saves silently — systemMessage notification with themes, no block
     assert result["systemMessage"].startswith("\u2726 15 memories woven into the palace")
     assert "hooks" in result["systemMessage"]
-    # tmp_path has no "-Projects-" segment, so _wing_from_transcript_path falls back to "wing_sessions"
+    # tmp_path has no "-Projects-" segment, so _ingest_wing falls back to "sessions"
     mock_save.assert_called_once_with(
-        str(transcript), "test", wing="wing_sessions", toast=False, agent_name="claude"
+        str(transcript), "test", wing="sessions", toast=False, agent_name="claude"
     )
 
 
@@ -538,7 +538,7 @@ def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
             state_dir=tmp_path,
         )
     mock_save.assert_called_once_with(
-        str(transcript), "test", wing="wing_myproject", toast=False, agent_name="claude"
+        str(transcript), "test", wing="myproject", toast=False, agent_name="claude"
     )
 
 
@@ -2307,7 +2307,7 @@ def test_session_end_uses_detached_paths_not_sync_mine(tmp_path):
     mock_auto.assert_called_once()
     mock_sync.assert_not_called()
     mock_save.assert_called_once_with(
-        expected_path, "sess", wing="wing_sessions", toast=False, agent_name="claude"
+        expected_path, "sess", wing="sessions", toast=False, agent_name="claude"
     )
     # The session is over; its per-session save marker is cleared.
     assert not last_save_file.exists()
