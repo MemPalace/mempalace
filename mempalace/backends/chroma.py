@@ -2420,6 +2420,90 @@ def sqlite_documents_for_ids(
     return docs
 
 
+def _sqlite_ready_metadata_segment(conn, collection_name):
+    """Return the unique collection/metadata segment only after queued writes landed.
+
+    The caller must keep this check and its reads in one explicit transaction.
+    Missing or ambiguous recovery state requires the normal Chroma path.
+    """
+    collections = conn.execute(
+        "SELECT id FROM collections WHERE name = ?", (collection_name,)
+    ).fetchall()
+    if len(collections) != 1:
+        return None
+    collection_id = collections[0][0]
+    segments = conn.execute(
+        "SELECT id FROM segments WHERE collection = ? AND scope = 'METADATA'",
+        (collection_id,),
+    ).fetchall()
+    if len(segments) != 1:
+        return None
+    segment_id = segments[0][0]
+    watermark = conn.execute(
+        "SELECT seq_id FROM max_seq_id WHERE segment_id = ?", (segment_id,)
+    ).fetchone()
+    suffix = f"/{collection_id}"
+    if watermark is None:
+        # A never-written collection has no watermark. Existing rows
+        # or a queued write make that missing state untrustworthy.
+        if (
+            conn.execute(
+                "SELECT 1 FROM embeddings WHERE segment_id = ? LIMIT 1", (segment_id,)
+            ).fetchone()
+            or conn.execute(
+                "SELECT 1 FROM embeddings_queue WHERE substr(topic, -length(?)) = ? LIMIT 1",
+                (suffix, suffix),
+            ).fetchone()
+        ):
+            return None
+        consumed = 0
+    else:
+        consumed = watermark[0]
+        if isinstance(consumed, bytes):
+            # Older Chroma stored big-endian 8-byte offsets. The
+            # newer \x11\x11-prefixed format is not that encoding.
+            if len(consumed) != 8 or consumed.startswith(b"\x11\x11"):
+                return None
+            consumed = int.from_bytes(consumed, "big")
+        if not isinstance(consumed, int) or not 0 <= consumed <= (1 << 63) - 1:
+            return None
+    # Legacy Collection.get backfills queued operations first. Read
+    # only when the metadata segment has already consumed them; the
+    # vector segment's lag does not affect stored text or metadata.
+    if conn.execute(
+        "SELECT 1 FROM embeddings_queue WHERE seq_id > ? AND substr(topic, -length(?)) = ? LIMIT 1",
+        (consumed, suffix, suffix),
+    ).fetchone():
+        return None
+    return collection_id, segment_id
+
+
+def _sqlite_hydrate_rows(conn, selected, value_columns):
+    """Hydrate scalar metadata/documents only for selected internal row ids."""
+    records = {row_id: [drawer_id, None, {}] for row_id, drawer_id in selected}
+    for start in range(0, len(selected), 500):
+        row_ids = [row_id for row_id, _ in selected[start : start + 500]]
+        marks = ",".join("?" for _ in row_ids)
+        rows = conn.execute(
+            f"SELECT id, key, {', '.join(value_columns)} FROM embedding_metadata"
+            f" WHERE id IN ({marks})",
+            row_ids,
+        )
+        for row_id, key, *cells in rows:
+            values = dict(zip(value_columns, cells))
+            value = _metadata_cell_value(
+                *(
+                    values.get(col)
+                    for col in ("string_value", "int_value", "float_value", "bool_value")
+                )
+            )
+            if key == "chroma:document":
+                records[row_id][1] = value
+            elif key is not None and value is not None:
+                records[row_id][2][key] = value
+    return [tuple(records[row_id]) for row_id, _ in selected]
+
+
 def sqlite_diary_rows(
     palace_path: str,
     collection_name: str,
@@ -2450,56 +2534,10 @@ def sqlite_diary_rows(
         try:
             conn.execute("PRAGMA busy_timeout = 3000")
             conn.execute("BEGIN")
-            collections = conn.execute(
-                "SELECT id FROM collections WHERE name = ?", (collection_name,)
-            ).fetchall()
-            if len(collections) != 1:
+            ready = _sqlite_ready_metadata_segment(conn, collection_name)
+            if ready is None:
                 return None
-            collection_id = collections[0][0]
-            segments = conn.execute(
-                "SELECT id FROM segments WHERE collection = ? AND scope = 'METADATA'",
-                (collection_id,),
-            ).fetchall()
-            if len(segments) != 1:
-                return None
-            segment_id = segments[0][0]
-            watermark = conn.execute(
-                "SELECT seq_id FROM max_seq_id WHERE segment_id = ?", (segment_id,)
-            ).fetchone()
-            suffix = f"/{collection_id}"
-            if watermark is None:
-                # A never-written collection has no watermark. Existing rows
-                # or a queued write make that missing state untrustworthy.
-                if (
-                    conn.execute(
-                        "SELECT 1 FROM embeddings WHERE segment_id = ? LIMIT 1", (segment_id,)
-                    ).fetchone()
-                    or conn.execute(
-                        "SELECT 1 FROM embeddings_queue WHERE substr(topic, -length(?)) = ? LIMIT 1",
-                        (suffix, suffix),
-                    ).fetchone()
-                ):
-                    return None
-                consumed = 0
-            else:
-                consumed = watermark[0]
-                if isinstance(consumed, bytes):
-                    # Older Chroma stored big-endian 8-byte offsets. The
-                    # newer \x11\x11-prefixed format is not that encoding.
-                    if len(consumed) != 8 or consumed.startswith(b"\x11\x11"):
-                        return None
-                    consumed = int.from_bytes(consumed, "big")
-                if not isinstance(consumed, int) or not 0 <= consumed <= (1 << 63) - 1:
-                    return None
-            # Legacy Collection.get backfills queued operations first. Read
-            # only when the metadata segment has already consumed them; the
-            # vector segment's lag does not affect diary text or metadata.
-            if conn.execute(
-                "SELECT 1 FROM embeddings_queue WHERE seq_id > ?"
-                " AND substr(topic, -length(?)) = ? LIMIT 1",
-                (consumed, suffix, suffix),
-            ).fetchone():
-                return None
+            collection_id, _segment_id = ready
             value_columns = _metadata_value_columns(conn)
             if "string_value" not in value_columns:
                 return None
@@ -2563,28 +2601,72 @@ def sqlite_diary_rows(
             if not selected:
                 return total, []
 
-            records = {row_id: [drawer_id, None, {}] for row_id, drawer_id in selected}
-            for start in range(0, len(selected), 500):
-                row_ids = [row_id for row_id, _ in selected[start : start + 500]]
-                marks = ",".join("?" for _ in row_ids)
-                rows = conn.execute(
-                    f"SELECT id, key, {', '.join(value_columns)} FROM embedding_metadata"
-                    f" WHERE id IN ({marks})",
-                    row_ids,
-                )
-                for row_id, key, *cells in rows:
-                    values = dict(zip(value_columns, cells))
-                    value = _metadata_cell_value(
-                        *(
-                            values.get(col)
-                            for col in ("string_value", "int_value", "float_value", "bool_value")
-                        )
-                    )
-                    if key == "chroma:document":
-                        records[row_id][1] = value
-                    elif key and value is not None:
-                        records[row_id][2][key] = value
-            return total, [tuple(records[row_id]) for row_id, _ in selected]
+            return total, _sqlite_hydrate_rows(conn, selected, value_columns)
+        finally:
+            conn.close()
+    except (sqlite3.Error, ValueError):
+        return None
+
+
+def sqlite_drawer_rows(
+    palace_path: str,
+    collection_name: str,
+    *,
+    drawer_id: str,
+) -> Optional[tuple[bool, list[tuple[str, Optional[str], dict]]]]:
+    """Read a direct drawer, or every scalar-parent-linked physical chunk.
+
+    The direct physical id wins over a logical group with the same handle.
+    Groups are complete and deduplicated by physical row, with no page cap.
+    Missing, unsupported, or unmaterialized records return ``None`` so Chroma
+    can recover them or preserve metadata types this scalar reader cannot
+    decode. In particular any selected array metadata requires that fallback.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        conn = open_palace_reader(db_path)
+        try:
+            conn.execute("PRAGMA busy_timeout = 3000")
+            conn.execute("BEGIN")
+            ready = _sqlite_ready_metadata_segment(conn, collection_name)
+            if ready is None:
+                return None
+            _collection_id, segment_id = ready
+            value_columns = _metadata_value_columns(conn)
+            if "string_value" not in value_columns:
+                return None
+            selected = conn.execute(
+                "SELECT id, embedding_id FROM embeddings"
+                " WHERE segment_id = ? AND embedding_id = ? ORDER BY id",
+                (segment_id, drawer_id),
+            ).fetchall()
+            direct = bool(selected)
+            if not direct:
+                # The composite key/string index drives the parent search;
+                # each row's internal id then seeks its embedding by PK.
+                selected = conn.execute(
+                    "SELECT DISTINCT e.id, e.embedding_id FROM embedding_metadata p"
+                    " CROSS JOIN embeddings e ON e.id = p.id"
+                    " WHERE p.key IN ('parent_drawer_id', 'parent_entry_id')"
+                    " AND p.string_value = ? AND e.segment_id = ? ORDER BY e.id",
+                    (drawer_id, segment_id),
+                ).fetchall()
+            if not selected:
+                return None
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embedding_metadata_array'"
+            ).fetchone():
+                for start in range(0, len(selected), 500):
+                    row_ids = [row_id for row_id, _ in selected[start : start + 500]]
+                    marks = ",".join("?" for _ in row_ids)
+                    if conn.execute(
+                        f"SELECT 1 FROM embedding_metadata_array WHERE id IN ({marks}) LIMIT 1",
+                        row_ids,
+                    ).fetchone():
+                        return None
+            return direct, _sqlite_hydrate_rows(conn, selected, value_columns)
         finally:
             conn.close()
     except (sqlite3.Error, ValueError):
