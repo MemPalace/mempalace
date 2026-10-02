@@ -43,6 +43,58 @@ class TestTripleOperations:
         tid2 = kg.add_triple("Alice", "knows", "Bob")
         assert tid1 == tid2
 
+    def test_identical_closed_interval_replay_returns_existing_id(self, kg):
+        # A retried historical assertion after an interruption must not create
+        # a second logical assertion (#2598).
+        kwargs = dict(
+            valid_from="2025-01-01T00:00:00Z",
+            valid_to="2025-02-01T00:00:00Z",
+            source_closet="synthetic-replay-fixture",
+        )
+        tid1 = kg.add_triple("Pilot History", "was", "Archived", **kwargs)
+        tid2 = kg.add_triple("Pilot History", "was", "Archived", **kwargs)
+        assert tid1 == tid2
+        rows = kg.query_entity("Pilot History", as_of="2025-01-15T00:00:00Z")
+        assert len(rows) == 1
+
+    def test_distinct_closed_intervals_stay_separate(self, kg):
+        # Recurring historical facts are genuinely different assertions.
+        tid1 = kg.add_triple(
+            "Alice",
+            "lived_in",
+            "Rome",
+            valid_from="2020-01-01T00:00:00Z",
+            valid_to="2020-12-31T00:00:00Z",
+        )
+        tid2 = kg.add_triple(
+            "Alice",
+            "lived_in",
+            "Rome",
+            valid_from="2023-01-01T00:00:00Z",
+            valid_to="2023-12-31T00:00:00Z",
+        )
+        assert tid1 != tid2
+
+    def test_closed_replay_with_different_provenance_stays_separate(self, kg):
+        # Independently sourced assertions of the same interval are distinct.
+        tid1 = kg.add_triple(
+            "Alice",
+            "lived_in",
+            "Rome",
+            valid_from="2020-01-01T00:00:00Z",
+            valid_to="2020-12-31T00:00:00Z",
+            source_closet="notebook-a",
+        )
+        tid2 = kg.add_triple(
+            "Alice",
+            "lived_in",
+            "Rome",
+            valid_from="2020-01-01T00:00:00Z",
+            valid_to="2020-12-31T00:00:00Z",
+            source_closet="notebook-b",
+        )
+        assert tid1 != tid2
+
     def test_invalidated_triple_allows_re_add(self, kg):
         tid1 = kg.add_triple("Alice", "works_at", "Acme")
         kg.invalidate("Alice", "works_at", "Acme", ended="2025-01-01")
