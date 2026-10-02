@@ -998,27 +998,29 @@ class TestWriteTools:
     def test_update_drawer_case_only_wing_rename_applies(
         self, monkeypatch, config, palace_path, kg
     ):
-        """Regression for #2395: a wing change that differs only by case must
-        be APPLIED, not skipped with success and the old value echoed back.
+        """Regression for #2395 + #2579: consolidating a *legacy* mixed-case
+        wing must APPLY, not be skipped with the old value echoed back.
 
-        ``list_drawers`` is case-sensitive, so case-duplicate wings are
-        distinct destinations and consolidation via update is their only
-        supported rewrite path — the comparison must be exact.
+        MCP writes now canonicalize with ``normalize_wing_name`` (#2579), so
+        a fresh ``tool_add_drawer`` never stores mixed case. Seed a pre-
+        normalization wing directly, then update: exact compare after
+        normalize must rewrite the stored slug to the canonical form.
         """
         _patch_mcp_server(monkeypatch, config, kg)
-        from mempalace.mcp_server import (
-            tool_add_drawer,
-            tool_get_drawer,
-            tool_update_drawer,
-        )
+        _client, col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_get_drawer, tool_update_drawer
 
-        added = tool_add_drawer(wing="ZZTestCaseRename", room="scratch", content="case probe")
-        assert added["success"] is True
-        drawer_id = added["drawer_id"]
+        drawer_id = "drawer_legacy_case_wing"
+        col.add(
+            ids=[drawer_id],
+            documents=["legacy mixed-case wing probe"],
+            metadatas=[{"wing": "ZZTestCaseRename", "room": "scratch"}],
+        )
 
         result = tool_update_drawer(drawer_id, wing="zztestcaserename", room="scratch")
         assert result["success"] is True
-        # The response must echo the NEW wing, not silently the old one.
+        # The response must echo the NEW (canonical) wing, not silently the old one.
         assert result["wing"] == "zztestcaserename"
 
         # The store, not just the response, must reflect the rename.
@@ -1049,19 +1051,24 @@ class TestWriteTools:
         assert fetched["room"] == "scratchroom"
 
     def test_update_drawer_identical_case_is_noop(self, monkeypatch, config, palace_path, kg):
-        """Regression for #2395: re-submitting the exact same casing must
-        still be a content-preserving no-op (no spurious write, old value
-        unchanged)."""
+        """Regression for #2395 + #2579: re-submitting the same wing input
+        must leave the stored (canonical) value unchanged.
+
+        ``tool_add_drawer`` canonicalizes ``StableWing`` → ``stablewing``
+        (#2579). Updating with the same input must echo that slug back, not
+        the pre-normalize spelling.
+        """
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_add_drawer, tool_update_drawer
 
         added = tool_add_drawer(wing="StableWing", room="stable_room", content="noop probe")
         assert added["success"] is True
+        assert added["wing"] == "stablewing"
         drawer_id = added["drawer_id"]
 
         result = tool_update_drawer(drawer_id, wing="StableWing", room="stable_room")
         assert result["success"] is True
-        assert result["wing"] == "StableWing"
+        assert result["wing"] == "stablewing"
         assert result["room"] == "stable_room"
 
     def test_update_drawer_content_purges_matching_closets(
