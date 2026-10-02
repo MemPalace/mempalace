@@ -2,14 +2,24 @@
 
 from datetime import datetime
 
+import pytest
+
 from _mcp_server_helpers import (
     _get_collection,
     _patch_mcp_server,
 )
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        "  Keep café, 日本語, and 🙂 exactly as written.\n",
+        "SESSION:2026-10-02|PROJ:MPL|ALC→JOR|*warm*|★★★\n",
+    ],
+    ids=["plain-text", "supplied-aaak"],
+)
 def test_diary_write_chunked_logical_id_fetches_deletes_and_lists_as_one(
-    monkeypatch, config, palace_path, kg
+    monkeypatch, config, palace_path, kg, line
 ):
     """Regression for #2185: the ``entry_id`` returned by a chunked
     ``tool_diary_write`` must behave like any other logical drawer id.
@@ -32,7 +42,8 @@ def test_diary_write_chunked_logical_id_fetches_deletes_and_lists_as_one(
         tool_list_drawers,
     )
 
-    oversized = "Z" * 5000
+    # Distinct lines expose reordered or repeated chunks that uniform text hides.
+    oversized = "".join(f"{index}: {line}" for index in range(100))
     written = tool_diary_write(agent_name="TestAgent", entry=oversized, topic="general")
     assert written["success"] is True
     assert written["chunks"] > 1
@@ -138,6 +149,31 @@ def test_legacy_diary_chunks_resolve_without_parent_drawer_id(monkeypatch, confi
 
 
 class TestDiaryTools:
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "  Preserve café, 日本語, and 🙂.\nKeep this second line and trailing spaces.  \n",
+            "SESSION:2026-10-02|PROJ:MPL|ALC→JOR|*warm*|★★★\n",
+        ],
+        ids=["plain-text", "supplied-aaak"],
+    )
+    def test_diary_text_round_trips_without_conversion(
+        self, monkeypatch, config, palace_path, kg, entry
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_diary_read, tool_diary_write, tool_get_drawer
+
+        written = tool_diary_write(agent_name="TestAgent", entry=entry)
+
+        assert written["success"] is True
+        assert written["chunks"] == 1
+        diary = tool_diary_read(agent_name="TestAgent")
+        assert diary["total"] == 1
+        assert diary["entries"][0]["content"] == entry
+        assert tool_get_drawer(written["entry_id"])["content"] == entry
+
     def test_diary_write_and_read(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         _client, _col = _get_collection(palace_path, create=True)

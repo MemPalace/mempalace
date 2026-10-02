@@ -364,11 +364,19 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
     },
     {
         "name": "mempalace_diary_write",
-        "description": "Append an AAAK diary entry.",
+        "description": (
+            "Append a diary entry in plain text by default; AAAK is optional when explicitly requested. "
+            "The supplied text is stored without format conversion."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
-                "entry": {"type": "string", "description": "Diary entry text."},
+                "entry": {
+                    "type": "string",
+                    "description": (
+                        "Diary entry text; plain text by default, AAAK optional when explicitly requested."
+                    ),
+                },
             },
             "required": ["entry"],
         },

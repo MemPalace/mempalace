@@ -167,8 +167,9 @@ msg = (
     "items=[{wing: " + wing + ", room: <short topic>, content: <verbatim "
     "quote>}, ...] for the key topics, decisions, and verbatim quotes from "
     "this session; and diary={agent_name: cursor-ide, wing: " + wing + ", "
-    "entry: <AAAK-format summary>}. It dedups, files non-duplicates, and "
-    "writes the diary in one call. Then stop."
+    "entry: <plain text session notes>}. It dedups, files non-duplicates, and "
+    "writes the diary in one call. Use plain text by default; AAAK is optional "
+    "only when explicitly requested. Then stop."
 )
 print(json.dumps({"followup_message": msg}))
 ' "$WING"

@@ -82,7 +82,7 @@ Both string DSL format (for fast natural-language generation) and structured JSO
 - `DELETE SOURCE <source_path> [COMMIT]` (defaults to dry run unless COMMIT is passed)
 - `MINE <directory> [MODE projects|convos|extract] [WING <wing>] [LIMIT <n>] [DRY_RUN]`
 - `SYNC [PROJECT <dir>] [WING <wing>] [APPLY]`
-- `CHECKPOINT <json_payload>` — Batch items + diary write in a single call.
+- `CHECKPOINT <json_payload>` — Batch items + diary write in a single call. Use plain text for the diary entry by default; AAAK is optional when explicitly requested.
 
 #### Knowledge Graph Lifecycle
 - `KG ADD <subject> -> <predicate> -> <object> [FROM <date>] [TO <date>] [CLOSET <id>] [DRAWER <id>]`
@@ -97,9 +97,12 @@ Both string DSL format (for fast natural-language generation) and structured JSO
 - `HALLWAY DELETE <hallway_id>`
 
 #### Agent Diary & System
-- `DIARY WRITE <agent_name> [TOPIC <topic>] [WING <wing>] <aaak_content>`
+- `DIARY WRITE <agent_name> [TOPIC <topic>] [WING <wing>] <entry_text>` — Plain text by default; AAAK is optional when explicitly requested.
 - `RECONNECT` — Flush caches and reconnect storage backend.
 - `SETTINGS [SILENT_SAVE true|false] [DESKTOP_TOAST true|false]`
+
+Diary and checkpoint entries are stored without automatic format conversion.
+For example: `DIARY WRITE reviewer TOPIC auth "PR 42 is missing an authentication middleware check."`
 
 ---
 

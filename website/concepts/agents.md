@@ -20,11 +20,14 @@ The diary is a lightweight memory stream for one named agent: observations, find
 
 ### Writing Entries
 
+Use plain text by default. AAAK is optional when explicitly requested; the tool
+does not convert entries between formats.
+
 ```text
 MCP tool: mempalace_diary_write
   arguments: {
     "agent_name": "reviewer",
-    "entry": "PR#42|auth.bypass.found|missing.middleware.check|pattern:3rd.time.this.quarter|★★★★"
+    "entry": "PR 42 is missing an authentication middleware check. This is the third occurrence this quarter."
   }
 ```
 
@@ -33,14 +36,14 @@ MCP tool: mempalace_diary_write
 ```text
 MCP tool: mempalace_diary_read
   arguments: { "agent_name": "reviewer", "last_n": 10 }
-  → returns last 10 findings, compressed in AAAK
+  → returns the last 10 diary entries in their stored format
 ```
 
 ### MCP Tools
 
 | Tool | Description |
 |------|-------------|
-| `mempalace_diary_write` | Write an AAAK diary entry |
+| `mempalace_diary_write` | Write a diary entry in plain text by default; AAAK optional when explicitly requested |
 | `mempalace_diary_read` | Read recent diary entries |
 
 ## How It Works

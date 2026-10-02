@@ -13,6 +13,8 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
 
     This is the agent's personal journal — observations, thoughts,
     what it worked on, what it noticed, what it thinks matters.
+    Plain text is the default. Caller-supplied AAAK is also supported;
+    neither format is automatically compressed or expanded.
 
     Note: ``agent_name`` is normalized to lowercase before storage so
     that diary reads are case-insensitive (see #1243). "Claude",
@@ -54,10 +56,8 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     )
 
     try:
-        # TODO: Future versions should expand AAAK before embedding to improve
-        # semantic search quality. For now, store raw AAAK in metadata so it's
-        # preserved, and keep the document as-is for embedding (even though
-        # compressed AAAK degrades embedding quality).
+        # Keep the supplied entry in its chosen format. Plain text is the
+        # default; caller-supplied AAAK remains supported without conversion.
         base_metadata = {
             "wing": wing,
             "room": room,

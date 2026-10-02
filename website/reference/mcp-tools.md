@@ -137,7 +137,7 @@ Save a whole session in one call. Semantic-dedups each item, files the non-dupli
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `items` | array | **Yes** | Verbatim items to file. Each is `{ wing, room, content }` |
-| `diary` | object | No | Diary entry written after filing: `{ agent_name, entry, topic?, wing? }` (`entry` is AAAK-format) |
+| `diary` | object | No | Diary entry written after filing: `{ agent_name, entry, topic?, wing? }`; `entry` is plain text by default, with AAAK optional when explicitly requested |
 | `dedup_threshold` | number | No | Similarity threshold 0–1 for the per-item dedup check (default 0.9) |
 | `added_by` | string | No | Who is filing these drawers. An explicit value takes precedence; otherwise the diary `agent_name`, else `checkpoint` |
 
@@ -481,12 +481,14 @@ Follow tunnels from a room to see what it connects to in other wings. Returns co
 
 ### `mempalace_diary_write`
 
-Write to your personal agent diary.
+Write to your personal agent diary in plain text by default. AAAK is optional
+when explicitly requested; the tool stores the supplied entry without automatic
+format conversion.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `agent_name` | string | **Yes** | Your name — each agent gets its own wing |
-| `entry` | string | **Yes** | Diary entry (in AAAK format recommended) |
+| `entry` | string | **Yes** | Diary entry text; plain text by default, AAAK optional when explicitly requested |
 | `topic` | string | No | Topic tag (default: "general") |
 
 **Returns:** `{ success, entry_id, agent, topic, timestamp }`
@@ -495,7 +497,7 @@ Write to your personal agent diary.
 
 ### `mempalace_diary_read`
 
-Read recent diary entries.
+Read recent diary entries in their stored format, including existing AAAK entries.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
