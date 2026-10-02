@@ -10,18 +10,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- **Read-only MCP tools advertise `annotations.readOnlyHint`.** Fourteen
-  inspection tools (`status`, `list_wings`, `list_rooms`, `get_taxonomy`,
-  `get_aaak_spec`, `search`, `check_duplicate`, `get_drawer`, `get_drawers`,
-  `list_drawers`, `diary_read`, `kg_query`, `kg_timeline`, `kg_stats`) set
-  `read_only: true` in the catalog so plan modes and read-only subagents can
-  admit memory search without a host-side allowlist. `memories_filed_away`
-  is not among them: it unlinks the checkpoint ack file, so the catalog
-  omits `readOnlyHint` (MCP default false). Server `--read-only` still hides
-  and refuses that tool.
+- **Read-only MCP tools advertise `annotations.readOnlyHint`.**
+  Twenty-two inspection tools (`status`, `list_wings`, `list_rooms`,
+  `get_taxonomy`, `get_aaak_spec`, `search`, `check_duplicate`,
+  `get_drawer`, `get_drawers`, `list_drawers`, `diary_read`, `kg_query`,
+  `kg_timeline`, `kg_stats`, `traverse`, `find_tunnels`, `graph_stats`,
+  `mesh_peers`, `list_tunnels`, `list_hallways`, `event_list`,
+  `artifact_get`) set `read_only: true` in the catalog so plan modes and
+  read-only subagents can admit memory search and graph/hallway recall
+  without a host-side allowlist. `memories_filed_away` is not among
+  them: it unlinks the checkpoint ack file. `follow_tunnels` is not
+  among them: it potentiates the tunnel file. The catalog omits
+  `readOnlyHint` for both (MCP default false). Server `--read-only`
+  still hides and refuses `memories_filed_away`.
 - **`mempalace_search` description is scoped to past sessions** (under
   200 characters) so small models and schema-pruning harnesses do not
-  call it for referents from the current conversation.
+  call it for referents from the current conversation. It also keeps
+  the keyword rule: `query` is keywords only; put background in
+  `context`.
 
 - **`hallways --rebuild` holds the palace writer lock,** so a mine cannot save
   a newer snapshot between the rebuild's scan and its save. It, `rooms apply`,
