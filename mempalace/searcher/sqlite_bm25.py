@@ -170,6 +170,7 @@ def _bm25_only_via_sqlite(
                 """
             )
             params.extend([key, value])
+        clauses.append(registry_metadata_exclusion_sql(row_id_expr))
         for op, sql_bound in _window_sql_prefilters(since_dt, before_dt):
             clauses.append(
                 f"""
@@ -319,6 +320,8 @@ def _bm25_only_via_sqlite(
     candidates = []
     for d in drawers.values():
         meta = d["metadata"]
+        if is_registry_sentinel(meta):
+            continue
         if wing and meta.get("wing") != wing:
             continue
         if room and meta.get("room") != room:
@@ -412,7 +415,7 @@ def _merge_bm25_union_candidates(
     before admitting them, preserving the same distance guarantee as the
     vector-only path.
     """
-    where = build_where_filter(wing, room, source_file)
+    where = drawer_search_where(wing, room, source_file)
     try:
         lexical = drawers_col.lexical_search(
             query=query,
@@ -435,6 +438,8 @@ def _merge_bm25_union_candidates(
     bm25_extra = []
     for hit in lexical.hits:
         meta = hit.metadata or {}
+        if is_registry_sentinel(meta):
+            continue
         # The window applies to every candidate source; a lexically strong
         # drawer outside [since, before) must not enter through this side
         # door (the vector-path candidates are filtered upstream).
