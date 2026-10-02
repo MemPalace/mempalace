@@ -4,7 +4,6 @@ import errno
 import json
 import os
 import stat
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -32,12 +31,10 @@ def test_allocation_permission_failure_is_immediate_and_preserves_old_bytes(
     def refuse_adjacent_temporary_file(path, *args, **kwargs):
         if Path(path).parent == hallway_file.parent and Path(path).name.startswith(".hallways-"):
             attempts.append(path)
+            assert len(attempts) == 1, "permission failures must not be retried"
             raise failure
         return real_open(path, *args, **kwargs)
 
-    # Keep the original Windows mkstemp path safe during the RED reproduction.
-    # Its permission retry budget can otherwise be billions of attempts.
-    monkeypatch.setattr(tempfile, "TMP_MAX", 8)
     monkeypatch.setattr(os, "open", refuse_adjacent_temporary_file)
 
     with pytest.raises(OSError) as raised:
