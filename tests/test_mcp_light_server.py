@@ -520,7 +520,7 @@ class TestSearchEnrichment:
         monkeypatch.setattr(
             mcp_server,
             "tool_follow_tunnels",
-            lambda wing, room: [
+            lambda wing, room, record=True: [
                 {
                     "connected_wing": "guidelines",
                     "connected_room": "rx",

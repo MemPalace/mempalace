@@ -11,7 +11,7 @@ from pathlib import Path
 
 INSTRUCTIONS_DIR = Path(__file__).parent / "instructions"
 
-AVAILABLE = ["init", "search", "mine", "help", "status"]
+AVAILABLE = ["init", "search", "mine", "help", "status", "audit"]
 
 # Longest-first so mempalace_kg_add cannot eat a prefix of a longer name.
 MCP_LIGHT_SUBSTITUTIONS = (

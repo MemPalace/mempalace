@@ -391,7 +391,7 @@ def main():
         help="Output skill instructions to stdout",
     )
     instructions_sub = p_instructions.add_subparsers(dest="instructions_name")
-    for instr_name in ["init", "search", "mine", "help", "status"]:
+    for instr_name in ["init", "search", "mine", "help", "status", "audit"]:
         instructions_sub.add_parser(instr_name, help=f"Output {instr_name} instructions")
 
     # rules
@@ -614,6 +614,144 @@ def main():
     p_hallways = sub.add_parser("hallways", help="List entity hallways (associative graph)")
     p_hallways.add_argument("--wing", default=None, help="Filter to one wing")
     p_hallways.add_argument("--limit", type=int, default=50, help="Max hallways to show")
+    p_hallways.add_argument(
+        "--prune-spellings",
+        action="store_true",
+        help="Remove hallways older mines wrote per entity spelling: self-links "
+        "(main.zig / src/main.zig) and duplicate spellings of one association; "
+        "dry run unless --yes",
+    )
+    p_hallways.add_argument("--yes", action="store_true", help="Apply --prune-spellings")
+    p_hallways.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Recompute hallways from drawer entities for --wing (or every wing); use after "
+        "`wings split`, which drops the split wing's records",
+    )
+    p_audit = sub.add_parser(
+        "audit",
+        help="Score how well organized the palace is (rooms, naming, tunnels, hallways, KG)",
+    )
+    p_audit.add_argument("--json", action="store_true", help="Emit the full report as JSON")
+    p_audit.add_argument(
+        "--quiet", action="store_true", help="Suppress the per-step progress lines on stderr"
+    )
+    p_audit.add_argument(
+        "--fail-under",
+        type=int,
+        default=None,
+        metavar="SCORE",
+        help="Exit 2 when the overall score is below SCORE (for CI or cron checks)",
+    )
+    p_rooms = sub.add_parser(
+        "rooms", help="Propose a closed room set for a wing with an LLM, then assign drawers to it"
+    )
+    rooms_sub = p_rooms.add_subparsers(dest="rooms_action")
+    p_rooms_propose = rooms_sub.add_parser(
+        "propose", help="Sample a wing and ask the LLM for a closed room set (saved for review)"
+    )
+    p_rooms_propose.add_argument("--wing", required=True, help="Wing to design rooms for")
+    p_rooms_propose.add_argument(
+        "--sample", type=int, default=60, help="Drawers to sample (default 60)"
+    )
+    p_rooms_propose.add_argument("--seed", type=int, default=0, help="Sampling seed (default 0)")
+    p_rooms_propose.add_argument(
+        "--max-rooms", type=int, default=12, help="Upper bound on proposed rooms (default 12)"
+    )
+    p_rooms_propose.add_argument(
+        "--llm-provider", default="ollama", choices=["ollama", "openai-compat", "anthropic"]
+    )
+    p_rooms_propose.add_argument("--llm-model", default="gemma4:e4b")
+    p_rooms_propose.add_argument("--llm-endpoint", default=None)
+    p_rooms_propose.add_argument("--llm-api-key", default=None)
+    p_rooms_propose.add_argument(
+        "--llm-timeout",
+        type=int,
+        default=600,
+        help="Seconds to wait for the LLM; a local model labelling 60 excerpts can take minutes "
+        "(default 600)",
+    )
+    p_rooms_propose.add_argument(
+        "--accept-external-llm",
+        action="store_true",
+        help="Allow the sampled excerpts to be sent to a non-local LLM endpoint",
+    )
+    p_rooms_apply = rooms_sub.add_parser(
+        "apply", help="Assign every drawer in the wing to its nearest room (dry run unless --yes)"
+    )
+    p_rooms_apply.add_argument("--wing", required=True, help="Wing whose room set to apply")
+    p_rooms_apply.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Minimum cosine similarity to move a drawer; below it the drawer keeps its room "
+        "(default 0.30)",
+    )
+    p_rooms_apply.add_argument(
+        "--from",
+        dest="from_rooms",
+        default=None,
+        metavar="ROOMS",
+        help="Comma-separated rooms whose drawers may move (default: the miner's generic rooms "
+        "general,technical,architecture,planning,problems); 'all' reclassifies every drawer",
+    )
+    p_rooms_apply.add_argument(
+        "--show",
+        type=int,
+        default=0,
+        metavar="N",
+        help="On a dry run, print N example drawers per destination room",
+    )
+    p_rooms_apply.add_argument("--yes", action="store_true", help="Write the room changes")
+    p_wings = sub.add_parser(
+        "wings", help="Wing maintenance: split a transcript wing by source project"
+    )
+    wings_sub = p_wings.add_subparsers(dest="wings_action")
+    p_wings_split = wings_sub.add_parser(
+        "split",
+        help="Re-key a machine-level transcript wing into one wing per source project "
+        "(plan file first; --yes applies)",
+    )
+    p_wings_split.add_argument("--wing", required=True, help="Wing to split")
+    p_wings_split.add_argument(
+        "--yes", action="store_true", help="Apply the saved plan (<palace>/wings/split-<wing>.json)"
+    )
+    p_kg = sub.add_parser("kg", help="Knowledge graph maintenance")
+    kg_sub = p_kg.add_subparsers(dest="kg_action")
+    p_kg_norm = kg_sub.add_parser(
+        "normalize",
+        help="Map one-off predicates onto a closed vocabulary with the LLM (plan first; "
+        "--yes applies, keeping history)",
+    )
+    p_kg_norm.add_argument(
+        "--vocabulary",
+        default=None,
+        help="Comma-separated allowed predicates (default: works_on,owns,depends_on,uses,"
+        "decided,status,located_in,measured)",
+    )
+    p_kg_norm.add_argument("--yes", action="store_true", help="Apply <palace>/kg/normalize.json")
+    p_kg_norm.add_argument(
+        "--llm-provider", default="ollama", choices=["ollama", "openai-compat", "anthropic"]
+    )
+    p_kg_norm.add_argument("--llm-model", default="gemma4:e4b")
+    p_kg_norm.add_argument("--llm-endpoint", default=None)
+    p_kg_norm.add_argument("--llm-api-key", default=None)
+    p_kg_norm.add_argument("--llm-timeout", type=int, default=600)
+    p_kg_norm.add_argument("--accept-external-llm", action="store_true")
+    p_tunnels = sub.add_parser("tunnels", help="Propose or prune cross-wing tunnels")
+    tunnels_sub = p_tunnels.add_subparsers(dest="tunnels_action")
+    p_tunnels_propose = tunnels_sub.add_parser(
+        "propose",
+        help="Rank shared entities across wings into a reviewable tunnel plan (--yes creates them)",
+    )
+    p_tunnels_propose.add_argument("--max", type=int, default=60, help="Cap on proposed tunnels")
+    p_tunnels_propose.add_argument("--yes", action="store_true", help="Create the saved plan")
+    p_tunnels_prune = tunnels_sub.add_parser(
+        "prune",
+        help="Remove tunnels on generic tokens, missing wings or duplicate spellings (dry run "
+        "unless --yes)",
+    )
+    p_tunnels_prune.add_argument("--yes", action="store_true", help="Apply the prune")
     p_status = sub.add_parser("status", help="Show what's been filed")
     p_status.add_argument(
         "--backend",
@@ -1012,6 +1150,11 @@ def main():
         "migrate": cmd_migrate,
         "migrate-wings": cmd_migrate_wings,
         "hallways": cmd_hallways,
+        "audit": cmd_audit,
+        "rooms": cmd_rooms,
+        "wings": cmd_wings,
+        "kg": cmd_kg,
+        "tunnels": cmd_tunnels,
         "status": cmd_status,
         "update": cmd_update,
     }
