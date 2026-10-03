@@ -762,11 +762,10 @@ def test_cmd_rooms_apply_resumes_a_marker_written_before_inputs_were_recorded(
 
 
 def test_cmd_rooms_apply_keeps_the_marker_when_closets_fail_to_open(tmp_path, monkeypatch, capsys):
-    """Only a never-created closet collection means "no closets"."""
+    """A failure after the drawer phase must retain the valid closet snapshot."""
     import contextlib
 
     import mempalace.cli as cli
-    from mempalace.backends import CollectionNotInitializedError
     from mempalace.rooms import pending_apply_path
 
     cfg = MempalaceConfig(palace_path=str(tmp_path))
@@ -785,21 +784,145 @@ def test_cmd_rooms_apply_keeps_the_marker_when_closets_fail_to_open(tmp_path, mo
     monkeypatch.setattr("mempalace.embedding.get_embedding_function", lambda: FakeEmbed())
     monkeypatch.setattr("mempalace.palace.mine_palace_lock", lambda p: contextlib.nullcontext())
     ns = Namespace(rooms_action="apply", palace=str(tmp_path), wing="w", threshold=0.75, yes=True)
+    closets = FakeCollection(
+        [{"id": "k1", "meta": {"wing": "w", "room": "technical", "source_file": "s1"}}]
+    )
+    opens = 0
 
     def broken(*a, **k):
+        nonlocal opens
+        opens += 1
+        if opens == 1:
+            return closets
         raise OSError("disk I/O error")
 
     monkeypatch.setattr("mempalace.palace.get_closets_collection", broken)
     with pytest.raises(OSError):
         cli.cmd_rooms(ns)
     assert os.path.isfile(pending_apply_path(cfg, "w"))  # recovery still pending
+    assert col.rows["a"]["meta"]["room"] == "releases"
+    assert closets.rows["k1"]["meta"]["room"] == "technical"
+
+    monkeypatch.setattr("mempalace.palace.get_closets_collection", lambda *a, **k: closets)
+    cli.cmd_rooms(ns)
+    assert closets.rows["k1"]["meta"]["room"] == "releases"
+    assert not os.path.exists(pending_apply_path(cfg, "w"))
+
+
+@pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.parametrize("failure_stage", ["open", "read"])
+def test_cmd_rooms_apply_snapshot_failure_does_not_write(
+    tmp_path, monkeypatch, capsys, pending, failure_stage
+):
+    """An unreadable snapshot is never a successful empty snapshot, even on retry."""
+    import contextlib
+    from pathlib import Path
+
+    import mempalace.cli as cli
+    from mempalace.rooms import pending_apply_path
+
+    cfg = MempalaceConfig(palace_path=str(tmp_path))
+    save_room_set(cfg, _room_set())
+    col = FakeCollection(
+        [
+            {
+                "id": "a",
+                "meta": {"wing": "w", "room": "technical", "source_file": "s1"},
+                "doc": "cut the release",
+                "emb": [1.0, 0.0],
+            }
+        ]
+    )
+    closets = FakeCollection(
+        [{"id": "k1", "meta": {"wing": "w", "room": "technical", "source_file": "s1"}}]
+    )
+    marker = Path(pending_apply_path(cfg, "w"))
+    if pending:
+        # A safe legacy marker still needs its identities resolved before writing.
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            json.dumps({"wing": "w", "closets": [["s1", "technical", "releases"]]}),
+            encoding="utf-8",
+        )
+    before = marker.read_bytes() if pending else None
+    monkeypatch.setattr("mempalace.palace.get_collection", lambda *a, **k: col)
+    monkeypatch.setattr("mempalace.embedding.get_embedding_function", lambda: FakeEmbed())
+    monkeypatch.setattr("mempalace.palace.mine_palace_lock", lambda p: contextlib.nullcontext())
+    real_get = closets.get
+    failed = False
+
+    def fail_once():
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("transient closet snapshot failure")
+
+    def open_closets(*a, **k):
+        if failure_stage == "open":
+            fail_once()
+        return closets
+
+    def read_closets(**kwargs):
+        if failure_stage == "read":
+            fail_once()
+        return real_get(**kwargs)
+
+    monkeypatch.setattr("mempalace.palace.get_closets_collection", open_closets)
+    monkeypatch.setattr(closets, "get", read_closets)
+    ns = Namespace(rooms_action="apply", palace=str(tmp_path), wing="w", threshold=0.75, yes=True)
+    with pytest.raises(OSError, match="transient closet snapshot failure"):
+        cli.cmd_rooms(ns)
+    assert not col.updates and not closets.updates
+    assert col.rows["a"]["meta"]["room"] == "technical"
+    assert closets.rows["k1"]["meta"]["room"] == "technical"
+    assert "Moved" not in capsys.readouterr().out
+    if pending:
+        assert marker.read_bytes() == before
+    else:
+        assert not marker.exists()
+
+    cli.cmd_rooms(ns)
+    assert col.rows["a"]["meta"]["room"] == "releases"
+    assert closets.rows["k1"]["meta"]["room"] == "releases"
+    assert col.rows["a"]["doc"] == "cut the release"
+    assert "1 closets followed" in capsys.readouterr().out
+    assert not marker.exists()
+
+
+def test_cmd_rooms_apply_without_a_closet_collection(tmp_path, monkeypatch, capsys):
+    """A collection that was never initialized still permits a drawer-only apply."""
+    import contextlib
+
+    import mempalace.cli as cli
+    from mempalace.backends import CollectionNotInitializedError
+    from mempalace.rooms import pending_apply_path
+
+    cfg = MempalaceConfig(palace_path=str(tmp_path))
+    save_room_set(cfg, _room_set())
+    col = FakeCollection(
+        [
+            {
+                "id": "a",
+                "meta": {"wing": "w", "room": "technical", "source_file": "s1"},
+                "doc": "cut the release",
+                "emb": [1.0, 0.0],
+            }
+        ]
+    )
 
     def absent(*a, **k):
         raise CollectionNotInitializedError("mempalace_closets")
 
+    monkeypatch.setattr("mempalace.palace.get_collection", lambda *a, **k: col)
     monkeypatch.setattr("mempalace.palace.get_closets_collection", absent)
-    cli.cmd_rooms(ns)
-    assert not os.path.exists(pending_apply_path(cfg, "w"))  # nothing to re-key
+    monkeypatch.setattr("mempalace.embedding.get_embedding_function", lambda: FakeEmbed())
+    monkeypatch.setattr("mempalace.palace.mine_palace_lock", lambda p: contextlib.nullcontext())
+    cli.cmd_rooms(
+        Namespace(rooms_action="apply", palace=str(tmp_path), wing="w", threshold=0.75, yes=True)
+    )
+    assert col.rows["a"]["meta"]["room"] == "releases"
+    assert "Moved 1 drawers. 0 closets followed." in capsys.readouterr().out
+    assert not os.path.exists(pending_apply_path(cfg, "w"))
 
 
 def test_rekey_closets_retry_does_not_follow_intermediate_room():

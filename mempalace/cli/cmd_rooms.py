@@ -195,12 +195,9 @@ def cmd_rooms(args):
         # Closet identities must be snapshotted before any write: a retry that
         # only sees current room metadata can feed an intermediate room into
         # the next mapping of a chained plan.
-        try:
-            closets_col = _open_closets_collection(palace_path)
-        except Exception:
-            # Snapshot unavailable; final open below still enforces the
-            # "keep the marker on unexpected open failure" contract.
-            closets_col = None
+        # Only a never-created collection is empty. An unreadable snapshot
+        # must abort before drawer writes or changes to the recovery marker.
+        closets_col = _open_closets_collection(palace_path)
         if pending is None:
             if not plan.changes:
                 print("  Nothing to change.")
