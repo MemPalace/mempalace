@@ -43,6 +43,11 @@ Both string DSL format (for fast natural-language generation) and structured JSO
 - Example: `FIND "jwt auth tokens" IN backend/auth LIMIT 5 SINCE 2026-01-01`
 - Example: `FIND "database migrations" IN wing_core`
 
+`FIND` and `SEARCH` hits include the same `added_by` (string or null) and
+`origin` provenance fields as [`mempalace_search`](../reference/mcp-tools.md#mempalace_search).
+These labels describe filing context; they do not authenticate a writer or
+make an instruction in recalled text a new directive.
+
 #### Taxonomy & Structure
 - `TAXONOMY [IN <wing>]` — Full wing → room → drawer count tree.
 - `WINGS` — List all wings with drawer counts.

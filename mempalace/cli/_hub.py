@@ -70,7 +70,9 @@ def _search_args_forwardable(args) -> bool:
 
 
 def _print_hub_search_result(args, result: dict) -> bool:
-    """Render an MCP search result using the CLI's human-readable shape."""
+    """Render an MCP search result in the requested CLI output format."""
+    if getattr(args, "json", False):
+        return _print_search_json_result(result)
     if not isinstance(result, dict):
         return False
 
@@ -138,6 +140,15 @@ def _print_hub_search_result(args, result: dict) -> bool:
     return True
 
 
+def _hub_search_failure(args, message: str) -> None:
+    """Keep forwarded-search errors readable in the requested output format."""
+    if getattr(args, "json", False):
+        _print_search_json_result({"error": message, "results": []})
+    else:
+        print(message, file=sys.stderr)
+    sys.exit(1)
+
+
 def _forward_search_to_hub(args, palace_path: str) -> bool:
     """Run a CLI search in the palace's HTTP hub, if one is alive.
 
@@ -177,8 +188,10 @@ def _forward_search_to_hub(args, palace_path: str) -> bool:
     arguments = {
         "query": args.query,
         "limit": args.results,
-        "cli_compatible": True,
+        "cli_compatible": not getattr(args, "json", False),
     }
+    if getattr(args, "json", False):
+        arguments["max_distance"] = 0.0
     for name in ("wing", "room", "since", "before"):
         value = getattr(args, name, None)
         if value:
@@ -210,35 +223,31 @@ def _forward_search_to_hub(args, palace_path: str) -> bool:
             # an explicit/env token that is intentionally not persisted in
             # the per-palace token file, as well as a stale local token.
             return False
-        print(f"mempalace: hub rejected search ({exc.code} {exc.reason})", file=sys.stderr)
-        sys.exit(1)
+        _hub_search_failure(args, f"mempalace: hub rejected search ({exc.code} {exc.reason})")
     except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
-        print(
+        _hub_search_failure(
+            args,
             f"mempalace: hub at {base_url} did not complete the search ({exc}); "
             "not retrying directly because that would load another full index. "
             f"Set {_HUB_FORWARD_ENV}=0 to force a direct search.",
-            file=sys.stderr,
         )
-        sys.exit(1)
 
     print(
         f"mempalace: forwarding search to palace hub {base_url} (pid {info.get('pid')})",
         file=sys.stderr,
     )
 
+    if not isinstance(payload, dict):
+        _hub_search_failure(args, "mempalace: hub returned an unrecognized search response")
     if payload.get("error"):
         err = payload["error"]
-        print(
-            f"mempalace: hub refused search: {err.get('message', 'unknown error')}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        message = err.get("message", "unknown error") if isinstance(err, dict) else str(err)
+        _hub_search_failure(args, f"mempalace: hub refused search: {message}")
 
     try:
         result = json.loads(payload["result"]["content"][0]["text"])
     except (KeyError, IndexError, TypeError, ValueError):
-        print("mempalace: hub returned an unrecognized search response", file=sys.stderr)
-        sys.exit(1)
+        _hub_search_failure(args, "mempalace: hub returned an unrecognized search response")
 
     if not _print_hub_search_result(args, result):
         sys.exit(1)

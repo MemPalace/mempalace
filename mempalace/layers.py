@@ -20,11 +20,13 @@ which backends honour that.
 
 import os
 import sys
+import unicodedata
 from pathlib import Path
 from collections import defaultdict
 
 from .config import MempalaceConfig
 from .palace import MineAlreadyRunning, get_collection as _get_collection
+from .provenance import memory_provenance
 from .searcher import (
     _distance_to_similarity,
     _first_or_empty,
@@ -67,6 +69,21 @@ def _read_open_failure(exc: Exception) -> str:
             "stop that process or wait for it to finish."
         )
     return "No palace found. Run: mempalace mine <dir>"
+
+
+def _digest_label(value: str, limit: int = 80) -> str:
+    """Render caller-supplied metadata as one bounded, literal digest label."""
+    prefix = value[: limit * 4]
+    text = " ".join(
+        "".join(
+            " " if unicodedata.category(char).startswith("C") else char for char in prefix
+        ).split()
+    )
+    if len(text) > limit or len(value) > len(prefix):
+        text = text[: limit - 3].rstrip() + "..."
+    for char in ("\\", "[", "]", "`"):
+        text = text.replace(char, "\\" + char)
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -183,16 +200,18 @@ class Layer1:
 
     def generate(self) -> str:
         """Pull top drawers from the palace and format as compact L1 text."""
+        max_chars = max(0, self.MAX_CHARS)
         try:
             col = _open_for_read(self.palace_path)
         except Exception as exc:
             message = _read_open_failure(exc)
-            return message if message.startswith("## ") else f"## L1 — {message}"
+            text = message if message.startswith("## ") else f"## L1 — {message}"
+            return text[:max_chars]
 
         docs, metas = self._fetch_candidates(col)
 
         if not docs:
-            return "## L1 — No memories yet."
+            return "## L1 — No memories yet."[:max_chars]
 
         # Score each drawer: prefer high importance, then most-recent filing.
         # NOTE: the ingest pipeline (miner, convo_miner, diary, add_drawer)
@@ -236,19 +255,20 @@ class Layer1:
         by_room = defaultdict(list)
         for imp, meta, doc in top:
             room = meta.get("room", "general")
+            if not isinstance(room, str):
+                room = "general"
             by_room[room].append((imp, meta, doc))
 
-        # Build compact text
-        lines = ["## L1 — ESSENTIAL STORY"]
-
-        total_len = 0
+        # Build complete entries before budgeting so every displayed identity
+        # stays attached to its snippet. There are at most MAX_DRAWERS entries.
+        header = "## L1 — ESSENTIAL STORY"
+        blocks = []
         for room, entries in sorted(by_room.items()):
-            room_line = f"\n[{room}]"
-            lines.append(room_line)
-            total_len += len(room_line)
+            room_header = f"\n\n[{_digest_label(room)}]"
 
             for _imp, meta, doc in entries:
-                source = Path(meta.get("source_file", "")).name if meta.get("source_file") else ""
+                source_file = meta.get("source_file")
+                source = Path(source_file).name if isinstance(source_file, str) else ""
 
                 # Truncate doc to keep L1 compact
                 snippet = doc.strip().replace("\n", " ")
@@ -257,16 +277,30 @@ class Layer1:
 
                 entry_line = f"  - {snippet}"
                 if source:
-                    entry_line += f"  ({source})"
+                    entry_line += f"  ({_digest_label(source)})"
+                provenance = memory_provenance(meta)
+                if provenance["origin"] in {"agent_note", "diary"}:
+                    writer = _digest_label(provenance["added_by"] or "unknown") or "unknown"
+                    entry_line += f"  [filed by {writer}]"
 
-                if total_len + len(entry_line) > self.MAX_CHARS:
-                    lines.append("  ... (more in L3 search)")
-                    return "\n".join(lines)
+                blocks.append(room_header + "\n" + entry_line)
+                room_header = ""
 
-                lines.append(entry_line)
-                total_len += len(entry_line)
+        text = header + "".join(blocks)
+        if len(text) <= max_chars:
+            return text
 
-        return "\n".join(lines)
+        # Account for the whole output, including its header, all separators,
+        # room headers, and omission marker. The old counter omitted these.
+        marker = "\n  ... (more in L3 search)"
+        text = header[:max_chars]
+        if len(text) + len(marker) > max_chars:
+            return text
+        for block in blocks:
+            if len(text) + len(block) + len(marker) > max_chars:
+                break
+            text += block
+        return text + marker
 
 
 # ---------------------------------------------------------------------------

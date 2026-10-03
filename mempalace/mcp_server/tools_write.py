@@ -539,6 +539,7 @@ def tool_add_drawer(
         "room": room,
         "source_file": source_file or "",
         "added_by": added_by,
+        "origin": "agent_note",
         "filed_at": datetime.now().isoformat(),
         "id_recipe": ID_RECIPE,
     }

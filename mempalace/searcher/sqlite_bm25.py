@@ -337,6 +337,7 @@ def _bm25_only_via_sqlite(
                 "source_file": Path(full_source).name if full_source else "?",
                 "source_path": full_source,
                 **_result_date_fields(meta),
+                **memory_provenance(meta),
                 # No vector distance available in BM25-only mode.
                 "similarity": None,
                 "distance": None,
@@ -457,6 +458,7 @@ def _merge_bm25_union_candidates(
                 "source_file": Path(full_source).name if full_source else "?",
                 "source_path": full_source,
                 **_result_date_fields(meta),
+                **memory_provenance(meta),
                 "similarity": (
                     None
                     if distance is None

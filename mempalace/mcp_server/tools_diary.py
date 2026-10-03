@@ -64,6 +64,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             "hall": "hall_diary",
             "topic": topic,
             "type": "diary_entry",
+            "origin": "diary",
             "agent": agent_name,
             "filed_at": now.isoformat(),
             "date": now.strftime("%Y-%m-%d"),

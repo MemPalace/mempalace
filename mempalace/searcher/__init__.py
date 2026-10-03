@@ -42,6 +42,7 @@ from ..palace import (
     get_collection,
     resolve_backend_name,
 )
+from ..provenance import memory_provenance
 
 # Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
 # Multiple lines may join with newlines inside one closet document.

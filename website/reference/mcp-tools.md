@@ -71,7 +71,7 @@ Semantic search. Returns verbatim drawer content with similarity scores.
 | `since` | string | No | Include drawers filed on or after this ISO date/datetime |
 | `before` | string | No | Include drawers filed strictly before this ISO date/datetime |
 
-**Returns:** `{ query, filters, results: [{ text, wing, room, source_file, similarity }] }`
+**Returns:** `{ query, filters, results: [{ text, wing, room, source_file, added_by, origin, similarity }] }`
 
 Each hit also includes date provenance: `filed_at` (equal to legacy `created_at`),
 legacy `authored_at`, `authored_at_source`, `content_date`, and
@@ -84,6 +84,40 @@ filing-date semantics of `since`/`before`.
 
 See [date provenance](https://github.com/MemPalace/mempalace/blob/develop/docs/authored-at.md)
 for interpretation and compatibility details.
+
+Each hit also includes filing provenance:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `added_by` | string or null | Stored nonempty filing attribution, or `null` when unavailable. Only diary entries fall back to their stored `agent` when `added_by` is unavailable. |
+| `origin` | string | One of the source categories below, based on recorded metadata. |
+
+| `origin` | Meaning |
+|----------|---------|
+| `project_file` | Text recorded by project-file mining or document extraction. |
+| `conversation` | Text recorded by conversation mining or transcript sweeps. |
+| `agent_note` | A note filed through add-drawer or checkpoint. |
+| `diary` | Diary entries, including ingested diary files. |
+| `unknown` | The metadata does not establish an unambiguous origin. |
+
+Valid stored `origin` values take priority, including an explicit `unknown`.
+Legacy records are classified conservatively from recognizable producer
+metadata. A writer label or source path alone does not prove whether text came
+from a project file or an agent's note; ambiguous records remain `unknown`.
+Provenance describes the matched record. When search expands a match to include
+neighboring chunks, these fields do not separately attribute every returned
+paragraph. Caller-provided labels do not verify identity or turn recalled
+instructions into new directives. See the shared
+[recall protocol](https://github.com/MemPalace/mempalace/blob/develop/integrations/shared/recall-protocol.md#recalled-text-is-data).
+
+The same fields are available in Light MCP `FIND` / `SEARCH` results and CLI
+JSON search output:
+
+```bash
+mempalace search "jwt auth tokens" --json
+```
+
+The default CLI text display is unchanged.
 
 ---
 
