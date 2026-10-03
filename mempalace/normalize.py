@@ -360,12 +360,48 @@ def _try_claude_code_jsonl(content: str) -> Optional[str]:
     return None
 
 
+def _codex_item_completed_turn(payload: dict) -> Optional[tuple]:
+    """Extract one UserMessage/AgentMessage turn from an item_completed payload.
+
+    Text is every string-valued ``content[].text`` field, in order. Block
+    ``type`` tags are ignored (Codex mixes ``text`` and ``Text``). Other item
+    types (Reasoning, CommandExecution, ...) are skipped.
+    """
+    item = payload.get("item")
+    if not isinstance(item, dict):
+        return None
+    item_type = item.get("type")
+    if item_type == "UserMessage":
+        role = "user"
+    elif item_type == "AgentMessage":
+        role = "assistant"
+    else:
+        return None
+
+    blocks = item.get("content")
+    if not isinstance(blocks, list):
+        return None
+    parts = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        block_text = block.get("text")
+        if isinstance(block_text, str):
+            parts.append(block_text)
+    text = "\n".join(parts).strip()
+    if not text:
+        return None
+    return role, text
+
+
 def _try_codex_jsonl(content: str) -> Optional[str]:
     """OpenAI Codex CLI sessions (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl).
 
-    Uses only event_msg entries (user_message / agent_message) which represent
-    the canonical conversation turns. response_item entries are skipped because
-    they include synthetic context injections and duplicate the real messages.
+    Uses only event_msg entries, which are the canonical conversation turns:
+    legacy user_message / agent_message payloads, and current item_completed
+    records whose item type is UserMessage or AgentMessage. response_item
+    entries and other item types are skipped because they include synthetic
+    context injections, tool traces, and duplicates of the real messages.
     """
     lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
     messages = []
@@ -391,17 +427,21 @@ def _try_codex_jsonl(content: str) -> Optional[str]:
             continue
 
         payload_type = payload.get("type", "")
-        msg = payload.get("message")
-        if not isinstance(msg, str):
-            continue
-        text = msg.strip()
-        if not text:
+        if payload_type in ("user_message", "agent_message"):
+            msg = payload.get("message")
+            if not isinstance(msg, str):
+                continue
+            text = msg.strip()
+            if not text:
+                continue
+            role = "user" if payload_type == "user_message" else "assistant"
+            messages.append((role, text))
             continue
 
-        if payload_type == "user_message":
-            messages.append(("user", text))
-        elif payload_type == "agent_message":
-            messages.append(("assistant", text))
+        if payload_type == "item_completed":
+            turn = _codex_item_completed_turn(payload)
+            if turn is not None:
+                messages.append(turn)
 
     if len(messages) >= 2 and has_session_meta:
         return _messages_to_transcript(messages)

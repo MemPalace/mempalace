@@ -458,6 +458,172 @@ def test_codex_jsonl_payload_not_dict():
     assert result is not None
 
 
+def _codex_item_completed(item):
+    return {
+        "type": "event_msg",
+        "payload": {"type": "item_completed", "item": item},
+    }
+
+
+def test_codex_jsonl_item_completed_user_and_agent_messages():
+    """Current Codex CLI records turns as item_completed UserMessage/AgentMessage.
+
+    Reasoning and other item types are skipped. Text comes from string-valued
+    content[].text fields regardless of block type casing.
+    """
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {}}),
+        json.dumps(
+            _codex_item_completed(
+                {
+                    "type": "UserMessage",
+                    "id": "u1",
+                    "content": [{"type": "text", "text": "hello"}],
+                }
+            )
+        ),
+        json.dumps(
+            _codex_item_completed(
+                {"type": "Reasoning", "summary_text": ["hidden-trace"], "raw_content": []}
+            )
+        ),
+        json.dumps(
+            _codex_item_completed(
+                {
+                    "type": "CommandExecution",
+                    "command": "DO_NOT_MINE",
+                    "content": [{"type": "text", "text": "command output"}],
+                }
+            )
+        ),
+        json.dumps(
+            _codex_item_completed(
+                {
+                    "type": "AgentMessage",
+                    "id": "a1",
+                    "content": [{"type": "Text", "text": "hi there"}],
+                    "phase": "commentary",
+                }
+            )
+        ),
+    ]
+    raw = "\n".join(lines)
+    result = _try_codex_jsonl(raw)
+    assert result == "> hello\nhi there\n"
+    assert "hidden-trace" not in result
+    assert "DO_NOT_MINE" not in result
+    assert "command output" not in result
+    assert "item_completed" not in result
+
+
+def test_codex_jsonl_item_completed_text_fields_ignore_block_type(tmp_path):
+    """Block type tags are not a gate; every string text field is kept in order."""
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {}}),
+        json.dumps(
+            _codex_item_completed(
+                {
+                    "type": "UserMessage",
+                    "content": [
+                        {"type": "input_image", "image_url": "skip-me"},
+                        {"type": "TEXT", "text": "one"},
+                        "not-a-block",
+                        {"type": "text", "text": 123},
+                        {"text": "two"},
+                    ],
+                }
+            )
+        ),
+        json.dumps(
+            _codex_item_completed(
+                {
+                    "type": "AgentMessage",
+                    "content": [{"type": "Text", "text": "three"}],
+                }
+            )
+        ),
+    ]
+    raw = "\n".join(lines)
+    assert _try_codex_jsonl(raw) == "> one\ntwo\nthree\n"
+
+    source = tmp_path / "rollout.jsonl"
+    source.write_text(raw, encoding="utf-8")
+    conversations = normalize_conversations(str(source))
+    assert conversations == ["> one\ntwo\nthree\n"]
+    assert "item_completed" not in conversations[0]
+
+
+def test_codex_jsonl_legacy_and_item_completed_side_by_side():
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {}}),
+        json.dumps(
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "legacy q"}}
+        ),
+        json.dumps(
+            _codex_item_completed(
+                {"type": "AgentMessage", "content": [{"type": "Text", "text": "new a"}]}
+            )
+        ),
+        json.dumps(
+            _codex_item_completed(
+                {"type": "UserMessage", "content": [{"type": "text", "text": "new q"}]}
+            )
+        ),
+        json.dumps(
+            {"type": "event_msg", "payload": {"type": "agent_message", "message": "legacy a"}}
+        ),
+    ]
+    result = _try_codex_jsonl("\n".join(lines))
+    assert result == "> legacy q\nnew a\n\n> new q\nlegacy a\n"
+
+
+def test_codex_jsonl_item_completed_issue_fixture_normalizes(tmp_path):
+    """Issue #2589 minimal lines must become a transcript, not raw JSON."""
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {}}),
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "id": "...",
+                        "content": [{"type": "text", "text": "hello"}],
+                    },
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {"type": "Reasoning", "summary_text": [], "raw_content": []},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "AgentMessage",
+                        "id": "...",
+                        "content": [{"type": "Text", "text": "hi there"}],
+                        "phase": "commentary",
+                    },
+                },
+            }
+        ),
+    ]
+    source = tmp_path / "rollout.jsonl"
+    source.write_text("\n".join(lines), encoding="utf-8")
+    conversations = normalize_conversations(str(source))
+    assert conversations == ["> hello\nhi there\n"]
+
+
 # ── _try_gemini_jsonl ──────────────────────────────────────────────────
 #
 # Gemini CLI sessions live at ``~/.gemini/tmp/<project_hash>/chats/`` as
