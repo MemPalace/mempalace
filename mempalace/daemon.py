@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import math
 import os
 import secrets
@@ -869,7 +870,62 @@ def _close_or_defer_writer_lease(
         writer_lease.close()
 
 
-def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -> None:
+# --- Foreground/lifecycle logging (#2475) ---------------------------------
+#
+# run_server (both the foreground in-process path and the detached ``serve``
+# child) emitted no structured output of its own: the HTTP handler's
+# ``log_message`` was a deliberate no-op, so a supervisor capturing the daemon
+# via stdout/stderr (launchd StandardOutPath/StandardErrorPath) saw an empty
+# file for the life of a healthy run.
+#
+# Stream contract for the daemon's own records:
+#   INFO  -> stdout   lifecycle lines (startup/shutdown) + HTTP access lines
+#   ERROR -> stderr   HTTP error lines (http.server.log_error)
+# The background path is unaffected: its stdout/stderr already go to the
+# per-daemon ``daemon.log`` via ``_detached_kwargs`` — this only adds the lines
+# that were previously missing, not a change of destination.
+_LIFECYCLE_LOGGER = logging.getLogger("mempalace.daemon")
+_LIFECYCLE_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+_lifecycle_logging_ready = False
+
+
+def _ensure_lifecycle_logging() -> None:
+    """Attach stdout/stderr handlers so daemon lifecycle + HTTP lines are emitted.
+
+    run_server has no logging configuration of its own, so without this the
+    daemon's INFO/ERROR records would fall through to Python's default
+    ``lastResort`` handler (WARNING+ to stderr only) and the INFO access and
+    lifecycle lines a ``StandardOutPath`` capture needs would be dropped.
+
+    ``propagate`` is disabled so the records are not re-emitted by an ancestor
+    logger the embedding application may also configure. Idempotent and
+    thread-safe enough for the single-threaded call sites (foreground
+    start_daemon and the detached child), and reset-able from tests via
+    clearing ``handlers`` and flipping ``_lifecycle_logging_ready``.
+    """
+    global _lifecycle_logging_ready
+    if _lifecycle_logging_ready:
+        return
+
+    formatter = logging.Formatter(_LIFECYCLE_FORMAT)
+
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setLevel(logging.INFO)
+    stdout_handler.setFormatter(formatter)
+
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(logging.ERROR)
+    stderr_handler.setFormatter(formatter)
+
+    # Replace (rather than append) so a re-init after a test reset doesn't
+    # stack duplicate handlers.
+    _LIFECYCLE_LOGGER.handlers = [stdout_handler, stderr_handler]
+    _LIFECYCLE_LOGGER.setLevel(logging.INFO)
+    _LIFECYCLE_LOGGER.propagate = False
+    _lifecycle_logging_ready = True
+
+
+def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -> None:  # noqa: C901
     palace_path = canonical_palace_path(palace_path)
     previous_env = {
         "MEMPALACE_PALACE_PATH": os.environ.get("MEMPALACE_PALACE_PATH"),
@@ -917,8 +973,15 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
         protocol_version = "HTTP/1.1"
         timeout = 10
 
-        def log_message(self, fmt, *args):  # pragma: no cover - stdlib access logging noise
-            return
+        def log_message(self, fmt, *args):
+            # Route access lines to the daemon's stdout handler (INFO); the
+            # previous no-op made a foreground/serve daemon completely silent.
+            _LIFECYCLE_LOGGER.info(fmt, *args)
+
+        def log_error(self, fmt, *args):
+            # Same routing but at ERROR level, so these are the "error lines"
+            # that land in launchd's StandardErrorPath.
+            _LIFECYCLE_LOGGER.error(fmt, *args)
 
         def _authorized(self) -> bool:
             auth = self.headers.get("Authorization")
@@ -1041,6 +1104,10 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
     # The owner-only umask set above (before DaemonRuntime built the queue DB)
     # covers every file this process creates — queue.sqlite3, its WAL/SHM
     # sidecars, and any future artifact — and is restored in the finally below.
+    # Ensure the daemon's own lifecycle lines actually reach stdout/stderr:
+    # without this a foreground or ``serve`` daemon was silent to any
+    # supervisor that captures those streams (#2475).
+    _ensure_lifecycle_logging()
     try:
         with _Server((HOST, port), _Handler) as httpd:
             actual_port = int(httpd.server_address[1])
@@ -1056,10 +1123,18 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
             }
             _write_private(endpoint_path(palace_path), json.dumps(endpoint, indent=2) + "\n")
             _write_private(pid_path(palace_path), f"{os.getpid()}\n")
+            _LIFECYCLE_LOGGER.info(
+                "daemon listening on %s:%s (pid=%s palace=%s)",
+                HOST,
+                actual_port,
+                os.getpid(),
+                palace_path,
+            )
             runtime.start_worker()
             try:
                 httpd.serve_forever(poll_interval=0.5)
             finally:
+                _LIFECYCLE_LOGGER.info("daemon shutting down")
                 _drain_and_cleanup(runtime, palace_path, previous_env)
     finally:
         _close_or_defer_writer_lease(writer_lease, runtime)

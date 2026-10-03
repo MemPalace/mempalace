@@ -311,6 +311,136 @@ def _start_server(tmp_path, monkeypatch, execute_fn):
     return client, thread, palace, holders
 
 
+def _reset_lifecycle_logging(monkeypatch) -> None:
+    """Give each lifecycle-logging test a fresh handler set.
+
+    ``_ensure_lifecycle_logging`` attaches stdout/stderr StreamHandlers once
+    and guards on a module-level ``_lifecycle_logging_ready`` flag.  Tests
+    that want a deterministic baseline must:
+
+    1. Clear any existing handlers on the daemon logger (if it exists — on
+       pre-fix HEAD this logger does not yet exist).
+    2. Flip the ready flag back to False so the next call to
+       ``_ensure_lifecycle_logging`` from ``run_server`` re-attaches.
+
+    Uses ``raising=False`` for the monkeypatch so the reset works whether or
+    not the post-fix attributes are present (RED vs GREEN).
+    """
+    logger = getattr(daemon, "_LIFECYCLE_LOGGER", None)
+    if logger is not None:
+        logger.handlers = []
+    monkeypatch.setattr(daemon, "_lifecycle_logging_ready", False, raising=False)
+
+
+def test_run_server_routes_lifecycle_and_access_to_stdout(monkeypatch, tmp_path, capsys):
+    """#2475 regression — a foreground/serve daemon must emit lifecycle and
+    HTTP access lines to stdout, so a supervisor capturing stdout (launchd
+    ``StandardOutPath``) actually sees the log.
+
+    RED on current HEAD: ``_Handler.log_message`` was a deliberate no-op and
+    ``run_server`` had no startup log call at all, so ``capsys.readouterr()``
+    returns empty stdout for the daemon's own records.
+    GREEN after the fix: both the startup line and the HTTP access line arrive.
+
+    Background/launchd daemon-start semantics are unchanged — this exercises
+    the same code path, but the daemon logs to *its* stdout (which
+    ``_detached_kwargs`` already redirects to ``per-daemon.log``) rather than
+    to a new destination.
+    """
+    _reset_lifecycle_logging(monkeypatch)
+
+    def _noop(_ctx, *a, **k):
+        return None
+
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    monkeypatch.setattr(service, "execute_job", _noop)
+    holders = _capture_httpd(monkeypatch)
+
+    thread = threading.Thread(
+        target=lambda: daemon.run_server(palace_path=str(palace), port=0),
+        name="test-daemon-server",
+        daemon=True,
+    )
+    thread.start()
+    client = None
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        client = daemon.get_client_if_running(str(palace))
+        if client is not None:
+            break
+        time.sleep(0.05)
+    assert client is not None, "daemon did not come up in 30s"
+
+    # One authenticated request so the handler's ``log_message`` fires.
+    client.health()
+
+    out, err = capsys.readouterr()
+
+    # Startup lifecycle INFO — must land on stdout so launchd StandardOutPath
+    # has the line. This is the primary acceptance line from the task.
+    assert "daemon listening on" in out, (
+        f"expected 'daemon listening on' on stdout; got:\nstdout={out!r}\nstderr={err!r}"
+    )
+
+    # HTTP access line (log_message) — was a no-op before the fix, so this is
+    # the strongest RED→GREEN signal: it only shows up now that log_message
+    # routes to the daemon's own logger.
+    assert '"GET /health' in out, (
+        f"expected the /health access line on stdout; got:\nstdout={out!r}\nstderr={err!r}"
+    )
+
+    # Shutdown lifecycle INFO — the run_server finally emits it; it must be on
+    # stdout as well.
+    out_after, err_after = capsys.readouterr()
+    _stop_server(client, thread, holders)
+    out_final, err_final = capsys.readouterr()
+    assert "daemon shutting down" in (out_after + out_final), (
+        f"expected 'daemon shutting down' on stdout after stop; got:\n"
+        f"out={out_final!r}\nstderr={err_final!r}"
+    )
+
+
+def test_lifecycle_error_routes_to_stderr(monkeypatch, capsys):
+    """#2475 — ERROR-level daemon records must land on stderr, so launchd
+    ``StandardErrorPath`` captures them. (Routing complement to the stdout
+    test above: INFO→stdout, ERROR→stderr.)
+
+    Exercised by calling the daemon logger directly after ``_ensure_lifecycle_
+    logging`` has attached its handlers.
+    """
+    _reset_lifecycle_logging(monkeypatch)
+    daemon._ensure_lifecycle_logging()
+
+    daemon._LIFECYCLE_LOGGER.info("info should not appear on stderr")
+    daemon._LIFECYCLE_LOGGER.error("error line for stderr capture")
+
+    _out, err = capsys.readouterr()
+
+    # The ERROR line routes to the stderr handler.
+    assert "error line for stderr capture" in err, (
+        f"expected the ERROR record on stderr; got:\nstderr={err!r}"
+    )
+
+    # And the INFO record must NOT land on stderr.
+    assert "info should not appear on stderr" not in err, (
+        f"INFO record leaked to stderr:\nstderr={err!r}"
+    )
+
+
+def test_reset_is_idempotent(monkeypatch):
+    """Re-attaching must not stack duplicate handlers (re-init after a test
+    reset shouldn't log the same record twice)."""
+    _reset_lifecycle_logging(monkeypatch)
+    daemon._ensure_lifecycle_logging()
+    n_first = len(daemon._LIFECYCLE_LOGGER.handlers)
+    _reset_lifecycle_logging(monkeypatch)
+    daemon._ensure_lifecycle_logging()
+    n_second = len(daemon._LIFECYCLE_LOGGER.handlers)
+    assert n_first == n_second == 2
+
+
 # --- ship-blocker regressions ---
 
 
