@@ -8,8 +8,10 @@ engine's two-replica convergence (including a partition with duplicate
 claims), and the CLI sync command.
 """
 
+import errno
 import http.client
 import json
+import multiprocessing
 import os
 import re
 import sqlite3
@@ -17,6 +19,7 @@ import threading
 
 import pytest
 
+import mempalace.replica as replica_module
 from mempalace import logsync
 from mempalace.hlc import MAX_FUTURE_DRIFT_MS, HybridLogicalClock, parse, render
 from mempalace.logstream import Logstream
@@ -85,6 +88,24 @@ def _wire_sync(dst, src):
         return logsync.sync_with_peer(dst, "fake://peer")
     finally:
         logsync._peer_get = original
+
+
+def _concurrent_replica_mint_worker(palace_path, barrier, result_queue, index):
+    """Start one first-mint contender in a fresh interpreter."""
+    import mempalace.replica as replica
+
+    def synchronized_mint():
+        # Every process has already observed replica.json as absent before it
+        # reaches _mint(). Distinct candidates make an accidental overwrite or
+        # caller/file mismatch visible rather than merely statistically likely.
+        barrier.wait(timeout=10)
+        return f"rep_{index:032x}"
+
+    replica._mint = synchronized_mint
+    try:
+        result_queue.put(("ok", replica.get_replica_id(palace_path)))
+    except BaseException as exc:
+        result_queue.put(("error", type(exc).__name__, str(exc)))
 
 
 # ── HLC ───────────────────────────────────────────────────────────────────
@@ -165,6 +186,113 @@ class TestReplicaIdentity:
             f.write("not json")
         with pytest.raises(ValueError, match="corrupt"):
             get_replica_id(palace_a)
+
+    def test_first_mint_loser_adopts_the_existing_winner(self, palace_a, monkeypatch):
+        winner = "rep_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+        def publish_winner_then_lose(_candidate, destination):
+            with open(destination, "w", encoding="utf-8") as f:
+                json.dump({"replica_id": winner}, f)
+            raise FileExistsError(destination)
+
+        monkeypatch.setattr(replica_module, "_mint", lambda: "rep_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        monkeypatch.setattr(replica_module.os, "link", publish_winner_then_lose)
+
+        assert get_replica_id(palace_a) == winner
+        assert get_replica_id(palace_a) == winner
+        assert not [name for name in os.listdir(palace_a) if name.endswith(".tmp")]
+
+    def test_publish_error_leaves_no_identity_or_temp_file(self, palace_a, monkeypatch):
+        def deny_publish(_candidate, _destination):
+            raise PermissionError("hard-link publication denied")
+
+        monkeypatch.setattr(replica_module.os, "link", deny_publish)
+
+        with pytest.raises(PermissionError, match="publication denied"):
+            get_replica_id(palace_a)
+
+        assert not os.path.exists(os.path.join(palace_a, "replica.json"))
+        assert os.listdir(palace_a) == []
+
+    @pytest.mark.parametrize("errno_name", ["EOPNOTSUPP", "ENOTSUP"])
+    def test_unsupported_hard_link_errno_is_actionable_and_fail_closed(
+        self, palace_a, monkeypatch, errno_name
+    ):
+        error_number = getattr(errno, errno_name, None)
+        if error_number is None:
+            pytest.skip(f"{errno_name} is not defined on this platform")
+
+        def reject_hard_link(_candidate, _destination):
+            raise OSError(error_number, f"{errno_name}: hard links unsupported")
+
+        monkeypatch.setattr(replica_module.os, "link", reject_hard_link)
+
+        with pytest.raises(
+            OSError, match="safe first-mint publication requires hard-link support"
+        ) as exc_info:
+            get_replica_id(palace_a)
+
+        assert "no replica identity was written to replica.json" in str(exc_info.value)
+        assert "Move the palace to a filesystem with hard-link support" in str(exc_info.value)
+        assert not os.path.exists(os.path.join(palace_a, "replica.json"))
+        assert os.listdir(palace_a) == []
+
+    @pytest.mark.parametrize("winerror", [1, 50])
+    def test_windows_unsupported_hard_link_error_is_actionable_and_fail_closed(
+        self, palace_a, monkeypatch, winerror
+    ):
+        def reject_hard_link(_candidate, _destination):
+            error = OSError(errno.EINVAL, "hard links unsupported")
+            error.winerror = winerror
+            raise error
+
+        monkeypatch.setattr(replica_module.os, "link", reject_hard_link)
+
+        with pytest.raises(
+            OSError, match="safe first-mint publication requires hard-link support"
+        ) as exc_info:
+            get_replica_id(palace_a)
+
+        assert "no replica identity was written to replica.json" in str(exc_info.value)
+        assert "Move the palace to a filesystem with hard-link support" in str(exc_info.value)
+        assert not os.path.exists(os.path.join(palace_a, "replica.json"))
+        assert os.listdir(palace_a) == []
+
+    def test_concurrent_first_mint_returns_the_persisted_winner(self, palace_a):
+        ctx = multiprocessing.get_context("spawn")
+        contenders = 4
+        barrier = ctx.Barrier(contenders)
+        result_queue = ctx.Queue()
+        processes = [
+            ctx.Process(
+                target=_concurrent_replica_mint_worker,
+                args=(palace_a, barrier, result_queue, index),
+            )
+            for index in range(1, contenders + 1)
+        ]
+
+        try:
+            for process in processes:
+                process.start()
+            for process in processes:
+                process.join(timeout=20)
+            assert all(not process.is_alive() for process in processes)
+
+            results = [result_queue.get(timeout=5) for _ in processes]
+        finally:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                process.join(timeout=5)
+            result_queue.close()
+            result_queue.join_thread()
+
+        assert [process.exitcode for process in processes] == [0] * contenders
+        assert all(result[0] == "ok" for result in results), results
+        with open(os.path.join(palace_a, "replica.json"), encoding="utf-8") as f:
+            persisted = json.load(f)["replica_id"]
+        assert {result[1] for result in results} == {persisted}
+        assert not [name for name in os.listdir(palace_a) if name.endswith(".tmp")]
 
     def test_logstream_adopts_palace_identity(self, palace_a, ls_a):
         assert ls_a.replica_id == get_replica_id(palace_a)
