@@ -996,9 +996,10 @@ def _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=None
     if drawers_filed <= 0:
         return
     try:
-        from .hallways import compute_hallways_for_wing
+        from .hallways import _report_disabled_hallways, compute_hallways_for_wing
 
         compute_hallways_for_wing(wing, col=collection, config=config)
+        _report_disabled_hallways(config)
     except Exception as exc:
         print(f"  (hallways skipped: {exc})")
 
