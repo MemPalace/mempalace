@@ -54,6 +54,20 @@ def _refuse_mismatched_resume(config, wing, recorded, current):
     sys.exit(1)
 
 
+def _open_closets_collection(palace_path):
+    """Return the closets collection, or ``None`` if it was never created.
+
+    Other open failures propagate so an interrupted apply keeps its marker.
+    """
+    from ..backends import CollectionNotInitializedError
+    from ..palace import get_closets_collection
+
+    try:
+        return get_closets_collection(palace_path, create=False)
+    except CollectionNotInitializedError:
+        return None
+
+
 def cmd_rooms(args):
     from ..rooms import (
         DEFAULT_THRESHOLD,
@@ -69,7 +83,6 @@ def cmd_rooms(args):
         plan_rooms,
         propose_rooms,
         rekey_closets_by_ids,
-        rekey_closets_to,
         resolve_closet_id_targets,
         save_pending_apply,
         room_set_path,
@@ -172,9 +185,6 @@ def cmd_rooms(args):
             print("\n  Dry run. Re-run with --yes to write the room changes.")
         return
 
-    from ..backends import CollectionNotInitializedError
-    from ..palace import get_closets_collection
-
     with _repair_lock(palace_path):
         inputs = apply_inputs(config, wing, threshold, from_rooms)
         pending = load_pending_apply(config, wing)
@@ -186,9 +196,7 @@ def cmd_rooms(args):
         # only sees current room metadata can feed an intermediate room into
         # the next mapping of a chained plan.
         try:
-            closets_col = get_closets_collection(palace_path, create=False)
-        except CollectionNotInitializedError:
-            closets_col = None
+            closets_col = _open_closets_collection(palace_path)
         except Exception:
             # Snapshot unavailable; final open below still enforces the
             # "keep the marker on unexpected open failure" contract.
@@ -205,8 +213,7 @@ def cmd_rooms(args):
             save_pending_apply(config, wing, targets, ambiguous, inputs, id_targets=id_targets)
         else:
             targets, ambiguous, _, id_targets = pending
-            if id_targets is None:
-                id_targets = resolve_closet_id_targets(closets_col, wing, targets)
+            id_targets = id_targets or resolve_closet_id_targets(closets_col, wing, targets)
             print("  Resuming an interrupted apply: finishing drawers, then closets.")
         try:
             done = apply_plan(col, plan) if plan.changes else 0
@@ -218,10 +225,7 @@ def cmd_rooms(args):
         # Only a closet collection that was never created means "no closets".
         # Any other failure to open it must stop the command with its
         # recovery marker kept, or the closet phase is skipped for good.
-        try:
-            closets_col = get_closets_collection(palace_path, create=False)
-        except CollectionNotInitializedError:
-            closets_col = None
+        closets_col = _open_closets_collection(palace_path)
         moved_closets = rekey_closets_by_ids(closets_col, id_targets)
         clear_pending_apply(config, wing)
         note = f" {moved_closets} closets followed."

@@ -811,7 +811,6 @@ def test_rekey_closets_retry_does_not_follow_intermediate_room():
     from mempalace.rooms import (
         resolve_closet_id_targets,
         rekey_closets_by_ids,
-        rekey_closets_to,
     )
 
     targets = {
