@@ -965,3 +965,26 @@ def test_cmd_rooms_apply_resume_keeps_drawer_and_closet_aligned(tmp_path, monkey
     assert closets.rows["b-second"]["meta"]["room"] == "releases"
     assert col.rows["a-first"]["meta"]["room"] == closets.rows["a-first"]["meta"]["room"]
     assert not os.path.exists(marker)
+
+
+def test_load_pending_apply_refuses_overlapping_legacy_marker(tmp_path):
+    """Legacy markers with chained targets cannot safely resume; refuse them."""
+    from mempalace.rooms import load_pending_apply, pending_apply_path
+
+    cfg = MempalaceConfig(palace_path=str(tmp_path))
+    marker = pending_apply_path(cfg, "w")
+    os.makedirs(os.path.dirname(marker), exist_ok=True)
+    with open(marker, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "wing": "w",
+                "ambiguous": 0,
+                "closets": [
+                    ["session.jsonl", "general", "technical"],
+                    ["session.jsonl", "technical", "releases"],
+                ],
+            },
+            f,
+        )
+    with pytest.raises(ValueError, match="overlapping closet targets"):
+        load_pending_apply(cfg, "w")

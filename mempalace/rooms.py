@@ -673,6 +673,9 @@ def rekey_closets_by_ids(closets_col, id_targets: dict) -> int:
     """
     if closets_col is None or not id_targets:
         return 0
+    for dest in id_targets.values():
+        if sanitize_name(str(dest), "room") != str(dest):
+            raise ValueError("closet destination must retain its approved room spelling")
     ids = [str(i) for i in id_targets]
     got = closets_col.get(ids=ids, include=["metadatas"])
     if isinstance(got, dict):
@@ -806,11 +809,26 @@ def load_pending_apply(
     inputs = data.get("inputs")
     id_targets = None
     moves = data.get("closet_moves")
+    if "closet_moves" not in data and any(
+        targets.get((source, target)) not in (None, target)
+        for (source, _old), target in targets.items()
+    ):
+        # Old markers cannot tell an unmoved closet from one already moved
+        # into another source room. Keep the marker instead of guessing.
+        raise ValueError(
+            "legacy room apply has overlapping closet targets; rebuild closets "
+            "from their sources before abandoning the pending marker"
+        )
     if isinstance(moves, list):
         id_targets = {}
         for row in moves:
             if isinstance(row, list) and len(row) == 2 and all(isinstance(x, str) for x in row):
-                id_targets[row[0]] = row[1]
+                dest = row[1]
+                if sanitize_name(dest, "room") != dest:
+                    raise ValueError(
+                        "pending closet destination must retain its approved room spelling"
+                    )
+                id_targets[row[0]] = dest
     return (
         targets,
         int(data.get("ambiguous") or 0),
