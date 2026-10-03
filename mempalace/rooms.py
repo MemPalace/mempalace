@@ -644,33 +644,70 @@ def closet_targets(plan: RoomPlan) -> tuple[dict, int]:
     return targets, ambiguous
 
 
-def rekey_closets_to(closets_col, wing: str, targets: dict) -> int:
-    """Move each matching closet to its target room; returns closets moved.
+def resolve_closet_id_targets(closets_col, wing: str, targets: dict) -> dict[str, str]:
+    """Snapshot ``{closet_id: destination_room}`` from ``(source_file, room)`` targets.
 
-    Idempotent: a closet already in its target room is left alone, so a
-    retry after an interruption finishes exactly the remainder. Only
-    ``room`` metadata is rewritten, never the record id, which is what
-    ``wings split`` does for ``wing``.
+    Resolved once against each closet's room at plan time. Chained plans
+    (``general→technical`` and ``technical→releases`` for one source) assign
+    each closet a single destination; a retry must not reinterpret a closet
+    already moved into an intermediate room as input to the next mapping.
     """
     if closets_col is None or not targets:
-        return 0
-    ids: list[str] = []
-    metas: list[dict] = []
-    stamp = datetime.now(timezone.utc).isoformat()
+        return {}
+    out: dict[str, str] = {}
     for row in _iter_wing_rows(closets_col, wing, include=["metadatas"]):
         meta = row["metadata"]
         key = (str(meta.get("source_file") or ""), str(meta.get("room") or ""))
         target = targets.get(key)
-        if not target or target == key[1]:
+        if target and target != key[1]:
+            out[str(row["id"])] = target
+    return out
+
+
+def rekey_closets_by_ids(closets_col, id_targets: dict) -> int:
+    """Move closets by stable id to their recorded destinations; returns moved.
+
+    Idempotent: a closet already in its destination is skipped. Identities
+    come from :func:`resolve_closet_id_targets` (or a pending apply marker),
+    never from reinterpreted current ``room`` metadata.
+    """
+    if closets_col is None or not id_targets:
+        return 0
+    ids = [str(i) for i in id_targets]
+    got = closets_col.get(ids=ids, include=["metadatas"])
+    if isinstance(got, dict):
+        got_ids = list(got.get("ids") or [])
+        got_metas = list(got.get("metadatas") or [])
+    else:
+        got_ids = list(getattr(got, "ids", None) or [])
+        got_metas = list(getattr(got, "metadatas", None) or [])
+    stamp = datetime.now(timezone.utc).isoformat()
+    move_ids: list[str] = []
+    metas: list[dict] = []
+    for cid, meta in zip(got_ids, got_metas):
+        if not isinstance(meta, dict):
             continue
-        ids.append(row["id"])
-        metas.append({"room": target, "last_modified": stamp})
-    for start in range(0, len(ids), _UPDATE_BATCH):
+        dest = id_targets.get(str(cid))
+        if not dest or str(meta.get("room") or "") == dest:
+            continue
+        move_ids.append(str(cid))
+        metas.append({"room": dest, "last_modified": stamp})
+    for start in range(0, len(move_ids), _UPDATE_BATCH):
         closets_col.update(
-            ids=ids[start : start + _UPDATE_BATCH],
+            ids=move_ids[start : start + _UPDATE_BATCH],
             metadatas=metas[start : start + _UPDATE_BATCH],
         )
-    return len(ids)
+    return len(move_ids)
+
+
+def rekey_closets_to(closets_col, wing: str, targets: dict) -> int:
+    """Move each matching closet to its target room; returns closets moved.
+
+    Resolves closet identities once, then moves by id so a retry cannot
+    treat an intermediate room as a fresh source mapping. Only ``room``
+    metadata is rewritten, never the record id.
+    """
+    return rekey_closets_by_ids(closets_col, resolve_closet_id_targets(closets_col, wing, targets))
 
 
 def rekey_closets(closets_col, plan: RoomPlan) -> dict:
@@ -726,6 +763,7 @@ def save_pending_apply(
     targets: dict,
     ambiguous: int,
     inputs: Optional[dict] = None,
+    id_targets: Optional[dict] = None,
 ) -> str:
     path = pending_apply_path(config, wing)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -735,6 +773,9 @@ def save_pending_apply(
         "ambiguous": int(ambiguous),
         "inputs": inputs,
         "closets": [[src, old, new] for (src, old), new in sorted(targets.items())],
+        # Stable closet identities + destinations so a retry cannot reinterpret
+        # an intermediate room as a fresh source mapping.
+        "closet_moves": [[cid, dest] for cid, dest in sorted((id_targets or {}).items())],
     }
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -745,10 +786,13 @@ def save_pending_apply(
 
 def load_pending_apply(
     config: MempalaceConfig, wing: str
-) -> Optional[tuple[dict, int, Optional[dict]]]:
-    """``(targets, ambiguous, inputs)`` from an interrupted apply, or ``None``.
+) -> Optional[tuple[dict, int, Optional[dict], Optional[dict]]]:
+    """``(targets, ambiguous, inputs, id_targets)`` from an interrupted apply, or ``None``.
 
     ``inputs`` is ``None`` for a marker written before inputs were recorded.
+    ``id_targets`` is ``None`` for a marker written before closet identities
+    were recorded; callers then resolve from ``targets`` against current rooms
+    (legacy best-effort).
     """
     path = pending_apply_path(config, wing)
     if not os.path.isfile(path):
@@ -760,7 +804,19 @@ def load_pending_apply(
         if isinstance(row, list) and len(row) == 3 and all(isinstance(x, str) for x in row):
             targets[(row[0], row[1])] = row[2]
     inputs = data.get("inputs")
-    return targets, int(data.get("ambiguous") or 0), inputs if isinstance(inputs, dict) else None
+    id_targets = None
+    moves = data.get("closet_moves")
+    if isinstance(moves, list):
+        id_targets = {}
+        for row in moves:
+            if isinstance(row, list) and len(row) == 2 and all(isinstance(x, str) for x in row):
+                id_targets[row[0]] = row[1]
+    return (
+        targets,
+        int(data.get("ambiguous") or 0),
+        inputs if isinstance(inputs, dict) else None,
+        id_targets,
+    )
 
 
 def clear_pending_apply(config: MempalaceConfig, wing: str) -> None:

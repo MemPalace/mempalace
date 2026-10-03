@@ -68,7 +68,9 @@ def cmd_rooms(args):
         load_pending_apply,
         plan_rooms,
         propose_rooms,
+        rekey_closets_by_ids,
         rekey_closets_to,
+        resolve_closet_id_targets,
         save_pending_apply,
         room_set_path,
         sample_drawers,
@@ -180,6 +182,17 @@ def cmd_rooms(args):
             _refuse_mismatched_resume(config, wing, pending[2], inputs)
         plan = plan_rooms(col, wing, decider, threshold=threshold, from_rooms=from_rooms)
         report(plan)
+        # Closet identities must be snapshotted before any write: a retry that
+        # only sees current room metadata can feed an intermediate room into
+        # the next mapping of a chained plan.
+        try:
+            closets_col = get_closets_collection(palace_path, create=False)
+        except CollectionNotInitializedError:
+            closets_col = None
+        except Exception:
+            # Snapshot unavailable; final open below still enforces the
+            # "keep the marker on unexpected open failure" contract.
+            closets_col = None
         if pending is None:
             if not plan.changes:
                 print("  Nothing to change.")
@@ -188,9 +201,12 @@ def cmd_rooms(args):
             # after an interruption can finish the closet phase even when no
             # drawer is left to move.
             targets, ambiguous = closet_targets(plan)
-            save_pending_apply(config, wing, targets, ambiguous, inputs)
+            id_targets = resolve_closet_id_targets(closets_col, wing, targets)
+            save_pending_apply(config, wing, targets, ambiguous, inputs, id_targets=id_targets)
         else:
-            targets, ambiguous, _ = pending
+            targets, ambiguous, _, id_targets = pending
+            if id_targets is None:
+                id_targets = resolve_closet_id_targets(closets_col, wing, targets)
             print("  Resuming an interrupted apply: finishing drawers, then closets.")
         try:
             done = apply_plan(col, plan) if plan.changes else 0
@@ -206,7 +222,7 @@ def cmd_rooms(args):
             closets_col = get_closets_collection(palace_path, create=False)
         except CollectionNotInitializedError:
             closets_col = None
-        moved_closets = rekey_closets_to(closets_col, wing, targets)
+        moved_closets = rekey_closets_by_ids(closets_col, id_targets)
         clear_pending_apply(config, wing)
         note = f" {moved_closets} closets followed."
         if ambiguous:

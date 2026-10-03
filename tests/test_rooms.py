@@ -800,3 +800,156 @@ def test_cmd_rooms_apply_keeps_the_marker_when_closets_fail_to_open(tmp_path, mo
     monkeypatch.setattr("mempalace.palace.get_closets_collection", absent)
     cli.cmd_rooms(ns)
     assert not os.path.exists(pending_apply_path(cfg, "w"))  # nothing to re-key
+
+def test_rekey_closets_retry_does_not_follow_intermediate_room():
+    """Chained plan general→technical and technical→releases: a closet already
+    moved to technical must not be fed into the second mapping on retry.
+
+    Regression for the review finding on PR #2654 (F3).
+    """
+    from mempalace.rooms import (
+        resolve_closet_id_targets,
+        rekey_closets_by_ids,
+        rekey_closets_to,
+    )
+
+    targets = {
+        ("session.jsonl", "general"): "technical",
+        ("session.jsonl", "technical"): "releases",
+    }
+    # First pass against the original rooms (batch of two closets).
+    closets = FakeCollection(
+        [
+            {"id": "a-first", "meta": {"wing": "w", "room": "general", "source_file": "session.jsonl"}},
+            {"id": "b-second", "meta": {"wing": "w", "room": "technical", "source_file": "session.jsonl"}},
+        ]
+    )
+    id_targets = resolve_closet_id_targets(closets, "w", targets)
+    assert id_targets == {"a-first": "technical", "b-second": "releases"}
+
+    calls = {"n": 0}
+    real_update = closets.update
+
+    def interrupt(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Simulate first batch succeeding then interruption before more work.
+            # With two ids in one batch, interrupt after applying by raising on a
+            # second call; apply the first batch manually then raise.
+            real_update(**kwargs)
+            raise RuntimeError("simulated interruption before second closet batch")
+        return real_update(**kwargs)
+
+    closets.update = interrupt
+    try:
+        rekey_closets_by_ids(closets, id_targets)
+    except RuntimeError:
+        pass
+    # After interrupt, a-first is technical; b-second may be releases if same batch.
+    # Force the reviewed mid-state: a-first in technical, b-second in releases.
+    closets.rows["a-first"]["meta"]["room"] = "technical"
+    closets.rows["b-second"]["meta"]["room"] = "releases"
+
+    # Retry with the SAME id_targets snapshot (as a pending marker would).
+    closets.update = real_update
+    moved = rekey_closets_by_ids(closets, id_targets)
+    assert closets.rows["a-first"]["meta"]["room"] == "technical"
+    assert closets.rows["b-second"]["meta"]["room"] == "releases"
+    assert moved == 0  # both already at recorded destinations
+
+    # The old (source, current_room) lookup double-moves a-first.
+    legacy = FakeCollection(
+        [
+            {"id": "a-first", "meta": {"wing": "w", "room": "technical", "source_file": "session.jsonl"}},
+            {"id": "b-second", "meta": {"wing": "w", "room": "releases", "source_file": "session.jsonl"}},
+        ]
+    )
+    # Demonstrate the defect class: matching current room against the plan map.
+    legacy_moved_ids = []
+    for row in legacy.rows.values():
+        key = (row["meta"]["source_file"], row["meta"]["room"])
+        if key in targets and targets[key] != row["meta"]["room"]:
+            legacy_moved_ids.append(row["id"])
+    assert "a-first" in legacy_moved_ids
+
+
+def test_cmd_rooms_apply_resume_keeps_drawer_and_closet_aligned(tmp_path, monkeypatch, capsys):
+    """Interrupt mid-closet-phase with a chained room plan; retry must not
+    move an already-completed closet into the next mapping."""
+    import contextlib
+
+    import mempalace.cli as cli
+    from mempalace.rooms import pending_apply_path
+
+    cfg = MempalaceConfig(palace_path=str(tmp_path))
+    save_room_set(
+        cfg,
+        RoomSet(
+            "w",
+            [
+                RoomSpec("technical", "technical", exemplars=["a-first"]),
+                RoomSpec("releases", "release", exemplars=["b-second"]),
+            ],
+        ),
+    )
+    # Drawers already in their destinations (drawer phase finished).
+    col = FakeCollection(
+        [
+            {
+                "id": "a-first",
+                "meta": {"wing": "w", "room": "technical", "source_file": "session.jsonl"},
+                "doc": "technical work",
+                "emb": [1.0, 0.0],
+            },
+            {
+                "id": "b-second",
+                "meta": {"wing": "w", "room": "releases", "source_file": "session.jsonl"},
+                "doc": "cut the release",
+                "emb": [0.0, 1.0],
+            },
+        ]
+    )
+    # Closet a-first already followed to technical; b-second still needs releases.
+    # Pending marker records the original id destinations from the first plan.
+    closets = FakeCollection(
+        [
+            {
+                "id": "a-first",
+                "meta": {"wing": "w", "room": "technical", "source_file": "session.jsonl"},
+            },
+            {
+                "id": "b-second",
+                "meta": {"wing": "w", "room": "technical", "source_file": "session.jsonl"},
+            },
+        ]
+    )
+    from mempalace.rooms import GENERIC_ROOMS, apply_inputs, save_pending_apply
+
+    marker = pending_apply_path(cfg, "w")
+    save_pending_apply(
+        cfg,
+        "w",
+        {
+            ("session.jsonl", "general"): "technical",
+            ("session.jsonl", "technical"): "releases",
+        },
+        0,
+        apply_inputs(cfg, "w", 0.75, GENERIC_ROOMS),
+        id_targets={"a-first": "technical", "b-second": "releases"},
+    )
+    assert os.path.isfile(marker)
+
+    monkeypatch.setattr("mempalace.palace.get_collection", lambda *a, **k: col)
+    monkeypatch.setattr("mempalace.palace.get_closets_collection", lambda *a, **k: closets)
+    monkeypatch.setattr("mempalace.embedding.get_embedding_function", lambda: FakeEmbed())
+    monkeypatch.setattr("mempalace.palace.mine_palace_lock", lambda p: contextlib.nullcontext())
+
+    cli.cmd_rooms(
+        Namespace(rooms_action="apply", palace=str(tmp_path), wing="w", threshold=0.75, yes=True)
+    )
+    out = capsys.readouterr().out
+    assert "Resuming an interrupted apply" in out
+    assert closets.rows["a-first"]["meta"]["room"] == "technical"
+    assert closets.rows["b-second"]["meta"]["room"] == "releases"
+    assert col.rows["a-first"]["meta"]["room"] == closets.rows["a-first"]["meta"]["room"]
+    assert not os.path.exists(marker)
