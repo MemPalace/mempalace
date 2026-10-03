@@ -148,6 +148,46 @@ class TestWriteTools:
         assert result["room"] == "test_room"
         assert result["drawer_id"].startswith("drawer_test_wing_test_room_")
 
+    def test_add_drawer_canonicalizes_wing_like_the_miners(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Regression #2579: the MCP write path must canonicalize wing names
+        with ``normalize_wing_name`` (lower, ``-``/space → ``_``) like the
+        miner / graph / migration code, so a drawer written as
+        ``virtual-species`` lands under ``virtual_species`` instead of
+        re-fragmenting the wing on every write."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        result = tool_add_drawer(
+            wing="virtual-species",
+            room="test_room",
+            content="A drawer that must land in the canonical wing slug.",
+        )
+        assert result["success"] is True
+        stored = col.get(ids=[result["drawer_id"]], include=["metadatas"])
+        assert stored["metadatas"], stored
+        assert stored["metadatas"][0]["wing"] == "virtual_species"
+
+    def test_add_drawer_non_string_wing_is_validation_error_not_crash(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Regression for Copilot review on #2581: normalization must not run
+        before the type check. A non-string wing previously produced
+        AttributeError out of ``normalize_wing_name``; it must remain the
+        stable ``wing must be a non-empty string`` validation error."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        for bad in (None, 123, b"bytes"):
+            result = tool_add_drawer(wing=bad, room="r", content="c")
+            assert result["success"] is False
+            assert "wing must be a non-empty string" in result["error"]
+
     def test_add_drawer_duplicate_detection(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         _client, _col = _get_collection(palace_path, create=True)
@@ -958,27 +998,29 @@ class TestWriteTools:
     def test_update_drawer_case_only_wing_rename_applies(
         self, monkeypatch, config, palace_path, kg
     ):
-        """Regression for #2395: a wing change that differs only by case must
-        be APPLIED, not skipped with success and the old value echoed back.
+        """Regression for #2395 + #2579: consolidating a *legacy* mixed-case
+        wing must APPLY, not be skipped with the old value echoed back.
 
-        ``list_drawers`` is case-sensitive, so case-duplicate wings are
-        distinct destinations and consolidation via update is their only
-        supported rewrite path — the comparison must be exact.
+        MCP writes now canonicalize with ``normalize_wing_name`` (#2579), so
+        a fresh ``tool_add_drawer`` never stores mixed case. Seed a pre-
+        normalization wing directly, then update: exact compare after
+        normalize must rewrite the stored slug to the canonical form.
         """
         _patch_mcp_server(monkeypatch, config, kg)
-        from mempalace.mcp_server import (
-            tool_add_drawer,
-            tool_get_drawer,
-            tool_update_drawer,
-        )
+        _client, col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_get_drawer, tool_update_drawer
 
-        added = tool_add_drawer(wing="ZZTestCaseRename", room="scratch", content="case probe")
-        assert added["success"] is True
-        drawer_id = added["drawer_id"]
+        drawer_id = "drawer_legacy_case_wing"
+        col.add(
+            ids=[drawer_id],
+            documents=["legacy mixed-case wing probe"],
+            metadatas=[{"wing": "ZZTestCaseRename", "room": "scratch"}],
+        )
 
         result = tool_update_drawer(drawer_id, wing="zztestcaserename", room="scratch")
         assert result["success"] is True
-        # The response must echo the NEW wing, not silently the old one.
+        # The response must echo the NEW (canonical) wing, not silently the old one.
         assert result["wing"] == "zztestcaserename"
 
         # The store, not just the response, must reflect the rename.
@@ -1009,19 +1051,24 @@ class TestWriteTools:
         assert fetched["room"] == "scratchroom"
 
     def test_update_drawer_identical_case_is_noop(self, monkeypatch, config, palace_path, kg):
-        """Regression for #2395: re-submitting the exact same casing must
-        still be a content-preserving no-op (no spurious write, old value
-        unchanged)."""
+        """Regression for #2395 + #2579: re-submitting the same wing input
+        must leave the stored (canonical) value unchanged.
+
+        ``tool_add_drawer`` canonicalizes ``StableWing`` → ``stablewing``
+        (#2579). Updating with the same input must echo that slug back, not
+        the pre-normalize spelling.
+        """
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_add_drawer, tool_update_drawer
 
         added = tool_add_drawer(wing="StableWing", room="stable_room", content="noop probe")
         assert added["success"] is True
+        assert added["wing"] == "stablewing"
         drawer_id = added["drawer_id"]
 
         result = tool_update_drawer(drawer_id, wing="StableWing", room="stable_room")
         assert result["success"] is True
-        assert result["wing"] == "StableWing"
+        assert result["wing"] == "stablewing"
         assert result["room"] == "stable_room"
 
     def test_update_drawer_content_purges_matching_closets(
