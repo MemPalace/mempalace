@@ -25,7 +25,7 @@ def test_palace_is_a_package():
     assert callable(palace.mine_lock)
     assert callable(palace.mine_palace_lock)
     assert issubclass(palace.MineAlreadyRunning, RuntimeError)
-    assert palace.NORMALIZE_VERSION == 2
+    assert palace.NORMALIZE_VERSION == 3
 
 
 @pytest.mark.parametrize("name", FRAGMENTS)
