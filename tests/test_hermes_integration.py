@@ -17,6 +17,7 @@ import os
 import sys
 import threading
 import types
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -37,7 +38,14 @@ def _install_stub_memory_provider() -> None:
     class MemoryProvider:  # mirrors the parts the integration class uses
         pass
 
+    @dataclass(frozen=True)
+    class RecallStatus:
+        provider_label: str
+        count: int
+        glyph: str = "🧠"
+
     mp_mod.MemoryProvider = MemoryProvider  # type: ignore[attr-defined]
+    mp_mod.RecallStatus = RecallStatus  # type: ignore[attr-defined]
     agent_mod.memory_provider = mp_mod  # type: ignore[attr-defined]
     sys.modules["agent"] = agent_mod
     sys.modules["agent.memory_provider"] = mp_mod
@@ -593,6 +601,41 @@ def test_kg_query_tool_rejects_missing_entity(initialized_provider):
     assert "error" in result
 
 
+def test_kg_query_tool_defaults_to_current_time(initialized_provider, palace_path):
+    """Omitting ``since`` must not leak expired KG facts."""
+    from mempalace.knowledge_graph import KnowledgeGraph
+
+    db_path = str(Path(palace_path).parent / "knowledge_graph.sqlite3")
+    kg = KnowledgeGraph(db_path=db_path)
+    try:
+        kg.add_triple(
+            "_kg_query_default_time",
+            "status",
+            "active",
+            valid_from="2026-01-01",
+        )
+        kg.supersede(
+            "_kg_query_default_time",
+            "status",
+            "active",
+            "revoked",
+            at="2026-02-01",
+        )
+    finally:
+        kg.close()
+
+    result = json.loads(
+        initialized_provider.handle_tool_call(
+            "mempalace_kg_query",
+            {"entity": "_kg_query_default_time"},
+        )
+    )
+
+    objects = {r.get("object") for r in result.get("relations", [])}
+    assert "revoked" in objects
+    assert "active" not in objects
+
+
 # ----- Diary roundtrip ----------------------------------------------------
 
 
@@ -937,3 +980,294 @@ def test_on_memory_write_skips_unknown_target_and_non_add(initialized_provider):
     initialized_provider.on_memory_write("replace", "memory", "x")
     initialized_provider.on_memory_write("remove", "user", "x")
     assert initialized_provider._worker_queue.qsize() == pre
+
+
+# ----- Automatic KnowledgeGraph factual prefetch -------------------------
+
+
+def test_active_provider_query_is_detected(integration_module):
+    checker = integration_module.MempalaceProvider._is_active_provider_query
+
+    assert checker("What memory provider are you currently using?") is True
+    assert checker(
+        "What memory provider are you currently using? Answer with only the provider name."
+    ) is True
+    assert checker("What memory provider are you using?") is True
+    assert checker("Which memory provider is currently active?") is True
+    assert checker("What did we discuss about the printer?") is False
+
+
+def test_factual_query_parser_identifies_current_status(integration_module):
+    parser = integration_module.MempalaceProvider._extract_factual_kg_query
+
+    assert parser("What is Atlas's current status?") == ("Atlas", None)
+    assert parser("What is Atlas current status?") == ("Atlas", None)
+    assert parser("What is the status of Atlas?") == ("Atlas", None)
+    assert parser("Atlas's status?") == ("Atlas", None)
+
+
+def test_factual_query_parser_extracts_historical_date(integration_module):
+    parser = integration_module.MempalaceProvider._extract_factual_kg_query
+
+    assert parser("What was Atlas's status on 2026-06-03?") == (
+        "Atlas",
+        "2026-06-03",
+    )
+
+
+def test_factual_query_parser_leaves_conversational_recall_alone(integration_module):
+    parser = integration_module.MempalaceProvider._extract_factual_kg_query
+
+    assert parser("What did we discuss about the printer?") == ("", None)
+
+
+def test_system_prompt_declares_mempalace_as_active_provider(provider):
+    provider._initialized = True
+    provider._cron_skipped = False
+    provider._identity = ""
+    provider._wake_up_cache = ""
+
+    block = provider.system_prompt_block()
+
+    assert "MemPalace is the active Hermes memory provider" in block
+    assert "Do not use recalled conversation text as authoritative" in block
+    assert "FINAL MEMPALACE PRECEDENCE RULE" in block
+    assert block.index("FINAL MEMPALACE PRECEDENCE RULE") > block.index("MemPalace is the active Hermes memory provider")
+
+
+def test_prefetch_skips_semantic_recall_for_active_provider_query(
+    provider, integration_module, tmp_path, monkeypatch
+):
+    provider._initialized = True
+    provider._cron_skipped = False
+    provider._palace_path = str(tmp_path / "palace")
+    Path(provider._palace_path).mkdir()
+
+    calls = []
+
+    def fake_search(query, **kwargs):
+        calls.append(query)
+        return {
+            "results": [
+                {
+                    "wing": "general",
+                    "room": "conversations",
+                    "text": "Assistant: holographic",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(integration_module, "search_memories", fake_search)
+
+    result = provider.prefetch(
+        "What memory provider are you currently using? Answer with only the provider name."
+    )
+
+    assert result == ""
+    assert calls == []
+    assert provider.recall_status() is None
+
+
+def test_prefetch_uses_kg_for_current_and_historical_status(
+    provider, integration_module, tmp_path, monkeypatch
+):
+    provider._initialized = True
+    provider._cron_skipped = False
+    provider._palace_path = str(tmp_path / "palace")
+    Path(provider._palace_path).mkdir()
+
+    db_path = provider._kg_db_path()
+    from mempalace.knowledge_graph import KnowledgeGraph
+
+    kg = KnowledgeGraph(db_path=db_path)
+    try:
+        kg.add_triple("Atlas", "status", "alive", valid_from="2026-05-01")
+        kg.supersede(
+            "Atlas",
+            "status",
+            "alive",
+            "dead",
+            at="2026-06-01",
+        )
+        kg.supersede(
+            "Atlas",
+            "status",
+            "dead",
+            "alive",
+            at="2026-06-02",
+        )
+    finally:
+        kg.close()
+
+    seen_queries = []
+
+    def fake_search(query, **kwargs):
+        seen_queries.append(query)
+        return {"results": []}
+
+    monkeypatch.setattr(integration_module, "search_memories", fake_search)
+
+    current = provider.prefetch("What is Atlas's current status?")
+    historical = provider.prefetch("What was Atlas's status on 2026-06-03?")
+
+    assert "Atlas → status → alive" in current
+    assert "current=True" in current
+
+    assert "Atlas → status → alive" in historical
+    assert "valid_from='2026-06-02T00:00:00Z'" in historical
+    assert "current=True" in historical
+    assert seen_queries == [
+        "What is Atlas's current status?",
+        "What was Atlas's status on 2026-06-03?",
+    ]
+
+
+def test_prefetch_keeps_semantic_search_for_conversational_query(
+    provider, integration_module, tmp_path, monkeypatch
+):
+    provider._initialized = True
+    provider._cron_skipped = False
+    provider._palace_path = str(tmp_path / "palace")
+    Path(provider._palace_path).mkdir()
+
+    calls = []
+
+    def fake_search(query, **kwargs):
+        calls.append(query)
+        return {
+            "results": [
+                {
+                    "wing": "project",
+                    "room": "printer",
+                    "text": "We discussed the printer calibration steps.",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(integration_module, "search_memories", fake_search)
+
+    result = provider.prefetch("What did we discuss about the printer?")
+
+    assert "## MemPalace — relevant context" in result
+    assert "printer calibration steps" in result
+    assert "authoritative factual context" not in result
+    assert calls == ["What did we discuss about the printer?"]
+
+
+def test_prefetch_falls_back_to_semantic_when_kg_has_no_fact(
+    provider, integration_module, tmp_path, monkeypatch
+):
+    provider._initialized = True
+    provider._cron_skipped = False
+    provider._palace_path = str(tmp_path / "palace")
+    Path(provider._palace_path).mkdir()
+
+    def fake_search(query, **kwargs):
+        return {
+            "results": [
+                {
+                    "wing": "notes",
+                    "room": "general",
+                    "text": "No structured fact was recorded here.",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(integration_module, "search_memories", fake_search)
+
+    result = provider.prefetch("What is Unknown's current status?")
+
+    assert "## MemPalace — relevant context" in result
+    assert "No structured fact was recorded here." in result
+    assert "authoritative factual context" not in result
+
+
+# ----- Deterministic recall indicator ---------------------------------------
+
+
+def test_recall_status_none_before_prefetch(provider):
+    assert provider.recall_status() is None
+
+
+def test_recall_status_reports_semantic_hit_count(
+    provider, integration_module, tmp_path, monkeypatch
+):
+    provider._initialized = True
+    provider._cron_skipped = False
+    provider._palace_path = str(tmp_path / "palace")
+    Path(provider._palace_path).mkdir()
+
+    monkeypatch.setattr(
+        integration_module,
+        "search_memories",
+        lambda query, **kwargs: {
+            "results": [
+                {"wing": "general", "room": "conversations", "text": "first"},
+                {"wing": "general", "room": "conversations", "text": "second"},
+            ]
+        },
+    )
+
+    result = provider.prefetch("What did we discuss?")
+
+    assert "first" in result
+    status = provider.recall_status()
+    assert status is not None
+    assert status.provider_label == "MemPalace"
+    assert status.count == 2
+
+
+def test_recall_status_reports_generic_for_kg_only(
+    provider, integration_module, tmp_path, monkeypatch
+):
+    provider._initialized = True
+    provider._cron_skipped = False
+    provider._palace_path = str(tmp_path / "palace")
+    Path(provider._palace_path).mkdir()
+
+    monkeypatch.setattr(
+        integration_module,
+        "search_memories",
+        lambda query, **kwargs: {"results": []},
+    )
+    monkeypatch.setattr(
+        provider,
+        "_prefetch_kg_fact",
+        lambda query: "- Atlas → status → alive",
+    )
+
+    result = provider.prefetch("What is Atlas's current status?")
+
+    assert "Atlas → status → alive" in result
+    status = provider.recall_status()
+    assert status is not None
+    assert status.count == 0
+
+
+def test_recall_status_clears_after_empty_prefetch(
+    provider, integration_module, tmp_path, monkeypatch
+):
+    provider._initialized = True
+    provider._cron_skipped = False
+    provider._palace_path = str(tmp_path / "palace")
+    Path(provider._palace_path).mkdir()
+
+    responses = iter(
+        [
+            {"results": [{"wing": "general", "room": "conversations", "text": "memory"}]},
+            {"results": []},
+        ]
+    )
+    monkeypatch.setattr(
+        integration_module,
+        "search_memories",
+        lambda query, **kwargs: next(responses),
+    )
+
+    provider.prefetch("first")
+    status = provider.recall_status()
+    assert status is not None
+    assert status.count == 1
+
+    assert provider.prefetch("second") == ""
+    assert provider.recall_status() is None
