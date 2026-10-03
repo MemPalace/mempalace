@@ -1497,7 +1497,7 @@ def hook_stop(data: dict, harness: str):
                 silent = True
                 toast = False
 
-            project_wing = _wing_from_transcript_path(transcript_path)
+            project_wing = _ingest_wing(transcript_path)
 
             if silent:
                 # Save directly via Python API — systemMessage renders in terminal
@@ -1680,7 +1680,7 @@ def hook_session_end(data: dict, harness: str):
                 _save_diary_direct(
                     valid_transcript,
                     session_id,
-                    wing=_wing_from_transcript_path(valid_transcript),
+                    wing=_ingest_wing(valid_transcript),
                     toast=toast,
                     agent_name=_diary_agent_for_harness(harness),
                 )
