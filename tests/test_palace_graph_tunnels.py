@@ -526,14 +526,19 @@ class TestTunnelFileFollowsConfig:
     to every other process touching the configured palace.
     """
 
-    def test_default_tunnel_file_is_sibling_of_palace_path(self):
+    def test_default_tunnel_file_unchanged(self):
         """Regression: tunnel_file is the sibling of palace_path (single
-        source of truth), regardless of whether the default resolves to the
-        legacy ``~/.mempalace/`` or the XDG ``~/.config/mempalace/`` layout.
+        source of truth), so existing single-user installs are not silently
+        relocated — this holds regardless of whether the default resolves to
+        the legacy ``~/.mempalace/`` or the XDG ``~/.config/mempalace/``
+        layout.
         """
         from mempalace.config import MempalaceConfig
 
         cfg = MempalaceConfig()
+        # tunnel_file is built from the normalized palace_path (abspath), so
+        # derive the expectation from cfg.palace_path rather than the raw
+        # DEFAULT_PALACE_PATH literal — keeps this host-independent.
         expected = os.path.join(os.path.dirname(cfg.palace_path), "tunnels.json")
         assert cfg.tunnel_file == expected
         assert palace_graph._get_tunnel_file(cfg) == expected
