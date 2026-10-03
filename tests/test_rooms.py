@@ -801,6 +801,7 @@ def test_cmd_rooms_apply_keeps_the_marker_when_closets_fail_to_open(tmp_path, mo
     cli.cmd_rooms(ns)
     assert not os.path.exists(pending_apply_path(cfg, "w"))  # nothing to re-key
 
+
 def test_rekey_closets_retry_does_not_follow_intermediate_room():
     """Chained plan general→technical and technical→releases: a closet already
     moved to technical must not be fed into the second mapping on retry.
@@ -820,8 +821,14 @@ def test_rekey_closets_retry_does_not_follow_intermediate_room():
     # First pass against the original rooms (batch of two closets).
     closets = FakeCollection(
         [
-            {"id": "a-first", "meta": {"wing": "w", "room": "general", "source_file": "session.jsonl"}},
-            {"id": "b-second", "meta": {"wing": "w", "room": "technical", "source_file": "session.jsonl"}},
+            {
+                "id": "a-first",
+                "meta": {"wing": "w", "room": "general", "source_file": "session.jsonl"},
+            },
+            {
+                "id": "b-second",
+                "meta": {"wing": "w", "room": "technical", "source_file": "session.jsonl"},
+            },
         ]
     )
     id_targets = resolve_closet_id_targets(closets, "w", targets)
@@ -860,8 +867,14 @@ def test_rekey_closets_retry_does_not_follow_intermediate_room():
     # The old (source, current_room) lookup double-moves a-first.
     legacy = FakeCollection(
         [
-            {"id": "a-first", "meta": {"wing": "w", "room": "technical", "source_file": "session.jsonl"}},
-            {"id": "b-second", "meta": {"wing": "w", "room": "releases", "source_file": "session.jsonl"}},
+            {
+                "id": "a-first",
+                "meta": {"wing": "w", "room": "technical", "source_file": "session.jsonl"},
+            },
+            {
+                "id": "b-second",
+                "meta": {"wing": "w", "room": "releases", "source_file": "session.jsonl"},
+            },
         ]
     )
     # Demonstrate the defect class: matching current room against the plan map.
