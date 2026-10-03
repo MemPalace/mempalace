@@ -5,9 +5,11 @@ decay (strength fades with time since last activation), with the Cepeda
 spacing effect: stability grows when reinforcement is spaced rather than
 massed.
 
-This module is pure. No I/O, no DB, no chromadb. It operates on plain
-dicts (hall records, tunnel records); the math lives here in one place so
-both connection kinds share identical semantics.
+The math has no I/O, no DB, no chromadb. It operates on plain
+dicts (hall records, tunnel records, drawer metadata records) and mutates
+them in place; the math lives here in one place so connection kinds and
+drawer salience share identical semantics. The drawer adapter logs invalid
+optional field names, never their values or drawer content.
 
 ``hallways.py`` and ``palace_graph.py`` currently call only
 ``initialize_dynamics_fields``: hall and tunnel records get these fields
@@ -36,9 +38,13 @@ Research grounding:
 
 from __future__ import annotations
 
+import logging
 import math
 from datetime import datetime, timezone
 from typing import Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -108,6 +114,90 @@ def initialize_dynamics_fields(connection: dict, *, now: Optional[datetime] = No
     connection.setdefault("last_activated", created_at)
     connection.setdefault("access_count", 0)
     return connection
+
+
+def initialize_drawer_dynamics_fields(
+    drawer_metadata: dict, *, now: Optional[datetime] = None
+) -> dict:
+    """Backfill and normalize optional drawer dynamics fields in place.
+
+    Drawer metadata historically has ``filed_at`` rather than connection-style
+    ``created_at``. This adapter keeps the shared dynamics math unchanged while
+    preserving the drawer metadata shape: ``created_at`` is only supplied as a
+    temporary fallback and is not left behind when absent from the input.
+    Arbitrary legacy metadata may use these field names for nonnumeric values;
+    only drawer dynamics use safe defaults for invalid values. Read callers
+    must pass a copy; opted-in writers can persist the normalized fields.
+    """
+
+    if now is None:
+        now = datetime.now(timezone.utc)
+    missing_created_at = "created_at" not in drawer_metadata
+    if missing_created_at and drawer_metadata.get("filed_at"):
+        drawer_metadata["created_at"] = drawer_metadata["filed_at"]
+
+    initialize_dynamics_fields(drawer_metadata, now=now)
+
+    normalized_fields = []
+    for field, default in (("strength", DEFAULT_STRENGTH), ("stability", DEFAULT_STABILITY)):
+        value = drawer_metadata[field]
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            number = math.nan
+        if (
+            isinstance(value, bool)
+            or not math.isfinite(number)
+            or number < 0
+            or (field == "stability" and number == 0)
+        ):
+            number = default
+            normalized_fields.append(field)
+        drawer_metadata[field] = number
+
+    value = drawer_metadata["access_count"]
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError):
+        count = -1
+    if isinstance(value, bool) or count < 0 or (isinstance(value, float) and value != count):
+        count = 0
+        normalized_fields.append("access_count")
+    drawer_metadata["access_count"] = count
+
+    if _parse_iso(drawer_metadata["last_activated"]) is None:
+        fallback = (
+            _parse_iso(drawer_metadata.get("created_at"))
+            or _parse_iso(drawer_metadata.get("filed_at"))
+            or now
+        )
+        drawer_metadata["last_activated"] = fallback.isoformat()
+        normalized_fields.append("last_activated")
+
+    if missing_created_at:
+        drawer_metadata.pop("created_at", None)
+
+    if normalized_fields:
+        logger.warning(
+            "Normalized invalid drawer dynamics fields: %s", ", ".join(normalized_fields)
+        )
+
+    return drawer_metadata
+
+
+def drawer_salience(drawer_metadata: dict, *, now: Optional[datetime] = None) -> dict:
+    """Return lazy-decayed salience for drawer metadata without mutating input."""
+
+    if now is None:
+        now = datetime.now(timezone.utc)
+    record = dict(drawer_metadata or {})
+    initialize_drawer_dynamics_fields(record, now=now)
+    return {
+        "strength": effective_strength(record, now=now),
+        "stability": record["stability"],
+        "last_activated": record["last_activated"],
+        "access_count": record["access_count"],
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
