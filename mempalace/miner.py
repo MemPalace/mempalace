@@ -155,6 +155,13 @@ READABLE_EXTENSIONS = {
     ".java",
     ".go",
     ".rs",
+    # C / C++
+    ".c",
+    ".h",
+    ".cpp",
+    ".hpp",
+    ".cc",
+    ".hh",
     ".swift",
     ".kt",
     ".kts",
