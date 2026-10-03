@@ -16,7 +16,7 @@ import time
 from collections import defaultdict
 from numbers import Integral
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional
 
 import chromadb
 from chromadb.config import Settings as _ChromaSettings
@@ -3135,13 +3135,78 @@ class ChromaCollection(BaseCollection):
     directly without going through ``ChromaBackend``.
     """
 
-    def __init__(self, collection, palace_path: Optional[str] = None, backend=None):
-        self._collection = collection
+    def __init__(
+        self,
+        collection,
+        palace_path: Optional[str] = None,
+        backend=None,
+        *,
+        reopen: Optional[Callable[[], "ChromaCollection"]] = None,
+        generation: Optional[int] = None,
+    ):
         self._palace_path = palace_path
         # Owning ChromaBackend, when this collection came through one. Used
         # only to re-baseline that backend's freshness stat after our writes
         # (see _write_lock). None for directly-constructed test doubles.
         self._backend = backend
+        # Opens this collection again from its owner. A System reset closes the
+        # backend and session clients, including the one behind this handle,
+        # while callers may still hold it; the handle then reopens instead of
+        # failing. None for handles that do not reopen: test doubles and the
+        # ones ChromaBackend.create_collection returns.
+        self._reopen = reopen
+        # The collection and the System generation its client was opened on,
+        # kept as one value so no reader pairs one with the other's replacement.
+        self._handle = (
+            collection,
+            chroma_system_generation() if generation is None else generation,
+        )
+
+    @property
+    def _collection(self):
+        return self._handle[0]
+
+    @_collection.setter
+    def _collection(self, collection):
+        self._handle = (collection, self._handle[1])
+
+    def _current(self):
+        """The underlying collection, reopened first if it has an owner to reopen
+        from and a reset closed its client."""
+        collection, generation = self._handle
+        if self._reopen is None or generation == chroma_system_generation():
+            return collection
+        fresh = self._reopen()
+        if fresh._palace_path != self._palace_path:
+            raise RuntimeError(
+                f"collection handle for {self._palace_path} cannot reopen on {fresh._palace_path}"
+            )
+        self._handle = fresh._handle
+        return fresh._handle[0]
+
+    def _call(self, operation):
+        """Run ``operation`` on the current collection.
+
+        If the operation fails after a System reset completed during it, it runs
+        once more on the reopened collection, whatever was raised, by chromadb
+        on the closed client or by the reopen. An operation already in
+        chromadb's native call when a reset lands finishes on the old System;
+        one still in its Python layer fails like one that had not started. A
+        write is safe to run twice: Chroma ignores an ``add`` of an id it
+        already holds, and ``upsert``, ``update`` and ``delete`` leave the same
+        rows when run twice. A failure during which no reset completed,
+        including one during a reset still running, is raised as it is.
+        """
+        started = chroma_system_generation()
+        try:
+            return operation(self._current())
+        except Exception:
+            if self._reopen is None or chroma_system_generation() == started:
+                raise
+            logger.debug(
+                "A System reset completed during the call; running it again", exc_info=True
+            )
+        return operation(self._current())
 
     @contextlib.contextmanager
     def _write_lock(self):
@@ -3253,7 +3318,7 @@ class ChromaCollection(BaseCollection):
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
         with self._write_lock():
-            self._collection.add(**kwargs)
+            self._call(lambda collection: collection.add(**kwargs))
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
         if getattr(self, "_require_embeddings", False) and embeddings is None:
@@ -3269,7 +3334,7 @@ class ChromaCollection(BaseCollection):
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
         with self._write_lock():
-            self._collection.upsert(**kwargs)
+            self._call(lambda collection: collection.upsert(**kwargs))
 
     def update(
         self,
@@ -3296,7 +3361,7 @@ class ChromaCollection(BaseCollection):
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
         with self._write_lock():
-            self._collection.update(**kwargs)
+            self._call(lambda collection: collection.update(**kwargs))
 
     # ------------------------------------------------------------------
     # Reads
@@ -3348,7 +3413,7 @@ class ChromaCollection(BaseCollection):
         if where_document is not None:
             kwargs["where_document"] = where_document
 
-        raw = self._collection.query(**kwargs)
+        raw = self._call(lambda collection: collection.query(**kwargs))
 
         num_queries = (
             len(query_texts)
@@ -3417,7 +3482,7 @@ class ChromaCollection(BaseCollection):
         if offset is not None:
             kwargs["offset"] = offset
 
-        raw = self._collection.get(**kwargs)
+        raw = self._call(lambda collection: collection.get(**kwargs))
         out_ids = list(raw.get("ids") or [])
         out_docs = list(raw.get("documents") or []) if spec.documents else []
         out_metas = list(raw.get("metadatas") or []) if spec.metadatas else []
@@ -3444,10 +3509,10 @@ class ChromaCollection(BaseCollection):
         if where is not None:
             kwargs["where"] = where
         with self._write_lock():
-            self._collection.delete(**kwargs)
+            self._call(lambda collection: collection.delete(**kwargs))
 
     def count(self):
-        return self._collection.count()
+        return self._call(lambda collection: collection.count())
 
     def iter_metadata(
         self, keys: Optional[Iterable[str]] = None, *, require_key: Optional[str] = None
@@ -3969,8 +4034,9 @@ class ChromaBackend(BaseBackend):
         reset, so their later ``close()`` calls could not stop their Systems.
 
         Draining invalidates every ``ChromaCollection`` previously returned by
-        those clients, including collections for unchanged palaces. Callers
-        must reacquire them through :meth:`get_collection`.
+        those clients, including collections for unchanged palaces. When the
+        drain is part of a System reset, a handle from :meth:`get_collection`
+        reopens before its next read or write (see ``ChromaCollection._current``).
         """
         clients = list(self._clients.values())
         self._clients.clear()
@@ -4246,6 +4312,10 @@ class ChromaBackend(BaseBackend):
         # Collection opens and creates write to chroma.sqlite3.
         with palace_db_lock(os.path.join(palace_path, "chroma.sqlite3")):
             client = self._client(palace_path)
+            # Read right after taking the client, so a reset that lands while the
+            # collection opens leaves the handle naming its client's generation,
+            # not the new one (-1, unknown, makes it reopen on first use).
+            generation = self._system_generation.get(palace_path, -1)
 
             if caller_vectors:
                 # Passing None explicitly prevents Chroma's client default EF.
@@ -4305,6 +4375,10 @@ class ChromaBackend(BaseBackend):
             collection,
             palace_path=palace_path,
             backend=self,
+            reopen=lambda: self.get_collection(
+                palace=palace_ref, collection_name=collection_name, create=False, options=options
+            ),
+            generation=generation,
         )
         wrapped._require_embeddings = caller_vectors
         return wrapped

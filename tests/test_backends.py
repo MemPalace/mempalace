@@ -2667,3 +2667,254 @@ def test_chroma_reset_by_another_owner_reopens_backend_and_keeps_its_client(tmp_
     finally:
         first.close()
         second.close()
+
+
+def _palace_with_one_drawer(tmp_path):
+    palace = tmp_path / "palace"
+    ref = PalaceRef(id=str(palace), local_path=str(palace))
+    backend = ChromaBackend()
+    col = backend.get_collection(palace=ref, collection_name="mempalace_drawers", create=True)
+    col.add(ids=["a"], documents=["alpha"], embeddings=[[0.1, 0.2, 0.3, 0.4]])
+    return backend, ref, col
+
+
+def _count_collection_opens(monkeypatch, backend):
+    """Count ``backend.get_collection`` calls, passing each one through."""
+    opened = []
+    real = backend.get_collection
+
+    def counting(*args, **kwargs):
+        opened.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "get_collection", counting)
+    return opened
+
+
+def _reset_as_the_next_starts(monkeypatch, method):
+    """Make the next chromadb ``Collection.<method>`` call reset the shared
+    System just before it reaches its client, as another request does when it
+    notices a peer's write at that moment. Returns each attempt's outcome."""
+    from chromadb.api.models.Collection import Collection
+
+    real = getattr(Collection, method)
+    attempts = []
+
+    def cut_off(self, *args, **kwargs):
+        if not attempts:
+            chroma_module._clear_chroma_system_cache()
+        try:
+            result = real(self, *args, **kwargs)
+        except Exception:
+            attempts.append("raised")
+            raise
+        attempts.append("ok")
+        return result
+
+    monkeypatch.setattr(Collection, method, cut_off)
+    return attempts
+
+
+def test_chroma_handle_keeps_working_after_another_owner_resets_the_system(tmp_path, monkeypatch):
+    """A handle taken before another owner resets the shared System (as after a
+    peer write) keeps answering although the reset closed the client it came
+    from: it reopens once, not again for every call after."""
+    backend, _ref, col = _palace_with_one_drawer(tmp_path)
+    try:
+        opened = _count_collection_opens(monkeypatch, backend)
+        chroma_module._clear_chroma_system_cache()
+
+        assert col.count() == 1
+        col.upsert(ids=["b"], documents=["beta"], embeddings=[[0.4, 0.3, 0.2, 0.1]])
+        assert sorted(col.get(ids=["a", "b"]).ids) == ["a", "b"]
+        assert opened == [1]
+    finally:
+        backend.close()
+
+
+def test_chroma_handle_does_not_reopen_while_the_system_is_unchanged(tmp_path, monkeypatch):
+    """Without a reset the handle keeps its collection; opening it again would
+    re-run the HNSW-thread pin, a modify() that can write chroma.sqlite3."""
+    backend, _ref, col = _palace_with_one_drawer(tmp_path)
+    try:
+        opened = _count_collection_opens(monkeypatch, backend)
+        for _ in range(3):
+            assert col.count() == 1
+            col.upsert(ids=["a"], documents=["alpha again"], embeddings=[[0.1, 0.2, 0.3, 0.4]])
+            assert col.get(ids=["a"]).documents == ["alpha again"]
+        assert opened == []
+    finally:
+        backend.close()
+
+
+def test_chroma_handle_runs_an_operation_again_when_a_reset_cut_it_off(tmp_path, monkeypatch):
+    """A reset that lands as an operation starts closes the client before
+    chromadb reaches it; the operation runs once more on the reopened collection."""
+    backend, _ref, col = _palace_with_one_drawer(tmp_path)
+    try:
+        attempts = _reset_as_the_next_starts(monkeypatch, "count")
+        assert col.count() == 1
+        assert attempts == ["raised", "ok"]
+    finally:
+        backend.close()
+
+
+def test_chroma_handle_does_not_retry_an_error_no_reset_explains(tmp_path, monkeypatch):
+    """Only a reset that completed during the call earns a second attempt; any
+    other failure reaches the caller as it was, without reopening."""
+    from chromadb.api.models.Collection import Collection
+
+    backend, _ref, col = _palace_with_one_drawer(tmp_path)
+    try:
+        opened = _count_collection_opens(monkeypatch, backend)
+        attempts = []
+
+        def failing_get(self, *args, **kwargs):
+            attempts.append(1)
+            raise ValueError("the store refused this read")
+
+        monkeypatch.setattr(Collection, "get", failing_get)
+        with pytest.raises(ValueError, match="the store refused this read"):
+            col.get(ids=["a"])
+        assert attempts == [1]
+        assert opened == []
+    finally:
+        backend.close()
+
+
+def test_chroma_handle_does_not_retry_a_failure_right_after_it_reopened(tmp_path, monkeypatch):
+    """A handle that reopened at the start of a call (the reset came before it)
+    runs a failing operation once: that failure is not the reset's."""
+    from chromadb.api.models.Collection import Collection
+
+    backend, _ref, col = _palace_with_one_drawer(tmp_path)
+    try:
+        chroma_module._clear_chroma_system_cache()
+        opened = _count_collection_opens(monkeypatch, backend)
+        attempts = []
+
+        def failing_get(self, *args, **kwargs):
+            attempts.append(1)
+            raise ValueError("the store refused this read")
+
+        monkeypatch.setattr(Collection, "get", failing_get)
+        with pytest.raises(ValueError, match="the store refused this read"):
+            col.get(ids=["a"])
+        assert opened == [1]
+        assert attempts == [1]
+    finally:
+        backend.close()
+
+
+def test_chroma_handle_gets_another_attempt_when_a_reset_lands_inside_its_reopen(
+    tmp_path, monkeypatch
+):
+    """The reopen itself can be cut off: another owner resets after the backend
+    took its client and before it opened the collection on it."""
+    backend, _ref, col = _palace_with_one_drawer(tmp_path)
+    try:
+        chroma_module._clear_chroma_system_cache()
+        real_resolve = ChromaBackend._resolve_embedding_function
+        resets = []
+
+        def resolve_while_another_owner_resets():
+            if not resets:
+                resets.append(1)
+                chroma_module._clear_chroma_system_cache()
+            return real_resolve()
+
+        monkeypatch.setattr(
+            ChromaBackend,
+            "_resolve_embedding_function",
+            staticmethod(resolve_while_another_owner_resets),
+        )
+        assert col.count() == 1
+        assert resets == [1]
+    finally:
+        backend.close()
+
+
+def test_chroma_handle_opened_while_another_owner_resets_still_works(tmp_path, monkeypatch):
+    """A reset can land after the backend took its client and before the handle
+    exists (another thread noticed a peer's write). The handle must still know
+    it belongs to the client the reset closed."""
+    backend, ref, col = _palace_with_one_drawer(tmp_path)
+    try:
+        real_pin = chroma_module._pin_hnsw_threads
+        resets = []
+
+        def pin_while_another_owner_resets(collection):
+            real_pin(collection)
+            if not resets:
+                resets.append(1)
+                chroma_module._clear_chroma_system_cache()
+
+        monkeypatch.setattr(chroma_module, "_pin_hnsw_threads", pin_while_another_owner_resets)
+        opened = backend.get_collection(palace=ref, collection_name="mempalace_drawers")
+
+        assert resets == [1]
+        assert opened.count() == 1
+    finally:
+        backend.close()
+
+
+def test_chroma_handle_add_cut_off_by_a_reset_lands_once(tmp_path, monkeypatch):
+    """Chroma ignores an ``add`` of an id it already holds, so an ``add`` that
+    wrote and was then cut off by a reset runs again like any other call, and
+    lands once."""
+    from chromadb.api.models.Collection import Collection
+
+    backend, _ref, col = _palace_with_one_drawer(tmp_path)
+    try:
+        real_add = Collection.add
+        attempts = []
+
+        def add_then_cut_off(self, *args, **kwargs):
+            attempts.append(1)
+            result = real_add(self, *args, **kwargs)
+            if len(attempts) == 1:
+                chroma_module._clear_chroma_system_cache()
+                raise RuntimeError("cut off after the write")
+            return result
+
+        monkeypatch.setattr(Collection, "add", add_then_cut_off)
+        col.add(ids=["b"], documents=["beta"], embeddings=[[0.4, 0.3, 0.2, 0.1]])
+        assert attempts == [1, 1]
+        assert col.count() == 2
+        assert col.get(ids=["b"]).documents == ["beta"]
+    finally:
+        backend.close()
+
+
+def test_chroma_handle_does_not_recreate_a_deleted_collection(tmp_path):
+    """Reopening never creates: a collection deleted before the reset stays
+    gone, and the call fails instead of answering from an empty new one."""
+    backend, _ref, col = _palace_with_one_drawer(tmp_path)
+    try:
+        backend.delete_collection(str(tmp_path / "palace"), "mempalace_drawers")
+        chroma_module._clear_chroma_system_cache()
+        with pytest.raises(CollectionNotInitializedError):
+            col.count()
+    finally:
+        backend.close()
+
+
+def test_chroma_caller_vector_handle_reopens_with_its_options(tmp_path):
+    """A caller-vector collection reopens as one: still without an embedding
+    function after the reset."""
+    palace = tmp_path / "palace"
+    ref = PalaceRef(id=str(palace), local_path=str(palace))
+    backend = ChromaBackend()
+    options = {"caller_vectors": True, "hnsw_space": "cosine"}
+    try:
+        col = backend.get_collection(
+            palace=ref, collection_name="vectors", create=True, options=options
+        )
+        col.upsert(ids=["v"], documents=["a vector"], embeddings=[[1.0, 0.0, 0.0]])
+        chroma_module._clear_chroma_system_cache()
+
+        found = col.query(query_embeddings=[[1.0, 0.0, 0.0]], n_results=1)
+        assert found.ids == [["v"]]
+        assert getattr(col._collection, "_embedding_function", None) is None
+    finally:
+        backend.close()
