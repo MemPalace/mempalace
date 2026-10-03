@@ -360,6 +360,37 @@ def test_chroma_lexical_search_ids_roundtrip_through_get(tmp_path):
     backend.close()
 
 
+def test_chroma_lexical_search_window_keeps_best_match_filed_last(tmp_path):
+    """The capped FTS window holds the best matches, not the first ones filed.
+
+    Regression for #2667: with more than 500 matches and no ``where``, the
+    window was read in rowid order, so a strong match filed late was never
+    scored.
+    """
+    backend = ChromaBackend()
+    palace = tmp_path / "palace"
+    ref = PalaceRef(id=str(palace), local_path=str(palace))
+    col = backend.get_collection(palace=ref, collection_name="mempalace_drawers", create=True)
+    ids = [f"filler-{i:03d}" for i in range(600)] + ["target"]
+    documents = [
+        f"Note {i}: a kestrel was seen near the north field during the morning survey."
+        for i in range(600)
+    ] + ["The kestrel migration is blocked on the kestrel migration permit."]
+    for start in range(0, len(ids), 200):
+        batch = slice(start, start + 200)
+        col.add(
+            ids=ids[batch],
+            documents=documents[batch],
+            embeddings=[[1.0, 0.0, 0.0]] * len(ids[batch]),
+            metadatas=[{"wing": "w"}] * len(ids[batch]),
+        )
+
+    hits = col.lexical_search(query="kestrel migration", n_results=5).hits
+
+    assert [hit.id for hit in hits][:1] == ["target"]
+    backend.close()
+
+
 def test_query_rejects_missing_input():
     fake = _FakeCollection()
     collection = ChromaCollection(fake)
