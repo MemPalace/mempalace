@@ -11,6 +11,8 @@ This file is RED-first. The corresponding implementation lives in
 
 from unittest.mock import MagicMock, patch
 
+import json
+
 
 # Mock chromadb at import time so the hallways module can be loaded even
 # in environments where chromadb isn't installed. Mirrors the pattern in
@@ -271,10 +273,156 @@ class TestComputeHallways:
         result = hallways_mod.compute_hallways_for_wing("wing_aya", col=col, min_count=2)
         assert result == []
 
+    def _pair(self, results, a, b):
+        """Return the hallway record for pair {a, b} in ``results`` or ``None``."""
+        hit = [h for h in results if {h["entity_a"], h["entity_b"]} == {a, b}]
+        return hit[0] if hit else None
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Query API — list_hallways, delete_hallway
-# ─────────────────────────────────────────────────────────────────────────────
+    def test_min_count_from_config_file_threshold(self, tmp_path, monkeypatch):
+        """config.json's ``hallway_min_count`` is honoured (acceptance #1).
+
+        The call omits ``min_count`` on purpose so the threshold must come
+        from config, not the historical literal 2. A corpus with A↔B in 2,
+        A↔C in 3, and C↔D in 4 drawers: at threshold 3 only A↔C and C↔D
+        materialize — A↔B is filtered.
+        """
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        from mempalace.config import MempalaceConfig
+
+        cfgdir = tmp_path / "cfg"
+        cfgdir.mkdir(exist_ok=True)
+        (cfgdir / "config.json").write_text(json.dumps({"hallway_min_count": 3}), encoding="utf-8")
+        monkeypatch.delenv("MEMPALACE_KG_HALLWAY_MIN_COUNT", raising=False)
+        cfg = MempalaceConfig(config_dir=cfgdir)
+
+        col = _fake_collection(
+            [
+                # A↔B in 2 drawers
+                {"wing": "w", "room": "r1", "entities": "A;B"},
+                {"wing": "w", "room": "r1", "entities": "A;B"},
+                # A↔C in 3 drawers
+                {"wing": "w", "room": "r1", "entities": "A;C"},
+                {"wing": "w", "room": "r2", "entities": "A;C"},
+                {"wing": "w", "room": "r2", "entities": "A;C"},
+                # C↔D in 4 drawers
+                {"wing": "w", "room": "r1", "entities": "C;D"},
+                {"wing": "w", "room": "r2", "entities": "C;D"},
+                {"wing": "w", "room": "r3", "entities": "C;D"},
+                {"wing": "w", "room": "r3", "entities": "C;D"},
+            ]
+        )
+        result = hallways_mod.compute_hallways_for_wing("w", col=col, config=cfg)
+        assert self._pair(result, "A", "B") is None
+        assert self._pair(result, "A", "C") is not None
+        assert self._pair(result, "C", "D") is not None
+
+    def test_min_count_from_env_precedence(self, tmp_path, monkeypatch):
+        """MEMPALACE_KG_HALLWAY_MIN_COUNT wins over config.json (acceptance #2).
+
+        Config sets 3, env sets 5. With 3 drawers each pair is below 5, so
+        the hallway set is empty — the env value must have applied.
+        """
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        from mempalace.config import MempalaceConfig
+
+        cfgdir = tmp_path / "cfg"
+        cfgdir.mkdir(exist_ok=True)
+        (cfgdir / "config.json").write_text(json.dumps({"hallway_min_count": 3}), encoding="utf-8")
+        monkeypatch.setenv("MEMPALACE_KG_HALLWAY_MIN_COUNT", "5")
+        cfg = MempalaceConfig(config_dir=cfgdir)
+
+        col = _fake_collection(
+            [
+                {"wing": "w", "room": "r1", "entities": "A;B"},
+                {"wing": "w", "room": "r1", "entities": "A;B"},
+                {"wing": "w", "room": "r2", "entities": "A;B"},
+            ]
+        )
+        result = hallways_mod.compute_hallways_for_wing("w", col=col, config=cfg)
+        assert result == []
+
+    def test_min_count_env_var_alone(self, tmp_path, monkeypatch):
+        """Env-only (no config key) threshold is honoured (synthetic matrix)."""
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        from mempalace.config import MempalaceConfig
+
+        monkeypatch.setenv("MEMPALACE_KG_HALLWAY_MIN_COUNT", "3")
+        cfg = MempalaceConfig()
+
+        col = _fake_collection(
+            [
+                {"wing": "w", "room": "r1", "entities": "A;B"},
+                {"wing": "w", "room": "r2", "entities": "A;B"},
+                {"wing": "w", "room": "r1", "entities": "A;C"},
+                {"wing": "w", "room": "r2", "entities": "A;C"},
+                {"wing": "w", "room": "r3", "entities": "A;C"},
+            ]
+        )
+        result = hallways_mod.compute_hallways_for_wing("w", col=col, config=cfg)
+        assert self._pair(result, "A", "B") is None
+        assert self._pair(result, "A", "C") is not None
+
+
+class TestHallwayMinCountProperty:
+    """Unit tests for MempalaceConfig.hallway_min_count — the resolution
+    contract (env > file > default, ``>=1`` clamp) that mirrors
+    ``topic_tunnel_min_count``.
+
+    These tests are RED on HEAD (pre-#2328) because the attribute does not
+    exist yet; GREEN once the property is added.
+    """
+
+    def _write_cfg(self, tmp_path, value):
+        cfgdir = tmp_path / "cfg"
+        cfgdir.mkdir(exist_ok=True)
+        (cfgdir / "config.json").write_text(
+            json.dumps({"hallway_min_count": value}), encoding="utf-8"
+        )
+        return cfgdir
+
+    def test_default_is_two(self, tmp_path, monkeypatch):
+        from mempalace.config import MempalaceConfig
+
+        monkeypatch.delenv("MEMPALACE_KG_HALLWAY_MIN_COUNT", raising=False)
+        assert MempalaceConfig(config_dir=tmp_path).hallway_min_count == 2
+
+    def test_file_value_honoured(self, tmp_path, monkeypatch):
+        from mempalace.config import MempalaceConfig
+
+        monkeypatch.delenv("MEMPALACE_KG_HALLWAY_MIN_COUNT", raising=False)
+        cfgdir = self._write_cfg(tmp_path, 5)
+        assert MempalaceConfig(config_dir=cfgdir).hallway_min_count == 5
+
+    def test_env_precedes_file(self, tmp_path, monkeypatch):
+        from mempalace.config import MempalaceConfig
+
+        cfgdir = self._write_cfg(tmp_path, 2)
+        monkeypatch.setenv("MEMPALACE_KG_HALLWAY_MIN_COUNT", "7")
+        assert MempalaceConfig(config_dir=cfgdir).hallway_min_count == 7
+
+    def test_clamps_below_one_to_one(self, tmp_path, monkeypatch):
+        from mempalace.config import MempalaceConfig
+
+        monkeypatch.delenv("MEMPALACE_KG_HALLWAY_MIN_COUNT", raising=False)
+        cfgdir = self._write_cfg(tmp_path, 0)
+        assert MempalaceConfig(config_dir=cfgdir).hallway_min_count == 1
+
+    def test_env_below_one_falls_through(self, tmp_path, monkeypatch):
+        """An env value of 0 is not >= 1, so the property falls through to
+        file/default. File has 4 → returns 4."""
+        from mempalace.config import MempalaceConfig
+
+        cfgdir = self._write_cfg(tmp_path, 4)
+        monkeypatch.setenv("MEMPALACE_KG_HALLWAY_MIN_COUNT", "0")
+        assert MempalaceConfig(config_dir=cfgdir).hallway_min_count == 4
+
+    def test_non_numeric_env_falls_through(self, tmp_path, monkeypatch):
+        """A non-numeric env value is ignored; file value returned."""
+        from mempalace.config import MempalaceConfig
+
+        cfgdir = self._write_cfg(tmp_path, 6)
+        monkeypatch.setenv("MEMPALACE_KG_HALLWAY_MIN_COUNT", "bogus")
+        assert MempalaceConfig(config_dir=cfgdir).hallway_min_count == 6
 
 
 class TestHallwayQuery:

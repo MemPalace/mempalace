@@ -593,7 +593,7 @@ Append an immutable agent-coordination event to the logstream (RFC 003).
 
 ### `mempalace_event_list`
 
-List events with structured filters.
+List events with structured filters. `writer` filters by who wrote an event. `from_agent` is the caller identity and does not narrow the result.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -602,7 +602,8 @@ List events with structured filters.
 | `topic` | string | No | Filter by topic |
 | `type` | string | No | Filter by event type |
 | `to_agent` | string | No | Filter by target; also matches `*` broadcasts |
-| `from_agent` | string | No | Filter by writer |
+| `from_agent` | string | No | Caller identity. Not a filter: it never narrows the result. To filter by who wrote an event use `writer` |
+| `writer` | string | No | Filter by the agent that wrote the event |
 | `correlation_id` | string | No | Filter by correlation id |
 | `status` | string | No | Filter by status |
 | `since_event_id` | string | No | Only events strictly after this id in append order (precise forward cursor) |
@@ -617,7 +618,7 @@ List events with structured filters.
 
 ### `mempalace_event_wait`
 
-Block until a matching event exists or the timeout expires (long-poll; max 5 minutes). Accepts the forward filters `stream`, `room`, `topic`, `type`, `to_agent`, `from_agent`, `correlation_id`, `status`, `since_event_id`, and `since_created_at`, plus:
+Block until a matching event exists or the timeout expires (long-poll; max 5 minutes). Accepts the forward filters `stream`, `room`, `topic`, `type`, `to_agent`, `writer`, `correlation_id`, `status`, `since_event_id`, and `since_created_at`. `from_agent` is the caller identity and does not filter. Also:
 
 For live-tail clients that can keep an HTTP connection open, use
 `GET /logstream/stream` SSE instead; `event_wait` is the polling MCP surface.

@@ -680,6 +680,50 @@ class TestHandleRequest:
         assert "mempalace_add_drawer" in names
         assert "mempalace_kg_add" in names
 
+    def test_tools_list_read_only_hint(self):
+        """Inspection tools advertise MCP annotations.readOnlyHint so plan
+        modes can admit them without a host-side allowlist.
+
+        mempalace_memories_filed_away unlinks the checkpoint ack file, so it
+        must not advertise the hint (omitted means the MCP default, false).
+        The same rule covers every tool --read-only refuses.
+        """
+        from mempalace.mcp_server import _READ_ONLY_REFUSED_TOOLS, handle_request
+
+        expected = {
+            "mempalace_status",
+            "mempalace_list_wings",
+            "mempalace_list_rooms",
+            "mempalace_get_taxonomy",
+            "mempalace_get_aaak_spec",
+            "mempalace_search",
+            "mempalace_check_duplicate",
+            "mempalace_get_drawer",
+            "mempalace_get_drawers",
+            "mempalace_list_drawers",
+            "mempalace_diary_read",
+            "mempalace_kg_query",
+            "mempalace_kg_timeline",
+            "mempalace_kg_stats",
+        }
+        resp = handle_request({"method": "tools/list", "id": 2, "params": {}})
+        tools = resp["result"]["tools"]
+        hinted = {t["name"] for t in tools if t.get("annotations", {}).get("readOnlyHint") is True}
+        assert hinted == expected
+        assert hinted.isdisjoint(_READ_ONLY_REFUSED_TOOLS)
+        filed = next(t for t in tools if t["name"] == "mempalace_memories_filed_away")
+        assert filed.get("annotations", {}).get("readOnlyHint") is not True
+        mutating = next(t for t in tools if t["name"] == "mempalace_add_drawer")
+        assert "annotations" not in mutating
+
+    def test_search_description_is_past_session_scoped(self):
+        from mempalace.mcp_server import TOOLS
+
+        description = TOOLS["mempalace_search"]["description"]
+        assert len(description) < 200
+        assert "past-session" in description
+        assert "current conversation" in description
+
     def test_no_tool_schema_uses_top_level_combinator(self):
         """Anthropic's Messages API rejects a tool whose input schema has a
         top-level anyOf/oneOf/allOf and drops the entire tools array with a
