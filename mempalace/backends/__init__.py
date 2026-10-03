@@ -41,6 +41,7 @@ from .pgvector import PgVectorBackend, PgVectorCollection
 from .qdrant import QdrantBackend, QdrantCollection
 from .sqlite_exact import SQLiteExactBackend, SQLiteExactCollection
 from .rust_exact import RustExactBackend, RustExactCollection
+from .sqlite_vec import SQLiteVecBackend, SQLiteVecCollection
 from .registry import (
     available_backends,
     detect_backend_for_path,
@@ -84,6 +85,8 @@ __all__ = [
     "RustExactCollection",
     "SQLiteExactBackend",
     "SQLiteExactCollection",
+    "SQLiteVecBackend",
+    "SQLiteVecCollection",
     "UnsupportedCapabilityError",
     "UnsupportedFilterError",
     "UnsupportedMaintenanceKindError",
