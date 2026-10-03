@@ -521,12 +521,15 @@ def _tool_reconnect_locked():
             if close_errors:
                 result["error"] = "; ".join(close_errors)
             return result
+        # Logical drawers, so this agrees with list_drawers/status on a palace
+        # with chunked drawers (a raw col.count() reports physical rows).
+        count_fields = _drawer_count_fields(logical_drawer_count(col))
         if close_errors:
             return _attach_stale_library_warning(
                 {
                     "success": False,
                     "message": "Reconnect reopened the palace but failed to fully reset cached handles",
-                    "drawers": col.count(),
+                    **count_fields,
                     "vector_disabled": _vector_disabled,
                     "vector_disabled_reason": _vector_disabled_reason,
                     "error": "; ".join(close_errors),
@@ -536,7 +539,7 @@ def _tool_reconnect_locked():
             {
                 "success": True,
                 "message": "Reconnected to palace",
-                "drawers": col.count(),
+                **count_fields,
                 "vector_disabled": _vector_disabled,
                 "vector_disabled_reason": _vector_disabled_reason,
             }
