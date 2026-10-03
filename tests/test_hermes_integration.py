@@ -284,27 +284,32 @@ def test_on_turn_start_tracks_turn_number(provider):
 
 
 # ---------------------------------------------------------------------------
-# on_session_end / on_pre_compress: sync_turn is the sole filing path — these
-# hooks must neither enqueue filing work nor promise persistence. Re-filing
-# the raw message list mints duplicate drawers (filed_at is hashed into the
-# drawer id, so upserts cannot collapse the copies).
+# on_session_end / on_pre_compress: sync_turn is the PRIMARY filing path —
+# these hooks enqueue a scan-based safety net that files only turns
+# sync_turn missed. Dedup correctness lives in _file_missing_exchanges.
 # ---------------------------------------------------------------------------
 
 
-def test_on_pre_compress_returns_no_hint_and_files_nothing(provider):
+def test_on_pre_compress_returns_hint_and_enqueues_safety_net(provider):
     provider._cron_skipped = False
     provider._initialized = True
     pre = provider._worker_queue.qsize()
-    assert provider.on_pre_compress([{"role": "user", "content": "hi"}]) == ""
-    assert provider._worker_queue.qsize() == pre
+    hint = provider.on_pre_compress([{"role": "user", "content": "hi"}])
+    assert "mempalace_search" in hint
+    assert provider._worker_queue.qsize() == pre + 1
 
 
-def test_on_session_end_files_nothing_when_initialized(provider):
+def test_on_session_end_enqueues_safety_net_then_wakeup(provider):
     provider._cron_skipped = False
     provider._initialized = True
-    pre = provider._worker_queue.qsize()
     provider.on_session_end([{"role": "user", "content": "hi"}])
-    assert provider._worker_queue.qsize() == pre
+    # The wake-up refresh is sequenced BEHIND the safety-net task so its
+    # ChromaDB reads never race the safety net's writes (Windows sqlite
+    # locks under concurrent access; a locked write drops a turn).
+    tasks = []
+    while not provider._worker_queue.empty():
+        tasks.append(provider._worker_queue.get_nowait()[0])
+    assert tasks == ["session_end", "wakeup"]
 
 
 def test_on_pre_compress_under_cron_returns_empty_string(provider, tmp_path):
@@ -937,3 +942,599 @@ def test_on_memory_write_skips_unknown_target_and_non_add(initialized_provider):
     initialized_provider.on_memory_write("replace", "memory", "x")
     initialized_provider.on_memory_write("remove", "user", "x")
     assert initialized_provider._worker_queue.qsize() == pre
+
+
+# ---------------------------------------------------------------------------
+# Dedup safety net: real-user detection, turn segmentation, fingerprints.
+# ---------------------------------------------------------------------------
+
+
+def test_is_real_user_message_distinguishes_tool_results(integration_module):
+    fn = integration_module._is_real_user_message
+    assert fn({"role": "user", "content": "plain text"}) is True
+    assert fn({"role": "user", "content": [{"type": "text", "text": "hi"}]}) is True
+    # Anthropic-format tool results are user-role with only tool_result blocks.
+    assert fn({"role": "user", "content": [{"type": "tool_result", "content": "out"}]}) is False
+    assert fn({"role": "assistant", "content": "hi"}) is False
+    assert fn({"role": "user", "content": ""}) is False
+    assert fn({"role": "user", "content": []}) is False
+    # Mixed content (tool_result + text) counts as real.
+    assert (
+        fn(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "content": "out"},
+                    {"type": "text", "text": "and another thing"},
+                ],
+            }
+        )
+        is True
+    )
+
+
+def test_turn_fingerprint_from_messages_uses_last_real_user(integration_module):
+    from mempalace.ids import make_turn_fingerprint
+
+    fn = integration_module._turn_fingerprint_from_messages
+    norm = integration_module._normalize_content
+    msgs = [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": [{"type": "text", "text": "second question"}]},
+        {"role": "assistant", "content": [{"type": "tool_use", "name": "grep"}]},
+        # Trailing tool result must NOT be picked as the turn anchor.
+        {"role": "user", "content": [{"type": "tool_result", "content": "grep out"}]},
+    ]
+    expected = make_turn_fingerprint(norm([{"type": "text", "text": "second question"}]))
+    assert fn(msgs) == expected
+    assert fn([]) == ""
+    assert fn([{"role": "assistant", "content": "orphan"}]) == ""
+
+
+def test_segment_turns_folds_tool_traffic_into_turn(integration_module):
+    fn = integration_module._segment_turns
+    msgs = [
+        {"role": "user", "content": "search for JWT handling"},
+        {"role": "assistant", "content": [{"type": "tool_use", "name": "grep"}]},
+        {"role": "user", "content": [{"type": "tool_result", "content": "auth.py:42"}]},
+        {"role": "assistant", "content": "JWT handling lives in auth.py."},
+        {"role": "user", "content": "thanks"},
+        {"role": "assistant", "content": "any time"},
+    ]
+    segs = fn(msgs)
+    assert len(segs) == 2
+    assert segs[0]["user"] == "search for JWT handling"
+    # Tool traffic and the final response all belong to the first turn.
+    assert "[tool_use: grep]" in segs[0]["assistant"]
+    assert "auth.py:42" in segs[0]["assistant"]
+    assert "JWT handling lives in auth.py." in segs[0]["assistant"]
+    assert segs[0]["turn_fp"] != ""
+    assert segs[1]["user"] == "thanks"
+    assert segs[1]["assistant"] == "any time"
+
+
+def test_segment_turns_preamble_without_user_anchor(integration_module):
+    fn = integration_module._segment_turns
+    msgs = [
+        {"role": "assistant", "content": "orphaned assistant text"},
+        {"role": "user", "content": "now a real question"},
+        {"role": "assistant", "content": "an answer"},
+    ]
+    segs = fn(msgs)
+    assert len(segs) == 2
+    assert segs[0]["user"] == ""
+    assert segs[0]["assistant"] == "orphaned assistant text"
+    assert segs[0]["turn_fp"] == ""  # no user anchor — text-only dedup applies
+    assert segs[1]["user"] == "now a real question"
+
+
+def test_segment_turns_drops_empty_segments(integration_module):
+    fn = integration_module._segment_turns
+    assert fn([]) == []
+    assert fn([{"role": "assistant", "content": ""}]) == []
+
+
+# ---------------------------------------------------------------------------
+# sync_turn coverage fingerprints: the correlation key the safety net uses.
+# ---------------------------------------------------------------------------
+
+
+def test_sync_turn_with_messages_stores_turn_fingerprint(initialized_provider):
+    from mempalace.ids import make_turn_fingerprint
+
+    msgs = [
+        {"role": "user", "content": "what's the plan?"},
+        {"role": "assistant", "content": "ship the PR"},
+    ]
+    initialized_provider.sync_turn("what's the plan?", "ship the PR", messages=msgs)
+    initialized_provider._worker_queue.join()
+
+    metas = initialized_provider._collection.get(include=["metadatas"]).get("metadatas") or []
+    hermes = [m for m in metas if m.get("source") == "hermes"]
+    assert len(hermes) == 1, f"expected exactly 1 hermes drawer, got {len(hermes)}"
+    assert hermes[0].get("turn_fp") == make_turn_fingerprint("what's the plan?")
+
+
+def test_sync_turn_without_messages_stores_no_fingerprint(initialized_provider):
+    # Legacy callers / on_delegation synthetic turns carry no snapshot —
+    # a fabricated fingerprint would wrongly mark raw turns as covered.
+    initialized_provider.sync_turn("solo question", "solo answer")
+    initialized_provider._worker_queue.join()
+
+    metas = initialized_provider._collection.get(include=["metadatas"]).get("metadatas") or []
+    hermes = [m for m in metas if m.get("source") == "hermes"]
+    assert len(hermes) == 1, f"expected exactly 1 hermes drawer, got {len(hermes)}"
+    assert "turn_fp" not in hermes[0]
+
+
+# ---------------------------------------------------------------------------
+# Branch lineage: /branch mints a new session id but carries the transcript
+# forward — the dedup scan must include ancestor sessions. /resume's
+# parent_session_id is the session being LEFT (not ancestry) and must clear
+# lineage; keeping it could false-dedup against unrelated drawers.
+# ---------------------------------------------------------------------------
+
+
+def test_session_switch_branch_appends_parent_to_lineage(provider):
+    provider._session_id = "parent-1"
+    provider.on_session_switch(
+        "branch-1", parent_session_id="parent-1", reset=False, reason="branch"
+    )
+    assert provider._session_lineage == ["parent-1"]
+    # Branch-of-branch chains.
+    provider.on_session_switch(
+        "branch-2", parent_session_id="branch-1", reset=False, reason="branch"
+    )
+    assert provider._session_lineage == ["parent-1", "branch-1"]
+
+
+def test_session_switch_resume_clears_lineage(provider):
+    provider._session_id = "branch-1"
+    provider._session_lineage = ["parent-1"]
+    provider.on_session_switch(
+        "other-session", parent_session_id="branch-1", reset=False, reason="resume"
+    )
+    assert provider._session_lineage == []
+
+
+def test_session_switch_reset_clears_lineage(provider):
+    provider._session_lineage = ["parent-1"]
+    provider.on_session_switch("fresh", reset=True, reason="new_session")
+    assert provider._session_lineage == []
+
+
+def test_session_switch_branch_without_parent_clears_lineage(provider):
+    provider._session_id = "parent-1"
+    provider._session_lineage = ["grandparent-0"]
+    provider.on_session_switch("branch-x", parent_session_id="", reset=False, reason="branch")
+    assert provider._session_lineage == []
+
+
+def test_session_switch_rewind_keeps_lineage(provider):
+    # Rewind stays within the same conversation — ancestry still applies.
+    provider._session_id = "branch-1"
+    provider._session_lineage = ["parent-1"]
+    provider.on_session_switch("branch-1", parent_session_id="", reset=False, rewound=True)
+    assert provider._session_lineage == ["parent-1"]
+
+
+def test_fingerprint_call_sites_are_consistent(integration_module):
+    # The invariant the dedup system rests on: _turn_fingerprint_from_messages
+    # (used by sync_turn) and _segment_turns (used by the safety net) must
+    # fingerprint the SAME message dict identically.
+    fn_fp = integration_module._turn_fingerprint_from_messages
+    fn_seg = integration_module._segment_turns
+    msgs = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": [{"type": "text", "text": "second"}]},
+        {"role": "assistant", "content": [{"type": "tool_use", "name": "grep"}]},
+        {"role": "user", "content": [{"type": "tool_result", "content": "out"}]},
+    ]
+    direct = fn_fp(msgs)
+    from_seg = next((s["turn_fp"] for s in reversed(fn_seg(msgs)) if s["turn_fp"]), None)
+    assert from_seg is not None
+    assert direct != ""
+    assert direct == from_seg
+
+
+# ---------------------------------------------------------------------------
+# Dedup safety net end-to-end: session_end / pre_compress file only what
+# sync_turn missed.
+# ---------------------------------------------------------------------------
+
+
+def test_session_end_does_not_refile_synced_turns(initialized_provider):
+    msgs = [
+        {"role": "user", "content": "what's the plan?"},
+        {"role": "assistant", "content": "ship the PR"},
+    ]
+    initialized_provider.sync_turn("what's the plan?", "ship the PR", messages=msgs)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+    assert pre >= 1
+
+    initialized_provider.on_session_end(msgs)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre
+
+
+def test_session_end_skips_tool_turns_covered_by_sync(initialized_provider):
+    # The representation-mismatch case: sync_turn files the CLEAN pair while
+    # the raw list carries injected user content + tool traffic. Exact-text
+    # matching can never catch this — the fingerprint must.
+    msgs = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "search for JWT handling"},
+                {"type": "text", "text": "[injected skill context]"},
+            ],
+        },
+        {"role": "assistant", "content": [{"type": "tool_use", "name": "grep"}]},
+        {"role": "user", "content": [{"type": "tool_result", "content": "auth.py:42"}]},
+        {"role": "assistant", "content": "JWT handling lives in auth.py."},
+    ]
+    initialized_provider.sync_turn(
+        "search for JWT handling", "JWT handling lives in auth.py.", messages=msgs
+    )
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+    assert pre >= 1
+
+    initialized_provider.on_session_end(msgs)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre
+
+
+def test_session_end_files_turns_sync_never_saw(initialized_provider):
+    synced = [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "first answer"},
+    ]
+    initialized_provider.sync_turn("first question", "first answer", messages=synced)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+
+    full = synced + [
+        {"role": "user", "content": "second question"},
+        {"role": "assistant", "content": "second answer"},
+    ]
+    initialized_provider.on_session_end(full)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre + 1
+    docs = initialized_provider._collection.get(include=["documents"]).get("documents") or []
+    assert any("second question" in d for d in docs)
+
+
+def test_double_session_end_is_idempotent(initialized_provider):
+    # session_end fires more than once in Hermes (best-effort interrupt hook
+    # plus real shutdown). Drawers the first pass files carry turn_fp, so
+    # the second pass's scan sees them as covered.
+    msgs = [
+        {"role": "user", "content": "never synced question"},
+        {"role": "assistant", "content": "never synced answer"},
+    ]
+    initialized_provider.on_session_end(msgs)
+    initialized_provider._worker_queue.join()
+    once = initialized_provider._collection.count()
+    assert once >= 1
+
+    initialized_provider.on_session_end(msgs)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == once
+
+
+def test_repeated_identical_exchanges_use_multiset_counts(initialized_provider):
+    # Two identical turns, only one synced → session_end owes exactly one.
+    one_turn = [
+        {"role": "user", "content": "are we done?"},
+        {"role": "assistant", "content": "yes"},
+    ]
+    initialized_provider.sync_turn("are we done?", "yes", messages=one_turn)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+
+    initialized_provider.on_session_end(one_turn + one_turn)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre + 1
+
+
+def test_empty_session_id_blind_files(initialized_provider):
+    # Without a session id every anonymous session shares the
+    # hermes-session:unknown bucket — dedup there would false-match across
+    # sessions (data loss). Blind-filing (duplication) is the safe direction.
+    msgs = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "hi"},
+    ]
+    initialized_provider.sync_turn("hello", "hi", messages=msgs)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+
+    initialized_provider._session_id = ""
+    initialized_provider.on_session_end(msgs)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre + 1
+
+
+def test_branch_session_end_skips_parent_filed_turns(initialized_provider):
+    msgs = [
+        {"role": "user", "content": "parent question"},
+        {"role": "assistant", "content": "parent answer"},
+    ]
+    # Filed under the original session id ("test-session-1").
+    initialized_provider.sync_turn("parent question", "parent answer", messages=msgs)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+
+    # /branch mints a new id; the transcript carries forward.
+    initialized_provider.on_session_switch(
+        "branch-1", parent_session_id="test-session-1", reset=False, reason="branch"
+    )
+    initialized_provider.on_session_end(msgs)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre
+
+
+def test_pre_compress_skips_covered_turns_files_missing(initialized_provider):
+    synced = [
+        {"role": "user", "content": "covered question"},
+        {"role": "assistant", "content": "covered answer"},
+    ]
+    initialized_provider.sync_turn("covered question", "covered answer", messages=synced)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+
+    window = synced + [
+        {"role": "user", "content": "uncovered question"},
+        {"role": "assistant", "content": "uncovered answer"},
+    ]
+    hint = initialized_provider.on_pre_compress(window)
+    initialized_provider._worker_queue.join()
+    assert "mempalace_search" in hint
+    assert initialized_provider._collection.count() == pre + 1
+
+
+def test_one_drawer_protects_exactly_one_of_two_same_fp_occurrences(initialized_provider):
+    # Turn synced once (drawer: fp F, CLEAN text). The window holds two
+    # occurrences of that turn: tool-shaped (fp F, raw text) and a plain
+    # repeat whose raw composition equals the drawer's clean text (fp F).
+    # One physical drawer must protect exactly one of them.
+    tool_turn = [
+        {"role": "user", "content": "same question"},
+        {"role": "assistant", "content": [{"type": "tool_use", "name": "grep"}]},
+        {"role": "assistant", "content": "same answer"},
+    ]
+    initialized_provider.sync_turn("same question", "same answer", messages=tool_turn)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+
+    window = tool_turn + [
+        {"role": "user", "content": "same question"},
+        {"role": "assistant", "content": "same answer"},
+    ]
+    initialized_provider.on_session_end(window)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre + 1
+
+
+def test_text_fallback_consumes_the_drawer_fingerprint_too(initialized_provider):
+    # Drawer filed with fp F_injected (sync_turn saw an injected snapshot)
+    # and clean text T. Window: a plain segment composing exactly T (fp
+    # F_plain) followed by the tool-shaped segment carrying F_injected.
+    # The text-fallback consumes the drawer for the first segment; the
+    # second must then be FILED, not skipped on the drawer's orphaned fp.
+    injected_turn = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "q2"},
+                {"type": "text", "text": "[injected skill]"},
+            ],
+        },
+        {"role": "assistant", "content": [{"type": "tool_use", "name": "grep"}]},
+        {"role": "assistant", "content": "a2"},
+    ]
+    initialized_provider.sync_turn("q2", "a2", messages=injected_turn)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+
+    window = [
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "a2"},
+    ] + injected_turn
+    initialized_provider.on_session_end(window)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre + 1
+
+
+def test_interrupted_then_retried_identical_prompt_keeps_both(initialized_provider):
+    # Turn A: "continue" → partial answer (interrupted; Hermes never syncs
+    # interrupted turns). Turn B: "continue" → "done" (synced). The exact
+    # match for B must win before A's fp arm can steal the drawer — A's
+    # content gets filed, B is skipped.
+    synced = [
+        {"role": "user", "content": "continue"},
+        {"role": "assistant", "content": "done"},
+    ]
+    initialized_provider.sync_turn("continue", "done", messages=synced)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+
+    window = [
+        {"role": "user", "content": "continue"},
+        {"role": "assistant", "content": "partial answer before interrupt"},
+    ] + synced
+    initialized_provider.on_session_end(window)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre + 1
+    docs = initialized_provider._collection.get(include=["documents"]).get("documents") or []
+    assert any("partial answer before interrupt" in d for d in docs)
+
+
+def test_contended_fingerprint_files_all_occurrences(initialized_provider):
+    # Two same-prompt tool turns with different outcomes; only one synced,
+    # and neither raw segment exact-matches the clean drawer. We cannot
+    # tell which occurrence the drawer covers — file BOTH (bounded
+    # duplication), never guess (possible loss).
+    t1 = [
+        {"role": "user", "content": "run it"},
+        {"role": "assistant", "content": [{"type": "tool_use", "name": "bash"}]},
+        {"role": "assistant", "content": "exit 0"},
+    ]
+    t2 = [
+        {"role": "user", "content": "run it"},
+        {"role": "assistant", "content": [{"type": "tool_use", "name": "bash"}]},
+        {"role": "assistant", "content": "exit 1"},
+    ]
+    initialized_provider.sync_turn("run it", "exit 0", messages=t1)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+
+    initialized_provider.on_session_end(t1 + t2)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre + 2
+
+
+def test_preamble_segment_dedups_across_repeated_pre_compress(initialized_provider):
+    # A post-compression window can START with assistant/tool messages (no
+    # user anchor). The anchorless segment files once, and a second
+    # overlapping window must not re-file it (exact-text pass, fp == "").
+    window = [
+        {"role": "assistant", "content": "orphaned assistant tail"},
+        {"role": "user", "content": "next question"},
+        {"role": "assistant", "content": "next answer"},
+    ]
+    initialized_provider.on_pre_compress(window)
+    initialized_provider._worker_queue.join()
+    once = initialized_provider._collection.count()
+    assert once >= 2  # preamble segment + anchored turn
+
+    initialized_provider.on_pre_compress(window)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == once
+
+
+def test_pre_compress_scans_branch_lineage(initialized_provider):
+    msgs = [
+        {"role": "user", "content": "lineage question"},
+        {"role": "assistant", "content": "lineage answer"},
+    ]
+    initialized_provider.sync_turn("lineage question", "lineage answer", messages=msgs)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+
+    initialized_provider.on_session_switch(
+        "branch-pc", parent_session_id="test-session-1", reset=False, reason="branch"
+    )
+    hint = initialized_provider.on_pre_compress(msgs)
+    initialized_provider._worker_queue.join()
+    assert "mempalace_search" in hint
+    assert initialized_provider._collection.count() == pre
+
+
+def test_scan_failure_blind_files_with_warning(initialized_provider, monkeypatch, caplog):
+    import logging
+
+    def _boom(col, source_files):
+        raise RuntimeError("chroma exploded")
+
+    monkeypatch.setattr(initialized_provider, "_scan_filed", _boom)
+    msgs = [
+        {"role": "user", "content": "scan failure question"},
+        {"role": "assistant", "content": "scan failure answer"},
+    ]
+    pre = initialized_provider._collection.count()
+    with caplog.at_level(logging.WARNING, logger="mempalace.hermes"):
+        initialized_provider.on_session_end(msgs)
+        initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre + 1
+    assert any("filing without dedup" in r.message for r in caplog.records)
+
+
+def test_session_end_blocking_put_times_out_with_warning(provider, caplog):
+    import logging
+    import queue as queue_module
+
+    provider._cron_skipped = False
+    provider._initialized = True
+    provider.SESSION_END_ENQUEUE_TIMEOUT = 0.05
+    provider._worker_queue = queue_module.Queue(maxsize=1)
+    provider._worker_queue.put_nowait(("file_turn", {}))  # saturate; no worker running
+    with caplog.at_level(logging.WARNING, logger="mempalace.hermes"):
+        provider.on_session_end([{"role": "user", "content": "hi"}])
+    assert any("queue full at session_end" in r.message for r in caplog.records)
+
+
+def test_truncated_window_fp_coverage_is_accepted_limit(initialized_provider):
+    # KNOWN, ACCEPTED residual (documented in _file_missing_exchanges):
+    # a synced occurrence of a byte-identical prompt was compressed out of
+    # the window; a NEW, never-synced occurrence of the same prompt is then
+    # fp-skipped against the stale drawer, and its partial assistant output
+    # is not captured. Undecidable with occurrence counting alone — Hermes
+    # message dicts carry no per-message identity — and dropping fp-skip
+    # would re-file every tool-shaped turn. This test PINS the accepted
+    # behavior; if it ever starts failing because the content IS captured,
+    # a better correlation key exists and the docstring should be updated.
+    old_tool_turn = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": [{"type": "tool_use", "name": "bash"}]},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    initialized_provider.sync_turn("go", "old answer", messages=old_tool_turn)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+
+    window = [  # post-compression window: only the NEW, never-synced "go" turn
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "brand new partial output qqq"},
+    ]
+    initialized_provider.on_session_end(window)
+    initialized_provider._worker_queue.join()
+    docs = initialized_provider._collection.get(include=["documents"]).get("documents") or []
+    assert not any("brand new partial output qqq" in d for d in docs)
+    assert initialized_provider._collection.count() == pre
+
+
+def test_file_turn_retries_transient_database_lock(
+    integration_module, initialized_provider, monkeypatch
+):
+    # Chroma's sqlite briefly locks under concurrent readers (notably on
+    # Windows — this reproduced in CI as a lost turn). A transient lock
+    # must be retried, not swallowed as a permanent write failure.
+    calls = {"n": 0}
+    real = integration_module.file_conversation_exchange
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("Error updating collection: database is locked")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(integration_module, "file_conversation_exchange", flaky)
+    monkeypatch.setattr(initialized_provider, "FILE_TURN_LOCK_BACKOFF", 0.01)
+    pre = initialized_provider._collection.count()
+    initialized_provider.sync_turn("locked once", "but persisted")
+    initialized_provider._worker_queue.join()
+    assert calls["n"] == 2
+    assert initialized_provider._collection.count() == pre + 1
+
+
+def test_file_turn_gives_up_on_persistent_lock_with_warning(
+    integration_module, initialized_provider, monkeypatch, caplog
+):
+    import logging
+
+    def always_locked(*args, **kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(integration_module, "file_conversation_exchange", always_locked)
+    monkeypatch.setattr(initialized_provider, "FILE_TURN_LOCK_BACKOFF", 0.01)
+    pre = initialized_provider._collection.count()
+    with caplog.at_level(logging.WARNING, logger="mempalace.hermes"):
+        initialized_provider.sync_turn("never lands", "sadly")
+        initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre
+    assert any("turn not persisted" in r.message for r in caplog.records)
