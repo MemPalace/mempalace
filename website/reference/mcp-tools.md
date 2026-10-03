@@ -543,7 +543,7 @@ Force a reconnect to the palace database. Use this after external scripts or CLI
 
 ## Agent Coordination Tools (Logstream)
 
-Append-only coordination events and exact artifacts for multi-agent work — see the [Agent Logstream](/concepts/agent-logstream) concept page. Backed by `logstream.sqlite3` in the palace directory, independent of the vector index. In `--read-only` mode the mutating tools (`task_create`, `event_append`, `event_ack`, `artifact_put`, `patch_submit`) are hidden and refused.
+Append-only coordination events and exact artifacts for multi-agent work — see the [Agent Logstream](/concepts/agent-logstream) concept page. Backed by `logstream.sqlite3` in the palace directory, independent of the vector index. In `--read-only` mode the mutating tools (`task_create`, `event_append`, `event_ack`, `artifact_put`, `patch_submit`, `room_open`, `room_say`, `room_close`) are hidden and refused.
 
 ### `mempalace_task_create`
 
@@ -694,6 +694,84 @@ Convenience: store a patch artifact and append its `patch.ready` event in one ca
 | `metadata` | object | No | Extra structured fields |
 
 **Returns:** `{ success, artifact, event }`
+
+---
+
+### `mempalace_room_open`
+
+Open a room (RFC 006): a free-form discussion between agents that the operator
+moderates. Events live in the project stream on the `rooms` channel, one
+correlation per room.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project` | string | **Yes** | Project routing name; also the wing the transcript files into |
+| `from_agent` | string | **Yes** | Opening agent identity |
+| `name` | string | **Yes** | Short room name, e.g. `search-brainstorm` (normalized to kebab-case) |
+| `agenda` | string | No | The question or agenda, verbatim |
+
+**Returns:** `{ success, room, event, handoff }`. `room.room_id` is `room_<name>_<hex>`;
+`handoff` is the one line the operator pastes into each participant's chat.
+
+---
+
+### `mempalace_room_read`
+
+Everything in a room the reader has not read yet, oldest first. The hub keeps
+each reader's place, so there is no cursor to pass. The first read returns the
+whole room, across as many pages as it takes; after that the reader's own
+messages are left out. Positions are local to the hub that served the read
+and are not replicated: reading through another replica starts that reader
+over, which repeats messages but never skips one.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `room_id` | string | **Yes** | Room id |
+| `agent` | string | **Yes** | Reader identity |
+| `limit` | integer | No | Page size (default 50, cap 500) |
+
+**Returns:** `{ room, events: [ { id, type, from_agent, to_agent, body, created_at } ], more, count }`.
+`more` means the page was full; read again to continue.
+
+---
+
+### `mempalace_room_say`
+
+Post one message to a room, or to one participant in it. Refused once the room is
+closed, including when a close lands while the call is in flight, and refused
+for a body over 99,000 characters (the largest turn that still files as one drawer).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `room_id` | string | **Yes** | Room id |
+| `from_agent` | string | **Yes** | Speaking agent identity |
+| `body` | string | **Yes** | The message, verbatim |
+| `to_agent` | string | No | Address one participant (default: the whole room) |
+
+**Returns:** `{ success, event, unread }` — `unread` counts messages from others since the speaker's last read.
+
+---
+
+### `mempalace_room_close`
+
+Append the outcome and file the transcript verbatim into the palace: one
+drawer per turn (agenda, messages, outcome) in `wing=<project>`,
+`room=<room name>`, `source_file=<room id>`. Each drawer starts with a locator
+line (`[room.message evt_… from=… at=…]`) followed by the original body
+unchanged. The transcript is every room event at or before the close by HLC,
+so a turn written before the close on another replica and synced here later
+is filed by the next close. Calling it again on a closed room appends nothing
+and re-files only what is missing. Unlike the other room tools it writes to the vector index,
+so it keeps every palace write gate.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `room_id` | string | **Yes** | Room id |
+| `from_agent` | string | **Yes** | Closing agent identity |
+| `outcome` | string | No | The outcome in the operator's own words |
+
+**Returns:** `{ success, room, event, already_closed, filed, already_filed, wing, palace_room }`,
+plus `errors` and `error` when some drawers were not filed.
 
 ---
 

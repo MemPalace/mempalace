@@ -1106,6 +1106,98 @@ TOOLS = {
         },
         "handler": tool_patch_submit,
     },
+    "mempalace_room_open": {
+        "description": (
+            "Open a room: a free-form discussion between agents that the operator"
+            " moderates. Returns the room id and one handoff line to paste into each"
+            " participant's chat. Open a room only when the operator asks for one."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "Project routing name; also the wing the transcript files into",
+                },
+                "from_agent": {"type": "string", "description": "Opening agent identity"},
+                "name": {
+                    "type": "string",
+                    "description": "Short room name, e.g. 'search-brainstorm'",
+                },
+                "agenda": {
+                    "type": "string",
+                    "description": "The question or agenda, verbatim (optional)",
+                },
+            },
+            "required": ["project", "from_agent", "name"],
+        },
+        "handler": tool_room_open,
+    },
+    "mempalace_room_read": {
+        "description": (
+            "Read a room: everything you have not read yet, oldest first. The hub keeps"
+            " your place, so never pass a cursor; your own messages are left out after"
+            " your first read. When 'more' is true, read again before you speak."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "room_id": {"type": "string", "description": "Room id (room_<name>_<hex>)"},
+                "agent": {"type": "string", "description": "Your agent identity"},
+                "limit": {
+                    "type": "integer",
+                    "description": "Page size (default 50, max 500)",
+                    "minimum": 1,
+                    "maximum": 500,
+                },
+            },
+            "required": ["room_id", "agent"],
+        },
+        "handler": tool_room_read,
+    },
+    "mempalace_room_say": {
+        "description": (
+            "Post one message to a room. Speak only to add a fact, a constraint, a"
+            " proposal, an objection, or an answer to something addressed to you; never"
+            " post agreement, acknowledgement, or a restatement. 'unread' in the result"
+            " counts messages that arrived since your last read."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "room_id": {"type": "string", "description": "Room id (room_<name>_<hex>)"},
+                "from_agent": {"type": "string", "description": "Your agent identity"},
+                "body": {"type": "string", "description": "Your message, verbatim"},
+                "to_agent": {
+                    "type": "string",
+                    "description": "Address one participant (optional; default the whole room)",
+                },
+            },
+            "required": ["room_id", "from_agent", "body"],
+        },
+        "handler": tool_room_say,
+    },
+    "mempalace_room_close": {
+        "description": (
+            "Close a room and file its transcript verbatim into the palace: one drawer"
+            " per turn in wing=<project>, room=<room name>, including the outcome. Close"
+            " only when the operator says the discussion is over. Calling it again on a"
+            " closed room retries the filing without closing twice."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "room_id": {"type": "string", "description": "Room id (room_<name>_<hex>)"},
+                "from_agent": {"type": "string", "description": "Closing agent identity"},
+                "outcome": {
+                    "type": "string",
+                    "description": "The outcome in the operator's own words (optional)",
+                },
+            },
+            "required": ["room_id", "from_agent"],
+        },
+        "handler": tool_room_close,
+    },
 }
 
 # MCP ToolAnnotations.readOnlyHint for clients that hide mutating tools

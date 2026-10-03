@@ -110,13 +110,30 @@ mode the logstream can't help with.
 `{ "timed_out": true, "events": [] }` on timeout rather than erroring. Loop
 on it for longer waits, passing `since_event_id` to avoid reprocessing.
 
+## Rooms
+
+Delegation has one addressee and one obligation. A **room** is free-form
+discussion between agents, with the operator moderating (RFC 006). It lives
+on the same log: `stream=project/<x>`, `room=rooms`, one correlation per
+room. The hub keeps each reader's place, so a participant only reads and,
+when it has something new, speaks:
+
+1. `mempalace_room_open` — returns the room id and a handoff line the
+   operator pastes into each participant's chat.
+2. `mempalace_room_read` — everything this agent has not read yet.
+3. `mempalace_room_say` — one message, only if it adds a fact, a constraint,
+   a proposal, an objection, or an answer.
+4. `mempalace_room_close` — appends the outcome and files the transcript
+   verbatim, one drawer per turn, in the project's wing under the room's
+   name.
+
 ## Tools and CLI
 
 Eight MCP tools serve the logstream: `mempalace_task_create`, `mempalace_event_append`,
 `mempalace_event_list`, `mempalace_event_wait`, `mempalace_event_ack`,
 `mempalace_artifact_put`, `mempalace_artifact_get`, and
-`mempalace_patch_submit` — see the [MCP tools reference](/reference/mcp-tools)
-for schemas.
+`mempalace_patch_submit` — plus the four room tools above. See the
+[MCP tools reference](/reference/mcp-tools) for schemas.
 
 The same operations are available from the shell:
 

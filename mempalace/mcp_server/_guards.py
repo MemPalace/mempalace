@@ -181,6 +181,11 @@ _SQLITE_INTEGRITY_ALLOWED_TOOLS = frozenset(
         "mempalace_artifact_put",
         "mempalace_artifact_get",
         "mempalace_patch_submit",
+        # RFC 006: open/read/say are logstream-only. Close files drawers into
+        # Chroma, so it stays behind the gate.
+        "mempalace_room_open",
+        "mempalace_room_read",
+        "mempalace_room_say",
         # RFC 004: the estate is observability — logstream + sync state +
         # peers.json, no FTS5 dependency (the profile's drawer count
         # degrades gracefully). A damaged palace is exactly when mesh
@@ -239,6 +244,12 @@ _MUTATING_TOOLS = frozenset(
         "mempalace_event_ack",
         "mempalace_artifact_put",
         "mempalace_patch_submit",
+        # mempalace_room_read is deliberately absent: it writes only the
+        # reader's own read position, bookkeeping rather than palace state,
+        # so a read-only client can still follow a room.
+        "mempalace_room_open",
+        "mempalace_room_say",
+        "mempalace_room_close",
     }
 )
 
@@ -269,6 +280,8 @@ _PEER_WRITER_EXEMPT_TOOLS = frozenset(
         "mempalace_event_ack",
         "mempalace_artifact_put",
         "mempalace_patch_submit",
+        "mempalace_room_open",
+        "mempalace_room_say",
         "mempalace_kg_add",
         "mempalace_kg_invalidate",
         "mempalace_kg_supersede",
@@ -296,6 +309,8 @@ _VECTOR_WRITE_TOOLS = frozenset(
         "mempalace_checkpoint",
         "mempalace_mine",
         "mempalace_sync",
+        # Files the transcript through add_drawer.
+        "mempalace_room_close",
     }
 )
 

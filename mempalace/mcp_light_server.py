@@ -376,6 +376,14 @@ def tool_palace_coordinate(arguments: Dict[str, Any] | str) -> Dict[str, Any]:
         return _call_handler_safe(mcp_server.tool_artifact_get, params)
     elif action == "patch_submit":
         return _call_handler_safe(mcp_server.tool_patch_submit, params)
+    elif action == "room_open":
+        return _call_handler_safe(mcp_server.tool_room_open, params)
+    elif action == "room_read":
+        return _call_handler_safe(mcp_server.tool_room_read, params)
+    elif action == "room_say":
+        return _call_handler_safe(mcp_server.tool_room_say, params)
+    elif action == "room_close":
+        return _call_handler_safe(mcp_server.tool_room_close, params)
     elif action in ("mesh_peers", "peers"):
         return mcp_server.tool_mesh_peers()
     else:
@@ -576,13 +584,16 @@ LIGHT_TOOLS = {
     "palace_coordinate": {
         "description": (
             "Unified Multi-Agent Coordination Engine (RFC 003 / RFC 005). Immutable task delegation, "
-            "logstream event append/list/wait/ack, artifact put/get, patch submission, and mesh estate snapshot. "
+            "logstream event append/list/wait/ack, artifact put/get, patch submission, agent rooms (RFC 006), "
+            "and mesh estate snapshot. "
             "DO NOT use for reading memories, viewing status, checking graph stats, or querying diaries (use palace_query instead). "
             "Accepts a concise coordination DSL string (e.g. 'TASK CREATE project:mempalace from:agent1 "
             'to:agent2 goal:"fix" branch:b base:c done:"done"\', \'EVENT APPEND type:task.request ...\', '
             "'EVENT INBOX to:agent', 'EVENT LIST stream:project/x [DESC|ASC] [LIMIT n] [PREVIEW]', "
             "'EVENT WAIT correlation:task_1', 'EVENT ACK id:evt_1 from:agent1 status:applied', "
-            "'ARTIFACT PUT kind:patch ...', 'PATCH SUBMIT ...', 'MESH PEERS') "
+            "'ARTIFACT PUT kind:patch ...', 'PATCH SUBMIT ...', 'MESH PEERS', "
+            "'ROOM READ id:room_x agent:me', 'ROOM SAY id:room_x from:me body:\"...\"', "
+            "'ROOM OPEN project:x from:me name:y agenda:\"...\"', 'ROOM CLOSE id:room_x from:me outcome:\"...\"') "
             "or a structured dict payload. EVENT LIST defaults to newest-first (order='desc') when no cursor is passed."
         ),
         "input_schema": {
@@ -596,7 +607,8 @@ LIGHT_TOOLS = {
                     "type": "string",
                     "description": (
                         "Action: task_create, event_append, event_list, event_wait, event_ack, "
-                        "artifact_put, artifact_get, patch_submit, mesh_peers, inbox"
+                        "artifact_put, artifact_get, patch_submit, mesh_peers, inbox, "
+                        "room_open, room_read, room_say, room_close"
                     ),
                 },
                 "project": {"type": "string", "description": "Project routing name (optional)"},
@@ -651,6 +663,20 @@ LIGHT_TOOLS = {
                 "created_by": {"type": "string", "description": "Artifact author (optional)"},
                 "metadata": {"type": "object", "description": "Event/artifact metadata (optional)"},
                 "topic": {"type": "string", "description": "Event topic (optional)"},
+                "room_id": {
+                    "type": "string",
+                    "description": "Room id for room_* actions (optional)",
+                },
+                "agent": {
+                    "type": "string",
+                    "description": "Reader identity for room_read (optional)",
+                },
+                "name": {"type": "string", "description": "Room name for room_open (optional)"},
+                "agenda": {"type": "string", "description": "Room agenda for room_open (optional)"},
+                "outcome": {
+                    "type": "string",
+                    "description": "Room outcome for room_close (optional)",
+                },
             },
         },
         "handler": tool_palace_coordinate,

@@ -103,6 +103,17 @@ class TestRenderSharedBrainRules:
         assert "mempalace logstream watch" in full
         assert _strip_tool_tokens(full) == _strip_tool_tokens(light)
 
+    def test_snippet_carries_the_rooms_rule(self):
+        """Rooms reach agents only through the pinned snippet, and the rule
+        there stays short: the tools carry the mechanics, the prompt carries
+        only when to read and when to speak."""
+        content = SHARED_BRAIN_RULES_FILE.read_text(encoding="utf-8")
+        for needle in ("mempalace_room_read", "mempalace_room_say", "Never agree"):
+            assert needle in content, f"snippet missing {needle!r}"
+        light = render_shared_brain_rules("mac", "claude", "myapp", mcp="light")
+        assert "palace_coordinate ROOM READ" in light
+        assert "mempalace_room_" not in light
+
     def test_apply_mcp_shape_rejects_unknown(self):
         with pytest.raises(ValueError, match="full"):
             apply_mcp_shape("x", "pql")

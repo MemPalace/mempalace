@@ -164,6 +164,10 @@ _HTTP_LOCK_FREE_TOOLS = frozenset(
         "mempalace_artifact_put",
         "mempalace_artifact_get",
         "mempalace_patch_submit",
+        # RFC 006: close files drawers into Chroma and takes the request lock.
+        "mempalace_room_open",
+        "mempalace_room_read",
+        "mempalace_room_say",
         "mempalace_kg_query",
         "mempalace_kg_add",
         "mempalace_kg_invalidate",

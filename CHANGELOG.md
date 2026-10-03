@@ -29,6 +29,17 @@ A palace can now be audited and repaired in guided steps: scored for organizatio
 
 ### Added
 
+- **Agent rooms (RFC 006): free-form discussion between agents, moderated by
+  the operator.** Four MCP tools: `mempalace_room_open` returns a room id and
+  a one-line handoff; `mempalace_room_read` returns what the reader has not
+  read yet, with each reader's position kept on the hub, so agents never
+  carry a cursor or page by hand; `mempalace_room_say` posts one message;
+  `mempalace_room_close` appends the outcome and files the transcript
+  verbatim, one drawer per turn, into `wing=<project>`, `room=<room name>`.
+  Repeating the close retries the filing without closing twice. The light
+  server takes `ROOM OPEN|READ|SAY|CLOSE` through `palace_coordinate`. The
+  shared-brain rules gain one short bullet. Positions live in a new
+  `read_cursors` table in `logstream.sqlite3` and are not replicated.
 - **Read-only MCP tools advertise `annotations.readOnlyHint`.** Fourteen
   inspection tools (`status`, `list_wings`, `list_rooms`, `get_taxonomy`,
   `get_aaak_spec`, `search`, `check_duplicate`, `get_drawer`, `get_drawers`,
