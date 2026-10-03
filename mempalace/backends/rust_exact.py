@@ -17,6 +17,9 @@ from .base import (
     DimensionMismatchError,
     QueryResult,
     _IncludeSpec,
+    REGISTRY_SENTINEL_ROOM,
+    REGISTRY_SENTINEL_INGEST_MODE,
+    where_without_registry_exclusion,
 )
 from .sqlite_exact import (
     _DB_FILENAME,
@@ -24,6 +27,8 @@ from .sqlite_exact import (
     SQLiteExactCollection,
     _SnapshotChanged,
     _as_vector_array,
+    _json_field_sql,
+    _validate_where,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,7 +66,20 @@ class RustExactCollection(SQLiteExactCollection):
             self._handle._native_cache.pop(self._collection_name, None)
             try:
                 index = _NativeVectorIndex.load_from_sqlite(db_file, self._collection_name)
-                self._handle._native_cache[self._collection_name] = (version, index)
+                room_expr = _json_field_sql("room", locus_columns=self._handle.has_locus_columns)
+                registry_ids = frozenset(
+                    row[0]
+                    for row in cur.execute(
+                        f"SELECT id FROM documents WHERE collection_id = ? AND "
+                        f"({room_expr} = ? OR json_extract(metadata_json, '$.ingest_mode') = ?)",
+                        (
+                            self._collection_id(cur),
+                            REGISTRY_SENTINEL_ROOM,
+                            REGISTRY_SENTINEL_INGEST_MODE,
+                        ),
+                    )
+                )
+                self._handle._native_cache[self._collection_name] = (version, index, registry_ids)
             except Exception as e:
                 logger.warning("Failed to load Rust native vector index: %s", e)
         return self._native_index
@@ -86,18 +104,13 @@ class RustExactCollection(SQLiteExactCollection):
             raise ValueError("query input must be a non-empty list")
 
         spec = _IncludeSpec.resolve(include, default_distances=True)
+        _validate_where(where)
+        scope = where_without_registry_exclusion(where)
         can_use_native = (
             _NativeVectorIndex is not None
             and not spec.embeddings
             and not where_document
-            and (
-                not where
-                or (
-                    isinstance(where, dict)
-                    and len(where) == 1
-                    and isinstance(where.get("wing"), str)
-                )
-            )
+            and (not scope or (len(scope) == 1 and isinstance(scope.get("wing"), str)))
         )
         if not can_use_native:
             # Fall back to base SQLiteExactCollection implementation
@@ -110,7 +123,7 @@ class RustExactCollection(SQLiteExactCollection):
             )
 
         try:
-            return self._query_native(query_embeddings, n_results, where, spec)
+            return self._query_native(query_embeddings, n_results, scope, spec)
         except _NativeUnavailable:
             return super()._query_once(
                 query_embeddings=query_embeddings,
@@ -134,6 +147,7 @@ class RustExactCollection(SQLiteExactCollection):
             native = self._ensure_native_index(cur)
             if native is None:
                 raise _NativeUnavailable()
+            registry_ids = self._handle._native_cache[self._collection_name][2]
 
             filter_wing = where.get("wing") if where else None
             for query_vector in query_embeddings:
@@ -149,7 +163,12 @@ class RustExactCollection(SQLiteExactCollection):
                     outer_metas.append([])
                     outer_dists.append([])
                     continue
-                hits = native.query_parallel(q.tolist(), n_results, filter_wing)
+                # Installed native extensions accept only a wing filter. At
+                # most len(registry_ids) candidates can be bookkeeping rows,
+                # so overfetching by that count preserves the real top-k.
+                # Cache the IDs with the index rather than scan metadata per query.
+                hits = native.query_parallel(q.tolist(), n_results + len(registry_ids), filter_wing)
+                hits = [hit for hit in hits if hit[0] not in registry_ids][:n_results]
                 top_ids = [h[0] for h in hits]
                 top_dists = [float(h[1]) for h in hits]
                 docs_by_id: dict[str, str] = {}
