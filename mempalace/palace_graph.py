@@ -61,6 +61,7 @@ def _normalize_wing(wing: str | None) -> str | None:
 # Module-level graph cache with TTL and write-invalidation.
 # Warm cache serves build_graph() in O(1); invalidate_graph_cache() clears on writes.
 _graph_cache_lock = threading.Lock()
+_graph_cache_key = None
 _graph_cache_nodes = None
 _graph_cache_edges = None
 _graph_cache_time = 0.0
@@ -174,8 +175,9 @@ def _nodes_edges_from_grouped_rows(rows):
 
 def invalidate_graph_cache():
     """Clear the graph cache. Called from mcp_server.py on writes."""
-    global _graph_cache_nodes, _graph_cache_edges, _graph_cache_time
+    global _graph_cache_key, _graph_cache_nodes, _graph_cache_edges, _graph_cache_time
     with _graph_cache_lock:
+        _graph_cache_key = None
         _graph_cache_nodes = None
         _graph_cache_edges = None
         _graph_cache_time = 0.0
@@ -221,30 +223,37 @@ def build_graph(col=None, config=None):
     Returns cached result if fresh (within TTL). Cache is invalidated
     on writes via invalidate_graph_cache(). Thread-safe via _graph_cache_lock.
 
-    Note: warm cache ignores ``col`` and ``config`` arguments — this is
-    intentional for the MCP server's single-palace use case. Callers
-    switching collections should call ``invalidate_graph_cache()`` first.
+    The warm cache is keyed on the config's ``(palace_path, collection_name)``
+    identity, so sequential palaces or non-default collections in one
+    process cannot be served each other's graph. Callers that pass an
+    explicit ``col`` are isolation-critical by definition — they bypass the
+    cache entirely rather than risk a stale cross-target hit.
 
     Returns:
         nodes: dict of {room: {wings: set, halls: set, count: int}}
         edges: list of {room, wing_a, wing_b, hall} — one per tunnel crossing
     """
-    global _graph_cache_nodes, _graph_cache_edges, _graph_cache_time
+    global _graph_cache_key, _graph_cache_nodes, _graph_cache_edges, _graph_cache_time
     now = time.time()
-    # NOTE: warm cache ignores col/config args — intentional for the MCP server's
-    # single-palace use case. Callers switching collections must invalidate first.
-    with _graph_cache_lock:
-        if _graph_cache_nodes is not None and (now - _graph_cache_time) < _GRAPH_CACHE_TTL:
-            return _graph_cache_nodes, _graph_cache_edges
+    caller_supplied_col = col is not None
 
-    # Only when the caller did not pass a collection: MCP tools. Tests that
-    # inject ``col=`` keep the client paging path against that collection.
     if col is None:
+        cfg = config or MempalaceConfig()
+        cache_key = (cfg.palace_path, cfg.collection_name)
+        with _graph_cache_lock:
+            if (
+                _graph_cache_key == cache_key
+                and _graph_cache_nodes is not None
+                and (now - _graph_cache_time) < _GRAPH_CACHE_TTL
+            ):
+                return _graph_cache_nodes, _graph_cache_edges
+
         sqlite_graph = _try_sqlite_nodes_edges(config)
         if sqlite_graph is not None:
             nodes, edges = sqlite_graph
             if nodes:
                 with _graph_cache_lock:
+                    _graph_cache_key = cache_key
                     _graph_cache_nodes = nodes
                     _graph_cache_edges = edges
                     _graph_cache_time = time.time()
@@ -307,9 +316,12 @@ def build_graph(col=None, config=None):
         }
 
     # Only cache non-empty graphs so new data is picked up immediately
-    # when the palace is first populated.
-    if nodes:
+    # when the palace is first populated. A caller-supplied col is keyed
+    # by nothing we can verify — caching it would tag foreign data with
+    # whatever key is currently warm, so it bypasses the cache entirely.
+    if nodes and not caller_supplied_col:
         with _graph_cache_lock:
+            _graph_cache_key = cache_key
             _graph_cache_nodes = nodes
             _graph_cache_edges = edges
             _graph_cache_time = time.time()
