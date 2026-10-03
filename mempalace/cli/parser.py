@@ -1016,6 +1016,30 @@ def main():
         choices=tuple(_TASK_RUNNER_ADAPTERS),
         help="Headless agent runner",
     )
+    p_task_launch.add_argument(
+        "--codex-path",
+        "--codex-executable",
+        dest="codex_path",
+        default=None,
+        help="Codex executable path (default: resolve codex from PATH)",
+    )
+    p_task_launch.add_argument(
+        "-m",
+        "--model",
+        dest="codex_model",
+        default=None,
+        help="Model passed to codex exec",
+    )
+    p_task_launch.add_argument(
+        "-c",
+        "--config",
+        "--codex-config",
+        dest="codex_config",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Configuration override passed to codex exec; repeatable",
+    )
     p_task_launch.add_argument("--workspace", required=True, help="Trusted workspace directory")
     p_task_launch.add_argument(
         "--agent",
