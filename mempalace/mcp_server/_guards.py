@@ -222,6 +222,7 @@ _MUTATING_TOOLS = frozenset(
         "mempalace_kg_add",
         "mempalace_kg_invalidate",
         "mempalace_kg_supersede",
+        "mempalace_apply_merge",
         "mempalace_create_tunnel",
         "mempalace_delete_tunnel",
         "mempalace_delete_hallway",
