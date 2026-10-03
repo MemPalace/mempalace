@@ -371,6 +371,7 @@ def main():
         help="Run hook logic (reads JSON from stdin, outputs JSON to stdout)",
     )
     hook_sub = p_hook.add_subparsers(dest="hook_action")
+    hook_sub.add_parser("daemon-available", help="Probe an existing daemon with the hook timeout")
     p_hook_run = hook_sub.add_parser("run", help="Execute a hook")
     p_hook_run.add_argument(
         "--hook",
