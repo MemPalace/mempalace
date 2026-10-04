@@ -142,15 +142,9 @@ def file_already_mined(
     exact source fingerprint instead of the legacy mtime tolerance. Rows
     without it are re-mined once to record a verified source snapshot.
 
-    When check_mtime=True (used by the project miner, and by the convo
-    miner's in-lock recheck), also re-mines on content change. Conversation
-    transcripts are NOT assumed immutable: a Claude Code session keeps
-    appending to its own file while active, and /compact or /clear can
-    rewrite one in place. The convo miner's bulk skip-check uses
-    prefetch_mined_set()'s stored mtimes instead of calling this function
-    per file (same mtime-aware decision, without the O(n) per-file query
-    cost); this function's check_mtime=True path remains its per-file,
-    lock-held race-condition recheck.
+    The project miner uses check_mtime=True. The conversation miner uses
+    check_source_fingerprint=True for this lock-held recheck and requests
+    the same fingerprints from prefetch_mined_set() for its bulk skip-check.
 
     When extract_mode is set (used by convo miner), idempotency is scoped to
     that extraction mode so exchange-mode and general-mode drawers can coexist
@@ -158,9 +152,9 @@ def file_already_mined(
     treated as exchange-mode drawers.
 
     A drawer whose metadata carries ``chunk_total`` (see #21) is only
-    counted toward a match once its stored_mtime group has accumulated at
+    counted toward a match once its source-state group has accumulated at
     least that many drawers -- guarding against a mid-file crash between
-    upsert batches, where the surviving drawers share the current mtime
+    upsert batches, where the surviving drawers share the current source state
     (the file itself was never touched) but are short of the full set. A
     drawer with no ``chunk_total`` (legacy rows, or a single-shot
     ``add_drawer()`` call with no partial-batch risk) is trusted on its own,
@@ -169,9 +163,9 @@ def file_already_mined(
     try:
         # Under the additive-mining model, a single ``source_file`` can have
         # multiple ``parent_drawer_id`` groups in the palace — one per
-        # mining pass — each with its own stored ``source_mtime`` and
+        # mining pass — each with its own stored source state and
         # ``normalize_version``. The function must return True if ANY stored
-        # group is current (matching version + matching mtime when checked),
+        # group is current (matching version + matching source state when checked),
         # because ChromaDB's ``get(..., limit=1)`` has undefined ordering
         # across multiple matching rows: a ``limit=1`` shortcut picks
         # whichever row ChromaDB orders first and only checks that one,
@@ -189,7 +183,7 @@ def file_already_mined(
             else None
         )
         offset = 0
-        # Tracks, per matching stored_mtime group, how many drawers have
+        # Tracks, per matching source-state group, how many drawers have
         # been seen so far toward that group's own chunk_total (#21).
         group_counts: dict = {}
         while True:
@@ -253,22 +247,13 @@ def prefetch_mined_set(
     *,
     source_fingerprints: bool = False,
 ) -> dict[str, Optional[Union[float, str]]]:
-    """Pre-fetch source_file -> stored source_mtime for files already mined
+    """Pre-fetch source_file -> stored source state for files already mined
     at the current NORMALIZE_VERSION, in one bulk pass instead of one
     ChromaDB query per file.
 
-    Return type is a dict rather than a bare set so callers get mtime
-    awareness "for free": conversation transcripts are not immutable once
-    mined (a Claude Code session keeps appending to the same file while
-    active, and /compact or /clear can rewrite one in place), so "we've
-    seen this source_file before" is not sufficient to skip it -- the caller
-    must also confirm its current on-disk mtime still matches what was
-    stored. `if src in mined_set` still means the same thing as the old
-    set-based return (dict `in` checks keys); a caller that wants staleness
-    detection reads `mined_set[src]` and compares against
-    os.path.getmtime(src) itself. `None` means either no mtime was ever
-    stored (drawers written before this field existed) or getmtime failed
-    when the drawer was written -- both should be treated as stale.
+    The default values are stored mtimes. Callers compare each value with
+    os.path.getmtime(src); membership alone does not establish freshness.
+    None means no verified state was stored and must be treated as stale.
 
     With source_fingerprints=True, values and completion groups use exact
     source fingerprints instead. Missing fingerprints return None so callers
@@ -279,7 +264,7 @@ def prefetch_mined_set(
 
     Completeness mirrors :func:`file_already_mined`'s ``chunk_total`` rule
     (#2183): a source that only has a mid-file partial (surviving drawers
-    share the current mtime but are short of ``chunk_total``) is **omitted**
+    share the current source state but are short of ``chunk_total``) is **omitted**
     from the result so the bulk skip path re-mines instead of permanently
     stranding the missing exchanges. Drawers with no ``chunk_total``
     (legacy rows, registry sentinels) are trusted on their own, as before.

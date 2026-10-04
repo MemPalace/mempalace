@@ -687,7 +687,7 @@ def _file_chunks_locked(
     Combines the per-file serialization that prevents concurrent agents from
     duplicating work (via mine_lock) with the rebuild contract
     (purge-before-insert so stale drawers never survive) that fires on
-    either a normalize-version bump OR a changed/grown source file (mtime
+    either a normalize-version bump OR a changed/grown source file (fingerprint
     differs from what's stored) -- transcripts are not assumed immutable,
     since a Claude Code session keeps appending to its own file while
     active and /compact or /clear can rewrite one in place.
@@ -698,7 +698,7 @@ def _file_chunks_locked(
     drawers_added = 0
     with mine_lock(source_file):
         # Re-check after lock — another agent may have just finished this file
-        # at the current schema/mtime. A stale hit here returns False, so we
+        # at the current schema/fingerprint. A stale hit here returns False, so we
         # still fall through to the purge+rebuild path below.
         if file_already_mined(
             collection,
@@ -711,7 +711,7 @@ def _file_chunks_locked(
 
         # Purge stale drawers first. Fires both on a normalize-schema bump
         # (file_already_mined() returned False for pre-v2 drawers) and on a
-        # changed/grown transcript (mtime differs) — clean them out so the
+        # changed/grown transcript (fingerprint differs) — clean them out so the
         # source doesn't end up with mixed old/new drawers.
         #
         # A failed purge must abort this file's mine attempt rather than
@@ -720,7 +720,7 @@ def _file_chunks_locked(
         # mixed schema versions, with no operator-visible signal beyond a
         # debug log (#105 — convo_miner's own instance of the same swallow
         # already fixed for miner.py at #23). Returning here leaves the old
-        # drawers' stored mtime untouched, so the next mine still sees a
+        # drawers' stored fingerprint untouched, so the next mine still sees a
         # mismatch and retries.
         try:
             delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
@@ -744,7 +744,7 @@ def _file_chunks_locked(
         # Every drawer of this pass carries ``chunk_total`` so
         # ``file_already_mined`` / ``prefetch_mined_set`` can tell a complete
         # multi-batch mine from one that crashed mid-file (#2183). Without it
-        # a stable mtime + any surviving drawer permanently skips the file
+        # an unchanged fingerprint + any surviving drawer permanently skips the file
         # and the missing exchanges never come back.
         filed_at = datetime.now().isoformat()
         chunk_total = len(chunks)
@@ -807,7 +807,7 @@ def _file_chunks_locked(
                     if "already exists" not in str(e).lower():
                         raise
         except Exception:
-            # A successful earlier batch has the source's current mtime and
+            # A successful earlier batch has the source snapshot's fingerprint and
             # chunk_total. Leaving those drawers behind would make the next
             # run treat the incomplete set as fully filed (#2183 / #2122).
             try:
