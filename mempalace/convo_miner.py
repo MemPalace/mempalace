@@ -29,11 +29,7 @@ from .ids import (
     make_convo_sentinel_id,
     make_exchange_drawer_id,
 )
-from .normalize import (
-    SourceChangedDuringReadError,
-    UnparsedCodexTranscriptError,
-    normalize_conversations,
-)
+from .normalize import UnparsedCodexTranscriptError, normalize_conversations
 from .source_identity import identity_metadata, source_directory_identity
 from .entities import entities_metadata
 from .palace import (
@@ -1027,10 +1023,10 @@ def _normalize_convo_conversations(
         conversations = [
             c for c in normalize_conversations(str(filepath), source_metadata=source_metadata) if c
         ]
-    except (UnparsedCodexTranscriptError, SourceChangedDuringReadError) as exc:
+    except (OSError, UnparsedCodexTranscriptError) as exc:
         logger.warning("Skipping %s: %s; source remains eligible for retry", filepath, exc)
         return None
-    except (OSError, ValueError):
+    except ValueError:
         if not dry_run:
             _register_file(
                 collection, source_file, wing, agent, extract_mode, source_metadata=source_metadata

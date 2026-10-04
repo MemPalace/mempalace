@@ -439,6 +439,156 @@ def _rows(palace):
     return dict(zip(rows["ids"], zip(rows["documents"], rows["metadatas"])))
 
 
+@pytest.mark.parametrize("scan", ["full", "over-threshold", "scoped-fallback"])
+def test_sqlite_prefetch_preserves_snapshot_groups(tmp_path, monkeypatch, scan):
+    from mempalace.backends.chroma import ChromaCollection
+
+    collection = get_collection(str(tmp_path / "palace"))
+    source = tmp_path / "session.txt"
+    source.write_text(_INITIAL, encoding="utf-8")
+    fingerprint = source_fingerprint(source.stat())
+    common = {
+        "source_file": str(source),
+        "source_mtime": 1_700_000_000.0,
+        "normalize_version": NORMALIZE_VERSION,
+        "convo_chunker_version": CONVO_CHUNKER_VERSION,
+        "extract_mode": "exchange",
+        "chunk_total": 2,
+    }
+    collection.add(
+        ids=["old-partial", "new-partial", "legacy", "other-mode"],
+        documents=["stored exchange"] * 4,
+        metadatas=[
+            {**common, "source_fingerprint": "old-snapshot"},
+            {**common, "source_fingerprint": fingerprint},
+            {**common, "source_file": "legacy.txt", "chunk_total": 1},
+            {
+                **common,
+                "extract_mode": "general",
+                "source_fingerprint": fingerprint,
+                "chunk_total": 1,
+            },
+        ],
+    )
+    calls = []
+    original_iter = ChromaCollection.iter_metadata
+
+    def counted_iter(self, *args, **kwargs):
+        calls.append(True)
+        return original_iter(self, *args, **kwargs)
+
+    def no_paging(*args, **kwargs):
+        raise RuntimeError("collection paging unavailable")
+
+    monkeypatch.setattr(ChromaCollection, "iter_metadata", counted_iter)
+    monkeypatch.setattr(ChromaCollection, "get", no_paging)
+    monkeypatch.setattr(ChromaCollection, "count", no_paging)
+    sources = {
+        "full": None,
+        "over-threshold": [str(source)] + [f"candidate-{i}" for i in range(50)],
+        "scoped-fallback": [str(source)],
+    }[scan]
+
+    def prefetched():
+        return prefetch_mined_set(
+            collection, extract_mode="exchange", source_files=sources, source_fingerprints=True
+        )
+
+    assert prefetched() == {"legacy.txt": None}, "incomplete snapshots must stay separate"
+    collection.add(
+        ids=["new-complete"],
+        documents=["remaining exchange"],
+        metadatas=[{**common, "source_fingerprint": fingerprint}],
+    )
+    assert prefetched() == {"legacy.txt": None, str(source): fingerprint}
+    assert len(calls) == 2, "both prefetches must exercise the SQLite metadata stream"
+
+
+def test_large_sweep_skips_verified_sources_and_recovers_one_append(tmp_path, monkeypatch):
+    source_dir = tmp_path / "sessions"
+    source_dir.mkdir()
+    sources = [source_dir / f"session-{i}.txt" for i in range(51)]
+    for i, source in enumerate(sources):
+        source.write_text(f"Session {i}\n\n{_INITIAL}", encoding="utf-8")
+    palace = tmp_path / "palace"
+    _mine(source_dir, palace)
+    before = _rows(palace)
+    normalized = []
+    original_normalize = convo_miner.normalize_conversations
+
+    def counted_normalize(filepath, **kwargs):
+        normalized.append(filepath)
+        return original_normalize(filepath, **kwargs)
+
+    monkeypatch.setattr(convo_miner, "normalize_conversations", counted_normalize)
+    _mine(source_dir, palace)
+    assert normalized == [], "an unchanged bulk sweep must not re-normalize verified files"
+    assert _rows(palace) == before
+
+    changed = sources[0]
+    previous_stat = changed.stat()
+    with changed.open("a", encoding="utf-8") as stream:
+        stream.write(_APPEND)
+    os.utime(changed, ns=(previous_stat.st_atime_ns, previous_stat.st_mtime_ns))
+    _mine(source_dir, palace)
+    assert normalized == [str(changed)]
+    after = _rows(palace)
+    assert any("APPENDED_TURN_MARKER" in document for document, _ in after.values())
+    assert {key: row for key, row in after.items() if row[1]["source_file"] != str(changed)} == {
+        key: row for key, row in before.items() if row[1]["source_file"] != str(changed)
+    }
+
+
+@pytest.mark.parametrize("failure", ["read", "post-read-stat"])
+def test_io_failure_during_read_preserves_stored_snapshot(tmp_path, monkeypatch, failure):
+    source = tmp_path / "session.txt"
+    source.write_text(_INITIAL, encoding="utf-8")
+    palace = tmp_path / "palace"
+    _mine(source, palace)
+    before = _rows(palace)
+    source.write_text(_INITIAL + _APPEND, encoding="utf-8")
+    original_fdopen = normalize_module.os.fdopen
+    source_stat = source.stat()
+    failed = []
+
+    class FailingReader:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def read(self):
+            if failure == "read":
+                failed.append(True)
+                raise OSError("injected transcript read failure")
+            return self.stream.read()
+
+        def fileno(self):
+            failed.append(True)
+            raise OSError("injected post-read stat failure")
+
+    def failing_fdopen(fd, *args, **kwargs):
+        file_stat = os.fstat(fd)
+        stream = original_fdopen(fd, *args, **kwargs)
+        if (file_stat.st_dev, file_stat.st_ino) == (source_stat.st_dev, source_stat.st_ino):
+            return FailingReader(stream)
+        return stream
+
+    with monkeypatch.context() as race:
+        race.setattr(normalize_module.os, "fdopen", failing_fdopen)
+        _mine(source, palace)
+
+    assert failed
+    assert _rows(palace) == before, "a failed read must not add an unverified registry sentinel"
+    _mine(source, palace)
+    assert any("APPENDED_TURN_MARKER" in document for document, _ in _rows(palace).values())
+
+
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX change-time semantics")
 def test_inplace_rewrite_with_same_size_and_restored_mtime_is_remined(tmp_path, monkeypatch):
     source = tmp_path / "session.txt"

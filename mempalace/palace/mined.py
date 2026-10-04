@@ -44,6 +44,7 @@ def _meta_is_current(meta: dict, extract_mode: Optional[str]) -> bool:
 _MINED_SCAN_KEYS = (
     "source_file",
     "source_mtime",
+    "source_fingerprint",
     "chunk_total",
     "extract_mode",
     "ingest_mode",
