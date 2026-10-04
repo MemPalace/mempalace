@@ -92,7 +92,10 @@ class TestRegistration:
         assert LOGSTREAM_TOOLS <= mcp_server._SQLITE_INTEGRITY_ALLOWED_TOOLS
 
     def test_mutating_logstream_tools_exempt_from_peer_writer_gate(self):
-        assert LOGSTREAM_MUTATING == mcp_server._PEER_WRITER_EXEMPT_TOOLS
+        # Subset (not equality): the KG tools (#2297) also join the exempt
+        # set, so the logstream family is a *subset* of all peer-writer
+        # exemptions, not the whole thing.
+        assert LOGSTREAM_MUTATING <= mcp_server._PEER_WRITER_EXEMPT_TOOLS
 
 
 # ── Dispatch round trips ──────────────────────────────────────────────────
@@ -211,6 +214,63 @@ class TestDispatch:
         )
         assert prev["events"][0]["body"] == APPEND_ARGS["body"]
         assert "body_truncated" not in prev["events"][0]
+
+    def test_list_from_agent_is_the_callers_identity_not_a_filter(self, patched_server):
+        # The recipient passes its own identity as from_agent (as agents are told to on every call) and must still
+        # see the request written to it: from_agent used to filter by writer and returned nothing.
+        _result(_call(patched_server, "mempalace_event_append", APPEND_ARGS))
+        got = _result(
+            _call(
+                patched_server,
+                "mempalace_event_list",
+                {"correlation_id": "task_mcp", "from_agent": "windows-codex"},
+            )
+        )
+        assert got["count"] == 1
+        assert got["events"][0]["from_agent"] == "mac-codex"
+        assert "writer=" in got["note"]
+
+    def test_list_writer_filters_by_who_wrote_the_event(self, patched_server):
+        _result(_call(patched_server, "mempalace_event_append", APPEND_ARGS))
+        mine = _result(
+            _call(
+                patched_server,
+                "mempalace_event_list",
+                {"correlation_id": "task_mcp", "writer": "mac-codex"},
+            )
+        )
+        other = _result(
+            _call(
+                patched_server,
+                "mempalace_event_list",
+                {"correlation_id": "task_mcp", "writer": "windows-codex"},
+            )
+        )
+        assert mine["count"] == 1 and other["count"] == 0
+        assert "note" not in mine
+
+    def test_wait_from_agent_is_the_callers_identity_not_a_filter(self, patched_server):
+        _result(_call(patched_server, "mempalace_event_append", APPEND_ARGS))
+        result = _result(
+            _call(
+                patched_server,
+                "mempalace_event_wait",
+                {"correlation_id": "task_mcp", "from_agent": "windows-codex", "timeout_ms": 5000},
+            )
+        )
+        assert result["timed_out"] is False and result["count"] == 1
+        assert "writer=" in result["note"]
+
+    def test_wait_writer_filters_by_who_wrote_the_event(self, patched_server):
+        _result(_call(patched_server, "mempalace_event_append", APPEND_ARGS))
+        result = _result(
+            _call(
+                patched_server,
+                "mempalace_event_wait",
+                {"correlation_id": "task_mcp", "writer": "windows-codex", "timeout_ms": 200},
+            )
+        )
+        assert result["timed_out"] is True and result["count"] == 0
 
     def test_wait_returns_existing_event(self, patched_server):
         _result(_call(patched_server, "mempalace_event_append", APPEND_ARGS))

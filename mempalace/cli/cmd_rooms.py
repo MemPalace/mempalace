@@ -54,6 +54,20 @@ def _refuse_mismatched_resume(config, wing, recorded, current):
     sys.exit(1)
 
 
+def _open_closets_collection(palace_path):
+    """Return the closets collection, or ``None`` if it was never created.
+
+    Other open failures propagate so an interrupted apply keeps its marker.
+    """
+    from ..backends import CollectionNotInitializedError
+    from ..palace import get_closets_collection
+
+    try:
+        return get_closets_collection(palace_path, create=False)
+    except CollectionNotInitializedError:
+        return None
+
+
 def cmd_rooms(args):
     from ..rooms import (
         DEFAULT_THRESHOLD,
@@ -68,7 +82,8 @@ def cmd_rooms(args):
         load_pending_apply,
         plan_rooms,
         propose_rooms,
-        rekey_closets_to,
+        rekey_closets_by_ids,
+        plan_closet_moves,
         save_pending_apply,
         room_set_path,
         sample_drawers,
@@ -170,9 +185,6 @@ def cmd_rooms(args):
             print("\n  Dry run. Re-run with --yes to write the room changes.")
         return
 
-    from ..backends import CollectionNotInitializedError
-    from ..palace import get_closets_collection
-
     with _repair_lock(palace_path):
         inputs = apply_inputs(config, wing, threshold, from_rooms)
         pending = load_pending_apply(config, wing)
@@ -180,6 +192,12 @@ def cmd_rooms(args):
             _refuse_mismatched_resume(config, wing, pending[2], inputs)
         plan = plan_rooms(col, wing, decider, threshold=threshold, from_rooms=from_rooms)
         report(plan)
+        # Closet identities must be snapshotted before any write: a retry that
+        # only sees current room metadata can feed an intermediate room into
+        # the next mapping of a chained plan.
+        # Only a never-created collection is empty. An unreadable snapshot
+        # must abort before drawer writes or changes to the recovery marker.
+        closets_col = _open_closets_collection(palace_path)
         if pending is None:
             if not plan.changes:
                 print("  Nothing to change.")
@@ -188,9 +206,14 @@ def cmd_rooms(args):
             # after an interruption can finish the closet phase even when no
             # drawer is left to move.
             targets, ambiguous = closet_targets(plan)
-            save_pending_apply(config, wing, targets, ambiguous, inputs)
+            moves = plan_closet_moves(closets_col, wing, targets)
+            save_pending_apply(config, wing, targets, ambiguous, inputs, moves=moves)
         else:
-            targets, ambiguous, _ = pending
+            targets, ambiguous, _, moves = pending
+            # Only a missing legacy snapshot may be recomputed. An explicit empty
+            # ``closet_moves: {}`` means this operation owns no closet moves.
+            if moves is None:
+                moves = plan_closet_moves(closets_col, wing, targets)
             print("  Resuming an interrupted apply: finishing drawers, then closets.")
         try:
             done = apply_plan(col, plan) if plan.changes else 0
@@ -202,11 +225,8 @@ def cmd_rooms(args):
         # Only a closet collection that was never created means "no closets".
         # Any other failure to open it must stop the command with its
         # recovery marker kept, or the closet phase is skipped for good.
-        try:
-            closets_col = get_closets_collection(palace_path, create=False)
-        except CollectionNotInitializedError:
-            closets_col = None
-        moved_closets = rekey_closets_to(closets_col, wing, targets)
+        closets_col = _open_closets_collection(palace_path)
+        moved_closets = rekey_closets_by_ids(closets_col, wing, moves)
         clear_pending_apply(config, wing)
         note = f" {moved_closets} closets followed."
         if ambiguous:

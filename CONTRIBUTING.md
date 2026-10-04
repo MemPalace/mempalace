@@ -94,6 +94,31 @@ assets/             ← logo + brand
 - **`main` is reserved for tagged, stable releases.** Releases are promoted by merging `develop` into `main` (e.g., `v3.7.0`, `v3.6.0`).
 - Only emergency hotfixes should branch directly off — and target — `main`.
 
+## Checking release versions
+
+Before preparing a release, run the same consistency check as CI:
+
+```bash
+python scripts/check_versions.py
+```
+
+The checker compares thirteen version values in eleven files, using
+`mempalace/version.py` as the reference: `pyproject.toml`, the Claude, Codex and
+DSH manifests, the OpenClaw skill frontmatter, the README version badge, the
+editable MemPalace entry in `uv.lock`, the Cargo workspace version, and the three
+MemPalace workspace-package entries in `Cargo.lock`. Other dependency versions
+are outside this check.
+
+It reports missing, ambiguous or mismatched entries and exits with a nonzero
+status. It reads the release files without modifying them. On Python 3.9 or
+3.10, it uses the `tomli` dependency installed with MemPalace; newer Python
+versions use the standard library TOML parser.
+
+The Version Guard workflow runs this check when guarded files change and on
+`v*` tag pushes. Stable tags must also match the reference version; prerelease
+tags retain their existing exemption from that tag comparison. Release-version
+edits remain a separate release-preparation step.
+
 ## Code Style
 
 - **Formatting**: [Ruff](https://docs.astral.sh/ruff/) with 100-char line limit (configured in `pyproject.toml`)

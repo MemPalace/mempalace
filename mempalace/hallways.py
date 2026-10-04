@@ -180,14 +180,29 @@ _CODE_EXTENSIONS = frozenset(
 )
 
 
+def _code_extension(entity: str) -> Optional[str]:
+    """Lower-case code extension of ``entity``, or ``None`` if it has none.
+
+    ``src/parser.c`` → ``"c"``; ``mcp_server`` and ``ChatStore.send`` →
+    ``None`` (no known code extension on the basename). Unequal explicit
+    extensions name different files even when their stems match.
+    """
+    base = str(entity).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    stem, dot, ext = base.rpartition(".")
+    if dot and stem and ext.lower() in _CODE_EXTENSIONS:
+        return ext.lower()
+    return None
+
+
 def entity_spelling_key(entity: str) -> str:
     """Basename without a known code extension, lower-cased.
 
     ``src/main.zig``, ``main.zig`` and ``/Users/x/proj/src/main.zig`` all key
     to ``main``; ``mcp_server`` and ``mcp_server.py`` both key to
-    ``mcp_server``. Two entities sharing a key are one thing spelled two
-    ways, so a hallway between them is the entity co-occurring with itself,
-    not an association. Used by the miner to skip such pairs and by
+    ``mcp_server``. The soft key groups candidate aliases; unequal explicit
+    extensions of the same stem (``parser.c`` / ``parser.h``) still key
+    together here and are separated by :func:`same_file_spelling` and
+    :func:`_spelling_clusters`. Used by the miner to skip self-pairs and by
     ``mempalace audit`` / ``mempalace hallways --prune-self-links`` to find
     the ones older mines already wrote.
     """
@@ -345,8 +360,16 @@ def same_file_spelling(a: str, b: str) -> bool:
     ``src/models/user.py`` and ``tests/models/user.py`` are two files that
     happen to share a name. Keying on the basename alone merged their
     associations and let ``--prune-spellings`` delete one of them.
+
+    Unequal explicit code extensions stay distinct: ``src/parser.c`` and
+    ``src/parser.h`` share a stem and a directory, but they are two files.
+    An extensionless spelling may still alias a single extension
+    (``mcp_server`` / ``mcp_server.py``).
     """
     if entity_spelling_key(a) != entity_spelling_key(b):
+        return False
+    ext_a, ext_b = _code_extension(a), _code_extension(b)
+    if ext_a is not None and ext_b is not None and ext_a != ext_b:
         return False
     if _is_diff_pair(a, b):
         return True
@@ -380,36 +403,45 @@ def canonical_spelling(cluster: list[str]) -> str:
 def _spelling_clusters(entities: list[str]) -> list[list[str]]:
     """Group spellings of one basename into the distinct files they name.
 
-    Spellings are bucketed by their directory path. A path that is a suffix
-    of exactly one longer path is the same file and joins it (``main.zig``
-    under ``src/main.zig``). One that could belong to two or more names no
-    file at all (``user.py`` beside ``src/models/user.py`` and
-    ``tests/models/user.py``) and is left out of every cluster: attributing
-    it to either file would be a guess, and keeping it as an entity of its
-    own would pair it with the very files it might be, which
-    :func:`is_self_link` and :func:`association_groups` then rightly call
-    artifacts. Callers skip spellings that appear in no cluster.
+    Unequal explicit code extensions are different files even in the same
+    directory (``src/parser.c`` / ``src/parser.h``). Within one extension,
+    spellings are bucketed by directory path: a path that is a suffix of
+    exactly one longer path joins it (``main.zig`` under ``src/main.zig``);
+    one that could belong to two or more is left out (``user.py`` beside
+    ``src/models/user.py`` and ``tests/models/user.py``). An extensionless
+    spelling joins the unique extension cluster it can only name
+    (``mcp_server`` under ``mcp_server.py``); if it could be more than one
+    file it is left out, the same rule as an ambiguous bare path.
+    Callers skip spellings that appear in no cluster.
     """
-    # ``a/x`` beside ``b/x`` is one file seen through a diff: bucket both
-    # under ``x``'s directory so they cluster with each other and with ``x``.
-    resolved = _diff_resolved(entities)
-    groups: dict[tuple, list[str]] = {}
-    for e in entities:
-        groups.setdefault(tuple(_dir_segments(resolved.get(e, e))), []).append(e)
-    by_length = sorted(groups, key=len, reverse=True)
-    maximal: list[tuple] = []
-    for dirs in by_length:
-        if not any(len(m) > len(dirs) and m[len(m) - len(dirs) :] == dirs for m in maximal):
-            maximal.append(dirs)
-    clusters: dict[tuple, list[str]] = {m: list(groups[m]) for m in maximal}
-    for dirs in by_length:
-        if dirs in clusters:
+    # Resolve diff prefixes against the complete set, as their paired
+    # spellings may otherwise look like incompatible directories.
+    names = list(dict.fromkeys(entities))
+    resolved = _diff_resolved(names)
+    matches = {
+        name: {
+            other
+            for other in names
+            if same_file_spelling(resolved.get(name, name), resolved.get(other, other))
+        }
+        for name in names
+    }
+    # A short path or missing extension must never bridge incompatible
+    # files. Decide ambiguity before building any cluster: adding Router
+    # to src/Router first would let tests/Router join through that alias.
+    # Every pair of possible hosts must agree, including intermediate
+    # suffixes and extensionless paths, regardless of input order.
+    unambiguous = {
+        name for name, hosts in matches.items() if all(hosts <= matches[host] for host in hosts)
+    }
+    clusters: list[list[str]] = []
+    for name in names:
+        if name not in unambiguous:
             continue
-        hosts = [m for m in maximal if len(m) > len(dirs) and m[len(m) - len(dirs) :] == dirs]
-        if len(hosts) == 1:
-            clusters[hosts[0]].extend(groups[dirs])
-        # Two or more hosts: ambiguous, deliberately left out.
-    return list(clusters.values())
+        cluster = [other for other in names if other in unambiguous and other in matches[name]]
+        clusters.append(cluster)
+        unambiguous.difference_update(cluster)
+    return clusters
 
 
 def is_self_link(record) -> bool:
@@ -517,7 +549,7 @@ def _wing_file_keys(metadatas) -> dict[str, str]:
 def compute_hallways_for_wing(
     wing: str,
     col=None,
-    min_count: int = 2,
+    min_count: int | None = None,
     config=None,
 ) -> list[dict]:
     """Compute entity-pair hallways for one wing.
@@ -549,9 +581,14 @@ def compute_hallways_for_wing(
             didn't supply a backing store, so nothing to compute against).
             Tests pass a controlled MagicMock.
         min_count: minimum co-occurrence count required to materialize a
-            hallway between two entities. Default 2 — single co-occurrences
-            are noise (entities mentioned together once in one drawer);
-            two or more is a real signal. Clamped to ``>=1``.
+            hallway between two entities. Pass an explicit ``None`` (the
+            default) — or omit the arg — to resolve it from config:
+            ``MEMPALACE_KG_HALLWAY_MIN_COUNT`` env first, then the
+            ``hallway_min_count`` config-file value, then the historical
+            default of ``2`` (single co-occurrences are noise — entities named
+            together once in one drawer; two or more is a real signal). An
+            explicitly supplied integer is honoured verbatim, clamped to
+            ``>=1``.
         config: Optional ``MempalaceConfig`` selecting the palace-scoped
             hallway sidecar. Callers using an explicit palace path must pass
             the matching config so derived graph state cannot leak into the
@@ -565,7 +602,22 @@ def compute_hallways_for_wing(
         logger.debug("compute_hallways_for_wing: no collection provided for %s", wing)
         return []
 
-    min_count = max(1, int(min_count))
+    # Resolve the min_count threshold: honour an explicit value, otherwise
+    # fall back to config (env > file > historical default 2). This is the
+    # single source of truth for the within-wing hallway threshold, so callers
+    # that omit the arg and production callers that rely on the default resolve
+    # it identically via MempalaceConfig.hallway_min_count — mirroring the
+    # topic_tunnel_min_count convention while keeping backward compat (an
+    # unconfigured corpus still gets min_count=2, so existing hallways are
+    # byte-identical).
+    threshold: int
+    if min_count is None:
+        from .config import MempalaceConfig
+
+        threshold = (config or MempalaceConfig()).hallway_min_count
+    else:
+        threshold = min_count
+    min_count = max(1, int(threshold))
 
     # 1. Query drawers for this wing: scoped to the wing server-side AND
     #    paginated. An unbounded get(where={"wing": wing}) binds one SQL
@@ -626,10 +678,13 @@ def compute_hallways_for_wing(
         if meta.get("is_sentinel"):
             continue
         entities = []
-        for spelling in canonical_entities(_parse_entities(meta.get("entities"))):
+        for spelling in _parse_entities(meta.get("entities")):
             # The file this spelling names, not its basename: two files
             # sharing a name must not merge into one entity here either,
-            # or one drawer naming both counts the same pair twice.
+            # or one drawer naming both counts the same pair twice. Resolve
+            # the raw names against the whole wing first: a drawer-local
+            # canonical name such as Parser could hide its explicit Parser.c
+            # when Parser is ambiguous with Parser.h elsewhere in the wing.
             canonical = file_keys.get(spelling)
             if canonical is None:
                 continue  # an ambiguous name: it identifies no single file

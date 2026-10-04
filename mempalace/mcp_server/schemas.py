@@ -295,7 +295,11 @@ TOOLS = {
         "handler": tool_follow_tunnels,
     },
     "mempalace_search": {
-        "description": "Semantic search. Returns verbatim drawer content with similarity scores. IMPORTANT: 'query' must contain ONLY search keywords. Use 'context' for background. Results with cosine distance > max_distance are filtered out.",
+        "description": (
+            "Search past-session memories. Returns matching drawers. "
+            "Not for the current conversation — if it happened in this "
+            "session, answer from context instead."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -530,6 +534,14 @@ TOOLS = {
                     "description": (
                         "Convos extraction strategy: exchange (default) or general. "
                         "Ignored by other modes."
+                    ),
+                },
+                "include_ignored": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Project-relative paths to scan even if ignored, matching CLI "
+                        "--include-ignored. Projects mode only; default: []."
                     ),
                 },
             },
@@ -870,8 +882,9 @@ TOOLS = {
             " peer's event syncs in whenever it arrives, so it can already be older than a"
             " timestamp cursor and be missed permanently; since_created_at is a time window"
             " ('what happened today'), not a cursor. Pass preview=true when sweeping a busy"
-            " stream. to_agent=<you> also matches '*' broadcasts. To wait for future events, use"
-            " mempalace_event_wait."
+            " stream. to_agent=<you> also matches '*' broadcasts. writer=<agent> filters by who"
+            " wrote an event; from_agent is your identity and never filters. To wait for"
+            " future events, use mempalace_event_wait."
         ),
         "input_schema": {
             "type": "object",
@@ -884,7 +897,17 @@ TOOLS = {
                     "type": "string",
                     "description": "Filter by target agent; also matches '*' broadcasts (optional)",
                 },
-                "from_agent": {"type": "string", "description": "Filter by writer (optional)"},
+                "from_agent": {
+                    "type": "string",
+                    "description": (
+                        "Your agent identity (optional). NOT a filter: it never narrows the result."
+                        " To filter by who wrote an event use writer."
+                    ),
+                },
+                "writer": {
+                    "type": "string",
+                    "description": "Filter by the agent that wrote the event (optional)",
+                },
                 "correlation_id": {
                     "type": "string",
                     "description": "Filter by correlation id (optional)",
@@ -948,7 +971,17 @@ TOOLS = {
                     "type": "string",
                     "description": "Filter by target agent; also matches '*' broadcasts (optional)",
                 },
-                "from_agent": {"type": "string", "description": "Filter by writer (optional)"},
+                "from_agent": {
+                    "type": "string",
+                    "description": (
+                        "Your agent identity (optional). NOT a filter: it never narrows the result."
+                        " To filter by who wrote an event use writer."
+                    ),
+                },
+                "writer": {
+                    "type": "string",
+                    "description": "Filter by the agent that wrote the event (optional)",
+                },
                 "correlation_id": {
                     "type": "string",
                     "description": "Filter by correlation id (optional)",
@@ -1074,6 +1107,30 @@ TOOLS = {
         "handler": tool_patch_submit,
     },
 }
+
+# MCP ToolAnnotations.readOnlyHint for clients that hide mutating tools
+# (plan modes, read-only subagents). Only tools that do not change state
+# belong here. Server --read-only uses the wider _READ_ONLY_REFUSED_TOOLS
+# set: mempalace_memories_filed_away unlinks the checkpoint ack file, so it
+# stays refused there and must not advertise readOnlyHint (MCP default is
+# false when the annotation is omitted).
+for _read_only_name in (
+    "mempalace_status",
+    "mempalace_list_wings",
+    "mempalace_list_rooms",
+    "mempalace_get_taxonomy",
+    "mempalace_get_aaak_spec",
+    "mempalace_search",
+    "mempalace_check_duplicate",
+    "mempalace_get_drawer",
+    "mempalace_get_drawers",
+    "mempalace_list_drawers",
+    "mempalace_diary_read",
+    "mempalace_kg_query",
+    "mempalace_kg_timeline",
+    "mempalace_kg_stats",
+):
+    TOOLS[_read_only_name]["read_only"] = True
 
 
 SUPPORTED_PROTOCOL_VERSIONS = [

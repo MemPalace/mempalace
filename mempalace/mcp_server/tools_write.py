@@ -159,11 +159,53 @@ def _single_record(drawer_id, doc, meta):
     }
 
 
-def _logical_drawer_record(col, drawer_id: str):
+def _sqlite_logical_drawer_record(drawer_id: str):
+    """Resolve a configured Chroma drawer without opening its collection.
+
+    Missing rows and unsupported SQLite state retain the collection fallback.
+    Both readers use the same record builders for physical and logical IDs.
+    """
+    if not isinstance(drawer_id, str) or not drawer_id or not _is_chroma_backend():
+        return None
+    try:
+        from ..backends.chroma import sqlite_drawer_rows
+
+        result = sqlite_drawer_rows(
+            _config.palace_path, _config.collection_name, drawer_id=drawer_id
+        )
+        if result is None:
+            return None
+        is_direct, rows = result
+        if not rows:
+            return None
+        if is_direct:
+            physical_id, doc, meta = rows[0]
+            return _single_record(physical_id, doc, meta)
+        return _chunk_group_record(
+            drawer_id,
+            [
+                (_chunk_index(_safe_meta(meta)), physical_id, doc or "", _safe_meta(meta))
+                for physical_id, doc, meta in rows
+            ],
+        )
+    except Exception:
+        logger.debug("sqlite drawer lookup failed; falling back", exc_info=True)
+        return None
+
+
+def _collection_logical_drawer_record(col, drawer_id: str):
+    """Resolve a drawer through the original collection lookup path."""
     direct = _single_drawer_record(col, drawer_id)
     if direct is not None:
         return direct
     return _logical_chunk_group(col, drawer_id)
+
+
+def _logical_drawer_record(col, drawer_id: str):
+    record = _sqlite_logical_drawer_record(drawer_id)
+    if record is not None:
+        return record
+    return _collection_logical_drawer_record(col, drawer_id)
 
 
 def _bulk_drawer_records(col, drawer_ids):
@@ -651,7 +693,11 @@ def _delete_resolved_drawer(col, drawer_id: str, *, bulk: bool = False):
     A physical chunk id removes that one row, because resolution hits the
     row directly. Returns the singular success or not-found dict.
     """
-    record = _logical_drawer_record(col, drawer_id)
+    record = (
+        _collection_logical_drawer_record(col, drawer_id)
+        if bulk
+        else _logical_drawer_record(col, drawer_id)
+    )
     if record is None:
         return {"success": False, "error": f"Drawer not found: {drawer_id}"}
     return _delete_record(col, drawer_id, record, bulk=bulk)
@@ -775,6 +821,7 @@ def tool_mine(
     limit: int = 0,
     dry_run: bool = False,
     extract: str = "exchange",
+    include_ignored: Optional[list[str]] = None,
 ):
     """Mine a directory into the palace — the MCP equivalent of ``mempalace mine``.
 
@@ -795,6 +842,8 @@ def tool_mine(
     dry_run: walk + chunk and report, but file nothing.
     extract: convos extraction strategy — ``"exchange"`` (default) or
              ``"general"``; ignored by the other modes.
+    include_ignored: project-relative paths to scan even if ignored, matching
+                     the CLI's ``--include-ignored``; projects mode only.
 
     Runs synchronously and mirrors the :func:`tool_sync` contract: success
     returns ``{success: True, mode, dry_run, output[, output_truncated]}`` where ``output`` is
@@ -817,6 +866,22 @@ def tool_mine(
         return {
             "success": False,
             "error": f"invalid mode '{mode}'; expected one of: {', '.join(valid_modes)}",
+        }
+
+    if include_ignored is not None and (
+        not isinstance(include_ignored, list)
+        or any(not isinstance(path, str) or not path.strip() for path in include_ignored)
+    ):
+        return {
+            "success": False,
+            "error": "include_ignored must be an array of non-empty project-relative path strings",
+            "error_class": "ValueError",
+        }
+    if include_ignored and mode != "projects":
+        return {
+            "success": False,
+            "error": "include_ignored is supported only in projects mode",
+            "error_class": "ValueError",
         }
 
     src = os.path.expanduser(source) if source else ""
@@ -864,6 +929,7 @@ def tool_mine(
             agent=agent,
             limit=limit,
             dry_run=dry_run,
+            **({"include_ignored": include_ignored} if include_ignored else {}),
         )
 
     try:
@@ -1124,12 +1190,19 @@ def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
 
 def tool_get_drawer(drawer_id: str):
     """Fetch a single logical drawer by ID."""
+    try:
+        record = _sqlite_logical_drawer_record(drawer_id)
+        if record is not None:
+            return _drawer_payload(record)
+    except Exception as e:
+        return {"error": str(e)}
+
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
 
     try:
-        record = _logical_drawer_record(col, drawer_id)
+        record = _collection_logical_drawer_record(col, drawer_id)
         if record is None:
             return {"error": f"Drawer not found: {drawer_id}"}
         return _drawer_payload(record)
@@ -1200,7 +1273,7 @@ def tool_get_drawers(drawer_ids: list):
     for drawer_id in drawer_ids:
         try:
             if found is None:
-                record = _logical_drawer_record(col, drawer_id)
+                record = _collection_logical_drawer_record(col, drawer_id)
             else:
                 record = found.get(drawer_id)
             error = None
@@ -1349,7 +1422,11 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 wing = sanitize_name(wing, "wing")
             except ValueError as e:
                 return {"success": False, "error": str(e)}
-            if wing.lower() != str(old_meta.get("wing") or "").lower():
+            # Case-sensitive comparison: a case-only rename IS a rename.
+            # ``list_drawers`` is case-sensitive, so case-duplicate wings are
+            # distinct destinations, and the caller's exact casing is
+            # authoritative (#2395).
+            if wing != str(old_meta.get("wing") or ""):
                 new_meta["wing"] = wing
 
         if room is not None:
@@ -1357,7 +1434,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 room = sanitize_name(room, "room")
             except ValueError as e:
                 return {"success": False, "error": str(e)}
-            if room.lower() != str(old_meta.get("room") or "").lower():
+            if room != str(old_meta.get("room") or ""):
                 new_meta["room"] = room
 
         new_meta["last_modified"] = datetime.now().isoformat()

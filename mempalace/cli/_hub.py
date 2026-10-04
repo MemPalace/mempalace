@@ -248,14 +248,16 @@ def _forward_search_to_hub(args, palace_path: str) -> bool:
 def _mine_args_forwardable(args, include_ignored) -> bool:
     """Only forward mines the ``mempalace_mine`` MCP tool can express.
 
-    Flags the tool has no parameters for (kg-extract, gitignore handling,
+    Flags the tool has no parameters for (kg-extract, disabling gitignore,
     chunking overrides, origin redetection, explicit backend) keep the
     direct path — where a held writer lease still surfaces as the existing
     MineAlreadyRunning error rather than being silently dropped.
     """
     if getattr(args, "kg_extract", False) or getattr(args, "redetect_origin", False):
         return False
-    if args.no_gitignore or include_ignored:
+    if args.no_gitignore:
+        return False
+    if include_ignored and (getattr(args, "mode", None) or "projects") != "projects":
         return False
     if getattr(args, "max_chunks_per_file", None) is not None:
         return False
@@ -264,7 +266,7 @@ def _mine_args_forwardable(args, include_ignored) -> bool:
     return True
 
 
-def _forward_mine_to_hub(args, palace_path: str) -> bool:
+def _forward_mine_to_hub(args, palace_path: str, *, include_ignored=None) -> bool:
     """Run this mine inside the palace's HTTP hub, if one is alive.
 
     A long-lived hub (``mempalace serve``) holds the MCP writer lease for
@@ -303,6 +305,17 @@ def _forward_mine_to_hub(args, palace_path: str) -> bool:
     except (urllib.error.URLError, OSError, ValueError):
         return False
 
+    # Older hubs cannot express this override. Never discard it or compete
+    # with their lifetime writer lease by silently opening a local writer.
+    if include_ignored and "mine_include_ignored" not in (info.get("capabilities") or []):
+        print(
+            f"mempalace: palace hub {base_url} (pid {info.get('pid')}) does not support "
+            "--include-ignored; upgrade MemPalace in the hub's environment and restart "
+            "the hub before retrying. No mine was submitted or run locally.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     arguments = {
         "source": os.path.abspath(os.path.expanduser(args.dir)),
         "mode": args.mode,
@@ -313,6 +326,8 @@ def _forward_mine_to_hub(args, palace_path: str) -> bool:
     }
     if args.wing:
         arguments["wing"] = args.wing
+    if include_ignored:
+        arguments["include_ignored"] = include_ignored
     body = json.dumps(
         {
             "jsonrpc": "2.0",

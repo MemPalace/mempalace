@@ -46,6 +46,7 @@ from .palace import (
     get_collection,
     mine_lock,
     mine_palace_lock,
+    mine_yield_point,
     prefetch_content_hashes,
     prefetch_mined_set,
 )
@@ -1151,6 +1152,7 @@ def _mine_convos_impl(
     room_counts = defaultdict(int)
 
     for i, filepath in enumerate(files, 1):
+        mine_yield_point()
         files_processed = i
         source_file = str(filepath)
 

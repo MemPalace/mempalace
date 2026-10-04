@@ -10,12 +10,13 @@ import pickle
 import re
 import shlex
 import sqlite3
+import weakref
 import struct
 import time
 from collections import defaultdict
 from numbers import Integral
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 import chromadb
 from chromadb.config import Settings as _ChromaSettings
@@ -605,6 +606,199 @@ def _bm25_scores(
             score += idf[term] * num / den
         scores.append(score)
     return scores
+
+
+# Most full-text matches the candidate pickers below read, best-ranked first.
+_FTS_SCAN_CAP = 50_000
+# A metadata filter matching at most this many drawers is evaluated by reading
+# those drawers' text instead of ranking the whole full-text match set.
+_FTS_FILTER_DRIVEN_MAX = 20_000
+
+
+def _fts_tokens(query: str, stop_words: frozenset = frozenset()) -> list[str]:
+    """Query terms the trigram index can match: three or more characters.
+
+    Stop words are dropped unless the query holds nothing else.
+    """
+    terms = [t for t in _tokenize(query) if len(t) >= 3]
+    return [t for t in terms if t not in stop_words] or terms
+
+
+# When the ranked window above is full but holds fewer whole-word matches than
+# asked for, this many more matches are read in storage order, newest first.
+_FTS_CONTINUATION_BUDGET = 500_000
+
+
+class CandidateRows(list):
+    """Candidate row ids; ``truncated`` when a read budget ran out first."""
+
+    truncated = False
+
+
+def _whole_words_first(rows, query_tokens: Iterable[str], limit: Optional[int]) -> list[int]:
+    """Row ids from ``(row_id, text)`` pairs, whole-word matches first.
+
+    The whole-word BM25 re-rank scores a drawer by the query words it
+    contains, so drawers holding one as a whole word go first. Drawers that
+    only contain a query term inside another word keep the places left over:
+    they still carry near misses such as ``vectors`` for ``vector``.
+    """
+    words = set(query_tokens)
+    whole: list[int] = []
+    partial: list[int] = []
+    for row_id, text in rows:
+        if words.intersection(_tokenize(text)):
+            whole.append(int(row_id))
+            if limit is not None and len(whole) >= limit:
+                break
+        elif limit is None or len(partial) < limit:
+            partial.append(int(row_id))
+    picked = whole + partial
+    return picked if limit is None else picked[:limit]
+
+
+def _fts_candidate_rows(
+    conn,
+    collection_name: str,
+    query: str,
+    *,
+    limit: Optional[int],
+    filter_sql: str = "",
+    filter_params: Iterable = (),
+    stop_words: frozenset = frozenset(),
+) -> list[int]:
+    """Row ids of the full-text matches most worth ranking, best first.
+
+    ``chroma.sqlite3``'s full-text index uses the trigram tokenizer, so a
+    query term matches inside other words: ``aven`` hits ``haven't`` and
+    ``Avenue``, and a short name can have tens of thousands of such matches.
+    Taking the first ``limit`` matches in storage order handed the whole-word
+    BM25 re-rank the oldest substring hits, so the drawers that actually say
+    ``Aven`` never reached it. Matches are read in FTS rank order (documents
+    matching more query terms first), at most ``_FTS_SCAN_CAP`` of them, and
+    picked by :func:`_whole_words_first`. ``filter_sql`` is appended to the
+    WHERE clause and may refer to ``embedding_fulltext_search.rowid``.
+    ``stop_words`` are left out of the full-text query: they match nearly
+    every drawer and would make the ranking score the whole palace.
+    """
+    tokens = _fts_tokens(query, stop_words)
+    if not tokens:
+        return CandidateRows()
+    match_sql = f"""
+        SELECT embedding_fulltext_search.rowid, embedding_fulltext_search.string_value
+        FROM embedding_fulltext_search
+        JOIN embeddings e ON e.id = embedding_fulltext_search.rowid
+        JOIN segments s ON e.segment_id = s.id
+        JOIN collections c ON s.collection = c.id
+        WHERE embedding_fulltext_search MATCH ? AND c.name = ?
+        {filter_sql}
+    """
+    params = (" OR ".join(tokens), collection_name, *filter_params)
+    words = set(tokens)
+    ranked = conn.execute(
+        match_sql + " ORDER BY embedding_fulltext_search.rank LIMIT ?",
+        (*params, _FTS_SCAN_CAP),
+    ).fetchall()
+    result = CandidateRows(_whole_words_first(ranked, tokens, limit))
+    if len(ranked) < _FTS_SCAN_CAP:
+        return result
+    text_by_id = {int(row_id): text or "" for row_id, text in ranked}
+    whole = [row_id for row_id in result if words.intersection(_tokenize(text_by_id[row_id]))]
+    if limit is not None and len(whole) >= limit:
+        return result
+    # The ranked window is full and short of whole-word matches: a name can
+    # rank below tens of thousands of substring hits (``Aven`` under
+    # ``Avenue``). Keep reading the rest, newest first, within a budget.
+    seen = text_by_id.keys()
+    extra: list[int] = []
+    read = 0
+    for row_id, text in conn.execute(
+        match_sql + " ORDER BY embedding_fulltext_search.rowid DESC LIMIT ?",
+        (*params, _FTS_CONTINUATION_BUDGET),
+    ):
+        read += 1
+        if int(row_id) in seen or not words.intersection(_tokenize(text)):
+            continue
+        extra.append(int(row_id))
+        if limit is not None and len(whole) + len(extra) >= limit:
+            break
+    else:
+        result.truncated = read >= _FTS_CONTINUATION_BUDGET
+    whole_ids = set(whole)
+    others = [row_id for row_id in result if row_id not in whole_ids]
+    picked = whole + extra + others
+    out = CandidateRows(picked if limit is None else picked[:limit])
+    out.truncated = result.truncated
+    return out
+
+
+def _filtered_candidate_rows(
+    conn,
+    collection_name: str,
+    query: str,
+    *,
+    limit: Optional[int],
+    equalities: list[tuple[str, str]],
+    filter_sql: str = "",
+    filter_params: Iterable = (),
+    stop_words: frozenset = frozenset(),
+) -> Optional[list[int]]:
+    """:func:`_fts_candidate_rows` for a filter that matches few drawers.
+
+    Ranking every full-text match and testing the filter on each took seconds
+    for a ten-drawer wing, because the match set is the whole palace for a
+    common term. When the smallest of ``equalities`` (string metadata
+    equalities, checked by one count on the ``(key, string_value)`` index)
+    matches at most ``_FTS_FILTER_DRIVEN_MAX`` drawers, this reads just those
+    drawers' text, keeps the ones the trigram index would match (any term of
+    three or more characters as a case-insensitive substring), newest first,
+    and picks by :func:`_whole_words_first`. ``filter_sql`` must hold every
+    filter and may refer to ``e.id``. ``None`` when the filter is too broad.
+    """
+    tokens = _fts_tokens(query, stop_words)
+    if not tokens or not equalities:
+        return None
+    sizes = [
+        conn.execute(
+            "SELECT COUNT(*) FROM embedding_metadata WHERE key = ? AND string_value = ?", pair
+        ).fetchone()[0]
+        for pair in equalities
+    ]
+    if min(sizes) > _FTS_FILTER_DRIVEN_MAX:
+        return None
+    key, value = equalities[sizes.index(min(sizes))]
+    row_ids = [
+        row[0]
+        for row in conn.execute(
+            f"""
+            SELECT e.id FROM embedding_metadata w
+            CROSS JOIN embeddings e ON e.id = w.id
+            JOIN segments s ON e.segment_id = s.id
+            JOIN collections c ON s.collection = c.id
+            WHERE w.key = ? AND w.string_value = ? AND c.name = ?
+            {filter_sql}
+            ORDER BY e.id DESC
+            """,
+            (key, value, collection_name, *filter_params),
+        )
+    ]
+    texts: dict[int, str] = {}
+    for start in range(0, len(row_ids), 500):
+        chunk = row_ids[start : start + 500]
+        texts.update(
+            conn.execute(
+                "SELECT id, string_value FROM embedding_metadata"
+                f" WHERE key = 'chroma:document' AND id IN ({','.join('?' * len(chunk))})",
+                chunk,
+            ).fetchall()
+        )
+    matching = []
+    for row_id in row_ids:
+        text = texts.get(row_id) or ""
+        lowered = text.lower()
+        if any(token in lowered for token in tokens):
+            matching.append((row_id, text))
+    return _whole_words_first(matching, tokens, limit)
 
 
 def _coerce_metadata_value(value: Any) -> Any:
@@ -1532,6 +1726,229 @@ def _sqlite_embedding_count(palace_path: str, collection_name: str) -> Optional[
         return None
 
 
+def _sqlite_collection_has_rows(palace_path: str, collection_name: str) -> Optional[bool]:
+    """Whether ``collection_name`` holds any drawer, read from chroma.sqlite3.
+
+    ``Collection.count()`` on a freshly built client loads the whole HNSW
+    segment while holding the GIL, which on a multi-million-drawer palace
+    stalls every thread in the process for seconds. This answers the same
+    empty-or-not question with one indexed row. ``None`` when the database
+    is missing or unreadable, so callers can fall back to ``count()``.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        conn = open_palace_reader(db_path)
+        try:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM embeddings e
+                JOIN segments s ON e.segment_id = s.id
+                JOIN collections c ON s.collection = c.id
+                WHERE c.name = ? AND s.scope = 'METADATA'
+                LIMIT 1
+                """,
+                (collection_name,),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
+def _string_equalities(where: Optional[dict]) -> Optional[list[tuple[str, str]]]:
+    """``where`` as ``[(key, value), ...]`` string equalities, or ``None``.
+
+    Accepts ``None``, ``{"k": "v"}``, ``{"k": {"$eq": "v"}}`` and an ``$and``
+    of those. ``None`` means the filter has another shape (or a non-string
+    value), which the sqlite readers below do not evaluate.
+    """
+    if not where:
+        return []
+    if set(where) == {"$and"}:
+        clauses = where["$and"]
+        if not isinstance(clauses, list):
+            return None
+        pairs: list[tuple[str, str]] = []
+        for clause in clauses:
+            sub = _string_equalities(clause) if isinstance(clause, dict) else None
+            if sub is None or len(sub) != 1:
+                return None
+            pairs.extend(sub)
+        return pairs
+    if len(where) != 1:
+        return None
+    key, value = next(iter(where.items()))
+    if key.startswith("$"):
+        return None
+    if isinstance(value, dict) and set(value) == {"$eq"}:
+        value = value["$eq"]
+    if not isinstance(value, str):
+        return None
+    return [(key, value)]
+
+
+def _sqlite_metadata_value(sval, ival, fval, bval):
+    if sval is not None:
+        return sval
+    if bval is not None:
+        return bool(bval)
+    if ival is not None:
+        return ival
+    return fval
+
+
+# Filters matching at most this many rows are read whole and ordered in Python
+# (see _sqlite_recent_records); larger ones walk the order_field index.
+_RECENT_FILTER_DRIVEN_MAX = 200_000
+
+
+def _sqlite_recent_records(
+    palace_path: str,
+    collection_name: str,
+    *,
+    limit: int,
+    equalities: list[tuple[str, str]],
+    order_field: str,
+) -> Optional[list[tuple[str, str, Optional[dict]]]]:
+    """``(id, document, metadata)`` for the newest ``limit`` records, from chroma.sqlite3.
+
+    Newest first by ``order_field`` as text, records without a non-empty string
+    value last in storage order: the order :func:`recency_sort_key` defines.
+    ``equalities`` filter on string metadata. ``None`` when the database is
+    missing or the read fails, so the caller can fall back to Chroma.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    filter_sql = "".join(
+        " AND EXISTS (SELECT 1 FROM embedding_metadata w"
+        " WHERE w.id = e.id AND w.key = ? AND w.string_value = ?)"
+        for _ in equalities
+    )
+    filter_params = [part for pair in equalities for part in pair]
+    # METADATA only. A VECTOR-segment row (HNSW bookkeeping, or a future
+    # chroma that stores one) is not a drawer; joining it returns a ghost
+    # with empty document and metadata. Same predicate as the other sqlite
+    # readers and repair.extract_via_sqlite.
+    scope_sql = """
+        FROM embeddings e
+        JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
+        JOIN collections c ON s.collection = c.id
+    """
+    try:
+        conn = open_palace_reader(db_path)
+        try:
+            # Walking the order_field index and testing the filter on each row
+            # finds `limit` matches fast when the filter is dense, but reads the
+            # whole collection for a sparse one (a ten-drawer wing). Size the
+            # filter from its index first and, when it is small, read just the
+            # matching rows and order them here.
+            sizes = [
+                conn.execute(
+                    "SELECT COUNT(*) FROM embedding_metadata WHERE key = ? AND string_value = ?",
+                    pair,
+                ).fetchone()[0]
+                for pair in equalities
+            ]
+            filter_driven = bool(sizes) and min(sizes) <= _RECENT_FILTER_DRIVEN_MAX
+            if filter_driven:
+                drive = sizes.index(min(sizes))
+                drive_key, drive_value = equalities[drive]
+                rest = equalities[:drive] + equalities[drive + 1 :]
+                rest_sql = "".join(
+                    " AND EXISTS (SELECT 1 FROM embedding_metadata w2"
+                    " WHERE w2.id = w.id AND w2.key = ? AND w2.string_value = ?)"
+                    for _ in rest
+                )
+                rows = conn.execute(
+                    f"""
+                    SELECT w.id, o.string_value
+                    FROM embedding_metadata w
+                    CROSS JOIN embeddings e ON e.id = w.id
+                    JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
+                    JOIN collections c ON s.collection = c.id
+                    LEFT JOIN embedding_metadata o ON o.id = w.id AND o.key = ?
+                    WHERE w.key = ? AND w.string_value = ? AND c.name = ?
+                    {rest_sql}
+                    """,
+                    (
+                        order_field,
+                        drive_key,
+                        drive_value,
+                        collection_name,
+                        *[part for pair in rest for part in pair],
+                    ),
+                ).fetchall()
+                rows.sort(key=lambda r: r[0])
+                dated = [r for r in rows if isinstance(r[1], str) and r[1]]
+                dated.sort(key=lambda r: r[1], reverse=True)
+                undated = [r for r in rows if not (isinstance(r[1], str) and r[1])]
+                row_ids = [r[0] for r in (dated + undated)[:limit]]
+            else:
+                row_ids = [
+                    r[0]
+                    for r in conn.execute(
+                        f"""
+                        SELECT e.id {scope_sql}
+                        JOIN embedding_metadata o ON o.id = e.id
+                        WHERE c.name = ? AND o.key = ? AND o.string_value > ''
+                        {filter_sql}
+                        ORDER BY o.string_value DESC, e.id
+                        LIMIT ?
+                        """,
+                        (collection_name, order_field, *filter_params, limit),
+                    )
+                ]
+            # The filter-driven branch already ordered the undated rows.
+            if len(row_ids) < limit and not filter_driven:
+                row_ids += [
+                    r[0]
+                    for r in conn.execute(
+                        f"""
+                        SELECT e.id {scope_sql}
+                        WHERE c.name = ?
+                        AND NOT EXISTS (SELECT 1 FROM embedding_metadata o
+                            WHERE o.id = e.id AND o.key = ? AND o.string_value > '')
+                        {filter_sql}
+                        ORDER BY e.id
+                        LIMIT ?
+                        """,
+                        (collection_name, order_field, *filter_params, limit - len(row_ids)),
+                    )
+                ]
+            records: dict[int, list] = {}
+            for start in range(0, len(row_ids), 500):
+                chunk = row_ids[start : start + 500]
+                marks = ",".join("?" * len(chunk))
+                for row_id, embedding_id in conn.execute(
+                    f"SELECT id, embedding_id FROM embeddings WHERE id IN ({marks})", chunk
+                ):
+                    records[row_id] = [embedding_id, "", None]
+                for row_id, key, sval, ival, fval, bval in conn.execute(
+                    "SELECT id, key, string_value, int_value, float_value, bool_value"
+                    f" FROM embedding_metadata WHERE id IN ({marks})",
+                    chunk,
+                ):
+                    record = records.get(row_id)
+                    if record is None:
+                        continue
+                    if key == "chroma:document":
+                        record[1] = sval or ""
+                    elif not key.startswith("chroma:"):
+                        if record[2] is None:
+                            record[2] = {}
+                        record[2][key] = _sqlite_metadata_value(sval, ival, fval, bval)
+            return [tuple(records[row_id]) for row_id in row_ids if row_id in records]
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
 def _sqlite_wing_room_counts(
     palace_path: str, collection_name: str
 ) -> Optional[tuple[int, dict[str, dict[str, int]]]]:
@@ -1668,6 +2085,70 @@ def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Opti
             conn.close()
     except sqlite3.Error:
         return None
+
+
+def _sqlite_iter_metadata(
+    conn,
+    collection_name: str,
+    keys: Optional[Iterable[str]],
+    require_key: Optional[str],
+) -> Iterator[Optional[dict]]:
+    """Stream each drawer's metadata from an open chroma.sqlite3 connection, in row order.
+
+    With ``keys``, only those keys are read, and a drawer that has none of
+    them is skipped. With ``keys=None``, every non-internal key is read and a
+    drawer without metadata yields ``None``, the way Chroma's ``get`` returns
+    it. ``require_key`` limits the scan to drawers holding a string value
+    under that key, found through the ``(key, string_value)`` index. Chroma's
+    own paging is a SQL ``OFFSET``, which re-walks every skipped row, so a
+    full pass that way is quadratic in the number of drawers.
+    """
+    scope = """
+        SELECT e.id FROM embeddings e
+        JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
+        JOIN collections c ON s.collection = c.id
+        WHERE c.name = ?
+    """
+    params: list = [collection_name]
+    if require_key is not None:
+        scope += """ AND e.id IN (SELECT r.id FROM embedding_metadata r
+                     WHERE r.key = ? AND r.string_value IS NOT NULL)"""
+        params.append(require_key)
+    # Older chromadb schemas lack bool_value; select NULL for any value
+    # column the table does not have so the row shape stays fixed.
+    present = set(_metadata_value_columns(conn))
+    columns = "m.key, " + ", ".join(
+        f"m.{col}" if col in present else f"NULL AS {col}"
+        for col in ("string_value", "int_value", "float_value", "bool_value")
+    )
+    if keys is not None:
+        keys = list(keys)
+        sql = f"""
+            SELECT m.id, {columns} FROM embedding_metadata m
+            WHERE m.key IN ({",".join("?" * len(keys))}) AND m.id IN ({scope})
+            ORDER BY m.id
+        """
+        cursor = conn.execute(sql, [*keys, *params])
+    else:
+        sql = f"""
+            SELECT ids.id, {columns} FROM ({scope}) ids
+            LEFT JOIN embedding_metadata m ON m.id = ids.id AND m.key NOT LIKE 'chroma:%'
+            ORDER BY ids.id
+        """
+        cursor = conn.execute(sql, params)
+    current_id = None
+    current: Optional[dict] = None
+    for row_id, key, sval, ival, fval, bval in cursor:
+        if row_id != current_id:
+            if current_id is not None:
+                yield current
+            current_id, current = row_id, None
+        if key is not None:
+            if current is None:
+                current = {}
+            current[key] = _sqlite_metadata_value(sval, ival, fval, bval)
+    if current_id is not None:
+        yield current
 
 
 def sqlite_wing_source_counts(palace_path: str, collection_name: str) -> Optional[list[tuple]]:
@@ -1937,6 +2418,261 @@ def sqlite_documents_for_ids(
     except sqlite3.Error:
         return None
     return docs
+
+
+def _sqlite_ready_metadata_segment(conn, collection_name):
+    """Return the unique collection/metadata segment only after queued writes landed.
+
+    The caller must keep this check and its reads in one explicit transaction.
+    Missing or ambiguous recovery state requires the normal Chroma path.
+    """
+    collections = conn.execute(
+        "SELECT id FROM collections WHERE name = ?", (collection_name,)
+    ).fetchall()
+    if len(collections) != 1:
+        return None
+    collection_id = collections[0][0]
+    segments = conn.execute(
+        "SELECT id FROM segments WHERE collection = ? AND scope = 'METADATA'",
+        (collection_id,),
+    ).fetchall()
+    if len(segments) != 1:
+        return None
+    segment_id = segments[0][0]
+    watermark = conn.execute(
+        "SELECT seq_id FROM max_seq_id WHERE segment_id = ?", (segment_id,)
+    ).fetchone()
+    suffix = f"/{collection_id}"
+    if watermark is None:
+        # A never-written collection has no watermark. Existing rows
+        # or a queued write make that missing state untrustworthy.
+        if (
+            conn.execute(
+                "SELECT 1 FROM embeddings WHERE segment_id = ? LIMIT 1", (segment_id,)
+            ).fetchone()
+            or conn.execute(
+                "SELECT 1 FROM embeddings_queue WHERE substr(topic, -length(?)) = ? LIMIT 1",
+                (suffix, suffix),
+            ).fetchone()
+        ):
+            return None
+        consumed = 0
+    else:
+        consumed = watermark[0]
+        if isinstance(consumed, bytes):
+            # Older Chroma stored big-endian 8-byte offsets. The
+            # newer \x11\x11-prefixed format is not that encoding.
+            if len(consumed) != 8 or consumed.startswith(b"\x11\x11"):
+                return None
+            consumed = int.from_bytes(consumed, "big")
+        if not isinstance(consumed, int) or not 0 <= consumed <= (1 << 63) - 1:
+            return None
+    # Legacy Collection.get backfills queued operations first. Read
+    # only when the metadata segment has already consumed them; the
+    # vector segment's lag does not affect stored text or metadata.
+    if conn.execute(
+        "SELECT 1 FROM embeddings_queue WHERE seq_id > ? AND substr(topic, -length(?)) = ? LIMIT 1",
+        (consumed, suffix, suffix),
+    ).fetchone():
+        return None
+    return collection_id, segment_id
+
+
+def _sqlite_hydrate_rows(conn, selected, value_columns):
+    """Hydrate scalar metadata/documents only for selected internal row ids."""
+    records = {row_id: [drawer_id, None, {}] for row_id, drawer_id in selected}
+    for start in range(0, len(selected), 500):
+        row_ids = [row_id for row_id, _ in selected[start : start + 500]]
+        marks = ",".join("?" for _ in row_ids)
+        rows = conn.execute(
+            f"SELECT id, key, {', '.join(value_columns)} FROM embedding_metadata"
+            f" WHERE id IN ({marks})",
+            row_ids,
+        )
+        for row_id, key, *cells in rows:
+            values = dict(zip(value_columns, cells))
+            value = _metadata_cell_value(
+                *(
+                    values.get(col)
+                    for col in ("string_value", "int_value", "float_value", "bool_value")
+                )
+            )
+            if key == "chroma:document":
+                records[row_id][1] = value
+            elif key is not None and not key.startswith("chroma:") and value is not None:
+                # Collection.get keeps internal fields (notably chroma:uri)
+                # out of user metadata, even when URIs were stored with rows.
+                records[row_id][2][key] = value
+    return [tuple(records[row_id]) for row_id, _ in selected]
+
+
+def sqlite_diary_rows(
+    palace_path: str,
+    collection_name: str,
+    *,
+    agent_name: str,
+    wing: str = "",
+    limit: int = 10,
+) -> Optional[tuple[int, list[tuple[str, Optional[str], dict]]]]:
+    """Count physical diary rows and hydrate only the newest ``limit`` rows.
+
+    All reads share one SQLite snapshot. Missing timestamps sort as empty
+    strings, with storage order breaking ties, matching the diary's paged
+    ``Collection.get`` path. Non-string timestamps, an ambiguous collection,
+    or an unavailable schema return ``None`` for that path to handle instead.
+    Queued writes ahead of the metadata watermark also require Chroma's
+    recovery path. A missing stored document remains ``None`` as it does in
+    Chroma's get. ``limit`` is bounded to the diary API's range of 1..100.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path) or not isinstance(limit, int):
+        return None
+    limit = max(1, min(limit, 100))
+    equalities = [("room", "diary"), ("agent", agent_name)]
+    if wing:
+        equalities.append(("wing", wing))
+    try:
+        conn = open_palace_reader(db_path)
+        try:
+            conn.execute("PRAGMA busy_timeout = 3000")
+            conn.execute("BEGIN")
+            ready = _sqlite_ready_metadata_segment(conn, collection_name)
+            if ready is None:
+                return None
+            collection_id, _segment_id = ready
+            value_columns = _metadata_value_columns(conn)
+            if "string_value" not in value_columns:
+                return None
+
+            # Drive from the smallest indexed metadata equality. Driving from
+            # embeddings instead scans the entire palace for a sparse diary.
+            sizes = [
+                conn.execute(
+                    "SELECT COUNT(*) FROM embedding_metadata WHERE key = ? AND string_value = ?",
+                    pair,
+                ).fetchone()[0]
+                for pair in equalities
+            ]
+            drive = sizes.index(min(sizes))
+            remaining = equalities[:drive] + equalities[drive + 1 :]
+            filters = "".join(
+                " AND EXISTS (SELECT 1 FROM embedding_metadata w"
+                " WHERE w.id = f.id AND w.key = ? AND w.string_value = ?)"
+                for _ in remaining
+            )
+            scope = f"""
+                FROM embedding_metadata f
+                CROSS JOIN embeddings e ON e.id = f.id
+                JOIN segments s ON s.id = e.segment_id
+                LEFT JOIN embedding_metadata stamp ON stamp.id = e.id AND stamp.key = 'filed_at'
+                WHERE f.key = ? AND f.string_value = ?
+                  AND s.collection = ? AND s.scope = 'METADATA'
+                {filters}
+            """
+            params = [
+                *equalities[drive],
+                collection_id,
+                *[part for pair in remaining for part in pair],
+            ]
+            unsupported_timestamp = "(stamp.id IS NOT NULL AND stamp.string_value IS NULL)"
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embedding_metadata_array'"
+            ).fetchone():
+                # The legacy diary response exposes these values unchanged.
+                # Array hydration is not this scalar reader's responsibility;
+                # an array timestamp must not be mistaken for a missing one.
+                unsupported_timestamp += (
+                    " OR EXISTS (SELECT 1 FROM embedding_metadata_array a"
+                    " WHERE a.id = f.id AND a.key IN ('filed_at', 'date', 'topic'))"
+                )
+            total, unsupported = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(CASE WHEN "
+                + unsupported_timestamp
+                + " THEN 1 ELSE 0 END), 0) "
+                + scope,
+                params,
+            ).fetchone()
+            if unsupported:
+                return None
+            selected = conn.execute(
+                "SELECT e.id, e.embedding_id "
+                + scope
+                + " ORDER BY COALESCE(stamp.string_value, '') DESC, e.id LIMIT ?",
+                [*params, limit],
+            ).fetchall()
+            if not selected:
+                return total, []
+
+            return total, _sqlite_hydrate_rows(conn, selected, value_columns)
+        finally:
+            conn.close()
+    except (sqlite3.Error, ValueError):
+        return None
+
+
+def sqlite_drawer_rows(
+    palace_path: str,
+    collection_name: str,
+    *,
+    drawer_id: str,
+) -> Optional[tuple[bool, list[tuple[str, Optional[str], dict]]]]:
+    """Read a direct drawer, or every scalar-parent-linked physical chunk.
+
+    The direct physical id wins over a logical group with the same handle.
+    Groups are complete and deduplicated by physical row, with no page cap.
+    Missing, unsupported, or unmaterialized records return ``None`` so Chroma
+    can recover them or preserve metadata types this scalar reader cannot
+    decode. In particular any selected array metadata requires that fallback.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        conn = open_palace_reader(db_path)
+        try:
+            conn.execute("PRAGMA busy_timeout = 3000")
+            conn.execute("BEGIN")
+            ready = _sqlite_ready_metadata_segment(conn, collection_name)
+            if ready is None:
+                return None
+            _collection_id, segment_id = ready
+            value_columns = _metadata_value_columns(conn)
+            if "string_value" not in value_columns:
+                return None
+            selected = conn.execute(
+                "SELECT id, embedding_id FROM embeddings"
+                " WHERE segment_id = ? AND embedding_id = ? ORDER BY id",
+                (segment_id, drawer_id),
+            ).fetchall()
+            direct = bool(selected)
+            if not direct:
+                # The composite key/string index drives the parent search;
+                # each row's internal id then seeks its embedding by PK.
+                selected = conn.execute(
+                    "SELECT DISTINCT e.id, e.embedding_id FROM embedding_metadata p"
+                    " CROSS JOIN embeddings e ON e.id = p.id"
+                    " WHERE p.key IN ('parent_drawer_id', 'parent_entry_id')"
+                    " AND p.string_value = ? AND e.segment_id = ? ORDER BY e.id",
+                    (drawer_id, segment_id),
+                ).fetchall()
+            if not selected:
+                return None
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embedding_metadata_array'"
+            ).fetchone():
+                for start in range(0, len(selected), 500):
+                    row_ids = [row_id for row_id, _ in selected[start : start + 500]]
+                    marks = ",".join("?" for _ in row_ids)
+                    if conn.execute(
+                        f"SELECT 1 FROM embedding_metadata_array WHERE id IN ({marks}) LIMIT 1",
+                        row_ids,
+                    ).fetchone():
+                        return None
+            return direct, _sqlite_hydrate_rows(conn, selected, value_columns)
+        finally:
+            conn.close()
+    except (sqlite3.Error, ValueError):
+        return None
 
 
 def _pin_hnsw_threads(collection) -> None:
@@ -2284,36 +3020,101 @@ def _close_client(client) -> None:
         logger.debug("client.close() unavailable or failed", exc_info=True)
 
 
-def _clear_chroma_system_cache() -> None:
+# The ``chroma.sqlite3`` stat that this process's own client opens and writes
+# last left each palace at, keyed by the exact path string the client was built
+# with, plus the :data:`_SYSTEM_GENERATION` that client was opened on.
+# ChromaBackend and the MCP server's session client both record here.
+# Chroma keys its System (and the live HNSW segment) by that same string, so a
+# write through one of them is already in the memory the other reads. Without
+# the shared record each read the other's footprint as an external change, and
+# a server alternating search with other tools rebuilt a client, reloading the
+# whole index, on every switch.
+#
+# The generation is what keeps that shortcut from hiding a stale client. A peer
+# write resets the shared System and then records the fresh stat. The client
+# that was not the one to notice still holds the segment the reset discarded;
+# the new stat would otherwise look like a write it can trust.
+_OWN_DB_STAMPS: dict[str, tuple[tuple[int, float], int]] = {}
+_SYSTEM_GENERATION = 0
+_BEFORE_SYSTEM_CACHE_RESET: list = []
+_clearing_system_cache = False
+
+
+def chroma_system_generation() -> int:
+    """Generation of the process-wide Chroma System cache.
+
+    Increments each time :func:`_clear_chroma_system_cache` drops the cache.
+    A client opened at an older generation is reading a discarded segment.
+    """
+    return _SYSTEM_GENERATION
+
+
+def register_before_system_cache_reset(callback) -> None:
+    """Run ``callback`` before the shared Chroma System cache is dropped.
+
+    ``clear_system_cache`` forgets Chroma's maps without stopping Systems.
+    Every client this module does not itself own has to be closed while those
+    maps still resolve. The callback must not call
+    :func:`_clear_chroma_system_cache`.
+    """
+    if callback not in _BEFORE_SYSTEM_CACHE_RESET:
+        _BEFORE_SYSTEM_CACHE_RESET.append(callback)
+
+
+def _note_own_db_stamp(palace_path: str, stamp: tuple) -> None:
+    if stamp != (0, 0.0):
+        _OWN_DB_STAMPS[palace_path] = (stamp, _SYSTEM_GENERATION)
+
+
+def _is_own_db_stamp(palace_path: str, stamp: tuple, *, generation: int) -> bool:
+    """True when ``stamp`` is a write this process made on ``generation``'s System."""
+    return stamp != (0, 0.0) and _OWN_DB_STAMPS.get(palace_path) == (stamp, generation)
+
+
+def _clear_chroma_system_cache() -> bool:
     """Drop Chroma's process-global ``SharedSystemClient`` cache.
 
-    ``clear_system_cache()`` replaces Chroma's system and refcount maps without
-    calling ``System.stop()``. Callers must close every client they own before
-    invoking this helper, while Chroma can still resolve those maps.
+    Closes clients registered with :func:`register_before_system_cache_reset`
+    first. ``clear_system_cache()`` replaces Chroma's system and refcount maps
+    without calling ``System.stop()``, so a client still open keeps the segment
+    the reset discarded and a later write can persist that stale index over
+    the peer's (#2002).
 
-    Chroma caches its ``System`` (and the live HNSW segment) keyed by path. A
-    bare ``chromadb.PersistentClient(path=...)`` reopen reuses that cached
-    System, so after a peer or rebuild changes ``chroma.sqlite3`` on disk we
-    would rebuild against stale in-memory state and could persist an outdated
-    index over the on-disk changes -- the same data-loss class as #2002,
-    reached through :meth:`ChromaBackend._client` instead of
-    ``mcp_server._get_client``.
+    Returns whether Chroma's clear ran. The generation advances either way: a
+    caller that already closed its client must not treat the following reopen
+    as the same System.
 
     The clear is process-global because Chroma exposes no public per-path
-    eviction primitive. It runs only on the external inode/mtime-change branch,
-    never on the steady-state hot path.
+    eviction primitive. It runs only when a peer or rebuild changed the palace
+    on disk, never on the steady-state hot path.
     """
+    global _SYSTEM_GENERATION, _clearing_system_cache
+    if _clearing_system_cache:
+        return False
+    _clearing_system_cache = True
     try:
-        from chromadb.api.client import SharedSystemClient
+        for callback in list(_BEFORE_SYSTEM_CACHE_RESET):
+            try:
+                callback()
+            except Exception:
+                logger.debug("Chroma system-reset hook failed", exc_info=True)
+        cleared = True
+        try:
+            from chromadb.api.client import SharedSystemClient
 
-        clear = getattr(SharedSystemClient, "clear_system_cache", None)
-        if callable(clear):
-            clear()
-    except Exception:
-        logger.debug(
-            "Failed to clear chromadb SharedSystemClient cache",
-            exc_info=True,
-        )
+            clear = getattr(SharedSystemClient, "clear_system_cache", None)
+            if callable(clear):
+                clear()
+        except Exception:
+            logger.debug(
+                "Failed to clear chromadb SharedSystemClient cache",
+                exc_info=True,
+            )
+            cleared = False
+        _SYSTEM_GENERATION += 1
+        return cleared
+    finally:
+        _clearing_system_cache = False
 
 
 class ChromaCollection(BaseCollection):
@@ -2365,7 +3166,7 @@ class ChromaCollection(BaseCollection):
         from ..palace import mine_palace_lock
 
         # palace_db_lock keeps this process's Python sqlite3 readers out of the
-        # write: fcntl locks never conflict within one process (#2302).
+        # write: fcntl locks never conflict within one process.
         with (
             mine_palace_lock(self._palace_path),
             palace_db_lock(os.path.join(self._palace_path, "chroma.sqlite3")),
@@ -2649,6 +3450,103 @@ class ChromaCollection(BaseCollection):
 
     def count(self):
         return self._collection.count()
+
+    def iter_metadata(
+        self, keys: Optional[Iterable[str]] = None, *, require_key: Optional[str] = None
+    ) -> Optional[Iterator[Optional[dict]]]:
+        """Stream every drawer's metadata from chroma.sqlite3 in one linear pass.
+
+        ``keys`` and ``require_key`` narrow the read (see
+        :func:`_sqlite_iter_metadata`). Returns ``None`` when this collection
+        has no palace path or no database file, so the caller can page through
+        :meth:`get` instead. A read error raises from the iterator.
+        """
+        if self._palace_path is None:
+            return None
+        db_path = os.path.join(self._palace_path, "chroma.sqlite3")
+        if not os.path.isfile(db_path):
+            return None
+        name = self._collection.name
+
+        def rows():
+            conn = open_palace_reader(db_path)
+            try:
+                yield from _sqlite_iter_metadata(conn, name, keys, require_key)
+            finally:
+                conn.close()
+
+        return rows()
+
+    def get_all_metadata(self, where: Optional[dict] = None) -> list[dict]:
+        """Every drawer's metadata in one pass over chroma.sqlite3 (#1796).
+
+        The base implementation pages ``get(limit, offset)``, and Chroma turns
+        ``offset`` into SQL ``OFFSET``, which steps over every skipped row, so
+        that pass is quadratic: on a 360k-drawer palace one page cost 81 ms at
+        offset 0 and 717 ms at offset 359k. A ``where`` filter still goes
+        through the base implementation.
+        """
+        if where is None:
+            rows = self.iter_metadata()
+            if rows is not None:
+                try:
+                    return list(rows)
+                except sqlite3.Error:
+                    logger.debug("sqlite metadata scan failed; paging instead", exc_info=True)
+        return super().get_all_metadata(where=where)
+
+    def get_recent(
+        self,
+        *,
+        limit: int,
+        where: Optional[dict] = None,
+        order_field: str = "filed_at",
+        include: Optional[list[str]] = None,
+    ) -> GetResult:
+        """Newest ``limit`` records by ``order_field``, read from chroma.sqlite3.
+
+        Chroma's ``get`` loads the collection's whole HNSW segment before it
+        answers, even for a metadata-only read, so the base implementation's
+        paged ``get`` loaded every vector in the palace to pick a few recent
+        drawers: ``mempalace wake-up`` for a ten-drawer wing loaded millions.
+        This reads the ordered window from the metadata tables instead, which
+        also makes the window exact rather than whatever ``get`` paged first.
+        ``where`` made of string equalities (what Layer 1 passes) is evaluated
+        in sqlite; any other filter, or a database the read cannot reach, goes
+        through the base implementation.
+
+        String equalities and an unfiltered read are the true top ``limit``
+        at any collection size, which is why :class:`ChromaBackend` advertises
+        ``supports_recency_order``. A filter this path cannot evaluate keeps
+        the base implementation's approximate window.
+        """
+        equalities = _string_equalities(where)
+        spec = _IncludeSpec.resolve(include, default_distances=False)
+        records = None
+        if (
+            limit > 0
+            and self._palace_path is not None
+            and equalities is not None
+            and not spec.embeddings
+        ):
+            _validate_where(where)
+            records = _sqlite_recent_records(
+                self._palace_path,
+                self._collection.name,
+                limit=limit,
+                equalities=equalities,
+                order_field=order_field,
+            )
+        if records is None:
+            return super().get_recent(
+                limit=limit, where=where, order_field=order_field, include=include
+            )
+        return GetResult(
+            ids=[record_id for record_id, _, _ in records],
+            documents=[document for _, document, _ in records] if spec.documents else [],
+            metadatas=[metadata for _, _, metadata in records] if spec.metadatas else [],
+            embeddings=None,
+        )
 
     def lexical_search(
         self,
@@ -2986,6 +3884,7 @@ class ChromaBackend(BaseBackend):
             "supports_metadata_filters",
             "supports_contains_fast",
             "supports_lexical_search",
+            "supports_recency_order",
             "local_mode",
         }
     )
@@ -2995,7 +3894,10 @@ class ChromaBackend(BaseBackend):
         self._clients: dict[str, Any] = {}
         # palace_path -> (inode, mtime) of chroma.sqlite3 at cache time.
         self._freshness: dict[str, tuple[int, float]] = {}
+        # palace_path -> system generation the cached client was opened on.
+        self._system_generation: dict[str, int] = {}
         self._closed = False
+        _LIVE_BACKENDS.add(self)
 
     @staticmethod
     def _resolve_embedding_function():
@@ -3075,6 +3977,7 @@ class ChromaBackend(BaseBackend):
         clients = list(self._clients.values())
         self._clients.clear()
         self._freshness.clear()
+        self._system_generation.clear()
         for client in clients:
             _close_client(client)
 
@@ -3082,7 +3985,7 @@ class ChromaBackend(BaseBackend):
         """Return a cached ``PersistentClient`` (see :meth:`_client_locked`).
 
         Opening, closing and replacing the client all write to
-        ``chroma.sqlite3``, so they run under :func:`palace_db_lock` (#2302).
+        ``chroma.sqlite3``, so they run under :func:`palace_db_lock`.
         """
         with palace_db_lock(os.path.join(palace_path, "chroma.sqlite3")):
             return self._client_locked(palace_path)
@@ -3118,6 +4021,7 @@ class ChromaBackend(BaseBackend):
         if cached is not None and not os.path.isfile(db_path):
             _close_client(self._clients.pop(palace_path, None))
             self._freshness.pop(palace_path, None)
+            self._system_generation.pop(palace_path, None)
             cached = None
             cached_inode, cached_mtime = 0, 0.0
 
@@ -3130,6 +4034,34 @@ class ChromaBackend(BaseBackend):
             and cached_mtime != 0.0
             and abs(current_mtime - cached_mtime) > 0.01
         )
+        opened_generation = self._system_generation.get(palace_path, -1)
+        if cached is not None and opened_generation != _SYSTEM_GENERATION:
+            # Another owner dropped the shared System cache after this client
+            # opened, so it reads a discarded segment. Forget it without
+            # close(): Chroma's maps now resolve this path to the replacement
+            # System, and closing through them could stop the fresh owner's.
+            # The reset already happened, so reopen without another one.
+            self._clients.pop(palace_path, None)
+            self._freshness.pop(palace_path, None)
+            self._system_generation.pop(palace_path, None)
+            cached = None
+            cached_inode, cached_mtime = 0, 0.0
+            mtime_appeared = mtime_changed = inode_changed = False
+        if (
+            cached is not None
+            and mtime_changed
+            and not inode_changed
+            and _is_own_db_stamp(
+                palace_path,
+                (current_inode, current_mtime),
+                generation=opened_generation,
+            )
+        ):
+            # Written by another client in this process on the same System:
+            # nothing to reload. A stamp recorded after that System was
+            # dropped belongs to the replacement client.
+            self._freshness[palace_path] = (current_inode, current_mtime)
+            mtime_changed = False
 
         if cached is None or inode_changed or mtime_changed or mtime_appeared:
             # Drop the per-process quarantine gate so the HNSW pre-checks
@@ -3162,6 +4094,8 @@ class ChromaBackend(BaseBackend):
             # chroma.sqlite3 lazily, so the stat captured before the call
             # may still be (0, 0.0) on first open.
             self._freshness[palace_path] = self._db_stat(palace_path)
+            self._system_generation[palace_path] = _SYSTEM_GENERATION
+            _note_own_db_stamp(palace_path, self._freshness[palace_path])
         return cached
 
     def _restamp(self, palace_path: str) -> None:
@@ -3197,6 +4131,7 @@ class ChromaBackend(BaseBackend):
         """
         if palace_path in self._freshness:
             self._freshness[palace_path] = self._db_stat(palace_path)
+            _note_own_db_stamp(palace_path, self._freshness[palace_path])
 
     # ------------------------------------------------------------------
     # Public static helpers (legacy; prefer :meth:`get_collection`)
@@ -3310,7 +4245,7 @@ class ChromaBackend(BaseBackend):
             except (OSError, NotImplementedError):
                 pass
 
-        # Collection opens and creates write to chroma.sqlite3 (#2302).
+        # Collection opens and creates write to chroma.sqlite3.
         with palace_db_lock(os.path.join(palace_path, "chroma.sqlite3")):
             client = self._client(palace_path)
 
@@ -3390,6 +4325,7 @@ class ChromaBackend(BaseBackend):
         with palace_db_lock(os.path.join(path, "chroma.sqlite3")):
             _close_client(self._clients.pop(path, None))
             self._freshness.pop(path, None)
+            self._system_generation.pop(path, None)
 
     def close(self) -> None:
         self._drain_clients()
@@ -3449,6 +4385,21 @@ class ChromaBackend(BaseBackend):
             )
             self._restamp(palace_path)
         return ChromaCollection(collection, palace_path=palace_path, backend=self)
+
+
+# Every live ChromaBackend, drained before any reset of the shared System cache
+# (the MCP session, repair, and the diary tool reset it too). Without this a
+# backend kept clients on the discarded System, unclosed while Chroma's maps
+# could still resolve them.
+_LIVE_BACKENDS: "weakref.WeakSet[ChromaBackend]" = weakref.WeakSet()
+
+
+def _drain_live_backends() -> None:
+    for backend in list(_LIVE_BACKENDS):
+        backend._drain_clients()
+
+
+register_before_system_cache_reset(_drain_live_backends)
 
 
 def _normalize_get_collection_args(args, kwargs):
