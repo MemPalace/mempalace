@@ -55,6 +55,18 @@ def test_scan_project_includes_php_ecosystem_files(tmp_path):
     assert scanned_files(tmp_path) == sorted(expected)
 
 
+def test_scan_project_includes_prisma_schema_but_not_generated_client(tmp_path):
+    schema = "model User {\n  id    Int    @id @default(autoincrement())\n  email String\n}\n"
+    write_file(tmp_path / "prisma" / "schema.prisma", schema)
+    # ``prisma generate`` copies the schema into the generated client. No
+    # .gitignore here, so only SKIP_DIRS keeps that copy out of the palace.
+    write_file(tmp_path / "node_modules" / ".prisma" / "client" / "schema.prisma", schema)
+
+    assert ".prisma" in READABLE_EXTENSIONS
+    assert scanned_files(tmp_path) == ["prisma/schema.prisma"]
+    assert scanned_files(tmp_path, respect_gitignore=False) == ["prisma/schema.prisma"]
+
+
 def test_project_mining():
     tmpdir = tempfile.mkdtemp()
     try:
