@@ -3,7 +3,7 @@ Hook logic for MemPalace — Python implementation of session-start, stop, sessi
 
 Reads JSON from stdin, outputs JSON to stdout.
 Supported hooks: session-start, stop, session-end, precompact
-Supported harnesses: claude-code, codex, dsh (extensible to cursor, gemini, etc.)
+Supported harnesses: claude-code, codex, dsh, workbuddy (extensible to cursor, gemini, etc.)
 
 ``dsh`` (the DeepSeek Harness) cannot hand a hook its own transcript: DSH stores
 sessions zstd-compressed, and its hook bridge passes an empty
@@ -1009,6 +1009,25 @@ def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUN
                             if isinstance(text, str) and text.strip():
                                 if not _is_harness_boilerplate(text):
                                     messages.append(text.strip()[:200])
+                    # WorkBuddy format: ``role``/``content`` sit at the row top
+                    # level instead of nested under ``message``, and the content
+                    # blocks carry the same ``text`` key as Claude's. This is
+                    # the same branch ``_count_human_messages`` has: without it
+                    # the counter above reaches SAVE_INTERVAL but
+                    # ``_save_diary_direct`` still extracts zero messages from
+                    # every WorkBuddy transcript and files no checkpoint — the
+                    # session wires up, counts, and silently never saves.
+                    elif entry.get("role") == "user":
+                        content = entry.get("content", "")
+                        if isinstance(content, list):
+                            content = " ".join(
+                                b.get("text", "") for b in content if isinstance(b, dict)
+                            )
+                        if not isinstance(content, str) or not content.strip():
+                            continue
+                        if _is_harness_boilerplate(content):
+                            continue
+                        messages.append(content.strip()[:200])
                 except (json.JSONDecodeError, AttributeError):
                     pass
     except OSError:
@@ -1255,7 +1274,7 @@ def _diary_agent_for_harness(harness: str) -> str:
     under whichever agent name that deployment's readers query, rather than
     inheriting the harness name. Set ``MEMPALACE_AGENT_<HARNESS>`` (upper-cased,
     non-alphanumerics to ``_``) to that agent name — e.g.
-    ``MEMPALACE_AGENT_WORKBUDDY=mei``. The check runs first, so it can also
+    ``MEMPALACE_AGENT_WORKBUDDY=alice``. The check runs first, so it can also
     override the ``claude-code`` → ``claude`` default. Unset means "use the
     default identity", which keeps every existing harness's behaviour unchanged.
     """
@@ -1410,7 +1429,7 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
        step 2's encoded-folder heuristic has nothing to decode because
        WorkBuddy paths carry no project name. WorkBuddy has no project
        concept to preserve — the workspace directory is disposable and its
-       timestamp is already carried by ``authored_at`` — so every session of
+       timestamp is carried by ``authored_at`` (#2611) — so every session of
        a given harness is filed under that harness's agent wing. The name
        comes from ``_diary_agent_for_harness("workbuddy")``, which honours
        the ``MEMPALACE_AGENT_WORKBUDDY`` override, so an installer that

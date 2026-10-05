@@ -27,7 +27,11 @@ Nothing is written; JSON goes to stdout. The script needs a corpus of ``.jsonl``
 transcripts (defaults to the WorkBuddy store, overridable with
 ``--workbuddy-root``) and two trees that can be imported — a reviewer without a
 WorkBuddy install can point ``--workbuddy-root`` at any directory of transcripts
-to exercise the two trees against a corpus of their own. These corpora are live
+to exercise the two trees against a corpus of their own. One boundary: the wing
+census feeds each file's real path to ``_wing_from_transcript_path()``, so the
+fold only triggers when the corpus path contains ``/.workbuddy/projects/``; a
+corpus parked elsewhere reports a zero wing delta on both trees, while the
+human-turn census (content-based) reproduces anywhere. These corpora are live
 conversation stores, so counts drift between runs: every file's input hash is
 recorded, and a file whose bytes changed between the two passes is excluded from
 the comparison.
@@ -147,8 +151,9 @@ def main() -> None:
     if not root.is_dir():
         raise SystemExit(
             f"corpus directory not found: {root}\n"
-            "Point --workbuddy-root at any directory of .jsonl transcripts; the "
-            "WorkBuddy store is only the default."
+            "Point --workbuddy-root at any directory of .jsonl transcripts (the "
+            "WorkBuddy store is only the default); the wing fold reproduces only "
+            "when the path contains /.workbuddy/projects/."
         )
     files = sorted(root.rglob("*.jsonl"))
 
