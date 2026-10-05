@@ -381,6 +381,18 @@ def search_memories(
         scored.append(entry)
 
     scored.sort(key=lambda h: h["_sort_key"])
+    # Union mode cuts the vector pool to n_results before the lexical merge,
+    # discarding the distances of candidates ranked n+1 to 3n (#2660). Snapshot
+    # the full pool's distances first so a lexical hit that was already a
+    # vector candidate keeps its vector score instead of scoring BM25-only.
+    vector_distances = {}
+    if candidate_strategy == "union":
+        for entry in scored:
+            full = entry.get("_source_file_full")
+            ci = entry.get("_chunk_index")
+            key = (full, ci) if full and ci is not None else entry.get("source_file")
+            if key is not None and key not in vector_distances:
+                vector_distances[key] = entry.get("distance")
     hits = scored[:pre_enrichment_limit]
 
     # Drawer-grep enrichment: retain the wider pool until repeated
@@ -413,6 +425,7 @@ def search_memories(
         stop_words=stop_words,
         since_dt=since_dt,
         before_dt=before_dt,
+        vector_distances=vector_distances,
     )
     if strategy_error:
         return strategy_error

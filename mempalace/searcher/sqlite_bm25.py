@@ -392,6 +392,7 @@ def _merge_bm25_union_candidates(
     stop_words: frozenset = frozenset(),
     since_dt=None,
     before_dt=None,
+    vector_distances: dict = None,
 ) -> None:
     """Append top-K backend lexical candidates into ``hits`` in place.
 
@@ -410,7 +411,9 @@ def _merge_bm25_union_candidates(
     ``max_distance`` threshold is set. Under a threshold, union mode loads
     stored embeddings for lexical hits and computes their vector distance
     before admitting them, preserving the same distance guarantee as the
-    vector-only path.
+    vector-only path. A lexical hit that was already a vector candidate
+    keeps the distance the vector query returned (via ``vector_distances``)
+    so it scores on both signals instead of BM25 alone.
     """
     where = build_where_filter(wing, room, source_file)
     try:
@@ -444,6 +447,17 @@ def _merge_bm25_union_candidates(
             continue
         full_source = meta.get("source_file", "") or ""
         distance = lexical_distances.get(hit.id)
+        if distance is None and vector_distances:
+            chunk_index = meta.get("chunk_index")
+            key = (
+                (full_source, chunk_index)
+                if full_source and chunk_index is not None
+                else Path(full_source).name
+                if full_source
+                else None
+            )
+            if key is not None:
+                distance = vector_distances.get(key)
         if max_distance > 0.0:
             if distance is None or distance > max_distance:
                 continue
