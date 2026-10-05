@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import sqlite3
 import subprocess
@@ -409,6 +410,12 @@ def test_lifecycle_error_routes_to_stderr(monkeypatch, capsys):
 
     Exercised by calling the daemon logger directly after ``_ensure_lifecycle_
     logging`` has attached its handlers.
+
+    Extended after igorls's CHANGES_REQUESTED review: ``Handler.setLevel`` is
+    a *floor*, not a range, so the ERROR record also passed the stdout
+    handler's INFO floor and was emitted on BOTH streams — here and (in the
+    detached path) twice into the merged daemon.log. The ERROR text must be
+    absent from the captured stdout, not merely present on stderr.
     """
     _reset_lifecycle_logging(monkeypatch)
     daemon._ensure_lifecycle_logging()
@@ -423,10 +430,66 @@ def test_lifecycle_error_routes_to_stderr(monkeypatch, capsys):
         f"expected the ERROR record on stderr; got:\nstderr={err!r}"
     )
 
+    # AND the ERROR line must NOT land on stdout (level-floor leak).
+    assert "error line for stderr capture" not in _out, (
+        f"ERROR record leaked to stdout:\nstdout={_out!r}"
+    )
+
     # And the INFO record must NOT land on stderr.
     assert "info should not appear on stderr" not in err, (
         f"INFO record leaked to stderr:\nstderr={err!r}"
     )
+
+
+def test_lifecycle_stdout_handler_rejects_error(monkeypatch):
+    """#2475 (igorls review) — the stdout handler must carry an upper-bound
+    filter, not just a level floor: it rejects ERROR/CRITICAL records and
+    admits INFO/WARNING. Unit-level check of the handler filter itself,
+    independent of the end-to-end stream assertions above.
+
+    A handler filter that rejects ERROR and CRITICAL but accepts INFO will
+    correctly enforce the "stdout must never contain ERROR" contract.
+    """
+    _reset_lifecycle_logging(monkeypatch)
+    daemon._ensure_lifecycle_logging()
+
+    stdout_handler = daemon._LIFECYCLE_LOGGER.handlers[0]
+    stderr_handler = daemon._LIFECYCLE_LOGGER.handlers[1]
+
+    # ``Handler.filters`` may hold ``logging.Filter`` subclasses or plain
+    # callables — handle both uniformly.
+    def _accepts(f, record) -> bool:
+        return bool(f(record) if callable(f) else f.filter(record))
+
+    # Helper to build a log record at a given level
+    def _mk(level: int) -> logging.LogRecord:
+        return logging.LogRecord(
+            name=daemon._LIFECYCLE_LOGGER.name,
+            level=level,
+            pathname=__file__,
+            lineno=1,
+            msg="probe",
+            args=(),
+            exc_info=None,
+        )
+
+    # The stdout handler must explicitly reject ERROR and CRITICAL via a filter
+    assert not all(_accepts(f, _mk(logging.ERROR)) for f in stdout_handler.filters), (
+        "stdout handler must reject ERROR-level records via a filter"
+    )
+    assert not all(_accepts(f, _mk(logging.CRITICAL)) for f in stdout_handler.filters), (
+        "stdout handler must reject CRITICAL-level records via a filter"
+    )
+
+    # ...while admitting INFO and WARNING (the level floor still applies).
+    assert stdout_handler.level <= logging.INFO, (
+        f"stdout handler floor should be INFO, is {logging.getLevelName(stdout_handler.level)}"
+    )
+    assert stderr_handler.level >= logging.ERROR
+    assert all(
+        _accepts(f, _mk(logging.INFO)) and _accepts(f, _mk(logging.WARNING))
+        for f in stdout_handler.filters
+    ), "stdout handler must admit INFO and WARNING records"
 
 
 def test_reset_is_idempotent(monkeypatch):

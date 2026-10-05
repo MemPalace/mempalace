@@ -889,6 +889,25 @@ _LIFECYCLE_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 _lifecycle_logging_ready = False
 
 
+class _BelowLevel(logging.Filter):
+    """Reject records whose level is at or above ``max_level``.
+
+    ``Handler.setLevel`` is a *floor*, not a range, so it cannot express
+    "INFO+WARNING only" on the stdout handler: an ERROR record (levelno 40)
+    would pass the INFO (20) floor and be emitted by both handlers.
+    ``StreamHandler.emit`` consults ``self.filters`` after the level check,
+    so a handler-level filter is the minimal way to bound the stream from
+    above and keep ERROR/CRITICAL exclusively on stderr.
+    """
+
+    def __init__(self, max_level: int) -> None:
+        super().__init__()
+        self.max_level = max_level
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno < self.max_level
+
+
 def _ensure_lifecycle_logging() -> None:
     """Attach stdout/stderr handlers so daemon lifecycle + HTTP lines are emitted.
 
@@ -911,6 +930,13 @@ def _ensure_lifecycle_logging() -> None:
 
     stdout_handler = logging.StreamHandler(sys.stdout)
     stdout_handler.setLevel(logging.INFO)
+    # ``StreamHandler.emit`` consults ``self.filters`` after the level check,
+    # so a handler-level filter (not a logger filter) bounds the stream from
+    # above: ERROR/CRITICAL pass the INFO *floor* setLevel above but are
+    # rejected here — the stated contract is ERROR+ → stderr ONLY (the
+    # background path merges both fds into one daemon.log, where a
+    # level-floor alone would write every ERROR twice).
+    stdout_handler.addFilter(_BelowLevel(logging.ERROR))
     stdout_handler.setFormatter(formatter)
 
     stderr_handler = logging.StreamHandler(sys.stderr)
