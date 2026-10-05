@@ -2742,7 +2742,12 @@ def _clear_harness_agent_overrides(monkeypatch):
     exists to serve) would otherwise fail them for the wrong reason. Tests that
     want an override set it themselves; this only clears the ambient value.
     """
-    for key in ("MEMPALACE_AGENT_WORKBUDDY", "MEMPALACE_AGENT_CODEX", "MEMPALACE_AGENT_DSH"):
+    for key in (
+        "MEMPALACE_AGENT_CLAUDE_CODE",
+        "MEMPALACE_AGENT_WORKBUDDY",
+        "MEMPALACE_AGENT_CODEX",
+        "MEMPALACE_AGENT_DSH",
+    ):
         monkeypatch.delenv(key, raising=False)
 
 
