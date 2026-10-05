@@ -3648,7 +3648,10 @@ class ChromaCollection(BaseCollection):
                 # If a metadata filter is present, do not cap before filtering:
                 # otherwise a common term can fill the window with wrong-scope
                 # rows and hide valid scoped hits later in the FTS result set.
-                limit_sql = "" if where else "LIMIT ?"
+                # Without a filter the window is capped, so read it in FTS rank
+                # order. Otherwise SQLite returns matches in rowid order and a
+                # later best match never gets scored.
+                limit_sql = "" if where else "ORDER BY embedding_fulltext_search.rank LIMIT ?"
                 params = [fts_query, collection_name]
                 if not where:
                     params.append(max(max_candidates, n_results))
