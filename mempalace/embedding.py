@@ -51,6 +51,7 @@ rejected by a witness embedding at load time.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import os
@@ -60,6 +61,34 @@ from typing import Optional
 from .version import __version__
 
 logger = logging.getLogger(__name__)
+
+# Optional per-thread hook around embedding inference. The HTTP transport
+# installs a context manager that releases its request lock only for the
+# model call, so embedding latency does not stall unrelated requests.
+# CLI and stdio leave this unset. The hook belongs around the explicit
+# embed that runs before a backend write lock — not inside the embedding
+# function Chroma invokes while that lock is held.
+_embedding_section_hook_local = threading.local()
+
+
+def set_embedding_section_hook(hook) -> None:
+    """Install or clear this thread's embedding-section context manager factory.
+
+    ``hook`` is ``None`` or a zero-arg callable that returns a context manager.
+    """
+    _embedding_section_hook_local.hook = hook
+
+
+@contextlib.contextmanager
+def embedding_section():
+    """Run the body under this thread's embedding-section hook, if any."""
+    hook = getattr(_embedding_section_hook_local, "hook", None)
+    if hook is None:
+        yield
+        return
+    with hook():
+        yield
+
 
 _PROVIDER_MAP = {
     "cpu": ["CPUExecutionProvider"],
@@ -781,6 +810,8 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
         cached = _EF_CACHE.get(cache_key)
         if cached is not None:
             return cached
+        # Return the concrete function. Chroma accepts only ``__call__(self, input)``,
+        # and callers distinguish backends by type. A proxy breaks both.
         ef = OpenAICompatEmbeddingFunction(base_url=url, model=api_model, api_key=api_key)
         _EF_CACHE[cache_key] = ef
         logger.info(

@@ -2,11 +2,13 @@
 
 import json
 from argparse import Namespace
+from itertools import permutations
 
 import pytest
 
 from mempalace.config import MempalaceConfig
 from mempalace.tunnels_tool import (
+    ambiguous_entity_spellings,
     apply_proposal,
     load_proposal,
     propose_tunnels,
@@ -292,3 +294,101 @@ def test_apply_proposal_skips_a_link_created_meanwhile_under_another_spelling(
     assert apply_proposal(plan) == 1
     rooms = sorted(t["source"]["room"] for t in pg.list_tunnels())
     assert rooms == ["entity:Router", "entity:main.py"]
+
+
+def test_prune_keeps_qualified_links_when_bare_alias_is_ambiguous():
+    """A high-count bare filename must not erase two distinct qualified paths.
+
+    Regression for the review finding on PR #2654 (F2): prune sorted by
+    access_count, inserted bare ``CodeRouter.py`` first, then pairwise
+    suffix-matched both ``src/models/CodeRouter.py`` and
+    ``tests/fixtures/CodeRouter.py`` as its duplicates.
+    """
+
+    def tunnel(name, entity, count):
+        return {
+            "id": name,
+            "kind": "entity",
+            "access_count": count,
+            "source": {"wing": "alpha", "room": "entity:" + entity},
+            "target": {"wing": "beta", "room": "entity:" + entity},
+        }
+
+    rows = [
+        tunnel("ambiguous", "CodeRouter.py", 10),
+        tunnel("production", "src/models/CodeRouter.py", 5),
+        tunnel("test-fixture", "tests/fixtures/CodeRouter.py", 3),
+    ]
+    kept, report = prune_tunnels(rows, {"alpha", "beta"})
+    kept_ids = {r["id"] for r in kept}
+    assert {"production", "test-fixture"} <= kept_ids, (
+        "two distinct qualified connections were pruned by an ambiguous basename"
+    )
+
+    # Same acceptance when a qualified path has the highest count.
+    rows_qualified_first = [
+        tunnel("production", "src/models/CodeRouter.py", 10),
+        tunnel("ambiguous", "CodeRouter.py", 5),
+        tunnel("test-fixture", "tests/fixtures/CodeRouter.py", 3),
+    ]
+    kept2, _ = prune_tunnels(rows_qualified_first, {"alpha", "beta"})
+    assert {"production", "test-fixture"} <= {r["id"] for r in kept2}
+
+    # Unambiguous bare + one qualified path still collapses to one link.
+    alone = [
+        tunnel("bare", "swim.zig", 10),
+        tunnel("qualified", "src/swim.zig", 5),
+    ]
+    kept3, report3 = prune_tunnels(alone, {"alpha", "beta"})
+    assert len(kept3) == 1
+    assert report3["duplicates"] == 1
+
+
+@pytest.mark.parametrize("basename", ["CodeRouter.py", "CodeRouter"])
+def test_prune_keeps_nested_ambiguous_aliases_in_every_order(basename):
+    """An intermediate suffix cannot hide two incompatible qualified hosts."""
+    spellings = (
+        basename,
+        f"models/{basename}",
+        f"src/models/{basename}",
+        f"tests/models/{basename}",
+    )
+    for ordering in permutations(spellings):
+        assert ambiguous_entity_spellings(ordering) == set(spellings[:2])
+        rows = [
+            {
+                "id": spelling,
+                "access_count": len(ordering) - index,
+                "source": {"wing": "alpha", "room": f"entity:{spelling}"},
+                "target": {"wing": "beta", "room": f"entity:{spelling}"},
+            }
+            for index, spelling in enumerate(ordering)
+        ]
+        # Identical qualified endpoints still deduplicate, even when reversed.
+        rows.append(
+            {
+                "id": "duplicate",
+                "source": {"wing": "beta", "room": f"entity:{spellings[2]}"},
+                "target": {"wing": "alpha", "room": f"entity:{spellings[2]}"},
+            }
+        )
+        kept, report = prune_tunnels(rows, {"alpha", "beta"})
+        assert {row["id"] for row in kept} == set(spellings)
+        assert report["duplicates"] == report["removed"] == 1
+
+
+def test_prune_collapses_an_unambiguous_suffix_chain_in_every_order():
+    spellings = ("CodeRouter.py", "models/CodeRouter.py", "src/models/CodeRouter.py")
+    for ordering in permutations(spellings):
+        assert ambiguous_entity_spellings(ordering) == set()
+        rows = [
+            {
+                "id": spelling,
+                "source": {"wing": "alpha", "room": f"entity:{spelling}"},
+                "target": {"wing": "beta", "room": f"entity:{spelling}"},
+            }
+            for spelling in ordering
+        ]
+        kept, report = prune_tunnels(rows, {"alpha", "beta"})
+        assert [row["id"] for row in kept] == [ordering[0]]
+        assert report["duplicates"] == report["removed"] == 2

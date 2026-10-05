@@ -3311,8 +3311,12 @@ def test_prefetch_discards_a_failed_fast_scan_and_pages_instead(tmp_path, monkey
         rows = real(self, keys, require_key=require_key)
 
         def gen():
-            yield next(rows)
-            raise sqlite3.OperationalError("injected mid-scan failure")
+            try:
+                yield next(rows)
+                raise sqlite3.OperationalError("injected mid-scan failure")
+            finally:
+                # Release the SQLite reader before Chroma's fallback needs to write.
+                rows.close()
 
         return gen()
 

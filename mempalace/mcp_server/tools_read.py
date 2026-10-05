@@ -95,8 +95,8 @@ def _sqlite_taxonomy():
     cache_key = (_config.palace_path, _config.collection_name)
     # Taken before the query, so a write that lands during it invalidates.
     fingerprint = _palace_db_fingerprint()
-    # A readable chroma.sqlite3 changes stat on every commit, so a different
-    # fingerprint recounts even inside the TTL. The TTL is only the fallback
+    # The Chroma database/WAL fingerprint changes on committed writes, so a
+    # different fingerprint recounts even inside the TTL. The TTL is the fallback
     # for backends whose file stat misses commits (sqlite_exact's WAL) and
     # for a palace whose file cannot be stat'ed.
     fingerprint_matches = (
@@ -398,7 +398,7 @@ def tool_status():
 
 PALACE_PROTOCOL = """IMPORTANT — MemPalace Memory Protocol:
 1. ON WAKE-UP: Call mempalace_status to load palace overview + AAAK spec.
-2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.
+2. BEFORE RESPONDING about any person, project, or past event: verify with the tool that fits the question — mempalace_kg_query for known relationships or time-bound facts, mempalace_search for source text, or mempalace_diary_read for recent agent continuity. Use small search/diary limits and relevant known scopes. Stop when answered; search stored text or widen filters if recall is insufficient. Never guess.
 3. IF UNSURE about a fact (name, gender, age, relationship): say "let me check" and query the palace. Wrong is worse than slow.
 4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.
 5. WHEN A SINGLE-VALUED FACT CHANGES (model, employer, address): call mempalace_kg_supersede(subject, predicate, old, new) to replace it atomically at one boundary — do NOT hand-roll invalidate + add, which leaves the old and new values overlapping at the boundary. Use mempalace_kg_invalidate for a fact that simply ended, and mempalace_kg_add to add an independent (possibly concurrent) fact.

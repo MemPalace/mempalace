@@ -760,6 +760,10 @@ class TestForwardability:
     def test_plain_convo_mine_is_forwardable(self, tmp_path):
         assert cli._mine_args_forwardable(_mine_args(tmp_path), []) is True
 
+    def test_project_include_ignored_is_forwardable(self, tmp_path):
+        args = _mine_args(tmp_path, mode="projects")
+        assert cli._mine_args_forwardable(args, [".agents/handoffs/note.md"]) is True
+
     @pytest.mark.parametrize(
         "overrides,include_ignored",
         [
@@ -1069,11 +1073,101 @@ class TestServeHttpRegistersServerinfo:
         assert observed["during"] is not None, "hub must be discoverable while serving"
         assert observed["during"]["port"] == 12345
         assert observed["during"]["read_only"] is mcp_server._READ_ONLY
+        assert "mine_include_ignored" in observed["during"]["capabilities"]
         # After shutdown the record is gone — no stale forwarding target.
         assert server_registry.read_live_serverinfo(palace) is None
 
 
 class TestCmdMineIntegration:
+    def test_include_ignored_routes_normalized_paths_through_hub(
+        self, isolated_home, tmp_path, fake_hub, monkeypatch
+    ):
+        from mempalace import miner
+
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub, capabilities=["mine_include_ignored"])
+        monkeypatch.setattr(miner, "mine", lambda **kw: pytest.fail("must not open a local writer"))
+        args = _mine_args(
+            tmp_path / "project",
+            palace=palace,
+            mode="projects",
+            include_ignored=[" .agents/handoffs/note.md, docs/private.md ", "reports"],
+            limit=1,
+            agent="test-agent",
+        )
+        cli.cmd_mine(args)
+        (request,) = fake_hub.requests
+        assert request["params"]["arguments"] == {
+            "source": str(tmp_path / "project"),
+            "mode": "projects",
+            "agent": "test-agent",
+            "limit": 1,
+            "dry_run": False,
+            "extract": "exchange",
+            "include_ignored": [".agents/handoffs/note.md", "docs/private.md", "reports"],
+        }
+
+    def test_include_ignored_old_hub_refused_without_local_fallback(
+        self, isolated_home, tmp_path, fake_hub, monkeypatch, capsys
+    ):
+        from mempalace import miner
+
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        monkeypatch.setattr(
+            miner, "mine", lambda **kw: pytest.fail("must not fall back to a local writer")
+        )
+        args = _mine_args(
+            tmp_path / "project", palace=palace, mode="projects", include_ignored=["notes"]
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_mine(args)
+        assert exc.value.code == 1
+        assert fake_hub.requests == []
+        error = capsys.readouterr().err
+        assert "--include-ignored" in error
+        assert "upgrade" in error.lower() and "restart" in error.lower()
+
+    def test_include_ignored_without_hub_preserves_local_options(
+        self, isolated_home, tmp_path, monkeypatch
+    ):
+        from mempalace import miner
+
+        calls = []
+        monkeypatch.setattr(miner, "mine", lambda **kw: calls.append(kw))
+        args = _mine_args(
+            tmp_path / "project",
+            palace=str(isolated_home / "palace"),
+            mode="projects",
+            include_ignored=["notes, reports"],
+        )
+        cli.cmd_mine(args)
+        assert calls[0]["include_ignored"] == ["notes", "reports"]
+        assert calls[0]["respect_gitignore"] is True
+
+    def test_include_ignored_uncertain_hub_write_is_not_replayed(
+        self, isolated_home, tmp_path, fake_hub, monkeypatch, capsys
+    ):
+        from mempalace import miner
+
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub, capabilities=["mine_include_ignored"])
+        monkeypatch.setattr(
+            miner, "mine", lambda **kw: pytest.fail("must not replay an uncertain write")
+        )
+
+        def uncertain(*args, **kwargs):
+            raise TimeoutError("response lost after submission")
+
+        monkeypatch.setattr(server_registry, "urlopen_with_server_tokens", uncertain)
+        args = _mine_args(
+            tmp_path / "project", palace=palace, mode="projects", include_ignored=["notes"]
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_mine(args)
+        assert exc.value.code == 1
+        assert "not retrying directly" in capsys.readouterr().err
+
     def test_cmd_mine_routes_through_hub(self, isolated_home, tmp_path, fake_hub, monkeypatch):
         palace = str(isolated_home / "palace")
         _register_hub(palace, fake_hub)

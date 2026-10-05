@@ -46,23 +46,31 @@ Time:      ~5 minutes on Apple Silicon
 
 ## Benchmark 2: LoCoMo (1,986 QA pairs)
 
-Tests multi-hop reasoning across 10 long conversations (19-32 sessions each, 400-600 dialog turns).
+Measures retrieval of labelled evidence across 10 long conversations (19-32 sessions each, 400-600 dialog turns), rather than generated-answer accuracy.
+
+**LoCoMo reranking:** `--llm-rerank` reorders IDs after retrieval has already
+been cut to top-k. `Avg Recall` checks membership and ignores ordering, so the
+flag cannot improve this metric for the same retrieved set. It adds LLM latency
+and any provider cost when executed. Omit it for recall-only comparisons and
+keep mode, top-k, granularity and embedding model fixed. At top-50 in unfiltered
+raw or hybrid session retrieval, every session fits in the retrieved set,
+making recall structurally saturated.
 
 ```bash
 # Clone LoCoMo
 git clone https://github.com/snap-research/locomo.git /tmp/locomo
 
-# Run (session granularity — our 60.3% result)
-python benchmarks/locomo_bench.py /tmp/locomo/data/locomo10.json --granularity session
+# Run (session granularity, top-10 — our 60.3% result)
+python benchmarks/locomo_bench.py /tmp/locomo/data/locomo10.json --granularity session --top-k 10
 
 # Dialog granularity (harder — 48.0%)
-python benchmarks/locomo_bench.py /tmp/locomo/data/locomo10.json --granularity dialog
+python benchmarks/locomo_bench.py /tmp/locomo/data/locomo10.json --granularity dialog --top-k 10
 
-# Higher top-k (77.8% at top-50)
-python benchmarks/locomo_bench.py /tmp/locomo/data/locomo10.json --top-k 50
+# Higher top-k (session granularity; every session fits under top-50)
+python benchmarks/locomo_bench.py /tmp/locomo/data/locomo10.json --granularity session --top-k 50
 
 # Quick test on 1 conversation
-python benchmarks/locomo_bench.py /tmp/locomo/data/locomo10.json --limit 1
+python benchmarks/locomo_bench.py /tmp/locomo/data/locomo10.json --granularity session --top-k 10 --limit 1
 ```
 
 **Expected output (session, top-10, full 10 conversations):**
@@ -71,6 +79,10 @@ Avg Recall: 0.603
 Temporal:   0.692
 Time:       ~2 minutes
 ```
+
+The earlier guide reported 77.8% at top-50 without recording its granularity;
+that historical value is not the expected result of the session top-50 command
+above. The CLI defaults to top-50, so top-10 comparisons require `--top-k 10`.
 
 ## Benchmark 3: ConvoMem (Salesforce, 75K+ QA pairs)
 
@@ -102,7 +114,7 @@ Time:            ~2 minutes
 | Benchmark | What it measures | Why it matters |
 |---|---|---|
 | **LongMemEval** | Can you find a fact buried in 53 sessions? | Tests basic retrieval quality — the "needle in a haystack" |
-| **LoCoMo** | Can you connect facts across conversations over weeks? | Tests multi-hop reasoning and temporal understanding |
+| **LoCoMo** | Can you retrieve labelled evidence across conversations over weeks? | Measures evidence coverage for multi-hop and temporal questions |
 | **ConvoMem** | Does your memory system work at scale? | Tests all memory types: facts, preferences, changes, abstention |
 
 ## Results Files

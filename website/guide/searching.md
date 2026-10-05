@@ -75,11 +75,40 @@ The `search_memories()` function returns a dict:
 
 ## MCP Search
 
-When connected via MCP, your AI searches automatically:
+When connected via MCP, your AI chooses a retrieval tool for your question. These are alternative starting points; stop as soon as the returned evidence answers the question.
 
-> *"What did we decide about auth last month?"*
+For a known entity's relationships or a fact at a requested date, use `mempalace_kg_query`. Set `as_of` only when the question specifies a date. For current relationships without a date, use the returned `active_facts`; the query also returns historical and future facts.
 
-The AI calls `mempalace_search` behind the scenes. You never type a search command.
+For example, to look up Alice's relationships on March 1, 2026:
+
+```json
+{
+  "name": "mempalace_kg_query",
+  "arguments": {"entity": "Alice", "as_of": "2026-03-01"}
+}
+```
+
+For narrative recall or the original source words, use `mempalace_search` with a short query and a small result limit. Add a wing or room only when its scope is known. For *"Why did we change authentication?"* in the known `myapp` wing:
+
+```json
+{
+  "name": "mempalace_search",
+  "arguments": {"query": "why we changed authentication", "wing": "myapp", "limit": 3}
+}
+```
+
+For recent continuity, read a few diary rows directly using the name of the agent that wrote them:
+
+```json
+{
+  "name": "mempalace_diary_read",
+  "arguments": {"agent_name": "claude", "last_n": 3}
+}
+```
+
+Omitting the diary's `wing` reads across that agent's wings. `last_n` bounds stored rows, so a long diary entry may span multiple results.
+
+Expand retrieval only if the first result leaves the question unanswered. Search returns stored text; quote relevant passages verbatim, never summarize or paraphrase them. See the [Recall Protocol](https://github.com/MemPalace/mempalace/blob/develop/integrations/shared/recall-protocol.md#retrieve-only-the-context-you-need) for the shared workflow.
 
 See [MCP Integration](/guide/mcp-integration) for setup.
 

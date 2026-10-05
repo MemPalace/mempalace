@@ -602,7 +602,11 @@ LIGHT_TOOLS = {
                 "project": {"type": "string", "description": "Project routing name (optional)"},
                 "stream": {"type": "string", "description": "Logical stream (optional)"},
                 "room": {"type": "string", "description": "Sub-channel (optional)"},
-                "from_agent": {"type": "string", "description": "Writer agent identity (optional)"},
+                "from_agent": {
+                    "type": "string",
+                    "description": "Your identity (never filters; use writer)",
+                },
+                "writer": {"type": "string", "description": "List/wait: filter by event writer"},
                 "to_agent": {"type": "string", "description": "Target agent identity (optional)"},
                 "goal": {"type": "string", "description": "Task goal (optional)"},
                 "branch": {"type": "string", "description": "Git branch (optional)"},

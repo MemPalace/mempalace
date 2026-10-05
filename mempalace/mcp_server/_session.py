@@ -574,22 +574,30 @@ def _invalidate_overview_caches():
 
 
 def _palace_db_fingerprint():
-    """A stat of chroma.sqlite3 that changes with every committed write, or None.
+    """Stats of the Chroma database and its WAL, or None when unavailable.
 
-    chromadb keeps chroma.sqlite3 in rollback-journal mode (see
-    ``backends.chroma``), so a commit from any process rewrites the main file.
-    Counts grouped from the file cannot change while this value holds, which
-    lets overview caches outlive their TTL on a palace nobody is writing to.
+    New Chroma databases use rollback-journal mode, but an existing database
+    can retain WAL mode. Its commits can change only the WAL until a
+    checkpoint, so both files must participate in overview invalidation.
+    Exclude shm: readers can restamp it without changing stored records.
     ``None`` for other backends (sqlite_exact writes through a WAL, so the main
-    file's stat would miss commits) and when the file cannot be stat'ed.
+    file's stat would miss commits) and when either required stat fails.
     """
     if not _is_chroma_backend():
         return None
+    db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
     try:
-        st = os.stat(os.path.join(_config.palace_path, "chroma.sqlite3"))
+        st = os.stat(db_path)
+        main = (st.st_ino, st.st_mtime_ns, st.st_size)
+        try:
+            wal = os.stat(db_path + "-wal")
+        except FileNotFoundError:
+            wal_stamp = None
+        else:
+            wal_stamp = (wal.st_ino, wal.st_mtime_ns, wal.st_size)
     except OSError:
         return None
-    return (st.st_ino, st.st_mtime_ns, st.st_size)
+    return main, wal_stamp
 
 
 def _get_cached_metadata(col, where=None):
