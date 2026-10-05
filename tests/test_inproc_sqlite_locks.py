@@ -1,4 +1,4 @@
-"""Python ``sqlite3`` readers must not break Chroma's SQLite in the same process (#2302).
+"""Python ``sqlite3`` readers must not break Chroma's SQLite in the same process.
 
 ChromaDB opens ``chroma.sqlite3`` through its own statically linked SQLite, so
 the fast paths that read the file through Python's ``sqlite3`` are a second
@@ -72,6 +72,29 @@ print(conn.execute("select count(*) from embeddings").fetchone()[0])
 conn.close()
 """
 
+_EXTERNAL_SQLITE_WRITE = """
+import json, sqlite3, sys
+conn = sqlite3.connect(sys.argv[1], timeout=0.2)
+conn.execute("PRAGMA busy_timeout=200")
+conn.execute("INSERT INTO t VALUES (?)", (int(sys.argv[2]),))
+conn.commit()
+result = {
+    "journal_mode": conn.execute("PRAGMA journal_mode").fetchone()[0],
+    "rows": conn.execute("SELECT count(*) FROM t").fetchone()[0],
+}
+if len(sys.argv) > 3:
+    result["checkpoint_busy"] = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+conn.close()
+print(json.dumps(result))
+"""
+
+_EXTERNAL_WAL_SWITCH = """
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1], timeout=0.2)
+print(conn.execute("PRAGMA journal_mode=WAL").fetchone()[0])
+conn.close()
+"""
+
 
 def _run(script: str, *args) -> str:
     return subprocess.run(
@@ -79,7 +102,25 @@ def _run(script: str, *args) -> str:
         check=True,
         capture_output=True,
         text=True,
+        timeout=5,
     ).stdout.strip()
+
+
+def _stop_process(proc) -> None:
+    if proc.stdin is not None and not proc.stdin.closed:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=3)
+    finally:
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
 
 
 def _held(path: str, start: int, size: int) -> bool:
@@ -333,3 +374,163 @@ def test_chroma_reopen_keeps_python_reads_current(tmp_path):
     with contextlib.closing(sqlite3.connect(db)) as fresh:
         assert fresh.execute("select count(*) from embeddings").fetchone() == (3,)
     backend.close()
+
+
+def test_a_busy_anchor_stays_open(tmp_path, monkeypatch):
+    """Closing the anchor after a busy prime drops this process's POSIX locks."""
+    db = tmp_path / "chroma.sqlite3"
+    _make_db(db, rows=1)
+    closed = []
+
+    class _Conn:
+        def execute(self, _sql):
+            raise sqlite3.OperationalError("database is locked")
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(_inproc_sqlite, "connect_sqlite_read", lambda *_args, **_kwargs: _Conn())
+    key = _inproc_sqlite._key(str(db))
+
+    _inproc_sqlite._ensure_anchor(str(db), key)
+    _inproc_sqlite._ensure_anchor(str(db), key)
+
+    assert closed == []
+    anchor = _inproc_sqlite._anchors[key]
+    assert anchor.primed is False
+
+
+def test_lock_holder_allows_checkpoints_without_replacing_sidecars(tmp_path):
+    db = tmp_path / "chroma.sqlite3"
+    _make_db(db, rows=1)
+    with contextlib.closing(sqlite3.connect(db)) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+
+    checkpoint = (
+        "import sqlite3, sys\n"
+        "conn = sqlite3.connect(sys.argv[1], timeout=0)\n"
+        "conn.execute('INSERT INTO t VALUES (-1)')\n"
+        "conn.commit()\n"
+        "busy, _log, _ckpt = conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()\n"
+        "print('busy' if busy else 'done')\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _inproc_sqlite._HOLD_SCRIPT, str(db)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdout is not None
+    try:
+        assert _inproc_sqlite._read_holder_line(proc) == "ready"
+        # An idle WAL connection retains the lifetime locks, without a read
+        # snapshot preventing checkpoint progress. Truncating/reusing WAL
+        # files is safe; removing/recreating the mapped sidecars is not.
+        sidecars = _sidecar_inodes(str(db))
+        assert _run(checkpoint, db) == "done"
+        assert _sidecar_inodes(str(db)) == sidecars
+        _run(_EXTERNAL_CLOSE, db)
+        assert _sidecar_inodes(str(db)) == sidecars
+    finally:
+        _stop_process(proc)
+
+    assert proc.returncode == 0
+    assert _run(checkpoint, db) == "done"
+
+
+def test_open_reader_keeps_a_holder_until_release(tmp_path, monkeypatch):
+    monkeypatch.setattr(_inproc_sqlite, "_HOLD_LOCKS", True)
+    monkeypatch.setattr(_inproc_sqlite, "_ANCHORED", False)
+    monkeypatch.setattr(_inproc_sqlite, "_F_OFD_SETLK", None)
+    db = tmp_path / "chroma.sqlite3"
+    _make_db(db, rows=1)
+    with contextlib.closing(sqlite3.connect(db)) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+
+    try:
+        with contextlib.closing(_inproc_sqlite.open_reader(db)) as reader:
+            assert reader.execute("SELECT count(*) FROM t").fetchone() == (1,)
+        holder = _inproc_sqlite._holders[_inproc_sqlite._key(str(db))]
+        assert holder.ready
+        assert holder.alive()
+    finally:
+        _inproc_sqlite.release(db)
+
+    assert _inproc_sqlite._key(str(db)) not in _inproc_sqlite._holders
+    assert not holder.alive()
+
+
+def test_idle_rollback_holder_allows_external_commits_and_fresh_reads(tmp_path, monkeypatch):
+    monkeypatch.setattr(_inproc_sqlite, "_HOLD_LOCKS", True)
+    monkeypatch.setattr(_inproc_sqlite, "_ANCHORED", False)
+    monkeypatch.setattr(_inproc_sqlite, "_F_OFD_SETLK", None)
+    db = tmp_path / "chroma.sqlite3"
+    _make_db(db, rows=1)
+    key = _inproc_sqlite._key(str(db))
+
+    reader = _inproc_sqlite.open_reader(db)
+    try:
+        assert reader.execute("SELECT count(*) FROM t").fetchone() == (1,)
+        assert not reader.in_transaction
+        # The idle frontend reader and retained helper must not prevent a
+        # different process from taking EXCLUSIVE for a rollback-journal commit.
+        first = json.loads(_run(_EXTERNAL_SQLITE_WRITE, db, 1))
+        assert first == {"journal_mode": "delete", "rows": 2}
+        holder = _inproc_sqlite._holders[key]
+        assert holder.alive()
+        assert not holder.ready
+        assert key not in _inproc_sqlite._anchors
+        reader.close()
+
+        second = json.loads(_run(_EXTERNAL_SQLITE_WRITE, db, 2))
+        assert second == {"journal_mode": "delete", "rows": 3}
+        with contextlib.closing(_inproc_sqlite.open_reader(db)) as fresh:
+            assert fresh.execute("SELECT count(*) FROM t").fetchone() == (3,)
+            assert fresh.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+        assert _inproc_sqlite._holders[key] is holder
+        assert holder.alive()
+        assert not holder.ready
+    finally:
+        reader.close()
+        _inproc_sqlite.release(db)
+
+    assert key not in _inproc_sqlite._holders
+    assert not holder.alive()
+
+
+def test_idle_holder_detects_delete_to_wal_and_retains_sidecar_guard(tmp_path, monkeypatch):
+    monkeypatch.setattr(_inproc_sqlite, "_HOLD_LOCKS", True)
+    monkeypatch.setattr(_inproc_sqlite, "_ANCHORED", False)
+    monkeypatch.setattr(_inproc_sqlite, "_F_OFD_SETLK", None)
+    db = tmp_path / "chroma.sqlite3"
+    _make_db(db, rows=1)
+    key = _inproc_sqlite._key(str(db))
+
+    try:
+        with contextlib.closing(_inproc_sqlite.open_reader(db)) as reader:
+            assert reader.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+        holder = _inproc_sqlite._holders[key]
+        assert holder.alive()
+        assert not holder.ready
+
+        assert _run(_EXTERNAL_WAL_SWITCH, db) == "wal"
+        with contextlib.closing(_inproc_sqlite.open_reader(db)) as reader:
+            assert reader.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+        assert _inproc_sqlite._holders[key] is holder
+        assert holder.ready
+        assert holder.alive()
+
+        # The helper retains sidecar ownership while permitting both the
+        # writer's commit and a checkpoint after its transaction ends.
+        sidecars = _sidecar_inodes(str(db))
+        during = json.loads(_run(_EXTERNAL_SQLITE_WRITE, db, 1, "checkpoint"))
+        assert during == {"journal_mode": "wal", "rows": 2, "checkpoint_busy": 0}
+        assert _sidecar_inodes(str(db)) == sidecars
+    finally:
+        _inproc_sqlite.release(db)
+
+    assert not holder.alive()
+    assert key not in _inproc_sqlite._holders
+    after = json.loads(_run(_EXTERNAL_SQLITE_WRITE, db, 2, "checkpoint"))
+    assert after == {"journal_mode": "wal", "rows": 3, "checkpoint_busy": 0}
