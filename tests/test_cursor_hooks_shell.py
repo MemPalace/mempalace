@@ -666,6 +666,17 @@ def _age_file(path: Path, days: int) -> None:
     os.utime(path, (old, old))
 
 
+class TestTranscriptPathExpansion:
+    def test_expands_leading_tilde_against_home(self, tmp_path):
+        payload = _stop_payload(transcript="~/sessions/conv-1.jsonl")
+        out = _run_common_snippet(
+            'mempal_parse_stdin "$TEST_CURSOR_PAYLOAD"; printf "%s" "$MEMPAL_TRANSCRIPT"',
+            tmp_path,
+            extra_env={"TEST_CURSOR_PAYLOAD": payload},
+        )
+        assert out == str(tmp_path / "sessions" / "conv-1.jsonl")
+
+
 class TestStateTtlDays:
     @pytest.mark.parametrize(
         "value,expected",
