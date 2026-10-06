@@ -616,8 +616,7 @@ async def handle_mcp_post(request: web.Request) -> web.StreamResponse:
             content_type="text/event-stream",
             headers=resp_headers,
         )
-    else:
-        return web.json_response(payload, status=status, headers=resp_headers)
+    return web.json_response(payload, status=status, headers=resp_headers)
 
 
 async def handle_mcp_get(request: web.Request) -> web.StreamResponse:
