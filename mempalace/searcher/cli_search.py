@@ -159,6 +159,10 @@ def _cli_ranked_hits(
     metas = _first_or_empty(results, "metadatas")
     dists = _first_or_empty(results, "distances")
     ids = _first_or_empty(results, "ids")
+    if not ids:
+        # Backends (and test doubles) may omit ids — pad so the zip
+        # below does not collapse every hit.
+        ids = [None] * len(docs)
     fetched = len(docs)
     if window is not None:
         # Keep the whole in-window pool: the hybrid re-rank must see every
