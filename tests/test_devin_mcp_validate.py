@@ -134,6 +134,12 @@ class TestValidation:
             module.validate_arguments({"query": "x", "wait_for_previous": True}, permissive) == []
         )
 
+        # wait_for_previous is a transport kwarg the server pops before
+        # schema validation — exempt even under additionalProperties:false.
+        assert (
+            module.validate_arguments({"query": "x", "wait_for_previous": True}, strict) == []
+        )
+
     def test_scalar_coercion_passes(self):
         module = load_hook_module()
         schema = {"properties": {"limit": {"type": "integer"}}}
