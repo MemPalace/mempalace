@@ -346,7 +346,7 @@ def search(
         wing_name = meta.get("wing", "?")
         room_name = meta.get("room", "?")
         drawer_id = hit.get("id") or meta.get("drawer_id", "?")
-        parent_drawer_id = meta.get("parent_drawer_id", "?")
+        parent_drawer_id = meta.get("parent_drawer_id")
 
         print(f"  [{i}] {wing_name} / {room_name}")
         print(f"      Drawer: {drawer_id}")
