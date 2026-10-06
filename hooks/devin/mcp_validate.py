@@ -287,6 +287,8 @@ def validate_arguments(arguments: dict, schema: dict) -> list:
 
     if schema.get("additionalProperties") is False:
         for key in arguments:
+            if key == "wait_for_previous":
+                continue  # transport kwarg the server always accepts (protocol.py)
             if key not in properties:
                 errors.append(f"unknown parameter: {key}")
 
