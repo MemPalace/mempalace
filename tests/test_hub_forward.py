@@ -283,6 +283,13 @@ class TestForwardMineToHub:
         assert "forwarding mine to palace hub" in out
         assert "filed 1" in out
 
+    def test_forwards_projects_mode_when_mode_omitted(self, isolated_home, tmp_path, fake_hub):
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        assert cli._forward_mine_to_hub(_mine_args(tmp_path, mode=None), palace) is True
+        (request,) = fake_hub.requests
+        assert request["params"]["arguments"]["mode"] == "projects"
+
     def test_attaches_bearer_token_when_present(self, isolated_home, tmp_path, fake_hub):
         palace = str(isolated_home / "palace")
         _register_hub(palace, fake_hub)
