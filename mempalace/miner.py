@@ -1867,13 +1867,11 @@ def process_file(
 
     Returns ``(drawer_count, room_name, skip_reason)``. ``skip_reason`` is
     ``None`` on success and on every non-chunk-cap skip path: already
-    filed (pre- or post-lock re-check), unreadable (``OSError``), or
-    too-short content (below ``min_chunk_size``). It is ``"chunk_cap"``
-    when the per-file chunk cap aborted the file. Callers use the tag to
-    surface a separate counter in the mine summary (see #1455).
+    filed (pre- or post-lock re-check), unreadable (``OSError``), or zero
+    chunks after filtering. It is ``"chunk_cap"`` when the per-file chunk cap
+    aborted the file. Callers use the tag to surface a separate counter in the
+    mine summary (see #1455).
     """
-    effective_min = min_chunk_size if min_chunk_size is not None else MIN_CHUNK_SIZE
-
     # Skip if already filed
     source_file = str(filepath)
     if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
@@ -1885,9 +1883,9 @@ def process_file(
     content, read_mtime = read_result
 
     content = content.strip()
-    if len(content) < effective_min:
-        return 0, "general", None
 
+    # Short files still run through the normal lock/purge path. chunk_text()
+    # yields no chunks, and mine() continues to count 0 drawers as skipped.
     room = detect_room(filepath, content, rooms, project_path)
     chunks = chunk_text(
         content,
