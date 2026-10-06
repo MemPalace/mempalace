@@ -1110,3 +1110,83 @@ class TestEndToEnd:
                 await client.close()
 
         self._run_client(test)
+
+
+class TestMainEntrypoint:
+    """Regression: main() must actually start (review #1999).
+
+    The previous _setup_signals() touched app._runner — AttributeError on
+    every Python version, so the entry point never served a request. These
+    run the real process rather than asserting on internals.
+    """
+
+    PROXY = os.path.join(
+        os.path.dirname(__file__), "..", "deploy", "proxy", "mempalace_mcp_proxy.py"
+    )
+
+    def _env(self, **overrides):
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOST": "127.0.0.1",
+                "UPSTREAM_URL": "http://127.0.0.1:1/mcp",  # dead upstream is fine
+                "PYTHONPATH": os.path.dirname(self.PROXY),
+            }
+        )
+        env.update(overrides)
+        return env
+
+    def test_main_starts_and_serves_health(self):
+        import socket
+        import subprocess
+        import time
+        import urllib.request
+
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+
+        proc = subprocess.Popen(
+            [sys.executable, self.PROXY],
+            env=self._env(PORT=str(port)),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.time() + 15
+            body = None
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    pytest.fail(f"proxy exited early: rc={proc.returncode}")
+                try:
+                    with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/health", timeout=2
+                    ) as resp:
+                        body = json.loads(resp.read())
+                    break
+                except urllib.error.HTTPError as e:
+                    # /health reports 503 when the upstream is unreachable;
+                    # that still proves main() is serving.
+                    body = json.loads(e.read())
+                    break
+                except Exception:
+                    time.sleep(0.3)
+            assert body is not None, "proxy never answered /health"
+            assert body["status"] in ("ok", "degraded")
+            assert body["upstream"] == "http://127.0.0.1:1/mcp"
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10)
+        assert proc.returncode in (0, -15, 15)  # clean exit or SIGTERM
+
+    def test_main_refuses_non_loopback_without_token(self):
+        import subprocess
+
+        proc = subprocess.run(
+            [sys.executable, self.PROXY],
+            env=self._env(HOST="0.0.0.0", PORT="18977", INBOUND_TOKEN=""),
+            capture_output=True,
+            timeout=15,
+        )
+        assert proc.returncode == 2
