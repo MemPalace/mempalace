@@ -908,7 +908,11 @@ def _resolve_embedding_model(model) -> str:
     if warning_key not in _WARNED:
         _WARNED.add(warning_key)
         logger.warning(
-            "Unknown embedding_model %r; falling back to 'minilm'. Valid values: %s.",
+            "Unknown embedding_model %r; falling back to 'minilm'. Valid values: %s. "
+            "If you meant embeddinggemma or embeddinggemma2, fix the spelling; a palace "
+            "already filed under this fallback holds MiniLM vectors, so re-embed it with "
+            "`mempalace repair rebuild-index` (`mempalace palace set-embedder` only "
+            "re-records the model name).",
             name,
             ", ".join(sorted(_KNOWN_EMBEDDING_MODELS)),
         )

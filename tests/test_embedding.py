@@ -72,6 +72,10 @@ def test_unknown_embedding_model_falls_back_to_minilm_with_one_warning(monkeypat
     assert len(warnings) == 1
     assert repr(model) in warnings[0].getMessage()
     assert "falling back to 'minilm'" in warnings[0].getMessage()
+    assert "If you meant embeddinggemma or embeddinggemma2, fix the spelling" in (
+        warnings[0].getMessage()
+    )
+    assert "`mempalace repair rebuild-index`" in warnings[0].getMessage()
 
 
 @pytest.mark.parametrize(
