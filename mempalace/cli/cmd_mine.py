@@ -159,7 +159,7 @@ def cmd_mine(args):
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(1)
     except UnknownEmbeddingModelError as exc:
-        # A misspelled EmbeddingGemma name: nothing was written; say what to fix.
+        # A misspelled model name: nothing was written; say what to fix.
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(1)
     except MineValidationError as exc:

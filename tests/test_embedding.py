@@ -53,8 +53,8 @@ def _fallback_warnings(caplog):
 
 @pytest.mark.parametrize(
     "model",
-    ["all-minilm-l6-v2", "minilm-l6", "", "none"],
-    ids=["non-canonical", "other-name", "empty", "null"],
+    ["all-minilm-l6-v2", "minilm-l6", "", "none", "open", "gemma"],
+    ids=["non-canonical", "other-name", "empty", "null", "open", "gemma"],
 )
 def test_unknown_embedding_model_falls_back_to_minilm_with_one_warning(monkeypatch, caplog, model):
     """An unrecognized model keeps the historical MiniLM fallback, and every
@@ -105,8 +105,32 @@ def test_embeddinggemma_near_miss_raises_instead_of_falling_back(monkeypatch, ca
 
 
 @pytest.mark.parametrize(
+    "model",
+    ["openai", "openai_compat", "openaicompat", "OpenAI", "opnai-compat", "openai-compatible"],
+)
+def test_openai_compat_near_miss_raises_instead_of_falling_back(monkeypatch, caplog, model):
+    """Someone who meant remote embeddings would get local MiniLM vectors that
+    only a full re-embed can replace, so a near miss of ``openai-compat`` stops
+    with a hint instead, like an EmbeddingGemma typo does."""
+    _fake_minilm(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger=embedding.logger.name):
+        with pytest.raises(embedding.UnknownEmbeddingModelError) as excinfo:
+            embedding.get_embedding_function(device="cpu", model=model)
+    message = str(excinfo.value)
+    assert repr(model.strip().lower()) in message
+    assert "did you mean 'openai-compat'?" in message
+    assert "embeddinggemma' or" not in message
+    assert "Valid values: embeddinggemma, embeddinggemma2, minilm, openai-compat" in message
+    assert "Not falling back to 'minilm'" in message
+    assert not _FakeMiniLM.built
+    assert not _fallback_warnings(caplog)
+
+
+@pytest.mark.parametrize(
     "model, expected",
     [
+        ("OpenAI-Compat", "openai-compat"),
+        (" openai-compat ", "openai-compat"),
         ("EmbeddingGemma2", "embeddinggemma2"),
         (" EmbeddingGemma ", "embeddinggemma"),
         ("embeddinggemma", "embeddinggemma"),

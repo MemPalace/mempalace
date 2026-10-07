@@ -888,16 +888,26 @@ class OpenAICompatEmbeddingFunction:
 _KNOWN_EMBEDDING_MODELS = frozenset(
     {"minilm", "embeddinggemma", "embeddinggemma2", "openai-compat"}
 )
-_GEMMA_MODELS = ("embeddinggemma", "embeddinggemma2")
+# Families whose near misses refuse instead of falling back to MiniLM: each
+# entry is (prefix, suggested names). A name is a near miss of a family when it
+# starts with the prefix or is within _NEAR_MISS_DISTANCE edits of a suggested
+# name. Someone who typed one of these meant that model (or remote embeddings),
+# and MiniLM vectors filed in its place take a full re-embed to replace.
+_GUARDED_MODEL_FAMILIES = (
+    ("embeddinggemma", ("embeddinggemma", "embeddinggemma2")),
+    ("openai", ("openai-compat",)),
+)
+_NEAR_MISS_DISTANCE = 2
 
 
 class UnknownEmbeddingModelError(ValueError):
-    """``embedding_model`` looks like a misspelled EmbeddingGemma name.
+    """``embedding_model`` looks like a misspelled supported model name.
 
-    Raised instead of the MiniLM fallback: filing MiniLM vectors under a
-    palace the user meant to embed with EmbeddingGemma can only be undone by
-    re-embedding everything (``mempalace repair rebuild-index``). The Chroma
-    backend re-raises it rather than opening with chromadb's default.
+    Raised instead of the MiniLM fallback for near misses of EmbeddingGemma
+    or ``openai-compat``: filing MiniLM vectors under a palace the user meant
+    to embed with another model can only be undone by re-embedding everything
+    (``mempalace repair rebuild-index``). The Chroma backend re-raises it
+    rather than opening with chromadb's default.
     """
 
 
@@ -912,11 +922,14 @@ def _edit_distance(a: str, b: str) -> int:
     return previous[-1]
 
 
-def _is_gemma_near_miss(name: str) -> bool:
-    """``name`` (already normalized, not a known model) reads as an EmbeddingGemma typo."""
-    return name.startswith("embeddinggemma") or any(
-        _edit_distance(name, gemma) <= 2 for gemma in _GEMMA_MODELS
-    )
+def _near_miss_suggestions(name: str) -> tuple:
+    """Supported names ``name`` (normalized, not a known model) is a typo of, or ``()``."""
+    for prefix, suggestions in _GUARDED_MODEL_FAMILIES:
+        if name.startswith(prefix) or any(
+            _edit_distance(name, suggestion) <= _NEAR_MISS_DISTANCE for suggestion in suggestions
+        ):
+            return suggestions
+    return ()
 
 
 def _resolve_embedding_model(model) -> str:
@@ -924,9 +937,11 @@ def _resolve_embedding_model(model) -> str:
 
     Names are compared stripped and lowercased, like
     :attr:`MempalaceConfig.embedding_model`, so ``"EmbeddingGemma2"`` is
-    ``"embeddinggemma2"``. A near miss of ``embeddinggemma`` or
-    ``embeddinggemma2`` (starts with ``embeddinggemma``, or within edit
-    distance 2 of either) raises :class:`UnknownEmbeddingModelError`. Any
+    ``"embeddinggemma2"``. A near miss of a guarded family (see
+    ``_GUARDED_MODEL_FAMILIES``: starts with ``embeddinggemma`` or within edit
+    distance 2 of ``embeddinggemma``/``embeddinggemma2``; starts with
+    ``openai`` or within edit distance 2 of ``openai-compat``) raises
+    :class:`UnknownEmbeddingModelError` naming the likely intended model. Any
     other unrecognized value (``"all-minilm-l6-v2"``, an empty string, a JSON
     ``null`` read back as ``"none"``) falls back to ``"minilm"``, as it always
     has, with a warning logged once per process and value. Every caller
@@ -939,10 +954,12 @@ def _resolve_embedding_model(model) -> str:
     if name in _KNOWN_EMBEDDING_MODELS:
         return name
     valid = ", ".join(sorted(_KNOWN_EMBEDDING_MODELS))
-    if _is_gemma_near_miss(name):
+    suggestions = _near_miss_suggestions(name)
+    if suggestions:
+        did_you_mean = " or ".join(repr(suggestion) for suggestion in suggestions)
         raise UnknownEmbeddingModelError(
-            f"Unknown embedding_model {name!r}; did you mean 'embeddinggemma' or "
-            f"'embeddinggemma2'? Valid values: {valid}. Not falling back to 'minilm': "
+            f"Unknown embedding_model {name!r}; did you mean {did_you_mean}? "
+            f"Valid values: {valid}. Not falling back to 'minilm': "
             "vectors filed with the wrong model can only be replaced by re-embedding "
             "the whole palace."
         )
