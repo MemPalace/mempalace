@@ -122,6 +122,12 @@ def _enforce_embedder_identity(
                 except Exception:
                     logger.debug("embedder-identity record failed", exc_info=True)
         elif count:
+            if model_name.startswith("embeddinggemma2:"):
+                raise EmbedderIdentityMismatchError(
+                    f"collection {collection_name!r} has vectors but no recorded embedding identity; "
+                    "the vectors may come from a different model or modality configuration. "
+                    "Rebuild the index before using it with EmbeddingGemma 2."
+                )
             warnings.warn(
                 f"palace collection {collection_name!r} has no recorded embedder "
                 f"identity; assuming the current model {model_name!r}. Run "
@@ -137,19 +143,19 @@ def _enforce_embedder_identity(
 # searchable index layer and MemPalace never opens a differently-named closets
 # store. Mirrored independently in repair.py as ``CLOSETS_COLLECTION_NAME``.
 CLOSETS_COLLECTION_NAME = "mempalace_closets"
+ASSETS_COLLECTION_NAME = "mempalace_assets"
 
 
 def _allowed_wrapper_collection_names() -> List[str]:
     """The collection names the ``get_collection`` wrapper routes through.
 
-    Only two stores are first-class to MemPalace: the configured drawers
-    collection (default ``mempalace_drawers``, overridable in config) and the
-    closets collection. Every other name points at a store the search/CLI/MCP
+    The configured drawers collection, closets collection, and fixed media
+    assets collection are first-class to MemPalace. Every other name points at a store the search/CLI/MCP
     layer never reads — the exact silent-miss failure of issue ``#2347``.
     """
     from ..config import get_configured_collection_name
 
-    allowed = [get_configured_collection_name(), CLOSETS_COLLECTION_NAME]
+    allowed = [get_configured_collection_name(), CLOSETS_COLLECTION_NAME, ASSETS_COLLECTION_NAME]
     seen: set[str] = set()
     out: list[str] = []
     for name in allowed:
@@ -193,8 +199,9 @@ class CollectionNameMismatchError(ValueError):
             f"invisible to search, MCP, and repair. Use one of the configured "
             f"names — the drawers collection name (default "
             f"'mempalace_drawers', overridable in config; expose it with "
-            f"``get_configured_collection_name()``) or the closets collection "
-            f"``get_closets_collection()`` — not an ad-hoc string."
+            f"``get_configured_collection_name()``), the closets collection "
+            f"``get_closets_collection()``, or the fixed ``mempalace_assets`` "
+            f"collection — not an ad-hoc string."
         )
 
 
@@ -207,9 +214,9 @@ def get_collection(
     _skip_identity_check: bool = False,
     _skip_name_check: bool = False,
 ):
-    """Get a first-class MemPalace collection (drawers or closets).
+    """Get a first-class MemPalace collection (drawers, closets, or media assets).
 
-    The wrapper front-loads exactly two collections and is the public surface
+    The wrapper front-loads the drawers, closets, and fixed media asset collections and is the public surface
     MCP, miners, the search layer, and the CLI use to open a palace:
 
     * the **drawers** collection — the verbatim document store. Its name is
@@ -219,6 +226,9 @@ def get_collection(
     * the **closets** collection — the searchable index layer. Always named
       :data:`mempalace.palace.CLOSETS_COLLECTION_NAME`` ("mempalace_closets");
       open it through :func:`mempalace.palace.get_closets_collection`.
+    * the **media assets** collection — local image, audio, and video references
+      stored separately from drawer documents. Always named
+      :data:`mempalace.palace.ASSETS_COLLECTION_NAME`.
 
     Any other name points to a store the rest of MemPalace never reads, so data
     upserted through it stays invisible to search/CLI/MCP. ``get_collection``
@@ -250,6 +260,16 @@ def get_collection(
         allowed = _allowed_wrapper_collection_names()
         if collection_name not in allowed:
             raise CollectionNameMismatchError(collection_name, allowed, palace_path)
+    if collection_name == ASSETS_COLLECTION_NAME:
+        # Validate provider configuration before opening storage. The identity
+        # checker intentionally degrades gracefully for legacy collections,
+        # but invalid EmbeddingGemma 2 settings must not be hidden by it.
+        from ..config import MempalaceConfig
+
+        if MempalaceConfig().embedding_model == "embeddinggemma2":
+            from ..embedding import get_embedding_function
+
+            get_embedding_function(model="embeddinggemma2")
     backend_obj = get_backend_for_palace(palace_path, explicit=backend)
     palace_ref = PalaceRef(id=palace_path, local_path=palace_path)
     backend_options = {"read_only": True} if read_only else None

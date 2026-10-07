@@ -753,6 +753,32 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
         if model is None:
             model = cfg.embedding_model
 
+    model = str(model).strip().lower()
+    if model not in {"minilm", "embeddinggemma", "embeddinggemma2", "openai-compat"}:
+        raise ValueError(
+            f"Unknown embedding_model {model!r}; choose minilm, embeddinggemma, "
+            "embeddinggemma2, or openai-compat"
+        )
+
+    if model == "embeddinggemma2":
+        from .config import MempalaceConfig
+        from .embeddinggemma2 import EmbeddingGemma2EmbeddingFunction
+
+        cfg = MempalaceConfig()
+        settings = {
+            "dimension": cfg.embeddinggemma2_dimension,
+            "modalities": cfg.embeddinggemma2_modalities,
+            "revision": cfg.embeddinggemma2_revision,
+            "device": device,
+        }
+        cache_key = ("embeddinggemma2", tuple(sorted(settings.items())))
+        with _EF_CACHE_LOCK:
+            cached = _EF_CACHE.get(cache_key)
+            if cached is None:
+                cached = EmbeddingGemma2EmbeddingFunction(**settings)
+                _EF_CACHE[cache_key] = cached
+        return cached
+
     # OpenAI-compatible embedding API: bypasses local ONNX entirely. Checked
     # before device→provider resolution since it needs no hardware accelerator.
     if model == "openai-compat":
@@ -806,7 +832,7 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
                 batch_size=_resolve_embeddinggemma_batch_size(),
             )
         else:
-            # Default: minilm (or anything we don't recognize — back-compat win).
+            # MiniLM keeps its historical embedding behavior.
             ef_cls = _build_ef_class()
             ef = ef_cls(preferred_providers=providers, intra_op_num_threads=threads)
 
@@ -828,6 +854,9 @@ def describe_device(device: Optional[str] = None, model: Optional[str] = None) -
     that embeddings are served by a remote endpoint rather than local hardware
     (in which case the ``embedding_device`` accelerator label is irrelevant).
     """
+    if current_model_name(model).startswith("embeddinggemma2:"):
+        ef = get_embedding_function(device=device, model="embeddinggemma2")
+        return f"embeddinggemma2 ({ef.effective_device or device or 'auto'}, float32)"
     if device is None:
         from .config import MempalaceConfig
 
@@ -856,11 +885,12 @@ def current_model_name(model: Optional[str] = None) -> str:
     ``"embeddinggemma"`` / ...), not the embedding function's internal
     ``name()`` (which is spoofed to ``"default"`` for ChromaDB compatibility).
     """
-    if model is not None:
-        return str(model).strip().lower()
     from .config import MempalaceConfig
 
-    return MempalaceConfig().embedding_model
+    name = str(model).strip().lower() if model is not None else MempalaceConfig().embedding_model
+    if name == "embeddinggemma2":
+        return get_embedding_function(model=name).identity
+    return name
 
 
 def probe_dimension(device: Optional[str] = None, model: Optional[str] = None) -> int:
@@ -872,6 +902,8 @@ def probe_dimension(device: Optional[str] = None, model: Optional[str] = None) -
     by the identity check, so a probe failure never blocks normal operation).
     """
     name = current_model_name(model)
+    if name.startswith("embeddinggemma2:"):
+        return get_embedding_function(device=device, model="embeddinggemma2").dimension
     cached = _DIM_CACHE.get(name)
     if cached is not None:
         return cached

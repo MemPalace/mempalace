@@ -2949,6 +2949,10 @@ class ChromaBackend(BaseBackend):
 
             return get_embedding_function()
         except Exception:
+            from ..config import MempalaceConfig
+
+            if MempalaceConfig().embedding_model == "embeddinggemma2":
+                raise
             logger.exception("Failed to build embedding function; using chromadb default")
             return None
 

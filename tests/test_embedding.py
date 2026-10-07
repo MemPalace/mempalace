@@ -9,6 +9,61 @@ def isolate_embedding_state(monkeypatch):
     monkeypatch.setattr(embedding, "_WARNED", set())
 
 
+def test_embeddinggemma2_factory_is_lazy_cached_and_identity_tracks_settings(monkeypatch):
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "embeddinggemma2")
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_DEVICE", "cpu")
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA2_DIMENSION", "768")
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA2_MODALITIES", "text")
+    first = embedding.get_embedding_function()
+    assert first is embedding.get_embedding_function()
+    assert first._model is None
+    assert embedding.probe_dimension() == 768
+    identity = embedding.get_embedder_identity()
+    assert identity.model_name == first.identity
+    assert "google/embeddinggemma-2@" in identity.model_name
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA2_DIMENSION", "256")
+    second = embedding.get_embedding_function()
+    assert second is not first
+    assert embedding.get_embedder_identity().dimension == 256
+    assert embedding.current_model_name() != identity.model_name
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA2_MODALITIES", "all")
+    assert embedding.get_embedding_function().identity != second.identity
+
+
+def test_unknown_embedding_model_fails_instead_of_using_minilm():
+    with pytest.raises(ValueError, match="Unknown embedding_model"):
+        embedding.get_embedding_function(device="cpu", model="embeddinggemm2")
+
+
+def test_embedding_wrapper_selects_query_and_metadata_document_methods(monkeypatch):
+    from mempalace.backends import embedding_wrapper as ew
+
+    class Provider:
+        calls = []
+
+        def __call__(self, input):
+            raise AssertionError("asymmetric provider should use explicit methods")
+
+        def embed_query(self, input):
+            self.calls.append(("query", input))
+            return [[1.0, 0.0]]
+
+        def embed_documents(self, input, metadatas=None):
+            self.calls.append(("documents", input, metadatas))
+            return [[0.0, 1.0]]
+
+    provider = Provider()
+    monkeypatch.setattr(embedding, "get_embedding_function", lambda: provider)
+    assert ew._embed_texts(["where is authentication?"], query=True) == [[1.0, 0.0]]
+    assert ew._embed_texts(["def auth(): pass"], metadatas=[{"source_file": "auth.py"}]) == [
+        [0.0, 1.0]
+    ]
+    assert provider.calls == [
+        ("query", ["where is authentication?"]),
+        ("documents", ["def auth(): pass"], [{"source_file": "auth.py"}]),
+    ]
+
+
 def test_auto_picks_cuda(monkeypatch):
     monkeypatch.setattr(
         "onnxruntime.get_available_providers",

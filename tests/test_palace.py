@@ -8,6 +8,7 @@ import pytest
 
 from mempalace.backends import CollectionNotInitializedError, PalaceNotFoundError
 from mempalace.palace import (
+    ASSETS_COLLECTION_NAME,
     CLOSETS_COLLECTION_NAME,
     CollectionNameMismatchError,
     _allowed_wrapper_collection_names,
@@ -366,8 +367,9 @@ class TestGetCollectionNameValidation:
         with pytest.raises(CollectionNameMismatchError):
             get_collection(str(palace), collection_name="mempalace_drawers", create=True)
 
-    def test_allowed_names_helper_lists_both(self):
+    def test_allowed_names_helper_lists_all_supported_collections(self):
         allowed = _allowed_wrapper_collection_names()
         assert "mempalace_drawers" in allowed
         assert "mempalace_closets" in allowed
-        assert len(allowed) == 2
+        assert ASSETS_COLLECTION_NAME in allowed
+        assert len(allowed) == 3

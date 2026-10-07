@@ -42,6 +42,8 @@ _REAL_EMBEDDING_TEST_MODULES = {
     "test_embedding",
     "test_embedding_api",
     "test_embeddinggemma",
+    "test_embeddinggemma2",
+    "test_embeddinggemma2_integration",
 }
 
 
@@ -138,7 +140,7 @@ def _stable_embedding_function_for_tests(request, monkeypatch):
     monkeypatch.setattr(
         chroma_mod.ChromaBackend, "_resolve_embedding_function", staticmethod(lambda: ef)
     )
-    monkeypatch.setattr(embedding_wrapper, "_embed_texts", lambda texts: ef(input=list(texts)))
+    monkeypatch.setattr(embedding_wrapper, "_embed_texts", lambda texts, **_: ef(input=list(texts)))
     yield
 
 

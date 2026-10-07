@@ -122,6 +122,21 @@ pgvector = ["psycopg[binary]>=3.1"]
 gpu = ["onnxruntime-gpu>=1.16"]
 dml = ["onnxruntime-directml>=1.16"]
 coreml = ["onnxruntime>=1.16"]
+# Opt-in PyTorch/Transformers implementation of Google EmbeddingGemma 2.
+# The upstream image extra supplies Pillow and torchvision, which the
+# processor imports even for text-only use.
+embeddinggemma2 = [
+    "sentence-transformers[image]>=6.1.0; python_version >= '3.10'",
+    "transformers>=5.19.0; python_version >= '3.10'",
+    "torch>=2.14.0; python_version >= '3.10'",
+]
+multimodal = [
+    "sentence-transformers[image]>=6.1.0; python_version >= '3.10'",
+    "transformers>=5.19.0; python_version >= '3.10'",
+    "torch>=2.14.0; python_version >= '3.10'",
+    "soundfile>=0.13.1; python_version >= '3.10'",
+    "torchcodec>=0.17.0; python_version >= '3.10'",
+]
 # Multilingual extra kept as a no-op alias for back-compat with
 # `pip install mempalace[multilingual]` — these deps now ship in core.
 multilingual = []

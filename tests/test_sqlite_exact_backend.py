@@ -800,7 +800,7 @@ def test_palace_wrapper_embeds_for_sqlite_exact(tmp_path, monkeypatch):
     monkeypatch.setattr(
         embedding_wrapper,
         "_embed_texts",
-        lambda texts: [[float(len(text)), 1.0] for text in texts],
+        lambda texts, **_kwargs: [[float(len(text)), 1.0] for text in texts],
     )
 
     col = get_collection(str(tmp_path), create=True)
@@ -883,7 +883,7 @@ def test_search_union_uses_sqlite_exact_lexical_search(tmp_path, monkeypatch):
     from mempalace.palace import get_collection
     from mempalace.searcher import search_memories
 
-    def fake_embed(texts):
+    def fake_embed(texts, **_kwargs):
         vectors = []
         for text in texts:
             if text == "rareterm":
@@ -935,7 +935,7 @@ def test_search_closets_use_lexical_not_vector_on_sqlite_exact(tmp_path, monkeyp
 
     monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
     monkeypatch.setattr(
-        embedding_wrapper, "_embed_texts", lambda texts: [[1.0, 0.0] for _ in texts]
+        embedding_wrapper, "_embed_texts", lambda texts, **_kwargs: [[1.0, 0.0] for _ in texts]
     )
 
     drawers = get_collection(str(tmp_path), create=True)
@@ -1647,7 +1647,7 @@ def test_hybrid_search_keeps_closet_boost_under_writer_lease(tmp_path, monkeypat
     backend.close()
     monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", backend_name)
     monkeypatch.setattr(
-        embedding_wrapper, "_embed_texts", lambda texts: [[1.0, 0.0] for _ in texts]
+        embedding_wrapper, "_embed_texts", lambda texts, **_kwargs: [[1.0, 0.0] for _ in texts]
     )
     holder_code = """
 import sys
