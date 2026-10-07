@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **The stop hook supports WorkBuddy.** Its transcripts put `role`/`content` at
+  the row top level instead of nesting them under `message`, so
+  `_count_human_messages` counted zero exchanges and the save hook never reached
+  `SAVE_INTERVAL`; the checkpoint extractor read the same rows, so even a
+  triggered save had nothing to file — a WorkBuddy session silently never
+  saved. A WorkBuddy session also minted a wing per session, because its `cwd`
+  is a disposable date-stamped workspace folder rather than a project root;
+  every session of a harness now files under that harness's agent wing
+  (`wing_workbuddy` by default). `MEMPALACE_AGENT_<HARNESS>` lets a deployment
+  choose the diary agent name those checkpoints are filed under.
+
 ---
 
 ## [3.11.0] — 2026-10-02

@@ -111,6 +111,17 @@ lifecycle hooks are PreToolUse/PostToolUse/PreInvocation/PostInvocation/Stop,
 and MemPalace already saves there via `Stop`); Cursor and Codex can adopt the
 same entry point as a follow-up wherever their own session-end event is available.
 
+## Install — WorkBuddy
+
+No script from this directory is needed: register
+`mempalace hook run --hook stop --harness workbuddy` as a Stop hook in
+WorkBuddy's own hook configuration (the same way `.claude/settings.local.json`
+registers the script above). WorkBuddy's stop-hook stdin already carries
+`session_id`, `transcript_path`, and `stop_hook_active` under exactly the names
+the hook parser reads, so that one command is the whole wiring. Checkpoints
+file under the `workbuddy` diary agent name (`MEMPALACE_AGENT_WORKBUDDY`
+overrides it), and every session folds into the single `wing_workbuddy` wing.
+
 ## Configuration
 
 Edit `mempal_save_hook.sh` to change:
