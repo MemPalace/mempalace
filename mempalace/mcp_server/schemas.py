@@ -945,6 +945,14 @@ TOOLS = {
                         " (default false)"
                     ),
                 },
+                "slim": {
+                    "type": "boolean",
+                    "description": (
+                        "Leave out metadata, replication bookkeeping (seq, origin_replica,"
+                        " origin_seq, hlc) and empty fields. Re-fetch without slim for the"
+                        " whole event (default false)"
+                    ),
+                },
             },
         },
         "handler": tool_event_list,

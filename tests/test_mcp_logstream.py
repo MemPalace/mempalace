@@ -215,6 +215,31 @@ class TestDispatch:
         assert prev["events"][0]["body"] == APPEND_ARGS["body"]
         assert "body_truncated" not in prev["events"][0]
 
+    def test_slim_leaves_out_metadata_bookkeeping_and_empty_fields(self, patched_server):
+        _result(
+            _call(
+                patched_server,
+                "mempalace_event_append",
+                {**APPEND_ARGS, "metadata": {"note": "x" * 500}},
+            )
+        )
+        full = _result(
+            _call(patched_server, "mempalace_event_list", {"correlation_id": "task_mcp"})
+        )["events"][0]
+        assert full["metadata"] == {"note": "x" * 500} and "hlc" in full
+        slim = _result(
+            _call(
+                patched_server,
+                "mempalace_event_list",
+                {"correlation_id": "task_mcp", "slim": True},
+            )
+        )["events"][0]
+        for key in ("metadata", "seq", "origin_replica", "origin_seq", "hlc"):
+            assert key not in slim
+        assert all(v not in (None, "", [], {}) for v in slim.values())
+        assert slim["id"] == full["id"] and slim["correlation_id"] == "task_mcp"
+        assert slim["body"] == APPEND_ARGS["body"]
+
     def test_list_from_agent_is_the_callers_identity_not_a_filter(self, patched_server):
         # The recipient passes its own identity as from_agent (as agents are told to on every call) and must still
         # see the request written to it: from_agent used to filter by writer and returned nothing.
