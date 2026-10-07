@@ -590,6 +590,7 @@ def tool_search(
     context: str = None,
     candidate_strategy: str = "vector",
     cli_compatible: bool = False,
+    expand_wings: bool = False,
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
@@ -660,6 +661,7 @@ def tool_search(
                         since=since,
                         before=before,
                         collection=collection,
+                        expand_wings=expand_wings,
                     )
                 )
         except SearchError as exc:
@@ -693,6 +695,7 @@ def tool_search(
         vector_disabled=_vector_disabled,
         candidate_strategy=candidate_strategy,
         collection_name=_config.collection_name,
+        expand_wings=expand_wings,
     )
     if _is_transient_index_error(result):
         # Post-bulk-write HNSW flush window (#1315): drop caches, give
@@ -714,6 +717,7 @@ def tool_search(
             vector_disabled=_vector_disabled,
             candidate_strategy=candidate_strategy,
             collection_name=_config.collection_name,
+            expand_wings=expand_wings,
         )
         if not _is_transient_index_error(result):
             result["index_recovered"] = True
