@@ -35,6 +35,7 @@ from ..backends._inproc_sqlite import open_reader as open_palace_reader
 from ..backends.chroma import _filtered_candidate_rows, _fts_candidate_rows
 from ..config import MempalaceConfig
 from ..date_window import filed_at_in_window, parse_window
+from ..dynamics import drawer_salience
 from ..i18n import _canonical_lang, get_stopwords
 from ..palace import (
     _open_collection_or_explain,

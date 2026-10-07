@@ -287,7 +287,7 @@ def _bm25_only_via_sqlite(
         placeholders = ",".join(["?"] * len(candidate_ids))
         meta_rows = conn.execute(
             f"""
-            SELECT m.id, e.embedding_id, m.key, m.string_value, m.int_value
+            SELECT m.id, e.embedding_id, m.key, m.string_value, m.int_value, m.float_value
             FROM embedding_metadata AS m
             JOIN embeddings AS e ON e.id = m.id
             WHERE m.id IN ({placeholders})
@@ -299,7 +299,7 @@ def _bm25_only_via_sqlite(
 
     # Group metadata rows into per-drawer dicts.
     drawers: dict[int, dict] = {}
-    for emb_id, stored_drawer_id, key, sval, ival in meta_rows:
+    for emb_id, stored_drawer_id, key, sval, ival, fval in meta_rows:
         d = drawers.setdefault(
             emb_id,
             {
@@ -312,7 +312,7 @@ def _bm25_only_via_sqlite(
         if key == "chroma:document":
             d["text"] = sval or ""
         else:
-            d["metadata"][key] = sval if sval is not None else ival
+            d["metadata"][key] = sval if sval is not None else ival if ival is not None else fval
 
     # Apply wing/room filters in Python (FTS5 candidates may include
     # entries from other wings).
@@ -341,6 +341,7 @@ def _bm25_only_via_sqlite(
                 "similarity": None,
                 "distance": None,
                 "matched_via": "bm25_sqlite",
+                "salience": drawer_salience(meta),
                 # Internal: full path + chunk_index let callers (notably
                 # candidate_strategy="union") dedupe at chunk granularity
                 # rather than basename — two files in different directories
@@ -467,6 +468,7 @@ def _merge_bm25_union_candidates(
                 "closet_boost": 0.0,
                 "matched_via": "bm25_backend",
                 "bm25_score": round(float(hit.score), 3),
+                "salience": drawer_salience(meta),
                 "_source_file_full": full_source,
                 "_chunk_index": meta.get("chunk_index"),
             }
