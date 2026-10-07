@@ -40,6 +40,11 @@ Indexes conversation exports from Claude, ChatGPT, Slack, and other tools. Chunk
 mempalace mine ~/chats/ --mode convos
 ```
 
+Repeated runs pick up appended or rewritten transcripts. Files that change or fail
+during reading keep their stored data and are retried on the next run. Existing
+transcripts without a verified source fingerprint are reprocessed once; subsequent
+runs skip unchanged, verified files.
+
 Supports five chat formats automatically:
 - Claude JSON exports
 - ChatGPT exports

@@ -27,6 +27,12 @@ import stat
 from pathlib import Path
 from typing import Optional
 
+from ._source_state import source_fingerprint
+
+
+class SourceChangedDuringReadError(OSError):
+    """A transcript changed while it was being read; retry on a later pass."""
+
 
 class UnparsedCodexTranscriptError(ValueError):
     """A recognized Codex rollout did not yield a supported conversation."""
@@ -121,7 +127,7 @@ def strip_noise(text: str) -> str:
     return text.strip()
 
 
-def _read_transcript_file(filepath: str) -> str:
+def _read_transcript_file(filepath: str, *, source_metadata: Optional[dict] = None) -> str:
     """Read a transcript source file with the same safety checks normalize()
     and normalize_conversations() both need: no symlinks, regular files only,
     size-capped, BOM-tolerant.
@@ -151,7 +157,18 @@ def _read_transcript_file(filepath: str) -> str:
             raise IOError(f"file too large ({file_stat.st_size // (1024 * 1024)} MB)")
         with os.fdopen(fd, "r", encoding="utf-8-sig", errors="replace") as f:
             fd = -1
-            return f.read()
+            content = f.read()
+            if source_metadata is not None:
+                fingerprint = source_fingerprint(file_stat)
+                if source_fingerprint(os.fstat(f.fileno())) != fingerprint:
+                    raise SourceChangedDuringReadError(f"Source changed while reading {filepath}")
+                source_metadata.update(
+                    source_mtime=file_stat.st_mtime,
+                    source_fingerprint=fingerprint,
+                )
+            return content
+    except SourceChangedDuringReadError:
+        raise
     except OSError as e:
         raise IOError(f"Could not read {filepath}: {e}") from e
     finally:
@@ -189,7 +206,7 @@ def normalize(filepath: str) -> str:
     return content
 
 
-def normalize_conversations(filepath: str) -> list:
+def normalize_conversations(filepath: str, *, source_metadata: Optional[dict] = None) -> list:
     """Like normalize(), but keeps each conversation in a bundle export as a
     separate string instead of joining them into one.
 
@@ -208,8 +225,12 @@ def normalize_conversations(filepath: str) -> list:
     Non-bundle formats (a single Claude Code session, plain text, ...)
     always normalize to one conversation, so this returns a one-element
     list for those — identical dedup granularity to before.
+
+    When supplied, source_metadata receives the state verified against the
+    open file before and after reading. Persist it with the resulting content,
+    rather than sampling the path again when filing.
     """
-    content = _read_transcript_file(filepath)
+    content = _read_transcript_file(filepath, source_metadata=source_metadata)
 
     if not content.strip():
         return []
