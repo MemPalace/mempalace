@@ -944,11 +944,11 @@ def _resolve_embedding_model(model) -> str:
     :class:`UnknownEmbeddingModelError` naming the likely intended model. Any
     other unrecognized value (``"all-minilm-l6-v2"``, an empty string, a JSON
     ``null`` read back as ``"none"``) falls back to ``"minilm"``, as it always
-    has, with a warning logged once per process and value. Every caller
-    resolves through here, so mine, search and MCP writes all embed with the
-    same function for the same configuration. Palaces that record an
-    embedder identity stay protected by the identity check, which keeps
-    comparing the configured name (:func:`current_model_name`).
+    has, with a warning logged once per process and value.
+    :attr:`MempalaceConfig.embedding_model` resolves through here too, so
+    mine, search and MCP writes all embed with the same function for the
+    same configuration, and the identity a palace records and checks
+    (:func:`current_model_name`) is the resolved name.
     """
     name = str(model).strip().lower()
     if name in _KNOWN_EMBEDDING_MODELS:
@@ -1125,10 +1125,15 @@ def current_model_name(model: Optional[str] = None) -> str:
     This is the configured ``embedding_model`` (``"minilm"`` /
     ``"embeddinggemma"`` / ...), not the embedding function's internal
     ``name()`` (which is spoofed to ``"default"`` for ChromaDB compatibility).
+    Unrecognized names resolve to ``"minilm"``, the model that embeds them,
+    and near misses raise :class:`UnknownEmbeddingModelError`.
     """
     from .config import MempalaceConfig
 
-    name = str(model).strip().lower() if model is not None else MempalaceConfig().embedding_model
+    if model is None:
+        name = MempalaceConfig().embedding_model  # already resolved
+    else:
+        name = _resolve_embedding_model(model)
     if name == "embeddinggemma2":
         return get_embedding_function(model=name).identity
     return name

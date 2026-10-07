@@ -1,4 +1,5 @@
 import logging
+import re
 
 import pytest
 
@@ -181,17 +182,25 @@ def test_configured_embeddinggemma_typo_raises_through_the_chroma_backend(monkey
 
 
 @pytest.mark.parametrize(
-    "configured, expected_name",
-    [("all-minilm-l6-v2", "all-minilm-l6-v2"), ("", ""), (None, "none")],
-    ids=["non-canonical", "empty", "null"],
+    "configured, raw",
+    [
+        ("notamodel", "notamodel"),
+        ("all-minilm-l6-v2", "all-minilm-l6-v2"),
+        ("", ""),
+        (None, "none"),
+    ],
+    ids=["unknown", "non-canonical", "empty", "null"],
 )
-def test_configured_unknown_model_falls_back_and_keeps_its_raw_identity(
-    monkeypatch, tmp_path, caplog, configured, expected_name
+def test_configured_unknown_model_falls_back_and_records_minilm(
+    monkeypatch, tmp_path, caplog, configured, raw
 ):
     """The same fallback through ``config.json``, the path mine, search and
-    the MCP server take; the identity name stays the configured string so a
-    palace that recorded it keeps opening."""
+    the MCP server take. The config resolves the name, so the identity a
+    fresh palace records and checks is the model that embeds it, ``minilm``,
+    and correcting the config to ``minilm`` later is not a model swap."""
     import json
+
+    from mempalace.config import MempalaceConfig
 
     (tmp_path / "config.json").write_text(json.dumps({"embedding_model": configured}))
     monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(tmp_path))
@@ -200,22 +209,102 @@ def test_configured_unknown_model_falls_back_and_keeps_its_raw_identity(
     _fake_minilm(monkeypatch)
 
     with caplog.at_level(logging.WARNING, logger=embedding.logger.name):
+        assert MempalaceConfig().embedding_model == "minilm"
         ef = embedding.get_embedding_function()
         assert embedding.get_embedding_function() is ef
         assert embedding.describe_device() == "cpu"
+        assert embedding.current_model_name() == "minilm"
+        assert MempalaceConfig().embedding_model == "minilm"
     assert ef is embedding.get_embedding_function(device="cpu", model="minilm")
-    assert embedding.current_model_name() == expected_name
-    assert len(_fallback_warnings(caplog)) == 1
+    warnings = _fallback_warnings(caplog)
+    assert len(warnings) == 1
+    assert repr(raw) in warnings[0].getMessage()
 
 
 def test_unknown_model_from_the_environment_falls_back(monkeypatch, caplog):
     monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
     monkeypatch.setenv("MEMPALACE_EMBEDDING_DEVICE", "cpu")
     _fake_minilm(monkeypatch)
+    from mempalace.config import MempalaceConfig
+
     with caplog.at_level(logging.WARNING, logger=embedding.logger.name):
         ef = embedding.get_embedding_function()
+        assert MempalaceConfig().embedding_model == "minilm"
+        assert embedding.current_model_name() == "minilm"
     assert ef is embedding.get_embedding_function(device="cpu", model="minilm")
-    assert len(_fallback_warnings(caplog)) == 1
+    warnings = _fallback_warnings(caplog)
+    assert len(warnings) == 1
+    assert "'all-minilm-l6-v2'" in warnings[0].getMessage()
+
+
+@pytest.mark.parametrize("source", ["env", "config.json"])
+@pytest.mark.parametrize(
+    "configured, hint",
+    [
+        ("embeddinggemm2", "did you mean 'embeddinggemma' or 'embeddinggemma2'?"),
+        ("openai", "did you mean 'openai-compat'?"),
+    ],
+)
+def test_config_refuses_near_misses(monkeypatch, tmp_path, caplog, source, configured, hint):
+    """A near miss raises from the config itself, before anything reads the
+    model to stamp an identity or open a palace."""
+    import json
+
+    from mempalace.config import MempalaceConfig
+
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(tmp_path))
+    if source == "env":
+        monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", configured)
+    else:
+        monkeypatch.delenv("MEMPALACE_EMBEDDING_MODEL", raising=False)
+        (tmp_path / "config.json").write_text(json.dumps({"embedding_model": configured}))
+    with caplog.at_level(logging.WARNING, logger=embedding.logger.name):
+        with pytest.raises(embedding.UnknownEmbeddingModelError, match=re.escape(hint)):
+            MempalaceConfig().embedding_model
+        with pytest.raises(embedding.UnknownEmbeddingModelError, match=re.escape(hint)):
+            embedding.current_model_name()
+    assert not _fallback_warnings(caplog)
+
+
+@pytest.mark.parametrize(
+    "configured, expected",
+    [
+        ("minilm", "minilm"),
+        ("EmbeddingGemma", "embeddinggemma"),
+        (" embeddinggemma2 ", "embeddinggemma2"),
+        ("OpenAI-Compat", "openai-compat"),
+    ],
+)
+def test_config_keeps_supported_names(monkeypatch, tmp_path, caplog, configured, expected):
+    import json
+
+    from mempalace.config import MempalaceConfig
+
+    (tmp_path / "config.json").write_text(json.dumps({"embedding_model": configured}))
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_MODEL", raising=False)
+    with caplog.at_level(logging.WARNING, logger=embedding.logger.name):
+        assert MempalaceConfig().embedding_model == expected
+    assert not _fallback_warnings(caplog)
+
+
+def test_search_config_fingerprint_stays_total_for_a_near_miss(monkeypatch, tmp_path):
+    """The Hub fingerprint must never raise; a typo gets its own digest and the
+    direct path reports the actionable error."""
+    import json
+
+    from mempalace.config import MempalaceConfig
+
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_MODEL", raising=False)
+    digests = {}
+    for name in ("embeddinggemm2", "minilm", "notamodel"):
+        (tmp_path / "config.json").write_text(
+            json.dumps({"palace_path": str(tmp_path / "palace"), "embedding_model": name})
+        )
+        digests[name] = MempalaceConfig().search_config_fingerprint
+    assert digests["notamodel"] == digests["minilm"]
+    assert digests["embeddinggemm2"] != digests["minilm"]
 
 
 def test_known_models_do_not_warn(monkeypatch, caplog):

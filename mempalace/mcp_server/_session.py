@@ -327,6 +327,11 @@ def _get_collection(create=False):
                 _collection_cache = None
                 _collection_cache_backend = None
                 _collection_cache_palace = None
+            if create or _collection_cache is None:
+                # Resolve the configured model before _get_client(): building
+                # the client creates the palace folder, and a misspelled model
+                # (UnknownEmbeddingModelError) must leave nothing behind.
+                _config.embedding_model
             client = _get_client()
             # ChromaDB 1.x persists the EF *identity* (its ``name()``) with the
             # collection but not the EF *instance/configuration*. So a reader or

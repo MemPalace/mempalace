@@ -245,3 +245,96 @@ def test_openai_typo_stops_mine_search_and_add_drawer(unknown_model_palace, monk
     client = chromadb.PersistentClient(path=str(palace))
     assert client.get_collection("mempalace_drawers").count() == before
     client.close()
+
+
+def _set_model(config, palace, model):
+    # The fixture keeps config.json next to the palace: tmp_path/config, tmp_path/palace.
+    config_file = palace.parent / "config" / "config.json"
+    config_file.write_text(json.dumps({"palace_path": str(palace), "embedding_model": model}))
+    embedding._EF_CACHE.clear()
+
+
+def _recorded_identity(palace):
+    sidecar = palace / "mempalace_embedder.json"
+    return json.loads(sidecar.read_text())
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["embeddinggemm2", "openai"], indirect=True)
+def test_fresh_mine_with_a_near_miss_leaves_nothing_behind(unknown_model_palace, monkeypatch, kg):
+    """The guard fires before the palace folder, a collection or the identity
+    sidecar exists, so fixing the config afterwards mines normally."""
+    from _mcp_server_helpers import _patch_mcp_server
+
+    from mempalace.config import MempalaceConfig
+    from mempalace.mcp_server import tool_add_drawer
+    from mempalace.miner import mine
+    from mempalace.searcher import search_memories
+
+    project, palace, config = unknown_model_palace
+    with pytest.raises(embedding.UnknownEmbeddingModelError, match="did you mean"):
+        mine(str(project), str(palace))
+    assert not palace.exists()
+    searched = search_memories("greenhouse tomatoes", str(palace))
+    assert searched.get("error"), searched
+    _patch_mcp_server(monkeypatch, MempalaceConfig(config_dir=str(palace.parent / "config")), kg)
+    added = tool_add_drawer(wing="garden", room="notes", content="The compost bin is turned.")
+    assert added.get("success") is not True, added
+    assert "did you mean" in added.get("details", ""), added
+    assert not palace.exists()
+    assert not (palace / "mempalace_embedder.json").exists()
+
+    _set_model(config, palace, "minilm")
+    mine(str(project), str(palace))
+    assert _recorded_identity(palace)["mempalace_drawers"]["model_name"] == "minilm"
+    found = search_memories("greenhouse tomatoes watering", str(palace))
+    assert found.get("results"), found
+
+
+@pytest.mark.parametrize(
+    "unknown_model_palace",
+    ["notamodel", "", None],
+    ids=["unknown", "empty", "null"],
+    indirect=True,
+)
+def test_fresh_mine_with_a_fallback_name_records_minilm(unknown_model_palace, caplog):
+    """A fresh palace mined under the fallback records the model that embedded
+    it, so correcting the config to minilm keeps mining and searching it."""
+    import chromadb
+
+    from mempalace.miner import mine
+    from mempalace.searcher import search_memories
+
+    project, palace, config = unknown_model_palace
+    mine(str(project), str(palace))
+    identity = _recorded_identity(palace)
+    assert {entry["model_name"] for entry in identity.values()} == {"minilm"}, identity
+
+    _set_model(config, palace, "minilm")
+    (project / "notes" / "rain.md").write_text("The rain barrel overflows in April.\n" * 8)
+    with caplog.at_level(logging.WARNING):
+        mine(str(project), str(palace))
+        found = search_memories("rain barrel overflows", str(palace))
+    assert found.get("results"), found
+    assert "rain barrel" in found["results"][0]["text"]
+    assert not [r for r in caplog.records if "embedder identity" in r.getMessage()]
+    client = chromadb.PersistentClient(path=str(palace))
+    assert client.get_collection("mempalace_drawers").count() >= 2
+    client.close()
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+def test_rebuild_with_a_near_miss_refuses_before_archiving(unknown_model_palace):
+    """``repair rebuild-index`` used to archive the palace and only then hit
+    the typo, leaving a half-built palace beside the archive."""
+    from mempalace.miner import mine
+    from mempalace.repair import rebuild_from_sqlite
+
+    project, palace, config = unknown_model_palace
+    mine(str(project), str(palace))
+    before = sorted(p.name for p in palace.parent.iterdir())
+    _set_model(config, palace, "embeddinggemm2")
+
+    with pytest.raises(embedding.UnknownEmbeddingModelError, match="did you mean"):
+        rebuild_from_sqlite(str(palace), str(palace), archive_existing_dest=True)
+    assert sorted(p.name for p in palace.parent.iterdir()) == before
+    assert _recorded_identity(palace)["mempalace_drawers"]["model_name"] == "minilm"

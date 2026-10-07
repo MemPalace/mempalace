@@ -272,13 +272,17 @@ def get_collection(
         allowed = _allowed_wrapper_collection_names()
         if collection_name not in allowed:
             raise CollectionNameMismatchError(collection_name, allowed, palace_path)
+    from ..config import MempalaceConfig
+
+    # Read (and so validate) the configured model before the backend can
+    # create a palace folder, collection or identity sidecar: a misspelled
+    # model name (UnknownEmbeddingModelError) must leave nothing behind.
+    configured_model = MempalaceConfig().embedding_model
     if collection_name == ASSETS_COLLECTION_NAME:
         # Validate provider configuration before opening storage. The identity
         # checker intentionally degrades gracefully for legacy collections,
         # but invalid EmbeddingGemma 2 settings must not be hidden by it.
-        from ..config import MempalaceConfig
-
-        if MempalaceConfig().embedding_model == "embeddinggemma2":
+        if configured_model == "embeddinggemma2":
             from ..embedding import get_embedding_function
 
             get_embedding_function(model="embeddinggemma2")

@@ -1706,6 +1706,18 @@ def _post_rebuild_cleanup(palace_path: str, backend: "ChromaBackend", progress=p
     _vacuum_and_rebuild_fts5(palace_path, progress=progress)
 
 
+def _require_valid_embedding_model() -> None:
+    """Refuse a misspelled ``embedding_model`` before anything is archived or created.
+
+    Reading the config raises :class:`~mempalace.embedding.UnknownEmbeddingModelError`
+    for a near miss; without this the rebuild would archive the palace and
+    only fail once the first collection asks for its embedding function.
+    """
+    from .config import MempalaceConfig
+
+    MempalaceConfig().embedding_model
+
+
 def rebuild_index(
     palace_path=None,
     confirm_truncation_ok: bool = False,
@@ -1739,6 +1751,7 @@ def rebuild_index(
     if not os.path.isdir(palace_path):
         progress(f"\n  No palace found at {palace_path}")
         return
+    _require_valid_embedding_model()
 
     progress(f"\n{'=' * 55}")
     progress("  MemPalace Repair -- Index Rebuild")
@@ -2312,6 +2325,8 @@ def rebuild_from_sqlite(
     """
     source_palace = os.path.abspath(os.path.expanduser(source_palace))
     dest_palace = os.path.abspath(os.path.expanduser(dest_palace))
+    if not dry_run:
+        _require_valid_embedding_model()
 
     src_db = os.path.join(source_palace, "chroma.sqlite3")
 

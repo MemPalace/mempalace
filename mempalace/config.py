@@ -856,7 +856,16 @@ class MempalaceConfig:
             # normal backend opening reports the actionable error.
             backend = self.backend
             backend_resolution_error = f"{type(exc).__name__}: {exc}"
-        embedding_model = self.embedding_model
+        from .embedding import UnknownEmbeddingModelError
+
+        embedding_model_error = None
+        try:
+            embedding_model = self.embedding_model
+        except UnknownEmbeddingModelError as exc:
+            # Same contract as the backend: stay total and let the direct path
+            # report the misspelled model.
+            embedding_model = self._configured_embedding_model()
+            embedding_model_error = f"{type(exc).__name__}: {exc}"
         effective = {
             "backend": backend,
             "collection_name": self.collection_name,
@@ -865,6 +874,8 @@ class MempalaceConfig:
         }
         if backend_resolution_error is not None:
             effective["backend_resolution_error"] = backend_resolution_error
+        if embedding_model_error is not None:
+            effective["embedding_model_error"] = embedding_model_error
         if embedding_model == "openai-compat":
             effective.update(
                 embedding_api_key=self.embedding_api_key,
@@ -1388,7 +1399,21 @@ class MempalaceConfig:
         (different vector space) — ChromaDB rejects reads when the persisted
         EF name doesn't match. Run ``mempalace repair rebuild-index`` after
         changing this value.
+
+        The value is resolved to the embedder that will actually be built
+        (:func:`mempalace.embedding._resolve_embedding_model`): an
+        unrecognized name (including ``""`` and a JSON ``null``) is logged
+        once with the configured value and reads as ``"minilm"``, so the
+        identity a palace records and checks is the model that embeds it. A
+        near miss of a supported name (``"embeddinggemm2"``, ``"openai"``)
+        raises :class:`~mempalace.embedding.UnknownEmbeddingModelError`.
         """
+        from .embedding import _resolve_embedding_model
+
+        return _resolve_embedding_model(self._configured_embedding_model())
+
+    def _configured_embedding_model(self) -> str:
+        """``embedding_model`` as configured (env first), stripped and lowercased."""
         env_val = os.environ.get("MEMPALACE_EMBEDDING_MODEL")
         if env_val:
             return env_val.strip().lower()
@@ -1552,8 +1577,8 @@ class MempalaceConfig:
         Onboarding calls this once on first run. Accepts ``"minilm"``,
         ``"embeddinggemma"``, ``"embeddinggemma2"``, or ``"openai-compat"``;
         other values are normalized to lowercase and persisted
-        (``embedding.get_embedding_function`` falls back to minilm for
-        unrecognized values, with a warning).
+        (:attr:`embedding_model` then reads unrecognized values as minilm,
+        with a warning, and refuses near misses of supported names).
         """
         self._file_config["embedding_model"] = str(model).strip().lower()
         # ``develop`` created the directory here, outside any ``try``, so this
