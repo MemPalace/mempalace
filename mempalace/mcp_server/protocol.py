@@ -858,9 +858,7 @@ def handle_request(request):
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {
-                    "content": [
-                        {"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}
-                    ]
+                    "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]
                 },
             }
         except TypeError as e:

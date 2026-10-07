@@ -1065,6 +1065,27 @@ class Logstream:
 
             order_clause = "DESC" if order == "desc" else "ASC"
             sql = "SELECT rowid, * FROM events"
+            selective = any(
+                value is not None
+                for value in (
+                    topic,
+                    type,
+                    from_agent,
+                    correlation_id,
+                    status,
+                    to_agent,
+                    since_created_at,
+                )
+            )
+            if not selective:
+                # A page ordered by rowid with no selective filter is a scan
+                # in append order with per-row filtering: it stops reading at
+                # LIMIT. Left to the optimizer, the stream index turns the
+                # same page into a sort of every event the room ever held —
+                # the whole room on every page. Selective filters keep the
+                # index path, where the alternative scan would read the whole
+                # log without it.
+                sql += " NOT INDEXED"
             if where:
                 sql += " WHERE " + " AND ".join(where)
             sql += f" ORDER BY rowid {order_clause} LIMIT ?"
