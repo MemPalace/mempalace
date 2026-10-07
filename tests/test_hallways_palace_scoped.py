@@ -34,7 +34,10 @@ class TestHallwayFileResolution:
         # is the frozen legacy constant and is no longer the default base, so the
         # expectation is derived from the resolved ``config_dir`` instead.
         cfg = MempalaceConfig()
-        expected = os.path.join(cfg.config_dir, "hallways.json")
+        # hallway_file is built from the normalized palace_path (abspath), not
+        # from the raw DEFAULT_PALACE_PATH literal — mirror that in the
+        # expectation so the assertion is platform-independent.
+        expected = os.path.join(os.path.dirname(cfg.palace_path), "hallways.json")
         assert cfg.hallway_file == expected
         assert hallways_mod._get_hallway_file(cfg) == expected
 
