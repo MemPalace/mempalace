@@ -84,7 +84,28 @@ SHUTDOWN_DRAIN_SECONDS = 10.0
 # Terminal jobs are kept for diagnostics then pruned so the queue DB (which
 # holds verbatim payloads) doesn't grow without bound across a long-lived
 # daemon. Override via env for operators who want a longer/shorter window.
-JOB_RETENTION_DAYS = int(os.environ.get("MEMPALACE_DAEMON_RETENTION_DAYS", "7") or "7")
+_DEFAULT_JOB_RETENTION_DAYS = 7
+
+
+def _job_retention_days() -> int:
+    """Days a terminal job is retained before the queue DB prunes it.
+
+    Read at module scope, so a value that is not an integer -- a lone space left
+    by a quoted ``MEMPALACE_DAEMON_RETENTION_DAYS=" "``, or ``30d`` -- must fall
+    back to the default rather than raise out of ``import mempalace.daemon``;
+    same rule as ``_lock_defer_backoff_seconds``. A non-positive window stays
+    honored: ``QueueStore.prune_terminal`` reads it as "keep terminal jobs",
+    which is an operator choice, not a typo.
+    """
+    try:
+        return int(
+            os.environ.get("MEMPALACE_DAEMON_RETENTION_DAYS", "") or _DEFAULT_JOB_RETENTION_DAYS
+        )
+    except ValueError:
+        return _DEFAULT_JOB_RETENTION_DAYS
+
+
+JOB_RETENTION_DAYS = _job_retention_days()
 try:
     import fcntl as _fcntl  # POSIX only; absent on Windows
 except ImportError:  # pragma: no cover - Windows fallback

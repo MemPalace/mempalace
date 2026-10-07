@@ -615,6 +615,42 @@ def test_invalid_lock_backoff_env_falls_back_to_the_default(monkeypatch):
     assert daemon._lock_defer_backoff_seconds() == daemon._DEFAULT_LOCK_BACKOFF_SECONDS
 
 
+def test_invalid_retention_days_env_falls_back_to_the_default(monkeypatch):
+    """A non-integer MEMPALACE_DAEMON_RETENTION_DAYS yields the default.
+
+    ``JOB_RETENTION_DAYS`` is read at module scope, so before this guard a value
+    that is not a bare integer -- a lone space left by the quotes in a ``.env``,
+    or ``30d`` -- raised ``ValueError`` out of ``import mempalace.daemon``
+    instead of falling back. Same rule as the lock backoff above: an operator
+    typo must not stop the daemon from importing. Unlike the backoff, ``0`` and
+    negative values stay honored: ``QueueStore.prune_terminal`` reads a
+    non-positive window as "keep terminal jobs", which is a choice an operator
+    makes on purpose."""
+    for bad in ("", " ", "not-a-float", "30d"):
+        monkeypatch.setenv("MEMPALACE_DAEMON_RETENTION_DAYS", bad)
+        assert daemon._job_retention_days() == daemon._DEFAULT_JOB_RETENTION_DAYS, bad
+
+    for honored, expected in (("30", 30), ("0", 0), ("-1", -1)):
+        monkeypatch.setenv("MEMPALACE_DAEMON_RETENTION_DAYS", honored)
+        assert daemon._job_retention_days() == expected, honored
+
+    monkeypatch.delenv("MEMPALACE_DAEMON_RETENTION_DAYS")
+    assert daemon._job_retention_days() == daemon._DEFAULT_JOB_RETENTION_DAYS
+
+
+def test_daemon_imports_with_a_whitespace_retention_env():
+    """The import path, not just the helper: a whitespace override is not fatal."""
+    env = dict(os.environ, MEMPALACE_DAEMON_RETENTION_DAYS=" ")
+    result = subprocess.run(
+        [sys.executable, "-c", "import mempalace.daemon as d; print(d.JOB_RETENTION_DAYS)"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(daemon._DEFAULT_JOB_RETENTION_DAYS)
+
+
 def test_defer_returns_job_to_queued_without_spending_an_attempt(tmp_path, monkeypatch):
     """defer must undo claim_next's increment, so a palace held across many
     claims cannot walk a job to MAX_ATTEMPTS on work that never landed."""
