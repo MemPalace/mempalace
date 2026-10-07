@@ -245,6 +245,408 @@ class TestPalaceReadsDoNotStarveTheHub:
         write_thread.join(timeout=5)
         assert write_started.is_set()
 
+    @staticmethod
+    def _patch_stepwise_mine(monkeypatch, log, files=3, step_s=0.3):
+        """A mine that reaches mine_yield_point() before each of its files."""
+        from mempalace.palace import mine_yield_point
+
+        started = threading.Event()
+
+        def stepwise_mine(**kwargs):
+            started.set()
+            tag = kwargs.get("source", "mine")
+            for i in range(files):
+                mine_yield_point()
+                log.append((f"{tag}:file{i}:start", time.monotonic()))
+                time.sleep(step_s)
+                log.append((f"{tag}:file{i}:end", time.monotonic()))
+            return {"success": True}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_mine"], "handler", stepwise_mine)
+        return started
+
+    def test_a_read_runs_between_the_files_of_a_mine(self, http_server, monkeypatch):
+        """A hub mine held the exclusive lock for its whole run, so a status
+        call waited for all of it. It now runs between files, never inside one."""
+        port, _ = http_server
+        log: list = []
+        mine_started = self._patch_stepwise_mine(monkeypatch, log)
+
+        def quick_search(**_kwargs):
+            log.append(("search", time.monotonic()))
+            return {"query": "x", "results": []}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", quick_search)
+        mine_thread = threading.Thread(
+            target=lambda: self._call(port, "mempalace_mine", {"source": "m"}, req_id=41)
+        )
+        mine_thread.start()
+        assert mine_started.wait(timeout=2)
+        time.sleep(0.05)  # inside file0
+        self._call(port, "mempalace_search", {"query": "x"}, req_id=42)
+        mine_thread.join(timeout=10)
+        assert not mine_thread.is_alive()
+
+        names = [name for name, _ in log]
+        search_at = names.index("search")
+        assert search_at < names.index("m:file2:end"), "the read waited for the whole mine"
+        assert names[search_at - 1].endswith(":end"), f"read ran inside a file: {names}"
+
+    def test_a_second_mine_waits_for_the_first(self, http_server, monkeypatch):
+        port, _ = http_server
+        log: list = []
+        first_started = self._patch_stepwise_mine(monkeypatch, log, files=2, step_s=0.2)
+        first = threading.Thread(
+            target=lambda: self._call(port, "mempalace_mine", {"source": "a"}, req_id=51)
+        )
+        first.start()
+        assert first_started.wait(timeout=2)
+        second = threading.Thread(
+            target=lambda: self._call(port, "mempalace_mine", {"source": "b"}, req_id=52)
+        )
+        second.start()
+        first.join(timeout=10)
+        second.join(timeout=10)
+        names = [name for name, _ in log]
+        assert names.index("a:file1:end") < names.index("b:file0:start"), names
+
+
+class TestEmbeddingDoesNotHoldTheHttpLock:
+    """Embedding inference must not extend how long unrelated requests wait."""
+
+    @staticmethod
+    def _request(port, body, timeout=10):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+        try:
+            conn.request(
+                "POST",
+                "/mcp",
+                json.dumps(body),
+                headers={"Content-Type": "application/json"},
+            )
+            response = conn.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            conn.close()
+
+    def _call(self, port, name, arguments, req_id=1, timeout=10):
+        status, payload = self._request(
+            port,
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            },
+            timeout=timeout,
+        )
+        assert status == 200, payload
+        text = payload["result"]["content"][0]["text"]
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return payload["result"]
+
+    def test_status_completes_while_diary_write_embeds(self, http_server, monkeypatch):
+        """A write's embedding phase must not stall an unrelated status read."""
+
+        port, _ = http_server
+        # Make diary_write call embedding_section then return success.
+        embed_started = threading.Event()
+
+        def slow_diary(**_kwargs):
+            from mempalace.embedding import embedding_section
+
+            with embedding_section():
+                embed_started.set()
+                time.sleep(1.0)
+            return {"success": True}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_diary_write"], "handler", slow_diary)
+
+        def quick_status(**_kwargs):
+            return {"total_drawers": 0, "wings": {}, "rooms": {}}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_status"], "handler", quick_status)
+
+        errors = []
+
+        def writer():
+            try:
+                self._call(
+                    port,
+                    "mempalace_diary_write",
+                    {"agent_name": "a", "entry": "x"},
+                    req_id=61,
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        assert embed_started.wait(timeout=3)
+        started_at = time.perf_counter()
+        result = self._call(port, "mempalace_status", {}, req_id=62)
+        elapsed = time.perf_counter() - started_at
+        thread.join(timeout=5)
+
+        assert not errors, errors
+        assert result["total_drawers"] == 0
+        assert elapsed < 0.5, f"status waited on diary embedding: {elapsed:.3f}s"
+
+    def test_status_completes_while_search_embeds(self, http_server, monkeypatch):
+        port, _ = http_server
+        embed_started = threading.Event()
+
+        def slow_search(**_kwargs):
+            from mempalace.embedding import embedding_section
+
+            with embedding_section():
+                embed_started.set()
+                time.sleep(1.0)
+            return {"query": "x", "results": []}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", slow_search)
+
+        def quick_status(**_kwargs):
+            return {"total_drawers": 0, "wings": {}, "rooms": {}}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_status"], "handler", quick_status)
+
+        errors = []
+
+        def searcher():
+            try:
+                self._call(port, "mempalace_search", {"query": "x"}, req_id=71)
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=searcher)
+        thread.start()
+        assert embed_started.wait(timeout=3)
+        started_at = time.perf_counter()
+        self._call(port, "mempalace_status", {}, req_id=72)
+        elapsed = time.perf_counter() - started_at
+        thread.join(timeout=5)
+
+        assert not errors, errors
+        assert elapsed < 0.5, f"status waited on search embedding: {elapsed:.3f}s"
+
+    def test_write_still_waits_for_search_backend_phase(self, http_server, monkeypatch):
+        """Releasing only around embedding must not let writes overlap a read's backend work."""
+        port, _ = http_server
+        search_backend_started = threading.Event()
+        search_release = threading.Event()
+        write_started = threading.Event()
+
+        def search_with_backend_hold(**_kwargs):
+            from mempalace.embedding import embedding_section
+
+            with embedding_section():
+                time.sleep(0.05)  # brief embed window — lock released
+            search_backend_started.set()
+            search_release.wait(timeout=5)
+            return {"query": "x", "results": []}
+
+        def state_change(**_kwargs):
+            write_started.set()
+            return {"success": True}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", search_with_backend_hold)
+        monkeypatch.setitem(mcp.TOOLS["mempalace_add_drawer"], "handler", state_change)
+
+        search_thread = threading.Thread(
+            target=lambda: self._call(port, "mempalace_search", {"query": "x"}, req_id=81)
+        )
+        search_thread.start()
+        assert search_backend_started.wait(timeout=3)
+        write_thread = threading.Thread(
+            target=lambda: self._call(
+                port,
+                "mempalace_add_drawer",
+                {"wing": "w", "room": "r", "content": "c"},
+                req_id=82,
+            )
+        )
+        write_thread.start()
+        time.sleep(0.25)
+        assert not write_started.is_set(), "write ran during search backend phase"
+        search_release.set()
+        search_thread.join(timeout=5)
+        write_thread.join(timeout=5)
+        assert write_started.is_set()
+
+    def test_cli_compatible_search_keeps_the_request_lock(self, http_server, monkeypatch):
+        """The CLI capture lock is held across embed, so this path must not drop the lease."""
+        port, _ = http_server
+        seen = []
+
+        def cli_search(**_kwargs):
+            from mempalace.embedding import _embedding_section_hook_local
+
+            seen.append(getattr(_embedding_section_hook_local, "hook", None))
+            return {"query": "x", "cli_output": "ok"}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", cli_search)
+        result = self._call(
+            port,
+            "mempalace_search",
+            {"query": "x", "cli_compatible": True},
+            req_id=91,
+        )
+        assert result["cli_output"] == "ok"
+        assert seen == [None]
+
+    def test_plain_search_installs_the_embedding_hook(self, http_server, monkeypatch):
+        port, _ = http_server
+        seen = []
+
+        def plain_search(**_kwargs):
+            from mempalace.embedding import _embedding_section_hook_local
+
+            seen.append(getattr(_embedding_section_hook_local, "hook", None))
+            return {"query": "x", "results": []}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", plain_search)
+        self._call(port, "mempalace_search", {"query": "x"}, req_id=92)
+        assert seen[0] is not None
+
+
+def test_embedding_reacquires_the_request_lock_before_releasing_lifecycle():
+    """Reconnect takes the lifecycle lock first, so it must not win that lock
+    until the embedding request holds its lease again."""
+    entered = threading.Event()
+    release_embed = threading.Event()
+    still_holding = threading.Event()
+    lifecycle_seen = threading.Event()
+    left_request = threading.Event()
+    errors = []
+
+    def embedder():
+        try:
+            with mcp._HTTP_REQUEST_LOCK:
+                with mcp._http_release_request_lock_for_embedding("write"):
+                    entered.set()
+                    assert release_embed.wait(timeout=3)
+                still_holding.set()
+                assert lifecycle_seen.wait(timeout=3)
+            left_request.set()
+        except Exception as exc:
+            errors.append(exc)
+            still_holding.set()
+            left_request.set()
+
+    def reconnect():
+        try:
+            assert entered.wait(timeout=3)
+            with mcp._http_embedding_lifecycle():
+                assert still_holding.is_set()
+                assert mcp._HTTP_REQUEST_LOCK._writer is True
+                lifecycle_seen.set()
+                assert left_request.wait(timeout=3)
+                with mcp._HTTP_REQUEST_LOCK:
+                    assert mcp._HTTP_REQUEST_LOCK._writer is True
+        except Exception as exc:
+            errors.append(exc)
+            lifecycle_seen.set()
+            left_request.set()
+
+    embed_thread = threading.Thread(target=embedder)
+    reconnect_thread = threading.Thread(target=reconnect)
+    embed_thread.start()
+    try:
+        assert entered.wait(timeout=3)
+        reconnect_thread.start()
+        time.sleep(0.2)
+        assert not still_holding.is_set()
+        release_embed.set()
+        embed_thread.join(timeout=5)
+        reconnect_thread.join(timeout=5)
+    finally:
+        release_embed.set()
+        lifecycle_seen.set()
+        left_request.set()
+        embed_thread.join(timeout=5)
+        reconnect_thread.join(timeout=5)
+
+    assert not errors, errors
+    assert still_holding.is_set()
+    assert left_request.is_set()
+
+
+class TestRWLockYield:
+    """_RWLock.yield_write: the handoff a stepwise writer uses between steps."""
+
+    @staticmethod
+    def _in_thread(fn):
+        thread = threading.Thread(target=fn, daemon=True)
+        thread.start()
+        return thread
+
+    def test_queued_reader_runs_before_the_writer_resumes(self):
+        lock = mcp._RWLock()
+        order: list = []
+        lock.acquire_write()
+
+        def reader():
+            with lock.read_lock():
+                order.append("read")
+
+        thread = self._in_thread(reader)
+        time.sleep(0.1)
+        assert order == []  # blocked by the writer
+        lock.yield_write()
+        order.append("writer resumed")
+        thread.join(timeout=2)
+        lock.release_write()
+        assert order == ["read", "writer resumed"]
+
+    def test_queued_writer_takes_its_turn(self):
+        lock = mcp._RWLock()
+        order: list = []
+        lock.acquire_write()
+
+        def writer():
+            with lock:
+                order.append("other writer")
+
+        thread = self._in_thread(writer)
+        time.sleep(0.1)
+        lock.yield_write()
+        order.append("writer resumed")
+        thread.join(timeout=2)
+        lock.release_write()
+        assert order == ["other writer", "writer resumed"]
+
+    def test_no_op_without_waiters_and_for_a_thread_not_holding_it(self):
+        lock = mcp._RWLock()
+        lock.acquire_write()
+        started = time.monotonic()
+        lock.yield_write()
+        assert time.monotonic() - started < 0.05
+        assert lock._writer
+
+        done = threading.Event()
+
+        def stranger():
+            lock.yield_write()
+            done.set()
+
+        self._in_thread(stranger)
+        assert done.wait(timeout=1)
+        assert lock._writer  # still held by this thread
+        lock.release_write()
+
+    def test_readers_still_wait_for_a_queued_writer_outside_a_yield(self):
+        lock = mcp._RWLock()
+        lock.acquire_read()
+        entered = threading.Event()
+        self._in_thread(lock.acquire_write)
+        time.sleep(0.1)  # writer now queued behind our read
+        self._in_thread(lambda: (lock.acquire_read(), entered.set()))
+        assert not entered.wait(timeout=0.2), "writer preference was lost"
+        lock.release_read()
+
 
 def test_healthz_ok(http_server):
     port, _ = http_server

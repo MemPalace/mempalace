@@ -429,10 +429,12 @@ def _installed_dist_state() -> tuple[dict[str, str], dict[str, str]]:
 
 
 # Baseline: what was installed at the moment this module was imported, which is
-# the moment the code being served was loaded. Every watched distribution is
-# already in sys.modules by now — mempalace by definition, chromadb through the
-# unconditional `from chromadb.errors import NotFoundError as _ChromaNotFoundError`
-# above — so this snapshot describes the code actually running.
+# the moment the code being served was loaded. (_apply_server_flags() reads it
+# again, before the first request, if --backend changes what is watched.) Every
+# watched distribution is already in sys.modules by now — mempalace by
+# definition, chromadb through the unconditional
+# `from chromadb.errors import NotFoundError as _ChromaNotFoundError` above — so
+# this snapshot describes the code actually running.
 #
 # Both sides of the comparison are therefore read the same way, from the same
 # metadata, and that is what keeps the gate honest. Comparing a live
@@ -687,6 +689,23 @@ def _normalize_envelope(request: dict) -> "tuple[str, dict]":
     return method, params
 
 
+def _tool_catalog_entry(name: str, tool: dict) -> dict:
+    """Build one tools/list row, including MCP ToolAnnotations when set.
+
+    Plan modes, read-only subagents, and schema-pruning harnesses use
+    ``annotations.readOnlyHint`` to admit inspection tools without a
+    host-side allowlist.
+    """
+    entry = {
+        "name": name,
+        "description": tool["description"],
+        "inputSchema": tool["input_schema"],
+    }
+    if tool.get("read_only"):
+        entry["annotations"] = {"readOnlyHint": True}
+    return entry
+
+
 def handle_request(request):
     global _last_request_time
     if not isinstance(request, dict):
@@ -729,7 +748,7 @@ def handle_request(request):
             "id": req_id,
             "result": {
                 "tools": [
-                    {"name": n, "description": t["description"], "inputSchema": t["input_schema"]}
+                    _tool_catalog_entry(n, t)
                     for n, t in TOOLS.items()
                     if not (_READ_ONLY and n in _READ_ONLY_REFUSED_TOOLS)
                 ]

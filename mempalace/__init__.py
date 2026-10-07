@@ -62,6 +62,13 @@ from .version import __version__  # noqa: E402
 # case future chromadb versions re-introduce real telemetry calls.
 logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.CRITICAL)
 
+# Silencing the logger only hides telemetry; this turns it off. The backend passes
+# ``Settings(anonymized_telemetry=False)`` to every client it opens, and this
+# covers chromadb clients opened by anything else in the process (a notebook, a
+# plugin) that would otherwise inherit ChromaDB's opt-out-by-default. setdefault,
+# so an operator who deliberately exports the variable still wins. (GHSA-8h77)
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+
 # NOTE: the previous block set ``ORT_DISABLE_COREML=1`` on macOS arm64 as a
 # supposed workaround for the #74 ARM64 segfault.  Two problems:
 #

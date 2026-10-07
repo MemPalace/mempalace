@@ -121,3 +121,36 @@ def test_media_search_refuses_disabled_vector_index(indexed_media):
     found = search_memories("screenshot", palace, include_media=True, vector_disabled=True)
     assert "disabled" in found["error"]
     assert provider.calls == []
+
+
+@pytest.mark.parametrize("query_task", ["search", "code"])
+def test_media_query_releases_request_lock_only_during_inference(
+    indexed_media, monkeypatch, query_task
+):
+    palace, provider, _ = indexed_media
+    events = []
+
+    class _Hook:
+        def __enter__(self):
+            events.append("enter")
+
+        def __exit__(self, *_args):
+            events.append("exit")
+
+    method = "embed_code_query" if query_task == "code" else "embed_query"
+    original = getattr(provider, method)
+
+    def encode(input):
+        assert events == ["enter"]
+        events.append("inference")
+        return original(input)
+
+    monkeypatch.setattr(provider, method, encode)
+    embedding.set_embedding_section_hook(lambda: _Hook())
+    try:
+        found = search_memories("screenshot", palace, include_media=True, query_task=query_task)
+    finally:
+        embedding.set_embedding_section_hook(None)
+    assert not found.get("error"), found
+    assert found["results"]
+    assert events == ["enter", "inference", "exit"]

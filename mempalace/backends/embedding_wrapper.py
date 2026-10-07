@@ -43,25 +43,28 @@ def _embed_texts(
     convert to real Python floats. ``.tolist()`` does that in C; the
     ``float(x)`` branch covers embedders that already hand back plain
     sequences.
+
+    Runs under :func:`mempalace.embedding.embedding_section` so a transport
+    can release its request lock for this call only. Callers must invoke this
+    before taking a backend write lock: dropping that lock from inside the
+    embedding function Chroma runs during ``add`` deadlocks with the next writer.
     """
     if not texts:
         return []
-    if embedder is None:
-        from ..embedding import get_embedding_function
+    from ..embedding import embedding_section, get_embedding_function
 
-        ef = get_embedding_function()
-    else:
-        ef = embedder
-    if query and callable(getattr(ef, "embed_query", None)):
-        vectors = ef.embed_query(input=texts)
-    elif not query and callable(getattr(ef, "embed_documents", None)):
-        method = ef.embed_documents
-        if _supports_metadata_aware_documents(ef):
-            vectors = method(input=texts, metadatas=metadatas)
+    with embedding_section():
+        ef = get_embedding_function() if embedder is None else embedder
+        if query and callable(getattr(ef, "embed_query", None)):
+            vectors = ef.embed_query(input=texts)
+        elif not query and callable(getattr(ef, "embed_documents", None)):
+            method = ef.embed_documents
+            if _supports_metadata_aware_documents(ef):
+                vectors = method(input=texts, metadatas=metadatas)
+            else:
+                vectors = method(input=texts)
         else:
-            vectors = method(input=texts)
-    else:
-        vectors = ef(input=texts)
+            vectors = ef(input=texts)
     return [
         v.tolist() if hasattr(v, "tolist") else [float(x) for x in v]  # numpy | plain sequence
         for v in vectors

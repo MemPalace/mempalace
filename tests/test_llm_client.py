@@ -210,6 +210,79 @@ def test_openai_compat_resolves_url_with_existing_v1():
     assert captured["url"] == "http://h:1234/v1/chat/completions"
 
 
+def test_openai_compat_think_false_sends_reasoning_effort_none():
+    captured = {}
+
+    def fake_urlopen(req, *, timeout):
+        captured["body"] = json.loads(req.data)
+        return _mock_openai_response('{"ok": true}')
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        p = OpenAICompatProvider(model="x", endpoint="http://h")
+        p.classify("s", "u", think=False)
+        assert captured["body"]["reasoning_effort"] == "none"
+        p.classify("s", "u")
+        assert "reasoning_effort" not in captured["body"]
+
+
+def test_openai_compat_retries_without_reasoning_effort_on_400():
+    from urllib.error import HTTPError
+
+    bodies = []
+
+    def fake_urlopen(req, *, timeout):
+        body = json.loads(req.data)
+        bodies.append(body)
+        if "reasoning_effort" in body:
+            raise HTTPError(req.full_url, 400, "unknown field", hdrs=None, fp=None)
+        return _mock_openai_response('{"ok": true}')
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        p = OpenAICompatProvider(model="x", endpoint="http://h")
+        assert p.classify("s", "u", think=False).text == '{"ok": true}'
+    assert len(bodies) == 2 and "reasoning_effort" not in bodies[1]
+
+
+def test_openai_compat_empty_content_after_length_cutoff_names_the_cause():
+    mock = MagicMock()
+    payload = {"choices": [{"finish_reason": "length", "message": {"content": ""}}]}
+    mock.read.return_value = json.dumps(payload).encode()
+    mock.__enter__.return_value = mock
+    mock.__exit__.return_value = False
+    with patch("mempalace.llm_client.urlopen", return_value=mock):
+        p = OpenAICompatProvider(model="x", endpoint="http://h")
+        with pytest.raises(LLMError, match="finish_reason=length"):
+            p.classify("s", "u")
+
+
+def _models_response(ids):
+    mock = MagicMock()
+    mock.read.return_value = json.dumps({"data": [{"id": i} for i in ids]}).encode()
+    mock.__enter__.return_value = mock
+    mock.__exit__.return_value = False
+    return mock
+
+
+def test_openai_compat_auto_model_follows_the_served_model():
+    with patch("mempalace.llm_client.urlopen", return_value=_models_response(["qwen3.8-27b"])):
+        p = OpenAICompatProvider(model="auto", endpoint="http://h:1")
+        assert p.check_available() == (True, "ok")
+        assert p.model == "qwen3.8-27b"
+
+
+def test_openai_compat_check_warns_but_passes_on_model_mismatch(caplog):
+    # A gateway's listing may be partial or spelled differently; the request
+    # decides, so a mismatch is a warning that names the served models.
+    with patch("mempalace.llm_client.urlopen", return_value=_models_response(["other"])):
+        p = OpenAICompatProvider(model="gone", endpoint="http://h:1")
+        with caplog.at_level("WARNING", logger="mempalace_llm"):
+            ok, msg = p.check_available()
+    assert ok and msg == "ok"
+    assert "other" in caplog.text and "auto" in caplog.text
+    with patch("mempalace.llm_client.urlopen", return_value=_models_response([])):
+        assert OpenAICompatProvider(model="x", endpoint="http://h:1").check_available()[0]
+
+
 def test_openai_compat_requires_endpoint():
     p = OpenAICompatProvider(model="x")
     with pytest.raises(LLMError, match="requires --llm-endpoint"):
@@ -348,6 +421,36 @@ def test_ollama_provider_default_endpoint_is_local():
     )
 
 
+def test_single_label_hostname_is_local_only_when_it_resolves_privately(monkeypatch):
+    import socket
+
+    from mempalace.llm_client import _endpoint_is_local
+
+    def fake_getaddrinfo(host, *a, **k):
+        table = {
+            "gpu-box": [("192.168.1.20",), ("fe80::1%en0",)],
+            "llm": [("8.8.8.8",)],
+            "mixed": [("10.0.0.5",), ("8.8.8.8",)],
+        }
+        if host not in table:
+            raise socket.gaierror("no such host")
+        return [(None, None, None, None, addr) for addr in table[host]]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    assert _endpoint_is_local("http://gpu-box:8010")
+    assert _endpoint_is_local("http://gpu-box:11434/v1")
+    # A search domain can expand a bare label to a public host: external.
+    assert not _endpoint_is_local("http://llm:8010/v1")
+    assert not _endpoint_is_local("http://mixed:8010/v1")
+    # Unresolvable is external too; the consent flag remains the override.
+    assert not _endpoint_is_local("http://nowhere:8010/v1")
+    # An IPv6 literal is dotless too, but it is an address, not a LAN name.
+    assert not _endpoint_is_local("http://[2606:4700:4700::1111]:8010/v1")
+    assert _endpoint_is_local("http://[::1]:8010/v1")
+    assert not _endpoint_is_local("https://api.openai.com")
+    assert not _endpoint_is_local("http://gpu-box.example.com:8010")
+
+
 def test_openai_compat_provider_localhost_endpoint_is_local():
     """LM Studio / llama.cpp server / vLLM commonly bind to localhost.
     Those setups must NOT trigger the external-API warning."""
@@ -483,3 +586,88 @@ def test_ollama_api_key_source_is_none():
     p = OllamaProvider(model="gemma4:e4b")
     assert p.api_key is None
     assert p.api_key_source is None
+
+
+def test_private_range_prefixes_in_a_hostname_are_not_private():
+    """A domain that merely starts like a private range is still a domain."""
+    from mempalace.llm_client import _endpoint_is_local
+
+    for url in (
+        "https://10.example.com/v1",
+        "https://192.168.example.com/v1",
+        "https://172.16.example.com/v1",
+        "https://100.64.example.com/v1",
+        "https://fd.example.com/v1",
+        "https://fdroid.example.org/v1",
+        "https://fc-llm.example.net/v1",
+    ):
+        assert not _endpoint_is_local(url), url
+
+
+def test_private_ip_literals_stay_local_and_neighbours_do_not():
+    from mempalace.llm_client import _endpoint_is_local
+
+    for url in (
+        "http://10.0.0.5:8000",
+        "http://172.16.0.1:8000",
+        "http://172.31.255.254:8000",
+        "http://192.168.1.20:11434",
+        "http://100.64.0.1:8000",
+        "http://100.127.255.254:8000",
+        "http://[fd00::1]:8000",
+        "http://[fe80::1]:8000",
+        "http://127.0.0.1:8000",
+    ):
+        assert _endpoint_is_local(url), url
+    for url in (
+        "http://172.32.0.1:8000",
+        "http://100.128.0.1:8000",
+        "http://100.63.255.255:8000",
+        "http://8.8.8.8:8000",
+    ):
+        assert not _endpoint_is_local(url), url
+
+
+def test_dot_local_names_are_resolved_not_trusted(monkeypatch):
+    """Office networks reuse .local for unicast DNS; the suffix proves nothing."""
+    import socket
+
+    from mempalace.llm_client import _endpoint_is_local
+
+    table = {"studio.local": "192.168.1.9", "corp.local": "8.8.8.8"}
+
+    def fake_getaddrinfo(host, *a, **k):
+        if host not in table:
+            raise socket.gaierror("no such host")
+        return [(None, None, None, None, (table[host], 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    assert _endpoint_is_local("http://studio.local:11434")
+    assert not _endpoint_is_local("http://corp.local:11434")
+    assert not _endpoint_is_local("http://gone.local:11434")
+
+
+def _served_models_request(monkeypatch, *, accepted):
+    """The Request an openai-compat model listing sends, for an env-resolved key
+    and an external endpoint."""
+    monkeypatch.setenv("OPENAI_API_KEY", "env-key")
+    listing = MagicMock()
+    listing.read.return_value = json.dumps({"data": [{"id": "m"}]}).encode()
+    listing.__enter__.return_value = listing
+    listing.__exit__.return_value = False
+    p = OpenAICompatProvider(model="auto", endpoint="https://api.example.com")
+    assert p.api_key_source == "env" and p.is_external_service
+    p.external_use_accepted = accepted
+    with patch("mempalace.llm_client.urlopen", return_value=listing) as opened:
+        assert p.served_models() == ["m"]
+    return opened.call_args[0][0]
+
+
+def test_served_models_withholds_env_key_from_external_endpoint_without_consent(monkeypatch):
+    request = _served_models_request(monkeypatch, accepted=False)
+    assert request.get_header("Authorization") is None
+
+
+def test_served_models_sends_env_key_once_external_use_is_accepted(monkeypatch):
+    request = _served_models_request(monkeypatch, accepted=True)
+    assert request.get_header("Authorization") == "Bearer env-key"

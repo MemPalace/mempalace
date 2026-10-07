@@ -248,13 +248,24 @@ TOOLS = {
         "handler": tool_delete_tunnel,
     },
     "mempalace_list_hallways": {
-        "description": "List within-wing hallway records (entity-to-entity co-occurrence links built at mine time). Optionally filter by wing.",
+        "description": "List within-wing hallway records (entity-to-entity co-occurrence links built at mine time), strongest first, paged. Optionally filter by wing. Returns {hallways, total, count, offset, limit}.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "wing": {
                     "type": "string",
                     "description": "Filter hallways by wing",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Page size (default 100, max 500)",
+                    "minimum": 1,
+                    "maximum": 500,
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Offset for pagination (default 0)",
+                    "minimum": 0,
                 },
             },
         },
@@ -284,7 +295,11 @@ TOOLS = {
         "handler": tool_follow_tunnels,
     },
     "mempalace_search": {
-        "description": "Semantic search. Returns verbatim drawer content with similarity scores. IMPORTANT: 'query' must contain ONLY search keywords. Use 'context' for background. Results with cosine distance > max_distance are filtered out.",
+        "description": (
+            "Search past-session memories. Returns matching drawers. "
+            "Not for the current conversation — if it happened in this "
+            "session, answer from context instead."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -454,6 +469,32 @@ TOOLS = {
         },
         "handler": tool_delete_drawer,
     },
+    "mempalace_delete_drawers": {
+        "description": (
+            "Delete many drawers by ID in one call — the bulk form of "
+            "mempalace_delete_drawer. Each ID is removed the same way as the "
+            "singular tool: a logical drawer id removes the whole group, "
+            "including its chunk rows, and a physical chunk id removes that "
+            "one row. Irreversible. A missing ID is an item in `results` and "
+            "is counted in `errors`; the rest of the batch still runs. An "
+            "accepted call (1 to 500 IDs) always returns `results` plus "
+            "`deleted`/`errors` totals, including a one-ID call. An empty "
+            "list, a non-list, or more than 500 IDs is rejected with `error` "
+            "and deletes nothing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "drawer_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "One or more drawer IDs to delete (max 500)",
+                },
+            },
+            "required": ["drawer_ids"],
+        },
+        "handler": tool_delete_drawers,
+    },
     "mempalace_mine": {
         "description": (
             "Mine a directory into the palace — the MCP equivalent of `mempalace mine`. "
@@ -502,6 +543,14 @@ TOOLS = {
                     "description": (
                         "Convos extraction strategy: exchange (default) or general. "
                         "Ignored by other modes."
+                    ),
+                },
+                "include_ignored": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Project-relative paths to scan even if ignored, matching CLI "
+                        "--include-ignored. Projects mode only; default: []."
                     ),
                 },
             },
@@ -555,6 +604,32 @@ TOOLS = {
             "required": ["drawer_id"],
         },
         "handler": tool_get_drawer,
+    },
+    "mempalace_get_drawers": {
+        "description": (
+            "Fetch many drawers by ID in one call — the bulk form of "
+            "mempalace_get_drawer for a caller that already holds a list of IDs. "
+            "Each ID resolves the same way as the singular tool (a logical id "
+            "reassembles the chunk group; a physical chunk id returns that row) "
+            "and returns the same per-drawer payload. An ID that does not "
+            "resolve is an item in `results` and is counted in `errors`; the "
+            "rest of the batch still returns. An accepted call (1 to 500 IDs) "
+            "always returns `results`, including a one-ID call. An empty list, "
+            "a non-list, or more than 500 IDs is rejected with `error` and "
+            "does not read the palace."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "drawer_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "One or more drawer IDs to fetch (max 500)",
+                },
+            },
+            "required": ["drawer_ids"],
+        },
+        "handler": tool_get_drawers,
     },
     "mempalace_list_drawers": {
         "description": "List drawers with pagination. Optional wing/room filter and since/before date filter on filed_at (since inclusive, before exclusive; drawers without a parseable filed_at are excluded when a date bound is set). Returns IDs, wings, rooms, content previews, and total matching count for pagination.",
@@ -816,8 +891,9 @@ TOOLS = {
             " peer's event syncs in whenever it arrives, so it can already be older than a"
             " timestamp cursor and be missed permanently; since_created_at is a time window"
             " ('what happened today'), not a cursor. Pass preview=true when sweeping a busy"
-            " stream. to_agent=<you> also matches '*' broadcasts. To wait for future events, use"
-            " mempalace_event_wait."
+            " stream. to_agent=<you> also matches '*' broadcasts. writer=<agent> filters by who"
+            " wrote an event; from_agent is your identity and never filters. To wait for"
+            " future events, use mempalace_event_wait."
         ),
         "input_schema": {
             "type": "object",
@@ -830,7 +906,17 @@ TOOLS = {
                     "type": "string",
                     "description": "Filter by target agent; also matches '*' broadcasts (optional)",
                 },
-                "from_agent": {"type": "string", "description": "Filter by writer (optional)"},
+                "from_agent": {
+                    "type": "string",
+                    "description": (
+                        "Your agent identity (optional). NOT a filter: it never narrows the result."
+                        " To filter by who wrote an event use writer."
+                    ),
+                },
+                "writer": {
+                    "type": "string",
+                    "description": "Filter by the agent that wrote the event (optional)",
+                },
                 "correlation_id": {
                     "type": "string",
                     "description": "Filter by correlation id (optional)",
@@ -894,7 +980,17 @@ TOOLS = {
                     "type": "string",
                     "description": "Filter by target agent; also matches '*' broadcasts (optional)",
                 },
-                "from_agent": {"type": "string", "description": "Filter by writer (optional)"},
+                "from_agent": {
+                    "type": "string",
+                    "description": (
+                        "Your agent identity (optional). NOT a filter: it never narrows the result."
+                        " To filter by who wrote an event use writer."
+                    ),
+                },
+                "writer": {
+                    "type": "string",
+                    "description": "Filter by the agent that wrote the event (optional)",
+                },
                 "correlation_id": {
                     "type": "string",
                     "description": "Filter by correlation id (optional)",
@@ -1020,6 +1116,30 @@ TOOLS = {
         "handler": tool_patch_submit,
     },
 }
+
+# MCP ToolAnnotations.readOnlyHint for clients that hide mutating tools
+# (plan modes, read-only subagents). Only tools that do not change state
+# belong here. Server --read-only uses the wider _READ_ONLY_REFUSED_TOOLS
+# set: mempalace_memories_filed_away unlinks the checkpoint ack file, so it
+# stays refused there and must not advertise readOnlyHint (MCP default is
+# false when the annotation is omitted).
+for _read_only_name in (
+    "mempalace_status",
+    "mempalace_list_wings",
+    "mempalace_list_rooms",
+    "mempalace_get_taxonomy",
+    "mempalace_get_aaak_spec",
+    "mempalace_search",
+    "mempalace_check_duplicate",
+    "mempalace_get_drawer",
+    "mempalace_get_drawers",
+    "mempalace_list_drawers",
+    "mempalace_diary_read",
+    "mempalace_kg_query",
+    "mempalace_kg_timeline",
+    "mempalace_kg_stats",
+):
+    TOOLS[_read_only_name]["read_only"] = True
 
 
 SUPPORTED_PROTOCOL_VERSIONS = [

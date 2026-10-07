@@ -36,6 +36,9 @@ from .palace import (
     get_collection,
     mine_lock,
     mine_palace_lock,
+    mine_yield_point,
+    palace_write_serial,
+    prefetch_complete_mtimes,
     purge_file_closets,
     upsert_closet_lines,
 )
@@ -47,6 +50,7 @@ from .palace import (
 from .collision_scan import assert_no_collisions
 from .hallways import compute_hallways_for_wing
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
+from .source_identity import source_directory_identity
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -912,6 +916,39 @@ def _registry_write_target(registry_path):
     return registry_path
 
 
+# ``mkstemp`` is not usable where a permission error has to reach the caller.
+# On Windows it treats ``PermissionError`` as a name collision and tries the
+# next candidate, up to ``tempfile.TMP_MAX`` of them. That constant is 20 on
+# Python 3.13 and later, and ``os.TMP_MAX`` -- 2_147_483_647 -- on 3.12 and
+# earlier, where the sweep runs for hours at roughly 21_000 names a second and
+# reads as a hang. Both callers below need the error instead: it is how they
+# learn the directory takes no new names. (#2530)
+_TEMP_NAME_ATTEMPTS = 8
+
+
+def _open_new_temp_file(directory, prefix: str, suffix: str = ""):
+    """Create one new file under ``directory`` and return ``(fd, path)``.
+
+    Only a name already taken is retried, and only ``_TEMP_NAME_ATTEMPTS``
+    times. Every other ``OSError`` -- ``EPERM``, ``EACCES``, ``EROFS`` among
+    them -- is raised for the caller to act on, which is what ``mkstemp``
+    cannot be relied on to do. Exhausting the attempts raises
+    ``FileExistsError``, as ``mkstemp`` does.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    names = tempfile._get_candidate_names()
+    for _ in range(_TEMP_NAME_ATTEMPTS):
+        candidate = os.path.join(str(directory), f"{prefix}{next(names)}{suffix}")
+        try:
+            return os.open(candidate, flags, 0o600), candidate
+        except FileExistsError:
+            continue
+    raise FileExistsError(
+        errno.EEXIST,
+        f"no usable temporary file name found in {directory} after {_TEMP_NAME_ATTEMPTS} attempts",
+    )
+
+
 def _keep_unmergeable_registry(registry_path) -> Optional[str]:
     """Move a registry this call could not merge aside, keeping its bytes.
 
@@ -929,8 +966,8 @@ def _keep_unmergeable_registry(registry_path) -> Optional[str]:
 
     registry_path = _registry_write_target(registry_path)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    fd, target = tempfile.mkstemp(
-        dir=str(registry_path.parent),
+    fd, target = _open_new_temp_file(
+        registry_path.parent,
         prefix=f"{registry_path.name}.unreadable-{stamp}-",
     )
     os.close(fd)
@@ -1037,8 +1074,8 @@ def _publish_registry(registry_path, payload: dict) -> None:
         # directory for a name of its own instead: what it says about a name
         # it chooses is about the directory.
         try:
-            fd, tmp = tempfile.mkstemp(
-                dir=str(registry_path.parent),
+            fd, tmp = _open_new_temp_file(
+                registry_path.parent,
                 prefix=f".{registry_path.name}.",
                 suffix=".tmp",
             )
@@ -1707,6 +1744,7 @@ def _build_drawer_metadata(
     content_date: Optional[str] = None,
     chunk_total: Optional[int] = None,
     content_date_source: Optional[str] = None,
+    source_dir_ino: Optional[str] = None,
 ) -> dict:
     """Build the metadata dict for one drawer without upserting.
 
@@ -1726,6 +1764,14 @@ def _build_drawer_metadata(
     ``content_date_source`` records which extraction tier supplied the
     date: filename, frontmatter, body, or mtime. A supplied date with no
     recorded source is marked ``unknown``, never inferred retroactively.
+
+    ``source_dir_ino`` — the inode of the directory this file was read
+    from, as ``source_identity`` takes it. ``sync`` compares it against the
+    inode answering at the moment the verdict is formed, so a volume that is
+    away, a volume mounted in its place, and a bind mount over it all fail to
+    corroborate a removal. ``None`` when the directory could not be stat'ed,
+    and the key is then absent, which leaves that drawer exactly where it
+    was.
 
     ``chunk_total`` — the total number of chunks this mining pass expects
     to write for ``source_file`` (see #21). Every chunk of the same pass
@@ -1756,6 +1802,8 @@ def _build_drawer_metadata(
         metadata["content_date_source"] = content_date_source or "unknown"
     if chunk_total is not None:
         metadata["chunk_total"] = chunk_total
+    if source_dir_ino:
+        metadata["source_dir_ino"] = source_dir_ino
     metadata["hall"] = detect_hall(content)
     entities = _extract_entities_for_metadata(content)
     if entities:
@@ -1777,8 +1825,18 @@ def add_drawer(
         source_mtime = os.path.getmtime(source_file)
     except OSError:
         source_mtime = None
+    # An external caller's drawer names a source file the same way a mined one
+    # does, and ``sync`` decides both by the same rule (#2320).
+    source_dir_ino = source_directory_identity(source_file)
     metadata = _build_drawer_metadata(
-        wing, room, source_file, chunk_index, agent, content, source_mtime
+        wing,
+        room,
+        source_file,
+        chunk_index,
+        agent,
+        content,
+        source_mtime,
+        source_dir_ino=source_dir_ino,
     )
     collection.upsert(
         documents=[content],
@@ -1791,6 +1849,24 @@ def add_drawer(
 # =============================================================================
 # PROCESS ONE FILE
 # =============================================================================
+
+
+def _prefetched_as_mined(source_file: str, mined_mtimes: Optional[dict]) -> bool:
+    """True when the prefetched groups prove ``file_already_mined()`` would
+    return True: a complete group's stored mtime matches the file's on-disk
+    mtime within the same 1 ms tolerance. False means "ask the palace", never
+    "not mined".
+    """
+    if not mined_mtimes:
+        return False
+    stored = mined_mtimes.get(source_file)
+    if not stored:
+        return False
+    try:
+        current_mtime = os.path.getmtime(source_file)
+    except OSError:
+        return False
+    return any(abs(mtime - current_mtime) < 0.001 for mtime in stored)
 
 
 def process_file(
@@ -1806,6 +1882,7 @@ def process_file(
     chunk_overlap: int = None,
     min_chunk_size: int = None,
     max_chunks_per_file: Optional[int] = None,
+    mined_mtimes: Optional[dict] = None,
 ) -> tuple:
     """Read, chunk, route, and file one file.
 
@@ -1815,12 +1892,19 @@ def process_file(
     too-short content (below ``min_chunk_size``). It is ``"chunk_cap"``
     when the per-file chunk cap aborted the file. Callers use the tag to
     surface a separate counter in the mine summary (see #1455).
+
+    ``mined_mtimes`` is :func:`prefetch_complete_mtimes`'s map for this
+    mine. A file it proves already filed is skipped without querying the
+    palace; any other file goes through ``file_already_mined()``.
     """
     effective_min = min_chunk_size if min_chunk_size is not None else MIN_CHUNK_SIZE
 
     # Skip if already filed
     source_file = str(filepath)
-    if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
+    if not dry_run and (
+        _prefetched_as_mined(source_file, mined_mtimes)
+        or file_already_mined(collection, source_file, check_mtime=True)
+    ):
         return 0, "general", None
 
     read_result = _read_text_no_follow(filepath, project_path)
@@ -1902,6 +1986,13 @@ def process_file(
         # and silently, permanently skips the appended tail.
         source_mtime = read_mtime
 
+        # Which directory this file is being read from, taken as its inode
+        # so ``sync`` can ask the same question later. Nothing is written to
+        # the source tree for this. A directory that cannot be stat'ed answers
+        # None and the drawers carry no identity, which is what every drawer
+        # filed before this looked like.
+        source_dir_ino = source_directory_identity(filepath)
+
         # Tier 6a content-date: extract once per file (not per chunk) and
         # share across all chunks. Reads filename / frontmatter / content /
         # mtime hierarchy. Returns None when nothing usable found → caller
@@ -1942,6 +2033,7 @@ def process_file(
                             content_date=file_content_date,
                             chunk_total=len(chunks),
                             content_date_source=file_content_date_source,
+                            source_dir_ino=source_dir_ino,
                         )
                     )
                 assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
@@ -2219,6 +2311,7 @@ def _mine_impl(
 ):
     from .config import MempalaceConfig
 
+    writes_at_start = palace_write_serial()
     project_path = Path(project_dir).expanduser().resolve()
     config = load_config(project_dir)
     palace_config = MempalaceConfig()
@@ -2265,9 +2358,14 @@ def _mine_impl(
     if not dry_run:
         collection = get_collection(palace_path)
         closets_col = get_closets_collection(palace_path)
+        # One sqlite pass instead of one get(where=source_file) per file,
+        # which costs ~0.1 s each on a 1M-drawer palace (#2684). None on
+        # other backends: every file then takes the per-file check.
+        mined_mtimes = prefetch_complete_mtimes(collection, [str(f) for f in files])
     else:
         collection = None
         closets_col = None
+        mined_mtimes = None
 
     total_drawers = 0
     files_mined = 0
@@ -2280,6 +2378,7 @@ def _mine_impl(
 
     try:
         for i, filepath in enumerate(files, 1):
+            mine_yield_point()
             try:
                 drawers, room, skip_reason = process_file(
                     filepath=filepath,
@@ -2298,6 +2397,7 @@ def _mine_impl(
                     # otherwise a malformed env var would emit its warning
                     # per file.
                     max_chunks_per_file=effective_chunk_cap,
+                    mined_mtimes=mined_mtimes,
                 )
             except KeyboardInterrupt:
                 # Re-raise so the outer handler prints the summary; we
@@ -2376,7 +2476,7 @@ def _mine_impl(
                     file=sys.stderr,
                 )
 
-            _validate_palace_fts5_after_mine(palace_path)
+            _validate_palace_fts5_after_mine(palace_path, writes_since=writes_at_start)
 
         print(f"\n{'=' * 55}")
         print("  Done.")

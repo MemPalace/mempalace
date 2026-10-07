@@ -33,7 +33,7 @@ def search_with_media(
     Missing asset files remain searchable references with ``available=False``.
     """
     from ..palace import ASSETS_COLLECTION_NAME
-    from ..embedding import get_embedding_function
+    from ..embedding import embedding_section, get_embedding_function
     from . import (
         _distance_to_similarity,
         _result_date_fields,
@@ -84,10 +84,11 @@ def search_with_media(
             collections.append((result_type, col))
         if not collections:
             raise ValueError("No text or media index found; mine the sandbox corpus first")
-        ef = get_embedding_function()
-        query_vectors = (
-            ef.embed_code_query([query]) if query_task == "code" else ef.embed_query([query])
-        )
+        with embedding_section():
+            ef = get_embedding_function()
+            query_vectors = (
+                ef.embed_code_query([query]) if query_task == "code" else ef.embed_query([query])
+            )
         candidates = []
         fetched = 0
         pool_full = False

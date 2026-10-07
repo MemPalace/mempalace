@@ -342,6 +342,58 @@ def test_minilm_ef_model_override_falls_back_when_uncapped(monkeypatch):
     assert captured["sess_options"].intra_op_num_threads == 0
 
 
+def _max_concurrent_forwards(monkeypatch, providers, n_threads):
+    """Run ``_forward`` from ``n_threads`` threads and return peak overlap.
+
+    The upstream ``_forward`` is replaced by a stub that only counts how many
+    calls are inside it at once, so no model is downloaded or loaded.
+    """
+    import threading
+    import time
+
+    from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
+
+    state = {"in_flight": 0, "max": 0}
+    lock = threading.Lock()
+
+    def counting_forward(self, documents, batch_size=32):
+        with lock:
+            state["in_flight"] += 1
+            state["max"] = max(state["max"], state["in_flight"])
+        time.sleep(0.05)
+        with lock:
+            state["in_flight"] -= 1
+        return [[0.0]] * len(documents)
+
+    monkeypatch.setattr(ONNXMiniLM_L6_V2, "_forward", counting_forward)
+    ef = embedding._build_ef_class()(preferred_providers=providers)
+    start = threading.Barrier(n_threads)
+
+    def worker():
+        start.wait(timeout=5)
+        ef._forward(["doc"])
+
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    return state["max"]
+
+
+def test_minilm_ef_serializes_runs_on_dml(monkeypatch):
+    """ONNX Runtime does not support concurrent Run() on a DirectML session;
+    overlapping calls fault with an access violation and kill the MCP HTTP
+    server, whose request threads share one cached EF instance."""
+    providers = ["DmlExecutionProvider", "CPUExecutionProvider"]
+    assert _max_concurrent_forwards(monkeypatch, providers, 4) == 1
+
+
+def test_minilm_ef_does_not_serialize_cpu_runs(monkeypatch):
+    """The DirectML guard must leave concurrent-safe providers parallel."""
+    assert _max_concurrent_forwards(monkeypatch, ["CPUExecutionProvider"], 4) > 1
+
+
 def test_describe_device_uses_resolved_effective_device(monkeypatch):
     monkeypatch.setattr(
         embedding,
@@ -472,6 +524,43 @@ def test_embed_texts_handles_plain_sequence_embedders(monkeypatch):
     for row in vectors:
         assert isinstance(row, list)
         assert all(type(x) is float for x in row), f"got {type(row[0])}, not builtin float"
+
+
+def test_collection_add_embeds_before_the_inner_write(monkeypatch):
+    """The request lock may drop during inference. That window has to close
+    before the backend write, which holds the palace lock."""
+    from mempalace.backends.embedding_wrapper import EmbeddingCollection
+    from mempalace.embedding import set_embedding_section_hook
+
+    events = []
+
+    class _Hook:
+        def __enter__(self):
+            events.append("enter")
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("exit")
+            return False
+
+    set_embedding_section_hook(lambda: _Hook())
+    try:
+        monkeypatch.setattr(
+            embedding,
+            "get_embedding_function",
+            lambda device=None, model=None: lambda input: [[0.5, 0.5]],
+        )
+
+        class _Inner:
+            def add(self, *, documents, ids, metadatas=None, embeddings=None):
+                events.append("write")
+                assert embeddings == [[0.5, 0.5]]
+
+        EmbeddingCollection(_Inner()).add(documents=["hello"], ids=["1"])
+    finally:
+        set_embedding_section_hook(None)
+
+    assert events == ["enter", "exit", "write"]
 
 
 def test_embed_texts_short_circuits_on_empty_input(monkeypatch):

@@ -12,19 +12,29 @@ if __name__ != "mempalace.mcp_server":
 # every other reader. Protocol methods and independent stores bypass this
 # lock; palace reads share it; palace writes take it exclusively.
 class _RWLock:
-    """Writer-preferring readers-writer lock."""
+    """Writer-preferring readers-writer lock that a long writer can yield."""
 
     def __init__(self):
         self._cond = threading.Condition(threading.Lock())
         self._readers = 0
         self._writer = False
+        self._writer_ident = None
         self._waiting_writers = 0
+        self._waiting_readers = 0
+        # True while a yielding writer lets queued readers in (yield_write).
+        self._handoff = False
 
     def acquire_read(self) -> None:
         with self._cond:
-            while self._writer or self._waiting_writers:
-                self._cond.wait()
+            self._waiting_readers += 1
+            try:
+                while self._writer or (self._waiting_writers and not self._handoff):
+                    self._cond.wait()
+            finally:
+                self._waiting_readers -= 1
             self._readers += 1
+            if self._handoff:
+                self._cond.notify_all()
 
     def release_read(self) -> None:
         with self._cond:
@@ -39,13 +49,50 @@ class _RWLock:
                 while self._writer or self._readers:
                     self._cond.wait()
                 self._writer = True
+                self._writer_ident = threading.get_ident()
             finally:
                 self._waiting_writers -= 1
 
     def release_write(self) -> None:
         with self._cond:
             self._writer = False
+            self._writer_ident = None
             self._cond.notify_all()
+
+    def yield_write(self) -> None:
+        """Let the requests queued behind a held write lock run, then take it back.
+
+        For a writer that works in steps, a mine between files. Plain writer
+        preference would keep queued readers out while this writer asks for
+        the lock again, so they are let in first; a queued writer takes its
+        turn as usual. Returns at once when nobody waits, or when the calling
+        thread is not the one holding the write lock.
+        """
+        with self._cond:
+            if not self._writer or self._writer_ident != threading.get_ident():
+                return
+            if not self._waiting_readers and not self._waiting_writers:
+                return
+            self._writer = False
+            self._writer_ident = None
+            self._handoff = True
+            self._cond.notify_all()
+            try:
+                # Until everything queued has had its turn: waiting readers
+                # enter now, and a waiting writer counts as served once it has
+                # taken the lock (its release wakes this loop again).
+                while self._waiting_readers or self._waiting_writers:
+                    self._cond.wait()
+            finally:
+                self._handoff = False
+            self._waiting_writers += 1
+            try:
+                while self._writer or self._readers:
+                    self._cond.wait()
+                self._writer = True
+                self._writer_ident = threading.get_ident()
+            finally:
+                self._waiting_writers -= 1
 
     def read_lock(self):
         lock = self
@@ -71,6 +118,30 @@ class _RWLock:
 
 
 _HTTP_REQUEST_LOCK = _RWLock()
+# Taken before _HTTP_REQUEST_LOCK by a hub mine, so a second mine waits for the
+# first as before even though the first yields the request lock between files.
+_HTTP_MINE_LOCK = threading.Lock()
+# Tools that hold the request lock exclusively for a long run but reach
+# mine_yield_point() between files, where waiting requests may run.
+_HTTP_YIELDING_TOOLS = frozenset({"mempalace_mine"})
+# Tools whose handler makes one request-local embedding call before an
+# otherwise independent backend operation. Holding ``_HTTP_REQUEST_LOCK``
+# through that inference stalls unrelated requests for the whole model call.
+# Compound read-modify-write tools stay fully serialized.
+_HTTP_EMBEDDING_RELEASE_TOOLS = frozenset(
+    {
+        "mempalace_search",
+        "mempalace_check_duplicate",
+        "mempalace_diary_write",
+    }
+)
+# Reserved before a request releases the request lock mid-embedding so
+# ``mempalace_reconnect`` cannot close backend handles during that window.
+# Reconnect acquires this before the request lock; embedding reacquires the
+# request lock before releasing this one.
+_HTTP_EMBEDDING_LIFECYCLE_LOCK = threading.Lock()
+_http_embedding_lifecycle_tls = threading.local()
+_http_embedding_release_tls = threading.local()
 _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 _HTTP_ACTIVE_CLIENT_WINDOW_S = 120.0
 
@@ -359,6 +430,107 @@ def _sse_max_clients() -> int:
         return _SSE_MAX_CLIENTS_DEFAULT
 
 
+@contextlib.contextmanager
+def _http_embedding_lifecycle():
+    """Hold the embedding lifecycle lock. Reentrant on this thread.
+
+    HTTP dispatch for reconnect acquires this before the request lock. The
+    reconnect tool acquires it again, and that nested enter is a no-op, so
+    stdio (which has no dispatch wrapper) still waits out an embedding window.
+    """
+    if getattr(_http_embedding_lifecycle_tls, "held", False):
+        yield
+        return
+    _HTTP_EMBEDDING_LIFECYCLE_LOCK.acquire()
+    _http_embedding_lifecycle_tls.held = True
+    try:
+        yield
+    finally:
+        _http_embedding_lifecycle_tls.held = False
+        _HTTP_EMBEDDING_LIFECYCLE_LOCK.release()
+
+
+def _call_arguments(request):
+    if not isinstance(request, dict):
+        return None
+    params = request.get("params")
+    if not isinstance(params, dict):
+        return None
+    arguments = params.get("arguments")
+    return arguments if isinstance(arguments, dict) else None
+
+
+def _embedding_release_mode(tool_name, request, access):
+    """Return ``access`` when this call may drop the request lock around inference.
+
+    ``mempalace_search(cli_compatible=True)`` holds the CLI capture lock across
+    its embed. Dropping the request lock there lets a second search keep a read
+    lease while waiting for that capture lock, and a queued writer then stops
+    the first search from taking its lease back.
+    """
+    if tool_name not in _HTTP_EMBEDDING_RELEASE_TOOLS:
+        return None
+    if tool_name == "mempalace_search":
+        arguments = _call_arguments(request)
+        if arguments and arguments.get("cli_compatible"):
+            return None
+    return access
+
+
+@contextlib.contextmanager
+def _http_release_request_lock_for_embedding(mode: str):
+    """Release the held request lock only around embedding inference.
+
+    ``mode`` is ``"read"`` or ``"write"`` and must match how ``_http_dispatch``
+    acquired ``_HTTP_REQUEST_LOCK`` for this request. Nested embedding calls
+    on the same thread do not double-release.
+
+    Reserve lifecycle protection before dropping the request lease. If it is
+    already held, keep the request lease through inference: its owner may be
+    a reconnect waiting for this lease, so waiting here would deadlock. On
+    the responsive path the lease is taken back before lifecycle is dropped.
+    """
+    depth = getattr(_http_embedding_release_tls, "depth", 0)
+    _http_embedding_release_tls.depth = depth + 1
+    try:
+        if depth > 0:
+            yield
+            return
+        if not _HTTP_EMBEDDING_LIFECYCLE_LOCK.acquire(blocking=False):
+            yield
+            return
+        try:
+            if mode == "read":
+                _HTTP_REQUEST_LOCK.release_read()
+            else:
+                _HTTP_REQUEST_LOCK.release_write()
+            try:
+                yield
+            finally:
+                # Reacquire even when inference raises, before reconnect can
+                # obtain lifecycle protection and close the captured handle.
+                if mode == "read":
+                    _HTTP_REQUEST_LOCK.acquire_read()
+                else:
+                    _HTTP_REQUEST_LOCK.acquire_write()
+        finally:
+            _HTTP_EMBEDDING_LIFECYCLE_LOCK.release()
+    finally:
+        _http_embedding_release_tls.depth = depth
+
+
+@contextlib.contextmanager
+def _http_embedding_release_installed(mode: str):
+    """Install this thread's embedding-section hook for one dispatch."""
+    from ..embedding import set_embedding_section_hook
+
+    set_embedding_section_hook(lambda: _http_release_request_lock_for_embedding(mode))
+    try:
+        yield
+    finally:
+        set_embedding_section_hook(None)
+
+
 def _http_dispatch(request):
     """Dispatch one JSON-RPC request with the transport's locking policy.
 
@@ -382,7 +554,33 @@ def _http_dispatch(request):
     from ..service import classify_tool
 
     if classify_tool(tool_name) == "read":
+        release_mode = _embedding_release_mode(tool_name, request, "read")
+        if release_mode:
+            with _http_embedding_release_installed(release_mode), _HTTP_REQUEST_LOCK.read_lock():
+                return handle_request(request)
         with _HTTP_REQUEST_LOCK.read_lock():
+            return handle_request(request)
+    if tool_name in _HTTP_YIELDING_TOOLS:
+        # A mine held the exclusive lock for its whole run, so every other
+        # palace request, status included, waited for all of it. It still runs
+        # exclusively, but hands the lock to waiting requests between files.
+        from ..palace import mine_yield_hook
+
+        with (
+            _HTTP_MINE_LOCK,
+            _HTTP_REQUEST_LOCK,
+            mine_yield_hook(_HTTP_REQUEST_LOCK.yield_write),
+        ):
+            return handle_request(request)
+    if tool_name == "mempalace_reconnect":
+        # Lifecycle before the request lease. An in-flight embed holds the
+        # lifecycle lock across the window where it does not hold the lease,
+        # and takes the lease back before releasing lifecycle.
+        with _http_embedding_lifecycle(), _HTTP_REQUEST_LOCK:
+            return handle_request(request)
+    release_mode = _embedding_release_mode(tool_name, request, "write")
+    if release_mode:
+        with _http_embedding_release_installed(release_mode), _HTTP_REQUEST_LOCK:
             return handle_request(request)
     with _HTTP_REQUEST_LOCK:
         return handle_request(request)
@@ -1154,7 +1352,7 @@ def _serve_http(host: str, port: int) -> None:
                 port=bound_port,
                 scheme=getattr(httpd, "scheme", "http"),
                 read_only=_READ_ONLY,
-                capabilities=["search_cli_compatible"],
+                capabilities=["mine_include_ignored", "search_cli_compatible"],
                 search_config_fingerprint=_config.search_config_fingerprint,
             )
             import atexit

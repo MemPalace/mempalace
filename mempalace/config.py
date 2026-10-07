@@ -348,7 +348,9 @@ def _is_wal_without_sidecars(db_path: str) -> bool:
     return len(header) == 19 and header[:16] == b"SQLite format 3\x00" and header[18] == 2
 
 
-def connect_sqlite_read(db_path: str, *, timeout: "float | None" = None):
+def connect_sqlite_read(
+    db_path: str, *, timeout: "float | None" = None, check_same_thread: bool = True
+):
     """Open ``db_path`` for reading, and keep reading when ``mode=ro`` cannot.
 
     A WAL database whose ``-wal`` and ``-shm`` sidecars are absent cannot be
@@ -369,6 +371,8 @@ def connect_sqlite_read(db_path: str, *, timeout: "float | None" = None):
     import sqlite3
 
     kwargs = {} if timeout is None else {"timeout": timeout}
+    if not check_same_thread:
+        kwargs["check_same_thread"] = False
     if _is_wal_without_sidecars(db_path):
         return sqlite3.connect(os.fspath(db_path), **kwargs)
     return sqlite3.connect(sqlite_read_uri(db_path), uri=True, **kwargs)
@@ -935,7 +939,13 @@ class MempalaceConfig:
         """
         if self._palace_path_override is not None:
             return self._palace_path_override
-        env_val = os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALACE_PATH")
+        # Precedence: MEMPALACE_PALACE_PATH (documented, primary) >
+        # MEMPALACE_PALACE (short alias accepted per #2366) > MEMPAL_PALACE_PATH (legacy).
+        env_val = (
+            os.environ.get("MEMPALACE_PALACE_PATH")
+            or os.environ.get("MEMPALACE_PALACE")
+            or os.environ.get("MEMPAL_PALACE_PATH")
+        )
         if env_val:
             # Normalize: expand ~ and collapse .. to match the CLI --palace
             # code path (mcp_server.py:62) and prevent surprise redirection
@@ -1611,6 +1621,36 @@ class MempalaceConfig:
             parsed = int(cfg_val) if cfg_val is not None else 1
         except (TypeError, ValueError):
             parsed = 1
+        return max(1, parsed)
+
+    @property
+    def hallway_min_count(self):
+        """Minimum co-occurrence count required to materialize a within-wing
+        hallway between two entities.
+
+        Mirrors :attr:`topic_tunnel_min_count` (same env > file > default
+        resolution and ``>=1`` floor), but for the within-wing hallway
+        primitive (``mempalace.hallways.compute_hallways_for_wing``) rather
+        than the cross-wing topic tunnels. Default is ``2`` — a single
+        co-occurrence is noise (two entities named together once in one drawer
+        is not a real link); two or more is a real signal. Bump to ``3+`` if
+        your corpus has loosely-associated entity pairs you don't want linked.
+        Reads ``MEMPALACE_KG_HALLWAY_MIN_COUNT`` env first, then the
+        ``hallway_min_count`` config-file value, then ``2``. Clamped to ``>=1``.
+        """
+        env_val = os.environ.get("MEMPALACE_KG_HALLWAY_MIN_COUNT")
+        if env_val:
+            try:
+                parsed = int(env_val)
+                if parsed >= 1:
+                    return parsed
+            except ValueError:
+                pass
+        cfg_val = self._file_config.get("hallway_min_count")
+        try:
+            parsed = int(cfg_val) if cfg_val is not None else 2
+        except (TypeError, ValueError):
+            parsed = 2
         return max(1, parsed)
 
     @property

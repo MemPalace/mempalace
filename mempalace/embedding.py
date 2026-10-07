@@ -51,6 +51,7 @@ rejected by a witness embedding at load time.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import os
@@ -60,6 +61,34 @@ from typing import Optional
 from .version import __version__
 
 logger = logging.getLogger(__name__)
+
+# Optional per-thread hook around embedding inference. The HTTP transport
+# installs a context manager that releases its request lock only for the
+# model call, so embedding latency does not stall unrelated requests.
+# CLI and stdio leave this unset. The hook belongs around the explicit
+# embed that runs before a backend write lock — not inside the embedding
+# function Chroma invokes while that lock is held.
+_embedding_section_hook_local = threading.local()
+
+
+def set_embedding_section_hook(hook) -> None:
+    """Install or clear this thread's embedding-section context manager factory.
+
+    ``hook`` is ``None`` or a zero-arg callable that returns a context manager.
+    """
+    _embedding_section_hook_local.hook = hook
+
+
+@contextlib.contextmanager
+def embedding_section():
+    """Run the body under this thread's embedding-section hook, if any."""
+    hook = getattr(_embedding_section_hook_local, "hook", None)
+    if hook is None:
+        yield
+        return
+    with hook():
+        yield
+
 
 _PROVIDER_MAP = {
     "cpu": ["CPUExecutionProvider"],
@@ -97,6 +126,22 @@ _AUTO_ORDER = [
 _AUTO_PROVIDER_DENYLIST = {
     "embeddinggemma": {"CoreMLExecutionProvider"},
 }
+
+# Providers whose InferenceSession must not take two ``run()`` calls at once.
+# ONNX Runtime documents that DirectML does not support concurrent Run() on one
+# session; when it gets them, it faults inside onnxruntime_pybind11_state with an
+# access violation and the whole process dies. The MCP HTTP server embeds from
+# several request threads through one cached EF instance, so on these providers
+# every run on that session is serialized.
+_SERIAL_RUN_PROVIDERS = frozenset({"DmlExecutionProvider"})
+
+
+def _run_guard(providers, lock):
+    """Return ``lock`` when ``providers`` need serialized runs, else a no-op."""
+    if any(p in _SERIAL_RUN_PROVIDERS for p in providers or ()):
+        return lock
+    return contextlib.nullcontext()
+
 
 _EF_CACHE: dict = {}
 # Check-then-construct on the cache must be atomic: without it, two threads
@@ -221,10 +266,17 @@ def _build_ef_class():
         def __init__(self, preferred_providers=None, intra_op_num_threads=0):
             super().__init__(preferred_providers=preferred_providers)
             self._intra_op_num_threads = intra_op_num_threads
+            self._run_lock = threading.Lock()
 
         @staticmethod
         def name() -> str:
             return "default"
+
+        def _forward(self, documents, batch_size=32):
+            # Every upstream embed path (__call__, embed_query) runs the
+            # session here, so this is the one place to serialize it.
+            with _run_guard(self._preferred_providers, self._run_lock):
+                return super()._forward(documents, batch_size)
 
         @cached_property
         def model(self):
@@ -404,6 +456,9 @@ class EmbeddinggemmaONNX:
         # one-time model load so concurrent cold calls cannot build (and
         # transiently hold) two full model sessions.
         self._load_lock = threading.Lock()
+        # Held around session.run on providers that cannot run concurrently
+        # (see _SERIAL_RUN_PROVIDERS).
+        self._run_lock = threading.Lock()
 
     def _lazy_load(self) -> None:
         if self._session is not None:
@@ -546,13 +601,14 @@ class EmbeddinggemmaONNX:
         # time (#1770).
         for start in range(0, len(order), self._batch_size):
             idxs = order[start : start + self._batch_size]
-            sent_emb = _embeddinggemma_forward(
-                self._session,
-                self._tokenizer,
-                self._output_idx,
-                np,
-                [input[i] for i in idxs],
-            )
+            with _run_guard(self._providers, self._run_lock):
+                sent_emb = _embeddinggemma_forward(
+                    self._session,
+                    self._tokenizer,
+                    self._output_idx,
+                    np,
+                    [input[i] for i in idxs],
+                )
             # L2-normalize so cosine similarity == dot product (matches what the
             # MTEB methodology assumes; ChromaDB's distance is configured for it).
             norms = np.linalg.norm(sent_emb, axis=1, keepdims=True) + 1e-12
@@ -807,6 +863,8 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
         cached = _EF_CACHE.get(cache_key)
         if cached is not None:
             return cached
+        # Return the concrete function. Chroma accepts only ``__call__(self, input)``,
+        # and callers distinguish backends by type. A proxy breaks both.
         ef = OpenAICompatEmbeddingFunction(base_url=url, model=api_model, api_key=api_key)
         _EF_CACHE[cache_key] = ef
         logger.info(

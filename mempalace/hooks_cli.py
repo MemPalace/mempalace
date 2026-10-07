@@ -1038,21 +1038,29 @@ def _save_diary_direct(
     the transcript path); a `diary_read` with an empty wing spans every wing
     the agent wrote to, so project-derived wings stay discoverable.
 
-    Returns {"count": N, "themes": [...]} on success, {"count": 0} on failure.
-    A daemon lock deferral also returns {"count": 0}: nothing is filed yet, but
-    the entry is queued and the daemon files it once the holder exits, so the
-    checkpoint marker is deliberately not advanced.
+    Returns (success):  {"drawers_filed": 1, "messages_folded": N, "themes": [...]}
+    Returns (failure / no messages / routing blocked / daemon deferral):
+        {"drawers_filed": 0, "messages_folded": 0}
+        (+ "routing_blocked" / "routing_message" when blocked).
+
+    drawers_filed is the number of palace drawers (memory entries) filed by this
+    call. One checkpoint write files exactly ONE drawer -- never N. That is the
+    distinction #2303 is about: the legacy return conflated "memories stored"
+    (drawers) with the transcript-message count compressed into that single
+    drawer, which is now reported separately as messages_folded. The render path
+    must label each unit correctly.
     """
     messages = _extract_recent_messages(transcript_path)
     if not messages:
         _log("No recent messages to save")
-        return {"count": 0}
+        return {"drawers_filed": 0, "messages_folded": 0}
 
     routing = _current_hook_write_routing()
     if routing.blocked:
         _log_hook_write_blocked(routing, "diary checkpoint")
         return {
-            "count": 0,
+            "drawers_filed": 0,
+            "messages_folded": 0,
             "routing_blocked": True,
             "routing_message": routing.notice,
         }
@@ -1085,7 +1093,7 @@ def _save_diary_direct(
             except Exception as exc:
                 # Daemon accepted context — don't fall back (would double-write).
                 _log(f"Daemon diary checkpoint failed: {exc}")
-                return {"count": 0}
+                return {"drawers_filed": 0, "messages_folded": 0}
             result = job.get("result") or {}
             if job.get("state") == "succeeded" and result.get("success"):
                 _log(f"Diary checkpoint saved: {result.get('entry_id', '?')}")
@@ -1099,15 +1107,15 @@ def _save_diary_direct(
                     pass
                 if toast:
                     _desktop_toast(f"Checkpoint saved - {len(messages)} messages archived")
-                return {"count": len(messages), "themes": themes}
+                return {"drawers_filed": 1, "messages_folded": len(messages), "themes": themes}
             if _job_deferred_by_lock(job):
                 # Queued behind the palace lock: the entry is held and the daemon
                 # files it once the holder exits. Not a failure, and not a reason
                 # to re-file it here -- that would duplicate verbatim content.
                 _log(f"Daemon diary checkpoint deferred: {_lock_deferral_reason(job)}")
-                return {"count": 0}
+                return {"drawers_filed": 0, "messages_folded": 0}
             _log(f"Daemon diary checkpoint failed: {result.get('error', job.get('error'))}")
-            return {"count": 0}
+            return {"drawers_filed": 0, "messages_folded": 0}
 
         from .mcp_server import tool_diary_write
 
@@ -1130,12 +1138,12 @@ def _save_diary_direct(
                 pass
             if toast:
                 _desktop_toast(f"Checkpoint saved \u2014 {len(messages)} messages archived")
-            return {"count": len(messages), "themes": themes}
+            return {"drawers_filed": 1, "messages_folded": len(messages), "themes": themes}
         else:
             _log(f"Diary checkpoint failed: {result.get('error', 'unknown')}")
     except Exception as e:
         _log(f"Diary checkpoint error: {e}")
-    return {"count": 0}
+    return {"drawers_filed": 0, "messages_folded": 0}
 
 
 def _ingest_transcript(transcript_path: str):
@@ -1159,6 +1167,7 @@ def _ingest_transcript(transcript_path: str):
         _log_hook_write_blocked(routing, "transcript ingest")
         return
 
+    wing = _ingest_wing(str(path))
     try:
         if routing.use_daemon:
             try:
@@ -1167,7 +1176,7 @@ def _ingest_transcript(transcript_path: str):
                     {
                         "source": str(path),
                         "mode": "convos",
-                        "wing": "sessions",
+                        "wing": wing,
                         "agent": "mempalace",
                     },
                     dedupe_key=_daemon_mine_dedupe_key(str(path), "convos"),
@@ -1192,10 +1201,10 @@ def _ingest_transcript(transcript_path: str):
                 "--mode",
                 "convos",
                 "--wing",
-                "sessions",
+                wing,
             ]
         )
-        _log(f"Transcript ingest started: {path.name}")
+        _log(f"Transcript ingest started: {path.name} -> {wing}")
     except OSError:
         pass
     except Exception as exc:
@@ -1270,15 +1279,16 @@ def _safe_wing_slug(name: str) -> str:
     return slug or "sessions"
 
 
-def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
-    """Read ``cwd`` from the first JSONL line that records it.
+def _cwd_from_jsonl(transcript_path: str) -> Optional[str]:
+    """The session's working directory, from the first JSONL line that has one.
 
     Claude Code stores the absolute working directory on most message
     types (tool_use, tool_result, user/assistant turns), but not all
-    (e.g. queue-operation lines lack it). Scan up to 200 lines to find
-    the first record that includes a non-empty cwd, then derive the
-    wing from its leaf path segment. Returns ``None`` if the file is
-    unreadable, empty, or contains no cwd.
+    (e.g. queue-operation lines lack it). Scans up to 200 lines. Returns
+    the path with forward slashes and no trailing slash, with a git
+    worktree under ``<project>/.claude/worktrees/`` collapsed to
+    ``<project>``, or ``None`` if the file is unreadable, empty, or
+    records no cwd.
     """
     try:
         path = Path(transcript_path).expanduser()
@@ -1307,12 +1317,49 @@ def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
                 _wt_marker = "/.claude/worktrees/"
                 if _wt_marker in cwd_norm:
                     cwd_norm = cwd_norm.split(_wt_marker, 1)[0]
-                project = cwd_norm.rsplit("/", 1)[-1]
-                if project:
-                    return f"wing_{_safe_wing_slug(project)}"
+                return cwd_norm
     except OSError:
         pass
     return None
+
+
+def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
+    """``wing_<project>`` from the transcript's cwd leaf, or ``None``."""
+    cwd_norm = _cwd_from_jsonl(transcript_path)
+    if not cwd_norm:
+        return None
+    project = cwd_norm.rsplit("/", 1)[-1]
+    if project:
+        return f"wing_{_safe_wing_slug(project)}"
+    return None
+
+
+def _workstation_wing() -> str:
+    """Wing for sessions started in the home directory, per machine."""
+    if sys.platform == "darwin":
+        return "mac_workstation"
+    if sys.platform.startswith("win"):
+        return "windows_workstation"
+    return "linux_workstation"
+
+
+def _ingest_wing(transcript_path: str) -> str:
+    """Wing for a hook-ingested transcript: the project the session ran in.
+
+    Same derivation the diary uses (cwd first, encoded project folder
+    second) without the ``wing_`` prefix, so a session in
+    ``~/dev/mempalace`` files into ``mempalace`` next to everything else
+    about that project instead of a flat ``sessions`` wing that
+    ``mempalace audit`` then flags. A session started in the home directory
+    belongs to no project and goes to the machine's workstation wing.
+    """
+    cwd_norm = _cwd_from_jsonl(transcript_path)
+    if cwd_norm:
+        home = str(Path.home()).replace("\\", "/").rstrip("/")
+        if cwd_norm.lower() == home.lower():
+            return _workstation_wing()
+    wing = _wing_from_transcript_path(transcript_path)
+    return wing[len("wing_") :] if wing.startswith("wing_") else wing
 
 
 def _wing_from_transcript_path(transcript_path: str) -> str:
@@ -1454,7 +1501,7 @@ def hook_stop(data: dict, harness: str):
 
             if silent:
                 # Save directly via Python API — systemMessage renders in terminal
-                result = {"count": 0}
+                result = {"drawers_filed": 0, "messages_folded": 0}
                 if transcript_path:
                     result = _save_diary_direct(
                         transcript_path,
@@ -1465,13 +1512,16 @@ def hook_stop(data: dict, harness: str):
                     )
                     _ingest_transcript(transcript_path)
                 _maybe_auto_ingest()
-                # Only advance save marker after successful save
-                count = result.get("count", 0)
-                if count > 0:
+                # Only advance the save marker after a genuine drawer was filed
+                # (#2303): the legacy "count" was the compressed-message count and
+                # was misread as a storage count. Report each unit truthfully.
+                drawers_filed = result.get("drawers_filed", 0)
+                if drawers_filed > 0:
                     try:
                         last_save_file.write_text(str(exchange_count), encoding="utf-8")
                     except OSError:
                         pass
+                    messages_folded = result.get("messages_folded", 0)
                     themes = result.get("themes", [])
                     if themes:
                         tag = " \u2014 " + ", ".join(themes)
@@ -1479,7 +1529,7 @@ def hook_stop(data: dict, harness: str):
                         tag = ""
                     _output(
                         {
-                            "systemMessage": f"\u2726 {count} memories woven into the palace{tag}",
+                            "systemMessage": f"\u2726 {drawers_filed} checkpoint saved \u2014 {messages_folded} messages woven into the palace{tag}",
                         }
                     )
                 else:

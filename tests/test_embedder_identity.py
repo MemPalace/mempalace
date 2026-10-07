@@ -54,6 +54,62 @@ def test_enforce_embedder_identity_skips_count_on_hnsw_divergence():
     collection.count.assert_not_called()
 
 
+def _no_count(self):
+    raise AssertionError("count() loads the whole HNSW segment; read chroma.sqlite3")
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["bare", "embedding_wrapped"])
+def test_chroma_unrecorded_populated_palace_warns_without_count(tmp_path, monkeypatch, wrapped):
+    """A legacy palace with drawers and no recorded identity is detected from
+    chroma.sqlite3. count() on a fresh client would load every vector under
+    the GIL just to learn "not empty". get_collection() hands the check an
+    EmbeddingCollection around the Chroma one, so both shapes must take the
+    sqlite read."""
+    from mempalace.backends.chroma import ChromaCollection
+    from mempalace.backends.embedding_wrapper import EmbeddingCollection
+    from mempalace.palace import _enforce_embedder_identity
+
+    col = _chroma_collection(tmp_path)
+    col.add(ids=["d1"], documents=["a drawer"], embeddings=[[0.1, 0.2, 0.3, 0.4]])
+    monkeypatch.setattr(ChromaCollection, "count", _no_count)
+    if wrapped:
+        col = EmbeddingCollection(col)
+
+    with (
+        patch("mempalace.embedding.current_model_name", return_value="minilm"),
+        pytest.warns(EmbedderIdentityUnknownWarning),
+    ):
+        _enforce_embedder_identity(
+            col, str(tmp_path), "mempalace_drawers", create=False, repeat_unknown_warning=True
+        )
+
+
+def test_chroma_empty_palace_records_identity_without_count(tmp_path, monkeypatch):
+    from mempalace.backends.chroma import ChromaCollection
+    from mempalace.palace import _enforce_embedder_identity
+
+    col = _chroma_collection(tmp_path)
+    monkeypatch.setattr(ChromaCollection, "count", _no_count)
+
+    with patch("mempalace.embedding.current_model_name", return_value="minilm"):
+        _enforce_embedder_identity(
+            col, str(tmp_path), "mempalace_drawers", create=True, repeat_unknown_warning=True
+        )
+
+    assert col.get_stored_embedder_identity().model_name == "minilm"
+
+
+def test_sqlite_collection_has_rows(tmp_path):
+    from mempalace.backends.chroma import _sqlite_collection_has_rows
+
+    assert _sqlite_collection_has_rows(str(tmp_path / "missing"), "mempalace_drawers") is None
+    col = _chroma_collection(tmp_path)
+    assert _sqlite_collection_has_rows(str(tmp_path), "mempalace_drawers") is False
+    col.add(ids=["d1"], documents=["a drawer"], embeddings=[[0.1, 0.2, 0.3, 0.4]])
+    assert _sqlite_collection_has_rows(str(tmp_path), "mempalace_drawers") is True
+    assert _sqlite_collection_has_rows(str(tmp_path), "other_collection") is False
+
+
 def test_unknown_when_nothing_stored():
     assert check_embedder_identity(None, EmbedderIdentity("minilm", 384)) == "unknown"
 

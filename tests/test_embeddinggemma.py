@@ -506,6 +506,78 @@ def test_concurrent_first_calls_load_model_once(patched_lazy_load, monkeypatch):
     assert all(r is not None and len(r) == 1 for r in results)
 
 
+class _InFlightSession(_MarkerSession):
+    """Record the most ``run()`` calls that were ever in flight at once."""
+
+    def __init__(self, rendezvous=None):
+        self._rendezvous = rendezvous
+        self._lock = threading.Lock()
+        self._in_flight = 0
+        self.max_in_flight = 0
+
+    def run(self, output_names, feed):
+        with self._lock:
+            self._in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self._in_flight)
+        try:
+            if self._rendezvous is not None:
+                self._rendezvous.wait(timeout=5)
+            else:
+                time.sleep(0.05)  # widen the window an unguarded run would overlap in
+            return super().run(output_names, feed)
+        finally:
+            with self._lock:
+                self._in_flight -= 1
+
+
+def _embed_from_threads(ef, n_threads):
+    errors = []
+
+    def worker(slot):
+        try:
+            ef([f"doc {slot}"])
+        except Exception as exc:  # surfaced below; a thread cannot fail the test itself
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(slot,)) for slot in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert not errors
+
+
+def test_dml_session_runs_one_call_at_a_time(patched_lazy_load):
+    """DirectML must never see two concurrent run() calls on one session.
+
+    ONNX Runtime does not support that on DirectML; it faults with an access
+    violation inside onnxruntime and takes the MCP HTTP server down, whose
+    request threads all embed through one cached EF instance.
+    """
+    session = _InFlightSession()
+    ef = _marker_ef(patched_lazy_load, session=session)
+    ef._providers = ["DmlExecutionProvider", "CPUExecutionProvider"]
+
+    _embed_from_threads(ef, 4)
+
+    assert session.max_in_flight == 1
+
+
+def test_cpu_session_runs_stay_concurrent(patched_lazy_load):
+    """The DirectML guard must not serialize providers that run concurrently.
+
+    The fake session blocks each run() until a second one arrives, so a
+    serialized CPU path would break the barrier instead of passing.
+    """
+    session = _InFlightSession(rendezvous=threading.Barrier(2))
+    ef = _marker_ef(patched_lazy_load, session=session)
+    ef._providers = ["CPUExecutionProvider"]
+
+    _embed_from_threads(ef, 2)
+
+    assert session.max_in_flight == 2
+
+
 def test_concurrent_get_embedding_function_single_instance(monkeypatch):
     """Concurrent cache misses must converge on one shared EF instance.
 

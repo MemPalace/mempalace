@@ -152,6 +152,56 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         return {"success": False, "error": str(e)}
 
 
+def _diary_read_response(agent_name: str, entries: list, total: int) -> dict:
+    if total == 0:
+        return {"agent": agent_name, "entries": [], "message": "No diary entries yet."}
+    return {
+        "agent": agent_name,
+        "entries": entries,
+        "total": total,
+        "showing": len(entries),
+    }
+
+
+def _sqlite_diary_read(agent_name: str, last_n: int, wing: str):
+    """Read the requested diary page without cold-loading Chroma's HNSW index.
+
+    ``None`` preserves the collection path for other backends, unavailable
+    databases, unsupported schemas, and records SQLite cannot safely order.
+    This does not cache content or change diary chunk/total semantics.
+    """
+    if not _is_chroma_backend():
+        return None
+    try:
+        from ..backends.chroma import sqlite_diary_rows
+
+        result = sqlite_diary_rows(
+            _config.palace_path,
+            _config.collection_name,
+            agent_name=agent_name,
+            wing=wing,
+            limit=last_n,
+        )
+        if result is None:
+            return None
+        total, rows = result
+        entries = []
+        for _drawer_id, doc, meta in rows:
+            meta = _safe_meta(meta)
+            entries.append(
+                {
+                    "date": meta.get("date", ""),
+                    "timestamp": meta.get("filed_at", ""),
+                    "topic": meta.get("topic", ""),
+                    "content": doc,
+                }
+            )
+        return _diary_read_response(agent_name, entries, total)
+    except Exception:
+        logger.debug("sqlite diary read failed; falling back", exc_info=True)
+        return None
+
+
 def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
     """
     Read an agent's recent diary entries. Returns the last N entries
@@ -175,6 +225,9 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
     except ValueError as e:
         return {"error": str(e)}
     last_n = max(1, min(last_n, 100))
+    result = _sqlite_diary_read(agent_name, last_n, wing)
+    if result is not None:
+        return result
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
@@ -228,15 +281,7 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
             if len(batch_ids) < _DIARY_READ_PAGE_SIZE:
                 break
 
-        if total == 0:
-            return {"agent": agent_name, "entries": [], "message": "No diary entries yet."}
-
-        return {
-            "agent": agent_name,
-            "entries": entries,
-            "total": total,
-            "showing": len(entries),
-        }
+        return _diary_read_response(agent_name, entries, total)
     except Exception:
         logger.exception("diary_read failed")
         return {"error": "Failed to read diary entries"}
@@ -352,6 +397,15 @@ def tool_reconnect():
     or replace ``knowledge_graph.sqlite3`` directly, which can leave the
     in-memory HNSW index stale or pin a closed-on-disk SQLite connection.
     """
+    # Serialize against HTTP embedding windows that temporarily drop the
+    # request lock. HTTP dispatch already holds this lock, taken before the
+    # request lease; the nested enter is a no-op on that thread.
+    with _http_embedding_lifecycle():
+        return _tool_reconnect_locked()
+
+
+def _tool_reconnect_locked():
+    """Reconnect body; caller holds the embedding lifecycle lock."""
     global \
         _client_cache, \
         _collection_cache, \
@@ -397,23 +451,9 @@ def tool_reconnect():
         except Exception as exc:
             logger.debug("Failed to close MCP-local Chroma client during reconnect", exc_info=True)
             close_errors.append(f"local Chroma client close failed: {exc}")
-    if _is_chroma_backend():
-        try:
-            from chromadb.api.client import SharedSystemClient
-
-            clear_system_cache = getattr(SharedSystemClient, "clear_system_cache", None)
-            if callable(clear_system_cache):
-                clear_system_cache()
-            else:
-                logger.debug(
-                    "SharedSystemClient.clear_system_cache is unavailable; skipping shared Chroma cache clear during reconnect"
-                )
-        except Exception as exc:
-            logger.debug(
-                "Failed to clear Chroma shared system cache during reconnect",
-                exc_info=True,
-            )
-            close_errors.append(f"shared Chroma cache clear failed: {exc}")
+    if _is_chroma_backend() and not _clear_chroma_system_cache():
+        logger.debug("Failed to clear Chroma shared system cache during reconnect")
+        close_errors.append("shared Chroma cache clear failed")
     _client_cache = None
     _collection_cache = None
     _collection_cache_backend = None
