@@ -37,6 +37,8 @@ from .palace import (
     mine_lock,
     mine_palace_lock,
     mine_yield_point,
+    palace_write_serial,
+    prefetch_complete_mtimes,
     purge_file_closets,
     upsert_closet_lines,
 )
@@ -1849,6 +1851,24 @@ def add_drawer(
 # =============================================================================
 
 
+def _prefetched_as_mined(source_file: str, mined_mtimes: Optional[dict]) -> bool:
+    """True when the prefetched groups prove ``file_already_mined()`` would
+    return True: a complete group's stored mtime matches the file's on-disk
+    mtime within the same 1 ms tolerance. False means "ask the palace", never
+    "not mined".
+    """
+    if not mined_mtimes:
+        return False
+    stored = mined_mtimes.get(source_file)
+    if not stored:
+        return False
+    try:
+        current_mtime = os.path.getmtime(source_file)
+    except OSError:
+        return False
+    return any(abs(mtime - current_mtime) < 0.001 for mtime in stored)
+
+
 def process_file(
     filepath: Path,
     project_path: Path,
@@ -1862,6 +1882,7 @@ def process_file(
     chunk_overlap: int = None,
     min_chunk_size: int = None,
     max_chunks_per_file: Optional[int] = None,
+    mined_mtimes: Optional[dict] = None,
 ) -> tuple:
     """Read, chunk, route, and file one file.
 
@@ -1871,12 +1892,19 @@ def process_file(
     too-short content (below ``min_chunk_size``). It is ``"chunk_cap"``
     when the per-file chunk cap aborted the file. Callers use the tag to
     surface a separate counter in the mine summary (see #1455).
+
+    ``mined_mtimes`` is :func:`prefetch_complete_mtimes`'s map for this
+    mine. A file it proves already filed is skipped without querying the
+    palace; any other file goes through ``file_already_mined()``.
     """
     effective_min = min_chunk_size if min_chunk_size is not None else MIN_CHUNK_SIZE
 
     # Skip if already filed
     source_file = str(filepath)
-    if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
+    if not dry_run and (
+        _prefetched_as_mined(source_file, mined_mtimes)
+        or file_already_mined(collection, source_file, check_mtime=True)
+    ):
         return 0, "general", None
 
     read_result = _read_text_no_follow(filepath, project_path)
@@ -2283,6 +2311,7 @@ def _mine_impl(
 ):
     from .config import MempalaceConfig
 
+    writes_at_start = palace_write_serial()
     project_path = Path(project_dir).expanduser().resolve()
     config = load_config(project_dir)
     palace_config = MempalaceConfig()
@@ -2329,9 +2358,14 @@ def _mine_impl(
     if not dry_run:
         collection = get_collection(palace_path)
         closets_col = get_closets_collection(palace_path)
+        # One sqlite pass instead of one get(where=source_file) per file,
+        # which costs ~0.1 s each on a 1M-drawer palace (#2684). None on
+        # other backends: every file then takes the per-file check.
+        mined_mtimes = prefetch_complete_mtimes(collection, [str(f) for f in files])
     else:
         collection = None
         closets_col = None
+        mined_mtimes = None
 
     total_drawers = 0
     files_mined = 0
@@ -2363,6 +2397,7 @@ def _mine_impl(
                     # otherwise a malformed env var would emit its warning
                     # per file.
                     max_chunks_per_file=effective_chunk_cap,
+                    mined_mtimes=mined_mtimes,
                 )
             except KeyboardInterrupt:
                 # Re-raise so the outer handler prints the summary; we
@@ -2441,7 +2476,7 @@ def _mine_impl(
                     file=sys.stderr,
                 )
 
-            _validate_palace_fts5_after_mine(palace_path)
+            _validate_palace_fts5_after_mine(palace_path, writes_since=writes_at_start)
 
         print(f"\n{'=' * 55}")
         print("  Done.")

@@ -546,6 +546,85 @@ def _wing_file_keys(metadatas) -> dict[str, str]:
     return mapping
 
 
+# Every drawer metadata key compute_hallways_for_wing reads.
+_HALLWAY_KEYS = ("wing", "room", "entities", "is_sentinel")
+
+
+def _wing_metadata_from_sqlite(col, wing: str) -> Optional[list]:
+    """The wing's drawer metadata from Chroma's one-pass sqlite stream.
+
+    Returns ``None`` when ``col`` has no such stream or reading it failed, and
+    the caller pages instead. Paging is ``get(where={"wing": ...}, offset=N)``,
+    which Chroma runs as SQL ``OFFSET``: every page re-walks the rows before
+    it, so a large wing costs the square of its size (#2684).
+
+    The read is scoped to the wing in sqlite, and only drawers holding
+    ``entities`` are read, both through the ``(key, string_value)`` index, so
+    a small wing in a large palace reads its own rows rather than the
+    palace's. A drawer without entities neither forms a pair nor names a
+    file, so the hallways come out the same. A wing none of whose drawers
+    hold any still has to replace its old hallways with none, so a second
+    scoped read, stopped at its first row, tells it apart from a wing with no
+    drawers at all.
+    """
+    from .palace import _fast_collection_metadata
+
+    scope = {"wing": wing}
+    try:
+        rows = _fast_collection_metadata(col, _HALLWAY_KEYS, require_key="entities", equals=scope)
+        if rows is None:
+            return None
+        metadatas = [m for m in rows if isinstance(m, dict) and m.get("wing") == wing]
+        if not metadatas:
+            probe = _fast_collection_metadata(col, _HALLWAY_KEYS, equals=scope)
+            try:
+                first = next(probe, None)
+            finally:
+                probe.close()
+            if isinstance(first, dict) and first.get("wing") == wing:
+                metadatas = [first]
+    except Exception:
+        logger.warning(
+            "compute_hallways_for_wing: sqlite metadata scan failed for %s; paging instead",
+            wing,
+            exc_info=True,
+        )
+        return None
+    return metadatas
+
+
+def _wing_metadata_paged(col, wing: str) -> list:
+    """The wing's drawer metadata: scoped to the wing server-side AND paginated.
+
+    An unbounded get(where={"wing": wing}) binds one SQL variable per matched
+    id and overflows SQLite's SQLITE_MAX_VARIABLE_NUMBER (32766) on wings >
+    ~32k drawers (#1619); a bounded page binds at most batch_size ids. Walking
+    the WHOLE collection instead and filtering client-side cost O(total palace
+    drawers) on every mine, so filing one small session into an 800k-drawer
+    palace pegged the CPU for minutes (#2466). The client-side wing check
+    stays as a guard for stores that ignore ``where``. The loop ends on a
+    short page: count() counts every wing, so it cannot bound a scoped walk.
+    """
+    metadatas: list = []
+    batch_size = 5000
+    offset = 0
+    while True:
+        batch = col.get(
+            where={"wing": wing},
+            limit=batch_size,
+            offset=offset,
+            include=["metadatas"],
+        )
+        batch_metas = (batch or {}).get("metadatas") or []
+        if not batch_metas:
+            break
+        metadatas.extend(m for m in batch_metas if isinstance(m, dict) and m.get("wing") == wing)
+        offset += len(batch_metas)
+        if len(batch_metas) < batch_size:
+            break
+    return metadatas
+
+
 def compute_hallways_for_wing(
     wing: str,
     col=None,
@@ -568,7 +647,9 @@ def compute_hallways_for_wing(
 
     Args:
         wing: wing name to scan.
-        col: ChromaDB collection — must support paginated
+        col: ChromaDB collection. A Chroma collection is read in one pass
+            over ``chroma.sqlite3`` (see :func:`_wing_metadata_from_sqlite`).
+            Any other must support paginated
             ``.get(where={"wing": ...}, limit=..., offset=..., include=...)``.
             The fetch is scoped to ``wing`` server-side AND paginated: an
             unbounded ``.get(where=...)`` binds one SQL variable per matched
@@ -619,37 +700,12 @@ def compute_hallways_for_wing(
         threshold = min_count
     min_count = max(1, int(threshold))
 
-    # 1. Query drawers for this wing: scoped to the wing server-side AND
-    #    paginated. An unbounded get(where={"wing": wing}) binds one SQL
-    #    variable per matched id and overflows SQLite's
-    #    SQLITE_MAX_VARIABLE_NUMBER (32766) on wings > ~32k drawers (#1619);
-    #    a bounded page binds at most batch_size ids. Walking the WHOLE
-    #    collection instead and filtering client-side cost O(total palace
-    #    drawers) on every mine, so filing one small session into an 800k-
-    #    drawer palace pegged the CPU for minutes (#2466). The client-side
-    #    wing check stays as a guard for stores that ignore ``where``. The
-    #    loop ends on a short page: count() counts every wing, so it cannot
-    #    bound a scoped walk.
-    metadatas: list = []
+    # 1. Query drawers for this wing. On Chroma, one linear pass over the
+    #    drawers holding entities (#2684); elsewhere, wing-scoped pages.
     try:
-        batch_size = 5000
-        offset = 0
-        while True:
-            batch = col.get(
-                where={"wing": wing},
-                limit=batch_size,
-                offset=offset,
-                include=["metadatas"],
-            )
-            batch_metas = (batch or {}).get("metadatas") or []
-            if not batch_metas:
-                break
-            metadatas.extend(
-                m for m in batch_metas if isinstance(m, dict) and m.get("wing") == wing
-            )
-            offset += len(batch_metas)
-            if len(batch_metas) < batch_size:
-                break
+        metadatas = _wing_metadata_from_sqlite(col, wing)
+        if metadatas is None:
+            metadatas = _wing_metadata_paged(col, wing)
     except Exception:
         logger.warning(
             "compute_hallways_for_wing: collection fetch failed for %s", wing, exc_info=True

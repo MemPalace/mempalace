@@ -127,6 +127,22 @@ _AUTO_PROVIDER_DENYLIST = {
     "embeddinggemma": {"CoreMLExecutionProvider"},
 }
 
+# Providers whose InferenceSession must not take two ``run()`` calls at once.
+# ONNX Runtime documents that DirectML does not support concurrent Run() on one
+# session; when it gets them, it faults inside onnxruntime_pybind11_state with an
+# access violation and the whole process dies. The MCP HTTP server embeds from
+# several request threads through one cached EF instance, so on these providers
+# every run on that session is serialized.
+_SERIAL_RUN_PROVIDERS = frozenset({"DmlExecutionProvider"})
+
+
+def _run_guard(providers, lock):
+    """Return ``lock`` when ``providers`` need serialized runs, else a no-op."""
+    if any(p in _SERIAL_RUN_PROVIDERS for p in providers or ()):
+        return lock
+    return contextlib.nullcontext()
+
+
 _EF_CACHE: dict = {}
 # Check-then-construct on the cache must be atomic: without it, two threads
 # resolving the same key each keep their own EF instance, and each instance
@@ -250,10 +266,17 @@ def _build_ef_class():
         def __init__(self, preferred_providers=None, intra_op_num_threads=0):
             super().__init__(preferred_providers=preferred_providers)
             self._intra_op_num_threads = intra_op_num_threads
+            self._run_lock = threading.Lock()
 
         @staticmethod
         def name() -> str:
             return "default"
+
+        def _forward(self, documents, batch_size=32):
+            # Every upstream embed path (__call__, embed_query) runs the
+            # session here, so this is the one place to serialize it.
+            with _run_guard(self._preferred_providers, self._run_lock):
+                return super()._forward(documents, batch_size)
 
         @cached_property
         def model(self):
@@ -433,6 +456,9 @@ class EmbeddinggemmaONNX:
         # one-time model load so concurrent cold calls cannot build (and
         # transiently hold) two full model sessions.
         self._load_lock = threading.Lock()
+        # Held around session.run on providers that cannot run concurrently
+        # (see _SERIAL_RUN_PROVIDERS).
+        self._run_lock = threading.Lock()
 
     def _lazy_load(self) -> None:
         if self._session is not None:
@@ -575,13 +601,14 @@ class EmbeddinggemmaONNX:
         # time (#1770).
         for start in range(0, len(order), self._batch_size):
             idxs = order[start : start + self._batch_size]
-            sent_emb = _embeddinggemma_forward(
-                self._session,
-                self._tokenizer,
-                self._output_idx,
-                np,
-                [input[i] for i in idxs],
-            )
+            with _run_guard(self._providers, self._run_lock):
+                sent_emb = _embeddinggemma_forward(
+                    self._session,
+                    self._tokenizer,
+                    self._output_idx,
+                    np,
+                    [input[i] for i in idxs],
+                )
             # L2-normalize so cosine similarity == dot product (matches what the
             # MTEB methodology assumes; ChromaDB's distance is configured for it).
             norms = np.linalg.norm(sent_emb, axis=1, keepdims=True) + 1e-12

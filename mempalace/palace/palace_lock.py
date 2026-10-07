@@ -30,8 +30,16 @@ class MineValidationError(RuntimeError):
         self.errors: tuple[str, ...] = tuple(errors)
 
 
-def _validate_palace_fts5_after_mine(palace_path: str) -> None:
+def _validate_palace_fts5_after_mine(
+    palace_path: str, *, writes_since: Optional[int] = None
+) -> None:
     """Raise MineValidationError if PRAGMA quick_check reports any error after a mine.
+
+    ``writes_since`` is :func:`palace_write_serial` read before the mine's
+    first write. When nothing was written since, the check is skipped: a mine
+    that filed, purged and registered nothing left the database as it found
+    it, and on a 1M-drawer palace the full quick_check costs ~40 s warm, most
+    of a no-op mine (#2684). ``None`` always checks.
 
     Reuses the same primitive that `cmd_repair` already runs as preflight so the
     operator sees the same recovery banner regardless of which command surfaces
@@ -46,6 +54,8 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
     last word here: it checks the content table against `embedding_metadata`
     before rebuilding from it, and declines when it cannot.
     """
+    if writes_since is not None and palace_write_serial() == writes_since:
+        return
     if resolve_backend_name(palace_path) != "chroma":
         return
 
@@ -76,6 +86,17 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
         errors = maybe_autoheal_fts5_index(palace_path, errors, progress=logger.warning)
     if errors:
         raise MineValidationError(palace_path, errors)
+
+
+def palace_write_serial() -> int:
+    """A counter that moves whenever this process writes to a Chroma palace.
+
+    A miner reads it before its first write and hands it to
+    :func:`_validate_palace_fts5_after_mine` as ``writes_since``.
+    """
+    from ..backends.chroma import chroma_write_serial
+
+    return chroma_write_serial()
 
 
 # Process-wide record of palaces this PROCESS already holds the lock for. Used

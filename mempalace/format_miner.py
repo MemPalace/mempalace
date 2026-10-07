@@ -77,6 +77,7 @@ from .palace import (
     get_collection,
     mine_lock,
     mine_yield_point,
+    palace_write_serial,
 )
 
 # Module-level imports from .miner so tests can patch them via
@@ -770,6 +771,7 @@ def mine_formats(
     # who customized their config see the effect in format-mode mining.
     # Per PR #1555 review (Gemini #3).
     palace_config = MempalaceConfig(palace_path=palace_path)
+    writes_at_start = palace_write_serial()
 
     format_path = Path(format_dir).expanduser().resolve()
     if not wing:
@@ -986,7 +988,7 @@ def mine_formats(
             # exit Done on the --mode extract path that bypasses _mine_impl.
             # Sits outside the per-file try/except in the for-loop body, so
             # caught per-file errors do not mask the integrity result.
-            _validate_palace_fts5_after_mine(palace_path)
+            _validate_palace_fts5_after_mine(palace_path, writes_since=writes_at_start)
     finally:
         # Hook-spawned mines write a PID file that miner.py's
         # _cleanup_mine_pid_file() clears; we mirror that so format-mode
