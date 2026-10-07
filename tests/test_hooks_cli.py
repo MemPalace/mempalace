@@ -445,7 +445,8 @@ def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None):
     mock_config = MagicMock()
     type(mock_config).hook_silent_save = PropertyMock(return_value=True)
     type(mock_config).hook_desktop_toast = PropertyMock(return_value=False)
-    patches.append(patch("mempalace.config.MempalaceConfig", return_value=mock_config))
+    if not isinstance(hooks_cli_mod.MempalaceConfig, Mock):
+        patches.append(patch("mempalace.hooks_cli.MempalaceConfig", return_value=mock_config))
     # A Stop or PreCompact hook spawns the transcript ingest through
     # ``_spawn_mine``, and a real child here outlives the test that started
     # it: it holds the palace's writer lease, and the next test file to ask

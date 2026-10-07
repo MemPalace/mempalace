@@ -524,10 +524,10 @@ def _apply_topics_by_wing_renames(renames):
     tbw = reg.get("topics_by_wing")
     if not isinstance(tbw, dict):
         return
-    for old, new in renames.items():
-        if old not in tbw:
-            continue
-        old_topics = tbw.pop(old) or []
+    # Remove all sources first so chained mappings use the original namespaces.
+    moved_topics = {old: tbw.pop(old) or [] for old in renames if old in tbw}
+    for old, old_topics in moved_topics.items():
+        new = renames[old]
         if new in tbw:
             merged = list(tbw[new])
             for topic in old_topics:

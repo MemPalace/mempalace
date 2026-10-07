@@ -7,7 +7,12 @@ stay discoverable under the new name, merging collisions. IDs are left untouched
 (they are opaque keys), and the pass is idempotent.
 """
 
+import json
+
+import pytest
+
 from mempalace.migrate import (
+    _apply_topics_by_wing_renames,
     migrate_wing_names,
     plan_tunnel_wing_renames,
     plan_wing_renames,
@@ -16,6 +21,33 @@ from mempalace.palace_graph import _canonical_tunnel_id
 
 
 # --- pure planner ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "renames, expected",
+    [
+        ({"alpha": "beta", "beta": "gamma"}, {"beta": ["a"], "gamma": ["g", "b"]}),
+        ({"alpha": "beta", "beta": "alpha"}, {"alpha": ["b"], "beta": ["a"], "gamma": ["g"]}),
+        ({"alpha": "gamma", "beta": "gamma"}, {"gamma": ["g", "a", "b"]}),
+    ],
+)
+def test_topic_renames_use_original_wings(monkeypatch, tmp_path, renames, expected):
+    from mempalace import miner
+
+    registry_path = tmp_path / "known_entities.json"
+    registry = {"topics_by_wing": {"alpha": ["a"], "beta": ["b"], "gamma": ["g"]}}
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    monkeypatch.setattr(miner, "_ENTITY_REGISTRY_PATH", str(registry_path))
+    monkeypatch.setattr(
+        miner,
+        "_load_known_entities_raw",
+        lambda: json.loads(registry_path.read_text(encoding="utf-8")),
+    )
+
+    _apply_topics_by_wing_renames(renames)
+
+    saved = json.loads(registry_path.read_text(encoding="utf-8"))
+    assert saved["topics_by_wing"] == expected
 
 
 def test_plan_renames_strips_leading_and_trailing():
