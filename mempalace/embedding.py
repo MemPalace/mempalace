@@ -885,6 +885,36 @@ class OpenAICompatEmbeddingFunction:
         return (arr / norms).tolist()
 
 
+_KNOWN_EMBEDDING_MODELS = frozenset(
+    {"minilm", "embeddinggemma", "embeddinggemma2", "openai-compat"}
+)
+
+
+def _resolve_embedding_model(model) -> str:
+    """Normalize ``model`` to the embedder that will actually be built.
+
+    An unrecognized value (a typo, ``"all-minilm-l6-v2"``, an empty string, a
+    JSON ``null`` read back as ``"none"``) falls back to ``"minilm"``, as it
+    always has, with a warning logged once per process and value. Every
+    caller resolves through here, so mine, search and MCP writes all embed
+    with the same function for the same configuration. Palaces that record
+    an embedder identity stay protected by the identity check, which keeps
+    comparing the configured name (:func:`current_model_name`).
+    """
+    name = str(model).strip().lower()
+    if name in _KNOWN_EMBEDDING_MODELS:
+        return name
+    warning_key = ("unknown-embedding-model", name)
+    if warning_key not in _WARNED:
+        _WARNED.add(warning_key)
+        logger.warning(
+            "Unknown embedding_model %r; falling back to 'minilm'. Valid values: %s.",
+            name,
+            ", ".join(sorted(_KNOWN_EMBEDDING_MODELS)),
+        )
+    return "minilm"
+
+
 def get_embedding_function(device: Optional[str] = None, model: Optional[str] = None):
     """Return a cached embedding function for the requested device + model.
 
@@ -902,12 +932,7 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
         if model is None:
             model = cfg.embedding_model
 
-    model = str(model).strip().lower()
-    if model not in {"minilm", "embeddinggemma", "embeddinggemma2", "openai-compat"}:
-        raise ValueError(
-            f"Unknown embedding_model {model!r}; choose minilm, embeddinggemma, "
-            "embeddinggemma2, or openai-compat"
-        )
+    model = _resolve_embedding_model(model)
 
     if model == "embeddinggemma2":
         from .config import MempalaceConfig
@@ -983,7 +1008,7 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
                 batch_size=_resolve_embeddinggemma_batch_size(),
             )
         else:
-            # MiniLM keeps its historical embedding behavior.
+            # minilm, and every unrecognized value (see _resolve_embedding_model).
             ef_cls = _build_ef_class()
             ef = ef_cls(preferred_providers=providers, intra_op_num_threads=threads)
 
@@ -1020,6 +1045,10 @@ def describe_device(device: Optional[str] = None, model: Optional[str] = None) -
             # The resolved device depends on the model (_AUTO_PROVIDER_DENYLIST),
             # so the label would otherwise name a provider we won't use.
             model = cfg.embedding_model
+    if model is not None:
+        # Label the provider list the factory will actually build with, which
+        # for an unrecognized model is minilm's.
+        model = _resolve_embedding_model(model)
     _, effective = _resolve_providers(device, model)
     return effective
 

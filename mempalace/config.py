@@ -1551,8 +1551,9 @@ class MempalaceConfig:
 
         Onboarding calls this once on first run. Accepts ``"minilm"``,
         ``"embeddinggemma"``, ``"embeddinggemma2"``, or ``"openai-compat"``;
-        other values are normalized to lowercase and persisted. The embedding
-        factory rejects unrecognized values when resolving the provider.
+        other values are normalized to lowercase and persisted
+        (``embedding.get_embedding_function`` falls back to minilm for
+        unrecognized values, with a warning).
         """
         self._file_config["embedding_model"] = str(model).strip().lower()
         # ``develop`` created the directory here, outside any ``try``, so this

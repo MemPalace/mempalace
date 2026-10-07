@@ -44,6 +44,7 @@ _REAL_EMBEDDING_TEST_MODULES = {
     "test_embeddinggemma",
     "test_embeddinggemma2",
     "test_embeddinggemma2_integration",
+    "test_embedding_model_fallback",
 }
 
 

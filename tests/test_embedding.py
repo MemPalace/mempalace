@@ -1,3 +1,5 @@
+import logging
+
 import pytest
 
 import mempalace.embedding as embedding
@@ -30,9 +32,100 @@ def test_embeddinggemma2_factory_is_lazy_cached_and_identity_tracks_settings(mon
     assert embedding.get_embedding_function().identity != second.identity
 
 
-def test_unknown_embedding_model_fails_instead_of_using_minilm():
-    with pytest.raises(ValueError, match="Unknown embedding_model"):
-        embedding.get_embedding_function(device="cpu", model="embeddinggemm2")
+class _FakeMiniLM:
+    """Stands in for the MiniLM ONNX class so no model is loaded."""
+
+    built = []
+
+    def __init__(self, preferred_providers=None, intra_op_num_threads=0):
+        self.preferred_providers = preferred_providers
+        _FakeMiniLM.built.append(self)
+
+
+def _fake_minilm(monkeypatch):
+    _FakeMiniLM.built = []
+    monkeypatch.setattr(embedding, "_build_ef_class", lambda: _FakeMiniLM)
+
+
+def _fallback_warnings(caplog):
+    return [r for r in caplog.records if "Unknown embedding_model" in r.getMessage()]
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["embeddinggemm2", "all-minilm-l6-v2", "", "none"],
+    ids=["typo", "non-canonical", "empty", "null"],
+)
+def test_unknown_embedding_model_falls_back_to_minilm_with_one_warning(monkeypatch, caplog, model):
+    """An unrecognized model keeps the historical MiniLM fallback, and every
+    call resolves to the same cached function that ``"minilm"`` gets."""
+    _fake_minilm(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger=embedding.logger.name):
+        first = embedding.get_embedding_function(device="cpu", model=model)
+        second = embedding.get_embedding_function(device="cpu", model=model)
+        minilm = embedding.get_embedding_function(device="cpu", model="minilm")
+
+    assert isinstance(first, _FakeMiniLM)
+    assert first is second is minilm
+    assert len(_FakeMiniLM.built) == 1
+    warnings = _fallback_warnings(caplog)
+    assert len(warnings) == 1
+    assert repr(model) in warnings[0].getMessage()
+    assert "falling back to 'minilm'" in warnings[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    "configured, expected_name",
+    [("all-minilm-l6-v2", "all-minilm-l6-v2"), ("", ""), (None, "none")],
+    ids=["non-canonical", "empty", "null"],
+)
+def test_configured_unknown_model_falls_back_and_keeps_its_raw_identity(
+    monkeypatch, tmp_path, caplog, configured, expected_name
+):
+    """The same fallback through ``config.json``, the path mine, search and
+    the MCP server take; the identity name stays the configured string so a
+    palace that recorded it keeps opening."""
+    import json
+
+    (tmp_path / "config.json").write_text(json.dumps({"embedding_model": configured}))
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_MODEL", raising=False)
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_DEVICE", "cpu")
+    _fake_minilm(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger=embedding.logger.name):
+        ef = embedding.get_embedding_function()
+        assert embedding.get_embedding_function() is ef
+        assert embedding.describe_device() == "cpu"
+    assert ef is embedding.get_embedding_function(device="cpu", model="minilm")
+    assert embedding.current_model_name() == expected_name
+    assert len(_fallback_warnings(caplog)) == 1
+
+
+def test_unknown_model_from_the_environment_falls_back(monkeypatch, caplog):
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_DEVICE", "cpu")
+    _fake_minilm(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger=embedding.logger.name):
+        ef = embedding.get_embedding_function()
+    assert ef is embedding.get_embedding_function(device="cpu", model="minilm")
+    assert len(_fallback_warnings(caplog)) == 1
+
+
+def test_known_models_do_not_warn(monkeypatch, caplog):
+    _fake_minilm(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger=embedding.logger.name):
+        embedding.get_embedding_function(device="cpu", model=" MiniLM ")
+    assert not _fallback_warnings(caplog)
+
+
+def test_invalid_embeddinggemma2_dimension_still_raises(monkeypatch):
+    """The fallback covers unknown model names only; a known model with an
+    invalid setting still fails closed."""
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "embeddinggemma2")
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA2_DIMENSION", "300")
+    with pytest.raises(ValueError, match="embeddinggemma2_dimension"):
+        embedding.get_embedding_function(device="cpu")
 
 
 def test_embedding_wrapper_selects_query_and_metadata_document_methods(monkeypatch):
