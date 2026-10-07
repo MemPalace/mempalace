@@ -126,3 +126,39 @@ class TestStatsMetadata:
         stats = kg.stats()
 
         assert stats["relationship_types"] == ["loves", "works_at"]
+class TestQueryEntityProvenance:
+    """query_entity must return the source_file it was given (#kg-provenance)."""
+
+    def test_outgoing_fact_returns_source_file(self, kg):
+        kg.add_triple(
+            "Alice",
+            "works_on",
+            "mempalace",
+            valid_from="2026-01-01",
+            source_file="notes/alice.md",
+        )
+
+        (fact,) = kg.query_entity("Alice", direction="outgoing")
+
+        assert fact["source_file"] == "notes/alice.md"
+        assert fact["source_closet"] is None
+
+    def test_incoming_fact_returns_source_file(self, kg):
+        kg.add_triple(
+            "Alice",
+            "works_on",
+            "mempalace",
+            valid_from="2026-01-01",
+            source_file="notes/alice.md",
+        )
+
+        (fact,) = kg.query_entity("mempalace", direction="incoming")
+
+        assert fact["source_file"] == "notes/alice.md"
+
+    def test_source_file_is_none_when_not_supplied(self, kg):
+        kg.add_triple("Bob", "likes", "chess", valid_from="2026-01-01")
+
+        (fact,) = kg.query_entity("Bob", direction="outgoing")
+
+        assert fact["source_file"] is None
