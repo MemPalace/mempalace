@@ -51,6 +51,7 @@ def cmd_mine(args):
         )
         return
 
+    from ..embedding import UnknownEmbeddingModelError
     from ..palace import MineAlreadyRunning, MineFileErrors, MineValidationError
     from ..media import MediaAssetError, MediaAssetSetupError
 
@@ -155,6 +156,10 @@ def cmd_mine(args):
     except MineFileErrors as exc:
         # The summary above already counted them; exit non-zero so scripts
         # and hooks do not treat a partial mine as done.
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except UnknownEmbeddingModelError as exc:
+        # A misspelled EmbeddingGemma name: nothing was written; say what to fix.
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(1)
     except MineValidationError as exc:

@@ -18,6 +18,13 @@ def _open_search_collection(palace_path: str, collection_name: str):
             "No palace found",
             hint="Run: mempalace init <dir> && mempalace mine <dir>",
         )
+    except UnknownEmbeddingModelError as e:
+        logger.error("%s", e)
+        return None, _search_error_result(
+            "Unknown embedding_model",
+            details=str(e),
+            hint="Fix embedding_model in config.json or MEMPALACE_EMBEDDING_MODEL.",
+        )
     except BackendError as e:
         logger.error("Backend error opening palace at %s: %s", palace_path, e)
         return None, _search_error_result(

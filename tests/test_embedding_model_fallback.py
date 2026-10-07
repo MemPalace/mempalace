@@ -161,3 +161,47 @@ def test_mine_search_and_add_drawer_share_the_fallback_embedder(
     # One warning per process, not per call.
     warnings = [r for r in caplog.records if "Unknown embedding_model" in r.getMessage()]
     assert len(warnings) == 1
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+@pytest.mark.parametrize("typo", ["embeddinggemm2", "embeddinggema"])
+def test_embeddinggemma_typo_stops_mine_search_and_add_drawer(
+    unknown_model_palace, monkeypatch, kg, typo
+):
+    """A palace mined with a known model, then a misspelled EmbeddingGemma in
+    the config: every path refuses with the hint and nothing is written."""
+    import chromadb
+    from _mcp_server_helpers import _patch_mcp_server
+
+    from mempalace.config import MempalaceConfig
+    from mempalace.mcp_server import tool_add_drawer
+    from mempalace.miner import mine
+    from mempalace.searcher import search_memories
+
+    project, palace, config = unknown_model_palace
+    mine(str(project), str(palace))
+    client = chromadb.PersistentClient(path=str(palace))
+    before = client.get_collection("mempalace_drawers").count()
+    client.close()
+
+    config_file = project.parent / "config" / "config.json"
+    config_file.write_text(json.dumps({"palace_path": str(palace), "embedding_model": typo}))
+    embedding._EF_CACHE.clear()
+    (project / "notes" / "more.md").write_text("The rain barrel overflows in April.\n" * 8)
+
+    with pytest.raises(embedding.UnknownEmbeddingModelError, match="did you mean"):
+        mine(str(project), str(palace))
+    searched = search_memories("greenhouse tomatoes", str(palace))
+    assert searched["results"] == []
+    assert searched["error"] == "Unknown embedding_model", searched
+    assert "did you mean 'embeddinggemma' or 'embeddinggemma2'?" in searched["details"]
+
+    _patch_mcp_server(monkeypatch, MempalaceConfig(config_dir=str(config_file.parent)), kg)
+    added = tool_add_drawer(wing="garden", room="notes", content="The compost bin is turned.")
+    assert added.get("success") is not True, added
+    assert added["error"] == "Unknown embedding_model", added
+    assert "did you mean 'embeddinggemma' or 'embeddinggemma2'?" in added["details"]
+
+    client = chromadb.PersistentClient(path=str(palace))
+    assert client.get_collection("mempalace_drawers").count() == before
+    client.close()

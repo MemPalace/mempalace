@@ -283,6 +283,13 @@ def _get_collection(create=False):
                 _collection_cache_palace = None
                 _invalidate_overview_caches()
                 return None
+            except UnknownEmbeddingModelError as exc:
+                _collection_open_error = _unknown_embedding_model_error(exc)
+                _collection_cache = None
+                _collection_cache_backend = None
+                _collection_cache_palace = None
+                _invalidate_overview_caches()
+                return None
             except Exception:
                 logger.exception(
                     "_get_collection generic attempt %d/2 failed (palace=%s, create=%s)",
@@ -403,6 +410,16 @@ def _get_collection(create=False):
             _palace_db_mtime = 0.0
             _invalidate_overview_caches()
             return None
+        except UnknownEmbeddingModelError as exc:
+            # Deterministic config error: retrying cannot help, and the
+            # generic "Backend open failed" would hide the fix.
+            _collection_open_error = _unknown_embedding_model_error(exc)
+            _client_cache = None
+            _collection_cache = None
+            _collection_cache_backend = None
+            _collection_cache_palace = None
+            _invalidate_overview_caches()
+            return None
         except Exception:
             logger.exception(
                 "_get_collection attempt %d/2 failed (palace=%s, create=%s)",
@@ -440,6 +457,15 @@ def _get_collection(create=False):
         "hint": "Run: mempalace status or mempalace repair-status for diagnostics.",
     }
     return None
+
+
+def _unknown_embedding_model_error(exc) -> dict:
+    logger.error("%s", exc)
+    return {
+        "error": "Unknown embedding_model",
+        "details": str(exc),
+        "hint": "Fix embedding_model in config.json or MEMPALACE_EMBEDDING_MODEL.",
+    }
 
 
 def _no_palace():

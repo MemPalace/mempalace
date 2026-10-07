@@ -888,33 +888,73 @@ class OpenAICompatEmbeddingFunction:
 _KNOWN_EMBEDDING_MODELS = frozenset(
     {"minilm", "embeddinggemma", "embeddinggemma2", "openai-compat"}
 )
+_GEMMA_MODELS = ("embeddinggemma", "embeddinggemma2")
+
+
+class UnknownEmbeddingModelError(ValueError):
+    """``embedding_model`` looks like a misspelled EmbeddingGemma name.
+
+    Raised instead of the MiniLM fallback: filing MiniLM vectors under a
+    palace the user meant to embed with EmbeddingGemma can only be undone by
+    re-embedding everything (``mempalace repair rebuild-index``). The Chroma
+    backend re-raises it rather than opening with chromadb's default.
+    """
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """Levenshtein distance between ``a`` and ``b`` (insert, delete, substitute)."""
+    previous = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        current = [i]
+        for j, cb in enumerate(b, 1):
+            current.append(min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (ca != cb)))
+        previous = current
+    return previous[-1]
+
+
+def _is_gemma_near_miss(name: str) -> bool:
+    """``name`` (already normalized, not a known model) reads as an EmbeddingGemma typo."""
+    return name.startswith("embeddinggemma") or any(
+        _edit_distance(name, gemma) <= 2 for gemma in _GEMMA_MODELS
+    )
 
 
 def _resolve_embedding_model(model) -> str:
     """Normalize ``model`` to the embedder that will actually be built.
 
-    An unrecognized value (a typo, ``"all-minilm-l6-v2"``, an empty string, a
-    JSON ``null`` read back as ``"none"``) falls back to ``"minilm"``, as it
-    always has, with a warning logged once per process and value. Every
-    caller resolves through here, so mine, search and MCP writes all embed
-    with the same function for the same configuration. Palaces that record
-    an embedder identity stay protected by the identity check, which keeps
+    Names are compared stripped and lowercased, like
+    :attr:`MempalaceConfig.embedding_model`, so ``"EmbeddingGemma2"`` is
+    ``"embeddinggemma2"``. A near miss of ``embeddinggemma`` or
+    ``embeddinggemma2`` (starts with ``embeddinggemma``, or within edit
+    distance 2 of either) raises :class:`UnknownEmbeddingModelError`. Any
+    other unrecognized value (``"all-minilm-l6-v2"``, an empty string, a JSON
+    ``null`` read back as ``"none"``) falls back to ``"minilm"``, as it always
+    has, with a warning logged once per process and value. Every caller
+    resolves through here, so mine, search and MCP writes all embed with the
+    same function for the same configuration. Palaces that record an
+    embedder identity stay protected by the identity check, which keeps
     comparing the configured name (:func:`current_model_name`).
     """
     name = str(model).strip().lower()
     if name in _KNOWN_EMBEDDING_MODELS:
         return name
+    valid = ", ".join(sorted(_KNOWN_EMBEDDING_MODELS))
+    if _is_gemma_near_miss(name):
+        raise UnknownEmbeddingModelError(
+            f"Unknown embedding_model {name!r}; did you mean 'embeddinggemma' or "
+            f"'embeddinggemma2'? Valid values: {valid}. Not falling back to 'minilm': "
+            "vectors filed with the wrong model can only be replaced by re-embedding "
+            "the whole palace."
+        )
     warning_key = ("unknown-embedding-model", name)
     if warning_key not in _WARNED:
         _WARNED.add(warning_key)
         logger.warning(
             "Unknown embedding_model %r; falling back to 'minilm'. Valid values: %s. "
-            "If you meant embeddinggemma or embeddinggemma2, fix the spelling; a palace "
-            "already filed under this fallback holds MiniLM vectors, so re-embed it with "
-            "`mempalace repair rebuild-index` (`mempalace palace set-embedder` only "
-            "re-records the model name).",
+            "Drawers filed meanwhile are embedded with MiniLM, so moving this palace "
+            "to another model later takes `mempalace repair rebuild-index`.",
             name,
-            ", ".join(sorted(_KNOWN_EMBEDDING_MODELS)),
+            valid,
         )
     return "minilm"
 

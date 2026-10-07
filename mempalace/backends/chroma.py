@@ -3946,10 +3946,16 @@ class ChromaBackend(BaseBackend):
         collection, so a reader that omits the argument silently gets the
         library default and its queries won't match the writer's vectors.
         """
+        from ..embedding import UnknownEmbeddingModelError
+
         try:
             from ..embedding import get_embedding_function
 
             return get_embedding_function()
+        except UnknownEmbeddingModelError:
+            # A misspelled model must stop the open, not run on chromadb's
+            # default (MiniLM) function and file vectors for the wrong model.
+            raise
         except Exception:
             from ..config import MempalaceConfig
 

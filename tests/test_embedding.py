@@ -53,8 +53,8 @@ def _fallback_warnings(caplog):
 
 @pytest.mark.parametrize(
     "model",
-    ["embeddinggemm2", "all-minilm-l6-v2", "", "none"],
-    ids=["typo", "non-canonical", "empty", "null"],
+    ["all-minilm-l6-v2", "minilm-l6", "", "none"],
+    ids=["non-canonical", "other-name", "empty", "null"],
 )
 def test_unknown_embedding_model_falls_back_to_minilm_with_one_warning(monkeypatch, caplog, model):
     """An unrecognized model keeps the historical MiniLM fallback, and every
@@ -72,10 +72,88 @@ def test_unknown_embedding_model_falls_back_to_minilm_with_one_warning(monkeypat
     assert len(warnings) == 1
     assert repr(model) in warnings[0].getMessage()
     assert "falling back to 'minilm'" in warnings[0].getMessage()
-    assert "If you meant embeddinggemma or embeddinggemma2, fix the spelling" in (
-        warnings[0].getMessage()
-    )
     assert "`mempalace repair rebuild-index`" in warnings[0].getMessage()
+    assert "did you mean" not in warnings[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "embeddinggemm2",
+        "embeddinggema",
+        "embedinggemma",
+        "embeddingemma2",
+        "EmbeddingGema2",
+        "embeddinggemma-300m",
+        "embeddinggemma3",
+    ],
+)
+def test_embeddinggemma_near_miss_raises_instead_of_falling_back(monkeypatch, caplog, model):
+    """A misspelled EmbeddingGemma name would file MiniLM vectors that only a
+    full re-embed can replace, so it stops with a hint instead."""
+    _fake_minilm(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger=embedding.logger.name):
+        with pytest.raises(embedding.UnknownEmbeddingModelError) as excinfo:
+            embedding.get_embedding_function(device="cpu", model=model)
+    message = str(excinfo.value)
+    assert repr(model.strip().lower()) in message
+    assert "did you mean 'embeddinggemma' or 'embeddinggemma2'?" in message
+    assert "Valid values: embeddinggemma, embeddinggemma2, minilm, openai-compat" in message
+    assert isinstance(excinfo.value, ValueError)
+    assert not _FakeMiniLM.built
+    assert not _fallback_warnings(caplog)
+
+
+@pytest.mark.parametrize(
+    "model, expected",
+    [
+        ("EmbeddingGemma2", "embeddinggemma2"),
+        (" EmbeddingGemma ", "embeddinggemma"),
+        ("embeddinggemma", "embeddinggemma"),
+        ("embeddinggemma2", "embeddinggemma2"),
+        ("MiniLM", "minilm"),
+    ],
+)
+def test_known_models_resolve_case_insensitively(model, expected):
+    """Names are compared stripped and lowercased, as config.embedding_model
+    already normalizes them, so a capitalized known name is that model."""
+    assert embedding._resolve_embedding_model(model) == expected
+
+
+@pytest.mark.parametrize(
+    "a, b, distance",
+    [
+        ("", "", 0),
+        ("embeddinggemma", "embeddinggemma", 0),
+        ("embeddinggemm2", "embeddinggemma2", 1),
+        ("embeddinggema", "embeddinggemma", 1),
+        ("kitten", "sitting", 3),
+        ("", "abc", 3),
+    ],
+)
+def test_edit_distance(a, b, distance):
+    assert embedding._edit_distance(a, b) == distance
+    assert embedding._edit_distance(b, a) == distance
+
+
+def test_configured_embeddinggemma_typo_raises_through_the_chroma_backend(monkeypatch, tmp_path):
+    """The Chroma backend used to swallow factory errors and open with
+    chromadb's default function; the typo error must get through it."""
+    import json
+
+    from mempalace.backends.chroma import ChromaBackend
+
+    (tmp_path / "config.json").write_text(json.dumps({"embedding_model": "embeddinggemm2"}))
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_MODEL", raising=False)
+    _fake_minilm(monkeypatch)
+
+    with pytest.raises(embedding.UnknownEmbeddingModelError):
+        embedding.get_embedding_function()
+    with pytest.raises(embedding.UnknownEmbeddingModelError):
+        ChromaBackend._resolve_embedding_function()
+    with pytest.raises(embedding.UnknownEmbeddingModelError):
+        embedding.describe_device()
 
 
 @pytest.mark.parametrize(
