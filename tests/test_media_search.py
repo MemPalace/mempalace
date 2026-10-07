@@ -99,14 +99,16 @@ def test_code_task_and_date_scope(indexed_media):
     found = search_memories(
         "authentication function", palace, include_media=True, query_task="code"
     )
+    assert not found.get("error"), found
     assert found["results"][0]["result_type"] == "text"
     assert provider.calls == ["code"]
     recent = search_memories("screenshot", palace, include_media=True, since="2026-10-02")
+    assert not recent.get("error"), recent
     assert len(recent["results"]) == 1
     assert recent["results"][0]["result_type"] == "asset"
-    assert not search_memories("screenshot", palace, include_media=True, wing="elsewhere")[
-        "results"
-    ]
+    filtered = search_memories("screenshot", palace, include_media=True, wing="elsewhere")
+    assert not filtered.get("error"), filtered
+    assert not filtered["results"]
 
 
 def test_default_search_excludes_assets_and_keeps_legacy_hit_schema(indexed_media):

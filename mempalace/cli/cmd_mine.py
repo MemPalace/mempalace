@@ -2,6 +2,8 @@
 if __name__ != "mempalace.cli":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.cli")
 
+from typing import Optional
+
 
 def cmd_mine(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
@@ -246,8 +248,8 @@ def mine_source_adapter(
     source_path: str,
     palace_path: str,
     dry_run: bool = False,
-    project: str | None = None,
-    related_drawer_id: str | None = None,
+    project: Optional[str] = None,
+    related_drawer_id: Optional[str] = None,
 ) -> int:
     """Run an explicitly selected RFC 002 source adapter through ``PalaceContext``.
 
