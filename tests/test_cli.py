@@ -891,6 +891,53 @@ def test_cmd_mine_exits_nonzero_on_lock_holder(mock_config_cls, capsys):
     assert "mcp_server" in captured.err
 
 
+def _mismatch_errors():
+    from mempalace.backends.base import (
+        DimensionMismatchError,
+        EmbedderIdentityMismatchError,
+        EmbeddingFunctionMismatchError,
+    )
+
+    return [
+        EmbedderIdentityMismatchError(
+            "collection was built with embedder 'minilm' but the current embedder is 'x'."
+        ),
+        DimensionMismatchError("collection was built with a 384-dim embedder ('minilm')"),
+        EmbeddingFunctionMismatchError(
+            "Embedding model mismatch reading palace at '/fake/palace'."
+        ),
+    ]
+
+
+@pytest.mark.parametrize("error_index", [0, 1, 2], ids=["identity", "dimension", "chroma-ef"])
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_prints_model_mismatch_cleanly(mock_config_cls, capsys, error_index):
+    """A model/identity mismatch is a configuration problem, not a crash:
+    mine prints the message (as search does) and exits 1, no traceback."""
+    error = _mismatch_errors()[error_index]
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(
+        dir="/src",
+        palace=None,
+        mode="projects",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+    )
+    with patch("mempalace.miner.mine", side_effect=error):
+        with pytest.raises(SystemExit) as excinfo:
+            cmd_mine(args)
+    assert excinfo.value.code == 1
+    err = capsys.readouterr().err
+    assert err.startswith("mempalace: "), err
+    assert str(error) in err
+    assert "Traceback" not in err
+
+
 # ── cmd_wakeup ─────────────────────────────────────────────────────────
 
 

@@ -144,6 +144,26 @@ def test_dimension_change_raises_dimension_error_first():
         check_embedder_identity(EmbedderIdentity("a", 384), EmbedderIdentity("b", 768))
 
 
+def test_name_mismatch_points_to_a_re_embed_not_set_embedder_force():
+    """The vectors differ, so the hint must not suggest relabelling them with
+    ``set-embedder --force``; it names the real re-embed commands."""
+    with pytest.raises(EmbedderIdentityMismatchError) as excinfo:
+        check_embedder_identity(
+            EmbedderIdentity("embeddinggemma2", 0), EmbedderIdentity("minilm", 0)
+        )
+    message = str(excinfo.value)
+    assert "set-embedder" not in message
+    assert "--force" not in message
+    assert "`mempalace repair rebuild-index`" in message
+    assert "repair --mode from-sqlite --source" in message
+
+
+def test_dimension_mismatch_names_the_re_embed_commands():
+    with pytest.raises(DimensionMismatchError) as excinfo:
+        check_embedder_identity(EmbedderIdentity("a", 384), EmbedderIdentity("b", 768))
+    assert "`mempalace repair rebuild-index`" in str(excinfo.value)
+
+
 def test_force_returns_mismatch_without_raising():
     assert (
         check_embedder_identity(

@@ -51,6 +51,11 @@ def cmd_mine(args):
         )
         return
 
+    from ..backends.base import (
+        DimensionMismatchError,
+        EmbedderIdentityMismatchError,
+        EmbeddingFunctionMismatchError,
+    )
     from ..embedding import UnknownEmbeddingModelError
     from ..palace import MineAlreadyRunning, MineFileErrors, MineValidationError
     from ..media import MediaAssetError, MediaAssetSetupError
@@ -158,8 +163,15 @@ def cmd_mine(args):
         # and hooks do not treat a partial mine as done.
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(1)
-    except UnknownEmbeddingModelError as exc:
-        # A misspelled model name: nothing was written; say what to fix.
+    except (
+        UnknownEmbeddingModelError,
+        EmbedderIdentityMismatchError,
+        DimensionMismatchError,
+        EmbeddingFunctionMismatchError,
+    ) as exc:
+        # A misspelled model, or a model that differs from the one the palace
+        # was built with: nothing was written. Print the fix, as search does,
+        # instead of a traceback.
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(1)
     except MineValidationError as exc:

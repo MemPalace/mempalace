@@ -2632,8 +2632,13 @@ def test_get_collection_translates_ef_mismatch_to_helpful_error(tmp_path):
     backend.close_palace(palace_path)
 
     try:
-        with pytest.raises(ValueError, match=r"rebuild-index"):
+        with pytest.raises(ValueError, match=r"rebuild-index") as excinfo:
             backend.get_collection(palace_path, "drawers", create=False)
+        # A ValueError subclass, so callers like `mine` can report it cleanly.
+        from mempalace.backends.base import EmbeddingFunctionMismatchError
+
+        assert isinstance(excinfo.value, EmbeddingFunctionMismatchError)
+        assert "unset MEMPALACE_EMBEDDING_MODEL" not in str(excinfo.value)
     finally:
         backend._resolve_embedding_function = original_resolver
         backend.close_palace(palace_path)

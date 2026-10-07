@@ -32,6 +32,7 @@ from .base import (
     BaseBackend,
     BaseCollection,
     CollectionNotInitializedError,
+    EmbeddingFunctionMismatchError,
     GetResult,
     HealthStatus,
     LexicalHit,
@@ -3989,10 +3990,11 @@ class ChromaBackend(BaseBackend):
         return (
             f"Embedding model mismatch reading palace at {palace_path!r}.\n"
             f"  Underlying ChromaDB error: {msg}\n"
-            f"  Current MEMPALACE_EMBEDDING_MODEL={current_model!r}.\n"
+            f"  Current embedding_model={current_model!r}.\n"
             f"  The palace was built with a different embedding model. Either:\n"
-            f"    (a) revert the model: unset MEMPALACE_EMBEDDING_MODEL (or set "
-            f"the previous value), or\n"
+            f"    (a) revert the model: set embedding_model (config.json or "
+            f"MEMPALACE_EMBEDDING_MODEL) back to the value the palace was built "
+            f"with, or\n"
             f"    (b) re-embed in place: `{rebuild_cmd}` "
             f"(writes new vectors with the current model)."
         )
@@ -4331,7 +4333,7 @@ class ChromaBackend(BaseBackend):
                 except ValueError as e:
                     explanation = self._explain_ef_mismatch(e, palace_path)
                     if explanation:
-                        raise ValueError(explanation) from e
+                        raise EmbeddingFunctionMismatchError(explanation) from e
                     raise
             else:
                 try:
@@ -4341,7 +4343,7 @@ class ChromaBackend(BaseBackend):
                 except ValueError as e:
                     explanation = self._explain_ef_mismatch(e, palace_path)
                     if explanation:
-                        raise ValueError(explanation) from e
+                        raise EmbeddingFunctionMismatchError(explanation) from e
                     raise
             if caller_vectors:
                 _require_caller_vector_collection(collection)
