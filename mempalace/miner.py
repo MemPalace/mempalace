@@ -164,6 +164,7 @@ READABLE_EXTENSIONS = {
     ".sh",
     ".csv",
     ".sql",
+    ".prisma",
     ".toml",
     ".tex",
     ".bib",
