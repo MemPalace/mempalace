@@ -21,7 +21,7 @@ def _open_search_collection(palace_path: str, collection_name: str):
     except UnknownEmbeddingModelError as e:
         logger.error("%s", e)
         return None, _search_error_result(
-            "Unknown embedding_model",
+            UNKNOWN_EMBEDDING_MODEL_ERROR,
             details=str(e),
             hint="Fix embedding_model in config.json or MEMPALACE_EMBEDDING_MODEL.",
         )

@@ -651,6 +651,27 @@ def _mcp_tool_preflight_refusal(req_id, tool_name: str, *, check_writer: bool = 
     return _mcp_peer_writer_refusal(req_id, tool_name) if check_writer else None
 
 
+def _tool_result_is_error(result) -> bool:
+    """Whether a tool result reports an error the MCP client should flag.
+
+    Tool errors are otherwise plain ``{"error": ...}`` results. A misspelled
+    ``embedding_model`` refuses every read and write until the config is
+    fixed, so it also sets MCP's ``isError`` for clients that only check
+    the flag.
+    """
+    return isinstance(result, dict) and result.get("error") == UNKNOWN_EMBEDDING_MODEL_ERROR
+
+
+def _tool_call_response(req_id, result) -> dict:
+    """The JSON-RPC response carrying a tool's result as MCP text content."""
+    tool_result = {
+        "content": [{"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}]
+    }
+    if _tool_result_is_error(result):
+        tool_result["isError"] = True
+    return {"jsonrpc": "2.0", "id": req_id, "result": tool_result}
+
+
 def _decorate_mcp_tool_result(tool_name: str, result):
     """Attach MCP transport-only diagnostics outside handle_request complexity."""
 
@@ -854,15 +875,7 @@ def handle_request(request):
                     tool_name, TOOLS[tool_name]["handler"](**tool_args)
                 )
 
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "content": [
-                        {"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}
-                    ]
-                },
-            }
+            return _tool_call_response(req_id, result)
         except TypeError as e:
             # Qualname match prevents leaking internal helper/param names raised
             # inside the handler body — see test_handler_internal_signature_shape_stays_generic.

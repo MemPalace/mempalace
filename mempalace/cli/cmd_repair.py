@@ -185,18 +185,6 @@ def _legacy_repair_after_prompt(backend, palace_path, collection_name, args):
         raise SystemExit(2) from exc
 
 
-def _exit_on_misspelled_embedding_model():
-    """Refuse a misspelled embedding_model before the confirmation prompt and
-    before anything is archived or re-embedded."""
-    from ..embedding import UnknownEmbeddingModelError
-
-    try:
-        MempalaceConfig().embedding_model
-    except UnknownEmbeddingModelError as exc:
-        print(f"mempalace: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-
 def cmd_repair(args):
     """Rebuild palace vector index from SQLite metadata.
 

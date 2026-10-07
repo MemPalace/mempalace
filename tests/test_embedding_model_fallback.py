@@ -459,3 +459,43 @@ def test_set_embedder_resolves_the_model_name(unknown_model_palace):
     old, new = set_palace_embedder_identity(str(palace), model="minilm")
     assert new.model_name == "minilm"
     assert _recorded_identity(palace)["mempalace_drawers"]["model_name"] == "minilm"
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["embeddinggemm2"], indirect=True)
+def test_mcp_marks_the_near_miss_refusal_as_a_tool_error(unknown_model_palace, monkeypatch, kg):
+    """Clients that only check ``isError`` must see the refusal as an error;
+    a successful call keeps the plain result."""
+    from _mcp_server_helpers import _patch_mcp_server
+
+    from mempalace.config import MempalaceConfig
+    from mempalace.mcp_server import handle_request
+
+    project, palace, config = unknown_model_palace
+    _patch_mcp_server(monkeypatch, MempalaceConfig(config_dir=str(palace.parent / "config")), kg)
+
+    def call(name, arguments):
+        return handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            }
+        )
+
+    refused = call(
+        "mempalace_add_drawer", {"wing": "garden", "room": "notes", "content": "Compost."}
+    )
+    assert refused["result"]["isError"] is True, refused
+    body = json.loads(refused["result"]["content"][0]["text"])
+    assert body["error"] == "Unknown embedding_model"
+    assert "did you mean" in body["details"]
+    searched = call("mempalace_search", {"query": "compost"})
+    assert searched["result"]["isError"] is True, searched
+    assert not palace.exists()
+
+    _set_model(config, palace, "minilm")
+    _patch_mcp_server(monkeypatch, MempalaceConfig(config_dir=str(palace.parent / "config")), kg)
+    added = call("mempalace_add_drawer", {"wing": "garden", "room": "notes", "content": "Compost."})
+    assert "isError" not in added["result"], added
+    assert json.loads(added["result"]["content"][0]["text"])["success"] is True

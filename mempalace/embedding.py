@@ -900,6 +900,10 @@ _GUARDED_MODEL_FAMILIES = (
 _NEAR_MISS_DISTANCE = 2
 
 
+# ``error`` of the MCP / search result for an UnknownEmbeddingModelError.
+UNKNOWN_EMBEDDING_MODEL_ERROR = "Unknown embedding_model"
+
+
 class UnknownEmbeddingModelError(ValueError):
     """``embedding_model`` looks like a misspelled supported model name.
 
@@ -968,11 +972,11 @@ def _resolve_embedding_model(model) -> str:
     same configuration, and the identity a palace records and checks
     (:func:`current_model_name`) is the resolved name.
     """
-    name = str(model).strip().lower()
+    name = "" if model is None else str(model).strip().lower()
     if name in _KNOWN_EMBEDDING_MODELS:
         return name
     valid = ", ".join(sorted(_KNOWN_EMBEDDING_MODELS))
-    suggestions = _near_miss_suggestions(name)
+    suggestions = _near_miss_suggestions(name) if name else ()
     if suggestions:
         did_you_mean = " or ".join(repr(suggestion) for suggestion in suggestions)
         raise UnknownEmbeddingModelError(
@@ -982,14 +986,22 @@ def _resolve_embedding_model(model) -> str:
             "the whole palace. Older builds embedded unrecognized names with MiniLM; "
             "set embedding_model to minilm to keep using such a palace."
         )
-    warning_key = ("unknown-embedding-model", name)
+    # Show the configured value as written: a JSON null as null (not the
+    # string 'none'), an empty string flagged as such, anything else quoted.
+    if model is None:
+        shown = "null"
+    elif not name:
+        shown = "'' (empty)"
+    else:
+        shown = repr(name)
+    warning_key = ("unknown-embedding-model", shown)
     if warning_key not in _WARNED:
         _WARNED.add(warning_key)
         logger.warning(
-            "Unknown embedding_model %r; falling back to 'minilm'. Valid values: %s. "
+            "Unknown embedding_model %s; falling back to 'minilm'. Valid values: %s. "
             "Drawers filed meanwhile are embedded with MiniLM, so moving this palace "
             "to another model later takes `mempalace repair rebuild-index`.",
-            name,
+            shown,
             valid,
         )
     return "minilm"

@@ -184,10 +184,10 @@ def test_configured_embeddinggemma_typo_raises_through_the_chroma_backend(monkey
 @pytest.mark.parametrize(
     "configured, raw",
     [
-        ("notamodel", "notamodel"),
-        ("all-minilm-l6-v2", "all-minilm-l6-v2"),
-        ("", ""),
-        (None, "none"),
+        ("notamodel", "'notamodel'"),
+        ("all-minilm-l6-v2", "'all-minilm-l6-v2'"),
+        ("", "'' (empty)"),
+        (None, "null"),
     ],
     ids=["unknown", "non-canonical", "empty", "null"],
 )
@@ -218,7 +218,10 @@ def test_configured_unknown_model_falls_back_and_records_minilm(
     assert ef is embedding.get_embedding_function(device="cpu", model="minilm")
     warnings = _fallback_warnings(caplog)
     assert len(warnings) == 1
-    assert repr(raw) in warnings[0].getMessage()
+    # How the configured value appears: quoted strings, an empty string
+    # flagged as such, and a JSON null as null rather than the string 'none'.
+    assert f"Unknown embedding_model {raw}" in warnings[0].getMessage()
+    assert "'none'" not in warnings[0].getMessage()
 
 
 def test_unknown_model_from_the_environment_falls_back(monkeypatch, caplog):

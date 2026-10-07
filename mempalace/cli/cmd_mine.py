@@ -102,6 +102,11 @@ def cmd_mine(args):
     ):
         return
 
+    # Before --redetect-origin (which writes into the palace) and before the
+    # miner's banner: a misspelled model stops here with nothing printed or
+    # created.
+    _exit_on_misspelled_embedding_model()
+
     # --redetect-origin re-runs corpus_origin on the current corpus state
     # and overwrites <palace>/.mempalace/origin.json before mining proceeds.
     # Heuristic-only by design — full LLM detection lives on `mempalace init`.

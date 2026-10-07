@@ -467,7 +467,7 @@ def _get_collection(create=False):
 def _unknown_embedding_model_error(exc) -> dict:
     logger.error("%s", exc)
     return {
-        "error": "Unknown embedding_model",
+        "error": UNKNOWN_EMBEDDING_MODEL_ERROR,
         "details": str(exc),
         "hint": "Fix embedding_model in config.json or MEMPALACE_EMBEDDING_MODEL.",
     }

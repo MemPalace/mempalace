@@ -2598,6 +2598,17 @@ def test_explain_ef_mismatch_recognizes_chromadb_conflict():
     assert "mempalace --palace /tmp/palace.db repair rebuild-index" in msg
 
 
+def test_explain_ef_mismatch_also_offers_a_separate_palace_rebuild():
+    """Same two re-embed routes as the identity-mismatch hint: in place, or
+    into a separate palace with ``--mode from-sqlite``."""
+    err = ValueError("Embedding function conflict: new: embeddinggemma2 vs persisted: default")
+    msg = ChromaBackend._explain_ef_mismatch(err, "/tmp/palace.db")
+    assert "mempalace --palace /tmp/palace.db repair rebuild-index" in msg
+    assert (
+        "mempalace --palace <new-palace> repair --mode from-sqlite --source /tmp/palace.db" in msg
+    )
+
+
 def test_explain_ef_mismatch_returns_none_for_unrelated_errors():
     """Don't paper over unrelated ValueErrors with the EF-mismatch message —
     the caller needs to re-raise unmodified so debugging stays sane."""

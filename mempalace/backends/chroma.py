@@ -3986,7 +3986,11 @@ class ChromaBackend(BaseBackend):
             current_model = MempalaceConfig().embedding_model
         except Exception:
             current_model = "unknown"
-        rebuild_cmd = f"mempalace --palace {shlex.quote(palace_path)} repair rebuild-index"
+        quoted = shlex.quote(palace_path)
+        rebuild_cmd = f"mempalace --palace {quoted} repair rebuild-index"
+        separate_cmd = (
+            f"mempalace --palace <new-palace> repair --mode from-sqlite --source {quoted}"
+        )
         return (
             f"Embedding model mismatch reading palace at {palace_path!r}.\n"
             f"  Underlying ChromaDB error: {msg}\n"
@@ -3995,8 +3999,9 @@ class ChromaBackend(BaseBackend):
             f"    (a) revert the model: set embedding_model (config.json or "
             f"MEMPALACE_EMBEDDING_MODEL) back to the value the palace was built "
             f"with, or\n"
-            f"    (b) re-embed in place: `{rebuild_cmd}` "
-            f"(writes new vectors with the current model)."
+            f"    (b) re-embed with the current model: `{rebuild_cmd}` (in place; "
+            f"archives the original palace first) or `{separate_cmd}` (into a "
+            f"separate palace)."
         )
 
     # ------------------------------------------------------------------

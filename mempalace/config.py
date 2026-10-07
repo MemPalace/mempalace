@@ -1412,12 +1412,17 @@ class MempalaceConfig:
 
         return _resolve_embedding_model(self._configured_embedding_model())
 
-    def _configured_embedding_model(self) -> str:
-        """``embedding_model`` as configured (env first), stripped and lowercased."""
+    def _configured_embedding_model(self) -> "str | None":
+        """``embedding_model`` as configured (env first), stripped and lowercased.
+
+        A JSON ``null`` in config.json stays ``None`` (not the string
+        ``"none"``) so the fallback warning can show it as ``null``.
+        """
         env_val = os.environ.get("MEMPALACE_EMBEDDING_MODEL")
         if env_val:
             return env_val.strip().lower()
-        return str(self._file_config.get("embedding_model", "minilm")).strip().lower()
+        value = self._file_config.get("embedding_model", "minilm")
+        return None if value is None else str(value).strip().lower()
 
     @property
     def embedding_threads(self) -> int:
