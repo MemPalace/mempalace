@@ -316,6 +316,7 @@ def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None)
             "source_file": source_label or jsonl_path,
             "filed_at": datetime.now().isoformat(),
             "ingest_mode": "sweep",
+            "origin": "conversation",
         }
         # The directory this drawer's ``source_file`` sits in, so ``sync``
         # decides a swept drawer by the same reading as a mined one (#2320).

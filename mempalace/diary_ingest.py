@@ -176,6 +176,7 @@ def ingest_diaries(
                 "room": "daily",
                 "source_file": source_file,
                 "source_session": "daily_diary",
+                "origin": "diary",
                 "filed_at": now_iso,
             }
             # Which directory this diary was read from, so ``sync`` decides an

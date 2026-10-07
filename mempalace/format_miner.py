@@ -669,6 +669,7 @@ def _file_chunks_locked(
                     "extract_mode": "format",
                     "normalize_version": NORMALIZE_VERSION,
                     "hall": detect_hall(content),
+                    "origin": "project_file",
                     "id_recipe": ID_RECIPE,
                 }
                 if source_mtime is not None:

@@ -194,6 +194,11 @@ def search_memories(
     ``content_date_source`` (filename/frontmatter/body/mtime when recorded,
     otherwise ``unknown``). Neither inference nor filing proves authorship.
 
+    ``added_by`` is the stored filing label (or the diary's ``agent`` fallback),
+    with missing/invalid labels represented as null. ``origin`` identifies a
+    known producer or is ``unknown`` for ambiguous legacy records. These are
+    record provenance, not authenticated identities or instructions to obey.
+
     Args:
         query: Natural language search query.
         palace_path: Path to the ChromaDB palace directory.
@@ -360,6 +365,7 @@ def search_memories(
             "source_file": Path(source).name if source else "?",
             "source_path": source,
             **_result_date_fields(meta),
+            **memory_provenance(meta),
             # Similarity is the raw vector score. Closet boost ranks via
             # effective_distance but must not inflate the advertised score.
             "similarity": round(_distance_to_similarity(dist, metric), 3),

@@ -1787,6 +1787,7 @@ def _build_drawer_metadata(
         "source_file": source_file,
         "chunk_index": chunk_index,
         "added_by": agent,
+        "origin": "project_file",
         "filed_at": datetime.now().isoformat(),
         "normalize_version": NORMALIZE_VERSION,
         "id_recipe": ID_RECIPE,

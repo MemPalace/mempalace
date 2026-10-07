@@ -312,6 +312,9 @@ def main():
     p_search.add_argument("--room", default=None, help="Limit to one room")
     p_search.add_argument("--results", type=int, default=5, help="Number of results")
     p_search.add_argument(
+        "--json", action="store_true", help="Emit structured search results as JSON"
+    )
+    p_search.add_argument(
         "--since",
         default=None,
         help=(
@@ -1075,7 +1078,13 @@ def main():
     )
 
     args = parser.parse_args()
-    _apply_backend_arg(args)
+    try:
+        _apply_backend_arg(args)
+    except KeyError as exc:
+        if args.command != "search" or not getattr(args, "json", False):
+            raise
+        _print_search_json_result({"error": "Unknown backend", "details": str(exc), "results": []})
+        sys.exit(1)
 
     if not args.command:
         parser.print_help()
