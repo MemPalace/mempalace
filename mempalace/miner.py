@@ -48,7 +48,7 @@ from .palace import (
 # lives at the end of _mine_impl, alongside the existing
 # ``_compute_topic_tunnels_for_wing`` post-mine block.
 from .collision_scan import assert_no_collisions
-from .hallways import compute_hallways_for_wing
+from .hallways import _report_disabled_hallways, compute_hallways_for_wing
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
 from .source_identity import source_directory_identity
 
@@ -2452,6 +2452,7 @@ def _mine_impl(
                 hallways_created = compute_hallways_for_wing(
                     wing, col=collection, config=graph_config
                 )
+                _report_disabled_hallways(graph_config)
                 if hallways_created:
                     print(f"\n  Hallways: +{len(hallways_created)} within-wing entity link(s)")
             except Exception as e:
@@ -2623,8 +2624,16 @@ def _compute_entity_tunnels_for_wing(wing: str, config=None) -> int:
     ``follow_tunnels`` API.
 
     Returns the number of tunnels created or refreshed. Zero means no
-    eligible entity exists in this wing yet (or no hallway records do).
+    eligible entity exists in this wing yet (or no hallway records do), or
+    hallway construction is disabled. Disabling skips the hallway scan and
+    leaves previously stored hallways and tunnels untouched.
     """
+    from .config import MempalaceConfig
+
+    cfg = config if config is not None else MempalaceConfig()
+    if not getattr(cfg, "hallways_enabled", True):
+        return 0
+
     from .hallways import list_hallways
     from .palace_graph import entity_tunnels_for_wing
 

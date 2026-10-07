@@ -1527,6 +1527,32 @@ class MempalaceConfig:
         return self._resolve_str_setting("MEMPALACE_EMBEDDING_API_KEY", "embedding_api_key")
 
     @property
+    def hallways_enabled(self) -> bool:
+        """Whether to construct hallways and their automatic entity tunnels.
+
+        Reads ``MEMPALACE_KG_HALLWAYS_ENABLED`` first, then
+        ``hallways_enabled`` in ``config.json``, then defaults to ``True``.
+        Accepts JSON booleans and case-insensitive strings ``true``/``false``,
+        ``1``/``0``, ``yes``/``no``, and ``on``/``off``, ignoring surrounding
+        whitespace. Invalid values fall through to the next source; numeric
+        config values are not booleans. Disabling construction leaves stored
+        hallway records and explicit reads available.
+        """
+        for value in (
+            os.environ.get("MEMPALACE_KG_HALLWAYS_ENABLED"),
+            self._file_config.get("hallways_enabled"),
+        ):
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {"true", "1", "yes", "on"}:
+                    return True
+                if normalized in {"false", "0", "no", "off"}:
+                    return False
+        return True
+
+    @property
     def topic_tunnel_min_count(self):
         """Minimum number of overlapping confirmed topics required to create
         a cross-wing tunnel between two wings.

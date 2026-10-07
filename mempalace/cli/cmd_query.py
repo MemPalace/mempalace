@@ -98,7 +98,12 @@ def cmd_hallways(args):
     )
     config = MempalaceConfig(palace_path=palace_path)
     if getattr(args, "rebuild", False):
-        from ..hallways import compute_hallways_for_wing
+        from ..hallways import _HALLWAYS_DISABLED_NOTICE, compute_hallways_for_wing
+
+        if not config.hallways_enabled:
+            print(_HALLWAYS_DISABLED_NOTICE, file=sys.stderr)
+            return
+
         from ..palace import get_collection
         from ..palace_graph import sqlite_grouped_counts_reader
 
