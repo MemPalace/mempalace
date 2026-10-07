@@ -616,6 +616,14 @@ class TestInferWing:
     def test_spaces_collapsed_to_underscore(self):
         assert _call_infer_wing("/Users/me/my project") == "my_project"
 
+    def test_hyphens_collapsed_to_underscore(self):
+        # Hyphens must collapse to "_" like spaces, so the hook-derived
+        # wing matches config.normalize_wing_name (which does the same).
+        # Otherwise a hyphenated repo dir like ~/code/my-proj yields wing
+        # "my-proj" from the hook but "my_proj" from the miners, and
+        # wing-filtered search misses the project's drawers (#1936).
+        assert _call_infer_wing("/Users/me/my-proj") == "my_proj"
+
     def test_lowercases_uppercase_basename(self):
         # Cursor on macOS often hands us /Users/<user>/Projects/MyApp.
         # The wing scoping in MemPalace's MCP tools is case-sensitive,
