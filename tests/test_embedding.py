@@ -54,8 +54,8 @@ def _fallback_warnings(caplog):
 
 @pytest.mark.parametrize(
     "model",
-    ["all-minilm-l6-v2", "minilm-l6", "", "none", "open", "gemma"],
-    ids=["non-canonical", "other-name", "empty", "null", "open", "gemma"],
+    ["all-minilm-l6-v2", "minilm-l6", "", "none", "open", "gemma", "gemma2"],
+    ids=["non-canonical", "other-name", "empty", "null", "open", "gemma", "gemma2"],
 )
 def test_unknown_embedding_model_falls_back_to_minilm_with_one_warning(monkeypatch, caplog, model):
     """An unrecognized model keeps the historical MiniLM fallback, and every

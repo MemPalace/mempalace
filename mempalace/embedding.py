@@ -932,6 +932,24 @@ def _near_miss_suggestions(name: str) -> tuple:
     return ()
 
 
+def _normalize_stored_model_name(name) -> str:
+    """The core model whose vectors a recorded ``model_name`` stands for.
+
+    Older builds (and develop before #2694) embedded any unrecognized
+    ``embedding_model`` with MiniLM but recorded the raw name
+    (``"all-minilm-l6-v2"``, ``"none"`` from a JSON null, ``"minilm-l6"``,
+    even a typo such as ``"embedinggemma2"``). So a recorded name that is
+    neither a supported model nor an ``embeddinggemma2:`` identity reads as
+    ``"minilm"``; supported names and gemma2 identities are returned as is
+    and stay strict. Only for core embedders: a ``server_embedder``
+    backend's names are its own and must not go through here.
+    """
+    stored = str(name or "").strip().lower()
+    if stored in _KNOWN_EMBEDDING_MODELS or stored.startswith("embeddinggemma2:"):
+        return stored
+    return "minilm"
+
+
 def _resolve_embedding_model(model) -> str:
     """Normalize ``model`` to the embedder that will actually be built.
 
@@ -961,7 +979,8 @@ def _resolve_embedding_model(model) -> str:
             f"Unknown embedding_model {name!r}; did you mean {did_you_mean}? "
             f"Valid values: {valid}. Not falling back to 'minilm': "
             "vectors filed with the wrong model can only be replaced by re-embedding "
-            "the whole palace."
+            "the whole palace. Older builds embedded unrecognized names with MiniLM; "
+            "set embedding_model to minilm to keep using such a palace."
         )
     warning_key = ("unknown-embedding-model", name)
     if warning_key not in _WARNED:

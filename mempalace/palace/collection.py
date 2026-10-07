@@ -54,6 +54,47 @@ def _collection_has_rows(collection, palace_path, collection_name) -> Optional[b
         return None
 
 
+def _server_embedder_identity(collection):
+    """The identity a ``server_embedder`` collection reports, or ``None``.
+
+    A server_embedder backend embeds with its own model and ignores the core
+    embedder; ``effective_embedder_identity()`` returning a named identity is
+    how it says so. ``None`` means the core (configured) embedder does the
+    embedding.
+    """
+    try:
+        effective = collection.effective_embedder_identity()
+    except Exception:
+        return None
+    if effective is not None and getattr(effective, "model_name", ""):
+        return effective
+    return None
+
+
+def _normalize_legacy_identity(collection, stored, *, create):
+    """Read a core embedder's legacy recorded name as the model behind it.
+
+    Older builds recorded the raw configured name while embedding anything
+    unrecognized with MiniLM, so a recorded ``"all-minilm-l6-v2"`` or
+    ``"none"`` is a MiniLM palace (see ``_normalize_stored_model_name``). A
+    write open (``create``) records the normalized name; a read open only
+    compares with it.
+    """
+    from ..backends.base import EmbedderIdentity
+    from ..embedding import _normalize_stored_model_name
+
+    normalized = _normalize_stored_model_name(stored.model_name)
+    if normalized == stored.model_name:
+        return stored
+    stored = EmbedderIdentity(model_name=normalized, dimension=stored.dimension)
+    if create:
+        try:
+            collection.set_embedder_identity(stored)
+        except Exception:
+            logger.debug("legacy embedder-identity rewrite failed", exc_info=True)
+    return stored
+
+
 def _enforce_embedder_identity(
     collection,
     palace_path,
@@ -93,11 +134,9 @@ def _enforce_embedder_identity(
     # model — is what must be checked and recorded. Fall back to the configured
     # model name for the normal (core-embedder) case.
     current: Optional[EmbedderIdentity] = None
-    try:
-        effective = collection.effective_embedder_identity()
-    except Exception:
-        effective = None
-    if effective is not None and getattr(effective, "model_name", ""):
+    effective = _server_embedder_identity(collection)
+    core_embedder = effective is None
+    if not core_embedder:
         current = effective
     else:
         try:
@@ -118,6 +157,13 @@ def _enforce_embedder_identity(
     except Exception:
         logger.debug("embedder-identity read failed for %s", collection_name, exc_info=True)
         return
+    legacy_name_unrecorded = False
+    if core_embedder and stored is not None and getattr(stored, "model_name", ""):
+        normalized = _normalize_legacy_identity(collection, stored, create=create)
+        # A read open compares with the normalized name but does not write it;
+        # stay out of the cache so the next write open records it.
+        legacy_name_unrecorded = normalized is not stored and not create
+        stored = normalized
     try:
         state = check_embedder_identity(stored, current)
     except (EmbedderIdentityMismatchError, DimensionMismatchError):
@@ -148,7 +194,8 @@ def _enforce_embedder_identity(
                 stacklevel=2,
             )
 
-    _VALIDATED_IDENTITY.add(key)
+    if not legacy_name_unrecorded:
+        _VALIDATED_IDENTITY.add(key)
 
 
 # The closets collection name is fixed (not user-configurable) — it is the
@@ -359,16 +406,34 @@ def set_palace_embedder_identity(
     """
     from ..backends.base import EmbedderIdentity, EmbedderIdentityMismatchError
     from ..config import MempalaceConfig
-    from ..embedding import get_embedder_identity
+    from ..embedding import (
+        _normalize_stored_model_name,
+        _resolve_embedding_model,
+        get_embedder_identity,
+    )
 
     configured = MempalaceConfig().embedding_model
-    target = (model or configured or "").strip().lower()
+    requested = (model or "").strip().lower()
+    target = requested or (configured or "").strip().lower()
     if not target:
         # No model given and none configured — there is nothing to record, and
         # recording a nameless identity is a silent no-op in every backend.
         raise ValueError(
             "no embedder model to record: pass --model NAME or configure MEMPALACE_EMBEDDING_MODEL"
         )
+    collection = get_collection(
+        palace_path,
+        collection_name=collection_name,
+        create=True,
+        backend=backend,
+        _skip_identity_check=True,
+    )
+    core_embedder = _server_embedder_identity(collection) is None
+    if requested and core_embedder:
+        # Record the model the name embeds with, as the factory resolves it:
+        # `--model all-minilm-l6-v2` is minilm. A server embedder's names are
+        # its own and are recorded as given.
+        target = _resolve_embedding_model(requested)
     if target == (configured or "").strip().lower():
         # Recording the in-use model — probe its dimension (already loaded).
         new = get_embedder_identity()
@@ -377,18 +442,15 @@ def set_palace_embedder_identity(
         # never load a foreign model (which can be a large download) just to
         # probe a dimension. The model-name check is the actual protection.
         new = EmbedderIdentity(model_name=target, dimension=0)
-    collection = get_collection(
-        palace_path,
-        collection_name=collection_name,
-        create=True,
-        backend=backend,
-        _skip_identity_check=True,
-    )
     try:
         old = collection.get_stored_embedder_identity()
     except Exception:
         old = None
-    if old is not None and old.model_name != new.model_name and not force:
+    old_name = getattr(old, "model_name", "")
+    if old is not None and core_embedder:
+        # A legacy raw name that stands for the same model is not a swap.
+        old_name = _normalize_stored_model_name(old_name)
+    if old is not None and old_name != new.model_name and not force:
         raise EmbedderIdentityMismatchError(
             f"palace already records embedder {old.model_name!r}; pass --force to "
             f"overwrite it with {new.model_name!r} (only if the vectors are compatible)"

@@ -419,6 +419,72 @@ def test_enforcement_prefers_effective_identity(monkeypatch, clear_identity_cach
         P._enforce_embedder_identity(_ServerCol(), "/tmp/x", "c", create=False)
 
 
+@pytest.mark.parametrize("stored_name", ["all-minilm-l6-v2", "none", "minilm"])
+def test_server_embedder_stored_names_are_not_normalized(
+    monkeypatch, clear_identity_cache, stored_name
+):
+    """Server-embedder names are arbitrary: an unrecognized stored name is
+    compared as is (never read as MiniLM) and never rewritten."""
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "minilm")
+    from mempalace import palace as P
+
+    class _ServerCol:
+        def effective_embedder_identity(self):
+            return EmbedderIdentity("text-embedding-3-small", 0)
+
+        def get_stored_embedder_identity(self):
+            return EmbedderIdentity(stored_name, 0)
+
+        def count(self):
+            return 5
+
+        def set_embedder_identity(self, identity):
+            raise AssertionError("must not rewrite a server-embedder identity")
+
+    with pytest.raises(EmbedderIdentityMismatchError):
+        P._enforce_embedder_identity(_ServerCol(), "/tmp/x", "c", create=True)
+
+
+def test_server_embedder_with_matching_arbitrary_name_passes(monkeypatch, clear_identity_cache):
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "minilm")
+    from mempalace import palace as P
+
+    class _ServerCol:
+        def effective_embedder_identity(self):
+            return EmbedderIdentity("nomic-embed-text", 0)
+
+        def get_stored_embedder_identity(self):
+            return EmbedderIdentity("nomic-embed-text", 0)
+
+        def count(self):
+            return 5
+
+        def set_embedder_identity(self, identity):
+            raise AssertionError("must not rewrite a server-embedder identity")
+
+    P._enforce_embedder_identity(_ServerCol(), "/tmp/x", "c", create=True)
+
+
+@pytest.mark.parametrize(
+    "stored, expected",
+    [
+        ("minilm", "minilm"),
+        ("embeddinggemma", "embeddinggemma"),
+        ("openai-compat", "openai-compat"),
+        ("embeddinggemma2:google/embeddinggemma-2@abc:768:text:retrieval-v1", None),
+        ("all-minilm-l6-v2", "minilm"),
+        ("none", "minilm"),
+        ("minilm-l6", "minilm"),
+        ("embedinggemma2", "minilm"),
+        ("gemma", "minilm"),
+    ],
+)
+def test_stored_core_model_names_normalize_to_the_model_that_embedded_them(stored, expected):
+    from mempalace.embedding import _normalize_stored_model_name
+
+    assert _normalize_stored_model_name(stored) == (expected or stored)
+
+
 def test_chroma_corrupt_sidecar_returns_none(tmp_path):
     # A malformed sidecar (non-dict JSON) must not raise — degrade to unknown.
     col = _chroma_collection(tmp_path)

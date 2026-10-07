@@ -338,3 +338,124 @@ def test_rebuild_with_a_near_miss_refuses_before_archiving(unknown_model_palace)
         rebuild_from_sqlite(str(palace), str(palace), archive_existing_dest=True)
     assert sorted(p.name for p in palace.parent.iterdir()) == before
     assert _recorded_identity(palace)["mempalace_drawers"]["model_name"] == "minilm"
+
+
+def _stamp_legacy_identity(palace, model_name):
+    """Rewrite the sidecar as develop / older builds left it for a palace
+    configured with a non-standard name: the raw name, MiniLM vectors."""
+    sidecar = palace / "mempalace_embedder.json"
+    data = json.loads(sidecar.read_text())
+    for entry in data.values():
+        entry["model_name"] = model_name
+    sidecar.write_text(json.dumps(data))
+
+
+_LEGACY_OPENS = [
+    ("all-minilm-l6-v2", "all-minilm-l6-v2"),
+    ("all-minilm-l6-v2", "minilm"),
+    ("none", None),
+    ("none", "minilm"),
+    ("minilm-l6", "minilm-l6"),
+    ("minilm-l6", "minilm"),
+    ("embedinggemma2", "minilm"),
+]
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+@pytest.mark.parametrize(
+    "stored, configured", _LEGACY_OPENS, ids=[f"{s}-cfg-{c}" for s, c in _LEGACY_OPENS]
+)
+def test_legacy_palace_with_a_raw_stored_name_keeps_working(
+    unknown_model_palace, monkeypatch, stored, configured
+):
+    """Older builds embedded an unrecognized name with MiniLM but recorded the
+    raw name. Opening such a palace with that name (or with minilm) must keep
+    mining and searching without a re-embed; a write open records minilm."""
+    import chromadb
+
+    from mempalace.miner import mine
+    from mempalace.palace import _VALIDATED_IDENTITY
+    from mempalace.searcher import search_memories
+
+    project, palace, config = unknown_model_palace
+    mine(str(project), str(palace))
+    _stamp_legacy_identity(palace, stored)
+    _VALIDATED_IDENTITY.clear()
+    _set_model(config, palace, configured)
+
+    found = search_memories("greenhouse tomatoes watering", str(palace))
+    assert found.get("results"), found
+    assert _recorded_identity(palace)["mempalace_drawers"]["model_name"] == stored  # read-only
+
+    (project / "notes" / "rain.md").write_text("The rain barrel overflows in April.\n" * 8)
+    mine(str(project), str(palace))
+    found = search_memories("rain barrel overflows", str(palace))
+    assert "rain barrel" in found["results"][0]["text"], found
+    recorded = _recorded_identity(palace)
+    assert {entry["model_name"] for entry in recorded.values()} == {"minilm"}, recorded
+    client = chromadb.PersistentClient(path=str(palace))
+    assert client.get_collection("mempalace_drawers").count() == 2
+    client.close()
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+def test_legacy_near_miss_name_as_config_raises_with_the_minilm_hint(unknown_model_palace):
+    """``embedinggemma2`` is a near miss as a config value and refuses by
+    design; the error says how to keep using a palace older builds filled."""
+    from mempalace.miner import mine
+    from mempalace.palace import _VALIDATED_IDENTITY
+
+    project, palace, config = unknown_model_palace
+    mine(str(project), str(palace))
+    _stamp_legacy_identity(palace, "embedinggemma2")
+    _VALIDATED_IDENTITY.clear()
+    _set_model(config, palace, "embedinggemma2")
+    with pytest.raises(embedding.UnknownEmbeddingModelError) as excinfo:
+        mine(str(project), str(palace))
+    assert (
+        "Older builds embedded unrecognized names with MiniLM; set embedding_model to "
+        "minilm to keep using such a palace." in str(excinfo.value)
+    )
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+def test_a_known_stored_model_still_refuses_a_swap(unknown_model_palace):
+    """Only unrecognized stored names are read as MiniLM; a palace that
+    records embeddinggemma stays strict against a minilm config."""
+    from mempalace.backends.base import EmbedderIdentityMismatchError
+    from mempalace.miner import mine
+    from mempalace.palace import _VALIDATED_IDENTITY
+    from mempalace.searcher import search_memories
+
+    project, palace, config = unknown_model_palace
+    mine(str(project), str(palace))
+    _stamp_legacy_identity(palace, "embeddinggemma")
+    _VALIDATED_IDENTITY.clear()
+    (project / "notes" / "rain.md").write_text("The rain barrel overflows in April.\n" * 8)
+    with pytest.raises(EmbedderIdentityMismatchError):
+        mine(str(project), str(palace))
+    searched = search_memories("greenhouse tomatoes", str(palace))
+    assert searched.get("error"), searched
+    assert _recorded_identity(palace)["mempalace_drawers"]["model_name"] == "embeddinggemma"
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+def test_set_embedder_resolves_the_model_name(unknown_model_palace):
+    """`set-embedder --model all-minilm-l6-v2 --force` records the model that
+    name embeds with, minilm; on a legacy palace no --force is needed."""
+    from mempalace.miner import mine
+    from mempalace.palace import set_palace_embedder_identity
+
+    project, palace, config = unknown_model_palace
+    mine(str(project), str(palace))
+    _stamp_legacy_identity(palace, "all-minilm-l6-v2")
+
+    old, new = set_palace_embedder_identity(str(palace), model="all-minilm-l6-v2", force=True)
+    assert old.model_name == "all-minilm-l6-v2"
+    assert new.model_name == "minilm"
+    assert _recorded_identity(palace)["mempalace_drawers"]["model_name"] == "minilm"
+
+    _stamp_legacy_identity(palace, "minilm-l6")
+    old, new = set_palace_embedder_identity(str(palace), model="minilm")
+    assert new.model_name == "minilm"
+    assert _recorded_identity(palace)["mempalace_drawers"]["model_name"] == "minilm"
