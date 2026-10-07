@@ -262,10 +262,18 @@ def _run_git(cwd: Path, *args: str, timeout: int = GIT_TIMEOUT) -> str:
             ["git", "-C", str(cwd), *args],
             capture_output=True,
             text=True,
+            # git emits UTF-8 on every platform, but bare text=True decodes
+            # with the locale codepage (e.g. cp1254 on Turkish Windows), which
+            # crashes the stdout reader thread on non-ASCII names ("Ş" is
+            # 0xc5 0x9e in UTF-8; 0x9e is undefined in cp1254) and silently
+            # leaves r.stdout as None. Decode explicitly; errors="replace"
+            # keeps legacy-encoded history from aborting a whole scan.
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             check=False,
         )
-        return r.stdout if r.returncode == 0 else ""
+        return (r.stdout or "") if r.returncode == 0 else ""
     except (OSError, subprocess.SubprocessError):
         return ""
 
@@ -283,6 +291,9 @@ def _global_git_identity() -> tuple[str, str]:
             ["git", "config", "--global", "user.name"],
             capture_output=True,
             text=True,
+            # Same UTF-8 rationale as _run_git above.
+            encoding="utf-8",
+            errors="replace",
             timeout=2,
             check=False,
         ).stdout.strip()
@@ -290,6 +301,8 @@ def _global_git_identity() -> tuple[str, str]:
             ["git", "config", "--global", "user.email"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=2,
             check=False,
         ).stdout.strip()
