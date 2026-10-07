@@ -346,6 +346,7 @@ def _apply_candidate_strategy(
     source_file: str = None,
     since_dt=None,
     before_dt=None,
+    vector_distances: dict = None,
 ) -> None:
     """Dispatch to the registered merger for ``strategy``.
 
@@ -365,6 +366,7 @@ def _apply_candidate_strategy(
             source_file=source_file,
             since_dt=since_dt,
             before_dt=before_dt,
+            vector_distances=vector_distances,
         )
 
 
@@ -382,6 +384,7 @@ def _finalize_candidate_hits(
     stop_words: frozenset = frozenset(),
     since_dt=None,
     before_dt=None,
+    vector_distances: dict = None,
 ) -> tuple:
     try:
         _apply_candidate_strategy(
@@ -396,6 +399,7 @@ def _finalize_candidate_hits(
             source_file=source_file,
             since_dt=since_dt,
             before_dt=before_dt,
+            vector_distances=vector_distances,
         )
     except UnsupportedCapabilityError:
         return [], _search_error_result(
