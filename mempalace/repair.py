@@ -839,6 +839,16 @@ def _is_a_named_pipe(sqlite_path: str) -> bool:
         return False
 
 
+def _is_readonly_refusal(error: BaseException) -> bool:
+    """True when SQLite refused a write with SQLITE_READONLY (result code 8)."""
+    if not isinstance(error, sqlite3.OperationalError):
+        return False
+    code = getattr(error, "sqlite_errorcode", None)
+    if code is not None:
+        return code & 0xFF == sqlite3.SQLITE_READONLY
+    return "readonly database" in str(error).lower()
+
+
 def _quick_check_errors(sqlite_path: str) -> list[str]:
     """Run ``PRAGMA quick_check`` against ``sqlite_path`` and report what it says.
 
@@ -886,7 +896,21 @@ def _quick_check_errors(sqlite_path: str) -> list[str]:
         ) as conn:
             rows = conn.execute("PRAGMA quick_check").fetchall()
     except (sqlite3.Error, ValueError) as e:
-        return [f"PRAGMA quick_check failed: {e}"]
+        if not _is_readonly_refusal(e):
+            return [f"PRAGMA quick_check failed: {e}"]
+        # SQLite refused a write the read-only probe cannot give (FTS5
+        # validation can need one). The file is not shown to be damaged, so
+        # ask again on a writable connection rather than call it corruption.
+        try:
+            with closing(
+                open_palace_writer(sqlite_path, timeout=_SQLITE_INTEGRITY_BUSY_TIMEOUT_SECONDS)
+            ) as conn:
+                rows = conn.execute("PRAGMA quick_check").fetchall()
+        except (sqlite3.Error, ValueError) as retry_error:
+            return [
+                f"quick_check could not run (mode=rw, SQLite {sqlite3.sqlite_version}): "
+                f"{retry_error}"
+            ]
 
     errors: list[str] = []
     for row in rows:
@@ -963,6 +987,21 @@ def print_sqlite_integrity_abort(palace_path: str, errors: list[str]) -> None:
 
     sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
     preview = errors[:5]
+
+    if errors and all(e.startswith("quick_check could not run") for e in errors):
+        print("\n  ABORT: the SQLite probe could not run, so repair cannot tell whether")
+        print("  the database is healthy.")
+        print("  `mempalace repair` will not call Chroma delete_collection() without a verdict.")
+        print()
+        print(f"  Database: {sqlite_path}")
+        print()
+        print("  Probe output:")
+        for message in preview:
+            print(f"    - {message}")
+        print()
+        print("  Check that the palace directory and chroma.sqlite3 are writable by this")
+        print("  user and that no other process holds the database, then re-run.")
+        return
 
     print("\n  ABORT: SQLite-layer corruption detected before repair rebuild.")
     print("  `mempalace repair` will not call Chroma delete_collection() because")
