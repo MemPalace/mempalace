@@ -556,6 +556,14 @@ def _no_palace():
     }
 
 
+def _identity_unconfirmed_open_error() -> bool:
+    """Whether the last open refused a write because the embedder identity is unconfirmed."""
+    return bool(
+        _collection_open_error
+        and _collection_open_error.get("error_class") == "EmbedderIdentityUnconfirmedError"
+    )
+
+
 def _collection_error_or_no_palace():
     if not _collection_open_error:
         return _no_palace()

@@ -112,10 +112,44 @@ class EmbedderIdentityRecordError(BackendError):
 EMBEDDER_IDENTITY_NOT_RECORDED_ERROR = "Embedder identity not recorded"
 
 
+class EmbedderIdentityUnreadableError(BackendError):
+    """A collection's embedder identity record exists but cannot be read.
+
+    Raised by ``get_stored_embedder_identity`` for a truncated or malformed
+    ``mempalace_embedder.json`` (or one entry of it), or a record the backend
+    fails to read. It is not the same as "nothing recorded": something was
+    recorded, and MemPalace cannot tell what, so reads warn and writes refuse
+    with :class:`EmbedderIdentityUnconfirmedError` until ``mempalace palace
+    set-embedder`` records the model again.
+    """
+
+
+class EmbedderIdentityUnconfirmedError(EmbedderIdentityMismatchError):
+    """A write was refused because the model behind a collection's vectors is unconfirmed.
+
+    Raised on write opens only, when the collection holds vectors (or may
+    hold vectors) and its embedder identity is missing, unreadable, or a
+    legacy bare ``openai-compat`` stamp that does not name the endpoint
+    model. Writing with the current model could then mix two models in one
+    collection, and nothing would notice afterwards. Reads keep working with
+    a warning. The fix is to confirm the model the palace was built with and
+    record it with ``mempalace palace set-embedder --model <name>``.
+
+    A subclass of :class:`EmbedderIdentityMismatchError`, so every caller
+    that already refuses a model mismatch cleanly (CLI ``mine``, MCP tools,
+    search) refuses this the same way.
+    """
+
+
+EMBEDDER_IDENTITY_UNCONFIRMED_ERROR = "Embedder identity unconfirmed"
+
+
 def model_mismatch_error_kind(exc: BaseException) -> Optional[str]:
     """The result ``error`` value for a model mismatch error, else None."""
     if isinstance(exc, EmbedderIdentityRecordError):
         return EMBEDDER_IDENTITY_NOT_RECORDED_ERROR
+    if isinstance(exc, EmbedderIdentityUnconfirmedError):
+        return EMBEDDER_IDENTITY_UNCONFIRMED_ERROR
     if isinstance(exc, EmbedderIdentityMismatchError):
         return EMBEDDER_IDENTITY_MISMATCH_ERROR
     if isinstance(exc, DimensionMismatchError):
@@ -137,9 +171,19 @@ _RE_EMBED_HINT = (
 class EmbedderIdentityUnknownWarning(UserWarning):
     """Emitted on first open of a collection with no recorded embedder identity.
 
-    Legacy palaces created before identity tracking carry no model name. Per
-    RFC 001 the right behavior is warn-not-fail: the identity is recorded on
-    the next write and subsequent opens become strict.
+    Legacy palaces created before identity tracking carry no model name.
+    Reads warn and go on with the current model. A write records the current
+    model only while the collection is empty; a collection that already holds
+    vectors refuses writes (:class:`EmbedderIdentityUnconfirmedError`) until
+    ``mempalace palace set-embedder`` records the model that built it.
+    """
+
+
+class EmbedderIdentityUnreadableWarning(EmbedderIdentityUnknownWarning):
+    """Emitted when a read opens a collection whose identity record is unreadable.
+
+    The read goes on with the current model; writes refuse until the record
+    is repaired with ``mempalace palace set-embedder``.
     """
 
 

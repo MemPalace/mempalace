@@ -1058,6 +1058,7 @@ MODEL_ERROR_CLASS_NAMES = frozenset(
         "EmbeddingFunctionUnavailableError",
         "EmbeddingAPIError",
         "EmbedderIdentityMismatchError",
+        "EmbedderIdentityUnconfirmedError",
         "EmbedderIdentityRecordError",
         "DimensionMismatchError",
         "EmbeddingFunctionMismatchError",
@@ -1071,6 +1072,10 @@ _MODEL_REFUSAL_HINT = (
 )
 _UNKNOWN_MODEL_HINT = "Fix embedding_model in config.json or MEMPALACE_EMBEDDING_MODEL."
 _IDENTITY_NOT_RECORDED_HINT = "Check that the palace directory is writable, then retry."
+_IDENTITY_UNCONFIRMED_HINT = (
+    "Confirm the model the palace was built with, then run "
+    "`mempalace palace set-embedder --model <model>`; reads and search keep working meanwhile."
+)
 _UNAVAILABLE_EF_HINT = (
     "Fix the embedding settings in config.json (for openai-compat: embedding_api_url "
     "and embedding_api_model) or install the missing dependency, then retry."
@@ -1090,6 +1095,7 @@ def _model_error_class(exc: BaseException) -> Optional[type]:
         DimensionMismatchError,
         EmbedderIdentityMismatchError,
         EmbedderIdentityRecordError,
+        EmbedderIdentityUnconfirmedError,
         EmbeddingFunctionMismatchError,
     )
 
@@ -1098,6 +1104,7 @@ def _model_error_class(exc: BaseException) -> Optional[type]:
         EmbeddingFunctionUnavailableError,
         EmbeddingAPIError,
         EmbedderIdentityRecordError,
+        EmbedderIdentityUnconfirmedError,
         EmbedderIdentityMismatchError,
         DimensionMismatchError,
         EmbeddingFunctionMismatchError,
@@ -1150,6 +1157,8 @@ def model_error_result(exc: BaseException, *, palace_path=None, log=None) -> Opt
         kind, hint = EMBEDDING_API_UNAVAILABLE_ERROR, _EMBEDDING_API_HINT
     elif cls.__name__ == "EmbedderIdentityRecordError":
         kind, hint = model_mismatch_error_kind(exc), _IDENTITY_NOT_RECORDED_HINT
+    elif cls.__name__ == "EmbedderIdentityUnconfirmedError":
+        kind, hint = model_mismatch_error_kind(exc), _IDENTITY_UNCONFIRMED_HINT
     else:
         kind, hint = model_mismatch_error_kind(exc), _MODEL_REFUSAL_HINT
     if log is not None:

@@ -71,6 +71,53 @@ def _server_embedder_identity(collection):
     return None
 
 
+def _persists_embedder_identity(collection) -> bool:
+    """Whether the collection's backend records an embedder identity at all.
+
+    A plugin backend that keeps :class:`~mempalace.backends.base.BaseCollection`'s
+    no-op identity hooks never records one, so "no recorded identity" is its
+    permanent state, not a sign of a legacy palace; refusing its writes would
+    lock it forever. Such backends keep the old warn-and-write behavior.
+    """
+    from ..backends.base import BaseCollection
+
+    inner = collection._inner if isinstance(collection, EmbeddingCollection) else collection
+    if not isinstance(inner, BaseCollection):
+        # Duck-typed collection: it records an identity if it has the hooks.
+        return callable(getattr(inner, "get_stored_embedder_identity", None)) and callable(
+            getattr(inner, "set_embedder_identity", None)
+        )
+    cls = type(inner)
+    getter = getattr(cls, "get_stored_embedder_identity", None)
+    setter = getattr(cls, "set_embedder_identity", None)
+    if getter is None or setter is None:
+        return False
+    return (
+        getter is not BaseCollection.get_stored_embedder_identity
+        and setter is not BaseCollection.set_embedder_identity
+    )
+
+
+def _set_embedder_model_arg(model_name: str) -> str:
+    """The ``--model`` value that makes ``palace set-embedder`` record ``model_name``."""
+    if model_name.startswith("embeddinggemma2:"):
+        return "embeddinggemma2"
+    return model_name
+
+
+def _confirm_model_hint(palace_path, model_name: str) -> str:
+    """How to confirm the model behind a collection's vectors (shared by every refusal)."""
+    import shlex
+
+    command = f"mempalace --palace {shlex.quote(str(palace_path))} palace set-embedder --model"
+    return (
+        "Confirm the model the palace was built with, then record it with "
+        f"`{command} <model>` (if that is the configured model: "
+        f"`{command} {shlex.quote(_set_embedder_model_arg(model_name))}`). "
+        "Reads and search keep working meanwhile."
+    )
+
+
 def _normalize_legacy_identity(collection, stored, *, create):
     """Read a core embedder's legacy recorded name as the model behind it.
 
@@ -108,21 +155,32 @@ def _enforce_embedder_identity(
     """Check (and, for a brand-new collection, record) embedder identity (RFC 001).
 
     Check at open so a model swap fails fast — before any query silently
-    returns degraded results. Record only when the collection is brand-new and
-    empty: recording the *current* model on a legacy palace that already holds
-    vectors from an unknown model would mislabel it, so populated-but-unrecorded
-    collections warn instead and are resolved with
-    ``mempalace palace set-embedder``.
+    returns degraded results. ``create`` marks a write open.
+
+    When the identity cannot be checked, reads go on with a warning and
+    writes refuse with
+    :class:`~mempalace.backends.base.EmbedderIdentityUnconfirmedError` until
+    ``mempalace palace set-embedder`` records the model:
+
+    * no recorded identity: a write records the current model only while the
+      collection is empty. Recording it over vectors from an unknown model
+      would mislabel them, and writing without a record would let a later
+      same-dimension model swap through, so a collection that holds vectors
+      (or whose row count cannot be read) refuses the write;
+    * an unreadable record (a truncated ``mempalace_embedder.json``, a
+      malformed entry, a failed read): something was recorded and MemPalace
+      cannot tell what, so a write refuses whatever the row count.
+
+    A backend that never records identities (``BaseCollection``'s no-op hooks)
+    keeps the warn-and-write behavior: it has nothing to confirm against.
 
     ``repeat_unknown_warning`` bypasses the process cache so a long-lived Hub
     can reproduce the warning a standalone CLI process emits on every search.
 
-    Bookkeeping must never break memory operations: only the deliberate
-    identity/dimension mismatch propagates, plus
-    :class:`~mempalace.backends.base.EmbedderIdentityRecordError` when a write
-    open cannot record a brand-new collection's identity (writing on would
-    leave it unprotected against a later model swap); every other error is
-    swallowed.
+    Errors that propagate: the identity/dimension mismatches,
+    :class:`~mempalace.backends.base.EmbedderIdentityUnconfirmedError` above,
+    and :class:`~mempalace.backends.base.EmbedderIdentityRecordError` when a
+    write open cannot record a brand-new collection's identity.
     """
     import warnings
 
@@ -131,7 +189,10 @@ def _enforce_embedder_identity(
         EmbedderIdentity,
         EmbedderIdentityMismatchError,
         EmbedderIdentityRecordError,
+        EmbedderIdentityUnconfirmedError,
         EmbedderIdentityUnknownWarning,
+        EmbedderIdentityUnreadableError,
+        EmbedderIdentityUnreadableWarning,
         check_embedder_identity,
     )
     from ..embedding import current_model_name
@@ -156,15 +217,45 @@ def _enforce_embedder_identity(
 
     model_name = current.model_name
     key = (str(palace_path), str(collection_name), model_name)
-    if key in _VALIDATED_IDENTITY and not repeat_unknown_warning:
+    # A verdict that allows writes ("rw") also covers reads; a read-only
+    # verdict ("r": the identity could not be confirmed) never covers a write.
+    write_key, read_key = key + ("rw",), key + ("r",)
+    if not repeat_unknown_warning and (
+        write_key in _VALIDATED_IDENTITY or (not create and read_key in _VALIDATED_IDENTITY)
+    ):
         return
 
+    persists = _persists_embedder_identity(collection)
     try:
         stored = collection.get_stored_embedder_identity()
-    except Exception:
+    except Exception as exc:
         logger.debug("embedder-identity read failed for %s", collection_name, exc_info=True)
+        if not persists:
+            return
+        if isinstance(exc, EmbedderIdentityUnreadableError):
+            problem = str(exc)
+        else:
+            problem = (
+                f"the embedder identity of collection {collection_name!r} in {palace_path} "
+                f"could not be read ({type(exc).__name__}: {exc})"
+            )
+        hint = _confirm_model_hint(palace_path, model_name)
+        if create:
+            raise EmbedderIdentityUnconfirmedError(
+                f"{problem}, so MemPalace cannot tell which model embedded the collection's "
+                f"vectors; writing with the current model {model_name!r} could mix two models "
+                f"in one palace. {hint}"
+            ) from exc
+        warnings.warn(
+            f"{problem}; reading with the current model {model_name!r}. Writes are refused "
+            f"until the record is repaired. {hint}",
+            EmbedderIdentityUnreadableWarning,
+            stacklevel=2,
+        )
+        _VALIDATED_IDENTITY.add(read_key)
         return
     unrecorded = False
+    write_ok = True
     if core_embedder and stored is not None and getattr(stored, "model_name", ""):
         normalized = _normalize_legacy_identity(collection, stored, create=create)
         # A read open compares with the normalized name but does not write it;
@@ -190,25 +281,56 @@ def _enforce_embedder_identity(
                     collection.set_embedder_identity(current)
                 except EmbedderIdentityRecordError:
                     raise
-                except Exception:
-                    logger.debug("embedder-identity record failed", exc_info=True)
-        elif has_rows:
-            if model_name.startswith("embeddinggemma2:"):
+                except Exception as exc:
+                    # Writing on would leave the collection unrecorded, and
+                    # its next write open would refuse; say so now instead.
+                    raise EmbedderIdentityRecordError(
+                        f"could not record the embedder identity of collection "
+                        f"{collection_name!r} in {palace_path}: {type(exc).__name__}: {exc}"
+                    ) from exc
+        else:
+            if has_rows and model_name.startswith("embeddinggemma2:"):
                 raise EmbedderIdentityMismatchError(
                     f"collection {collection_name!r} has vectors but no recorded embedding identity; "
                     "the vectors may come from a different model or modality configuration. "
                     "Rebuild the index before using it with EmbeddingGemma 2."
                 )
-            warnings.warn(
-                f"palace collection {collection_name!r} has no recorded embedder "
-                f"identity; assuming the current model {model_name!r}. Run "
-                "`mempalace palace set-embedder --model <name>` to record it.",
-                EmbedderIdentityUnknownWarning,
-                stacklevel=2,
-            )
+            if not persists:
+                if has_rows:
+                    warnings.warn(
+                        f"palace collection {collection_name!r} has no recorded embedder "
+                        f"identity; assuming the current model {model_name!r}.",
+                        EmbedderIdentityUnknownWarning,
+                        stacklevel=2,
+                    )
+            else:
+                held = (
+                    "holds vectors"
+                    if has_rows
+                    else "may hold vectors (its row count could not be read)"
+                )
+                problem = (
+                    f"collection {collection_name!r} in {palace_path} {held} but has no "
+                    "recorded embedder identity, so MemPalace cannot tell which model "
+                    "embedded them"
+                )
+                hint = _confirm_model_hint(palace_path, model_name)
+                if create:
+                    raise EmbedderIdentityUnconfirmedError(
+                        f"{problem}; writing with the current model {model_name!r} could mix "
+                        f"two models in one palace. {hint}"
+                    )
+                if has_rows:
+                    warnings.warn(
+                        f"palace {problem}; reading with the current model {model_name!r}. "
+                        f"Writes are refused until the model is recorded. {hint}",
+                        EmbedderIdentityUnknownWarning,
+                        stacklevel=2,
+                    )
+                write_ok = False
 
     if not unrecorded:
-        _VALIDATED_IDENTITY.add(key)
+        _VALIDATED_IDENTITY.add(write_key if write_ok else read_key)
 
 
 # The closets collection name is fixed (not user-configurable) — it is the
@@ -417,6 +539,8 @@ def set_palace_embedder_identity(
     force: bool = False,
     backend: Optional[str] = None,
     collection_name: Optional[str] = None,
+    only_if_exists: bool = False,
+    report: Optional[dict] = None,
 ):
     """Record (or force-override) a palace collection's embedder identity (RFC 001).
 
@@ -425,8 +549,20 @@ def set_palace_embedder_identity(
     different model (the user must confirm they know the vectors are
     compatible). Opens with the identity check skipped so a mismatched palace —
     the exact state being repaired — can be opened at all.
+
+    An unreadable record (see
+    :class:`~mempalace.backends.base.EmbedderIdentityUnreadableError`) is
+    replaced without ``force``: running this command is the confirmation the
+    write refusal asks for. ``old`` is then ``None`` and ``report["unreadable"]``
+    holds the read error. ``only_if_exists`` opens without creating the
+    collection and returns ``None`` when it does not exist yet.
     """
-    from ..backends.base import EmbedderIdentity, EmbedderIdentityMismatchError
+    from ..backends.base import (
+        CollectionNotInitializedError,
+        EmbedderIdentity,
+        EmbedderIdentityMismatchError,
+        PalaceNotFoundError,
+    )
     from ..config import MempalaceConfig
     from ..embedding import (
         _normalize_stored_model_name,
@@ -450,13 +586,18 @@ def set_palace_embedder_identity(
         # open below can create the palace folder, chroma.sqlite3 or a
         # collection. A server embedder's names are its own and skip this.
         _resolve_embedding_model(requested)
-    collection = get_collection(
-        palace_path,
-        collection_name=collection_name,
-        create=True,
-        backend=backend,
-        _skip_identity_check=True,
-    )
+    try:
+        collection = get_collection(
+            palace_path,
+            collection_name=collection_name,
+            create=not only_if_exists,
+            backend=backend,
+            _skip_identity_check=True,
+        )
+    except (CollectionNotInitializedError, PalaceNotFoundError):
+        if only_if_exists:
+            return None
+        raise
     core_embedder = _server_embedder_identity(collection) is None
     if requested and core_embedder:
         # Record the model the name embeds with, as the factory resolves it:
@@ -482,8 +623,10 @@ def set_palace_embedder_identity(
         new = EmbedderIdentity(model_name=target, dimension=0)
     try:
         old = collection.get_stored_embedder_identity()
-    except Exception:
+    except Exception as exc:
         old = None
+        if report is not None:
+            report["unreadable"] = str(exc)
     old_name = getattr(old, "model_name", "")
     if old is not None and core_embedder:
         # A legacy raw name that stands for the same model is not a swap.
