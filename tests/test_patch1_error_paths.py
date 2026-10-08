@@ -636,3 +636,56 @@ def test_mcp_and_cli_name_a_rejected_key(request, monkeypatch, capfd, kg):
     assert rc == 1, (out, err)
     assert "HTTP 401" in err and "embedding_api_key" in err, err
     assert "Traceback" not in out + err
+
+
+def test_set_embedder_on_a_palace_another_process_holds_is_one_line(tmp_path, monkeypatch, capfd):
+    """A sqlite_exact palace is held by its writer (an MCP server, a mine): a
+    set-embedder from another process printed a MineAlreadyRunning traceback."""
+    import subprocess
+    import sys
+
+    from mempalace.palace import get_collection
+
+    palace = tmp_path / "palace"
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(tmp_path / "cfg"))
+    # The CLI's --backend exports these; monkeypatch restores them.
+    from mempalace.cli import _EXPLICIT_BACKEND_ENV
+
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    monkeypatch.setenv(_EXPLICIT_BACKEND_ENV, "sqlite_exact")
+    get_collection(str(palace), backend="sqlite_exact", create=True).close()
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys, time\n"
+            "from mempalace.palace import mine_palace_lock\n"
+            "with mine_palace_lock(sys.argv[1]):\n"
+            "    print('held', flush=True)\n"
+            "    time.sleep(60)\n",
+            str(palace),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        capfd.readouterr()
+        rc = _run_cli(
+            monkeypatch,
+            "--palace",
+            str(palace),
+            "palace",
+            "set-embedder",
+            "--backend",
+            "sqlite_exact",
+            "--model",
+            "minilm",
+        )
+        out, err = capfd.readouterr()
+    finally:
+        holder.kill()
+        holder.wait()
+    assert rc == 2, (out, err)
+    assert "is held by PID" in out + err, (out, err)
+    assert "Traceback" not in out + err

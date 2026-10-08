@@ -26,6 +26,7 @@ def cmd_palace_set_embedder(args):
     from ..palace import (
         ASSETS_COLLECTION_NAME,
         CLOSETS_COLLECTION_NAME,
+        MineAlreadyRunning,
         _set_embedder_model_arg,
         set_palace_embedder_identity,
     )
@@ -43,6 +44,9 @@ def cmd_palace_set_embedder(args):
         # UnknownEmbeddingModelError, and nothing to record (no model, or
         # openai-compat without an endpoint model).
         ValueError,
+        # A backend that holds the palace for its writer (sqlite_exact while
+        # an MCP server or a mine has it open): nothing was recorded.
+        MineAlreadyRunning,
     )
     report: dict = {}
     try:
