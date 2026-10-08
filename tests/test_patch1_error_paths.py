@@ -5,6 +5,7 @@ Each test pins one refusal: what it says, which channel it uses (one
 written or deleted when the write it belongs to fails.
 """
 
+import json
 import re
 
 import pytest
@@ -511,3 +512,127 @@ def test_the_rebuild_record_failure_hint_suggests_an_accepted_model(tmp_path, mo
     models, env = _suggested_names(capsys.readouterr().out)
     assert models == [_GEMMA2], models
     _assert_accepted(models, env)
+
+
+# ── (9) a server that answers 400/401 is not "unavailable" ───────────────
+
+
+class _Answering:
+    """A local /v1/embeddings server that answers every POST with one status."""
+
+    def __init__(self, status, body):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        payload = json.dumps(body).encode()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802 - http.server API
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *_args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/v1"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+
+
+_UNAUTHORIZED = (401, {"error": {"message": "Invalid API key provided", "type": "auth"}})
+_NO_SUCH_MODEL = (400, {"error": {"message": "model 'text-embed-a' not found"}})
+
+
+def _api_error(status, body):
+    from mempalace.embedding import EmbeddingAPIError, OpenAICompatEmbeddingFunction
+
+    with _Answering(status, body) as server:
+        with pytest.raises(EmbeddingAPIError) as caught:
+            OpenAICompatEmbeddingFunction(server.url, "text-embed-a")(["probe"])
+    return caught.value
+
+
+@pytest.mark.parametrize(
+    ("answer", "kind", "says"),
+    [
+        (_UNAUTHORIZED, "Embedding API authentication failed", ["HTTP 401", "embedding_api_key"]),
+        (
+            (403, {"error": "forbidden"}),
+            "Embedding API authentication failed",
+            ["HTTP 403", "embedding_api_key"],
+        ),
+        (
+            _NO_SUCH_MODEL,
+            "Embedding API rejected the request",
+            ["HTTP 400", "model 'text-embed-a' not found", "embedding_api_model"],
+        ),
+    ],
+    ids=["401", "403", "400"],
+)
+def test_an_endpoint_that_refuses_the_request_is_not_called_unavailable(answer, kind, says):
+    from mempalace.embedding import model_error_result
+
+    exc = _api_error(*answer)
+    for text in says:
+        assert text in str(exc), str(exc)
+    assert "is reachable" not in str(exc), str(exc)
+    result = model_error_result(exc)
+    assert result["error"] == kind, result
+    assert result["error_class"] == "EmbeddingAPIError", result
+    assert "running and reachable" not in result["hint"], result
+
+
+def test_a_server_error_or_dead_endpoint_stays_unavailable():
+    from mempalace.embedding import model_error_result
+
+    exc = _api_error(503, {"error": "loading model"})
+    assert "HTTP 503" in str(exc), str(exc)
+    assert model_error_result(exc)["error"] == "Embedding API unavailable"
+
+
+def test_a_malformed_response_is_not_called_unavailable():
+    from mempalace.embedding import model_error_result
+
+    exc = _api_error(200, {"object": "list"})
+    assert model_error_result(exc)["error"] == "Embedding API returned an invalid response"
+
+
+@_MINILM
+def test_mcp_and_cli_name_a_rejected_key(request, monkeypatch, capfd, kg):
+    palace = _dead_endpoint_palace(request, monkeypatch)
+    config = palace.parent / "config" / "config.json"
+    with _Answering(*_UNAUTHORIZED) as server:
+        settings = json.loads(config.read_text())
+        settings["embedding_api_url"] = server.url
+        config.write_text(json.dumps(settings))
+        from mempalace import embedding
+
+        embedding._EF_CACHE.clear()
+        call = _mcp_caller(monkeypatch, palace, kg)
+        result, body = call(
+            "mempalace_add_drawer",
+            {"wing": "garden", "room": "notes", "content": "The shed key is under the pot."},
+        )
+        assert result.get("isError") is True, body
+        assert body["error"] == "Embedding API authentication failed", body
+        assert "HTTP 401" in body["details"], body
+
+        capfd.readouterr()
+        rc = _run_cli(monkeypatch, "--palace", str(palace), "search", "shed key")
+        out, err = capfd.readouterr()
+    assert rc == 1, (out, err)
+    assert "HTTP 401" in err and "embedding_api_key" in err, err
+    assert "Traceback" not in out + err

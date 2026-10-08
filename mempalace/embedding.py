@@ -761,13 +761,50 @@ _EF_API_BATCH = 64
 _EF_API_TIMEOUT = 120
 
 
+# EmbeddingAPIError.reason: what went wrong, which decides the error kind
+# and hint a tool reports (see model_error_result).
+API_UNAVAILABLE = "unavailable"  # no answer, a timeout, HTTP 408/429 or 5xx
+API_AUTH = "auth"  # HTTP 401/403: the key is missing or not accepted
+API_REJECTED = "rejected"  # any other 4xx: the server refused this request
+API_BAD_RESPONSE = "bad_response"  # an answer that is not the embeddings asked for
+
+# HTTP statuses a retry later can fix: the server is busy, not refusing.
+_API_RETRYABLE_STATUSES = frozenset({408, 425, 429})
+
+
 class EmbeddingAPIError(RuntimeError):
-    """Raised when the embedding API is unreachable or returns an invalid body.
+    """Raised when the embedding API is unreachable, refuses, or returns an invalid body.
 
     Module-specific subclass mirroring ``llm_client.LLMError`` so callers can
     distinguish embedding-endpoint failures; subclasses ``RuntimeError`` so
-    existing ``except RuntimeError`` paths still catch it.
+    existing ``except RuntimeError`` paths still catch it. ``reason`` is one
+    of ``API_UNAVAILABLE``, ``API_AUTH``, ``API_REJECTED`` or
+    ``API_BAD_RESPONSE``; ``status`` the HTTP status, when there was one.
     """
+
+    def __init__(self, message, *, reason=API_UNAVAILABLE, status=None):
+        super().__init__(message)
+        self.reason = reason
+        self.status = status
+
+
+def _http_error_detail(exc) -> str:
+    """The server's own error message from an HTTP error body, if it sent one."""
+    import json
+
+    try:
+        raw = exc.read(2048)
+    except Exception:
+        return ""
+    try:
+        body = json.loads(raw)
+    except (ValueError, TypeError):
+        text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw or "")
+        return " ".join(text.split())[:300]
+    error = body.get("error", body) if isinstance(body, dict) else body
+    if isinstance(error, dict):
+        error = error.get("message") or error.get("detail") or error
+    return " ".join(str(error).split())[:300]
 
 
 class OpenAICompatEmbeddingFunction:
@@ -847,7 +884,16 @@ class OpenAICompatEmbeddingFunction:
             # ValueError covers an invalid/missing URL scheme and json.JSONDecodeError;
             # http.client.HTTPException covers low-level protocol faults (BadStatusLine,
             # IncompleteRead) common with local/overloaded servers.
-            except (HTTPError, URLError, OSError, http.client.HTTPException, ValueError) as e:
+            except HTTPError as e:
+                raise self._http_error(e) from e
+            except json.JSONDecodeError as e:
+                raise EmbeddingAPIError(
+                    f"Embedding API at {self._url} returned a response that is not JSON: {e}. "
+                    f"Check that embedding_api_url points at an OpenAI-compatible "
+                    f"/v1/embeddings endpoint.",
+                    reason=API_BAD_RESPONSE,
+                ) from e
+            except (URLError, OSError, http.client.HTTPException, ValueError) as e:
                 raise EmbeddingAPIError(
                     f"Embedding API request to {self._url} failed: {e}. Check that the "
                     f"server is reachable and MEMPALACE_EMBEDDING_API_URL / embedding_api_url "
@@ -855,6 +901,37 @@ class OpenAICompatEmbeddingFunction:
                 ) from e
             out.extend(self._vectors_from_response(data, len(batch)))
         return out
+
+    def _http_error(self, exc) -> "EmbeddingAPIError":
+        """The error for an HTTP error status: refused, or unavailable.
+
+        A 401/403 names the key, another 4xx the request (usually the model),
+        with the server's own message; a 5xx, 408 or 429 is a server that may
+        answer later, reported as unavailable like a refused connection.
+        """
+        status = exc.code
+        detail = _http_error_detail(exc)
+        said = f"HTTP {status} {exc.reason or ''}".rstrip() + (f": {detail}" if detail else "")
+        if status in (401, 403):
+            return EmbeddingAPIError(
+                f"Embedding API at {self._url} rejected the credentials ({said}). Check "
+                f"embedding_api_key in config.json or MEMPALACE_EMBEDDING_API_KEY.",
+                reason=API_AUTH,
+                status=status,
+            )
+        if 400 <= status < 500 and status not in _API_RETRYABLE_STATUSES:
+            return EmbeddingAPIError(
+                f"Embedding API at {self._url} rejected the request ({said}). Check that "
+                f"embedding_api_model ({self._model!r}) is a model the server serves, and "
+                f"that embedding_api_url is its OpenAI-compatible endpoint.",
+                reason=API_REJECTED,
+                status=status,
+            )
+        return EmbeddingAPIError(
+            f"Embedding API request to {self._url} failed ({said}). Check that the "
+            f"server is running and reachable, then retry.",
+            status=status,
+        )
 
     def _vectors_from_response(self, data, n: int) -> list:
         """Validate one ``/v1/embeddings`` response and return L2-normed vectors.
@@ -871,16 +948,19 @@ class OpenAICompatEmbeddingFunction:
 
         if not isinstance(data, dict):
             raise EmbeddingAPIError(
-                f"Embedding API at {self._url} returned a non-object response: {data}"
+                f"Embedding API at {self._url} returned a non-object response: {data}",
+                reason=API_BAD_RESPONSE,
             )
         rows = data.get("data")
         if not isinstance(rows, list):
             raise EmbeddingAPIError(
-                f"Embedding API at {self._url} returned no 'data' array: {data.get('error', data)}"
+                f"Embedding API at {self._url} returned no 'data' array: {data.get('error', data)}",
+                reason=API_BAD_RESPONSE,
             )
         if len(rows) != n:
             raise EmbeddingAPIError(
-                f"Embedding API at {self._url} returned {len(rows)} embeddings for {n} inputs"
+                f"Embedding API at {self._url} returned {len(rows)} embeddings for {n} inputs",
+                reason=API_BAD_RESPONSE,
             )
         # The endpoint may return rows out of order — sort by index, then
         # require the indices to be exactly 0..n-1 so positional alignment is
@@ -891,22 +971,26 @@ class OpenAICompatEmbeddingFunction:
             indices = [r.get("index") for r in rows]
         except AttributeError as e:
             raise EmbeddingAPIError(
-                f"Embedding API at {self._url} returned non-object rows: {e}"
+                f"Embedding API at {self._url} returned non-object rows: {e}",
+                reason=API_BAD_RESPONSE,
             ) from e
         if indices != list(range(n)):
             raise EmbeddingAPIError(
                 f"Embedding API at {self._url} returned non-contiguous or duplicate "
-                f"'index' values; cannot align embeddings with inputs"
+                f"'index' values; cannot align embeddings with inputs",
+                reason=API_BAD_RESPONSE,
             )
         try:
             arr = np.asarray([r["embedding"] for r in rows], dtype=np.float32)
         except (KeyError, TypeError, ValueError) as e:
             raise EmbeddingAPIError(
-                f"Embedding API at {self._url} returned malformed embeddings: {e}"
+                f"Embedding API at {self._url} returned malformed embeddings: {e}",
+                reason=API_BAD_RESPONSE,
             ) from e
         if arr.ndim != 2:
             raise EmbeddingAPIError(
-                f"Embedding API at {self._url} returned non-vector embeddings (shape {arr.shape})"
+                f"Embedding API at {self._url} returned non-vector embeddings (shape {arr.shape})",
+                reason=API_BAD_RESPONSE,
             )
         # L2-normalize so cosine == dot product (collection uses
         # hnsw:space=cosine), matching EmbeddinggemmaONNX above.
@@ -1069,8 +1153,11 @@ MODEL_ERROR_CLASS_NAMES = frozenset(
         "EmbeddingFunctionMismatchError",
     }
 )
-# ``error`` of the MCP / search result for an EmbeddingAPIError.
+# ``error`` of the MCP / search result for an EmbeddingAPIError, by reason.
 EMBEDDING_API_UNAVAILABLE_ERROR = "Embedding API unavailable"
+EMBEDDING_API_AUTH_ERROR = "Embedding API authentication failed"
+EMBEDDING_API_REJECTED_ERROR = "Embedding API rejected the request"
+EMBEDDING_API_BAD_RESPONSE_ERROR = "Embedding API returned an invalid response"
 _MODEL_REFUSAL_HINT = (
     "Set embedding_model back to the model the palace was built with, "
     "or re-embed the palace as the details describe."
@@ -1090,6 +1177,25 @@ _EMBEDDING_API_HINT = (
     "and that embedding_api_model (and embedding_api_key, if it needs one) are right, "
     "then retry."
 )
+_EMBEDDING_API_AUTH_HINT = (
+    "The server answered but refused the key: set embedding_api_key in config.json "
+    "(or MEMPALACE_EMBEDDING_API_KEY) to a key it accepts, then retry."
+)
+_EMBEDDING_API_REJECTED_HINT = (
+    "The server answered but refused the request: check that embedding_api_model names "
+    "a model it serves and that embedding_api_url is its /v1/embeddings endpoint."
+)
+_EMBEDDING_API_BAD_RESPONSE_HINT = (
+    "The server answered with something other than embeddings: check that "
+    "embedding_api_url points at an OpenAI-compatible /v1/embeddings endpoint."
+)
+# EmbeddingAPIError.reason -> (error kind, hint).
+_EMBEDDING_API_KINDS = {
+    API_UNAVAILABLE: (EMBEDDING_API_UNAVAILABLE_ERROR, _EMBEDDING_API_HINT),
+    API_AUTH: (EMBEDDING_API_AUTH_ERROR, _EMBEDDING_API_AUTH_HINT),
+    API_REJECTED: (EMBEDDING_API_REJECTED_ERROR, _EMBEDDING_API_REJECTED_HINT),
+    API_BAD_RESPONSE: (EMBEDDING_API_BAD_RESPONSE_ERROR, _EMBEDDING_API_BAD_RESPONSE_HINT),
+}
 _REFUSALS_LOGGED: set = set()
 _REFUSALS_LOCK = threading.Lock()
 
@@ -1159,7 +1265,9 @@ def model_error_result(exc: BaseException, *, palace_path=None, log=None) -> Opt
     elif cls is EmbeddingFunctionUnavailableError:
         kind, hint = EMBEDDING_FUNCTION_UNAVAILABLE_ERROR, _UNAVAILABLE_EF_HINT
     elif cls is EmbeddingAPIError:
-        kind, hint = EMBEDDING_API_UNAVAILABLE_ERROR, _EMBEDDING_API_HINT
+        kind, hint = _EMBEDDING_API_KINDS.get(
+            getattr(exc, "reason", API_UNAVAILABLE), _EMBEDDING_API_KINDS[API_UNAVAILABLE]
+        )
     elif cls.__name__ == "EmbedderIdentityRecordError":
         kind, hint = model_mismatch_error_kind(exc), _IDENTITY_NOT_RECORDED_HINT
     elif cls.__name__ == "EmbedderIdentityUnconfirmedError":
