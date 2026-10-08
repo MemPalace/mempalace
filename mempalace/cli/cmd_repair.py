@@ -298,6 +298,8 @@ def cmd_repair(args):
 
     if not getattr(args, "dry_run", False):
         _exit_on_misspelled_embedding_model()
+        # Before the backup, the archive and the confirmation prompt.
+        _exit_on_unusable_embedder()
 
     if getattr(args, "mode", "legacy") == "from-sqlite":
         from ..migrate import confirm_destructive_action

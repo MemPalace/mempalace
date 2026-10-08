@@ -261,3 +261,21 @@ def _exit_on_misspelled_embedding_model():
     except UnknownEmbeddingModelError as exc:
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(1)
+
+
+def _exit_on_unusable_embedder():
+    """Refuse before a command archives or rewrites a palace it cannot re-embed.
+
+    ``repair`` calls this before its backup, archive or collection drop: a
+    probe embed that fails (no endpoint URL, a dead or refusing endpoint, an
+    unloadable model) prints one line and exits 1 with the palace untouched.
+    """
+    from ..embedding import _model_error_class, require_working_embedder
+
+    try:
+        require_working_embedder()
+    except Exception as exc:
+        if _model_error_class(exc) is None:
+            raise
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)

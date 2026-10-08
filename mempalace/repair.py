@@ -1727,15 +1727,18 @@ def _post_rebuild_cleanup(palace_path: str, backend: "ChromaBackend", progress=p
 
 
 def _require_valid_embedding_model() -> None:
-    """Refuse a misspelled ``embedding_model`` before anything is archived or created.
+    """Refuse an unusable embedder before anything is archived or created.
 
     Reading the config raises :class:`~mempalace.embedding.UnknownEmbeddingModelError`
-    for a near miss; without this the rebuild would archive the palace and
-    only fail once the first collection asks for its embedding function.
+    for a near miss, and a probe embed raises for an embedder that cannot be
+    built or an endpoint that does not answer. Without this the rebuild
+    archived the palace and only failed at its first upsert.
     """
     from .config import MempalaceConfig
+    from .embedding import require_working_embedder
 
     MempalaceConfig().embedding_model
+    require_working_embedder()
 
 
 def rebuild_index(

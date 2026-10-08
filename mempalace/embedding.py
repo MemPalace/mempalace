@@ -1548,6 +1548,23 @@ def probe_dimension(device: Optional[str] = None, model: Optional[str] = None) -
     return dim
 
 
+def require_working_embedder(device: Optional[str] = None, model: Optional[str] = None) -> int:
+    """Embed a probe with the configured embedder; return its dimension.
+
+    Unlike :func:`probe_dimension` a failure raises the embedder's own error
+    (:class:`EmbeddingFunctionUnavailableError`, :class:`EmbeddingAPIError`,
+    an unloadable model), and it always embeds, so an endpoint that went down
+    since an earlier probe is caught. A command about to archive, back up or
+    rewrite a palace calls it first, so a refusal leaves the palace as it was.
+    """
+    name = current_model_name(model)
+    vectors = get_embedding_function(device=device, model=model)(input=["probe"])
+    dim = len(vectors[0]) if vectors and vectors[0] is not None else 0
+    if dim:
+        _DIM_CACHE[name] = dim
+    return dim
+
+
 def get_embedder_identity(device: Optional[str] = None, model: Optional[str] = None):
     """Resolve the current embedder identity (RFC 001).
 

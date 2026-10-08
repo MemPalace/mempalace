@@ -259,3 +259,42 @@ def test_the_type_migration_runs_only_for_chromadb_that_needs_it(monkeypatch, ve
 
     monkeypatch.setattr(chroma.chromadb, "__version__", version)
     assert chroma._chromadb_requires_collection_type() is required
+
+
+# ── (5) repair probes the embedder before it archives anything ───────────
+
+
+@_MINILM
+@pytest.mark.parametrize("argv", [["repair", "rebuild-index"], ["repair", "--yes"]])
+def test_repair_on_a_dead_endpoint_refuses_before_archiving(request, monkeypatch, capfd, argv):
+    """rebuild-index archived the palace, then failed at the first upsert;
+    legacy repair backed it up and dropped the collection first."""
+    import hashlib
+
+    palace = _dead_endpoint_palace(request, monkeypatch)
+    siblings = sorted(p.name for p in palace.parent.iterdir())
+    db = hashlib.sha256((palace / "chroma.sqlite3").read_bytes()).hexdigest()
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+    capfd.readouterr()
+
+    assert _run_cli(monkeypatch, "--palace", str(palace), *argv) == 1
+    out, err = capfd.readouterr()
+    assert "mempalace: Embedding API request to http://127.0.0.1:" in err, (out, err)
+    assert "Traceback" not in out + err
+    assert sorted(p.name for p in palace.parent.iterdir()) == siblings
+    assert hashlib.sha256((palace / "chroma.sqlite3").read_bytes()).hexdigest() == db
+
+
+@_MINILM
+def test_the_rebuild_library_calls_probe_the_embedder_first(request, monkeypatch):
+    from mempalace import embedding, repair
+
+    palace = _dead_endpoint_palace(request, monkeypatch)
+    siblings = sorted(p.name for p in palace.parent.iterdir())
+    with pytest.raises(embedding.EmbeddingAPIError):
+        repair.rebuild_from_sqlite(
+            source_palace=str(palace), dest_palace=str(palace), archive_existing_dest=True
+        )
+    with pytest.raises(embedding.EmbeddingAPIError):
+        repair.rebuild_index(str(palace), progress=lambda *_: None)
+    assert sorted(p.name for p in palace.parent.iterdir()) == siblings
