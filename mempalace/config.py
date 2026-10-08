@@ -1368,7 +1368,8 @@ class MempalaceConfig:
         """Hardware device for the ONNX embedding model.
 
         Values: ``"auto"`` (default), ``"cpu"``, ``"cuda"``, ``"coreml"``,
-        ``"dml"``. Read from env ``MEMPALACE_EMBEDDING_DEVICE`` first, then
+        ``"dml"``; ``embeddinggemma2`` (PyTorch) takes ``"auto"``, ``"cpu"``,
+        ``"cuda"`` and ``"mps"`` (see :mod:`mempalace.embedding`). Read from env ``MEMPALACE_EMBEDDING_DEVICE`` first, then
         ``embedding_device`` in ``config.json``, then ``"auto"``.
 
         ``auto`` resolves to the first available accelerator at runtime via
@@ -1481,6 +1482,29 @@ class MempalaceConfig:
         except (TypeError, ValueError):
             return _EMBEDDINGGEMMA_BATCH_SIZE
         return val if val > 0 else _EMBEDDINGGEMMA_BATCH_SIZE
+
+    @property
+    def embeddinggemma2_batch_size(self) -> "int | None":
+        """Documents per encode() call for EmbeddingGemma 2, or None for the default.
+
+        The default depends on the device the model runs on (32 on CUDA, 4 on
+        CPU and MPS; ``mempalace.embeddinggemma2``). Read from env
+        ``MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE`` first, then
+        ``embeddinggemma2_batch_size`` in ``config.json``; a set value wins on
+        every device. Separate from ``embeddinggemma_batch_size``, which sizes
+        ONNX runs of the first EmbeddingGemma model. Unset, non-numeric or
+        non-positive values mean the per-device default, as for that setting.
+        """
+        raw = os.environ.get("MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE")
+        if raw is None:
+            raw = self._file_config.get("embeddinggemma2_batch_size")
+        if raw is None:
+            return None
+        try:
+            val = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return None
+        return val if val > 0 else None
 
     @property
     def embeddinggemma2_dimension(self) -> int:

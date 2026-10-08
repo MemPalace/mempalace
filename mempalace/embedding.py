@@ -41,6 +41,11 @@ in ``~/.mempalace/config.json``):
 * ``coreml`` — Apple Neural Engine (macOS)
 * ``dml`` — DirectML (Windows / AMD / Intel GPUs)
 
+``embeddinggemma2`` runs on PyTorch rather than ONNX Runtime and reads the same
+setting: ``auto`` (CUDA ▸ MPS ▸ CPU), ``cuda``, ``mps`` or ``cpu``. The
+ONNX-only ``coreml`` and ``dml`` read as ``auto`` there, and ``mps`` reads as
+``auto`` for the ONNX models, each with a one-time warning.
+
 Requesting an unavailable accelerator emits a warning and falls back to CPU
 rather than hard-failing — mining must still work on a laptop without CUDA.
 The same applies to an accelerator that runs but computes the model wrongly:
@@ -144,6 +149,10 @@ def _run_guard(providers, lock):
     return contextlib.nullcontext()
 
 
+# embedding_device values that name a PyTorch device for EmbeddingGemma 2
+# (mempalace.embeddinggemma2.SUPPORTED_DEVICES) but no ONNX Runtime provider.
+_TORCH_ONLY_DEVICES = frozenset({"mps"})
+
 _EF_CACHE: dict = {}
 # Check-then-construct on the cache must be atomic: without it, two threads
 # resolving the same key each keep their own EF instance, and each instance
@@ -171,6 +180,20 @@ def _resolve_providers(device: str, model: Optional[str] = None) -> tuple[list, 
         available = set(ort.get_available_providers())
     except ImportError:
         return (["CPUExecutionProvider"], "cpu")
+
+    if device in _TORCH_ONLY_DEVICES:
+        # One embedding_device serves both runtimes; a value meant for
+        # EmbeddingGemma 2's PyTorch path picks the best ONNX provider instead.
+        warn_key = ("onnx-torch-only-device", device)
+        if warn_key not in _WARNED:
+            _WARNED.add(warn_key)
+            logger.warning(
+                "embedding_device=%r is a PyTorch device used by embeddinggemma2 only; "
+                "the ONNX model %r uses 'auto' instead.",
+                device,
+                model or "minilm",
+            )
+        device = "auto"
 
     if device == "auto":
         for provider, name in _AUTO_ORDER:
@@ -1007,6 +1030,38 @@ def _resolve_embedding_model(model) -> str:
     return "minilm"
 
 
+def _embeddinggemma2_device(device: Optional[str]) -> str:
+    """Map the shared ``embedding_device`` onto an EmbeddingGemma 2 device.
+
+    PyTorch devices (auto, cuda, mps, cpu) pass through. ONNX Runtime
+    provider names (``coreml``, ``dml``) have no PyTorch equivalent and read
+    as ``auto``; any other value reads as ``cpu``, as it does for the ONNX
+    models. Both warn once instead of failing the model load.
+    """
+    from .embeddinggemma2 import SUPPORTED_DEVICES
+
+    value = (device or "auto").strip().lower()
+    if value in SUPPORTED_DEVICES:
+        return value
+    if value in _PROVIDER_MAP:
+        mapped = "auto"
+        reason = "is an ONNX Runtime provider; EmbeddingGemma 2 runs on PyTorch"
+    else:
+        mapped = "cpu"
+        reason = "is not a known device"
+    warn_key = ("embeddinggemma2-device", value)
+    if warn_key not in _WARNED:
+        _WARNED.add(warn_key)
+        logger.warning(
+            "embedding_device=%r %s, so embeddinggemma2 uses %r (supported: %s).",
+            value,
+            reason,
+            mapped,
+            ", ".join(sorted(SUPPORTED_DEVICES)),
+        )
+    return mapped
+
+
 def get_embedding_function(device: Optional[str] = None, model: Optional[str] = None):
     """Return a cached embedding function for the requested device + model.
 
@@ -1035,7 +1090,8 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
             "dimension": cfg.embeddinggemma2_dimension,
             "modalities": cfg.embeddinggemma2_modalities,
             "revision": cfg.embeddinggemma2_revision,
-            "device": device,
+            "device": _embeddinggemma2_device(device),
+            "batch_size": cfg.embeddinggemma2_batch_size,
         }
         cache_key = ("embeddinggemma2", tuple(sorted(settings.items())))
         with _EF_CACHE_LOCK:
@@ -1124,7 +1180,7 @@ def describe_device(device: Optional[str] = None, model: Optional[str] = None) -
     """
     if current_model_name(model).startswith("embeddinggemma2:"):
         ef = get_embedding_function(device=device, model="embeddinggemma2")
-        return f"embeddinggemma2 ({ef.effective_device or device or 'auto'}, float32)"
+        return f"embeddinggemma2 ({ef.planned_device()}, float32)"
     if device is None:
         from .config import MempalaceConfig
 

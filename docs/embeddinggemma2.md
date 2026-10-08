@@ -19,6 +19,14 @@ export MEMPALACE_EMBEDDINGGEMMA2_MODALITIES=all
 
 Use `.[embeddinggemma2]` for text/image inference, or `.[multimodal]` for audio/video decoding too. TorchCodec needs compatible FFmpeg libraries. Install FFmpeg using your platform's package manager before using audio/video file inputs.
 
+The extras pull `torch` from PyPI. On Windows that wheel is CPU-only. To run on an NVIDIA GPU (Windows or Linux), install torch from the PyTorch CUDA index first, choosing the CUDA build for your driver at [pytorch.org](https://pytorch.org/get-started/locally/). For a smaller CPU-only install on Linux, use the CPU index:
+
+```bash
+uv pip install --python .venv/embeddinggemma2/bin/python torch --index-url https://download.pytorch.org/whl/cu132  # NVIDIA GPU
+uv pip install --python .venv/embeddinggemma2/bin/python torch --index-url https://download.pytorch.org/whl/cpu    # CPU only
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
 Model loading is lazy. First inference downloads the pinned model to the Hugging Face cache; subsequent inference is local. After the model is cached, set `HF_HUB_OFFLINE=1` to disable further model downloads. This does not configure other MemPalace services or providers.
 
 ## Configuration
@@ -30,12 +38,13 @@ Environment values override the corresponding `config.json` values:
 | `embedding_model` | `MEMPALACE_EMBEDDING_MODEL` | `embeddinggemma2` to opt in |
 | `embeddinggemma2_dimension` | `MEMPALACE_EMBEDDINGGEMMA2_DIMENSION` | `768` (default), `512`, `256`, `128` |
 | `embeddinggemma2_modalities` | `MEMPALACE_EMBEDDINGGEMMA2_MODALITIES` | `text` (default), `text+vision`, `text+audio`, `all` |
-| `embedding_device` | `MEMPALACE_EMBEDDING_DEVICE` | `auto` (default), `mps`, `cpu` |
+| `embedding_device` | `MEMPALACE_EMBEDDING_DEVICE` | `auto` (default), `cuda`, `mps`, `cpu` |
+| `embeddinggemma2_batch_size` | `MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE` | Unset: 32 on CUDA, 4 on CPU/MPS. A positive integer applies on every device |
 | `embeddinggemma2_revision` | `MEMPALACE_EMBEDDINGGEMMA2_REVISION` | Immutable 40-character model commit SHA |
 
 The default revision is [`914f7f89142e33e77833254d9c9b90c3cef7303b`](https://huggingface.co/google/embeddinggemma-2/tree/914f7f89142e33e77833254d9c9b90c3cef7303b). Model, dimension, modalities, revision and prompt version identify the vector space. Changing these values on a populated palace requires rebuilding, not relabelling old vectors.
 
-`auto` uses Apple MPS when available and CPU otherwise. Weights and inference use float32. MPS runs a repeatability witness on first use; initialization, MPS/Metal inference and invalid-vector failures warn and retry on CPU. Unrelated decoder errors fail the item without moving a healthy model to CPU. Explicit `mps` requires MPS support.
+`auto` uses CUDA when PyTorch reports a GPU, then Apple MPS, then CPU; `mempalace mine` prints the device it resolved. Weights and inference use float32. An explicit `cuda` or `mps` that PyTorch cannot use warns and runs on CPU, as the ONNX models do for an unavailable accelerator. `embedding_device` is shared with the ONNX models, so the ONNX-only `dml` and `coreml` read as `auto` here, with a warning. The device is not part of the vector space: a palace mined on CUDA opens and searches on a CPU-only machine. MPS runs a repeatability witness on first use; initialization, MPS/Metal inference and invalid-vector failures warn and retry on CPU. Unrelated decoder errors fail the item without moving a healthy model to CPU. Inputs are truncated at the model's 8,192-token context.
 
 Documents use `Document`, with a real title or source filename when present. Queries use `SearchQuery`, or `CodeRetrieval` for explicit code search. All output vectors are dimension-checked, finite and L2-normalized.
 
