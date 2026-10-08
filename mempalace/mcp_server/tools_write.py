@@ -975,6 +975,11 @@ def tool_mine(
             logger.exception("tool_mine: unexpected ImportError (mode=%s)", mode)
             return {"success": False, "error": f"mine failed: {exc}", "error_class": "ImportError"}
         except ValueError as exc:
+            # A misspelled model (UnknownEmbeddingModelError is a ValueError)
+            # is a model refusal: same shape and isError as the other tools.
+            refused = _model_mismatch_error(exc)
+            if refused is not None:
+                return {"success": False, **refused}
             return {"success": False, "error": str(exc), "error_class": "ValueError"}
         except SystemExit as exc:
             # A library mine() must never terminate the MCP server. miner.mine
@@ -988,6 +993,11 @@ def tool_mine(
                 "error_class": "Interrupted",
             }
         except Exception as exc:
+            refused = _model_mismatch_error(exc)
+            if refused is not None:
+                # A dead endpoint or an identity refusal: one log line from
+                # _model_mismatch_error, not a chained traceback per mine.
+                return {"success": False, **refused}
             logger.exception("tool_mine: mine failed (mode=%s)", mode)
             return {
                 "success": False,

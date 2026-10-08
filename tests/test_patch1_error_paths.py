@@ -298,3 +298,40 @@ def test_the_rebuild_library_calls_probe_the_embedder_first(request, monkeypatch
     with pytest.raises(embedding.EmbeddingAPIError):
         repair.rebuild_index(str(palace), progress=lambda *_: None)
     assert sorted(p.name for p in palace.parent.iterdir()) == siblings
+
+
+# ── (6) MCP mine flags a model refusal, without a traceback ──────────────
+
+
+@pytest.mark.usefixtures("unknown_model_palace")
+@pytest.mark.parametrize("unknown_model_palace", ["embeddinggemm2"], indirect=True)
+def test_mcp_mine_with_a_near_miss_model_is_a_tool_error(request, monkeypatch, kg, caplog, capfd):
+    project, palace, _ = request.getfixturevalue("unknown_model_palace")
+    call = _mcp_caller(monkeypatch, palace, kg)
+    result, body = call("mempalace_mine", {"source": str(project)})
+    assert result.get("isError") is True, body
+    assert body["error_class"] == "UnknownEmbeddingModelError", body
+    assert "did you mean" in body["details"], body
+    assert "Traceback" not in caplog.text + "".join(capfd.readouterr())
+    assert not palace.exists()
+
+    capfd.readouterr()
+    assert _run_cli(monkeypatch, "--palace", str(palace), "mine", str(project)) == 1
+    err = capfd.readouterr().err
+    assert err.startswith("mempalace: ") and "did you mean" in err, err
+    assert "Traceback" not in err
+
+
+@_MINILM
+def test_mcp_mine_on_a_dead_endpoint_logs_no_traceback(request, monkeypatch, kg, caplog):
+    """tool_mine logged the full chained traceback of every refused mine."""
+    palace = _dead_endpoint_palace(request, monkeypatch)
+    project = palace.parent / "project"
+    (project / "notes" / "shed.md").write_text("The shed roof leaks near the bench.\n" * 8)
+    call = _mcp_caller(monkeypatch, palace, kg)
+    result, body = call("mempalace_mine", {"source": str(project)})
+    assert result.get("isError") is True, body
+    assert body["error_class"] == "EmbeddingAPIError", body
+    assert body["error"] == "Embedding API unavailable", body
+    assert "Traceback" not in caplog.text
+    assert not [r for r in caplog.records if r.exc_info], [r.getMessage() for r in caplog.records]
