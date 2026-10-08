@@ -14,6 +14,7 @@ import weakref
 import struct
 import threading
 import time
+import warnings
 from collections import defaultdict
 from numbers import Integral
 from pathlib import Path
@@ -46,6 +47,27 @@ from .base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# chromadb persists EmbeddingGemma 2's EF config on the collection and, on
+# every later open, tries to rebuild it from its own registry, which does not
+# know "embeddinggemma2": it warns "Could not reconstruct embedding function
+# embeddinggemma2 ... Setting to None" and drops the rebuilt function. That
+# is harmless here (MemPalace always passes its own function or caller
+# vectors and checks the recorded identity), so silence exactly that warning.
+# Registering the class instead would let chromadb build and embed with a
+# function from the persisted config whenever none is passed, which is the
+# kind of silent fallback the backend refuses.
+def _ignore_embeddinggemma2_reconstruct_warning() -> None:
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Could not reconstruct embedding function embeddinggemma2: ",
+        category=UserWarning,
+        module=r"chromadb(\.|$)",
+    )
+
+
+_ignore_embeddinggemma2_reconstruct_warning()
 
 
 # ChromaDB's own default is ``anonymized_telemetry=True``. In the 1.x line we
