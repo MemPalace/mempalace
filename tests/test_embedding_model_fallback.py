@@ -970,3 +970,120 @@ def test_cli_search_prints_model_errors_cleanly(
     assert "Error opening palace" not in out + err
     assert "MismatchError(" not in out + err and "\\n" not in out + err
     assert "Traceback" not in out + err
+
+
+# ── C: never fall back to chromadb's default embedding function (S2) ─────
+
+
+def _break_openai_compat(palace, monkeypatch):
+    """Record the palace as openai-compat, then configure openai-compat with
+    no endpoint: the configured function cannot be built."""
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_API_URL", raising=False)
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_API_MODEL", raising=False)
+    _restamp_as_another_process(palace, "openai-compat")
+    config_file = palace.parent / "config" / "config.json"
+    config_file.write_text(
+        json.dumps(
+            {
+                "palace_path": str(palace),
+                "embedding_model": "openai-compat",
+                "embedding_api_model": "text-embed-a",
+            }
+        )
+    )
+    embedding._EF_CACHE.clear()
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+def test_mcp_add_drawer_refuses_when_the_embedding_function_cannot_be_built(
+    unknown_model_palace, monkeypatch, kg
+):
+    """S2: the MCP write used to succeed on chromadb's default MiniLM
+    function (rows 4 -> 5, success true) while the palace records
+    openai-compat. It now refuses as a tool error and writes nothing."""
+    from mempalace.miner import mine
+
+    project, palace, config = unknown_model_palace
+    mine(str(project), str(palace))
+    rows = _embedding_rows(palace)
+    _break_openai_compat(palace, monkeypatch)
+
+    call = _mcp_caller(monkeypatch, palace, kg)
+    result, body = call("mempalace_add_drawer", _ADD)
+    assert result["isError"] is True, body
+    assert body["error"] == "Embedding function unavailable"
+    assert body["error_class"] == "EmbeddingFunctionUnavailableError"
+    assert "embedding_api_url" in body["details"]
+    assert "does not fall back" in body["details"]
+    assert _embedding_rows(palace) == rows
+
+    result, body = call("mempalace_search", {"query": "greenhouse tomatoes"})
+    assert result["isError"] is True, body
+    assert body["error_class"] == "EmbeddingFunctionUnavailableError"
+
+    # Reads that never embed keep working.
+    result, body = call("mempalace_status", {})
+    assert "isError" not in result, body
+    assert body.get("total_drawers", 0) >= 1, body
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+def test_cli_search_and_mine_refuse_when_the_embedding_function_cannot_be_built(
+    unknown_model_palace, monkeypatch, capfd
+):
+    from mempalace.miner import mine
+
+    project, palace, config = unknown_model_palace
+    mine(str(project), str(palace))
+    rows = _embedding_rows(palace)
+    _break_openai_compat(palace, monkeypatch)
+    capfd.readouterr()
+
+    assert _run_cli(monkeypatch, "--palace", str(palace), "search", "greenhouse") == 1
+    err = capfd.readouterr().err
+    assert "mempalace: Could not build the embedding function" in err
+    assert "Traceback" not in err
+
+    (project / "notes" / "shed.md").write_text("The shed roof leaks near the bench.\n" * 8)
+    assert _run_cli(monkeypatch, "--palace", str(palace), "mine", str(project)) == 1
+    err = capfd.readouterr().err
+    assert "mempalace: Could not build the embedding function" in err
+    assert "Traceback" not in err
+    assert _embedding_rows(palace) == rows
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+def test_fresh_mine_refuses_before_creating_the_palace(unknown_model_palace, monkeypatch):
+    from mempalace.miner import mine
+
+    project, palace, config = unknown_model_palace
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_API_URL", raising=False)
+    (palace.parent / "config" / "config.json").write_text(
+        json.dumps({"palace_path": str(palace), "embedding_model": "openai-compat"})
+    )
+    embedding._EF_CACHE.clear()
+    with pytest.raises(embedding.EmbeddingFunctionUnavailableError):
+        mine(str(project), str(palace))
+    assert not (palace / "chroma.sqlite3").exists()
+    assert not (palace / "mempalace_embedder.json").exists()
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+def test_chroma_resolver_never_returns_none(unknown_model_palace, monkeypatch):
+    """The resolver refuses (write) or hands back a refusing stand-in (read);
+    it never returns None, which made chromadb use its default function."""
+    from mempalace.backends.chroma import ChromaBackend
+
+    def _broken(**_kwargs):
+        raise OSError("onnxruntime failed to load")
+
+    monkeypatch.setattr(embedding, "get_embedding_function", _broken)
+    with pytest.raises(embedding.EmbeddingFunctionUnavailableError, match="onnxruntime"):
+        ChromaBackend._resolve_embedding_function()
+    stand_in = ChromaBackend._resolve_embedding_function(read_only=True)
+    assert isinstance(stand_in, embedding.UnavailableEmbeddingFunction)
+    for embed in (stand_in, stand_in.embed_query, stand_in.embed_documents):
+        with pytest.raises(embedding.EmbeddingFunctionUnavailableError):
+            embed(input=["x"])
+    # Refusal classes stay model errors, so MCP sets isError for them.
+    assert "EmbeddingFunctionUnavailableError" in embedding.MODEL_ERROR_CLASS_NAMES

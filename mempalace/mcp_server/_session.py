@@ -289,7 +289,7 @@ def _get_collection(create=False):
                 _collection_cache_palace = None
                 _invalidate_overview_caches()
                 return None
-            except UnknownEmbeddingModelError as exc:
+            except (UnknownEmbeddingModelError, EmbeddingFunctionUnavailableError) as exc:
                 _collection_open_error = _unknown_embedding_model_error(exc)
                 _collection_cache = None
                 _collection_cache_backend = None
@@ -365,8 +365,9 @@ def _get_collection(create=False):
             # zero-cost. Reuse the backend helper so the two call sites can't
             # drift on logging or fallback semantics.
             if create:
-                ef = ChromaBackend._resolve_embedding_function()
-                ef_kwargs = {"embedding_function": ef} if ef is not None else {}
+                # Raises EmbeddingFunctionUnavailableError rather than letting
+                # chromadb embed the write with its default function (S2).
+                ef_kwargs = {"embedding_function": ChromaBackend._resolve_embedding_function()}
                 # hnsw:num_threads=1 disables ChromaDB's multi-threaded ParallelFor
                 # HNSW insert path, which has a race in repairConnectionsForUpdate /
                 # addPoint (see issues #974, #965). Set via metadata on fresh
@@ -399,8 +400,10 @@ def _get_collection(create=False):
                 _collection_open_error = None
                 _invalidate_overview_caches()
             elif _collection_cache is None:
-                ef = ChromaBackend._resolve_embedding_function()
-                ef_kwargs = {"embedding_function": ef} if ef is not None else {}
+                # Reads that never embed keep working; an embed refuses.
+                ef_kwargs = {
+                    "embedding_function": ChromaBackend._resolve_embedding_function(read_only=True)
+                }
                 raw = client.get_collection(_config.collection_name, **ef_kwargs)
                 _pin_hnsw_threads(raw)
                 _collection_cache = _checked_chroma_collection(raw, create=False)
@@ -426,7 +429,7 @@ def _get_collection(create=False):
             _palace_db_mtime = 0.0
             _invalidate_overview_caches()
             return None
-        except UnknownEmbeddingModelError as exc:
+        except (UnknownEmbeddingModelError, EmbeddingFunctionUnavailableError) as exc:
             # Deterministic config error: retrying cannot help, and the
             # generic "Backend open failed" would hide the fix.
             _collection_open_error = _unknown_embedding_model_error(exc)

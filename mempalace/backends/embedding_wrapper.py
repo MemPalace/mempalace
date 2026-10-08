@@ -22,9 +22,9 @@ def _supports_metadata_aware_documents(embedder) -> bool:
 
 
 def _get_document_embedder():
-    from ..embedding import get_embedding_function
+    from ..embedding import configured_embedding_function
 
-    return get_embedding_function()
+    return configured_embedding_function()
 
 
 def _embed_texts(
@@ -51,10 +51,10 @@ def _embed_texts(
     """
     if not texts:
         return []
-    from ..embedding import embedding_section, get_embedding_function
+    from ..embedding import configured_embedding_function, embedding_section
 
     with embedding_section():
-        ef = get_embedding_function() if embedder is None else embedder
+        ef = configured_embedding_function() if embedder is None else embedder
         if query and callable(getattr(ef, "embed_query", None)):
             vectors = ef.embed_query(input=texts)
         elif not query and callable(getattr(ef, "embed_documents", None)):

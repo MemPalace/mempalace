@@ -56,12 +56,13 @@ def cmd_mine(args):
         EmbedderIdentityMismatchError,
         EmbeddingFunctionMismatchError,
     )
-    from ..embedding import UnknownEmbeddingModelError
+    from ..embedding import EmbeddingFunctionUnavailableError, UnknownEmbeddingModelError
     from ..palace import MineAlreadyRunning, MineFileErrors, MineValidationError
     from ..media import MediaAssetError, MediaAssetSetupError
 
     model_errors = (
         UnknownEmbeddingModelError,
+        EmbeddingFunctionUnavailableError,
         EmbedderIdentityMismatchError,
         DimensionMismatchError,
         EmbeddingFunctionMismatchError,

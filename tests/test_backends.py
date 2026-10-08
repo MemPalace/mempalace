@@ -2638,7 +2638,7 @@ def test_get_collection_translates_ef_mismatch_to_helpful_error(tmp_path):
             return [[0.0] * _TEST_EMBED_DIM for _ in input]
 
     original_resolver = backend._resolve_embedding_function
-    backend._resolve_embedding_function = lambda: _ConflictingEF()
+    backend._resolve_embedding_function = lambda **_: _ConflictingEF()
     # Drop the cached client so the next call goes through the open path.
     backend.close_palace(palace_path)
 

@@ -775,11 +775,16 @@ class OpenAICompatEmbeddingFunction:
     endpoint (LM Studio, llama.cpp, vLLM, Ollama's OpenAI shim, etc.).
 
     Selected via ``embedding_model == "openai-compat"``. Vectors are produced
-    server-side and fetched over HTTP, which changes the vector space — so
-    ``name()`` encodes the model id: ChromaDB persists the EF name on the
-    collection and rejects mismatched reads, the signal to run ``mempalace
-    repair rebuild-index`` after changing model/endpoint. stdlib ``urllib``
-    only, no new dependency.
+    server-side and fetched over HTTP, which changes the vector space.
+    ``name()`` encodes the model id, but this does **not** guard a model or
+    endpoint change: chromadb 1.5.x persists this class as a legacy EF
+    (``{"type": "legacy"}``, no name), so it never compares names on open,
+    and the recorded palace identity is the bare ``openai-compat`` for every
+    endpoint model. Switching ``embedding_api_model`` to another model with
+    the same dimension is therefore accepted silently; run ``mempalace
+    repair rebuild-index`` yourself after changing the model or endpoint.
+    (Recording the endpoint model in the identity is follow-up item D.)
+    stdlib ``urllib`` only, no new dependency.
     """
 
     def __init__(self, base_url: str, model: str, api_key: Optional[str] = None):
@@ -942,9 +947,112 @@ class UnknownEmbeddingModelError(ValueError):
 # misspelled name, or a palace built with another model). Every read and write
 # refuses until the config or the palace is fixed, so tool results built from
 # one carry ``error_class`` (the class name below) and MCP sets ``isError``.
+EMBEDDING_FUNCTION_UNAVAILABLE_ERROR = "Embedding function unavailable"
+
+
+class EmbeddingFunctionUnavailableError(RuntimeError):
+    """The configured embedding function could not be built.
+
+    MemPalace refuses the call instead of letting chromadb embed with its
+    own default function: that writes vectors from a model the palace's
+    recorded identity does not name, and nothing downstream notices (the
+    stored and configured names still agree). Raised for writes and
+    searches; reads that never embed keep working (see
+    :class:`UnavailableEmbeddingFunction`).
+    """
+
+    def __init__(self, model: str, cause: BaseException):
+        self.model = model
+        self.cause = cause
+        super().__init__(
+            f"Could not build the embedding function for embedding_model {model!r}: "
+            f"{type(cause).__name__}: {cause}\n"
+            "MemPalace does not fall back to chromadb's default embedding function, "
+            "which would embed with a different model than the palace records. "
+            "Fix the embedding settings (or the missing dependency) and retry."
+        )
+
+
+def embedding_function_unavailable(cause: BaseException) -> EmbeddingFunctionUnavailableError:
+    """Wrap a failure to build the configured embedding function."""
+    try:
+        from .config import MempalaceConfig
+
+        model = MempalaceConfig().embedding_model
+    except Exception:
+        model = "<unreadable config>"
+    return EmbeddingFunctionUnavailableError(model, cause)
+
+
+def configured_embedding_function():
+    """:func:`get_embedding_function` for the configured model, refusing on a build failure.
+
+    A misspelled model keeps raising :class:`UnknownEmbeddingModelError`, and
+    an EmbeddingGemma 2 failure keeps its own error (it already names the
+    missing extra or device); any other failure to build raises
+    :class:`EmbeddingFunctionUnavailableError`. Nothing calls chromadb's
+    default function instead.
+    """
+    try:
+        return get_embedding_function()
+    except UnknownEmbeddingModelError:
+        raise
+    except Exception as exc:
+        from .config import MempalaceConfig
+
+        try:
+            gemma2 = MempalaceConfig().embedding_model == "embeddinggemma2"
+        except Exception:
+            gemma2 = False
+        if gemma2:
+            raise
+        raise embedding_function_unavailable(exc) from exc
+
+
+class UnavailableEmbeddingFunction:
+    """Stand-in Chroma EF for a read-only open when the configured one failed to build.
+
+    Opening a collection to count, list or fetch rows never embeds, so those
+    reads keep working; any embed (a query, or a write that passes text)
+    raises the :class:`EmbeddingFunctionUnavailableError` instead of
+    reaching chromadb's default function. ``name()`` is ``"default"`` so
+    chromadb's EF-name check on open never trips on it; it is never passed
+    to a create, so chromadb never persists it.
+    """
+
+    def __init__(self, error: EmbeddingFunctionUnavailableError):
+        self.error = error
+
+    @staticmethod
+    def name() -> str:
+        return "default"
+
+    def is_legacy(self) -> bool:
+        return True
+
+    def get_config(self) -> dict:
+        return {}
+
+    def default_space(self) -> str:
+        return "cosine"
+
+    def supported_spaces(self) -> list:
+        return ["cosine", "l2", "ip"]
+
+    def __call__(self, input):  # noqa: A002 — ChromaDB EF protocol
+        raise self.error
+
+    def embed_query(self, input):  # noqa: A002
+        raise self.error
+
+    def embed_documents(self, input):  # noqa: A002
+        raise self.error
+
+
 MODEL_ERROR_CLASS_NAMES = frozenset(
     {
         "UnknownEmbeddingModelError",
+        "EmbeddingFunctionUnavailableError",
         "EmbedderIdentityMismatchError",
         "DimensionMismatchError",
         "EmbeddingFunctionMismatchError",
@@ -955,6 +1063,10 @@ _MODEL_REFUSAL_HINT = (
     "or re-embed the palace as the details describe."
 )
 _UNKNOWN_MODEL_HINT = "Fix embedding_model in config.json or MEMPALACE_EMBEDDING_MODEL."
+_UNAVAILABLE_EF_HINT = (
+    "Fix the embedding settings in config.json (for openai-compat: embedding_api_url "
+    "and embedding_api_model) or install the missing dependency, then retry."
+)
 _REFUSALS_LOGGED: set = set()
 _REFUSALS_LOCK = threading.Lock()
 
@@ -969,6 +1081,7 @@ def _model_error_class(exc: BaseException) -> Optional[type]:
 
     for cls in (
         UnknownEmbeddingModelError,
+        EmbeddingFunctionUnavailableError,
         EmbedderIdentityMismatchError,
         DimensionMismatchError,
         EmbeddingFunctionMismatchError,
@@ -1015,6 +1128,8 @@ def model_error_result(exc: BaseException, *, palace_path=None, log=None) -> Opt
         return None
     if cls is UnknownEmbeddingModelError:
         kind, hint = UNKNOWN_EMBEDDING_MODEL_ERROR, _UNKNOWN_MODEL_HINT
+    elif cls is EmbeddingFunctionUnavailableError:
+        kind, hint = EMBEDDING_FUNCTION_UNAVAILABLE_ERROR, _UNAVAILABLE_EF_HINT
     else:
         kind, hint = model_mismatch_error_kind(exc), _MODEL_REFUSAL_HINT
     if log is not None:

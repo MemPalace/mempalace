@@ -3939,31 +3939,39 @@ class ChromaBackend(BaseBackend):
         _LIVE_BACKENDS.add(self)
 
     @staticmethod
-    def _resolve_embedding_function():
-        """Return the EF for the user's ``embedding_device`` setting.
+    def _resolve_embedding_function(*, read_only: bool = False):
+        """Return the EF for the user's ``embedding_model`` / ``embedding_device``.
 
         Both ``get_collection`` and ``get_or_create_collection`` must receive
         the EF explicitly — ChromaDB 1.x does not persist it with the
         collection, so a reader that omits the argument silently gets the
         library default and its queries won't match the writer's vectors.
+
+        Never returns None, so chromadb's default function is never used. A
+        configured function that fails to build raises
+        :class:`~mempalace.embedding.EmbeddingFunctionUnavailableError` (an
+        EmbeddingGemma 2 failure keeps its original error). With
+        ``read_only=True`` it returns an
+        :class:`~mempalace.embedding.UnavailableEmbeddingFunction` instead,
+        so opens that only count, list or fetch rows keep working and any
+        embed raises that error.
         """
-        from ..embedding import UnknownEmbeddingModelError
+        from ..embedding import (
+            EmbeddingFunctionUnavailableError,
+            UnavailableEmbeddingFunction,
+            configured_embedding_function,
+        )
 
+        # A misspelled model (UnknownEmbeddingModelError) always stops the
+        # open, not run on chromadb's default (MiniLM) function. The caller
+        # reports a refusal (CLI: one ``mempalace:`` line; MCP: the tool
+        # error plus one rate-limited log line).
         try:
-            from ..embedding import get_embedding_function
-
-            return get_embedding_function()
-        except UnknownEmbeddingModelError:
-            # A misspelled model must stop the open, not run on chromadb's
-            # default (MiniLM) function and file vectors for the wrong model.
+            return configured_embedding_function()
+        except EmbeddingFunctionUnavailableError as error:
+            if read_only:
+                return UnavailableEmbeddingFunction(error)
             raise
-        except Exception:
-            from ..config import MempalaceConfig
-
-            if MempalaceConfig().embedding_model == "embeddinggemma2":
-                raise
-            logger.exception("Failed to build embedding function; using chromadb default")
-            return None
 
     @staticmethod
     def _explain_ef_mismatch(error: Exception, palace_path: str) -> Optional[str]:
@@ -4293,6 +4301,18 @@ class ChromaBackend(BaseBackend):
         if not create and not os.path.isdir(palace_path):
             raise PalaceNotFoundError(palace_path)
 
+        if caller_vectors:
+            # Passing None explicitly prevents Chroma's client default EF.
+            ef_kwargs = {
+                "embedding_function": None,
+            }
+        else:
+            # Before the folder is created: a configured function that cannot
+            # be built refuses a create with nothing written.
+            ef_kwargs = {
+                "embedding_function": self._resolve_embedding_function(read_only=not create),
+            }
+
         if create:
             os.makedirs(palace_path, exist_ok=True)
             try:
@@ -4303,21 +4323,6 @@ class ChromaBackend(BaseBackend):
         # Collection opens and creates write to chroma.sqlite3.
         with palace_db_lock(os.path.join(palace_path, "chroma.sqlite3")):
             client = self._client(palace_path)
-
-            if caller_vectors:
-                # Passing None explicitly prevents Chroma's client default EF.
-                ef_kwargs = {
-                    "embedding_function": None,
-                }
-            else:
-                ef = self._resolve_embedding_function()
-                ef_kwargs = (
-                    {
-                        "embedding_function": ef,
-                    }
-                    if ef is not None
-                    else {}
-                )
 
             if create:
                 try:
@@ -4430,8 +4435,7 @@ class ChromaBackend(BaseBackend):
         self, palace_path: str, collection_name: str, hnsw_space: str = "cosine"
     ) -> ChromaCollection:
         """Create (not get-or-create) ``collection_name`` with the given HNSW space."""
-        ef = self._resolve_embedding_function()
-        ef_kwargs = {"embedding_function": ef} if ef is not None else {}
+        ef_kwargs = {"embedding_function": self._resolve_embedding_function()}
         with palace_db_lock(os.path.join(palace_path, "chroma.sqlite3")):
             collection = self._client(palace_path).create_collection(
                 collection_name,

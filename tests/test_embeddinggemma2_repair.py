@@ -59,7 +59,9 @@ def test_rebuild_index_migrates_old_identity_and_preserves_drawers(
     os.makedirs(palace_path)
     backend = ChromaBackend()
     request.addfinalizer(backend.close)
-    monkeypatch.setattr(ChromaBackend, "_resolve_embedding_function", staticmethod(lambda: None))
+    monkeypatch.setattr(
+        ChromaBackend, "_resolve_embedding_function", staticmethod(lambda **_: None)
+    )
     fake_ef = _FakeEmbeddingGemma2()
     monkeypatch.setattr(embedding, "get_embedding_function", lambda **_kwargs: fake_ef)
     from mempalace.backends import embedding_wrapper

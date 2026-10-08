@@ -111,6 +111,7 @@ from ..backends.base import (  # noqa: E402
 )
 from ..embedding import (  # noqa: E402
     MODEL_ERROR_CLASS_NAMES,
+    EmbeddingFunctionUnavailableError,
     UnknownEmbeddingModelError,
     model_error_result,
 )
