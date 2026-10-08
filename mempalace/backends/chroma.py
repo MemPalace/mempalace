@@ -33,6 +33,7 @@ from .base import (
     BaseBackend,
     BaseCollection,
     CollectionNotInitializedError,
+    DimensionMismatchError,
     EmbeddingFunctionMismatchError,
     GetResult,
     HealthStatus,
@@ -43,6 +44,7 @@ from .base import (
     QueryResult,
     UnsupportedFilterError,
     _IncludeSpec,
+    dimension_mismatch_message,
     initialize_last_modified_metadata,
 )
 
@@ -3169,6 +3171,35 @@ def _count_write() -> None:
         _write_serial += 1
 
 
+_CHROMA_DIMENSION_ERROR = re.compile(
+    r"expecting embedding with dimension of (\d+), got (\d+)", re.IGNORECASE
+)
+
+
+@contextlib.contextmanager
+def _typed_dimension_errors(collection):
+    """Raise chromadb's dimension rejection as :class:`DimensionMismatchError`.
+
+    chromadb reports a vector of the wrong width as a bare
+    ``InvalidArgumentError("Collection expecting embedding with dimension of
+    N, got M")``, which callers cannot tell from any other failure: the CLI
+    printed a traceback and MCP a generic error. The typed error carries the
+    same recovery hint as the other backends, and MCP flags it ``isError``.
+    """
+    try:
+        yield
+    except DimensionMismatchError:
+        raise
+    except Exception as exc:
+        match = _CHROMA_DIMENSION_ERROR.search(str(exc))
+        if match is None:
+            raise
+        name = getattr(collection, "name", None) or "?"
+        raise DimensionMismatchError(
+            dimension_mismatch_message("chroma", str(name), match.group(1), match.group(2))
+        ) from exc
+
+
 class ChromaCollection(BaseCollection):
     """Thin adapter translating ChromaDB dict returns into typed results.
 
@@ -3309,7 +3340,7 @@ class ChromaCollection(BaseCollection):
             kwargs["metadatas"] = sanitized
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
-        with self._write_lock():
+        with self._write_lock(), _typed_dimension_errors(self._collection):
             self._collection.add(**kwargs)
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
@@ -3325,7 +3356,7 @@ class ChromaCollection(BaseCollection):
             kwargs["metadatas"] = sanitized
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
-        with self._write_lock():
+        with self._write_lock(), _typed_dimension_errors(self._collection):
             self._collection.upsert(**kwargs)
 
     def update(
@@ -3352,7 +3383,7 @@ class ChromaCollection(BaseCollection):
             kwargs["metadatas"] = metadatas
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
-        with self._write_lock():
+        with self._write_lock(), _typed_dimension_errors(self._collection):
             self._collection.update(**kwargs)
 
     # ------------------------------------------------------------------
@@ -3405,7 +3436,8 @@ class ChromaCollection(BaseCollection):
         if where_document is not None:
             kwargs["where_document"] = where_document
 
-        raw = self._collection.query(**kwargs)
+        with _typed_dimension_errors(self._collection):
+            raw = self._collection.query(**kwargs)
 
         num_queries = (
             len(query_texts)

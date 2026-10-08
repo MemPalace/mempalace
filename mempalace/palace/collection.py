@@ -144,6 +144,28 @@ def _normalize_legacy_identity(collection, stored, *, create):
     return stored
 
 
+def _identity_to_record(current, *, core_embedder: bool):
+    """The identity a first write records: with the real vector dimension.
+
+    The open-time check compares names only (``current`` carries dimension
+    0, so opening never loads a model), but the record must say what the
+    vectors are: a first mine used to record dimension 0 while a rebuild of
+    the same palace recorded 384 or 768. A core embedder is probed once per
+    process (the write about to happen embeds with it anyway); a failed probe
+    records 0, "unknown", as before. A server embedder reports its own.
+    """
+    from ..backends.base import EmbedderIdentity
+    from ..embedding import probe_dimension
+
+    if not core_embedder or current.dimension:
+        return current
+    try:
+        dimension = probe_dimension()
+    except Exception:
+        dimension = 0
+    return EmbedderIdentity(model_name=current.model_name, dimension=dimension)
+
+
 def _enforce_unreadable_record(exc, palace_path, collection_name, model_name, *, create) -> None:
     """A write refuses and a read warns when the identity record cannot be read."""
     import warnings
@@ -205,7 +227,9 @@ def _enforce_bare_openai_compat(
     if has_rows is False:
         if not create:
             return  # nothing to mislabel; the next write open records it
-        new = EmbedderIdentity(model_name=model_name, dimension=stored.dimension or 0)
+        new = _identity_to_record(
+            EmbedderIdentity(model_name=model_name, dimension=0), core_embedder=True
+        )
         try:
             collection.set_embedder_identity(new)
         except Exception as exc:
@@ -377,7 +401,9 @@ def _enforce_embedder_identity(
             unrecorded = not create
             if create:
                 try:
-                    collection.set_embedder_identity(current)
+                    collection.set_embedder_identity(
+                        _identity_to_record(current, core_embedder=core_embedder)
+                    )
                 except EmbedderIdentityRecordError:
                     raise
                 except Exception as exc:
@@ -670,6 +696,7 @@ def set_palace_embedder_identity(
         current_model_name,
         get_embedder_identity,
         get_embedding_function,
+        known_dimension,
         openai_compat_api_model,
     )
 
@@ -737,10 +764,13 @@ def set_palace_embedder_identity(
             dimension=get_embedding_function(model=target).dimension,
         )
     else:
-        # Explicit override of a non-configured model: record the name only,
-        # never load a foreign model (which can be a large download) just to
-        # probe a dimension. The model-name check is the actual protection.
-        new = EmbedderIdentity(model_name=target, dimension=0)
+        # Explicit override of a non-configured model: never load a foreign
+        # model (which can be a large download) just to probe a dimension.
+        # A bundled model's width is fixed; an unprobed endpoint model's is
+        # unknown (0). The model-name check is the actual protection.
+        new = EmbedderIdentity(
+            model_name=target, dimension=known_dimension(target) if core_embedder else 0
+        )
     try:
         old = collection.get_stored_embedder_identity()
     except Exception as exc:

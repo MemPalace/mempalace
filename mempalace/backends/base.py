@@ -168,6 +168,29 @@ _RE_EMBED_HINT = (
 )
 
 
+def dimension_mismatch_message(backend: str, collection_name: str, expected, got) -> str:
+    """The :class:`DimensionMismatchError` message every backend raises.
+
+    Keeps the ``expects embedding dimension X, got Y`` wording callers and
+    tests match on, then says what it means and how to recover. The
+    in-place re-embed (``repair rebuild-index``) exists for Chroma only, so
+    other backends are pointed at the configured model or a fresh mine.
+    """
+    if backend == "chroma":
+        recover = _RE_EMBED_HINT
+    else:
+        recover = (
+            "re-embed by mining the sources into a new palace with the current model "
+            "(`mempalace repair rebuild-index` is Chroma-only)"
+        )
+    return (
+        f"{backend} collection {collection_name!r} expects embedding dimension {expected}, "
+        f"got {got}: the configured embedding model produces {got}-dim vectors, but the "
+        f"collection holds {expected}-dim vectors from another model. Set embedding_model "
+        f"back to the model the palace was built with, or {recover}."
+    )
+
+
 class EmbedderIdentityUnknownWarning(UserWarning):
     """Emitted on first open of a collection with no recorded embedder identity.
 

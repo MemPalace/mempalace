@@ -31,6 +31,7 @@ from .base import (
     BaseCollection,
     CollectionNotInitializedError,
     DimensionMismatchError,
+    dimension_mismatch_message,
     GetResult,
     HealthStatus,
     LexicalHit,
@@ -651,8 +652,7 @@ class SQLiteExactCollection(BaseCollection):
             )
         elif stored != dim:
             raise DimensionMismatchError(
-                f"sqlite_exact collection {self._collection_name!r} expects "
-                f"embedding dimension {stored}, got {dim}"
+                dimension_mismatch_message("sqlite_exact", self._collection_name, stored, dim)
             )
 
     def _fts_available(self, cur) -> bool:
@@ -1054,8 +1054,9 @@ class SQLiteExactCollection(BaseCollection):
                 q = _as_vector_array(query_vector)
                 if expected_dim is not None and int(q.size) != expected_dim:
                     raise DimensionMismatchError(
-                        f"sqlite_exact collection {self._collection_name!r} expects "
-                        f"embedding dimension {expected_dim}, got {int(q.size)}"
+                        dimension_mismatch_message(
+                            "sqlite_exact", self._collection_name, expected_dim, int(q.size)
+                        )
                     )
                 if mat.size == 0 or n_results == 0:
                     outer_ids.append([])
@@ -1067,8 +1068,9 @@ class SQLiteExactCollection(BaseCollection):
                     continue
                 if mat.shape[1] != q.size:
                     raise DimensionMismatchError(
-                        f"sqlite_exact collection {self._collection_name!r} expects "
-                        f"embedding dimension {int(mat.shape[1])}, got {int(q.size)}"
+                        dimension_mismatch_message(
+                            "sqlite_exact", self._collection_name, int(mat.shape[1]), int(q.size)
+                        )
                     )
                 dist = _cosine_distances(mat, q, norms)
                 k = min(n_results, int(dist.size))

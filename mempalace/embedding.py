@@ -1472,6 +1472,20 @@ def describe_device(device: Optional[str] = None, model: Optional[str] = None) -
 # Probed vector widths, keyed by resolved model name. Populated once per
 # process the first time an identity is resolved for a model.
 _DIM_CACHE: dict = {}
+# Output widths of the bundled ONNX models, fixed by the code that runs them.
+# Used to record a model that is not loaded (``palace set-embedder --model``).
+_FIXED_DIMENSIONS = {"minilm": 384, "embeddinggemma": _EMBEDDINGGEMMA_DIM}
+
+
+def known_dimension(model_name: str) -> int:
+    """The vector width of ``model_name`` without loading it, or ``0`` (unknown).
+
+    The bundled ONNX models have fixed widths, and a model probed earlier in
+    this process is cached. An endpoint model that was never probed is
+    unknown.
+    """
+    name = str(model_name or "")
+    return _FIXED_DIMENSIONS.get(name) or _DIM_CACHE.get(name) or 0
 
 
 def current_model_name(model: Optional[str] = None) -> str:
@@ -1513,6 +1527,8 @@ def probe_dimension(device: Optional[str] = None, model: Optional[str] = None) -
     cached per resolved model name so the probe is paid at most once per
     process. Returns ``0`` if the probe fails (treated as "dimension unknown"
     by the identity check, so a probe failure never blocks normal operation).
+    A failed probe is not cached: an endpoint that was down answers the
+    next probe.
     """
     name = current_model_name(model)
     if name.startswith("embeddinggemma2:"):
@@ -1526,8 +1542,9 @@ def probe_dimension(device: Optional[str] = None, model: Optional[str] = None) -
         dim = len(vectors[0]) if vectors and vectors[0] is not None else 0
     except Exception:
         logger.debug("Embedding dimension probe failed for model=%s", name, exc_info=True)
-        dim = 0
-    _DIM_CACHE[name] = dim
+        return 0
+    if dim:
+        _DIM_CACHE[name] = dim
     return dim
 
 
