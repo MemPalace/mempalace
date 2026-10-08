@@ -517,3 +517,96 @@ def test_status_shows_the_resolved_device(eg2_config, monkeypatch, capsys):
     assert "embeddinggemma2 (cpu; cuda requested but unavailable, float32)" in (
         capsys.readouterr().out
     )
+
+
+# ── CUDA out-of-memory: halve the batch and retry (per call) ─────────────
+
+
+class _CudaOOM(RuntimeError):
+    """Stands in for torch.cuda.OutOfMemoryError."""
+
+
+class _OOMModel(_FakeModel):
+    """Runs out of memory above ``fits`` documents per batch."""
+
+    def __init__(self, fits, error=_CudaOOM):
+        super().__init__()
+        self.fits = fits
+        self.error = error
+
+    def encode(self, texts, **kwargs):
+        if self.fits is None or kwargs["batch_size"] > self.fits:
+            self.calls.append((list(texts), kwargs))
+            raise self.error("CUDA out of memory. Tried to allocate 2.00 GiB")
+        return super().encode(texts, **kwargs)
+
+
+def _oom_provider(monkeypatch, model, *, batch_size=None, device="cuda"):
+    emptied = []
+    torch = _torch(cuda=device == "cuda")
+    torch.cuda.OutOfMemoryError = _CudaOOM
+    torch.cuda.empty_cache = lambda: emptied.append(True)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    provider = EmbeddingGemma2EmbeddingFunction(device=device, batch_size=batch_size)
+    monkeypatch.setattr(provider, "_load_model_for", lambda _selected: model)
+    return provider, emptied
+
+
+def _batches(model):
+    return [kwargs["batch_size"] for _texts, kwargs in model.calls]
+
+
+def test_cuda_oom_halves_the_batch_for_this_call_only(monkeypatch, caplog):
+    model = _OOMModel(fits=8)
+    provider, emptied = _oom_provider(monkeypatch, model)
+    with caplog.at_level(logging.WARNING, logger="mempalace.embeddinggemma2"):
+        vectors = provider.embed_documents(["a", "b", "c"])
+    assert len(vectors) == 3
+    assert _batches(model) == [32, 16, 8]
+    assert len(emptied) == 2  # between attempts
+    assert [r.getMessage() for r in caplog.records if "out of CUDA memory" in r.getMessage()] == [
+        "EmbeddingGemma 2 ran out of CUDA memory at batch size 32; retrying this call at 16",
+        "EmbeddingGemma 2 ran out of CUDA memory at batch size 16; retrying this call at 8",
+    ]
+
+    # The next call starts at the device default again (no permanent shrink).
+    model.calls.clear()
+    provider.embed_documents(["d"])
+    assert _batches(model)[0] == 32
+
+
+def test_cuda_oom_starts_from_the_configured_batch_size(monkeypatch):
+    model = _OOMModel(fits=1)
+    provider, _ = _oom_provider(monkeypatch, model, batch_size=6)
+    provider.embed_documents(["a", "b"])
+    assert _batches(model) == [6, 3, 1]
+
+
+def test_cuda_oom_at_batch_size_one_raises_a_clear_error(monkeypatch):
+    from mempalace.embeddinggemma2 import EmbeddingGemma2OutOfMemoryError
+
+    model = _OOMModel(fits=None)
+    provider, emptied = _oom_provider(monkeypatch, model, batch_size=4)
+    with pytest.raises(EmbeddingGemma2OutOfMemoryError) as excinfo:
+        provider.embed_documents(["a"])
+    assert _batches(model) == [4, 2, 1]
+    assert len(emptied) == 3
+    message = str(excinfo.value)
+    assert "MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE" in message
+    assert "from 4 down to 1" in message
+
+
+def test_a_runtime_error_saying_out_of_memory_also_retries(monkeypatch):
+    model = _OOMModel(fits=16, error=RuntimeError)
+    provider, _ = _oom_provider(monkeypatch, model)
+    provider.embed_query(["q"])
+    assert _batches(model) == [32, 16]
+
+
+def test_out_of_memory_off_cuda_is_not_retried(monkeypatch):
+    model = _OOMModel(fits=None, error=RuntimeError)
+    provider, emptied = _oom_provider(monkeypatch, model, device="cpu")
+    with pytest.raises(RuntimeError, match="out of memory"):
+        provider.embed_documents(["a"])
+    assert _batches(model) == [_BATCH_SIZE]
+    assert emptied == []

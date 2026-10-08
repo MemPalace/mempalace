@@ -40,6 +40,10 @@ class EmbeddingOutputError(RuntimeError):
     """Raised when the model returns vectors that cannot safely be stored."""
 
 
+class EmbeddingGemma2OutOfMemoryError(RuntimeError):
+    """CUDA ran out of memory even at batch size 1."""
+
+
 def _config_kwargs(modalities: str) -> dict[str, Any]:
     """Return the selective encoder settings documented by the model card."""
     if modalities == "text":
@@ -334,9 +338,11 @@ class EmbeddingGemma2EmbeddingFunction:
         _cap_max_seq_length(model)
         return model
 
-    def _encode_raw(self, inputs, *, prompt_name: Optional[str] = None, prompt=None):
+    def _encode_raw(
+        self, inputs, *, prompt_name: Optional[str] = None, prompt=None, batch_size=None
+    ):
         kwargs = {
-            "batch_size": self.batch_size_for(self._resolved_device),
+            "batch_size": batch_size or self.batch_size_for(self._resolved_device),
             "show_progress_bar": False,
             "convert_to_numpy": True,
             "convert_to_tensor": False,
@@ -378,9 +384,65 @@ class EmbeddingGemma2EmbeddingFunction:
             raise EmbeddingOutputError("EmbeddingGemma 2 returned a zero or invalid vector")
         return (vectors / norms).astype(np.float32, copy=False).tolist()
 
-    def _encode_once(self, inputs, *, prompt_name=None, prompt=None):
-        raw = self._encode_raw(inputs, prompt_name=prompt_name, prompt=prompt)
+    def _encode_once(self, inputs, *, prompt_name=None, prompt=None, batch_size=None):
+        raw = self._encode_raw(
+            inputs, prompt_name=prompt_name, prompt=prompt, batch_size=batch_size
+        )
         return self._validate_and_normalize(raw, len(inputs))
+
+    @staticmethod
+    def _is_cuda_oom(exc: BaseException) -> bool:
+        try:
+            import torch
+
+            oom_class = getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None)
+        except ImportError:
+            oom_class = None
+        if isinstance(oom_class, type) and isinstance(exc, oom_class):
+            return True
+        return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+    @staticmethod
+    def _empty_cuda_cache() -> None:
+        try:
+            import torch
+
+            torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001 - best effort between retries
+            pass
+
+    def _encode_shrinking_on_oom(self, inputs, *, prompt_name=None, prompt=None):
+        """Encode; on a CUDA out-of-memory error, halve the batch and retry, down to 1.
+
+        The smaller batch applies to this call only: the next call starts
+        again at the configured (or per-device default) batch size, so one
+        long document does not slow every later batch.
+        """
+        start = batch = self.batch_size_for(self._resolved_device)
+        while True:
+            try:
+                return self._encode_once(
+                    inputs, prompt_name=prompt_name, prompt=prompt, batch_size=batch
+                )
+            except Exception as exc:
+                if self._resolved_device != "cuda" or not self._is_cuda_oom(exc):
+                    raise
+                self._empty_cuda_cache()
+                if batch <= 1:
+                    raise EmbeddingGemma2OutOfMemoryError(
+                        f"EmbeddingGemma 2 ran out of CUDA memory at every batch size from "
+                        f"{start} down to 1 ({exc}). Free GPU memory used by other processes, "
+                        "set MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE (or embeddinggemma2_batch_size) "
+                        "to a smaller value, or set MEMPALACE_EMBEDDING_DEVICE=cpu."
+                    ) from exc
+                smaller = max(1, batch // 2)
+                logger.warning(
+                    "EmbeddingGemma 2 ran out of CUDA memory at batch size %d; "
+                    "retrying this call at %d",
+                    batch,
+                    smaller,
+                )
+                batch = smaller
 
     @staticmethod
     def _is_mps_runtime_error(exc: RuntimeError) -> bool:
@@ -447,7 +509,7 @@ class EmbeddingGemma2EmbeddingFunction:
             # witness has proved the provider healthy.
             self._load_and_check()
             try:
-                return self._encode_once(inputs, prompt_name=prompt_name, prompt=prompt)
+                return self._encode_shrinking_on_oom(inputs, prompt_name=prompt_name, prompt=prompt)
             except (RuntimeError, EmbeddingOutputError) as exc:
                 if self._resolved_device != "mps":
                     raise
