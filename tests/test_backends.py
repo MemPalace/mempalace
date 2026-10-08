@@ -2609,6 +2609,17 @@ def test_explain_ef_mismatch_also_offers_a_separate_palace_rebuild():
     )
 
 
+def test_explain_ef_mismatch_prints_a_windows_path_as_typed():
+    """Eve's GPU recheck on Windows: the message formatted the path with
+    ``!r``, so ``search`` showed it quoted, with every backslash doubled."""
+    err = ValueError("Embedding function conflict: new: embeddinggemma2 vs persisted: default")
+    path = r"C:\Users\igorl\.mempalace\palace"
+    msg = ChromaBackend._explain_ef_mismatch(err, path)
+    first_line = msg.splitlines()[0]
+    assert first_line == rf"Embedding model mismatch reading palace at {path}."
+    assert "\\\\" not in msg
+
+
 def test_explain_ef_mismatch_returns_none_for_unrelated_errors():
     """Don't paper over unrelated ValueErrors with the EF-mismatch message —
     the caller needs to re-raise unmodified so debugging stays sane."""

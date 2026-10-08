@@ -4022,7 +4022,7 @@ class ChromaBackend(BaseBackend):
             f"mempalace --palace <new-palace> repair --mode from-sqlite --source {quoted}"
         )
         return (
-            f"Embedding model mismatch reading palace at {palace_path!r}.\n"
+            f"Embedding model mismatch reading palace at {palace_path}.\n"
             f"  Underlying ChromaDB error: {msg}\n"
             f"  Current embedding_model={current_model!r}.\n"
             f"  The palace was built with a different embedding model. Either:\n"

@@ -903,9 +903,7 @@ def _mismatch_errors():
             "collection was built with embedder 'minilm' but the current embedder is 'x'."
         ),
         DimensionMismatchError("collection was built with a 384-dim embedder ('minilm')"),
-        EmbeddingFunctionMismatchError(
-            "Embedding model mismatch reading palace at '/fake/palace'."
-        ),
+        EmbeddingFunctionMismatchError("Embedding model mismatch reading palace at /fake/palace."),
     ]
 
 
