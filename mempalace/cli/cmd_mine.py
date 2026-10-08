@@ -57,7 +57,11 @@ def cmd_mine(args):
         EmbedderIdentityRecordError,
         EmbeddingFunctionMismatchError,
     )
-    from ..embedding import EmbeddingFunctionUnavailableError, UnknownEmbeddingModelError
+    from ..embedding import (
+        EmbeddingAPIError,
+        EmbeddingFunctionUnavailableError,
+        UnknownEmbeddingModelError,
+    )
     from ..palace import MineAlreadyRunning, MineFileErrors, MineValidationError
     from ..media import MediaAssetError, MediaAssetSetupError
 
@@ -103,7 +107,7 @@ def cmd_mine(args):
         except MineAlreadyRunning as exc:
             print(f"mempalace: {exc}", file=sys.stderr)
             sys.exit(1)
-        except model_errors as exc:
+        except (*model_errors, EmbeddingAPIError) as exc:
             print(f"mempalace: {exc}", file=sys.stderr)
             sys.exit(1)
         suffix = " would be written" if args.dry_run else " written"
@@ -185,6 +189,13 @@ def cmd_mine(args):
         # A misspelled model, or a model that differs from the one the palace
         # was built with: nothing was written. Print the fix, as search does,
         # instead of a traceback.
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except EmbeddingAPIError as exc:
+        # The openai-compat endpoint refused the connection, failed, or sent
+        # something other than embeddings. The miner has already printed its
+        # "Mine aborted" summary (drawers filed so far are kept, and a re-run
+        # resumes); the cause needs one line, not a traceback.
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(1)
     except MineValidationError as exc:

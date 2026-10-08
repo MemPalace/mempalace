@@ -1200,3 +1200,31 @@ def test_an_unrelated_write_failure_stays_a_plain_error():
     refused = _embed_failure(api_error, success=False)
     assert refused["error_class"] == "EmbeddingAPIError" and refused["success"] is False
     assert _tool_call_response(1, refused)["result"]["isError"] is True
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+def test_cli_mine_and_search_on_a_dead_endpoint_print_one_line(
+    unknown_model_palace, monkeypatch, capfd
+):
+    """Eve's recheck of c9b6814 (predates the follow-up): CLI mine on a dead
+    openai-compat endpoint printed a full traceback after its "Mine aborted"
+    summary. It now prints one ``mempalace:`` line and exits 1."""
+    project = unknown_model_palace[0]
+    palace = _openai_compat_palace_with_a_dead_endpoint(unknown_model_palace, monkeypatch)
+    rows = _embedding_rows(palace)
+    (project / "notes" / "shed.md").write_text("The shed roof leaks near the bench.\n" * 8)
+    capfd.readouterr()
+
+    assert _run_cli(monkeypatch, "--palace", str(palace), "mine", str(project)) == 1
+    out, err = capfd.readouterr()
+    assert "Mine aborted" in out  # the partial-progress summary stays
+    lines = [line for line in err.splitlines() if line.strip()]
+    assert [line for line in lines if line.startswith("mempalace: ")] == [lines[-1]], err
+    assert lines[-1].startswith("mempalace: Embedding API request to http://127.0.0.1:")
+    assert "Traceback" not in out + err
+    assert _embedding_rows(palace) == rows
+
+    assert _run_cli(monkeypatch, "--palace", str(palace), "search", "greenhouse") == 1
+    out, err = capfd.readouterr()
+    assert "mempalace: Embedding API request to http://127.0.0.1:" in err
+    assert "Traceback" not in out + err

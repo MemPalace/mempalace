@@ -897,6 +897,7 @@ def _mismatch_errors():
         EmbedderIdentityMismatchError,
         EmbeddingFunctionMismatchError,
     )
+    from mempalace.embedding import EmbeddingAPIError
 
     return [
         EmbedderIdentityMismatchError(
@@ -904,10 +905,16 @@ def _mismatch_errors():
         ),
         DimensionMismatchError("collection was built with a 384-dim embedder ('minilm')"),
         EmbeddingFunctionMismatchError("Embedding model mismatch reading palace at /fake/palace."),
+        EmbeddingAPIError(
+            "Embedding API request to http://127.0.0.1:9/v1/embeddings failed: "
+            "<urlopen error [Errno 111] Connection refused>."
+        ),
     ]
 
 
-@pytest.mark.parametrize("error_index", [0, 1, 2], ids=["identity", "dimension", "chroma-ef"])
+@pytest.mark.parametrize(
+    "error_index", [0, 1, 2, 3], ids=["identity", "dimension", "chroma-ef", "dead-endpoint"]
+)
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_mine_prints_model_mismatch_cleanly(mock_config_cls, capsys, error_index):
     """A model/identity mismatch is a configuration problem, not a crash:
