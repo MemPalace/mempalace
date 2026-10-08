@@ -3174,6 +3174,21 @@ def _count_write() -> None:
 _CHROMA_DIMENSION_ERROR = re.compile(
     r"expecting embedding with dimension of (\d+), got (\d+)", re.IGNORECASE
 )
+# chromadb's ``validation_context`` appends " in <method>." to every error
+# raised inside a collection call, our embedder's included.
+_CHROMA_METHOD_SUFFIX = re.compile(r" in (?:add|get|query|update|upsert|delete)\.$")
+
+
+def _strip_chroma_method_suffix(exc: BaseException) -> None:
+    """Drop chromadb's " in upsert." tail from ``exc``'s message, in place.
+
+    Without it a refusal read "...embedding_api_url is correct. in upsert."
+    on the CLI, in MCP ``details`` and in the logs.
+    """
+    if exc.args and isinstance(exc.args[0], str):
+        trimmed = _CHROMA_METHOD_SUFFIX.sub("", exc.args[0])
+        if trimmed != exc.args[0]:
+            exc.args = (trimmed,) + exc.args[1:]
 
 
 @contextlib.contextmanager
@@ -3185,12 +3200,14 @@ def _typed_dimension_errors(collection):
     N, got M")``, which callers cannot tell from any other failure: the CLI
     printed a traceback and MCP a generic error. The typed error carries the
     same recovery hint as the other backends, and MCP flags it ``isError``.
+    Every other error passes through with chromadb's method suffix removed.
     """
     try:
         yield
     except DimensionMismatchError:
         raise
     except Exception as exc:
+        _strip_chroma_method_suffix(exc)
         match = _CHROMA_DIMENSION_ERROR.search(str(exc))
         if match is None:
             raise

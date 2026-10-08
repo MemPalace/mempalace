@@ -5,6 +5,8 @@ Each test pins one refusal: what it says, which channel it uses (one
 written or deleted when the write it belongs to fails.
 """
 
+import re
+
 import pytest
 
 from test_embedding_model_fallback import (
@@ -60,3 +62,39 @@ def test_a_failed_update_drawer_keeps_the_source_closets(request, monkeypatch, k
     assert result.get("isError") is True, body
     assert body["error_class"] == "EmbeddingAPIError", body
     assert _closet_count(palace) == closets
+
+
+# ── (2) no chromadb " in upsert." tail on the error text ─────────────────
+
+_CHROMA_TAIL = re.compile(r" in (?:add|get|query|update|upsert|delete)\.$")
+
+
+@_MINILM
+def test_embedder_errors_lose_chromadbs_method_suffix(request, monkeypatch, kg, capfd):
+    """chromadb appends " in <method>." to any error raised inside a collection
+    call, so the text read '...embedding_api_url is correct. in upsert.'."""
+    palace = _dead_endpoint_palace(request, monkeypatch)
+    drawer_id = _a_mined_drawer(palace)
+    call = _mcp_caller(monkeypatch, palace, kg)
+    for name, arguments in (
+        ("mempalace_add_drawer", {"wing": "garden", "room": "notes", "content": "Compost."}),
+        ("mempalace_update_drawer", {"drawer_id": drawer_id, "content": "Rewritten note."}),
+        ("mempalace_search", {"query": "greenhouse tomatoes"}),
+    ):
+        result, body = call(name, arguments)
+        assert result.get("isError") is True, (name, body)
+        assert body["details"].endswith("is correct."), (name, body["details"])
+        assert not _CHROMA_TAIL.search(body["details"]), (name, body["details"])
+
+    from mempalace.palace import get_collection
+
+    col = get_collection(str(palace), create=False)
+    for method, kwargs in (
+        ("add", {"ids": ["x"], "documents": ["Compost."]}),
+        ("upsert", {"ids": ["x"], "documents": ["Compost."]}),
+        ("update", {"ids": [drawer_id], "documents": ["Compost."]}),
+        ("query", {"query_texts": ["compost"], "n_results": 1}),
+    ):
+        with pytest.raises(Exception) as caught:
+            getattr(col, method)(**kwargs)
+        assert str(caught.value).endswith("is correct."), (method, str(caught.value))
