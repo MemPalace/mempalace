@@ -52,6 +52,7 @@ from .backends.chroma import ChromaBackend, _clear_chroma_system_cache, hnsw_cap
 # backends._inproc_sqlite, which opens them with connect_sqlite_read under the
 # palace's in-process lock.
 from .config import connect_sqlite_read, sqlite_read_uri  # noqa: F401
+from .embedding import get_embedder_identity
 from .backends._inproc_sqlite import open_reader as open_palace_reader
 from .backends._inproc_sqlite import open_writer as open_palace_writer
 from .backends._inproc_sqlite import release as release_palace_anchor
@@ -1863,6 +1864,9 @@ def _rebuild_one_collection(
         # ``archive_path`` — instead of an unstructured exception that
         # strands the user without recovery instructions.
         col = backend.create_collection(dest_palace, collection_name)
+        # An in-place rebuild archives the palace directory, sidecar included,
+        # and every row below is re-embedded with the current model (#2709).
+        col.set_embedder_identity(get_embedder_identity())
 
         for emb_id, doc, meta in extract_via_sqlite(source_palace, collection_name):
             ids.append(emb_id)
