@@ -71,6 +71,8 @@ def _query_drawers_with_filter_fallback(
             _first_or_empty(raw, "distances"),
         ):
             meta = meta or {}
+            if is_registry_sentinel(meta):
+                continue
             if wing and meta.get("wing") != wing:
                 continue
             if room and meta.get("room") != room:
@@ -274,7 +276,10 @@ def search_memories(
         return open_error
 
     metric = _metric_for_collection(drawers_col)
-    where = build_where_filter(wing, room, source_file)
+    # Closets are not registry rows. Keep their filter on the caller scope so
+    # an unfiltered search does not turn the closet scan into a full FTS read.
+    closet_where = build_where_filter(wing, room, source_file)
+    where = drawer_search_where(wing, room, source_file)
 
     # Hybrid retrieval: always query drawers directly (the floor), then use
     # closet hits to boost rankings. Closets are a ranking SIGNAL, never a
@@ -306,7 +311,7 @@ def search_memories(
     try:
         closets_col = get_closets_collection(palace_path, create=False, read_only=True)
         closet_boost_by_source = _closet_boosts(
-            closets_col, query=query, n_results=n_results, where=where
+            closets_col, query=query, n_results=n_results, where=closet_where
         )
     except Exception:
         # No closets yet — hybrid degrades to pure drawer search.
@@ -329,6 +334,8 @@ def search_memories(
     ):
         meta = meta or {}
         doc = doc or ""
+        if is_registry_sentinel(meta):
+            continue
         if _candidate_out_of_scope(dist, meta, max_distance, since_dt, before_dt):
             continue
 

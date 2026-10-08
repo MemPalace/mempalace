@@ -92,6 +92,82 @@ class EmbedderIdentityUnknownWarning(UserWarning):
     """
 
 
+# Convo-miner bookkeeping. ``_register_file`` writes one of these per skipped
+# or content-duplicate transcript. They are not memories. Search must drop a
+# row that carries either marker; ``file_already_mined`` still reads them
+# through ``get``, which is not filtered here.
+REGISTRY_SENTINEL_ROOM = "_registry"
+REGISTRY_SENTINEL_INGEST_MODE = "registry"
+
+
+def is_registry_sentinel(meta: Optional[dict]) -> bool:
+    """True for a convo-miner registry row (``room`` or ``ingest_mode``)."""
+    if not meta:
+        return False
+    return (
+        meta.get("room") == REGISTRY_SENTINEL_ROOM
+        or meta.get("ingest_mode") == REGISTRY_SENTINEL_INGEST_MODE
+    )
+
+
+def registry_exclusion_clauses() -> list:
+    """Where-clauses that drop registry sentinels and keep rows missing the key.
+
+    ``$nin`` matches a missing key. ``$ne`` does not, and project drawers omit
+    ``ingest_mode`` while sweeper drawers omit ``room``.
+    """
+    return [
+        {"room": {"$nin": [REGISTRY_SENTINEL_ROOM]}},
+        {"ingest_mode": {"$nin": [REGISTRY_SENTINEL_INGEST_MODE]}},
+    ]
+
+
+def _is_registry_exclusion_clause(clause: object) -> bool:
+    return clause in (
+        {"room": {"$nin": [REGISTRY_SENTINEL_ROOM]}},
+        {"ingest_mode": {"$nin": [REGISTRY_SENTINEL_INGEST_MODE]}},
+    )
+
+
+def and_where(*parts: Optional[dict]) -> dict:
+    """AND the given where-clauses, flattening a single ``$and`` wrapper."""
+    clauses = []
+    for part in parts:
+        if not part:
+            continue
+        if list(part.keys()) == ["$and"] and isinstance(part.get("$and"), list):
+            clauses.extend(clause for clause in part["$and"] if clause)
+        else:
+            clauses.append(part)
+    if not clauses:
+        return {}
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
+
+
+def where_without_registry_exclusion(where: Optional[dict]) -> dict:
+    """Caller scope with the standard registry-exclusion clauses removed.
+
+    An empty result means the where did not narrow by wing, room, or
+    source file. Lexical candidate caps key off that, so registry
+    exclusion alone must not turn a capped scan into a full scan.
+    """
+    if not where:
+        return {}
+    if list(where.keys()) == ["$and"] and isinstance(where.get("$and"), list):
+        kept = [clause for clause in where["$and"] if not _is_registry_exclusion_clause(clause)]
+    elif _is_registry_exclusion_clause(where):
+        return {}
+    else:
+        return dict(where)
+    if not kept:
+        return {}
+    if len(kept) == 1:
+        return kept[0]
+    return {"$and": kept}
+
+
 # ---------------------------------------------------------------------------
 # Value objects
 # ---------------------------------------------------------------------------

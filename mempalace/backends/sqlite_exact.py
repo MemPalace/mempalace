@@ -25,6 +25,8 @@ import numpy as np
 
 from ._magic import has_sqlite_magic, read_header_fields
 from .base import (
+    REGISTRY_SENTINEL_INGEST_MODE,
+    REGISTRY_SENTINEL_ROOM,
     BackendClosedError,
     BackendError,
     BaseBackend,
@@ -41,6 +43,8 @@ from .base import (
     UnsupportedCapabilityError,
     UnsupportedFilterError,
     _IncludeSpec,
+    is_registry_sentinel,
+    where_without_registry_exclusion,
 )
 
 logger = logging.getLogger(__name__)
@@ -543,7 +547,7 @@ class _SQLiteExactHandle:
         self._vector_cache_data_version: Optional[int] = None
         # Native accelerators share one versioned index per collection across
         # the short-lived wrappers created by application searches.
-        self._native_cache: dict[str, tuple[tuple, Any]] = {}
+        self._native_cache: dict[str, tuple[tuple, Any, frozenset[str]]] = {}
 
 
 class SQLiteExactCollection(BaseCollection):
@@ -1139,17 +1143,20 @@ class SQLiteExactCollection(BaseCollection):
             cached = self._load_all_vectors(cur, collection_id, expected)
             self._handle._vector_cache[collection_id] = cached
         ids, mat, norms, metas = cached
-        if not where and not where_document:
+        # Registry rows were excluded when building the cache. Unscoped
+        # searches reuse the same matrix without a full advanced-index copy.
+        scope = where_without_registry_exclusion(where)
+        if not scope and not where_document:
             return ids, mat, norms
         if mat.size == 0:
             return ids, mat, norms
-        if where_document or not _where_uses_only_cached_keys(where):
+        if where_document or not _where_uses_only_cached_keys(scope):
             wanted = {
-                row["id"] for row in self._rows(cur, where=where, where_document=where_document)
+                row["id"] for row in self._rows(cur, where=scope, where_document=where_document)
             }
             keep = [i for i, doc_id in enumerate(ids) if doc_id in wanted]
         else:
-            keep = [i for i, meta in enumerate(metas) if _matches_where(meta, where)]
+            keep = [i for i, meta in enumerate(metas) if _matches_where(meta, scope)]
         if not keep:
             return (
                 [],
@@ -1167,7 +1174,8 @@ class SQLiteExactCollection(BaseCollection):
         rows = cur.execute(
             f"""
             SELECT id, embedding, {wing_expr}, {room_expr},
-                   json_extract(metadata_json, '$.source_file')
+                   json_extract(metadata_json, '$.source_file'),
+                   json_extract(metadata_json, '$.ingest_mode')
             FROM documents
             WHERE collection_id = ?
             ORDER BY rowid
@@ -1177,7 +1185,9 @@ class SQLiteExactCollection(BaseCollection):
         ids: list[str] = []
         vecs: list[np.ndarray] = []
         metas: list[dict] = []
-        for doc_id, blob, wing, room, source_file in rows:
+        for doc_id, blob, wing, room, source_file, ingest_mode in rows:
+            if is_registry_sentinel({"room": room, "ingest_mode": ingest_mode}):
+                continue
             vec = _decode_array(blob)
             if vec is None:
                 continue
@@ -1192,6 +1202,8 @@ class SQLiteExactCollection(BaseCollection):
                 meta["room"] = room
             if source_file is not None:
                 meta["source_file"] = source_file
+            if ingest_mode is not None:
+                meta["ingest_mode"] = ingest_mode
             metas.append(meta)
         if not vecs:
             return (
@@ -1398,15 +1410,25 @@ class SQLiteExactCollection(BaseCollection):
         fts_query = " OR ".join(tokens)
         collection_id = self._collection_id(cur)
         try:
-            limit_sql = "" if where else "LIMIT ?"
+            # Same cap rule as chroma lexical search: registry exclusion is
+            # applied in SQL, so it must not by itself drop the LIMIT.
+            scope = where_without_registry_exclusion(where)
+            limit_sql = "" if scope else "LIMIT ?"
             params = (fts_query, collection_id)
-            if not where:
+            if not scope:
                 params = (*params, max(n_results * 5, n_results))
             rows = cur.execute(
                 f"""
-                SELECT doc_id, bm25(docs_fts) AS rank
+                SELECT docs_fts.doc_id, bm25(docs_fts) AS rank
                 FROM docs_fts
-                WHERE docs_fts MATCH ? AND collection_id = ?
+                JOIN documents
+                  ON documents.collection_id = docs_fts.collection_id
+                 AND documents.id = docs_fts.doc_id
+                WHERE docs_fts MATCH ? AND docs_fts.collection_id = ?
+                  AND COALESCE(json_extract(documents.metadata_json, '$.room'), '')
+                      != '{REGISTRY_SENTINEL_ROOM}'
+                  AND COALESCE(json_extract(documents.metadata_json, '$.ingest_mode'), '')
+                      != '{REGISTRY_SENTINEL_INGEST_MODE}'
                 ORDER BY rank
                 {limit_sql}
                 """,
@@ -1439,7 +1461,7 @@ class SQLiteExactCollection(BaseCollection):
             if doc_meta is None:
                 continue
             doc, meta = doc_meta
-            if not _matches_where(meta, where):
+            if is_registry_sentinel(meta) or not _matches_where(meta, where):
                 continue
             hits.append(
                 LexicalHit(

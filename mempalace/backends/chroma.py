@@ -29,6 +29,8 @@ from ._inproc_sqlite import palace_db_lock
 from ._magic import has_sqlite_magic
 from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
+    REGISTRY_SENTINEL_INGEST_MODE,
+    REGISTRY_SENTINEL_ROOM,
     BaseBackend,
     BaseCollection,
     CollectionNotInitializedError,
@@ -42,6 +44,8 @@ from .base import (
     UnsupportedFilterError,
     _IncludeSpec,
     initialize_last_modified_metadata,
+    is_registry_sentinel,
+    where_without_registry_exclusion,
 )
 
 logger = logging.getLogger(__name__)
@@ -656,6 +660,28 @@ def _whole_words_first(rows, query_tokens: Iterable[str], limit: Optional[int]) 
             partial.append(int(row_id))
     picked = whole + partial
     return picked if limit is None else picked[:limit]
+
+
+def registry_metadata_exclusion_sql(row_id_expr: str) -> str:
+    """AND-clauses that drop convo-miner registry sentinels before a row cap.
+
+    A missing key stays (``NOT EXISTS``), matching ``$nin``. ``row_id_expr``
+    is the embeddings id of the candidate (FTS rowid or ``e.id``).
+    """
+    return f"""
+        AND NOT EXISTS (
+            SELECT 1 FROM embedding_metadata reg_room
+            WHERE reg_room.id = {row_id_expr}
+              AND reg_room.key = 'room'
+              AND reg_room.string_value = '{REGISTRY_SENTINEL_ROOM}'
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM embedding_metadata reg_mode
+            WHERE reg_mode.id = {row_id_expr}
+              AND reg_mode.key = 'ingest_mode'
+              AND reg_mode.string_value = '{REGISTRY_SENTINEL_INGEST_MODE}'
+        )
+    """
 
 
 def _fts_candidate_rows(
@@ -3681,15 +3707,19 @@ class ChromaCollection(BaseCollection):
         try:
             if tokens:
                 fts_query = " OR ".join(tokens)
-                # If a metadata filter is present, do not cap before filtering:
-                # otherwise a common term can fill the window with wrong-scope
-                # rows and hide valid scoped hits later in the FTS result set.
-                # Without a filter, rank the window so it holds the best matches
-                # rather than the first ones filed.
-                limit_sql = "" if where else "ORDER BY embedding_fulltext_search.rank LIMIT ?"
+                # If a caller metadata filter is present, do not cap before
+                # filtering: otherwise a common term can fill the window with
+                # wrong-scope rows and hide valid scoped hits later in the FTS
+                # result set. Without a caller filter, rank the window so it
+                # holds the best matches rather than the first ones filed.
+                # Registry exclusion is applied in SQL and must not by itself
+                # remove that cap.
+                scope_where = where_without_registry_exclusion(where)
+                limit_sql = "" if scope_where else "ORDER BY embedding_fulltext_search.rank LIMIT ?"
                 params = [fts_query, collection_name]
-                if not where:
+                if not scope_where:
                     params.append(max(max_candidates, n_results))
+                registry_sql = registry_metadata_exclusion_sql("e.id")
                 try:
                     rows = conn.execute(
                         f"""
@@ -3700,6 +3730,7 @@ class ChromaCollection(BaseCollection):
                         JOIN collections c ON s.collection = c.id
                         WHERE embedding_fulltext_search MATCH ?
                           AND c.name = ?
+                        {registry_sql}
                         {limit_sql}
                         """,
                         params,
@@ -3714,6 +3745,7 @@ class ChromaCollection(BaseCollection):
 
             if not candidate_ids and use_recency_fallback:
                 order_expr = "e.created_at DESC"
+                registry_sql = registry_metadata_exclusion_sql("e.id")
                 try:
                     rows = conn.execute(
                         f"""
@@ -3722,6 +3754,7 @@ class ChromaCollection(BaseCollection):
                         JOIN segments s ON e.segment_id = s.id
                         JOIN collections c ON s.collection = c.id
                         WHERE c.name = ?
+                        {registry_sql}
                         ORDER BY {order_expr}
                         LIMIT ?
                         """,
@@ -3732,12 +3765,13 @@ class ChromaCollection(BaseCollection):
                         "Chroma lexical recency fallback failed; ordering by id", exc_info=True
                     )
                     rows = conn.execute(
-                        """
+                        f"""
                         SELECT e.id, e.embedding_id
                         FROM embeddings e
                         JOIN segments s ON e.segment_id = s.id
                         JOIN collections c ON s.collection = c.id
                         WHERE c.name = ?
+                        {registry_sql}
                         ORDER BY e.id DESC
                         LIMIT ?
                         """,
@@ -3803,7 +3837,7 @@ class ChromaCollection(BaseCollection):
             if drawer is None:
                 continue
             meta = drawer["metadata"]
-            if not _matches_where(meta, where):
+            if is_registry_sentinel(meta) or not _matches_where(meta, where):
                 continue
             ordered.append((emb_id, drawer["document"], meta))
 
