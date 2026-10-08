@@ -213,6 +213,9 @@ def _open_collection_or_explain(
             else:
                 emit(f"mempalace: {e}")
             return None
-        emit(f"\n  Error opening palace at {palace_path}: {e!r}")
+        # str(e), not repr: a repr escapes newlines and quotes and wraps the
+        # message in the class name; keep the class only when the message
+        # is empty.
+        emit(f"\n  Error opening palace at {palace_path}: {str(e) or type(e).__name__}")
         emit("  Try: mempalace repair-status --palace <path>")
         return None
