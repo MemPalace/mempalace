@@ -26,6 +26,19 @@ def _dead_endpoint_palace(request, monkeypatch):
     return _openai_compat_palace_with_a_dead_endpoint(palace, monkeypatch)
 
 
+def _run_cli(monkeypatch, *argv):
+    import sys
+
+    from mempalace.cli import main
+
+    monkeypatch.setattr(sys, "argv", ["mempalace", *argv])
+    try:
+        main()
+    except SystemExit as exc:
+        return exc.code or 0
+    return 0
+
+
 def _closet_count(palace) -> int:
     from mempalace.palace import get_closets_collection
 
@@ -98,3 +111,83 @@ def test_embedder_errors_lose_chromadbs_method_suffix(request, monkeypatch, kg, 
         with pytest.raises(Exception) as caught:
             getattr(col, method)(**kwargs)
         assert str(caught.value).endswith("is correct."), (method, str(caught.value))
+
+
+# ── (3) a failed first mine leaves no palace folder behind ───────────────
+
+
+def _dead_endpoint_config(project_palace_config, monkeypatch):
+    import json
+    import socket
+
+    from mempalace import embedding
+
+    _, palace, _ = project_palace_config
+    with socket.socket() as sock:  # a port nothing listens on
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_API_URL", raising=False)
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_API_MODEL", raising=False)
+    (palace.parent / "config" / "config.json").write_text(
+        json.dumps(
+            {
+                "palace_path": str(palace),
+                "embedding_model": "openai-compat",
+                "embedding_api_url": f"http://127.0.0.1:{port}/v1",
+                "embedding_api_model": "text-embed-a",
+            }
+        )
+    )
+    embedding._EF_CACHE.clear()
+
+
+@_MINILM
+@pytest.mark.parametrize("backend", ["chroma", "sqlite_exact"])
+@pytest.mark.parametrize("existed", [False, True], ids=["new-folder", "existing-folder"])
+def test_a_failed_first_mine_removes_only_the_folder_it_created(
+    request, monkeypatch, capfd, backend, existed
+):
+    """A mine on a dead endpoint left an empty palace folder (a database file
+    and an identity record, no drawers) behind. A folder the mine created is
+    removed; one that was already there is left alone."""
+    project, palace, _ = request.getfixturevalue("unknown_model_palace")
+    _dead_endpoint_config((project, palace, None), monkeypatch)
+    monkeypatch.setenv("MEMPALACE_BACKEND", backend)
+    if existed:
+        palace.mkdir()
+    capfd.readouterr()
+
+    assert _run_cli(monkeypatch, "--palace", str(palace), "mine", str(project)) == 1
+    err = capfd.readouterr().err
+    assert "mempalace: Embedding API request to http://127.0.0.1:" in err, err
+    assert "Traceback" not in err
+    assert palace.exists() is existed
+
+
+@_MINILM
+def test_a_new_palace_that_got_drawers_before_the_failure_is_kept(request, monkeypatch, capfd):
+    """Drawers filed before the endpoint died stay, and so does their folder."""
+    from test_openai_compat_identity import _serve, _use
+
+    from mempalace import embedding, miner
+
+    project, palace, _ = request.getfixturevalue("unknown_model_palace")
+    server, url = _serve()
+    _use(monkeypatch, url, "text-embed-a")
+    real_mine = miner.mine
+
+    def mine_then_die(*args, **kwargs):
+        real_mine(*args, **kwargs)
+        raise embedding.EmbeddingAPIError("Embedding API request failed mid-mine.")
+
+    monkeypatch.setattr(miner, "mine", mine_then_die)
+    try:
+        assert _run_cli(monkeypatch, "--palace", str(palace), "mine", str(project)) == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert "mempalace: Embedding API request failed mid-mine." in capfd.readouterr().err
+    assert palace.is_dir()
+    from mempalace.palace import get_collection
+
+    assert get_collection(str(palace), create=False, _skip_identity_check=True).count() > 0
