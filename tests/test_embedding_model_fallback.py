@@ -341,6 +341,71 @@ def test_rebuild_with_a_near_miss_refuses_before_archiving(unknown_model_palace)
     assert _recorded_identity(palace)["mempalace_drawers"]["model_name"] == "minilm"
 
 
+def _search_warnings(query, palace):
+    import warnings
+
+    from mempalace.backends.base import EmbedderIdentityUnknownWarning
+    from mempalace.searcher import search_memories
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        found = search_memories(query, str(palace))
+    unknown = [w for w in caught if issubclass(w.category, EmbedderIdentityUnknownWarning)]
+    return found, unknown
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+@pytest.mark.parametrize("mode", ["rebuild-index", "from-sqlite"])
+def test_sqlite_rebuild_records_the_identity_of_every_collection(unknown_model_palace, mode):
+    """#2709: ``repair rebuild-index`` (an in-place SQLite rebuild that
+    archives the palace first) and ``repair --mode from-sqlite`` re-embed
+    every row but left the rebuilt palace without mempalace_embedder.json,
+    so every later open warned that the identity was unknown."""
+    from mempalace.miner import mine
+    from mempalace.repair import rebuild_from_sqlite
+
+    project, palace, config = unknown_model_palace
+    mine(str(project), str(palace))
+    if mode == "rebuild-index":
+        rebuild_from_sqlite(str(palace), str(palace), archive_existing_dest=True)
+        rebuilt = palace
+    else:
+        rebuilt = palace.parent / "rebuilt"
+        rebuild_from_sqlite(str(palace), str(rebuilt))
+
+    identity = _recorded_identity(rebuilt)
+    assert set(identity) == {"mempalace_drawers", "mempalace_closets"}, identity
+    for entry in identity.values():
+        assert entry == {"model_name": "minilm", "dimension": _DIM}
+    found, unknown = _search_warnings("greenhouse tomatoes", rebuilt)
+    assert found.get("results"), found
+    assert unknown == []
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+def test_temp_collection_rebuild_records_the_identity(unknown_model_palace):
+    """The temp-collection rebuild (``repair.rebuild_index``, the daemon's
+    path) records the identity on every model, not only EmbeddingGemma 2."""
+    from mempalace.miner import mine
+    from mempalace.repair import rebuild_index
+
+    project, palace, config = unknown_model_palace
+    mine(str(project), str(palace))
+    # rebuild_index touches only the drawers; drop just their entry.
+    sidecar = palace / "mempalace_embedder.json"
+    recorded = json.loads(sidecar.read_text())
+    del recorded["mempalace_drawers"]
+    sidecar.write_text(json.dumps(recorded))
+
+    rebuild_index(str(palace), progress=lambda *_args: None)
+
+    entry = _recorded_identity(palace)["mempalace_drawers"]
+    assert entry == {"model_name": "minilm", "dimension": _DIM}
+    found, unknown = _search_warnings("greenhouse tomatoes", palace)
+    assert found.get("results"), found
+    assert unknown == []
+
+
 def _stamp_legacy_identity(palace, model_name):
     """Rewrite the sidecar as develop / older builds left it for a palace
     configured with a non-standard name: the raw name, MiniLM vectors."""
