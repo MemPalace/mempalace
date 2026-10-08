@@ -191,3 +191,71 @@ def test_a_new_palace_that_got_drawers_before_the_failure_is_kept(request, monke
     from mempalace.palace import get_collection
 
     assert get_collection(str(palace), create=False, _skip_identity_check=True).count() > 0
+
+
+# ── (4) read-only opens do not migrate or create ─────────────────────────
+
+
+def _folder_state(palace):
+    import hashlib
+
+    return {
+        str(f.relative_to(palace)): hashlib.sha256(f.read_bytes()).hexdigest()
+        for f in sorted(palace.rglob("*"))
+        if f.is_file() and f.name.startswith(".")
+    }
+
+
+@_MINILM
+def test_a_cold_search_of_a_fresh_palace_runs_no_migration(request, monkeypatch, caplog):
+    """chromadb 1.5.x before 1.5.9 creates collections with
+    ``config_json_str='{}'``, so the next open of a fresh palace logged "Fixed
+    N collection(s) missing _type …", rewrote chroma.sqlite3 and wrote two
+    migration markers. Only chromadb 1.5.9+ needs ``_type`` (and writes it on
+    create), and a palace created by chromadb 1.x has no 0.6 BLOB seq_ids, so
+    a cold read of a fresh palace has nothing to migrate."""
+    import logging
+
+    from mempalace.backends.registry import reset_backends
+    from mempalace.miner import mine
+    from mempalace.searcher import search_memories
+
+    project, palace, _ = request.getfixturevalue("unknown_model_palace")
+    mine(str(project), str(palace))
+    reset_backends()  # drop the in-process client so the next open is cold
+    markers = _folder_state(palace)
+    with caplog.at_level(logging.INFO, logger="mempalace.backends.chroma"):
+        search_memories("greenhouse tomatoes", str(palace))
+    assert "missing _type" not in caplog.text
+    assert _folder_state(palace) == markers
+
+
+@_MINILM
+def test_read_only_tools_do_not_create_a_database_in_an_empty_folder(request, monkeypatch, kg):
+    """MCP status and search on an existing, empty palace folder created
+    chroma.sqlite3 (a PersistentClient opened to look for a collection)."""
+    _, palace, _ = request.getfixturevalue("unknown_model_palace")
+    palace.mkdir()
+    call = _mcp_caller(monkeypatch, palace, kg)
+    call("mempalace_status", {})
+    call("mempalace_search", {"query": "greenhouse tomatoes"})
+    call("mempalace_list_drawers", {})
+    assert sorted(p.name for p in palace.iterdir()) == []
+
+    from mempalace.backends.base import CollectionNotInitializedError
+    from mempalace.palace import get_collection
+
+    with pytest.raises(CollectionNotInitializedError):
+        get_collection(str(palace), create=False)
+    assert sorted(p.name for p in palace.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("version", "required"),
+    [("1.5.7", False), ("1.5.8", False), ("1.5.9", True), ("1.6.0", True), ("2.0.0rc1", True)],
+)
+def test_the_type_migration_runs_only_for_chromadb_that_needs_it(monkeypatch, version, required):
+    from mempalace.backends import chroma
+
+    monkeypatch.setattr(chroma.chromadb, "__version__", version)
+    assert chroma._chromadb_requires_collection_type() is required

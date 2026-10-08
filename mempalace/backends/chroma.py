@@ -2963,6 +2963,39 @@ def _fix_blob_seq_ids(palace_path: str) -> None:
         logger.exception("Could not write migration marker %s", marker)
 
 
+def _chromadb_requires_collection_type() -> bool:
+    """Whether the installed chromadb refuses a collection config without ``_type``.
+
+    chromadb 1.5.9 switched to ``CollectionConfigurationInternal.from_json``,
+    which raises ``KeyError: '_type'`` on the ``'{}'`` that 1.5.8 and older
+    write, and writes ``_type`` itself on create. Older versions read both.
+    An unparseable version counts as "requires", so the migration still runs.
+    """
+    parts = re.findall(r"\d+", str(getattr(chromadb, "__version__", "")))[:3]
+    if len(parts) < 3:
+        return True
+    return tuple(int(p) for p in parts) >= (1, 5, 9)
+
+
+def _mark_fresh_palace(palace_path: str) -> None:
+    """Record that the database chromadb just created needs no migration.
+
+    The database did not exist before this client opened, so it holds no
+    chromadb 0.6 BLOB seq_ids, and on chromadb 1.5.9+ every collection is
+    created with ``_type``. Without the markers the next cold open of a palace
+    that has only ever been written by this chromadb scans it (and, before
+    1.5.9's ``_type``, rewrote it) as if it were a legacy palace.
+    """
+    markers = [_BLOB_FIX_MARKER]
+    if _chromadb_requires_collection_type():
+        markers.append(_COLLECTION_TYPE_MARKER)
+    for name in markers:
+        try:
+            Path(os.path.join(palace_path, name)).touch()
+        except OSError:
+            logger.debug("Could not write migration marker %s", name, exc_info=True)
+
+
 def _fix_missing_collection_type(palace_path: str) -> None:
     """Add ``_type`` to ``collections.config_json_str`` where absent.
 
@@ -4221,8 +4254,11 @@ class ChromaBackend(BaseBackend):
                 # global reset; release only the requested path.
                 _close_client(self._clients.pop(palace_path, None))
 
+            fresh_db = not os.path.isfile(db_path)
             ChromaBackend._prepare_palace_for_open(palace_path)
             cached = chromadb.PersistentClient(path=palace_path, settings=_CLIENT_SETTINGS)
+            if fresh_db and os.path.isfile(db_path):
+                _mark_fresh_palace(palace_path)
             self._clients[palace_path] = cached
             # Re-stat after the client constructor runs: chromadb creates
             # chroma.sqlite3 lazily, so the stat captured before the call
@@ -4298,7 +4334,9 @@ class ChromaBackend(BaseBackend):
 
         1. ``_fix_missing_collection_type`` — adds the ``_type`` marker to
            ``collections.config_json_str`` that chromadb 1.5.9+ requires
-           but <= 1.5.8 never wrote (#1611).
+           but <= 1.5.8 never wrote (#1611). Runs only when the installed
+           chromadb requires it, so an older chromadb never rewrites a
+           palace on a read; the first open after an upgrade migrates.
         2. ``_fix_blob_seq_ids`` — repairs the BLOB seq_id quirk that bites
            certain chromadb migrations.
         3. ``quarantine_invalid_hnsw_metadata`` — renames aside any HNSW
@@ -4316,7 +4354,8 @@ class ChromaBackend(BaseBackend):
         re-open a palace. The ``_quarantined_paths`` gate prevents thrash on
         hot paths (e.g. ``_client()`` is called on every backend operation).
         """
-        _fix_missing_collection_type(palace_path)
+        if _chromadb_requires_collection_type():
+            _fix_missing_collection_type(palace_path)
         _fix_blob_seq_ids(palace_path)
         if palace_path not in ChromaBackend._quarantined_paths:
             quarantine_invalid_hnsw_metadata(palace_path)
@@ -4371,6 +4410,10 @@ class ChromaBackend(BaseBackend):
 
         if not create and not os.path.isdir(palace_path):
             raise PalaceNotFoundError(palace_path)
+        if not create and not os.path.isfile(os.path.join(palace_path, "chroma.sqlite3")):
+            # Opening a client creates chroma.sqlite3: a read of an empty
+            # folder must not turn it into a palace.
+            raise CollectionNotInitializedError(palace_path)
 
         if caller_vectors:
             # Passing None explicitly prevents Chroma's client default EF.
