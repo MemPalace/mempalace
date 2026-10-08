@@ -2793,6 +2793,28 @@ def test_rebuild_from_sqlite_in_place_archives_when_opted_in(tmp_path):
     assert rebuilt.count() == 15
 
 
+def test_rebuild_from_sqlite_in_place_records_embedder_identity(tmp_path):
+    """The archive rename takes ``mempalace_embedder.json`` with it, so the
+    rebuild must record the identity of the model that re-embedded each
+    collection, or every later open warns ``EmbedderIdentityUnknownWarning``
+    (#2709)."""
+    from mempalace.backends._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar
+    from mempalace.embedding import current_model_name
+
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [("d1", "doc", {"wing": "w", "room": "r"})])
+    _seed_palace(palace, "mempalace_closets", [("c1", "pointer", {"wing": "w"})])
+
+    counts = repair.rebuild_from_sqlite(str(palace), str(palace), archive_existing_dest=True)
+    assert counts == {"mempalace_drawers": 1, "mempalace_closets": 1}
+
+    sidecar = str(palace / EMBEDDER_SIDECAR_FILENAME)
+    for name in ("mempalace_drawers", "mempalace_closets"):
+        identity = read_embedder_sidecar(sidecar, name)
+        assert identity is not None, name
+        assert identity.model_name == current_model_name()
+
+
 def test_rebuild_from_sqlite_in_place_refuses_without_archive_flag(tmp_path):
     """Source == dest without archive flag must abort untouched. The
     most catastrophic possible regression of this code path is silently
