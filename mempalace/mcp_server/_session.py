@@ -3,19 +3,10 @@ if __name__ != "mempalace.mcp_server":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.mcp_server")
 
 
-# ``error`` values of failures that refuse every call until the config or the
-# palace is fixed. A tool result carrying one of these is a failed call, so
-# protocol.py also sets MCP's ``isError`` for it.
+# ``error`` of a collection that will not open after the retry. Like a model
+# error (``error_class`` in MODEL_ERROR_CLASS_NAMES), it refuses every call
+# until fixed, so protocol.py sets MCP's ``isError`` for both.
 BACKEND_OPEN_FAILED_ERROR = "Backend open failed"
-TOOL_ERROR_KINDS = frozenset(
-    {
-        UNKNOWN_EMBEDDING_MODEL_ERROR,
-        EMBEDDER_IDENTITY_MISMATCH_ERROR,
-        EMBEDDING_DIMENSION_MISMATCH_ERROR,
-        EMBEDDING_MODEL_MISMATCH_ERROR,
-        BACKEND_OPEN_FAILED_ERROR,
-    }
-)
 
 
 def _stat_palace_db() -> tuple:
@@ -460,7 +451,7 @@ def _get_collection(create=False):
             if explained is not None:
                 # Chroma refused the configured embedding function by name.
                 _collection_open_error = _model_mismatch_error(
-                    explained, kind=EMBEDDING_MODEL_MISMATCH_ERROR
+                    EmbeddingFunctionMismatchError(explained)
                 )
                 _collection_cache = None
                 _collection_cache_backend = None
@@ -522,27 +513,14 @@ def _checked_chroma_collection(raw, *, create):
     return collection
 
 
-def _model_mismatch_error(exc, *, kind=None) -> dict:
-    """The tool result for a palace built with a different embedding model."""
-    if kind is None:
-        kind = model_mismatch_error_kind(exc) or EMBEDDER_IDENTITY_MISMATCH_ERROR
-    # One line, no traceback: the details carry the fix.
-    logger.error("%s: %s", kind, exc)
-    return {
-        "error": kind,
-        "details": str(exc),
-        "hint": "Set embedding_model back to the model the palace was built with, "
-        "or re-embed the palace as the details describe.",
-    }
+def _model_mismatch_error(exc) -> dict:
+    """The tool result for a model error (a palace built with another model,
+    or a misspelled embedding_model). Logs one line, no traceback: the full
+    message once per palace and message, then a short line per refusal."""
+    return model_error_result(exc, palace_path=_config.palace_path, log=logger)
 
 
-def _unknown_embedding_model_error(exc) -> dict:
-    logger.error("%s", exc)
-    return {
-        "error": UNKNOWN_EMBEDDING_MODEL_ERROR,
-        "details": str(exc),
-        "hint": "Fix embedding_model in config.json or MEMPALACE_EMBEDDING_MODEL.",
-    }
+_unknown_embedding_model_error = _model_mismatch_error
 
 
 def _no_palace():

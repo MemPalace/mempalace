@@ -938,6 +938,90 @@ class UnknownEmbeddingModelError(ValueError):
     """
 
 
+# Model errors: the configured model cannot be used with this palace (a
+# misspelled name, or a palace built with another model). Every read and write
+# refuses until the config or the palace is fixed, so tool results built from
+# one carry ``error_class`` (the class name below) and MCP sets ``isError``.
+MODEL_ERROR_CLASS_NAMES = frozenset(
+    {
+        "UnknownEmbeddingModelError",
+        "EmbedderIdentityMismatchError",
+        "DimensionMismatchError",
+        "EmbeddingFunctionMismatchError",
+    }
+)
+_MODEL_REFUSAL_HINT = (
+    "Set embedding_model back to the model the palace was built with, "
+    "or re-embed the palace as the details describe."
+)
+_UNKNOWN_MODEL_HINT = "Fix embedding_model in config.json or MEMPALACE_EMBEDDING_MODEL."
+_REFUSALS_LOGGED: set = set()
+_REFUSALS_LOCK = threading.Lock()
+
+
+def _model_error_class(exc: BaseException) -> Optional[type]:
+    """The model-error class ``exc`` is an instance of, or None."""
+    from .backends.base import (
+        DimensionMismatchError,
+        EmbedderIdentityMismatchError,
+        EmbeddingFunctionMismatchError,
+    )
+
+    for cls in (
+        UnknownEmbeddingModelError,
+        EmbedderIdentityMismatchError,
+        DimensionMismatchError,
+        EmbeddingFunctionMismatchError,
+    ):
+        if isinstance(exc, cls):
+            return cls
+    return None
+
+
+def log_model_refusal(log, kind: str, exc: BaseException, palace_path=None) -> None:
+    """Log a refused call: the full message once per palace and message, then one short line.
+
+    A long-lived MCP server refuses every call until the config or the palace
+    is fixed; repeating the multi-line explanation on each call buries
+    everything else on stderr.
+    """
+    message = str(exc)
+    key = (str(palace_path or ""), kind, message)
+    with _REFUSALS_LOCK:
+        first = key not in _REFUSALS_LOGGED
+        _REFUSALS_LOGGED.add(key)
+    if first:
+        log.error("%s: %s", kind, message)
+    else:
+        log.error(
+            "%s at %s (refused again; the details were logged above)",
+            kind,
+            palace_path or "the palace",
+        )
+
+
+def model_error_result(exc: BaseException, *, palace_path=None, log=None) -> Optional[dict]:
+    """The tool/search result for a model error, or None for any other exception.
+
+    Matched by exception class. ``error`` is the human-readable kind,
+    ``error_class`` the model-error class name (``MODEL_ERROR_CLASS_NAMES``)
+    that MCP checks to set ``isError``, ``details`` the full message with the
+    fix. ``log``, when given, gets one rate-limited line (no traceback).
+    """
+    from .backends.base import model_mismatch_error_kind
+
+    cls = _model_error_class(exc)
+    if cls is None:
+        return None
+    if cls is UnknownEmbeddingModelError:
+        kind, hint = UNKNOWN_EMBEDDING_MODEL_ERROR, _UNKNOWN_MODEL_HINT
+    else:
+        kind, hint = model_mismatch_error_kind(exc), _MODEL_REFUSAL_HINT
+    if log is not None:
+        log_model_refusal(log, kind, exc, palace_path)
+    return {"error": kind, "error_class": cls.__name__, "details": str(exc), "hint": hint}
+
+
 def _edit_distance(a: str, b: str) -> int:
     """Levenshtein distance between ``a`` and ``b`` (insert, delete, substitute)."""
     previous = list(range(len(b) + 1))
@@ -968,11 +1052,17 @@ def _normalize_stored_model_name(name) -> str:
     even a typo such as ``"embedinggemma2"``). So a recorded name that is
     neither a supported model nor an ``embeddinggemma2:`` identity reads as
     ``"minilm"``; supported names and gemma2 identities are returned as is
-    and stay strict. Only for core embedders: a ``server_embedder``
-    backend's names are its own and must not go through here.
+    and stay strict. A bare ``"embeddinggemma2"`` is legacy too: EmbeddingGemma
+    2 palaces always record the full ``embeddinggemma2:<model>@<revision>:...``
+    identity, so the bare name can only come from a build that did not know
+    the model and embedded with MiniLM. Only for core embedders: a
+    ``server_embedder`` backend's names are its own and must not go through
+    here.
     """
     stored = str(name or "").strip().lower()
-    if stored in _KNOWN_EMBEDDING_MODELS or stored.startswith("embeddinggemma2:"):
+    if stored.startswith("embeddinggemma2:"):
+        return stored
+    if stored in _KNOWN_EMBEDDING_MODELS and stored != "embeddinggemma2":
         return stored
     return "minilm"
 
@@ -1180,7 +1270,10 @@ def describe_device(device: Optional[str] = None, model: Optional[str] = None) -
     """
     if current_model_name(model).startswith("embeddinggemma2:"):
         ef = get_embedding_function(device=device, model="embeddinggemma2")
-        return f"embeddinggemma2 ({ef.planned_device()}, float32)"
+        # An explicit device torch cannot use warns now, before the caller
+        # prints the label, and the label says so.
+        ef.warn_if_device_unavailable()
+        return f"embeddinggemma2 ({ef.device_label()}, float32)"
     if device is None:
         from .config import MempalaceConfig
 

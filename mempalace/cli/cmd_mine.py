@@ -60,6 +60,18 @@ def cmd_mine(args):
     from ..palace import MineAlreadyRunning, MineFileErrors, MineValidationError
     from ..media import MediaAssetError, MediaAssetSetupError
 
+    model_errors = (
+        UnknownEmbeddingModelError,
+        EmbedderIdentityMismatchError,
+        DimensionMismatchError,
+        EmbeddingFunctionMismatchError,
+    )
+
+    # Before any mining path (a source adapter such as `--source media`,
+    # --redetect-origin, the miner's banner): a misspelled model stops here
+    # with nothing printed or created.
+    _exit_on_misspelled_embedding_model()
+
     if source_adapter:
         try:
             drawers_written = mine_source_adapter(
@@ -88,6 +100,9 @@ def cmd_mine(args):
         except MineAlreadyRunning as exc:
             print(f"mempalace: {exc}", file=sys.stderr)
             sys.exit(1)
+        except model_errors as exc:
+            print(f"mempalace: {exc}", file=sys.stderr)
+            sys.exit(1)
         suffix = " would be written" if args.dry_run else " written"
         item_name = "media asset(s)" if source_adapter == "media" else "drawer(s)"
         print(f"  Source adapter {source_adapter!r}: {drawers_written} {item_name}{suffix}.")
@@ -101,11 +116,6 @@ def cmd_mine(args):
         args, palace_path, include_ignored=include_ignored
     ):
         return
-
-    # Before --redetect-origin (which writes into the palace) and before the
-    # miner's banner: a misspelled model stops here with nothing printed or
-    # created.
-    _exit_on_misspelled_embedding_model()
 
     # --redetect-origin re-runs corpus_origin on the current corpus state
     # and overwrites <palace>/.mempalace/origin.json before mining proceeds.
@@ -168,12 +178,7 @@ def cmd_mine(args):
         # and hooks do not treat a partial mine as done.
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(1)
-    except (
-        UnknownEmbeddingModelError,
-        EmbedderIdentityMismatchError,
-        DimensionMismatchError,
-        EmbeddingFunctionMismatchError,
-    ) as exc:
+    except model_errors as exc:
         # A misspelled model, or a model that differs from the one the palace
         # was built with: nothing was written. Print the fix, as search does,
         # instead of a traceback.

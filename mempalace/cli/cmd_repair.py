@@ -13,6 +13,7 @@ def cmd_palace_set_embedder(args):
     differently-named identity.
     """
     from ..backends.base import EmbedderIdentityMismatchError
+    from ..embedding import UnknownEmbeddingModelError
     from ..palace import set_palace_embedder_identity
 
     config = MempalaceConfig()
@@ -27,7 +28,9 @@ def cmd_palace_set_embedder(args):
             force=getattr(args, "force", False),
             backend=_backend_arg(args),
         )
-    except EmbedderIdentityMismatchError as exc:
+    except (EmbedderIdentityMismatchError, UnknownEmbeddingModelError) as exc:
+        # A misspelled --model (or configured model) is refused before the
+        # palace is opened, so nothing was created.
         print(f"  ✗ {exc}")
         raise SystemExit(2) from exc
     if old is None:

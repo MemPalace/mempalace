@@ -17,6 +17,7 @@ import errno
 import hashlib
 import json
 import math
+import logging
 import os
 import stat
 import re
@@ -282,7 +283,12 @@ DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
 DEFAULT_BACKEND = "chroma"
 DEFAULT_EMBEDDINGGEMMA2_REVISION = "914f7f89142e33e77833254d9c9b90c3cef7303b"
+logger = logging.getLogger(__name__)
 _EMBEDDINGGEMMA2_DIMENSIONS = frozenset({768, 512, 256, 128})
+# Upper bound for embeddinggemma2_batch_size: larger values are almost
+# certainly a typo and would allocate far beyond any GPU's memory.
+_EMBEDDINGGEMMA2_MAX_BATCH_SIZE = 1024
+_BATCH_SIZE_WARNED: set = set()
 _EMBEDDINGGEMMA2_MODALITIES = frozenset({"text", "text+vision", "text+audio", "all"})
 DEFAULT_MILVUS_CONSISTENCY_LEVEL = "Strong"
 _MILVUS_CONSISTENCY_LEVELS = {
@@ -1492,19 +1498,36 @@ class MempalaceConfig:
         ``MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE`` first, then
         ``embeddinggemma2_batch_size`` in ``config.json``; a set value wins on
         every device. Separate from ``embeddinggemma_batch_size``, which sizes
-        ONNX runs of the first EmbeddingGemma model. Unset, non-numeric or
-        non-positive values mean the per-device default, as for that setting.
+        ONNX runs of the first EmbeddingGemma model. A value that is not an
+        integer from 1 to 1024 logs one warning per process and value and
+        means the per-device default.
         """
-        raw = os.environ.get("MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE")
+        source = "MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE"
+        raw = os.environ.get(source)
         if raw is None:
-            raw = self._file_config.get("embeddinggemma2_batch_size")
+            source = "embeddinggemma2_batch_size"
+            raw = self._file_config.get(source)
         if raw is None:
             return None
-        try:
-            val = int(str(raw).strip())
-        except (TypeError, ValueError):
-            return None
-        return val if val > 0 else None
+        val = None
+        if not isinstance(raw, (bool, float)):
+            try:
+                val = int(str(raw).strip())
+            except (TypeError, ValueError):
+                val = None
+        if val is not None and 1 <= val <= _EMBEDDINGGEMMA2_MAX_BATCH_SIZE:
+            return val
+        key = (source, repr(raw))
+        if key not in _BATCH_SIZE_WARNED:
+            _BATCH_SIZE_WARNED.add(key)
+            logger.warning(
+                "%s=%r is not an integer from 1 to %d; EmbeddingGemma 2 uses the "
+                "per-device default batch size (32 on CUDA, 4 on CPU/MPS).",
+                source,
+                raw,
+                _EMBEDDINGGEMMA2_MAX_BATCH_SIZE,
+            )
+        return None
 
     @property
     def embeddinggemma2_dimension(self) -> int:

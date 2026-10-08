@@ -93,6 +93,7 @@ def unknown_model_palace(monkeypatch, tmp_path, request):
     monkeypatch.setattr(embedding, "_EF_CACHE", {})
     monkeypatch.setattr(embedding, "_WARNED", set())
     monkeypatch.setattr(embedding, "_DIM_CACHE", {})
+    monkeypatch.setattr(embedding, "_REFUSALS_LOGGED", set())
     _MiniLMStandIn.instances = []
     _MiniLMStandIn.calls = []
     monkeypatch.setattr(embedding, "_build_ef_class", lambda: _MiniLMStandIn)
@@ -589,7 +590,7 @@ def test_mcp_add_drawer_refuses_a_palace_recorded_with_another_model(
 
 
 @pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
-@pytest.mark.parametrize("stored", ["all-minilm-l6-v2", "none", "minilm-l6"])
+@pytest.mark.parametrize("stored", ["all-minilm-l6-v2", "none", "minilm-l6", "embeddinggemma2"])
 def test_mcp_write_rewrites_a_legacy_raw_stamp_to_minilm(
     unknown_model_palace, monkeypatch, kg, stored
 ):
@@ -666,21 +667,50 @@ def test_mcp_chroma_embedding_function_conflict_is_a_clean_tool_error(
     assert not [r for r in caplog.records if r.exc_info]
 
 
-@pytest.mark.parametrize(
-    "kind",
-    [
-        "Unknown embedding_model",
-        "Embedder identity mismatch",
-        "Embedding dimension mismatch",
-        "Embedding model mismatch",
-        "Backend open failed",
-    ],
-)
-def test_model_and_open_failures_set_is_error(kind):
+def _model_errors():
+    from mempalace.backends.base import (
+        DimensionMismatchError,
+        EmbedderIdentityMismatchError,
+        EmbeddingFunctionMismatchError,
+    )
+
+    return {
+        "Unknown embedding_model": embedding.UnknownEmbeddingModelError("typo"),
+        "Embedder identity mismatch": EmbedderIdentityMismatchError("identity"),
+        "Embedding dimension mismatch": DimensionMismatchError("dimension"),
+        "Embedding model mismatch": EmbeddingFunctionMismatchError("chroma ef"),
+    }
+
+
+@pytest.mark.parametrize("kind", sorted(_model_errors()))
+def test_model_errors_set_is_error_by_exception_class(kind):
     from mempalace.mcp_server import _tool_call_response
 
-    response = _tool_call_response(1, {"error": kind, "details": "x"})
-    assert response["result"]["isError"] is True
+    exc = _model_errors()[kind]
+    result = embedding.model_error_result(exc)
+    assert result["error"] == kind
+    assert result["error_class"] == type(exc).__name__
+    assert result["details"] == str(exc)
+    assert _tool_call_response(1, result)["result"]["isError"] is True
+    # The flag follows the exception class, not the wording of ``error``.
+    assert "isError" not in _tool_call_response(1, {"error": kind, "details": "x"})["result"]
+
+
+def test_model_error_subclasses_report_the_model_error_class():
+    from mempalace.backends.base import EmbedderIdentityMismatchError
+
+    class _Narrower(EmbedderIdentityMismatchError):
+        pass
+
+    result = embedding.model_error_result(_Narrower("x"))
+    assert result["error_class"] == "EmbedderIdentityMismatchError"
+    assert embedding.model_error_result(ValueError("other")) is None
+
+
+def test_open_failure_sets_is_error_and_plain_errors_do_not():
+    from mempalace.mcp_server import _tool_call_response
+
+    assert _tool_call_response(1, {"error": "Backend open failed"})["result"]["isError"] is True
     assert "isError" not in _tool_call_response(1, {"error": "No palace found"})["result"]
     assert "isError" not in _tool_call_response(1, {"success": True})["result"]
 
@@ -695,3 +725,183 @@ def test_dimension_mismatch_gets_its_own_error_kind():
     assert _model_mismatch_error(EmbedderIdentityMismatchError("i"))["error"] == (
         "Embedder identity mismatch"
     )
+
+
+# ── follow-up polish ─────────────────────────────────────────────────────────
+
+
+def test_bare_embeddinggemma2_stored_name_reads_as_legacy_minilm():
+    """#2694 always records EmbeddingGemma 2 by its full identity, so a bare
+    "embeddinggemma2" comes from a build that embedded the name with MiniLM."""
+    norm = embedding._normalize_stored_model_name
+    assert norm("embeddinggemma2") == "minilm"
+    assert norm(" EmbeddingGemma2 ") == "minilm"
+    full = "embeddinggemma2:google/embeddinggemma-2@abc:768:text:retrieval-v1"
+    assert norm(full) == full
+    for name in ("minilm", "embeddinggemma", "openai-compat"):
+        assert norm(name) == name
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+def test_set_embedder_records_the_full_embeddinggemma2_identity(unknown_model_palace):
+    """Recording the bare name would now read back as MiniLM."""
+    from mempalace.miner import mine
+    from mempalace.palace import set_palace_embedder_identity
+
+    project, palace, config = unknown_model_palace
+    mine(str(project), str(palace))
+    old, new = set_palace_embedder_identity(str(palace), model="embeddinggemma2", force=True)
+    assert new.model_name.startswith("embeddinggemma2:google/embeddinggemma-2@")
+    assert new.model_name.endswith(":768:text:retrieval-v1")
+    assert new.dimension == 768
+    assert _recorded_identity(palace)["mempalace_drawers"]["model_name"] == new.model_name
+
+
+def _run_cli(monkeypatch, *argv):
+    import sys
+
+    from mempalace.cli import main
+
+    monkeypatch.setattr(sys, "argv", ["mempalace", *argv])
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+    return excinfo.value.code
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+@pytest.mark.parametrize("existing", [False, True], ids=["missing-palace", "existing-palace"])
+def test_set_embedder_refuses_a_near_miss_model_before_opening(
+    unknown_model_palace, monkeypatch, capfd, existing
+):
+    from mempalace.miner import mine
+
+    project, palace, config = unknown_model_palace
+    if existing:
+        mine(str(project), str(palace))
+        sidecar = (palace / "mempalace_embedder.json").read_text()
+        db_mtime = (palace / "chroma.sqlite3").stat().st_mtime_ns
+    capfd.readouterr()
+    code = _run_cli(
+        monkeypatch, "--palace", str(palace), "palace", "set-embedder", "--model", "embeddinggemm2"
+    )
+    out, err = capfd.readouterr()
+    assert code == 2
+    assert "✗ Unknown embedding_model 'embeddinggemm2'; did you mean" in out
+    assert "Traceback" not in out + err
+    if existing:
+        assert (palace / "mempalace_embedder.json").read_text() == sidecar
+        assert (palace / "chroma.sqlite3").stat().st_mtime_ns == db_mtime
+    else:
+        assert not palace.exists()
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["embeddinggemm2"], indirect=True)
+def test_mine_source_media_refuses_a_near_miss_cleanly(unknown_model_palace, monkeypatch, capfd):
+    project, palace, config = unknown_model_palace
+    code = _run_cli(monkeypatch, "--palace", str(palace), "mine", str(project), "--source", "media")
+    out, err = capfd.readouterr()
+    assert code == 1
+    assert err.startswith("mempalace: Unknown embedding_model 'embeddinggemm2'; did you mean"), err
+    assert "Traceback" not in out + err
+    assert not palace.exists()
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+def test_mcp_media_search_model_errors_are_tool_errors(unknown_model_palace, monkeypatch, kg):
+    from mempalace.miner import mine
+
+    project, palace, config = unknown_model_palace
+    mine(str(project), str(palace))
+    call = _mcp_caller(monkeypatch, palace, kg)
+    media = {"query": "greenhouse tomatoes", "include_media": True}
+
+    # Not a model error: media search needs embeddinggemma2. A plain result.
+    result, body = call("mempalace_search", media)
+    assert "isError" not in result and "embeddinggemma2" in body["error"], body
+
+    # A palace built with MiniLM under an embeddinggemma2 config.
+    _set_model(config, palace, "embeddinggemma2")
+    result, body = call("mempalace_search", media)
+    assert result["isError"] is True, body
+    assert body["error_class"] in embedding.MODEL_ERROR_CLASS_NAMES
+    assert body["results"] == []
+
+    _set_model(config, palace, "embeddinggemm2")
+    result, body = call("mempalace_search", media)
+    assert result["isError"] is True, body
+    assert body["error_class"] == "UnknownEmbeddingModelError"
+    assert "did you mean" in body["details"]
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+def test_mcp_refusal_logs_the_full_message_once_then_a_short_line(
+    unknown_model_palace, monkeypatch, caplog, kg
+):
+    from mempalace.miner import mine
+
+    project, palace, config = unknown_model_palace
+    mine(str(project), str(palace))
+    _restamp_as_another_process(palace, "embeddinggemma")
+    call = _mcp_caller(monkeypatch, palace, kg)
+    with caplog.at_level(logging.ERROR):
+        for _ in range(3):
+            result, body = call("mempalace_add_drawer", _ADD)
+            assert result["isError"] is True
+    lines = [
+        r.getMessage() for r in caplog.records if "Embedder identity mismatch" in r.getMessage()
+    ]
+    assert len(lines) == 3, lines
+    assert "repair rebuild-index" in lines[0]
+    for line in lines[1:]:
+        assert "refused again" in line and str(palace) in line
+        assert "repair rebuild-index" not in line
+    # Each call still returns the full details.
+    assert "repair rebuild-index" in body["details"]
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+@pytest.mark.parametrize(
+    "case, expected",
+    [
+        ("identity", "mempalace: collection was built with embedder 'embeddinggemma'"),
+        ("dimension", "mempalace: collection was built with a 768-dim embedder"),
+        ("chroma-ef", "mempalace: Embedding model mismatch reading palace at"),
+        ("unknown-model", "mempalace: Unknown embedding_model 'embeddinggemm2'; did you mean"),
+    ],
+)
+def test_cli_search_prints_model_errors_cleanly(
+    unknown_model_palace, monkeypatch, capfd, case, expected
+):
+    """Like mine: one `mempalace: <message>` line on stderr, exit 1, no
+    exception repr (no ``EmbedderIdentityMismatchError(...)``, no ``\\n``)."""
+    from mempalace.miner import mine
+
+    project, palace, config = unknown_model_palace
+    mine(str(project), str(palace))
+    if case == "identity":
+        _restamp_as_another_process(palace, "embeddinggemma")
+    elif case == "dimension":
+        # Chroma opens never compare dimensions (the probe is skipped at open);
+        # the pgvector/milvus backends raise this from their own open.
+        import mempalace.searcher as searcher
+        from mempalace.backends.base import DimensionMismatchError
+
+        def refuse(*args, **kwargs):
+            raise DimensionMismatchError(
+                "collection was built with a 768-dim embedder ('embeddinggemma') but the "
+                "current embedder produces 384-dim vectors ('minilm')."
+            )
+
+        monkeypatch.setattr(searcher, "get_collection", refuse)
+    elif case == "chroma-ef":
+        _set_model(config, palace, "embeddinggemma2")
+    else:
+        _set_model(config, palace, "embeddinggemm2")
+    capfd.readouterr()
+    code = _run_cli(monkeypatch, "--palace", str(palace), "search", "greenhouse")
+    out, err = capfd.readouterr()
+    assert code == 1
+    assert err.startswith(expected), err
+    assert "Error opening palace" not in out + err
+    assert "MismatchError(" not in out + err and "\\n" not in out + err
+    assert "Traceback" not in out + err

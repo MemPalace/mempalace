@@ -91,15 +91,20 @@ def test_explicit_cuda_runs_on_cuda_when_available(monkeypatch):
 
 
 @pytest.mark.parametrize("device", ["cuda", "mps"])
-def test_explicit_accelerator_pytorch_cannot_use_warns_and_runs_on_cpu(monkeypatch, device):
+def test_explicit_accelerator_pytorch_cannot_use_warns_and_runs_on_cpu(monkeypatch, caplog, device):
     """Like the ONNX providers: an unavailable accelerator falls back to CPU
-    instead of failing, so one config works on a laptop without the GPU."""
+    instead of failing, so one config works on a laptop without the GPU. The
+    warning is one logger line (stderr), not a second RuntimeWarning copy."""
     provider, loads = _provider(monkeypatch, device=device)
     assert provider.planned_device() == "cpu"
-    with pytest.warns(RuntimeWarning, match=rf"embedding_device='{device}'.*falls back to CPU"):
+    with caplog.at_level(logging.WARNING, logger="mempalace.embeddinggemma2"):
         provider.embed_query(["q"])
+        provider.embed_query(["again"])
+    fallbacks = [r.getMessage() for r in caplog.records if "falls back to CPU" in r.getMessage()]
+    assert len(fallbacks) == 1 and f"embedding_device='{device}'" in fallbacks[0]
     assert loads == ["cpu"]
     assert provider.effective_device == "cpu"
+    assert provider.device_label() == f"cpu; {device} requested but unavailable"
 
 
 def test_a_broken_cuda_probe_reads_as_unavailable(monkeypatch):
@@ -252,12 +257,46 @@ def test_batch_size_from_env_and_config(eg2_config, monkeypatch):
     assert embedding.get_embedding_function().batch_size == 24
 
 
-@pytest.mark.parametrize("raw", ["0", "-4", "abc", ""])
-def test_invalid_batch_size_setting_means_the_device_default(eg2_config, monkeypatch, raw):
+@pytest.mark.parametrize("raw", ["0", "-4", "abc", "", "2.5", "1025", "100000"])
+def test_invalid_batch_size_env_warns_once_and_means_the_device_default(
+    eg2_config, monkeypatch, caplog, raw
+):
+    import mempalace.config as config_mod
+
+    monkeypatch.setattr(config_mod, "_BATCH_SIZE_WARNED", set())
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE", raw)
+    with caplog.at_level(logging.WARNING, logger="mempalace.config"):
+        assert config_mod.MempalaceConfig().embeddinggemma2_batch_size is None
+        assert config_mod.MempalaceConfig().embeddinggemma2_batch_size is None
+    warnings = [r.getMessage() for r in caplog.records if "batch size" in r.getMessage()]
+    assert len(warnings) == 1, warnings
+    assert "MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE" in warnings[0]
+    assert "1 to 1024" in warnings[0]
+
+
+@pytest.mark.parametrize("raw", [True, 8.0, "eight", 0, 4096, [4]])
+def test_invalid_batch_size_config_warns_once_and_means_the_device_default(
+    eg2_config, monkeypatch, caplog, raw
+):
+    import mempalace.config as config_mod
+
+    monkeypatch.setattr(config_mod, "_BATCH_SIZE_WARNED", set())
+    eg2_config(embeddinggemma2_batch_size=raw)
+    with caplog.at_level(logging.WARNING, logger="mempalace.config"):
+        assert config_mod.MempalaceConfig().embeddinggemma2_batch_size is None
+        assert embedding.get_embedding_function().batch_size_for("cuda") == 32
+    warnings = [r.getMessage() for r in caplog.records if "batch size" in r.getMessage()]
+    assert len(warnings) == 1 and "embeddinggemma2_batch_size" in warnings[0], warnings
+
+
+@pytest.mark.parametrize("raw, expected", [("1", 1), (" 64 ", 64), ("1024", 1024)])
+def test_batch_size_bounds_are_inclusive(eg2_config, monkeypatch, caplog, raw, expected):
     monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE", raw)
     from mempalace.config import MempalaceConfig
 
-    assert MempalaceConfig().embeddinggemma2_batch_size is None
+    with caplog.at_level(logging.WARNING, logger="mempalace.config"):
+        assert MempalaceConfig().embeddinggemma2_batch_size == expected
+    assert not caplog.records
 
 
 def test_onnx_batch_size_setting_does_not_size_gemma2(eg2_config, monkeypatch):
@@ -351,10 +390,9 @@ def test_palace_mined_on_cuda_opens_and_searches_on_a_cpu_only_machine(
     palace_mod._VALIDATED_IDENTITY.clear()
     embedding._EF_CACHE.clear()
     monkeypatch.setitem(sys.modules, "torch", _torch(cuda=False))
-    with pytest.warns(RuntimeWarning, match="falls back to CPU"):
-        reopened = palace_mod.get_collection(palace_path, create=False)
-        assert reopened.count() == 2
-        hits = reopened.query(query_texts=["alpha"], n_results=2)
+    reopened = palace_mod.get_collection(palace_path, create=False)
+    assert reopened.count() == 2
+    hits = reopened.query(query_texts=["alpha"], n_results=2)
     assert loads[-1] == "cpu"
     assert sorted(hits["ids"][0]) == ["d1", "d2"]
 
@@ -378,3 +416,104 @@ def test_mine_header_names_the_resolved_device(eg2_config, monkeypatch):
     assert loads == []
     eg2_config(embedding_device="cpu")
     assert embedding.describe_device() == "embeddinggemma2 (cpu, float32)"
+
+
+# ── an unusable explicit device is visible before the mine header ───────────
+
+
+def _record_warnings_and_prints(monkeypatch):
+    """Events in order: ("warn", message) from the logger, ("print", text)."""
+    import builtins
+
+    events = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record):
+            events.append(("warn", record.getMessage()))
+
+    handler = _Handler(level=logging.WARNING)
+    logging.getLogger("mempalace").addHandler(handler)
+    monkeypatch.setattr(
+        logging.getLogger("mempalace"), "handlers", [*logging.getLogger("mempalace").handlers]
+    )
+    real_print = builtins.print
+
+    def recording_print(*args, **kwargs):
+        events.append(("print", " ".join(str(a) for a in args)))
+        real_print(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "print", recording_print)
+    return events, handler
+
+
+def test_describe_device_warns_first_and_labels_an_unavailable_explicit_device(
+    eg2_config, monkeypatch, caplog
+):
+    monkeypatch.setitem(sys.modules, "torch", _torch(cuda=False))
+    loads = []
+    monkeypatch.setattr(
+        EmbeddingGemma2EmbeddingFunction,
+        "_load_model_for",
+        lambda self, d: loads.append(d) or _FakeModel(),
+    )
+    eg2_config(embedding_device="cuda")
+    with caplog.at_level(logging.WARNING, logger="mempalace.embeddinggemma2"):
+        label = embedding.describe_device()
+        assert embedding.describe_device() == label
+        embedding.get_embedding_function().embed_query(["q"])
+    assert label == "embeddinggemma2 (cpu; cuda requested but unavailable, float32)"
+    fallbacks = [r for r in caplog.records if "falls back to CPU" in r.getMessage()]
+    assert len(fallbacks) == 1  # the header preview and the model load share one warning
+    assert loads == ["cpu"]
+    # Usable devices keep the plain label.
+    monkeypatch.setitem(sys.modules, "torch", _torch(cuda=True))
+    eg2_config(embedding_device="cuda")
+    assert embedding.describe_device() == "embeddinggemma2 (cuda, float32)"
+    eg2_config(embedding_device="auto")
+    monkeypatch.setitem(sys.modules, "torch", _torch(cuda=False))
+    assert embedding.describe_device() == "embeddinggemma2 (cpu, float32)"
+
+
+def test_mine_prints_the_device_warning_before_the_header(eg2_config, monkeypatch, tmp_path):
+    import yaml
+
+    from mempalace.miner import mine
+
+    monkeypatch.setitem(sys.modules, "torch", _torch(cuda=False))
+    monkeypatch.setattr(
+        EmbeddingGemma2EmbeddingFunction, "_load_model_for", lambda self, d: _FakeModel()
+    )
+    eg2_config(embedding_device="cuda")
+    project = tmp_path / "proj"
+    (project / "notes").mkdir(parents=True)
+    (project / "notes" / "a.md").write_text("The greenhouse tomatoes need water.\n" * 20)
+    with open(project / "mempalace.yaml", "w") as fh:
+        yaml.dump({"wing": "garden", "rooms": [{"name": "notes", "description": "N"}]}, fh)
+    events, handler = _record_warnings_and_prints(monkeypatch)
+    try:
+        mine(str(project), str(tmp_path / "palace"), dry_run=True)
+    finally:
+        logging.getLogger("mempalace").removeHandler(handler)
+    warn_at = next(i for i, (kind, text) in enumerate(events) if "falls back to CPU" in text)
+    header_at = next(i for i, (kind, text) in enumerate(events) if "MemPalace Mine" in text)
+    device_lines = [text for kind, text in events if "Device:" in text]
+    assert events[warn_at][0] == "warn" and warn_at < header_at
+    assert device_lines == [
+        "  Device:  embeddinggemma2 (cpu; cuda requested but unavailable, float32)"
+    ]
+    assert sum("falls back to CPU" in text for kind, text in events) == 1
+
+
+def test_status_shows_the_resolved_device(eg2_config, monkeypatch, capsys):
+    from mempalace.miner import _print_status
+
+    monkeypatch.setitem(sys.modules, "torch", _torch(cuda=True))
+    eg2_config(embedding_device="auto")
+    _print_status(3, {"garden": {"notes": 3}})
+    assert "  Device:  embeddinggemma2 (cuda, float32)" in capsys.readouterr().out
+    monkeypatch.setitem(sys.modules, "torch", _torch(cuda=False))
+    eg2_config(embedding_device="cuda")
+    _print_status(3, {"garden": {"notes": 3}})
+    assert "embeddinggemma2 (cpu; cuda requested but unavailable, float32)" in (
+        capsys.readouterr().out
+    )

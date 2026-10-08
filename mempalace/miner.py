@@ -2348,6 +2348,9 @@ def _mine_impl(
 
     from .embedding import describe_device
 
+    # Resolved before the header: an explicit device torch cannot use warns
+    # here, so the warning is printed above the header, not inside it.
+    device = describe_device()
     print(f"\n{'=' * 55}")
     print("  MemPalace Mine")
     print(f"{'=' * 55}")
@@ -2356,7 +2359,7 @@ def _mine_impl(
     limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
     print(f"  Files:   {len(files)}{limit_suffix}")
     print(f"  Palace:  {palace_path}")
-    print(f"  Device:  {describe_device()}")
+    print(f"  Device:  {device}")
     if dry_run:
         print("  DRY RUN -- nothing will be filed")
     if not respect_gitignore:
@@ -2739,10 +2742,23 @@ def status(palace_path: str):
     _print_status(total, wing_rooms)
 
 
+def _describe_device_or_none() -> Optional[str]:
+    """The embedding device label for status output, or None if it cannot be resolved."""
+    from .embedding import describe_device
+
+    try:
+        return describe_device()
+    except Exception:
+        return None
+
+
 def _print_status(total: int, wing_rooms: dict[str, dict[str, int]]) -> None:
     """Render the wing/room histogram shared by both status code paths."""
     print(f"\n{'=' * 55}")
     print(f"  MemPalace Status -- {total} drawers")
+    device = _describe_device_or_none()
+    if device:
+        print(f"  Device:  {device}")
     print(f"{'=' * 55}\n")
     for wing, rooms in sorted(wing_rooms.items()):
         print(f"  WING: {wing}")

@@ -388,6 +388,15 @@ def get_collection(
     return collection
 
 
+def _backend_has_server_embedder(palace_path, backend) -> bool:
+    """Whether the palace's backend advertises ``server_embedder`` (RFC 001 §2.1)."""
+    try:
+        capabilities = get_backend_for_palace(palace_path, explicit=backend).capabilities
+    except Exception:
+        return False
+    return "server_embedder" in capabilities
+
+
 def set_palace_embedder_identity(
     palace_path: str,
     model: Optional[str] = None,
@@ -409,7 +418,9 @@ def set_palace_embedder_identity(
     from ..embedding import (
         _normalize_stored_model_name,
         _resolve_embedding_model,
+        current_model_name,
         get_embedder_identity,
+        get_embedding_function,
     )
 
     configured = MempalaceConfig().embedding_model
@@ -421,6 +432,11 @@ def set_palace_embedder_identity(
         raise ValueError(
             "no embedder model to record: pass --model NAME or configure MEMPALACE_EMBEDDING_MODEL"
         )
+    if requested and not _backend_has_server_embedder(palace_path, backend):
+        # Refuse a misspelled --model (UnknownEmbeddingModelError) before the
+        # open below can create the palace folder, chroma.sqlite3 or a
+        # collection. A server embedder's names are its own and skip this.
+        _resolve_embedding_model(requested)
     collection = get_collection(
         palace_path,
         collection_name=collection_name,
@@ -437,6 +453,15 @@ def set_palace_embedder_identity(
     if target == (configured or "").strip().lower():
         # Recording the in-use model — probe its dimension (already loaded).
         new = get_embedder_identity()
+    elif core_embedder and target == "embeddinggemma2":
+        # EmbeddingGemma 2 is recorded by its full identity (model, revision,
+        # dimension, modalities), never the bare name: a bare stored
+        # "embeddinggemma2" reads as a legacy MiniLM palace. Built from the
+        # configured EmbeddingGemma 2 settings without loading the model.
+        new = EmbedderIdentity(
+            model_name=current_model_name(target),
+            dimension=get_embedding_function(model=target).dimension,
+        )
     else:
         # Explicit override of a non-configured model: record the name only,
         # never load a foreign model (which can be a large download) just to

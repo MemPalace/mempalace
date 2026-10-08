@@ -11,6 +11,7 @@ identity immediately — the same approach the chroma backend uses.
 
 import json
 import os
+import tempfile
 from typing import Optional
 
 EMBEDDER_SIDECAR_FILENAME = "mempalace_embedder.json"
@@ -46,7 +47,8 @@ def write_embedder_sidecar(path: Optional[str], collection_name: Optional[str], 
     """Record ``identity`` for ``collection_name`` in the sidecar, creating it if needed.
 
     No-ops for a missing path, missing collection name, or a nameless identity.
-    Preserves other collections' entries; never raises on I/O failure.
+    Preserves other collections' entries; never raises on I/O failure. The
+    file is replaced atomically, so a failed write keeps the previous one.
     """
     if not path or not collection_name or not identity or not getattr(identity, "model_name", ""):
         return
@@ -63,9 +65,41 @@ def write_embedder_sidecar(path: Optional[str], collection_name: Optional[str], 
         "model_name": str(identity.model_name),
         "dimension": int(identity.dimension or 0),
     }
+    _write_atomically(path, data)
+
+
+def _write_atomically(path: str, data: dict) -> None:
+    """Replace ``path`` with ``data`` as JSON, or leave it untouched.
+
+    The JSON goes to a temp file in the same directory (so ``os.replace``
+    stays on one filesystem), is fsynced, then renamed over the sidecar. An
+    interrupted or failed write leaves the previous sidecar intact instead
+    of a truncated file, which would read back as "no identity recorded".
+    Never raises on I/O failure; the temp file is removed.
+    """
+    tmp_path = None
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        fd, tmp_path = tempfile.mkstemp(
+            dir=os.path.dirname(path) or ".", prefix=".mempalace_embedder.", suffix=".tmp"
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-        os.chmod(path, 0o600)
-    except (OSError, NotImplementedError):
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass  # not every filesystem supports fsync
+        try:
+            os.chmod(tmp_path, 0o600)
+        except (OSError, NotImplementedError):
+            pass
+        os.replace(tmp_path, path)
+        tmp_path = None
+    except (OSError, NotImplementedError, TypeError, ValueError):
         pass
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass

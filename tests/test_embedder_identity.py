@@ -8,6 +8,7 @@ only the configured model name (cheap), and persistence is exercised with
 ``EmbedderIdentity`` objects and explicit vectors.
 """
 
+import json
 import os
 import warnings
 from unittest.mock import MagicMock, patch
@@ -592,3 +593,63 @@ def test_qdrant_enforcement_model_swap_raises(tmp_path, monkeypatch, clear_ident
     monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "embeddinggemma")
     with pytest.raises(EmbedderIdentityMismatchError):
         P._enforce_embedder_identity(col, str(tmp_path), "mempalace_drawers", create=False)
+
+
+# ── the identity sidecar is replaced atomically ───────────────────────────────
+
+
+def _sidecar_dir_entries(path):
+    return sorted(p.name for p in path.parent.iterdir())
+
+
+def test_sidecar_write_keeps_other_entries_and_owner_only_mode(tmp_path):
+    import stat
+
+    from mempalace.backends import _sidecar
+
+    path = tmp_path / "mempalace_embedder.json"
+    _sidecar.write_embedder_sidecar(str(path), "mempalace_drawers", EmbedderIdentity("minilm", 384))
+    _sidecar.write_embedder_sidecar(str(path), "mempalace_closets", EmbedderIdentity("minilm", 384))
+    data = json.loads(path.read_text())
+    assert set(data) == {"mempalace_drawers", "mempalace_closets"}
+    assert _sidecar_dir_entries(path) == ["mempalace_embedder.json"]
+    if os.name == "posix":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("failure", ["mid-write", "fsync", "replace"])
+def test_a_failed_sidecar_write_leaves_the_previous_sidecar_intact(tmp_path, monkeypatch, failure):
+    """A crash or I/O error mid-write must not truncate the sidecar: a
+    truncated file reads back as "no identity recorded", which turns a
+    recorded palace into a legacy one."""
+    from mempalace.backends import _sidecar
+
+    path = tmp_path / "mempalace_embedder.json"
+    _sidecar.write_embedder_sidecar(str(path), "mempalace_drawers", EmbedderIdentity("minilm", 384))
+    before = path.read_text()
+
+    def boom(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    if failure == "mid-write":
+
+        def dump_half(obj, fp, **kwargs):
+            fp.write(json.dumps(obj)[:10])
+            boom()
+
+        monkeypatch.setattr(_sidecar.json, "dump", dump_half)
+    elif failure == "fsync":
+        monkeypatch.setattr(_sidecar.os, "fsync", boom)
+    else:
+        monkeypatch.setattr(_sidecar.os, "replace", boom)
+
+    _sidecar.write_embedder_sidecar(
+        str(path), "mempalace_drawers", EmbedderIdentity("embeddinggemma", 768)
+    )
+    monkeypatch.undo()
+    if failure == "fsync":
+        # fsync is best effort (not every filesystem has it); the write lands.
+        assert json.loads(path.read_text())["mempalace_drawers"]["model_name"] == "embeddinggemma"
+    else:
+        assert path.read_text() == before
+    assert _sidecar_dir_entries(path) == ["mempalace_embedder.json"]

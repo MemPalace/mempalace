@@ -150,6 +150,9 @@ class EmbeddingGemma2EmbeddingFunction:
             raise ValueError("revision must be a non-empty model revision")
         self._model = None
         self._resolved_device: Optional[str] = None
+        # The explicit device torch could not use (it runs on CPU instead).
+        self._unavailable_device: Optional[str] = None
+        self._unavailable_warned = False
         self._load_lock = threading.Lock()
         self._inference_lock = threading.Lock()
 
@@ -208,6 +211,51 @@ class EmbeddingGemma2EmbeddingFunction:
             return self.device
         return self._pick_device(torch)[0]
 
+    def unavailable_device(self) -> Optional[str]:
+        """The explicit device (``cuda``/``mps``) torch cannot use, if any.
+
+        ``None`` when the configured device is usable, or is ``auto``/``cpu``.
+        Probed without loading the model.
+        """
+        if self._resolved_device is not None:
+            return self._unavailable_device
+        try:
+            import torch
+        except ImportError:
+            return None
+        return self._pick_device(torch)[1]
+
+    def device_label(self) -> str:
+        """The device for headers and status: ``cuda``, or ``cpu; cuda requested but unavailable``."""
+        device = self.planned_device()
+        unavailable = self.unavailable_device()
+        if unavailable is None:
+            return device
+        return f"{device}; {unavailable} requested but unavailable"
+
+    def warn_if_device_unavailable(self) -> None:
+        """Warn once (stderr, via the logger) that the explicit device falls back to CPU.
+
+        Called before the mine header is printed, so the warning comes first,
+        and again at model load; only the first call warns.
+        """
+        unavailable = self.unavailable_device()
+        if unavailable is None or self._unavailable_warned:
+            return
+        self._unavailable_warned = True
+        hint = (
+            "Install a CUDA build of torch from the PyTorch index "
+            "(https://pytorch.org/get-started/locally/)"
+            if unavailable == "cuda"
+            else "MPS needs Apple Silicon and a torch build with MPS support"
+        )
+        logger.warning(
+            "embedding_device=%r requested, but PyTorch cannot use it; EmbeddingGemma 2 "
+            "falls back to CPU. %s, or set embedding_device to 'auto' or 'cpu'.",
+            unavailable,
+            hint,
+        )
+
     def batch_size_for(self, device: Optional[str]) -> int:
         """Documents per encode() call on ``device``; a configured value wins."""
         if self.batch_size is not None:
@@ -261,20 +309,9 @@ class EmbeddingGemma2EmbeddingFunction:
 
     def _select_device(self, torch) -> str:
         selected, unavailable = self._pick_device(torch)
+        self._unavailable_device = unavailable
         if unavailable is not None:
-            hint = (
-                "Install a CUDA build of torch from the PyTorch index "
-                "(https://pytorch.org/get-started/locally/)"
-                if unavailable == "cuda"
-                else "MPS needs Apple Silicon and a torch build with MPS support"
-            )
-            message = (
-                f"embedding_device={unavailable!r} requested, but PyTorch cannot use it; "
-                f"EmbeddingGemma 2 falls back to CPU. {hint}, or set embedding_device "
-                "to 'auto' or 'cpu'."
-            )
-            logger.warning("%s", message)
-            warnings.warn(message, RuntimeWarning, stacklevel=3)
+            self.warn_if_device_unavailable()
         return selected
 
     def _load_model_for(self, device: str):

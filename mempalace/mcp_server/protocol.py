@@ -658,10 +658,16 @@ def _tool_result_is_error(result) -> bool:
     that refuse every read and write until the config or the palace is fixed
     (a misspelled ``embedding_model``, a palace built with a different
     model, a collection that will not open) also set MCP's ``isError`` for
-    clients that only check the flag. Matched on the ``error`` field's exact
-    value (``TOOL_ERROR_KINDS``, set where those results are built).
+    clients that only check the flag. Model errors are matched by the
+    exception class they were built from (``error_class``, set by
+    ``embedding.model_error_result``); an open failure by its ``error``.
     """
-    return isinstance(result, dict) and result.get("error") in TOOL_ERROR_KINDS
+    if not isinstance(result, dict):
+        return False
+    return (
+        result.get("error_class") in MODEL_ERROR_CLASS_NAMES
+        or result.get("error") == BACKEND_OPEN_FAILED_ERROR
+    )
 
 
 def _tool_call_response(req_id, result) -> dict:
@@ -942,9 +948,9 @@ _WARMUP_PROBE_TEXT = "__mempalace_warmup_probe__"
 def _describe_device_safe() -> str:
     """Return ``embedding.describe_device()`` value or ``"unknown"`` on failure.
 
-    Used only inside warmup-failure log lines; the import is deferred so
-    that an embedding-stack import error cannot itself crash the warmup
-    diagnostic path.
+    Used in warmup-failure log lines and ``mempalace_status``; the import is
+    deferred so that an embedding-stack import error cannot itself crash
+    either.
     """
     try:
         from ..embedding import describe_device
