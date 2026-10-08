@@ -26,6 +26,17 @@ def _open_search_collection(palace_path: str, collection_name: str):
             hint="Fix embedding_model in config.json or MEMPALACE_EMBEDDING_MODEL.",
         )
     except BackendError as e:
+        mismatch = model_mismatch_error_kind(e)
+        if mismatch is not None:
+            # A palace built with a different embedding model: the message
+            # names the fix (revert the model, or re-embed).
+            logger.error("%s: %s", mismatch, e)
+            return None, _search_error_result(
+                mismatch,
+                details=str(e),
+                hint="Set embedding_model back to the model the palace was built with, "
+                "or re-embed the palace as the details describe.",
+            )
         logger.error("Backend error opening palace at %s: %s", palace_path, e)
         return None, _search_error_result(
             "Backend error",

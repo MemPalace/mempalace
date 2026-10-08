@@ -24,6 +24,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Optional
 
+from ..backends.base import model_mismatch_error_kind
 from ..backends import (
     BackendError,
     BackendMismatchError,

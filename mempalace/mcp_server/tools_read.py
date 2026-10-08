@@ -667,7 +667,7 @@ def tool_search(
                             repeat_unknown_warning=True,
                         )
                     except (EmbedderIdentityMismatchError, DimensionMismatchError) as exc:
-                        return {"error": "Embedder identity mismatch", "details": str(exc)}
+                        return _model_mismatch_error(exc)
                 _, output = _capture_fd_stdout(
                     lambda: cli_search(
                         query=query,

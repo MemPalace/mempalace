@@ -104,6 +104,14 @@ from ..backends.chroma import (  # noqa: E402
     reset_hnsw_capacity_cache,
 )
 from ..backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
+from ..backends.base import (  # noqa: E402
+    EMBEDDER_IDENTITY_MISMATCH_ERROR,
+    EMBEDDING_DIMENSION_MISMATCH_ERROR,
+    EMBEDDING_MODEL_MISMATCH_ERROR,
+    DimensionMismatchError,
+    EmbedderIdentityMismatchError,
+    model_mismatch_error_kind,
+)
 from ..embedding import UNKNOWN_EMBEDDING_MODEL_ERROR, UnknownEmbeddingModelError  # noqa: E402
 from ..date_window import filed_at_in_window, parse_date_bound  # noqa: E402
 from ..query_sanitizer import sanitize_query  # noqa: E402

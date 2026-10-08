@@ -92,6 +92,24 @@ class EmbeddingFunctionMismatchError(BackendError, ValueError):
     """
 
 
+# ``error`` values of tool and search results for the three mismatch errors
+# above. MCP flags results carrying one of them with ``isError``.
+EMBEDDER_IDENTITY_MISMATCH_ERROR = "Embedder identity mismatch"
+EMBEDDING_DIMENSION_MISMATCH_ERROR = "Embedding dimension mismatch"
+EMBEDDING_MODEL_MISMATCH_ERROR = "Embedding model mismatch"
+
+
+def model_mismatch_error_kind(exc: BaseException) -> Optional[str]:
+    """The result ``error`` value for a model mismatch error, else None."""
+    if isinstance(exc, EmbedderIdentityMismatchError):
+        return EMBEDDER_IDENTITY_MISMATCH_ERROR
+    if isinstance(exc, DimensionMismatchError):
+        return EMBEDDING_DIMENSION_MISMATCH_ERROR
+    if isinstance(exc, EmbeddingFunctionMismatchError):
+        return EMBEDDING_MODEL_MISMATCH_ERROR
+    return None
+
+
 # Re-embedding with the current model: in place (archives the original), or
 # into a separate palace from the original's SQLite.
 _RE_EMBED_HINT = (

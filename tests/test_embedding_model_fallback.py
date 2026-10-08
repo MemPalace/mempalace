@@ -499,3 +499,199 @@ def test_mcp_marks_the_near_miss_refusal_as_a_tool_error(unknown_model_palace, m
     added = call("mempalace_add_drawer", {"wing": "garden", "room": "notes", "content": "Compost."})
     assert "isError" not in added["result"], added
     assert json.loads(added["result"]["content"][0]["text"])["success"] is True
+
+
+# ── MCP writes go through the same embedder-identity check as the CLI ────
+
+
+def _mcp_caller(monkeypatch, palace, kg):
+    from _mcp_server_helpers import _patch_mcp_server
+
+    from mempalace.config import MempalaceConfig
+    from mempalace.mcp_server import handle_request
+
+    _patch_mcp_server(monkeypatch, MempalaceConfig(config_dir=str(palace.parent / "config")), kg)
+
+    def call(name, arguments):
+        response = handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            }
+        )
+        result = response["result"]
+        return result, json.loads(result["content"][0]["text"])
+
+    return call
+
+
+def _restamp_as_another_process(palace, model_name):
+    """Stamp the sidecar, then forget this process's validated identities, as a
+    separate MCP server process would start without them."""
+    from mempalace import palace as palace_mod
+
+    _stamp_legacy_identity(palace, model_name)
+    palace_mod._VALIDATED_IDENTITY.clear()
+
+
+def _embedding_rows(palace) -> int:
+    import sqlite3
+
+    with sqlite3.connect(str(palace / "chroma.sqlite3")) as db:
+        return db.execute("select count(*) from embeddings").fetchone()[0]
+
+
+_ADD = {"wing": "garden", "room": "notes", "content": "The compost bin is turned every Sunday."}
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+@pytest.mark.parametrize(
+    "configured, kind",
+    [
+        ("minilm", "Embedder identity mismatch"),
+        # Chroma's own embedding-function name check fires first here.
+        ("embeddinggemma2", "Embedding model mismatch"),
+    ],
+)
+def test_mcp_add_drawer_refuses_a_palace_recorded_with_another_model(
+    unknown_model_palace, monkeypatch, caplog, capfd, kg, configured, kind
+):
+    """#2694 adds a second 768-dim model, so a same-dimension write with the
+    wrong model would be silent. A palace recorded as embeddinggemma must
+    refuse an MCP write under minilm or embeddinggemma2, as the CLI does."""
+    from mempalace.miner import mine
+
+    project, palace, config = unknown_model_palace
+    mine(str(project), str(palace))
+    _restamp_as_another_process(palace, "embeddinggemma")
+    rows = _embedding_rows(palace)
+    _set_model(config, palace, configured)
+
+    call = _mcp_caller(monkeypatch, palace, kg)
+    with caplog.at_level(logging.WARNING):
+        result, body = call("mempalace_add_drawer", _ADD)
+    assert result["isError"] is True, body
+    assert body["error"] == kind, body
+    assert "repair rebuild-index" in body["details"]
+    assert "from-sqlite" in body["details"]
+    assert _embedding_rows(palace) == rows
+    assert _recorded_identity(palace)["mempalace_drawers"]["model_name"] == "embeddinggemma"
+    # One clean log line, no traceback.
+    assert not [r for r in caplog.records if r.exc_info], [r.getMessage() for r in caplog.records]
+    assert "Traceback" not in capfd.readouterr().err
+
+    # A second call refuses too: the refused collection is not cached.
+    result, body = call("mempalace_add_drawer", _ADD)
+    assert result["isError"] is True and body["error"] == kind
+    assert _embedding_rows(palace) == rows
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+@pytest.mark.parametrize("stored", ["all-minilm-l6-v2", "none", "minilm-l6"])
+def test_mcp_write_rewrites_a_legacy_raw_stamp_to_minilm(
+    unknown_model_palace, monkeypatch, kg, stored
+):
+    from mempalace.miner import mine
+
+    project, palace, config = unknown_model_palace
+    mine(str(project), str(palace))
+    _restamp_as_another_process(palace, stored)
+    rows = _embedding_rows(palace)
+
+    call = _mcp_caller(monkeypatch, palace, kg)
+    result, body = call("mempalace_add_drawer", _ADD)
+    assert "isError" not in result and body["success"] is True, body
+    assert _embedding_rows(palace) == rows + 1
+    assert _recorded_identity(palace)["mempalace_drawers"]["model_name"] == "minilm"
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+def test_mcp_write_records_the_identity_of_a_fresh_palace(unknown_model_palace, monkeypatch, kg):
+    project, palace, config = unknown_model_palace
+    call = _mcp_caller(monkeypatch, palace, kg)
+    result, body = call("mempalace_add_drawer", _ADD)
+    assert body["success"] is True, body
+    assert _recorded_identity(palace)["mempalace_drawers"]["model_name"] == "minilm"
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+def test_mcp_search_of_a_palace_recorded_with_another_model_is_a_tool_error(
+    unknown_model_palace, monkeypatch, kg
+):
+    from mempalace.miner import mine
+
+    project, palace, config = unknown_model_palace
+    mine(str(project), str(palace))
+    _restamp_as_another_process(palace, "embeddinggemma")
+    call = _mcp_caller(monkeypatch, palace, kg)
+    result, body = call("mempalace_search", {"query": "greenhouse tomatoes"})
+    assert result.get("isError") is True, body
+    assert "embeddinggemma" in json.dumps(body)
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+def test_mcp_chroma_embedding_function_conflict_is_a_clean_tool_error(
+    unknown_model_palace, monkeypatch, caplog, kg
+):
+    """Chroma's own name check (persisted EF name differs) must come back as
+    the explained mismatch, without the retry and its logged traceback."""
+    from mempalace.miner import mine
+
+    project, palace, config = unknown_model_palace
+    mine(str(project), str(palace))
+    call = _mcp_caller(monkeypatch, palace, kg)
+
+    import mempalace.mcp_server as mcp
+
+    opens = []
+
+    class _Client:
+        def get_collection(self, name, **kwargs):
+            opens.append(name)
+            raise ValueError(
+                "An embedding function already exists in the collection configuration, and a "
+                "new one is provided. Embedding function conflict: new: embeddinggemma2 vs "
+                "persisted: default"
+            )
+
+    monkeypatch.setattr(mcp, "_get_client", lambda: _Client())
+    with caplog.at_level(logging.WARNING):
+        result, body = call("mempalace_add_drawer", _ADD)
+    assert result["isError"] is True, body
+    assert body["error"] == "Embedding model mismatch"
+    assert "repair --mode from-sqlite" in body["details"]
+    assert len(opens) == 1  # no retry
+    assert not [r for r in caplog.records if r.exc_info]
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "Unknown embedding_model",
+        "Embedder identity mismatch",
+        "Embedding dimension mismatch",
+        "Embedding model mismatch",
+        "Backend open failed",
+    ],
+)
+def test_model_and_open_failures_set_is_error(kind):
+    from mempalace.mcp_server import _tool_call_response
+
+    response = _tool_call_response(1, {"error": kind, "details": "x"})
+    assert response["result"]["isError"] is True
+    assert "isError" not in _tool_call_response(1, {"error": "No palace found"})["result"]
+    assert "isError" not in _tool_call_response(1, {"success": True})["result"]
+
+
+def test_dimension_mismatch_gets_its_own_error_kind():
+    from mempalace.backends.base import DimensionMismatchError, EmbedderIdentityMismatchError
+    from mempalace.mcp_server import _model_mismatch_error
+
+    assert _model_mismatch_error(DimensionMismatchError("d"))["error"] == (
+        "Embedding dimension mismatch"
+    )
+    assert _model_mismatch_error(EmbedderIdentityMismatchError("i"))["error"] == (
+        "Embedder identity mismatch"
+    )

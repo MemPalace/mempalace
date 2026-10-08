@@ -654,12 +654,14 @@ def _mcp_tool_preflight_refusal(req_id, tool_name: str, *, check_writer: bool = 
 def _tool_result_is_error(result) -> bool:
     """Whether a tool result reports an error the MCP client should flag.
 
-    Tool errors are otherwise plain ``{"error": ...}`` results. A misspelled
-    ``embedding_model`` refuses every read and write until the config is
-    fixed, so it also sets MCP's ``isError`` for clients that only check
-    the flag.
+    Tool errors are otherwise plain ``{"error": ...}`` results. The failures
+    that refuse every read and write until the config or the palace is fixed
+    (a misspelled ``embedding_model``, a palace built with a different
+    model, a collection that will not open) also set MCP's ``isError`` for
+    clients that only check the flag. Matched on the ``error`` field's exact
+    value (``TOOL_ERROR_KINDS``, set where those results are built).
     """
-    return isinstance(result, dict) and result.get("error") == UNKNOWN_EMBEDDING_MODEL_ERROR
+    return isinstance(result, dict) and result.get("error") in TOOL_ERROR_KINDS
 
 
 def _tool_call_response(req_id, result) -> dict:
