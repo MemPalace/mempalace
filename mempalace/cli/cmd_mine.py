@@ -504,6 +504,21 @@ def cmd_sweep(args):
             auto_start=routing.decision.auto_start_daemon,
         )
         return
+    from ..embedding import _model_error_class
+
+    try:
+        _sweep_target(target, palace_path, sweep, sweep_directory)
+    except Exception as exc:
+        if _model_error_class(exc) is None:
+            raise
+        # A misspelled model, an embedder that cannot be built or reached,
+        # or a palace built with another model: one line, as mine prints.
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _sweep_target(target, palace_path, sweep, sweep_directory):
+    """``cmd_sweep``'s direct route: sweep ``target`` and print the tally."""
     if os.path.isfile(target):
         result = sweep(target, palace_path)
         print(

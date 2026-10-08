@@ -1558,7 +1558,13 @@ def require_working_embedder(device: Optional[str] = None, model: Optional[str] 
     rewrite a palace calls it first, so a refusal leaves the palace as it was.
     """
     name = current_model_name(model)
-    vectors = get_embedding_function(device=device, model=model)(input=["probe"])
+    if device is None and model is None:
+        # The configured function, built the way every open builds it: a
+        # failure is an EmbeddingFunctionUnavailableError, not a bare ValueError.
+        ef = configured_embedding_function()
+    else:
+        ef = get_embedding_function(device=device, model=model)
+    vectors = ef(input=["probe"])
     dim = len(vectors[0]) if vectors and vectors[0] is not None else 0
     if dim:
         _DIM_CACHE[name] = dim

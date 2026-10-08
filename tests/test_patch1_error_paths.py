@@ -335,3 +335,90 @@ def test_mcp_mine_on_a_dead_endpoint_logs_no_traceback(request, monkeypatch, kg,
     assert body["error"] == "Embedding API unavailable", body
     assert "Traceback" not in caplog.text
     assert not [r for r in caplog.records if r.exc_info], [r.getMessage() for r in caplog.records]
+
+
+# ── (7) the remaining error paths: one line, no traceback, no exit 0 ─────
+
+
+def _one_document(monkeypatch, src):
+    from mempalace import format_miner as format_mod
+
+    src.mkdir(exist_ok=True)
+    doc = src / "notes.docx"
+    doc.write_bytes(b"PK\x03\x04stub")
+    text = "The quarterly review covers memory palace retention. " * 20
+    monkeypatch.setattr(format_mod, "scan_formats", lambda *_a, **_k: [doc])
+    monkeypatch.setattr(
+        format_mod, "extract_text", lambda *_a, **_k: (text, format_mod.ExtractionStatus.OK)
+    )
+
+
+@_MINILM
+def test_mine_extract_on_a_dead_endpoint_fails_like_the_other_modes(
+    request, monkeypatch, capfd, kg
+):
+    """The format miner caught the refusal as a per-file or outer-loop error,
+    printed "Mine aborted by exception" and returned: CLI exit 0, MCP success."""
+    palace = _dead_endpoint_palace(request, monkeypatch)
+    docs = palace.parent / "docs"
+    _one_document(monkeypatch, docs)
+    capfd.readouterr()
+
+    rc = _run_cli(monkeypatch, "--palace", str(palace), "mine", str(docs), "--mode", "extract")
+    out, err = capfd.readouterr()
+    assert rc == 1, (out, err)
+    assert "mempalace: Embedding API request to http://127.0.0.1:" in err, err
+    assert "Traceback" not in out + err
+
+    call = _mcp_caller(monkeypatch, palace, kg)
+    result, body = call("mempalace_mine", {"source": str(docs), "mode": "extract"})
+    assert result.get("isError") is True, body
+    assert body["error_class"] == "EmbeddingAPIError", body
+
+
+@_MINILM
+def test_sweep_refuses_a_model_error_in_one_line(request, monkeypatch, capfd):
+    import json
+
+    palace = _dead_endpoint_palace(request, monkeypatch)
+    config = palace.parent / "config" / "config.json"
+    settings = json.loads(config.read_text())
+    settings.pop("embedding_api_url")  # openai-compat without an endpoint
+    config.write_text(json.dumps(settings))
+    from mempalace import embedding
+
+    embedding._EF_CACHE.clear()
+    transcript = palace.parent / "session.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "user", "message": {"role": "user", "content": "Water the tomatoes."}})
+        + "\n"
+        + json.dumps(
+            {"type": "assistant", "message": {"role": "assistant", "content": "Done at nine."}}
+        )
+        + "\n"
+    )
+    capfd.readouterr()
+    rc = _run_cli(monkeypatch, "--palace", str(palace), "sweep", "--direct", str(transcript))
+    out, err = capfd.readouterr()
+    assert rc == 1, (out, err)
+    assert err.startswith("mempalace: Could not build the embedding function"), err
+    assert "Traceback" not in out + err
+
+
+@_MINILM
+def test_repair_without_an_endpoint_url_refuses_in_one_line(request, monkeypatch, capfd):
+    import json
+
+    from mempalace import embedding
+
+    palace = _dead_endpoint_palace(request, monkeypatch)
+    config = palace.parent / "config" / "config.json"
+    settings = json.loads(config.read_text())
+    settings.pop("embedding_api_url")
+    config.write_text(json.dumps(settings))
+    embedding._EF_CACHE.clear()
+    capfd.readouterr()
+    assert _run_cli(monkeypatch, "--palace", str(palace), "repair", "rebuild-index", "--yes") == 1
+    out, err = capfd.readouterr()
+    assert err.startswith("mempalace: Could not build the embedding function"), err
+    assert "Traceback" not in out + err
