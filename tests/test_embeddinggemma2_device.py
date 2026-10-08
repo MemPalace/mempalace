@@ -529,15 +529,18 @@ class _CudaOOM(RuntimeError):
 class _OOMModel(_FakeModel):
     """Runs out of memory above ``fits`` documents per batch."""
 
-    def __init__(self, fits, error=_CudaOOM):
+    def __init__(
+        self, fits, error=_CudaOOM, message="CUDA out of memory. Tried to allocate 2.00 GiB"
+    ):
         super().__init__()
         self.fits = fits
         self.error = error
+        self.message = message
 
     def encode(self, texts, **kwargs):
         if self.fits is None or kwargs["batch_size"] > self.fits:
             self.calls.append((list(texts), kwargs))
-            raise self.error("CUDA out of memory. Tried to allocate 2.00 GiB")
+            raise self.error(self.message)
         return super().encode(texts, **kwargs)
 
 
@@ -594,6 +597,61 @@ def test_cuda_oom_at_batch_size_one_raises_a_clear_error(monkeypatch):
     message = str(excinfo.value)
     assert "MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE" in message
     assert "from 4 down to 1" in message
+
+
+# torch's OOM text as Eve's Windows recheck printed it: the first sentence,
+# then a line per process (bogus 16 EiB figures on Windows) and allocator advice.
+_WINDOWS_TORCH_OOM = (
+    "CUDA out of memory. Tried to allocate 36.00 GiB. GPU 0 has a total capacity of "
+    "95.59 GiB of which 0 bytes is free.\n"
+    + "".join(f"Process {pid} has 17179869184.00 GiB memory in use.\n" for pid in range(60))
+    + "Of the allocated memory 61.27 GiB is allocated by PyTorch, and 1.04 GiB is reserved "
+    "by PyTorch but unallocated. If reserved but unallocated memory is large try setting "
+    "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See "
+    "documentation for Memory Management  "
+    "(https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)"
+)
+
+
+@pytest.mark.parametrize(
+    "torch_message",
+    [_WINDOWS_TORCH_OOM, _WINDOWS_TORCH_OOM.replace("\n", " ")],
+    ids=["multi-line", "one-line"],
+)
+def test_cuda_oom_error_keeps_only_the_first_sentence_of_torchs_message(monkeypatch, torch_message):
+    from mempalace.embeddinggemma2 import EmbeddingGemma2OutOfMemoryError
+
+    model = _OOMModel(fits=None, message=torch_message)
+    provider, _ = _oom_provider(monkeypatch, model, batch_size=2)
+    with pytest.raises(EmbeddingGemma2OutOfMemoryError) as excinfo:
+        provider.embed_documents(["a"])
+    message = str(excinfo.value)
+    assert "(CUDA out of memory.)" in message, message
+    assert "\n" not in message
+    assert "Process" not in message and "17179869184" not in message
+    assert "Tried to allocate" not in message and "PYTORCH_CUDA_ALLOC_CONF" not in message
+    assert "MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE" in message
+    # The full torch text stays on the chained exception for a traceback.
+    assert str(excinfo.value.__cause__) == torch_message
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("CUDA out of memory. Tried to allocate 20.00 MiB.", "CUDA out of memory."),
+        (
+            "\n  CUDA error: out of memory\nCUDA kernel errors might be reported",
+            "CUDA error: out of memory",
+        ),
+        ("", "_CudaOOM"),
+        ("x" * 300, "x" * 199 + "\u2026"),
+    ],
+    ids=["torch", "no-period", "empty", "long"],
+)
+def test_first_sentence(text, expected):
+    from mempalace.embeddinggemma2 import _first_sentence
+
+    assert _first_sentence(_CudaOOM(text)) == expected
 
 
 def test_a_runtime_error_saying_out_of_memory_also_retries(monkeypatch):

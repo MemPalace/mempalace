@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import threading
 import warnings
 from pathlib import Path, PurePath
@@ -42,6 +43,23 @@ class EmbeddingOutputError(RuntimeError):
 
 class EmbeddingGemma2OutOfMemoryError(RuntimeError):
     """CUDA ran out of memory even at batch size 1."""
+
+
+def _first_sentence(exc: BaseException) -> str:
+    """The first sentence of an exception's message, on one line.
+
+    torch's CUDA out-of-memory message is "CUDA out of memory." followed by the
+    allocation size, a line per process using the GPU (on Windows about 60
+    bogus "Process N has 17179869184.00 GiB memory in use" lines) and
+    allocator advice. Only the first sentence belongs in a one-line error; the
+    full text stays on the chained exception.
+    """
+    lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
+    if not lines:
+        return type(exc).__name__
+    match = re.match(r"(.+?[.!?])(?:\s|$)", lines[0])
+    sentence = match.group(1) if match else lines[0]
+    return sentence if len(sentence) <= 200 else sentence[:199] + "\u2026"
 
 
 def _config_kwargs(modalities: str) -> dict[str, Any]:
@@ -431,8 +449,9 @@ class EmbeddingGemma2EmbeddingFunction:
                 if batch <= 1:
                     raise EmbeddingGemma2OutOfMemoryError(
                         f"EmbeddingGemma 2 ran out of CUDA memory at every batch size from "
-                        f"{start} down to 1 ({exc}). Free GPU memory used by other processes, "
-                        "set MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE (or embeddinggemma2_batch_size) "
+                        f"{start} down to 1 ({_first_sentence(exc)}). Free GPU memory used by "
+                        "other processes, set MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE (or "
+                        "embeddinggemma2_batch_size) "
                         "to a smaller value, or set MEMPALACE_EMBEDDING_DEVICE=cpu."
                     ) from exc
                 smaller = max(1, batch // 2)
