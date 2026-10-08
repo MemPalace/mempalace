@@ -57,6 +57,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `--force` (keeping a `mempalace_embedder.json.corrupt-<timestamp>` copy),
   and reports an embedding function that cannot be built as a refusal
   instead of a traceback.
+- **Embedder failures leave the palace as they found it.** `update_drawer`
+  purges the source's closets only after the new content is written, so a
+  failed embed no longer loses them. A first `mine` that fails before filing
+  anything removes the palace folder it created (never one that existed).
+  `repair` embeds one probe before it archives anything, so a dead endpoint
+  refuses with one line before the archive step.
+- **Read-only opens do not migrate.** `search`, `status` and the other
+  read-only paths no longer create `chroma.sqlite3` in an empty folder, and
+  the `_type` collection-config migration only runs on chromadb 1.5.9 and
+  later, which need it. The writes chromadb itself makes on open are listed
+  in `docs/read-only-opens.md`.
+- **Model errors are one line everywhere.** `mine --mode extract` and MCP
+  `mempalace_mine` (including a misspelled model) report the refusal (CLI
+  exit 1, MCP `isError`) instead of counting it as per-file errors;
+  `sweep` and `repair` print one line instead of a traceback, as does
+  `palace set-embedder` on a palace another process holds; chromadb's
+  trailing `in upsert.` is no longer appended to the message.
+- **`set-embedder` hints name a model the command accepts**: an
+  EmbeddingGemma 2 palace is suggested as `embeddinggemma2`, never its full
+  recorded identity.
+- **openai-compat endpoint errors say what went wrong.** An HTTP 401/403
+  reads "Embedding API authentication failed" and names
+  `embedding_api_key`, any other 4xx "Embedding API rejected the request"
+  with the server's own message, and a body that is not embeddings
+  "Embedding API returned an invalid response"; only a refused connection,
+  timeout, 408/429 or 5xx is "Embedding API unavailable".
 
 ---
 
