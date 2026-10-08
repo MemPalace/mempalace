@@ -941,3 +941,45 @@ def test_a_line_json_loads_rejects_does_not_end_the_light_server(monkeypatch, tm
 
     responses = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
     assert [response.get("id") for response in responses] == [2]
+
+
+class TestLightIsError:
+    """The light server flags refusals with ``isError`` like the full server."""
+
+    @staticmethod
+    def _call(name, arguments, req_id=90):
+        return mcp_light_server.handle_light_request(
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            }
+        )
+
+    def test_a_model_refusal_sets_is_error(self, monkeypatch, config, collection, kg, palace_path):
+        from mempalace import palace as palace_mod
+
+        _patch_light_server(monkeypatch, config, kg)
+        # The palace records another model than the configured (minilm) one.
+        with open(os.path.join(palace_path, "mempalace_embedder.json"), "w") as fh:
+            json.dump({"mempalace_drawers": {"model_name": "embeddinggemma", "dimension": 384}}, fh)
+        palace_mod._VALIDATED_IDENTITY.clear()
+
+        res = self._call("palace_exec", 'ADD IN test_wing/test_room "OAuth2 rotation" SOURCE a.md')
+        payload = json.loads(res["result"]["content"][0]["text"])
+        assert res["result"].get("isError") is True, payload
+        assert payload["error_class"] == "EmbedderIdentityMismatchError", payload
+
+        res = self._call("palace_query", 'SEARCH "OAuth2 rotation"', req_id=91)
+        payload = json.loads(res["result"]["content"][0]["text"])
+        assert res["result"].get("isError") is True, payload
+        assert payload["error"] == "Embedder identity mismatch", payload
+
+    def test_ordinary_results_and_plain_failures_do_not(self, monkeypatch, config, collection, kg):
+        _patch_light_server(monkeypatch, config, kg)
+        res = self._call("palace_query", "STATUS")
+        assert "isError" not in res["result"]
+        # A tool-level failure that is not a refusal stays a plain result.
+        res = self._call("palace_query", "DRAWER no_such_drawer", req_id=92)
+        assert "isError" not in res["result"]
