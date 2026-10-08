@@ -389,7 +389,7 @@ def get_collection(
 
 
 def _backend_has_server_embedder(palace_path, backend) -> bool:
-    """Whether the palace's backend advertises ``server_embedder`` (RFC 001 §2.1)."""
+    """Whether the palace's backend advertises ``server_embedder``."""
     try:
         capabilities = get_backend_for_palace(palace_path, explicit=backend).capabilities
     except Exception:
