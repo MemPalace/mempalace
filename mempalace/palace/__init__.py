@@ -95,9 +95,11 @@ NORMALIZE_VERSION = 2
 CONVO_CHUNKER_VERSION = 2
 
 
-# (palace_id, collection_name, model_name) tuples already validated this
-# process, so the identity check (one metadata read) runs at most once per
-# collection per run — keeps the hot get_collection path cheap.
+# (palace_id, collection_name, model_name, "rw" | "r", stored record) tuples
+# already validated this process. The stored record is re-read on every open
+# (one small sidecar or meta read) and is part of the key, so a cached verdict
+# lapses as soon as another process changes the record; the expensive part of
+# the check (counting rows, recording) still runs at most once per record.
 _VALIDATED_IDENTITY: set = set()
 
 _FRAGMENT_DIR = Path(__file__).resolve().parent

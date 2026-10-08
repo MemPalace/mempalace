@@ -216,20 +216,36 @@ def _enforce_embedder_identity(
         current = EmbedderIdentity(model_name=model_name, dimension=0)
 
     model_name = current.model_name
+    # The record is read on every open (a small sidecar file or one sqlite
+    # row) and is part of the cache key, so a verdict cached by a
+    # long-running process (MCP server, hub, daemon) holds only while the
+    # record is unchanged: another process's `set-embedder --force`, an
+    # in-place rebuild with another model, or a deleted sidecar makes the
+    # next open check again instead of writing on with the old verdict.
+    try:
+        stored = collection.get_stored_embedder_identity()
+        read_error = None
+        record = stored
+    except Exception as exc:
+        stored, read_error = None, exc
+        record = ("unreadable", type(exc).__name__, str(exc))
+    try:
+        hash(record)
+    except TypeError:
+        record = repr(record)
     key = (str(palace_path), str(collection_name), model_name)
     # A verdict that allows writes ("rw") also covers reads; a read-only
     # verdict ("r": the identity could not be confirmed) never covers a write.
-    write_key, read_key = key + ("rw",), key + ("r",)
+    write_key, read_key = key + ("rw", record), key + ("r", record)
     if not repeat_unknown_warning and (
         write_key in _VALIDATED_IDENTITY or (not create and read_key in _VALIDATED_IDENTITY)
     ):
         return
 
     persists = _persists_embedder_identity(collection)
-    try:
-        stored = collection.get_stored_embedder_identity()
-    except Exception as exc:
-        logger.debug("embedder-identity read failed for %s", collection_name, exc_info=True)
+    if read_error is not None:
+        exc = read_error
+        logger.debug("embedder-identity read failed for %s", collection_name, exc_info=read_error)
         if not persists:
             return
         if isinstance(exc, EmbedderIdentityUnreadableError):

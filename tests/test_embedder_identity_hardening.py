@@ -474,3 +474,79 @@ def test_fresh_palace_still_records_on_first_mine(request):
     recorded = json.loads(_sidecar(palace).read_text())
     assert recorded["mempalace_drawers"]["model_name"] == "minilm"
     assert recorded["mempalace_closets"]["model_name"] == "minilm"
+
+
+# ── H: long-running processes re-check a changed record (scope S6) ───────
+
+
+def _restamp_elsewhere(palace, model_name):
+    """Rewrite the record as another process would (set-embedder --force, an
+    in-place rebuild with another model) WITHOUT touching this process's cache."""
+    sidecar = _sidecar(palace)
+    data = json.loads(sidecar.read_text())
+    for entry in data.values():
+        entry["model_name"] = model_name
+    sidecar.write_text(json.dumps(data))
+
+
+def test_a_record_changed_by_another_process_is_checked_again(tmp_path, monkeypatch):
+    from mempalace import palace as P
+    from mempalace.backends.base import EmbedderIdentityMismatchError
+    from mempalace.backends.sqlite_exact import SQLiteExactBackend
+
+    _sqlite_palace(tmp_path, monkeypatch, rows=True, record="minilm")
+    P.get_collection(str(tmp_path), create=True)  # validated and cached
+
+    other = SQLiteExactBackend().get_collection(
+        palace=PalaceRef(id=str(tmp_path), local_path=str(tmp_path)),
+        collection_name="mempalace_drawers",
+        create=True,
+    )
+    other.set_embedder_identity(EmbedderIdentity("embeddinggemma", 384))
+    with pytest.raises(EmbedderIdentityMismatchError):
+        P.get_collection(str(tmp_path), create=True)
+    with pytest.raises(EmbedderIdentityMismatchError):
+        P.get_collection(str(tmp_path), create=False)
+
+
+def test_an_unchanged_record_keeps_the_cached_verdict(tmp_path, monkeypatch):
+    from mempalace import palace as P
+
+    _sqlite_palace(tmp_path, monkeypatch, rows=True, record=None)
+    calls = []
+    real = P._collection_has_rows
+    monkeypatch.setattr(P, "_collection_has_rows", lambda *a: calls.append(1) or real(*a))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for _ in range(3):
+            P.get_collection(str(tmp_path), create=False)
+    assert len(calls) == 1
+
+
+@_MINILM
+@pytest.mark.parametrize("change", ["another-model", "record-deleted"])
+def test_mcp_server_refuses_after_the_record_changes_under_it(request, monkeypatch, kg, change):
+    project, palace, _ = _mined(_palace(request))
+    call = _mcp_caller(monkeypatch, palace, kg)
+    result, payload = call("mempalace_add_drawer", dict(_ADD))
+    assert payload.get("success") is True, payload
+    search_result, _ = call("mempalace_search", {"query": "greenhouse tomatoes"})
+    assert not search_result.get("isError")
+    rows = _rows(palace)
+
+    # Another process changes the record while this server keeps running.
+    if change == "another-model":
+        _restamp_elsewhere(palace, "embeddinggemma")
+        kind = "Embedder identity mismatch"
+    else:
+        _sidecar(palace).unlink()
+        kind = "Embedder identity unconfirmed"
+
+    more = dict(_ADD, content="The rain barrel overflows after every storm in April.")
+    result, payload = call("mempalace_add_drawer", more)
+    assert result.get("isError") is True, payload
+    assert payload["error"] == kind, payload
+    assert _rows(palace) == rows
+    if change == "another-model":
+        search_result, found = call("mempalace_search", {"query": "greenhouse tomatoes"})
+        assert search_result.get("isError") is True, found
