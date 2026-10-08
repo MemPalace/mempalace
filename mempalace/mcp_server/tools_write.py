@@ -1470,10 +1470,10 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 
         # A closet quotes the source file, not the stored drawer, so it only
         # goes stale on a content change; wing/room alone leaves it correct (#2325).
-        closets_deleted = 0
+        # Purge only once the write has landed: a refused embed (dead endpoint,
+        # identity refusal) must leave the drawer and its closets as they were.
         source_file = old_meta.get("source_file")
-        if content is not None and source_file:
-            closets_deleted = _purge_source_closets(source_file, commit=True)
+        purge_closets = content is not None and bool(source_file)
 
         chunk_size = max(1, int(getattr(_config, "chunk_size", 800) or 800))
         should_chunk = bool(record.get("chunked")) or len(new_doc) > chunk_size
@@ -1493,6 +1493,9 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             if stale_ids:
                 col.delete(ids=stale_ids)
 
+            closets_deleted = (
+                _purge_source_closets(source_file, commit=True) if purge_closets else 0
+            )
             _invalidate_overview_caches()
 
             logger.info("Updated drawer: %s (%s rows)", drawer_id, len(chunk_ids))
@@ -1513,6 +1516,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         update_kwargs["metadatas"] = [new_meta]
 
         col.update(**update_kwargs)
+        closets_deleted = _purge_source_closets(source_file, commit=True) if purge_closets else 0
         _invalidate_overview_caches()
 
         logger.info("Updated drawer: %s", drawer_id)
