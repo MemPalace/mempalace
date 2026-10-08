@@ -8,6 +8,56 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Writes refuse until a collection's embedder model is confirmed.** A
+  collection that holds vectors but has no recorded embedder identity (a
+  palace from before identity tracking, a deleted `mempalace_embedder.json`),
+  or whose record is unreadable (a truncated sidecar), used to take writes
+  with the current model, so a later same-dimension model swap went unnoticed.
+  `mine`, MCP writes and the daemon now refuse those writes with
+  `EmbedderIdentityUnconfirmedError` (CLI exit 1, MCP `isError`) until
+  `mempalace palace set-embedder --model <model>` records the model the palace
+  was built with. Reads and search keep working with a warning. An empty
+  collection still records the current model on its first write. This applies
+  on every backend; in particular every qdrant or pgvector palace that an
+  earlier build mined into a folder that did not exist yet has no record and
+  needs this one `set-embedder` step.
+- **openai-compat palaces record the endpoint model.** The identity is now
+  `openai-compat:<embedding_api_model>`, so switching `embedding_api_model`
+  to another model refuses even at the same dimension; the endpoint URL is
+  not part of it. A palace recorded by an earlier build carries the bare
+  `openai-compat`, which does not say which model embedded it: reads warn,
+  and the first write refuses until you confirm the model with `mempalace
+  palace set-embedder --model openai-compat` (records the configured
+  `embedding_api_model`) or `--model openai-compat:<model id>` (records the
+  one given). No `--force` is needed for that step.
+
+### Fixed
+
+- **A record changed by another process is checked again.** A long-running
+  MCP server, hub or daemon kept a validated identity for its lifetime, so
+  another process's `set-embedder --force`, an in-place rebuild with another
+  model, or a deleted sidecar did not stop its writes. Each open now re-reads
+  the record and re-checks it when it changed.
+- **The recorded dimension is the real one.** A first mine recorded the
+  identity with dimension 0 while a rebuild recorded 384 or 768; every first
+  write now records the probed dimension, and `palace set-embedder --model`
+  records a bundled model's fixed width.
+- **Chroma dimension errors are typed.** chromadb's `Collection expecting
+  embedding with dimension of N, got M` is raised as `DimensionMismatchError`
+  with a recovery hint: `mine` prints one line instead of a traceback, `search`
+  prints it on stderr instead of a `Search error` on stdout, and MCP
+  `add_drawer` and search set `isError`. Every backend uses the same wording,
+  and `repair rebuild-index` is only offered on Chroma.
+- **The light MCP server sets `isError`** for the same refusals the full
+  server flags.
+- **`palace set-embedder`** also records the closets and media assets
+  collections when they exist, replaces an unreadable record without
+  `--force` (keeping a `mempalace_embedder.json.corrupt-<timestamp>` copy),
+  and reports an embedding function that cannot be built as a refusal
+  instead of a traceback.
+
 ---
 
 ## [3.11.0] — 2026-10-02
