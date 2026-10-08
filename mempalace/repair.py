@@ -2066,7 +2066,9 @@ def _rebuild_one_collection(
         _flush()
         if (embeddinggemma2 or media_assets) and upserted:
             _verify_collection_count(col, upserted, "SQLite rebuilt collection")
-            _record_rebuilt_embedder_identity(col, dest_palace)
+        # An in-place rebuild archives the palace directory, sidecar included,
+        # so record the identity for every model, not only EmbeddingGemma 2 (#2709).
+        _record_rebuilt_embedder_identity(col, dest_palace)
     except Exception as exc:  # noqa: BLE001 — chromadb raises many shapes
         partial = dict(counts_so_far)
         partial[collection_name] = upserted
