@@ -534,6 +534,21 @@ def _model_mismatch_error(exc) -> dict:
 _unknown_embedding_model_error = _model_mismatch_error
 
 
+def _embed_failure(exc, **fields) -> dict:
+    """The result for a tool whose embed or write raised ``exc``.
+
+    A model error raised while embedding (an openai-compat endpoint that
+    refuses the connection, say) keeps its ``error_class`` so MCP sets
+    ``isError``, as a refusal at open does; any other failure stays the
+    plain ``{"error": str(exc)}`` it always was. ``fields`` (such as
+    ``success=False``) lead the result.
+    """
+    refused = _model_mismatch_error(exc)
+    if refused is not None:
+        return {**fields, **refused}
+    return {**fields, "error": str(exc)}
+
+
 def _no_palace():
     return {
         "error": "No palace found",

@@ -806,7 +806,10 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
             "is_duplicate": len(duplicates) > 0,
             "matches": duplicates,
         }
-    except Exception:
+    except Exception as e:
+        refused = _model_mismatch_error(e)
+        if refused is not None:
+            return refused
         logger.exception("check_duplicate failed")
         return {"error": "Duplicate check failed"}
 

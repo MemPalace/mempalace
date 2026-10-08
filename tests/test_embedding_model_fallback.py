@@ -744,6 +744,7 @@ def _model_errors():
         "Embedder identity mismatch": EmbedderIdentityMismatchError("identity"),
         "Embedding dimension mismatch": DimensionMismatchError("dimension"),
         "Embedding model mismatch": EmbeddingFunctionMismatchError("chroma ef"),
+        "Embedding API unavailable": embedding.EmbeddingAPIError("connection refused"),
     }
 
 
@@ -1087,3 +1088,115 @@ def test_chroma_resolver_never_returns_none(unknown_model_palace, monkeypatch):
             embed(input=["x"])
     # Refusal classes stay model errors, so MCP sets isError for them.
     assert "EmbeddingFunctionUnavailableError" in embedding.MODEL_ERROR_CLASS_NAMES
+
+
+# ── A dead openai-compat endpoint is a tool error, like a missing URL ────
+
+
+class _EmbeddingsHandler:
+    """Deterministic ``/v1/embeddings`` answers (the MiniLM stand-in's vectors)."""
+
+    @staticmethod
+    def make():
+        from http.server import BaseHTTPRequestHandler
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                vectors = _MiniLMStandIn(_factory=False)(body["input"])
+                out = json.dumps(
+                    {"data": [{"index": i, "embedding": v} for i, v in enumerate(vectors)]}
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+            def log_message(self, *args):
+                pass
+
+        return Handler
+
+
+def _openai_compat_palace_with_a_dead_endpoint(unknown_model_palace, monkeypatch):
+    """Mine an openai-compat palace against a live local endpoint, then stop
+    the server: the configured URL now refuses the connection."""
+    import threading
+    from http.server import ThreadingHTTPServer
+
+    from mempalace.miner import mine
+
+    project, palace, config = unknown_model_palace
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_API_URL", raising=False)
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_API_MODEL", raising=False)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _EmbeddingsHandler.make())
+    url = f"http://127.0.0.1:{server.server_address[1]}/v1"
+    (palace.parent / "config" / "config.json").write_text(
+        json.dumps(
+            {
+                "palace_path": str(palace),
+                "embedding_model": "openai-compat",
+                "embedding_api_url": url,
+                "embedding_api_model": "text-embed-a",
+            }
+        )
+    )
+    embedding._EF_CACHE.clear()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        mine(str(project), str(palace))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+    assert _recorded_identity(palace)["mempalace_drawers"]["model_name"] == "openai-compat"
+    return palace
+
+
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+def test_mcp_dead_openai_compat_endpoint_is_a_tool_error(unknown_model_palace, monkeypatch, kg):
+    """Eve's recheck of c9b6814: with the URL set but nothing listening, MCP
+    returned ``success: false`` without ``isError``, while a missing URL set
+    ``isError``. Both now refuse as tool errors, and nothing is written."""
+    palace = _openai_compat_palace_with_a_dead_endpoint(unknown_model_palace, monkeypatch)
+    rows = _embedding_rows(palace)
+    call = _mcp_caller(monkeypatch, palace, kg)
+
+    result, body = call("mempalace_add_drawer", _ADD)
+    assert result["isError"] is True, body
+    assert body["success"] is False
+    assert body["error"] == "Embedding API unavailable"
+    assert body["error_class"] == "EmbeddingAPIError"
+    assert "refused" in body["details"].lower(), body["details"]
+    assert "embedding_api_url" in body["hint"]
+    assert _embedding_rows(palace) == rows
+
+    for name, arguments in (
+        ("mempalace_search", {"query": "greenhouse tomatoes"}),
+        ("mempalace_check_duplicate", {"content": "greenhouse tomatoes"}),
+        ("mempalace_diary_write", {"agent_name": "eve", "entry": "Watered the tomatoes."}),
+    ):
+        result, body = call(name, arguments)
+        assert result.get("isError") is True, (name, body)
+        assert body["error_class"] == "EmbeddingAPIError", (name, body)
+    assert _embedding_rows(palace) == rows
+
+    # Reads that never embed keep working.
+    result, body = call("mempalace_status", {})
+    assert "isError" not in result, body
+    assert body.get("total_drawers", 0) >= 1, body
+
+
+def test_an_unrelated_write_failure_stays_a_plain_error():
+    from mempalace.mcp_server import _embed_failure, _tool_call_response
+
+    result = _embed_failure(RuntimeError("disk full"), success=False)
+    assert result == {"success": False, "error": "disk full"}
+    assert "isError" not in _tool_call_response(1, result)["result"]
+
+    api_error = embedding.EmbeddingAPIError("Embedding API request to http://x failed")
+    refused = _embed_failure(api_error, success=False)
+    assert refused["error_class"] == "EmbeddingAPIError" and refused["success"] is False
+    assert _tool_call_response(1, refused)["result"]["isError"] is True

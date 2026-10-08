@@ -657,8 +657,9 @@ def _tool_result_is_error(result) -> bool:
     Tool errors are otherwise plain ``{"error": ...}`` results. The failures
     that refuse every read and write until the config or the palace is fixed
     (a misspelled ``embedding_model``, a palace built with a different
-    model, a collection that will not open) also set MCP's ``isError`` for
-    clients that only check the flag. Model errors are matched by the
+    model, a collection that will not open), and an openai-compat endpoint
+    that cannot be reached, also set MCP's ``isError`` for clients that only
+    check the flag. Model errors are matched by the
     exception class they were built from (``error_class``, set by
     ``embedding.model_error_result``); an open failure by its ``error``.
     """

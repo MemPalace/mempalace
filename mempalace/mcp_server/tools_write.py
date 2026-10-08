@@ -639,7 +639,7 @@ def tool_add_drawer(
         _wal_result("add_drawer", outcome)
         return outcome
     except Exception as e:
-        outcome = {"success": False, "error": str(e)}
+        outcome = _embed_failure(e, success=False)
         _wal_result("add_drawer", outcome)
         return outcome
 
@@ -1525,7 +1525,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             "closets_deleted": closets_deleted,
         }
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return _embed_failure(e, success=False)
 
 
 def tool_delete_drawers(drawer_ids: list):
