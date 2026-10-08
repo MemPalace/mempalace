@@ -234,3 +234,21 @@ def test_a_width_change_refuses_cleanly_on_every_path(request, monkeypatch, capf
     result, body = call("mempalace_search", {"query": "greenhouse tomatoes"})
     assert result.get("isError") is True, body
     assert body["error"] == "Embedding dimension mismatch", body
+
+
+def test_the_rebuild_record_warning_quotes_the_palace_path(tmp_path, monkeypatch, capsys):
+    """A copy-pasted command must survive a palace path with spaces."""
+    from mempalace import repair
+    from mempalace.backends.base import EmbedderIdentityRecordError
+
+    class _Unrecordable:
+        def set_embedder_identity(self, identity):
+            raise EmbedderIdentityRecordError("disk full")
+
+    _use(monkeypatch, "http://unused", "Nomic Embed:latest")
+    monkeypatch.setattr(embedding, "probe_dimension", lambda *a, **k: 768)
+    palace = tmp_path / "my palace"
+    repair._record_rebuilt_embedder_identity(_Unrecordable(), str(palace))
+    out = capsys.readouterr().out
+    assert f"mempalace --palace '{palace}' palace set-embedder" in out, out
+    assert "--model 'openai-compat:Nomic Embed:latest'" in out, out

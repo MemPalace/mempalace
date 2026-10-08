@@ -376,9 +376,14 @@ def _record_rebuilt_embedder_identity(collection, palace_path: str) -> None:
     except EmbedderIdentityRecordError as exc:
         # The rebuilt rows are verified and kept; only the record failed.
         # Say so loudly instead of leaving the palace unrecorded in silence.
+        import shlex
+
+        from .palace import _set_embedder_model_arg
+
+        model = _set_embedder_model_arg(identity.model_name)
         print(
             f"  WARNING: {exc}\n  Once fixed, record it with: mempalace --palace "
-            f"{palace_path} palace set-embedder --model {identity.model_name.split(':')[0]}"
+            f"{shlex.quote(str(palace_path))} palace set-embedder --model {shlex.quote(model)}"
         )
     clear_validated_embedder_identity(palace_path)
 
