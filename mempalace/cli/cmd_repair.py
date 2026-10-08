@@ -18,7 +18,11 @@ def cmd_palace_set_embedder(args):
     and ``mine`` writes closets as well as drawers.
     """
     from ..backends.base import EmbedderIdentityMismatchError, EmbedderIdentityRecordError
-    from ..embedding import UnknownEmbeddingModelError
+    from ..embedding import (
+        EmbeddingFunctionUnavailableError,
+        current_model_name,
+        openai_compat_api_model,
+    )
     from ..palace import (
         ASSETS_COLLECTION_NAME,
         CLOSETS_COLLECTION_NAME,
@@ -33,7 +37,11 @@ def cmd_palace_set_embedder(args):
     refusals = (
         EmbedderIdentityMismatchError,
         EmbedderIdentityRecordError,
-        UnknownEmbeddingModelError,
+        # The configured function cannot be built (chroma opens with it).
+        EmbeddingFunctionUnavailableError,
+        # UnknownEmbeddingModelError, and nothing to record (no model, or
+        # openai-compat without an endpoint model).
+        ValueError,
     )
     report: dict = {}
     try:
@@ -72,11 +80,22 @@ def cmd_palace_set_embedder(args):
     # set-embedder records the palace's identity; it does not change the
     # configured model. If they differ, the next normal open would mismatch —
     # tell the user how to align them.
-    configured = config.embedding_model
+    try:
+        configured = current_model_name()
+    except Exception:
+        configured = config.embedding_model
     if new.model_name and configured and new.model_name != configured:
+        api_model = openai_compat_api_model(new.model_name)
+        if api_model:
+            align = (
+                f"set MEMPALACE_EMBEDDING_MODEL=openai-compat and "
+                f"MEMPALACE_EMBEDDING_API_MODEL={api_model} (or embedding_api_model in config.json)"
+            )
+        else:
+            name = new.model_name.split(":", 1)[0]  # embeddinggemma2:<identity>
+            align = f"set MEMPALACE_EMBEDDING_MODEL={name} (or run onboarding)"
         print(
-            f"  ⚠ configured model is {configured!r}; set MEMPALACE_EMBEDDING_MODEL="
-            f"{new.model_name} (or run onboarding) so normal opens of this palace match."
+            f"  ⚠ configured model is {configured!r}; {align} so normal opens of this palace match."
         )
     if failed:
         raise SystemExit(2)

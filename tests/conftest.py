@@ -47,6 +47,7 @@ _REAL_EMBEDDING_TEST_MODULES = {
     "test_embeddinggemma2_integration",
     "test_embedding_model_fallback",
     "test_embedder_identity_hardening",
+    "test_openai_compat_identity",
 }
 
 

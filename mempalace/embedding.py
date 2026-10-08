@@ -775,15 +775,16 @@ class OpenAICompatEmbeddingFunction:
     endpoint (LM Studio, llama.cpp, vLLM, Ollama's OpenAI shim, etc.).
 
     Selected via ``embedding_model == "openai-compat"``. Vectors are produced
-    server-side and fetched over HTTP, which changes the vector space.
-    ``name()`` encodes the model id, but this does **not** guard a model or
-    endpoint change: chromadb 1.5.x persists this class as a legacy EF
-    (``{"type": "legacy"}``, no name), so it never compares names on open,
-    and the recorded palace identity is the bare ``openai-compat`` for every
-    endpoint model. Switching ``embedding_api_model`` to another model with
-    the same dimension is therefore accepted silently; run ``mempalace
-    repair rebuild-index`` yourself after changing the model or endpoint.
-    (Recording the endpoint model in the identity is follow-up item D.)
+    server-side and fetched over HTTP, so the endpoint model defines the
+    vector space. The palace records it: the embedder identity is
+    ``openai-compat:<embedding_api_model>`` (see :func:`current_model_name`),
+    so switching ``embedding_api_model`` to another model refuses on every
+    backend, even at the same dimension, until ``mempalace repair
+    rebuild-index`` re-embeds the palace. The endpoint URL is deliberately
+    not part of the identity: the same model served from another host, port
+    or tunnel produces the same vectors. ``name()`` does not guard anything:
+    chromadb 1.5.x persists this class as a legacy EF (``{"type":
+    "legacy"}``, no name) and never compares names on open.
     stdlib ``urllib`` only, no new dependency.
     """
 
@@ -807,9 +808,9 @@ class OpenAICompatEmbeddingFunction:
         return f"{url}/v1/embeddings"
 
     def name(self) -> str:
-        # Encode the model so switching it changes the persisted EF identity
-        # and forces a rebuild_index (vectors from a different model/space are
-        # not interchangeable). ChromaDB compares this on every read.
+        # Informational only: chromadb persists this class as a legacy EF and
+        # never compares the name. The model swap guard is the recorded
+        # embedder identity (``openai-compat:<model>``, current_model_name).
         return f"openai_compat_emb_{self._model}".replace("/", "_")
 
     def embed_query(self, input):  # noqa: A002 — ChromaDB EF protocol uses `input`
@@ -921,6 +922,10 @@ _KNOWN_EMBEDDING_MODELS = frozenset(
 # starts with the prefix or is within _NEAR_MISS_DISTANCE edits of a suggested
 # name. Someone who typed one of these meant that model (or remote embeddings),
 # and MiniLM vectors filed in its place take a full re-embed to replace.
+# The recorded identity of an openai-compat palace names the endpoint model:
+# ``openai-compat:<embedding_api_model>``. A bare ``openai-compat`` comes
+# from builds that did not record the model (see _is_bare_openai_compat).
+OPENAI_COMPAT_IDENTITY_PREFIX = "openai-compat:"
 _GUARDED_MODEL_FAMILIES = (
     ("embeddinggemma", ("embeddinggemma", "embeddinggemma2")),
     ("openai", ("openai-compat",)),
@@ -1203,12 +1208,38 @@ def _normalize_stored_model_name(name) -> str:
     ``server_embedder`` backend's names are its own and must not go through
     here.
     """
-    stored = str(name or "").strip().lower()
+    raw = str(name or "").strip()
+    api_model = openai_compat_api_model(raw)
+    if api_model:
+        # The endpoint model keeps its case and any ``:tag``: servers treat
+        # ids case-sensitively. Only the prefix is normalized.
+        return OPENAI_COMPAT_IDENTITY_PREFIX + api_model
+    stored = raw.lower()
+    if stored == OPENAI_COMPAT_IDENTITY_PREFIX:
+        return "openai-compat"  # a prefix with no model names no model
     if stored.startswith("embeddinggemma2:"):
         return stored
     if stored in _KNOWN_EMBEDDING_MODELS and stored != "embeddinggemma2":
         return stored
     return "minilm"
+
+
+def openai_compat_api_model(name) -> str:
+    """The endpoint model of an ``openai-compat:<model>`` identity, else ``""``.
+
+    Splits on the first ``:`` only, so an Ollama tag such as
+    ``openai-compat:nomic-embed-text:latest`` keeps its ``:latest``.
+    """
+    text = str(name or "").strip()
+    prefix, sep, rest = text.partition(":")
+    if not sep or prefix.lower() != "openai-compat":
+        return ""
+    return rest.strip()
+
+
+def _is_bare_openai_compat(name) -> bool:
+    """A legacy ``openai-compat`` identity that does not name the endpoint model."""
+    return _normalize_stored_model_name(name) == "openai-compat"
 
 
 def _resolve_embedding_model(model) -> str:
@@ -1451,6 +1482,14 @@ def current_model_name(model: Optional[str] = None) -> str:
     ``name()`` (which is spoofed to ``"default"`` for ChromaDB compatibility).
     Unrecognized names resolve to ``"minilm"``, the model that embeds them,
     and near misses raise :class:`UnknownEmbeddingModelError`.
+
+    Two models carry more than the name, because the name alone does not fix
+    the vector space: EmbeddingGemma 2 returns its full
+    ``embeddinggemma2:<model>@<revision>:...`` identity, and ``openai-compat``
+    returns ``openai-compat:<embedding_api_model>`` (stripped, case kept), so
+    a same-dimension endpoint model swap is a model mismatch. The endpoint
+    URL is not part of it. With no ``embedding_api_model`` configured the
+    bare ``openai-compat`` comes back; building that function refuses anyway.
     """
     from .config import MempalaceConfig
 
@@ -1460,6 +1499,10 @@ def current_model_name(model: Optional[str] = None) -> str:
         name = _resolve_embedding_model(model)
     if name == "embeddinggemma2":
         return get_embedding_function(model=name).identity
+    if name == "openai-compat":
+        api_model = (MempalaceConfig().embedding_api_model or "").strip()
+        if api_model:
+            return OPENAI_COMPAT_IDENTITY_PREFIX + api_model
     return name
 
 
