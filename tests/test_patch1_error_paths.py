@@ -422,3 +422,92 @@ def test_repair_without_an_endpoint_url_refuses_in_one_line(request, monkeypatch
     out, err = capfd.readouterr()
     assert err.startswith("mempalace: Could not build the embedding function"), err
     assert "Traceback" not in out + err
+
+
+# ── (8) every set-embedder hint names a model the command accepts ────────
+
+_GEMMA2 = "embeddinggemma2"
+
+
+def _suggested_names(text):
+    """The `--model X` and `MEMPALACE_EMBEDDING_MODEL=X` values a hint suggests."""
+    import re
+    import shlex
+
+    models = [shlex.split(m)[0] for m in re.findall(r"--model ('[^']*'|[^\s`]+)", text)]
+    models = [m for m in models if m != "<model>"]
+    env = re.findall(r"MEMPALACE_EMBEDDING_MODEL=([^\s`]+)", text)
+    return models, env
+
+
+def _assert_accepted(models, env):
+    from mempalace.embedding import _resolve_embedding_model
+
+    for name in models:  # set-embedder --model: a known name or openai-compat:<id>
+        if not name.startswith("openai-compat:"):
+            _resolve_embedding_model(name)  # UnknownEmbeddingModelError on a near miss
+    for name in env:  # a configured model: never a recorded identity
+        _resolve_embedding_model(name)
+        assert ":" not in name, name
+
+
+@pytest.mark.parametrize("recorded", [_GEMMA2, "openai-compat:text-embed-a"])
+def test_set_embedders_align_hint_suggests_a_configurable_model(
+    recorded, tmp_path, monkeypatch, capsys
+):
+    """Recording EmbeddingGemma 2 with MiniLM configured told the user to set
+    MEMPALACE_EMBEDDING_MODEL to the full identity, which config refuses."""
+    import json
+
+    from mempalace import embedding
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    palace = tmp_path / "palace"
+    (cfg / "config.json").write_text(json.dumps({"palace_path": str(palace)}))
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(cfg))
+    for var in ("MEMPALACE_EMBEDDING_MODEL", "MEMPALACE_EMBEDDING_API_URL"):
+        monkeypatch.delenv(var, raising=False)
+    embedding._EF_CACHE.clear()
+    if recorded.startswith("openai-compat:"):
+        # Recording an endpoint model probes its width; no server here.
+        monkeypatch.setattr(embedding, "known_dimension", lambda *_a, **_k: 384, raising=False)
+    rc = _run_cli(
+        monkeypatch, "--palace", str(palace), "palace", "set-embedder", "--model", recorded
+    )
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "configured model is" in out, out
+    models, env = _suggested_names(out)
+    assert env or "MEMPALACE_EMBEDDING_API_MODEL=" in out, out
+    _assert_accepted(models, env)
+
+
+@pytest.mark.parametrize(
+    "configured", [_GEMMA2, "openai-compat:text-embed-a", "all-minilm-l6-v2", "embeddinggemma"]
+)
+def test_the_confirm_hint_suggests_a_model_set_embedder_accepts(configured, tmp_path):
+    from mempalace.embedding import current_model_name
+    from mempalace.palace import _confirm_model_hint
+
+    name = current_model_name(_GEMMA2) if configured == _GEMMA2 else configured
+    models, env = _suggested_names(_confirm_model_hint(tmp_path / "my palace", name))
+    assert models, name
+    _assert_accepted(models, env)
+
+
+def test_the_rebuild_record_failure_hint_suggests_an_accepted_model(tmp_path, monkeypatch, capsys):
+    from mempalace import embedding, repair
+    from mempalace.backends.base import EmbedderIdentity, EmbedderIdentityRecordError
+
+    identity = EmbedderIdentity(model_name=embedding.current_model_name(_GEMMA2), dimension=768)
+    monkeypatch.setattr(embedding, "get_embedder_identity", lambda *_a, **_k: identity)
+
+    class _Unrecordable:
+        def set_embedder_identity(self, _identity):
+            raise EmbedderIdentityRecordError("the sidecar is read-only")
+
+    repair._record_rebuilt_embedder_identity(_Unrecordable(), str(tmp_path / "my palace"))
+    models, env = _suggested_names(capsys.readouterr().out)
+    assert models == [_GEMMA2], models
+    _assert_accepted(models, env)

@@ -26,6 +26,7 @@ def cmd_palace_set_embedder(args):
     from ..palace import (
         ASSETS_COLLECTION_NAME,
         CLOSETS_COLLECTION_NAME,
+        _set_embedder_model_arg,
         set_palace_embedder_identity,
     )
 
@@ -92,7 +93,9 @@ def cmd_palace_set_embedder(args):
                 f"MEMPALACE_EMBEDDING_API_MODEL={api_model} (or embedding_api_model in config.json)"
             )
         else:
-            name = new.model_name.split(":", 1)[0]  # embeddinggemma2:<identity>
+            # The configurable name, never a recorded identity (an
+            # EmbeddingGemma 2 identity is refused as embedding_model).
+            name = _set_embedder_model_arg(new.model_name)
             align = f"set MEMPALACE_EMBEDDING_MODEL={name} (or run onboarding)"
         print(
             f"  ⚠ configured model is {configured!r}; {align} so normal opens of this palace match."
