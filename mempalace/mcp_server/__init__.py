@@ -107,6 +107,7 @@ from ..backends import BackendMismatchError, PalaceRef, detect_backend_for_path 
 from ..backends.base import (  # noqa: E402
     DimensionMismatchError,
     EmbedderIdentityMismatchError,
+    EmbedderIdentityRecordError,
     EmbeddingFunctionMismatchError,
 )
 from ..embedding import (  # noqa: E402

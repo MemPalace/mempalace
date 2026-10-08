@@ -296,7 +296,11 @@ def _get_collection(create=False):
                 _collection_cache_palace = None
                 _invalidate_overview_caches()
                 return None
-            except (EmbedderIdentityMismatchError, DimensionMismatchError) as exc:
+            except (
+                EmbedderIdentityMismatchError,
+                DimensionMismatchError,
+                EmbedderIdentityRecordError,
+            ) as exc:
                 # palace.get_collection's identity check: a different model
                 # built this palace. Retrying cannot help.
                 _collection_open_error = _model_mismatch_error(exc)
@@ -439,7 +443,11 @@ def _get_collection(create=False):
             _collection_cache_palace = None
             _invalidate_overview_caches()
             return None
-        except (EmbedderIdentityMismatchError, DimensionMismatchError) as exc:
+        except (
+            EmbedderIdentityMismatchError,
+            DimensionMismatchError,
+            EmbedderIdentityRecordError,
+        ) as exc:
             # The palace records a different model than the configured one.
             # Deterministic, like the error above: refuse without retrying and
             # without caching the collection, so every call refuses.

@@ -12,7 +12,7 @@ def cmd_palace_set_embedder(args):
     ``MEMPALACE_EMBEDDING_MODEL``. ``--force`` overwrites an existing,
     differently-named identity.
     """
-    from ..backends.base import EmbedderIdentityMismatchError
+    from ..backends.base import EmbedderIdentityMismatchError, EmbedderIdentityRecordError
     from ..embedding import UnknownEmbeddingModelError
     from ..palace import set_palace_embedder_identity
 
@@ -28,7 +28,11 @@ def cmd_palace_set_embedder(args):
             force=getattr(args, "force", False),
             backend=_backend_arg(args),
         )
-    except (EmbedderIdentityMismatchError, UnknownEmbeddingModelError) as exc:
+    except (
+        EmbedderIdentityMismatchError,
+        EmbedderIdentityRecordError,
+        UnknownEmbeddingModelError,
+    ) as exc:
         # A misspelled --model (or configured model) is refused before the
         # palace is opened, so nothing was created.
         print(f"  ✗ {exc}")

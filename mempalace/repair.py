@@ -366,10 +366,20 @@ def _record_rebuilt_embedder_identity(collection, palace_path: str) -> None:
     writes (drawers, closets, media assets), on every model (#2709: the
     rebuilt palace used to come back without mempalace_embedder.json).
     """
+    from .backends.base import EmbedderIdentityRecordError
     from .embedding import get_embedder_identity
     from .palace import clear_validated_embedder_identity
 
-    collection.set_embedder_identity(get_embedder_identity())
+    identity = get_embedder_identity()
+    try:
+        collection.set_embedder_identity(identity)
+    except EmbedderIdentityRecordError as exc:
+        # The rebuilt rows are verified and kept; only the record failed.
+        # Say so loudly instead of leaving the palace unrecorded in silence.
+        print(
+            f"  WARNING: {exc}\n  Once fixed, record it with: mempalace --palace "
+            f"{palace_path} palace set-embedder --model {identity.model_name.split(':')[0]}"
+        )
     clear_validated_embedder_identity(palace_path)
 
 

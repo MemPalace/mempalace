@@ -90,8 +90,10 @@ def _normalize_legacy_identity(collection, stored, *, create):
     if create:
         try:
             collection.set_embedder_identity(stored)
-        except Exception:
-            logger.debug("legacy embedder-identity rewrite failed", exc_info=True)
+        except Exception as exc:
+            # Not fatal: the palace stays protected, the legacy name keeps
+            # reading as the normalized one. Say so rather than hide it.
+            logger.warning("could not rewrite the legacy embedder identity: %s", exc)
     return stored
 
 
@@ -116,7 +118,11 @@ def _enforce_embedder_identity(
     can reproduce the warning a standalone CLI process emits on every search.
 
     Bookkeeping must never break memory operations: only the deliberate
-    identity/dimension mismatch propagates; every other error is swallowed.
+    identity/dimension mismatch propagates, plus
+    :class:`~mempalace.backends.base.EmbedderIdentityRecordError` when a write
+    open cannot record a brand-new collection's identity (writing on would
+    leave it unprotected against a later model swap); every other error is
+    swallowed.
     """
     import warnings
 
@@ -124,6 +130,7 @@ def _enforce_embedder_identity(
         DimensionMismatchError,
         EmbedderIdentity,
         EmbedderIdentityMismatchError,
+        EmbedderIdentityRecordError,
         EmbedderIdentityUnknownWarning,
         check_embedder_identity,
     )
@@ -157,12 +164,12 @@ def _enforce_embedder_identity(
     except Exception:
         logger.debug("embedder-identity read failed for %s", collection_name, exc_info=True)
         return
-    legacy_name_unrecorded = False
+    unrecorded = False
     if core_embedder and stored is not None and getattr(stored, "model_name", ""):
         normalized = _normalize_legacy_identity(collection, stored, create=create)
         # A read open compares with the normalized name but does not write it;
         # stay out of the cache so the next write open records it.
-        legacy_name_unrecorded = normalized is not stored and not create
+        unrecorded = normalized is not stored and not create
         stored = normalized
     try:
         state = check_embedder_identity(stored, current)
@@ -174,9 +181,15 @@ def _enforce_embedder_identity(
     if state == "unknown" and stored is None:
         has_rows = _collection_has_rows(collection, palace_path, collection_name)
         if has_rows is False:
+            # A read open of an empty, unrecorded collection records nothing;
+            # stay out of the cache so the next write open in this process
+            # still records it.
+            unrecorded = not create
             if create:
                 try:
                     collection.set_embedder_identity(current)
+                except EmbedderIdentityRecordError:
+                    raise
                 except Exception:
                     logger.debug("embedder-identity record failed", exc_info=True)
         elif has_rows:
@@ -194,7 +207,7 @@ def _enforce_embedder_identity(
                 stacklevel=2,
             )
 
-    if not legacy_name_unrecorded:
+    if not unrecorded:
         _VALIDATED_IDENTITY.add(key)
 
 

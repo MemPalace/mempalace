@@ -943,10 +943,6 @@ class UnknownEmbeddingModelError(ValueError):
     """
 
 
-# Model errors: the configured model cannot be used with this palace (a
-# misspelled name, or a palace built with another model). Every read and write
-# refuses until the config or the palace is fixed, so tool results built from
-# one carry ``error_class`` (the class name below) and MCP sets ``isError``.
 EMBEDDING_FUNCTION_UNAVAILABLE_ERROR = "Embedding function unavailable"
 
 
@@ -1049,11 +1045,17 @@ class UnavailableEmbeddingFunction:
         raise self.error
 
 
+# Model errors: the configured model cannot be used with this palace (a
+# misspelled name, a palace built with another model, an embedding function
+# that cannot be built) or a write cannot record the palace's identity. The
+# call refuses until the config or the palace is fixed, so tool results built
+# from one carry ``error_class`` (the class name below) and MCP sets ``isError``.
 MODEL_ERROR_CLASS_NAMES = frozenset(
     {
         "UnknownEmbeddingModelError",
         "EmbeddingFunctionUnavailableError",
         "EmbedderIdentityMismatchError",
+        "EmbedderIdentityRecordError",
         "DimensionMismatchError",
         "EmbeddingFunctionMismatchError",
     }
@@ -1063,6 +1065,7 @@ _MODEL_REFUSAL_HINT = (
     "or re-embed the palace as the details describe."
 )
 _UNKNOWN_MODEL_HINT = "Fix embedding_model in config.json or MEMPALACE_EMBEDDING_MODEL."
+_IDENTITY_NOT_RECORDED_HINT = "Check that the palace directory is writable, then retry."
 _UNAVAILABLE_EF_HINT = (
     "Fix the embedding settings in config.json (for openai-compat: embedding_api_url "
     "and embedding_api_model) or install the missing dependency, then retry."
@@ -1076,12 +1079,14 @@ def _model_error_class(exc: BaseException) -> Optional[type]:
     from .backends.base import (
         DimensionMismatchError,
         EmbedderIdentityMismatchError,
+        EmbedderIdentityRecordError,
         EmbeddingFunctionMismatchError,
     )
 
     for cls in (
         UnknownEmbeddingModelError,
         EmbeddingFunctionUnavailableError,
+        EmbedderIdentityRecordError,
         EmbedderIdentityMismatchError,
         DimensionMismatchError,
         EmbeddingFunctionMismatchError,
@@ -1130,6 +1135,8 @@ def model_error_result(exc: BaseException, *, palace_path=None, log=None) -> Opt
         kind, hint = UNKNOWN_EMBEDDING_MODEL_ERROR, _UNKNOWN_MODEL_HINT
     elif cls is EmbeddingFunctionUnavailableError:
         kind, hint = EMBEDDING_FUNCTION_UNAVAILABLE_ERROR, _UNAVAILABLE_EF_HINT
+    elif cls.__name__ == "EmbedderIdentityRecordError":
+        kind, hint = model_mismatch_error_kind(exc), _IDENTITY_NOT_RECORDED_HINT
     else:
         kind, hint = model_mismatch_error_kind(exc), _MODEL_REFUSAL_HINT
     if log is not None:

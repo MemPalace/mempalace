@@ -312,8 +312,9 @@ with mine_palace_lock(sys.argv[1]):
             # Force a peer-writer-coexistence read (opens query_only handle).
             result = mcp_server.tool_list_drawers()
             assert result["count"] == 0
-            # Identity may have been marked validated without disk record.
-            assert any(key[0] == palace_path for key in palace._VALIDATED_IDENTITY)
+            # A read open of an empty, unrecorded collection records nothing,
+            # so it is not cached as validated either.
+            assert not any(key[0] == palace_path for key in palace._VALIDATED_IDENTITY)
 
             assert holder.stdin is not None
             holder.stdin.close()

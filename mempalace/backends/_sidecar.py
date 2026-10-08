@@ -47,11 +47,29 @@ def write_embedder_sidecar(path: Optional[str], collection_name: Optional[str], 
     """Record ``identity`` for ``collection_name`` in the sidecar, creating it if needed.
 
     No-ops for a missing path, missing collection name, or a nameless identity.
-    Preserves other collections' entries; never raises on I/O failure. The
-    file is replaced atomically, so a failed write keeps the previous one.
+    Preserves other collections' entries. Creates the palace directory when it
+    does not exist yet: qdrant and pgvector record a new palace's identity on
+    its first open, before their first upsert creates the folder, and the
+    write used to fail there silently, leaving the palace unrecorded for good.
+
+    The file is replaced atomically, so a failed write keeps the previous
+    one, and a failure raises
+    :class:`~mempalace.backends.base.EmbedderIdentityRecordError` instead of
+    passing silently. Only write paths record an identity, so read-only opens
+    are unaffected.
     """
     if not path or not collection_name or not identity or not getattr(identity, "model_name", ""):
         return
+    directory = os.path.dirname(path) or "."
+    if not os.path.isdir(directory):
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError as exc:
+            raise _record_error(path, collection_name, exc) from exc
+        try:
+            os.chmod(directory, 0o700)
+        except (OSError, NotImplementedError):
+            pass
     data: dict = {}
     if os.path.isfile(path):
         try:
@@ -65,7 +83,20 @@ def write_embedder_sidecar(path: Optional[str], collection_name: Optional[str], 
         "model_name": str(identity.model_name),
         "dimension": int(identity.dimension or 0),
     }
-    _write_atomically(path, data)
+    try:
+        _write_atomically(path, data)
+    except (OSError, NotImplementedError, TypeError, ValueError) as exc:
+        raise _record_error(path, collection_name, exc) from exc
+
+
+def _record_error(path: str, collection_name: str, exc: BaseException):
+    from .base import EmbedderIdentityRecordError
+
+    return EmbedderIdentityRecordError(
+        f"could not record the embedder identity of collection {collection_name!r} "
+        f"in {path}: {type(exc).__name__}: {exc}. Without it a later model swap "
+        "would not be detected; check that the palace directory is writable and retry."
+    )
 
 
 def _write_atomically(path: str, data: dict) -> None:
@@ -75,7 +106,7 @@ def _write_atomically(path: str, data: dict) -> None:
     stays on one filesystem), is fsynced, then renamed over the sidecar. An
     interrupted or failed write leaves the previous sidecar intact instead
     of a truncated file, which would read back as "no identity recorded".
-    Never raises on I/O failure; the temp file is removed.
+    A failure re-raises after the temp file is removed.
     """
     tmp_path = None
     try:
@@ -95,8 +126,6 @@ def _write_atomically(path: str, data: dict) -> None:
             pass
         os.replace(tmp_path, path)
         tmp_path = None
-    except (OSError, NotImplementedError, TypeError, ValueError):
-        pass
     finally:
         if tmp_path is not None:
             try:

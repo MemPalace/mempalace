@@ -54,6 +54,7 @@ def cmd_mine(args):
     from ..backends.base import (
         DimensionMismatchError,
         EmbedderIdentityMismatchError,
+        EmbedderIdentityRecordError,
         EmbeddingFunctionMismatchError,
     )
     from ..embedding import EmbeddingFunctionUnavailableError, UnknownEmbeddingModelError
@@ -63,6 +64,7 @@ def cmd_mine(args):
     model_errors = (
         UnknownEmbeddingModelError,
         EmbeddingFunctionUnavailableError,
+        EmbedderIdentityRecordError,
         EmbedderIdentityMismatchError,
         DimensionMismatchError,
         EmbeddingFunctionMismatchError,

@@ -99,8 +99,23 @@ EMBEDDING_DIMENSION_MISMATCH_ERROR = "Embedding dimension mismatch"
 EMBEDDING_MODEL_MISMATCH_ERROR = "Embedding model mismatch"
 
 
+class EmbedderIdentityRecordError(BackendError):
+    """The embedder identity could not be recorded for a collection.
+
+    Raised on write paths only (a brand-new collection's first write open,
+    ``palace set-embedder``): writing on without a recorded identity would
+    leave the palace unprotected against a later same-dimension model swap.
+    Reads never record an identity, so they never raise it.
+    """
+
+
+EMBEDDER_IDENTITY_NOT_RECORDED_ERROR = "Embedder identity not recorded"
+
+
 def model_mismatch_error_kind(exc: BaseException) -> Optional[str]:
     """The result ``error`` value for a model mismatch error, else None."""
+    if isinstance(exc, EmbedderIdentityRecordError):
+        return EMBEDDER_IDENTITY_NOT_RECORDED_ERROR
     if isinstance(exc, EmbedderIdentityMismatchError):
         return EMBEDDER_IDENTITY_MISMATCH_ERROR
     if isinstance(exc, DimensionMismatchError):

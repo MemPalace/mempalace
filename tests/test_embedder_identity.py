@@ -643,9 +643,18 @@ def test_a_failed_sidecar_write_leaves_the_previous_sidecar_intact(tmp_path, mon
     else:
         monkeypatch.setattr(_sidecar.os, "replace", boom)
 
-    _sidecar.write_embedder_sidecar(
-        str(path), "mempalace_drawers", EmbedderIdentity("embeddinggemma", 768)
-    )
+    if failure == "fsync":
+        _sidecar.write_embedder_sidecar(
+            str(path), "mempalace_drawers", EmbedderIdentity("embeddinggemma", 768)
+        )
+    else:
+        # A failed write is loud, not silent (the palace would go unrecorded).
+        from mempalace.backends.base import EmbedderIdentityRecordError
+
+        with pytest.raises(EmbedderIdentityRecordError, match="No space left"):
+            _sidecar.write_embedder_sidecar(
+                str(path), "mempalace_drawers", EmbedderIdentity("embeddinggemma", 768)
+            )
     monkeypatch.undo()
     if failure == "fsync":
         # fsync is best effort (not every filesystem has it); the write lands.
