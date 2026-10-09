@@ -32,6 +32,7 @@ from .normalize import UnparsedCodexTranscriptError, normalize_conversations
 from .source_identity import identity_metadata, source_directory_identity
 from .entities import entities_metadata
 from .palace import (
+    CODEX_NORMALIZE_VERSION,
     CONVO_CHUNKER_VERSION,
     NORMALIZE_VERSION,
     SKIP_DIRS,
@@ -39,6 +40,7 @@ from .palace import (
     _validate_palace_fts5_after_mine,
     file_already_mined,
     get_collection,
+    is_codex_rollout_source,
     mine_lock,
     mine_palace_lock,
     mine_yield_point,
@@ -146,6 +148,8 @@ def file_conversation_exchange(
         # a live exchange and a historical one by the same rule (#2320).
         **identity_metadata(source_file),
     }
+    if is_codex_rollout_source(source_file):
+        metadata["codex_normalize_version"] = CODEX_NORMALIZE_VERSION
     if extra_metadata:
         for key, value in extra_metadata.items():
             metadata.setdefault(key, value)
@@ -265,6 +269,8 @@ def _register_file(
     }
     if extract_mode == "exchange":
         meta["convo_chunker_version"] = CONVO_CHUNKER_VERSION
+    if is_codex_rollout_source(source_file):
+        meta["codex_normalize_version"] = CODEX_NORMALIZE_VERSION
     if source_mtime is not None:
         meta["source_mtime"] = source_mtime
     if content_hash is not None:
@@ -749,6 +755,7 @@ def _file_chunks_locked(
         except OSError:
             source_mtime = None
         chunk_total = len(chunks)
+        codex_rollout = is_codex_rollout_source(source_file)
         try:
             for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
                 batch_docs: list = []
@@ -783,6 +790,8 @@ def _file_chunks_locked(
                     }
                     if extract_mode == "exchange":
                         meta["convo_chunker_version"] = CONVO_CHUNKER_VERSION
+                    if codex_rollout:
+                        meta["codex_normalize_version"] = CODEX_NORMALIZE_VERSION
                     if source_mtime is not None:
                         meta["source_mtime"] = source_mtime
                     if source_dir_ino:
@@ -912,7 +921,9 @@ def _resolve_wing(convo_path: Path, wing: Optional[str]) -> str:
          an AI-tool path. Empty string is treated as "no wing".
       2. AI-tool path detection — defaults to ``wing_api`` so Claude
          Code / Codex / Gemini conversations group under a single wing
-         dedicated to API-sourced content.
+         dedicated to API-sourced content. On this path a Codex rollout
+         that records its project is re-routed per file by
+         ``_codex_project_wing``; ``wing_api`` is the fallback.
       3. Basename fallback — sanitized via ``config.normalize_wing_name``
          (lowercase, spaces/hyphens collapsed to underscores). Shared
          single source of truth with ``cmd_init``,
@@ -926,6 +937,70 @@ def _resolve_wing(convo_path: Path, wing: Optional[str]) -> str:
     if _is_ai_tool_path(convo_path):
         return "wing_api"
     return normalize_wing_name(convo_path.name)
+
+
+def _existing_wing_names(palace_config) -> set:
+    """Wings already in the palace, from the grouped-counts reader ``wings
+    split`` uses. Empty when the reader is unavailable (non-sqlite backend,
+    missing palace) -- routing then falls back to derived names."""
+    from .palace_graph import sqlite_grouped_counts_reader
+
+    try:
+        reader = sqlite_grouped_counts_reader(palace_config)
+        rows = reader(palace_config.palace_path, palace_config.collection_name) if reader else None
+    except Exception:
+        logger.debug("Could not list existing wings for Codex routing", exc_info=True)
+        return set()
+    return {str(r[1]) for r in rows or () if r[1]}
+
+
+def _codex_project_wing(filepath: Path, existing_wings) -> Optional[str]:
+    """Wing for a Codex rollout: the project its session ran in, or ``None``.
+
+    Reads the ``cwd`` recorded in the rollout's ``session_meta`` and resolves
+    it exactly as ``mempalace wings split`` resolves a Codex project key --
+    to an existing wing whose name the project ends with, else a derived
+    name -- so mining a rollout and splitting ``wing_api`` afterwards land
+    the same session in the same wing.
+
+    ``None`` (caller keeps its default wing) when the file is not a rollout,
+    records no ``cwd``, or the session belongs to no project (see
+    ``wing_split.codex_project_name``).
+    """
+    from .config import sanitize_name
+    from .wing_split import _codex_cwd, codex_project_name, resolve_target
+
+    if not is_codex_rollout_source(str(filepath)):
+        return None
+    project = codex_project_name(_codex_cwd(str(filepath)))
+    if not project:
+        return None
+    target, _how = resolve_target(project, existing_wings)
+    try:
+        return sanitize_name(target, "wing")
+    except ValueError:
+        return None
+
+
+def _wing_note(file_wing: str, run_wing: str) -> str:
+    """Progress-line suffix naming a file's wing when it differs from the run's."""
+    return f"  -> {file_wing}" if file_wing != run_wing else ""
+
+
+def _codex_wing_router(convo_path: Path, explicit_wing, default_wing: str, files, palace_config):
+    """``(wing_for, per_project)``: the per-file wing chooser for this run.
+
+    Only on the AI-tool default path (no explicit ``--wing``) and only when the
+    scan found a rollout does ``per_project`` hold: each rollout then files
+    into its project's wing via ``_codex_project_wing``, everything else into
+    ``default_wing``. Otherwise every file gets ``default_wing``.
+    """
+    if explicit_wing or not _is_ai_tool_path(convo_path):
+        return (lambda _filepath: default_wing), False
+    if not any(is_codex_rollout_source(str(f)) for f in files):
+        return (lambda _filepath: default_wing), False
+    existing = _existing_wing_names(palace_config) - {default_wing}
+    return (lambda filepath: _codex_project_wing(filepath, existing) or default_wing), True
 
 
 def mine_convos(
@@ -1002,6 +1077,13 @@ def _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=None
         compute_hallways_for_wing(wing, col=collection, config=config)
     except Exception as exc:
         print(f"  (hallways skipped: {exc})")
+
+
+def _compute_hallways_for_wings_safe(wings, collection, drawers_filed, config=None):
+    """``_compute_hallways_for_wing_safe`` for every wing this mine filed into
+    (one per Codex project, plus the run's own wing)."""
+    for wing in sorted(wings):
+        _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=config)
 
 
 def _normalize_convo_conversations(
@@ -1091,14 +1173,22 @@ def _mine_convos_impl(
     cfg_min_chunk_size = explicit_min if explicit_min is not None else MIN_CHUNK_SIZE
 
     convo_path = Path(convo_dir).expanduser().resolve()
+    explicit_wing = wing
     wing = _resolve_wing(convo_path, wing)
 
     files = scan_convos(convo_dir, include_subagents=include_subagents)
+    # Codex rollouts record the project they ran in, so on the AI-tool
+    # default path each one files into that project's wing instead of
+    # wing_api. An explicit --wing always wins.
+    wing_for, per_project = _codex_wing_router(
+        convo_path, explicit_wing, wing, files, palace_config
+    )
+    wings_filed: set = set()
 
     print(f"\n{'=' * 55}")
     print("  MemPalace Mine -- Conversations")
     print(f"{'=' * 55}")
-    print(f"  Wing:    {wing}")
+    print(f"  Wing:    {wing}{' (Codex rollouts: per project)' * per_project}")
     print(f"  Source:  {convo_path}")
     limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
     print(f"  Files:   {len(files)}{limit_suffix}")
@@ -1166,11 +1256,13 @@ def _mine_convos_impl(
             files_skipped += 1
             continue
 
+        file_wing = wing_for(filepath)
+
         conversations = _normalize_convo_conversations(
             filepath,
             source_file,
             collection,
-            wing,
+            file_wing,
             agent,
             extract_mode,
             dry_run,
@@ -1186,11 +1278,11 @@ def _mine_convos_impl(
         # filed under a different source_file in this wing are dropped;
         # the rest are re-joined and mined as usual.
         new_items, duplicates = _split_new_and_duplicate_conversations(
-            conversations, wing, source_file, mined_content_hashes
+            conversations, file_wing, source_file, mined_content_hashes
         )
         if not new_items:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _register_file(collection, source_file, file_wing, agent, extract_mode)
             dup_source = duplicates[0][1]
             print(
                 f"  = [{i:4}/{len(files)}] {filepath.name[:50]:50} "
@@ -1217,7 +1309,7 @@ def _mine_convos_impl(
 
         if not chunks:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _register_file(collection, source_file, file_wing, agent, extract_mode)
             continue
 
         # Detect room from content (general mode uses memory_type instead)
@@ -1234,7 +1326,10 @@ def _mine_convos_impl(
                 types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
                 print(f"    [DRY RUN] {filepath.name} -> {len(chunks)} memories ({types_str})")
             else:
-                print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
+                print(
+                    f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)"
+                    f"{_wing_note(file_wing, wing)}"
+                )
             total_drawers += len(chunks)
             # Track room counts
             if extract_mode == "general":
@@ -1256,7 +1351,7 @@ def _mine_convos_impl(
             collection,
             source_file,
             chunks,
-            wing,
+            file_wing,
             room,
             agent,
             extract_mode,
@@ -1271,10 +1366,14 @@ def _mine_convos_impl(
             room_counts[r] += n
 
         for h, _ in new_items:
-            mined_content_hashes[(wing, h)] = source_file
+            mined_content_hashes[(file_wing, h)] = source_file
+        wings_filed.add(file_wing)
         total_drawers += drawers_added
         files_mined += 1
-        print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
+        print(
+            f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}"
+            f"{_wing_note(file_wing, wing)}"
+        )
         if limit > 0 and files_mined >= limit:
             break
 
@@ -1282,7 +1381,9 @@ def _mine_convos_impl(
         # Compute hallways before the FTS5 validation: the latter opens a direct sqlite
         # connection to the Chroma DB, which can invalidate the live collection handle on
         # some Chroma builds and make the hallway fetch fail.
-        _compute_hallways_for_wing_safe(wing, collection, total_drawers, config=palace_config)
+        _compute_hallways_for_wings_safe(
+            wings_filed, collection, total_drawers, config=palace_config
+        )
         _validate_palace_fts5_after_mine(palace_path, writes_since=writes_at_start)
 
     print(f"\n{'=' * 55}")

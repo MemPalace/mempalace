@@ -67,14 +67,36 @@ def _codex_cwd(path: str) -> Optional[str]:
     return None
 
 
+# Codex Desktop starts a chat that has no project in a fresh scratch folder,
+# ``~/Documents/Codex/<YYYY-MM-DD>/<slug>``; its leaf names the chat, not a
+# project.
+_CODEX_SCRATCH_RE = re.compile(r"/codex/\d{4}-\d{2}-\d{2}/[^/]+$", re.IGNORECASE)
+
+
+def codex_project_name(cwd: Optional[str]) -> Optional[str]:
+    """The project a Codex session's ``cwd`` names, or ``None`` for no project.
+
+    The last path segment, except for the home directory and Codex Desktop's
+    per-chat scratch folders, which belong to no project.
+    """
+    if not cwd:
+        return None
+    cwd_norm = cwd.replace("\\", "/").rstrip("/")
+    home = os.path.expanduser("~").replace("\\", "/").rstrip("/")
+    if not cwd_norm or cwd_norm.lower() == home.lower() or _CODEX_SCRATCH_RE.search(cwd_norm):
+        return None
+    return cwd_norm.rsplit("/", 1)[-1] or None
+
+
 def project_key(source_file: Optional[str]) -> Optional[str]:
     """The project identifier a transcript path carries, or ``None``.
 
     Claude Code encodes the working directory in the path
     (``.claude/projects/-Users-me-dev-mempalace/<session>.jsonl``,
     subagent transcripts nest below it); the encoded segment is the key.
-    Codex rollouts carry no project in the path; the key is the basename of
-    the ``cwd`` in the file when the file is on this machine.
+    Codex rollouts carry no project in the path; the key is
+    :func:`codex_project_name` of the ``cwd`` in the file when the file is on
+    this machine.
     """
     if not source_file:
         return None
@@ -82,10 +104,7 @@ def project_key(source_file: Optional[str]) -> Optional[str]:
     if match:
         return match.group(1)
     if _CODEX_SESSIONS_RE.search(source_file):
-        cwd = _codex_cwd(source_file)
-        if cwd:
-            base = cwd.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
-            return base or None
+        return codex_project_name(_codex_cwd(source_file))
     return None
 
 

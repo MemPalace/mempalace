@@ -8,6 +8,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **Codex rollouts mine into the project they ran in.** `mempalace mine
+  ~/.codex --mode convos` without `--wing` files each rollout under the wing
+  of the `cwd` its `session_meta` records, resolved the way `wings split`
+  resolves it (an existing wing the project name ends with, else a derived
+  name), instead of putting every session in `wing_api`. Sessions in the home
+  directory, Codex Desktop's per-chat scratch folders
+  (`Documents/Codex/<date>/<slug>`) and rollouts with no `cwd` stay in
+  `wing_api`; `wings split` now leaves those folders alone too instead of
+  making a wing per chat. An explicit `--wing` still wins.
+
+### Fixed
+
+- **A Codex parser fix now reaches rollouts that were already filed.** Convo
+  rows from a Codex rollout carry `codex_normalize_version`; a missing or
+  older value makes the next mine re-normalize that rollout even when its
+  bytes and mtime are unchanged, replacing its drawers through the usual
+  purge-then-refile path. Rollouts stored as raw JSON by releases before the
+  unsupported-rollout guard, or filed into `wing_api`, are rebuilt once on the
+  first mine after upgrade; later mines skip them as before. A rollout the
+  parser still can't read keeps its old drawers and stays eligible for retry.
+  (#2470)
+
 ---
 
 ## [3.11.0] — 2026-10-02
