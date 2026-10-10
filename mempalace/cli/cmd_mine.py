@@ -2,6 +2,8 @@
 if __name__ != "mempalace.cli":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.cli")
 
+from typing import Optional
+
 
 def cmd_mine(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
@@ -50,6 +52,7 @@ def cmd_mine(args):
         return
 
     from ..palace import MineAlreadyRunning, MineFileErrors, MineValidationError
+    from ..media import MediaAssetError, MediaAssetSetupError
 
     if source_adapter:
         try:
@@ -58,15 +61,30 @@ def cmd_mine(args):
                 source_path=args.dir,
                 palace_path=palace_path,
                 dry_run=args.dry_run,
+                **(
+                    {
+                        "project": getattr(args, "wing", None),
+                        "related_drawer_id": getattr(args, "related_drawer_id", None),
+                    }
+                    if source_adapter == "media"
+                    else {}
+                ),
             )
         except (UnknownSourceAdapterError, UnsupportedSourceAdapterProtocolError) as exc:
             print(f"mempalace: {exc}", file=sys.stderr)
+            sys.exit(2)
+        except MediaAssetSetupError as exc:
+            print(f"mempalace: media indexing is unavailable: {exc}", file=sys.stderr)
+            sys.exit(2)
+        except MediaAssetError as exc:
+            print(f"mempalace: media indexing failed: {exc}", file=sys.stderr)
             sys.exit(2)
         except MineAlreadyRunning as exc:
             print(f"mempalace: {exc}", file=sys.stderr)
             sys.exit(1)
         suffix = " would be written" if args.dry_run else " written"
-        print(f"  Source adapter {source_adapter!r}: {drawers_written} drawer(s){suffix}.")
+        item_name = "media asset(s)" if source_adapter == "media" else "drawer(s)"
+        print(f"  Source adapter {source_adapter!r}: {drawers_written} {item_name}{suffix}.")
         return
 
     # A live HTTP hub for this palace holds the MCP writer lease, so a
@@ -235,6 +253,8 @@ def mine_source_adapter(
     source_path: str,
     palace_path: str,
     dry_run: bool = False,
+    project: Optional[str] = None,
+    related_drawer_id: Optional[str] = None,
 ) -> int:
     """Run an explicitly selected RFC 002 source adapter through ``PalaceContext``.
 
@@ -242,6 +262,8 @@ def mine_source_adapter(
     miners.  Until those miners are migrated to first-party adapters, no-flag
     and ``--mode`` calls must retain their established dispatch paths.
     """
+    import logging
+
     from ..knowledge_graph import KnowledgeGraph
     from ..palace import get_collection, mine_palace_lock
     from ..sources import (
@@ -252,6 +274,9 @@ def mine_source_adapter(
         get_adapter,
         resolve_adapter_for_source,
     )
+    from ..media import MediaAsset, MediaAssetError, MediaAssetSetupError, store_media_asset
+
+    logger = logging.getLogger(__name__)
 
     adapter_name = resolve_adapter_for_source(explicit=source_name)
     try:
@@ -293,8 +318,16 @@ def mine_source_adapter(
                 adapter_version=adapter.adapter_version,
             )
             drawers_written = 0
+            media_failures = 0
+            media_seen = 0
+            source_options = {}
+            if source_name == "media":
+                if project:
+                    source_options["project"] = project
+                if related_drawer_id:
+                    source_options["related_drawer_id"] = related_drawer_id
             for result in adapter.ingest(
-                source=SourceRef(local_path=source_path),
+                source=SourceRef(local_path=source_path, options=source_options),
                 palace=context,
             ):
                 if isinstance(result, SourceItemMetadata):
@@ -313,10 +346,41 @@ def mine_source_adapter(
                     drawers_written += 1
                     context.upsert_drawer(result)
                     continue
+                if isinstance(result, MediaAsset):
+                    media_seen += 1
+                    if dry_run:
+                        drawers_written += 1
+                        continue
+                    try:
+                        drawers_written += store_media_asset(
+                            result,
+                            palace_path,
+                            drawer_collection=drawer_collection,
+                        )
+                    except MediaAssetSetupError:
+                        raise
+                    except Exception as exc:
+                        media_failures += 1
+                        logger.warning(
+                            "skipping media asset %s: %s",
+                            result.source_file,
+                            exc,
+                        )
+                    continue
                 raise TypeError(
                     f"source adapter {adapter_name!r} yielded unsupported result type "
                     f"{type(result).__name__}"
                 )
+            if media_failures:
+                logger.warning(
+                    "media indexing finished: %d indexed, %d failed",
+                    drawers_written,
+                    media_failures,
+                )
+                if not dry_run and media_seen == media_failures:
+                    raise MediaAssetError(
+                        f"all {media_failures} discovered media assets failed; none were indexed"
+                    )
             return drawers_written
         finally:
             if knowledge_graph is not None and hasattr(knowledge_graph, "close"):

@@ -174,6 +174,8 @@ def search(
     since: str = None,
     before: str = None,
     collection=None,
+    include_media: bool = False,
+    query_task: str = "search",
 ):
     """
     Search the palace. Returns verbatim drawer content.
@@ -181,6 +183,35 @@ def search(
     drawers whose ``filed_at`` falls in the ``[since, before)`` window —
     same semantics as ``search_memories``/``list_drawers`` (#1128/#463).
     """
+    if include_media or query_task != "search":
+        result = search_memories(
+            query,
+            palace_path,
+            wing=wing,
+            room=room,
+            n_results=n_results,
+            since=since,
+            before=before,
+            include_media=include_media,
+            query_task=query_task,
+        )
+        if result.get("error"):
+            print(result["error"])
+            raise SearchError(result["error"])
+        for index, hit in enumerate(result["results"], 1):
+            kind = hit.get("media_type") or "text/code"
+            print(f"{index}. [{kind}] {hit['source_file']}  similarity={hit['similarity']:.3f}")
+            print(f"   {hit['source_path']}")
+            if hit.get("result_type") == "asset":
+                if not hit.get("available"):
+                    print("   File is missing; the indexed reference is retained.")
+                if hit.get("drawer_id"):
+                    print(f"   Related drawer: {hit['drawer_id']}")
+            else:
+                print(hit["text"])
+        if not result["results"]:
+            print("No results found.")
+        return
     # Resolved before the fence below: both exits from this function rank by
     # BM25, so the filter has to be in hand on either branch.
     stop_words = _resolve_stop_words(None)

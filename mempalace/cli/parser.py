@@ -193,6 +193,11 @@ def main():
     )
     p_mine.add_argument("--wing", default=None, help="Wing name (default: directory name)")
     p_mine.add_argument(
+        "--related-drawer-id",
+        default=None,
+        help="Associate media assets with an existing drawer (--source media only)",
+    )
+    p_mine.add_argument(
         "--no-gitignore",
         action="store_true",
         help="Don't respect .gitignore files when scanning project files",
@@ -311,6 +316,17 @@ def main():
     p_search.add_argument("--wing", default=None, help="Limit to one project")
     p_search.add_argument("--room", default=None, help="Limit to one room")
     p_search.add_argument("--results", type=int, default=5, help="Number of results")
+    p_search.add_argument(
+        "--include-media",
+        action="store_true",
+        help="Include local media assets using shared EmbeddingGemma 2 cosine ranking",
+    )
+    p_search.add_argument(
+        "--query-task",
+        choices=["search", "code"],
+        default="search",
+        help="Use the EmbeddingGemma 2 code retrieval prompt (default: search)",
+    )
     p_search.add_argument(
         "--since",
         default=None,

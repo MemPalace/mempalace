@@ -281,6 +281,9 @@ def _default_config_dir() -> Path:
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
 DEFAULT_BACKEND = "chroma"
+DEFAULT_EMBEDDINGGEMMA2_REVISION = "914f7f89142e33e77833254d9c9b90c3cef7303b"
+_EMBEDDINGGEMMA2_DIMENSIONS = frozenset({768, 512, 256, 128})
+_EMBEDDINGGEMMA2_MODALITIES = frozenset({"text", "text+vision", "text+audio", "all"})
 DEFAULT_MILVUS_CONSISTENCY_LEVEL = "Strong"
 _MILVUS_CONSISTENCY_LEVELS = {
     "strong": "Strong",
@@ -868,6 +871,14 @@ class MempalaceConfig:
                 embedding_api_model=self.embedding_api_model,
                 embedding_api_url=self.embedding_api_url,
             )
+        elif embedding_model == "embeddinggemma2":
+            effective.update(
+                embeddinggemma2_dimension=self.embeddinggemma2_dimension,
+                embeddinggemma2_modalities=self.embeddinggemma2_modalities,
+                embeddinggemma2_revision=self.embeddinggemma2_revision,
+                embedding_device=self.embedding_device,
+                embedding_threads=self.embedding_threads,
+            )
         else:
             effective.update(
                 embedding_device=self.embedding_device,
@@ -1364,7 +1375,8 @@ class MempalaceConfig:
 
         Values: ``"minilm"`` (ChromaDB's all-MiniLM-L6-v2 — English-only),
         ``"embeddinggemma"`` (multilingual, 100+ languages, default for
-        new installs since onboarding writes the choice), or
+        new installs since onboarding writes the choice),
+        ``"embeddinggemma2"`` (Google EmbeddingGemma 2), or
         ``"openai-compat"`` (embeddings served by an OpenAI-compatible
         ``/v1/embeddings`` endpoint — see ``embedding_api_url`` /
         ``embedding_api_model`` / ``embedding_api_key``). Read from env
@@ -1441,6 +1453,65 @@ class MempalaceConfig:
         return val if val > 0 else _EMBEDDINGGEMMA_BATCH_SIZE
 
     @property
+    def embeddinggemma2_dimension(self) -> int:
+        """EmbeddingGemma 2 output dimension (768, 512, 256, or 128).
+
+        Read from ``MEMPALACE_EMBEDDINGGEMMA2_DIMENSION`` first, then
+        ``embeddinggemma2_dimension`` in ``config.json``, then 768. Invalid
+        values raise ``ValueError`` so the selected model cannot silently use
+        a dimension different from the configured vector space.
+        """
+        raw = os.environ.get("MEMPALACE_EMBEDDINGGEMMA2_DIMENSION")
+        if raw is None:
+            raw = self._file_config.get("embeddinggemma2_dimension", 768)
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "embeddinggemma2_dimension must be one of 768, 512, 256, or 128"
+            ) from exc
+        if value not in _EMBEDDINGGEMMA2_DIMENSIONS:
+            raise ValueError("embeddinggemma2_dimension must be one of 768, 512, 256, or 128")
+        return value
+
+    @property
+    def embeddinggemma2_modalities(self) -> str:
+        """Enabled modalities: text, text+vision, text+audio, or all.
+
+        Read from ``MEMPALACE_EMBEDDINGGEMMA2_MODALITIES`` first, then
+        ``embeddinggemma2_modalities`` in ``config.json``, then ``"text"``.
+        Values are normalized to lowercase and invalid values raise
+        ``ValueError``.
+        """
+        raw = os.environ.get("MEMPALACE_EMBEDDINGGEMMA2_MODALITIES")
+        if raw is None:
+            raw = self._file_config.get("embeddinggemma2_modalities", "text")
+        value = str(raw).strip().lower()
+        if value not in _EMBEDDINGGEMMA2_MODALITIES:
+            allowed = ", ".join(sorted(_EMBEDDINGGEMMA2_MODALITIES))
+            raise ValueError(f"embeddinggemma2_modalities must be one of: {allowed}")
+        return value
+
+    @property
+    def embeddinggemma2_revision(self) -> str:
+        """Immutable Hugging Face commit pinned for reproducible model loading.
+
+        Read from ``MEMPALACE_EMBEDDINGGEMMA2_REVISION`` first, then
+        ``embeddinggemma2_revision`` in ``config.json``, then the pinned
+        default. Only a full 40-character hexadecimal commit is accepted;
+        branch names and tags are mutable and rejected.
+        """
+        raw = os.environ.get("MEMPALACE_EMBEDDINGGEMMA2_REVISION")
+        if raw is None:
+            raw = self._file_config.get(
+                "embeddinggemma2_revision", DEFAULT_EMBEDDINGGEMMA2_REVISION
+            )
+        value = str(raw).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", value):
+            raise ValueError("embeddinggemma2_revision must be a 40-character hexadecimal commit")
+        return value
+
+    @property
     def hybrid_rank_vector_weight(self) -> float:
         """Weight of the vector (embedding-similarity) signal in the hybrid
         re-rank (``searcher._hybrid_rank``).
@@ -1478,10 +1549,10 @@ class MempalaceConfig:
     def set_embedding_model(self, model: str) -> None:
         """Persist the embedding-model choice to ``config.json``.
 
-        Onboarding calls this once on first run. Accepts ``"minilm"`` or
-        ``"embeddinggemma"``; other values are normalized to lowercase and
-        passed through (``embedding.get_embedding_function`` falls back to
-        minilm for unrecognized values).
+        Onboarding calls this once on first run. Accepts ``"minilm"``,
+        ``"embeddinggemma"``, ``"embeddinggemma2"``, or ``"openai-compat"``;
+        other values are normalized to lowercase and persisted. The embedding
+        factory rejects unrecognized values when resolving the provider.
         """
         self._file_config["embedding_model"] = str(model).strip().lower()
         # ``develop`` created the directory here, outside any ``try``, so this

@@ -42,6 +42,8 @@ def _hub_forward_disabled() -> bool:
 
 def _search_args_forwardable(args) -> bool:
     """Return whether ``mempalace_search`` preserves this CLI search exactly."""
+    if getattr(args, "include_media", False) or getattr(args, "query_task", "search") != "search":
+        return False
     if _backend_arg(args) or not 1 <= args.results <= _HUB_SEARCH_MAX_RESULTS:
         return False
     if any(os.environ.get(name, "").strip() for name in _SEARCH_OVERRIDE_ENV_VARS):

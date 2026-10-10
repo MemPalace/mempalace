@@ -1157,7 +1157,7 @@ def test_palace_wrapper_embeds_for_chroma(tmp_path, monkeypatch):
 
     calls = []
 
-    def fake_embed(texts):
+    def fake_embed(texts, **_kwargs):
         texts = list(texts)
         calls.append(texts)
         return [[float(len(text)), 1.0, 0.0, 0.0] for text in texts]

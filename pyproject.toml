@@ -77,6 +77,10 @@ rust_exact = "mempalace.backends.rust_exact:RustExactBackend"
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
+    # Offline media tests exercise real image objects and audio resampling
+    # without installing the optional model or its PyTorch dependencies.
+    "pillow>=10.0",
+    "scipy>=1.10",
     # Retries known-transient ChromaDB-on-Windows HNSW compaction failures in CI
     # (wired only into the test-windows job in ci.yml, scoped to the specific
     # error). Local/Linux/macOS runs never rerun, so real failures stay loud.
@@ -122,6 +126,22 @@ pgvector = ["psycopg[binary]>=3.1"]
 gpu = ["onnxruntime-gpu>=1.16"]
 dml = ["onnxruntime-directml>=1.16"]
 coreml = ["onnxruntime>=1.16"]
+# Opt-in PyTorch/Transformers implementation of Google EmbeddingGemma 2.
+# The upstream image extra supplies Pillow and torchvision, which the
+# processor imports even for text-only use.
+embeddinggemma2 = [
+    "sentence-transformers[image]>=6.1.0; python_version >= '3.10'",
+    "transformers>=5.19.0; python_version >= '3.10'",
+    "torch>=2.14.0; python_version >= '3.10'",
+]
+multimodal = [
+    "sentence-transformers[image]>=6.1.0; python_version >= '3.10'",
+    "transformers>=5.19.0; python_version >= '3.10'",
+    "torch>=2.14.0; python_version >= '3.10'",
+    "soundfile>=0.13.1; python_version >= '3.10'",
+    "scipy>=1.10; python_version >= '3.10'",
+    "torchcodec>=0.17.0; python_version >= '3.10'",
+]
 # Multilingual extra kept as a no-op alias for back-compat with
 # `pip install mempalace[multilingual]` — these deps now ship in core.
 multilingual = []
@@ -145,6 +165,8 @@ extract = [
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
+    "pillow>=10.0",
+    "scipy>=1.10",
     # Retries known-transient ChromaDB-on-Windows HNSW compaction failures in CI
     # (wired only into the test-windows job in ci.yml, scoped to the specific
     # error). Local/Linux/macOS runs never rerun, so real failures stay loud.

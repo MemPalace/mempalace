@@ -182,6 +182,8 @@ def search_memories(
     collection_name: str = None,
     lang: Optional[str] = None,
     _pool_scale: int = 1,
+    include_media: bool = False,
+    query_task: str = "search",
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
 
@@ -247,6 +249,28 @@ def search_memories(
     # regardless of whether the call routes through the vector path or
     # the BM25-only fallback below.
     _validate_candidate_strategy(candidate_strategy)
+
+    if include_media or query_task != "search":
+        if vector_disabled:
+            return _search_error_result(
+                "Media/code vector search is disabled until the index is repaired"
+            )
+        from .media_search import search_with_media
+
+        return search_with_media(
+            query,
+            palace_path,
+            include_media=include_media,
+            query_task=query_task,
+            n_results=n_results,
+            wing=wing,
+            room=room,
+            source_file=source_file,
+            since=since,
+            before=before,
+            max_distance=max_distance,
+            collection_name=collection_name,
+        )
 
     # Resolve stop words once up-front so every BM25 site (the vector path's
     # `_hybrid_rank`, the `vector_disabled` fallback, and the union-merge

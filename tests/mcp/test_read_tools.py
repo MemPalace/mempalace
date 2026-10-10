@@ -67,7 +67,7 @@ class TestReadTools:
         monkeypatch.setattr(
             embedding_wrapper,
             "_embed_texts",
-            lambda texts: [[float(len(text)), 1.0] for text in texts],
+            lambda texts, **_kwargs: [[float(len(text)), 1.0] for text in texts],
         )
         col = get_collection(palace_path, create=True)
         col.add(
@@ -100,7 +100,7 @@ class TestReadTools:
         monkeypatch.setattr(
             embedding_wrapper,
             "_embed_texts",
-            lambda texts: [[float(len(text)), 1.0] for text in texts],
+            lambda texts, **_kwargs: [[float(len(text)), 1.0] for text in texts],
         )
         col = palace.get_collection(palace_path, create=True)
         col.add(
@@ -159,7 +159,7 @@ class TestReadTools:
         monkeypatch.setattr(
             embedding_wrapper,
             "_embed_texts",
-            lambda texts: [[float(len(text)), 1.0] for text in texts],
+            lambda texts, **_kwargs: [[float(len(text)), 1.0] for text in texts],
         )
         col = palace.get_collection(palace_path, create=True)
         col.add(
@@ -261,7 +261,7 @@ with mine_palace_lock(sys.argv[1]):
         monkeypatch.setattr(
             embedding_wrapper,
             "_embed_texts",
-            lambda texts: [[float(len(text)), 1.0] for text in texts],
+            lambda texts, **_kwargs: [[float(len(text)), 1.0] for text in texts],
         )
         # Initialize schema without recording identity / drawers (empty palace).
         col = palace.get_collection(palace_path, create=True, _skip_identity_check=True)

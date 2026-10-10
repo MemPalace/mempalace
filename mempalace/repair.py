@@ -176,15 +176,27 @@ def _drawers_collection_name() -> str:
         return COLLECTION_NAME
 
 
-def _recoverable_collections() -> tuple[str, ...]:
+def _recoverable_collections(palace_path: Optional[str] = None) -> tuple[str, ...]:
     """Collections rebuilt by ``rebuild_from_sqlite``, in upsert order.
 
     Drawers first (bulk data), then closets (AAAK index layer that
-    references drawer IDs by string in their documents — no
-    foreign-key validation, so ordering is informational, not
-    load-bearing).
+    references drawer IDs by string in their documents), then local media
+    assets. Collection ordering is informational, not load-bearing.
     """
-    return (_drawers_collection_name(), CLOSETS_COLLECTION_NAME)
+    # Media assets are first-class palace data too. The SQLite recovery path
+    # must either restore them with their original modality vectors or fail
+    # explicitly, rather than producing a palace that silently lost them.
+    from .palace import ASSETS_COLLECTION_NAME
+
+    collections = [_drawers_collection_name(), CLOSETS_COLLECTION_NAME]
+    # Keep the historical result shape for palaces without assets. When a
+    # source path is supplied, SQLite ground truth decides whether there are
+    # asset rows to restore and whether native media support is required.
+    if palace_path is not None:
+        asset_count = sqlite_drawer_count(palace_path, ASSETS_COLLECTION_NAME)
+        if asset_count is None or asset_count > 0:
+            collections.append(ASSETS_COLLECTION_NAME)
+    return tuple(dict.fromkeys(collections))
 
 
 # Back-compat alias for callers that imported the constant. New code
@@ -337,6 +349,97 @@ def _delete_collection_if_exists(backend, palace_path: str, collection_name: str
         return
 
 
+def _embeddinggemma2_collection(collection, enabled: bool):
+    """Wrap rebuild writes with EmbeddingGemma 2's metadata-aware encoder."""
+    if not enabled:
+        return collection
+    from .backends.embedding_wrapper import EmbeddingCollection
+
+    return EmbeddingCollection(collection)
+
+
+def _record_rebuilt_embedder_identity(collection, palace_path: str) -> None:
+    """Record the active identity only after the rebuilt collection verifies."""
+    from .embedding import get_embedder_identity
+    from .palace import clear_validated_embedder_identity
+
+    collection.set_embedder_identity(get_embedder_identity())
+    clear_validated_embedder_identity(palace_path)
+
+
+def _asset_media_embedder():
+    """Return the configured provider for native asset re-embedding."""
+    from .embedding import get_embedding_function
+
+    embedder = get_embedding_function()
+    if not callable(getattr(embedder, "embed_media", None)):
+        raise RuntimeError(
+            "repairing mempalace_assets requires an embedding provider with native "
+            "media support; select EmbeddingGemma 2 and enable the asset modality"
+        )
+    return embedder
+
+
+def _embed_asset_rows(embedder, rows):
+    """Encode asset descriptors from their local files and refresh identity metadata."""
+    import copy
+    from pathlib import Path
+
+    vectors = []
+    refreshed = []
+    for doc, meta in zip(rows[0], rows[1]):
+        source_path = meta.get("source_path") or meta.get("source_file")
+        media_type = str(meta.get("media_type", "")).strip().lower()
+        if not isinstance(source_path, str) or not source_path:
+            raise ValueError(
+                "media asset metadata is missing source_path; refusing text re-embedding"
+            )
+        if media_type not in {"image", "audio", "video"}:
+            raise ValueError(
+                f"media asset {source_path!r} has unsupported media_type {media_type!r}"
+            )
+        path = Path(source_path).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"media asset is unavailable at {path}; restore the file before rebuilding"
+            )
+        vectors.append(embedder.embed_media(str(path), media_type=media_type))
+        updated = copy.deepcopy(meta)
+        updated.update(
+            {
+                "embedding_model": embedder.identity,
+                "embedding_identity": embedder.identity,
+                "embedding_dimension": int(embedder.dimension),
+                "embedding_modalities": str(embedder.modalities),
+            }
+        )
+        refreshed.append(updated)
+    return vectors, refreshed
+
+
+def _preflight_asset_files(source_palace: str) -> None:
+    """Fail closed before archive/swap when any SQLite asset lacks its source file."""
+    from .palace import ASSETS_COLLECTION_NAME
+
+    asset_count = sqlite_drawer_count(source_palace, ASSETS_COLLECTION_NAME)
+    if asset_count is None:
+        raise ValueError("could not verify the media asset row count in chroma.sqlite3")
+    if asset_count == 0:
+        return
+    for asset_id, _doc, meta in extract_via_sqlite(source_palace, ASSETS_COLLECTION_NAME):
+        source_path = meta.get("source_path") or meta.get("source_file")
+        if not isinstance(source_path, str) or not source_path:
+            raise ValueError(
+                f"media asset {asset_id!r} is missing source_path metadata; "
+                "repair cannot safely reconstruct its vector"
+            )
+        if not os.path.isfile(os.path.expanduser(source_path)):
+            raise FileNotFoundError(
+                f"media asset {asset_id!r} references unavailable file {source_path!r}; "
+                "restore the file before rebuilding"
+            )
+
+
 class RebuildCollectionError(RuntimeError):
     """Raised when temp rebuild fails, carrying whether the live swap happened."""
 
@@ -354,9 +457,13 @@ def _rebuild_collection_via_temp(
     batch_size: int,
     collection_name: Optional[str] = None,
     progress=print,
+    embeddinggemma2: bool = False,
 ) -> int:
     expected = len(all_ids)
     collection_name = collection_name or _drawers_collection_name()
+    from .palace import ASSETS_COLLECTION_NAME
+
+    media_assets = collection_name == ASSETS_COLLECTION_NAME
     temp_name = f"{collection_name}__repair_tmp"
     live_replaced = False
 
@@ -364,13 +471,28 @@ def _rebuild_collection_via_temp(
         _delete_collection_if_exists(backend, palace_path, temp_name)
 
         progress(f"  Building temporary collection: {temp_name}")
+        # Asset descriptors are not the asset representation. Always use the
+        # provider's native media encoder and explicit vectors for this fixed
+        # collection, even when the text wrapper is enabled.
+        asset_embedder = _asset_media_embedder() if media_assets else None
         temp_col = backend.create_collection(palace_path, temp_name)
+        if not media_assets:
+            temp_col = _embeddinggemma2_collection(temp_col, embeddinggemma2)
         staged = 0
         for i in range(0, expected, batch_size):
             batch_ids = all_ids[i : i + batch_size]
             batch_docs = all_docs[i : i + batch_size]
             batch_metas = all_metas[i : i + batch_size]
-            temp_col.upsert(documents=batch_docs, ids=batch_ids, metadatas=batch_metas)
+            if media_assets:
+                vectors, batch_metas = _embed_asset_rows(asset_embedder, (batch_docs, batch_metas))
+                temp_col.upsert(
+                    documents=batch_docs,
+                    ids=batch_ids,
+                    metadatas=batch_metas,
+                    embeddings=vectors,
+                )
+            else:
+                temp_col.upsert(documents=batch_docs, ids=batch_ids, metadatas=batch_metas)
             staged += len(batch_ids)
             progress(f"  Staged {staged}/{expected} drawers...")
         _verify_collection_count(temp_col, expected, "temporary rebuild")
@@ -379,16 +501,29 @@ def _rebuild_collection_via_temp(
         backend.delete_collection(palace_path, collection_name)
         live_replaced = True
         new_col = backend.create_collection(palace_path, collection_name)
+        if not media_assets:
+            new_col = _embeddinggemma2_collection(new_col, embeddinggemma2)
 
         rebuilt = 0
         for i in range(0, expected, batch_size):
             batch_ids = all_ids[i : i + batch_size]
             batch_docs = all_docs[i : i + batch_size]
             batch_metas = all_metas[i : i + batch_size]
-            new_col.upsert(documents=batch_docs, ids=batch_ids, metadatas=batch_metas)
+            if media_assets:
+                vectors, batch_metas = _embed_asset_rows(asset_embedder, (batch_docs, batch_metas))
+                new_col.upsert(
+                    documents=batch_docs,
+                    ids=batch_ids,
+                    metadatas=batch_metas,
+                    embeddings=vectors,
+                )
+            else:
+                new_col.upsert(documents=batch_docs, ids=batch_ids, metadatas=batch_metas)
             rebuilt += len(batch_ids)
             progress(f"  Re-filed {rebuilt}/{expected} drawers...")
         _verify_collection_count(new_col, expected, "rebuilt live collection")
+        if embeddinggemma2 or media_assets:
+            _record_rebuilt_embedder_identity(new_col, palace_path)
 
         try:
             _delete_collection_if_exists(backend, palace_path, temp_name)
@@ -426,6 +561,7 @@ def _promote_temp_collection(
     expected: int,
     batch_size: int,
     progress=print,
+    embeddinggemma2: bool = False,
 ) -> int:
     """Recover a failed live-swap by promoting the verified temp copy.
 
@@ -439,18 +575,33 @@ def _promote_temp_collection(
     """
     temp_col = backend.get_collection(palace_path, temp_name)
     ids, docs, metas = _extract_drawers(temp_col, expected, batch_size)
+    from .palace import ASSETS_COLLECTION_NAME
+
+    media_assets = collection_name == ASSETS_COLLECTION_NAME
+    asset_embedder = _asset_media_embedder() if media_assets else None
     _delete_collection_if_exists(backend, palace_path, collection_name)
     new_col = backend.create_collection(palace_path, collection_name)
+    if not media_assets:
+        new_col = _embeddinggemma2_collection(new_col, embeddinggemma2)
     promoted = 0
     for i in range(0, len(ids), batch_size):
-        new_col.upsert(
-            documents=docs[i : i + batch_size],
-            ids=ids[i : i + batch_size],
-            metadatas=metas[i : i + batch_size],
-        )
+        batch_docs = docs[i : i + batch_size]
+        batch_metas = metas[i : i + batch_size]
+        kwargs = {
+            "documents": batch_docs,
+            "ids": ids[i : i + batch_size],
+            "metadatas": batch_metas,
+        }
+        if media_assets:
+            vectors, batch_metas = _embed_asset_rows(asset_embedder, (batch_docs, batch_metas))
+            kwargs["metadatas"] = batch_metas
+            kwargs["embeddings"] = vectors
+        new_col.upsert(**kwargs)
         promoted += len(ids[i : i + batch_size])
         progress(f"  Promoted {promoted}/{expected} drawers from verified temp copy...")
     _verify_collection_count(new_col, expected, "promoted temp collection")
+    if embeddinggemma2 or media_assets:
+        _record_rebuilt_embedder_identity(new_col, palace_path)
     # Promotion has already fully succeeded and verified at this point --
     # cleaning up the now-redundant temp copy is best-effort, matching the
     # identical post-success cleanup in _rebuild_collection_via_temp above.
@@ -1652,8 +1803,21 @@ def _rebuild_index_under_lease(
     progress: Callable[[str], None],
 ):
     """Run rebuild_index's snapshot/rebuild body under its writer lease."""
+    from .config import MempalaceConfig
+
+    embeddinggemma2 = MempalaceConfig().embedding_model == "embeddinggemma2"
     try:
-        col = backend.get_collection(palace_path, collection_name)
+        if embeddinggemma2:
+            # Opening through get_collection binds the configured EF, and
+            # Chroma rejects that name when the existing collection was
+            # created by the previous model. Use this backend's prepared
+            # client but request no EF so the old documents can be copied
+            # without embedding or interpreting them during extraction.
+            col = backend._client(palace_path).get_collection(
+                collection_name, embedding_function=None
+            )
+        else:
+            col = backend.get_collection(palace_path, collection_name)
         total = col.count()
     except Exception as e:
         progress(f"  Error reading palace: {e}")
@@ -1707,6 +1871,7 @@ def _rebuild_index_under_lease(
             batch_size,
             collection_name=collection_name,
             progress=progress,
+            embeddinggemma2=embeddinggemma2,
         )
     except RebuildCollectionError as e:
         progress(f"\n  ERROR during rebuild: {e}")
@@ -1731,6 +1896,7 @@ def _rebuild_index_under_lease(
                     len(all_ids),
                     batch_size,
                     progress=progress,
+                    embeddinggemma2=embeddinggemma2,
                 )
                 progress(
                     "  Recovery succeeded: live collection restored from the verified temp copy."
@@ -1840,19 +2006,30 @@ def _rebuild_one_collection(
     ids: list[str] = []
     docs: list[str] = []
     metas: list[dict] = []
+    embeddings: list[list[float]] = []
     upserted = 0
     col = None
+    from .palace import ASSETS_COLLECTION_NAME
+    from .config import MempalaceConfig
+
+    media_assets = collection_name == ASSETS_COLLECTION_NAME
+    embeddinggemma2 = MempalaceConfig().embedding_model == "embeddinggemma2"
+    asset_embedder = None
 
     def _flush() -> int:
         nonlocal upserted
         if not ids:
             return upserted
-        col.upsert(ids=list(ids), documents=list(docs), metadatas=list(metas))
+        kwargs = {"ids": list(ids), "documents": list(docs), "metadatas": list(metas)}
+        if media_assets:
+            kwargs["embeddings"] = list(embeddings)
+        col.upsert(**kwargs)
         upserted += len(ids)
         print(f"    upserted {upserted}")
         ids.clear()
         docs.clear()
         metas.clear()
+        embeddings.clear()
         return upserted
 
     try:
@@ -1862,7 +2039,11 @@ def _rebuild_one_collection(
         # reported as a structured ``RebuildPartialError`` carrying
         # ``archive_path`` — instead of an unstructured exception that
         # strands the user without recovery instructions.
+        if media_assets:
+            asset_embedder = _asset_media_embedder()
         col = backend.create_collection(dest_palace, collection_name)
+        if not media_assets:
+            col = _embeddinggemma2_collection(col, embeddinggemma2)
 
         for emb_id, doc, meta in extract_via_sqlite(source_palace, collection_name):
             ids.append(emb_id)
@@ -1874,10 +2055,18 @@ def _rebuild_one_collection(
             # embedding_metadata could yield an emb_id with no rows.
             # Coerce to a sentinel that satisfies validation and is
             # discoverable later via `where={"_repaired_empty_meta": True}`.
-            metas.append(meta if (meta and len(meta) > 0) else {"_repaired_empty_meta": True})
+            stored_meta = meta if (meta and len(meta) > 0) else {"_repaired_empty_meta": True}
+            if media_assets:
+                vectors, refreshed = _embed_asset_rows(asset_embedder, ([doc or ""], [stored_meta]))
+                embeddings.extend(vectors)
+                stored_meta = refreshed[0]
+            metas.append(stored_meta)
             if len(ids) >= batch_size:
                 _flush()
         _flush()
+        if (embeddinggemma2 or media_assets) and upserted:
+            _verify_collection_count(col, upserted, "SQLite rebuilt collection")
+            _record_rebuilt_embedder_identity(col, dest_palace)
     except Exception as exc:  # noqa: BLE001 — chromadb raises many shapes
         partial = dict(counts_so_far)
         partial[collection_name] = upserted
@@ -2054,11 +2243,10 @@ def rebuild_from_sqlite(
     :func:`extract_via_sqlite`.
 
     Re-embeds documents at upsert time using the configured embedding
-    function; the original HNSW vectors are not preserved (they live in
-    the corrupt ``data_level0.bin`` / ``link_lists.bin``, not in
-    SQLite). Acceptable for a corruption-recovery flow because the
-    embedding model is deterministic — same model + same document text
-    yields semantically equivalent search results.
+    function and media assets from their local source files using the
+    provider's native media encoder. Original HNSW vectors are not preserved
+    (they live in the corrupt ``data_level0.bin`` / ``link_lists.bin``, not in
+    SQLite).
 
     ``archive_existing_dest`` controls behavior when ``dest_palace``
     already exists:
@@ -2235,7 +2423,7 @@ def _preview_rebuild_from_sqlite(
         print(f"  Would rebuild into {dest_palace} from {source_palace}.")
 
     counts: dict[str, int] = {}
-    for cname in _recoverable_collections():
+    for cname in _recoverable_collections(source_palace):
         n = sqlite_drawer_count(source_palace, cname)
         if n is None:
             _print_unreadable_count_refusal(collection_name=cname, palace_path=source_palace)
@@ -2387,6 +2575,16 @@ def _rebuild_from_sqlite_locked(
     before this body runs, so a held lock never reaches the archive.
     """
     archive_path: Optional[str] = None
+    try:
+        # Full recovery can archive the source in-place. Validate every asset
+        # reference before that rename so an absent local file never strands
+        # the original palace or produces a silently incomplete replacement.
+        _preflight_asset_files(source_palace)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"\n  Cannot safely rebuild media assets: {exc}")
+        print("  Restore the referenced local media file and retry; the palace was left untouched.")
+        return {}
+
     if in_place:
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         archive_path = f"{dest_palace}.pre-rebuild-{ts}"
@@ -2444,7 +2642,7 @@ def _rebuild_from_sqlite_locked(
     backend = ChromaBackend()
     counts: dict[str, int] = {}
     try:
-        for cname in _recoverable_collections():
+        for cname in _recoverable_collections(source_palace):
             print(f"\n  [{cname}]")
             upserted = _rebuild_one_collection(
                 backend=backend,

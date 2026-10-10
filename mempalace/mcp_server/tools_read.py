@@ -590,6 +590,8 @@ def tool_search(
     context: str = None,
     candidate_strategy: str = "vector",
     cli_compatible: bool = False,
+    include_media: bool = False,
+    query_task: str = "search",
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
@@ -603,6 +605,22 @@ def tool_search(
     candidate_strategy = candidate_strategy or "vector"
     if not isinstance(candidate_strategy, str) or candidate_strategy not in {"vector", "union"}:
         return {"error": "candidate_strategy must be one of ('vector', 'union')"}
+    if (
+        not isinstance(include_media, bool)
+        or not isinstance(query_task, str)
+        or query_task not in {"search", "code"}
+    ):
+        return {"error": "include_media must be boolean and query_task must be 'search' or 'code'"}
+    if cli_compatible and (include_media or query_task != "search"):
+        return {"error": "cli_compatible cannot be combined with media/code task search"}
+    experimental = {
+        name: value
+        for name, value, default in (
+            ("include_media", include_media, False),
+            ("query_task", query_task, "search"),
+        )
+        if value != default
+    }
     # Mitigate system prompt contamination (Issue #333)
     sanitized = sanitize_query(query)
     if cli_compatible:
@@ -693,6 +711,7 @@ def tool_search(
         vector_disabled=_vector_disabled,
         candidate_strategy=candidate_strategy,
         collection_name=_config.collection_name,
+        **experimental,
     )
     if _is_transient_index_error(result):
         # Post-bulk-write HNSW flush window (#1315): drop caches, give
@@ -714,6 +733,7 @@ def tool_search(
             vector_disabled=_vector_disabled,
             candidate_strategy=candidate_strategy,
             collection_name=_config.collection_name,
+            **experimental,
         )
         if not _is_transient_index_error(result):
             result["index_recovered"] = True
