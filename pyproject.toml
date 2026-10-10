@@ -66,6 +66,7 @@ pgvector = "mempalace.backends.pgvector:PgVectorBackend"
 qdrant = "mempalace.backends.qdrant:QdrantBackend"
 sqlite_exact = "mempalace.backends.sqlite_exact:SQLiteExactBackend"
 rust_exact = "mempalace.backends.rust_exact:RustExactBackend"
+sqlite_vec = "mempalace.backends.sqlite_vec:SQLiteVecBackend"
 
 # RFC 002 source-adapter entry-point group. Core publishes no first-party
 # adapters under this group yet; ``miner.py`` and ``convo_miner.py`` migrate
@@ -100,6 +101,9 @@ dev = [
     # Run ad-hoc with ``mypy mempalace/``; CI doesn't gate on it yet but
     # contributors should fix mypy errors they see before pushing.
     "mypy>=1.0",
+    # Built-in backend under test: the conformance suite parametrizes
+    # sqlite_vec, so the dev environment must be able to load its extension.
+    "sqlite-vec>=0.1.9",
 ]
 spellcheck = ["autocorrect>=2.0"]
 # Opt-in Milvus backend. Defaults to per-palace Milvus Lite
@@ -114,6 +118,9 @@ milvus = [
 # MEMPALACE_BACKEND=pgvector / --backend pgvector; never required for the
 # default (Chroma) install.
 pgvector = ["psycopg[binary]>=3.1"]
+# Opt-in sqlite-vec ANN backend. Requires the sqlite-vec Python package.
+# Selected via MEMPALACE_BACKEND=sqlite_vec / --backend sqlite_vec.
+sqlite_vec = ["sqlite-vec>=0.1.9"]
 # Hardware acceleration for the ONNX embedding model. Install exactly one:
 #   pip install mempalace[gpu]       — NVIDIA CUDA
 #   pip install mempalace[dml]       — DirectML (Windows AMD/Intel/NVIDIA)
@@ -154,6 +161,9 @@ dev = [
     "hypothesis>=6.0",
     "pre-commit>=3.0",
     "mypy>=1.0",
+    # Keep in sync with [project.optional-dependencies].dev above — the
+    # conformance suite parametrizes sqlite_vec, so dev installs need it.
+    "sqlite-vec>=0.1.9",
 ]
 
 [build-system]
