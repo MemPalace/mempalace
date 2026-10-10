@@ -265,6 +265,18 @@ def main():
         "target",
         help="A .jsonl transcript file, or a directory to scan recursively",
     )
+    p_sweep.add_argument(
+        "--wing",
+        default=None,
+        help="File the drawers this sweep adds under this wing (like `mine --wing`); "
+        "drawers already in the palace keep theirs. Default leaves new drawers "
+        "unclassified as ?/?",
+    )
+    p_sweep.add_argument(
+        "--room",
+        default=None,
+        help="Room for the drawers this sweep adds when --wing is set (default: general)",
+    )
 
     # sync
     add_cli_write_routing_flags(p_sweep)
