@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **`mempalace-native` finds the palace of an XDG install.** `stats`, `bench`
+  and `search` defaulted `--db` to `~/.mempalace/palace/sqlite_exact.sqlite3`,
+  so on an install whose config lives under `$XDG_CONFIG_HOME/mempalace` the
+  default file did not exist and every command failed unless `--db` was passed,
+  while the Python tools found the palace. The default now resolves with the
+  same precedence as `mempalace.config._default_config_dir()` —
+  `$MEMPALACE_CONFIG_DIR`, a real legacy `~/.mempalace`, `$XDG_CONFIG_HOME`,
+  `~/.config/mempalace` — and honours a configured `palace_path` (#2520).
+
 ---
 
 ## [3.11.0] — 2026-10-02
@@ -597,7 +608,6 @@ A palace can now be audited and repaired in guided steps: scored for organizatio
 - Dependabot: `docker/build-push-action` 7.3.0 → 7.4.0,
   `docker/setup-buildx-action` 4.3.0 → 4.4.0, and
   `docker/setup-qemu-action` 4.3.0 → 4.4.0. (#2547, #2548, #2549)
-
 
 ---
 
