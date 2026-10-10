@@ -8,6 +8,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **`mempalace-native` reads a cleanly closed WAL database.**
+  `VectorIndex::load_from_sqlite` opened every database read-only, but a WAL
+  database whose `-wal`/`-shm` sidecars are both absent cannot be read through
+  a read-only connection on SQLite builds that may not create the shared-memory
+  index there — Apple's system library, which macOS links — so the standalone
+  `stats`/`bench`/`search` failed with `SQLITE_CANTOPEN` and the in-process
+  native index silently lost its speed-up to the Python fallback. The state is
+  now probed the way `config.connect_sqlite_read` probes it (#2490) and only
+  that case takes a read-write open (#2521).
+
 ---
 
 ## [3.11.0] — 2026-10-02
@@ -597,7 +609,6 @@ A palace can now be audited and repaired in guided steps: scored for organizatio
 - Dependabot: `docker/build-push-action` 7.3.0 → 7.4.0,
   `docker/setup-buildx-action` 4.3.0 → 4.4.0, and
   `docker/setup-qemu-action` 4.3.0 → 4.4.0. (#2547, #2548, #2549)
-
 
 ---
 
