@@ -2,7 +2,7 @@
 """
 MemPalace Lightweight MCP Server
 ================================
-Consolidates 45 MemPalace tools into a high-performance 3-tool interface
+Consolidates 47 MemPalace tools into a high-performance 3-tool interface
 (`palace_query`, `palace_exec`, `palace_coordinate`) powered by Palace Query
 Language (PQL) and Command DSL, while retaining 100% of underlying features,
 guarantees, and safety checks.
