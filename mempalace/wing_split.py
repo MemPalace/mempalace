@@ -23,6 +23,7 @@ Two steps, like ``rooms``:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -282,6 +283,53 @@ def _rekey_collection(col, wing: str, targets: dict[str, str], stamp: str, progr
 def split_pending_path(config: MempalaceConfig, wing: str) -> str:
     """Marker that a split of ``wing`` started and has not finished every phase."""
     return os.path.join(config.palace_path, "wings", f"split-{sanitize_name(wing, 'wing')}.pending")
+
+
+def split_plan_fingerprint(plan: dict) -> str:
+    """Digest of the wing and each project's target — the decisions apply_split follows."""
+    targets = {str(key): str(entry["target"]) for key, entry in sorted(plan["projects"].items())}
+    payload = json.dumps(
+        {"wing": str(plan["wing"]), "targets": targets},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def write_split_pending(config: MempalaceConfig, wing: str, plan: dict) -> str:
+    """Record that a split started, pinning the plan targets being applied."""
+    path = split_pending_path(config, wing)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = {
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "plan_sha256": split_plan_fingerprint(plan),
+    }
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, path)
+    return path
+
+
+def assert_split_pending_matches_plan(config: MempalaceConfig, wing: str, plan: dict) -> None:
+    """Refuse a retry whose saved plan targets no longer match the pinned split."""
+    path = split_pending_path(config, wing)
+    with open(path, encoding="utf-8") as f:
+        raw = f.read().strip()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = None
+    pinned = data.get("plan_sha256") if isinstance(data, dict) else None
+    current = split_plan_fingerprint(plan)
+    if not pinned or pinned != current:
+        raise ValueError(
+            f"split plan for {wing!r} changed since this split started "
+            f"(pinned {pinned or 'missing'}, current {current}); "
+            "restore the original plan targets before re-running --yes, "
+            "or remove the pending marker only after deciding how to finish"
+        )
 
 
 def apply_split(
