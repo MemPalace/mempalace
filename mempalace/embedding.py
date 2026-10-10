@@ -59,7 +59,7 @@ import re
 import threading
 from typing import Optional
 
-from .version import __version__
+from .user_agent import USER_AGENT
 
 logger = logging.getLogger(__name__)
 
@@ -799,7 +799,7 @@ class OpenAICompatEmbeddingFunction:
             "Content-Type": "application/json",
             # Some hosted (Cloudflare-fronted) endpoints 403 the default
             # ``Python-urllib`` User-Agent — send our own (see issue #1570).
-            "User-Agent": f"mempalace/{__version__}",
+            "User-Agent": USER_AGENT,
         }
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
