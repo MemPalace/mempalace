@@ -103,6 +103,18 @@ def _preview_event(event: dict) -> dict:
     return out
 
 
+# Left out of a slim listing: metadata and replication bookkeeping.
+_SLIM_DROP = frozenset({"seq", "origin_replica", "origin_seq", "hlc", "metadata"})
+
+
+def _slim_event(event: dict) -> dict:
+    """Keep the fields a reader needs to decide what to fetch in full.
+
+    Drops ``metadata`` and replication bookkeeping, and leaves out empty
+    values. Re-fetch without ``slim`` for the whole event."""
+    return {k: v for k, v in event.items() if k not in _SLIM_DROP and v not in (None, "", [], {})}
+
+
 # ``from_agent`` means "who I am" on every other coordination call (append, ack, artifacts), and agents are told to
 # pass their identity on every call. On list/wait it used to filter by WRITER, so an agent following that rule and
 # asking for its task by correlation id saw only its own events and missed the request written to it (2026-09-29:
@@ -130,6 +142,7 @@ def tool_event_list(
     order: str = None,
     preview: bool = False,
     writer: str = None,
+    slim: bool = False,
 ):
     """List coordination events with structured filters.
 
@@ -144,6 +157,9 @@ def tool_event_list(
     ``preview=True`` truncates each event's verbatim body to a short excerpt
     (marking ``body_truncated`` + ``body_length``) so scanning many events
     stays cheap.
+
+    ``slim=True`` drops ``metadata``, replication bookkeeping and empty fields
+    from each event, for a smaller listing.
 
     ``writer`` filters by the agent that wrote the event. ``from_agent`` is the
     caller's identity and does not filter (see ``_FROM_AGENT_NOTE``).
@@ -175,6 +191,8 @@ def tool_event_list(
         return {"error": str(e)}
     if preview:
         events = [_preview_event(e) for e in events]
+    if slim:
+        events = [_slim_event(e) for e in events]
     result = {"events": events, "count": len(events)}
     if from_agent and not writer:
         result["note"] = _FROM_AGENT_NOTE
