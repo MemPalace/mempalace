@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **Replaying an identical closed historical assertion through `add_triple` returns the
+  original row instead of storing a duplicate.** The dedup check matched only open triples
+  (`valid_to IS NULL`), so a historical insert with `valid_to` set was never recognized as a
+  replay. An interrupted import that re-sent the same assertion stored a second logical
+  assertion under a new id, and the as-of query returned the same fact twice. A replay must
+  match subject, predicate, object, both bounds, confidence and all provenance columns; a
+  recurring interval or an independently sourced assertion of the same interval stays two
+  separate facts. (#2598)
+
 ---
 
 ## [3.11.0] — 2026-10-02
