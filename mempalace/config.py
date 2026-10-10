@@ -709,6 +709,40 @@ def _atomic_write_json(path: Path, payload) -> None:
     _fsync_directory(path.parent)
 
 
+def _json_type_name(value) -> str:
+    """Name a decoded JSON value by its JSON type, for messages."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    return type(value).__name__
+
+
+# (path, problem) pairs already reported by this process. MempalaceConfig is
+# built many times per process (CLI, MCP, hooks, search), and one unusable
+# file should be one line on stderr, not one per construction.
+_WARNED_UNUSABLE_CONFIGS: set = set()
+
+
+def _warn_unusable_config_once(config_file: Path, problem: str) -> None:
+    """Say on stderr that ``config_file`` is being ignored, once per process."""
+    key = (str(config_file), problem)
+    if key in _WARNED_UNUSABLE_CONFIGS:
+        return
+    _WARNED_UNUSABLE_CONFIGS.add(key)
+    print(
+        f"  ! {config_file} {problem}; ignoring it and using default settings. "
+        "Fix or remove it; the next settings write keeps it aside and starts a new one.",
+        file=sys.stderr,
+    )
+
+
 class MempalaceConfig:
     """Configuration manager for MemPalace.
 
@@ -749,6 +783,8 @@ class MempalaceConfig:
         #              declines rather than writing defaults into it
         self._file_config_state = "absent"
         self._file_config_error = None
+        # Why an "unparsed" file was set aside, for the warnings below.
+        self._file_config_problem = None
         try:
             raw = self._config_file.read_bytes()
         except FileNotFoundError:
@@ -771,12 +807,24 @@ class MempalaceConfig:
             except ValueError:
                 # JSONDecodeError and UnicodeDecodeError are both ValueErrors:
                 # text that is not JSON, and bytes that are not UTF-8.
-                loaded = None
-            if isinstance(loaded, dict):
-                self._file_config = loaded
-                self._file_config_state = "read"
-            else:
                 self._file_config_state = "unparsed"
+                self._file_config_problem = "does not parse"
+            else:
+                if isinstance(loaded, dict):
+                    self._file_config = loaded
+                    self._file_config_state = "read"
+                else:
+                    # Valid JSON whose top level is not an object (``null``,
+                    # ``[]``, ``"x"``, ``42``, ``true``). Every setting reads
+                    # it through ``.get()``, so it is treated exactly like a
+                    # file that does not parse: defaults now, kept aside by
+                    # the first setter (#2234).
+                    self._file_config_state = "unparsed"
+                    self._file_config_problem = (
+                        f"is a JSON {_json_type_name(loaded)}, not an object"
+                    )
+            if self._file_config_state == "unparsed":
+                _warn_unusable_config_once(self._config_file, self._file_config_problem)
 
     @property
     def search_config_fingerprint(self) -> str:
@@ -892,7 +940,7 @@ class MempalaceConfig:
                 kept = _keep_unreadable_file(self._config_file)
             except OSError as exc:
                 print(
-                    f"  ! Not writing {self._config_file}: it does not parse "
+                    f"  ! Not writing {self._config_file}: it {self._file_config_problem} "
                     f"and could not be moved aside ({exc})",
                     file=sys.stderr,
                 )
@@ -900,7 +948,7 @@ class MempalaceConfig:
             self._file_config_state = "read"
             if kept is not None:
                 print(
-                    f"  ! {self._config_file} does not parse; kept it as {kept} "
+                    f"  ! {self._config_file} {self._file_config_problem}; kept it as {kept} "
                     "and started a new one",
                     file=sys.stderr,
                 )
