@@ -177,6 +177,23 @@ CONVO_EXTENSIONS = {
 # only — project mining semantics are unchanged.
 CONVO_SKIP_DIRS = SKIP_DIRS | {"tool-results"}
 
+
+def _is_claude_code_artifact(path: Path) -> bool:
+    """True for Claude Code machine files that sit beside session transcripts.
+
+    ``<session>/workflows/wf_*.json`` is workflow run state (the orchestration
+    script plus raw agent output) and ``<session>/auto-mode-classifier-error.txt``
+    is a debug dump that re-embeds the whole transcript. Neither is a
+    conversation; both are matched by exact name so a user folder that happens
+    to be called ``workflows`` still scans.
+    """
+    if path.name == "auto-mode-classifier-error.txt":
+        return True
+    return (
+        path.parent.name == "workflows" and path.name.startswith("wf_") and path.suffix == ".json"
+    )
+
+
 MIN_CHUNK_SIZE = 30
 CHUNK_SIZE = 800  # chars per drawer — align with miner.py
 _LINE_GROUP_SIZE = 25  # lines per fallback group when no paragraph breaks
@@ -593,6 +610,8 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
             if filename.endswith(".meta.json"):
                 continue
             filepath = Path(root) / filename
+            if _is_claude_code_artifact(filepath):
+                continue
             if filepath.suffix.lower() in CONVO_EXTENSIONS:
                 # Skip symlinks and oversized files
                 if filepath.is_symlink():
