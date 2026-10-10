@@ -319,6 +319,93 @@ def test_load_config_no_yaml_normalizes_hyphenated_wing():
         shutil.rmtree(parent)
 
 
+# --- project config filename resolution (#2676) -----------------------------
+
+
+@pytest.mark.parametrize("name", ["mempalace.yml", "mempal.yml"])
+def test_load_config_reads_yml_spelling(tmp_path, name):
+    """A project whose only config is ``*.yml`` is read, not ignored (#2676)."""
+    write_file(tmp_path / name, "wing: from_yml\nrooms:\n  - name: backend\n")
+    config = load_config(str(tmp_path))
+    assert config["wing"] == "from_yml"
+    assert config["rooms"] == [{"name": "backend"}]
+
+
+@pytest.mark.parametrize(
+    "present, winner",
+    [
+        (["mempalace.yaml", "mempalace.yml"], "mempalace.yaml"),
+        (["mempalace.yml", "mempal.yaml"], "mempalace.yml"),
+        (["mempal.yaml", "mempal.yml"], "mempal.yaml"),
+        (["mempalace.yaml", "mempalace.yml", "mempal.yaml", "mempal.yml"], "mempalace.yaml"),
+    ],
+)
+def test_load_config_resolution_order_and_shadow_warning(tmp_path, capsys, present, winner):
+    """Order is mempalace.yaml, mempalace.yml, mempal.yaml, mempal.yml; the
+    shadowed files are named on stderr instead of being silently skipped."""
+    from mempalace.miner import PROJECT_CONFIG_FILENAMES, find_project_config
+
+    for name in present:
+        write_file(tmp_path / name, f"wing: {name.replace('.', '_')}\nrooms: []\n")
+    assert PROJECT_CONFIG_FILENAMES == (
+        "mempalace.yaml",
+        "mempalace.yml",
+        "mempal.yaml",
+        "mempal.yml",
+    )
+    assert find_project_config(tmp_path) == tmp_path.resolve() / winner
+    capsys.readouterr()
+
+    config = load_config(str(tmp_path))
+
+    assert config["wing"] == winner.replace(".", "_")
+    err = capsys.readouterr().err
+    assert f"using {winner}" in err
+    for name in present:
+        if name != winner:
+            assert name in err
+
+
+def test_load_config_single_config_is_quiet(tmp_path, capsys):
+    write_file(tmp_path / "mempalace.yml", "wing: solo\nrooms: []\n")
+    assert load_config(str(tmp_path))["wing"] == "solo"
+    assert capsys.readouterr().err == ""
+
+
+def test_project_config_filenames_are_never_mined_as_content():
+    from mempalace.miner import PROJECT_CONFIG_FILENAMES, SKIP_FILENAMES
+
+    assert set(PROJECT_CONFIG_FILENAMES) <= SKIP_FILENAMES
+
+
+def test_mine_honors_mempalace_yml_wing_and_excludes(monkeypatch, tmp_path):
+    """End to end through mine(): wing, rooms and exclude_patterns come from
+    mempalace.yml. Before #2676 the file was ignored, the wing fell back to
+    the directory name and the excluded file was mined."""
+    import mempalace.miner as miner_mod
+
+    project_root = (tmp_path / "proj").resolve()
+    write_file(project_root / "src" / "app.py", "print('app')\n" * 20)
+    write_file(project_root / "secret" / "keys.md", "# do not mine\n" * 20)
+    write_file(
+        project_root / "mempalace.yml",
+        "wing: yml_wing\nrooms:\n  - name: general\n    description: General\n"
+        "exclude_patterns:\n  - secret/\n",
+    )
+
+    seen = []
+    real_process_file = miner_mod.process_file
+
+    def capture(filepath, **kwargs):
+        seen.append((filepath.relative_to(project_root).as_posix(), kwargs["wing"]))
+        return real_process_file(filepath, **kwargs)
+
+    monkeypatch.setattr(miner_mod, "process_file", capture)
+    mine(str(project_root), str(tmp_path / "palace"), dry_run=True)
+
+    assert seen == [("src/app.py", "yml_wing")]
+
+
 def test_scan_project_skips_mempalace_generated_files():
     with tempfile.TemporaryDirectory() as tmpdir:
         project_root = Path(tmpdir).resolve()
@@ -1485,6 +1572,8 @@ def test_process_file_aborts_when_stale_drawer_purge_fails(tmp_path, monkeypatch
         "purge raised — old and new rows can now coexist as duplicates/orphans"
     )
     assert drawers == 0
+    # Tagged so the mine counts an error, not an "already filed" skip.
+    assert skip_reason == "purge_failed"
 
 
 def test_process_file_purges_closets_even_when_all_chunks_filtered_out(tmp_path, monkeypatch):

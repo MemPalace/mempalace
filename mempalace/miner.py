@@ -39,7 +39,9 @@ from .palace import (
     mine_yield_point,
     palace_write_serial,
     prefetch_complete_mtimes,
+    print_files_failed,
     purge_file_closets,
+    raise_if_files_failed,
     upsert_closet_lines,
 )
 
@@ -50,6 +52,9 @@ from .palace import (
 from .collision_scan import assert_no_collisions
 from .hallways import compute_hallways_for_wing
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
+
+# Re-exported: callers and tests import these from the miner (#2676).
+from .project_config import PROJECT_CONFIG_FILENAMES, find_project_config  # noqa: F401
 from .source_identity import source_directory_identity
 
 logger = logging.getLogger("mempalace_mcp")
@@ -181,6 +186,10 @@ READABLE_EXTENSIONS = {
     ".sln",
     ".razor",
     ".cshtml",
+    # Dynamics 365 Business Central (AL language) source, #278.
+    ".al",
+    # PowerShell scripts, the Windows counterpart of ``.sh`` above.
+    ".ps1",
 } | PHP_EXTENSIONS
 
 SKIP_FILENAMES = {
@@ -521,47 +530,43 @@ def _apply_exclude_patterns_to_prescanned_files(
 
 
 def load_config(project_dir: str) -> dict:
-    """Load mempalace.yaml from project directory (falls back to mempal.yaml)."""
+    """Load the project config from ``project_dir``.
+
+    Resolution order is :data:`PROJECT_CONFIG_FILENAMES`: ``mempalace.yaml``,
+    ``mempalace.yml``, then the legacy ``mempal.yaml`` and ``mempal.yml``.
+    Without any of them the auto-detected defaults are returned.
+    """
     import yaml
 
     resolved_project_dir = Path(project_dir).expanduser().resolve()
-    config_path = resolved_project_dir / "mempalace.yaml"
-    # ``is_file()`` rather than ``exists()``: the latter is true for a FIFO,
-    # and the ``open`` at the end of this function would then block in the
-    # kernel until a writer appears. A config that is not a regular file is
-    # treated as absent, which lands on the auto-detected defaults below.
-    if not config_path.is_file():
-        # Fallback to legacy name
-        legacy_path = resolved_project_dir / "mempal.yaml"
-        if legacy_path.is_file():
-            config_path = legacy_path
-        else:
-            from .config import normalize_wing_name
+    config_path = find_project_config(resolved_project_dir)
+    if config_path is None:
+        from .config import normalize_wing_name
 
-            # Normalize the dirname-derived fallback wing the same way
-            # ``cmd_init`` and ``room_detector_local`` do — otherwise a
-            # hyphenated project mined without a yaml file lands under a
-            # raw-name wing while ``topics_by_wing`` was keyed under the
-            # normalized slug, silently dropping every topic tunnel
-            # (the no-yaml branch of issue #1194).
-            wing_name = normalize_wing_name(resolved_project_dir.name)
-            print(
-                f"  No mempalace.yaml found in {resolved_project_dir} "
-                f"— using auto-detected defaults (wing='{wing_name}'). "
-                "Directories with the same basename will share a wing; "
-                "add mempalace.yaml to disambiguate.",
-                file=sys.stderr,
-            )
-            return {
-                "wing": wing_name,
-                "rooms": [
-                    {
-                        "name": "general",
-                        "description": "All project files",
-                        "keywords": ["general"],
-                    }
-                ],
-            }
+        # Normalize the dirname-derived fallback wing the same way
+        # ``cmd_init`` and ``room_detector_local`` do — otherwise a
+        # hyphenated project mined without a yaml file lands under a
+        # raw-name wing while ``topics_by_wing`` was keyed under the
+        # normalized slug, silently dropping every topic tunnel
+        # (the no-yaml branch of issue #1194).
+        wing_name = normalize_wing_name(resolved_project_dir.name)
+        print(
+            f"  No mempalace.yaml found in {resolved_project_dir} "
+            f"— using auto-detected defaults (wing='{wing_name}'). "
+            "Directories with the same basename will share a wing; "
+            "add mempalace.yaml to disambiguate.",
+            file=sys.stderr,
+        )
+        return {
+            "wing": wing_name,
+            "rooms": [
+                {
+                    "name": "general",
+                    "description": "All project files",
+                    "keywords": ["general"],
+                }
+            ],
+        }
     with open(config_path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
@@ -1891,7 +1896,9 @@ def process_file(
     filed (pre- or post-lock re-check), unreadable (``OSError``), or
     too-short content (below ``min_chunk_size``). It is ``"chunk_cap"``
     when the per-file chunk cap aborted the file. Callers use the tag to
-    surface a separate counter in the mine summary (see #1455).
+    surface a separate counter in the mine summary (see #1455). It is
+    ``"purge_failed"`` when the stale-drawer purge raised: the file was not
+    mined, and the mine counts it as an error rather than a skip.
 
     ``mined_mtimes`` is :func:`prefetch_complete_mtimes`'s map for this
     mine. A file it proves already filed is skipped without querying the
@@ -1965,17 +1972,20 @@ def process_file(
         # see #23. Returning here (without touching source_mtime/chunk_total)
         # leaves the old drawers' stored mtime untouched, so the next mine
         # still sees a mismatch against the current on-disk mtime and retries.
+        #
+        # It is a failure, not a skip: tagged so the mine counts it as an
+        # error and does not report success.
         try:
             collection.delete(where={"source_file": source_file})
         except Exception as exc:
             print(
-                f"  ! [skip] {filepath.name[:50]:50} stale-drawer purge failed "
+                f"  ! [error] {filepath.name[:50]:50} stale-drawer purge failed "
                 f"({exc!r}); leaving existing drawers untouched, will retry "
                 f"on the next mine",
                 file=sys.stderr,
             )
             logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
-            return 0, room, None
+            return 0, room, "purge_failed"
 
         # source_mtime is the mtime paired with the content actually read
         # above (from _read_text_no_follow's own fstat), not a fresh re-stat
@@ -2371,6 +2381,7 @@ def _mine_impl(
     files_mined = 0
     files_skipped = 0
     files_skipped_chunk_cap = 0
+    files_failed: list = []
     files_processed = 0
     last_file = None
     room_counts = defaultdict(int)
@@ -2378,7 +2389,7 @@ def _mine_impl(
 
     try:
         for i, filepath in enumerate(files, 1):
-            mine_yield_point()
+            collection, closets_col = _yield_and_reopen(palace_path, collection, closets_col)
             try:
                 drawers, room, skip_reason = process_file(
                     filepath=filepath,
@@ -2410,8 +2421,11 @@ def _mine_impl(
             # modes so the summary "Files processed" arithmetic and the
             # residual-skip counter stay honest under ``--dry-run`` too. The
             # chunk-cap counter is partitioned out for its dedicated
-            # summary line (see #1455 + Gemini review on PR #1554).
-            if drawers == 0:
+            # summary line (see #1455 + Gemini review on PR #1554). A file
+            # that failed is neither skipped nor mined.
+            if skip_reason == "purge_failed":
+                files_failed.append(str(filepath))
+            elif drawers == 0:
                 files_skipped += 1
                 if skip_reason == "chunk_cap":
                     files_skipped_chunk_cap += 1
@@ -2480,7 +2494,8 @@ def _mine_impl(
 
         print(f"\n{'=' * 55}")
         print("  Done.")
-        print(f"  Files processed: {files_processed - files_skipped}")
+        print(f"  Files processed: {files_processed - files_skipped - len(files_failed)}")
+        print_files_failed(files_failed)
         # The residual skip bucket label depends on mode: dry-run bypasses
         # the already-mined check, so the only paths producing (0, room,
         # None) under dry_run are OSError / too-short / post-lock re-check
@@ -2502,9 +2517,7 @@ def _mine_impl(
                 f"set 0 to disable)"
             )
         print(f"  Drawers filed: {total_drawers}")
-        print("\n  By room:")
-        for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
-            print(f"    {room:20} {count} files")
+        _print_room_counts(room_counts)
         print('\n  Next: mempalace search "what you\'re looking for"')
         print(f"{'=' * 55}\n")
     except KeyboardInterrupt:
@@ -2555,6 +2568,28 @@ def _mine_impl(
         # short-lived test runs. Only remove if the file claims our
         # own PID — never another process's.
         _cleanup_mine_pid_file()
+
+    # After the summary, so the operator still sees what was filed.
+    raise_if_files_failed(files_failed, files_processed)
+
+
+def _print_room_counts(room_counts) -> None:
+    print("\n  By room:")
+    for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
+        print(f"    {room:20} {count} files")
+
+
+def _yield_and_reopen(palace_path, collection, closets_col):
+    """Pass a file boundary, reopening the collections if requests ran in it.
+
+    A request in the hub's handoff may close the backend under these handles
+    (a search resets the Chroma caches after a transient index error).
+    Reopening returns the cached collection when nothing closed it. A dry run
+    holds no collections and gets ``None`` back.
+    """
+    if not mine_yield_point() or collection is None:
+        return collection, closets_col
+    return get_collection(palace_path), get_closets_collection(palace_path)
 
 
 def _cleanup_mine_pid_file() -> None:

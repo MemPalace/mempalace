@@ -71,28 +71,244 @@ def _doc_tool_names() -> list:
 
 
 # ---------------------------------------------------------------------------
-# 1. Tool count — README says 19, verify actual count
+# 1. Tool count — every "N MCP tools" claim must match len(TOOLS)
 # ---------------------------------------------------------------------------
+
+SCHEMAS_PATH = MEMPALACE_PKG / "mcp_server" / "schemas.py"
+LIGHT_SERVER_PATH = MEMPALACE_PKG / "mcp_light_server.py"
+
+# Matches a number that states a tool count, in every wording the docs use:
+#   "45 tools", "45 MCP tools", "(45 MCP tools)", "All 45 MemPalace MCP tools",
+#   "**45 separate tools", "the 45-tool server", "Full MCP surface: 47 tools",
+#   and "three PQL tools ... instead of 45" (the DSH patch comment).
+# The lookbehind keeps a version suffix like "v3.45 tools" from reading as 45.
+TOOL_COUNT_CLAIM_RE = re.compile(
+    r"(?<![\w.])(\d+)(?:-|\s+)(?:(?:MemPalace|MCP|separate)\s+)*tools?\b"
+    r"|\binstead\s+of\s+(\d+)\b",
+    re.IGNORECASE,
+)
+
+# Every living file that states the full MCP server's tool count, with the
+# number of claims it makes. The per-file count is part of the contract: if a
+# rewording stops matching TOOL_COUNT_CLAIM_RE, the file drops below its
+# expected count and the test fails instead of silently losing coverage.
+# CHANGELOG.md is deliberately absent (historical entries keep their counts),
+# as are benchmarks/ (they pin a "legacy 45" fixture on purpose).
+TOOL_COUNT_CLAIM_FILES = {
+    "README.md": 1,
+    ".claude-plugin/README.md": 2,
+    ".claude-plugin/plugin.json": 1,
+    ".claude-plugin/marketplace.json": 1,
+    ".claude-plugin/skills/mempalace/SKILL.md": 1,
+    ".codex-plugin/README.md": 1,
+    ".codex-plugin/plugin.json": 2,
+    ".cursor-plugin/README.md": 2,
+    ".cursor-plugin/plugin.json": 1,
+    ".cursor-plugin/marketplace.json": 1,
+    ".dsh-plugin/README.md": 1,
+    ".dsh-plugin/cordis.patch.yml": 2,
+    "integrations/openclaw/SKILL.md": 1,
+    "skills/mempalace/SKILL.md": 1,
+    "website/guide/claude-code.md": 1,
+    "website/guide/lightweight-mcp.md": 2,
+    "website/guide/mcp-integration.md": 2,
+    "website/guide/openclaw.md": 1,
+    "website/reference/cli.md": 1,
+    "website/reference/mcp-tools.md": 1,
+    "website/reference/modules.md": 1,
+    "mempalace/cli/parser.py": 1,
+    "mempalace/instructions_cli.py": 1,
+    "mempalace/mcp_light_server.py": 1,
+}
+
+
+def _literal_dict_key_count(path: Path, name: str) -> int:
+    """Count the keys of the module-level ``name = {...}`` literal in ``path``.
+
+    Parsed with ``ast`` rather than imported: schemas.py is an exec'd
+    fragment of mempalace.mcp_server and refuses a standalone import.
+    """
+    import ast
+
+    tree = ast.parse(_read(path))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict):
+            if any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+                return len(node.value.keys)
+    raise AssertionError(f"{name} dict literal not found in {path.relative_to(REPO_ROOT)}")
+
+
+def _tools_count() -> int:
+    return _literal_dict_key_count(SCHEMAS_PATH, "TOOLS")
+
+
+def _light_tools_count() -> int:
+    return _literal_dict_key_count(LIGHT_SERVER_PATH, "LIGHT_TOOLS")
+
+
+def _tool_count_claims(text: str) -> list:
+    """Return ``(line_no, count)`` for every full-server tool-count claim.
+
+    Claims equal to the light server's size ("3-tool server", "the 3-tool
+    triad") describe mempalace-light-mcp, not mempalace-mcp, and are skipped.
+    """
+    light = _light_tools_count()
+    claims = []
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        for match in TOOL_COUNT_CLAIM_RE.finditer(line):
+            count = int(match.group(1) or match.group(2))
+            if count != light:
+                claims.append((line_no, count))
+    return claims
 
 
 class TestToolCount:
-    """README claims '19 tools available through MCP' in multiple places."""
+    """Every doc / manifest that states the MCP tool count must match TOOLS."""
+
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            ("with 45 MCP tools, auto-save hooks", [45]),
+            ("server (45 MCP tools), ships", [45]),
+            ("All 45 MemPalace MCP tools (`mempalace_search`", [45]),
+            ("cover everything the 45-tool server does", [45]),
+            ("reduces it from **45 separate tools down to 3 high-density tools**", [45]),
+            ("Full MCP surface: 47 tools. Destructive", [47]),
+            ("a local MCP server with 45 tools for storing", [45]),
+            ("palace_coordinate) instead of 45, because DSH", [45]),
+            ("register the 3-tool server as `mempalace-light`", []),
+            ("MemPalace v3.45 tools", []),
+        ],
+    )
+    def test_claim_regex_matches_every_wording(self, text, expected):
+        assert [count for _, count in _tool_count_claims(text)] == expected
 
     def test_readme_tool_count_matches_code(self):
-        """Claim: README says 19 tools. Actual TOOLS dict may differ.
-
-        This test asserts the REAL tool count so the README can be updated.
-        If TOOLS has 25 entries, the README should say 25, not 19.
-        """
-        actual_count = len(_tools_dict_keys())
-        readme = _readme()
-        # Find all "19 tools" claims in README
-        claimed_counts = re.findall(r"(\d+)\s+tools", readme)
-        for claimed in claimed_counts:
-            assert int(claimed) == actual_count, (
-                f"README claims {claimed} tools but TOOLS dict has {actual_count}. "
-                f"Update every occurrence of '{claimed} tools' to '{actual_count} tools'."
+        """README.md's tool count matches len(TOOLS) (kept for history; the
+        file is also covered by test_every_tool_count_claim_matches_code)."""
+        actual_count = _tools_count()
+        claims = _tool_count_claims(_readme())
+        assert claims, "README.md no longer states the MCP tool count"
+        for line_no, claimed in claims:
+            assert claimed == actual_count, (
+                f"README.md:{line_no} claims {claimed} tools but TOOLS has "
+                f"{actual_count}. Update it to {actual_count}."
             )
+
+    def test_tools_count_parse_matches_source_scan(self):
+        """The ast count of TOOLS agrees with the legacy source scan."""
+        assert _tools_count() == len(_tools_dict_keys())
+
+    @pytest.mark.parametrize("rel_path", sorted(TOOL_COUNT_CLAIM_FILES))
+    def test_every_tool_count_claim_matches_code(self, rel_path):
+        actual_count = _tools_count()
+        path = REPO_ROOT / rel_path
+        assert path.is_file(), f"{rel_path} is listed in TOOL_COUNT_CLAIM_FILES but missing"
+        claims = _tool_count_claims(_read(path))
+        stale = [f"{rel_path}:{n} says {c}" for n, c in claims if c != actual_count]
+        assert stale == [], (
+            f"Stale MCP tool counts (TOOLS in mempalace/mcp_server/schemas.py has "
+            f"{actual_count}): {stale}"
+        )
+        expected_claims = TOOL_COUNT_CLAIM_FILES[rel_path]
+        assert len(claims) == expected_claims, (
+            f"{rel_path}: expected {expected_claims} tool-count claim(s), found "
+            f"{len(claims)} at lines {[n for n, _ in claims]}. If the wording changed, "
+            f"widen TOOL_COUNT_CLAIM_RE; if a claim was added or removed, update "
+            f"TOOL_COUNT_CLAIM_FILES."
+        )
+
+
+# ---------------------------------------------------------------------------
+# 1b. Plugin command count — every "N slash commands" claim matches the files
+# ---------------------------------------------------------------------------
+
+_NUMBER_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+
+# "5 guided commands", "ships 5 slash commands", "five slash commands",
+# "five different subcommands".
+COMMAND_COUNT_CLAIM_RE = re.compile(
+    r"\b(\d+|" + "|".join(_NUMBER_WORDS) + r")\s+"
+    r"(?:(?:guided|slash|different)\s+)*(?:sub)?commands\b",
+    re.IGNORECASE,
+)
+
+# The same command set ships three ways: Claude Code slash commands, Cursor's
+# global ``/mempalace-*`` commands, and the Codex ``$mempalace <command>`` skills.
+CLAUDE_COMMANDS_DIR = REPO_ROOT / ".claude-plugin" / "commands"
+CURSOR_COMMANDS_DIR = REPO_ROOT / "commands"
+CODEX_COMMAND_SKILLS_DIR = REPO_ROOT / ".codex-plugin" / "skills"
+
+# Every file that states the plugin command count, with its number of claims.
+COMMAND_COUNT_CLAIM_FILES = {
+    ".claude-plugin/README.md": 1,
+    ".cursor-plugin/README.md": 1,
+    ".codex-plugin/README.md": 1,
+    "examples/cursor/README.md": 1,
+}
+
+
+def _plugin_command_names() -> dict:
+    return {
+        "claude": sorted(p.stem for p in CLAUDE_COMMANDS_DIR.glob("*.md")),
+        "cursor": sorted(
+            p.stem.removeprefix("mempalace-") for p in CURSOR_COMMANDS_DIR.glob("mempalace-*.md")
+        ),
+        "codex": sorted(p.parent.name for p in CODEX_COMMAND_SKILLS_DIR.glob("*/SKILL.md")),
+    }
+
+
+def _command_count_claims(text: str) -> list:
+    claims = []
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        for match in COMMAND_COUNT_CLAIM_RE.finditer(line):
+            raw = match.group(1).lower()
+            claims.append((line_no, int(raw) if raw.isdigit() else _NUMBER_WORDS[raw]))
+    return claims
+
+
+class TestPluginCommandCount:
+    """Plugin READMEs state how many commands ship; that must match the files."""
+
+    def test_every_plugin_ships_the_same_commands(self):
+        names = _plugin_command_names()
+        assert names["claude"], f"no commands found in {CLAUDE_COMMANDS_DIR}"
+        assert names["claude"] == names["cursor"] == names["codex"], names
+
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            ("auto-save hooks, and 5 guided commands.", [5]),
+            ("ships 5 slash commands, three model-invocable skills", [5]),
+            ("packages the MCP server, five slash commands, and", [5]),
+            ("can be invoked with five different subcommands.", [5]),
+            ("run the init command to complete setup", []),
+        ],
+    )
+    def test_claim_regex_matches_every_wording(self, text, expected):
+        assert [count for _, count in _command_count_claims(text)] == expected
+
+    @pytest.mark.parametrize("rel_path", sorted(COMMAND_COUNT_CLAIM_FILES))
+    def test_every_command_count_claim_matches_the_files(self, rel_path):
+        actual = len(_plugin_command_names()["claude"])
+        claims = _command_count_claims(_read(REPO_ROOT / rel_path))
+        stale = [f"{rel_path}:{n} says {c}" for n, c in claims if c != actual]
+        assert stale == [], f"Stale plugin command counts (actual {actual}): {stale}"
+        assert len(claims) == COMMAND_COUNT_CLAIM_FILES[rel_path], (
+            f"{rel_path}: expected {COMMAND_COUNT_CLAIM_FILES[rel_path]} command-count "
+            f"claim(s), found {len(claims)} at lines {[n for n, _ in claims]}"
+        )
 
 
 # ---------------------------------------------------------------------------

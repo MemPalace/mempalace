@@ -710,6 +710,19 @@ def _file_chunks_locked(
     return drawers_added, False
 
 
+def _yield_and_reopen(palace_path: str, collection):
+    """Pass a file boundary, reopening the collection if requests ran in it.
+
+    A request in the hub's handoff may close the backend under this handle (a
+    search resets the Chroma caches after a transient index error). Reopening
+    returns the cached collection when nothing closed it. A dry run holds no
+    collection and gets ``None`` back.
+    """
+    if not mine_yield_point() or collection is None:
+        return collection
+    return get_collection(palace_path)
+
+
 def mine_formats(
     format_dir: str,
     palace_path: str,
@@ -838,7 +851,7 @@ def mine_formats(
         collection = get_collection(palace_path) if not dry_run else None
 
         for i, filepath in enumerate(files, 1):
-            mine_yield_point()
+            collection = _yield_and_reopen(palace_path, collection)
             files_processed = i
             source_file = str(filepath)
 

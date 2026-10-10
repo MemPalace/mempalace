@@ -265,7 +265,7 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
         _run_pass_zero(project_dir=source, palace_dir=palace_path, llm_provider=None)
 
     from .daemon import LOCK_REFUSAL_ERROR_CLASS
-    from .palace import MineAlreadyRunning, MineValidationError
+    from .palace import MineAlreadyRunning, MineFileErrors, MineValidationError
 
     try:
         if source_adapter:
@@ -323,6 +323,14 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
             "success": False,
             "error": str(exc),
             "error_class": LOCK_REFUSAL_ERROR_CLASS,
+            "exit_code": 1,
+        }
+    except MineFileErrors as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "error_class": "MineFileErrors",
+            "files_failed": len(exc.failed_files),
             "exit_code": 1,
         }
     except MineValidationError as exc:

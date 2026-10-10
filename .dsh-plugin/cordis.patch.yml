@@ -17,9 +17,9 @@
 
     # The palace, served through the harness's own MCP client by MemPalace's
     # light MCP server: three PQL tools (palace_query, palace_exec,
-    # palace_coordinate) instead of 45, because DSH re-sends every tool schema
+    # palace_coordinate) instead of 47, because DSH re-sends every tool schema
     # on every model step. The model sees them as mcp__mempalace__<tool>. For
-    # the full 45-tool surface, override this row's command with mempalace-mcp.
+    # the full 47-tool surface, override this row's command with mempalace-mcp.
     - id: mempalace-mcp
       name: '@deepseek-ai/dsh-mcp-client'
       config:
