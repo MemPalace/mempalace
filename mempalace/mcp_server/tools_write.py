@@ -849,13 +849,16 @@ def tool_mine(
     returns ``{success: True, mode, dry_run, output[, output_truncated]}`` where ``output`` is
     the miner's human-readable summary (captured so it cannot corrupt the
     JSON-RPC stream); failure returns ``{success: False, error[, error_class]}``.
+    A mine that ran but could not file some files returns ``success: False``
+    with ``error_class: "MineFileErrors"``, ``files_failed``, up to 20
+    ``failed_files`` and the same ``output``.
     The palace write lock is held by the miners themselves, so a concurrent mine
     surfaces as a structured already-running error. Orphan cleanup is not part of
     mining — use ``mempalace_sync`` for that.
     """
     global _metadata_cache
     from ..daemon import LOCK_REFUSAL_ERROR_CLASS
-    from ..palace import MineAlreadyRunning, MineValidationError
+    from ..palace import MineAlreadyRunning, MineFileErrors, MineValidationError
 
     if not _config.palace_path:
         np = _no_palace()
@@ -897,6 +900,14 @@ def tool_mine(
         return {"success": False, "error": f"source not found: {source!r}"}
 
     def _run():
+        # Files that failed are reported with the summary the mine printed,
+        # which an exception escaping the stdout capture would discard.
+        try:
+            return _run_miner()
+        except MineFileErrors as exc:
+            return exc
+
+    def _run_miner():
         if mode == "convos":
             from ..convo_miner import mine_convos
 
@@ -987,6 +998,12 @@ def tool_mine(
         # payload to the MCP client. The useful summary is at the tail, so keep
         # the end and flag the truncation (never silently).
         payload = {"success": True, "mode": mode, "dry_run": dry_run, "output": output}
+        if isinstance(_result, MineFileErrors):
+            payload["success"] = False
+            payload["error"] = str(_result)
+            payload["error_class"] = "MineFileErrors"
+            payload["files_failed"] = len(_result.failed_files)
+            payload["failed_files"] = list(_result.failed_files[:20])
         cap = 4000
         if len(output) > cap:
             payload["output"] = output[-cap:]

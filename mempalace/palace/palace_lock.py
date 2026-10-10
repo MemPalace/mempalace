@@ -7,6 +7,41 @@ class MineAlreadyRunning(RuntimeError):
     """Raised when another `mempalace mine` already holds the per-palace lock."""
 
 
+class MineFileErrors(RuntimeError):
+    """Raised at the end of a mine when one or more files could not be filed.
+
+    The mine finished its loop and printed its summary. Each failed file kept
+    whatever drawers it had and is retried by the next mine, but the run is
+    not a success, and no caller may report it as one.
+    """
+
+    def __init__(self, failed_files: list[str], total_files: int) -> None:
+        if not failed_files:
+            raise ValueError("MineFileErrors requires at least one failed file")
+        super().__init__(
+            f"{len(failed_files)} of {total_files} file(s) failed to mine; "
+            "per-file errors went to stderr (the server's stderr over MCP, the "
+            "terminal on the CLI), and the next mine retries them"
+        )
+        self.failed_files: tuple[str, ...] = tuple(failed_files)
+        self.total_files = total_files
+
+
+def print_files_failed(failed_files: list) -> None:
+    """Add the failed-file count to a mine summary; nothing when none failed."""
+    if failed_files:
+        print(
+            f"  Files failed: {len(failed_files)} (not mined; per-file errors went to "
+            "stderr, retried on the next mine)"
+        )
+
+
+def raise_if_files_failed(failed_files: list, total_files: int) -> None:
+    """End a mine that could not file every file with :class:`MineFileErrors`."""
+    if failed_files:
+        raise MineFileErrors(failed_files, total_files)
+
+
 class MineValidationError(RuntimeError):
     """Raised at end of mine when PRAGMA quick_check on the palace reports errors."""
 

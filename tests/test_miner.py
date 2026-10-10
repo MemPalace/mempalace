@@ -1485,6 +1485,8 @@ def test_process_file_aborts_when_stale_drawer_purge_fails(tmp_path, monkeypatch
         "purge raised — old and new rows can now coexist as duplicates/orphans"
     )
     assert drawers == 0
+    # Tagged so the mine counts an error, not an "already filed" skip.
+    assert skip_reason == "purge_failed"
 
 
 def test_process_file_purges_closets_even_when_all_chunks_filtered_out(tmp_path, monkeypatch):

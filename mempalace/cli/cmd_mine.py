@@ -49,7 +49,7 @@ def cmd_mine(args):
         )
         return
 
-    from ..palace import MineAlreadyRunning, MineValidationError
+    from ..palace import MineAlreadyRunning, MineFileErrors, MineValidationError
 
     if source_adapter:
         try:
@@ -132,6 +132,11 @@ def cmd_mine(args):
         # palace. Surface the holder identity so the operator knows what
         # to wait for (or stop), and exit non-zero so wrappers like
         # nohup / scripts can detect the contention.
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except MineFileErrors as exc:
+        # The summary above already counted them; exit non-zero so scripts
+        # and hooks do not treat a partial mine as done.
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(1)
     except MineValidationError as exc:

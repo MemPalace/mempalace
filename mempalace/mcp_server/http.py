@@ -59,20 +59,22 @@ class _RWLock:
             self._writer_ident = None
             self._cond.notify_all()
 
-    def yield_write(self) -> None:
+    def yield_write(self) -> bool:
         """Let the requests queued behind a held write lock run, then take it back.
 
         For a writer that works in steps, a mine between files. Plain writer
         preference would keep queued readers out while this writer asks for
         the lock again, so they are let in first; a queued writer takes its
-        turn as usual. Returns at once when nobody waits, or when the calling
-        thread is not the one holding the write lock.
+        turn as usual. Returns False at once when nobody waits, or when the
+        calling thread is not the one holding the write lock; True when other
+        requests ran, so the caller knows backend handles it holds may have
+        been closed under it.
         """
         with self._cond:
             if not self._writer or self._writer_ident != threading.get_ident():
-                return
+                return False
             if not self._waiting_readers and not self._waiting_writers:
-                return
+                return False
             self._writer = False
             self._writer_ident = None
             self._handoff = True
@@ -93,6 +95,7 @@ class _RWLock:
                 self._writer_ident = threading.get_ident()
             finally:
                 self._waiting_writers -= 1
+            return True
 
     def read_lock(self):
         lock = self
@@ -120,7 +123,14 @@ class _RWLock:
 _HTTP_REQUEST_LOCK = _RWLock()
 # Taken before _HTTP_REQUEST_LOCK by a hub mine, so a second mine waits for the
 # first as before even though the first yields the request lock between files.
+# mempalace_reconnect takes it too (see _http_dispatch): a mine keeps the
+# collection handles it opened across every yield, and reconnect closes them.
 _HTTP_MINE_LOCK = threading.Lock()
+# How long mempalace_reconnect waits for a running hub mine before refusing.
+# Long enough to absorb a mine that is wrapping up; a mine can run for hours,
+# and holding an MCP request open that long would time the client out with
+# no explanation.
+_HTTP_RECONNECT_MINE_WAIT_S = 10.0
 # Tools that hold the request lock exclusively for a long run but reach
 # mine_yield_point() between files, where waiting requests may run.
 _HTTP_YIELDING_TOOLS = frozenset({"mempalace_mine"})
@@ -531,6 +541,30 @@ def _http_embedding_release_installed(mode: str):
         set_embedding_section_hook(None)
 
 
+def _http_reconnect_refused_during_mine(request):
+    """Tool result for a reconnect that found a hub mine still running."""
+    req_id = request.get("id")
+    if req_id is None:
+        return None
+    payload = {
+        "success": False,
+        "error": (
+            "a mine is running on this hub; reconnect closes the backend handles "
+            f"that mine is writing through, so it was not run (waited "
+            f"{_HTTP_RECONNECT_MINE_WAIT_S:g}s)"
+        ),
+        "error_class": "MineInProgress",
+        "hint": "Retry mempalace_reconnect after the mine finishes.",
+    }
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "content": [{"type": "text", "text": json.dumps(payload, indent=2, ensure_ascii=False)}]
+        },
+    }
+
+
 def _http_dispatch(request):
     """Dispatch one JSON-RPC request with the transport's locking policy.
 
@@ -573,11 +607,24 @@ def _http_dispatch(request):
         ):
             return handle_request(request)
     if tool_name == "mempalace_reconnect":
+        # A mine hands the request lock to queued requests between files but
+        # keeps the collection handles it opened at the start. Reconnect closes
+        # every backend handle, so letting it into that handoff left the mine
+        # writing through closed handles for the rest of its files. Take the
+        # mine lock first. Lock order is mine -> lifecycle -> request, the mine
+        # path's mine -> request with lifecycle between; nothing that holds
+        # lifecycle or the request lock ever waits for the mine lock.
+        #
         # Lifecycle before the request lease. An in-flight embed holds the
         # lifecycle lock across the window where it does not hold the lease,
         # and takes the lease back before releasing lifecycle.
-        with _http_embedding_lifecycle(), _HTTP_REQUEST_LOCK:
-            return handle_request(request)
+        if not _HTTP_MINE_LOCK.acquire(timeout=_HTTP_RECONNECT_MINE_WAIT_S):
+            return _http_reconnect_refused_during_mine(request)
+        try:
+            with _http_embedding_lifecycle(), _HTTP_REQUEST_LOCK:
+                return handle_request(request)
+        finally:
+            _HTTP_MINE_LOCK.release()
     release_mode = _embedding_release_mode(tool_name, request, "write")
     if release_mode:
         with _http_embedding_release_installed(release_mode), _HTTP_REQUEST_LOCK:
