@@ -181,6 +181,10 @@ READABLE_EXTENSIONS = {
     ".sln",
     ".razor",
     ".cshtml",
+    # Dynamics 365 Business Central (AL language) source, #278.
+    ".al",
+    # PowerShell scripts, the Windows counterpart of ``.sh`` above.
+    ".ps1",
 } | PHP_EXTENSIONS
 
 SKIP_FILENAMES = {
