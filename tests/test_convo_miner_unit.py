@@ -487,6 +487,19 @@ class TestScanConvos:
         files = scan_convos(str(tmp_path))
         assert [f.name for f in files] == ["old-chat.md"]
 
+    def test_scan_skips_claude_code_session_artifacts(self, tmp_path):
+        # Workflow run state and classifier debug dumps sit beside session JSONL
+        # but are not conversations; a user's own "workflows" folder still scans.
+        session_dir = tmp_path / "1234-5678-session"
+        (session_dir / "workflows").mkdir(parents=True)
+        (session_dir / "workflows" / "wf_3af02285-4b0.json").write_text("{}", encoding="utf-8")
+        (session_dir / "auto-mode-classifier-error.txt").write_text("dump", encoding="utf-8")
+        (tmp_path / "workflows").mkdir()
+        (tmp_path / "workflows" / "chat.md").write_text("> q\na\n> q2\na2", encoding="utf-8")
+        (tmp_path / "session.jsonl").write_text('{"type": "user"}', encoding="utf-8")
+        files = scan_convos(str(tmp_path))
+        assert sorted(f.name for f in files) == ["chat.md", "session.jsonl"]
+
     @pytest.mark.skipif(
         sys.platform == "win32",
         reason="symlink creation requires elevated privileges on Windows",

@@ -592,6 +592,11 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
         for filename in filenames:
             if filename.endswith(".meta.json"):
                 continue
+            # Claude Code session artifacts, not conversations (workflow state, classifier dumps)
+            if filename == "auto-mode-classifier-error.txt" or (
+                filename.startswith("wf_") and os.path.basename(root) == "workflows"
+            ):
+                continue
             filepath = Path(root) / filename
             if filepath.suffix.lower() in CONVO_EXTENSIONS:
                 # Skip symlinks and oversized files
