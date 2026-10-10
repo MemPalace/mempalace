@@ -10,6 +10,7 @@ The policy applies to:
 - `mempalace mine`;
 - `mempalace sweep`;
 - `mempalace sync`;
+- `mempalace import`;
 - the optional post-setup mine run by `mempalace init`.
 
 ## Policies
