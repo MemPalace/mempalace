@@ -3338,6 +3338,44 @@ def test_project_mine_reaches_a_yield_point_before_each_file(tmp_path):
     assert len(calls) == 3
 
 
+def test_project_mine_refiles_changed_files_after_a_reset_at_a_yield_point(tmp_path):
+    """A hub serves other requests at a mine's yield points. One that notices a
+    peer's write resets the shared System, which closes the client the mine's
+    collections came from; the changed files after that point are still filed,
+    not skipped as a failed stale-drawer purge."""
+    from mempalace.backends import chroma as chroma_module
+    from mempalace.palace import get_collection, mine_yield_hook
+
+    project_root = tmp_path / "proj"
+    files = [project_root / "backend" / f"mod{n}.py" for n in range(3)]
+    for n, path in enumerate(files):
+        write_file(path, f"def f{n}():\n    return {n}\n" * 20)
+    with open(project_root / "mempalace.yaml", "w") as f:
+        yaml.dump({"wing": "proj", "rooms": [{"name": "backend", "description": "code"}]}, f)
+    palace = str(tmp_path / "palace")
+    mine(str(project_root), palace)
+
+    for n, path in enumerate(files):
+        write_file(path, f"def changed_{n}():\n    return {n} + 1\n" * 20)
+        later = os.stat(path).st_mtime + 10
+        os.utime(path, (later, later))
+    resets = []
+
+    def another_request_resets():
+        if not resets:
+            resets.append(1)
+            chroma_module._clear_chroma_system_cache()
+
+    with mine_yield_hook(another_request_resets):
+        mine(str(project_root), palace)
+
+    documents = get_collection(palace).get(include=["documents"]).documents
+    assert resets == [1]
+    assert all("def changed_" in d for d in documents), documents[:2]
+    for n in range(3):
+        assert any(f"def changed_{n}()" in d for d in documents), n
+
+
 def test_metadata_scan_reads_a_schema_without_bool_value():
     """Older chromadb schemas predate bool_value; the scan reads the columns
     the table has instead of failing on the missing one."""
