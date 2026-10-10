@@ -526,48 +526,83 @@ def _apply_exclude_patterns_to_prescanned_files(
 # =============================================================================
 
 
+# Project config filenames, in resolution order (#2676). The first regular
+# file wins; ``mempal.*`` is the legacy name. SKIP_FILENAMES above lists the
+# same four so none of them is ever mined as content.
+PROJECT_CONFIG_FILENAMES = (
+    "mempalace.yaml",
+    "mempalace.yml",
+    "mempal.yaml",
+    "mempal.yml",
+)
+
+
+def find_project_config(project_dir) -> Optional[Path]:
+    """Return the project config file for ``project_dir``, or None.
+
+    Checks :data:`PROJECT_CONFIG_FILENAMES` in order. ``is_file()`` rather
+    than ``exists()``: the latter is true for a FIFO, and opening one would
+    block in the kernel until a writer appears, so a config that is not a
+    regular file is treated as absent. When more than one candidate exists,
+    the first one is used and the rest are named on stderr so the shadowed
+    file does not go silently unread.
+    """
+    resolved_project_dir = Path(project_dir).expanduser().resolve()
+    found = [
+        resolved_project_dir / name
+        for name in PROJECT_CONFIG_FILENAMES
+        if (resolved_project_dir / name).is_file()
+    ]
+    if not found:
+        return None
+    if len(found) > 1:
+        ignored = ", ".join(p.name for p in found[1:])
+        print(
+            f"  Multiple project configs in {resolved_project_dir}: using "
+            f"{found[0].name}, ignoring {ignored}.",
+            file=sys.stderr,
+        )
+    return found[0]
+
+
 def load_config(project_dir: str) -> dict:
-    """Load mempalace.yaml from project directory (falls back to mempal.yaml)."""
+    """Load the project config from ``project_dir``.
+
+    Resolution order is :data:`PROJECT_CONFIG_FILENAMES`: ``mempalace.yaml``,
+    ``mempalace.yml``, then the legacy ``mempal.yaml`` and ``mempal.yml``.
+    Without any of them the auto-detected defaults are returned.
+    """
     import yaml
 
     resolved_project_dir = Path(project_dir).expanduser().resolve()
-    config_path = resolved_project_dir / "mempalace.yaml"
-    # ``is_file()`` rather than ``exists()``: the latter is true for a FIFO,
-    # and the ``open`` at the end of this function would then block in the
-    # kernel until a writer appears. A config that is not a regular file is
-    # treated as absent, which lands on the auto-detected defaults below.
-    if not config_path.is_file():
-        # Fallback to legacy name
-        legacy_path = resolved_project_dir / "mempal.yaml"
-        if legacy_path.is_file():
-            config_path = legacy_path
-        else:
-            from .config import normalize_wing_name
+    config_path = find_project_config(resolved_project_dir)
+    if config_path is None:
+        from .config import normalize_wing_name
 
-            # Normalize the dirname-derived fallback wing the same way
-            # ``cmd_init`` and ``room_detector_local`` do — otherwise a
-            # hyphenated project mined without a yaml file lands under a
-            # raw-name wing while ``topics_by_wing`` was keyed under the
-            # normalized slug, silently dropping every topic tunnel
-            # (the no-yaml branch of issue #1194).
-            wing_name = normalize_wing_name(resolved_project_dir.name)
-            print(
-                f"  No mempalace.yaml found in {resolved_project_dir} "
-                f"— using auto-detected defaults (wing='{wing_name}'). "
-                "Directories with the same basename will share a wing; "
-                "add mempalace.yaml to disambiguate.",
-                file=sys.stderr,
-            )
-            return {
-                "wing": wing_name,
-                "rooms": [
-                    {
-                        "name": "general",
-                        "description": "All project files",
-                        "keywords": ["general"],
-                    }
-                ],
-            }
+        # Normalize the dirname-derived fallback wing the same way
+        # ``cmd_init`` and ``room_detector_local`` do — otherwise a
+        # hyphenated project mined without a yaml file lands under a
+        # raw-name wing while ``topics_by_wing`` was keyed under the
+        # normalized slug, silently dropping every topic tunnel
+        # (the no-yaml branch of issue #1194).
+        wing_name = normalize_wing_name(resolved_project_dir.name)
+        print(
+            f"  No mempalace.yaml found in {resolved_project_dir} "
+            f"— using auto-detected defaults (wing='{wing_name}'). "
+            "Directories with the same basename will share a wing; "
+            "add mempalace.yaml to disambiguate.",
+            file=sys.stderr,
+        )
+        return {
+            "wing": wing_name,
+            "rooms": [
+                {
+                    "name": "general",
+                    "description": "All project files",
+                    "keywords": ["general"],
+                }
+            ],
+        }
     with open(config_path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
