@@ -26,6 +26,10 @@ MCP_LIGHT_SUBSTITUTIONS = (
     ("mempalace_event_ack", "palace_coordinate EVENT ACK"),
     ("mempalace_patch_submit", "palace_coordinate PATCH SUBMIT"),
     ("mempalace_artifact_get", "palace_coordinate ARTIFACT GET"),
+    ("mempalace_room_open", "palace_coordinate ROOM OPEN"),
+    ("mempalace_room_read", "palace_coordinate ROOM READ"),
+    ("mempalace_room_say", "palace_coordinate ROOM SAY"),
+    ("mempalace_room_close", "palace_coordinate ROOM CLOSE"),
     ("mempalace_search", "palace_query FIND"),
 )
 
