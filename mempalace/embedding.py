@@ -41,6 +41,11 @@ in ``~/.mempalace/config.json``):
 * ``coreml`` — Apple Neural Engine (macOS)
 * ``dml`` — DirectML (Windows / AMD / Intel GPUs)
 
+``embeddinggemma2`` runs on PyTorch rather than ONNX Runtime and reads the same
+setting: ``auto`` (CUDA ▸ MPS ▸ CPU), ``cuda``, ``mps`` or ``cpu``. The
+ONNX-only ``coreml`` and ``dml`` read as ``auto`` there, and ``mps`` reads as
+``auto`` for the ONNX models, each with a one-time warning.
+
 Requesting an unavailable accelerator emits a warning and falls back to CPU
 rather than hard-failing — mining must still work on a laptop without CUDA.
 The same applies to an accelerator that runs but computes the model wrongly:
@@ -144,6 +149,10 @@ def _run_guard(providers, lock):
     return contextlib.nullcontext()
 
 
+# embedding_device values that name a PyTorch device for EmbeddingGemma 2
+# (mempalace.embeddinggemma2.SUPPORTED_DEVICES) but no ONNX Runtime provider.
+_TORCH_ONLY_DEVICES = frozenset({"mps"})
+
 _EF_CACHE: dict = {}
 # Check-then-construct on the cache must be atomic: without it, two threads
 # resolving the same key each keep their own EF instance, and each instance
@@ -171,6 +180,20 @@ def _resolve_providers(device: str, model: Optional[str] = None) -> tuple[list, 
         available = set(ort.get_available_providers())
     except ImportError:
         return (["CPUExecutionProvider"], "cpu")
+
+    if device in _TORCH_ONLY_DEVICES:
+        # One embedding_device serves both runtimes; a value meant for
+        # EmbeddingGemma 2's PyTorch path picks the best ONNX provider instead.
+        warn_key = ("onnx-torch-only-device", device)
+        if warn_key not in _WARNED:
+            _WARNED.add(warn_key)
+            logger.warning(
+                "embedding_device=%r is a PyTorch device used by embeddinggemma2 only; "
+                "the ONNX model %r uses 'auto' instead.",
+                device,
+                model or "minilm",
+            )
+        device = "auto"
 
     if device == "auto":
         for provider, name in _AUTO_ORDER:
@@ -752,11 +775,16 @@ class OpenAICompatEmbeddingFunction:
     endpoint (LM Studio, llama.cpp, vLLM, Ollama's OpenAI shim, etc.).
 
     Selected via ``embedding_model == "openai-compat"``. Vectors are produced
-    server-side and fetched over HTTP, which changes the vector space — so
-    ``name()`` encodes the model id: ChromaDB persists the EF name on the
-    collection and rejects mismatched reads, the signal to run ``mempalace
-    repair rebuild-index`` after changing model/endpoint. stdlib ``urllib``
-    only, no new dependency.
+    server-side and fetched over HTTP, which changes the vector space.
+    ``name()`` encodes the model id, but this does **not** guard a model or
+    endpoint change: chromadb 1.5.x persists this class as a legacy EF
+    (``{"type": "legacy"}``, no name), so it never compares names on open,
+    and the recorded palace identity is the bare ``openai-compat`` for every
+    endpoint model. Switching ``embedding_api_model`` to another model with
+    the same dimension is therefore accepted silently; run ``mempalace
+    repair rebuild-index`` yourself after changing the model or endpoint.
+    (Recording the endpoint model in the identity is follow-up item D.)
+    stdlib ``urllib`` only, no new dependency.
     """
 
     def __init__(self, base_url: str, model: str, api_key: Optional[str] = None):
@@ -885,6 +913,380 @@ class OpenAICompatEmbeddingFunction:
         return (arr / norms).tolist()
 
 
+_KNOWN_EMBEDDING_MODELS = frozenset(
+    {"minilm", "embeddinggemma", "embeddinggemma2", "openai-compat"}
+)
+# Families whose near misses refuse instead of falling back to MiniLM: each
+# entry is (prefix, suggested names). A name is a near miss of a family when it
+# starts with the prefix or is within _NEAR_MISS_DISTANCE edits of a suggested
+# name. Someone who typed one of these meant that model (or remote embeddings),
+# and MiniLM vectors filed in its place take a full re-embed to replace.
+_GUARDED_MODEL_FAMILIES = (
+    ("embeddinggemma", ("embeddinggemma", "embeddinggemma2")),
+    ("openai", ("openai-compat",)),
+)
+_NEAR_MISS_DISTANCE = 2
+
+
+# ``error`` of the MCP / search result for an UnknownEmbeddingModelError.
+UNKNOWN_EMBEDDING_MODEL_ERROR = "Unknown embedding_model"
+
+
+class UnknownEmbeddingModelError(ValueError):
+    """``embedding_model`` looks like a misspelled supported model name.
+
+    Raised instead of the MiniLM fallback for near misses of EmbeddingGemma
+    or ``openai-compat``: filing MiniLM vectors under a palace the user meant
+    to embed with another model can only be undone by re-embedding everything
+    (``mempalace repair rebuild-index``). The Chroma backend re-raises it
+    rather than opening with chromadb's default.
+    """
+
+
+EMBEDDING_FUNCTION_UNAVAILABLE_ERROR = "Embedding function unavailable"
+
+
+class EmbeddingFunctionUnavailableError(RuntimeError):
+    """The configured embedding function could not be built.
+
+    MemPalace refuses the call instead of letting chromadb embed with its
+    own default function: that writes vectors from a model the palace's
+    recorded identity does not name, and nothing downstream notices (the
+    stored and configured names still agree). Raised for writes and
+    searches; reads that never embed keep working (see
+    :class:`UnavailableEmbeddingFunction`).
+    """
+
+    def __init__(self, model: str, cause: BaseException):
+        self.model = model
+        self.cause = cause
+        super().__init__(
+            f"Could not build the embedding function for embedding_model {model!r}: "
+            f"{type(cause).__name__}: {cause}\n"
+            "MemPalace does not fall back to chromadb's default embedding function, "
+            "which would embed with a different model than the palace records. "
+            "Fix the embedding settings (or the missing dependency) and retry."
+        )
+
+
+def embedding_function_unavailable(cause: BaseException) -> EmbeddingFunctionUnavailableError:
+    """Wrap a failure to build the configured embedding function."""
+    try:
+        from .config import MempalaceConfig
+
+        model = MempalaceConfig().embedding_model
+    except Exception:
+        model = "<unreadable config>"
+    return EmbeddingFunctionUnavailableError(model, cause)
+
+
+def configured_embedding_function():
+    """:func:`get_embedding_function` for the configured model, refusing on a build failure.
+
+    A misspelled model keeps raising :class:`UnknownEmbeddingModelError`, and
+    an EmbeddingGemma 2 failure keeps its own error (it already names the
+    missing extra or device); any other failure to build raises
+    :class:`EmbeddingFunctionUnavailableError`. Nothing calls chromadb's
+    default function instead.
+    """
+    try:
+        return get_embedding_function()
+    except UnknownEmbeddingModelError:
+        raise
+    except Exception as exc:
+        from .config import MempalaceConfig
+
+        try:
+            gemma2 = MempalaceConfig().embedding_model == "embeddinggemma2"
+        except Exception:
+            gemma2 = False
+        if gemma2:
+            raise
+        raise embedding_function_unavailable(exc) from exc
+
+
+class UnavailableEmbeddingFunction:
+    """Stand-in Chroma EF for a read-only open when the configured one failed to build.
+
+    Opening a collection to count, list or fetch rows never embeds, so those
+    reads keep working; any embed (a query, or a write that passes text)
+    raises the :class:`EmbeddingFunctionUnavailableError` instead of
+    reaching chromadb's default function. ``name()`` is ``"default"`` so
+    chromadb's EF-name check on open never trips on it; it is never passed
+    to a create, so chromadb never persists it.
+    """
+
+    def __init__(self, error: EmbeddingFunctionUnavailableError):
+        self.error = error
+
+    @staticmethod
+    def name() -> str:
+        return "default"
+
+    def is_legacy(self) -> bool:
+        return True
+
+    def get_config(self) -> dict:
+        return {}
+
+    def default_space(self) -> str:
+        return "cosine"
+
+    def supported_spaces(self) -> list:
+        return ["cosine", "l2", "ip"]
+
+    def __call__(self, input):  # noqa: A002 — ChromaDB EF protocol
+        raise self.error
+
+    def embed_query(self, input):  # noqa: A002
+        raise self.error
+
+    def embed_documents(self, input):  # noqa: A002
+        raise self.error
+
+
+# Model errors: the configured model cannot be used with this palace (a
+# misspelled name, a palace built with another model, an embedding function
+# that cannot be built, an openai-compat endpoint that cannot be reached or
+# answers with something other than embeddings) or a write cannot record the
+# palace's identity. Nothing is embedded or written until the config, the
+# endpoint or the palace is fixed, so tool results built from one carry
+# ``error_class`` (the class name below) and MCP sets ``isError``.
+MODEL_ERROR_CLASS_NAMES = frozenset(
+    {
+        "UnknownEmbeddingModelError",
+        "EmbeddingFunctionUnavailableError",
+        "EmbeddingAPIError",
+        "EmbedderIdentityMismatchError",
+        "EmbedderIdentityRecordError",
+        "DimensionMismatchError",
+        "EmbeddingFunctionMismatchError",
+    }
+)
+# ``error`` of the MCP / search result for an EmbeddingAPIError.
+EMBEDDING_API_UNAVAILABLE_ERROR = "Embedding API unavailable"
+_MODEL_REFUSAL_HINT = (
+    "Set embedding_model back to the model the palace was built with, "
+    "or re-embed the palace as the details describe."
+)
+_UNKNOWN_MODEL_HINT = "Fix embedding_model in config.json or MEMPALACE_EMBEDDING_MODEL."
+_IDENTITY_NOT_RECORDED_HINT = "Check that the palace directory is writable, then retry."
+_UNAVAILABLE_EF_HINT = (
+    "Fix the embedding settings in config.json (for openai-compat: embedding_api_url "
+    "and embedding_api_model) or install the missing dependency, then retry."
+)
+_EMBEDDING_API_HINT = (
+    "Check that the embedding server at embedding_api_url is running and reachable, "
+    "and that embedding_api_model (and embedding_api_key, if it needs one) are right, "
+    "then retry."
+)
+_REFUSALS_LOGGED: set = set()
+_REFUSALS_LOCK = threading.Lock()
+
+
+def _model_error_class(exc: BaseException) -> Optional[type]:
+    """The model-error class ``exc`` is an instance of, or None."""
+    from .backends.base import (
+        DimensionMismatchError,
+        EmbedderIdentityMismatchError,
+        EmbedderIdentityRecordError,
+        EmbeddingFunctionMismatchError,
+    )
+
+    for cls in (
+        UnknownEmbeddingModelError,
+        EmbeddingFunctionUnavailableError,
+        EmbeddingAPIError,
+        EmbedderIdentityRecordError,
+        EmbedderIdentityMismatchError,
+        DimensionMismatchError,
+        EmbeddingFunctionMismatchError,
+    ):
+        if isinstance(exc, cls):
+            return cls
+    return None
+
+
+def log_model_refusal(log, kind: str, exc: BaseException, palace_path=None) -> None:
+    """Log a refused call: the full message once per palace and message, then one short line.
+
+    A long-lived MCP server refuses every call until the config or the palace
+    is fixed; repeating the multi-line explanation on each call buries
+    everything else on stderr.
+    """
+    message = str(exc)
+    key = (str(palace_path or ""), kind, message)
+    with _REFUSALS_LOCK:
+        first = key not in _REFUSALS_LOGGED
+        _REFUSALS_LOGGED.add(key)
+    if first:
+        log.error("%s: %s", kind, message)
+    else:
+        log.error(
+            "%s at %s (refused again; the details were logged above)",
+            kind,
+            palace_path or "the palace",
+        )
+
+
+def model_error_result(exc: BaseException, *, palace_path=None, log=None) -> Optional[dict]:
+    """The tool/search result for a model error, or None for any other exception.
+
+    Matched by exception class. ``error`` is the human-readable kind,
+    ``error_class`` the model-error class name (``MODEL_ERROR_CLASS_NAMES``)
+    that MCP checks to set ``isError``, ``details`` the full message with the
+    fix. ``log``, when given, gets one rate-limited line (no traceback).
+    """
+    from .backends.base import model_mismatch_error_kind
+
+    cls = _model_error_class(exc)
+    if cls is None:
+        return None
+    if cls is UnknownEmbeddingModelError:
+        kind, hint = UNKNOWN_EMBEDDING_MODEL_ERROR, _UNKNOWN_MODEL_HINT
+    elif cls is EmbeddingFunctionUnavailableError:
+        kind, hint = EMBEDDING_FUNCTION_UNAVAILABLE_ERROR, _UNAVAILABLE_EF_HINT
+    elif cls is EmbeddingAPIError:
+        kind, hint = EMBEDDING_API_UNAVAILABLE_ERROR, _EMBEDDING_API_HINT
+    elif cls.__name__ == "EmbedderIdentityRecordError":
+        kind, hint = model_mismatch_error_kind(exc), _IDENTITY_NOT_RECORDED_HINT
+    else:
+        kind, hint = model_mismatch_error_kind(exc), _MODEL_REFUSAL_HINT
+    if log is not None:
+        log_model_refusal(log, kind, exc, palace_path)
+    return {"error": kind, "error_class": cls.__name__, "details": str(exc), "hint": hint}
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """Levenshtein distance between ``a`` and ``b`` (insert, delete, substitute)."""
+    previous = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        current = [i]
+        for j, cb in enumerate(b, 1):
+            current.append(min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (ca != cb)))
+        previous = current
+    return previous[-1]
+
+
+def _near_miss_suggestions(name: str) -> tuple:
+    """Supported names ``name`` (normalized, not a known model) is a typo of, or ``()``."""
+    for prefix, suggestions in _GUARDED_MODEL_FAMILIES:
+        if name.startswith(prefix) or any(
+            _edit_distance(name, suggestion) <= _NEAR_MISS_DISTANCE for suggestion in suggestions
+        ):
+            return suggestions
+    return ()
+
+
+def _normalize_stored_model_name(name) -> str:
+    """The core model whose vectors a recorded ``model_name`` stands for.
+
+    Older builds (and develop before #2694) embedded any unrecognized
+    ``embedding_model`` with MiniLM but recorded the raw name
+    (``"all-minilm-l6-v2"``, ``"none"`` from a JSON null, ``"minilm-l6"``,
+    even a typo such as ``"embedinggemma2"``). So a recorded name that is
+    neither a supported model nor an ``embeddinggemma2:`` identity reads as
+    ``"minilm"``; supported names and gemma2 identities are returned as is
+    and stay strict. A bare ``"embeddinggemma2"`` is legacy too: EmbeddingGemma
+    2 palaces always record the full ``embeddinggemma2:<model>@<revision>:...``
+    identity, so the bare name can only come from a build that did not know
+    the model and embedded with MiniLM. Only for core embedders: a
+    ``server_embedder`` backend's names are its own and must not go through
+    here.
+    """
+    stored = str(name or "").strip().lower()
+    if stored.startswith("embeddinggemma2:"):
+        return stored
+    if stored in _KNOWN_EMBEDDING_MODELS and stored != "embeddinggemma2":
+        return stored
+    return "minilm"
+
+
+def _resolve_embedding_model(model) -> str:
+    """Normalize ``model`` to the embedder that will actually be built.
+
+    Names are compared stripped and lowercased, like
+    :attr:`MempalaceConfig.embedding_model`, so ``"EmbeddingGemma2"`` is
+    ``"embeddinggemma2"``. A near miss of a guarded family (see
+    ``_GUARDED_MODEL_FAMILIES``: starts with ``embeddinggemma`` or within edit
+    distance 2 of ``embeddinggemma``/``embeddinggemma2``; starts with
+    ``openai`` or within edit distance 2 of ``openai-compat``) raises
+    :class:`UnknownEmbeddingModelError` naming the likely intended model. Any
+    other unrecognized value (``"all-minilm-l6-v2"``, an empty string, a JSON
+    ``null`` read back as ``"none"``) falls back to ``"minilm"``, as it always
+    has, with a warning logged once per process and value.
+    :attr:`MempalaceConfig.embedding_model` resolves through here too, so
+    mine, search and MCP writes all embed with the same function for the
+    same configuration, and the identity a palace records and checks
+    (:func:`current_model_name`) is the resolved name.
+    """
+    name = "" if model is None else str(model).strip().lower()
+    if name in _KNOWN_EMBEDDING_MODELS:
+        return name
+    valid = ", ".join(sorted(_KNOWN_EMBEDDING_MODELS))
+    suggestions = _near_miss_suggestions(name) if name else ()
+    if suggestions:
+        did_you_mean = " or ".join(repr(suggestion) for suggestion in suggestions)
+        raise UnknownEmbeddingModelError(
+            f"Unknown embedding_model {name!r}; did you mean {did_you_mean}? "
+            f"Valid values: {valid}. Not falling back to 'minilm': "
+            "vectors filed with the wrong model can only be replaced by re-embedding "
+            "the whole palace. Older builds embedded unrecognized names with MiniLM; "
+            "set embedding_model to minilm to keep using such a palace."
+        )
+    # Show the configured value as written: a JSON null as null (not the
+    # string 'none'), an empty string flagged as such, anything else quoted.
+    if model is None:
+        shown = "null"
+    elif not name:
+        shown = "'' (empty)"
+    else:
+        shown = repr(name)
+    warning_key = ("unknown-embedding-model", shown)
+    if warning_key not in _WARNED:
+        _WARNED.add(warning_key)
+        logger.warning(
+            "Unknown embedding_model %s; falling back to 'minilm'. Valid values: %s. "
+            "Drawers filed meanwhile are embedded with MiniLM, so moving this palace "
+            "to another model later takes `mempalace repair rebuild-index`.",
+            shown,
+            valid,
+        )
+    return "minilm"
+
+
+def _embeddinggemma2_device(device: Optional[str]) -> str:
+    """Map the shared ``embedding_device`` onto an EmbeddingGemma 2 device.
+
+    PyTorch devices (auto, cuda, mps, cpu) pass through. ONNX Runtime
+    provider names (``coreml``, ``dml``) have no PyTorch equivalent and read
+    as ``auto``; any other value reads as ``cpu``, as it does for the ONNX
+    models. Both warn once instead of failing the model load.
+    """
+    from .embeddinggemma2 import SUPPORTED_DEVICES
+
+    value = (device or "auto").strip().lower()
+    if value in SUPPORTED_DEVICES:
+        return value
+    if value in _PROVIDER_MAP:
+        mapped = "auto"
+        reason = "is an ONNX Runtime provider; EmbeddingGemma 2 runs on PyTorch"
+    else:
+        mapped = "cpu"
+        reason = "is not a known device"
+    warn_key = ("embeddinggemma2-device", value)
+    if warn_key not in _WARNED:
+        _WARNED.add(warn_key)
+        logger.warning(
+            "embedding_device=%r %s, so embeddinggemma2 uses %r (supported: %s).",
+            value,
+            reason,
+            mapped,
+            ", ".join(sorted(SUPPORTED_DEVICES)),
+        )
+    return mapped
+
+
 def get_embedding_function(device: Optional[str] = None, model: Optional[str] = None):
     """Return a cached embedding function for the requested device + model.
 
@@ -902,12 +1304,7 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
         if model is None:
             model = cfg.embedding_model
 
-    model = str(model).strip().lower()
-    if model not in {"minilm", "embeddinggemma", "embeddinggemma2", "openai-compat"}:
-        raise ValueError(
-            f"Unknown embedding_model {model!r}; choose minilm, embeddinggemma, "
-            "embeddinggemma2, or openai-compat"
-        )
+    model = _resolve_embedding_model(model)
 
     if model == "embeddinggemma2":
         from .config import MempalaceConfig
@@ -918,7 +1315,8 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
             "dimension": cfg.embeddinggemma2_dimension,
             "modalities": cfg.embeddinggemma2_modalities,
             "revision": cfg.embeddinggemma2_revision,
-            "device": device,
+            "device": _embeddinggemma2_device(device),
+            "batch_size": cfg.embeddinggemma2_batch_size,
         }
         cache_key = ("embeddinggemma2", tuple(sorted(settings.items())))
         with _EF_CACHE_LOCK:
@@ -983,7 +1381,7 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
                 batch_size=_resolve_embeddinggemma_batch_size(),
             )
         else:
-            # MiniLM keeps its historical embedding behavior.
+            # minilm, and every unrecognized value (see _resolve_embedding_model).
             ef_cls = _build_ef_class()
             ef = ef_cls(preferred_providers=providers, intra_op_num_threads=threads)
 
@@ -1007,7 +1405,10 @@ def describe_device(device: Optional[str] = None, model: Optional[str] = None) -
     """
     if current_model_name(model).startswith("embeddinggemma2:"):
         ef = get_embedding_function(device=device, model="embeddinggemma2")
-        return f"embeddinggemma2 ({ef.effective_device or device or 'auto'}, float32)"
+        # An explicit device torch cannot use warns now, before the caller
+        # prints the label, and the label says so.
+        ef.warn_if_device_unavailable()
+        return f"embeddinggemma2 ({ef.device_label()}, float32)"
     if device is None:
         from .config import MempalaceConfig
 
@@ -1020,6 +1421,10 @@ def describe_device(device: Optional[str] = None, model: Optional[str] = None) -
             # The resolved device depends on the model (_AUTO_PROVIDER_DENYLIST),
             # so the label would otherwise name a provider we won't use.
             model = cfg.embedding_model
+    if model is not None:
+        # Label the provider list the factory will actually build with, which
+        # for an unrecognized model is minilm's.
+        model = _resolve_embedding_model(model)
     _, effective = _resolve_providers(device, model)
     return effective
 
@@ -1035,10 +1440,15 @@ def current_model_name(model: Optional[str] = None) -> str:
     This is the configured ``embedding_model`` (``"minilm"`` /
     ``"embeddinggemma"`` / ...), not the embedding function's internal
     ``name()`` (which is spoofed to ``"default"`` for ChromaDB compatibility).
+    Unrecognized names resolve to ``"minilm"``, the model that embeds them,
+    and near misses raise :class:`UnknownEmbeddingModelError`.
     """
     from .config import MempalaceConfig
 
-    name = str(model).strip().lower() if model is not None else MempalaceConfig().embedding_model
+    if model is None:
+        name = MempalaceConfig().embedding_model  # already resolved
+    else:
+        name = _resolve_embedding_model(model)
     if name == "embeddinggemma2":
         return get_embedding_function(model=name).identity
     return name

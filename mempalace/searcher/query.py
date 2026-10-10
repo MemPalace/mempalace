@@ -18,7 +18,12 @@ def _open_search_collection(palace_path: str, collection_name: str):
             "No palace found",
             hint="Run: mempalace init <dir> && mempalace mine <dir>",
         )
-    except BackendError as e:
+    except (UnknownEmbeddingModelError, BackendError) as e:
+        # A misspelled model, or a palace built with a different embedding
+        # model: the message names the fix (revert the model, or re-embed).
+        refused = model_error_result(e, palace_path=palace_path, log=logger)
+        if refused is not None:
+            return None, _search_error_result(refused.pop("error"), **refused)
         logger.error("Backend error opening palace at %s: %s", palace_path, e)
         return None, _search_error_result(
             "Backend error",
@@ -50,7 +55,7 @@ def _query_drawers_with_filter_fallback(
     try:
         return drawers_col.query(**dkwargs)
     except Exception as filter_err:
-        if not where:
+        if not where or _model_error_class(filter_err) is not None:
             raise
         logger.warning(
             "Filtered search failed (%s); falling back to unfiltered + post-filter",
@@ -323,6 +328,11 @@ def search_memories(
             drawers_col, dkwargs, query, n_results, wing, room, source_file
         )
     except Exception as e:
+        # The configured embedding function could not be built: the
+        # read-only open succeeded, but embedding the query refused (C).
+        refused = model_error_result(e, palace_path=palace_path, log=logger)
+        if refused is not None:
+            return _search_error_result(refused.pop("error"), **refused)
         return _search_error_result(f"Search error: {e}")
 
     # Gather closet hits (best-per-source) to build a boost lookup.

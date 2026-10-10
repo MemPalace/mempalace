@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from pathlib import Path
 
@@ -9,6 +10,8 @@ from ..backends.base import CollectionNotInitializedError, PalaceNotFoundError
 from ..config import MempalaceConfig
 from ..date_window import filed_at_in_window, parse_window
 from ..palace import get_collection, resolve_backend_name
+
+logger = logging.getLogger(__name__)
 
 
 def search_with_media(
@@ -166,6 +169,13 @@ def search_with_media(
         result["query_task"] = query_task
         return result
     except Exception as exc:
+        from ..embedding import model_error_result
+
+        # A misspelled model or a palace built with another model: the same
+        # structured result (and MCP isError) as drawer-only search.
+        refused = model_error_result(exc, palace_path=palace_path, log=logger)
+        if refused is not None:
+            return {**refused, "results": []}
         return {
             "error": str(exc),
             "hint": "Use the isolated embeddinggemma2 palace and compatible indexes.",

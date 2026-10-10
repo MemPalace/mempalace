@@ -61,6 +61,8 @@ class _FakeKnowledgeGraph:
 
 
 class _FakeConfig:
+    embedding_model = "minilm"
+
     def __init__(self, palace_path=None):
         self.palace_path = palace_path or "/fake/palace"
 

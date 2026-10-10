@@ -12,7 +12,8 @@ def cmd_palace_set_embedder(args):
     ``MEMPALACE_EMBEDDING_MODEL``. ``--force`` overwrites an existing,
     differently-named identity.
     """
-    from ..backends.base import EmbedderIdentityMismatchError
+    from ..backends.base import EmbedderIdentityMismatchError, EmbedderIdentityRecordError
+    from ..embedding import UnknownEmbeddingModelError
     from ..palace import set_palace_embedder_identity
 
     config = MempalaceConfig()
@@ -27,7 +28,13 @@ def cmd_palace_set_embedder(args):
             force=getattr(args, "force", False),
             backend=_backend_arg(args),
         )
-    except EmbedderIdentityMismatchError as exc:
+    except (
+        EmbedderIdentityMismatchError,
+        EmbedderIdentityRecordError,
+        UnknownEmbeddingModelError,
+    ) as exc:
+        # A misspelled --model (or configured model) is refused before the
+        # palace is opened, so nothing was created.
         print(f"  ✗ {exc}")
         raise SystemExit(2) from exc
     if old is None:
@@ -228,6 +235,9 @@ def cmd_repair(args):
             assume_yes=getattr(args, "yes", False),
         )
         return
+
+    if not getattr(args, "dry_run", False):
+        _exit_on_misspelled_embedding_model()
 
     if getattr(args, "mode", "legacy") == "from-sqlite":
         from ..migrate import confirm_destructive_action

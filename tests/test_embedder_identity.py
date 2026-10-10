@@ -8,6 +8,7 @@ only the configured model name (cheap), and persistence is exercised with
 ``EmbedderIdentity`` objects and explicit vectors.
 """
 
+import json
 import os
 import warnings
 from unittest.mock import MagicMock, patch
@@ -142,6 +143,26 @@ def test_dimension_change_raises_dimension_error_first():
     # Width change is physically unusable — checked before the name swap.
     with pytest.raises(DimensionMismatchError):
         check_embedder_identity(EmbedderIdentity("a", 384), EmbedderIdentity("b", 768))
+
+
+def test_name_mismatch_points_to_a_re_embed_not_set_embedder_force():
+    """The vectors differ, so the hint must not suggest relabelling them with
+    ``set-embedder --force``; it names the real re-embed commands."""
+    with pytest.raises(EmbedderIdentityMismatchError) as excinfo:
+        check_embedder_identity(
+            EmbedderIdentity("embeddinggemma2", 0), EmbedderIdentity("minilm", 0)
+        )
+    message = str(excinfo.value)
+    assert "set-embedder" not in message
+    assert "--force" not in message
+    assert "`mempalace repair rebuild-index`" in message
+    assert "repair --mode from-sqlite --source" in message
+
+
+def test_dimension_mismatch_names_the_re_embed_commands():
+    with pytest.raises(DimensionMismatchError) as excinfo:
+        check_embedder_identity(EmbedderIdentity("a", 384), EmbedderIdentity("b", 768))
+    assert "`mempalace repair rebuild-index`" in str(excinfo.value)
 
 
 def test_force_returns_mismatch_without_raising():
@@ -399,6 +420,72 @@ def test_enforcement_prefers_effective_identity(monkeypatch, clear_identity_cach
         P._enforce_embedder_identity(_ServerCol(), "/tmp/x", "c", create=False)
 
 
+@pytest.mark.parametrize("stored_name", ["all-minilm-l6-v2", "none", "minilm"])
+def test_server_embedder_stored_names_are_not_normalized(
+    monkeypatch, clear_identity_cache, stored_name
+):
+    """Server-embedder names are arbitrary: an unrecognized stored name is
+    compared as is (never read as MiniLM) and never rewritten."""
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "minilm")
+    from mempalace import palace as P
+
+    class _ServerCol:
+        def effective_embedder_identity(self):
+            return EmbedderIdentity("text-embedding-3-small", 0)
+
+        def get_stored_embedder_identity(self):
+            return EmbedderIdentity(stored_name, 0)
+
+        def count(self):
+            return 5
+
+        def set_embedder_identity(self, identity):
+            raise AssertionError("must not rewrite a server-embedder identity")
+
+    with pytest.raises(EmbedderIdentityMismatchError):
+        P._enforce_embedder_identity(_ServerCol(), "/tmp/x", "c", create=True)
+
+
+def test_server_embedder_with_matching_arbitrary_name_passes(monkeypatch, clear_identity_cache):
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "minilm")
+    from mempalace import palace as P
+
+    class _ServerCol:
+        def effective_embedder_identity(self):
+            return EmbedderIdentity("nomic-embed-text", 0)
+
+        def get_stored_embedder_identity(self):
+            return EmbedderIdentity("nomic-embed-text", 0)
+
+        def count(self):
+            return 5
+
+        def set_embedder_identity(self, identity):
+            raise AssertionError("must not rewrite a server-embedder identity")
+
+    P._enforce_embedder_identity(_ServerCol(), "/tmp/x", "c", create=True)
+
+
+@pytest.mark.parametrize(
+    "stored, expected",
+    [
+        ("minilm", "minilm"),
+        ("embeddinggemma", "embeddinggemma"),
+        ("openai-compat", "openai-compat"),
+        ("embeddinggemma2:google/embeddinggemma-2@abc:768:text:retrieval-v1", None),
+        ("all-minilm-l6-v2", "minilm"),
+        ("none", "minilm"),
+        ("minilm-l6", "minilm"),
+        ("embedinggemma2", "minilm"),
+        ("gemma", "minilm"),
+    ],
+)
+def test_stored_core_model_names_normalize_to_the_model_that_embedded_them(stored, expected):
+    from mempalace.embedding import _normalize_stored_model_name
+
+    assert _normalize_stored_model_name(stored) == (expected or stored)
+
+
 def test_chroma_corrupt_sidecar_returns_none(tmp_path):
     # A malformed sidecar (non-dict JSON) must not raise — degrade to unknown.
     col = _chroma_collection(tmp_path)
@@ -506,3 +593,72 @@ def test_qdrant_enforcement_model_swap_raises(tmp_path, monkeypatch, clear_ident
     monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "embeddinggemma")
     with pytest.raises(EmbedderIdentityMismatchError):
         P._enforce_embedder_identity(col, str(tmp_path), "mempalace_drawers", create=False)
+
+
+# ── the identity sidecar is replaced atomically ───────────────────────────────
+
+
+def _sidecar_dir_entries(path):
+    return sorted(p.name for p in path.parent.iterdir())
+
+
+def test_sidecar_write_keeps_other_entries_and_owner_only_mode(tmp_path):
+    import stat
+
+    from mempalace.backends import _sidecar
+
+    path = tmp_path / "mempalace_embedder.json"
+    _sidecar.write_embedder_sidecar(str(path), "mempalace_drawers", EmbedderIdentity("minilm", 384))
+    _sidecar.write_embedder_sidecar(str(path), "mempalace_closets", EmbedderIdentity("minilm", 384))
+    data = json.loads(path.read_text())
+    assert set(data) == {"mempalace_drawers", "mempalace_closets"}
+    assert _sidecar_dir_entries(path) == ["mempalace_embedder.json"]
+    if os.name == "posix":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("failure", ["mid-write", "fsync", "replace"])
+def test_a_failed_sidecar_write_leaves_the_previous_sidecar_intact(tmp_path, monkeypatch, failure):
+    """A crash or I/O error mid-write must not truncate the sidecar: a
+    truncated file reads back as "no identity recorded", which turns a
+    recorded palace into a legacy one."""
+    from mempalace.backends import _sidecar
+
+    path = tmp_path / "mempalace_embedder.json"
+    _sidecar.write_embedder_sidecar(str(path), "mempalace_drawers", EmbedderIdentity("minilm", 384))
+    before = path.read_text()
+
+    def boom(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    if failure == "mid-write":
+
+        def dump_half(obj, fp, **kwargs):
+            fp.write(json.dumps(obj)[:10])
+            boom()
+
+        monkeypatch.setattr(_sidecar.json, "dump", dump_half)
+    elif failure == "fsync":
+        monkeypatch.setattr(_sidecar.os, "fsync", boom)
+    else:
+        monkeypatch.setattr(_sidecar.os, "replace", boom)
+
+    if failure == "fsync":
+        _sidecar.write_embedder_sidecar(
+            str(path), "mempalace_drawers", EmbedderIdentity("embeddinggemma", 768)
+        )
+    else:
+        # A failed write is loud, not silent (the palace would go unrecorded).
+        from mempalace.backends.base import EmbedderIdentityRecordError
+
+        with pytest.raises(EmbedderIdentityRecordError, match="No space left"):
+            _sidecar.write_embedder_sidecar(
+                str(path), "mempalace_drawers", EmbedderIdentity("embeddinggemma", 768)
+            )
+    monkeypatch.undo()
+    if failure == "fsync":
+        # fsync is best effort (not every filesystem has it); the write lands.
+        assert json.loads(path.read_text())["mempalace_drawers"]["model_name"] == "embeddinggemma"
+    else:
+        assert path.read_text() == before
+    assert _sidecar_dir_entries(path) == ["mempalace_embedder.json"]

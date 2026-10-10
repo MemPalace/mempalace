@@ -125,6 +125,13 @@ def _cli_ranked_hits(
             kwargs["where"] = where
         results = _query_drawers_with_filter_fallback(col, kwargs, query, n_results, wing, room)
     except Exception as e:
+        if _model_error_class(e) is not None:
+            # The configured embedding function could not be built (C): the
+            # message names the fix, so print it plainly.
+            import sys
+
+            print(f"mempalace: {e}", file=sys.stderr)
+            raise SearchError(str(e)) from e
         print(f"\n  Search error: {e}")
         raise SearchError(f"Search error: {e}") from e
 
@@ -196,7 +203,13 @@ def search(
             query_task=query_task,
         )
         if result.get("error"):
-            print(result["error"])
+            if result.get("error_class"):
+                # A model error: the details carry the explanation and the fix.
+                import sys
+
+                print(f"mempalace: {result['details']}", file=sys.stderr)
+            else:
+                print(result["error"])
             raise SearchError(result["error"])
         for index, hit in enumerate(result["results"], 1):
             kind = hit.get("media_type") or "text/code"

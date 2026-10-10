@@ -359,11 +359,27 @@ def _embeddinggemma2_collection(collection, enabled: bool):
 
 
 def _record_rebuilt_embedder_identity(collection, palace_path: str) -> None:
-    """Record the active identity only after the rebuilt collection verifies."""
+    """Record the active identity only after the rebuilt collection verifies.
+
+    A rebuild re-embeds every row with the configured model, so that model
+    is the collection's identity. Called for every collection a rebuild
+    writes (drawers, closets, media assets), on every model (#2709: the
+    rebuilt palace used to come back without mempalace_embedder.json).
+    """
+    from .backends.base import EmbedderIdentityRecordError
     from .embedding import get_embedder_identity
     from .palace import clear_validated_embedder_identity
 
-    collection.set_embedder_identity(get_embedder_identity())
+    identity = get_embedder_identity()
+    try:
+        collection.set_embedder_identity(identity)
+    except EmbedderIdentityRecordError as exc:
+        # The rebuilt rows are verified and kept; only the record failed.
+        # Say so loudly instead of leaving the palace unrecorded in silence.
+        print(
+            f"  WARNING: {exc}\n  Once fixed, record it with: mempalace --palace "
+            f"{palace_path} palace set-embedder --model {identity.model_name.split(':')[0]}"
+        )
     clear_validated_embedder_identity(palace_path)
 
 
@@ -522,8 +538,8 @@ def _rebuild_collection_via_temp(
             rebuilt += len(batch_ids)
             progress(f"  Re-filed {rebuilt}/{expected} drawers...")
         _verify_collection_count(new_col, expected, "rebuilt live collection")
-        if embeddinggemma2 or media_assets:
-            _record_rebuilt_embedder_identity(new_col, palace_path)
+        # Verified: record the model that just embedded every row (#2709).
+        _record_rebuilt_embedder_identity(new_col, palace_path)
 
         try:
             _delete_collection_if_exists(backend, palace_path, temp_name)
@@ -600,8 +616,7 @@ def _promote_temp_collection(
         promoted += len(ids[i : i + batch_size])
         progress(f"  Promoted {promoted}/{expected} drawers from verified temp copy...")
     _verify_collection_count(new_col, expected, "promoted temp collection")
-    if embeddinggemma2 or media_assets:
-        _record_rebuilt_embedder_identity(new_col, palace_path)
+    _record_rebuilt_embedder_identity(new_col, palace_path)
     # Promotion has already fully succeeded and verified at this point --
     # cleaning up the now-redundant temp copy is best-effort, matching the
     # identical post-success cleanup in _rebuild_collection_via_temp above.
@@ -1706,6 +1721,18 @@ def _post_rebuild_cleanup(palace_path: str, backend: "ChromaBackend", progress=p
     _vacuum_and_rebuild_fts5(palace_path, progress=progress)
 
 
+def _require_valid_embedding_model() -> None:
+    """Refuse a misspelled ``embedding_model`` before anything is archived or created.
+
+    Reading the config raises :class:`~mempalace.embedding.UnknownEmbeddingModelError`
+    for a near miss; without this the rebuild would archive the palace and
+    only fail once the first collection asks for its embedding function.
+    """
+    from .config import MempalaceConfig
+
+    MempalaceConfig().embedding_model
+
+
 def rebuild_index(
     palace_path=None,
     confirm_truncation_ok: bool = False,
@@ -1739,6 +1766,7 @@ def rebuild_index(
     if not os.path.isdir(palace_path):
         progress(f"\n  No palace found at {palace_path}")
         return
+    _require_valid_embedding_model()
 
     progress(f"\n{'=' * 55}")
     progress("  MemPalace Repair -- Index Rebuild")
@@ -2066,7 +2094,17 @@ def _rebuild_one_collection(
         _flush()
         if (embeddinggemma2 or media_assets) and upserted:
             _verify_collection_count(col, upserted, "SQLite rebuilt collection")
+        # Record the model that re-embedded the rows, for every collection,
+        # once the rebuilt count matches what was upserted (#2709). Elsewhere
+        # a mismatch is not fatal, as before; the collection is then left
+        # unrecorded and the next open warns.
+        if col.count() == upserted:
             _record_rebuilt_embedder_identity(col, dest_palace)
+        else:
+            print(
+                f"    {collection_name}: {col.count()} rows after {upserted} upserts; "
+                "embedder identity not recorded"
+            )
     except Exception as exc:  # noqa: BLE001 — chromadb raises many shapes
         partial = dict(counts_so_far)
         partial[collection_name] = upserted
@@ -2312,6 +2350,8 @@ def rebuild_from_sqlite(
     """
     source_palace = os.path.abspath(os.path.expanduser(source_palace))
     dest_palace = os.path.abspath(os.path.expanduser(dest_palace))
+    if not dry_run:
+        _require_valid_embedding_model()
 
     src_db = os.path.join(source_palace, "chroma.sqlite3")
 

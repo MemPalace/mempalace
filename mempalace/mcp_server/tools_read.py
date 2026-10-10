@@ -324,6 +324,7 @@ def tool_status():
             "protocol": PALACE_PROTOCOL,
             "aaak_dialect": AAAK_SPEC,
             "backend": _selected_backend_name(),
+            "embedding_device": _describe_device_safe(),
         }
 
     # Use create=True only when a palace DB already exists on disk -- this
@@ -342,6 +343,7 @@ def tool_status():
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
         "backend": _selected_backend_name(),
+        "embedding_device": _describe_device_safe(),
     }
     try:
         if _supports_metadata_facets(col):
@@ -667,7 +669,7 @@ def tool_search(
                             repeat_unknown_warning=True,
                         )
                     except (EmbedderIdentityMismatchError, DimensionMismatchError) as exc:
-                        return {"error": "Embedder identity mismatch", "details": str(exc)}
+                        return _model_mismatch_error(exc)
                 _, output = _capture_fd_stdout(
                     lambda: cli_search(
                         query=query,
@@ -804,7 +806,10 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
             "is_duplicate": len(duplicates) > 0,
             "matches": duplicates,
         }
-    except Exception:
+    except Exception as e:
+        refused = _model_mismatch_error(e)
+        if refused is not None:
+            return refused
         logger.exception("check_duplicate failed")
         return {"error": "Duplicate check failed"}
 

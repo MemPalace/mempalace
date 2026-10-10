@@ -1267,6 +1267,9 @@ def test_read_only_refuses_the_hook_settings_config_write(http_server, monkeypat
     monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("HOMEDRIVE", os.path.splitdrive(str(home))[0] or "C:")
     monkeypatch.setenv("HOMEPATH", os.path.splitdrive(str(home))[1] or str(home))
+    # MEMPALACE_CONFIG_DIR wins over HOME: an inherited one would point the
+    # tool at another config.json and fail the control below.
+    monkeypatch.delenv("MEMPALACE_CONFIG_DIR", raising=False)
     pristine = cfg_file.read_bytes()
 
     port, _ = http_server

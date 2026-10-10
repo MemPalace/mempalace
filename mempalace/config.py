@@ -17,6 +17,7 @@ import errno
 import hashlib
 import json
 import math
+import logging
 import os
 import stat
 import re
@@ -282,7 +283,12 @@ DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
 DEFAULT_BACKEND = "chroma"
 DEFAULT_EMBEDDINGGEMMA2_REVISION = "914f7f89142e33e77833254d9c9b90c3cef7303b"
+logger = logging.getLogger(__name__)
 _EMBEDDINGGEMMA2_DIMENSIONS = frozenset({768, 512, 256, 128})
+# Upper bound for embeddinggemma2_batch_size: larger values are almost
+# certainly a typo and would allocate far beyond any GPU's memory.
+_EMBEDDINGGEMMA2_MAX_BATCH_SIZE = 1024
+_BATCH_SIZE_WARNED: set = set()
 _EMBEDDINGGEMMA2_MODALITIES = frozenset({"text", "text+vision", "text+audio", "all"})
 DEFAULT_MILVUS_CONSISTENCY_LEVEL = "Strong"
 _MILVUS_CONSISTENCY_LEVELS = {
@@ -856,7 +862,16 @@ class MempalaceConfig:
             # normal backend opening reports the actionable error.
             backend = self.backend
             backend_resolution_error = f"{type(exc).__name__}: {exc}"
-        embedding_model = self.embedding_model
+        from .embedding import UnknownEmbeddingModelError
+
+        embedding_model_error = None
+        try:
+            embedding_model = self.embedding_model
+        except UnknownEmbeddingModelError as exc:
+            # Same contract as the backend: stay total and let the direct path
+            # report the misspelled model.
+            embedding_model = self._configured_embedding_model()
+            embedding_model_error = f"{type(exc).__name__}: {exc}"
         effective = {
             "backend": backend,
             "collection_name": self.collection_name,
@@ -865,6 +880,8 @@ class MempalaceConfig:
         }
         if backend_resolution_error is not None:
             effective["backend_resolution_error"] = backend_resolution_error
+        if embedding_model_error is not None:
+            effective["embedding_model_error"] = embedding_model_error
         if embedding_model == "openai-compat":
             effective.update(
                 embedding_api_key=self.embedding_api_key,
@@ -1357,7 +1374,8 @@ class MempalaceConfig:
         """Hardware device for the ONNX embedding model.
 
         Values: ``"auto"`` (default), ``"cpu"``, ``"cuda"``, ``"coreml"``,
-        ``"dml"``. Read from env ``MEMPALACE_EMBEDDING_DEVICE`` first, then
+        ``"dml"``; ``embeddinggemma2`` (PyTorch) takes ``"auto"``, ``"cpu"``,
+        ``"cuda"`` and ``"mps"`` (see :mod:`mempalace.embedding`). Read from env ``MEMPALACE_EMBEDDING_DEVICE`` first, then
         ``embedding_device`` in ``config.json``, then ``"auto"``.
 
         ``auto`` resolves to the first available accelerator at runtime via
@@ -1388,11 +1406,30 @@ class MempalaceConfig:
         (different vector space) — ChromaDB rejects reads when the persisted
         EF name doesn't match. Run ``mempalace repair rebuild-index`` after
         changing this value.
+
+        The value is resolved to the embedder that will actually be built
+        (:func:`mempalace.embedding._resolve_embedding_model`): an
+        unrecognized name (including ``""`` and a JSON ``null``) is logged
+        once with the configured value and reads as ``"minilm"``, so the
+        identity a palace records and checks is the model that embeds it. A
+        near miss of a supported name (``"embeddinggemm2"``, ``"openai"``)
+        raises :class:`~mempalace.embedding.UnknownEmbeddingModelError`.
+        """
+        from .embedding import _resolve_embedding_model
+
+        return _resolve_embedding_model(self._configured_embedding_model())
+
+    def _configured_embedding_model(self) -> "str | None":
+        """``embedding_model`` as configured (env first), stripped and lowercased.
+
+        A JSON ``null`` in config.json stays ``None`` (not the string
+        ``"none"``) so the fallback warning can show it as ``null``.
         """
         env_val = os.environ.get("MEMPALACE_EMBEDDING_MODEL")
         if env_val:
             return env_val.strip().lower()
-        return str(self._file_config.get("embedding_model", "minilm")).strip().lower()
+        value = self._file_config.get("embedding_model", "minilm")
+        return None if value is None else str(value).strip().lower()
 
     @property
     def embedding_threads(self) -> int:
@@ -1451,6 +1488,46 @@ class MempalaceConfig:
         except (TypeError, ValueError):
             return _EMBEDDINGGEMMA_BATCH_SIZE
         return val if val > 0 else _EMBEDDINGGEMMA_BATCH_SIZE
+
+    @property
+    def embeddinggemma2_batch_size(self) -> "int | None":
+        """Documents per encode() call for EmbeddingGemma 2, or None for the default.
+
+        The default depends on the device the model runs on (32 on CUDA, 4 on
+        CPU and MPS; ``mempalace.embeddinggemma2``). Read from env
+        ``MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE`` first, then
+        ``embeddinggemma2_batch_size`` in ``config.json``; a set value wins on
+        every device. Separate from ``embeddinggemma_batch_size``, which sizes
+        ONNX runs of the first EmbeddingGemma model. A value that is not an
+        integer from 1 to 1024 logs one warning per process and value and
+        means the per-device default.
+        """
+        source = "MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE"
+        raw = os.environ.get(source)
+        if raw is None:
+            source = "embeddinggemma2_batch_size"
+            raw = self._file_config.get(source)
+        if raw is None:
+            return None
+        val = None
+        if not isinstance(raw, (bool, float)):
+            try:
+                val = int(str(raw).strip())
+            except (TypeError, ValueError):
+                val = None
+        if val is not None and 1 <= val <= _EMBEDDINGGEMMA2_MAX_BATCH_SIZE:
+            return val
+        key = (source, repr(raw))
+        if key not in _BATCH_SIZE_WARNED:
+            _BATCH_SIZE_WARNED.add(key)
+            logger.warning(
+                "%s=%r is not an integer from 1 to %d; EmbeddingGemma 2 uses the "
+                "per-device default batch size (32 on CUDA, 4 on CPU/MPS).",
+                source,
+                raw,
+                _EMBEDDINGGEMMA2_MAX_BATCH_SIZE,
+            )
+        return None
 
     @property
     def embeddinggemma2_dimension(self) -> int:
@@ -1551,8 +1628,9 @@ class MempalaceConfig:
 
         Onboarding calls this once on first run. Accepts ``"minilm"``,
         ``"embeddinggemma"``, ``"embeddinggemma2"``, or ``"openai-compat"``;
-        other values are normalized to lowercase and persisted. The embedding
-        factory rejects unrecognized values when resolving the provider.
+        other values are normalized to lowercase and persisted
+        (:attr:`embedding_model` then reads unrecognized values as minilm,
+        with a warning, and refuses near misses of supported names).
         """
         self._file_config["embedding_model"] = str(model).strip().lower()
         # ``develop`` created the directory here, outside any ``try``, so this

@@ -83,6 +83,57 @@ class EmbedderIdentityMismatchError(BackendError):
     """Raised when the stored embedder model name differs from the current one."""
 
 
+class EmbeddingFunctionMismatchError(BackendError, ValueError):
+    """Raised when a backend's persisted embedding function differs from the current one.
+
+    Chroma stores the embedding function's name on each collection and
+    refuses to open it with another. A ``ValueError`` subclass, as the bare
+    error used to be, so existing ``except ValueError`` callers still see it.
+    """
+
+
+# ``error`` values of tool and search results for the three mismatch errors
+# above. MCP flags results carrying one of them with ``isError``.
+EMBEDDER_IDENTITY_MISMATCH_ERROR = "Embedder identity mismatch"
+EMBEDDING_DIMENSION_MISMATCH_ERROR = "Embedding dimension mismatch"
+EMBEDDING_MODEL_MISMATCH_ERROR = "Embedding model mismatch"
+
+
+class EmbedderIdentityRecordError(BackendError):
+    """The embedder identity could not be recorded for a collection.
+
+    Raised on write paths only (a brand-new collection's first write open,
+    ``palace set-embedder``): writing on without a recorded identity would
+    leave the palace unprotected against a later same-dimension model swap.
+    Reads never record an identity, so they never raise it.
+    """
+
+
+EMBEDDER_IDENTITY_NOT_RECORDED_ERROR = "Embedder identity not recorded"
+
+
+def model_mismatch_error_kind(exc: BaseException) -> Optional[str]:
+    """The result ``error`` value for a model mismatch error, else None."""
+    if isinstance(exc, EmbedderIdentityRecordError):
+        return EMBEDDER_IDENTITY_NOT_RECORDED_ERROR
+    if isinstance(exc, EmbedderIdentityMismatchError):
+        return EMBEDDER_IDENTITY_MISMATCH_ERROR
+    if isinstance(exc, DimensionMismatchError):
+        return EMBEDDING_DIMENSION_MISMATCH_ERROR
+    if isinstance(exc, EmbeddingFunctionMismatchError):
+        return EMBEDDING_MODEL_MISMATCH_ERROR
+    return None
+
+
+# Re-embedding with the current model: in place (archives the original), or
+# into a separate palace from the original's SQLite.
+_RE_EMBED_HINT = (
+    "re-embed with the current model: `mempalace repair rebuild-index` (in place; "
+    "archives the original palace first) or `mempalace --palace <new-palace> repair "
+    "--mode from-sqlite --source <palace>` (into a separate palace)"
+)
+
+
 class EmbedderIdentityUnknownWarning(UserWarning):
     """Emitted on first open of a collection with no recorded embedder identity.
 
@@ -234,14 +285,15 @@ def check_embedder_identity(
             f"collection was built with a {stored.dimension}-dim embedder "
             f"({stored.model_name!r}) but the current embedder is "
             f"{current.dimension}-dim ({current.model_name!r}); the stored "
-            "vectors are incompatible. Re-embed the palace to switch models."
+            "vectors are incompatible. Set embedding_model back to the model "
+            f"the palace was built with, or {_RE_EMBED_HINT}."
         )
     raise EmbedderIdentityMismatchError(
         f"collection was built with embedder {stored.model_name!r} but the "
         f"current embedder is {current.model_name!r}. Searching across a model "
-        "swap silently degrades recall. Re-embed the palace, or run "
-        "`mempalace palace set-embedder --model <name> --force` to record the "
-        "new identity if you know the vectors are compatible."
+        "swap silently degrades recall. Set embedding_model (config.json or "
+        "MEMPALACE_EMBEDDING_MODEL) back to the model the palace was built with, "
+        f"or {_RE_EMBED_HINT}."
     )
 
 

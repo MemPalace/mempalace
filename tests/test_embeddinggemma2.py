@@ -78,7 +78,7 @@ def test_rejects_unsupported_modalities(modalities):
         EmbeddingGemma2EmbeddingFunction(modalities=modalities)
 
 
-@pytest.mark.parametrize("device", ["cuda", "mps:0", "", None])
+@pytest.mark.parametrize("device", ["dml", "coreml", "cuda:0", "mps:0", "", None])
 def test_rejects_unsupported_devices(device):
     with pytest.raises(ValueError, match="device"):
         EmbeddingGemma2EmbeddingFunction(device=device)

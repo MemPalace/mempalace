@@ -51,8 +51,33 @@ def cmd_mine(args):
         )
         return
 
+    from ..backends.base import (
+        DimensionMismatchError,
+        EmbedderIdentityMismatchError,
+        EmbedderIdentityRecordError,
+        EmbeddingFunctionMismatchError,
+    )
+    from ..embedding import (
+        EmbeddingAPIError,
+        EmbeddingFunctionUnavailableError,
+        UnknownEmbeddingModelError,
+    )
     from ..palace import MineAlreadyRunning, MineFileErrors, MineValidationError
     from ..media import MediaAssetError, MediaAssetSetupError
+
+    model_errors = (
+        UnknownEmbeddingModelError,
+        EmbeddingFunctionUnavailableError,
+        EmbedderIdentityRecordError,
+        EmbedderIdentityMismatchError,
+        DimensionMismatchError,
+        EmbeddingFunctionMismatchError,
+    )
+
+    # Before any mining path (a source adapter such as `--source media`,
+    # --redetect-origin, the miner's banner): a misspelled model stops here
+    # with nothing printed or created.
+    _exit_on_misspelled_embedding_model()
 
     if source_adapter:
         try:
@@ -80,6 +105,9 @@ def cmd_mine(args):
             print(f"mempalace: media indexing failed: {exc}", file=sys.stderr)
             sys.exit(2)
         except MineAlreadyRunning as exc:
+            print(f"mempalace: {exc}", file=sys.stderr)
+            sys.exit(1)
+        except (*model_errors, EmbeddingAPIError) as exc:
             print(f"mempalace: {exc}", file=sys.stderr)
             sys.exit(1)
         suffix = " would be written" if args.dry_run else " written"
@@ -155,6 +183,19 @@ def cmd_mine(args):
     except MineFileErrors as exc:
         # The summary above already counted them; exit non-zero so scripts
         # and hooks do not treat a partial mine as done.
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except model_errors as exc:
+        # A misspelled model, or a model that differs from the one the palace
+        # was built with: nothing was written. Print the fix, as search does,
+        # instead of a traceback.
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except EmbeddingAPIError as exc:
+        # The openai-compat endpoint refused the connection, failed, or sent
+        # something other than embeddings. The miner has already printed its
+        # "Mine aborted" summary (drawers filed so far are kept, and a re-run
+        # resumes); the cause needs one line, not a traceback.
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(1)
     except MineValidationError as exc:

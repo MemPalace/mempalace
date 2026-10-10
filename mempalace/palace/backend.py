@@ -137,6 +137,9 @@ def _open_collection_or_explain(
     State D: healthy — returns the opened collection.
     State E: an unexpected error opens the backend — message points the
         user at ``repair-status`` for further diagnosis.
+    State F: a model error (``UnknownEmbeddingModelError``, an identity,
+        dimension or embedding-function mismatch) — its message is printed
+        as ``mempalace: <message>`` (stderr by default).
 
     ``out`` is the message sink; defaults to the builtin ``print``. Pass a
     callable (e.g. a repair progress emitter) to route messages through it.
@@ -197,6 +200,22 @@ def _open_collection_or_explain(
         # not that the palace on disk is in a recoverable state.
         raise
     except Exception as e:  # noqa: BLE001 — backend exceptions vary (chromadb, OSError, lock errors)
-        emit(f"\n  Error opening palace at {palace_path}: {e!r}")
+        from ..embedding import _model_error_class
+
+        if _model_error_class(e) is not None:
+            # A misspelled model or a palace built with another model: the
+            # message is the explanation and the fix. One `mempalace:` line
+            # on stderr (unless the caller routes messages), as `mine` prints.
+            if out is None:
+                import sys
+
+                print(f"mempalace: {e}", file=sys.stderr)
+            else:
+                emit(f"mempalace: {e}")
+            return None
+        # str(e), not repr: a repr escapes newlines and quotes and wraps the
+        # message in the class name; keep the class only when the message
+        # is empty.
+        emit(f"\n  Error opening palace at {palace_path}: {str(e) or type(e).__name__}")
         emit("  Try: mempalace repair-status --palace <path>")
         return None

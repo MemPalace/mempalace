@@ -11,6 +11,7 @@ identity immediately — the same approach the chroma backend uses.
 
 import json
 import os
+import tempfile
 from typing import Optional
 
 EMBEDDER_SIDECAR_FILENAME = "mempalace_embedder.json"
@@ -46,10 +47,29 @@ def write_embedder_sidecar(path: Optional[str], collection_name: Optional[str], 
     """Record ``identity`` for ``collection_name`` in the sidecar, creating it if needed.
 
     No-ops for a missing path, missing collection name, or a nameless identity.
-    Preserves other collections' entries; never raises on I/O failure.
+    Preserves other collections' entries. Creates the palace directory when it
+    does not exist yet: qdrant and pgvector record a new palace's identity on
+    its first open, before their first upsert creates the folder, and the
+    write used to fail there silently, leaving the palace unrecorded for good.
+
+    The file is replaced atomically, so a failed write keeps the previous
+    one, and a failure raises
+    :class:`~mempalace.backends.base.EmbedderIdentityRecordError` instead of
+    passing silently. Only write paths record an identity, so read-only opens
+    are unaffected.
     """
     if not path or not collection_name or not identity or not getattr(identity, "model_name", ""):
         return
+    directory = os.path.dirname(path) or "."
+    if not os.path.isdir(directory):
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError as exc:
+            raise _record_error(path, collection_name, exc) from exc
+        try:
+            os.chmod(directory, 0o700)
+        except (OSError, NotImplementedError):
+            pass
     data: dict = {}
     if os.path.isfile(path):
         try:
@@ -64,8 +84,51 @@ def write_embedder_sidecar(path: Optional[str], collection_name: Optional[str], 
         "dimension": int(identity.dimension or 0),
     }
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        _write_atomically(path, data)
+    except (OSError, NotImplementedError, TypeError, ValueError) as exc:
+        raise _record_error(path, collection_name, exc) from exc
+
+
+def _record_error(path: str, collection_name: str, exc: BaseException):
+    from .base import EmbedderIdentityRecordError
+
+    return EmbedderIdentityRecordError(
+        f"could not record the embedder identity of collection {collection_name!r} "
+        f"in {path}: {type(exc).__name__}: {exc}. Without it a later model swap "
+        "would not be detected; check that the palace directory is writable and retry."
+    )
+
+
+def _write_atomically(path: str, data: dict) -> None:
+    """Replace ``path`` with ``data`` as JSON, or leave it untouched.
+
+    The JSON goes to a temp file in the same directory (so ``os.replace``
+    stays on one filesystem), is fsynced, then renamed over the sidecar. An
+    interrupted or failed write leaves the previous sidecar intact instead
+    of a truncated file, which would read back as "no identity recorded".
+    A failure re-raises after the temp file is removed.
+    """
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            dir=os.path.dirname(path) or ".", prefix=".mempalace_embedder.", suffix=".tmp"
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-        os.chmod(path, 0o600)
-    except (OSError, NotImplementedError):
-        pass
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass  # not every filesystem supports fsync
+        try:
+            os.chmod(tmp_path, 0o600)
+        except (OSError, NotImplementedError):
+            pass
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass

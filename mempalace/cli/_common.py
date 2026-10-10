@@ -245,3 +245,19 @@ def _ensure_mempalace_files_gitignored(project_dir) -> bool:
         f.write(block)
     print(f"  Added {', '.join(missing)} to {gitignore.name}")
     return True
+
+
+def _exit_on_misspelled_embedding_model():
+    """Refuse a misspelled embedding_model before a command starts work.
+
+    ``mine`` and ``repair`` call this first, so the error is not preceded by
+    a banner, a confirmation prompt or an archived palace. Prints the error
+    and exits 1.
+    """
+    from ..embedding import UnknownEmbeddingModelError
+
+    try:
+        MempalaceConfig().embedding_model
+    except UnknownEmbeddingModelError as exc:
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)

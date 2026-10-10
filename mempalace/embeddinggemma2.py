@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import threading
 import warnings
 from pathlib import Path, PurePath
@@ -20,13 +21,45 @@ MODEL_ID = "google/embeddinggemma-2"
 DEFAULT_REVISION = "914f7f89142e33e77833254d9c9b90c3cef7303b"
 SUPPORTED_DIMENSIONS = frozenset({768, 512, 256, 128})
 SUPPORTED_MODALITIES = frozenset({"text", "text+vision", "text+audio", "all"})
-SUPPORTED_DEVICES = frozenset({"auto", "mps", "cpu"})
+SUPPORTED_DEVICES = frozenset({"auto", "cuda", "mps", "cpu"})
+# Documents per encode() call when no batch size is configured. CPU and MPS
+# keep the original 4. CUDA amortizes kernel launches over larger batches: on
+# an RTX PRO 6000, batch 32 ran short documents ~12x faster than CPU, against
+# ~2x at batch 4, using 5.6-10 GB of VRAM.
 _BATCH_SIZE = 4
+_DEVICE_BATCH_SIZES = {"cuda": 32}
+# The model card for the pinned revision gives an 8,192-token context window
+# shared by all modalities. The checkpoint's config.json reports
+# text_config.max_position_embeddings=262144 (the rotary table, not the
+# trained context) and the tokenizer reports no limit, so Sentence
+# Transformers would otherwise encode an over-long document untruncated.
+_CONTEXT_TOKENS = 8192
 _WITNESS = "mempalace embedding provider health check"
 
 
 class EmbeddingOutputError(RuntimeError):
     """Raised when the model returns vectors that cannot safely be stored."""
+
+
+class EmbeddingGemma2OutOfMemoryError(RuntimeError):
+    """CUDA ran out of memory even at batch size 1."""
+
+
+def _first_sentence(exc: BaseException) -> str:
+    """The first sentence of an exception's message, on one line.
+
+    torch's CUDA out-of-memory message is "CUDA out of memory." followed by the
+    allocation size, a line per process using the GPU (on Windows about 60
+    bogus "Process N has 17179869184.00 GiB memory in use" lines) and
+    allocator advice. Only the first sentence belongs in a one-line error; the
+    full text stays on the chained exception.
+    """
+    lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
+    if not lines:
+        return type(exc).__name__
+    match = re.match(r"(.+?[.!?])(?:\s|$)", lines[0])
+    sentence = match.group(1) if match else lines[0]
+    return sentence if len(sentence) <= 200 else sentence[:199] + "\u2026"
 
 
 def _config_kwargs(modalities: str) -> dict[str, Any]:
@@ -69,6 +102,29 @@ def _metadata_title(metadata: Optional[dict]) -> Optional[str]:
     return None
 
 
+def _cap_max_seq_length(model) -> None:
+    """Truncate inputs at the model's context window (``_CONTEXT_TOKENS``).
+
+    Uses the checkpoint's own ``max_position_embeddings`` when it is smaller.
+    Leaves a smaller limit already set on the model alone.
+    """
+    limit = _CONTEXT_TOKENS
+    try:
+        text_config = getattr(model[0].auto_model.config, "text_config", None)
+        positions = getattr(text_config, "max_position_embeddings", None)
+    except Exception:
+        positions = None
+    if isinstance(positions, int) and 0 < positions < limit:
+        limit = positions
+    current = getattr(model, "max_seq_length", None)
+    if isinstance(current, (int, float)) and 0 < current <= limit:
+        return
+    try:
+        model.max_seq_length = limit
+    except Exception:
+        logger.warning("Could not cap EmbeddingGemma 2 max_seq_length at %d", limit)
+
+
 class EmbeddingGemma2EmbeddingFunction:
     """Chroma-compatible local EmbeddingGemma 2 function.
 
@@ -85,6 +141,7 @@ class EmbeddingGemma2EmbeddingFunction:
         modalities: str = "text",
         device: str = "auto",
         revision: Optional[str] = None,
+        batch_size: Optional[int] = None,
     ):
         if isinstance(dimension, bool) or dimension not in SUPPORTED_DIMENSIONS:
             raise ValueError(
@@ -99,14 +156,25 @@ class EmbeddingGemma2EmbeddingFunction:
         if device not in SUPPORTED_DEVICES:
             raise ValueError(f"device must be one of {sorted(SUPPORTED_DEVICES)}, got {device!r}")
 
+        if batch_size is not None and (
+            isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1
+        ):
+            raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
+
         self.dimension = int(dimension)
         self.modalities = modalities
         self.device = device
+        # Runtime tuning only: not part of get_config() or the identity, so
+        # it never changes the vector space or a persisted collection config.
+        self.batch_size = batch_size
         self.revision = str(revision or DEFAULT_REVISION).strip()
         if not self.revision:
             raise ValueError("revision must be a non-empty model revision")
         self._model = None
         self._resolved_device: Optional[str] = None
+        # The explicit device torch could not use (it runs on CPU instead).
+        self._unavailable_device: Optional[str] = None
+        self._unavailable_warned = False
         self._load_lock = threading.Lock()
         self._inference_lock = threading.Lock()
 
@@ -150,6 +218,72 @@ class EmbeddingGemma2EmbeddingFunction:
         """Resolved runtime device after the lazy model load, if loaded."""
         return self._resolved_device
 
+    def planned_device(self) -> str:
+        """The device the model runs on, or will run on once loaded.
+
+        Before the lazy load this previews ``auto`` (and an unavailable
+        explicit device) without loading weights or warning, so the mine
+        header can name it. Without torch it returns the configured value.
+        """
+        if self._resolved_device is not None:
+            return self._resolved_device
+        try:
+            import torch
+        except ImportError:
+            return self.device
+        return self._pick_device(torch)[0]
+
+    def unavailable_device(self) -> Optional[str]:
+        """The explicit device (``cuda``/``mps``) torch cannot use, if any.
+
+        ``None`` when the configured device is usable, or is ``auto``/``cpu``.
+        Probed without loading the model.
+        """
+        if self._resolved_device is not None:
+            return self._unavailable_device
+        try:
+            import torch
+        except ImportError:
+            return None
+        return self._pick_device(torch)[1]
+
+    def device_label(self) -> str:
+        """The device for headers and status: ``cuda``, or ``cpu; cuda requested but unavailable``."""
+        device = self.planned_device()
+        unavailable = self.unavailable_device()
+        if unavailable is None:
+            return device
+        return f"{device}; {unavailable} requested but unavailable"
+
+    def warn_if_device_unavailable(self) -> None:
+        """Warn once (stderr, via the logger) that the explicit device falls back to CPU.
+
+        Called before the mine header is printed, so the warning comes first,
+        and again at model load; only the first call warns.
+        """
+        unavailable = self.unavailable_device()
+        if unavailable is None or self._unavailable_warned:
+            return
+        self._unavailable_warned = True
+        hint = (
+            "Install a CUDA build of torch from the PyTorch index "
+            "(https://pytorch.org/get-started/locally/)"
+            if unavailable == "cuda"
+            else "MPS needs Apple Silicon and a torch build with MPS support"
+        )
+        logger.warning(
+            "embedding_device=%r requested, but PyTorch cannot use it; EmbeddingGemma 2 "
+            "falls back to CPU. %s, or set embedding_device to 'auto' or 'cpu'.",
+            unavailable,
+            hint,
+        )
+
+    def batch_size_for(self, device: Optional[str]) -> int:
+        """Documents per encode() call on ``device``; a configured value wins."""
+        if self.batch_size is not None:
+            return self.batch_size
+        return _DEVICE_BATCH_SIZES.get(device or "", _BATCH_SIZE)
+
     def is_legacy(self) -> bool:
         return False
 
@@ -160,18 +294,47 @@ class EmbeddingGemma2EmbeddingFunction:
             f"{self.modalities}:retrieval-v1"
         )
 
-    def _select_device(self, torch) -> str:
+    @staticmethod
+    def _cuda_available(torch) -> bool:
+        cuda = getattr(torch, "cuda", None)
+        try:
+            return bool(cuda is not None and cuda.is_available())
+        except Exception:  # a broken CUDA install must not stop CPU inference
+            return False
+
+    @staticmethod
+    def _mps_available(torch) -> bool:
+        mps = getattr(getattr(torch, "backends", None), "mps", None)
+        try:
+            return bool(mps is not None and mps.is_available())
+        except Exception:
+            return False
+
+    def _pick_device(self, torch) -> tuple[str, Optional[str]]:
+        """Return ``(device, unavailable_request)`` without side effects.
+
+        ``auto`` prefers CUDA, then MPS, then CPU. An explicit accelerator
+        that PyTorch cannot use falls back to CPU, as the ONNX providers do,
+        and is reported as the second element so the caller can warn.
+        """
         if self.device == "cpu":
-            return "cpu"
-        mps_available = bool(
-            getattr(getattr(torch, "backends", None), "mps", None)
-            and torch.backends.mps.is_available()
-        )
+            return "cpu", None
+        if self.device == "cuda":
+            return ("cuda", None) if self._cuda_available(torch) else ("cpu", "cuda")
         if self.device == "mps":
-            if not mps_available:
-                raise RuntimeError("device='mps' requested, but PyTorch MPS is unavailable")
-            return "mps"
-        return "mps" if mps_available else "cpu"
+            return ("mps", None) if self._mps_available(torch) else ("cpu", "mps")
+        if self._cuda_available(torch):
+            return "cuda", None
+        if self._mps_available(torch):
+            return "mps", None
+        return "cpu", None
+
+    def _select_device(self, torch) -> str:
+        selected, unavailable = self._pick_device(torch)
+        self._unavailable_device = unavailable
+        if unavailable is not None:
+            self.warn_if_device_unavailable()
+        return selected
 
     def _load_model_for(self, device: str):
         try:
@@ -190,11 +353,14 @@ class EmbeddingGemma2EmbeddingFunction:
             model_kwargs={"dtype": torch.float32},
             config_kwargs=_config_kwargs(self.modalities),
         )
+        _cap_max_seq_length(model)
         return model
 
-    def _encode_raw(self, inputs, *, prompt_name: Optional[str] = None, prompt=None):
+    def _encode_raw(
+        self, inputs, *, prompt_name: Optional[str] = None, prompt=None, batch_size=None
+    ):
         kwargs = {
-            "batch_size": _BATCH_SIZE,
+            "batch_size": batch_size or self.batch_size_for(self._resolved_device),
             "show_progress_bar": False,
             "convert_to_numpy": True,
             "convert_to_tensor": False,
@@ -236,9 +402,66 @@ class EmbeddingGemma2EmbeddingFunction:
             raise EmbeddingOutputError("EmbeddingGemma 2 returned a zero or invalid vector")
         return (vectors / norms).astype(np.float32, copy=False).tolist()
 
-    def _encode_once(self, inputs, *, prompt_name=None, prompt=None):
-        raw = self._encode_raw(inputs, prompt_name=prompt_name, prompt=prompt)
+    def _encode_once(self, inputs, *, prompt_name=None, prompt=None, batch_size=None):
+        raw = self._encode_raw(
+            inputs, prompt_name=prompt_name, prompt=prompt, batch_size=batch_size
+        )
         return self._validate_and_normalize(raw, len(inputs))
+
+    @staticmethod
+    def _is_cuda_oom(exc: BaseException) -> bool:
+        try:
+            import torch
+
+            oom_class = getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None)
+        except ImportError:
+            oom_class = None
+        if isinstance(oom_class, type) and isinstance(exc, oom_class):
+            return True
+        return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+    @staticmethod
+    def _empty_cuda_cache() -> None:
+        try:
+            import torch
+
+            torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001 - best effort between retries
+            pass
+
+    def _encode_shrinking_on_oom(self, inputs, *, prompt_name=None, prompt=None):
+        """Encode; on a CUDA out-of-memory error, halve the batch and retry, down to 1.
+
+        The smaller batch applies to this call only: the next call starts
+        again at the configured (or per-device default) batch size, so one
+        long document does not slow every later batch.
+        """
+        start = batch = self.batch_size_for(self._resolved_device)
+        while True:
+            try:
+                return self._encode_once(
+                    inputs, prompt_name=prompt_name, prompt=prompt, batch_size=batch
+                )
+            except Exception as exc:
+                if self._resolved_device != "cuda" or not self._is_cuda_oom(exc):
+                    raise
+                self._empty_cuda_cache()
+                if batch <= 1:
+                    raise EmbeddingGemma2OutOfMemoryError(
+                        f"EmbeddingGemma 2 ran out of CUDA memory at every batch size from "
+                        f"{start} down to 1 ({_first_sentence(exc)}). Free GPU memory used by "
+                        "other processes, set MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE (or "
+                        "embeddinggemma2_batch_size) "
+                        "to a smaller value, or set MEMPALACE_EMBEDDING_DEVICE=cpu."
+                    ) from exc
+                smaller = max(1, batch // 2)
+                logger.warning(
+                    "EmbeddingGemma 2 ran out of CUDA memory at batch size %d; "
+                    "retrying this call at %d",
+                    batch,
+                    smaller,
+                )
+                batch = smaller
 
     @staticmethod
     def _is_mps_runtime_error(exc: RuntimeError) -> bool:
@@ -305,7 +528,7 @@ class EmbeddingGemma2EmbeddingFunction:
             # witness has proved the provider healthy.
             self._load_and_check()
             try:
-                return self._encode_once(inputs, prompt_name=prompt_name, prompt=prompt)
+                return self._encode_shrinking_on_oom(inputs, prompt_name=prompt_name, prompt=prompt)
             except (RuntimeError, EmbeddingOutputError) as exc:
                 if self._resolved_device != "mps":
                     raise
