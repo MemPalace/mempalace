@@ -515,9 +515,9 @@ def test_stop_hook_saves_silently_at_interval(tmp_path):
     # Saves silently — systemMessage notification with themes, no block
     assert result["systemMessage"].startswith("\u2726 1 checkpoint saved")
     assert "hooks" in result["systemMessage"]
-    # tmp_path has no "-Projects-" segment, so _wing_from_transcript_path falls back to "wing_sessions"
+    # tmp_path has no "-Projects-" segment, so _ingest_wing falls back to "sessions"
     mock_save.assert_called_once_with(
-        str(transcript), "test", wing="wing_sessions", toast=False, agent_name="claude"
+        str(transcript), "test", wing="sessions", toast=False, agent_name="claude"
     )
 
 
@@ -538,7 +538,7 @@ def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
             state_dir=tmp_path,
         )
     mock_save.assert_called_once_with(
-        str(transcript), "test", wing="wing_myproject", toast=False, agent_name="claude"
+        str(transcript), "test", wing="myproject", toast=False, agent_name="claude"
     )
 
 
@@ -2310,7 +2310,7 @@ def test_session_end_uses_detached_paths_not_sync_mine(tmp_path):
     mock_auto.assert_called_once()
     mock_sync.assert_not_called()
     mock_save.assert_called_once_with(
-        expected_path, "sess", wing="wing_sessions", toast=False, agent_name="claude"
+        expected_path, "sess", wing="sessions", toast=False, agent_name="claude"
     )
     # The session is over; its per-session save marker is cleared.
     assert not last_save_file.exists()
@@ -2717,3 +2717,28 @@ def test_ingest_transcript_passes_the_project_wing_to_mine(tmp_path, monkeypatch
     )
     hooks_cli._ingest_transcript(path)
     assert jobs and jobs[0]["wing"] == "mempalace"
+
+
+@pytest.mark.parametrize("hook", [hook_stop, hook_session_end])
+def test_hook_files_the_diary_under_the_ingest_wing(tmp_path, monkeypatch, hook):
+    """One hook fire files its diary and its transcript drawers in one wing (#2299)."""
+    from mempalace import hooks_cli
+
+    path = _write_transcript_with_cwd(tmp_path, "/Users/me/dev/herdmates")
+    with open(path, "a", encoding="utf-8") as f:
+        for i in range(SAVE_INTERVAL):
+            f.write(json.dumps({"message": {"role": "user", "content": f"msg {i}"}}) + "\n")
+    monkeypatch.setattr(hooks_cli, "_maybe_auto_ingest", lambda: None)
+    ingested = []
+    monkeypatch.setattr(hooks_cli, "_ingest_transcript", lambda p: ingested.append(p))
+    with patch(
+        "mempalace.hooks_cli._save_diary_direct", return_value={"count": 1, "themes": []}
+    ) as mock_save:
+        _capture_hook_output(
+            hook,
+            {"session_id": "s", "stop_hook_active": False, "transcript_path": path},
+            state_dir=tmp_path,
+        )
+    assert ingested
+    assert mock_save.call_args.kwargs["wing"] == "herdmates"
+    assert hooks_cli._ingest_wing(ingested[0]) == "herdmates"
