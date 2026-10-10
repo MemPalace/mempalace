@@ -23,6 +23,11 @@ Type=exec
 User=mempalace
 Group=mempalace
 EnvironmentFile=/etc/mempalace/server.env
+# To keep the token out of the service's environment, leave
+# MEMPALACE_MCP_HTTP_TOKEN unset in server.env and pass it as a credential:
+#   sudo sh -c 'umask 077; openssl rand -hex 32 > /etc/mempalace/token'
+# LoadCredential=mempalace_mcp_http_token:/etc/mempalace/token
+# Environment=MEMPALACE_MCP_HTTP_TOKEN_FILE=%d/mempalace_mcp_http_token
 ExecStart=mempalace serve --host 0.0.0.0 --port 8765
 # The idle watchdog exits with status 0, which on-failure reads as an
 # intentional stop, so the server would stay down. server.env disables the

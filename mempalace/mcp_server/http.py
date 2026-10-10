@@ -1191,14 +1191,19 @@ def _build_http_server(host: str, port: int):
     """
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-    auth_token = os.environ.get("MEMPALACE_MCP_HTTP_TOKEN", "").strip()
+    from ..secret_env import read_secret_env
+
+    # MEMPALACE_MCP_HTTP_TOKEN_FILE (a Compose secret, a systemd credential)
+    # keeps the token out of the environment; a bad one raises before bind.
+    auth_token = (read_secret_env("MEMPALACE_MCP_HTTP_TOKEN") or "").strip()
     if (
         not _http_is_loopback(host)
         and not auth_token
         and not _truthy_env(_HTTP_ALLOW_INSECURE_NO_TOKEN_ENV)
     ):
         raise ValueError(
-            "MEMPALACE_MCP_HTTP_TOKEN is required when binding MCP HTTP to a "
+            "MEMPALACE_MCP_HTTP_TOKEN (or MEMPALACE_MCP_HTTP_TOKEN_FILE) is required "
+            "when binding MCP HTTP to a "
             f"non-loopback host. Set {_HTTP_ALLOW_INSECURE_NO_TOKEN_ENV}=1 only "
             "when a trusted fronting layer provides access control."
         )

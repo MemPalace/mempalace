@@ -14,6 +14,7 @@ def isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.delenv("MEMPALACE_MCP_HTTP_TOKEN", raising=False)
+    monkeypatch.delenv("MEMPALACE_MCP_HTTP_TOKEN_FILE", raising=False)
     return tmp_path
 
 
@@ -41,6 +42,26 @@ def test_process_token_is_fallback_without_palace_token(isolated_home, monkeypat
 
     assert server_registry.load_server_tokens(palace) == ("process-token",)
     assert server_registry.load_server_token(palace) == "process-token"
+
+
+def test_process_token_can_come_from_a_token_file(isolated_home, monkeypatch):
+    palace = str(isolated_home / "palace")
+    _write_palace_token(palace, "palace-token")
+    token_file = isolated_home / "token"
+    token_file.write_text("file-token\n", encoding="utf-8")
+    monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN_FILE", str(token_file))
+
+    assert server_registry.load_server_tokens(palace) == ("palace-token", "file-token")
+
+
+def test_bad_process_token_file_keeps_the_palace_token(isolated_home, monkeypatch, caplog):
+    palace = str(isolated_home / "palace")
+    _write_palace_token(palace, "palace-token")
+    monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN_FILE", str(isolated_home / "missing"))
+
+    with caplog.at_level("WARNING", logger="mempalace.server_registry"):
+        assert server_registry.load_server_tokens(palace) == ("palace-token",)
+    assert "MEMPALACE_MCP_HTTP_TOKEN_FILE" in caplog.text
 
 
 def test_duplicate_tokens_are_attempted_once(isolated_home, monkeypatch):

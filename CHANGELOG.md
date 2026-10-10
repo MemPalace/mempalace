@@ -8,6 +8,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **The bearer token and the Qdrant API key can come from a file.**
+  `MEMPALACE_MCP_HTTP_TOKEN_FILE` and `MEMPALACE_QDRANT_API_KEY_FILE` name a
+  file holding the secret, the `_FILE` convention of the postgres and mysql
+  images, so a Compose secret or a systemd `LoadCredential=` can supply it
+  without putting it in the environment, where `docker inspect`,
+  `docker compose config` and `/proc/<pid>/environ` show it. Setting both a
+  variable and its `_FILE` form is refused at startup, as is an unreadable or
+  empty file; an empty variable counts as unset. `mempalace serve` hands a token
+  file to the server by path, its own generated token included, so the value
+  stays out of the server's environment too. `deploy/docker-compose.server.yml`
+  now passes the token as a Compose secret sourced from the same
+  `MEMPALACE_MCP_HTTP_TOKEN` in `deploy/.env`, so an existing deployment needs no
+  change and its token leaves the container's metadata. (#2626)
+
 ---
 
 ## [3.11.0] — 2026-10-02

@@ -134,20 +134,45 @@ def cmd_serve(args):
             sys.exit(2)
     scheme = "https" if tls_cert else "http"
 
-    # Token resolution. Explicit flag > existing env > (non-loopback) auto-generated.
-    token = (args.token or os.environ.get("MEMPALACE_MCP_HTTP_TOKEN", "")).strip()
+    # Token resolution. Explicit flag > existing env (the value, or the file
+    # MEMPALACE_MCP_HTTP_TOKEN_FILE names) > (non-loopback) auto-generated.
+    from ..secret_env import SecretEnvError, read_secret_env, secret_file_env
+
+    token_env = "MEMPALACE_MCP_HTTP_TOKEN"
+    token_file_env = secret_file_env(token_env)
+    token = (args.token or "").strip()
+    # A file holding the token: handed to the server by path, so the value
+    # stays out of the server's environment (/proc/<pid>/environ) as well.
+    token_file = None
+    if not token:
+        try:
+            token = (read_secret_env(token_env) or "").strip()
+        except SecretEnvError as exc:
+            print(f"mempalace: {exc}", file=sys.stderr)
+            sys.exit(2)
+        raw_token_file = os.environ.get(token_file_env, "")
+        if token and raw_token_file.strip():
+            # The exact path read_secret_env opened, untrimmed, so the server
+            # reads the same file.
+            token_file = raw_token_file
     token_created = False
     if not token and not loopback and not args.allow_insecure:
         token, token_created = _load_or_create_server_token(palace_path)
+        token_file = str(_server_token_path(palace_path))
 
     # Build the child environment. Token rides in the env (never argv) so it
-    # stays out of the process table.
+    # stays out of the process table. Exactly one form is passed: the server
+    # refuses to start when both are set.
     env = dict(os.environ)
     env["MEMPALACE_PALACE_PATH"] = palace_path
     if backend:
         env["MEMPALACE_BACKEND"] = str(backend).strip().lower()
-    if token:
-        env["MEMPALACE_MCP_HTTP_TOKEN"] = token
+    env.pop(token_env, None)
+    env.pop(token_file_env, None)
+    if token_file:
+        env[token_file_env] = token_file
+    elif token:
+        env[token_env] = token
     if args.allow_insecure:
         env["MEMPALACE_MCP_HTTP_ALLOW_INSECURE_NO_TOKEN"] = "1"
 
