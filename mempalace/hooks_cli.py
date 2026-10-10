@@ -923,6 +923,8 @@ _HARNESS_BOILERPLATE_MARKERS = (
     "[Request interrupted by user",  # interruption record, carries no topic
     "[Image:",  # pasted-image placeholder, no words to summarize
     "Base directory for this skill:",  # skill preamble
+    "Another Claude session sent a message:",  # subagent hand-back
+    "The app was quit while you were working.",  # resume notice
 )
 
 
