@@ -39,7 +39,7 @@ codex
 
 ### Skill Commands
 
-The main `$mempalace:mempalace` skill can be invoked with five different subcommands. `$mempalace <command>` can be used as a short form invocation. 
+The main `$mempalace:mempalace` skill can be invoked with six different subcommands. `$mempalace <command>` can be used as a short form invocation.
 
 | Command | Description |
 |---------| ------------|

@@ -220,6 +220,98 @@ class TestToolCount:
 
 
 # ---------------------------------------------------------------------------
+# 1b. Plugin command count — every "N slash commands" claim matches the files
+# ---------------------------------------------------------------------------
+
+_NUMBER_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+
+# "5 guided commands", "ships 5 slash commands", "five slash commands",
+# "five different subcommands".
+COMMAND_COUNT_CLAIM_RE = re.compile(
+    r"\b(\d+|" + "|".join(_NUMBER_WORDS) + r")\s+"
+    r"(?:(?:guided|slash|different)\s+)*(?:sub)?commands\b",
+    re.IGNORECASE,
+)
+
+# The same command set ships three ways: Claude Code slash commands, Cursor's
+# global ``/mempalace-*`` commands, and the Codex ``$mempalace <command>`` skills.
+CLAUDE_COMMANDS_DIR = REPO_ROOT / ".claude-plugin" / "commands"
+CURSOR_COMMANDS_DIR = REPO_ROOT / "commands"
+CODEX_COMMAND_SKILLS_DIR = REPO_ROOT / ".codex-plugin" / "skills"
+
+# Every file that states the plugin command count, with its number of claims.
+COMMAND_COUNT_CLAIM_FILES = {
+    ".claude-plugin/README.md": 1,
+    ".cursor-plugin/README.md": 1,
+    ".codex-plugin/README.md": 1,
+    "examples/cursor/README.md": 1,
+}
+
+
+def _plugin_command_names() -> dict:
+    return {
+        "claude": sorted(p.stem for p in CLAUDE_COMMANDS_DIR.glob("*.md")),
+        "cursor": sorted(
+            p.stem.removeprefix("mempalace-") for p in CURSOR_COMMANDS_DIR.glob("mempalace-*.md")
+        ),
+        "codex": sorted(p.parent.name for p in CODEX_COMMAND_SKILLS_DIR.glob("*/SKILL.md")),
+    }
+
+
+def _command_count_claims(text: str) -> list:
+    claims = []
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        for match in COMMAND_COUNT_CLAIM_RE.finditer(line):
+            raw = match.group(1).lower()
+            claims.append((line_no, int(raw) if raw.isdigit() else _NUMBER_WORDS[raw]))
+    return claims
+
+
+class TestPluginCommandCount:
+    """Plugin READMEs state how many commands ship; that must match the files."""
+
+    def test_every_plugin_ships_the_same_commands(self):
+        names = _plugin_command_names()
+        assert names["claude"], f"no commands found in {CLAUDE_COMMANDS_DIR}"
+        assert names["claude"] == names["cursor"] == names["codex"], names
+
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            ("auto-save hooks, and 5 guided commands.", [5]),
+            ("ships 5 slash commands, three model-invocable skills", [5]),
+            ("packages the MCP server, five slash commands, and", [5]),
+            ("can be invoked with five different subcommands.", [5]),
+            ("run the init command to complete setup", []),
+        ],
+    )
+    def test_claim_regex_matches_every_wording(self, text, expected):
+        assert [count for _, count in _command_count_claims(text)] == expected
+
+    @pytest.mark.parametrize("rel_path", sorted(COMMAND_COUNT_CLAIM_FILES))
+    def test_every_command_count_claim_matches_the_files(self, rel_path):
+        actual = len(_plugin_command_names()["claude"])
+        claims = _command_count_claims(_read(REPO_ROOT / rel_path))
+        stale = [f"{rel_path}:{n} says {c}" for n, c in claims if c != actual]
+        assert stale == [], f"Stale plugin command counts (actual {actual}): {stale}"
+        assert len(claims) == COMMAND_COUNT_CLAIM_FILES[rel_path], (
+            f"{rel_path}: expected {COMMAND_COUNT_CLAIM_FILES[rel_path]} command-count "
+            f"claim(s), found {len(claims)} at lines {[n for n, _ in claims]}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # 2. Every tool listed in README actually exists in TOOLS dict
 # ---------------------------------------------------------------------------
 
