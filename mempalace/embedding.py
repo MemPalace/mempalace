@@ -55,6 +55,7 @@ import contextlib
 import hashlib
 import logging
 import os
+import re
 import threading
 from typing import Optional
 
@@ -338,6 +339,97 @@ _EMBEDDINGGEMMA_BATCH_SIZE = 32
 _EMBEDDINGGEMMA_WITNESS = "mempalace embedding provider health check"
 
 
+def _embeddinggemma_gather_patch(model_path: str):
+    """The q8 graph with its token lookup ahead of the dequantize, or ``None``.
+
+    As published, the graph dequantizes its whole 262,144 x 768 token table
+    on every ``run()`` and only then gathers the rows it needs, so each run,
+    even for a two-word query, builds a 768 MiB float32 copy that the CPU
+    arena keeps; a long-running server grew with every concurrent search
+    until it was OOM-killed (#2681). See :mod:`mempalace.onnx_graph`.
+    ``None`` (load the file unchanged) when the graph has no such lookup or
+    cannot be read.
+    """
+    if not os.path.isfile(model_path):
+        return None
+    try:
+        from .onnx_graph import gather_before_dequantize
+
+        return gather_before_dequantize(model_path)
+    except Exception:
+        logger.warning(
+            "Could not rewrite the EmbeddingGemma token lookup; loading the model "
+            "unchanged, which dequantizes the full token table on every run",
+            exc_info=True,
+        )
+        return None
+
+
+# ONNX Runtime honours ``session.model_external_initializers_file_folder_path``
+# for a model loaded from memory from 1.21 on. Older releases (1.19.2 is the
+# newest that installs on Python 3.9; 1.20.x ignores it too) drop the option
+# and resolve the external data against the process working directory, so the
+# patched model either fails to load or, when the working directory holds a
+# file of the same name, silently runs with that file's weights.
+_ORT_MIN_EXTERNAL_DATA_FOLDER = (1, 21)
+
+
+def _ort_honours_external_data_folder(ort) -> bool:
+    """Whether ``ort`` can load a patched model's external data from memory.
+
+    An unparseable version counts as too old: the cost of skipping the
+    rewrite is memory, the cost of loading it on a release that ignores the
+    folder option can be the wrong weights.
+    """
+    match = re.match(r"(\d+)\.(\d+)", str(getattr(ort, "__version__", "")))
+    if match is None:
+        return False
+    return (int(match.group(1)), int(match.group(2))) >= _ORT_MIN_EXTERNAL_DATA_FOLDER
+
+
+def _new_embeddinggemma_session(ort, model_path, patch, intra_op_num_threads, providers):
+    """Build an EmbeddingGemma session, from ``patch`` when there is one.
+
+    A patched model loads from memory, pointed at its external data's real
+    directory. If ONNX Runtime refuses it, the file at ``model_path`` loads
+    unchanged instead, so the rewrite can cost memory but never the model.
+    On an ONNX Runtime too old to point an in-memory model at its external
+    data, a patch that has external data is not tried at all.
+    """
+    if (
+        patch is not None
+        and patch.external_data_dir is not None
+        and not _ort_honours_external_data_folder(ort)
+    ):
+        logger.info(
+            "onnxruntime %s cannot load the rewritten EmbeddingGemma graph's external "
+            "data from memory (needs >= %d.%d); loading it unchanged, which "
+            "dequantizes the full token table on every run",
+            getattr(ort, "__version__", "?"),
+            *_ORT_MIN_EXTERNAL_DATA_FOLDER,
+        )
+        patch = None
+    if patch is not None:
+        so = _intra_op_session_options(intra_op_num_threads) or ort.SessionOptions()
+        if patch.external_data_dir is not None:
+            so.add_session_config_entry(
+                "session.model_external_initializers_file_folder_path", patch.external_data_dir
+            )
+        try:
+            return ort.InferenceSession(patch.model_bytes, sess_options=so, providers=providers)
+        except Exception:
+            logger.warning(
+                "onnxruntime rejected the rewritten EmbeddingGemma graph; loading it "
+                "unchanged, which dequantizes the full token table on every run",
+                exc_info=True,
+            )
+    return ort.InferenceSession(
+        model_path,
+        sess_options=_intra_op_session_options(intra_op_num_threads),
+        providers=providers,
+    )
+
+
 def _sanitize_embeddinggemma_input_ids(tokenizer, input_ids, np):
     """Replace tokenizer-only IDs that the text ONNX model cannot embed."""
     model_vocab_size = tokenizer.get_vocab_size(with_added_tokens=False)
@@ -492,10 +584,9 @@ class EmbeddinggemmaONNX:
             )
             tok_path = hf_hub_download(_EMBEDDINGGEMMA_REPO, filename="tokenizer.json")
 
-            session = ort.InferenceSession(
-                model_path,
-                sess_options=_intra_op_session_options(self._intra_op_num_threads),
-                providers=self._providers,
+            patch = _embeddinggemma_gather_patch(model_path)
+            session = _new_embeddinggemma_session(
+                ort, model_path, patch, self._intra_op_num_threads, self._providers
             )
             out_names = [o.name for o in session.get_outputs()]
             # Model card: sentence_embedding is the pooled output (last_hidden_state
@@ -522,10 +613,12 @@ class EmbeddinggemmaONNX:
                         "~/.mempalace/config.json to skip this check.",
                         self._providers[0],
                     )
-                    session = ort.InferenceSession(
+                    session = _new_embeddinggemma_session(
+                        ort,
                         model_path,
-                        sess_options=_intra_op_session_options(self._intra_op_num_threads),
-                        providers=["CPUExecutionProvider"],
+                        patch,
+                        self._intra_op_num_threads,
+                        ["CPUExecutionProvider"],
                     )
                     if not _embeddinggemma_session_is_healthy(session, tokenizer, output_idx, np):
                         # No provider left to fall back to. Raising loses this
