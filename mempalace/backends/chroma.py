@@ -3794,7 +3794,9 @@ class ChromaCollection(BaseCollection):
             drawer = drawers.setdefault(emb_id, {"metadata": {}, "document": ""})
             if key == "chroma:document":
                 drawer["document"] = str(value or "")
-            else:
+            elif not key.startswith("chroma:"):
+                # Collection.get keeps internal fields (notably chroma:uri)
+                # out of user metadata, even when URIs were stored with rows.
                 drawer["metadata"][key] = value
 
         ordered = []
