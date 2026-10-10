@@ -251,7 +251,7 @@ class TestSearchTool:
         for result in results:
             assert result["cli_output"] == "output\n"
             assert "no recorded embedder identity" in result["cli_error_output"]
-            assert "mempalace palace set-embedder" in result["cli_error_output"]
+            assert "palace set-embedder --model" in result["cli_error_output"]
 
     def test_search_cli_compatible_serializes_output_capture(self, monkeypatch, config, kg):
         import threading

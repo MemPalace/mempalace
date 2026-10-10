@@ -34,6 +34,7 @@ from .base import (
     BaseCollection,
     CollectionNotInitializedError,
     DimensionMismatchError,
+    dimension_mismatch_message,
     GetResult,
     HealthStatus,
     LexicalHit,
@@ -747,8 +748,9 @@ class QdrantCollection(BaseCollection):
             if self._known_dimension is not None:
                 if self._known_dimension != dimension:
                     raise DimensionMismatchError(
-                        f"qdrant collection {self._collection_name!r} expects "
-                        f"embedding dimension {self._known_dimension}, got {dimension}"
+                        dimension_mismatch_message(
+                            "qdrant", self._collection_name, self._known_dimension, dimension
+                        )
                     )
                 return
             if not self._remote_exists():
@@ -761,8 +763,9 @@ class QdrantCollection(BaseCollection):
             remote_dim = self._remote_dimension()
             if remote_dim is not None and remote_dim != dimension:
                 raise DimensionMismatchError(
-                    f"qdrant collection {self._collection_name!r} expects "
-                    f"embedding dimension {remote_dim}, got {dimension}"
+                    dimension_mismatch_message(
+                        "qdrant", self._collection_name, remote_dim, dimension
+                    )
                 )
             self._known_dimension = remote_dim or dimension
 
@@ -1006,8 +1009,9 @@ class QdrantCollection(BaseCollection):
                 self._known_dimension = self._remote_dimension()
             if self._known_dimension is not None and int(q.size) != self._known_dimension:
                 raise DimensionMismatchError(
-                    f"qdrant collection {self._collection_name!r} expects "
-                    f"embedding dimension {self._known_dimension}, got {int(q.size)}"
+                    dimension_mismatch_message(
+                        "qdrant", self._collection_name, self._known_dimension, int(q.size)
+                    )
                 )
             points = self._client.query_points(
                 self._remote_collection,

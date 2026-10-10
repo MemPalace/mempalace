@@ -255,6 +255,11 @@ def _get_collection(create=False):
                     and _collection_cache_backend == backend_name
                     and _collection_cache_palace == _config.palace_path
                 ):
+                    # The handle is cached, the identity verdict is not: the
+                    # check re-reads the record (cheap) so a record another
+                    # process changed is caught here, and a write call on a
+                    # handle opened by a read still gets the write check.
+                    _recheck_cached_identity(create)
                     _collection_open_error = None
                     return _collection_cache
                 _collection_cache = None
@@ -416,6 +421,9 @@ def _get_collection(create=False):
                 _collection_cache_palace = _config.palace_path
                 _collection_open_error = None
                 _invalidate_overview_caches()
+            else:
+                # A cached read handle: re-check the identity record, as above.
+                _recheck_cached_identity(create)
             return _collection_cache
         except (BackendMismatchError, KeyError) as exc:
             _collection_open_error = {
@@ -524,6 +532,20 @@ def _checked_chroma_collection(raw, *, create):
     return collection
 
 
+def _recheck_cached_identity(create) -> None:
+    """Run the identity check on the cached collection handle.
+
+    Cheap when nothing changed (one record read, then the cached verdict).
+    Raises the same model errors as an open; callers run it inside the open's
+    ``try`` so a refusal drops the cached handle and becomes the tool error.
+    """
+    from ..palace import _enforce_embedder_identity
+
+    _enforce_embedder_identity(
+        _collection_cache, _config.palace_path, _config.collection_name, create=create
+    )
+
+
 def _model_mismatch_error(exc) -> dict:
     """The tool result for a model error (a palace built with another model,
     or a misspelled embedding_model). Logs one line, no traceback: the full
@@ -554,6 +576,14 @@ def _no_palace():
         "error": "No palace found",
         "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
     }
+
+
+def _identity_unconfirmed_open_error() -> bool:
+    """Whether the last open refused a write because the embedder identity is unconfirmed."""
+    return bool(
+        _collection_open_error
+        and _collection_open_error.get("error_class") == "EmbedderIdentityUnconfirmedError"
+    )
 
 
 def _collection_error_or_no_palace():

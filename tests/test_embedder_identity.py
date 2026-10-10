@@ -36,7 +36,12 @@ def test_enforce_embedder_identity_skips_count_on_hnsw_divergence():
     whole process down regardless. _enforce_embedder_identity runs on
     EVERY get_collection() call (the universal chokepoint every tool
     passes through) and must never reach count() when hnsw_capacity_status
-    reports divergence (#89)."""
+    reports divergence (#89).
+
+    With no recorded identity and the row count unknown, the write open
+    refuses (the collection may hold vectors from another model); it still
+    must not call count() to find out."""
+    from mempalace.backends.base import EmbedderIdentityUnconfirmedError
     from mempalace.palace import _enforce_embedder_identity
 
     collection = MagicMock()
@@ -49,6 +54,7 @@ def test_enforce_embedder_identity_skips_count_on_hnsw_divergence():
             "mempalace.backends.chroma.hnsw_capacity_status",
             return_value={"diverged": True, "message": "test divergence"},
         ),
+        pytest.raises(EmbedderIdentityUnconfirmedError),
     ):
         _enforce_embedder_identity(collection, "/fake/palace", "mempalace_drawers", create=True)
 
@@ -486,14 +492,19 @@ def test_stored_core_model_names_normalize_to_the_model_that_embedded_them(store
     assert _normalize_stored_model_name(stored) == (expected or stored)
 
 
-def test_chroma_corrupt_sidecar_returns_none(tmp_path):
-    # A malformed sidecar (non-dict JSON) must not raise — degrade to unknown.
+def test_chroma_corrupt_sidecar_is_unreadable_not_unrecorded(tmp_path):
+    # A malformed sidecar (non-dict JSON) was recorded by something and can
+    # no longer be read: that is not "nothing recorded", so it raises and the
+    # enforcement refuses writes until set-embedder records the model again.
+    from mempalace.backends.base import EmbedderIdentityUnreadableError
+
     col = _chroma_collection(tmp_path)
     path = os.path.join(str(tmp_path), "mempalace_embedder.json")
     with open(path, "w", encoding="utf-8") as f:
         f.write('["not", "a", "dict"]')
-    assert col.get_stored_embedder_identity() is None
-    # And a subsequent set still works (overwrites the junk).
+    with pytest.raises(EmbedderIdentityUnreadableError):
+        col.get_stored_embedder_identity()
+    # An explicit set still works (it keeps a copy of the junk, then replaces it).
     col.set_embedder_identity(EmbedderIdentity("minilm", 384))
     assert col.get_stored_embedder_identity().model_name == "minilm"
 

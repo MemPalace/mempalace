@@ -84,6 +84,7 @@ from .palace import (
 # mempalace.format_miner.<name>. Lazy imports inside functions would not
 # expose these as attributes of this module, breaking the test seams.
 from .config import MempalaceConfig, normalize_wing_name
+from .embedding import _model_error_class
 from .collision_scan import assert_no_collisions
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
 from .source_identity import identity_metadata, source_directory_identity
@@ -723,6 +724,15 @@ def _yield_and_reopen(palace_path: str, collection):
     return get_collection(palace_path)
 
 
+def _reraise_model_error(exc: BaseException, announce: bool = False) -> None:
+    """Re-raise ``exc`` when it is an embedding-model refusal; else return."""
+    if _model_error_class(exc) is None:
+        return
+    if announce:
+        print(f"\n  Mine aborted by exception ({type(exc).__name__}).", file=sys.stderr)
+    raise exc
+
+
 def mine_formats(
     format_dir: str,
     palace_path: str,
@@ -939,6 +949,11 @@ def mine_formats(
                 if limit > 0 and files_mined >= limit:
                     break
             except Exception as exc:
+                # The embedder refused (dead endpoint, identity or dimension
+                # mismatch): every file would fail the same way. Abort like
+                # the other miners so the caller reports it, instead of
+                # exiting 0 with N "errored" files.
+                _reraise_model_error(exc)
                 # Log and continue — one malformed file shouldn't kill the
                 # whole mine. Mirrors miner.py's per-file recovery.
                 files_errored += 1
@@ -957,6 +972,9 @@ def mine_formats(
         # upserts to the same rows. Print a clean summary and exit.
         print("\n  Mine interrupted by user (Ctrl-C).")
     except Exception as exc:
+        # A model refusal is the caller's to report (CLI: one line and exit
+        # 1; MCP: isError), as it is for mine and mine --mode convos.
+        _reraise_model_error(exc, announce=True)
         # Defense in depth — the per-file try/except above catches most
         # realistic crashes, but a programming error in the outer-loop
         # plumbing (file enumeration, scan_formats itself, etc.) would

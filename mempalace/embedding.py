@@ -761,13 +761,50 @@ _EF_API_BATCH = 64
 _EF_API_TIMEOUT = 120
 
 
+# EmbeddingAPIError.reason: what went wrong, which decides the error kind
+# and hint a tool reports (see model_error_result).
+API_UNAVAILABLE = "unavailable"  # no answer, a timeout, HTTP 408/429 or 5xx
+API_AUTH = "auth"  # HTTP 401/403: the key is missing or not accepted
+API_REJECTED = "rejected"  # any other 4xx: the server refused this request
+API_BAD_RESPONSE = "bad_response"  # an answer that is not the embeddings asked for
+
+# HTTP statuses a retry later can fix: the server is busy, not refusing.
+_API_RETRYABLE_STATUSES = frozenset({408, 425, 429})
+
+
 class EmbeddingAPIError(RuntimeError):
-    """Raised when the embedding API is unreachable or returns an invalid body.
+    """Raised when the embedding API is unreachable, refuses, or returns an invalid body.
 
     Module-specific subclass mirroring ``llm_client.LLMError`` so callers can
     distinguish embedding-endpoint failures; subclasses ``RuntimeError`` so
-    existing ``except RuntimeError`` paths still catch it.
+    existing ``except RuntimeError`` paths still catch it. ``reason`` is one
+    of ``API_UNAVAILABLE``, ``API_AUTH``, ``API_REJECTED`` or
+    ``API_BAD_RESPONSE``; ``status`` the HTTP status, when there was one.
     """
+
+    def __init__(self, message, *, reason=API_UNAVAILABLE, status=None):
+        super().__init__(message)
+        self.reason = reason
+        self.status = status
+
+
+def _http_error_detail(exc) -> str:
+    """The server's own error message from an HTTP error body, if it sent one."""
+    import json
+
+    try:
+        raw = exc.read(2048)
+    except Exception:
+        return ""
+    try:
+        body = json.loads(raw)
+    except (ValueError, TypeError):
+        text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw or "")
+        return " ".join(text.split())[:300]
+    error = body.get("error", body) if isinstance(body, dict) else body
+    if isinstance(error, dict):
+        error = error.get("message") or error.get("detail") or error
+    return " ".join(str(error).split())[:300]
 
 
 class OpenAICompatEmbeddingFunction:
@@ -775,15 +812,16 @@ class OpenAICompatEmbeddingFunction:
     endpoint (LM Studio, llama.cpp, vLLM, Ollama's OpenAI shim, etc.).
 
     Selected via ``embedding_model == "openai-compat"``. Vectors are produced
-    server-side and fetched over HTTP, which changes the vector space.
-    ``name()`` encodes the model id, but this does **not** guard a model or
-    endpoint change: chromadb 1.5.x persists this class as a legacy EF
-    (``{"type": "legacy"}``, no name), so it never compares names on open,
-    and the recorded palace identity is the bare ``openai-compat`` for every
-    endpoint model. Switching ``embedding_api_model`` to another model with
-    the same dimension is therefore accepted silently; run ``mempalace
-    repair rebuild-index`` yourself after changing the model or endpoint.
-    (Recording the endpoint model in the identity is follow-up item D.)
+    server-side and fetched over HTTP, so the endpoint model defines the
+    vector space. The palace records it: the embedder identity is
+    ``openai-compat:<embedding_api_model>`` (see :func:`current_model_name`),
+    so switching ``embedding_api_model`` to another model refuses on every
+    backend, even at the same dimension, until ``mempalace repair
+    rebuild-index`` re-embeds the palace. The endpoint URL is deliberately
+    not part of the identity: the same model served from another host, port
+    or tunnel produces the same vectors. ``name()`` does not guard anything:
+    chromadb 1.5.x persists this class as a legacy EF (``{"type":
+    "legacy"}``, no name) and never compares names on open.
     stdlib ``urllib`` only, no new dependency.
     """
 
@@ -807,9 +845,9 @@ class OpenAICompatEmbeddingFunction:
         return f"{url}/v1/embeddings"
 
     def name(self) -> str:
-        # Encode the model so switching it changes the persisted EF identity
-        # and forces a rebuild_index (vectors from a different model/space are
-        # not interchangeable). ChromaDB compares this on every read.
+        # Informational only: chromadb persists this class as a legacy EF and
+        # never compares the name. The model swap guard is the recorded
+        # embedder identity (``openai-compat:<model>``, current_model_name).
         return f"openai_compat_emb_{self._model}".replace("/", "_")
 
     def embed_query(self, input):  # noqa: A002 — ChromaDB EF protocol uses `input`
@@ -846,7 +884,16 @@ class OpenAICompatEmbeddingFunction:
             # ValueError covers an invalid/missing URL scheme and json.JSONDecodeError;
             # http.client.HTTPException covers low-level protocol faults (BadStatusLine,
             # IncompleteRead) common with local/overloaded servers.
-            except (HTTPError, URLError, OSError, http.client.HTTPException, ValueError) as e:
+            except HTTPError as e:
+                raise self._http_error(e) from e
+            except json.JSONDecodeError as e:
+                raise EmbeddingAPIError(
+                    f"Embedding API at {self._url} returned a response that is not JSON: {e}. "
+                    f"Check that embedding_api_url points at an OpenAI-compatible "
+                    f"/v1/embeddings endpoint.",
+                    reason=API_BAD_RESPONSE,
+                ) from e
+            except (URLError, OSError, http.client.HTTPException, ValueError) as e:
                 raise EmbeddingAPIError(
                     f"Embedding API request to {self._url} failed: {e}. Check that the "
                     f"server is reachable and MEMPALACE_EMBEDDING_API_URL / embedding_api_url "
@@ -854,6 +901,37 @@ class OpenAICompatEmbeddingFunction:
                 ) from e
             out.extend(self._vectors_from_response(data, len(batch)))
         return out
+
+    def _http_error(self, exc) -> "EmbeddingAPIError":
+        """The error for an HTTP error status: refused, or unavailable.
+
+        A 401/403 names the key, another 4xx the request (usually the model),
+        with the server's own message; a 5xx, 408 or 429 is a server that may
+        answer later, reported as unavailable like a refused connection.
+        """
+        status = exc.code
+        detail = _http_error_detail(exc)
+        said = f"HTTP {status} {exc.reason or ''}".rstrip() + (f": {detail}" if detail else "")
+        if status in (401, 403):
+            return EmbeddingAPIError(
+                f"Embedding API at {self._url} rejected the credentials ({said}). Check "
+                f"embedding_api_key in config.json or MEMPALACE_EMBEDDING_API_KEY.",
+                reason=API_AUTH,
+                status=status,
+            )
+        if 400 <= status < 500 and status not in _API_RETRYABLE_STATUSES:
+            return EmbeddingAPIError(
+                f"Embedding API at {self._url} rejected the request ({said}). Check that "
+                f"embedding_api_model ({self._model!r}) is a model the server serves, and "
+                f"that embedding_api_url is its OpenAI-compatible endpoint.",
+                reason=API_REJECTED,
+                status=status,
+            )
+        return EmbeddingAPIError(
+            f"Embedding API request to {self._url} failed ({said}). Check that the "
+            f"server is running and reachable, then retry.",
+            status=status,
+        )
 
     def _vectors_from_response(self, data, n: int) -> list:
         """Validate one ``/v1/embeddings`` response and return L2-normed vectors.
@@ -870,16 +948,19 @@ class OpenAICompatEmbeddingFunction:
 
         if not isinstance(data, dict):
             raise EmbeddingAPIError(
-                f"Embedding API at {self._url} returned a non-object response: {data}"
+                f"Embedding API at {self._url} returned a non-object response: {data}",
+                reason=API_BAD_RESPONSE,
             )
         rows = data.get("data")
         if not isinstance(rows, list):
             raise EmbeddingAPIError(
-                f"Embedding API at {self._url} returned no 'data' array: {data.get('error', data)}"
+                f"Embedding API at {self._url} returned no 'data' array: {data.get('error', data)}",
+                reason=API_BAD_RESPONSE,
             )
         if len(rows) != n:
             raise EmbeddingAPIError(
-                f"Embedding API at {self._url} returned {len(rows)} embeddings for {n} inputs"
+                f"Embedding API at {self._url} returned {len(rows)} embeddings for {n} inputs",
+                reason=API_BAD_RESPONSE,
             )
         # The endpoint may return rows out of order — sort by index, then
         # require the indices to be exactly 0..n-1 so positional alignment is
@@ -890,22 +971,26 @@ class OpenAICompatEmbeddingFunction:
             indices = [r.get("index") for r in rows]
         except AttributeError as e:
             raise EmbeddingAPIError(
-                f"Embedding API at {self._url} returned non-object rows: {e}"
+                f"Embedding API at {self._url} returned non-object rows: {e}",
+                reason=API_BAD_RESPONSE,
             ) from e
         if indices != list(range(n)):
             raise EmbeddingAPIError(
                 f"Embedding API at {self._url} returned non-contiguous or duplicate "
-                f"'index' values; cannot align embeddings with inputs"
+                f"'index' values; cannot align embeddings with inputs",
+                reason=API_BAD_RESPONSE,
             )
         try:
             arr = np.asarray([r["embedding"] for r in rows], dtype=np.float32)
         except (KeyError, TypeError, ValueError) as e:
             raise EmbeddingAPIError(
-                f"Embedding API at {self._url} returned malformed embeddings: {e}"
+                f"Embedding API at {self._url} returned malformed embeddings: {e}",
+                reason=API_BAD_RESPONSE,
             ) from e
         if arr.ndim != 2:
             raise EmbeddingAPIError(
-                f"Embedding API at {self._url} returned non-vector embeddings (shape {arr.shape})"
+                f"Embedding API at {self._url} returned non-vector embeddings (shape {arr.shape})",
+                reason=API_BAD_RESPONSE,
             )
         # L2-normalize so cosine == dot product (collection uses
         # hnsw:space=cosine), matching EmbeddinggemmaONNX above.
@@ -921,6 +1006,10 @@ _KNOWN_EMBEDDING_MODELS = frozenset(
 # starts with the prefix or is within _NEAR_MISS_DISTANCE edits of a suggested
 # name. Someone who typed one of these meant that model (or remote embeddings),
 # and MiniLM vectors filed in its place take a full re-embed to replace.
+# The recorded identity of an openai-compat palace names the endpoint model:
+# ``openai-compat:<embedding_api_model>``. A bare ``openai-compat`` comes
+# from builds that did not record the model (see _is_bare_openai_compat).
+OPENAI_COMPAT_IDENTITY_PREFIX = "openai-compat:"
 _GUARDED_MODEL_FAMILIES = (
     ("embeddinggemma", ("embeddinggemma", "embeddinggemma2")),
     ("openai", ("openai-compat",)),
@@ -1058,19 +1147,27 @@ MODEL_ERROR_CLASS_NAMES = frozenset(
         "EmbeddingFunctionUnavailableError",
         "EmbeddingAPIError",
         "EmbedderIdentityMismatchError",
+        "EmbedderIdentityUnconfirmedError",
         "EmbedderIdentityRecordError",
         "DimensionMismatchError",
         "EmbeddingFunctionMismatchError",
     }
 )
-# ``error`` of the MCP / search result for an EmbeddingAPIError.
+# ``error`` of the MCP / search result for an EmbeddingAPIError, by reason.
 EMBEDDING_API_UNAVAILABLE_ERROR = "Embedding API unavailable"
+EMBEDDING_API_AUTH_ERROR = "Embedding API authentication failed"
+EMBEDDING_API_REJECTED_ERROR = "Embedding API rejected the request"
+EMBEDDING_API_BAD_RESPONSE_ERROR = "Embedding API returned an invalid response"
 _MODEL_REFUSAL_HINT = (
     "Set embedding_model back to the model the palace was built with, "
     "or re-embed the palace as the details describe."
 )
 _UNKNOWN_MODEL_HINT = "Fix embedding_model in config.json or MEMPALACE_EMBEDDING_MODEL."
 _IDENTITY_NOT_RECORDED_HINT = "Check that the palace directory is writable, then retry."
+_IDENTITY_UNCONFIRMED_HINT = (
+    "Confirm the model the palace was built with, then run "
+    "`mempalace palace set-embedder --model <model>`; reads and search keep working meanwhile."
+)
 _UNAVAILABLE_EF_HINT = (
     "Fix the embedding settings in config.json (for openai-compat: embedding_api_url "
     "and embedding_api_model) or install the missing dependency, then retry."
@@ -1080,6 +1177,25 @@ _EMBEDDING_API_HINT = (
     "and that embedding_api_model (and embedding_api_key, if it needs one) are right, "
     "then retry."
 )
+_EMBEDDING_API_AUTH_HINT = (
+    "The server answered but refused the key: set embedding_api_key in config.json "
+    "(or MEMPALACE_EMBEDDING_API_KEY) to a key it accepts, then retry."
+)
+_EMBEDDING_API_REJECTED_HINT = (
+    "The server answered but refused the request: check that embedding_api_model names "
+    "a model it serves and that embedding_api_url is its /v1/embeddings endpoint."
+)
+_EMBEDDING_API_BAD_RESPONSE_HINT = (
+    "The server answered with something other than embeddings: check that "
+    "embedding_api_url points at an OpenAI-compatible /v1/embeddings endpoint."
+)
+# EmbeddingAPIError.reason -> (error kind, hint).
+_EMBEDDING_API_KINDS = {
+    API_UNAVAILABLE: (EMBEDDING_API_UNAVAILABLE_ERROR, _EMBEDDING_API_HINT),
+    API_AUTH: (EMBEDDING_API_AUTH_ERROR, _EMBEDDING_API_AUTH_HINT),
+    API_REJECTED: (EMBEDDING_API_REJECTED_ERROR, _EMBEDDING_API_REJECTED_HINT),
+    API_BAD_RESPONSE: (EMBEDDING_API_BAD_RESPONSE_ERROR, _EMBEDDING_API_BAD_RESPONSE_HINT),
+}
 _REFUSALS_LOGGED: set = set()
 _REFUSALS_LOCK = threading.Lock()
 
@@ -1090,6 +1206,7 @@ def _model_error_class(exc: BaseException) -> Optional[type]:
         DimensionMismatchError,
         EmbedderIdentityMismatchError,
         EmbedderIdentityRecordError,
+        EmbedderIdentityUnconfirmedError,
         EmbeddingFunctionMismatchError,
     )
 
@@ -1098,6 +1215,7 @@ def _model_error_class(exc: BaseException) -> Optional[type]:
         EmbeddingFunctionUnavailableError,
         EmbeddingAPIError,
         EmbedderIdentityRecordError,
+        EmbedderIdentityUnconfirmedError,
         EmbedderIdentityMismatchError,
         DimensionMismatchError,
         EmbeddingFunctionMismatchError,
@@ -1147,9 +1265,13 @@ def model_error_result(exc: BaseException, *, palace_path=None, log=None) -> Opt
     elif cls is EmbeddingFunctionUnavailableError:
         kind, hint = EMBEDDING_FUNCTION_UNAVAILABLE_ERROR, _UNAVAILABLE_EF_HINT
     elif cls is EmbeddingAPIError:
-        kind, hint = EMBEDDING_API_UNAVAILABLE_ERROR, _EMBEDDING_API_HINT
+        kind, hint = _EMBEDDING_API_KINDS.get(
+            getattr(exc, "reason", API_UNAVAILABLE), _EMBEDDING_API_KINDS[API_UNAVAILABLE]
+        )
     elif cls.__name__ == "EmbedderIdentityRecordError":
         kind, hint = model_mismatch_error_kind(exc), _IDENTITY_NOT_RECORDED_HINT
+    elif cls.__name__ == "EmbedderIdentityUnconfirmedError":
+        kind, hint = model_mismatch_error_kind(exc), _IDENTITY_UNCONFIRMED_HINT
     else:
         kind, hint = model_mismatch_error_kind(exc), _MODEL_REFUSAL_HINT
     if log is not None:
@@ -1194,12 +1316,38 @@ def _normalize_stored_model_name(name) -> str:
     ``server_embedder`` backend's names are its own and must not go through
     here.
     """
-    stored = str(name or "").strip().lower()
+    raw = str(name or "").strip()
+    api_model = openai_compat_api_model(raw)
+    if api_model:
+        # The endpoint model keeps its case and any ``:tag``: servers treat
+        # ids case-sensitively. Only the prefix is normalized.
+        return OPENAI_COMPAT_IDENTITY_PREFIX + api_model
+    stored = raw.lower()
+    if stored == OPENAI_COMPAT_IDENTITY_PREFIX:
+        return "openai-compat"  # a prefix with no model names no model
     if stored.startswith("embeddinggemma2:"):
         return stored
     if stored in _KNOWN_EMBEDDING_MODELS and stored != "embeddinggemma2":
         return stored
     return "minilm"
+
+
+def openai_compat_api_model(name) -> str:
+    """The endpoint model of an ``openai-compat:<model>`` identity, else ``""``.
+
+    Splits on the first ``:`` only, so an Ollama tag such as
+    ``openai-compat:nomic-embed-text:latest`` keeps its ``:latest``.
+    """
+    text = str(name or "").strip()
+    prefix, sep, rest = text.partition(":")
+    if not sep or prefix.lower() != "openai-compat":
+        return ""
+    return rest.strip()
+
+
+def _is_bare_openai_compat(name) -> bool:
+    """A legacy ``openai-compat`` identity that does not name the endpoint model."""
+    return _normalize_stored_model_name(name) == "openai-compat"
 
 
 def _resolve_embedding_model(model) -> str:
@@ -1432,6 +1580,20 @@ def describe_device(device: Optional[str] = None, model: Optional[str] = None) -
 # Probed vector widths, keyed by resolved model name. Populated once per
 # process the first time an identity is resolved for a model.
 _DIM_CACHE: dict = {}
+# Output widths of the bundled ONNX models, fixed by the code that runs them.
+# Used to record a model that is not loaded (``palace set-embedder --model``).
+_FIXED_DIMENSIONS = {"minilm": 384, "embeddinggemma": _EMBEDDINGGEMMA_DIM}
+
+
+def known_dimension(model_name: str) -> int:
+    """The vector width of ``model_name`` without loading it, or ``0`` (unknown).
+
+    The bundled ONNX models have fixed widths, and a model probed earlier in
+    this process is cached. An endpoint model that was never probed is
+    unknown.
+    """
+    name = str(model_name or "")
+    return _FIXED_DIMENSIONS.get(name) or _DIM_CACHE.get(name) or 0
 
 
 def current_model_name(model: Optional[str] = None) -> str:
@@ -1442,6 +1604,14 @@ def current_model_name(model: Optional[str] = None) -> str:
     ``name()`` (which is spoofed to ``"default"`` for ChromaDB compatibility).
     Unrecognized names resolve to ``"minilm"``, the model that embeds them,
     and near misses raise :class:`UnknownEmbeddingModelError`.
+
+    Two models carry more than the name, because the name alone does not fix
+    the vector space: EmbeddingGemma 2 returns its full
+    ``embeddinggemma2:<model>@<revision>:...`` identity, and ``openai-compat``
+    returns ``openai-compat:<embedding_api_model>`` (stripped, case kept), so
+    a same-dimension endpoint model swap is a model mismatch. The endpoint
+    URL is not part of it. With no ``embedding_api_model`` configured the
+    bare ``openai-compat`` comes back; building that function refuses anyway.
     """
     from .config import MempalaceConfig
 
@@ -1451,6 +1621,10 @@ def current_model_name(model: Optional[str] = None) -> str:
         name = _resolve_embedding_model(model)
     if name == "embeddinggemma2":
         return get_embedding_function(model=name).identity
+    if name == "openai-compat":
+        api_model = (MempalaceConfig().embedding_api_model or "").strip()
+        if api_model:
+            return OPENAI_COMPAT_IDENTITY_PREFIX + api_model
     return name
 
 
@@ -1461,6 +1635,8 @@ def probe_dimension(device: Optional[str] = None, model: Optional[str] = None) -
     cached per resolved model name so the probe is paid at most once per
     process. Returns ``0`` if the probe fails (treated as "dimension unknown"
     by the identity check, so a probe failure never blocks normal operation).
+    A failed probe is not cached: an endpoint that was down answers the
+    next probe.
     """
     name = current_model_name(model)
     if name.startswith("embeddinggemma2:"):
@@ -1474,8 +1650,32 @@ def probe_dimension(device: Optional[str] = None, model: Optional[str] = None) -
         dim = len(vectors[0]) if vectors and vectors[0] is not None else 0
     except Exception:
         logger.debug("Embedding dimension probe failed for model=%s", name, exc_info=True)
-        dim = 0
-    _DIM_CACHE[name] = dim
+        return 0
+    if dim:
+        _DIM_CACHE[name] = dim
+    return dim
+
+
+def require_working_embedder(device: Optional[str] = None, model: Optional[str] = None) -> int:
+    """Embed a probe with the configured embedder; return its dimension.
+
+    Unlike :func:`probe_dimension` a failure raises the embedder's own error
+    (:class:`EmbeddingFunctionUnavailableError`, :class:`EmbeddingAPIError`,
+    an unloadable model), and it always embeds, so an endpoint that went down
+    since an earlier probe is caught. A command about to archive, back up or
+    rewrite a palace calls it first, so a refusal leaves the palace as it was.
+    """
+    name = current_model_name(model)
+    if device is None and model is None:
+        # The configured function, built the way every open builds it: a
+        # failure is an EmbeddingFunctionUnavailableError, not a bare ValueError.
+        ef = configured_embedding_function()
+    else:
+        ef = get_embedding_function(device=device, model=model)
+    vectors = ef(input=["probe"])
+    dim = len(vectors[0]) if vectors and vectors[0] is not None else 0
+    if dim:
+        _DIM_CACHE[name] = dim
     return dim
 
 

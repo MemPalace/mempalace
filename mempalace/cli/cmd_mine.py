@@ -124,6 +124,10 @@ def cmd_mine(args):
     ):
         return
 
+    # A palace folder this command creates is removed again if the mine
+    # fails before anything is filed (see _discard_unused_new_palace).
+    palace_is_new = not args.dry_run and not os.path.lexists(palace_path)
+
     # --redetect-origin re-runs corpus_origin on the current corpus state
     # and overwrites <palace>/.mempalace/origin.json before mining proceeds.
     # Heuristic-only by design — full LLM detection lives on `mempalace init`.
@@ -189,6 +193,8 @@ def cmd_mine(args):
         # A misspelled model, or a model that differs from the one the palace
         # was built with: nothing was written. Print the fix, as search does,
         # instead of a traceback.
+        if palace_is_new:
+            _discard_unused_new_palace(palace_path)
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(1)
     except EmbeddingAPIError as exc:
@@ -196,6 +202,8 @@ def cmd_mine(args):
         # something other than embeddings. The miner has already printed its
         # "Mine aborted" summary (drawers filed so far are kept, and a re-run
         # resumes); the cause needs one line, not a traceback.
+        if palace_is_new:
+            _discard_unused_new_palace(palace_path)
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(1)
     except MineValidationError as exc:
@@ -216,6 +224,35 @@ def cmd_mine(args):
             file=sys.stderr,
         )
         sys.exit(1)
+
+
+def _discard_unused_new_palace(palace_path: str) -> None:
+    """Remove a palace folder that this mine created and left without data.
+
+    A first mine that fails at its first embed (a dead endpoint, a refused
+    model) has already opened the palace: the folder holds an empty database
+    and an identity record, so the next open treats it as an existing palace.
+    The caller only passes a folder that did not exist when the command
+    started. It is removed only when both the drawers and the closets
+    collection still count zero rows; if the count cannot be read the folder
+    stays. Remote backends keep their (empty) server-side collections.
+    """
+    import shutil
+
+    from ..backends.registry import reset_backends
+    from ..palace import get_collection
+
+    try:
+        for name in (None, "mempalace_closets"):
+            col = get_collection(
+                palace_path, collection_name=name, create=False, _skip_identity_check=True
+            )
+            if col is not None and col.count():
+                return
+    except Exception:
+        return
+    reset_backends()  # release the database handles before removing the files
+    shutil.rmtree(palace_path, ignore_errors=True)
 
 
 class UnknownSourceAdapterError(ValueError):
@@ -467,6 +504,21 @@ def cmd_sweep(args):
             auto_start=routing.decision.auto_start_daemon,
         )
         return
+    from ..embedding import _model_error_class
+
+    try:
+        _sweep_target(target, palace_path, sweep, sweep_directory)
+    except Exception as exc:
+        if _model_error_class(exc) is None:
+            raise
+        # A misspelled model, an embedder that cannot be built or reached,
+        # or a palace built with another model: one line, as mine prints.
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _sweep_target(target, palace_path, sweep, sweep_directory):
+    """``cmd_sweep``'s direct route: sweep ``target`` and print the tally."""
     if os.path.isfile(target):
         result = sweep(target, palace_path)
         print(

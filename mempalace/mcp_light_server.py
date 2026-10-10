@@ -830,20 +830,22 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             handler = LIGHT_TOOLS[tool_name]["handler"]
             with mcp_server._write_stall_watch(underlying_name):
                 result = handler(arguments)
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": json.dumps(result, ensure_ascii=False, indent=2)
-                            if not isinstance(result, str)
-                            else result,
-                        }
-                    ]
-                },
+            tool_result = {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(result, ensure_ascii=False, indent=2)
+                        if not isinstance(result, str)
+                        else result,
+                    }
+                ]
             }
+            # The same isError rule as the full server (model refusals, a
+            # palace that will not open), so a client that only checks the
+            # flag sees the refusal behind palace_query / palace_exec too.
+            if mcp_server._tool_result_is_error(result):
+                tool_result["isError"] = True
+            return {"jsonrpc": "2.0", "id": req_id, "result": tool_result}
         except Exception as e:
             return mcp_server._internal_tool_error(req_id, tool_name, e)
 

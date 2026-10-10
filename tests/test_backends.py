@@ -2376,6 +2376,10 @@ def test_chroma_backend_preflights_metadata_before_persistent_client(tmp_path, m
     monkeypatch.setattr(
         "mempalace.backends.chroma._fix_missing_collection_type", _record("collection_type")
     )
+    # The _type migration only runs where chromadb 1.5.9+ needs it.
+    monkeypatch.setattr(
+        "mempalace.backends.chroma._chromadb_requires_collection_type", lambda: True
+    )
     monkeypatch.setattr("mempalace.backends.chroma._fix_blob_seq_ids", _record("blob"))
     monkeypatch.setattr(
         "mempalace.backends.chroma.quarantine_invalid_hnsw_metadata", _record("invalid")
@@ -2419,6 +2423,10 @@ def test_chroma_backend_quarantine_rearms_on_mtime_refresh(tmp_path, monkeypatch
     monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
     monkeypatch.setattr(
         "mempalace.backends.chroma._fix_missing_collection_type", _record("collection_type")
+    )
+    # The _type migration only runs where chromadb 1.5.9+ needs it.
+    monkeypatch.setattr(
+        "mempalace.backends.chroma._chromadb_requires_collection_type", lambda: True
     )
     monkeypatch.setattr("mempalace.backends.chroma._fix_blob_seq_ids", _record("blob"))
     monkeypatch.setattr(
@@ -2469,6 +2477,10 @@ def test_chroma_backend_requarantines_after_inode_replacement(tmp_path, monkeypa
     monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
     monkeypatch.setattr(
         "mempalace.backends.chroma._fix_missing_collection_type", _record("collection_type")
+    )
+    # The _type migration only runs where chromadb 1.5.9+ needs it.
+    monkeypatch.setattr(
+        "mempalace.backends.chroma._chromadb_requires_collection_type", lambda: True
     )
     monkeypatch.setattr("mempalace.backends.chroma._fix_blob_seq_ids", _record("blob"))
     monkeypatch.setattr(

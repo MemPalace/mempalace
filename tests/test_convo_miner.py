@@ -933,6 +933,11 @@ def test_mine_convos_reprocesses_legacy_drawer_without_stored_mtime(capsys):
             ],
         )
         del col, client
+        # The legacy palace confirms its model once (palace set-embedder):
+        # a write into a populated, unrecorded collection refuses.
+        from mempalace.palace import set_palace_embedder_identity
+
+        set_palace_embedder_identity(palace_path)
 
         mine_convos(tmpdir, palace_path, wing="test")
         out = capsys.readouterr().out
