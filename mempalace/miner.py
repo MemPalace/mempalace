@@ -52,6 +52,9 @@ from .palace import (
 from .collision_scan import assert_no_collisions
 from .hallways import compute_hallways_for_wing
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
+
+# Re-exported: callers and tests import these from the miner (#2676).
+from .project_config import PROJECT_CONFIG_FILENAMES, find_project_config  # noqa: F401
 from .source_identity import source_directory_identity
 
 logger = logging.getLogger("mempalace_mcp")
@@ -524,45 +527,6 @@ def _apply_exclude_patterns_to_prescanned_files(
 # =============================================================================
 # CONFIG
 # =============================================================================
-
-
-# Project config filenames, in resolution order (#2676). The first regular
-# file wins; ``mempal.*`` is the legacy name. SKIP_FILENAMES above lists the
-# same four so none of them is ever mined as content.
-PROJECT_CONFIG_FILENAMES = (
-    "mempalace.yaml",
-    "mempalace.yml",
-    "mempal.yaml",
-    "mempal.yml",
-)
-
-
-def find_project_config(project_dir) -> Optional[Path]:
-    """Return the project config file for ``project_dir``, or None.
-
-    Checks :data:`PROJECT_CONFIG_FILENAMES` in order. ``is_file()`` rather
-    than ``exists()``: the latter is true for a FIFO, and opening one would
-    block in the kernel until a writer appears, so a config that is not a
-    regular file is treated as absent. When more than one candidate exists,
-    the first one is used and the rest are named on stderr so the shadowed
-    file does not go silently unread.
-    """
-    resolved_project_dir = Path(project_dir).expanduser().resolve()
-    found = [
-        resolved_project_dir / name
-        for name in PROJECT_CONFIG_FILENAMES
-        if (resolved_project_dir / name).is_file()
-    ]
-    if not found:
-        return None
-    if len(found) > 1:
-        ignored = ", ".join(p.name for p in found[1:])
-        print(
-            f"  Multiple project configs in {resolved_project_dir}: using "
-            f"{found[0].name}, ignoring {ignored}.",
-            file=sys.stderr,
-        )
-    return found[0]
 
 
 def load_config(project_dir: str) -> dict:
