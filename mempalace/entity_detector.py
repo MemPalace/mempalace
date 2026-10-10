@@ -235,6 +235,10 @@ READABLE_EXTENSIONS = {
     ".rb",
     ".go",
     ".rs",
+    # Mirrors miner.READABLE_EXTENSIONS: Business Central AL (#278) and
+    # PowerShell, so an AL-only repo still has files to sample.
+    ".al",
+    ".ps1",
 }
 
 SKIP_DIRS = {

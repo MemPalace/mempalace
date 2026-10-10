@@ -1146,3 +1146,18 @@ def test_entity_extraction_no_redos_on_adversarial_ascii_run():
         )
     assert result.returncode == 0, result.stderr
     assert "OK" in result.stdout
+
+
+def test_al_and_ps1_are_sampled_when_prose_is_scarce(tmp_path):
+    """An AL-only Business Central repo still yields files to sample (#278).
+    The miner's own list gains the same two extensions in #2702."""
+    from mempalace import entity_detector
+
+    assert {".al", ".ps1"} <= entity_detector.READABLE_EXTENSIONS
+    (tmp_path / "Customer.Codeunit.al").write_text('codeunit 50100 "Greeting" { }\n')
+    (tmp_path / "Build.AL").write_text("table 50100 Thing { }\n")
+    (tmp_path / "build.ps1").write_text('Write-Host "build"\n')
+
+    found = sorted(p.name for p in entity_detector.scan_for_detection(str(tmp_path)))
+
+    assert found == ["Build.AL", "Customer.Codeunit.al", "build.ps1"]
