@@ -487,29 +487,18 @@ class TestScanConvos:
         files = scan_convos(str(tmp_path))
         assert [f.name for f in files] == ["old-chat.md"]
 
-    def test_scan_skips_claude_code_workflow_state_and_classifier_dumps(self, tmp_path):
-        # Claude Code writes <session>/workflows/wf_*.json (workflow run state)
-        # and <session>/auto-mode-classifier-error.txt (a debug dump embedding
-        # the whole transcript) beside session JSONL. Neither is a conversation.
+    def test_scan_skips_claude_code_session_artifacts(self, tmp_path):
+        # Workflow run state and classifier debug dumps sit beside session JSONL
+        # but are not conversations; a user's own "workflows" folder still scans.
         session_dir = tmp_path / "1234-5678-session"
-        workflows = session_dir / "workflows"
-        workflows.mkdir(parents=True)
-        (workflows / "wf_3af02285-4b0.json").write_text('{"runId": "x"}', encoding="utf-8")
-        (session_dir / "auto-mode-classifier-error.txt").write_text(
-            "=== ERROR ===\n" * 100, encoding="utf-8"
-        )
+        (session_dir / "workflows").mkdir(parents=True)
+        (session_dir / "workflows" / "wf_3af02285-4b0.json").write_text("{}", encoding="utf-8")
+        (session_dir / "auto-mode-classifier-error.txt").write_text("dump", encoding="utf-8")
+        (tmp_path / "workflows").mkdir()
+        (tmp_path / "workflows" / "chat.md").write_text("> q\na\n> q2\na2", encoding="utf-8")
         (tmp_path / "session.jsonl").write_text('{"type": "user"}', encoding="utf-8")
         files = scan_convos(str(tmp_path))
-        assert [f.name for f in files] == ["session.jsonl"]
-
-    def test_scan_keeps_user_files_in_a_workflows_dir(self, tmp_path):
-        # The match is on Claude Code's exact file names, not the folder name.
-        workflows = tmp_path / "workflows"
-        workflows.mkdir()
-        (workflows / "deploy-chat.md").write_text("> q\na\n> q2\na2\n> q3\na3", encoding="utf-8")
-        (workflows / "notes.json").write_text("{}", encoding="utf-8")
-        files = scan_convos(str(tmp_path))
-        assert sorted(f.name for f in files) == ["deploy-chat.md", "notes.json"]
+        assert sorted(f.name for f in files) == ["chat.md", "session.jsonl"]
 
     @pytest.mark.skipif(
         sys.platform == "win32",
