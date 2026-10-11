@@ -31,6 +31,7 @@ from mempalace.hooks_cli import (
     _sanitize_session_id,
     _save_diary_direct,
     _validate_transcript_path,
+    _resolved_hook_wing,
     _wing_from_transcript_path,
     hook_stop,
     hook_session_start,
@@ -444,7 +445,8 @@ def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None):
     mock_config = MagicMock()
     type(mock_config).hook_silent_save = PropertyMock(return_value=True)
     type(mock_config).hook_desktop_toast = PropertyMock(return_value=False)
-    patches.append(patch("mempalace.config.MempalaceConfig", return_value=mock_config))
+    if not isinstance(hooks_cli_mod.MempalaceConfig, Mock):
+        patches.append(patch("mempalace.hooks_cli.MempalaceConfig", return_value=mock_config))
     # A Stop or PreCompact hook spawns the transcript ingest through
     # ``_spawn_mine``, and a real child here outlives the test that started
     # it: it holds the palace's writer lease, and the next test file to ask
@@ -789,6 +791,21 @@ def test_wing_from_transcript_path_extracts_project():
 
 def test_wing_from_transcript_path_fallback():
     assert _wing_from_transcript_path("/some/random/path.jsonl") == "wing_sessions"
+
+
+def test_resolved_hook_wing_uses_configured_canonical_wing():
+    config = MagicMock()
+    config.hook_wing = "sessions"
+    with patch("mempalace.hooks_cli.MempalaceConfig", return_value=config):
+        assert _resolved_hook_wing("/some/random/path.jsonl") == "sessions"
+
+
+def test_resolved_hook_wing_preserves_project_derivation_by_default():
+    config = MagicMock()
+    config.hook_wing = None
+    path = "/home/jp/.claude/projects/-home-jp-Projects-memorypalace/session.jsonl"
+    with patch("mempalace.hooks_cli.MempalaceConfig", return_value=config):
+        assert _resolved_hook_wing(path) == "wing_memorypalace"
 
 
 def test_wing_from_transcript_path_windows_backslashes():
