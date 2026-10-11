@@ -94,6 +94,34 @@ NORMALIZE_VERSION = 2
 #               whitespace instead of mid-word.
 CONVO_CHUNKER_VERSION = 2
 
+# Revision of the Codex rollout parser (``normalize._try_codex_jsonl``),
+# stamped on convo rows whose source is a Codex rollout as
+# ``codex_normalize_version``. A missing or older value makes the mined-set
+# checks re-mine that rollout even when its bytes and mtime are unchanged, so
+# a parser fix reaches sessions already filed by the old parser (#2470):
+# rollouts stored as raw JSON before the unsupported-rollout guard, or filed
+# into ``wing_api`` before per-project routing. Only Codex sources are
+# affected; bumping NORMALIZE_VERSION would re-mine every file instead.
+#
+# v1 (2026-10): first stamped revision; Codex rollouts file into the wing of
+#               the project their session ran in.
+CODEX_NORMALIZE_VERSION = 1
+
+_CODEX_ROLLOUT_NAME_RE = re.compile(r"^rollout-.+\.jsonl$")
+
+
+def is_codex_rollout_source(source_file: Optional[str]) -> bool:
+    """True when ``source_file`` names a Codex CLI rollout transcript.
+
+    Matched on the basename (``rollout-<timestamp>-<id>.jsonl``) rather than
+    the ``.codex/sessions`` path, so rollouts under ``archived_sessions`` or
+    copied elsewhere are covered too.
+    """
+    if not source_file:
+        return False
+    name = source_file.replace("\\", "/").rsplit("/", 1)[-1]
+    return bool(_CODEX_ROLLOUT_NAME_RE.match(name))
+
 
 # (palace_id, collection_name, model_name) tuples already validated this
 # process, so the identity check (one metadata read) runs at most once per

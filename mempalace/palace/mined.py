@@ -32,8 +32,17 @@ def _meta_is_current(meta: dict, extract_mode: Optional[str]) -> bool:
     Pre-v2 drawers have no ``normalize_version`` and count as stale. In the
     exchange scope a missing ``convo_chunker_version`` is stale too, so a
     chunker fix re-mines conversation files without touching project files.
+    In any convo scope a Codex rollout row with a missing or older
+    ``codex_normalize_version`` is stale, so a Codex parser fix re-mines
+    rollouts whose bytes never changed (#2470).
     """
     if meta.get("normalize_version", 1) < NORMALIZE_VERSION:
+        return False
+    if (
+        extract_mode is not None
+        and is_codex_rollout_source(meta.get("source_file"))
+        and meta.get("codex_normalize_version", 0) < CODEX_NORMALIZE_VERSION
+    ):
         return False
     if extract_mode == "exchange":
         return meta.get("convo_chunker_version", 1) >= CONVO_CHUNKER_VERSION
@@ -49,6 +58,7 @@ _MINED_SCAN_KEYS = (
     "ingest_mode",
     "normalize_version",
     "convo_chunker_version",
+    "codex_normalize_version",
     "content_hash",
     "wing",
 )
