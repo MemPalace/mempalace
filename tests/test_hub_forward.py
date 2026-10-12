@@ -174,7 +174,14 @@ class TestServerRegistry:
 class _FakeHub:
     """Minimal /healthz + /mcp endpoint standing in for `mempalace serve`."""
 
-    def __init__(self, mine_result=None, search_result=None, rpc_error=None, required_token=None):
+    def __init__(
+        self,
+        mine_result=None,
+        search_result=None,
+        sync_result=None,
+        rpc_error=None,
+        required_token=None,
+    ):
         self.requests = []
         self.auth_headers = []
         outer = self
@@ -193,6 +200,20 @@ class _FakeHub:
                     "bm25_score": 1.25,
                 }
             ],
+        }
+        sync_result = sync_result or {
+            "success": True,
+            "scanned": 10,
+            "kept": 8,
+            "gitignored": 1,
+            "missing": 1,
+            "unresolved": 0,
+            "no_source": 0,
+            "out_of_scope": 0,
+            "by_source": {},
+            "unresolved_by_source": {},
+            "removed_drawers": 0,
+            "removed_closets": 0,
         }
 
         class Handler(BaseHTTPRequestHandler):
@@ -222,7 +243,12 @@ class _FakeHub:
                     payload = {"jsonrpc": "2.0", "id": request.get("id"), "error": rpc_error}
                 else:
                     tool_name = request.get("params", {}).get("name")
-                    tool_result = search_result if tool_name == "mempalace_search" else mine_result
+                    if tool_name == "mempalace_search":
+                        tool_result = search_result
+                    elif tool_name == "mempalace_sync":
+                        tool_result = sync_result
+                    else:
+                        tool_result = mine_result
                     payload = {
                         "jsonrpc": "2.0",
                         "id": request.get("id"),
@@ -377,6 +403,49 @@ class TestForwardMineToHub:
             assert "read-only server" in capsys.readouterr().err
         finally:
             hub.stop()
+
+
+def _sync_args(source_dir=None, **overrides):
+    defaults = dict(
+        dir=str(source_dir) if source_dir else None,
+        root=[],
+        palace=None,
+        backend=None,
+        global_backend=None,
+        wing=None,
+        dry_run=True,
+    )
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+class TestForwardSyncToHub:
+    def test_forwards_when_hub_alive(self, isolated_home, tmp_path, fake_hub, capsys):
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        args = _sync_args(tmp_path / "convos")
+        handled = cli._forward_sync_to_hub(args, palace)
+        assert handled is True
+        (request,) = fake_hub.requests
+        assert request["params"]["name"] == "mempalace_sync"
+        arguments = request["params"]["arguments"]
+        assert arguments["apply"] is False
+        assert arguments["project_dir"] == os.path.abspath(str(tmp_path / "convos"))
+        out = capsys.readouterr().out
+        assert "forwarding sync to palace hub" in out
+        assert "DRY RUN" in out
+
+    def test_no_hub_returns_false(self, isolated_home, tmp_path):
+        palace = str(isolated_home / "palace")
+        assert cli._forward_sync_to_hub(_sync_args(tmp_path), palace) is False
+
+    def test_multi_root_stays_direct(self, tmp_path):
+        args = _sync_args(tmp_path / "a", root=[str(tmp_path / "b")])
+        assert cli._sync_args_forwardable(args) is False
+
+    def test_explicit_backend_is_not_forwardable(self, tmp_path):
+        args = _sync_args(tmp_path, backend="chroma")
+        assert cli._sync_args_forwardable(args) is False
 
 
 class TestForwardSearchToHub:
