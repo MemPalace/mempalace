@@ -28,6 +28,11 @@ def cmd_sync(args):
             auto_start=routing.decision.auto_start_daemon,
         )
         return
+    # A live HTTP hub for this palace holds the MCP writer lease, so a
+    # direct sync here would be refused. Hand the job to the hub instead,
+    # the way mine and search already do (#2723).
+    if _sync_args_forwardable(args) and _forward_sync_to_hub(args, palace_path):
+        return
     from ..palace import MineAlreadyRunning
     from ..wal import _wal_log
     from ..backends import detect_backend_for_path
