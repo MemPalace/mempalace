@@ -6,10 +6,13 @@ Two hooks for Claude Code and Codex that automatically save memories during work
 
 | Hook | When It Fires | What Happens |
 |------|--------------|-------------|
-| **Save Hook** | Every 15 human messages | Blocks the AI, tells it to save key topics/decisions/quotes to the palace |
-| **PreCompact Hook** | Right before context compaction | Emergency save — forces the AI to save everything before losing context |
+| **Save Hook** | Every 15 human messages | Files a diary checkpoint and mines the session transcript into the palace |
+| **PreCompact Hook** | Right before context compaction | Mines the transcript before compaction discards it |
 
-The AI does the actual filing — it knows the conversation context, so it classifies memories into the right wings/halls/closets. The hooks just tell it **when** to save.
+Both run silently by default (`hooks.silent_save`, since v3.3.0): the hooks file
+the memories themselves and spend no tokens in the chat window. Setting
+`silent_save` to `false` restores the legacy behaviour, where the hook blocks
+instead and asks the AI to file via MCP tools.
 
 ## Install — Claude Code
 
@@ -68,6 +71,28 @@ Edit `mempal_save_hook.sh` to change:
 - **`SAVE_INTERVAL=15`** — How many messages between saves. Lower = more frequent, higher = less interruption.
 - **`STATE_DIR`** — Where hook state is stored (defaults to `~/.mempalace/hook_state/`)
 - **`MEMPAL_DIR`** — Optional. Set to a conversations directory to auto-run `mempalace mine` on each save trigger.
+
+Two settings in `~/.mempalace/config.json` control what gets captured:
+
+```json
+{
+  "hooks": {
+    "auto_save": true,
+    "mine_transcript": false
+  }
+}
+```
+
+- **`auto_save`** (default `true`) — the master switch. `false` makes all hooks
+  pass straight through; nothing is captured.
+- **`mine_transcript`** (default `true`) — whether to file the whole session
+  transcript verbatim, tool output included. Turn it off to keep continuity
+  checkpoints without archiving every command's output; MemPalace never
+  summarizes or redacts, so whatever a command printed is stored as printed.
+
+Environment equivalents (`MEMPALACE_HOOKS_AUTO_SAVE`,
+`MEMPALACE_HOOKS_MINE_TRANSCRIPT`) win over the config file. Full reference:
+[`hooks/README.md`](https://github.com/MemPalace/mempalace/blob/develop/hooks/README.md).
 
 ## How It Works
 

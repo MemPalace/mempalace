@@ -97,6 +97,26 @@ def make_convo_drawer_id(
     )
 
 
+def make_convo_drawer_version_id(
+    wing: str, room: str, source_file: str, extract_mode: str, chunk_index: int, chunk_hash: str
+) -> str:
+    """Drawer ID for a later version of a conversation chunk.
+
+    The first content filed at a chunk position takes
+    :func:`make_convo_drawer_id`. When a re-mine finds different content at
+    that position, the new text gets its own drawer under this ID instead of
+    overwriting the old one, so earlier versions are never destroyed (#1593).
+    Deterministic over the content: re-filing the same version lands on the
+    same ID.
+
+    Hash input is ``f"{source_file}|{extract_mode}|{chunk_index}|{chunk_hash}"``.
+    """
+    return (
+        f"drawer_{wing}_{room}_"
+        f"{_delimited_sha256((source_file, extract_mode, str(chunk_index), chunk_hash), _HASH_TRUNC_DRAWER)}"
+    )
+
+
 def make_convo_sentinel_id(source_file: str, extract_mode: str) -> str:
     """Sentinel registry ID for the conversation miner zero-chunk-file path.
 

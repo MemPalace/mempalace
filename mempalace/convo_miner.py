@@ -25,6 +25,7 @@ from .collision_scan import assert_no_collisions
 from .ids import (
     ID_RECIPE,
     make_convo_drawer_id,
+    make_convo_drawer_version_id,
     make_convo_sentinel_id,
     make_exchange_drawer_id,
 )
@@ -36,6 +37,7 @@ from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
     _metadata_matches_extract_mode,
+    _meta_is_current,
     _validate_palace_fts5_after_mine,
     file_already_mined,
     get_collection,
@@ -282,31 +284,52 @@ def _register_file(
     )
 
 
-def _source_file_delete_ids(collection, source_file: str, extract_mode: str) -> list[str]:
-    """Collect drawer IDs for one source file and extraction mode.
+def _source_file_snapshot(
+    collection, source_file: str, extract_mode: str
+) -> tuple[dict[str, dict], dict[str, Optional[str]], set[str]]:
+    """Read what the palace holds for one source file and extraction mode.
+
+    Returns ``(metadatas, documents, taken_ids)``: drawer_id -> stored
+    metadata and drawer_id -> stored text for the drawers in this extraction
+    mode, plus every drawer id stored for the source in any mode (a new
+    drawer must never be written over one of them).
 
     Legacy conversation drawers did not carry extract_mode; treat those as
-    exchange-mode rows so schema rebuilds can still clean them up without
-    deleting newer general-mode drawers for the same transcript.
+    exchange-mode rows so they stay in the exchange scope without touching
+    newer general-mode drawers for the same transcript.
     """
-    ids: list[str] = []
+    metadatas: dict[str, dict] = {}
+    documents: dict[str, Optional[str]] = {}
+    taken_ids: set[str] = set()
     offset = 0
     while True:
         batch = collection.get(
             where={"source_file": source_file},
             limit=1000,
             offset=offset,
-            include=["metadatas"],
+            include=["metadatas", "documents"],
         )
         batch_ids = batch.get("ids") or []
-        metadatas = batch.get("metadatas") or []
-        for drawer_id, meta in zip(batch_ids, metadatas):
+        batch_metas = batch.get("metadatas") or []
+        batch_docs = batch.get("documents") or [None] * len(batch_ids)
+        for drawer_id, meta, doc in zip(batch_ids, batch_metas, batch_docs):
+            taken_ids.add(drawer_id)
             if _metadata_matches_extract_mode(meta or {}, extract_mode):
-                ids.append(drawer_id)
+                metadatas[drawer_id] = meta or {}
+                documents[drawer_id] = doc
         if not batch_ids:
             break
         offset += len(batch_ids)
-    return ids
+    return metadatas, documents, taken_ids
+
+
+def _source_file_delete_ids(collection, source_file: str, extract_mode: str) -> list[str]:
+    """Collect drawer IDs for one source file and extraction mode."""
+    return list(_source_file_snapshot(collection, source_file, extract_mode)[0])
+
+
+def _chunk_hash(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 # =============================================================================
@@ -691,60 +714,70 @@ def _file_chunks_locked(
     content_hash=None,
     source_dir_ino=None,
 ):
-    """Lock the source file, purge stale drawers, and upsert fresh chunks.
+    """Lock the source file and file its chunks additively.
 
     Combines the per-file serialization that prevents concurrent agents from
-    duplicating work (via mine_lock) with the rebuild contract
-    (purge-before-insert so stale drawers never survive) that fires on
-    either a normalize-version bump OR a changed/grown source file (mtime
-    differs from what's stored) -- transcripts are not assumed immutable,
-    since a Claude Code session keeps appending to its own file while
-    active and /compact or /clear can rewrite one in place.
+    duplicating work (via mine_lock) with an additive re-mine contract
+    (#1593, #2403). A source is re-mined when it changed — a Claude Code
+    session appends to its own transcript every turn, and /compact or /clear
+    can rewrite one in place — and the re-mine never destroys what the
+    palace already holds:
 
-    Returns (drawers_added, room_counts_delta, skipped). ``skipped`` is
-    :data:`PURGE_FAILED` when the stale-drawer purge raised, which the mine
-    counts as an error rather than a skip.
+    - A chunk whose exact text is already filed at the same position keeps
+      its drawer and embedding; it only gets a metadata refresh
+      (``source_mtime`` / ``chunk_total``) so the completion check in
+      ``file_already_mined`` sees one full current-mtime group.
+    - A chunk with new text gets a NEW drawer. The first text at a position
+      takes the positional id; any later version takes a content-derived id
+      (:func:`make_convo_drawer_version_id`). No upsert ever lands on a
+      drawer holding different text, so a pass that fails after some
+      batches leaves every earlier version intact.
+    - Nothing is deleted. Chunks the new transcript no longer contains stay
+      in the palace as history; they keep their old ``source_mtime``, so
+      they never count toward the current generation's completion check.
+
+    Any interrupted pass leaves the current-mtime group short of its
+    ``chunk_total`` — ``file_already_mined`` returns False and the next mine
+    finishes it (#2183).
+
+    Returns (drawers_added, room_counts_delta, skipped) where drawers_added
+    counts only the drawers actually upserted this pass. ``skipped`` is
+    :data:`PURGE_FAILED` when the existing-drawer snapshot raised, which the
+    mine counts as an error rather than a skip.
     """
     room_counts_delta: dict = defaultdict(int)
     drawers_added = 0
     with mine_lock(source_file):
         # Re-check after lock — another agent may have just finished this file
         # at the current schema/mtime. A stale hit here returns False, so we
-        # still fall through to the purge+rebuild path below.
+        # still fall through to the incremental path below.
         if file_already_mined(collection, source_file, check_mtime=True, extract_mode=extract_mode):
             return 0, room_counts_delta, True
 
-        # Purge stale drawers first. Fires both on a normalize-schema bump
-        # (file_already_mined() returned False for pre-v2 drawers) and on a
-        # changed/grown transcript (mtime differs) — clean them out so the
-        # source doesn't end up with mixed old/new drawers.
-        #
-        # A failed purge must abort this file's mine attempt rather than
-        # fall through to upsert: proceeding on top of an unpurged (or
-        # partially purged) set produces duplicate/stale drawers under
-        # mixed schema versions, with no operator-visible signal beyond a
-        # debug log (#105 — convo_miner's own instance of the same swallow
-        # already fixed for miner.py at #23). Returning here leaves the old
-        # drawers' stored mtime untouched, so the next mine still sees a
-        # mismatch and retries.
+        # Snapshot what the palace already holds for this source+mode. A
+        # failed snapshot must abort this file's mine attempt rather than
+        # fall through to a blind full upsert: without the snapshot the pass
+        # cannot tell new text from text already filed, and could write over
+        # a drawer it never saw (#105 — convo_miner's own instance of the
+        # same swallow already fixed for miner.py at #23). Returning here
+        # leaves the old drawers' stored mtime untouched, so the next mine
+        # still sees a mismatch and retries.
         try:
-            delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
-            if delete_ids:
-                collection.delete(ids=delete_ids)
+            existing, existing_docs, taken_ids = _source_file_snapshot(
+                collection, source_file, extract_mode
+            )
         except Exception as exc:
             print(
-                f"  ! [error] stale-drawer purge failed for {source_file!r} "
+                f"  ! [error] existing-drawer snapshot failed for {source_file!r} "
                 f"({exc!r}); leaving existing drawers untouched, will retry "
                 f"on the next mine",
                 file=sys.stderr,
             )
-            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
+            logger.debug("Existing-drawer snapshot failed for %s", source_file, exc_info=True)
             return 0, room_counts_delta, PURGE_FAILED
 
-        # Batch chunks into bounded upserts so large transcripts keep most of
-        # the embedding speedup without one huge Chroma/SQLite request. Keep
-        # one filed_at per source file so all transcript drawers share an
-        # ingest timestamp.
+        # One filed_at per source file so all transcript drawers of a pass
+        # share an ingest timestamp.
         #
         # Every drawer of this pass carries ``chunk_total`` so
         # ``file_already_mined`` / ``prefetch_mined_set`` can tell a complete
@@ -757,80 +790,144 @@ def _file_chunks_locked(
         except OSError:
             source_mtime = None
         chunk_total = len(chunks)
-        try:
-            for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
-                batch_docs: list = []
-                batch_ids: list = []
-                batch_metas: list = []
-                for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                    chunk_room = (
-                        chunk.get("memory_type", room) if extract_mode == "general" else room
-                    )
-                    if extract_mode == "general":
-                        room_counts_delta[chunk_room] += 1
-                    drawer_id = make_convo_drawer_id(
-                        wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
-                    )
-                    batch_docs.append(chunk["content"])
-                    batch_ids.append(drawer_id)
-                    meta = {
-                        "wing": wing,
-                        "room": chunk_room,
-                        "hall": _detect_hall_cached(chunk["content"]),
-                        "source_file": source_file,
-                        "chunk_index": chunk["chunk_index"],
-                        "added_by": agent,
-                        "filed_at": filed_at,
-                        "entities": entities_metadata(chunk["content"]),
-                        "authored_at": authored_at if authored_at is not None else filed_at,
-                        "ingest_mode": "convos",
-                        "extract_mode": extract_mode,
-                        "normalize_version": NORMALIZE_VERSION,
-                        "id_recipe": ID_RECIPE,
-                        "chunk_total": chunk_total,
-                    }
-                    if extract_mode == "exchange":
-                        meta["convo_chunker_version"] = CONVO_CHUNKER_VERSION
-                    if source_mtime is not None:
-                        meta["source_mtime"] = source_mtime
-                    if source_dir_ino:
-                        # Which directory this transcript was read from, so
-                        # ``sync`` can tell a neighbour in the same directory
-                        # from one on a volume mounted there since (#2320).
-                        meta["source_dir_ino"] = source_dir_ino
-                    # Stamp content_hash only on chunk 0 so multi-conversation
-                    # privacy-export hashes are not O(N²)-duplicated across every
-                    # chunk row. ``prefetch_content_hashes`` still finds them —
-                    # it scans all drawers and splits comma-joined hash fields.
-                    if content_hash is not None and chunk.get("chunk_index", 0) == 0:
-                        meta["content_hash"] = content_hash
-                    batch_metas.append(meta)
-                assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
-                try:
-                    collection.upsert(
-                        documents=batch_docs,
-                        ids=batch_ids,
-                        metadatas=batch_metas,
-                    )
-                    drawers_added += len(batch_docs)
-                except Exception as e:
-                    if "already exists" not in str(e).lower():
-                        raise
-        except Exception:
-            # A successful earlier batch has the source's current mtime and
-            # chunk_total. Leaving those drawers behind would make the next
-            # run treat the incomplete set as fully filed (#2183 / #2122).
-            try:
-                delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
-                if delete_ids:
-                    collection.delete(ids=delete_ids)
-            except Exception:
-                logger.warning(
-                    "Failed to clean partial convo drawers after upsert error for %s",
-                    source_file,
-                    exc_info=True,
+
+        # Index every stored version by (wing, room, position, text hash).
+        # The hash is taken from the stored text itself whenever the backend
+        # returned it, so an in-place refresh below can only ever land on a
+        # drawer whose verbatim text is identical; the ``chunk_hash`` stamp
+        # is the fallback when no text came back.
+        stored_versions: dict[tuple, list] = defaultdict(list)
+        for drawer_id, prev in existing.items():
+            prev_doc = existing_docs.get(drawer_id)
+            prev_hash = (
+                _chunk_hash(prev_doc) if isinstance(prev_doc, str) else prev.get("chunk_hash")
+            )
+            if prev_hash:
+                key = (prev.get("wing"), prev.get("room"), prev.get("chunk_index"), prev_hash)
+                stored_versions[key].append(drawer_id)
+
+        # Partition the target set: text already filed at this position keeps
+        # its drawer (a metadata touch when current, a same-text re-upsert
+        # when filed by an older pipeline); new text gets a new drawer.
+        to_upsert: list = []  # (drawer_id, content, meta)
+        to_touch: list = []  # (drawer_id, refreshed_meta)
+        for chunk in chunks:
+            chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
+            if extract_mode == "general":
+                room_counts_delta[chunk_room] += 1
+            chunk_hash = _chunk_hash(chunk["content"])
+            matches = stored_versions.get((wing, chunk_room, chunk["chunk_index"], chunk_hash), [])
+            current = [i for i in matches if _meta_is_current(existing[i], extract_mode)]
+            if current:
+                drawer_id = current[0]
+                touched = dict(existing[drawer_id])
+                touched["chunk_total"] = chunk_total
+                touched["chunk_hash"] = chunk_hash
+                if source_mtime is not None:
+                    touched["source_mtime"] = source_mtime
+                else:
+                    # A stale stored mtime with no current one to replace it
+                    # would let an old group satisfy a future completion check.
+                    touched.pop("source_mtime", None)
+                if source_dir_ino:
+                    touched["source_dir_ino"] = source_dir_ino
+                # Refresh the chunk-0 conversation-hash stamp so cross-file
+                # dedup keeps seeing conversations added since the last pass.
+                if content_hash is not None and chunk.get("chunk_index", 0) == 0:
+                    touched["content_hash"] = content_hash
+                to_touch.append((drawer_id, touched))
+                continue
+            if matches:
+                # Same text, filed by an older pipeline: refresh it in place.
+                # The text is identical, so nothing is lost.
+                drawer_id = matches[0]
+            else:
+                drawer_id = make_convo_drawer_id(
+                    wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
                 )
-            raise
+                if drawer_id in taken_ids:
+                    # The position already holds other text: file this
+                    # version beside it rather than over it (#1593).
+                    drawer_id = make_convo_drawer_version_id(
+                        wing,
+                        chunk_room,
+                        source_file,
+                        extract_mode,
+                        chunk["chunk_index"],
+                        chunk_hash,
+                    )
+            taken_ids.add(drawer_id)
+            meta = {
+                "wing": wing,
+                "room": chunk_room,
+                "hall": _detect_hall_cached(chunk["content"]),
+                "source_file": source_file,
+                "chunk_index": chunk["chunk_index"],
+                "added_by": agent,
+                "filed_at": filed_at,
+                "entities": entities_metadata(chunk["content"]),
+                "authored_at": authored_at if authored_at is not None else filed_at,
+                "ingest_mode": "convos",
+                "extract_mode": extract_mode,
+                "normalize_version": NORMALIZE_VERSION,
+                "id_recipe": ID_RECIPE,
+                "chunk_total": chunk_total,
+                "chunk_hash": chunk_hash,
+            }
+            if extract_mode == "exchange":
+                meta["convo_chunker_version"] = CONVO_CHUNKER_VERSION
+            if source_mtime is not None:
+                meta["source_mtime"] = source_mtime
+            if source_dir_ino:
+                # Which directory this transcript was read from, so
+                # ``sync`` can tell a neighbour in the same directory
+                # from one on a volume mounted there since (#2320).
+                meta["source_dir_ino"] = source_dir_ino
+            # Stamp content_hash only on chunk 0 so multi-conversation
+            # privacy-export hashes are not O(N²)-duplicated across every
+            # chunk row. ``prefetch_content_hashes`` still finds them —
+            # it scans all drawers and splits comma-joined hash fields.
+            if content_hash is not None and chunk.get("chunk_index", 0) == 0:
+                meta["content_hash"] = content_hash
+            if matches:
+                # Keep when this text first entered the palace.
+                meta["filed_at"] = existing[drawer_id].get("filed_at", filed_at)
+            to_upsert.append((drawer_id, chunk["content"], meta))
+
+        # Batch into bounded requests so large transcripts keep most of the
+        # embedding speedup without one huge Chroma/SQLite request.
+        #
+        # No cleanup on failure: every upsert above either creates a new
+        # drawer or rewrites one with its own identical text, so everything
+        # the palace held before this pass is still there, verbatim. The
+        # partially written pass leaves the current-mtime group short of its
+        # ``chunk_total`` — ``file_already_mined`` stays False and the next
+        # mine finishes it (#2183 / #2403).
+        for batch_start in range(0, len(to_upsert), DRAWER_UPSERT_BATCH_SIZE):
+            batch = to_upsert[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+            batch_ids = [drawer_id for drawer_id, _, _ in batch]
+            batch_docs = [content for _, content, _ in batch]
+            batch_metas = [meta for _, _, meta in batch]
+            assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
+            try:
+                collection.upsert(
+                    documents=batch_docs,
+                    ids=batch_ids,
+                    metadatas=batch_metas,
+                )
+                drawers_added += len(batch_docs)
+            except Exception as e:
+                if "already exists" not in str(e).lower():
+                    raise
+        for batch_start in range(0, len(to_touch), DRAWER_UPSERT_BATCH_SIZE):
+            batch = to_touch[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+            collection.update(
+                ids=[drawer_id for drawer_id, _ in batch],
+                metadatas=[meta for _, meta in batch],
+            )
+        # Nothing is deleted: drawers holding text the current transcript no
+        # longer produces are earlier conversational history (#1593). Only an
+        # explicit user delete removes them.
     return drawers_added, room_counts_delta, False
 
 
