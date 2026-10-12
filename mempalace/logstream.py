@@ -78,6 +78,10 @@ _EVENT_TYPE_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 _MAX_ROUTING_LENGTH = 256
 
 
+class EventConflict(ValueError):
+    """A guarded append found its correlation already holds the event type it guards against."""
+
+
 def _utc_now_iso() -> str:
     """Canonical UTC timestamp, second precision: YYYY-MM-DDTHH:MM:SSZ.
 
@@ -537,6 +541,22 @@ class Logstream:
                 artifact_id TEXT NOT NULL,
                 PRIMARY KEY (event_id, artifact_id)
             );
+
+            -- Per-reader read positions (RFC 006 rooms). Local state, never
+            -- replicated: ``last_seq`` is a local rowid, and remote events get
+            -- their own local rowid on arrival, so a position means nothing
+            -- on another hub.
+            -- ``own_upto`` is the newest rowid in the scope at the reader's
+            -- first read: its own events up to there are part of that first
+            -- catch-up however many pages it takes.
+            CREATE TABLE IF NOT EXISTS read_cursors (
+                scope TEXT NOT NULL,
+                agent TEXT NOT NULL,
+                last_seq INTEGER NOT NULL,
+                own_upto INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (scope, agent)
+            );
         """)
         self._migrate_schema(conn)
         conn.commit()
@@ -686,11 +706,18 @@ class Logstream:
         metadata: dict = None,
         artifact_ids: list = None,
         topic: str = None,
+        unless_correlation_has: str = None,
     ) -> dict:
         """Append one immutable event. Returns the stored event dict.
 
         ``artifact_ids`` must reference already-stored artifacts; unknown
         ids are rejected so readers never see a dangling reference.
+
+        ``unless_correlation_has`` names an event type: if the event's
+        correlation already holds one, nothing is appended and
+        :class:`EventConflict` is raised. The check and the insert are one
+        write transaction, so no other writer can slip that event in
+        between them (a room's close, for a message posted to it).
         """
         type = _sanitize_event_type(type)
         stream = _sanitize_routing(stream, "stream")
@@ -704,6 +731,10 @@ class Logstream:
         status = _sanitize_status(status)
         body = _sanitize_body(body, self.max_body_bytes)
         metadata_json = _sanitize_metadata(metadata)
+        if unless_correlation_has is not None:
+            unless_correlation_has = _sanitize_event_type(unless_correlation_has)
+            if correlation_id is None:
+                raise ValueError("unless_correlation_has needs a correlation_id")
 
         if artifact_ids is None:
             artifact_ids = []
@@ -720,6 +751,17 @@ class Logstream:
         with self._lock:
             conn = self._conn()
             with conn:
+                if unless_correlation_has is not None:
+                    conn.execute("BEGIN IMMEDIATE")
+                    clash = conn.execute(
+                        "SELECT id FROM events WHERE correlation_id = ? AND type = ? LIMIT 1",
+                        (correlation_id, unless_correlation_has),
+                    ).fetchone()
+                    if clash is not None:
+                        raise EventConflict(
+                            f"correlation {correlation_id!r} already has "
+                            f"{unless_correlation_has} {clash['id']}"
+                        )
                 for artifact_id in artifact_ids:
                     found = conn.execute(
                         "SELECT 1 FROM artifacts WHERE id = ?", (artifact_id,)
@@ -1083,6 +1125,97 @@ class Logstream:
             conn = self._conn()
             row = conn.execute("SELECT id FROM events ORDER BY rowid DESC LIMIT 1").fetchone()
         return row["id"] if row is not None else None
+
+    # ── Per-reader positions (RFC 006 rooms) ──────────────────────────────
+
+    def read_correlation(
+        self,
+        correlation_id: str,
+        agent: str,
+        limit: int = DEFAULT_LIST_LIMIT,
+    ) -> dict:
+        """Events in one correlation after ``agent``'s stored read position.
+
+        The hub keeps the position, so a reader never carries a cursor
+        between turns, and the select and the advance happen in one
+        transaction, so nothing that lands in between is skipped. The
+        position moves to the last event returned, never past one the
+        reader was not shown.
+
+        The first read returns everything, the reader's own events included,
+        so a fresh session sees its earlier words. That stays true when the
+        first catch-up spans several pages: the newest event at the first
+        read marks how far the reader's own events are still returned. After
+        that the reader's own events are left out: it wrote them.
+
+        Returns ``{"events": [...], "more": bool, "first_read": bool}``;
+        ``more`` means the page was full and another read continues it.
+        """
+        correlation_id = _sanitize_routing(correlation_id, "correlation_id")
+        agent = _sanitize_routing(agent, "agent")
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        limit = min(limit, MAX_LIST_LIMIT)
+
+        with self._lock:
+            conn = self._conn()
+            with conn:
+                # IMMEDIATE: the read and the position update are one write
+                # transaction, even against another process on this file.
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT last_seq, own_upto FROM read_cursors WHERE scope = ? AND agent = ?",
+                    (correlation_id, agent),
+                ).fetchone()
+                first_read = row is None
+                if first_read:
+                    last_seq = 0
+                    own_upto = conn.execute(
+                        "SELECT coalesce(max(rowid), 0) AS top FROM events WHERE correlation_id = ?",
+                        (correlation_id,),
+                    ).fetchone()["top"]
+                else:
+                    last_seq, own_upto = row["last_seq"], row["own_upto"]
+                rows = conn.execute(
+                    "SELECT rowid, * FROM events WHERE correlation_id = ? AND rowid > ?"
+                    " AND (from_agent != ? OR rowid <= ?) ORDER BY rowid ASC LIMIT ?",
+                    (correlation_id, last_seq, agent, own_upto, limit + 1),
+                ).fetchall()
+                more = len(rows) > limit
+                rows = rows[:limit]
+                if rows or first_read:
+                    conn.execute(
+                        "INSERT INTO read_cursors (scope, agent, last_seq, own_upto, updated_at)"
+                        " VALUES (?, ?, ?, ?, ?)"
+                        " ON CONFLICT(scope, agent) DO UPDATE SET"
+                        " last_seq = excluded.last_seq, updated_at = excluded.updated_at",
+                        (
+                            correlation_id,
+                            agent,
+                            rows[-1]["rowid"] if rows else last_seq,
+                            own_upto,
+                            _utc_now_iso(),
+                        ),
+                    )
+            events = self._attach_artifact_ids(conn, [self._event_dict(r) for r in rows])
+        return {"events": events, "more": more, "first_read": first_read}
+
+    def unread_count(self, correlation_id: str, agent: str) -> int:
+        """How many events from others ``agent`` has not read in a correlation."""
+        correlation_id = _sanitize_routing(correlation_id, "correlation_id")
+        agent = _sanitize_routing(agent, "agent")
+        with self._lock:
+            conn = self._conn()
+            row = conn.execute(
+                "SELECT last_seq FROM read_cursors WHERE scope = ? AND agent = ?",
+                (correlation_id, agent),
+            ).fetchone()
+            count = conn.execute(
+                "SELECT count(*) AS n FROM events"
+                " WHERE correlation_id = ? AND rowid > ? AND from_agent != ?",
+                (correlation_id, row["last_seq"] if row else 0, agent),
+            ).fetchone()
+        return count["n"]
 
     def wait_events(
         self,

@@ -1217,6 +1217,38 @@ def _parse_kg_supersede_tokens(tokens: List[str]) -> Dict[str, Any]:
 # ==============================================================================
 
 
+_ROOM_VERBS = {
+    "OPEN": "room_open",
+    "READ": "room_read",
+    "SAY": "room_say",
+    "POST": "room_say",
+    "CLOSE": "room_close",
+}
+_ROOM_REQUIRED = {
+    "room_open": ("project", "from_agent", "name"),
+    "room_read": ("room_id", "agent"),
+    "room_say": ("room_id", "from_agent", "body"),
+    "room_close": ("room_id", "from_agent"),
+}
+
+
+def _normalize_room_params(action: str, params: Dict[str, Any]) -> None:
+    """Map the coordinate aliases (id, from, to, as) onto room tool arguments."""
+    if "id" in params and "room_id" not in params:
+        params["room_id"] = str(params.pop("id"))
+    if "from" in params and "from_agent" not in params:
+        params["from_agent"] = params.pop("from")
+    if "to" in params and "to_agent" not in params:
+        params["to_agent"] = params.pop("to")
+    if action == "room_read":
+        # Reading is done *as* someone; accept the writer spellings too.
+        for alias in ("as", "from_agent"):
+            if alias in params and "agent" not in params:
+                params["agent"] = params.pop(alias)
+        if "limit" in params:
+            params["limit"] = int(params["limit"])
+
+
 def parse_coordinate_input(input_data: Any, _internal: bool = False) -> Tuple[str, Dict[str, Any]]:  # noqa: C901
     """
     Parse input to `palace_coordinate`.
@@ -1241,6 +1273,7 @@ def parse_coordinate_input(input_data: Any, _internal: bool = False) -> Tuple[st
                     "PATCH",
                     "PEERS",
                     "MESH",
+                    "ROOM",
                 ):
                     op, parsed_p = parse_coordinate_input(v_strip, _internal=True)
                     sibling_has_explicit_order = "order" in params
@@ -1263,6 +1296,8 @@ def parse_coordinate_input(input_data: Any, _internal: bool = False) -> Tuple[st
                             parsed_p["base_commit"] = pv
                         elif pk == "id" and op == "event_ack":
                             parsed_p["event_id"] = pv
+                        elif pk == "id" and op.startswith("room_"):
+                            parsed_p["room_id"] = pv
                         elif pk == "event_type" and op == "event_append":
                             parsed_p["type"] = pv
                         elif pk == "diff" and op == "patch_submit":
@@ -1390,6 +1425,8 @@ def parse_coordinate_input(input_data: Any, _internal: bool = False) -> Tuple[st
             params.pop("base")
         if "id" in params and "event_id" not in params and action == "event_ack":
             params["event_id"] = params.pop("id")
+        if action.startswith("room_"):
+            _normalize_room_params(action, params)
         if action == "event_append" and "type" not in params and "event_type" in params:
             params["type"] = params.pop("event_type")
         elif "event_type" in params:
@@ -1553,6 +1590,24 @@ def parse_coordinate_input(input_data: Any, _internal: bool = False) -> Tuple[st
         if not _internal:
             kv.pop("_implicit_inbox_order", None)
         return "event_list", kv
+
+    # --- Agent rooms (RFC 006) ---
+    if first_tok == "ROOM":
+        sub = tokens[1].upper() if len(tokens) > 1 else ""
+        if sub not in _ROOM_VERBS:
+            raise QueryParseError("ROOM requires OPEN, READ, SAY or CLOSE")
+        action = _ROOM_VERBS[sub]
+        rest = tokens[2:]
+        kv = {}
+        if rest and rest[0].startswith("room_") and ":" not in rest[0]:
+            kv["room_id"] = rest[0]
+            rest = rest[1:]
+        kv.update(_parse_key_value_tokens(rest))
+        _normalize_room_params(action, kv)
+        for req in _ROOM_REQUIRED[action]:
+            if req not in kv:
+                raise QueryParseError(f"ROOM {sub} missing required field: '{req}'")
+        return action, kv
 
     # --- Event Wait ---
     if first_tok == "EVENT" and len(tokens) > 1 and tokens[1].upper() == "WAIT":

@@ -305,3 +305,106 @@ def tool_patch_submit(
     except ValueError as e:
         return {"success": False, "error": str(e)}
     return {"success": True, "artifact": result["artifact"], "event": result["event"]}
+
+
+# ==================== AGENT ROOMS (RFC 006) ====================
+#
+# Free-form discussion between agents, with the operator moderating. Open,
+# read and say touch only logstream.sqlite3; close also files the transcript
+# into the palace, so it is the one room tool that reaches Chroma.
+
+
+def tool_room_open(project: str, from_agent: str, name: str, agenda: str = ""):
+    """Open a room and return its id plus the line that brings agents in."""
+    from ..agent_rooms import open_room
+
+    try:
+        result = _call_logstream(
+            lambda ls: open_room(
+                ls, project=project, from_agent=from_agent, name=name, agenda=agenda
+            )
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, **result}
+
+
+def tool_room_read(room_id: str, agent: str, limit: int = 50):
+    """Everything in a room this agent has not read yet; the hub keeps its place."""
+    from ..agent_rooms import read_room
+
+    try:
+        result = _call_logstream(
+            lambda ls: read_room(ls, room_id=room_id, agent=agent, limit=limit)
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+    result["count"] = len(result["events"])
+    return result
+
+
+def tool_room_say(room_id: str, from_agent: str, body: str, to_agent: str = None):
+    """Post one message to a room, or to one agent in it."""
+    from ..agent_rooms import say_in_room
+
+    try:
+        result = _call_logstream(
+            lambda ls: say_in_room(
+                ls, room_id=room_id, from_agent=from_agent, body=body, to_agent=to_agent
+            )
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, **result}
+
+
+def tool_room_close(room_id: str, from_agent: str, outcome: str = ""):
+    """Close a room and file its transcript verbatim, one drawer per turn.
+
+    Closing again re-files without appending a second close: drawer ids
+    derive from content, and every drawer carries its event id, so a retry
+    after a partial failure files only what is missing.
+    """
+    from ..agent_rooms import close_room, transcript_drawers
+
+    try:
+        result = _call_logstream(
+            lambda ls: close_room(ls, room_id=room_id, from_agent=from_agent, outcome=outcome)
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+
+    room = result["room"]
+    filed, already_filed, errors = 0, 0, []
+    for content in transcript_drawers(result["transcript"]):
+        filing = tool_add_drawer(
+            wing=room["wing"],
+            room=room["name"],
+            content=content,
+            source_file=room["room_id"],
+            added_by=from_agent,
+        )
+        if not filing.get("success"):
+            errors.append(filing.get("error") or "unknown error")
+        elif filing.get("reason") == "already_exists":
+            already_filed += 1
+        else:
+            filed += 1
+
+    response = {
+        "success": not errors,
+        "room": room,
+        "event": result["event"],
+        "already_closed": result["already_closed"],
+        "filed": filed,
+        "already_filed": already_filed,
+        "wing": room["wing"],
+        "palace_room": room["name"],
+    }
+    if errors:
+        response["errors"] = errors
+        response["error"] = (
+            f"room closed, but {len(errors)} transcript drawer(s) were not filed; "
+            "call mempalace_room_close again to retry"
+        )
+    return response

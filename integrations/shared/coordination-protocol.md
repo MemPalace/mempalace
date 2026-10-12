@@ -298,6 +298,39 @@ Ping the operator to wake me; I sweep to_agent=<HOST>:<HARNESS>:<project> on eve
 Never claim to be monitoring when you are not. A false watcher is worse than
 a declared-absent one: the requester stops looking for a human to nudge.
 
+## Rooms — discussion between agents
+
+A delegation has one addressee and one obligation. A **room** is for the
+other kind of work: several agents thinking through a design, a review or a
+"what should we do about X" together, with the operator moderating. Full
+design: RFC 006 (`docs/rfcs/006-agent-rooms.md`).
+
+Four tools carry the whole protocol; there is no event vocabulary to learn:
+
+- `mempalace_room_open` (project, name, agenda) returns the room id and one
+  handoff line. The operator pastes that line into each participant's chat.
+- `mempalace_room_read` (room id, your identity) returns everything you have
+  not read yet, oldest first. The hub keeps your place: never carry a
+  cursor, never page by hand. When `more` is true, read again before you
+  speak. Your own messages are left out after your first read.
+- `mempalace_room_say` posts one message, to the room or to one participant.
+  `unread` in the result counts what arrived since your last read.
+- `mempalace_room_close` (operator's call) appends the outcome and files the
+  transcript verbatim: one drawer per turn, wing = project, palace room =
+  room name. Calling it again retries the filing; it never closes twice.
+
+How a turn reaches you depends on your harness, as everywhere else in this
+protocol. A turn-based agent acts when the operator says so ("check room
+X"). A self-waking agent can watch the room:
+`mempalace logstream watch --agent <you> --correlation-id <room id>
+--type room.message --type room.close`.
+
+The anti-chatter rule is the only floor control: speak only to add a fact,
+a constraint, a proposal, an objection, or an answer to something addressed
+to you. Never post agreement, acknowledgement, or a restatement. Silence
+writes nothing and costs nothing. When the operator wants one speaker at a
+time, they say so ("Codex, your turn") — that needs no protocol.
+
 ## Hard rules
 
 - **Never apply a patch silently.** Fetching an artifact is free;
@@ -421,6 +454,11 @@ Coordination (logstream):
   then mempalace_event_ack with status=applied or failed.
 - Events are append-only and verbatim. Close every loop — no task you
   touched stays open without an applied/failed/blocked ack.
+- Rooms (RFC 006) are free-form discussion between agents; the
+  operator moderates. When pointed at a room id, mempalace_room_read
+  as your identity (the hub keeps your place), then mempalace_room_say
+  only to add a fact, constraint, proposal, objection, or an answer
+  addressed to you. Never agree, acknowledge, or restate.
 ```
 
 ## See also
@@ -431,3 +469,5 @@ Coordination (logstream):
   event/artifact model and the full tool reference.
 - RFC 003 (`docs/rfcs/003-agent-logstream-coordination.md`) — design
   rationale and storage model.
+- RFC 006 (`docs/rfcs/006-agent-rooms.md`) — rooms: free-form discussion
+  between agents, read positions kept by the hub, transcript filing.

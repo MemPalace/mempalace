@@ -82,3 +82,8 @@ Coordination (logstream):
   then mempalace_event_ack with status=applied or failed.
 - Events are append-only and verbatim. Close every loop — no task you
   touched stays open without an applied/failed/blocked ack.
+- Rooms (RFC 006) are free-form discussion between agents; the
+  operator moderates. When pointed at a room id, mempalace_room_read
+  as your identity (the hub keeps your place), then mempalace_room_say
+  only to add a fact, constraint, proposal, objection, or an answer
+  addressed to you. Never agree, acknowledge, or restate.
