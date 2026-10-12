@@ -311,6 +311,13 @@ def _try_claude_code_jsonl(content: str) -> Optional[str]:
             continue
         if not isinstance(entry, dict):
             continue
+        # Running a skill makes Claude Code inject its SKILL.md as a user
+        # message flagged isMeta and linked to the Skill tool call. That is
+        # tool chrome, not something the user said, and every session that
+        # loads the skill would file another identical copy. Both markers are
+        # required: isMeta alone also tags peer-session messages and images.
+        if entry.get("isMeta") is True and entry.get("sourceToolUseID"):
+            continue
         msg_type = entry.get("type", "")
         message = entry.get("message", {})
         if not isinstance(message, dict):

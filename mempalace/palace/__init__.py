@@ -80,7 +80,10 @@ _EXPLICIT_BACKEND_ENV = "MEMPALACE_BACKEND_EXPLICIT"
 #
 # v2 (2026-04): introduced strip_noise() for Claude Code JSONL; previous
 #               drawers stored system tags / hook chrome verbatim.
-NORMALIZE_VERSION = 2
+# v3 (2026-10): Claude Code JSONL drops injected skill bodies (isMeta +
+#               sourceToolUseID); previous drawers filed every loaded
+#               SKILL.md as a user message, once per session.
+NORMALIZE_VERSION = 3
 
 # Revision of the conversation exchange chunker (``convo_miner.chunk_exchanges``),
 # stamped on exchange-mode convo rows as ``convo_chunker_version``. The
