@@ -9,6 +9,7 @@ import chromadb
 import pytest
 
 from mempalace.convo_miner import (
+    _file_chunks_locked,
     _is_ai_tool_path,
     _register_file,
     _resolve_wing,
@@ -130,11 +131,12 @@ def test_mine_convos_allows_general_after_exchange(capsys):
 
 def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
     """When stored drawers have an older normalize_version, the next mine
-    silently purges them and refiles — no manual erase required.
+    refiles the source at the current version — no manual erase required.
 
     This is what makes the strip_noise upgrade apply to existing corpora:
-    users just run `mempalace mine` again and old noise-filled drawers get
-    replaced with clean ones."""
+    users just run `mempalace mine` again and get clean current drawers.
+    Mining is additive (#1593): the older drawers are kept verbatim beside
+    the new generation; only an explicit user delete removes them."""
     from mempalace.palace import NORMALIZE_VERSION
 
     tmpdir = tempfile.mkdtemp()
@@ -172,7 +174,7 @@ def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
             documents=["STALE NOISE"] * len(first_pass["ids"]),
             metadatas=stale_metas,
         )
-        # Add an extra orphan drawer that should also be purged.
+        # Add an extra drawer the current transcript no longer produces.
         col.add(
             ids=["orphan_drawer"],
             documents=["OLD ORPHAN"],
@@ -198,23 +200,31 @@ def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
         client = chromadb.PersistentClient(path=palace_path)
         col = client.get_collection("mempalace_drawers")
         rebuilt = col.get(where={"source_file": resolved})
-        # Orphan is gone
-        assert "orphan_drawer" not in rebuilt["ids"]
-        # No stale content survived
-        assert all("STALE NOISE" not in d for d in rebuilt["documents"])
-        assert all("OLD ORPHAN" not in d for d in rebuilt["documents"])
-        # All rebuilt drawers carry the current version
-        for meta in rebuilt["metadatas"]:
-            assert meta.get("normalize_version") == NORMALIZE_VERSION
+        docs_by_id = dict(zip(rebuilt["ids"], rebuilt["documents"]))
+        metas_by_id = dict(zip(rebuilt["ids"], rebuilt["metadatas"]))
+        # Nothing was destroyed: the old drawers keep their verbatim text.
+        assert first_ids | {"orphan_drawer"} <= set(rebuilt["ids"])
+        assert docs_by_id["orphan_drawer"] == "OLD ORPHAN"
+        assert all(docs_by_id[i] == "STALE NOISE" for i in first_ids)
+        # A complete current-version generation was filed beside them.
+        current = [
+            i
+            for i, meta in metas_by_id.items()
+            if meta.get("normalize_version") == NORMALIZE_VERSION
+        ]
+        assert len(current) == len(first_ids)
+        assert all("STALE NOISE" not in docs_by_id[i] for i in current)
+        assert file_already_mined(col, resolved, check_mtime=True, extract_mode="exchange")
         del col, client
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def test_mine_convos_rebuilds_drawers_from_older_chunker(capsys):
-    """Exchange drawers from an older chunker revision are rebuilt on the next
+    """Exchange drawers from an older chunker revision are refiled on the next
     mine, which recovers text the old chunker discarded (here: everything
-    after a ``---`` rule inside a response)."""
+    after a ``---`` rule inside a response). Mining is additive (#1593): the
+    older drawers stay verbatim beside the new generation."""
     tmpdir = tempfile.mkdtemp()
     try:
         convo_path = Path(tmpdir) / "chat.txt"
@@ -250,10 +260,16 @@ def test_mine_convos_rebuilds_drawers_from_older_chunker(capsys):
         client = chromadb.PersistentClient(path=palace_path)
         col = client.get_collection("mempalace_drawers")
         rebuilt = col.get(where={"source_file": resolved})
-        assert all("V1 CHUNK" not in d for d in rebuilt["documents"])
-        assert any("AFTER_RULE_MARKER" in d for d in rebuilt["documents"])
-        for meta in rebuilt["metadatas"]:
-            assert meta["convo_chunker_version"] == CONVO_CHUNKER_VERSION
+        docs_by_id = dict(zip(rebuilt["ids"], rebuilt["documents"]))
+        assert all(docs_by_id[i] == "V1 CHUNK" for i in first_pass["ids"])
+        current = [
+            (i, m)
+            for i, m in zip(rebuilt["ids"], rebuilt["metadatas"])
+            if m["convo_chunker_version"] == CONVO_CHUNKER_VERSION
+        ]
+        assert len(current) == len(first_pass["ids"])
+        assert all("V1 CHUNK" not in docs_by_id[i] for i, _ in current)
+        assert any("AFTER_RULE_MARKER" in docs_by_id[i] for i, _ in current)
         del col, client
 
         # Current drawers are skipped again (only mined files are listed).
@@ -1359,3 +1375,141 @@ def test_mine_convos_reaches_a_yield_point_before_each_file(tmp_path, capsys):
     with mine_yield_hook(lambda: calls.append(1)):
         mine_convos(str(src), str(tmp_path / "palace"), wing="test")
     assert len(calls) == 3
+
+
+class TestPreviousGenerationPreserved:
+    """#1593 / #2408 review: a re-mine never destroys earlier verbatim content.
+
+    Exercised against a real Chroma collection so the assertions read back the
+    stored documents, not just drawer ids or counts.
+    """
+
+    @staticmethod
+    def _chunks(*texts):
+        return [{"content": text, "chunk_index": i} for i, text in enumerate(texts)]
+
+    @staticmethod
+    def _docs_for(col, source):
+        got = col.get(where={"source_file": str(source)}, include=["documents"])
+        return got["documents"]
+
+    @staticmethod
+    def _stamp(source, text, mtime):
+        source.write_text(text, encoding="utf-8")
+        os.utime(source, (mtime, mtime))
+
+    def test_failed_rewrite_keeps_previous_generation_content(
+        self, monkeypatch, tmp_path, collection
+    ):
+        """igorls' reproduction: start with original0/original1, rewrite both
+        chunks, fail the second upsert batch. The first batch must not have
+        overwritten original0 in place."""
+        import mempalace.convo_miner as convo_miner
+        from mempalace.ids import make_convo_drawer_id
+
+        monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 1)
+        source = tmp_path / "chat.txt"
+        original = ["original0 " + "alpha " * 20, "original1 " + "beta " * 20]
+        replacement = ["replacement0 " + "gamma " * 20, "replacement1 " + "delta " * 20]
+
+        self._stamp(source, "v1\n", 1_000_000.0)
+        _file_chunks_locked(
+            collection, str(source), self._chunks(*original), "wing", "general", "agent", "exchange"
+        )
+        positional = [
+            make_convo_drawer_id("wing", "general", str(source), "exchange", i) for i in range(2)
+        ]
+        assert collection.get(ids=positional)["documents"] == original
+
+        class FailSecondUpsert:
+            def __init__(self, inner):
+                self._inner = inner
+                self.upserts = 0
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def upsert(self, **kwargs):
+                self.upserts += 1
+                if self.upserts == 2:
+                    raise RuntimeError("simulated second-batch failure")
+                return self._inner.upsert(**kwargs)
+
+        self._stamp(source, "v2\n", 2_000_000.0)
+        failing = FailSecondUpsert(collection)
+        with pytest.raises(RuntimeError, match="second-batch failure"):
+            _file_chunks_locked(
+                failing,
+                str(source),
+                self._chunks(*replacement),
+                "wing",
+                "general",
+                "agent",
+                "exchange",
+            )
+        assert failing.upserts == 2, "the first replacement batch did not run"
+
+        got = collection.get(ids=positional, include=["documents"])
+        by_id = dict(zip(got["ids"], got["documents"]))
+        assert [by_id.get(i) for i in positional] == original, (
+            "a failed rewrite destroyed previous-generation content in place"
+        )
+        docs = self._docs_for(collection, source)
+        assert all(text in docs for text in original)
+        assert not file_already_mined(
+            collection, str(source), check_mtime=True, extract_mode="exchange"
+        ), "an interrupted rewrite reads as complete"
+
+        # The retry completes the new generation and still keeps the old one.
+        _file_chunks_locked(
+            collection,
+            str(source),
+            self._chunks(*replacement),
+            "wing",
+            "general",
+            "agent",
+            "exchange",
+        )
+        docs = self._docs_for(collection, source)
+        assert all(text in docs for text in original + replacement)
+        assert file_already_mined(
+            collection, str(source), check_mtime=True, extract_mode="exchange"
+        )
+
+    def test_successful_rewrite_is_additive(self, tmp_path, collection):
+        """A rewrite that changes one chunk and drops another (/compact,
+        /clear) adds the new generation beside the old one: no in-place
+        overwrite, no deletion of chunks the new transcript no longer has."""
+        source = tmp_path / "chat.txt"
+        a, b, c = ("keep " + "a " * 30, "before " + "b " * 30, "dropped " + "c " * 30)
+        b2 = "after " + "b " * 30
+
+        self._stamp(source, "v1\n", 1_000_000.0)
+        added, _, _ = _file_chunks_locked(
+            collection, str(source), self._chunks(a, b, c), "wing", "general", "agent", "exchange"
+        )
+        assert added == 3
+
+        self._stamp(source, "v2\n", 2_000_000.0)
+        added, _, _ = _file_chunks_locked(
+            collection, str(source), self._chunks(a, b2), "wing", "general", "agent", "exchange"
+        )
+        assert added == 1, "only the changed chunk is new content"
+        docs = self._docs_for(collection, source)
+        assert sorted(docs) == sorted([a, b, c, b2]), (
+            "a successful rewrite overwrote or deleted earlier conversational history"
+        )
+        assert file_already_mined(
+            collection, str(source), check_mtime=True, extract_mode="exchange"
+        )
+
+        # Content-hash dedup: going back to a version already filed adds nothing.
+        self._stamp(source, "v3\n", 3_000_000.0)
+        added, _, _ = _file_chunks_locked(
+            collection, str(source), self._chunks(a, b), "wing", "general", "agent", "exchange"
+        )
+        assert added == 0
+        assert sorted(self._docs_for(collection, source)) == sorted([a, b, c, b2])
+        assert file_already_mined(
+            collection, str(source), check_mtime=True, extract_mode="exchange"
+        )

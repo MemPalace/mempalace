@@ -121,6 +121,21 @@ def test_make_convo_drawer_id_returns_expected_prefix():
     assert result.startswith("drawer_claude_diary_")
 
 
+# ── make_convo_drawer_version_id ──────────────────────────────────────
+
+
+def test_make_convo_drawer_version_id_is_content_derived_and_distinct():
+    """A later version of a chunk position gets its own id (#1593): never the
+    positional id, different per text, stable for the same text."""
+    args = ("w", "r", "/c.jsonl", "exchange", 3)
+    positional = ids.make_convo_drawer_id(*args)
+    v1 = ids.make_convo_drawer_version_id(*args, "a" * 64)
+    v2 = ids.make_convo_drawer_version_id(*args, "b" * 64)
+    assert v1.startswith("drawer_w_r_")
+    assert len({positional, v1, v2}) == 3
+    assert v1 == ids.make_convo_drawer_version_id(*args, "a" * 64)
+
+
 # ── make_convo_sentinel_id ────────────────────────────────────────────
 
 

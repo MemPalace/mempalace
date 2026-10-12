@@ -857,7 +857,7 @@ class TestFileChunksLocked:
         held (#2403 defect 2: the old purge-before-refile contract meant an
         interrupted re-mine left a partial index — observed live as 5,765 of
         8,022 drawers after a SIGTERM). Under the incremental contract
-        nothing is deleted before the new set is fully written, and the
+        no upsert lands on a drawer holding other text, and the
         interrupted pass's mixed mtime groups each fall short of
         chunk_total, so file_already_mined stays False and the next mine
         repairs (#2183)."""
@@ -952,8 +952,7 @@ class TestFileChunksLocked:
         turn; the old purge-and-refile contract re-embedded the entire file
         each auto-save (observed live: >5 min per pass on a 75 MB
         transcript, O(n²) over a session). Unchanged chunks must keep their
-        embeddings and only get a metadata refresh; orphaned ids are
-        deleted only after the new set is fully written."""
+        embeddings and only get a metadata refresh; nothing is deleted."""
         import mempalace.convo_miner as convo_miner
         from mempalace.ids import make_convo_drawer_id
         from mempalace.palace import file_already_mined
@@ -1037,19 +1036,20 @@ class TestFileChunksLocked:
         assert all(m.get("chunk_total") == 5 for m in col.records.values())
         assert file_already_mined(col, str(source), check_mtime=True, extract_mode="exchange")
 
-        # A rewrite that drops the tail (e.g. /compact) orphans the extra
-        # ids; they are deleted, but only after the new set is written.
+        # A rewrite that drops the tail (e.g. /compact) keeps the dropped
+        # chunks as history (#1593): nothing is deleted, and the shrunk
+        # generation alone still reads as complete.
         source.write_text("rewritten\n", encoding="utf-8")
         drawers, _, skipped = _file_chunks_locked(
             col, str(source), chunks_v1, "wing", "general", "agent", "exchange"
         )
         assert skipped is False
-        orphaned = {
+        assert drawers == 0, "text already filed at its position was re-embedded"
+        dropped = {
             make_convo_drawer_id("wing", "general", str(source), "exchange", i) for i in (3, 4)
         }
-        assert set(col.deleted_ids) == orphaned, (
-            "a shrunk re-mine must delete exactly the orphaned ids, nothing else"
-        )
+        assert col.deleted_ids == [], "a shrunk re-mine deleted earlier history"
+        assert dropped <= set(col.records)
         assert file_already_mined(col, str(source), check_mtime=True, extract_mode="exchange")
 
 

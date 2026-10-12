@@ -156,14 +156,14 @@ def test_convo_mine_counts_purge_failures_as_errors_and_fails(
         )
     # The convo miner's pre-write read is the existing-drawer snapshot (#2408);
     # a failure there aborts the file exactly as the old purge failure did.
-    real = convo_miner._source_file_existing
+    real = convo_miner._source_file_snapshot
 
     def snapshot(collection, source_file, extract_mode):
         if os.path.basename(source_file) == "b.txt":
             raise RuntimeError("simulated closed backend handle")
         return real(collection, source_file, extract_mode)
 
-    monkeypatch.setattr(convo_miner, "_source_file_existing", snapshot)
+    monkeypatch.setattr(convo_miner, "_source_file_snapshot", snapshot)
 
     with pytest.raises(Exception) as excinfo:
         convo_miner.mine_convos(str(src), palace_path, wing="w")
