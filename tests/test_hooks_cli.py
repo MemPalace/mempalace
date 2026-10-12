@@ -5,7 +5,8 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 from hypothesis import given
@@ -20,6 +21,7 @@ from mempalace.hooks_cli import (
     _extract_recent_messages,
     _get_mine_targets,
     _hooks_daemon_enabled,
+    _is_harness_boilerplate,
     _log,
     _maybe_auto_ingest,
     _mempalace_python,
@@ -256,6 +258,168 @@ def test_extract_recent_messages_skips_commands(tmp_path):
     assert msgs[0] == "real msg"
 
 
+def test_extract_recent_messages_skips_harness_boilerplate(tmp_path):
+    """Harness-injected role=user text must not become the checkpoint summary."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {
+                "message": {
+                    "role": "user",
+                    "content": "<local-command-caveat>Caveat: the messages below...",
+                }
+            },
+            {
+                "message": {
+                    "role": "user",
+                    "content": "<task-notification>\n<task-id>abc</task-id>\n",
+                }
+            },
+            {
+                "message": {
+                    "role": "user",
+                    "content": "[SYSTEM NOTIFICATION - NOT USER INPUT] background task done",
+                }
+            },
+            {
+                "message": {
+                    "role": "user",
+                    "content": "Base directory for this skill: /skills/example",
+                }
+            },
+            {"message": {"role": "user", "content": "why is wake-up showing old drawers"}},
+        ],
+    )
+    assert _extract_recent_messages(str(transcript)) == ["why is wake-up showing old drawers"]
+
+
+def test_extract_recent_messages_skips_boilerplate_in_list_content(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "<task-notification>done</...>"}],
+                }
+            },
+            {
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "ship the fix"}],
+                }
+            },
+        ],
+    )
+    assert _extract_recent_messages(str(transcript)) == ["ship the fix"]
+
+
+def test_extract_recent_messages_skips_boilerplate_in_codex_format(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "[SYSTEM NOTIFICATION - NOT USER INPUT] agent finished",
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "review the diff"},
+            },
+        ],
+    )
+    assert _extract_recent_messages(str(transcript)) == ["review the diff"]
+
+
+def test_extract_recent_messages_keeps_text_mentioning_a_marker_word(tmp_path):
+    """Only the literal wrappers are filtered, not ordinary talk about them."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": "the task notification arrived late"}}],
+    )
+    assert _extract_recent_messages(str(transcript)) == ["the task notification arrived late"]
+
+
+def test_extract_recent_messages_keeps_long_message_quoting_a_wrapper(tmp_path):
+    """Regression: a wrapper quoted deep in genuine prose is not boilerplate.
+
+    Taken from a real transcript: a 7.7k-character message that discusses how
+    background events arrive, quoting the literal tag around 5k characters in.
+    Matching the marker anywhere threw the whole message away even though the
+    first 200 characters, the only part the checkpoint keeps, are pure prose.
+    """
+    real_text = (
+        "the deck should keep a persistent watcher instead of polling, so arm one "
+        "now with persistent true and let it idle between runs. "
+    )
+    real_text += "Padding out the body the way a long design message runs on. " * 90
+    real_text += "Its events arrive as <task-notification> messages and wake this loop."
+    assert len(real_text) > 5000
+    assert real_text.index("<task-notification>") > 5000
+
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(transcript, [{"message": {"role": "user", "content": real_text}}])
+
+    msgs = _extract_recent_messages(str(transcript))
+    assert len(msgs) == 1
+    assert msgs[0].startswith("the deck should keep a persistent watcher")
+
+
+def test_extract_recent_messages_skips_additional_harness_wrappers(tmp_path):
+    """Wrappers seen leading real transcripts but missing from the first pass."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {"message": {"role": "user", "content": "<local-command-stdout>Set model to opus"}},
+            {"message": {"role": "user", "content": "<command-name>/dira</command-name>"}},
+            {"message": {"role": "user", "content": "[Request interrupted by user for tool use]"}},
+            {
+                "message": {
+                    "role": "user",
+                    "content": "[Image: original 2880x1458, displayed at 2000x1013.]",
+                }
+            },
+            {"message": {"role": "user", "content": "now wire the checkpoint to the deck"}},
+        ],
+    )
+    assert _extract_recent_messages(str(transcript)) == ["now wire the checkpoint to the deck"]
+
+
+def test_is_harness_boilerplate_is_anchored_to_the_message_opening():
+    """The unit contract: a leading wrapper is boilerplate, a quote is not."""
+    assert _is_harness_boilerplate("<system-reminder>do the thing</system-reminder>")
+    assert _is_harness_boilerplate("   \n <task-notification>done</task-notification>")
+    assert not _is_harness_boilerplate("x" * 400 + "<system-reminder>quoted</system-reminder>")
+
+
+def test_is_harness_boilerplate_keeps_a_wrapper_quoted_inside_the_kept_window():
+    """A quote at offset 20 is inside the 200 characters the checkpoint keeps.
+
+    Bounding the match to a leading window instead of anchoring it is not
+    enough: this message's wrapper sits well inside that window, and every
+    character of it is text the checkpoint would store. Position, not
+    proximity, is what separates an injection from prose about one.
+    """
+    quoted = (
+        "The harness sends <task-notification> blocks to wake the loop, so the "
+        "stop hook has to ignore them when it composes the recent line."
+    )
+    offset = quoted.index("<task-notification>")
+    assert 0 < offset < 200 and len(quoted) < 200  # entirely inside the kept window
+    assert not _is_harness_boilerplate(quoted)
+
+    # ...and the same wrapper genuinely opening the message is still caught.
+    assert _is_harness_boilerplate("<task-notification>" + quoted)
+
+
 def test_extract_recent_messages_missing_file():
     assert _extract_recent_messages("/nonexistent.jsonl") == []
 
@@ -282,6 +446,15 @@ def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None):
     type(mock_config).hook_silent_save = PropertyMock(return_value=True)
     type(mock_config).hook_desktop_toast = PropertyMock(return_value=False)
     patches.append(patch("mempalace.config.MempalaceConfig", return_value=mock_config))
+    # A Stop or PreCompact hook spawns the transcript ingest through
+    # ``_spawn_mine``, and a real child here outlives the test that started
+    # it: it holds the palace's writer lease, and the next test file to ask
+    # for one is refused with "Peer MCP writer active". Nothing in this file
+    # asserts on a real mine. A test that asserts on the spawn installs its
+    # own stand-in before calling this helper, so only put one here when the
+    # attribute is still the real ``Popen``.
+    if not isinstance(hooks_cli_mod.subprocess.Popen, Mock):
+        patches.append(patch("mempalace.hooks_cli.subprocess.Popen"))
     with contextlib.ExitStack() as stack:
         for p in patches:
             stack.enter_context(p)
@@ -333,7 +506,7 @@ def test_stop_hook_saves_silently_at_interval(tmp_path):
         transcript,
         [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
     )
-    save_result = {"count": 15, "themes": ["hooks", "notifications"]}
+    save_result = {"drawers_filed": 1, "messages_folded": 15, "themes": ["hooks", "notifications"]}
     with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result) as mock_save:
         result = _capture_hook_output(
             hook_stop,
@@ -341,7 +514,7 @@ def test_stop_hook_saves_silently_at_interval(tmp_path):
             state_dir=tmp_path,
         )
     # Saves silently — systemMessage notification with themes, no block
-    assert result["systemMessage"].startswith("\u2726 15 memories woven into the palace")
+    assert result["systemMessage"].startswith("\u2726 1 checkpoint saved")
     assert "hooks" in result["systemMessage"]
     # tmp_path has no "-Projects-" segment, so _wing_from_transcript_path falls back to "wing_sessions"
     mock_save.assert_called_once_with(
@@ -358,7 +531,7 @@ def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
         transcript,
         [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
     )
-    save_result = {"count": 15, "themes": []}
+    save_result = {"drawers_filed": 1, "messages_folded": 15, "themes": []}
     with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result) as mock_save:
         _capture_hook_output(
             hook_stop,
@@ -383,7 +556,7 @@ def test_stop_hook_tracks_save_point(tmp_path):
     }
 
     # First call saves silently with systemMessage notification
-    save_result = {"count": 15, "themes": ["hooks"]}
+    save_result = {"drawers_filed": 1, "messages_folded": 15, "themes": ["hooks"]}
     with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result):
         result = _capture_hook_output(hook_stop, data, state_dir=tmp_path)
     assert "systemMessage" in result
@@ -500,9 +673,30 @@ def test_diary_agent_for_harness_unknown_falls_back_to_name():
         assert _diary_agent_for_harness(harness) != "session-hook"
 
 
+def test_dsh_harness_is_accepted_and_reads_diary_under_its_own_name():
+    """The DeepSeek Harness plugin drives `hook run --harness dsh`.
+
+    DSH supplies its own transcript (its on-disk session logs are
+    zstd-compressed and unreadable outside the harness), so `dsh` needs nothing
+    beyond being a recognised harness: the same input shape as Claude Code, and
+    a diary identity a `diary_read(agent_name="dsh")` call can actually find.
+    """
+    parsed = hooks_cli_mod._parse_harness_input(
+        {"session_id": "session-x", "transcript_path": "/tmp/t.jsonl"},
+        "dsh",
+    )
+    assert parsed == {
+        "session_id": "session-x",
+        "stop_hook_active": False,
+        "transcript_path": "/tmp/t.jsonl",
+    }
+    assert _diary_agent_for_harness("dsh") == "dsh"
+    assert "dsh" in hooks_cli_mod.SUPPORTED_HARNESSES
+
+
 @pytest.mark.parametrize(
     "harness,expected_agent",
-    [("claude-code", "claude"), ("codex", "codex")],
+    [("claude-code", "claude"), ("codex", "codex"), ("dsh", "dsh")],
 )
 def test_stop_hook_files_checkpoint_under_harness_agent(tmp_path, harness, expected_agent):
     """The Stop hook must file checkpoints under the agent identity that the
@@ -517,7 +711,8 @@ def test_stop_hook_files_checkpoint_under_harness_agent(tmp_path, harness, expec
         [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
     )
     with patch(
-        "mempalace.hooks_cli._save_diary_direct", return_value={"count": 5, "themes": []}
+        "mempalace.hooks_cli._save_diary_direct",
+        return_value={"drawers_filed": 1, "messages_folded": 5, "themes": []},
     ) as mock_save:
         _capture_hook_output(
             hook_stop,
@@ -551,7 +746,7 @@ def test_stop_hook_checkpoint_visible_to_diary_read(monkeypatch, config, palace_
 
     agent = _diary_agent_for_harness("claude-code")
     res = _save_diary_direct(str(transcript), "sess1", wing="wing_.claude", agent_name=agent)
-    assert res["count"] > 0
+    assert res["drawers_filed"] > 0
 
     visible = tool_diary_read(agent_name="claude")
     assert visible.get("total", 0) >= 1
@@ -584,7 +779,8 @@ def test_save_diary_direct_daemon_opt_in_submits_job(tmp_path):
                         agent_name="claude",
                     )
 
-    assert result["count"] == 3
+    assert result["drawers_filed"] == 1
+    assert result["messages_folded"] == 3
     mock_submit.assert_called_once()
     assert mock_submit.call_args.args[0] == "diary_write"
     payload = mock_submit.call_args.args[1]
@@ -633,7 +829,7 @@ def test_save_diary_daemon_lock_deferral_does_not_stall_the_hook(tmp_path):
     # The hook must ask the daemon to hand a parked job straight back.
     assert mock_submit.call_args.kwargs["stop_on_lock_deferral"] is True
 
-    assert result["count"] == 0  # nothing filed yet -- the daemon still owes the write
+    assert result["drawers_filed"] == 0  # nothing filed yet -- the daemon still owes the write
     assert not (tmp_path / "last_checkpoint").exists()  # and it must not be acked
 
     logged = " ".join(str(c.args[0]) for c in mock_log.call_args_list)
@@ -759,6 +955,20 @@ def test_wing_from_transcript_path_strips_parent_dir_with_hyphenated_project():
     the full project name after stripping the ``projects-`` parent (#1410)."""
     path = "/home/alice/.claude/projects/-home-alice-projects-react-native/abc.jsonl"
     assert _wing_from_transcript_path(path) == "wing_react_native"
+
+
+def test_wing_from_transcript_path_fallback_collapses_worktree():
+    """Regression: the fallback path (no cwd in the JSONL) left the flattened
+    ``--claude-worktrees-<wt>`` segment in the encoded folder name, giving every
+    worktree its own wing where the primary cwd-based path already collapses
+    it to <project> (#2388)."""
+    worktree_path = (
+        "/Users/u/.claude/projects/"
+        "-Users-u-projects-gsd-core--claude-worktrees-hardcore-wilbur-48691a/x.jsonl"
+    )
+    non_worktree_path = "/Users/u/.claude/projects/-Users-u-projects-gsd-core/x.jsonl"
+    assert _wing_from_transcript_path(worktree_path) == "wing_gsd_core"
+    assert _wing_from_transcript_path(non_worktree_path) == "wing_gsd_core"
 
 
 # --- _wing_from_transcript_path: cwd-from-JSONL primary path ---
@@ -1767,7 +1977,7 @@ def test_stop_hook_oserror_on_last_save_read(tmp_path):
     )
     # Write invalid content to last save file
     (tmp_path / "test_last_save").write_text("not_a_number")
-    save_result = {"count": 15, "themes": ["testing"]}
+    save_result = {"drawers_filed": 1, "messages_folded": 15, "themes": ["testing"]}
     with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result):
         result = _capture_hook_output(
             hook_stop,
@@ -1775,7 +1985,7 @@ def test_stop_hook_oserror_on_last_save_read(tmp_path):
             state_dir=tmp_path,
         )
     assert "systemMessage" in result
-    assert "15 memories" in result["systemMessage"]
+    assert "1 checkpoint saved" in result["systemMessage"]
 
 
 def test_stop_hook_oserror_on_write(tmp_path):
@@ -1789,7 +1999,7 @@ def test_stop_hook_oserror_on_write(tmp_path):
     def bad_write_text(*args, **kwargs):
         raise OSError("disk full")
 
-    save_result = {"count": 15, "themes": []}
+    save_result = {"drawers_filed": 1, "messages_folded": 15, "themes": []}
     with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
         with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result):
             with patch.object(Path, "write_text", bad_write_text):
@@ -1955,7 +2165,7 @@ def test_stop_hook_enabled_by_default(tmp_path):
         transcript,
         [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
     )
-    save_result = {"count": 3, "themes": ["auto-save"]}
+    save_result = {"drawers_filed": 1, "messages_folded": 3, "themes": ["auto-save"]}
     with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
         mock_cfg_cls.return_value.hooks_auto_save = True
         mock_cfg_cls.return_value.hook_silent_save = True
@@ -1971,7 +2181,7 @@ def test_stop_hook_enabled_by_default(tmp_path):
                 state_dir=tmp_path,
             )
     assert "systemMessage" in result
-    assert "3 memories" in result["systemMessage"]
+    assert "1 checkpoint saved" in result["systemMessage"]
 
 
 def test_precompact_hook_disabled_by_config(tmp_path):
@@ -2092,7 +2302,8 @@ def test_stop_hook_rejects_injected_stop_hook_active(tmp_path):
         [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
     )
     with patch(
-        "mempalace.hooks_cli._save_diary_direct", return_value={"count": 1, "themes": []}
+        "mempalace.hooks_cli._save_diary_direct",
+        return_value={"drawers_filed": 1, "messages_folded": 1, "themes": []},
     ) as mock_save:
         _capture_hook_output(
             hook_stop,
@@ -2122,6 +2333,9 @@ def _redirect_palace_root(monkeypatch, tmp_path):
     monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", fake_root)
     monkeypatch.setattr(hooks_cli_mod, "STATE_DIR", fake_root / "hook_state")
     monkeypatch.setattr(hooks_cli_mod, "_state_dir_initialized", False)
+    # The config dir satisfies the kill-switch too (#148); keep it absent so
+    # these tests exercise the "user cleared everything" path.
+    monkeypatch.setattr(hooks_cli_mod, "_config_root", lambda: tmp_path / "absent-config")
     return fake_root
 
 
@@ -2169,7 +2383,7 @@ def test_session_end_uses_detached_paths_not_sync_mine(tmp_path):
         with (
             patch(
                 "mempalace.hooks_cli._save_diary_direct",
-                return_value={"count": 3, "themes": ["exit"]},
+                return_value={"drawers_filed": 1, "messages_folded": 3, "themes": ["exit"]},
             ) as mock_save,
             patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
             patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto,
@@ -2223,7 +2437,7 @@ def test_session_end_defaults_to_saving_when_config_unreadable(tmp_path):
         with (
             patch(
                 "mempalace.hooks_cli._save_diary_direct",
-                return_value={"count": 1, "themes": []},
+                return_value={"drawers_filed": 1, "messages_folded": 1, "themes": []},
             ) as mock_save,
             patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
             patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto,
@@ -2353,7 +2567,7 @@ def test_session_end_accepts_full_sessionend_payload(tmp_path):
         with (
             patch(
                 "mempalace.hooks_cli._save_diary_direct",
-                return_value={"count": 1, "themes": []},
+                return_value={"drawers_filed": 1, "messages_folded": 1, "themes": []},
             ),
             patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
             patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto,
@@ -2459,6 +2673,31 @@ def test_existing_dir_proceeds_normally(tmp_path, monkeypatch):
     assert (fake_root / "hook_state" / "hook.log").is_file()
 
 
+def test_config_dir_satisfies_kill_switch_without_legacy_root(tmp_path, monkeypatch):
+    """A fresh install since #148 has its config dir but no ~/.mempalace.
+
+    Before the fix every hook short-circuited on such an install, so a fresh
+    ``mempalace init`` followed by a PreCompact hook filed nothing.
+    """
+    fake_root = _redirect_palace_root(monkeypatch, tmp_path)
+    config_root = tmp_path / "xdg" / "mempalace"
+    config_root.mkdir(parents=True)
+    monkeypatch.setattr(hooks_cli_mod, "_config_root", lambda: config_root)
+
+    assert hooks_cli_mod._palace_root_exists() is True
+    _log("test message")
+    assert (fake_root / "hook_state" / "hook.log").is_file()
+
+
+def test_kill_switch_config_root_follows_config_resolution(tmp_path, monkeypatch):
+    """``_config_root`` resolves the way ``mempalace.config`` does."""
+    config_dir = tmp_path / "explicit-config"
+    config_dir.mkdir()
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(config_dir))
+
+    assert hooks_cli_mod._config_root() == config_dir
+
+
 def test_regular_file_at_palace_root_treated_as_absent(tmp_path, monkeypatch):
     """A regular file at ~/.mempalace must be treated the same as absent.
 
@@ -2470,6 +2709,7 @@ def test_regular_file_at_palace_root_treated_as_absent(tmp_path, monkeypatch):
     fake_root = tmp_path / "file-not-dir"
     fake_root.write_text("oops, this is a file not a directory")
     monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", fake_root)
+    monkeypatch.setattr(hooks_cli_mod, "_config_root", lambda: tmp_path / "absent-config")
     monkeypatch.setattr(hooks_cli_mod, "STATE_DIR", fake_root / "hook_state")
     monkeypatch.setattr(hooks_cli_mod, "_state_dir_initialized", False)
 
@@ -2489,6 +2729,86 @@ def test_regular_file_at_palace_root_treated_as_absent(tmp_path, monkeypatch):
     # The stray file is left untouched; we never try to convert it.
     assert fake_root.is_file()
     assert fake_root.read_text() == "oops, this is a file not a directory"
+
+
+# --- _ingest_wing: hook-ingested transcripts file under the project wing ---
+
+
+def _write_transcript_with_cwd(tmp_path, cwd, name="s.jsonl"):
+    path = tmp_path / ".claude" / "projects" / "-Users-me-dev-thing" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        json.dumps({"type": "queue-operation"}),
+        json.dumps({"type": "user", "cwd": cwd, "message": {"content": "hi"}}),
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def test_ingest_wing_uses_the_project_from_cwd(tmp_path):
+    from mempalace.hooks_cli import _ingest_wing
+
+    path = _write_transcript_with_cwd(tmp_path, "/Users/me/dev/mempalace")
+    assert _ingest_wing(path) == "mempalace"
+
+
+def test_ingest_wing_collapses_worktrees_and_hyphens(tmp_path):
+    from mempalace.hooks_cli import _ingest_wing
+
+    path = _write_transcript_with_cwd(tmp_path, "/Users/me/dev/acme-app/.claude/worktrees/x")
+    assert _ingest_wing(path) == "acme_app"
+
+
+def test_ingest_wing_home_directory_sessions_go_to_the_workstation(tmp_path, monkeypatch):
+    from mempalace import hooks_cli
+
+    monkeypatch.setattr(hooks_cli.Path, "home", classmethod(lambda cls: Path("/Users/me")))
+    path = _write_transcript_with_cwd(tmp_path, "/Users/me/")
+    monkeypatch.setattr(hooks_cli.sys, "platform", "darwin")
+    assert hooks_cli._ingest_wing(path) == "mac_workstation"
+    monkeypatch.setattr(hooks_cli.sys, "platform", "win32")
+    assert hooks_cli._ingest_wing(path) == "windows_workstation"
+    monkeypatch.setattr(hooks_cli.sys, "platform", "linux")
+    assert hooks_cli._ingest_wing(path) == "linux_workstation"
+
+
+def test_ingest_wing_falls_back_to_the_encoded_folder_then_sessions(tmp_path):
+    from mempalace.hooks_cli import _ingest_wing
+
+    path = tmp_path / ".claude" / "projects" / "-Users-me-dev-thing" / "no-cwd.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"type": "queue-operation"}) + "\n", encoding="utf-8")
+    assert _ingest_wing(str(path)) == "thing"
+    assert _ingest_wing("/some/random/path.jsonl") == "sessions"
+
+
+def test_ingest_transcript_passes_the_project_wing_to_mine(tmp_path, monkeypatch):
+    from mempalace import hooks_cli
+
+    path = _write_transcript_with_cwd(tmp_path, "/Users/me/dev/mempalace")
+    Path(path).write_text(Path(path).read_text() + "x" * 200, encoding="utf-8")
+    monkeypatch.setattr(hooks_cli, "_validate_transcript_path", lambda p: Path(p))
+    monkeypatch.setattr(
+        hooks_cli, "MempalaceConfig", lambda: SimpleNamespace(hooks_mine_transcript=True)
+    )
+
+    class Routing:
+        blocked = False
+        use_daemon = False
+
+    monkeypatch.setattr(hooks_cli, "_current_hook_write_routing", lambda: Routing())
+    spawned = []
+    monkeypatch.setattr(hooks_cli, "_spawn_mine", lambda cmd: spawned.append(cmd))
+    hooks_cli._ingest_transcript(path)
+    assert spawned and spawned[0][-2:] == ["--wing", "mempalace"]
+
+    Routing.use_daemon = True
+    jobs = []
+    monkeypatch.setattr(
+        hooks_cli, "_submit_daemon_job", lambda kind, payload, **kw: jobs.append(payload)
+    )
+    hooks_cli._ingest_transcript(path)
+    assert jobs and jobs[0]["wing"] == "mempalace"
 
 
 # --- hooks.mine_transcript toggle ---
@@ -2529,7 +2849,7 @@ def test_stop_hook_checkpoints_without_mining(tmp_path):
         transcript,
         [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
     )
-    save_result = {"count": 4, "themes": []}
+    save_result = {"drawers_filed": 1, "messages_folded": 4, "themes": []}
     with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
         mock_cfg_cls.return_value.hooks_auto_save = True
         mock_cfg_cls.return_value.hook_silent_save = True
@@ -2548,7 +2868,7 @@ def test_stop_hook_checkpoints_without_mining(tmp_path):
                 )
     mock_save.assert_called_once()
     mock_popen.assert_not_called()
-    assert "4 memories" in result["systemMessage"]
+    assert "4 messages" in result["systemMessage"]
 
 
 def test_precompact_checkpoints_when_mining_disabled(tmp_path):
@@ -2564,7 +2884,8 @@ def test_precompact_checkpoints_when_mining_disabled(tmp_path):
         mock_cfg_cls.return_value.hook_desktop_toast = False
         with patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest:
             with patch(
-                "mempalace.hooks_cli._save_diary_direct", return_value={"count": 5}
+                "mempalace.hooks_cli._save_diary_direct",
+                return_value={"drawers_filed": 1, "messages_folded": 5},
             ) as mock_save:
                 with patch("mempalace.hooks_cli._mine_sync"):
                     _capture_hook_output(
@@ -2630,7 +2951,8 @@ def test_save_diary_direct_forwards_to_live_hub(tmp_path):
             str(transcript), "sess1", wing="wing_project", agent_name="claude"
         )
 
-    assert result["count"] == 3
+    assert result["drawers_filed"] == 1
+    assert result["messages_folded"] == 3
     mock_tool.assert_not_called()
     posted = json.loads(mock_urlopen.call_args_list[1].args[0].data.decode("utf-8"))
     assert posted["params"]["name"] == "mempalace_diary_write"
@@ -2654,7 +2976,7 @@ def test_save_diary_direct_does_not_retry_locally_when_hub_refuses(tmp_path):
             str(transcript), "sess1", wing="wing_project", agent_name="claude"
         )
 
-    assert result["count"] == 0
+    assert result["drawers_filed"] == 0
     mock_tool.assert_not_called()
 
 
@@ -2674,7 +2996,8 @@ def test_save_diary_direct_writes_in_process_without_a_hub(tmp_path):
                 result = _save_diary_direct(
                     str(transcript), "sess1", wing="wing_project", agent_name="claude"
                 )
-    assert result["count"] == 3
+    assert result["drawers_filed"] == 1
+    assert result["messages_folded"] == 3
     mock_tool.assert_called_once()
 
 

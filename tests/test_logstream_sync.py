@@ -890,6 +890,13 @@ class TestPeerSyncThreadStartup:
     the failure mode is silence, which is why it needs a test.
     """
 
+    @pytest.fixture(autouse=True)
+    def _cleanup_peer_sync_thread(self):
+        from mempalace import mcp_server as mcp
+
+        yield
+        mcp._stop_peer_sync_thread()
+
     def _start(self, tmp_path, monkeypatch, interval="0.05"):
         import threading
 
@@ -898,8 +905,6 @@ class TestPeerSyncThreadStartup:
         monkeypatch.setenv("MEMPALACE_SYNC_INTERVAL", interval)
         monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_path))
 
-        # Compare thread objects, not names: earlier tests in this class
-        # leave their own daemon loop running under the same name.
         before = set(threading.enumerate())
         mcp._start_peer_sync_thread()
         return [
@@ -925,7 +930,7 @@ class TestPeerSyncThreadStartup:
             return []
 
         monkeypatch.setattr("mempalace.logsync.sync_all", _fake_sync_all)
-        monkeypatch.setattr(mcp, "_get_logstream", lambda: object())
+        monkeypatch.setattr(mcp, "_get_logstream", lambda *args, **kwargs: object())
 
         assert self._start(tmp_path, monkeypatch)
 

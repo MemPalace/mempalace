@@ -17,7 +17,9 @@ import time
 import pytest
 
 from mempalace.backends.chroma import (
+    _fts_tokens,
     _hnsw_element_count,
+    _whole_words_first,
     _vector_segment_id,
     hnsw_capacity_status,
     reset_hnsw_capacity_cache,
@@ -1136,3 +1138,252 @@ class TestCapacityProbeCache:
             chroma_mod._hnsw_capacity_status_uncached = real
 
         assert chroma_mod._capacity_cache == {}, "the in-flight probe resurrected a reset entry"
+
+
+# ── Stranded indexes: no pickle, and it is not flush-lag ──────────────
+#
+# Two shapes where index_metadata.pickle is absent for a reason that will
+# never resolve, both previously reported as ordinary "metadata has not
+# been flushed; leaving vector search enabled".
+#
+# 1. UNREACHABLE THRESHOLD. Chroma compacts its write buffer into HNSW,
+#    and only then writes the pickle, once the buffer reaches
+#    hnsw:sync_threshold. Collections created before the default dropped
+#    still carry the old large value, so one that never grows past it
+#    never builds an index at all. Observed on a real palace: a closets
+#    collection sat at 13,284 records against sync_threshold 50,000 for
+#    three months, so it never flushed, its segment therefore failed the
+#    health check, and it was re-quarantined every session - 32 snapshots.
+#
+# 2. REPLACEMENT STUB. After a quarantine Chroma creates a fresh segment
+#    sized for ~100 elements. That stub has no pickle either, so treating
+#    "no pickle" as unconditionally inconclusive left the #1222 fallback
+#    disarmed against an index holding 100 slots while sqlite held 183,198
+#    rows. Filtered queries failed with "Error finding id"; unfiltered ones
+#    silently degraded to BM25.
+#
+# A segment with no data_level0.bin at all is still genuinely fresh and
+# stays "unknown".
+
+
+def _write_stub_payload(palace: str, segment_id: str, data_size: int) -> None:
+    seg_dir = os.path.join(palace, segment_id)
+    os.makedirs(seg_dir, exist_ok=True)
+    with open(os.path.join(seg_dir, "data_level0.bin"), "wb") as f:
+        f.write(b"\0" * data_size)
+    with open(os.path.join(seg_dir, "link_lists.bin"), "wb") as f:
+        f.write(b"")
+
+
+def test_capacity_status_flags_unreachable_sync_threshold(tmp_path):
+    """A collection below its own threshold can never flush."""
+    seg = "seg-unreachable"
+    _seed_chroma_db(str(tmp_path), sqlite_count=13_284, segment_id=seg, sync_threshold=50_000)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    # Deliberately not "diverged": those records are still reachable through
+    # Chroma's brute-force buffer, so routing every search to BM25 would make
+    # retrieval worse. The defect is that nothing surfaced the condition.
+    assert info["flush_unreachable"] is True
+    assert info["diverged"] is False
+    assert "sync_threshold" in info["message"]
+    assert "50,000" in info["message"]
+    assert "will not resolve on its own" in info["message"]
+
+
+def test_capacity_status_reachable_threshold_stays_unknown(tmp_path):
+    """A collection larger than its threshold is simply not flushed yet."""
+    seg = "seg-reachable"
+    _seed_chroma_db(str(tmp_path), sqlite_count=60_000, segment_id=seg, sync_threshold=50_000)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["flush_unreachable"] is False
+    assert info["status"] == "unknown"
+    assert "leaving vector search enabled" in info["message"]
+
+
+def test_capacity_status_unreachable_ignored_once_pickle_exists(tmp_path):
+    """A flushed index is healthy regardless of how it got there."""
+    seg = "seg-flushed"
+    _seed_chroma_db(str(tmp_path), sqlite_count=13_284, segment_id=seg, sync_threshold=50_000)
+    _write_pickle(str(tmp_path), seg, hnsw_count=13_284)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["status"] == "ok"
+    assert info["diverged"] is False
+    assert info["flush_unreachable"] is False
+
+
+def test_capacity_status_flags_stub_payload_against_large_sqlite(tmp_path):
+    """100-slot replacement stub standing in for a lost 183k index."""
+    seg = "seg-stub"
+    _seed_chroma_db(str(tmp_path), sqlite_count=183_198, segment_id=seg, sync_threshold=1_000)
+    _write_stub_payload(str(tmp_path), seg, data_size=167_600)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["status"] == "diverged"
+    assert info["diverged"] is True
+    assert "repair" in info["message"].lower()
+
+
+def test_capacity_status_still_unknown_when_no_payload_written(tmp_path):
+    """No data_level0.bin at all is a fresh segment, not a stub."""
+    seg = "seg-nopayload"
+    _seed_chroma_db(str(tmp_path), sqlite_count=10_000, segment_id=seg, sync_threshold=1_000)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["status"] == "unknown"
+    assert info["diverged"] is False
+    assert "leaving vector search enabled" in info["message"]
+
+
+def test_capacity_status_tolerates_small_palace_stub(tmp_path):
+    """A stub beside a small sqlite is a young palace, not corruption."""
+    seg = "seg-small"
+    _seed_chroma_db(str(tmp_path), sqlite_count=120, segment_id=seg, sync_threshold=1_000)
+    _write_stub_payload(str(tmp_path), seg, data_size=167_600)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["diverged"] is False
+    assert info["flush_unreachable"] is False
+
+
+def test_bm25_fallback_finds_whole_word_matches_behind_substring_hits(tmp_path):
+    """The trigram index matches ``aven`` inside ``haven't`` and ``Avenue``.
+    Taking the first 500 matches in storage order handed the re-rank only
+    those older substring hits, so the drawers that say Aven never reached it
+    and the results were zero-score noise."""
+    seg = "seg-bm25-substring"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=seg)
+    noise = [
+        (
+            f"I haven't walked down the Avenue in New Haven, entry {i}",
+            {"wing": "w", "room": "r", "source_file": f"/x/noise{i}.md"},
+            f"n-{i}",
+        )
+        for i in range(600)
+    ]
+    named = [
+        (
+            f"Aven said the wake sequence starts with the lantern, entry {i}",
+            {"wing": "w", "room": "r", "source_file": f"/x/aven{i}.md"},
+            f"a-{i}",
+        )
+        for i in range(3)
+    ]
+    _seed_drawers(str(tmp_path), seg, noise + named)
+
+    out = _bm25_only_via_sqlite("Aven", str(tmp_path), n_results=5)
+    top = [r["text"] for r in out["results"][:3]]
+    assert all(text.startswith("Aven said") for text in top), top
+    assert out["results"][0]["bm25_score"] > 0
+
+
+def test_bm25_fallback_still_returns_substring_near_misses(tmp_path):
+    """Whole-word matches go first, but substring-only matches still fill the
+    candidate set: a query for ``vector`` still finds a drawer that only says
+    ``vectors``."""
+    seg = "seg-bm25-near-miss"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=seg)
+    _seed_drawers(
+        str(tmp_path),
+        seg,
+        [("the vectors are rebuilt nightly", {"wing": "w", "room": "r"}, "v-1")],
+    )
+    out = _bm25_only_via_sqlite("vector", str(tmp_path), n_results=5)
+    assert [r["text"] for r in out["results"]] == ["the vectors are rebuilt nightly"]
+    scoped = _bm25_only_via_sqlite("vector", str(tmp_path), wing="w", n_results=5)
+    assert [r["text"] for r in scoped["results"]] == ["the vectors are rebuilt nightly"]
+
+
+def test_bm25_fallback_leaves_stop_words_out_of_the_candidate_query(tmp_path):
+    """A stop word matches nearly every drawer, so it would fill the candidate
+    set on its own; it is dropped unless the query has nothing else."""
+    seg = "seg-bm25-stop-words"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=seg)
+    filler = [
+        (f"the weather was the same as the day before, {i}", {"wing": "w", "room": "r"}, f"f-{i}")
+        for i in range(600)
+    ]
+    target = [("lantern notes from the evening", {"wing": "w", "room": "r"}, "t-1")]
+    _seed_drawers(str(tmp_path), seg, target + filler)
+    stop = frozenset({"the"})
+    out = _bm25_only_via_sqlite("the lantern", str(tmp_path), n_results=3, stop_words=stop)
+    assert out["results"][0]["text"] == "lantern notes from the evening"
+    only_stop = _bm25_only_via_sqlite("the", str(tmp_path), n_results=3, stop_words=stop)
+    assert only_stop["results"]
+
+
+def test_whole_word_candidate_pick_ignores_stop_words_when_terms_present():
+    tokens = _fts_tokens("the lantern", frozenset({"the"}))
+    rows = [(1, "the lanternfish was cataloged"), (2, "lantern notes from the evening")]
+    assert _whole_words_first(rows, tokens, limit=1) == [2]
+
+
+def _fts_conn(rows):
+    """In-memory chroma-shaped FTS store: ``rows`` is [(rowid, text), ...]."""
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE collections (id TEXT, name TEXT);
+        CREATE TABLE segments (id TEXT, collection TEXT);
+        CREATE TABLE embeddings (id INTEGER PRIMARY KEY, segment_id TEXT);
+        CREATE VIRTUAL TABLE embedding_fulltext_search USING fts5(string_value, tokenize='trigram');
+        INSERT INTO collections VALUES ('c', 'drawers');
+        INSERT INTO segments VALUES ('s', 'c');
+        """
+    )
+    conn.executemany("INSERT INTO embeddings VALUES (?, 's')", ((rid,) for rid, _ in rows))
+    conn.executemany(
+        "INSERT INTO embedding_fulltext_search(rowid, string_value) VALUES (?, ?)", rows
+    )
+    return conn
+
+
+def test_fts_candidates_reach_a_name_ranked_past_the_scan_cap():
+    """50,009 higher-ranked substring hits (``Avenue``) and one drawer that says
+    ``Aven``: the ranked window of 50,000 misses it, the continuation finds it."""
+    from mempalace.backends.chroma import _FTS_SCAN_CAP, _fts_candidate_rows
+
+    noise = [(i, "Avenue Avenue Avenue") for i in range(1, _FTS_SCAN_CAP + 10)]
+    target = _FTS_SCAN_CAP + 10
+    conn = _fts_conn(noise + [(target, "Aven " + "quiet lantern room " * 20)])
+    picked = _fts_candidate_rows(conn, "drawers", "Aven", limit=5)
+    assert picked[0] == target
+    assert not picked.truncated
+
+
+def test_fts_candidates_reach_the_oldest_lowest_ranked_name(monkeypatch):
+    import mempalace.backends.chroma as chroma
+
+    monkeypatch.setattr(chroma, "_FTS_SCAN_CAP", 50)
+    rows = [(1, "Aven " + "quiet lantern room " * 20)]
+    rows += [(i, "Avenue Avenue Avenue") for i in range(2, 70)]
+    picked = chroma._fts_candidate_rows(_fts_conn(rows), "drawers", "Aven", limit=5)
+    assert picked[0] == 1
+
+
+def test_fts_candidates_say_when_the_continuation_budget_ran_out(monkeypatch):
+    import mempalace.backends.chroma as chroma
+
+    monkeypatch.setattr(chroma, "_FTS_SCAN_CAP", 50)
+    monkeypatch.setattr(chroma, "_FTS_CONTINUATION_BUDGET", 60)
+    rows = [(1, "Aven " + "quiet lantern room " * 20)]
+    rows += [(i, "Avenue Avenue Avenue") for i in range(2, 200)]
+    picked = chroma._fts_candidate_rows(_fts_conn(rows), "drawers", "Aven", limit=5)
+    assert 1 not in picked
+    assert picked.truncated
+
+
+def test_bm25_fallback_reports_truncated_candidates(tmp_path, monkeypatch):
+    import mempalace.backends.chroma as chroma
+
+    monkeypatch.setattr(chroma, "_FTS_SCAN_CAP", 20)
+    monkeypatch.setattr(chroma, "_FTS_CONTINUATION_BUDGET", 25)
+    seg = "seg-bm25-truncated"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=seg)
+    named = [("Aven " + "quiet lantern room " * 20, {"wing": "w", "room": "r"}, "a-0")]
+    noise = [(f"Avenue Avenue Avenue {i}", {"wing": "w", "room": "r"}, f"n-{i}") for i in range(80)]
+    _seed_drawers(str(tmp_path), seg, named + noise)
+    out = _bm25_only_via_sqlite("Aven", str(tmp_path), n_results=5)
+    assert out["candidates_truncated"] is True

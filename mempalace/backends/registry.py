@@ -32,6 +32,31 @@ _discovered = False
 _lock = Lock()
 
 
+def _config_file_hint() -> str:
+    """The config.json this install resolves, for error messages."""
+    try:
+        from ..config import _default_config_dir
+
+        return str(_default_config_dir() / "config.json")
+    except Exception:
+        return "config.json in the MemPalace config directory"
+
+
+class BackendUnavailableError(KeyError):
+    """A selected backend is not registered in this Python process."""
+
+    def __init__(self, name: str, available: list[str]):
+        self.name = name
+        self.available = available
+        super().__init__(
+            f"unknown backend {name!r}; available: {available}. "
+            f"Check --backend, the backend setting in {_config_file_hint()}, and "
+            "MEMPALACE_BACKEND. Select the backend matching the existing storage "
+            "or install its backend package into the MCP server's Python environment "
+            "and restart the MCP server to discover it. No fallback was selected."
+        )
+
+
 def register(name: str, backend_cls: Type[BaseBackend]) -> None:
     """Register ``backend_cls`` under ``name``.
 
@@ -103,7 +128,7 @@ def get_backend_class(name: str) -> Type[BaseBackend]:
     try:
         return _registry[name]
     except KeyError as e:
-        raise KeyError(f"unknown backend {name!r}; available: {available_backends()}") from e
+        raise BackendUnavailableError(name, available_backends()) from e
 
 
 def get_backend(name: str) -> BaseBackend:
@@ -119,7 +144,7 @@ def get_backend(name: str) -> BaseBackend:
             return inst
         cls = _registry.get(name)
         if cls is None:
-            raise KeyError(f"unknown backend {name!r}; available: {sorted(_registry.keys())}")
+            raise BackendUnavailableError(name, sorted(_registry.keys()))
         inst = cls()
         _instances[name] = inst
         return inst

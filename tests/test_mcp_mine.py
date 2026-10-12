@@ -43,6 +43,9 @@ def test_registered_in_tools():
     entry = mcp_server.TOOLS["mempalace_mine"]
     assert entry["handler"] is mcp_server.tool_mine
     assert entry["input_schema"]["required"] == ["source"]
+    include_ignored = entry["input_schema"]["properties"]["include_ignored"]
+    assert include_ignored["type"] == "array"
+    assert include_ignored["items"]["type"] == "string"
 
 
 # ── Guard rails ──────────────────────────────────────────────────────────
@@ -81,7 +84,128 @@ def test_missing_source_dir_returns_structured_error(monkeypatch, config):
     assert "source" in result["error"].lower()
 
 
+@pytest.mark.parametrize("include_ignored", ["notes.md", 1, {}, [1], [None], [""], ["  "]])
+def test_invalid_include_ignored_is_rejected_before_ingestion(
+    monkeypatch, config, tmp_path, include_ignored
+):
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+
+    def _unexpected_mine(*args, **kwargs):
+        pytest.fail("invalid include_ignored reached the miner")
+
+    monkeypatch.setattr("mempalace.miner.mine", _unexpected_mine)
+    result = mcp_server.tool_mine(source=str(tmp_path), include_ignored=include_ignored)
+    assert result["success"] is False
+    assert result["error_class"] == "ValueError"
+    assert "include_ignored" in result["error"]
+
+
+@pytest.mark.parametrize("mode", ["convos", "extract"])
+def test_include_ignored_is_rejected_for_non_project_modes(monkeypatch, config, tmp_path, mode):
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+
+    def _unexpected_capture(_run):
+        pytest.fail("unsupported include_ignored reached ingestion")
+
+    monkeypatch.setattr(mcp_server, "_capture_fd_stdout", _unexpected_capture)
+    result = mcp_server.tool_mine(source=str(tmp_path), mode=mode, include_ignored=["notes.md"])
+    assert result["success"] is False
+    assert result["error_class"] == "ValueError"
+    assert "projects" in result["error"]
+
+
 # ── Dispatch + return contract ───────────────────────────────────────────
+
+
+def test_projects_include_ignored_reaches_miner_with_existing_options(
+    monkeypatch, config, tmp_path
+):
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    observed = {}
+
+    def _mine(**kwargs):
+        observed.update(kwargs)
+
+    monkeypatch.setattr("mempalace.miner.mine", _mine)
+    paths = [".agents/handoffs/notes.md", "docs/other note.md"]
+    result = mcp_server.tool_mine(
+        source=str(tmp_path),
+        wing="notes",
+        agent="codex",
+        limit=1,
+        dry_run=True,
+        include_ignored=paths,
+    )
+    assert result["success"] is True
+    assert observed == {
+        "project_dir": str(tmp_path),
+        "palace_path": config.palace_path,
+        "wing_override": "notes",
+        "agent": "codex",
+        "limit": 1,
+        "dry_run": True,
+        "include_ignored": paths,
+    }
+
+
+@pytest.mark.parametrize("mode", ["projects", "convos", "extract"])
+@pytest.mark.parametrize("options", [{}, {"include_ignored": None}, {"include_ignored": []}])
+def test_empty_include_ignored_preserves_default_dispatch(
+    monkeypatch, config, tmp_path, mode, options
+):
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    calls = []
+
+    def _mine(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr("mempalace.miner.mine", _mine)
+    monkeypatch.setattr("mempalace.convo_miner.mine_convos", _mine)
+    monkeypatch.setattr("mempalace.format_miner.mine_formats", _mine)
+    result = mcp_server.tool_mine(source=str(tmp_path), mode=mode, dry_run=True, **options)
+    assert result["success"] is True
+    assert len(calls) == 1
+    assert "include_ignored" not in calls[0]
+
+
+@pytest.mark.parametrize("include_ignored", [None, [], [".agents/handoffs/keep.md"]])
+def test_projects_include_ignored_preserves_gitignore_selection(
+    monkeypatch, config, tmp_path, include_ignored
+):
+    from mempalace import mcp_server, miner
+
+    _patch(monkeypatch, config)
+    (tmp_path / ".gitignore").write_text(".agents/\n", encoding="utf-8")
+    notes = tmp_path / ".agents" / "handoffs"
+    notes.mkdir(parents=True)
+    for path in (tmp_path / "visible.md", notes / "keep.md", notes / "ignored.md"):
+        path.write_text("# Notes\n\n" + "Verbatim project notes. " * 40, encoding="utf-8")
+
+    scan = miner.scan_project
+    selected = []
+
+    def _scan(*args, **kwargs):
+        files = scan(*args, **kwargs)
+        selected.extend(path.relative_to(tmp_path).as_posix() for path in files)
+        return files
+
+    monkeypatch.setattr(miner, "scan_project", _scan)
+    result = mcp_server.tool_mine(
+        source=str(tmp_path), dry_run=True, include_ignored=include_ignored
+    )
+    assert result["success"] is True, result
+    expected = ["visible.md"]
+    if include_ignored:
+        expected.append(".agents/handoffs/keep.md")
+    assert sorted(selected) == sorted(expected)
 
 
 def test_dry_run_projects_returns_success_and_output(monkeypatch, config, tmp_dir):

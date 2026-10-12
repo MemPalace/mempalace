@@ -4,6 +4,7 @@ All ChromaDB access is mocked — no real database needed.
 """
 
 import json
+import pytest
 import os
 from unittest.mock import MagicMock, patch
 
@@ -49,6 +50,47 @@ class TestBuildGraph:
         nodes, edges = build_graph(col=col)
         assert nodes == {}
         assert edges == []
+
+    def test_backend_collection_walks_metadata_once(self):
+        """A BaseCollection is read through get_all_metadata() (one cursor
+        pass on qdrant, #2452) instead of the limit/offset loop."""
+        # The module-level ``patch.dict(sys.modules, ...)`` above drops the
+        # modules imported while it was active, so a fresh import here would
+        # yield a different BaseCollection class than the one palace_graph
+        # holds; use palace_graph's own reference.
+        BaseCollection = build_graph.__globals__["BaseCollection"]
+
+        class _Col(BaseCollection):
+            def add(self, **kwargs):
+                raise NotImplementedError
+
+            def upsert(self, **kwargs):
+                raise NotImplementedError
+
+            def query(self, **kwargs):
+                raise NotImplementedError
+
+            def delete(self, **kwargs):
+                raise NotImplementedError
+
+            def count(self):
+                return 2
+
+            def get(self, **kwargs):
+                raise AssertionError(
+                    "build_graph must not page through get() on a backend collection"
+                )
+
+            def get_all_metadata(self, where=None):
+                return [
+                    {"room": "auth", "wing": "wing_a", "hall": "h"},
+                    {"room": "auth", "wing": "wing_b", "hall": "h"},
+                ]
+
+        nodes, edges = build_graph(col=_Col())
+
+        assert nodes["auth"]["count"] == 2
+        assert len(edges) == 1
 
     def test_falsy_collection(self):
         """When col is explicitly falsy, build_graph returns empty."""
@@ -408,3 +450,26 @@ def test_2288_graph_stats_preserve_room_names_and_count_room_instances():
         "matlab-drive",
         "octopus",
     }
+
+
+class TestChromaWingSourceCounts:
+    def test_reader_groups_transcript_sources_per_wing(self, tmp_path):
+        chromadb = pytest.importorskip("chromadb")
+        from mempalace.backends.chroma import sqlite_wing_source_counts
+
+        client = chromadb.PersistentClient(path=str(tmp_path))
+        col = client.get_or_create_collection("mempalace_drawers")
+        src = "/Users/me/.claude/projects/-Users-me-dev-thing/s.jsonl"
+        col.add(
+            ids=["a", "b", "c"],
+            documents=["x", "y", "z"],
+            metadatas=[
+                {"wing": "convos", "source_file": src},
+                {"wing": "convos", "source_file": src},
+                {"wing": "convos", "source_file": "notes.md"},
+            ],
+            embeddings=[[1.0, 0.0]] * 3,
+        )
+        rows = sqlite_wing_source_counts(str(tmp_path), "mempalace_drawers")
+        assert rows == [("convos", src, 2)]
+        assert sqlite_wing_source_counts(str(tmp_path), "other") is None

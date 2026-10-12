@@ -4,8 +4,14 @@ import chromadb
 
 from _chroma_palace_helper import make_minimal_chroma_sqlite
 
+import pytest
+
 from mempalace.backends import CollectionNotInitializedError, PalaceNotFoundError
 from mempalace.palace import (
+    ASSETS_COLLECTION_NAME,
+    CLOSETS_COLLECTION_NAME,
+    CollectionNameMismatchError,
+    _allowed_wrapper_collection_names,
     _candidate_entity_words,
     _metadata_matches_extract_mode,
     _open_collection_or_explain,
@@ -180,6 +186,35 @@ def test_open_collection_or_explain_state_e_unexpected_error(tmp_path, monkeypat
     assert any("repair-status" in line for line in lines)
 
 
+@pytest.mark.parametrize(
+    "error, shown",
+    [
+        (RuntimeError("index segment missing\nrun repair"), "index segment missing\nrun repair"),
+        (OSError(5, "Input/output error"), "[Errno 5] Input/output error"),
+        (RuntimeError(), "RuntimeError"),
+    ],
+)
+def test_open_collection_or_explain_prints_the_message_not_its_repr(
+    tmp_path, monkeypatch, error, shown
+):
+    """State E prints str(e): a repr escaped newlines and quotes and wrapped
+    the message in the class name (``RuntimeError('...\\n...')``)."""
+    emit, lines = _capture()
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    make_minimal_chroma_sqlite(palace)
+
+    def boom(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr("mempalace.palace.get_collection", boom)
+
+    assert _open_collection_or_explain(str(palace), out=emit) is None
+    message = next(line for line in lines if "Error opening palace" in line)
+    assert message.endswith(f": {shown}")
+    assert "\\n" not in message and "Error(" not in message
+
+
 def test_open_collection_or_explain_default_sink_is_print(tmp_path, capsys):
     """When out is None, messages go through builtin print → stdout."""
     missing = tmp_path / "no-such-palace"
@@ -265,3 +300,105 @@ def test_candidate_entity_words_drops_overlong_blob():
     words = _candidate_entity_words(longtok + " and Lantern")
     assert longtok not in words
     assert "Lantern" in words
+
+
+class TestGetCollectionNameValidation:
+    """#2347: get_collection must reject names the palace wrapper does not own.
+
+    The wrapper routes reads/writes through exactly two collections: the
+    configured drawers name (default ``mempalace_drawers``) and
+    ``mempalace_closets``. Any other name silently creates an orphan store
+    invisible to search/CLI/MCP. The check must fail loudly at the wrapper,
+    before the backend is touched.
+    """
+
+    def _bootstrap(self, tmp_path):
+        palace = tmp_path / "palace"
+        palace.mkdir()
+        get_collection(str(palace), create=True)
+        return palace
+
+    def test_configured_drawers_name_passes(self, tmp_path):
+        palace = self._bootstrap(tmp_path)
+        col = get_collection(str(palace), collection_name="mempalace_drawers")
+        assert col is not None
+
+    def test_closets_name_passes(self, tmp_path):
+        palace = self._bootstrap(tmp_path)
+        col = get_collection(str(palace), collection_name=CLOSETS_COLLECTION_NAME)
+        assert col is not None
+        assert CLOSETS_COLLECTION_NAME == "mempalace_closets"
+
+    def test_none_name_resolves_to_configured_and_passes(self, tmp_path):
+        palace = self._bootstrap(tmp_path)
+        col = get_collection(str(palace), collection_name=None)
+        assert col is not None
+
+    def test_short_alias_drawers_rejected(self, tmp_path):
+        palace = self._bootstrap(tmp_path)
+        with pytest.raises(CollectionNameMismatchError) as exc_info:
+            get_collection(str(palace), collection_name="drawers", create=True)
+        assert exc_info.value.requested == "drawers"
+        assert "mempalace_drawers" in exc_info.value.allowed
+        assert "mempalace_closets" in exc_info.value.allowed
+
+    def test_bare_mempalace_rejected(self, tmp_path):
+        palace = self._bootstrap(tmp_path)
+        with pytest.raises(CollectionNameMismatchError):
+            get_collection(str(palace), collection_name="mempalace", create=True)
+
+    def test_adhoc_name_rejected(self, tmp_path):
+        palace = self._bootstrap(tmp_path)
+        with pytest.raises(CollectionNameMismatchError):
+            get_collection(str(palace), collection_name="my_custom_store", create=True)
+
+    def test_error_is_valueerror_and_carries_context(self, tmp_path):
+        palace = self._bootstrap(tmp_path)
+        with pytest.raises(ValueError) as exc_info:
+            get_collection(str(palace), collection_name="drawers", create=True)
+        err = exc_info.value
+        assert isinstance(err, CollectionNameMismatchError)
+        assert err.requested == "drawers"
+        assert isinstance(err.allowed, list)
+        assert "mempalace_drawers" in err.allowed
+        assert str(palace) in str(err)
+
+    def test_skip_name_check_bypasses_validation(self, tmp_path):
+        """The maintenance escape hatch — a name outside the wrapper's route is
+        accepted when the caller explicitly opts in (repair-encoding tool)."""
+        palace = self._bootstrap(tmp_path)
+        # Must NOT raise CollectionNameMismatchError; it may raise a
+        # collection-not-found (create=False) from the backend, which proves
+        # the name check was bypassed.
+        try:
+            col = get_collection(
+                str(palace),
+                collection_name="totally_custom_name",
+                create=True,
+                _skip_name_check=True,
+            )
+            assert col is not None
+        except CollectionNameMismatchError:  # pragma: no cover
+            raise AssertionError("_skip_name_check=True must bypass the check")
+
+    def test_configured_override_is_accepted(self, tmp_path, monkeypatch):
+        """If the user configures a custom drawers name, that name must pass."""
+        palace = self._bootstrap(tmp_path)
+
+        import mempalace.config as config_mod
+
+        monkeypatch.setattr(config_mod, "get_configured_collection_name", lambda: "custom_drawers")
+        col = get_collection(str(palace), collection_name="custom_drawers", create=True)
+        assert col is not None
+
+        # Meanwhile the now-unconfigured default drawers name is no longer
+        # on the allowed list for this process.
+        with pytest.raises(CollectionNameMismatchError):
+            get_collection(str(palace), collection_name="mempalace_drawers", create=True)
+
+    def test_allowed_names_helper_lists_all_supported_collections(self):
+        allowed = _allowed_wrapper_collection_names()
+        assert "mempalace_drawers" in allowed
+        assert "mempalace_closets" in allowed
+        assert ASSETS_COLLECTION_NAME in allowed
+        assert len(allowed) == 3

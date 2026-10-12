@@ -23,8 +23,9 @@ discipline live in the public
    mempalace-task`. Require explicit authorization before running anything.
 2. Confirm the MemPalace MCP tools are connected and the active palace is the
    intended shared brain.
-3. Establish the current agent's stable identity. Never impersonate another
-   agent.
+3. Establish the current agent's stable `host:harness:project` identity.
+   Never impersonate another agent. Never mint a second harness suffix to
+   split windows.
 4. Check the destination agent's monitoring status when possible. A pasted
    handoff can wake a turn-based agent; a logstream event alone cannot.
 
@@ -84,7 +85,12 @@ When given `Open MemPalace task <id> as <agent>...`:
    `mempalace_event_list`; do not work from the short pasted line alone.
 2. Verify it is addressed to this agent (or is a broadcast explicitly being
    accepted), and verify the workspace, branch, and base commit before edits.
-3. Claim the request with `mempalace_event_ack(status=claimed)`.
+3. Claim the request with `mempalace_event_ack(status=claimed)`. Claiming
+   **is** a watch trigger: arm `mempalace logstream watch --agent <you>
+   --type task.request --type task.reply --type patch.ready --json` (the
+   CLI defaults a sanitized `--state-file`) unless this is a remote-only
+   MCP client (see below). Check for an existing `status=claimed` from
+   your own identity first; lowest-HLC wins on a simultaneous claim.
 4. Do the work and run the stated verification.
 5. Deliver a patch with `mempalace_patch_submit`. If blocked or failed, send a
    verbatim `task.reply` instead. Silence is not a valid outcome.

@@ -312,6 +312,45 @@ WATCH_STATE_EMPTY = "empty"
 WATCH_STATE_CORRUPT = "corrupt"
 
 
+def sanitize_watch_state_basename(agent: str) -> str:
+    """Turn an agent identity into a state-file basename (no directories).
+
+    RFC 005 identities use colons (``windows:grok:mempalace``), which are
+    illegal in Windows filenames. Slashes would escape ``~/.mempalace/watch``.
+    """
+    agent = (agent or "").strip()
+    if not agent:
+        raise ValueError("agent identity is required to name a watch state file")
+    # Double "_" before mapping ":" so identities that differ only in where
+    # "_" and ":" sit (a:b_c:proj vs a_b:c:proj) never share one cursor file.
+    safe = agent.replace("_", "__").replace(":", "_").replace("/", "_").replace("\\", "_")
+    if safe in {".", ".."} or not safe:
+        raise ValueError("agent identity sanitizes to an empty state-file name")
+    return safe
+
+
+def default_watch_state_file(agent: str, *, home: Optional[str] = None) -> str:
+    """``~/.mempalace/watch/<sanitized-agent>.json`` for ``logstream watch``."""
+    base = Path(home) if home is not None else Path.home()
+    return str(base / ".mempalace" / "watch" / f"{sanitize_watch_state_basename(agent)}.json")
+
+
+def resolve_watch_state_file(state_file: Optional[str], agent: Optional[str]) -> Optional[str]:
+    """Choose a watch state-file path.
+
+    ``None`` means "apply the default from ``--agent``". An empty string is
+    an explicit disable (tests, or a caller that does not want a cursor).
+    A non-empty string is used as-is.
+    """
+    if state_file:
+        return state_file
+    if state_file == "":
+        return None
+    if agent:
+        return default_watch_state_file(agent)
+    return None
+
+
 def read_watch_state(path: str) -> tuple:
     """Return ``(cursor, condition)`` for a watch state file.
 
@@ -974,6 +1013,10 @@ class Logstream:
         since_event_id = _sanitize_routing(since_event_id, "since_event_id", required=False)
         before_event_id = _sanitize_routing(before_event_id, "before_event_id", required=False)
         since_created_at = sanitize_iso_temporal(since_created_at, "since_created_at") or None
+        if order is None:
+            order = "asc"
+        elif isinstance(order, str):
+            order = order.lower().strip()
         if order not in ("asc", "desc"):
             raise ValueError(f"order={order!r} must be 'asc' or 'desc'")
         if not isinstance(limit, int) or limit < 1:

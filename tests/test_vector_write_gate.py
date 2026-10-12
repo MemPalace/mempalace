@@ -62,6 +62,7 @@ def test_vector_write_refused_while_index_diverged(diverged):
             "mempalace_add_drawer",
             "mempalace_update_drawer",
             "mempalace_delete_drawer",
+            "mempalace_delete_drawers",
             "mempalace_delete_by_source",
             "mempalace_diary_write",
             "mempalace_checkpoint",

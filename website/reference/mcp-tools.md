@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 45 MCP tools.
+Detailed parameter schemas for all 47 MCP tools.
 
 ## Palace — Read Tools
 
@@ -68,8 +68,22 @@ Semantic search. Returns verbatim drawer content with similarity scores.
 | `limit` | integer | No | Max results (default: 5) |
 | `wing` | string | No | Filter by wing |
 | `room` | string | No | Filter by room |
+| `since` | string | No | Include drawers filed on or after this ISO date/datetime |
+| `before` | string | No | Include drawers filed strictly before this ISO date/datetime |
 
 **Returns:** `{ query, filters, results: [{ text, wing, room, source_file, similarity }] }`
+
+Each hit also includes date provenance: `filed_at` (equal to legacy `created_at`),
+legacy `authored_at`, `authored_at_source`, `content_date`, and
+`content_date_source`. `authored_at_source` identifies stored authorship metadata
+(`authored_at`), the historical ingestion-time fallback (`filed_at`), or missing
+evidence (`unknown`). An inferred `content_date` is kept separate; its source is
+`filename`, `frontmatter`, `body`, `mtime`, or `unknown` for unrecorded provenance.
+Missing content dates are `null`. These fields do not change ranking or the
+filing-date semantics of `since`/`before`.
+
+See [date provenance](https://github.com/MemPalace/mempalace/blob/develop/docs/authored-at.md)
+for interpretation and compatibility details.
 
 ---
 
@@ -143,6 +157,18 @@ Delete a drawer by ID. Irreversible.
 
 ---
 
+### `mempalace_delete_drawers`
+
+Delete many drawers by ID in one call. Irreversible. Each ID is removed the same way as `mempalace_delete_drawer`: a logical drawer id removes the whole group, including its chunk rows, and a physical chunk id removes that one row. A missing ID is an item in `results` and is counted in `errors`; the rest of the batch still runs. An accepted call is 1 to 500 IDs and always returns `results`, including a one-ID call. An empty list or more than 500 IDs is rejected and deletes nothing.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `drawer_ids` | array of strings | **Yes** | Drawer IDs to delete (1 to 500) |
+
+**Returns:** `{ results, count, deleted, errors }` for an accepted call. Each result is `{ drawer_id, deleted_ids, chunks_deleted, closets_deleted }` or `{ drawer_id, error }`. A rejected call returns `{ error }`.
+
+---
+
 ### `mempalace_mine`
 
 Mine a directory into the palace — the MCP equivalent of `mempalace mine`. `mode='convos'` also accepts a single conversation file. Wraps the same in-process miners the CLI uses; runs synchronously and returns the miner's summary as `output`. The palace write lock is automatic — a concurrent mine returns a structured already-running error. Orphan cleanup is separate (see `mempalace_sync`).
@@ -158,6 +184,15 @@ Mine a directory into the palace — the MCP equivalent of `mempalace mine`. `mo
 | `extract` | string | No | Convos extraction strategy: `exchange` (default) or `general`; ignored by other modes |
 
 **Returns:** `{ success, mode, dry_run, output }` on success (`output` is the miner's human-readable summary; `output_truncated: true` is added when a very large summary is tail-trimmed), or `{ success: false, error, error_class? }` on failure.
+
+**Files that fail to mine** (`projects` and `convos` modes): when a file's stale-drawer purge raises, that file is not mined. Its existing drawers are left untouched, the next mine retries it, and the summary in `output` adds a `Files failed: N` line. The mine finishes the remaining files, but it is not reported as a success:
+
+```text
+{ success: false, mode, dry_run, output[, output_truncated],
+  error, error_class: "MineFileErrors", files_failed, failed_files }
+```
+
+`files_failed` is the number of files that failed. `failed_files` lists their paths, capped at the first 20. `error` reads `"N of M file(s) failed to mine; per-file errors went to stderr (the server's stderr over MCP, the terminal on the CLI), and the next mine retries them"`. Only stdout is captured into `output`, so the per-file `! [error] ... stale-drawer purge failed` lines go to the server's stderr (its log), not into `output`. The CLI behaves the same way: `mempalace mine` prints the summary, reports the failed files on stderr, and exits `1`.
 
 ---
 
@@ -187,7 +222,11 @@ Prune drawers whose source files are gitignored, deleted, or moved. Returns a dr
 
 **Returns:** `{ scanned, kept, gitignored, missing, unresolved, no_source, out_of_scope, removed_drawers, removed_closets, dry_run, by_source, unresolved_by_source }`
 
-Only `gitignored` and `missing` are removed. A source file that is not at its path counts as `missing` only while the palace can still see a source file of its own in the same directory: a deletion leaves its neighbours behind, an unmounted volume takes all of them at once. Everything else counts as `unresolved`, which is kept and named in `unresolved_by_source` the way removals are named in `by_source`.
+Only `gitignored` and `missing` are removed. A source file that is not at its path counts as `missing` only while the palace can still see a source file of its own in the same directory, and only while that directory is still the one the missing file was mined from: a deletion leaves its neighbours behind, an unmounted volume takes all of them at once, and a volume or bind mount put in place of that directory has neighbours that never knew the file. Everything else counts as `unresolved`, which is kept and named in `unresolved_by_source` the way removals are named in `by_source`.
+
+Mining records which directory that was by storing its inode on each drawer. A path is only a name: mount something at it and the name resolves to the root of what was mounted, which is a different inode, and unmounting brings the original back. Nothing is written to the source tree for this, so a read-only mount records an identity like any other. Drawers filed before this existed carry none, and are decided by the neighbour rule alone. One volume swapped for another at the same path is not separated, since the root of a filesystem carries a fixed inode for its type. A directory deleted and recreated may come back with a different inode, which keeps the drawers of files that really went. There is no bulk way out of that on purpose, since a drawer stranded that way and a drawer a volume is holding are the same reading: `unresolved_by_source` names the sources, and `mempalace_delete_by_source` removes them one at a time. That tool is blunter than this pass, matching `source_file` exactly and consulting neither the neighbours nor the identity, so read its dry run before applying it.
+
+`removed_closets` counts the closets of the sources this pass left holding no drawer, not of every source a drawer was removed from. Since the verdict is per drawer, a source can lose one and keep another, and purging by source would strand that survivor without the lines that index it. A source whose remaining drawers are in a wing this run did not read keeps its closets for the same reason. The sources it covers are therefore a subset of those named in `by_source`, though the count itself is of closet rows rather than of sources, and a source that kept its closets is not distinguished from one that had none.
 
 ---
 
@@ -200,6 +239,18 @@ Fetch a single drawer by ID — returns full content and metadata.
 | `drawer_id` | string | **Yes** | ID of the drawer to fetch |
 
 **Returns:** `{ drawer_id, content, wing, room, metadata }` where `metadata.source_file`, when present, is the basename only — the absolute path written by the miners is reduced before the dict is returned to MCP clients.
+
+---
+
+### `mempalace_get_drawers`
+
+Fetch many drawers by ID in one call. Each ID resolves the same way as `mempalace_get_drawer`: a logical id reassembles the chunk group, and a physical chunk id returns that row. A hit is that same payload. A missing ID is an item in `results` and is counted in `errors`; the rest of the batch still returns. An accepted call is 1 to 500 IDs and always returns `results`, including a one-ID call. An empty list or more than 500 IDs is rejected and does not read the palace.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `drawer_ids` | array of strings | **Yes** | Drawer IDs to fetch (1 to 500) |
+
+**Returns:** `{ results, count, errors }` for an accepted call. A rejected call returns `{ error }`.
 
 ---
 
@@ -497,6 +548,16 @@ Force a reconnect to the palace database. Use this after external scripts or CLI
 
 **Returns:** `{ success, message, drawers, vector_disabled[, vector_disabled_reason] }` (on no-palace: `{ success: false, message, drawers, vector_disabled }`; on exception: `{ success: false, error }`)
 
+**While a mine runs on a hub:** over the HTTP hub transport, reconnect waits up to 10 seconds for a running `mempalace_mine` on that hub to finish. Reconnect closes the backend handles the mine is writing through, so it never runs inside a mine. If the mine is still running after 10 seconds, reconnect is refused without touching the backend:
+
+```text
+{ success: false, error_class: "MineInProgress",
+  error: "a mine is running on this hub; reconnect closes the backend handles that mine is writing through, so it was not run (waited 10s)",
+  hint: "Retry mempalace_reconnect after the mine finishes." }
+```
+
+Retry once the mine has finished. A stdio server (no hub) is unaffected.
+
 ---
 
 ## Agent Coordination Tools (Logstream)
@@ -551,7 +612,7 @@ Append an immutable agent-coordination event to the logstream (RFC 003).
 
 ### `mempalace_event_list`
 
-List events with structured filters.
+List events with structured filters. `writer` filters by who wrote an event. `from_agent` is the caller identity and does not narrow the result.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -560,13 +621,14 @@ List events with structured filters.
 | `topic` | string | No | Filter by topic |
 | `type` | string | No | Filter by event type |
 | `to_agent` | string | No | Filter by target; also matches `*` broadcasts |
-| `from_agent` | string | No | Filter by writer |
+| `from_agent` | string | No | Caller identity. Not a filter: it never narrows the result. To filter by who wrote an event use `writer` |
+| `writer` | string | No | Filter by the agent that wrote the event |
 | `correlation_id` | string | No | Filter by correlation id |
 | `status` | string | No | Filter by status |
 | `since_event_id` | string | No | Only events strictly after this id in append order (precise forward cursor) |
 | `before_event_id` | string | No | Only events strictly before this id in append order (reverse/historical paging) |
 | `since_created_at` | string | No | Only events at/after this time (inclusive) |
-| `order` | string | No | `asc` (oldest first, default) or `desc` (newest first) |
+| `order` | string | No | `desc` (newest first) when `since_event_id` is omitted; `asc` (oldest first) when resuming from `since_event_id`. Explicit `order` always overrides |
 | `limit` | integer | No | Max events (default 50, cap 500) |
 
 **Returns:** `{ events: [...], count }`
@@ -575,7 +637,7 @@ List events with structured filters.
 
 ### `mempalace_event_wait`
 
-Block until a matching event exists or the timeout expires (long-poll; max 5 minutes). Accepts the forward filters `stream`, `room`, `topic`, `type`, `to_agent`, `from_agent`, `correlation_id`, `status`, `since_event_id`, and `since_created_at`, plus:
+Block until a matching event exists or the timeout expires (long-poll; max 5 minutes). Accepts the forward filters `stream`, `room`, `topic`, `type`, `to_agent`, `writer`, `correlation_id`, `status`, `since_event_id`, and `since_created_at`. `from_agent` is the caller identity and does not filter. Also:
 
 For live-tail clients that can keep an HTTP connection open, use
 `GET /logstream/stream` SSE instead; `event_wait` is the polling MCP surface.

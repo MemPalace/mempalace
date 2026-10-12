@@ -1293,3 +1293,100 @@ def test_resolve_python_falls_back_to_path_python3_without_console_scripts(
     assert os.path.basename(resolved).startswith("python"), (
         f"resolver should fall back to python3 on PATH; got {resolved!r}"
     )
+
+
+# ── kill switch honours the XDG config dir (#148) ─────────────────────
+
+
+def _kill_switch_tripped(home: Path, extra_env: dict[str, str] | None = None) -> bool:
+    """Source common.sh and report whether ``mempal_kill_switch_tripped`` fires."""
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k
+        not in (
+            "MEMPAL_DISABLE_HOOK",
+            "MEMPALACE_HOOKS_AUTO_SAVE",
+            "MEMPALACE_CONFIG_DIR",
+            "XDG_CONFIG_HOME",
+        )
+    }
+    home.mkdir(parents=True, exist_ok=True)
+    env["HOME"] = str(home)
+    # common.sh creates $MEMPAL_STATE_DIR when sourced; keep it outside HOME so
+    # sourcing cannot create the ~/.mempalace the kill switch is looking for.
+    state_dir = home.parent / f"{home.name}-state"
+    env["MEMPAL_STATE_DIR"] = str(state_dir)
+    if extra_env:
+        env.update(extra_env)
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1" >/dev/null 2>&1; if mempal_kill_switch_tripped; then echo tripped; else echo proceed; fi',
+            "bash",
+            COMMON_LIB.as_posix(),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    assert result.stdout.strip() in {"tripped", "proceed"}, result.stdout + result.stderr
+    return result.stdout.strip() == "tripped"
+
+
+def test_kill_switch_trips_when_no_palace_dir_exists(tmp_path: Path) -> None:
+    assert _kill_switch_tripped(tmp_path / "home") is True
+
+
+def test_kill_switch_proceeds_for_fresh_xdg_install(tmp_path: Path) -> None:
+    """A fresh install since #148 has ~/.config/mempalace and no ~/.mempalace."""
+    home = tmp_path / "home"
+    (home / ".config" / "mempalace").mkdir(parents=True)
+    assert _kill_switch_tripped(home) is False
+
+
+def test_kill_switch_proceeds_for_xdg_config_home(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    xdg = tmp_path / "xdg"
+    (xdg / "mempalace").mkdir(parents=True)
+    assert _kill_switch_tripped(home, {"XDG_CONFIG_HOME": xdg.as_posix()}) is False
+
+
+def test_kill_switch_proceeds_for_explicit_config_dir(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    config_dir = tmp_path / "explicit"
+    config_dir.mkdir()
+    assert _kill_switch_tripped(home, {"MEMPALACE_CONFIG_DIR": config_dir.as_posix()}) is False
+
+
+def test_kill_switch_expands_tilde_in_explicit_config_dir(tmp_path: Path) -> None:
+    """``MEMPALACE_CONFIG_DIR=~/alt`` resolves under HOME, as ``expanduser`` does."""
+    home = tmp_path / "home"
+    (home / "alt").mkdir(parents=True)
+    assert _kill_switch_tripped(home, {"MEMPALACE_CONFIG_DIR": "~/alt"}) is False
+
+
+def test_kill_switch_expands_tilde_in_xdg_config_home(tmp_path: Path) -> None:
+    """``XDG_CONFIG_HOME=~/xdg`` is absolute after expansion, as in Python."""
+    home = tmp_path / "home"
+    (home / "xdg" / "mempalace").mkdir(parents=True)
+    assert _kill_switch_tripped(home, {"XDG_CONFIG_HOME": "~/xdg"}) is False
+
+
+def test_kill_switch_legacy_dir_still_proceeds(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _ensure_palace(home)
+    assert _kill_switch_tripped(home) is False
+
+
+def test_kill_switch_reads_auto_save_from_xdg_config(tmp_path: Path) -> None:
+    """``hooks.auto_save: false`` is read from the resolved config dir."""
+    home = tmp_path / "home"
+    config_dir = home / ".config" / "mempalace"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.json").write_text(
+        json.dumps({"hooks": {"auto_save": False}}), encoding="utf-8"
+    )
+    assert _kill_switch_tripped(home) is True

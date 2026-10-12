@@ -26,11 +26,30 @@ def _strip_leaked_pythonpath_from_sys_path() -> None:
     if not leaked:
         return
 
+    import sysconfig
+
     def _norm(path: str) -> str:
         return os.path.normcase(os.path.normpath(path))
 
+    # Preserve this interpreter's package directories (#2484), not every
+    # descendant of sys.prefix: shared installations and nested venvs can
+    # contain packages built for another Python ABI under the same prefix.
+    paths = sysconfig.get_paths()
+    own_site_packages = {_norm(os.path.realpath(paths[name])) for name in ("purelib", "platlib")}
+
+    def _belongs_to_this_environment(path: str) -> bool:
+        try:
+            resolved = _norm(os.path.realpath(path))
+        except OSError:
+            return False
+        return resolved in own_site_packages
+
     leaked_entries = {_norm(p) for p in leaked.split(os.pathsep) if p}
-    sys.path[:] = [p for p in sys.path if not p or _norm(p) not in leaked_entries]
+    sys.path[:] = [
+        p
+        for p in sys.path
+        if not p or _norm(p) not in leaked_entries or _belongs_to_this_environment(p)
+    ]
 
 
 _strip_leaked_pythonpath_from_sys_path()
@@ -42,6 +61,13 @@ from .version import __version__  # noqa: E402
 # posthog client is a no-op stub, so this is now harmless — kept as a guard in
 # case future chromadb versions re-introduce real telemetry calls.
 logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.CRITICAL)
+
+# Silencing the logger only hides telemetry; this turns it off. The backend passes
+# ``Settings(anonymized_telemetry=False)`` to every client it opens, and this
+# covers chromadb clients opened by anything else in the process (a notebook, a
+# plugin) that would otherwise inherit ChromaDB's opt-out-by-default. setdefault,
+# so an operator who deliberately exports the variable still wins. (GHSA-8h77)
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 
 # NOTE: the previous block set ``ORT_DISABLE_COREML=1`` on macOS arm64 as a
 # supposed workaround for the #74 ARM64 segfault.  Two problems:
