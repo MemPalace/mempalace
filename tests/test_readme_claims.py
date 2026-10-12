@@ -23,7 +23,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 MEMPALACE_PKG = REPO_ROOT / "mempalace"
 README_PATH = REPO_ROOT / "README.md"
 MCP_TOOLS_DOC_PATH = REPO_ROOT / "website" / "reference" / "mcp-tools.md"
-MODULES_DOC_PATH = REPO_ROOT / "website" / "reference" / "modules.md"
 
 
 def _read(path: Path) -> str:
@@ -734,24 +733,32 @@ class TestDialectNotLossless:
 # 17. README file reference table for dialect.py does NOT say "lossless"
 # ---------------------------------------------------------------------------
 
+# Every module table that describes dialect.py. mempalace/README.md kept the
+# "30x lossless ratio" wording long after the website table was fixed, because
+# only the website table was checked.
+DIALECT_MODULE_TABLE_FILES = (
+    "website/reference/modules.md",
+    "mempalace/README.md",
+)
+
 
 class TestReadmeDialectNotLossless:
     """The file-reference documentation must not say dialect.py is lossless.
 
     Pre-#875 this lived in a README.md file table; it now lives in
-    website/reference/modules.md. The April 7 correction established that
-    AAAK is a lossy abbreviation system, not lossless compression, and
-    every docs surface that describes dialect.py must respect that.
+    website/reference/modules.md and in the package's own mempalace/README.md.
+    The April 7 correction established that AAAK is a lossy abbreviation
+    system, not lossless compression, and every docs surface that describes
+    dialect.py must respect that.
     """
 
-    def test_readme_dialect_line_not_lossless(self):
-        doc = _read(MODULES_DOC_PATH)
+    @pytest.mark.parametrize("rel_path", DIALECT_MODULE_TABLE_FILES)
+    def test_readme_dialect_line_not_lossless(self, rel_path):
+        doc = _read(REPO_ROOT / rel_path)
         # Any line mentioning dialect.py (narrative or table) must not call it lossless
         dialect_lines = [line for line in doc.splitlines() if "dialect.py" in line]
         assert len(dialect_lines) > 0, (
-            f"Could not find dialect.py in "
-            f"{MODULES_DOC_PATH.relative_to(REPO_ROOT)}. "
-            f"Expected at least one reference."
+            f"Could not find dialect.py in {rel_path}. Expected at least one reference."
         )
 
         for line in dialect_lines:
