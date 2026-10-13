@@ -68,7 +68,15 @@ TOOLS = {
                     "type": "string",
                     "description": "The relationship type (e.g. 'loves', 'works_on', 'daughter_of')",
                 },
-                "object": {"type": "string", "description": "The entity being connected to"},
+                "object": {
+                    "type": "string",
+                    "description": (
+                        "Entity name being connected to (max 128 chars — it becomes a graph "
+                        "node). Don't pack multi-item plans/lists into one object: split into "
+                        "separate facts (e.g. subject → next_batch_item → item1) or file a "
+                        "drawer and store a pointer."
+                    ),
+                },
                 "valid_from": {
                     "type": "string",
                     "description": "When this became true (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional)",
@@ -121,8 +129,17 @@ TOOLS = {
                     "type": "string",
                     "description": "The relationship type (e.g. 'uses_model', 'works_at')",
                 },
-                "old_object": {"type": "string", "description": "The value being replaced"},
-                "new_object": {"type": "string", "description": "The new value"},
+                "old_object": {
+                    "type": "string",
+                    "description": "The value being replaced (entity name, max 128 chars)",
+                },
+                "new_object": {
+                    "type": "string",
+                    "description": (
+                        "The new value (entity name, max 128 chars). For multi-item "
+                        "content, split into separate facts instead of packing one object."
+                    ),
+                },
                 "at": {
                     "type": "string",
                     "description": "Boundary instant (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional; defaults to now UTC)",

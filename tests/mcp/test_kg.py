@@ -211,7 +211,7 @@ class TestKGTools:
         # must warn up front that objects are entity names (max 128
         # chars) and that multi-item content belongs in per-item facts
         # or a drawer pointer, not one packed object.
-        from mempalace.mcp_server.schemas import TOOLS
+        from mempalace.mcp_server import TOOLS
 
         add_object = TOOLS["mempalace_kg_add"]["input_schema"]["properties"][
             "object"
