@@ -553,6 +553,14 @@ TOOLS = {
                         "--include-ignored. Projects mode only; default: []."
                     ),
                 },
+                "include_subagents": {
+                    "type": "boolean",
+                    "description": (
+                        "Also mine Claude Code subagent transcripts (subagents/ dirs), "
+                        "matching CLI --include-subagents. Convos mode only; ignored by "
+                        "other modes. Default: false."
+                    ),
+                },
             },
             "required": ["source"],
         },

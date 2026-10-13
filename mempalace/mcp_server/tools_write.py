@@ -822,6 +822,7 @@ def tool_mine(
     dry_run: bool = False,
     extract: str = "exchange",
     include_ignored: Optional[list[str]] = None,
+    include_subagents: bool = False,
 ):
     """Mine a directory into the palace — the MCP equivalent of ``mempalace mine``.
 
@@ -844,6 +845,9 @@ def tool_mine(
              ``"general"``; ignored by the other modes.
     include_ignored: project-relative paths to scan even if ignored, matching
                      the CLI's ``--include-ignored``; projects mode only.
+    include_subagents: also mine Claude Code ``subagents/`` transcript dirs,
+                       matching the CLI's ``--include-subagents``; convos mode
+                       only, ignored by the other modes.
 
     Runs synchronously and mirrors the :func:`tool_sync` contract: success
     returns ``{success: True, mode, dry_run, output[, output_truncated]}`` where ``output`` is
@@ -886,6 +890,14 @@ def tool_mine(
             "error": "include_ignored is supported only in projects mode",
             "error_class": "ValueError",
         }
+    # A truthy non-boolean ("false", 1) would silently opt into mining every
+    # subagent transcript, so accept only a real JSON boolean.
+    if not isinstance(include_subagents, bool):
+        return {
+            "success": False,
+            "error": "include_subagents must be a boolean",
+            "error_class": "ValueError",
+        }
 
     src = os.path.expanduser(source) if source else ""
     # convos accepts one conversation file as well as a directory — the CLI has
@@ -919,6 +931,7 @@ def tool_mine(
                 limit=limit,
                 dry_run=dry_run,
                 extract_mode=extract,
+                include_subagents=include_subagents,
             )
         if mode == "extract":
             from ..format_miner import mine_formats

@@ -1399,7 +1399,11 @@ def _serve_http(host: str, port: int) -> None:
                 port=bound_port,
                 scheme=getattr(httpd, "scheme", "http"),
                 read_only=_READ_ONLY,
-                capabilities=["mine_include_ignored", "search_cli_compatible"],
+                capabilities=[
+                    "mine_include_ignored",
+                    "mine_include_subagents",
+                    "search_cli_compatible",
+                ],
                 search_config_fingerprint=_config.search_config_fingerprint,
             )
             import atexit

@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **`mempalace mine --mode convos --include-subagents` keeps the flag through
+  a running hub or the daemon.** Both routes dropped it, so the forwarded mine
+  skipped `subagents/` folders as if the flag had not been passed. The
+  `mempalace_mine` tool accepts `include_subagents` (convos mode only), and the
+  daemon job carries it. A hub too old to advertise `mine_include_subagents` is
+  refused with an upgrade message instead of mining locally beside the hub's
+  writer lease. A plain `mempalace mine <dir>` with no `--mode` now forwards
+  `mode: "projects"` to the hub instead of `null`, which the hub refused.
+
 ---
 
 ## [3.11.0] — 2026-10-12

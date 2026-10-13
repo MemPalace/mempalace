@@ -182,6 +182,8 @@ Mine a directory into the palace — the MCP equivalent of `mempalace mine`. `mo
 | `limit` | integer | No | Max files to process (0 = all; default 0) |
 | `dry_run` | boolean | No | Report what would be filed without writing (default false) |
 | `extract` | string | No | Convos extraction strategy: `exchange` (default) or `general`; ignored by other modes |
+| `include_ignored` | array of strings | No | Project-relative paths to scan even if ignored, like CLI `--include-ignored`; `projects` mode only (default `[]`) |
+| `include_subagents` | boolean | No | Also mine Claude Code subagent transcripts (`subagents/` dirs), like CLI `--include-subagents`; `convos` mode only, ignored by other modes (default false) |
 
 **Returns:** `{ success, mode, dry_run, output }` on success (`output` is the miner's human-readable summary; `output_truncated: true` is added when a very large summary is tail-trimmed), or `{ success: false, error, error_class? }` on failure.
 

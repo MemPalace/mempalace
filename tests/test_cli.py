@@ -740,7 +740,40 @@ def test_cmd_mine_daemon_background_submits_job(mock_config_cls, capsys):
     assert call_kwargs["wait"] is False
     payload = mock_submit.call_args.args[1]
     assert payload["include_ignored"] == ["a.txt", "b.txt"]
+    assert payload["include_subagents"] is False
     assert "job-1" in capsys.readouterr().out
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_daemon_payload_carries_include_subagents(mock_config_cls):
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(
+        dir="/chats",
+        palace=None,
+        mode="convos",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+        daemon=True,
+        background=True,
+        backend=None,
+        global_backend=None,
+        max_chunks_per_file=None,
+        redetect_origin=False,
+        include_subagents=True,
+    )
+    with patch("mempalace.daemon.submit_job", return_value={"id": "job-1"}) as mock_submit:
+        with patch("mempalace.convo_miner.mine_convos") as mock_mine:
+            cmd_mine(args)
+
+    mock_mine.assert_not_called()
+    payload = mock_submit.call_args.args[1]
+    assert payload["mode"] == "convos"
+    assert payload["include_subagents"] is True
 
 
 @patch("mempalace.cli.MempalaceConfig")

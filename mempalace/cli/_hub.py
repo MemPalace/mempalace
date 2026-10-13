@@ -307,20 +307,30 @@ def _forward_mine_to_hub(args, palace_path: str, *, include_ignored=None) -> boo
     except (urllib.error.URLError, OSError, ValueError):
         return False
 
-    # Older hubs cannot express this override. Never discard it or compete
+    mode = getattr(args, "mode", None) or "projects"
+    # Only the convo miner reads this flag; the direct path ignores it in the
+    # other modes, so only a convos mine carries it to the hub.
+    include_subagents = mode == "convos" and bool(getattr(args, "include_subagents", False))
+
+    # Older hubs cannot express these overrides. Never discard one or compete
     # with their lifetime writer lease by silently opening a local writer.
-    if include_ignored and "mine_include_ignored" not in (info.get("capabilities") or []):
-        print(
-            f"mempalace: palace hub {base_url} (pid {info.get('pid')}) does not support "
-            "--include-ignored; upgrade MemPalace in the hub's environment and restart "
-            "the hub before retrying. No mine was submitted or run locally.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    capabilities = info.get("capabilities") or []
+    for requested, capability, flag in (
+        (include_ignored, "mine_include_ignored", "--include-ignored"),
+        (include_subagents, "mine_include_subagents", "--include-subagents"),
+    ):
+        if requested and capability not in capabilities:
+            print(
+                f"mempalace: palace hub {base_url} (pid {info.get('pid')}) does not support "
+                f"{flag}; upgrade MemPalace in the hub's environment and restart "
+                "the hub before retrying. No mine was submitted or run locally.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     arguments = {
         "source": os.path.abspath(os.path.expanduser(args.dir)),
-        "mode": args.mode,
+        "mode": mode,
         "agent": args.agent,
         "limit": args.limit or 0,
         "dry_run": bool(args.dry_run),
@@ -330,6 +340,8 @@ def _forward_mine_to_hub(args, palace_path: str, *, include_ignored=None) -> boo
         arguments["wing"] = args.wing
     if include_ignored:
         arguments["include_ignored"] = include_ignored
+    if include_subagents:
+        arguments["include_subagents"] = True
     body = json.dumps(
         {
             "jsonrpc": "2.0",

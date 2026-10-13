@@ -33,6 +33,7 @@ def cmd_mine(args):
             "redetect_origin",
             False,
         ),
+        "include_subagents": bool(getattr(args, "include_subagents", False)),
     }
     if source_adapter:
         payload["source_adapter"] = source_adapter

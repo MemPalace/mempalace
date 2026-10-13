@@ -288,6 +288,7 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
                 limit=limit,
                 dry_run=dry_run,
                 extract_mode=payload.get("extract") or "exchange",
+                include_subagents=bool(payload.get("include_subagents")),
             )
         elif mode == "extract":
             from .format_miner import mine_formats
