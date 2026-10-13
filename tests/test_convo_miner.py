@@ -1359,3 +1359,41 @@ def test_mine_convos_reaches_a_yield_point_before_each_file(tmp_path, capsys):
     with mine_yield_hook(lambda: calls.append(1)):
         mine_convos(str(src), str(tmp_path / "palace"), wing="test")
     assert len(calls) == 3
+
+
+def test_mine_convos_files_changed_transcripts_after_a_reset_at_a_yield_point(tmp_path):
+    """A hub serves other requests at the yield point before each transcript.
+    One that notices a peer's write resets the shared System and closes the
+    client the mine's collection came from; the changed transcripts are still
+    filed."""
+    from mempalace.backends import chroma as chroma_module
+    from mempalace.palace import get_collection, mine_yield_hook
+
+    src = tmp_path / "convos"
+    src.mkdir()
+    chats = [src / f"chat{n}.txt" for n in range(3)]
+    for n, chat in enumerate(chats):
+        chat.write_text(f"> question {n}?\nanswer {n} with enough words.\n" * 3)
+    palace = str(tmp_path / "palace")
+    mine_convos(str(src), palace, wing="test")
+
+    for n, chat in enumerate(chats):
+        chat.write_text(
+            chat.read_text() + f"> later question {n}?\nlater answer {n} with enough words.\n"
+        )
+        later = os.stat(chat).st_mtime + 10
+        os.utime(chat, (later, later))
+    resets = []
+
+    def another_request_resets():
+        if not resets:
+            resets.append(1)
+            chroma_module._clear_chroma_system_cache()
+
+    with mine_yield_hook(another_request_resets):
+        mine_convos(str(src), palace, wing="test")
+
+    documents = get_collection(palace).get(include=["documents"]).documents
+    assert resets == [1]
+    for n in range(3):
+        assert any(f"later question {n}?" in d for d in documents), n
