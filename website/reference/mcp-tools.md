@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 45 MCP tools.
+Detailed parameter schemas for all 47 MCP tools.
 
 ## Palace — Read Tools
 
@@ -182,8 +182,19 @@ Mine a directory into the palace — the MCP equivalent of `mempalace mine`. `mo
 | `limit` | integer | No | Max files to process (0 = all; default 0) |
 | `dry_run` | boolean | No | Report what would be filed without writing (default false) |
 | `extract` | string | No | Convos extraction strategy: `exchange` (default) or `general`; ignored by other modes |
+| `include_ignored` | array of strings | No | Project-relative paths to scan even if ignored, like CLI `--include-ignored`; `projects` mode only (default `[]`) |
+| `include_subagents` | boolean | No | Also mine Claude Code subagent transcripts (`subagents/` dirs), like CLI `--include-subagents`; `convos` mode only, ignored by other modes (default false) |
 
 **Returns:** `{ success, mode, dry_run, output }` on success (`output` is the miner's human-readable summary; `output_truncated: true` is added when a very large summary is tail-trimmed), or `{ success: false, error, error_class? }` on failure.
+
+**Files that fail to mine** (`projects` and `convos` modes): when a file's stale-drawer purge raises, that file is not mined. Its existing drawers are left untouched, the next mine retries it, and the summary in `output` adds a `Files failed: N` line. The mine finishes the remaining files, but it is not reported as a success:
+
+```text
+{ success: false, mode, dry_run, output[, output_truncated],
+  error, error_class: "MineFileErrors", files_failed, failed_files }
+```
+
+`files_failed` is the number of files that failed. `failed_files` lists their paths, capped at the first 20. `error` reads `"N of M file(s) failed to mine; per-file errors went to stderr (the server's stderr over MCP, the terminal on the CLI), and the next mine retries them"`. Only stdout is captured into `output`, so the per-file `! [error] ... stale-drawer purge failed` lines go to the server's stderr (its log), not into `output`. The CLI behaves the same way: `mempalace mine` prints the summary, reports the failed files on stderr, and exits `1`.
 
 ---
 
@@ -539,6 +550,16 @@ Force a reconnect to the palace database. Use this after external scripts or CLI
 
 **Returns:** `{ success, message, drawers, vector_disabled[, vector_disabled_reason] }` (on no-palace: `{ success: false, message, drawers, vector_disabled }`; on exception: `{ success: false, error }`)
 
+**While a mine runs on a hub:** over the HTTP hub transport, reconnect waits up to 10 seconds for a running `mempalace_mine` on that hub to finish. Reconnect closes the backend handles the mine is writing through, so it never runs inside a mine. If the mine is still running after 10 seconds, reconnect is refused without touching the backend:
+
+```text
+{ success: false, error_class: "MineInProgress",
+  error: "a mine is running on this hub; reconnect closes the backend handles that mine is writing through, so it was not run (waited 10s)",
+  hint: "Retry mempalace_reconnect after the mine finishes." }
+```
+
+Retry once the mine has finished. A stdio server (no hub) is unaffected.
+
 ---
 
 ## Agent Coordination Tools (Logstream)
@@ -593,7 +614,7 @@ Append an immutable agent-coordination event to the logstream (RFC 003).
 
 ### `mempalace_event_list`
 
-List events with structured filters.
+List events with structured filters. `writer` filters by who wrote an event. `from_agent` is the caller identity and does not narrow the result.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -602,7 +623,8 @@ List events with structured filters.
 | `topic` | string | No | Filter by topic |
 | `type` | string | No | Filter by event type |
 | `to_agent` | string | No | Filter by target; also matches `*` broadcasts |
-| `from_agent` | string | No | Filter by writer |
+| `from_agent` | string | No | Caller identity. Not a filter: it never narrows the result. To filter by who wrote an event use `writer` |
+| `writer` | string | No | Filter by the agent that wrote the event |
 | `correlation_id` | string | No | Filter by correlation id |
 | `status` | string | No | Filter by status |
 | `since_event_id` | string | No | Only events strictly after this id in append order (precise forward cursor) |
@@ -617,7 +639,7 @@ List events with structured filters.
 
 ### `mempalace_event_wait`
 
-Block until a matching event exists or the timeout expires (long-poll; max 5 minutes). Accepts the forward filters `stream`, `room`, `topic`, `type`, `to_agent`, `from_agent`, `correlation_id`, `status`, `since_event_id`, and `since_created_at`, plus:
+Block until a matching event exists or the timeout expires (long-poll; max 5 minutes). Accepts the forward filters `stream`, `room`, `topic`, `type`, `to_agent`, `writer`, `correlation_id`, `status`, `since_event_id`, and `since_created_at`. `from_agent` is the caller identity and does not filter. Also:
 
 For live-tail clients that can keep an HTTP connection open, use
 `GET /logstream/stream` SSE instead; `event_wait` is the polling MCP surface.

@@ -815,7 +815,8 @@ class TestFileChunksLocked:
             "as duplicates/orphans"
         )
         assert drawers == 0
-        assert skipped is True
+        # A failed purge is an error the mine counts, not an "already filed".
+        assert skipped == convo_miner.PURGE_FAILED
 
     def test_stamps_chunk_total_for_completion_check(self, monkeypatch):
         """Every convo drawer of one pass must carry chunk_total (#2183)."""

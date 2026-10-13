@@ -3,6 +3,7 @@
 import copy
 import json
 import logging
+import multiprocessing
 import os
 import re
 import sqlite3
@@ -10,6 +11,40 @@ import sqlite3
 import pytest
 
 from _chroma_palace_helper import make_minimal_chroma_sqlite
+
+
+def _probe_palace_lock_from_child(palace_path, result_q):
+    """Report whether this process can take the palace mine lock.
+
+    The parent calls this in a spawned child. A same-process acquire passes
+    through while that process still holds the lock, so only a second process
+    can tell a leaked flock from a cleared handle.
+    """
+    from mempalace.palace import MineAlreadyRunning, mine_palace_lock
+
+    try:
+        with mine_palace_lock(palace_path):
+            result_q.put("free")
+    except MineAlreadyRunning:
+        result_q.put("busy")
+    except Exception as exc:
+        result_q.put(f"error:{type(exc).__name__}:{exc}")
+
+
+def _assert_palace_lock_free(palace_path):
+    ctx = multiprocessing.get_context("spawn")
+    result_q = ctx.Queue()
+    child = ctx.Process(target=_probe_palace_lock_from_child, args=(palace_path, result_q))
+    child.start()
+    try:
+        status = result_q.get(timeout=30)
+        child.join(timeout=10)
+        assert child.exitcode == 0, f"lock probe exited {child.exitcode}: {status}"
+        assert status == "free", f"palace mine lock still held: {status}"
+    finally:
+        if child.is_alive():
+            child.terminate()
+            child.join(timeout=5)
 
 
 @pytest.fixture(autouse=True)
@@ -256,6 +291,64 @@ def test_peer_writer_guard_does_not_gate_kg_tools(monkeypatch):
     for name in ("mempalace_kg_add", "mempalace_kg_invalidate", "mempalace_kg_supersede"):
         assert name in mcp_server._READ_ONLY_REFUSED_TOOLS
         assert mcp_server._mcp_read_only_refusal(1, name) is not None
+
+
+def test_kg_add_does_not_leave_palace_mine_lock_held(monkeypatch, config, kg):
+    """A successful kg_add must not pin mine_palace_*.lock for the process.
+
+    The peer-writer lease used to wrap KG writes, and the flock stayed open
+    until the MCP process died, blocking every ``mempalace mine``. KG tools
+    are exempt now; a second process must be able to take the lock.
+    """
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_config", config)
+    monkeypatch.setattr(mcp_server, "_get_kg", lambda *_a, **_k: kg)
+    # Start from a clean lease so a prior test cannot mask a leak.
+    mcp_server._release_mcp_writer_lock()
+    assert mcp_server._MCP_WRITER_LOCK_CM is None
+
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "mempalace_kg_add",
+                "arguments": {
+                    "subject": "alice",
+                    "predicate": "likes",
+                    "object": "bob",
+                },
+            },
+        }
+    )
+    assert "error" not in response, response
+    body = json.loads(response["result"]["content"][0]["text"])
+    assert body.get("success") is True, body
+    assert mcp_server._MCP_WRITER_LOCK_CM is None
+
+    # A second process must be able to take the palace lock immediately.
+    _assert_palace_lock_free(config.palace_path)
+
+
+def test_writer_lock_setup_failure_releases_flock(monkeypatch, config):
+    """If promotion fails after __enter__, the flock must not stay pinned."""
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_config", config)
+    mcp_server._release_mcp_writer_lock()
+
+    def boom():
+        raise RuntimeError("simulated discard failure")
+
+    monkeypatch.setattr(mcp_server, "_discard_mcp_storage_handles", boom)
+
+    ok, reason = mcp_server._acquire_mcp_writer_lock()
+    assert ok is False
+    assert "simulated discard failure" in reason
+    assert mcp_server._MCP_WRITER_LOCK_CM is None
+    _assert_palace_lock_free(config.palace_path)
 
 
 def test_status_tool_does_not_acquire_peer_writer_lock(monkeypatch):

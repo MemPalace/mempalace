@@ -1038,21 +1038,29 @@ def _save_diary_direct(
     the transcript path); a `diary_read` with an empty wing spans every wing
     the agent wrote to, so project-derived wings stay discoverable.
 
-    Returns {"count": N, "themes": [...]} on success, {"count": 0} on failure.
-    A daemon lock deferral also returns {"count": 0}: nothing is filed yet, but
-    the entry is queued and the daemon files it once the holder exits, so the
-    checkpoint marker is deliberately not advanced.
+    Returns (success):  {"drawers_filed": 1, "messages_folded": N, "themes": [...]}
+    Returns (failure / no messages / routing blocked / daemon deferral):
+        {"drawers_filed": 0, "messages_folded": 0}
+        (+ "routing_blocked" / "routing_message" when blocked).
+
+    drawers_filed is the number of palace drawers (memory entries) filed by this
+    call. One checkpoint write files exactly ONE drawer -- never N. That is the
+    distinction #2303 is about: the legacy return conflated "memories stored"
+    (drawers) with the transcript-message count compressed into that single
+    drawer, which is now reported separately as messages_folded. The render path
+    must label each unit correctly.
     """
     messages = _extract_recent_messages(transcript_path)
     if not messages:
         _log("No recent messages to save")
-        return {"count": 0}
+        return {"drawers_filed": 0, "messages_folded": 0}
 
     routing = _current_hook_write_routing()
     if routing.blocked:
         _log_hook_write_blocked(routing, "diary checkpoint")
         return {
-            "count": 0,
+            "drawers_filed": 0,
+            "messages_folded": 0,
             "routing_blocked": True,
             "routing_message": routing.notice,
         }
@@ -1085,7 +1093,7 @@ def _save_diary_direct(
             except Exception as exc:
                 # Daemon accepted context — don't fall back (would double-write).
                 _log(f"Daemon diary checkpoint failed: {exc}")
-                return {"count": 0}
+                return {"drawers_filed": 0, "messages_folded": 0}
             result = job.get("result") or {}
             if job.get("state") == "succeeded" and result.get("success"):
                 _log(f"Diary checkpoint saved: {result.get('entry_id', '?')}")
@@ -1099,15 +1107,15 @@ def _save_diary_direct(
                     pass
                 if toast:
                     _desktop_toast(f"Checkpoint saved - {len(messages)} messages archived")
-                return {"count": len(messages), "themes": themes}
+                return {"drawers_filed": 1, "messages_folded": len(messages), "themes": themes}
             if _job_deferred_by_lock(job):
                 # Queued behind the palace lock: the entry is held and the daemon
                 # files it once the holder exits. Not a failure, and not a reason
                 # to re-file it here -- that would duplicate verbatim content.
                 _log(f"Daemon diary checkpoint deferred: {_lock_deferral_reason(job)}")
-                return {"count": 0}
+                return {"drawers_filed": 0, "messages_folded": 0}
             _log(f"Daemon diary checkpoint failed: {result.get('error', job.get('error'))}")
-            return {"count": 0}
+            return {"drawers_filed": 0, "messages_folded": 0}
 
         from .mcp_server import tool_diary_write
 
@@ -1130,12 +1138,12 @@ def _save_diary_direct(
                 pass
             if toast:
                 _desktop_toast(f"Checkpoint saved \u2014 {len(messages)} messages archived")
-            return {"count": len(messages), "themes": themes}
+            return {"drawers_filed": 1, "messages_folded": len(messages), "themes": themes}
         else:
             _log(f"Diary checkpoint failed: {result.get('error', 'unknown')}")
     except Exception as e:
         _log(f"Diary checkpoint error: {e}")
-    return {"count": 0}
+    return {"drawers_filed": 0, "messages_folded": 0}
 
 
 def _ingest_transcript(transcript_path: str):
@@ -1493,7 +1501,7 @@ def hook_stop(data: dict, harness: str):
 
             if silent:
                 # Save directly via Python API — systemMessage renders in terminal
-                result = {"count": 0}
+                result = {"drawers_filed": 0, "messages_folded": 0}
                 if transcript_path:
                     result = _save_diary_direct(
                         transcript_path,
@@ -1504,13 +1512,16 @@ def hook_stop(data: dict, harness: str):
                     )
                     _ingest_transcript(transcript_path)
                 _maybe_auto_ingest()
-                # Only advance save marker after successful save
-                count = result.get("count", 0)
-                if count > 0:
+                # Only advance the save marker after a genuine drawer was filed
+                # (#2303): the legacy "count" was the compressed-message count and
+                # was misread as a storage count. Report each unit truthfully.
+                drawers_filed = result.get("drawers_filed", 0)
+                if drawers_filed > 0:
                     try:
                         last_save_file.write_text(str(exchange_count), encoding="utf-8")
                     except OSError:
                         pass
+                    messages_folded = result.get("messages_folded", 0)
                     themes = result.get("themes", [])
                     if themes:
                         tag = " \u2014 " + ", ".join(themes)
@@ -1518,7 +1529,7 @@ def hook_stop(data: dict, harness: str):
                         tag = ""
                     _output(
                         {
-                            "systemMessage": f"\u2726 {count} memories woven into the palace{tag}",
+                            "systemMessage": f"\u2726 {drawers_filed} checkpoint saved \u2014 {messages_folded} messages woven into the palace{tag}",
                         }
                     )
                 else:

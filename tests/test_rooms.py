@@ -762,11 +762,10 @@ def test_cmd_rooms_apply_resumes_a_marker_written_before_inputs_were_recorded(
 
 
 def test_cmd_rooms_apply_keeps_the_marker_when_closets_fail_to_open(tmp_path, monkeypatch, capsys):
-    """Only a never-created closet collection means "no closets"."""
+    """A failure after the drawer phase must retain the valid closet snapshot."""
     import contextlib
 
     import mempalace.cli as cli
-    from mempalace.backends import CollectionNotInitializedError
     from mempalace.rooms import pending_apply_path
 
     cfg = MempalaceConfig(palace_path=str(tmp_path))
@@ -785,18 +784,336 @@ def test_cmd_rooms_apply_keeps_the_marker_when_closets_fail_to_open(tmp_path, mo
     monkeypatch.setattr("mempalace.embedding.get_embedding_function", lambda: FakeEmbed())
     monkeypatch.setattr("mempalace.palace.mine_palace_lock", lambda p: contextlib.nullcontext())
     ns = Namespace(rooms_action="apply", palace=str(tmp_path), wing="w", threshold=0.75, yes=True)
+    closets = FakeCollection(
+        [{"id": "k1", "meta": {"wing": "w", "room": "technical", "source_file": "s1"}}]
+    )
+    opens = 0
 
     def broken(*a, **k):
+        nonlocal opens
+        opens += 1
+        if opens == 1:
+            return closets
         raise OSError("disk I/O error")
 
     monkeypatch.setattr("mempalace.palace.get_closets_collection", broken)
     with pytest.raises(OSError):
         cli.cmd_rooms(ns)
     assert os.path.isfile(pending_apply_path(cfg, "w"))  # recovery still pending
+    assert col.rows["a"]["meta"]["room"] == "releases"
+    assert closets.rows["k1"]["meta"]["room"] == "technical"
+
+    monkeypatch.setattr("mempalace.palace.get_closets_collection", lambda *a, **k: closets)
+    cli.cmd_rooms(ns)
+    assert closets.rows["k1"]["meta"]["room"] == "releases"
+    assert not os.path.exists(pending_apply_path(cfg, "w"))
+
+
+@pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.parametrize("failure_stage", ["open", "read"])
+def test_cmd_rooms_apply_snapshot_failure_does_not_write(
+    tmp_path, monkeypatch, capsys, pending, failure_stage
+):
+    """An unreadable snapshot is never a successful empty snapshot, even on retry."""
+    import contextlib
+    from pathlib import Path
+
+    import mempalace.cli as cli
+    from mempalace.rooms import pending_apply_path
+
+    cfg = MempalaceConfig(palace_path=str(tmp_path))
+    save_room_set(cfg, _room_set())
+    col = FakeCollection(
+        [
+            {
+                "id": "a",
+                "meta": {"wing": "w", "room": "technical", "source_file": "s1"},
+                "doc": "cut the release",
+                "emb": [1.0, 0.0],
+            }
+        ]
+    )
+    closets = FakeCollection(
+        [{"id": "k1", "meta": {"wing": "w", "room": "technical", "source_file": "s1"}}]
+    )
+    marker = Path(pending_apply_path(cfg, "w"))
+    if pending:
+        # A safe legacy marker still needs its identities resolved before writing.
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            json.dumps({"wing": "w", "closets": [["s1", "technical", "releases"]]}),
+            encoding="utf-8",
+        )
+    before = marker.read_bytes() if pending else None
+    monkeypatch.setattr("mempalace.palace.get_collection", lambda *a, **k: col)
+    monkeypatch.setattr("mempalace.embedding.get_embedding_function", lambda: FakeEmbed())
+    monkeypatch.setattr("mempalace.palace.mine_palace_lock", lambda p: contextlib.nullcontext())
+    real_get = closets.get
+    failed = False
+
+    def fail_once():
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("transient closet snapshot failure")
+
+    def open_closets(*a, **k):
+        if failure_stage == "open":
+            fail_once()
+        return closets
+
+    def read_closets(**kwargs):
+        if failure_stage == "read":
+            fail_once()
+        return real_get(**kwargs)
+
+    monkeypatch.setattr("mempalace.palace.get_closets_collection", open_closets)
+    monkeypatch.setattr(closets, "get", read_closets)
+    ns = Namespace(rooms_action="apply", palace=str(tmp_path), wing="w", threshold=0.75, yes=True)
+    with pytest.raises(OSError, match="transient closet snapshot failure"):
+        cli.cmd_rooms(ns)
+    assert not col.updates and not closets.updates
+    assert col.rows["a"]["meta"]["room"] == "technical"
+    assert closets.rows["k1"]["meta"]["room"] == "technical"
+    assert "Moved" not in capsys.readouterr().out
+    if pending:
+        assert marker.read_bytes() == before
+    else:
+        assert not marker.exists()
+
+    cli.cmd_rooms(ns)
+    assert col.rows["a"]["meta"]["room"] == "releases"
+    assert closets.rows["k1"]["meta"]["room"] == "releases"
+    assert col.rows["a"]["doc"] == "cut the release"
+    assert "1 closets followed" in capsys.readouterr().out
+    assert not marker.exists()
+
+
+def test_cmd_rooms_apply_without_a_closet_collection(tmp_path, monkeypatch, capsys):
+    """A collection that was never initialized still permits a drawer-only apply."""
+    import contextlib
+
+    import mempalace.cli as cli
+    from mempalace.backends import CollectionNotInitializedError
+    from mempalace.rooms import pending_apply_path
+
+    cfg = MempalaceConfig(palace_path=str(tmp_path))
+    save_room_set(cfg, _room_set())
+    col = FakeCollection(
+        [
+            {
+                "id": "a",
+                "meta": {"wing": "w", "room": "technical", "source_file": "s1"},
+                "doc": "cut the release",
+                "emb": [1.0, 0.0],
+            }
+        ]
+    )
 
     def absent(*a, **k):
         raise CollectionNotInitializedError("mempalace_closets")
 
+    monkeypatch.setattr("mempalace.palace.get_collection", lambda *a, **k: col)
     monkeypatch.setattr("mempalace.palace.get_closets_collection", absent)
-    cli.cmd_rooms(ns)
-    assert not os.path.exists(pending_apply_path(cfg, "w"))  # nothing to re-key
+    monkeypatch.setattr("mempalace.embedding.get_embedding_function", lambda: FakeEmbed())
+    monkeypatch.setattr("mempalace.palace.mine_palace_lock", lambda p: contextlib.nullcontext())
+    cli.cmd_rooms(
+        Namespace(rooms_action="apply", palace=str(tmp_path), wing="w", threshold=0.75, yes=True)
+    )
+    assert col.rows["a"]["meta"]["room"] == "releases"
+    assert "Moved 1 drawers. 0 closets followed." in capsys.readouterr().out
+    assert not os.path.exists(pending_apply_path(cfg, "w"))
+
+
+def test_rekey_closets_retry_does_not_follow_intermediate_room():
+    """Chained plan general→technical and technical→releases: a closet already
+    moved to technical must not be fed into the second mapping on retry.
+
+    Regression for the review finding on PR #2654 (F3).
+    """
+    from mempalace.rooms import (
+        plan_closet_moves,
+        rekey_closets_by_ids,
+    )
+
+    targets = {
+        ("session.jsonl", "general"): "technical",
+        ("session.jsonl", "technical"): "releases",
+    }
+    # First pass against the original rooms (batch of two closets).
+    closets = FakeCollection(
+        [
+            {
+                "id": "a-first",
+                "meta": {"wing": "w", "room": "general", "source_file": "session.jsonl"},
+            },
+            {
+                "id": "b-second",
+                "meta": {"wing": "w", "room": "technical", "source_file": "session.jsonl"},
+            },
+        ]
+    )
+    moves = plan_closet_moves(closets, "w", targets)
+    assert moves == {
+        "a-first": ["session.jsonl", "general", "technical"],
+        "b-second": ["session.jsonl", "technical", "releases"],
+    }
+
+    calls = {"n": 0}
+    real_update = closets.update
+
+    def interrupt(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Simulate first batch succeeding then interruption before more work.
+            # With two ids in one batch, interrupt after applying by raising on a
+            # second call; apply the first batch manually then raise.
+            real_update(**kwargs)
+            raise RuntimeError("simulated interruption before second closet batch")
+        return real_update(**kwargs)
+
+    closets.update = interrupt
+    try:
+        rekey_closets_by_ids(closets, "w", moves)
+    except RuntimeError:
+        pass
+    # After interrupt, a-first is technical; b-second may be releases if same batch.
+    # Force the reviewed mid-state: a-first in technical, b-second in releases.
+    closets.rows["a-first"]["meta"]["room"] = "technical"
+    closets.rows["b-second"]["meta"]["room"] = "releases"
+
+    # Retry with the SAME moves snapshot (as a pending marker would).
+    closets.update = real_update
+    moved = rekey_closets_by_ids(closets, "w", moves)
+    assert closets.rows["a-first"]["meta"]["room"] == "technical"
+    assert closets.rows["b-second"]["meta"]["room"] == "releases"
+    assert moved == 0  # both already at recorded destinations
+
+    # The old (source, current_room) lookup double-moves a-first.
+    legacy = FakeCollection(
+        [
+            {
+                "id": "a-first",
+                "meta": {"wing": "w", "room": "technical", "source_file": "session.jsonl"},
+            },
+            {
+                "id": "b-second",
+                "meta": {"wing": "w", "room": "releases", "source_file": "session.jsonl"},
+            },
+        ]
+    )
+    # Demonstrate the defect class: matching current room against the plan map.
+    legacy_moved_ids = []
+    for row in legacy.rows.values():
+        key = (row["meta"]["source_file"], row["meta"]["room"])
+        if key in targets and targets[key] != row["meta"]["room"]:
+            legacy_moved_ids.append(row["id"])
+    assert "a-first" in legacy_moved_ids
+
+
+def test_cmd_rooms_apply_resume_keeps_drawer_and_closet_aligned(tmp_path, monkeypatch, capsys):
+    """Interrupt mid-closet-phase with a chained room plan; retry must not
+    move an already-completed closet into the next mapping."""
+    import contextlib
+
+    import mempalace.cli as cli
+    from mempalace.rooms import pending_apply_path
+
+    cfg = MempalaceConfig(palace_path=str(tmp_path))
+    save_room_set(
+        cfg,
+        RoomSet(
+            "w",
+            [
+                RoomSpec("technical", "technical", exemplars=["a-first"]),
+                RoomSpec("releases", "release", exemplars=["b-second"]),
+            ],
+        ),
+    )
+    # Drawers already in their destinations (drawer phase finished).
+    col = FakeCollection(
+        [
+            {
+                "id": "a-first",
+                "meta": {"wing": "w", "room": "technical", "source_file": "session.jsonl"},
+                "doc": "technical work",
+                "emb": [1.0, 0.0],
+            },
+            {
+                "id": "b-second",
+                "meta": {"wing": "w", "room": "releases", "source_file": "session.jsonl"},
+                "doc": "cut the release",
+                "emb": [0.0, 1.0],
+            },
+        ]
+    )
+    # Closet a-first already followed to technical; b-second still needs releases.
+    # Pending marker records the original id destinations from the first plan.
+    closets = FakeCollection(
+        [
+            {
+                "id": "a-first",
+                "meta": {"wing": "w", "room": "technical", "source_file": "session.jsonl"},
+            },
+            {
+                "id": "b-second",
+                "meta": {"wing": "w", "room": "technical", "source_file": "session.jsonl"},
+            },
+        ]
+    )
+    from mempalace.rooms import GENERIC_ROOMS, apply_inputs, save_pending_apply
+
+    marker = pending_apply_path(cfg, "w")
+    save_pending_apply(
+        cfg,
+        "w",
+        {
+            ("session.jsonl", "general"): "technical",
+            ("session.jsonl", "technical"): "releases",
+        },
+        0,
+        apply_inputs(cfg, "w", 0.75, GENERIC_ROOMS),
+        moves={
+            "a-first": ["session.jsonl", "general", "technical"],
+            "b-second": ["session.jsonl", "technical", "releases"],
+        },
+    )
+    assert os.path.isfile(marker)
+
+    monkeypatch.setattr("mempalace.palace.get_collection", lambda *a, **k: col)
+    monkeypatch.setattr("mempalace.palace.get_closets_collection", lambda *a, **k: closets)
+    monkeypatch.setattr("mempalace.embedding.get_embedding_function", lambda: FakeEmbed())
+    monkeypatch.setattr("mempalace.palace.mine_palace_lock", lambda p: contextlib.nullcontext())
+
+    cli.cmd_rooms(
+        Namespace(rooms_action="apply", palace=str(tmp_path), wing="w", threshold=0.75, yes=True)
+    )
+    out = capsys.readouterr().out
+    assert "Resuming an interrupted apply" in out
+    assert closets.rows["a-first"]["meta"]["room"] == "technical"
+    assert closets.rows["b-second"]["meta"]["room"] == "releases"
+    assert col.rows["a-first"]["meta"]["room"] == closets.rows["a-first"]["meta"]["room"]
+    assert not os.path.exists(marker)
+
+
+def test_load_pending_apply_refuses_overlapping_legacy_marker(tmp_path):
+    """Legacy markers with chained targets cannot safely resume; refuse them."""
+    from mempalace.rooms import load_pending_apply, pending_apply_path
+
+    cfg = MempalaceConfig(palace_path=str(tmp_path))
+    marker = pending_apply_path(cfg, "w")
+    os.makedirs(os.path.dirname(marker), exist_ok=True)
+    with open(marker, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "wing": "w",
+                "ambiguous": 0,
+                "closets": [
+                    ["session.jsonl", "general", "technical"],
+                    ["session.jsonl", "technical", "releases"],
+                ],
+            },
+            f,
+        )
+    with pytest.raises(ValueError, match="overlapping closet targets"):
+        load_pending_apply(cfg, "w")

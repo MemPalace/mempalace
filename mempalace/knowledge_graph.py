@@ -553,10 +553,26 @@ class KnowledgeGraph:
                     "INSERT OR IGNORE INTO entities (id, name) VALUES (?, ?)", (obj_id, obj)
                 )
                 conn.execute("UPDATE triples SET valid_to=? WHERE id=?", (boundary, triple_id))
+                # A scheduled future fact cannot cover the rewrite boundary.
+                # Nor can another witness stand in for this fact's evidence:
+                # reuse only an already-valid successor with equal provenance.
                 existing = conn.execute(
                     "SELECT id FROM triples "
-                    "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
-                    (sub_id, pred, obj_id),
+                    "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL "
+                    f"AND (valid_from IS NULL OR {_sql_temporal_start_expr('valid_from')} <= ?) "
+                    "AND confidence IS ? AND source_closet IS ? AND source_file IS ? "
+                    "AND source_drawer_id IS ? AND adapter_name IS ?",
+                    (
+                        sub_id,
+                        pred,
+                        obj_id,
+                        boundary,
+                        row["confidence"] if row["confidence"] is not None else 1.0,
+                        row["source_closet"],
+                        row["source_file"] or source_file,
+                        row["source_drawer_id"],
+                        row["adapter_name"],
+                    ),
                 ).fetchone()
                 if existing:
                     return existing["id"]

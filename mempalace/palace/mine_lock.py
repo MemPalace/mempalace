@@ -293,13 +293,19 @@ def mine_yield_hook(fn):
         _MINE_YIELD.fn = previous
 
 
-def mine_yield_point() -> None:
+def mine_yield_point() -> bool:
     """Mark a file boundary in a mine.
 
     No file is half-written and no per-file lock is held here, so a host that
     serializes the mine may briefly hand its lock to waiting requests. A no-op
     unless :func:`mine_yield_hook` is active in this thread.
+
+    Returns True when the hook let other requests run. A request in that
+    window may have closed the palace backend (the hub's search retry after a
+    transient index error resets the Chroma caches), so the miner must reopen
+    the collections it holds before writing again.
     """
     fn = getattr(_MINE_YIELD, "fn", None)
-    if fn is not None:
-        fn()
+    if fn is None:
+        return False
+    return bool(fn())

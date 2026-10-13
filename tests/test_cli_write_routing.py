@@ -832,6 +832,31 @@ def test_service_run_mine_forwards_valid_prescanned_files(
     ]
 
 
+@pytest.mark.parametrize(
+    "payload_value,expected",
+    [(True, True), (False, False), (None, False)],
+)
+def test_service_run_mine_passes_include_subagents_to_convo_miner(
+    tmp_path, payload_value, expected
+):
+    convos = tmp_path / "convos"
+    convos.mkdir()
+    payload = {
+        "palace_path": str(tmp_path / "palace"),
+        "source": str(convos),
+        "mode": "convos",
+        "dry_run": True,
+    }
+    if payload_value is not None:
+        payload["include_subagents"] = payload_value
+
+    with patch("mempalace.convo_miner.mine_convos") as mine_convos:
+        result = service.run_mine(payload)
+
+    assert result["success"] is True
+    assert mine_convos.call_args.kwargs["include_subagents"] is expected
+
+
 def test_service_run_mine_rejects_prescanned_path_outside_project(
     tmp_path,
 ):

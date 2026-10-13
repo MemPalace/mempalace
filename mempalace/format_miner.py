@@ -77,6 +77,7 @@ from .palace import (
     get_collection,
     mine_lock,
     mine_yield_point,
+    palace_write_serial,
 )
 
 # Module-level imports from .miner so tests can patch them via
@@ -709,6 +710,19 @@ def _file_chunks_locked(
     return drawers_added, False
 
 
+def _yield_and_reopen(palace_path: str, collection):
+    """Pass a file boundary, reopening the collection if requests ran in it.
+
+    A request in the hub's handoff may close the backend under this handle (a
+    search resets the Chroma caches after a transient index error). Reopening
+    returns the cached collection when nothing closed it. A dry run holds no
+    collection and gets ``None`` back.
+    """
+    if not mine_yield_point() or collection is None:
+        return collection
+    return get_collection(palace_path)
+
+
 def mine_formats(
     format_dir: str,
     palace_path: str,
@@ -770,6 +784,7 @@ def mine_formats(
     # who customized their config see the effect in format-mode mining.
     # Per PR #1555 review (Gemini #3).
     palace_config = MempalaceConfig(palace_path=palace_path)
+    writes_at_start = palace_write_serial()
 
     format_path = Path(format_dir).expanduser().resolve()
     if not wing:
@@ -836,7 +851,7 @@ def mine_formats(
         collection = get_collection(palace_path) if not dry_run else None
 
         for i, filepath in enumerate(files, 1):
-            mine_yield_point()
+            collection = _yield_and_reopen(palace_path, collection)
             files_processed = i
             source_file = str(filepath)
 
@@ -986,7 +1001,7 @@ def mine_formats(
             # exit Done on the --mode extract path that bypasses _mine_impl.
             # Sits outside the per-file try/except in the for-loop body, so
             # caught per-file errors do not mask the integrity result.
-            _validate_palace_fts5_after_mine(palace_path)
+            _validate_palace_fts5_after_mine(palace_path, writes_since=writes_at_start)
     finally:
         # Hook-spawned mines write a PID file that miner.py's
         # _cleanup_mine_pid_file() clears; we mirror that so format-mode

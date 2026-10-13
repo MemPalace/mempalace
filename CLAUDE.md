@@ -13,7 +13,8 @@ The name comes from the ancient "method of loci" — the memory palace technique
 - **Wings** for broad categories (people, projects, topics)
 - **Rooms** for time-based groupings (days, sessions)
 - **Drawers** for full verbatim content (your exact words)
-- **AAAK compression** for the index layer — a compact symbolic format (via `dialect.py`) that lets an LLM scan thousands of entries instantly and know exactly which drawer to open
+- **Closets** for the index layer — compact pointer lines (`topic|entities|→drawer_ids`) that the project miner writes next to the drawers, so search knows which drawer to open
+- **AAAK** (`dialect.py`) — an experimental, lossy abbreviation format (entity codes, emotion markers) that any LLM reads without a decoder. Opt-in via `mempalace compress`; not the storage default, and never a stand-in for the verbatim drawer
 
 ## Design Principles
 
@@ -74,7 +75,7 @@ mempalace/
 ├── backends/            # Pluggable storage backends (ChromaDB default)
 │   ├── base.py          # Abstract interface — implement this for new backends
 │   └── chroma.py        # ChromaDB implementation
-├── dialect.py           # AAAK compression dialect
+├── dialect.py           # AAAK dialect (experimental, lossy, opt-in)
 ├── normalize.py         # Transcript format detection + normalization
 ├── entity_detector.py   # Auto-detect people/projects from content
 ├── entity_registry.py   # Entity storage and disambiguation
@@ -115,9 +116,12 @@ Palace structure:
     └── ROOM (day/topic)
           └── DRAWER (verbatim text chunk)
 
-Index layer (AAAK):
-  Compressed pointers → DRAWER locations
-  Scanned by LLM to find relevant drawers without reading all content
+Index layer (closets, regex-built by the project miner):
+  Pointer lines (topic|entities|→drawer_ids) → DRAWER locations
+  Search always queries drawers; closet hits boost ranking, never gate it
+
+AAAK (dialect.py, opt-in via `mempalace compress`):
+  Lossy abbreviation for LLM reading; drawers stay verbatim
 
 Knowledge Graph:
   ENTITY → PREDICATE → ENTITY (with valid_from / valid_to dates)

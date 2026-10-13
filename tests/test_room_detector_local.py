@@ -2,6 +2,8 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from mempalace.room_detector_local import (
     FOLDER_ROOM_MAP,
     detect_rooms_from_files,
@@ -236,6 +238,159 @@ def test_save_config_valid_yaml(tmp_path):
     assert data["wing"] == "test_proj"
     assert len(data["rooms"]) == 1
     assert data["rooms"][0]["name"] == "general"
+
+
+ROOMS = [{"name": "backend", "description": "Server files", "keywords": ["backend"]}]
+
+
+@pytest.mark.parametrize("existing", ["mempalace.yml", "mempal.yaml", "mempal.yml"])
+def test_save_config_updates_an_existing_alternate_config(tmp_path, existing):
+    """init rewrites the config the miner reads instead of creating a
+    mempalace.yaml that would shadow it, and keeps hand-written keys."""
+    import yaml
+
+    (tmp_path / existing).write_text(
+        "wing: old\nrooms: []\nexclude_patterns:\n  - secret/\n", encoding="utf-8"
+    )
+
+    save_config(str(tmp_path), "myproject", ROOMS)
+
+    assert not (tmp_path / "mempalace.yaml").exists()
+    data = yaml.safe_load((tmp_path / existing).read_text(encoding="utf-8"))
+    assert data["wing"] == "myproject"
+    assert [r["name"] for r in data["rooms"]] == ["backend"]
+    assert data["exclude_patterns"] == ["secret/"]
+
+
+def test_save_config_keeps_hand_written_keys_in_mempalace_yaml(tmp_path):
+    import yaml
+
+    (tmp_path / "mempalace.yaml").write_text(
+        "wing: old\nrooms: []\nexclude_patterns: ['*.log']\n", encoding="utf-8"
+    )
+    save_config(str(tmp_path), "myproject", ROOMS)
+    data = yaml.safe_load((tmp_path / "mempalace.yaml").read_text(encoding="utf-8"))
+    assert data["wing"] == "myproject"
+    assert data["exclude_patterns"] == ["*.log"]
+
+
+# A broken config is user data init cannot read. It is regenerated (init has
+# to write something the miner can use) but only after a byte-exact copy is
+# kept beside it, and the user is told where.
+BROKEN = (
+    "# hand-written, keep me\nwing: [unclosed\nexclude_patterns:\n  - secret/ # café\n".encode()
+)
+
+
+@pytest.mark.parametrize("name", ["mempalace.yml", "mempalace.yaml", "mempal.yaml", "mempal.yml"])
+def test_save_config_backs_up_an_unparseable_config(tmp_path, capsys, name):
+    import yaml
+
+    (tmp_path / name).write_bytes(BROKEN)
+
+    save_config(str(tmp_path), "myproject", ROOMS)
+
+    backup = tmp_path / f"{name}.bak"
+    assert backup.read_bytes() == BROKEN
+    data = yaml.safe_load((tmp_path / name).read_text(encoding="utf-8"))
+    assert data == {"wing": "myproject", "rooms": ROOMS}
+    if name != "mempalace.yaml":
+        assert not (tmp_path / "mempalace.yaml").exists()
+    out = capsys.readouterr()
+    assert str(backup) in out.err
+    assert "does not parse" in out.err
+
+
+def test_save_config_warns_before_regenerating(tmp_path, capsys, monkeypatch):
+    """The backup and the warning both happen before the config is rewritten."""
+    import mempalace.room_detector_local as rdl
+
+    (tmp_path / "mempalace.yml").write_bytes(BROKEN)
+    seen_at_dump = {}
+    real_dump = rdl.yaml.dump
+
+    def spy_dump(*args, **kwargs):
+        seen_at_dump["err"] = capsys.readouterr().err
+        seen_at_dump["backup"] = (tmp_path / "mempalace.yml.bak").read_bytes()
+        return real_dump(*args, **kwargs)
+
+    monkeypatch.setattr(rdl.yaml, "dump", spy_dump)
+    save_config(str(tmp_path), "myproject", ROOMS)
+
+    assert str(tmp_path / "mempalace.yml.bak") in seen_at_dump["err"]
+    assert seen_at_dump["backup"] == BROKEN
+
+
+def test_save_config_never_clobbers_an_existing_backup(tmp_path, capsys):
+    older = b"wing: an older backup the user kept\n"
+    (tmp_path / "mempalace.yml.bak").write_bytes(older)
+    (tmp_path / "mempalace.yml").write_bytes(BROKEN)
+
+    save_config(str(tmp_path), "myproject", ROOMS)
+
+    assert (tmp_path / "mempalace.yml.bak").read_bytes() == older
+    new_backups = sorted(tmp_path.glob("mempalace.yml.bak.*"))
+    assert len(new_backups) == 1, new_backups
+    assert new_backups[0].read_bytes() == BROKEN
+    assert str(new_backups[0]) in capsys.readouterr().err
+
+
+def test_save_config_backs_up_a_config_that_is_not_a_mapping(tmp_path):
+    (tmp_path / "mempalace.yml").write_bytes(b"- just\n- a list\n")
+    save_config(str(tmp_path), "myproject", ROOMS)
+    assert (tmp_path / "mempalace.yml.bak").read_bytes() == b"- just\n- a list\n"
+
+
+def test_save_config_does_not_back_up_an_empty_config(tmp_path):
+    (tmp_path / "mempalace.yml").write_bytes(b"\n")
+    save_config(str(tmp_path), "myproject", ROOMS)
+    assert list(tmp_path.glob("*.bak*")) == []
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [b"# exclude_patterns:\n#   - secret/\n", b"# keep me\n{}\n", b"~ # nothing yet\n"],
+)
+def test_save_config_backs_up_a_config_that_parses_as_empty(tmp_path, capsys, raw):
+    """Comments-only bytes parse to nothing but are still the user's file."""
+    import yaml
+
+    (tmp_path / "mempalace.yml").write_bytes(raw)
+
+    save_config(str(tmp_path), "myproject", ROOMS)
+
+    assert (tmp_path / "mempalace.yml.bak").read_bytes() == raw
+    data = yaml.safe_load((tmp_path / "mempalace.yml").read_text(encoding="utf-8"))
+    assert data == {"wing": "myproject", "rooms": ROOMS}
+    assert "parses as empty" in capsys.readouterr().err
+
+
+def test_save_config_refuses_to_regenerate_when_the_backup_fails(tmp_path, monkeypatch):
+    import mempalace.room_detector_local as rdl
+
+    (tmp_path / "mempalace.yml").write_bytes(BROKEN)
+
+    def no_backup(path, data):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(rdl, "_write_backup", no_backup)
+    with pytest.raises(OSError, match="not overwritten"):
+        save_config(str(tmp_path), "myproject", ROOMS)
+    assert (tmp_path / "mempalace.yml").read_bytes() == BROKEN
+
+
+def test_init_then_load_config_sees_the_yml_settings(tmp_path):
+    """Round trip: after save_config, the miner's load_config still applies
+    the user's exclude_patterns from mempalace.yml."""
+    from mempalace.miner import load_config
+
+    (tmp_path / "mempalace.yml").write_text(
+        "wing: old\nrooms: []\nexclude_patterns: ['secret/']\n", encoding="utf-8"
+    )
+    save_config(str(tmp_path), "myproject", ROOMS)
+    config = load_config(str(tmp_path))
+    assert config["wing"] == "myproject"
+    assert config["exclude_patterns"] == ["secret/"]
 
 
 # ── print_proposed_structure ──────────────────────────────────────────

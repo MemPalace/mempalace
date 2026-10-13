@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
+from itertools import combinations
 from typing import Iterable, Optional
 
 from .config import MempalaceConfig, normalize_wing_name
@@ -86,6 +87,42 @@ def _rooms_match(a: str, b: str) -> bool:
     return room_spelling_key(a) == room_spelling_key(b)
 
 
+def _entity_room_name(room: str) -> Optional[str]:
+    text = str(room or "")
+    if text.startswith("entity:"):
+        return text[len("entity:") :]
+    return None
+
+
+def ambiguous_entity_spellings(spellings: Iterable[str]) -> set[str]:
+    """Spellings that could name two or more distinct files in ``spellings``.
+
+    Pairwise suffix matching is not transitive: bare ``CodeRouter.py`` matches
+    both ``src/models/CodeRouter.py`` and ``tests/fixtures/CodeRouter.py``,
+    while those two do not match each other. Treating the bare name as a
+    duplicate of either would delete a real connection. A spelling is
+    ambiguous when it ``same_file_spelling``-matches two hosts that are not
+    the same file as each other.
+    """
+    by_key: dict[str, set[str]] = {}
+    for spelling in spellings:
+        by_key.setdefault(entity_spelling_key(spelling), set()).add(spelling)
+    ambiguous: set[str] = set()
+    for group in by_key.values():
+        for spelling in group:
+            hosts = [
+                other
+                for other in group
+                if other != spelling and same_file_spelling(spelling, other)
+            ]
+            # Check every pair: a shared suffix such as models/CodeRouter.py
+            # can match both src/models/CodeRouter.py and
+            # tests/models/CodeRouter.py without making those the same file.
+            if any(not same_file_spelling(a, b) for a, b in combinations(hosts, 2)):
+                ambiguous.add(spelling)
+    return ambiguous
+
+
 class LinkIndex:
     """The links seen so far, matched the way a reader would.
 
@@ -95,22 +132,48 @@ class LinkIndex:
     files that only share a basename (``src/models/user.py`` and
     ``tests/fixtures/user.py``) are two links: deduping them as one would
     delete a real connection.
+
+    ``ambiguous`` lists entity spellings that could name more than one file
+    in the full endpoint set. Those only match an identical spelling, never
+    a qualified path, so an ambiguous bare alias cannot erase both distinct
+    links.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, ambiguous: Optional[Iterable[str]] = None) -> None:
         self._buckets: dict[tuple, list[tuple]] = {}
+        self._ambiguous = frozenset(ambiguous or ())
 
     @staticmethod
     def _bucket(ends: tuple) -> tuple:
         (wing_a, room_a), (wing_b, room_b) = ends
         return _link_key(wing_a, wing_b, room_a, room_b)
 
+    def _endpoint_match(self, a: str, b: str) -> bool:
+        if not _rooms_match(a, b):
+            return False
+        ea, eb = _entity_room_name(a), _entity_room_name(b)
+        if ea is not None and ea in self._ambiguous:
+            return ea == eb
+        if eb is not None and eb in self._ambiguous:
+            return ea == eb
+        return True
+
     def contains(self, ends: tuple) -> bool:
         (wa, ra), (wb, rb) = ends
         for (wa2, ra2), (wb2, rb2) in self._buckets.get(self._bucket(ends), []):
-            if wa == wa2 and wb == wb2 and _rooms_match(ra, ra2) and _rooms_match(rb, rb2):
+            if (
+                wa == wa2
+                and wb == wb2
+                and self._endpoint_match(ra, ra2)
+                and self._endpoint_match(rb, rb2)
+            ):
                 return True
-            if wa == wb2 and wb == wa2 and _rooms_match(ra, rb2) and _rooms_match(rb, ra2):
+            if (
+                wa == wb2
+                and wb == wa2
+                and self._endpoint_match(ra, rb2)
+                and self._endpoint_match(rb, ra2)
+            ):
                 return True
         return False
 
@@ -285,7 +348,15 @@ def prune_tunnels(tunnels: list, existing_wings: Iterable[str]) -> tuple[list, d
     wings = {_norm_wing(str(w)) for w in existing_wings}
     generic = dangling = duplicates = 0
     kept: list = []
-    seen = LinkIndex()
+    entity_spellings: list[str] = []
+    for t in tunnels:
+        if not isinstance(t, dict):
+            continue
+        for end in (t.get("source") or {}, t.get("target") or {}):
+            name = _entity_room_name(str(end.get("room") or ""))
+            if name is not None:
+                entity_spellings.append(name)
+    seen = LinkIndex(ambiguous_entity_spellings(entity_spellings))
     for t in sorted(
         (t for t in tunnels if isinstance(t, dict)),
         key=lambda t: -int(t.get("access_count") or 0),

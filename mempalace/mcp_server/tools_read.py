@@ -95,8 +95,8 @@ def _sqlite_taxonomy():
     cache_key = (_config.palace_path, _config.collection_name)
     # Taken before the query, so a write that lands during it invalidates.
     fingerprint = _palace_db_fingerprint()
-    # A readable chroma.sqlite3 changes stat on every commit, so a different
-    # fingerprint recounts even inside the TTL. The TTL is only the fallback
+    # The Chroma database/WAL fingerprint changes on committed writes, so a
+    # different fingerprint recounts even inside the TTL. The TTL is the fallback
     # for backends whose file stat misses commits (sqlite_exact's WAL) and
     # for a palace whose file cannot be stat'ed.
     fingerprint_matches = (
@@ -324,6 +324,7 @@ def tool_status():
             "protocol": PALACE_PROTOCOL,
             "aaak_dialect": AAAK_SPEC,
             "backend": _selected_backend_name(),
+            "embedding_device": _describe_device_safe(),
         }
 
     # Use create=True only when a palace DB already exists on disk -- this
@@ -342,6 +343,7 @@ def tool_status():
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
         "backend": _selected_backend_name(),
+        "embedding_device": _describe_device_safe(),
     }
     try:
         if _supports_metadata_facets(col):
@@ -398,7 +400,7 @@ def tool_status():
 
 PALACE_PROTOCOL = """IMPORTANT — MemPalace Memory Protocol:
 1. ON WAKE-UP: Call mempalace_status to load palace overview + AAAK spec.
-2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.
+2. BEFORE RESPONDING about any person, project, or past event: verify with the tool that fits the question — mempalace_kg_query for known relationships or time-bound facts, mempalace_search for source text, or mempalace_diary_read for recent agent continuity. Use small search/diary limits and relevant known scopes. Stop when answered; search stored text or widen filters if recall is insufficient. Never guess.
 3. IF UNSURE about a fact (name, gender, age, relationship): say "let me check" and query the palace. Wrong is worse than slow.
 4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.
 5. WHEN A SINGLE-VALUED FACT CHANGES (model, employer, address): call mempalace_kg_supersede(subject, predicate, old, new) to replace it atomically at one boundary — do NOT hand-roll invalidate + add, which leaves the old and new values overlapping at the boundary. Use mempalace_kg_invalidate for a fact that simply ended, and mempalace_kg_add to add an independent (possibly concurrent) fact.
@@ -590,6 +592,8 @@ def tool_search(
     context: str = None,
     candidate_strategy: str = "vector",
     cli_compatible: bool = False,
+    include_media: bool = False,
+    query_task: str = "search",
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
@@ -603,6 +607,22 @@ def tool_search(
     candidate_strategy = candidate_strategy or "vector"
     if not isinstance(candidate_strategy, str) or candidate_strategy not in {"vector", "union"}:
         return {"error": "candidate_strategy must be one of ('vector', 'union')"}
+    if (
+        not isinstance(include_media, bool)
+        or not isinstance(query_task, str)
+        or query_task not in {"search", "code"}
+    ):
+        return {"error": "include_media must be boolean and query_task must be 'search' or 'code'"}
+    if cli_compatible and (include_media or query_task != "search"):
+        return {"error": "cli_compatible cannot be combined with media/code task search"}
+    experimental = {
+        name: value
+        for name, value, default in (
+            ("include_media", include_media, False),
+            ("query_task", query_task, "search"),
+        )
+        if value != default
+    }
     # Mitigate system prompt contamination (Issue #333)
     sanitized = sanitize_query(query)
     if cli_compatible:
@@ -649,7 +669,7 @@ def tool_search(
                             repeat_unknown_warning=True,
                         )
                     except (EmbedderIdentityMismatchError, DimensionMismatchError) as exc:
-                        return {"error": "Embedder identity mismatch", "details": str(exc)}
+                        return _model_mismatch_error(exc)
                 _, output = _capture_fd_stdout(
                     lambda: cli_search(
                         query=query,
@@ -693,6 +713,7 @@ def tool_search(
         vector_disabled=_vector_disabled,
         candidate_strategy=candidate_strategy,
         collection_name=_config.collection_name,
+        **experimental,
     )
     if _is_transient_index_error(result):
         # Post-bulk-write HNSW flush window (#1315): drop caches, give
@@ -714,6 +735,7 @@ def tool_search(
             vector_disabled=_vector_disabled,
             candidate_strategy=candidate_strategy,
             collection_name=_config.collection_name,
+            **experimental,
         )
         if not _is_transient_index_error(result):
             result["index_recovered"] = True
@@ -784,7 +806,10 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
             "is_duplicate": len(duplicates) > 0,
             "matches": duplicates,
         }
-    except Exception:
+    except Exception as e:
+        refused = _model_mismatch_error(e)
+        if refused is not None:
+            return refused
         logger.exception("check_duplicate failed")
         return {"error": "Duplicate check failed"}
 

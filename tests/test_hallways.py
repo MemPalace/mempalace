@@ -11,6 +11,11 @@ This file is RED-first. The corresponding implementation lives in
 
 from unittest.mock import MagicMock, patch
 
+import itertools
+import json
+
+import pytest
+
 
 # Mock chromadb at import time so the hallways module can be loaded even
 # in environments where chromadb isn't installed. Mirrors the pattern in
@@ -271,10 +276,156 @@ class TestComputeHallways:
         result = hallways_mod.compute_hallways_for_wing("wing_aya", col=col, min_count=2)
         assert result == []
 
+    def _pair(self, results, a, b):
+        """Return the hallway record for pair {a, b} in ``results`` or ``None``."""
+        hit = [h for h in results if {h["entity_a"], h["entity_b"]} == {a, b}]
+        return hit[0] if hit else None
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Query API — list_hallways, delete_hallway
-# ─────────────────────────────────────────────────────────────────────────────
+    def test_min_count_from_config_file_threshold(self, tmp_path, monkeypatch):
+        """config.json's ``hallway_min_count`` is honoured (acceptance #1).
+
+        The call omits ``min_count`` on purpose so the threshold must come
+        from config, not the historical literal 2. A corpus with A↔B in 2,
+        A↔C in 3, and C↔D in 4 drawers: at threshold 3 only A↔C and C↔D
+        materialize — A↔B is filtered.
+        """
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        from mempalace.config import MempalaceConfig
+
+        cfgdir = tmp_path / "cfg"
+        cfgdir.mkdir(exist_ok=True)
+        (cfgdir / "config.json").write_text(json.dumps({"hallway_min_count": 3}), encoding="utf-8")
+        monkeypatch.delenv("MEMPALACE_KG_HALLWAY_MIN_COUNT", raising=False)
+        cfg = MempalaceConfig(config_dir=cfgdir)
+
+        col = _fake_collection(
+            [
+                # A↔B in 2 drawers
+                {"wing": "w", "room": "r1", "entities": "A;B"},
+                {"wing": "w", "room": "r1", "entities": "A;B"},
+                # A↔C in 3 drawers
+                {"wing": "w", "room": "r1", "entities": "A;C"},
+                {"wing": "w", "room": "r2", "entities": "A;C"},
+                {"wing": "w", "room": "r2", "entities": "A;C"},
+                # C↔D in 4 drawers
+                {"wing": "w", "room": "r1", "entities": "C;D"},
+                {"wing": "w", "room": "r2", "entities": "C;D"},
+                {"wing": "w", "room": "r3", "entities": "C;D"},
+                {"wing": "w", "room": "r3", "entities": "C;D"},
+            ]
+        )
+        result = hallways_mod.compute_hallways_for_wing("w", col=col, config=cfg)
+        assert self._pair(result, "A", "B") is None
+        assert self._pair(result, "A", "C") is not None
+        assert self._pair(result, "C", "D") is not None
+
+    def test_min_count_from_env_precedence(self, tmp_path, monkeypatch):
+        """MEMPALACE_KG_HALLWAY_MIN_COUNT wins over config.json (acceptance #2).
+
+        Config sets 3, env sets 5. With 3 drawers each pair is below 5, so
+        the hallway set is empty — the env value must have applied.
+        """
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        from mempalace.config import MempalaceConfig
+
+        cfgdir = tmp_path / "cfg"
+        cfgdir.mkdir(exist_ok=True)
+        (cfgdir / "config.json").write_text(json.dumps({"hallway_min_count": 3}), encoding="utf-8")
+        monkeypatch.setenv("MEMPALACE_KG_HALLWAY_MIN_COUNT", "5")
+        cfg = MempalaceConfig(config_dir=cfgdir)
+
+        col = _fake_collection(
+            [
+                {"wing": "w", "room": "r1", "entities": "A;B"},
+                {"wing": "w", "room": "r1", "entities": "A;B"},
+                {"wing": "w", "room": "r2", "entities": "A;B"},
+            ]
+        )
+        result = hallways_mod.compute_hallways_for_wing("w", col=col, config=cfg)
+        assert result == []
+
+    def test_min_count_env_var_alone(self, tmp_path, monkeypatch):
+        """Env-only (no config key) threshold is honoured (synthetic matrix)."""
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        from mempalace.config import MempalaceConfig
+
+        monkeypatch.setenv("MEMPALACE_KG_HALLWAY_MIN_COUNT", "3")
+        cfg = MempalaceConfig()
+
+        col = _fake_collection(
+            [
+                {"wing": "w", "room": "r1", "entities": "A;B"},
+                {"wing": "w", "room": "r2", "entities": "A;B"},
+                {"wing": "w", "room": "r1", "entities": "A;C"},
+                {"wing": "w", "room": "r2", "entities": "A;C"},
+                {"wing": "w", "room": "r3", "entities": "A;C"},
+            ]
+        )
+        result = hallways_mod.compute_hallways_for_wing("w", col=col, config=cfg)
+        assert self._pair(result, "A", "B") is None
+        assert self._pair(result, "A", "C") is not None
+
+
+class TestHallwayMinCountProperty:
+    """Unit tests for MempalaceConfig.hallway_min_count — the resolution
+    contract (env > file > default, ``>=1`` clamp) that mirrors
+    ``topic_tunnel_min_count``.
+
+    These tests are RED on HEAD (pre-#2328) because the attribute does not
+    exist yet; GREEN once the property is added.
+    """
+
+    def _write_cfg(self, tmp_path, value):
+        cfgdir = tmp_path / "cfg"
+        cfgdir.mkdir(exist_ok=True)
+        (cfgdir / "config.json").write_text(
+            json.dumps({"hallway_min_count": value}), encoding="utf-8"
+        )
+        return cfgdir
+
+    def test_default_is_two(self, tmp_path, monkeypatch):
+        from mempalace.config import MempalaceConfig
+
+        monkeypatch.delenv("MEMPALACE_KG_HALLWAY_MIN_COUNT", raising=False)
+        assert MempalaceConfig(config_dir=tmp_path).hallway_min_count == 2
+
+    def test_file_value_honoured(self, tmp_path, monkeypatch):
+        from mempalace.config import MempalaceConfig
+
+        monkeypatch.delenv("MEMPALACE_KG_HALLWAY_MIN_COUNT", raising=False)
+        cfgdir = self._write_cfg(tmp_path, 5)
+        assert MempalaceConfig(config_dir=cfgdir).hallway_min_count == 5
+
+    def test_env_precedes_file(self, tmp_path, monkeypatch):
+        from mempalace.config import MempalaceConfig
+
+        cfgdir = self._write_cfg(tmp_path, 2)
+        monkeypatch.setenv("MEMPALACE_KG_HALLWAY_MIN_COUNT", "7")
+        assert MempalaceConfig(config_dir=cfgdir).hallway_min_count == 7
+
+    def test_clamps_below_one_to_one(self, tmp_path, monkeypatch):
+        from mempalace.config import MempalaceConfig
+
+        monkeypatch.delenv("MEMPALACE_KG_HALLWAY_MIN_COUNT", raising=False)
+        cfgdir = self._write_cfg(tmp_path, 0)
+        assert MempalaceConfig(config_dir=cfgdir).hallway_min_count == 1
+
+    def test_env_below_one_falls_through(self, tmp_path, monkeypatch):
+        """An env value of 0 is not >= 1, so the property falls through to
+        file/default. File has 4 → returns 4."""
+        from mempalace.config import MempalaceConfig
+
+        cfgdir = self._write_cfg(tmp_path, 4)
+        monkeypatch.setenv("MEMPALACE_KG_HALLWAY_MIN_COUNT", "0")
+        assert MempalaceConfig(config_dir=cfgdir).hallway_min_count == 4
+
+    def test_non_numeric_env_falls_through(self, tmp_path, monkeypatch):
+        """A non-numeric env value is ignored; file value returned."""
+        from mempalace.config import MempalaceConfig
+
+        cfgdir = self._write_cfg(tmp_path, 6)
+        monkeypatch.setenv("MEMPALACE_KG_HALLWAY_MIN_COUNT", "bogus")
+        assert MempalaceConfig(config_dir=cfgdir).hallway_min_count == 6
 
 
 class TestHallwayQuery:
@@ -645,6 +796,78 @@ class TestEntitySpellings:
         assert survivor["id"] == hallways_mod._hallway_id("w", "src/store.py", "view")
 
 
+class TestUnequalCodeExtensionsStayDistinct:
+    """``src/parser.c`` and ``src/parser.h`` are two files, not spellings of one.
+
+    Regression for the review finding on PR #2654: stripping every code
+    extension made unequal explicit extensions collapse, so rebuild omitted
+    their hallway and prune deleted a seeded one as a self-link.
+    """
+
+    def test_canonical_entities_keeps_header_and_implementation(self):
+        from mempalace.hallways import canonical_entities
+
+        assert canonical_entities(["src/parser.c", "src/parser.h"]) == [
+            "src/parser.c",
+            "src/parser.h",
+        ]
+        # Extensionless aliases still collapse onto the unique extension.
+        assert canonical_entities(["mcp_server", "mcp_server.py"]) == ["mcp_server"]
+
+    def test_miner_builds_hallway_between_c_and_h(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        col = _fake_collection(
+            [
+                {
+                    "wing": "compiler",
+                    "room": "parser",
+                    "entities": "src/parser.c;src/parser.h",
+                },
+                {
+                    "wing": "compiler",
+                    "room": "parser",
+                    "entities": "src/parser.c;src/parser.h",
+                },
+            ]
+        )
+        created = hallways_mod.compute_hallways_for_wing("compiler", col=col, min_count=2)
+        assert len(created) == 1
+        pair = {created[0]["entity_a"], created[0]["entity_b"]}
+        assert pair == {"src/parser.c", "src/parser.h"}
+        assert created[0]["co_occurrence_count"] == 2
+
+    def test_prune_spellings_keeps_c_h_hallway(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        record = {
+            "id": hallways_mod._hallway_id("compiler", "src/parser.c", "src/parser.h"),
+            "wing": "compiler",
+            "entity_a": "src/parser.c",
+            "entity_b": "src/parser.h",
+            "co_occurrence_count": 2,
+        }
+        hallways_mod._save_hallways([record])
+        report = hallways_mod.prune_spelling_hallways(apply=True)
+        assert report["self_links"] == 0
+        assert report["removed"] == 0
+        left = hallways_mod.list_hallways()
+        assert len(left) == 1
+        assert {left[0]["entity_a"], left[0]["entity_b"]} == {"src/parser.c", "src/parser.h"}
+
+    def test_miner_resolves_raw_spellings_against_wing_file_map(self, tmp_path, monkeypatch):
+        """Bare Parser must not hide Parser.c when Parser.h makes it ambiguous wing-wide."""
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        col = _fake_collection(
+            [
+                {"wing": "w", "room": "r", "entities": "Parser.c;Parser.h"},
+                {"wing": "w", "room": "r", "entities": "Parser;Parser.c;Other"},
+                {"wing": "w", "room": "r", "entities": "Parser.c;Other"},
+            ]
+        )
+        created = hallways_mod.compute_hallways_for_wing("w", col=col, min_count=2)
+        pairs = {tuple(sorted((h["entity_a"], h["entity_b"]))) for h in created}
+        assert ("Other", "Parser.c") in pairs
+
+
 class TestSameNamedFilesStayApart:
     """``src/models/user.py`` and ``tests/models/user.py`` are two files."""
 
@@ -656,6 +879,9 @@ class TestSameNamedFilesStayApart:
         assert same_file_spelling("mcp_server", "mcp_server.py")
         assert not same_file_spelling("src/models/user.py", "tests/models/user.py")
         assert not same_file_spelling("ChatStore", "RootView")
+        assert not same_file_spelling("src/parser.c", "src/parser.h")
+        assert not same_file_spelling("parser.cpp", "parser.hpp")
+        assert not same_file_spelling("app.ts", "app.tsx")
 
     def test_canonical_entities_keeps_distinct_files_apart(self):
         from mempalace.hallways import canonical_entities
@@ -854,6 +1080,144 @@ class TestDiffAliasesAndEmptyRebuilds:
         (survivor,) = hallways_mod.list_hallways()
         assert {survivor["entity_a"], survivor["entity_b"]} == {"repo/src/user.py", "tests/user.py"}
         assert not hallways_mod.is_self_link(survivor)
+
+
+class TestExtensionlessAliasesNeverBridgeFiles:
+    @pytest.mark.parametrize(
+        ("names", "expected", "ambiguous"),
+        [
+            (
+                ["Router", "src/Router", "tests/Router"],
+                {"src/Router", "tests/Router"},
+                {"Router"},
+            ),
+            (
+                ["Router", "models/Router", "src/models/Router", "tests/models/Router"],
+                {"src/models/Router", "tests/models/Router"},
+                {"Router", "models/Router"},
+            ),
+            (
+                ["Router.py", "src/Router", "tests/Router"],
+                {"src/Router", "tests/Router"},
+                {"Router.py"},
+            ),
+            (
+                ["Router", "src/Router.py", "tests/Router"],
+                {"src/Router.py", "tests/Router"},
+                {"Router"},
+            ),
+            (
+                ["Parser", "src/Parser.c", "src/Parser.h"],
+                {"src/Parser.c", "src/Parser.h"},
+                {"Parser"},
+            ),
+        ],
+    )
+    def test_complete_set_resolves_ambiguity_in_every_order(self, names, expected, ambiguous):
+        for ordering in itertools.permutations(names):
+            assert set(hallways_mod.canonical_entities(ordering)) == expected, ordering
+            mapping = hallways_mod._wing_file_keys([{"entities": ordering}])
+            assert set(mapping.values()) == expected, ordering
+            assert set(mapping) == set(names) - ambiguous, ordering
+
+    @pytest.mark.parametrize(
+        ("names", "expected"),
+        [
+            (["Router", "models/Router", "repo/models/Router"], "repo/models/Router"),
+            (["Router.py", "models/Router", "repo/models/Router"], "repo/models/Router"),
+            (["Router", "models/Router.py", "repo/models/Router.py"], "repo/models/Router.py"),
+            (["Router", "a/src/Router", "b/src/Router", "src/Router"], "src/Router"),
+        ],
+    )
+    def test_unambiguous_suffix_and_diff_aliases_still_combine(self, names, expected):
+        for ordering in itertools.permutations(names):
+            assert hallways_mod.canonical_entities(ordering) == [expected], ordering
+            assert hallways_mod._wing_file_keys([{"entities": ordering}]) == dict.fromkeys(
+                names, expected
+            ), ordering
+
+    def test_rebuild_retains_both_qualified_hallways_and_counts(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        col = _fake_collection(
+            [
+                {"wing": "w", "room": "r", "entities": "Router;src/Router;Peer"},
+                {"wing": "w", "room": "r", "entities": "src/Router;Peer"},
+                {"wing": "w", "room": "r", "entities": "tests/Router;Peer"},
+                {"wing": "w", "room": "r", "entities": "tests/Router;Peer"},
+                # This drawer identifies neither qualified file.
+                {"wing": "w", "room": "r", "entities": "Router;Peer"},
+            ]
+        )
+        for _ in range(2):
+            hallways_mod.compute_hallways_for_wing("w", col=col, min_count=2)
+            stored = hallways_mod.list_hallways()
+            assert {(h["entity_a"], h["entity_b"]): h["co_occurrence_count"] for h in stored} == {
+                ("Peer", "src/Router"): 2,
+                ("Peer", "tests/Router"): 2,
+            }
+            assert hallways_mod.prune_spelling_hallways(apply=True)["removed"] == 0
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_prune_preserves_ambiguous_halls_and_removes_only_unique_duplicate(
+        self, tmp_path, monkeypatch, reverse
+    ):
+        from mempalace.palace_audit import _analyze_hallways
+
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        names = ["Router", "models/Router", "src/models/Router", "tests/models/Router"]
+        rows = [
+            {
+                "id": f"h-{i}",
+                "wing": "w",
+                "entity_a": name,
+                "entity_b": "Peer",
+                "co_occurrence_count": 10 - i,
+            }
+            for i, name in enumerate(names)
+        ]
+        # Only this more-qualified src alias is a proven duplicate.
+        rows.append(
+            {
+                "id": "duplicate",
+                "wing": "w",
+                "entity_a": "repo/src/models/Router",
+                "entity_b": "Peer",
+                "co_occurrence_count": 1,
+            }
+        )
+        if reverse:
+            rows.reverse()
+        hallways_mod._save_hallways(rows)
+        assert _analyze_hallways(rows)["duplicates"] == 1
+        report = hallways_mod.prune_spelling_hallways(apply=True)
+        assert report["removed"] == 1
+        assert {h["entity_a"] for h in hallways_mod.list_hallways()} == {
+            "Router",
+            "models/Router",
+            "repo/src/models/Router",
+            "tests/models/Router",
+        }
+        assert hallways_mod.prune_spelling_hallways(apply=True)["removed"] == 0
+
+    def test_prune_explicit_c_alias_preserves_header(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        hallways_mod._save_hallways(
+            [
+                {
+                    "id": f"h-{i}",
+                    "wing": "w",
+                    "entity_a": name,
+                    "entity_b": "Peer",
+                    "co_occurrence_count": 10 - i,
+                }
+                for i, name in enumerate(["src/parser.c", "parser.c", "src/parser.h"])
+            ]
+        )
+        assert hallways_mod.prune_spelling_hallways(apply=True)["removed"] == 1
+        assert {h["entity_a"] for h in hallways_mod.list_hallways()} == {
+            "src/parser.c",
+            "src/parser.h",
+        }
 
 
 class TestAmbiguousRecordsNeverBridgeFiles:

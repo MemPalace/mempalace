@@ -12,16 +12,38 @@ or implicit filters:
 
 ## 2. Determine Wing/Room Filters
 
-If the user mentions a specific domain, topic area, or context, map it to the
-appropriate wing and/or room. If unsure, omit filters to search globally. You
-can discover the taxonomy first if needed.
+Use a wing and/or room filter when its name is known and relevant to the
+question. If unsure, omit filters to search globally, or discover the taxonomy
+first. An empty scoped search is a reason to check or widen the scope, not
+proof that the memory does not exist.
 
 ## 3. Use MCP Tools (Preferred)
 
-If MCP tools are available, use them in this priority order:
+Choose the tool that fits the question, then stop when it answers the question.
+Follow the shared [recall protocol's query guide](https://github.com/MemPalace/mempalace/blob/develop/integrations/shared/recall-protocol.md#retrieve-only-the-context-you-need):
 
-- mempalace_search(query, wing, room) -- Primary search tool. Pass the semantic
-  query and any wing/room filters.
+- mempalace_kg_query(entity, as_of, direction) -- Start here for a known
+  entity's relationships or time-bound facts. Set as_of for a historical date;
+  without it, facts include active, historical, and future relationships, so
+  use active_facts for current-state questions. If the KG is empty or does not
+  answer the question, search the stored text.
+- mempalace_search(query, wing, room, limit) -- Start here for decisions,
+  explanations, or exact source words. Use a short query, relevant known
+  filters, and a small limit such as 3. Search returns stored text; retrieve a
+  specific drawer if you need its complete content, including a logical
+  drawer split into chunks.
+- mempalace_diary_read(agent_name, last_n, wing) -- Start here for recent
+  agent continuity or a handover. Use a small last_n such as 3 and a relevant
+  wing if known; omitting wing reads across this agent's wings. Results are
+  newest first and may be chunks of longer entries, not complete sessions.
+  For older or topic-specific context, use search.
+
+These are starting points, not a mandatory KG-to-search-to-diary sequence.
+Request more context only when the answer needs it. Response sizes vary with
+the number of facts and text length; result limits do not set a token budget.
+
+Use discovery tools when scope or navigation needs clarification:
+
 - mempalace_list_wings -- Discover all available wings. Use when the user asks
   what categories exist or you need to resolve a wing name.
 - mempalace_list_rooms(wing) -- List rooms within a specific wing. Use to help
@@ -46,11 +68,12 @@ When presenting search results:
 - Always include source attribution: wing, room, and drawer for each result
 - Show relevance or similarity scores if available
 - Group results by wing/room when returning multiple hits
-- Quote or summarize the memory content clearly
+- Quote the stored memory content verbatim
 
 ## 6. Offer Next Steps
 
-After presenting results, offer the user options to go deeper:
+If the results answer the question, stop. When more context is needed, offer
+relevant options to go deeper:
 - Drill deeper -- search within a specific room or narrow the query
 - Traverse -- explore the knowledge graph from a related room
 - Check tunnels -- look for cross-wing connections if the topic spans domains

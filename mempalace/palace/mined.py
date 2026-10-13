@@ -63,7 +63,7 @@ class MinedSetUnavailable(RuntimeError):
     """
 
 
-def _fast_collection_metadata(collection, keys, require_key=None):
+def _fast_collection_metadata(collection, keys, require_key=None, equals=None):
     """Chroma's one-pass sqlite metadata stream, or ``None`` for other backends.
 
     Paging ``get(limit, offset)`` costs a SQL ``OFFSET`` per page, which
@@ -75,7 +75,9 @@ def _fast_collection_metadata(collection, keys, require_key=None):
 
     inner = collection._inner if isinstance(collection, EmbeddingCollection) else collection
     if isinstance(inner, ChromaCollection):
-        return inner.iter_metadata(keys, require_key=require_key)
+        if equals is None:
+            return inner.iter_metadata(keys, require_key=require_key)
+        return inner.iter_metadata(keys, require_key=require_key, equals=equals)
     return None
 
 
@@ -144,7 +146,9 @@ def file_already_mined(
     prefetch_mined_set()'s stored mtimes instead of calling this function
     per file (same mtime-aware decision, without the O(n) per-file query
     cost); this function's check_mtime=True path remains its per-file,
-    lock-held race-condition recheck.
+    lock-held race-condition recheck. The project miner skips a file
+    without calling this only when prefetch_complete_mtimes() proves this
+    would return True.
 
     When extract_mode is set (used by convo miner), idempotency is scoped to
     that extraction mode so exchange-mode and general-mode drawers can coexist
@@ -333,6 +337,85 @@ def prefetch_mined_set(
                 mined[src] = mtime_key
                 break
     return mined
+
+
+# The keys file_already_mined() reads when called without an extract_mode.
+_PROJECT_MINED_KEYS = ("source_file", "source_mtime", "chunk_total", "normalize_version")
+
+
+def _is_plain_number(value) -> bool:
+    # NaN compares unequal to itself and would never prove a match.
+    return isinstance(value, (int, float)) and value == value
+
+
+def prefetch_complete_mtimes(collection, source_files) -> Optional[dict[str, tuple]]:
+    """``source_file -> stored mtimes of its complete drawer groups``, in one
+    sqlite pass, for the project miner's skip check (#2684).
+
+    ``file_already_mined(collection, src, check_mtime=True)`` costs one
+    ``get(where={"source_file": src})`` per file, ~0.1 s on a 1M-drawer
+    palace, which made a no-op mine of a 1.4k-file project take minutes.
+    A source is listed here only when its stored drawers prove that call
+    would return True for a matching on-disk mtime: some ``source_mtime``
+    group at the current ``normalize_version`` either has a drawer with no
+    ``chunk_total`` or holds at least the largest ``chunk_total`` any of
+    its drawers names. A source with a value that check could not compare
+    (a non-numeric ``normalize_version``, ``source_mtime`` or
+    ``chunk_total``) is left out, since there it returns False. A source
+    missing from the result is not "not mined": the caller asks
+    ``file_already_mined()`` as before.
+
+    Only ``source_files`` are tracked. Returns ``None`` on backends without
+    Chroma's sqlite stream, or when the stream fails, so the caller keeps
+    the per-file check for every file.
+    """
+    rows = _fast_collection_metadata(collection, _PROJECT_MINED_KEYS, require_key="source_file")
+    if rows is None:
+        return None
+    wanted = set(source_files)
+    # Per source_file: stored mtime -> [drawer count, largest chunk_total,
+    # whether some drawer has no chunk_total].
+    groups: dict[str, dict] = {}
+    unprovable: set = set()
+    try:
+        for meta in rows:
+            meta = meta or {}
+            src = meta.get("source_file")
+            if src not in wanted or src in unprovable:
+                continue
+            version = meta.get("normalize_version", 1)
+            stored_mtime = meta.get("source_mtime")
+            chunk_total = meta.get("chunk_total")
+            if not (
+                _is_plain_number(version)
+                and (stored_mtime is None or _is_plain_number(stored_mtime))
+                and (chunk_total is None or _is_plain_number(chunk_total))
+            ):
+                unprovable.add(src)
+                groups.pop(src, None)
+                continue
+            if version < NORMALIZE_VERSION or stored_mtime is None:
+                # file_already_mined() skips this drawer without counting it.
+                continue
+            entry = groups.setdefault(src, {}).setdefault(stored_mtime, [0, 0, False])
+            entry[0] += 1
+            if chunk_total is None:
+                entry[2] = True
+            else:
+                entry[1] = max(entry[1], chunk_total)
+    except Exception:
+        logger.warning("sqlite metadata scan failed; checking each file on its own", exc_info=True)
+        return None
+    complete: dict[str, tuple] = {}
+    for src, by_mtime in groups.items():
+        mtimes = tuple(
+            float(mtime)
+            for mtime, (count, largest, untracked) in by_mtime.items()
+            if untracked or count >= largest
+        )
+        if mtimes:
+            complete[src] = mtimes
+    return complete
 
 
 def prefetch_content_hashes(

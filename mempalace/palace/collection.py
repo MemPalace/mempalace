@@ -54,6 +54,49 @@ def _collection_has_rows(collection, palace_path, collection_name) -> Optional[b
         return None
 
 
+def _server_embedder_identity(collection):
+    """The identity a ``server_embedder`` collection reports, or ``None``.
+
+    A server_embedder backend embeds with its own model and ignores the core
+    embedder; ``effective_embedder_identity()`` returning a named identity is
+    how it says so. ``None`` means the core (configured) embedder does the
+    embedding.
+    """
+    try:
+        effective = collection.effective_embedder_identity()
+    except Exception:
+        return None
+    if effective is not None and getattr(effective, "model_name", ""):
+        return effective
+    return None
+
+
+def _normalize_legacy_identity(collection, stored, *, create):
+    """Read a core embedder's legacy recorded name as the model behind it.
+
+    Older builds recorded the raw configured name while embedding anything
+    unrecognized with MiniLM, so a recorded ``"all-minilm-l6-v2"`` or
+    ``"none"`` is a MiniLM palace (see ``_normalize_stored_model_name``). A
+    write open (``create``) records the normalized name; a read open only
+    compares with it.
+    """
+    from ..backends.base import EmbedderIdentity
+    from ..embedding import _normalize_stored_model_name
+
+    normalized = _normalize_stored_model_name(stored.model_name)
+    if normalized == stored.model_name:
+        return stored
+    stored = EmbedderIdentity(model_name=normalized, dimension=stored.dimension)
+    if create:
+        try:
+            collection.set_embedder_identity(stored)
+        except Exception as exc:
+            # Not fatal: the palace stays protected, the legacy name keeps
+            # reading as the normalized one. Say so rather than hide it.
+            logger.warning("could not rewrite the legacy embedder identity: %s", exc)
+    return stored
+
+
 def _enforce_embedder_identity(
     collection,
     palace_path,
@@ -75,7 +118,11 @@ def _enforce_embedder_identity(
     can reproduce the warning a standalone CLI process emits on every search.
 
     Bookkeeping must never break memory operations: only the deliberate
-    identity/dimension mismatch propagates; every other error is swallowed.
+    identity/dimension mismatch propagates, plus
+    :class:`~mempalace.backends.base.EmbedderIdentityRecordError` when a write
+    open cannot record a brand-new collection's identity (writing on would
+    leave it unprotected against a later model swap); every other error is
+    swallowed.
     """
     import warnings
 
@@ -83,6 +130,7 @@ def _enforce_embedder_identity(
         DimensionMismatchError,
         EmbedderIdentity,
         EmbedderIdentityMismatchError,
+        EmbedderIdentityRecordError,
         EmbedderIdentityUnknownWarning,
         check_embedder_identity,
     )
@@ -93,11 +141,9 @@ def _enforce_embedder_identity(
     # model — is what must be checked and recorded. Fall back to the configured
     # model name for the normal (core-embedder) case.
     current: Optional[EmbedderIdentity] = None
-    try:
-        effective = collection.effective_embedder_identity()
-    except Exception:
-        effective = None
-    if effective is not None and getattr(effective, "model_name", ""):
+    effective = _server_embedder_identity(collection)
+    core_embedder = effective is None
+    if not core_embedder:
         current = effective
     else:
         try:
@@ -118,6 +164,13 @@ def _enforce_embedder_identity(
     except Exception:
         logger.debug("embedder-identity read failed for %s", collection_name, exc_info=True)
         return
+    unrecorded = False
+    if core_embedder and stored is not None and getattr(stored, "model_name", ""):
+        normalized = _normalize_legacy_identity(collection, stored, create=create)
+        # A read open compares with the normalized name but does not write it;
+        # stay out of the cache so the next write open records it.
+        unrecorded = normalized is not stored and not create
+        stored = normalized
     try:
         state = check_embedder_identity(stored, current)
     except (EmbedderIdentityMismatchError, DimensionMismatchError):
@@ -128,12 +181,24 @@ def _enforce_embedder_identity(
     if state == "unknown" and stored is None:
         has_rows = _collection_has_rows(collection, palace_path, collection_name)
         if has_rows is False:
+            # A read open of an empty, unrecorded collection records nothing;
+            # stay out of the cache so the next write open in this process
+            # still records it.
+            unrecorded = not create
             if create:
                 try:
                     collection.set_embedder_identity(current)
+                except EmbedderIdentityRecordError:
+                    raise
                 except Exception:
                     logger.debug("embedder-identity record failed", exc_info=True)
         elif has_rows:
+            if model_name.startswith("embeddinggemma2:"):
+                raise EmbedderIdentityMismatchError(
+                    f"collection {collection_name!r} has vectors but no recorded embedding identity; "
+                    "the vectors may come from a different model or modality configuration. "
+                    "Rebuild the index before using it with EmbeddingGemma 2."
+                )
             warnings.warn(
                 f"palace collection {collection_name!r} has no recorded embedder "
                 f"identity; assuming the current model {model_name!r}. Run "
@@ -142,26 +207,27 @@ def _enforce_embedder_identity(
                 stacklevel=2,
             )
 
-    _VALIDATED_IDENTITY.add(key)
+    if not unrecorded:
+        _VALIDATED_IDENTITY.add(key)
 
 
 # The closets collection name is fixed (not user-configurable) — it is the
 # searchable index layer and MemPalace never opens a differently-named closets
 # store. Mirrored independently in repair.py as ``CLOSETS_COLLECTION_NAME``.
 CLOSETS_COLLECTION_NAME = "mempalace_closets"
+ASSETS_COLLECTION_NAME = "mempalace_assets"
 
 
 def _allowed_wrapper_collection_names() -> List[str]:
     """The collection names the ``get_collection`` wrapper routes through.
 
-    Only two stores are first-class to MemPalace: the configured drawers
-    collection (default ``mempalace_drawers``, overridable in config) and the
-    closets collection. Every other name points at a store the search/CLI/MCP
+    The configured drawers collection, closets collection, and fixed media
+    assets collection are first-class to MemPalace. Every other name points at a store the search/CLI/MCP
     layer never reads — the exact silent-miss failure of issue ``#2347``.
     """
     from ..config import get_configured_collection_name
 
-    allowed = [get_configured_collection_name(), CLOSETS_COLLECTION_NAME]
+    allowed = [get_configured_collection_name(), CLOSETS_COLLECTION_NAME, ASSETS_COLLECTION_NAME]
     seen: set[str] = set()
     out: list[str] = []
     for name in allowed:
@@ -205,8 +271,9 @@ class CollectionNameMismatchError(ValueError):
             f"invisible to search, MCP, and repair. Use one of the configured "
             f"names — the drawers collection name (default "
             f"'mempalace_drawers', overridable in config; expose it with "
-            f"``get_configured_collection_name()``) or the closets collection "
-            f"``get_closets_collection()`` — not an ad-hoc string."
+            f"``get_configured_collection_name()``), the closets collection "
+            f"``get_closets_collection()``, or the fixed ``mempalace_assets`` "
+            f"collection — not an ad-hoc string."
         )
 
 
@@ -219,9 +286,9 @@ def get_collection(
     _skip_identity_check: bool = False,
     _skip_name_check: bool = False,
 ):
-    """Get a first-class MemPalace collection (drawers or closets).
+    """Get a first-class MemPalace collection (drawers, closets, or media assets).
 
-    The wrapper front-loads exactly two collections and is the public surface
+    The wrapper front-loads the drawers, closets, and fixed media asset collections and is the public surface
     MCP, miners, the search layer, and the CLI use to open a palace:
 
     * the **drawers** collection — the verbatim document store. Its name is
@@ -231,6 +298,9 @@ def get_collection(
     * the **closets** collection — the searchable index layer. Always named
       :data:`mempalace.palace.CLOSETS_COLLECTION_NAME`` ("mempalace_closets");
       open it through :func:`mempalace.palace.get_closets_collection`.
+    * the **media assets** collection — local image, audio, and video references
+      stored separately from drawer documents. Always named
+      :data:`mempalace.palace.ASSETS_COLLECTION_NAME`.
 
     Any other name points to a store the rest of MemPalace never reads, so data
     upserted through it stays invisible to search/CLI/MCP. ``get_collection``
@@ -262,6 +332,20 @@ def get_collection(
         allowed = _allowed_wrapper_collection_names()
         if collection_name not in allowed:
             raise CollectionNameMismatchError(collection_name, allowed, palace_path)
+    from ..config import MempalaceConfig
+
+    # Read (and so validate) the configured model before the backend can
+    # create a palace folder, collection or identity sidecar: a misspelled
+    # model name (UnknownEmbeddingModelError) must leave nothing behind.
+    configured_model = MempalaceConfig().embedding_model
+    if collection_name == ASSETS_COLLECTION_NAME:
+        # Validate provider configuration before opening storage. The identity
+        # checker intentionally degrades gracefully for legacy collections,
+        # but invalid EmbeddingGemma 2 settings must not be hidden by it.
+        if configured_model == "embeddinggemma2":
+            from ..embedding import get_embedding_function
+
+            get_embedding_function(model="embeddinggemma2")
     backend_obj = get_backend_for_palace(palace_path, explicit=backend)
     palace_ref = PalaceRef(id=palace_path, local_path=palace_path)
     backend_options = {"read_only": True} if read_only else None
@@ -317,6 +401,15 @@ def get_collection(
     return collection
 
 
+def _backend_has_server_embedder(palace_path, backend) -> bool:
+    """Whether the palace's backend advertises ``server_embedder``."""
+    try:
+        capabilities = get_backend_for_palace(palace_path, explicit=backend).capabilities
+    except Exception:
+        return False
+    return "server_embedder" in capabilities
+
+
 def set_palace_embedder_identity(
     palace_path: str,
     model: Optional[str] = None,
@@ -335,24 +428,28 @@ def set_palace_embedder_identity(
     """
     from ..backends.base import EmbedderIdentity, EmbedderIdentityMismatchError
     from ..config import MempalaceConfig
-    from ..embedding import get_embedder_identity
+    from ..embedding import (
+        _normalize_stored_model_name,
+        _resolve_embedding_model,
+        current_model_name,
+        get_embedder_identity,
+        get_embedding_function,
+    )
 
     configured = MempalaceConfig().embedding_model
-    target = (model or configured or "").strip().lower()
+    requested = (model or "").strip().lower()
+    target = requested or (configured or "").strip().lower()
     if not target:
         # No model given and none configured — there is nothing to record, and
         # recording a nameless identity is a silent no-op in every backend.
         raise ValueError(
             "no embedder model to record: pass --model NAME or configure MEMPALACE_EMBEDDING_MODEL"
         )
-    if target == (configured or "").strip().lower():
-        # Recording the in-use model — probe its dimension (already loaded).
-        new = get_embedder_identity()
-    else:
-        # Explicit override of a non-configured model: record the name only,
-        # never load a foreign model (which can be a large download) just to
-        # probe a dimension. The model-name check is the actual protection.
-        new = EmbedderIdentity(model_name=target, dimension=0)
+    if requested and not _backend_has_server_embedder(palace_path, backend):
+        # Refuse a misspelled --model (UnknownEmbeddingModelError) before the
+        # open below can create the palace folder, chroma.sqlite3 or a
+        # collection. A server embedder's names are its own and skip this.
+        _resolve_embedding_model(requested)
     collection = get_collection(
         palace_path,
         collection_name=collection_name,
@@ -360,11 +457,38 @@ def set_palace_embedder_identity(
         backend=backend,
         _skip_identity_check=True,
     )
+    core_embedder = _server_embedder_identity(collection) is None
+    if requested and core_embedder:
+        # Record the model the name embeds with, as the factory resolves it:
+        # `--model all-minilm-l6-v2` is minilm. A server embedder's names are
+        # its own and are recorded as given.
+        target = _resolve_embedding_model(requested)
+    if target == (configured or "").strip().lower():
+        # Recording the in-use model — probe its dimension (already loaded).
+        new = get_embedder_identity()
+    elif core_embedder and target == "embeddinggemma2":
+        # EmbeddingGemma 2 is recorded by its full identity (model, revision,
+        # dimension, modalities), never the bare name: a bare stored
+        # "embeddinggemma2" reads as a legacy MiniLM palace. Built from the
+        # configured EmbeddingGemma 2 settings without loading the model.
+        new = EmbedderIdentity(
+            model_name=current_model_name(target),
+            dimension=get_embedding_function(model=target).dimension,
+        )
+    else:
+        # Explicit override of a non-configured model: record the name only,
+        # never load a foreign model (which can be a large download) just to
+        # probe a dimension. The model-name check is the actual protection.
+        new = EmbedderIdentity(model_name=target, dimension=0)
     try:
         old = collection.get_stored_embedder_identity()
     except Exception:
         old = None
-    if old is not None and old.model_name != new.model_name and not force:
+    old_name = getattr(old, "model_name", "")
+    if old is not None and core_embedder:
+        # A legacy raw name that stands for the same model is not a swap.
+        old_name = _normalize_stored_model_name(old_name)
+    if old is not None and old_name != new.model_name and not force:
         raise EmbedderIdentityMismatchError(
             f"palace already records embedder {old.model_name!r}; pass --force to "
             f"overwrite it with {new.model_name!r} (only if the vectors are compatible)"

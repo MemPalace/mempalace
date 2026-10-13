@@ -42,11 +42,18 @@ from .palace import (
     mine_lock,
     mine_palace_lock,
     mine_yield_point,
+    palace_write_serial,
     prefetch_content_hashes,
     prefetch_mined_set,
+    print_files_failed,
+    raise_if_files_failed,
 )
 
 logger = logging.getLogger("mempalace_mcp")
+
+# Third value of _file_chunks_locked when the stale-drawer purge raised: the
+# file was not mined. Truthy, so it still reads as "nothing filed".
+PURGE_FAILED = "purge_failed"
 
 
 # Cached hall keywords — avoids re-reading config per drawer
@@ -694,7 +701,9 @@ def _file_chunks_locked(
     since a Claude Code session keeps appending to its own file while
     active and /compact or /clear can rewrite one in place.
 
-    Returns (drawers_added, room_counts_delta, skipped).
+    Returns (drawers_added, room_counts_delta, skipped). ``skipped`` is
+    :data:`PURGE_FAILED` when the stale-drawer purge raised, which the mine
+    counts as an error rather than a skip.
     """
     room_counts_delta: dict = defaultdict(int)
     drawers_added = 0
@@ -724,13 +733,13 @@ def _file_chunks_locked(
                 collection.delete(ids=delete_ids)
         except Exception as exc:
             print(
-                f"  ! [skip] stale-drawer purge failed for {source_file!r} "
+                f"  ! [error] stale-drawer purge failed for {source_file!r} "
                 f"({exc!r}); leaving existing drawers untouched, will retry "
                 f"on the next mine",
                 file=sys.stderr,
             )
             logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
-            return 0, room_counts_delta, True
+            return 0, room_counts_delta, PURGE_FAILED
 
         # Batch chunks into bounded upserts so large transcripts keep most of
         # the embedding speedup without one huge Chroma/SQLite request. Keep
@@ -1042,6 +1051,25 @@ def _normalize_convo_conversations(
     return conversations
 
 
+def _print_room_counts(room_counts) -> None:
+    if room_counts:
+        print("\n  By room:")
+        for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
+            print(f"    {room:20} {count} files")
+
+
+def _yield_and_reopen(palace_path: str, collection, dry_run: bool):
+    """Pass a file boundary, reopening the collection if requests ran in it.
+
+    A request in the hub's handoff may close the backend under this handle (a
+    search resets the Chroma caches after a transient index error). Reopening
+    returns the cached collection when nothing closed it.
+    """
+    if not mine_yield_point() or dry_run:
+        return collection
+    return _open_convo_collection(palace_path, dry_run=False)
+
+
 def _open_convo_collection(
     palace_path: str,
     *,
@@ -1075,6 +1103,7 @@ def _mine_convos_impl(
 ):
     from .config import MempalaceConfig
 
+    writes_at_start = palace_write_serial()
     palace_config = MempalaceConfig(palace_path=palace_path)
     cfg_chunk_size = palace_config.chunk_size
     # Only override convo_miner's MIN_CHUNK_SIZE when the user has set
@@ -1140,11 +1169,12 @@ def _mine_convos_impl(
     total_drawers = 0
     files_mined = 0
     files_skipped = 0
+    files_failed: list = []
     files_processed = 0
     room_counts = defaultdict(int)
 
     for i, filepath in enumerate(files, 1):
-        mine_yield_point()
+        collection = _yield_and_reopen(palace_path, collection, dry_run)
         files_processed = i
         source_file = str(filepath)
 
@@ -1262,6 +1292,9 @@ def _mine_convos_impl(
             content_hash=content_hash,
             source_dir_ino=source_directory_identity(filepath),
         )
+        if skipped == PURGE_FAILED:
+            files_failed.append(source_file)
+            continue
         if skipped:
             files_skipped += 1
             continue
@@ -1281,19 +1314,19 @@ def _mine_convos_impl(
         # connection to the Chroma DB, which can invalidate the live collection handle on
         # some Chroma builds and make the hallway fetch fail.
         _compute_hallways_for_wing_safe(wing, collection, total_drawers, config=palace_config)
-        _validate_palace_fts5_after_mine(palace_path)
+        _validate_palace_fts5_after_mine(palace_path, writes_since=writes_at_start)
 
     print(f"\n{'=' * 55}")
     print("  Done.")
-    print(f"  Files processed: {files_processed - files_skipped}")
+    print(f"  Files processed: {files_processed - files_skipped - len(files_failed)}")
+    print_files_failed(files_failed)
     print(f"  Files skipped (already filed): {files_skipped}")
     print(f"  Drawers filed: {total_drawers}")
-    if room_counts:
-        print("\n  By room:")
-        for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
-            print(f"    {room:20} {count} files")
+    _print_room_counts(room_counts)
     print('\n  Next: mempalace search "what you\'re looking for"')
     print(f"{'=' * 55}\n")
+    # After the summary, so the operator still sees what was filed.
+    raise_if_files_failed(files_failed, files_processed)
 
 
 if __name__ == "__main__":

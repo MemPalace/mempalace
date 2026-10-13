@@ -651,6 +651,36 @@ def _mcp_tool_preflight_refusal(req_id, tool_name: str, *, check_writer: bool = 
     return _mcp_peer_writer_refusal(req_id, tool_name) if check_writer else None
 
 
+def _tool_result_is_error(result) -> bool:
+    """Whether a tool result reports an error the MCP client should flag.
+
+    Tool errors are otherwise plain ``{"error": ...}`` results. The failures
+    that refuse every read and write until the config or the palace is fixed
+    (a misspelled ``embedding_model``, a palace built with a different
+    model, a collection that will not open), and an openai-compat endpoint
+    that cannot be reached, also set MCP's ``isError`` for clients that only
+    check the flag. Model errors are matched by the
+    exception class they were built from (``error_class``, set by
+    ``embedding.model_error_result``); an open failure by its ``error``.
+    """
+    if not isinstance(result, dict):
+        return False
+    return (
+        result.get("error_class") in MODEL_ERROR_CLASS_NAMES
+        or result.get("error") == BACKEND_OPEN_FAILED_ERROR
+    )
+
+
+def _tool_call_response(req_id, result) -> dict:
+    """The JSON-RPC response carrying a tool's result as MCP text content."""
+    tool_result = {
+        "content": [{"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}]
+    }
+    if _tool_result_is_error(result):
+        tool_result["isError"] = True
+    return {"jsonrpc": "2.0", "id": req_id, "result": tool_result}
+
+
 def _decorate_mcp_tool_result(tool_name: str, result):
     """Attach MCP transport-only diagnostics outside handle_request complexity."""
 
@@ -687,6 +717,23 @@ def _normalize_envelope(request: dict) -> "tuple[str, dict]":
         params = {}
 
     return method, params
+
+
+def _tool_catalog_entry(name: str, tool: dict) -> dict:
+    """Build one tools/list row, including MCP ToolAnnotations when set.
+
+    Plan modes, read-only subagents, and schema-pruning harnesses use
+    ``annotations.readOnlyHint`` to admit inspection tools without a
+    host-side allowlist.
+    """
+    entry = {
+        "name": name,
+        "description": tool["description"],
+        "inputSchema": tool["input_schema"],
+    }
+    if tool.get("read_only"):
+        entry["annotations"] = {"readOnlyHint": True}
+    return entry
 
 
 def handle_request(request):
@@ -731,7 +778,7 @@ def handle_request(request):
             "id": req_id,
             "result": {
                 "tools": [
-                    {"name": n, "description": t["description"], "inputSchema": t["input_schema"]}
+                    _tool_catalog_entry(n, t)
                     for n, t in TOOLS.items()
                     if not (_READ_ONLY and n in _READ_ONLY_REFUSED_TOOLS)
                 ]
@@ -837,15 +884,7 @@ def handle_request(request):
                     tool_name, TOOLS[tool_name]["handler"](**tool_args)
                 )
 
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "content": [
-                        {"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}
-                    ]
-                },
-            }
+            return _tool_call_response(req_id, result)
         except TypeError as e:
             # Qualname match prevents leaking internal helper/param names raised
             # inside the handler body — see test_handler_internal_signature_shape_stays_generic.
@@ -910,9 +949,9 @@ _WARMUP_PROBE_TEXT = "__mempalace_warmup_probe__"
 def _describe_device_safe() -> str:
     """Return ``embedding.describe_device()`` value or ``"unknown"`` on failure.
 
-    Used only inside warmup-failure log lines; the import is deferred so
-    that an embedding-stack import error cannot itself crash the warmup
-    diagnostic path.
+    Used in warmup-failure log lines and ``mempalace_status``; the import is
+    deferred so that an embedding-stack import error cannot itself crash
+    either.
     """
     try:
         from ..embedding import describe_device

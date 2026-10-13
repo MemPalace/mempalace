@@ -600,20 +600,45 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
         logger.error(_MCP_WRITER_LOCK_ERROR)
         return False, _MCP_WRITER_LOCK_ERROR
 
-    _MCP_WRITER_LOCK_CM = lock_cm
-    import atexit
+    # The flock is held from __enter__ onward. Anything that fails while we
+    # finish promotion must release it in this try/finally — otherwise the
+    # open lock-file handle pins mine_palace_*.lock until process death
+    # (Windows: "being used by another process"), which is the kg_add leak
+    # shape in #2618 when a tool took the lease and then wedged mid-setup.
+    try:
+        _MCP_WRITER_LOCK_CM = lock_cm
+        import atexit
 
-    if not _MCP_WRITER_ATEXIT_REGISTERED:
-        atexit.register(_release_mcp_writer_lock)
-        _MCP_WRITER_ATEXIT_REGISTERED = True
-    # Reads performed before promotion may have cached a query-only SQLite
-    # collection. Drop it while ownership is held so the pending mutating
-    # request reopens a writable handle rather than failing on query_only.
-    _discard_mcp_storage_handles()
-    _MCP_WRITER_READ_ONLY = False
-    _MCP_WRITER_LOCK_FAILED = False
-    _MCP_WRITER_LOCK_ERROR = ""
-    return True, ""
+        if not _MCP_WRITER_ATEXIT_REGISTERED:
+            atexit.register(_release_mcp_writer_lock)
+            _MCP_WRITER_ATEXIT_REGISTERED = True
+        # Reads performed before promotion may have cached a query-only SQLite
+        # collection. Drop it while ownership is held so the pending mutating
+        # request reopens a writable handle rather than failing on query_only.
+        _discard_mcp_storage_handles()
+        _MCP_WRITER_READ_ONLY = False
+        _MCP_WRITER_LOCK_FAILED = False
+        _MCP_WRITER_LOCK_ERROR = ""
+        return True, ""
+    except Exception as exc:
+        _MCP_WRITER_LOCK_CM = None
+        _MCP_WRITER_READ_ONLY = False
+        try:
+            lock_cm.__exit__(None, None, None)
+        except Exception:
+            logger.debug(
+                "Failed to release palace lock after aborted writer setup",
+                exc_info=True,
+            )
+        _MCP_WRITER_LOCK_FAILED = True
+        _MCP_WRITER_LOCK_ERROR = (
+            "could not acquire MCP peer-writer lock for "
+            f"{_config.palace_path!r}: {exc!r}; refusing this mutating tool "
+            "because peer-writer protection could not be established; a later "
+            "mutating request will retry ownership"
+        )
+        logger.error(_MCP_WRITER_LOCK_ERROR)
+        return False, _MCP_WRITER_LOCK_ERROR
 
 
 def _mcp_peer_writer_refusal(req_id, tool_name: str):

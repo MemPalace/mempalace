@@ -3,8 +3,9 @@
 mempalace mine must not print "Done." and exit 0 on a palace whose
 chroma.sqlite3 left FTS5 in a malformed state. The validation hook in
 ``palace._validate_palace_fts5_after_mine`` runs PRAGMA quick_check at
-the end of every non-dry-run mine and raises ``MineValidationError`` so
-``cmd_mine`` can surface the same recovery banner ``cmd_repair`` prints.
+the end of every non-dry-run mine that wrote to the palace (#2684) and
+raises ``MineValidationError`` so ``cmd_mine`` can surface the same
+recovery banner ``cmd_repair`` prints.
 """
 
 from __future__ import annotations
@@ -233,7 +234,7 @@ def test_validate_skipped_on_dry_run(tmp_path, monkeypatch):
 
     calls = []
 
-    def _spy(palace_path):
+    def _spy(palace_path, **_kwargs):
         calls.append(palace_path)
 
     monkeypatch.setattr(miner, "_validate_palace_fts5_after_mine", _spy)
@@ -300,7 +301,7 @@ def test_full_chain_raises_through_mine_impl(tmp_path, monkeypatch):
     called = []
     real_errors = ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
 
-    def _validator_spy(path):
+    def _validator_spy(path, **_kwargs):
         called.append(path)
         raise MineValidationError(path, real_errors)
 
@@ -554,7 +555,7 @@ def test_mine_impl_does_not_print_partial_summary_on_validation_error(
     )
     (src / "big.md").write_text("lorem ipsum dolor " * 200)
 
-    def _raise(path):
+    def _raise(path, **_kwargs):
         raise MineValidationError(path, ["malformed inverted index for FTS5 table"])
 
     monkeypatch.setattr(palace_mod, "_validate_palace_fts5_after_mine", _raise)
@@ -624,7 +625,7 @@ def test_convo_miner_dry_run_skips_validator(tmp_path, monkeypatch):
 
     calls = []
 
-    def _spy(palace_path):
+    def _spy(palace_path, **_kwargs):
         calls.append(palace_path)
 
     monkeypatch.setattr(convo_mod, "_validate_palace_fts5_after_mine", _spy)
@@ -718,7 +719,7 @@ def test_mine_formats_dry_run_skips_validator(tmp_path, monkeypatch):
 
     calls = []
 
-    def _spy(palace_path):
+    def _spy(palace_path, **_kwargs):
         calls.append(palace_path)
 
     monkeypatch.setattr(format_mod, "_validate_palace_fts5_after_mine", _spy)
@@ -753,7 +754,7 @@ def test_mine_formats_keyboard_interrupt_skips_validator(tmp_path, monkeypatch):
 
     calls = []
 
-    def _spy(palace_path):
+    def _spy(palace_path, **_kwargs):
         calls.append(palace_path)
 
     def _interrupt(*_args, **_kwargs):
@@ -775,12 +776,26 @@ def test_mine_formats_keyboard_interrupt_skips_validator(tmp_path, monkeypatch):
     assert calls == [], f"mine_formats must not validate on KeyboardInterrupt, got: {calls}"
 
 
+def _one_extracted_document(monkeypatch, src: Path) -> None:
+    """Make mine_formats find one document that extracts to fileable text,
+    so the mine writes and the post-mine validation runs (#2684)."""
+    from mempalace import format_miner as format_mod
+
+    doc = src / "notes.docx"
+    doc.write_bytes(b"PK\x03\x04stub")
+    text = "The quarterly review covers memory palace retention. " * 20
+    monkeypatch.setattr(format_mod, "scan_formats", lambda *_a, **_k: [doc])
+    monkeypatch.setattr(
+        format_mod, "extract_text", lambda *_a, **_k: (text, format_mod.ExtractionStatus.OK)
+    )
+
+
 def test_mine_formats_full_chain_raises_when_fts5_corrupt(tmp_path, monkeypatch):
     """End-to-end: mine_formats must propagate MineValidationError from
     `_validate_palace_fts5_after_mine`. Mirrors
     `test_full_chain_raises_through_mine_impl` for the extract path.
-    Empty source dir is sufficient: the for-loop iterates zero times, the
-    `else` branch runs, validation fires on the (mock-corrupted) sqlite.
+    One extracted document is enough: the mine files it, the `else`
+    branch runs, validation fires on the (mock-corrupted) sqlite.
 
     The validator is monkeypatched to raise directly rather than corrupting
     the real sqlite file -- see test_full_chain_raises_through_mine_impl's
@@ -795,11 +810,12 @@ def test_mine_formats_full_chain_raises_when_fts5_corrupt(tmp_path, monkeypatch)
 
     src = tmp_path / "docs"
     src.mkdir()
+    _one_extracted_document(monkeypatch, src)
 
     called = []
     real_errors = ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
 
-    def _validator_spy(path):
+    def _validator_spy(path, **_kwargs):
         called.append(path)
         raise MineValidationError(path, real_errors)
 
@@ -820,13 +836,14 @@ def test_mine_formats_full_chain_raises_when_fts5_corrupt(tmp_path, monkeypatch)
     assert exc_info.value.palace_path == str(palace)
 
 
-def test_mine_formats_full_chain_auto_heals_isolated_fts5_corruption(tmp_path):
+def test_mine_formats_full_chain_auto_heals_isolated_fts5_corruption(tmp_path, monkeypatch):
     """End-to-end for the extract path: isolated FTS5-only corruption must
     be auto-healed by `_validate_palace_fts5_after_mine`, not raise.
     Mirrors `test_full_chain_auto_heals_isolated_fts5_corruption` for the
     project-miner path (#1926/#1928).
     """
     from mempalace import format_miner as format_mod
+    from mempalace.repair import sqlite_integrity_errors
 
     palace = tmp_path / "palace"
     _build_palace_with_drawer(palace)
@@ -834,6 +851,7 @@ def test_mine_formats_full_chain_auto_heals_isolated_fts5_corruption(tmp_path):
 
     src = tmp_path / "docs"
     src.mkdir()
+    _one_extracted_document(monkeypatch, src)
 
     # Must not raise: the corruption is healed before mine_formats returns.
     format_mod.mine_formats(
@@ -844,3 +862,142 @@ def test_mine_formats_full_chain_auto_heals_isolated_fts5_corruption(tmp_path):
         limit=0,
         dry_run=False,
     )
+    assert sqlite_integrity_errors(str(palace)) == []
+
+
+# ── 8. A mine that wrote nothing skips the check (#2684) ───────────
+
+
+def _record_quick_checks(monkeypatch) -> list:
+    from mempalace import repair as repair_mod
+
+    calls: list = []
+
+    def _clean(palace_path):
+        calls.append(palace_path)
+        return []
+
+    monkeypatch.setattr(repair_mod, "sqlite_integrity_errors", _clean)
+    return calls
+
+
+def test_validator_skips_only_when_nothing_was_written_since(tmp_path, monkeypatch):
+    from mempalace.backends.chroma import ChromaBackend
+    from mempalace.palace import palace_write_serial
+
+    palace = tmp_path / "palace"
+    _build_palace_with_drawer(palace)
+    checks = _record_quick_checks(monkeypatch)
+
+    before = palace_write_serial()
+    _validate_palace_fts5_after_mine(str(palace), writes_since=before)
+    assert checks == []
+
+    _validate_palace_fts5_after_mine(str(palace))
+    assert checks == [str(palace)], "writes_since=None must always check"
+
+    backend = ChromaBackend()
+    try:
+        col = backend.get_collection(str(palace), "mempalace_drawers")
+        col.upsert(ids=["d2"], documents=["another phrase"], metadatas=[{"wing": "w"}])
+    finally:
+        backend.close()
+    _validate_palace_fts5_after_mine(str(palace), writes_since=before)
+    assert checks == [str(palace), str(palace)]
+
+
+def test_project_mine_checks_only_when_it_wrote(tmp_path, monkeypatch):
+    """A re-mine of unchanged files writes nothing and must not pay for a
+    full quick_check; one that re-files an edited file still runs it."""
+    palace = tmp_path / "palace"
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "big.md").write_text("lorem ipsum " * 200)
+    checks = _record_quick_checks(monkeypatch)
+
+    def _mine():
+        miner.mine(project_dir=str(src), palace_path=str(palace), wing_override="w")
+
+    _mine()
+    assert checks == [str(palace)]
+
+    checks.clear()
+    _mine()
+    assert checks == [], "a mine that filed nothing ran the full quick_check"
+
+    (src / "big.md").write_text("lorem ipsum dolor " * 200)
+    _mine()
+    assert checks == [str(palace)]
+
+
+def test_convo_mine_checks_only_when_it_wrote(tmp_path, monkeypatch):
+    palace = tmp_path / "palace"
+    convos = tmp_path / "convos"
+    convos.mkdir()
+    (convos / "chat.txt").write_text(
+        "> What is memory?\nMemory is persistence.\n\n"
+        "> Why does it matter?\nIt enables continuity.\n\n"
+        "> How do we build it?\nWith structured storage.\n"
+    )
+    checks = _record_quick_checks(monkeypatch)
+
+    convo_miner.mine_convos(str(convos), str(palace), wing="w")
+    assert checks == [str(palace)]
+
+    checks.clear()
+    convo_miner.mine_convos(str(convos), str(palace), wing="w")
+    assert checks == [], "a mine that filed nothing ran the full quick_check"
+
+
+def test_format_mine_checks_only_when_it_wrote(tmp_path, monkeypatch):
+    from mempalace import format_miner as format_mod
+
+    palace = tmp_path / "palace"
+    _build_palace_with_drawer(palace)
+    src = tmp_path / "docs"
+    src.mkdir()
+    checks = _record_quick_checks(monkeypatch)
+
+    def _mine():
+        format_mod.mine_formats(format_dir=str(src), palace_path=str(palace), wing="w")
+
+    _mine()
+    assert checks == [], "a mine with nothing to file ran the full quick_check"
+
+    _one_extracted_document(monkeypatch, src)
+    _mine()
+    assert checks == [str(palace)]
+
+
+def test_write_serial_counts_every_chroma_write_even_a_failed_one(tmp_path, monkeypatch):
+    from mempalace.backends.chroma import ChromaBackend
+    from mempalace.palace import palace_write_serial
+
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    backend = ChromaBackend()
+    try:
+        col = backend.create_collection(str(palace), "mempalace_drawers")
+        before = palace_write_serial()
+        col.upsert(ids=["d1"], documents=["hello"], metadatas=[{"wing": "w"}])
+        col.update(ids=["d1"], metadatas=[{"wing": "w", "room": "r"}])
+        col.delete(ids=["d1"])
+        assert palace_write_serial() == before + 3
+
+        # Reads do not count.
+        col.get(include=["metadatas"])
+        assert palace_write_serial() == before + 3
+
+        # A write that fails partway may still have touched the database.
+        class Boom(RuntimeError):
+            pass
+
+        def _fail(**_kwargs):
+            raise Boom
+
+        monkeypatch.setattr(col._collection, "upsert", _fail)
+        with pytest.raises(Boom):
+            col.upsert(ids=["d2"], documents=["x"], metadatas=[{"wing": "w"}])
+        assert palace_write_serial() == before + 4
+    finally:
+        backend.close()

@@ -319,6 +319,93 @@ def test_load_config_no_yaml_normalizes_hyphenated_wing():
         shutil.rmtree(parent)
 
 
+# --- project config filename resolution (#2676) -----------------------------
+
+
+@pytest.mark.parametrize("name", ["mempalace.yml", "mempal.yml"])
+def test_load_config_reads_yml_spelling(tmp_path, name):
+    """A project whose only config is ``*.yml`` is read, not ignored (#2676)."""
+    write_file(tmp_path / name, "wing: from_yml\nrooms:\n  - name: backend\n")
+    config = load_config(str(tmp_path))
+    assert config["wing"] == "from_yml"
+    assert config["rooms"] == [{"name": "backend"}]
+
+
+@pytest.mark.parametrize(
+    "present, winner",
+    [
+        (["mempalace.yaml", "mempalace.yml"], "mempalace.yaml"),
+        (["mempalace.yml", "mempal.yaml"], "mempalace.yml"),
+        (["mempal.yaml", "mempal.yml"], "mempal.yaml"),
+        (["mempalace.yaml", "mempalace.yml", "mempal.yaml", "mempal.yml"], "mempalace.yaml"),
+    ],
+)
+def test_load_config_resolution_order_and_shadow_warning(tmp_path, capsys, present, winner):
+    """Order is mempalace.yaml, mempalace.yml, mempal.yaml, mempal.yml; the
+    shadowed files are named on stderr instead of being silently skipped."""
+    from mempalace.miner import PROJECT_CONFIG_FILENAMES, find_project_config
+
+    for name in present:
+        write_file(tmp_path / name, f"wing: {name.replace('.', '_')}\nrooms: []\n")
+    assert PROJECT_CONFIG_FILENAMES == (
+        "mempalace.yaml",
+        "mempalace.yml",
+        "mempal.yaml",
+        "mempal.yml",
+    )
+    assert find_project_config(tmp_path) == tmp_path.resolve() / winner
+    capsys.readouterr()
+
+    config = load_config(str(tmp_path))
+
+    assert config["wing"] == winner.replace(".", "_")
+    err = capsys.readouterr().err
+    assert f"using {winner}" in err
+    for name in present:
+        if name != winner:
+            assert name in err
+
+
+def test_load_config_single_config_is_quiet(tmp_path, capsys):
+    write_file(tmp_path / "mempalace.yml", "wing: solo\nrooms: []\n")
+    assert load_config(str(tmp_path))["wing"] == "solo"
+    assert capsys.readouterr().err == ""
+
+
+def test_project_config_filenames_are_never_mined_as_content():
+    from mempalace.miner import PROJECT_CONFIG_FILENAMES, SKIP_FILENAMES
+
+    assert set(PROJECT_CONFIG_FILENAMES) <= SKIP_FILENAMES
+
+
+def test_mine_honors_mempalace_yml_wing_and_excludes(monkeypatch, tmp_path):
+    """End to end through mine(): wing, rooms and exclude_patterns come from
+    mempalace.yml. Before #2676 the file was ignored, the wing fell back to
+    the directory name and the excluded file was mined."""
+    import mempalace.miner as miner_mod
+
+    project_root = (tmp_path / "proj").resolve()
+    write_file(project_root / "src" / "app.py", "print('app')\n" * 20)
+    write_file(project_root / "secret" / "keys.md", "# do not mine\n" * 20)
+    write_file(
+        project_root / "mempalace.yml",
+        "wing: yml_wing\nrooms:\n  - name: general\n    description: General\n"
+        "exclude_patterns:\n  - secret/\n",
+    )
+
+    seen = []
+    real_process_file = miner_mod.process_file
+
+    def capture(filepath, **kwargs):
+        seen.append((filepath.relative_to(project_root).as_posix(), kwargs["wing"]))
+        return real_process_file(filepath, **kwargs)
+
+    monkeypatch.setattr(miner_mod, "process_file", capture)
+    mine(str(project_root), str(tmp_path / "palace"), dry_run=True)
+
+    assert seen == [("src/app.py", "yml_wing")]
+
+
 def test_scan_project_skips_mempalace_generated_files():
     with tempfile.TemporaryDirectory() as tmpdir:
         project_root = Path(tmpdir).resolve()
@@ -1485,6 +1572,8 @@ def test_process_file_aborts_when_stale_drawer_purge_fails(tmp_path, monkeypatch
         "purge raised — old and new rows can now coexist as duplicates/orphans"
     )
     assert drawers == 0
+    # Tagged so the mine counts an error, not an "already filed" skip.
+    assert skip_reason == "purge_failed"
 
 
 def test_process_file_purges_closets_even_when_all_chunks_filtered_out(tmp_path, monkeypatch):
@@ -3311,8 +3400,12 @@ def test_prefetch_discards_a_failed_fast_scan_and_pages_instead(tmp_path, monkey
         rows = real(self, keys, require_key=require_key)
 
         def gen():
-            yield next(rows)
-            raise sqlite3.OperationalError("injected mid-scan failure")
+            try:
+                yield next(rows)
+                raise sqlite3.OperationalError("injected mid-scan failure")
+            finally:
+                # Release the SQLite reader before Chroma's fallback needs to write.
+                rows.close()
 
         return gen()
 
@@ -3344,3 +3437,168 @@ def test_prefetch_raises_when_no_complete_scan_is_possible(tmp_path, monkeypatch
         prefetch_mined_set(col, extract_mode="exchange")
     with pytest.raises(MinedSetUnavailable):
         prefetch_content_hashes(col, extract_mode="exchange")
+
+
+def _prefetch_cases_palace(tmp_path):
+    """One file per case, with the drawers each case stores for it."""
+    from mempalace.palace import get_collection
+
+    col = get_collection(str(tmp_path / "palace"), create=True)
+    paths = {}
+    for name in (
+        "complete",
+        "legacy",
+        "sentinel",
+        "two_groups",
+        "drift",
+        "changed",
+        "partial",
+        "stale_version",
+        "no_mtime",
+        "old_sentinel",
+        "mixed_totals",
+        "text_total",
+        "missing",
+    ):
+        path = tmp_path / "src" / f"{name}.md"
+        write_file(path, f"{name} content")
+        paths[name] = str(path)
+    mtime = {name: os.path.getmtime(path) for name, path in paths.items()}
+    current = {"normalize_version": NORMALIZE_VERSION}
+
+    def drawers(name, n, **meta):
+        return [{**current, "source_file": paths[name], **meta} for _ in range(n)]
+
+    rows = [
+        *drawers("complete", 2, source_mtime=mtime["complete"], chunk_total=2),
+        *drawers("legacy", 1, source_mtime=mtime["legacy"]),
+        # The convo miner's registry row: no chunk_total, trusted on its own.
+        *drawers(
+            "sentinel",
+            1,
+            source_mtime=mtime["sentinel"],
+            room="_registry",
+            ingest_mode="registry",
+            extract_mode="exchange",
+        ),
+        # An older complete pass next to the current one (additive mining).
+        *drawers("two_groups", 1, source_mtime=mtime["two_groups"] - 50, chunk_total=1),
+        *drawers("two_groups", 3, source_mtime=mtime["two_groups"], chunk_total=3),
+        *drawers("drift", 1, source_mtime=mtime["drift"] + 0.0005, chunk_total=1),
+        *drawers("changed", 1, source_mtime=mtime["changed"] - 10, chunk_total=1),
+        # A crash between upsert batches: 2 of 3 chunks.
+        *drawers("partial", 2, source_mtime=mtime["partial"], chunk_total=3),
+        {
+            "normalize_version": NORMALIZE_VERSION - 1,
+            "source_file": paths["stale_version"],
+            "source_mtime": mtime["stale_version"],
+            "chunk_total": 1,
+        },
+        *drawers("no_mtime", 1, chunk_total=1),
+        *drawers(
+            "old_sentinel",
+            1,
+            source_mtime=mtime["old_sentinel"] - 10,
+            room="_registry",
+            ingest_mode="registry",
+        ),
+        # Two drawers naming different totals: file_already_mined's answer
+        # depends on the order Chroma returns them in.
+        *drawers("mixed_totals", 1, source_mtime=mtime["mixed_totals"], chunk_total=2),
+        *drawers("mixed_totals", 1, source_mtime=mtime["mixed_totals"], chunk_total=3),
+        # A string total makes file_already_mined's comparison raise -> False.
+        *drawers("text_total", 1, source_mtime=mtime["text_total"], chunk_total="1"),
+    ]
+    col.add(
+        ids=[f"d{i}" for i in range(len(rows))],
+        documents=[f"doc {i}" for i in range(len(rows))],
+        embeddings=[[0.1 * (i % 7), 0.2] for i in range(len(rows))],
+        metadatas=rows,
+    )
+    return col, paths
+
+
+def test_prefetch_complete_mtimes_never_skips_a_file_the_per_file_check_would_mine(tmp_path):
+    from mempalace.miner import _prefetched_as_mined
+    from mempalace.palace import prefetch_complete_mtimes
+
+    col, paths = _prefetch_cases_palace(tmp_path)
+    mined_mtimes = prefetch_complete_mtimes(col, list(paths.values()))
+
+    fast = {name for name, path in paths.items() if _prefetched_as_mined(path, mined_mtimes)}
+    per_file = {
+        name for name, path in paths.items() if file_already_mined(col, path, check_mtime=True)
+    }
+    assert fast <= per_file
+    assert fast == {"complete", "legacy", "sentinel", "two_groups", "drift"}
+    assert per_file - {"mixed_totals"} == fast
+
+    # Sources outside this mine's file list are not tracked.
+    assert set(prefetch_complete_mtimes(col, [paths["complete"]])) == {paths["complete"]}
+
+    # A file edited since it was filed is no longer proven mined.
+    os.utime(paths["complete"], (0, os.path.getmtime(paths["complete"]) + 5))
+    assert not _prefetched_as_mined(paths["complete"], mined_mtimes)
+    assert file_already_mined(col, paths["complete"], check_mtime=True) is False
+
+
+def test_prefetch_complete_mtimes_gives_up_without_a_complete_sqlite_scan(tmp_path, monkeypatch):
+    import sqlite3
+
+    import mempalace.palace as palace_pkg
+    from mempalace.backends.chroma import ChromaCollection
+    from mempalace.palace import prefetch_complete_mtimes
+
+    col, paths = _prefetch_cases_palace(tmp_path)
+
+    def breaks_after_one_row(self, keys=None, *, require_key=None):
+        def gen():
+            yield {"source_file": paths["complete"], "normalize_version": NORMALIZE_VERSION}
+            raise sqlite3.OperationalError("injected failure")
+
+        return gen()
+
+    monkeypatch.setattr(ChromaCollection, "iter_metadata", breaks_after_one_row)
+    assert prefetch_complete_mtimes(col, list(paths.values())) is None
+
+    # A backend without the sqlite stream keeps the per-file check.
+    monkeypatch.setattr(palace_pkg, "_fast_collection_metadata", lambda *_a, **_k: None)
+    assert prefetch_complete_mtimes(col, list(paths.values())) is None
+
+
+def test_mine_skips_prefetched_files_without_a_per_file_query(tmp_path, monkeypatch):
+    import mempalace.miner as miner_mod
+    import mempalace.palace as palace_pkg
+
+    project_root = tmp_path / "proj"
+    _make_minable_project(project_root, n_files=3)
+    palace_path = str(tmp_path / "palace")
+    mine(str(project_root), palace_path)
+
+    asked = []
+    real_check = miner_mod.file_already_mined
+
+    def recording_check(collection, source_file, **kwargs):
+        asked.append(Path(source_file).name)
+        return real_check(collection, source_file, **kwargs)
+
+    monkeypatch.setattr(miner_mod, "file_already_mined", recording_check)
+
+    # Nothing changed: every file is skipped from the prefetched map.
+    mine(str(project_root), palace_path)
+    assert asked == []
+
+    # An edited file falls through to the per-file check and is re-mined;
+    # the unchanged ones are still skipped without a query.
+    edited = project_root / "f1.py"
+    os.utime(edited, (0, os.path.getmtime(edited) + 5))
+    mine(str(project_root), palace_path)
+    assert asked == ["f1.py", "f1.py"]  # the pre-lock check and the in-lock re-check
+    assert real_check(palace_pkg.get_collection(palace_path), str(edited), check_mtime=True)
+
+    # Without the sqlite stream every file takes the per-file check, and
+    # is still skipped.
+    asked.clear()
+    monkeypatch.setattr(palace_pkg, "_fast_collection_metadata", lambda *_a, **_k: None)
+    mine(str(project_root), palace_path)
+    assert sorted(asked) == ["f0.py", "f1.py", "f2.py"]

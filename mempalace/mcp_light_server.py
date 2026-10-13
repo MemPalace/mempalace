@@ -2,7 +2,7 @@
 """
 MemPalace Lightweight MCP Server
 ================================
-Consolidates 45 MemPalace tools into a high-performance 3-tool interface
+Consolidates 47 MemPalace tools into a high-performance 3-tool interface
 (`palace_query`, `palace_exec`, `palace_coordinate`) powered by Palace Query
 Language (PQL) and Command DSL, while retaining 100% of underlying features,
 guarantees, and safety checks.
@@ -602,7 +602,11 @@ LIGHT_TOOLS = {
                 "project": {"type": "string", "description": "Project routing name (optional)"},
                 "stream": {"type": "string", "description": "Logical stream (optional)"},
                 "room": {"type": "string", "description": "Sub-channel (optional)"},
-                "from_agent": {"type": "string", "description": "Writer agent identity (optional)"},
+                "from_agent": {
+                    "type": "string",
+                    "description": "Your identity (never filters; use writer)",
+                },
+                "writer": {"type": "string", "description": "List/wait: filter by event writer"},
                 "to_agent": {"type": "string", "description": "Target agent identity (optional)"},
                 "goal": {"type": "string", "description": "Task goal (optional)"},
                 "branch": {"type": "string", "description": "Git branch (optional)"},

@@ -65,10 +65,17 @@ sessions each).
 
 We do not publish a "100% R@10" headline for LoCoMo. A reported 100% in
 earlier drafts used `top_k=50`, which exceeds the per-conversation
-session count (19–32) — so the retrieval stage returns every session in
-every conversation by construction. That number measures an LLM's
-reading comprehension over the whole conversation, not retrieval. The
-honest retrieval-recall number for LoCoMo is the top-10 figure.
+session count (19–32) — so the unfiltered hybrid retrieval stage returns
+every session in every conversation by construction. That number measures
+evidence coverage of the whole conversation and does not assess an LLM's
+reading comprehension. The useful retrieval-recall comparison for
+LoCoMo is the top-10 figure.
+
+LoCoMo's `--llm-rerank` only reorders the already-selected results.
+Avg Recall checks which evidence IDs are present and ignores order,
+so reranking cannot change it. Omit the flag for recall-only comparisons
+to avoid extra LLM calls, latency, and any configured provider charges.
+Keep the mode, granularity, and top-k the same when comparing runs.
 
 ## Other Benchmarks
 
