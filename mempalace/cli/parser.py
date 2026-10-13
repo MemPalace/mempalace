@@ -3,6 +3,14 @@ if __name__ != "mempalace.cli":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.cli")
 
 
+# ``hook run --harness`` choices. Repeated here rather than imported from
+# ``hooks_cli.SUPPORTED_HARNESSES``: the parser is built on every CLI call and
+# hooks_cli is a deliberate lazy import (see ``cmd_hook``), so importing it
+# here would put the hook module on every unrelated command's startup path.
+# ``test_cli_harness_choices_match_supported_harnesses`` guards the pair.
+HOOK_HARNESS_CHOICES = ["claude-code", "codex", "dsh", "hermes"]
+
+
 def _reconfigure_stdio_utf8_on_windows():
     """Decode stdio as UTF-8 on Windows for the primary `mempalace` CLI.
 
@@ -397,7 +405,7 @@ def main():
     p_hook_run.add_argument(
         "--harness",
         required=True,
-        choices=["claude-code", "codex", "dsh"],
+        choices=HOOK_HARNESS_CHOICES,
         help="Harness type (determines stdin JSON format)",
     )
 
