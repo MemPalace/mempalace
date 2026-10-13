@@ -161,6 +161,96 @@ def test_token_file_is_passed_by_path(isolated_home, capture_exec, monkeypatch):
     assert not cli._server_token_path(str(isolated_home / "palace")).exists()
 
 
+def _connect_header(out):
+    """The quoted --header argument of the printed `claude mcp add` hint."""
+    import re
+
+    match = re.search(r'--header ("Authorization: Bearer .*")$', out, re.MULTILINE)
+    assert match, out
+    return match.group(1)
+
+
+def _shell_expand(header, cwd):
+    """What a POSIX shell passes for the header when the hint is pasted."""
+    import subprocess
+
+    # Popen, not run: the capture_exec fixture replaces subprocess.run. The
+    # assignment's status is the command substitution's, so a failing reader
+    # fails here rather than hiding behind printf's status.
+    proc = subprocess.Popen(
+        ["sh", "-c", f'h={header} && printf %s "$h"'],
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    out, err = proc.communicate()
+    assert proc.returncode == 0, err
+    assert err == ""
+    return out
+
+
+@pytest.mark.parametrize(
+    "rel_path, content",
+    [
+        ("token", "file-secret-token\n"),
+        ("token", "  file-secret-token \r\n"),  # padded, CRLF: the server trims both ends
+        ("-token", "file-secret-token\n"),  # must not reach the reader as an option
+        ("it's a $dir/token", "file-secret-token\n"),
+    ],
+)
+def test_token_file_connect_hint_reads_the_file(
+    isolated_home, capture_exec, monkeypatch, capsys, rel_path, content
+):
+    # MEMPALACE_MCP_HTTP_TOKEN is unset when the token comes from a file, so a
+    # hint naming it would send an empty bearer token.
+    import shlex
+
+    token_file = isolated_home / rel_path
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    token_file.write_bytes(content.encode("utf-8"))
+    monkeypatch.chdir(isolated_home)
+    monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN_FILE", rel_path)
+    with pytest.raises(_ExecCalled):
+        cli.cmd_serve(_serve_args(isolated_home, host="0.0.0.0"))
+    header = _connect_header(capsys.readouterr().out)
+    assert f"< {shlex.quote(rel_path)})" in header
+    assert "$MEMPALACE_MCP_HTTP_TOKEN" not in header
+    assert "file-secret-token" not in header
+    if os.name == "posix":
+        expanded = _shell_expand(header, isolated_home)
+        assert expanded == "Authorization: Bearer file-secret-token"
+
+
+def test_reused_generated_token_connect_hint_reads_the_token_file(
+    isolated_home, capture_exec, capsys
+):
+    # A token generated on an earlier start is reused, not printed again; the
+    # hint points at its file rather than at an unset variable.
+    palace = str(isolated_home / "palace")
+    token, created = cli._load_or_create_server_token(palace)
+    assert created is True
+    with pytest.raises(_ExecCalled):
+        cli.cmd_serve(_serve_args(isolated_home, host="0.0.0.0"))
+    out = capsys.readouterr().out
+    header = _connect_header(out)
+    assert token not in out
+    assert "$MEMPALACE_MCP_HTTP_TOKEN" not in header
+    if os.name == "posix":
+        assert _shell_expand(header, isolated_home) == f"Authorization: Bearer {token}"
+
+
+def test_env_token_connect_hint_names_the_variable(
+    isolated_home, capture_exec, monkeypatch, capsys
+):
+    monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "env-secret-token")
+    with pytest.raises(_ExecCalled):
+        cli.cmd_serve(_serve_args(isolated_home, host="0.0.0.0"))
+    out = capsys.readouterr().out
+    assert '"Authorization: Bearer $MEMPALACE_MCP_HTTP_TOKEN"' in out
+    assert "env-secret-token" not in out
+
+
 def test_env_token_is_passed_as_value(isolated_home, capture_exec, monkeypatch):
     monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "env-secret-token")
     monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN_FILE", "")

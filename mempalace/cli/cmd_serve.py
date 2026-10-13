@@ -213,9 +213,22 @@ def cmd_serve(args):
         print(f"    {token}")
     print("\nConnect a client:")
     if token:
+        if token_created:
+            bearer = token
+        elif token_file:
+            # Configured from a file: MEMPALACE_MCP_HTTP_TOKEN is unset in this
+            # mode, so point the client at the file the server reads. Trim the
+            # surrounding whitespace the server also strips (a CRLF or padded
+            # file), and read through a redirect so a path starting with "-" is
+            # not taken as an option.
+            bearer = (
+                f"$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' < {shlex.quote(token_file)})"
+            )
+        else:
+            bearer = "$MEMPALACE_MCP_HTTP_TOKEN"
         print(
             f"  claude mcp add --transport http mempalace {url} "
-            f'--header "Authorization: Bearer {token if token_created else "$MEMPALACE_MCP_HTTP_TOKEN"}"'
+            f'--header "Authorization: Bearer {bearer}"'
         )
     else:
         print(f"  claude mcp add --transport http mempalace {url}")
