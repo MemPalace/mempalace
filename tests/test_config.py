@@ -674,6 +674,14 @@ def test_kg_lookup_strips_lone_surrogates():
     assert sanitize_kg_lookup("Alice\udc95") == "Alice\ufffd"
 
 
+def test_kg_value_over_length_error_guides_splitting():
+    # Over-length KG values are almost always multi-item content packed
+    # into one object; the error must tell the caller how to fix it
+    # (split into separate facts, or file a drawer and store a pointer).
+    with pytest.raises(ValueError, match="split multi-item content"):
+        sanitize_kg_value("a" * 129)
+
+
 # --- sanitize_iso_temporal (date-only inputs) ---
 
 
