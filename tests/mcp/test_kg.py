@@ -204,6 +204,40 @@ class TestKGTools:
         assert "valid_from" in result["error"]
         assert "ISO-8601" in result["error"]
 
+    # --- Schema descriptions must teach the object-length constraint ---
+
+    def test_kg_schemas_document_object_length_limit(self):
+        # LLM callers see only the tool schema; the object descriptions
+        # must warn up front that objects are entity names (max 128
+        # chars) and that multi-item content belongs in per-item facts
+        # or a drawer pointer, not one packed object.
+        from mempalace.mcp_server.schemas import TOOLS
+
+        add_object = TOOLS["mempalace_kg_add"]["input_schema"]["properties"][
+            "object"
+        ]["description"]
+        assert "max 128" in add_object
+        assert "split" in add_object
+
+        supersede_new = TOOLS["mempalace_kg_supersede"]["input_schema"][
+            "properties"
+        ]["new_object"]["description"]
+        assert "max 128" in supersede_new
+
+    def test_kg_add_over_length_error_guides_splitting(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_add
+
+        result = tool_kg_add(
+            subject="Alice",
+            predicate="next_batch",
+            object="item1 / item2 / item3 / " + "x" * 129,
+        )
+        assert result["success"] is False
+        assert "split multi-item content" in result["error"]
+
     def test_kg_query_rejects_invalid_as_of(self, monkeypatch, config, palace_path, seeded_kg):
         _patch_mcp_server(monkeypatch, config, seeded_kg)
         from mempalace.mcp_server import tool_kg_query
