@@ -1513,3 +1513,222 @@ class TestPreviousGenerationPreserved:
         assert file_already_mined(
             collection, str(source), check_mtime=True, extract_mode="exchange"
         )
+
+
+class TestAdditiveHistoryKeepsSkipAndSearchClean:
+    """#2408 re-review: keeping earlier generations must not cost the cheap
+    no-op skip, and must not file unchanged text twice when only the
+    transcript's inferred room changed."""
+
+    @staticmethod
+    def _write_jsonl(path, turns, mtime):
+        lines = []
+        for user, assistant in turns:
+            lines.append(json.dumps({"type": "user", "message": {"role": "user", "content": user}}))
+            lines.append(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": assistant}],
+                        },
+                    }
+                )
+            )
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.utime(path, (mtime, mtime))
+
+    @staticmethod
+    def _stored(palace_path, source):
+        client = chromadb.PersistentClient(path=palace_path)
+        try:
+            col = client.get_collection("mempalace_drawers")
+            got = col.get(where={"source_file": source}, include=["documents", "metadatas"])
+            return got["ids"], got["documents"], got["metadatas"]
+        finally:
+            client.close()
+
+    def test_noop_mine_after_full_rewrite_skips_without_parsing(self, monkeypatch, tmp_path):
+        """A full rewrite leaves the previous generation complete under its
+        old mtime. The bulk skip must still recognise the current complete
+        generation, so a no-op mine never re-reads the transcript."""
+        import mempalace.convo_miner as convo_miner
+
+        convo_dir = tmp_path / "convos"
+        convo_dir.mkdir()
+        palace_path = str(tmp_path / "palace")
+        source = convo_dir / "session.jsonl"
+        generations = {}
+        for mtime, prefix in ((1_000_000.0, "ORIGINAL"), (2_000_000.0, "REPLACEMENT")):
+            turns = [
+                (f"{prefix} question {i} " + prefix * 10, f"{prefix} answer {i} " + prefix * 15)
+                for i in range(3)
+            ]
+            generations[prefix] = turns
+            self._write_jsonl(source, turns, mtime)
+            mine_convos(str(convo_dir), palace_path, wing="w")
+
+        resolved = str(source.resolve())
+        _, docs, metas = self._stored(palace_path, resolved)
+        # Both generations are kept, and both are complete groups.
+        for prefix, turns in generations.items():
+            for question, _ in turns:
+                assert any(question in d for d in docs), f"{prefix} text was dropped"
+        assert {m["source_mtime"] for m in metas} == {1_000_000.0, 2_000_000.0}
+
+        client = chromadb.PersistentClient(path=palace_path)
+        try:
+            col = client.get_collection("mempalace_drawers")
+            scoped = prefetch_mined_set(col, extract_mode="exchange", source_files=[resolved])
+            full = prefetch_mined_set(col, extract_mode="exchange")
+        finally:
+            client.close()
+        assert scoped[resolved] == pytest.approx(2_000_000.0, abs=0.001)
+        assert full[resolved] == pytest.approx(2_000_000.0, abs=0.001)
+
+        calls = []
+        real_normalize = convo_miner._normalize_convo_conversations
+
+        def counting_normalize(*args, **kwargs):
+            calls.append(args[0])
+            return real_normalize(*args, **kwargs)
+
+        monkeypatch.setattr(convo_miner, "_normalize_convo_conversations", counting_normalize)
+        for _ in range(3):
+            mine_convos(str(convo_dir), palace_path, wing="w")
+        assert calls == [], "an unchanged transcript was parsed again on a no-op mine"
+
+    @pytest.mark.parametrize("disk_mtime", [1_000_000.0, 2_000_000.0])
+    @pytest.mark.parametrize("newest_first", [False, True])
+    def test_prefetch_choice_does_not_depend_on_row_order(self, tmp_path, disk_mtime, newest_first):
+        """With two complete groups, the prefetch reports the one matching
+        the file on disk (what ``file_already_mined`` would accept), whatever
+        order the backend returns the rows in."""
+        source = tmp_path / "session.jsonl"
+        source.write_text("x\n", encoding="utf-8")
+        os.utime(source, (disk_mtime, disk_mtime))
+
+        def meta(mtime, index):
+            return {
+                "source_file": str(source),
+                "chunk_index": index,
+                "extract_mode": "exchange",
+                "normalize_version": NORMALIZE_VERSION,
+                "convo_chunker_version": CONVO_CHUNKER_VERSION,
+                "source_mtime": mtime,
+                "chunk_total": 2,
+            }
+
+        old = [meta(1_000_000.0, 0), meta(1_000_000.0, 1)]
+        new = [meta(2_000_000.0, 0), meta(2_000_000.0, 1)]
+        rows = new + old if newest_first else old + new
+
+        class Rows:
+            def get(self, **kwargs):
+                offset = kwargs.get("offset", 0)
+                page = rows[offset : offset + kwargs.get("limit", len(rows))]
+                return {"ids": [f"d{offset + i}" for i in range(len(page))], "metadatas": page}
+
+        mined = prefetch_mined_set(Rows(), extract_mode="exchange", source_files=[str(source)])
+        assert mined[str(source)] == pytest.approx(disk_mtime, abs=0.001)
+
+    def test_room_change_reuses_unchanged_text(self, tmp_path, collection):
+        """The inferred room is a property of the whole transcript; when it
+        flips, text already filed at the same position is reclassified in
+        place, not filed a second time. Different earlier text is kept."""
+        from mempalace.ids import make_convo_drawer_id
+
+        source = tmp_path / "chat.txt"
+        a, b = "plan " + "a " * 30, "bug " + "b " * 30
+        a2 = "rewritten " + "a " * 30
+
+        source.write_text("v1\n", encoding="utf-8")
+        os.utime(source, (1_000_000.0, 1_000_000.0))
+        chunks = [{"content": a, "chunk_index": 0}]
+        added, _, _ = _file_chunks_locked(
+            collection, str(source), chunks, "wing", "planning", "agent", "exchange"
+        )
+        assert added == 1
+
+        source.write_text("v2\n", encoding="utf-8")
+        os.utime(source, (2_000_000.0, 2_000_000.0))
+        chunks = [{"content": a, "chunk_index": 0}, {"content": b, "chunk_index": 1}]
+        added, _, _ = _file_chunks_locked(
+            collection, str(source), chunks, "wing", "technical", "agent", "exchange"
+        )
+        assert added == 1, "unchanged text was filed again because the room changed"
+        got = collection.get(where={"source_file": str(source)}, include=["documents", "metadatas"])
+        assert sorted(got["documents"]) == sorted([a, b])
+        rooms = {doc: m["room"] for doc, m in zip(got["documents"], got["metadatas"])}
+        assert rooms == {a: "technical", b: "technical"}
+        kept = collection.get(
+            ids=[make_convo_drawer_id("wing", "planning", str(source), "exchange", 0)],
+            include=["documents"],
+        )
+        assert kept["documents"] == [a], "the reused drawer lost its text"
+        assert file_already_mined(
+            collection, str(source), check_mtime=True, extract_mode="exchange"
+        )
+
+        # A later version with different text at that position, under yet
+        # another room, is added beside it: the earlier text survives.
+        source.write_text("v3\n", encoding="utf-8")
+        os.utime(source, (3_000_000.0, 3_000_000.0))
+        chunks = [{"content": a2, "chunk_index": 0}, {"content": b, "chunk_index": 1}]
+        added, _, _ = _file_chunks_locked(
+            collection, str(source), chunks, "wing", "planning", "agent", "exchange"
+        )
+        assert added == 1
+        docs = collection.get(where={"source_file": str(source)}, include=["documents"])[
+            "documents"
+        ]
+        assert sorted(docs) == sorted([a, a2, b])
+        assert file_already_mined(
+            collection, str(source), check_mtime=True, extract_mode="exchange"
+        )
+
+    def test_growing_session_room_flip_is_searchable_once(self, tmp_path):
+        """A growing Claude Code session whose inferred room flips from
+        planning to technical: the unchanged first exchange is stored once,
+        and a search returns it once."""
+        from collections import Counter
+
+        from mempalace.searcher import search_memories
+
+        convo_dir = tmp_path / "convos"
+        convo_dir.mkdir()
+        palace_path = str(tmp_path / "palace")
+        source = convo_dir / "s.jsonl"
+        turns = [
+            (
+                "Let us plan the roadmap for next quarter",
+                "Sure, here is a plan and roadmap with milestones for the quarter ahead, step by step.",
+            ),
+            (
+                "Now the bug: python function raises an error in the api",
+                "The bug is in the database code; debug the server function, add a test, then deploy via git.",
+            ),
+            (
+                "And refactor the code?",
+                "Yes, refactor the python code and rerun the test suite before you deploy.",
+            ),
+        ]
+        rooms_seen = []
+        mtime = 1_700_000_000.0
+        for n in range(1, len(turns) + 1):
+            mtime += 10
+            self._write_jsonl(source, turns[:n], mtime)
+            mine_convos(str(convo_dir), palace_path, wing="w", agent="test")
+            _, docs, metas = self._stored(palace_path, str(source.resolve()))
+            rooms_seen.append({m["room"] for m in metas})
+            dupes = {d: c for d, c in Counter(docs).items() if c > 1}
+            assert not dupes, f"turn {n}: identical text stored more than once: {dupes}"
+            assert len(docs) == n
+        # The scenario really exercises a room flip.
+        assert rooms_seen[0] == {"planning"} and rooms_seen[-1] == {"technical"}
+
+        result = search_memories("plan roadmap next quarter", palace_path, wing="w", n_results=4)
+        texts = [hit["text"] for hit in result["results"]]
+        planning = [t for t in texts if "plan the roadmap for next quarter" in t]
+        assert len(planning) == 1, f"one unchanged exchange took {len(planning)} search slots"

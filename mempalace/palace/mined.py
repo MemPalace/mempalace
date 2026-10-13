@@ -327,16 +327,44 @@ def prefetch_mined_set(
 
     mined: dict[str, Optional[float]] = {}
     for src, by_mtime in groups.items():
-        for mtime_key, entry in by_mtime.items():
-            chunk_total = entry["chunk_total"]
-            if chunk_total is None:
-                # Legacy / registry: no completion marker — trust membership.
-                mined[src] = mtime_key
-                break
-            if entry["count"] >= chunk_total:
-                mined[src] = mtime_key
-                break
+        complete = [
+            mtime_key
+            for mtime_key, entry in by_mtime.items()
+            # No completion marker (legacy / registry rows): trust membership.
+            if entry["chunk_total"] is None or entry["count"] >= entry["chunk_total"]
+        ]
+        if complete:
+            mined[src] = _current_complete_mtime(src, complete)
     return mined
+
+
+def _current_complete_mtime(source_file: str, complete: list) -> Optional[float]:
+    """Pick the stored mtime to report for a source with complete groups.
+
+    The convo miner keeps earlier generations (#1593), so after a rewrite a
+    source can hold several complete groups, each under the mtime it was
+    mined at. Reporting whichever group the backend happened to return
+    first would make the caller's mtime comparison fail against an old
+    group while the current one is complete, and every no-op mine would
+    re-parse the whole transcript. Mirror :func:`file_already_mined`
+    instead: if any complete group matches the file's mtime on disk, report
+    that one. Otherwise report the newest, so the result never depends on
+    row order. The file is only stat'ed when there is a choice to make.
+    """
+    if len(complete) == 1:
+        return complete[0]
+    known = [mtime for mtime in complete if mtime is not None]
+    if not known:
+        return None
+    try:
+        disk_mtime = os.path.getmtime(source_file)
+    except OSError:
+        disk_mtime = None
+    if disk_mtime is not None:
+        for mtime in known:
+            if abs(mtime - disk_mtime) < 0.001:
+                return mtime
+    return max(known)
 
 
 # The keys file_already_mined() reads when called without an extract_mode.

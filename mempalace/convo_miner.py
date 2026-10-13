@@ -53,7 +53,8 @@ from .palace import (
 
 logger = logging.getLogger("mempalace_mcp")
 
-# Third value of _file_chunks_locked when the stale-drawer purge raised: the
+# Third value of _file_chunks_locked when the existing-drawer snapshot raised
+# (the name predates additive re-mining, when that step was a purge): the
 # file was not mined. Truthy, so it still reads as "nothing filed".
 PURGE_FAILED = "purge_failed"
 
@@ -725,7 +726,8 @@ def _file_chunks_locked(
 
     - A chunk whose exact text is already filed at the same position keeps
       its drawer and embedding; it only gets a metadata refresh
-      (``source_mtime`` / ``chunk_total``) so the completion check in
+      (``source_mtime`` / ``chunk_total``, and ``room`` when the
+      transcript's inferred room changed) so the completion check in
       ``file_already_mined`` sees one full current-mtime group.
     - A chunk with new text gets a NEW drawer. The first text at a position
       takes the positional id; any later version takes a content-derived id
@@ -791,11 +793,19 @@ def _file_chunks_locked(
             source_mtime = None
         chunk_total = len(chunks)
 
-        # Index every stored version by (wing, room, position, text hash).
+        # Index every stored version by (wing, position, text hash).
         # The hash is taken from the stored text itself whenever the backend
         # returned it, so an in-place refresh below can only ever land on a
         # drawer whose verbatim text is identical; the ``chunk_hash`` stamp
         # is the fallback when no text came back.
+        #
+        # The room is deliberately not part of the key. ``detect_convo_room``
+        # classifies the whole transcript from its opening text, so a
+        # growing session can move from one room to another while its
+        # earlier exchanges stay byte-identical. Keying on the room would
+        # file each of them a second time under the new room, and search
+        # would then return the same passage twice. Identical text is
+        # reclassified in place instead (a metadata touch below).
         stored_versions: dict[tuple, list] = defaultdict(list)
         for drawer_id, prev in existing.items():
             prev_doc = existing_docs.get(drawer_id)
@@ -803,7 +813,7 @@ def _file_chunks_locked(
                 _chunk_hash(prev_doc) if isinstance(prev_doc, str) else prev.get("chunk_hash")
             )
             if prev_hash:
-                key = (prev.get("wing"), prev.get("room"), prev.get("chunk_index"), prev_hash)
+                key = (prev.get("wing"), prev.get("chunk_index"), prev_hash)
                 stored_versions[key].append(drawer_id)
 
         # Partition the target set: text already filed at this position keeps
@@ -816,11 +826,18 @@ def _file_chunks_locked(
             if extract_mode == "general":
                 room_counts_delta[chunk_room] += 1
             chunk_hash = _chunk_hash(chunk["content"])
-            matches = stored_versions.get((wing, chunk_room, chunk["chunk_index"], chunk_hash), [])
+            matches = stored_versions.get((wing, chunk["chunk_index"], chunk_hash), [])
+            # Prefer a copy already in this pass's room, so a stable room
+            # never changes which drawer is reused.
+            matches = sorted(matches, key=lambda i: existing[i].get("room") != chunk_room)
             current = [i for i in matches if _meta_is_current(existing[i], extract_mode)]
             if current:
                 drawer_id = current[0]
                 touched = dict(existing[drawer_id])
+                # Same text, possibly classified under an earlier room: move
+                # it with the rest of the current transcript. Only metadata
+                # changes; the stored text and embedding stay as they are.
+                touched["room"] = chunk_room
                 touched["chunk_total"] = chunk_total
                 touched["chunk_hash"] = chunk_hash
                 if source_mtime is not None:
@@ -1280,9 +1297,10 @@ def _mine_convos_impl(
         # a Claude Code session keeps appending to the same file while
         # active, and /compact or /clear can rewrite one in place -- so
         # "we've seen this source_file before" alone is not sufficient.
-        # Falling through re-mines: _file_chunks_locked purges this
-        # source_file's stale drawers before inserting fresh ones, so this
-        # never leaves duplicates behind.
+        # Falling through re-mines additively: _file_chunks_locked reuses
+        # drawers whose text is already filed at the same position, adds
+        # new text beside earlier versions, and deletes nothing (#1593), so
+        # earlier wording stays searchable as history.
         if _is_unchanged_since_last_mine(source_file, mined_mtimes):
             files_skipped += 1
             continue
@@ -1375,8 +1393,10 @@ def _mine_convos_impl(
         if extract_mode != "general":
             room_counts[room] += 1
 
-        # Lock + purge stale + file fresh chunks. Lock serializes concurrent
-        # agents; purge removes pre-v2 drawers so the schema bump applies.
+        # Lock + file chunks additively. The lock serializes concurrent
+        # agents; a drawer from an older schema holding the same text is
+        # refreshed in place, new text gets its own drawer, nothing is
+        # deleted.
         drawers_added, room_delta, skipped = _file_chunks_locked(
             collection,
             source_file,
