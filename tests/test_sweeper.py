@@ -628,7 +628,9 @@ class TestSweeperTaxonomy:
             import mempalace.backends.embedding_wrapper as embedding_wrapper
 
             monkeypatch.setattr(
-                embedding_wrapper, "_embed_texts", lambda texts: [[1.0, 0.0] for _ in texts]
+                embedding_wrapper,
+                "_embed_texts",
+                lambda texts, *, metadatas=None: [[1.0, 0.0] for _ in texts],
             )
         return request.param
 
