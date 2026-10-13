@@ -26,6 +26,28 @@ A palace can now be audited and repaired in guided steps: scored for organizatio
   property of the code and not of a default argument. Existing `wiki_cache`
   entries in `entities.json` are still read by `lookup()`; nothing new is written
   to that cache. (GHSA-mrj5)
+- **The first conversation mine after upgrading re-mines each conversation file
+  it covers, once.** The exchange chunker no longer discards text (#2591), so
+  conversation drawers filed before 3.11 count as stale and are re-chunked and
+  re-embedded from transcripts still on disk; transcripts no longer on disk keep
+  their drawers. It runs only when a conversation mine covers those files:
+  `mempalace mine --mode convos`, the `mempalace_mine` tool, or the legacy shell
+  hooks under `hooks/`, which mine the whole project transcript folder (the
+  PreCompact one synchronously). The plugin hooks mine only the active
+  transcript. Expect roughly 40 minutes to 3 hours per million drawers,
+  depending on hardware. While it runs, a hub serves other requests only
+  between files, and without a hub the mine and session MCP writes exclude each
+  other. On Chroma the vector index keeps the replaced entries. On a large
+  palace, back up first and run it in batches at a quiet time, for example
+  `mempalace mine <dir> --mode convos --limit 200`; an interrupted run resumes
+  where it stopped.
+- **A palace now refuses to open with a different embedding model than the one
+  that built it.** Search, mining and MCP writes stop with a message that names
+  the fix: set `embedding_model` (config.json or `MEMPALACE_EMBEDDING_MODEL`)
+  back to the model the palace was built with, or re-embed with
+  `mempalace repair rebuild-index`. A palace with no recorded model opens with
+  the configured one and a warning that names `mempalace palace set-embedder`.
+  (#2694, #2717)
 
 ### Added
 
