@@ -4,16 +4,17 @@
 # Cursor "stop" hook. After every agent loop ends, this hook:
 #   1. Counts stop invocations per conversation_id (each stop ≈ one
 #      assistant turn ≈ roughly one user message — see plan rationale).
-#   2. Every SAVE_INTERVAL stops, returns a followup_message telling
-#      the agent to file the session into MemPalace and write a diary
-#      entry. Cursor auto-submits that as the next user message.
+#   2. Every SAVE_INTERVAL stops, mines the Cursor JSONL transcript
+#      in the background (`mempalace mine --mode convos --wing`).
+#      Silent by default — no followup in the chat window.
 #   3. On the next stop, loop_count > 0 so we let the agent finish
 #      without re-firing — Cursor's loop_count is the equivalent of
 #      Claude Code's stop_hook_active flag.
 #   4. If the preCompact hook has left a `.pending` marker, force a
-#      save followup regardless of the counter and clear the marker.
+#      save followup only when MEMPAL_VERBOSE is on, then clear the
+#      marker either way.
 #
-# === WHY THE FOLLOWUP FIRES BY DEFAULT (differs from the Claude hook) ===
+# === WHY THE FOLLOWUP IS OPT-IN (matches the Claude hook) ===
 #
 # The Claude Code hook (hooks/mempal_save_hook.sh) is SILENT by default:
 # its background `mempalace mine --mode convos` captures the verbatim
@@ -21,19 +22,13 @@
 # MEMPAL_VERBOSE. That works because mempalace/normalize.py has a Claude
 # Code JSONL parser.
 #
-# Cursor is different. Cursor's transcript format is undocumented (see
-# STDIN_SHAPE.md) and normalize.py has NO Cursor parser, so the
-# background mine below is BEST-EFFORT only — it does not yet yield clean
-# verbatim drawers for Cursor. The followup_message is therefore the
-# load-bearing verbatim-capture path: it drives the agent to call
-# mempalace_add_drawer / mempalace_diary_write from its in-context memory.
-# That is why it is ON by default here — silencing it by default would
-# leave a default Cursor install capturing nothing.
-#
-# Users who want the Claude-style "zero tokens in the chat window"
-# behaviour can silence the followup (see MEMPAL_CURSOR_SILENT /
-# MEMPAL_VERBOSE below). Once normalize.py learns to read Cursor
-# transcripts, this default should flip to silent to match Claude.
+# Cursor now has the same path. `_try_cursor_jsonl` in normalize.py
+# unwraps `<user_query>`, drops injected Cursor blocks, and formats
+# Cursor tool_use records, so the background mine files clean verbatim
+# drawers. The followup_message is therefore opt-in via
+# MEMPAL_VERBOSE=true (same as Claude). MEMPAL_CURSOR_SILENT is kept as
+# a no-op alias for older installs that set it when the followup was
+# the default.
 #
 # Companion files in this directory:
 #   * lib/common.sh                       — shared helpers (sourced)
@@ -94,27 +89,6 @@ esac
 # the Claude Code hook's MEMPAL_DIR knob — purely additive, never an
 # override for the transcript mine).
 MEMPAL_DIR="${MEMPAL_DIR:-}"
-
-# ── Followup opt-out ──────────────────────────────────────────────
-#
-# Returns 0 (true) when the user has asked to suppress the
-# followup_message. See the header comment for why the followup is ON
-# by default for Cursor. When silenced, the hook still runs the
-# best-effort background mine and still maintains its counters/markers
-# — it just emits `{}` instead of a followup. Two equivalent signals:
-#   * MEMPAL_CURSOR_SILENT=1|true|yes|on  — dedicated Cursor opt-out
-#   * MEMPAL_VERBOSE=false|0|no|off        — cross-hook silence signal
-#     (mirror-image of the Claude hook, where MEMPAL_VERBOSE=true is
-#      what turns its diary nudge ON)
-mempal_followup_silenced() {
-    case "${MEMPAL_CURSOR_SILENT:-}" in
-        1|true|yes|on) return 0 ;;
-    esac
-    case "${MEMPAL_VERBOSE:-}" in
-        false|0|no|off) return 0 ;;
-    esac
-    return 1
-}
 
 # Kill switch — emit `{}` so Cursor proceeds with normal stop.
 if mempal_is_disabled; then
@@ -179,17 +153,17 @@ print(json.dumps({"followup_message": msg}))
 # preCompact cannot itself emit a followup_message (Cursor docs:
 # preCompact is observational-only, output supports only user_message),
 # so it drops a marker file and we consume it here. Forces a save
-# nudge regardless of the counter.
+# nudge regardless of the counter — only when MEMPAL_VERBOSE is on.
 if mempal_consume_pending "$MEMPAL_CONV_ID"; then
     mempal_log "stop" "$MEMPAL_CONV_ID" \
         "consumed pending-save marker (post-compaction)"
-    if mempal_followup_silenced; then
-        mempal_log "stop" "$MEMPAL_CONV_ID" \
-            "followup silenced (MEMPAL_CURSOR_SILENT/MEMPAL_VERBOSE); emitting {}"
-        mempal_emit '{}'
+    if mempal_verbose; then
+        _mempal_build_followup
         exit 0
     fi
-    _mempal_build_followup
+    mempal_log "stop" "$MEMPAL_CONV_ID" \
+        "followup silent by default; emitting {} (set MEMPAL_VERBOSE=true to nudge)"
+    mempal_emit '{}'
     exit 0
 fi
 
@@ -217,51 +191,53 @@ fi
 
 mempal_log "stop" "$MEMPAL_CONV_ID" "TRIGGERING SAVE at counter=$NEXT"
 
-# ── Background mine (best effort) ─────────────────────────────────
+# ── Background mine ───────────────────────────────────────────────
 #
 # Two independent targets — both run if both are set:
-#   1. transcript_path → its parent directory, --mode convos
+#   1. transcript_path → its parent directory, --mode convos --wing
 #   2. MEMPAL_DIR (user-configured project) → --mode projects
 #
-# IMPORTANT (Cursor caveat): the --mode convos mine is BEST-EFFORT for
-# Cursor. Cursor's transcript format is undocumented and
-# mempalace/normalize.py has no Cursor parser, so this call does not
-# yet produce clean verbatim conversation drawers — at best it ingests
-# raw bytes. The verbatim-capture guarantee for Cursor is carried by
-# the followup_message below, which drives the agent to file its own
-# in-context verbatim quotes. The --mode projects target (MEMPAL_DIR)
-# is unaffected — normalize.py reads ordinary project files fine.
+# The --mode convos mine is the verbatim-capture path: normalize.py
+# parses Cursor JSONL (`_try_cursor_jsonl`) and files the user's
+# exact words. --wing keeps the drawers in the workspace wing the
+# wake hook already searches (same as the Antigravity hook).
 #
 # Both run with stdout/stderr appended to the cursor log and are
 # backgrounded so a slow mine cannot push the hook past its
-# Cursor-configured timeout. `command -v mempalace` gates so a user
-# without the CLI on PATH (e.g. a fresh GUI-launched session) does
-# not see a noisy error.
-if command -v mempalace >/dev/null 2>&1; then
+# Cursor-configured timeout. Invoke via `"$MEMPAL_PYTHON_BIN" -m
+# mempalace` (same as the Claude Code and Antigravity hooks) so a
+# GUI-launched Cursor session whose PATH lacks the console script
+# still mines through the interpreter that can import the package.
+if "$MEMPAL_PYTHON_BIN" -m mempalace --version >/dev/null 2>&1; then
     if mempal_is_valid_transcript "$MEMPAL_TRANSCRIPT" \
         && [ -f "$MEMPAL_TRANSCRIPT" ]; then
-        ( mempalace mine "$(dirname "$MEMPAL_TRANSCRIPT")" --mode convos \
+        mempal_log "stop" "$MEMPAL_CONV_ID" \
+            "spawning background mine wing=$WING"
+        ( "$MEMPAL_PYTHON_BIN" -m mempalace mine \
+            "$(dirname "$MEMPAL_TRANSCRIPT")" --mode convos \
+            --wing "$WING" \
             >> "$MEMPAL_CURSOR_LOG" 2>&1 ) &
     elif [ -n "$MEMPAL_TRANSCRIPT" ]; then
         mempal_log "stop" "$MEMPAL_CONV_ID" \
             "skipping invalid transcript path: $MEMPAL_TRANSCRIPT"
     fi
     if [ -n "$MEMPAL_DIR" ] && [ -d "$MEMPAL_DIR" ]; then
-        ( mempalace mine "$MEMPAL_DIR" --mode projects \
+        ( "$MEMPAL_PYTHON_BIN" -m mempalace mine "$MEMPAL_DIR" \
+            --mode projects --wing "$WING" \
             >> "$MEMPAL_CURSOR_LOG" 2>&1 ) &
     fi
 else
     mempal_log "stop" "$MEMPAL_CONV_ID" \
-        "mempalace CLI not on PATH; skipping background mine"
+        "mempalace is not runnable via $MEMPAL_PYTHON_BIN -m mempalace; skipping background mine"
 fi
 
-# The followup is the load-bearing verbatim path for Cursor (see header),
-# so it fires by default. Honour the opt-out for users who want silence.
-if mempal_followup_silenced; then
-    mempal_log "stop" "$MEMPAL_CONV_ID" \
-        "followup silenced (MEMPAL_CURSOR_SILENT/MEMPAL_VERBOSE); background mine only"
-    mempal_emit '{}'
+# Followup is opt-in. Default is silent — the background mine is the
+# verbatim path. Set MEMPAL_VERBOSE=true to also nudge a diary write.
+if mempal_verbose; then
+    _mempal_build_followup
     exit 0
 fi
 
-_mempal_build_followup
+mempal_log "stop" "$MEMPAL_CONV_ID" \
+    "followup silent by default; background mine only (set MEMPAL_VERBOSE=true to nudge)"
+mempal_emit '{}'

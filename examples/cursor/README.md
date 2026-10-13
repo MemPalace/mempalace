@@ -18,14 +18,15 @@ Three hooks wired:
   inferred from the workspace root. Cursor-only — Claude Code has no
   equivalent.
 - **`stop`** — calls `mempal_save_hook_cursor.sh`. Counts stop
-  invocations per conversation and emits a `followup_message` every
-  `MEMPAL_SAVE_INTERVAL` (default 15) telling the agent to file the
-  session into the palace and write a diary entry. `loop_limit: 1` is
-  defense-in-depth on top of our own loop-count check.
+  invocations per conversation and mines the Cursor JSONL transcript
+  in the background every `MEMPAL_SAVE_INTERVAL` (default 15). Silent
+  by default; `MEMPAL_VERBOSE=true` also emits a `followup_message`.
+  `loop_limit: 1` is defense-in-depth on top of our own loop-count
+  check.
 - **`preCompact`** — calls `mempal_precompact_hook_cursor.sh`. Runs
-  `mempalace mine` synchronously on the transcript before compaction
-  summarises it, then drops a marker so the next `stop` forces a save
-  followup.
+  `mempalace mine --wing` synchronously on the transcript before
+  compaction summarises it, then drops a marker. The next `stop`
+  only emits a save followup when `MEMPAL_VERBOSE=true`.
 
 ### `hooks.minimal.json` — `stop` only
 

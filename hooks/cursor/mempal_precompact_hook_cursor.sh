@@ -12,20 +12,15 @@
 # and force a save before compaction proceeds), the Cursor preCompact
 # hook can only do two useful things at this moment:
 #
-#   1. Run `mempalace mine` SYNCHRONOUSLY against the transcript file
-#      so whatever Cursor's transcript contains is ingested BEFORE
-#      Cursor summarises the conversation — zero LLM cost, no agent
-#      interaction needed. NOTE: this is BEST-EFFORT for Cursor.
-#      Cursor's transcript format is undocumented and normalize.py has
-#      no Cursor parser, so this does not yet produce clean verbatim
-#      drawers; it is a safety net, not the primary capture path.
+#   1. Run `mempalace mine --wing` SYNCHRONOUSLY against the transcript
+#      file so the Cursor JSONL is ingested BEFORE Cursor summarises
+#      the conversation — zero LLM cost, no agent interaction needed.
+#      normalize.py's `_try_cursor_jsonl` parser is the verbatim path.
 #
 #   2. Drop a `.pending` marker file keyed on conversation_id. The
-#      next `stop` hook reads that marker and forces a save followup
-#      regardless of its counter, so the AI still gets a "write a
-#      diary entry now" nudge on the very next turn. THIS followup is
-#      the load-bearing verbatim-capture path for Cursor (the agent
-#      files its own in-context verbatim quotes via the MCP tools).
+#      next `stop` hook reads that marker and, only when
+#      MEMPAL_VERBOSE=true, forces a save followup regardless of its
+#      counter. Silent by default — the mine already filed the words.
 #
 # === INSTALL ===
 #
@@ -70,8 +65,10 @@ if [ "$MEMPAL_PARSE_OK" != "1" ]; then
     exit 0
 fi
 
+WING="$(mempal_infer_wing "$MEMPAL_WORKSPACE")"
+
 mempal_log "preCompact" "$MEMPAL_CONV_ID" \
-    "trigger=${MEMPAL_TRIGGER:-?} transcript=$MEMPAL_TRANSCRIPT"
+    "trigger=${MEMPAL_TRIGGER:-?} transcript=$MEMPAL_TRANSCRIPT wing=$WING"
 
 # ── Synchronous mine ──────────────────────────────────────────────
 #
@@ -92,10 +89,12 @@ mempal_log "preCompact" "$MEMPAL_CONV_ID" \
 # right before the irreversible compaction. The pending-save marker
 # below is the backstop: the next `stop` hook re-mines and nudges a
 # verbatim save regardless of whether this mine completed.
-if command -v mempalace >/dev/null 2>&1; then
+if "$MEMPAL_PYTHON_BIN" -m mempalace --version >/dev/null 2>&1; then
     if mempal_is_valid_transcript "$MEMPAL_TRANSCRIPT" \
         && [ -f "$MEMPAL_TRANSCRIPT" ]; then
-        mempalace mine "$(dirname "$MEMPAL_TRANSCRIPT")" --mode convos \
+        "$MEMPAL_PYTHON_BIN" -m mempalace mine \
+            "$(dirname "$MEMPAL_TRANSCRIPT")" --mode convos \
+            --wing "$WING" \
             >> "$MEMPAL_CURSOR_LOG" 2>&1 || \
             mempal_log "preCompact" "$MEMPAL_CONV_ID" \
                 "WARN: mempalace mine convos returned non-zero"
@@ -104,14 +103,15 @@ if command -v mempalace >/dev/null 2>&1; then
             "skipping invalid transcript path: $MEMPAL_TRANSCRIPT"
     fi
     if [ -n "$MEMPAL_DIR" ] && [ -d "$MEMPAL_DIR" ]; then
-        mempalace mine "$MEMPAL_DIR" --mode projects \
+        "$MEMPAL_PYTHON_BIN" -m mempalace mine "$MEMPAL_DIR" \
+            --mode projects --wing "$WING" \
             >> "$MEMPAL_CURSOR_LOG" 2>&1 || \
             mempal_log "preCompact" "$MEMPAL_CONV_ID" \
                 "WARN: mempalace mine projects returned non-zero"
     fi
 else
     mempal_log "preCompact" "$MEMPAL_CONV_ID" \
-        "mempalace CLI not on PATH; skipping synchronous mine"
+        "mempalace is not runnable via $MEMPAL_PYTHON_BIN -m mempalace; skipping synchronous mine"
 fi
 
 # ── Drop the pending-save marker ──────────────────────────────────
@@ -119,10 +119,10 @@ mempal_set_pending "$MEMPAL_CONV_ID" || \
     mempal_log "preCompact" "$MEMPAL_CONV_ID" \
         "WARN: could not write pending-save marker"
 
-# Surface a short user-visible note that compaction is about to
-# happen and we've already captured the verbatim text. user_message
-# is the only output field Cursor's preCompact accepts.
-"$MEMPAL_PYTHON_BIN" -c '
+# Surface a short user-visible note only when MEMPAL_VERBOSE is on.
+# user_message is the only output field Cursor's preCompact accepts.
+if mempal_verbose; then
+    "$MEMPAL_PYTHON_BIN" -c '
 import json
 print(json.dumps({
     "user_message": (
@@ -131,3 +131,7 @@ print(json.dumps({
     )
 }))
 '
+    exit 0
+fi
+mempal_emit '{}'
+

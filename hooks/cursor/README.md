@@ -15,8 +15,8 @@ the published version at
 | File                                | Role                                                                |
 |-------------------------------------|---------------------------------------------------------------------|
 | `lib/common.sh`                     | Shared bash helpers (parse, log, counter, wing inference, kill switch). Sourced by all three hooks. |
-| `mempal_save_hook_cursor.sh`        | Cursor `stop` hook. Counts stop invocations per conversation, emits a `followup_message` every `SAVE_INTERVAL` (default 15) telling the agent to file the session into MemPalace. |
-| `mempal_precompact_hook_cursor.sh`  | Cursor `preCompact` hook. Runs `mempalace mine` synchronously on the transcript before compaction, then drops a `.pending` marker so the next stop forces a save nudge. |
+| `mempal_save_hook_cursor.sh`        | Cursor `stop` hook. Counts stop invocations per conversation and mines the Cursor JSONL transcript in the background every `SAVE_INTERVAL` (default 15). Silent by default; `MEMPAL_VERBOSE=true` also emits a `followup_message`. |
+| `mempal_precompact_hook_cursor.sh`  | Cursor `preCompact` hook. Runs `mempalace mine --wing` synchronously on the transcript before compaction, then drops a `.pending` marker. The next stop only emits a save nudge when `MEMPAL_VERBOSE=true`. |
 | `mempal_wake_hook_cursor.sh`        | Cursor `sessionStart` hook. Returns `additional_context` telling the agent to recall scoped to the wing inferred from the workspace root. Cursor-only — Claude Code has no equivalent. |
 | `install.sh`                        | Optional installer. Copies the scripts to `~/.mempalace/hooks/cursor/` and merges entries into `~/.cursor/hooks.json` (or `.cursor/hooks.json` for project scope). Supports `--dry-run` and `--uninstall`. |
 | `STDIN_SHAPE.md`                    | Reference. Per-event stdin / stdout schema with citations to the official Cursor docs. |
@@ -72,8 +72,9 @@ possible so a single hook-state directory works for both editors.
 
 | Variable                       | Default                            | Purpose |
 |--------------------------------|------------------------------------|---------|
-| `MEMPAL_SAVE_INTERVAL`         | `15`                               | Number of `stop` events between save followups. |
-| `MEMPAL_CURSOR_SILENT`         | (unset)                            | Set to `1`/`true`/`yes` to suppress the `followup_message`. The hook still runs its best-effort background mine and keeps its counters — it just stays silent. `MEMPAL_VERBOSE=false`/`0`/`no` does the same. See note below on why the followup is on by default. |
+| `MEMPAL_SAVE_INTERVAL`         | `15`                               | Number of `stop` events between background mines (and, if verbose, followups). |
+| `MEMPAL_VERBOSE`               | (unset)                            | Set to `true`/`1` to emit a `followup_message` (and a preCompact `user_message`). Silent by default. |
+| `MEMPAL_CURSOR_SILENT`         | (unset)                            | No-op compatibility alias. The save hook is already silent by default. |
 | `MEMPAL_DIR`                   | (unset)                            | Optional project directory to also mine on each save. Additive — never replaces the transcript mine. |
 | `MEMPAL_PYTHON`                | auto-detected                      | Path to a Python 3 interpreter. Fallback order: `$MEMPAL_PYTHON` → `command -v python3` → bare `python3`. Useful when Cursor is launched from a GUI on macOS and the inherited PATH lacks your installed `python3`. |
 | `MEMPAL_STATE_DIR`             | `$HOME/.mempalace/hook_state`      | Where the hook keeps its per-conversation counter files, pending-save markers, and `cursor_hook.log`. |
@@ -116,9 +117,9 @@ misconfiguration cannot grow disk usage.
 |-------------------------|------------------------------------------------|-----------------------------------------------------|
 | Counter key             | `session_id`                                   | `conversation_id` (Cursor's stable per-conv id)     |
 | Loop guard              | `stop_hook_active` flag in stdin               | `loop_count` field in stdin                         |
-| Counting method         | Parses JSONL transcript for user messages      | Counts `stop` invocations (transcript schema undoc) |
-| Capture path            | Background `mine --mode convos` (normalize.py has a Claude parser) | Background mine is best-effort (no Cursor parser); the `followup_message` carries verbatim capture |
-| Save default            | Silent — diary nudge opt-IN behind `MEMPAL_VERBOSE=true` | Followup ON by default; opt-OUT via `MEMPAL_CURSOR_SILENT=1` / `MEMPAL_VERBOSE=false` |
+| Counting method         | Parses JSONL transcript for user messages      | Counts `stop` invocations; `normalize.py` parses the Cursor JSONL on mine |
+| Capture path            | Background `mine --mode convos` (normalize.py has a Claude parser) | Background `mine --mode convos --wing` (`_try_cursor_jsonl` in normalize.py) |
+| Save default            | Silent — diary nudge opt-IN behind `MEMPAL_VERBOSE=true` | Same: silent by default; opt-IN via `MEMPAL_VERBOSE=true`. `MEMPAL_CURSOR_SILENT` is a no-op alias |
 | PreCompact behaviour    | `decision: block` forces save before compaction | Pre-mine + pending-save marker (Cursor preCompact is observational-only) |
 | sessionStart            | n/a (Claude Code has no equivalent)            | `additional_context` injects recall guidance        |
 | State dir               | `$HOME/.mempalace/hook_state` (hardcoded)      | Same default, plus `MEMPAL_STATE_DIR` env override  |
@@ -129,29 +130,22 @@ See [`STDIN_SHAPE.md`](STDIN_SHAPE.md) for the per-event schema and
 [`website/guide/cursor-hooks.md`](../../website/guide/cursor-hooks.md) for
 the full walkthrough with diagrams.
 
-## Why the followup is on by default (Cursor-specific)
+## Why the followup is silent by default
 
-Unlike the Claude Code hook — which is silent by default because its
-background `mempalace mine --mode convos` captures the verbatim transcript
-on its own — Cursor's transcript format is **undocumented** and
-`mempalace/normalize.py` has **no Cursor parser**. The background mine on
-the Cursor `stop`/`preCompact` hooks is therefore **best-effort only**: it
-does not yet yield clean verbatim conversation drawers.
+The Claude Code hook is silent by default because its background
+`mempalace mine --mode convos` captures the verbatim transcript on its
+own. Cursor now has the same path: `normalize.py` parses Cursor agent
+JSONL (`_try_cursor_jsonl`), so the `stop` / `preCompact` mines file
+clean verbatim drawers without a chat takeover.
 
-That makes the `followup_message` the **load-bearing verbatim-capture
-path** for Cursor — it drives the agent to file its own in-context
-verbatim quotes via `mempalace_add_drawer` / `mempalace_diary_write`.
-Silencing it by default would leave a default Cursor install capturing
-nothing, which is why it is on by default here. Set `MEMPAL_CURSOR_SILENT=1`
-(or `MEMPAL_VERBOSE=false`) if you prefer the Claude-style silent
-behaviour and accept the reduced capture. Once `normalize.py` learns to
-read Cursor transcripts, this default will flip to silent to match Claude.
+Set `MEMPAL_VERBOSE=true` if you also want a diary-nudge followup every
+`SAVE_INTERVAL` stops (or after a preCompact marker). `MEMPAL_CURSOR_SILENT`
+is kept as a no-op alias for older installs that set it when the
+followup was the default.
 
 ## Cost
 
 Zero extra LLM tokens spent by the hooks themselves. The hooks are local
-bash scripts that run on your machine. The followup message the save hook
-emits is a normal user turn — it counts the same as any other user message
-and does not invoke any extra LLM call beyond the one the user would
-otherwise make. Suppress it with `MEMPAL_CURSOR_SILENT=1` if you want zero
-followups in the chat window.
+bash scripts that run on your machine. When `MEMPAL_VERBOSE=true`, the
+followup message the save hook emits is a normal user turn — it counts
+the same as any other user message. The default install spends none.
