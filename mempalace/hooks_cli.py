@@ -3,7 +3,7 @@ Hook logic for MemPalace — Python implementation of session-start, stop, sessi
 
 Reads JSON from stdin, outputs JSON to stdout.
 Supported hooks: session-start, stop, session-end, precompact
-Supported harnesses: claude-code, codex, dsh (extensible to cursor, gemini, etc.)
+Supported harnesses: claude-code, codex, dsh, workbuddy (extensible to cursor, gemini, etc.)
 
 ``dsh`` (the DeepSeek Harness) cannot hand a hook its own transcript: DSH stores
 sessions zstd-compressed, and its hook bridge passes an empty
@@ -212,6 +212,29 @@ def _count_human_messages(transcript_path: str) -> int:
                             msg_text = payload.get("message", "")
                             if isinstance(msg_text, str) and "<command-message>" not in msg_text:
                                 count += 1
+                    # Also handle WorkBuddy transcripts, which put ``role`` and
+                    # ``content`` at the top level instead of nesting them under
+                    # ``message`` like Claude Code does. The row shape is
+                    # {"role": "user", "content": [{...}, ...]}; a WorkBuddy
+                    # transcript mixes both shapes, and rows carrying a nested
+                    # ``message`` are claimed by the branch above. The content
+                    # list follows the same block shape as Claude's, so the
+                    # command-message filter is reused unchanged. Without this
+                    # branch a WorkBuddy session counts zero exchanges and the
+                    # stop hook never reaches SAVE_INTERVAL — it silently never
+                    # saves.
+                    elif entry.get("role") == "user":
+                        content = entry.get("content", "")
+                        if isinstance(content, str):
+                            if "<command-message>" in content:
+                                continue
+                        elif isinstance(content, list):
+                            text = " ".join(
+                                b.get("text", "") for b in content if isinstance(b, dict)
+                            )
+                            if "<command-message>" in text:
+                                continue
+                        count += 1
                 except (json.JSONDecodeError, AttributeError):
                     pass
     except OSError:
@@ -986,6 +1009,25 @@ def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUN
                             if isinstance(text, str) and text.strip():
                                 if not _is_harness_boilerplate(text):
                                     messages.append(text.strip()[:200])
+                    # WorkBuddy format: ``role``/``content`` sit at the row top
+                    # level instead of nested under ``message``, and the content
+                    # blocks carry the same ``text`` key as Claude's. This is
+                    # the same branch ``_count_human_messages`` has: without it
+                    # the counter above reaches SAVE_INTERVAL but
+                    # ``_save_diary_direct`` still extracts zero messages from
+                    # every WorkBuddy transcript and files no checkpoint — the
+                    # session wires up, counts, and silently never saves.
+                    elif entry.get("role") == "user":
+                        content = entry.get("content", "")
+                        if isinstance(content, list):
+                            content = " ".join(
+                                b.get("text", "") for b in content if isinstance(b, dict)
+                            )
+                        if not isinstance(content, str) or not content.strip():
+                            continue
+                        if _is_harness_boilerplate(content):
+                            continue
+                        messages.append(content.strip()[:200])
                 except (json.JSONDecodeError, AttributeError):
                     pass
     except OSError:
@@ -1214,7 +1256,7 @@ def _ingest_transcript(transcript_path: str):
         _log(f"transcript ingest hook failed: {exc}")
 
 
-SUPPORTED_HARNESSES = {"claude-code", "codex", "dsh"}
+SUPPORTED_HARNESSES = {"claude-code", "codex", "dsh", "workbuddy"}
 
 
 def _diary_agent_for_harness(harness: str) -> str:
@@ -1227,7 +1269,19 @@ def _diary_agent_for_harness(harness: str) -> str:
     as ``"claude"``; every other harness already reads under its own name, so
     returning the harness name keeps a newly supported harness discoverable
     instead of silently invisible again.
+
+    A deployment can override the identity per harness, so checkpoints are filed
+    under whichever agent name that deployment's readers query, rather than
+    inheriting the harness name. Set ``MEMPALACE_AGENT_<HARNESS>`` (upper-cased,
+    non-alphanumerics to ``_``) to that agent name — e.g.
+    ``MEMPALACE_AGENT_WORKBUDDY=alice``. The check runs first, so it can also
+    override the ``claude-code`` → ``claude`` default. Unset means "use the
+    default identity", which keeps every existing harness's behaviour unchanged.
     """
+    override_key = "MEMPALACE_AGENT_" + re.sub(r"[^A-Za-z0-9]+", "_", harness).upper()
+    override = os.environ.get(override_key, "").strip()
+    if override:
+        return override
     return "claude" if harness == "claude-code" else harness
 
 
@@ -1363,9 +1417,24 @@ def _ingest_wing(transcript_path: str) -> str:
 
 
 def _wing_from_transcript_path(transcript_path: str) -> str:
-    """Derive a project wing name from a Claude Code transcript path.
+    """Derive a project wing name from a transcript path.
 
     Strategy (in priority order):
+
+    0. WORKBUDDY — handled before all of the above, because the steps below
+       assume a stable project root. WorkBuddy's ``cwd`` is instead a
+       per-session workspace folder (``.../WorkBuddy/2026-09-13-11-04-25``,
+       a fresh date-stamped directory created for every session). Steps 1-2
+       therefore misfire: step 1 mints one wing per workspace instance, and
+       step 2's encoded-folder heuristic has nothing to decode because
+       WorkBuddy paths carry no project name. WorkBuddy has no project
+       concept to preserve — the workspace directory is disposable and its
+       timestamp is carried by ``authored_at`` (#2611) — so every session of
+       a given harness is filed under that harness's agent wing. The name
+       comes from ``_diary_agent_for_harness("workbuddy")``, which honours
+       the ``MEMPALACE_AGENT_WORKBUDDY`` override, so an installer that
+       backfilled under a different ``--agent`` can keep both halves under
+       one identity.
 
     1. PRIMARY — Read ``cwd`` from the JSONL transcript. Claude Code records
        the absolute working directory on most message types, so the project
@@ -1380,15 +1449,18 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
        ``projects-``, etc.), then convert the remaining dashes to
        underscores. Unlike the previous "last token only" heuristic, this
        never silently truncates a hyphenated project folder name like
-       ``claude-code``, ``react-native``, or ``customer-portal``.
+       ``claude-code``, ``react-native``, or ``customer-portal``. (Steps 1-2
+       close #1410.)
 
     3. LEGACY — Match an explicit ``-Projects-<name>`` segment for
        transcripts not under the standard Claude Code projects dir.
 
     4. DEFAULT — ``wing_sessions``.
-
-    Closes #1410.
     """
+    # 0. WorkBuddy — no stable project root; file everything under one wing.
+    if "/.workbuddy/projects/" in transcript_path.replace("\\", "/"):
+        return f"wing_{_safe_wing_slug(_diary_agent_for_harness('workbuddy'))}"
+
     # 1. Primary — cwd from JSONL is the canonical source of truth
     cwd_wing = _wing_from_jsonl_cwd(transcript_path)
     if cwd_wing:
