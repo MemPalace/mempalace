@@ -583,6 +583,40 @@ def test_kg_add_persists_to_palace_sibling_sqlite(initialized_provider, palace_p
     )
 
 
+def test_kg_query_tool_returns_triple_id_and_source_file(initialized_provider, palace_path):
+    from mempalace.knowledge_graph import KnowledgeGraph
+
+    db_path = str(Path(palace_path).parent / "knowledge_graph.sqlite3")
+    writer = KnowledgeGraph(db_path=db_path)
+    try:
+        tid = writer.add_triple("user", "likes", "coffee", source_file="chat.md")
+    finally:
+        writer.close()
+
+    result = json.loads(
+        initialized_provider.handle_tool_call("mempalace_kg_query", {"entity": "user"})
+    )
+
+    (relation,) = result["relations"]
+    assert relation["id"] == tid
+    assert relation["source_file"] == "chat.md"
+
+
+def test_kg_timeline_tool_returns_triple_id(initialized_provider, palace_path):
+    from mempalace.knowledge_graph import KnowledgeGraph
+
+    db_path = str(Path(palace_path).parent / "knowledge_graph.sqlite3")
+    writer = KnowledgeGraph(db_path=db_path)
+    try:
+        tid = writer.add_triple("user", "likes", "coffee")
+    finally:
+        writer.close()
+
+    result = json.loads(initialized_provider.handle_tool_call("mempalace_kg_timeline", {}))
+
+    assert [f["id"] for f in result["timeline"]] == [tid]
+
+
 def test_kg_query_tool_rejects_missing_entity(initialized_provider):
     result = json.loads(
         initialized_provider.handle_tool_call(
