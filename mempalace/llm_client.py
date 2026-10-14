@@ -23,13 +23,17 @@ normalizes that away from the caller.
 
 from __future__ import annotations
 
+import ipaddress
 import json
+import logging
 import os
 from dataclasses import dataclass
 from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
+logger = logging.getLogger("mempalace_llm")
 
 
 # ── External-service heuristic (issue #24 — privacy warning support) ─────
@@ -41,17 +45,51 @@ from urllib.request import Request, urlopen
 _LOCALHOST_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
+# Tailscale and other CGNAT overlays hand out 100.64.0.0/10, which Python's
+# ``is_private`` does not cover; a local LLM reached over one is still the
+# user's own network.
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _is_private_address(addr) -> bool:
+    """Loopback, private (RFC 1918, IPv6 unique-local), link-local or CGNAT."""
+    if addr.is_loopback or addr.is_private or addr.is_link_local:
+        return True
+    return addr.version == 4 and addr in _CGNAT
+
+
+def _resolves_private(host: str) -> bool:
+    """True when every address ``host`` resolves to stays on the user's network."""
+    import socket
+
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, OSError, UnicodeError):
+        return False
+    addresses = {info[4][0] for info in infos if info and info[4]}
+    if not addresses:
+        return False
+    for raw in addresses:
+        try:
+            addr = ipaddress.ip_address(raw.split("%", 1)[0])
+        except ValueError:
+            return False
+        if not _is_private_address(addr):
+            return False
+    return True
+
+
 def _endpoint_is_local(url: Optional[str]) -> bool:
     """Return True if ``url``'s hostname is on the user's machine or
     private network.
 
     Local includes:
       - localhost, 127.0.0.1, ::1
-      - hostnames ending in .local (mDNS/Bonjour)
-      - IPv4 RFC1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-      - IPv4 CGNAT (Tailscale and similar VPN/tunnel networks):
-        100.64.0.0/10 — first octet 100, second octet 64-127 inclusive
-      - IPv6 unique-local addresses (fc00::/7) — fc.../fd... prefixes
+      - IP literals that are loopback, RFC 1918 (10/8, 172.16/12,
+        192.168/16), link-local, IPv6 unique-local (fc00::/7), or CGNAT
+        100.64.0.0/10 (Tailscale and similar overlays)
+      - a single-label or ``.local`` hostname whose every resolved address
+        is one of the above
 
     None / empty / unparseable URLs are treated as local (defensive default —
     no endpoint means no external request can happen yet).
@@ -68,38 +106,23 @@ def _endpoint_is_local(url: Optional[str]) -> bool:
         return True
     if host in _LOCALHOST_HOSTS:
         return True
-    if host.endswith(".local"):
-        return True
-    if host.startswith("10."):
-        return True
-    if host.startswith("192.168."):
-        return True
-    if host.startswith("172."):
-        # 172.16.0.0 - 172.31.255.255
-        parts = host.split(".")
-        if len(parts) >= 2:
-            try:
-                if 16 <= int(parts[1]) <= 31:
-                    return True
-            except ValueError:
-                pass
-    if host.startswith("100."):
-        # 100.64.0.0/10 — Tailscale CGNAT range. First octet 100, second
-        # octet 64-127 inclusive. Users running a local LLM (LM Studio,
-        # Ollama, etc.) accessible via Tailscale on a 100.x.x.x address
-        # should not trigger the external-API privacy warning.
-        # 100.x.x.x outside this range is regular allocated public space
-        # and remains external.
-        parts = host.split(".")
-        if len(parts) >= 2:
-            try:
-                if 64 <= int(parts[1]) <= 127:
-                    return True
-            except ValueError:
-                pass
-    # IPv6 unique-local addresses fc00::/7 — match leading hex chars
-    if host.startswith("fc") or host.startswith("fd"):
-        return True
+    # An IP literal is judged by its address, never by how the text starts:
+    # ``10.example.com`` or ``fd.example.com`` are public names that merely
+    # begin like a private range, and a prefix test waved them through the
+    # consent gate that guards sending palace content.
+    try:
+        return _is_private_address(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+    # A single-label hostname (``gpu-box``) or an mDNS name (``gpu-box.local``)
+    # usually names a LAN machine, but a resolver search domain, or an office
+    # network that uses ``.local`` for unicast DNS, can point it anywhere, so
+    # the name shape proves nothing: resolve it and require every address to
+    # be private, loopback, link-local or CGNAT. Unresolvable or public means
+    # external, and the user can still opt in with the explicit consent flag.
+    if "." not in host or host.endswith(".local"):
+        return _resolves_private(host)
+    # Any other domain name is external: DNS can point it anywhere.
     return False
 
 
@@ -139,6 +162,11 @@ class LLMProvider:
         # uses this to gate the consent prompt — stray env-resolved keys
         # require explicit user confirmation.
         self.api_key_source = api_key_source
+        # Set by a caller whose consent gate has passed for an external
+        # endpoint (`rooms propose` / `kg normalize` with
+        # --accept-external-llm). Until then an env-resolved key is withheld
+        # from an external endpoint's model listing; see served_models().
+        self.external_use_accepted = False
 
     def classify(
         self,
@@ -316,19 +344,53 @@ class OpenAICompatProvider(LLMProvider):
             url = f"{url}/v1"
         return f"{url}/chat/completions"
 
-    def check_available(self) -> tuple[bool, str]:
-        if not self.endpoint:
-            return False, "no --llm-endpoint configured"
+    def _models_url(self) -> str:
         base = self.endpoint.rstrip("/")
         base = base.removesuffix("/chat/completions").removesuffix("/v1")
+        return f"{base}/v1/models"
+
+    def served_models(self) -> list[str]:
+        """Model ids the endpoint lists; ``[]`` when it cannot be read."""
+        req = Request(self._models_url())
+        if self.api_key and (
+            self.api_key_source != "env"
+            or not self.is_external_service
+            or self.external_use_accepted
+        ):
+            req.add_header("Authorization", f"Bearer {self.api_key}")
+        with urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        items = data.get("data") if isinstance(data, dict) else data
+        return [str(m.get("id")) for m in (items or []) if isinstance(m, dict) and m.get("id")]
+
+    def check_available(self) -> tuple[bool, str]:
+        """Reachability probe; ``model="auto"`` is resolved here to the served model.
+
+        A local server (vLLM, NInfer, LM Studio) serves one model at a time
+        and its id changes whenever the operator swaps it; ``auto`` follows
+        the swap instead of failing with ``model_not_found``.
+        """
+        if not self.endpoint:
+            return False, "no --llm-endpoint configured"
         try:
-            req = Request(f"{base}/v1/models")
-            if self.api_key and (self.api_key_source != "env" or not self.is_external_service):
-                req.add_header("Authorization", f"Bearer {self.api_key}")
-            with urlopen(req, timeout=5):
-                pass
-        except (URLError, HTTPError, OSError) as e:
+            models = self.served_models()
+        except (URLError, HTTPError, OSError, ValueError) as e:
             return False, f"Cannot reach {self.endpoint}: {e}"
+        if self.model == "auto":
+            if not models:
+                return False, f"{self.endpoint} lists no models to pick from"
+            self.model = models[0]
+        elif models and self.model not in models:
+            # A gateway may list only part of what it routes, or spell a model
+            # differently (``llama3.1`` vs ``llama3.1:8b``); the request itself
+            # is the authority, so this is advice, not a refusal.
+            logger.warning(
+                "model %r is not in the list served at %s (%s); continuing. "
+                "Use --llm-model auto to follow the server.",
+                self.model,
+                self.endpoint,
+                ", ".join(models[:8]),
+            )
         return True, "ok"
 
     def classify(
@@ -336,8 +398,18 @@ class OpenAICompatProvider(LLMProvider):
         system: str,
         user: str,
         json_mode: bool = True,
-        think: Optional[bool] = None,  # noqa: ARG002 — accepted for interface compat; OpenAI-compat has no thinking toggle
+        think: Optional[bool] = None,
     ) -> LLMResponse:
+        """``think=False`` sends ``reasoning_effort: "none"``.
+
+        Reasoning models served through an OpenAI-compatible endpoint (Qwen 3.x
+        on vLLM, NInfer, llama.cpp) think before answering, and their default
+        effort can spend the whole completion budget on the reasoning channel
+        and return an empty ``content`` — a 60-excerpt room proposal did
+        exactly that at 8192 reasoning tokens. ``reasoning_effort`` is the
+        OpenAI field for this and the servers above honor it; a server that
+        rejects unknown fields with HTTP 400 gets one retry without it.
+        """
         body: dict = {
             "model": self.model,
             "messages": [
@@ -348,16 +420,33 @@ class OpenAICompatProvider(LLMProvider):
         }
         if json_mode:
             body["response_format"] = {"type": "json_object"}
+        if think is False:
+            body["reasoning_effort"] = "none"
         headers = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        data = _http_post_json(self._resolve_url(), body, headers=headers, timeout=self.timeout)
+        url = self._resolve_url()
         try:
-            text = data["choices"][0]["message"]["content"]
+            data = _http_post_json(url, body, headers=headers, timeout=self.timeout)
+        except LLMError as e:
+            if "reasoning_effort" not in body or "HTTP 400" not in str(e):
+                raise
+            body.pop("reasoning_effort")
+            data = _http_post_json(url, body, headers=headers, timeout=self.timeout)
+        try:
+            choice = data["choices"][0]
+            text = choice["message"]["content"]
         except (KeyError, IndexError, TypeError) as e:
             raise LLMError(f"Unexpected response shape: {e}") from e
         if not text:
-            raise LLMError(f"Empty response from {self.name} (model={self.model})")
+            reason = ""
+            if isinstance(choice, dict) and choice.get("finish_reason") == "length":
+                reason = (
+                    " — the completion budget ran out (finish_reason=length); a reasoning "
+                    "model likely spent it thinking. Pass think=False or lower the "
+                    "model's reasoning effort."
+                )
+            raise LLMError(f"Empty response from {self.name} (model={self.model}){reason}")
         return LLMResponse(text=text, model=self.model, provider=self.name, raw=data)
 
 

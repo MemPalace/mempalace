@@ -282,8 +282,7 @@ applies them to every workspace. Render the canonical shared-brain rules
 block with a stable identity for this agent and drop it there:
 
 ```bash
-mempalace rules --agent mac-antigravity > ~/.gemini/config/GEMINI.md
-mkdir -p ~/.mempalace/watch
+mempalace rules --host mac --harness antigravity --project myapp > ~/.gemini/config/GEMINI.md
 ```
 
 If the file already has other content, paste the rendered block into it
@@ -292,10 +291,12 @@ instead of overwriting. The block comes from
 truth for the protocol — so re-run the command after an upgrade to pick up
 protocol fixes rather than editing the copy by hand.
 
-Pick an identity distinct from your other agents (`mac-antigravity` next
-to `mac-claude`, …). Identities share nothing: inbox filters, cursors,
-and watcher state files are all keyed by it, and two agents sharing one
-name will silently eat each other's mail.
+Pick a host+harness distinct from your other agents (`mac:antigravity:<project>`
+next to `mac:claude:<project>`, …). Two windows in the same project share
+that identity; do not mint `antigravity2`. Identities share nothing across
+harnesses: inbox filters, cursors, and watcher state files are all keyed
+by the tuple, and two harnesses sharing one name will silently eat each
+other's mail.
 
 ### 2. Allowlist the tools, or the loop stalls
 
@@ -306,10 +307,12 @@ quiet", indistinguishable from a crash. For unattended coordination,
 allowlist the mempalace MCP tools and the `mempalace logstream watch`
 command in Antigravity's permission settings.
 
-With both pieces in place the agent arms a background watcher at session
-start, wakes on inbox events, acks with `mempalace_event_ack`, and
-re-arms on its own. Measured on an otherwise idle machine, the round trip
-from event append to ack is about five seconds.
+With both pieces in place the agent stays declared-idle until it is in a
+coordination loop (the user asked it to listen, it claimed a task, or it
+delegated), then arms `mempalace logstream watch`, wakes on inbox events,
+acks with `mempalace_event_ack`, and re-arms on its own. Measured on an
+otherwise idle machine, the round trip from event append to ack is about
+five seconds.
 
 ## See also
 

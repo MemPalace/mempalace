@@ -15,12 +15,14 @@ These tests pin the mechanism (the lock survives the probes), the symptom
 """
 
 import builtins
+import gc
 import io
 import json
 import os
 import sqlite3
 import subprocess
 import sys
+import time
 
 import pytest
 from _chroma_palace_helper import make_minimal_chroma_sqlite, make_minimal_sqlite_exact_sqlite
@@ -82,6 +84,27 @@ def _run(script: str, db_path: str) -> str:
 
 def _shared_lock_held(db_path: str) -> bool:
     return json.loads(_run(_LOCK_PROBE, db_path))["held"]
+
+
+def _lock_released_within(db_path: str, timeout: float = 5.0) -> bool:
+    """Poll until no process holds the SHARED range, or ``timeout`` elapses.
+
+    ``backend.close()`` returning does not mean the lock is already gone.
+    Chroma's Rust system stops by dropping its Python reference to the native
+    bindings (``del self.bindings``), so the SQLite connection that holds the
+    lock is freed when that object is collected, which the garbage collector
+    and native teardown decide. Asserting on the very next line raced that and
+    failed intermittently on Linux CI. A lock that is never released still
+    fails after ``timeout``.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        gc.collect()
+        if not _shared_lock_held(db_path):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
 
 
 def _writer(tmp_path, name="mempalace_drawers"):
@@ -178,7 +201,8 @@ def test_probes_keep_writer_shared_lock(tmp_path):
         assert _shared_lock_held(db_path)
 
     backend.close()
-    assert not _shared_lock_held(db_path), "closing the writer releases the lock"
+    del col
+    assert _lock_released_within(db_path), "closing the writer releases the lock"
 
 
 @posix_only
@@ -203,7 +227,8 @@ def test_probes_keep_chroma_writer_shared_lock(tmp_path):
         assert _shared_lock_held(db_path), "Chroma writer SHARED lock dropped by detect()"
 
     backend.close()
-    assert not _shared_lock_held(db_path), "closing the writer releases the lock"
+    del col
+    assert _lock_released_within(db_path), "closing the writer releases the lock"
 
 
 @posix_only

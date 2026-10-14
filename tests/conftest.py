@@ -42,6 +42,10 @@ _REAL_EMBEDDING_TEST_MODULES = {
     "test_embedding",
     "test_embedding_api",
     "test_embeddinggemma",
+    "test_embeddinggemma2",
+    "test_embeddinggemma2_device",
+    "test_embeddinggemma2_integration",
+    "test_embedding_model_fallback",
 }
 
 
@@ -136,9 +140,9 @@ def _stable_embedding_function_for_tests(request, monkeypatch):
     )
     monkeypatch.setattr(embedding_mod, "get_embedding_function", lambda *_, **__: ef)
     monkeypatch.setattr(
-        chroma_mod.ChromaBackend, "_resolve_embedding_function", staticmethod(lambda: ef)
+        chroma_mod.ChromaBackend, "_resolve_embedding_function", staticmethod(lambda **_: ef)
     )
-    monkeypatch.setattr(embedding_wrapper, "_embed_texts", lambda texts: ef(input=list(texts)))
+    monkeypatch.setattr(embedding_wrapper, "_embed_texts", lambda texts, **_: ef(input=list(texts)))
     yield
 
 
@@ -168,6 +172,22 @@ def _reset_loaded_mcp_writer_state(mcp_server) -> None:
         ):
             if hasattr(mcp_server, name):
                 setattr(mcp_server, name, value)
+
+
+@pytest.fixture(autouse=True)
+def _release_palace_anchors():
+    """Close anchor connections on ``chroma.sqlite3`` after each test.
+
+    On Linux mempalace keeps one idle connection per database inode for the life
+    of the process; across thousands of temporary palaces that would run the
+    test process out of descriptors. Only acts when the module is loaded.
+    """
+    yield
+    import sys
+
+    inproc = sys.modules.get("mempalace.backends._inproc_sqlite")
+    if inproc is not None:
+        inproc.release_all()
 
 
 @pytest.fixture(autouse=True)

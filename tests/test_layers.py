@@ -951,3 +951,69 @@ def test_layer2_handles_none_metadata():
         result = layer.retrieve()
 
     assert "L2 — ON-DEMAND" in result
+
+
+# ---------------------------------------------------------------------------
+# Read-only opens and lock reporting
+#
+# This stack is pure read. Before it asked for a read-only open, a writable
+# open on sqlite_exact took the mine lock, so `mempalace wake-up` failed
+# whenever another MemPalace process (the hub, a daemon, a mine) held it — and
+# the swallowed exception reported that healthy palace as missing.
+# ---------------------------------------------------------------------------
+
+
+def test_layers_open_the_palace_read_only():
+    """Every read in this stack opens with create=False, read_only=True."""
+    with patch("mempalace.layers._get_collection") as mock_open:
+        Layer1(palace_path="/some/palace").generate()
+    mock_open.assert_called_once_with("/some/palace", create=False, read_only=True)
+
+    with patch("mempalace.layers._get_collection") as mock_open:
+        Layer2(palace_path="/some/palace").retrieve()
+    mock_open.assert_called_once_with("/some/palace", create=False, read_only=True)
+
+    with patch("mempalace.layers._get_collection") as mock_open:
+        Layer3(palace_path="/some/palace").search("q")
+    mock_open.assert_called_once_with("/some/palace", create=False, read_only=True)
+
+
+def test_layer1_lock_conflict_is_not_reported_as_missing_palace():
+    """A write lock held elsewhere must not read as "no palace" (regression)."""
+    from mempalace.palace import MineAlreadyRunning
+
+    layer = Layer1(palace_path="/some/palace")
+    with patch(
+        "mempalace.layers._open_for_read",
+        side_effect=MineAlreadyRunning("palace /some/palace is held by PID 30200"),
+    ):
+        result = layer.generate()
+
+    assert "write lock" in result
+    assert "No palace found" not in result
+
+
+def test_layer2_lock_conflict_is_not_reported_as_missing_palace():
+    from mempalace.palace import MineAlreadyRunning
+
+    layer = Layer2(palace_path="/some/palace")
+    with patch(
+        "mempalace.layers._open_for_read",
+        side_effect=MineAlreadyRunning("palace /some/palace is held by PID 30200"),
+    ):
+        result = layer.retrieve()
+
+    assert "write lock" in result
+
+
+def test_layer3_lock_conflict_is_not_reported_as_missing_palace():
+    from mempalace.palace import MineAlreadyRunning
+
+    layer = Layer3(palace_path="/some/palace")
+    with patch(
+        "mempalace.layers._open_for_read",
+        side_effect=MineAlreadyRunning("palace /some/palace is held by PID 30200"),
+    ):
+        result = layer.search("q")
+
+    assert "write lock" in result

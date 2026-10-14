@@ -278,7 +278,7 @@ def _lexical_hit_vector_distances(drawers_col, query: str, lexical_hits: list, m
     try:
         from ..backends.embedding_wrapper import _embed_texts
 
-        query_vector = _embed_texts([query])[0]
+        query_vector = _embed_texts([query], query=True)[0]
         stored = drawers_col.get(ids=ids, include=["embeddings"])
     except Exception:
         logger.debug(

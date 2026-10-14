@@ -52,3 +52,26 @@ def test_an_entrypoint_that_found_no_variable_leaves_none_behind(tmp_path, monke
         pass
 
     assert _ENV not in os.environ
+
+
+def test_mcp_tool_restores_the_palace_path_it_stamped(tmp_path, monkeypatch):
+    """run_mcp_tool points the server at the job's palace, and leaves
+    MEMPALACE_PALACE_PATH as it found it afterwards, like the other entrypoints."""
+    from _mcp_server_helpers import _keep_server_command_line_state
+
+    _keep_server_command_line_state(monkeypatch)
+    monkeypatch.setenv(_ENV, "/palace/the-caller-already-had")
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    out = service.run_mcp_tool(
+        {
+            "name": "mempalace_kg_add",
+            "arguments": {"subject": "alice", "predicate": "likes", "object": "tea"},
+            "palace_path": str(palace),
+        }
+    )
+
+    assert out["success"] is True, out
+    assert (palace / "knowledge_graph.sqlite3").is_file()
+    assert os.environ.get(_ENV) == "/palace/the-caller-already-had"

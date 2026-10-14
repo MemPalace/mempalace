@@ -1184,7 +1184,7 @@ def test_palace_wrapper_embeds_for_pgvector(tmp_path, monkeypatch, fake_pgvector
     from mempalace import palace
 
     monkeypatch.setattr(
-        embedding_wrapper, "_embed_texts", lambda texts: [[1.0, 0.0] for _ in texts]
+        embedding_wrapper, "_embed_texts", lambda texts, **_kwargs: [[1.0, 0.0] for _ in texts]
     )
     monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "pgvector")
     monkeypatch.setenv("MEMPALACE_BACKEND", "pgvector")

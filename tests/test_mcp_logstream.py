@@ -92,7 +92,10 @@ class TestRegistration:
         assert LOGSTREAM_TOOLS <= mcp_server._SQLITE_INTEGRITY_ALLOWED_TOOLS
 
     def test_mutating_logstream_tools_exempt_from_peer_writer_gate(self):
-        assert LOGSTREAM_MUTATING == mcp_server._PEER_WRITER_EXEMPT_TOOLS
+        # Subset (not equality): the KG tools (#2297) also join the exempt
+        # set, so the logstream family is a *subset* of all peer-writer
+        # exemptions, not the whole thing.
+        assert LOGSTREAM_MUTATING <= mcp_server._PEER_WRITER_EXEMPT_TOOLS
 
 
 # ── Dispatch round trips ──────────────────────────────────────────────────
@@ -212,6 +215,63 @@ class TestDispatch:
         assert prev["events"][0]["body"] == APPEND_ARGS["body"]
         assert "body_truncated" not in prev["events"][0]
 
+    def test_list_from_agent_is_the_callers_identity_not_a_filter(self, patched_server):
+        # The recipient passes its own identity as from_agent (as agents are told to on every call) and must still
+        # see the request written to it: from_agent used to filter by writer and returned nothing.
+        _result(_call(patched_server, "mempalace_event_append", APPEND_ARGS))
+        got = _result(
+            _call(
+                patched_server,
+                "mempalace_event_list",
+                {"correlation_id": "task_mcp", "from_agent": "windows-codex"},
+            )
+        )
+        assert got["count"] == 1
+        assert got["events"][0]["from_agent"] == "mac-codex"
+        assert "writer=" in got["note"]
+
+    def test_list_writer_filters_by_who_wrote_the_event(self, patched_server):
+        _result(_call(patched_server, "mempalace_event_append", APPEND_ARGS))
+        mine = _result(
+            _call(
+                patched_server,
+                "mempalace_event_list",
+                {"correlation_id": "task_mcp", "writer": "mac-codex"},
+            )
+        )
+        other = _result(
+            _call(
+                patched_server,
+                "mempalace_event_list",
+                {"correlation_id": "task_mcp", "writer": "windows-codex"},
+            )
+        )
+        assert mine["count"] == 1 and other["count"] == 0
+        assert "note" not in mine
+
+    def test_wait_from_agent_is_the_callers_identity_not_a_filter(self, patched_server):
+        _result(_call(patched_server, "mempalace_event_append", APPEND_ARGS))
+        result = _result(
+            _call(
+                patched_server,
+                "mempalace_event_wait",
+                {"correlation_id": "task_mcp", "from_agent": "windows-codex", "timeout_ms": 5000},
+            )
+        )
+        assert result["timed_out"] is False and result["count"] == 1
+        assert "writer=" in result["note"]
+
+    def test_wait_writer_filters_by_who_wrote_the_event(self, patched_server):
+        _result(_call(patched_server, "mempalace_event_append", APPEND_ARGS))
+        result = _result(
+            _call(
+                patched_server,
+                "mempalace_event_wait",
+                {"correlation_id": "task_mcp", "writer": "windows-codex", "timeout_ms": 200},
+            )
+        )
+        assert result["timed_out"] is True and result["count"] == 0
+
     def test_wait_returns_existing_event(self, patched_server):
         _result(_call(patched_server, "mempalace_event_append", APPEND_ARGS))
         result = _result(
@@ -255,6 +315,68 @@ class TestDispatch:
         )
         assert result["timed_out"] is False
         assert result["count"] == 2
+
+    def test_context_aware_order_and_case_insensitivity(self, patched_server):
+        ev1 = _result(
+            _call(
+                patched_server,
+                "mempalace_event_append",
+                dict(APPEND_ARGS, body="first"),
+            )
+        )["event"]
+        ev2 = _result(
+            _call(
+                patched_server,
+                "mempalace_event_append",
+                dict(APPEND_ARGS, body="second"),
+            )
+        )["event"]
+        ev3 = _result(
+            _call(
+                patched_server,
+                "mempalace_event_append",
+                dict(APPEND_ARGS, body="third"),
+            )
+        )["event"]
+
+        # Default without cursor: newest first (order='desc')
+        listed = _result(
+            _call(
+                patched_server,
+                "mempalace_event_list",
+                {"correlation_id": "task_mcp"},
+            )
+        )
+        assert [e["id"] for e in listed["events"]] == [ev3["id"], ev2["id"], ev1["id"]]
+
+        # Default with since_event_id cursor: forward chronological (order='asc')
+        resumed = _result(
+            _call(
+                patched_server,
+                "mempalace_event_list",
+                {"correlation_id": "task_mcp", "since_event_id": ev1["id"]},
+            )
+        )
+        assert [e["id"] for e in resumed["events"]] == [ev2["id"], ev3["id"]]
+
+        # Explicit order overrides default and handles uppercase
+        explicit_asc = _result(
+            _call(
+                patched_server,
+                "mempalace_event_list",
+                {"correlation_id": "task_mcp", "order": "ASC"},
+            )
+        )
+        assert [e["id"] for e in explicit_asc["events"]] == [ev1["id"], ev2["id"], ev3["id"]]
+
+        explicit_desc = _result(
+            _call(
+                patched_server,
+                "mempalace_event_list",
+                {"correlation_id": "task_mcp", "since_event_id": ev1["id"], "order": "DESC"},
+            )
+        )
+        assert [e["id"] for e in explicit_desc["events"]] == [ev3["id"], ev2["id"]]
 
     def test_artifact_put_get_round_trip(self, patched_server):
         patch = "diff --git a/x b/x\n+1\n"
@@ -434,11 +556,17 @@ class TestTopicAndOrderMcp:
         assert e1["topic"] == "feature-x"
         assert e2["topic"] == "feature-y"
 
-        # List by topic
+        # List by topic (defaults to newest-first when no cursor is provided)
         list_topic_x = _result(
             _call(patched_server, "mempalace_event_list", {"topic": "feature-x"})
         )
-        assert [e["id"] for e in list_topic_x["events"]] == [e1["id"], e3["id"]]
+        assert [e["id"] for e in list_topic_x["events"]] == [e3["id"], e1["id"]]
+
+        # Explicit order asc
+        list_asc = _result(
+            _call(patched_server, "mempalace_event_list", {"topic": "feature-x", "order": "asc"})
+        )
+        assert [e["id"] for e in list_asc["events"]] == [e1["id"], e3["id"]]
 
         # List order desc
         list_desc = _result(_call(patched_server, "mempalace_event_list", {"order": "desc"}))

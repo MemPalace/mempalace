@@ -247,6 +247,29 @@ def test_embeddinggemma_variant_rejects_unknown_value(tmp_path, monkeypatch):
         _ = cfg.embeddinggemma_variant
 
 
+@pytest.mark.parametrize("model", ["embeddinggemma", "minilm"])
+def test_search_fingerprint_tracks_only_active_embeddinggemma_variant(tmp_path, monkeypatch, model):
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", model)
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    cfg = MempalaceConfig(config_dir=str(tmp_path), palace_path=str(tmp_path / "palace"))
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", "q8")
+    q8 = cfg.search_config_fingerprint
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", "fp16")
+    fp16 = cfg.search_config_fingerprint
+    assert (q8 != fp16) == (model == "embeddinggemma")
+
+
+def test_search_fingerprint_handles_rejected_combined_variant(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "embeddinggemma:fp16")
+    cfg = MempalaceConfig(config_dir=str(tmp_path), palace_path=str(tmp_path / "palace"))
+    rejected = cfg.search_config_fingerprint
+    assert rejected == cfg.search_config_fingerprint
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "embeddinggemma")
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", "fp16")
+    assert cfg.search_config_fingerprint != rejected
+
+
 def test_embedding_threads_defaults_to_half_cpus(monkeypatch):
     monkeypatch.delenv("MEMPALACE_EMBEDDING_THREADS", raising=False)
     monkeypatch.setattr("os.cpu_count", lambda: 10)
@@ -496,6 +519,59 @@ def test_env_path_legacy_alias_normalized():
         assert ".." not in cfg.palace_path
         assert cfg.palace_path == os.path.abspath(os.path.expanduser(raw))
     finally:
+        del os.environ["MEMPAL_PALACE_PATH"]
+
+
+def test_env_path_mempalace_palace_alias():
+    """#2366: ``MEMPALACE_PALACE`` (the short form the reporter used) is
+    honored for ``palace_path`` with the same abspath+expanduser normalization
+    as ``MEMPALACE_PALACE_PATH`` and legacy ``MEMPAL_PALACE_PATH``. The issue
+    body's exact failing step is ``MEMPALACE_PALACE=/custom/path/palace
+    mempalace status`` — pre-fix this resolved to the hardcoded default.
+    """
+    os.environ.pop("MEMPALACE_PALACE_PATH", None)
+    os.environ.pop("MEMPAL_PALACE_PATH", None)
+    raw = os.path.join("~", "custom", "path", "palace")
+    os.environ["MEMPALACE_PALACE"] = raw
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert ".." not in cfg.palace_path
+        assert cfg.palace_path == os.path.abspath(os.path.expanduser(raw))
+        assert cfg.palace_path.endswith("custom" + os.sep + "path" + os.sep + "palace")
+    finally:
+        del os.environ["MEMPALACE_PALACE"]
+
+
+def test_env_path_primary_wins_over_alias():
+    """Precedence contract: ``MEMPALACE_PALACE_PATH`` (the documented primary)
+    must win over the ``MEMPALACE_PALACE`` alias, which must win over legacy
+    ``MEMPAL_PALACE_PATH``. Guards against the new alias being inserted ahead
+    of the primary and silently overriding it.
+    """
+    os.environ["MEMPALACE_PALACE_PATH"] = "/primary/should/wins"
+    os.environ["MEMPALACE_PALACE"] = "/alias/should/lose"
+    os.environ["MEMPAL_PALACE_PATH"] = "/legacy/should/lose"
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert cfg.palace_path == os.path.abspath("/primary/should/wins")
+    finally:
+        del os.environ["MEMPALACE_PALACE_PATH"]
+        del os.environ["MEMPALACE_PALACE"]
+        del os.environ["MEMPAL_PALACE_PATH"]
+
+
+def test_env_alias_wins_over_legacy():
+    """The ``MEMPALACE_PALACE`` alias outranks legacy ``MEMPAL_PALACE_PATH``
+    (both are newer than the legacy name), even when the legacy name is set.
+    """
+    os.environ.pop("MEMPALACE_PALACE_PATH", None)
+    os.environ["MEMPALACE_PALACE"] = "/alias/wins"
+    os.environ["MEMPAL_PALACE_PATH"] = "/legacy/loses"
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert cfg.palace_path == os.path.abspath("/alias/wins")
+    finally:
+        del os.environ["MEMPALACE_PALACE"]
         del os.environ["MEMPAL_PALACE_PATH"]
 
 

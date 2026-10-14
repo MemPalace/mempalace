@@ -800,7 +800,7 @@ def test_palace_wrapper_embeds_for_sqlite_exact(tmp_path, monkeypatch):
     monkeypatch.setattr(
         embedding_wrapper,
         "_embed_texts",
-        lambda texts: [[float(len(text)), 1.0] for text in texts],
+        lambda texts, **_kwargs: [[float(len(text)), 1.0] for text in texts],
     )
 
     col = get_collection(str(tmp_path), create=True)
@@ -883,7 +883,7 @@ def test_search_union_uses_sqlite_exact_lexical_search(tmp_path, monkeypatch):
     from mempalace.palace import get_collection
     from mempalace.searcher import search_memories
 
-    def fake_embed(texts):
+    def fake_embed(texts, **_kwargs):
         vectors = []
         for text in texts:
             if text == "rareterm":
@@ -935,19 +935,19 @@ def test_search_closets_use_lexical_not_vector_on_sqlite_exact(tmp_path, monkeyp
 
     monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
     monkeypatch.setattr(
-        embedding_wrapper, "_embed_texts", lambda texts: [[1.0, 0.0] for _ in texts]
+        embedding_wrapper, "_embed_texts", lambda texts, **_kwargs: [[1.0, 0.0] for _ in texts]
     )
 
     drawers = get_collection(str(tmp_path), create=True)
     closets = get_closets_collection(str(tmp_path), create=True)
     drawers.add(
         ids=["d1"],
-        documents=["meshguard trust path"],
+        documents=["meshkit trust path"],
         metadatas=[{"source_file": "a.md", "wing": "w", "room": "r", "chunk_index": 0}],
     )
     closets.add(
         ids=["c1"],
-        documents=["topic|meshguard|→d1"],
+        documents=["topic|meshkit|→d1"],
         metadatas=[{"source_file": "a.md", "wing": "w"}],
     )
 
@@ -968,7 +968,7 @@ def test_search_closets_use_lexical_not_vector_on_sqlite_exact(tmp_path, monkeyp
     monkeypatch.setattr(SQLiteExactCollection, "query", wrapped_query)
     monkeypatch.setattr(SQLiteExactCollection, "lexical_search", wrapped_lex)
 
-    result = search_memories("meshguard", str(tmp_path), n_results=1)
+    result = search_memories("meshkit", str(tmp_path), n_results=1)
     assert "error" not in result
     assert called["lex"] == 1
     assert called["query"] == 0
@@ -1640,14 +1640,12 @@ def test_hybrid_search_keeps_closet_boost_under_writer_lease(tmp_path, monkeypat
     backend, drawers = _collection(tmp_path)
     closets = backend.get_collection(str(tmp_path), "mempalace_closets", create=True)
     meta = {"source_file": "fixture.md", "wing": "project", "room": "notes", "chunk_index": 0}
-    drawers.add(
-        ids=["a"], documents=["meshguard memory"], metadatas=[meta], embeddings=[[1.0, 0.0]]
-    )
-    closets.add(ids=["c"], documents=["meshguard index"], metadatas=[meta], embeddings=[[1.0, 0.0]])
+    drawers.add(ids=["a"], documents=["meshkit memory"], metadatas=[meta], embeddings=[[1.0, 0.0]])
+    closets.add(ids=["c"], documents=["meshkit index"], metadatas=[meta], embeddings=[[1.0, 0.0]])
     backend.close()
     monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", backend_name)
     monkeypatch.setattr(
-        embedding_wrapper, "_embed_texts", lambda texts: [[1.0, 0.0] for _ in texts]
+        embedding_wrapper, "_embed_texts", lambda texts, **_kwargs: [[1.0, 0.0] for _ in texts]
     )
     holder_code = """
 import sys
@@ -1664,7 +1662,7 @@ with mine_palace_lock(sys.argv[1]):
     )
     try:
         assert holder.stdout.readline().strip() == "ready"
-        result = search_memories("meshguard", str(tmp_path), n_results=1)
+        result = search_memories("meshkit", str(tmp_path), n_results=1)
         assert "error" not in result
         assert result["results"][0]["matched_via"] == "drawer+closet"
         assert result["results"][0]["closet_boost"] > 0
@@ -1785,3 +1783,176 @@ def test_exact_query_retries_entire_batch_across_all_engines(
     finally:
         peer.close()
         backend.close()
+
+
+def test_sqlite_exact_metadata_only_update_keeps_document_embedding_and_fts(tmp_path):
+    """A wing/room move must not touch the document, its vector or its FTS row (#audit split)."""
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b"],
+        documents=["rareterm alpha note", "plain beta note"],
+        metadatas=[{"wing": "w", "room": "r", "keep": 1}, {"wing": "w", "room": "r"}],
+        embeddings=[[1, 0], [0, 1]],
+    )
+    col.update(
+        ids=["a", "missing"], metadatas=[{"wing": "target", "last_modified": "t"}, {"wing": "x"}]
+    )
+
+    got = col.get(ids=["a"], include=["documents", "metadatas", "embeddings"])
+    assert got["documents"] == ["rareterm alpha note"]
+    assert got["metadatas"][0] == {"wing": "target", "room": "r", "keep": 1, "last_modified": "t"}
+    assert list(got["embeddings"][0]) == [1.0, 0.0]
+    # The FTS row survived untouched and the new wing filter finds it.
+    hits = col.lexical_search(query="rareterm", n_results=5, where={"wing": "target"}).hits
+    assert [hit.id for hit in hits] == ["a"]
+    assert col.lexical_search(query="rareterm", n_results=5, where={"wing": "w"}).hits == []
+
+
+def test_sqlite_wing_source_counts_is_scoped_to_the_collection(tmp_path):
+    """Drawers and closets share one table; the audit must not count closets."""
+    from mempalace.backends.sqlite_exact import sqlite_wing_source_counts
+
+    backend, drawers = _collection(tmp_path, name="mempalace_drawers")
+    palace = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    closets = backend.get_collection(
+        palace=palace, collection_name="mempalace_closets", create=True
+    )
+    src = "/Users/me/.claude/projects/-Users-me-dev-thing/s.jsonl"
+    meta = {"wing": "convos", "room": "technical", "source_file": src}
+    drawers.add(
+        ids=["a", "b"], documents=["x", "y"], metadatas=[meta, meta], embeddings=[[1.0, 0.0]] * 2
+    )
+    drawers.add(
+        ids=["c"],
+        documents=["z"],
+        metadatas=[{"wing": "convos", "room": "technical", "source_file": "notes.md"}],
+        embeddings=[[1.0, 0.0]],
+    )
+    closets.add(ids=["k"], documents=["idx"], metadatas=[meta], embeddings=[[1.0, 0.0]])
+
+    rows = sqlite_wing_source_counts(str(tmp_path), "mempalace_drawers")
+    assert rows == [("convos", src, 2)]  # not 3: the closet is another collection
+    assert sqlite_wing_source_counts(str(tmp_path), "mempalace_closets") == [("convos", src, 1)]
+    assert sqlite_wing_source_counts(str(tmp_path), "nope") is None
+    assert sqlite_wing_source_counts(str(tmp_path / "missing"), "mempalace_drawers") is None
+
+
+def test_sqlite_exact_fts_rowid_sync_and_no_unindexed_delete(tmp_path):
+    """Ensure docs_fts.rowid == documents.rowid and writes never scan UNINDEXED FTS columns."""
+    backend, col = _collection(tmp_path)
+    try:
+        if not col._fts_available(col._handle.conn):
+            pytest.skip("SQLite FTS5 not available in this build")
+
+        traced_sql: list[str] = []
+        col._handle.conn.set_trace_callback(traced_sql.append)
+        try:
+            col.add(
+                ids=["d1", "d2"],
+                documents=["first alpha text", "second beta text"],
+                metadatas=[{"wing": "w"}, {"wing": "w"}],
+                embeddings=[[1.0, 0.0], [0.0, 1.0]],
+            )
+            # Brand-new add() must not issue any DELETE FROM docs_fts at all.
+            assert not any("DELETE FROM docs_fts" in s for s in traced_sql)
+
+            traced_sql.clear()
+            col.upsert(
+                ids=["d2", "d3"],
+                documents=["updated beta text", "third gamma text"],
+                metadatas=[{"wing": "w"}, {"wing": "w"}],
+                embeddings=[[0.0, 1.0], [1.0, 1.0]],
+            )
+            # Existing d2 triggers exactly one rowid-based delete; new d3 triggers none.
+            fts_deletes = [s for s in traced_sql if "DELETE FROM docs_fts" in s]
+            assert len(fts_deletes) == 1
+            assert "WHERE rowid =" in fts_deletes[0]
+            assert "collection_id" not in fts_deletes[0]
+
+            traced_sql.clear()
+            col.update(ids=["d1"], documents=["replaced alpha text"])
+            fts_deletes = [s for s in traced_sql if "DELETE FROM docs_fts" in s]
+            assert len(fts_deletes) == 1
+            assert "WHERE rowid =" in fts_deletes[0]
+
+            # Verify rowid alignment across all rows.
+            rows = col._handle.conn.execute(
+                """
+                SELECT d.rowid, f.rowid, d.id, f.doc_id, f.document
+                FROM documents d
+                JOIN docs_fts f ON f.rowid = d.rowid
+                ORDER BY d.id
+                """
+            ).fetchall()
+            assert len(rows) == 3
+            for d_rowid, f_rowid, d_id, f_doc_id, _doc in rows:
+                assert d_rowid == f_rowid
+                assert d_id == f_doc_id
+
+            # Lexical search reflects updated text and not stale text.
+            assert [h.id for h in col.lexical_search(query="replaced", n_results=5).hits] == ["d1"]
+            assert col.lexical_search(query="first", n_results=5).hits == []
+            assert [h.id for h in col.lexical_search(query="updated", n_results=5).hits] == ["d2"]
+
+            traced_sql.clear()
+            col.delete(ids=["d2"])
+            fts_deletes = [s for s in traced_sql if "DELETE FROM docs_fts" in s]
+            assert len(fts_deletes) == 1
+            assert "WHERE rowid IN" in fts_deletes[0]
+            assert "collection_id" not in fts_deletes[0]
+            assert col.lexical_search(query="updated", n_results=5).hits == []
+        finally:
+            col._handle.conn.set_trace_callback(None)
+    finally:
+        backend.close()
+
+
+def test_sqlite_exact_legacy_fts_rowid_migration(tmp_path):
+    """Opening a pre-3.11.1 DB whose docs_fts.rowid != documents.rowid resyncs automatically."""
+    backend, col = _collection(tmp_path)
+    if not col._fts_available(col._handle.conn):
+        backend.close()
+        pytest.skip("SQLite FTS5 not available in this build")
+
+    col.add(
+        ids=["a", "b"],
+        documents=["obsoletetoken alpha", "legacy beta"],
+        metadatas=[{"wing": "w"}, {"wing": "w"}],
+        embeddings=[[1.0, 0.0], [0.0, 1.0]],
+    )
+    # Simulate pre-3.11.1 state where docs_fts has drifted rowids and no fts5_rowid_synced flag.
+    conn = col._handle.conn
+    conn.execute("DELETE FROM meta WHERE key = 'fts5_rowid_synced'")
+    conn.execute("DELETE FROM docs_fts")
+    conn.execute(
+        "INSERT INTO docs_fts(rowid, collection_id, doc_id, document) VALUES (100, 1, 'a', 'obsoletetoken alpha')"
+    )
+    conn.execute(
+        "INSERT INTO docs_fts(rowid, collection_id, doc_id, document) VALUES (200, 1, 'b', 'legacy beta')"
+    )
+    conn.commit()
+    backend.close()
+
+    # Reopen writably: _init_schema -> _ensure_fts_rowid_sync must rebuild docs_fts with matching rowids.
+    backend2, col2 = _collection(tmp_path)
+    try:
+        synced = col2._handle.conn.execute(
+            "SELECT value FROM meta WHERE key = 'fts5_rowid_synced'"
+        ).fetchone()
+        assert synced is not None and synced[0] == "1"
+        mismatches = col2._handle.conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM documents d
+            LEFT JOIN docs_fts f ON f.rowid = d.rowid
+            WHERE f.rowid IS NULL OR f.doc_id != d.id
+            """
+        ).fetchone()[0]
+        assert mismatches == 0
+
+        # Updating 'a' now cleanly replaces its FTS entry without leaving ghost rows.
+        col2.update(ids=["a"], documents=["modernized alpha"])
+        assert col2.lexical_search(query="obsoletetoken", n_results=5).hits == []
+        assert [h.id for h in col2.lexical_search(query="modernized", n_results=5).hits] == ["a"]
+    finally:
+        backend2.close()

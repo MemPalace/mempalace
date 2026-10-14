@@ -6,14 +6,20 @@ character and breaks length alignment with ids/metadatas on explicit-vector
 backends.
 """
 
+import pytest
+
 from mempalace.backends import embedding_wrapper as ew
+
+_REAL_EMBED_TEXTS = ew._embed_texts
 
 
 class _FakeInner:
     """Captures what the wrapper delegates to the backend."""
 
-    def __init__(self):
+    def __init__(self, rows=None):
         self.calls = {}
+        self.rows = rows or {}
+        self.get_calls = []
 
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
         self.calls["add"] = {
@@ -39,6 +45,17 @@ class _FakeInner:
             "embeddings": embeddings,
         }
 
+    def get(self, *, ids=None, include=None, **_kwargs):
+        from mempalace.backends.base import GetResult
+
+        self.get_calls.append({"ids": ids, "include": include})
+        found = [(record_id, self.rows[record_id]) for record_id in ids if record_id in self.rows]
+        return GetResult(
+            ids=[record_id for record_id, _ in found],
+            documents=[row[0] for _, row in found],
+            metadatas=[row[1] for _, row in found],
+        )
+
     def query(self, *, query_texts=None, query_embeddings=None, **_kw):
         self.calls["query"] = {"query_texts": query_texts, "query_embeddings": query_embeddings}
         from mempalace.backends.base import QueryResult
@@ -50,12 +67,30 @@ def _patch_embed(monkeypatch):
     """Stub the embedder: one vector per input text, recording the inputs."""
     seen = {}
 
-    def fake(texts):
+    def fake(texts, **kwargs):
         seen["texts"] = texts
+        seen.update(kwargs)
         return [[0.0, 0.0] for _ in texts]
 
     monkeypatch.setattr(ew, "_embed_texts", fake)
+    monkeypatch.setattr(ew, "_get_document_embedder", lambda: None)
     return seen
+
+
+class _MetadataAwareEmbedder:
+    def __init__(self):
+        self.calls = []
+
+    def embed_documents(self, input, metadatas=None):
+        self.calls.append((list(input), metadatas))
+        return [[float(index + 1), 0.0] for index, _ in enumerate(input)]
+
+
+def _use_metadata_aware_embedder(monkeypatch):
+    embedder = _MetadataAwareEmbedder()
+    monkeypatch.setattr(ew, "_get_document_embedder", lambda: embedder)
+    monkeypatch.setattr(ew, "_embed_texts", _REAL_EMBED_TEXTS)
+    return embedder
 
 
 def test_as_list_wraps_bare_string():
@@ -95,6 +130,157 @@ def test_update_wraps_bare_string_document(monkeypatch):
     assert len(inner.calls["update"]["embeddings"]) == 1
 
 
+def test_document_update_preserves_stored_title_and_filename_for_embedding(monkeypatch):
+    embedder = _use_metadata_aware_embedder(monkeypatch)
+    inner = _FakeInner(
+        rows={"d1": ("old body", {"title": "Stored title", "source_file": "/docs/guide.md"})}
+    )
+
+    ew.EmbeddingCollection(inner).update(ids="d1", documents="changed body")
+
+    assert inner.get_calls == [{"ids": ["d1"], "include": ["documents", "metadatas"]}]
+    assert embedder.calls == [
+        (
+            ["changed body"],
+            [{"title": "Stored title", "source_file": "/docs/guide.md"}],
+        )
+    ]
+    assert inner.calls["update"]["embeddings"] == [[1.0, 0.0]]
+
+
+@pytest.mark.parametrize(
+    (
+        "changed_metadata",
+        "initial_metadata",
+        "expected_metadata_key",
+        "expected_path",
+        "expected_title",
+    ),
+    [
+        (
+            {"title": "New title"},
+            {"source_file": "/docs/guide.md"},
+            "source_file",
+            "/docs/guide.md",
+            "New title",
+        ),
+        (
+            {"source_file": "/docs/new.md"},
+            {"source_file": "/docs/guide.md"},
+            "source_file",
+            "/docs/new.md",
+            None,
+        ),
+        (
+            {"source_path": "/docs/new.md"},
+            {"source_path": "/docs/guide.md"},
+            "source_path",
+            "/docs/new.md",
+            None,
+        ),
+    ],
+)
+def test_title_or_source_metadata_update_reembeds_existing_document(
+    monkeypatch,
+    changed_metadata,
+    initial_metadata,
+    expected_metadata_key,
+    expected_path,
+    expected_title,
+):
+    embedder = _use_metadata_aware_embedder(monkeypatch)
+    inner = _FakeInner(rows={"d1": ("existing document body", initial_metadata)})
+
+    ew.EmbeddingCollection(inner).update(ids=["d1"], metadatas=[changed_metadata])
+
+    assert embedder.calls[0][0] == ["existing document body"]
+    assert embedder.calls[0][1][0][expected_metadata_key] == expected_path
+    if expected_title is not None:
+        assert embedder.calls[0][1][0]["title"] == expected_title
+    assert inner.calls["update"]["metadatas"] == [changed_metadata]
+    assert inner.calls["update"]["embeddings"] is not None
+
+
+def test_native_media_title_update_preserves_native_vector(monkeypatch):
+    embedder = _use_metadata_aware_embedder(monkeypatch)
+    inner = _FakeInner(
+        rows={"asset": ("Image asset: photo.png", {"media_type": "image", "title": "photo.png"})}
+    )
+
+    ew.EmbeddingCollection(inner).update(ids=["asset"], metadatas=[{"title": "Family photo"}])
+
+    assert embedder.calls == []
+    assert inner.calls["update"]["embeddings"] is None
+
+
+def test_native_media_document_update_requires_explicit_vector_or_reingest(monkeypatch):
+    _use_metadata_aware_embedder(monkeypatch)
+    inner = _FakeInner(
+        rows={"asset": ("Image asset: photo.png", {"media_type": "image", "title": "photo.png"})}
+    )
+
+    with pytest.raises(ValueError, match="re-ingest the source"):
+        ew.EmbeddingCollection(inner).update(ids=["asset"], documents=["edited descriptor"])
+
+
+def test_provider_title_falls_back_to_source_path():
+    from mempalace.embeddinggemma2 import _metadata_title
+
+    assert _metadata_title({"source_path": "/docs/guide.md"}) == "guide.md"
+
+
+def test_same_effective_title_metadata_does_not_reembed(monkeypatch):
+    embedder = _use_metadata_aware_embedder(monkeypatch)
+    inner = _FakeInner(
+        rows={"d1": ("existing body", {"title": "Same title", "source_file": "/docs/a.md"})}
+    )
+
+    ew.EmbeddingCollection(inner).update(ids=["d1"], metadatas=[{"title": "Same title"}])
+
+    assert inner.get_calls
+    assert embedder.calls == []
+    assert inner.calls["update"]["embeddings"] is None
+
+
+def test_native_media_type_update_requires_reingestion(monkeypatch):
+    _use_metadata_aware_embedder(monkeypatch)
+    inner = _FakeInner(rows={"asset": ("Image asset: photo.png", {"media_type": "image"})})
+    with pytest.raises(ValueError, match="re-ingesting"):
+        ew.EmbeddingCollection(inner).update(ids=["asset"], metadatas=[{"media_type": "audio"}])
+    assert "update" not in inner.calls
+
+
+def test_non_title_metadata_update_does_not_read_or_reembed(monkeypatch):
+    monkeypatch.setattr(
+        ew,
+        "_get_document_embedder",
+        lambda: (_ for _ in ()).throw(AssertionError("must not resolve embedder")),
+    )
+    inner = _FakeInner(rows={"d1": ("body", {"title": "Existing"})})
+
+    ew.EmbeddingCollection(inner).update(ids=["d1"], metadatas=[{"wing": "alpha"}])
+
+    assert inner.get_calls == []
+    assert inner.calls["update"]["embeddings"] is None
+
+
+def test_explicit_update_embeddings_bypass_reads_and_reembedding(monkeypatch):
+    monkeypatch.setattr(
+        ew,
+        "_get_document_embedder",
+        lambda: (_ for _ in ()).throw(AssertionError("must not resolve embedder")),
+    )
+    inner = _FakeInner(rows={"d1": ("old body", {"title": "Old"})})
+    explicit = [[0.25, 0.75]]
+
+    ew.EmbeddingCollection(inner).update(
+        ids=["d1"], documents=["new body"], metadatas=[{"title": "New"}], embeddings=explicit
+    )
+
+    assert inner.get_calls == []
+    assert inner.calls["update"]["embeddings"] is explicit
+
+
 def test_query_wraps_bare_string(monkeypatch):
     seen = _patch_embed(monkeypatch)
     inner = _FakeInner()
@@ -103,6 +289,7 @@ def test_query_wraps_bare_string(monkeypatch):
     # query_texts is consumed into a single query embedding
     assert len(inner.calls["query"]["query_embeddings"]) == 1
     assert inner.calls["query"]["query_texts"] is None
+    assert seen["query"] is True
 
 
 def test_list_inputs_unaffected(monkeypatch):
@@ -114,7 +301,7 @@ def test_list_inputs_unaffected(monkeypatch):
 
 
 def test_add_wraps_bare_string_ids_and_dict_metadatas(monkeypatch):
-    _patch_embed(monkeypatch)
+    seen = _patch_embed(monkeypatch)
     inner = _FakeInner()
     # a single id (str) and a single metadata (dict) are OneOrMany shapes too
     ew.EmbeddingCollection(inner).add(documents="solo", ids="d1", metadatas={"src": "web"})
@@ -124,6 +311,7 @@ def test_add_wraps_bare_string_ids_and_dict_metadatas(monkeypatch):
     # documents / embeddings / ids / metadatas all length-aligned at 1
     assert call["documents"] == ["solo"]
     assert len(call["embeddings"]) == 1
+    assert seen["metadatas"] == [{"src": "web"}]
 
 
 def test_facet_counts_forwards_to_inner():

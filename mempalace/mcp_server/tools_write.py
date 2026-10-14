@@ -27,6 +27,14 @@ def _response_safe_meta(meta):
         safe_meta["last_modified"] = safe_meta["filed_at"]
     if safe_meta.get("source_file"):
         safe_meta["source_file"] = Path(safe_meta["source_file"]).name
+    # ``source_dir_ino`` is bookkeeping for ``sync``, which reads the metadata
+    # directly. It says nothing a caller can use and it describes the host's
+    # filesystem, which is the same reason the path above is cut to its name.
+    # It comes off the copy made above, never the record: ``_safe_meta`` hands
+    # back the caller's own dict, and popping the field from a record a writer
+    # still holds would drop it from whatever that writer filed next. No caller
+    # passes a record it goes on to write through here today.
+    safe_meta.pop("source_dir_ino", None)
     return safe_meta
 
 
@@ -100,26 +108,31 @@ def _logical_chunk_group(col, drawer_id: str):
         logger.debug("chunk group lookup failed for %s", drawer_id, exc_info=True)
         return None
 
-    ids = _chroma_field(result, "ids", []) or []
-    if not ids:
-        return None
+    return _chunk_group_record(drawer_id, _rows_from_get(result))
 
+
+def _rows_from_get(result):
+    """Normalize a collection ``get`` into ``(index, id, doc, meta)`` rows."""
+    ids = _chroma_field(result, "ids", []) or []
     docs = _chroma_field(result, "documents", []) or []
     metas = _chroma_field(result, "metadatas", []) or []
-
     rows = []
     for idx, chunk_id in enumerate(ids):
         doc = docs[idx] if idx < len(docs) else ""
         meta = _safe_meta(metas[idx] if idx < len(metas) else {})
         rows.append((_chunk_index(meta), chunk_id, doc or "", meta))
+    return rows
 
+
+def _chunk_group_record(drawer_id, rows):
+    """Build one logical-group record from ``(index, id, doc, meta)`` rows."""
+    if not rows:
+        return None
     rows.sort(key=lambda row: (row[0], row[1]))
-
     chunk_ids = [row[1] for row in rows]
     chunk_docs = [row[2] for row in rows]
     chunk_metas = [row[3] for row in rows]
     first_meta = chunk_metas[0] if chunk_metas else {}
-
     return {
         "drawer_id": drawer_id,
         "ids": chunk_ids,
@@ -131,11 +144,126 @@ def _logical_chunk_group(col, drawer_id: str):
     }
 
 
-def _logical_drawer_record(col, drawer_id: str):
+def _single_record(drawer_id, doc, meta):
+    """Build the one-row record ``_single_drawer_record`` returns."""
+    doc = doc or ""
+    meta = _safe_meta(meta)
+    return {
+        "drawer_id": drawer_id,
+        "ids": [drawer_id],
+        "documents": [doc],
+        "metadatas": [meta],
+        "content": doc,
+        "metadata": meta,
+        "chunked": False,
+    }
+
+
+def _sqlite_logical_drawer_record(drawer_id: str):
+    """Resolve a configured Chroma drawer without opening its collection.
+
+    Missing rows and unsupported SQLite state retain the collection fallback.
+    Both readers use the same record builders for physical and logical IDs.
+    """
+    if not isinstance(drawer_id, str) or not drawer_id or not _is_chroma_backend():
+        return None
+    try:
+        from ..backends.chroma import sqlite_drawer_rows
+
+        result = sqlite_drawer_rows(
+            _config.palace_path, _config.collection_name, drawer_id=drawer_id
+        )
+        if result is None:
+            return None
+        is_direct, rows = result
+        if not rows:
+            return None
+        if is_direct:
+            physical_id, doc, meta = rows[0]
+            return _single_record(physical_id, doc, meta)
+        return _chunk_group_record(
+            drawer_id,
+            [
+                (_chunk_index(_safe_meta(meta)), physical_id, doc or "", _safe_meta(meta))
+                for physical_id, doc, meta in rows
+            ],
+        )
+    except Exception:
+        logger.debug("sqlite drawer lookup failed; falling back", exc_info=True)
+        return None
+
+
+def _collection_logical_drawer_record(col, drawer_id: str):
+    """Resolve a drawer through the original collection lookup path."""
     direct = _single_drawer_record(col, drawer_id)
     if direct is not None:
         return direct
     return _logical_chunk_group(col, drawer_id)
+
+
+def _logical_drawer_record(col, drawer_id: str):
+    record = _sqlite_logical_drawer_record(drawer_id)
+    if record is not None:
+        return record
+    return _collection_logical_drawer_record(col, drawer_id)
+
+
+def _bulk_drawer_records(col, drawer_ids):
+    """Resolve many ids with one direct read and, if needed, one group read.
+
+    A row returned by the direct read wins, so a physical chunk id stays
+    that one row. Ids with no row are matched together on either parent
+    key and assembled the same way as ``_logical_chunk_group``. An id that
+    matches neither read is absent. The caller keeps input order.
+    """
+    unique = list(
+        dict.fromkeys(drawer_id for drawer_id in drawer_ids if isinstance(drawer_id, str))
+    )
+    if not unique:
+        return {}
+
+    found = {}
+    for _index, chunk_id, doc, meta in _rows_from_get(
+        col.get(ids=unique, include=["documents", "metadatas"])
+    ):
+        found[chunk_id] = _single_record(chunk_id, doc, meta)
+
+    missing = [drawer_id for drawer_id in unique if drawer_id not in found]
+    if not missing:
+        return found
+
+    requested = set(missing)
+    grouped = {drawer_id: [] for drawer_id in missing}
+    seen = {drawer_id: set() for drawer_id in missing}
+    try:
+        group_rows = _rows_from_get(
+            col.get(
+                where={"$or": [{key: {"$in": missing}} for key in _PARENT_ID_KEYS]},
+                include=["documents", "metadatas"],
+            )
+        )
+    except Exception:
+        logger.debug("bulk chunk group lookup failed", exc_info=True)
+        return found
+
+    for row in group_rows:
+        meta = row[3]
+        parents = []
+        for key in _PARENT_ID_KEYS:
+            value = meta.get(key)
+            if value in requested and value not in parents:
+                parents.append(value)
+        for parent in parents:
+            if row[1] in seen[parent]:
+                continue
+            seen[parent].add(row[1])
+            grouped[parent].append(row)
+
+    for drawer_id, rows in grouped.items():
+        record = _chunk_group_record(drawer_id, rows)
+        if record is not None:
+            found[drawer_id] = record
+    return found
 
 
 def _drawer_payload(record):
@@ -247,7 +375,7 @@ def _fill_drawer_previews(col, page: list) -> None:
     _apply_drawer_previews(page, docs_by_id)
 
 
-def _fill_drawer_previews_from_sqlite(page: list) -> None:
+def _fill_drawer_previews_from_sqlite(page: list, *, connection=None) -> bool:
     """Same, reading the page's documents straight from ``chroma.sqlite3``.
 
     The list itself is answered from metadata only — joining documents into
@@ -256,18 +384,16 @@ def _fill_drawer_previews_from_sqlite(page: list) -> None:
     """
     physical_ids = _page_physical_ids(page)
     if not physical_ids:
-        return
+        return True
     from ..backends.chroma import sqlite_documents_for_ids
 
     docs_by_id = sqlite_documents_for_ids(
-        _config.palace_path, _config.collection_name, physical_ids
+        _config.palace_path, _config.collection_name, physical_ids, _connection=connection
     )
     if docs_by_id is None:
-        # sqlite went unreadable between the two reads; previews are a
-        # display detail, so degrade to blank rather than fail the listing.
-        logger.debug("sqlite preview hydration failed; leaving previews empty")
-        return
+        return False
     _apply_drawer_previews(page, docs_by_id)
+    return True
 
 
 def _collapse_drawer_rows(ids, documents, metadatas):
@@ -414,6 +540,12 @@ def tool_add_drawer(
         "filed_at": datetime.now().isoformat(),
         "id_recipe": ID_RECIPE,
     }
+    if source_file:
+        # A drawer filed here names a source file the same way a mined one
+        # does, and ``sync`` decides both by the same rule, so it records the
+        # same directory identity (#2320). Without it this tool would file the
+        # one kind of drawer in a palace that sync cannot protect.
+        base_meta.update(identity_metadata(source_file))
 
     base_meta["last_modified"] = base_meta["filed_at"]
     # Idempotency. Three cases to detect a prior committed write:
@@ -433,10 +565,14 @@ def tool_add_drawer(
     try:
         existing = col.get(ids=idempotency_probe_ids, include=[])
         if _get_result_ids(existing):
-            return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
+            outcome = {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
+            _wal_result("add_drawer", outcome)
+            return outcome
     except Exception as e:
         logger.warning("Idempotency pre-check failed for %s", idempotency_probe_ids, exc_info=True)
-        return {"success": False, "error": f"Idempotency check failed before write: {e}"}
+        outcome = {"success": False, "error": f"Idempotency check failed before write: {e}"}
+        _wal_result("add_drawer", outcome)
+        return outcome
 
     try:
         if len(content) <= chunk_size:
@@ -453,13 +589,15 @@ def tool_add_drawer(
                 )
             _invalidate_overview_caches()
             logger.info(f"Filed drawer: {drawer_id} -> {wing}/{room}")
-            return {
+            outcome = {
                 "success": True,
                 "drawer_id": drawer_id,
                 "wing": wing,
                 "room": room,
                 "chunks": 1,
             }
+            _wal_result("add_drawer", outcome)
+            return outcome
 
         # Oversized content: split into bounded per-chunk drawers so the
         # embedding model never sees a document above ``chunk_size``.
@@ -488,7 +626,7 @@ def tool_add_drawer(
             )
         _invalidate_overview_caches()
         logger.info(f"Filed drawer: {drawer_id} -> {wing}/{room} ({len(chunk_ids)} chunks)")
-        return {
+        outcome = {
             "success": True,
             "drawer_id": drawer_id,
             "wing": wing,
@@ -496,55 +634,85 @@ def tool_add_drawer(
             "chunks": len(chunk_ids),
             "chunk_ids": chunk_ids,
         }
+        _wal_result("add_drawer", outcome)
+        return outcome
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        outcome = _embed_failure(e, success=False)
+        _wal_result("add_drawer", outcome)
+        return outcome
+
+
+def _delete_record(col, drawer_id: str, record, *, bulk: bool = False):
+    """Write-ahead, delete, and closet-purge one already resolved record.
+
+    Closets are keyed by ``source_file``, not by drawer id, so a drawer-only
+    delete would leave an index entry quoting text that is now gone. Returns
+    the singular success dict. A backend failure propagates so the caller can
+    fail one call or one item of a batch. ``bulk`` marks the write-ahead
+    record when this delete is one item of a multi-id call.
+    """
+    details = {
+        "drawer_id": drawer_id,
+        "deleted_ids": record["ids"],
+        "deleted_meta": record["metadata"],
+        "content_preview": record["content"][:200],
+    }
+    if bulk:
+        details["bulk"] = True
+    _wal_log("delete_drawer", details)
+
+    col.delete(ids=record["ids"])
+    _invalidate_overview_caches()
+
+    source_file = record["metadata"].get("source_file")
+    closets_deleted = _purge_source_closets(source_file, commit=True) if source_file else 0
+
+    logger.info(
+        "Deleted drawer: %s (%s rows, %s closet(s) purged)%s",
+        drawer_id,
+        len(record["ids"]),
+        closets_deleted,
+        " [bulk]" if bulk else "",
+    )
+
+    return {
+        "success": True,
+        "drawer_id": drawer_id,
+        "deleted_ids": record["ids"],
+        "chunks_deleted": len(record["ids"]),
+        "closets_deleted": closets_deleted,
+    }
+
+
+def _delete_resolved_drawer(col, drawer_id: str, *, bulk: bool = False):
+    """Resolve one id and delete it.
+
+    A logical handle removes the whole group, including every chunk row.
+    A physical chunk id removes that one row, because resolution hits the
+    row directly. Returns the singular success or not-found dict.
+    """
+    record = (
+        _collection_logical_drawer_record(col, drawer_id)
+        if bulk
+        else _logical_drawer_record(col, drawer_id)
+    )
+    if record is None:
+        return {"success": False, "error": f"Drawer not found: {drawer_id}"}
+    return _delete_record(col, drawer_id, record, bulk=bulk)
 
 
 def tool_delete_drawer(drawer_id: str):
-    """Delete a single logical drawer by ID."""
-    global _metadata_cache
+    """Delete one drawer by ID.
 
+    A logical handle removes the whole group, including every chunk row.
+    A physical chunk id removes that one row.
+    """
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
 
     try:
-        record = _logical_drawer_record(col, drawer_id)
-        if record is None:
-            return {"success": False, "error": f"Drawer not found: {drawer_id}"}
-
-        _wal_log(
-            "delete_drawer",
-            {
-                "drawer_id": drawer_id,
-                "deleted_ids": record["ids"],
-                "deleted_meta": record["metadata"],
-                "content_preview": record["content"][:200],
-            },
-        )
-
-        col.delete(ids=record["ids"])
-        _invalidate_overview_caches()
-
-        # Closets are keyed by source_file, not drawer_id (#1722), so a
-        # drawer-only delete strands a closet quoting the now-deleted text (#2325).
-        source_file = record["metadata"].get("source_file")
-        closets_deleted = _purge_source_closets(source_file, commit=True) if source_file else 0
-
-        logger.info(
-            "Deleted drawer: %s (%s rows, %s closet(s) purged)",
-            drawer_id,
-            len(record["ids"]),
-            closets_deleted,
-        )
-
-        return {
-            "success": True,
-            "drawer_id": drawer_id,
-            "deleted_ids": record["ids"],
-            "chunks_deleted": len(record["ids"]),
-            "closets_deleted": closets_deleted,
-        }
+        return _delete_resolved_drawer(col, drawer_id)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -651,6 +819,8 @@ def tool_mine(
     limit: int = 0,
     dry_run: bool = False,
     extract: str = "exchange",
+    include_ignored: Optional[list[str]] = None,
+    include_subagents: bool = False,
 ):
     """Mine a directory into the palace — the MCP equivalent of ``mempalace mine``.
 
@@ -671,18 +841,26 @@ def tool_mine(
     dry_run: walk + chunk and report, but file nothing.
     extract: convos extraction strategy — ``"exchange"`` (default) or
              ``"general"``; ignored by the other modes.
+    include_ignored: project-relative paths to scan even if ignored, matching
+                     the CLI's ``--include-ignored``; projects mode only.
+    include_subagents: also mine Claude Code ``subagents/`` transcript dirs,
+                       matching the CLI's ``--include-subagents``; convos mode
+                       only, ignored by the other modes.
 
     Runs synchronously and mirrors the :func:`tool_sync` contract: success
     returns ``{success: True, mode, dry_run, output[, output_truncated]}`` where ``output`` is
     the miner's human-readable summary (captured so it cannot corrupt the
     JSON-RPC stream); failure returns ``{success: False, error[, error_class]}``.
+    A mine that ran but could not file some files returns ``success: False``
+    with ``error_class: "MineFileErrors"``, ``files_failed``, up to 20
+    ``failed_files`` and the same ``output``.
     The palace write lock is held by the miners themselves, so a concurrent mine
     surfaces as a structured already-running error. Orphan cleanup is not part of
     mining — use ``mempalace_sync`` for that.
     """
     global _metadata_cache
     from ..daemon import LOCK_REFUSAL_ERROR_CLASS
-    from ..palace import MineAlreadyRunning, MineValidationError
+    from ..palace import MineAlreadyRunning, MineFileErrors, MineValidationError
 
     if not _config.palace_path:
         np = _no_palace()
@@ -693,6 +871,30 @@ def tool_mine(
         return {
             "success": False,
             "error": f"invalid mode '{mode}'; expected one of: {', '.join(valid_modes)}",
+        }
+
+    if include_ignored is not None and (
+        not isinstance(include_ignored, list)
+        or any(not isinstance(path, str) or not path.strip() for path in include_ignored)
+    ):
+        return {
+            "success": False,
+            "error": "include_ignored must be an array of non-empty project-relative path strings",
+            "error_class": "ValueError",
+        }
+    if include_ignored and mode != "projects":
+        return {
+            "success": False,
+            "error": "include_ignored is supported only in projects mode",
+            "error_class": "ValueError",
+        }
+    # A truthy non-boolean ("false", 1) would silently opt into mining every
+    # subagent transcript, so accept only a real JSON boolean.
+    if not isinstance(include_subagents, bool):
+        return {
+            "success": False,
+            "error": "include_subagents must be a boolean",
+            "error_class": "ValueError",
         }
 
     src = os.path.expanduser(source) if source else ""
@@ -708,6 +910,14 @@ def tool_mine(
         return {"success": False, "error": f"source not found: {source!r}"}
 
     def _run():
+        # Files that failed are reported with the summary the mine printed,
+        # which an exception escaping the stdout capture would discard.
+        try:
+            return _run_miner()
+        except MineFileErrors as exc:
+            return exc
+
+    def _run_miner():
         if mode == "convos":
             from ..convo_miner import mine_convos
 
@@ -719,6 +929,7 @@ def tool_mine(
                 limit=limit,
                 dry_run=dry_run,
                 extract_mode=extract,
+                include_subagents=include_subagents,
             )
         if mode == "extract":
             from ..format_miner import mine_formats
@@ -740,6 +951,7 @@ def tool_mine(
             agent=agent,
             limit=limit,
             dry_run=dry_run,
+            **({"include_ignored": include_ignored} if include_ignored else {}),
         )
 
     try:
@@ -797,6 +1009,12 @@ def tool_mine(
         # payload to the MCP client. The useful summary is at the tail, so keep
         # the end and flag the truncation (never silently).
         payload = {"success": True, "mode": mode, "dry_run": dry_run, "output": output}
+        if isinstance(_result, MineFileErrors):
+            payload["success"] = False
+            payload["error"] = str(_result)
+            payload["error_class"] = "MineFileErrors"
+            payload["files_failed"] = len(_result.failed_files)
+            payload["failed_files"] = list(_result.failed_files[:20])
         cap = 4000
         if len(output) > cap:
             payload["output"] = output[-cap:]
@@ -1000,17 +1218,113 @@ def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
 
 def tool_get_drawer(drawer_id: str):
     """Fetch a single logical drawer by ID."""
+    try:
+        record = _sqlite_logical_drawer_record(drawer_id)
+        if record is not None:
+            return _drawer_payload(record)
+    except Exception as e:
+        return {"error": str(e)}
+
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
 
     try:
-        record = _logical_drawer_record(col, drawer_id)
+        record = _collection_logical_drawer_record(col, drawer_id)
         if record is None:
             return {"error": f"Drawer not found: {drawer_id}"}
         return _drawer_payload(record)
     except Exception as e:
         return {"error": str(e)}
+
+
+# Separate bulk tools sit beside the singular get and delete tools. Their
+# schemas stay array-only, so the singular tools' schemas and responses are
+# unchanged. An accepted call (1 to _BULK_DRAWER_MAX_IDS ids) always returns
+# {"results": [...]} in input order, including a one-id call, and a missing
+# id is an error slot rather than a failed batch. A non-list, an empty list,
+# or a list past the cap is rejected with {"error": ...} before any read or
+# write, so that rejection is a different shape from a batch that ran.
+_BULK_DRAWER_MAX_IDS = 500
+
+
+def _bulk_ids_error(drawer_ids, *, action: str):
+    """Return an error dict when ``drawer_ids`` cannot be processed.
+
+    ``action`` is the noun in the oversized-list message ("fetch" or
+    "delete"). Returns None when the list holds 1 to ``_BULK_DRAWER_MAX_IDS``
+    ids.
+    """
+    if not isinstance(drawer_ids, list):
+        return {"error": "drawer_ids must be a list of drawer IDs"}
+    if not drawer_ids:
+        return {"error": "drawer_ids must not be empty"}
+    if len(drawer_ids) > _BULK_DRAWER_MAX_IDS:
+        return {
+            "error": (
+                f"drawer_ids holds {len(drawer_ids)} ids, but the bulk {action} "
+                f"accepts at most {_BULK_DRAWER_MAX_IDS} per call"
+            )
+        }
+    return None
+
+
+def tool_get_drawers(drawer_ids: list):
+    """Fetch many drawers by ID in one call.
+
+    Each id resolves the same way as ``tool_get_drawer``: a logical handle
+    reassembles the chunk group, and a physical chunk id returns that row.
+    The payload for a hit is the singular tool's payload. An id that does
+    not resolve is ``{"drawer_id", "error"}`` and is counted in ``errors``;
+    later ids are still fetched.
+
+    A list of 1 to 500 ids returns ``{"results", "count", "errors"}``.
+    A non-list, an empty list, or more than 500 ids returns ``{"error"}``
+    and does not read the palace.
+    """
+    rejected = _bulk_ids_error(drawer_ids, action="fetch")
+    if rejected:
+        return rejected
+
+    col = _get_collection()
+    if not col:
+        return _collection_error_or_no_palace()
+
+    try:
+        found = _bulk_drawer_records(col, drawer_ids)
+    except Exception:
+        logger.exception("tool_get_drawers batch resolve failed; resolving one id at a time")
+        found = None
+
+    results = []
+    errors = 0
+    for drawer_id in drawer_ids:
+        try:
+            if found is None:
+                record = _collection_logical_drawer_record(col, drawer_id)
+            else:
+                record = found.get(drawer_id)
+            error = None
+        except Exception as e:
+            record = None
+            error = str(e)
+        if record is None:
+            errors += 1
+            results.append(
+                {"drawer_id": drawer_id, "error": error or f"Drawer not found: {drawer_id}"}
+            )
+            continue
+        try:
+            results.append(_drawer_payload(record))
+        except Exception as e:
+            errors += 1
+            results.append({"drawer_id": drawer_id, "error": str(e)})
+
+    return {
+        "results": results,
+        "count": len(results),
+        "errors": errors,
+    }
 
 
 def tool_list_drawers(
@@ -1058,46 +1372,47 @@ def tool_list_drawers(
         elif len(conditions) > 1:
             where = {"$and": conditions}
 
-        listed = None
+        def make_page(ids, metadatas):
+            drawers = _collapse_drawer_rows(ids, [], metadatas)
+            if since_dt is not None or before_dt is not None:
+                drawers = [
+                    d
+                    for d in drawers
+                    if _filed_at_in_window(
+                        d.get("metadata", {}).get("filed_at"), since_dt, before_dt
+                    )
+                ]
+            page = drawers[offset : offset + limit]
+            return {
+                "drawers": page,
+                "total": len(drawers),
+                "count": len(page),
+                "offset": offset,
+                "limit": limit,
+            }
+
         if _is_chroma_backend() and _config.palace_path:
-            from ..backends.chroma import sqlite_list_id_metadata
+            from ..backends.chroma import sqlite_list_id_metadata, sqlite_metadata_snapshot
 
-            listed = sqlite_list_id_metadata(
-                _config.palace_path, _config.collection_name, where=where
-            )
-        if listed is not None:
-            # Documents are fetched for the displayed page only, below.
-            ids, metadatas = listed
-            documents = []
-        else:
-            col = _get_collection()
-            if not col:
-                return _collection_error_or_no_palace()
-            ids, documents, metadatas = _fetch_drawer_rows(col, where=where, include=["metadatas"])
-        drawers = _collapse_drawer_rows(ids, documents, metadatas)
+            # Metadata selection, logical grouping and page-only text hydration
+            # share a recovered SQLite snapshot. Close it before any SDK fallback.
+            with sqlite_metadata_snapshot(_config.palace_path, _config.collection_name) as conn:
+                if conn is not None:
+                    listed = sqlite_list_id_metadata(
+                        _config.palace_path, _config.collection_name, where=where, _connection=conn
+                    )
+                    if listed is not None:
+                        result = make_page(*listed)
+                        if _fill_drawer_previews_from_sqlite(result["drawers"], connection=conn):
+                            return result
 
-        if since_dt is not None or before_dt is not None:
-            drawers = [
-                d
-                for d in drawers
-                if _filed_at_in_window(d.get("metadata", {}).get("filed_at"), since_dt, before_dt)
-            ]
-
-        page = drawers[offset : offset + limit]
-        if listed is not None:
-            _fill_drawer_previews_from_sqlite(page)
-        else:
-            col = _get_collection()
-            if col:
-                _fill_drawer_previews(col, page)
-
-        return {
-            "drawers": page,
-            "total": len(drawers),
-            "count": len(page),
-            "offset": offset,
-            "limit": limit,
-        }
+        col = _get_collection()
+        if not col:
+            return _collection_error_or_no_palace()
+        ids, _documents, metadatas = _fetch_drawer_rows(col, where=where, include=["metadatas"])
+        result = make_page(ids, metadatas)
+        _fill_drawer_previews(col, result["drawers"])
+        return result
     except Exception as e:
         logger.exception("tool_list_drawers failed")
         return {"error": str(e)}
@@ -1136,7 +1451,11 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 wing = sanitize_name(wing, "wing")
             except ValueError as e:
                 return {"success": False, "error": str(e)}
-            if wing.lower() != str(old_meta.get("wing") or "").lower():
+            # Case-sensitive comparison: a case-only rename IS a rename.
+            # ``list_drawers`` is case-sensitive, so case-duplicate wings are
+            # distinct destinations, and the caller's exact casing is
+            # authoritative (#2395).
+            if wing != str(old_meta.get("wing") or ""):
                 new_meta["wing"] = wing
 
         if room is not None:
@@ -1144,7 +1463,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 room = sanitize_name(room, "room")
             except ValueError as e:
                 return {"success": False, "error": str(e)}
-            if room.lower() != str(old_meta.get("room") or "").lower():
+            if room != str(old_meta.get("room") or ""):
                 new_meta["room"] = room
 
         new_meta["last_modified"] = datetime.now().isoformat()
@@ -1218,4 +1537,71 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             "closets_deleted": closets_deleted,
         }
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return _embed_failure(e, success=False)
+
+
+def tool_delete_drawers(drawer_ids: list):
+    """Delete many drawers by ID in one call. Irreversible.
+
+    Ids are resolved together, then each one is removed by ``_delete_record``,
+    the same mutation the singular tool runs. A logical handle removes the
+    whole group. A physical chunk id removes that one row. Per-item results
+    come back in input order. A missing id is an ``error`` slot counted in
+    ``errors``; later ids are still deleted.
+
+    A list of 1 to 500 ids returns ``{"results", "count", "deleted", "errors"}``.
+    A non-list, an empty list, or more than 500 ids returns ``{"error"}``
+    and deletes nothing.
+    """
+    rejected = _bulk_ids_error(drawer_ids, action="delete")
+    if rejected:
+        return rejected
+
+    col = _get_collection()
+    if not col:
+        return _collection_error_or_no_palace()
+
+    try:
+        found = _bulk_drawer_records(col, drawer_ids)
+    except Exception:
+        logger.exception("tool_delete_drawers batch resolve failed; deleting one id at a time")
+        found = None
+
+    results = []
+    deleted = 0
+    errors = 0
+    for drawer_id in drawer_ids:
+        try:
+            if found is None:
+                outcome = _delete_resolved_drawer(col, drawer_id, bulk=True)
+            else:
+                record = found.get(drawer_id)
+                if record is None:
+                    outcome = {"success": False, "error": f"Drawer not found: {drawer_id}"}
+                else:
+                    outcome = _delete_record(col, drawer_id, record, bulk=True)
+        except Exception as e:
+            errors += 1
+            results.append({"drawer_id": drawer_id, "error": str(e)})
+            logger.exception("tool_delete_drawers: delete failed for %s", drawer_id)
+            continue
+        if not outcome.get("success"):
+            errors += 1
+            results.append({"drawer_id": drawer_id, "error": outcome["error"]})
+            continue
+        deleted += 1
+        results.append(
+            {
+                "drawer_id": drawer_id,
+                "deleted_ids": outcome["deleted_ids"],
+                "chunks_deleted": outcome["chunks_deleted"],
+                "closets_deleted": outcome["closets_deleted"],
+            }
+        )
+
+    return {
+        "results": results,
+        "count": len(results),
+        "deleted": deleted,
+        "errors": errors,
+    }

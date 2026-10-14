@@ -99,10 +99,12 @@ def _request_is_mutating(request: dict) -> bool:
     # This decides whether a mid-flight failure may be replayed locally, so it
     # must return a verdict rather than raise: the same `or {}` trap made a
     # non-mapping `params` throw AttributeError instead of answering "not
-    # mutating", and an unhashable name broke the membership test.
+    # mutating", and an unhashable name broke the membership test. A call that
+    # changes state outside the palace must not be rerun either, so this reads
+    # read-only mode's set rather than the palace-write one.
     _, params = _normalize_envelope(request)
     name = params.get("name")
-    return isinstance(name, str) and name in _MUTATING_TOOLS
+    return isinstance(name, str) and name in _READ_ONLY_REFUSED_TOOLS
 
 
 def _dispatch_stdio_request(request: dict):
@@ -115,6 +117,7 @@ def _dispatch_stdio_request(request: dict):
     mutating call that failed mid-flight must NOT be replayed locally (the
     hub may still be executing it), so it surfaces as a JSON-RPC error.
     """
+    import http.client
     import urllib.error
 
     target = _hub_proxy_target()
@@ -128,7 +131,13 @@ def _dispatch_stdio_request(request: dict):
             request,
             _forward_request_to_hub(base_url, headers, request, _config.palace_path),
         )
-    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+    except (
+        urllib.error.URLError,
+        OSError,
+        TimeoutError,
+        ValueError,
+        http.client.HTTPException,
+    ) as exc:
         reached_hub = isinstance(exc, urllib.error.HTTPError)
         if not reached_hub and not _request_is_mutating(request):
             logger.warning("Hub at %s unreachable (%s); handling request locally", base_url, exc)
@@ -221,15 +230,12 @@ def _run_stdio_loop() -> None:
             request = json.loads(line)
         except KeyboardInterrupt:
             break
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            # Narrow on purpose: reporting a MemoryError or RecursionError as
-            # "Parse error" would be a lie. The id is unknowable here, so it is
-            # null per JSON-RPC 2.0 section 5 -- the "never answer a
-            # notification" rule cannot bind when the notification is exactly
-            # what could not be parsed. Staying silent left the client waiting
-            # on a request it had already sent, while the HTTP transport has
-            # answered -32700 all along.
-            logger.error("Server error: %s", exc)
+        except Exception as exc:
+            # ValueError (digit limit) and RecursionError (nesting) are still
+            # parse failures, so answer -32700 with a null id the way the HTTP
+            # transport does. The type is in the log because MemoryError has
+            # no message of its own.
+            logger.error("Server error: %s: %s", type(exc).__name__, exc)
             payload = json.dumps(_json_rpc_parse_error(), ensure_ascii=False)
         else:
             try:
@@ -264,6 +270,87 @@ def _run_stdio_loop() -> None:
             break
 
 
+_MCP_WRITER_WAIT_SECONDS_ENV = "MEMPALACE_MCP_WRITER_WAIT_SECONDS"
+_MCP_WRITER_WAIT_SECONDS_DEFAULT = 120.0
+_MCP_WRITER_WAIT_MAX_DELAY = 5.0
+
+
+def _writer_wait_seconds() -> float:
+    """How long a writable HTTP server waits for a peer to release the writer lease.
+
+    ``MEMPALACE_MCP_WRITER_WAIT_SECONDS`` (default 120). ``0`` restores the old
+    behaviour of refusing immediately. A value that is not a finite,
+    non-negative number falls back to the default with a warning.
+    """
+    import math
+
+    raw = os.environ.get(_MCP_WRITER_WAIT_SECONDS_ENV, "").strip()
+    if not raw:
+        return _MCP_WRITER_WAIT_SECONDS_DEFAULT
+    try:
+        seconds = float(raw)
+    except ValueError:
+        seconds = -1.0
+    if not math.isfinite(seconds) or seconds < 0:
+        logger.warning(
+            "Invalid %s=%r; using default %.0f s",
+            _MCP_WRITER_WAIT_SECONDS_ENV,
+            raw,
+            _MCP_WRITER_WAIT_SECONDS_DEFAULT,
+        )
+        return _MCP_WRITER_WAIT_SECONDS_DEFAULT
+    return seconds
+
+
+def _acquire_writer_lease_for_http_startup() -> tuple[bool, str]:
+    """Acquire the writer lease for writable HTTP startup, waiting if a peer holds it.
+
+    #2500: refusing at once turned a transient holder into an outage. A peer
+    session's MCP server, a hook-driven mine or a CLI write that holds the
+    lease releases it when it finishes, but ``SystemExit(2)`` before binding
+    meant nothing retried, and under ``Restart=always`` the unit restarted
+    forever without ever starting. The server now retries for a bounded time
+    with backoff, logging once when the wait starts, and still exits 2 when
+    the wait runs out so a supervisor sees a terminal failure.
+
+    Only contention waits. ``_acquire_mcp_writer_lock`` sets
+    ``_MCP_WRITER_READ_ONLY`` when another writer holds the lock; a setup
+    failure (backend or lock directory) leaves it unset, and waiting would not
+    fix that, so it returns at once as before.
+    """
+    ok, reason = _acquire_mcp_writer_lock()
+    if ok or not _MCP_WRITER_READ_ONLY:
+        return ok, reason
+
+    budget = _writer_wait_seconds()
+    if budget <= 0:
+        return ok, reason
+
+    logger.warning(
+        "Writable MCP HTTP startup is waiting up to %g s for the writer lease: %s",
+        budget,
+        reason,
+    )
+    started = time.monotonic()
+    deadline = started + budget
+    delay = 0.5
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, reason
+        time.sleep(min(delay, remaining))
+        delay = min(delay * 2, _MCP_WRITER_WAIT_MAX_DELAY)
+        ok, reason = _acquire_mcp_writer_lock()
+        if ok:
+            logger.info(
+                "Writable MCP HTTP startup acquired the writer lease after %.1f s",
+                time.monotonic() - started,
+            )
+            return True, ""
+        if not _MCP_WRITER_READ_ONLY:
+            return False, reason
+
+
 def _run_http_loop() -> None:
     # In HTTP mode there is no JSON-RPC stdio channel. Keeping the import-time
     # stdout->stderr guard in place means any accidental print from a dependency
@@ -273,10 +360,11 @@ def _run_http_loop() -> None:
     # A writable HTTP server is a long-lived storage client, so it must own the
     # local palace before it binds. Refusing at startup avoids advertising a
     # writable service that will only fail (or race) on its first mutation.
+    # A peer holding the lease is waited out for a bounded time first (#2500).
     # Explicit read-only HTTP remains safe to run beside the one writer owner.
     owns_writer_lease = False
     if not _READ_ONLY:
-        writer_ok, writer_reason = _acquire_mcp_writer_lock()
+        writer_ok, writer_reason = _acquire_writer_lease_for_http_startup()
         if not writer_ok:
             logger.error("Writable MCP HTTP startup refused: %s", writer_reason)
             raise SystemExit(2)
@@ -350,6 +438,10 @@ def _install_shutdown_signal_handlers() -> None:
 def main():
     """MCP server entry point for the ``mempalace-mcp`` console script.
 
+    Parses ``sys.argv`` and applies ``--palace`` / ``--backend`` / ``--read-only``
+    to the process, including ``MEMPALACE_PALACE_PATH`` and ``MEMPALACE_BACKEND``
+    in ``os.environ``; importing the package parses no argv (#2528).
+
     Side effect: pops ``PYTHONPATH`` from ``os.environ`` (see #1423) so any
     subprocess this server spawns inherits a clean env. Host applications that
     call ``main()`` programmatically should be aware that the parent process
@@ -362,6 +454,10 @@ def main():
       process, avoiding the long-lived stdio framing failure surface from
       #1801.
     """
+    global _args
+
+    _args = _parse_args()
+    _apply_server_flags(palace=_args.palace, backend=_args.backend, read_only=_args.read_only)
 
     # Drop leaked PYTHONPATH so any subprocess this server spawns starts
     # with a clean env. The sys.path filter in mempalace/__init__.py

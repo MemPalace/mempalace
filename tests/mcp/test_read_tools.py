@@ -67,7 +67,7 @@ class TestReadTools:
         monkeypatch.setattr(
             embedding_wrapper,
             "_embed_texts",
-            lambda texts: [[float(len(text)), 1.0] for text in texts],
+            lambda texts, **_kwargs: [[float(len(text)), 1.0] for text in texts],
         )
         col = get_collection(palace_path, create=True)
         col.add(
@@ -100,7 +100,7 @@ class TestReadTools:
         monkeypatch.setattr(
             embedding_wrapper,
             "_embed_texts",
-            lambda texts: [[float(len(text)), 1.0] for text in texts],
+            lambda texts, **_kwargs: [[float(len(text)), 1.0] for text in texts],
         )
         col = palace.get_collection(palace_path, create=True)
         col.add(
@@ -159,7 +159,7 @@ class TestReadTools:
         monkeypatch.setattr(
             embedding_wrapper,
             "_embed_texts",
-            lambda texts: [[float(len(text)), 1.0] for text in texts],
+            lambda texts, **_kwargs: [[float(len(text)), 1.0] for text in texts],
         )
         col = palace.get_collection(palace_path, create=True)
         col.add(
@@ -261,7 +261,7 @@ with mine_palace_lock(sys.argv[1]):
         monkeypatch.setattr(
             embedding_wrapper,
             "_embed_texts",
-            lambda texts: [[float(len(text)), 1.0] for text in texts],
+            lambda texts, **_kwargs: [[float(len(text)), 1.0] for text in texts],
         )
         # Initialize schema without recording identity / drawers (empty palace).
         col = palace.get_collection(palace_path, create=True, _skip_identity_check=True)
@@ -312,8 +312,9 @@ with mine_palace_lock(sys.argv[1]):
             # Force a peer-writer-coexistence read (opens query_only handle).
             result = mcp_server.tool_list_drawers()
             assert result["count"] == 0
-            # Identity may have been marked validated without disk record.
-            assert any(key[0] == palace_path for key in palace._VALIDATED_IDENTITY)
+            # A read open of an empty, unrecorded collection records nothing,
+            # so it is not cached as validated either.
+            assert not any(key[0] == palace_path for key in palace._VALIDATED_IDENTITY)
 
             assert holder.stdin is not None
             holder.stdin.close()
@@ -634,9 +635,13 @@ with mine_palace_lock(sys.argv[1]):
 
         scans = [s for s in statements if "FROM embeddings" in s and "ORDER BY e.id" in s]
         assert scans, f"no listing scan observed in {statements}"
-        scan = scans[0]
-        # Documents are excluded from the scan and the filter is pushed down.
-        assert "chroma:document" in scan and "!=" in scan
+        # Initialization can also scan metadata without a wing filter. Locate
+        # the filtered listing query, then verify that it excludes the entire
+        # reserved namespace (which includes chroma:document).
+        filtered_scans = [s for s in scans if "f0.string_value" in s]
+        assert filtered_scans, f"listing did not push its filter into SQL: {scans}"
+        scan = filtered_scans[0]
+        assert "substr(m.key, 1, 7) != 'chroma:'" in scan
         assert scan.count("JOIN embedding_metadata") >= 2, scan
         assert "string_value = " in scan or "string_value = ?" in scan
 
@@ -690,6 +695,125 @@ with mine_palace_lock(sys.argv[1]):
 
         result = tool_status()
         assert "error" in result
+
+
+class TestOverviewCaches:
+    """Status and graph counts run a full GROUP BY over chroma.sqlite3, which
+    takes minutes on a multi-million-drawer palace, so they must not re-run
+    it while nothing has written to the file."""
+
+    @staticmethod
+    def _seed(monkeypatch, config, collection, kg):
+        collection.add(
+            ids=["d1", "d2"],
+            documents=["first drawer", "second drawer"],
+            metadatas=[
+                {"wing": "wing_a", "room": "room_x", "hall": "h"},
+                {"wing": "wing_b", "room": "room_x", "hall": "h"},
+            ],
+        )
+        _patch_mcp_server(monkeypatch, config, kg)
+
+    @staticmethod
+    def _spy(monkeypatch, name, delay=0.0):
+        import time
+
+        from mempalace.backends import chroma
+
+        calls: list[int] = []
+        real = getattr(chroma, name)
+
+        def spy(*args, **kwargs):
+            if delay:
+                time.sleep(delay)
+            calls.append(1)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(chroma, name, spy)
+        return calls
+
+    @staticmethod
+    def _touch_db_as_peer(palace_path):
+        db = os.path.join(palace_path, "chroma.sqlite3")
+        mtime = os.stat(db).st_mtime + 10.0
+        os.utime(db, (mtime, mtime))
+
+    def test_taxonomy_outlives_ttl_while_db_is_unwritten(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        from mempalace import mcp_server
+
+        self._seed(monkeypatch, config, collection, kg)
+        calls = self._spy(monkeypatch, "_sqlite_wing_room_counts")
+
+        first = mcp_server._sqlite_taxonomy()
+        monkeypatch.setattr(mcp_server, "_taxonomy_cache_time", 0.0)  # TTL long gone
+        assert mcp_server._sqlite_taxonomy() == first
+        assert len(calls) == 1
+
+    def test_taxonomy_recounts_after_the_db_changes(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        from mempalace import mcp_server
+
+        self._seed(monkeypatch, config, collection, kg)
+        calls = self._spy(monkeypatch, "_sqlite_wing_room_counts")
+
+        mcp_server._sqlite_taxonomy()
+        self._touch_db_as_peer(palace_path)
+        monkeypatch.setattr(mcp_server, "_taxonomy_cache_time", 0.0)
+        mcp_server._sqlite_taxonomy()
+        assert len(calls) == 2
+
+    def test_taxonomy_recounts_a_changed_db_inside_the_ttl(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        """A peer commit inside the 5 s TTL must not return the previous totals.
+
+        The fingerprint is the invalidation key when it can be read. The TTL
+        only covers a palace whose file stat is unavailable.
+        """
+        from mempalace import mcp_server
+
+        self._seed(monkeypatch, config, collection, kg)
+        calls = self._spy(monkeypatch, "_sqlite_wing_room_counts")
+
+        mcp_server._sqlite_taxonomy()
+        self._touch_db_as_peer(palace_path)
+        mcp_server._sqlite_taxonomy()
+        assert len(calls) == 2
+
+    def test_taxonomy_slower_than_ttl_is_still_cached(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        """The TTL runs from when the query finished. Stamped at the start, a
+        query slower than the TTL stored an entry that had already expired."""
+        from mempalace import mcp_server
+
+        self._seed(monkeypatch, config, collection, kg)
+        monkeypatch.setattr(mcp_server, "_palace_db_fingerprint", lambda: None)
+        monkeypatch.setattr(mcp_server, "_TAXONOMY_CACHE_TTL", 0.2)
+        calls = self._spy(monkeypatch, "_sqlite_wing_room_counts", delay=0.3)
+
+        mcp_server._sqlite_taxonomy()
+        mcp_server._sqlite_taxonomy()
+        assert len(calls) == 1
+
+    def test_graph_stats_rows_cached_until_the_db_changes(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        from mempalace import mcp_server
+
+        self._seed(monkeypatch, config, collection, kg)
+        calls = self._spy(monkeypatch, "sqlite_room_wing_hall_counts")
+
+        first = mcp_server.tool_graph_stats()
+        assert mcp_server.tool_graph_stats() == first
+        assert len(calls) == 1
+
+        self._touch_db_as_peer(palace_path)
+        mcp_server.tool_graph_stats()
+        assert len(calls) == 2
 
 
 # ── Regression: None-metadata safety (issue #1426) ──────────────────────
@@ -846,6 +970,44 @@ class TestNoneMetadataSafety:
         # malformed rows — coerce, don't crash.
         assert _safe_meta("not a dict") == {}
         assert _safe_meta(["wing", "x"]) == {}
+
+    def test_response_meta_drops_the_source_directory_identity(self):
+        """It is bookkeeping ``sync`` reads off the metadata itself, and it
+        describes the host's filesystem, which is why the path beside it is
+        already cut down to a basename (#2320)."""
+        from mempalace.mcp_server import _response_safe_meta
+
+        safe = _response_safe_meta(
+            {
+                "wing": "demo",
+                "source_file": "/home/someone/project/notes.md",
+                "source_dir_ino": "1515983",
+            }
+        )
+
+        assert "source_dir_ino" not in safe
+        assert safe["source_file"] == "notes.md"
+        assert safe["wing"] == "demo"
+
+    def test_response_meta_leaves_the_record_it_was_given_alone(self):
+        """``_safe_meta`` hands back the caller's own dict, and two of the
+        edits here are removals from an object something else may still be
+        holding. One of them takes the field a writer path decides by: a
+        record read for a response and then written back would come out of it
+        without an identity, and the drawer would be decided as if it had
+        never carried one (#2320)."""
+        from mempalace.mcp_server import _response_safe_meta
+
+        record = {
+            "wing": "demo",
+            "source_file": "/home/someone/project/notes.md",
+            "source_dir_ino": "1515983",
+        }
+        safe = _response_safe_meta(record)
+
+        assert safe is not record
+        assert record["source_dir_ino"] == "1515983"
+        assert record["source_file"] == "/home/someone/project/notes.md"
 
     def test_get_drawer_tolerates_none_metadata(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)

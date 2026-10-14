@@ -16,6 +16,8 @@ import yaml
 from pathlib import Path
 from collections import defaultdict
 
+from .project_config import find_project_config
+
 logger = logging.getLogger(__name__)
 
 # Common room patterns — detected from folder names and filenames
@@ -279,6 +281,42 @@ def get_user_approval(rooms: list) -> list:
     return rooms
 
 
+def _write_backup(path: Path, data: bytes) -> Path:
+    """Write ``data`` to a new backup next to ``path`` and return its path.
+
+    Tries ``<name>.bak``, then ``<name>.bak.<timestamp>``, then numbered
+    variants of that. Each candidate is created with ``O_EXCL``, so an
+    existing backup is never overwritten, even by a concurrent init.
+    """
+    from datetime import datetime
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    candidates = [path.with_name(f"{path.name}.bak"), path.with_name(f"{path.name}.bak.{stamp}")]
+    candidates += [path.with_name(f"{path.name}.bak.{stamp}-{n}") for n in range(1, 100)]
+    for candidate in candidates:
+        try:
+            fd = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+                0o600,
+            )
+        except FileExistsError:
+            continue
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+        except BaseException:
+            try:
+                os.unlink(candidate)
+            except OSError:
+                pass
+            raise
+        return candidate
+    raise OSError(f"no free backup name next to {path}")
+
+
 def save_config(project_dir: str, project_name: str, rooms: list):
     config = {
         "wing": project_name,
@@ -291,7 +329,53 @@ def save_config(project_dir: str, project_name: str, rooms: list):
             for r in rooms
         ],
     }
-    config_path = Path(project_dir).expanduser().resolve() / "mempalace.yaml"
+    project_path = Path(project_dir).expanduser().resolve()
+    # Update the config the miner will actually read. A project that already
+    # has ``mempalace.yml`` (or a legacy ``mempal.*``) keeps it: writing a new
+    # ``mempalace.yaml`` beside it would shadow it, and every setting in it
+    # would stop applying without a word (#2676).
+    existing_path = find_project_config(project_path)
+    config_path = existing_path or project_path / "mempalace.yaml"
+    if existing_path is not None:
+        # Keep what init does not generate (``exclude_patterns`` and any
+        # other hand-written key); init only owns ``wing`` and ``rooms``.
+        try:
+            raw = existing_path.read_bytes()
+        except OSError as exc:
+            raise OSError(
+                f"Refusing to write config: {existing_path} exists and could not be "
+                f"read ({exc}), so it is not overwritten"
+            ) from exc
+        problem = None
+        try:
+            previous = yaml.safe_load(raw.decode("utf-8-sig"))
+        except (ValueError, yaml.YAMLError):
+            previous, problem = None, "does not parse"
+        if isinstance(previous, dict):
+            config = {**config, **{k: v for k, v in previous.items() if k not in config}}
+        elif problem is None and previous is not None:
+            problem = "is not a mapping"
+        if problem is None and not previous:
+            # Comments only (or ``{}`` / ``~``): parses to nothing, but the
+            # bytes are still the user's and the rewrite drops them.
+            problem = "parses as empty"
+        if problem is not None and raw.strip():
+            # Init has to write a config the miner can use, but the file it
+            # replaces is the user's and could not be read: keep a byte-exact
+            # copy first, and refuse to regenerate if that copy cannot be made.
+            try:
+                backup = _write_backup(existing_path, raw)
+            except OSError as exc:
+                raise OSError(
+                    f"Refusing to write config: {existing_path} {problem} and could not "
+                    f"be backed up ({exc}), so it is not overwritten"
+                ) from exc
+            print(
+                f"  ! {existing_path} {problem}; kept a copy at {backup} and "
+                "regenerating it. Settings in it (exclude_patterns, ...) are not "
+                "carried over; copy them back from the backup.",
+                file=sys.stderr,
+            )
     # Opening a pre-existing FIFO for writing blocks in the kernel until a
     # reader appears. Only a regular file is a valid config target; refuse
     # loudly rather than park ``init`` with no output.

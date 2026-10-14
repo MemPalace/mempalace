@@ -103,6 +103,17 @@ def _preview_event(event: dict) -> dict:
     return out
 
 
+# ``from_agent`` means "who I am" on every other coordination call (append, ack, artifacts), and agents are told to
+# pass their identity on every call. On list/wait it used to filter by WRITER, so an agent following that rule and
+# asking for its task by correlation id saw only its own events and missed the request written to it (2026-09-29:
+# windows:codex:blender got 0 events for a task.request from windows:claude:blender). The writer filter is now the
+# explicit ``writer``; ``from_agent`` on list/wait is the caller's identity and never narrows the result.
+_FROM_AGENT_NOTE = (
+    "from_agent is your identity and does not filter event_list/event_wait. "
+    "Filter by who wrote an event with writer=<agent>; for your inbox use to_agent=<you>."
+)
+
+
 def tool_event_list(
     stream: str = None,
     room: str = None,
@@ -116,17 +127,32 @@ def tool_event_list(
     before_event_id: str = None,
     since_created_at: str = None,
     limit: int = 50,
-    order: str = "asc",
+    order: str = None,
     preview: bool = False,
+    writer: str = None,
 ):
     """List coordination events with structured filters.
 
-    ``order='desc'`` returns newest events first (e.g. for sweeping recent inbox
-    or checking recent project history in a single call). Default is ``'asc'``.
+    Context-aware ordering default:
+    When ``order`` is omitted or None:
+    - If ``since_event_id`` is supplied (resuming from a cursor), defaults to ``'asc'``
+      so events replay in forward chronological append order without skipping.
+    - Otherwise (inbox sweeps, history checks), defaults to ``'desc'`` so the
+      newest events are returned first rather than ancient events from far back.
+
+    Explicit ``order='asc'`` or ``order='desc'`` (case-insensitive) always overrides.
     ``preview=True`` truncates each event's verbatim body to a short excerpt
     (marking ``body_truncated`` + ``body_length``) so scanning many events
     stays cheap.
+
+    ``writer`` filters by the agent that wrote the event. ``from_agent`` is the
+    caller's identity and does not filter (see ``_FROM_AGENT_NOTE``).
     """
+    if order is None:
+        resolved_order = "asc" if since_event_id else "desc"
+    else:
+        resolved_order = str(order).lower().strip()
+
     try:
         events = _call_logstream(
             lambda ls: ls.list_events(
@@ -135,21 +161,24 @@ def tool_event_list(
                 topic=topic,
                 type=type,
                 to_agent=to_agent,
-                from_agent=from_agent,
+                from_agent=writer,
                 correlation_id=correlation_id,
                 status=status,
                 since_event_id=since_event_id,
                 before_event_id=before_event_id,
                 since_created_at=since_created_at,
                 limit=limit,
-                order=order,
+                order=resolved_order,
             )
         )
     except ValueError as e:
         return {"error": str(e)}
     if preview:
         events = [_preview_event(e) for e in events]
-    return {"events": events, "count": len(events)}
+    result = {"events": events, "count": len(events)}
+    if from_agent and not writer:
+        result["note"] = _FROM_AGENT_NOTE
+    return result
 
 
 def tool_event_wait(
@@ -165,12 +194,15 @@ def tool_event_wait(
     since_created_at: str = None,
     timeout_ms: int = 60000,
     limit: int = 50,
+    writer: str = None,
 ):
     """Block until a matching event exists or the timeout expires.
 
     ``limit`` mirrors ``event_list`` so the two tools accept the same
     filter set — agents kept tripping over wait rejecting a parameter
     that list accepts (reported by windows-codex during dogfood).
+    ``writer`` filters by the agent that wrote the event; ``from_agent`` is the
+    caller's identity and does not filter (see ``_FROM_AGENT_NOTE``).
     """
     try:
         result = _call_logstream(
@@ -181,7 +213,7 @@ def tool_event_wait(
                 topic=topic,
                 type=type,
                 to_agent=to_agent,
-                from_agent=from_agent,
+                from_agent=writer,
                 correlation_id=correlation_id,
                 status=status,
                 since_event_id=since_event_id,
@@ -192,6 +224,8 @@ def tool_event_wait(
     except ValueError as e:
         return {"error": str(e)}
     result["count"] = len(result["events"])
+    if from_agent and not writer:
+        result["note"] = _FROM_AGENT_NOTE
     return result
 
 

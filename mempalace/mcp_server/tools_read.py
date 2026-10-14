@@ -17,7 +17,7 @@ def _tool_status_via_sqlite() -> dict:
     """
     import sqlite3 as _sqlite3
 
-    from ..config import connect_sqlite_read
+    from ..backends._inproc_sqlite import open_reader as open_palace_reader
 
     db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
@@ -28,7 +28,7 @@ def _tool_status_via_sqlite() -> dict:
     rooms: dict = {}
     total = 0
     try:
-        conn = connect_sqlite_read(db_path)
+        conn = open_palace_reader(db_path)
         try:
             row = conn.execute(
                 """
@@ -92,12 +92,23 @@ def _sqlite_taxonomy():
     GROUP BY so status does not page every metadata row.
     """
     global _taxonomy_cache, _taxonomy_cache_time
-    now = time.time()
     cache_key = (_config.palace_path, _config.collection_name)
+    # Taken before the query, so a write that lands during it invalidates.
+    fingerprint = _palace_db_fingerprint()
+    # The Chroma database/WAL fingerprint changes on committed writes, so a
+    # different fingerprint recounts even inside the TTL. The TTL is the fallback
+    # for backends whose file stat misses commits (sqlite_exact's WAL) and
+    # for a palace whose file cannot be stat'ed.
+    fingerprint_matches = (
+        _taxonomy_cache is not None
+        and fingerprint is not None
+        and _taxonomy_cache[2] == fingerprint
+    )
+    ttl_fresh = fingerprint is None and (time.time() - _taxonomy_cache_time) < _TAXONOMY_CACHE_TTL
     if (
         _taxonomy_cache is not None
         and _taxonomy_cache[0] == cache_key
-        and (now - _taxonomy_cache_time) < _TAXONOMY_CACHE_TTL
+        and (fingerprint_matches or ttl_fresh)
     ):
         return _taxonomy_cache[1]
     counts = None
@@ -133,8 +144,11 @@ def _sqlite_taxonomy():
             rkey = _norm(room)
             dest[rkey] = dest.get(rkey, 0) + n
     result = total, normalized
-    _taxonomy_cache = (cache_key, result)
-    _taxonomy_cache_time = now
+    _taxonomy_cache = (cache_key, result, fingerprint)
+    # Stamp once the query is done: stamped at the start, a query slower than
+    # the TTL (a full GROUP BY on a multi-million-drawer palace) stored an
+    # entry that had already expired, so every status call re-ran it.
+    _taxonomy_cache_time = time.time()
     return result
 
 
@@ -246,11 +260,26 @@ def _graph_sqlite_reader():
 
 
 def _chroma_room_wing_hall_counts():
+    global _graph_rows_cache
     if not _config.palace_path:
         return None
     from ..backends.chroma import sqlite_room_wing_hall_counts
 
-    return sqlite_room_wing_hall_counts(_config.palace_path, _config.collection_name)
+    # Same full GROUP BY as the status taxonomy; reuse it while chroma.sqlite3
+    # has not been written (see _palace_db_fingerprint).
+    cache_key = (_config.palace_path, _config.collection_name)
+    fingerprint = _palace_db_fingerprint()
+    if (
+        fingerprint is not None
+        and _graph_rows_cache is not None
+        and _graph_rows_cache[0] == cache_key
+        and _graph_rows_cache[2] == fingerprint
+    ):
+        return _graph_rows_cache[1]
+    rows = sqlite_room_wing_hall_counts(_config.palace_path, _config.collection_name)
+    if rows is not None and fingerprint is not None:
+        _graph_rows_cache = (cache_key, rows, fingerprint)
+    return rows
 
 
 def tool_status():
@@ -295,6 +324,7 @@ def tool_status():
             "protocol": PALACE_PROTOCOL,
             "aaak_dialect": AAAK_SPEC,
             "backend": _selected_backend_name(),
+            "embedding_device": _describe_device_safe(),
         }
 
     # Use create=True only when a palace DB already exists on disk -- this
@@ -313,6 +343,7 @@ def tool_status():
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
         "backend": _selected_backend_name(),
+        "embedding_device": _describe_device_safe(),
     }
     try:
         if _supports_metadata_facets(col):
@@ -369,7 +400,7 @@ def tool_status():
 
 PALACE_PROTOCOL = """IMPORTANT — MemPalace Memory Protocol:
 1. ON WAKE-UP: Call mempalace_status to load palace overview + AAAK spec.
-2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.
+2. BEFORE RESPONDING about any person, project, or past event: verify with the tool that fits the question — mempalace_kg_query for known relationships or time-bound facts, mempalace_search for source text, or mempalace_diary_read for recent agent continuity. Use small search/diary limits and relevant known scopes. Stop when answered; search stored text or widen filters if recall is insufficient. Never guess.
 3. IF UNSURE about a fact (name, gender, age, relationship): say "let me check" and query the palace. Wrong is worse than slow.
 4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.
 5. WHEN A SINGLE-VALUED FACT CHANGES (model, employer, address): call mempalace_kg_supersede(subject, predicate, old, new) to replace it atomically at one boundary — do NOT hand-roll invalidate + add, which leaves the old and new values overlapping at the boundary. Use mempalace_kg_invalidate for a fact that simply ended, and mempalace_kg_add to add an independent (possibly concurrent) fact.
@@ -561,6 +592,8 @@ def tool_search(
     context: str = None,
     candidate_strategy: str = "vector",
     cli_compatible: bool = False,
+    include_media: bool = False,
+    query_task: str = "search",
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
@@ -574,6 +607,22 @@ def tool_search(
     candidate_strategy = candidate_strategy or "vector"
     if not isinstance(candidate_strategy, str) or candidate_strategy not in {"vector", "union"}:
         return {"error": "candidate_strategy must be one of ('vector', 'union')"}
+    if (
+        not isinstance(include_media, bool)
+        or not isinstance(query_task, str)
+        or query_task not in {"search", "code"}
+    ):
+        return {"error": "include_media must be boolean and query_task must be 'search' or 'code'"}
+    if cli_compatible and (include_media or query_task != "search"):
+        return {"error": "cli_compatible cannot be combined with media/code task search"}
+    experimental = {
+        name: value
+        for name, value, default in (
+            ("include_media", include_media, False),
+            ("query_task", query_task, "search"),
+        )
+        if value != default
+    }
     # Mitigate system prompt contamination (Issue #333)
     sanitized = sanitize_query(query)
     if cli_compatible:
@@ -620,7 +669,7 @@ def tool_search(
                             repeat_unknown_warning=True,
                         )
                     except (EmbedderIdentityMismatchError, DimensionMismatchError) as exc:
-                        return {"error": "Embedder identity mismatch", "details": str(exc)}
+                        return _model_mismatch_error(exc)
                 _, output = _capture_fd_stdout(
                     lambda: cli_search(
                         query=query,
@@ -664,6 +713,7 @@ def tool_search(
         vector_disabled=_vector_disabled,
         candidate_strategy=candidate_strategy,
         collection_name=_config.collection_name,
+        **experimental,
     )
     if _is_transient_index_error(result):
         # Post-bulk-write HNSW flush window (#1315): drop caches, give
@@ -685,6 +735,7 @@ def tool_search(
             vector_disabled=_vector_disabled,
             candidate_strategy=candidate_strategy,
             collection_name=_config.collection_name,
+            **experimental,
         )
         if not _is_transient_index_error(result):
             result["index_recovered"] = True
@@ -755,7 +806,10 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
             "is_duplicate": len(duplicates) > 0,
             "matches": duplicates,
         }
-    except Exception:
+    except Exception as e:
+        refused = _model_mismatch_error(e)
+        if refused is not None:
+            return refused
         logger.exception("check_duplicate failed")
         return {"error": "Duplicate check failed"}
 
@@ -870,13 +924,31 @@ def tool_delete_tunnel(tunnel_id: str):
     return delete_tunnel(tunnel_id)
 
 
-def tool_list_hallways(wing: str = None):
-    """List within-wing hallway records, optionally filtered by wing."""
+def tool_list_hallways(wing: str = None, limit: int = 100, offset: int = 0):
+    """List within-wing hallway records, strongest first, one page at a time.
+
+    A palace of any size holds hundreds of thousands of hallways; returning
+    them all in one response closed the MCP connection. The page is sorted by
+    co-occurrence count so the first page is the one worth reading.
+    """
     try:
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
-    return list_hallways(wing)
+    try:
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        return {"error": "limit and offset must be integers"}
+    rows = sorted(list_hallways(wing), key=lambda h: -int(h.get("co_occurrence_count") or 0))
+    page = rows[offset : offset + limit]
+    return {
+        "hallways": page,
+        "total": len(rows),
+        "count": len(page),
+        "offset": offset,
+        "limit": limit,
+    }
 
 
 def tool_delete_hallway(hallway_id: str):
@@ -886,8 +958,15 @@ def tool_delete_hallway(hallway_id: str):
     return {"deleted": delete_hallway(hallway_id)}
 
 
-def tool_follow_tunnels(wing: str, room: str):
-    """Follow explicit tunnels from a room to see connected drawers in other wings."""
+def tool_follow_tunnels(wing: str, room: str, record: bool = True):
+    """Follow explicit tunnels from a room to see connected drawers in other wings.
+
+    An agent calling this tool is crossing the tunnel, so the traversal is
+    recorded (``access_count`` / ``strength``). Internal callers that only
+    decorate another result, such as the light server's search enrichment,
+    pass ``record=False``: a search hit is not a crossing. A read-only
+    server or a peer without the writer lock never writes the tunnel file.
+    """
     try:
         wing = sanitize_name(wing, "wing")
         room = sanitize_name(room, "room")
@@ -896,4 +975,6 @@ def tool_follow_tunnels(wing: str, room: str):
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
-    return follow_tunnels(wing, room, col=col)
+    return follow_tunnels(
+        wing, room, col=col, record=record and not (_READ_ONLY or _MCP_WRITER_READ_ONLY)
+    )

@@ -429,10 +429,12 @@ def _installed_dist_state() -> tuple[dict[str, str], dict[str, str]]:
 
 
 # Baseline: what was installed at the moment this module was imported, which is
-# the moment the code being served was loaded. Every watched distribution is
-# already in sys.modules by now — mempalace by definition, chromadb through the
-# unconditional `from chromadb.errors import NotFoundError as _ChromaNotFoundError`
-# above — so this snapshot describes the code actually running.
+# the moment the code being served was loaded. (_apply_server_flags() reads it
+# again, before the first request, if --backend changes what is watched.) Every
+# watched distribution is already in sys.modules by now — mempalace by
+# definition, chromadb through the unconditional
+# `from chromadb.errors import NotFoundError as _ChromaNotFoundError` above — so
+# this snapshot describes the code actually running.
 #
 # Both sides of the comparison are therefore read the same way, from the same
 # metadata, and that is what keeps the gate honest. Comparing a live
@@ -649,6 +651,36 @@ def _mcp_tool_preflight_refusal(req_id, tool_name: str, *, check_writer: bool = 
     return _mcp_peer_writer_refusal(req_id, tool_name) if check_writer else None
 
 
+def _tool_result_is_error(result) -> bool:
+    """Whether a tool result reports an error the MCP client should flag.
+
+    Tool errors are otherwise plain ``{"error": ...}`` results. The failures
+    that refuse every read and write until the config or the palace is fixed
+    (a misspelled ``embedding_model``, a palace built with a different
+    model, a collection that will not open), and an openai-compat endpoint
+    that cannot be reached, also set MCP's ``isError`` for clients that only
+    check the flag. Model errors are matched by the
+    exception class they were built from (``error_class``, set by
+    ``embedding.model_error_result``); an open failure by its ``error``.
+    """
+    if not isinstance(result, dict):
+        return False
+    return (
+        result.get("error_class") in MODEL_ERROR_CLASS_NAMES
+        or result.get("error") == BACKEND_OPEN_FAILED_ERROR
+    )
+
+
+def _tool_call_response(req_id, result) -> dict:
+    """The JSON-RPC response carrying a tool's result as MCP text content."""
+    tool_result = {
+        "content": [{"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}]
+    }
+    if _tool_result_is_error(result):
+        tool_result["isError"] = True
+    return {"jsonrpc": "2.0", "id": req_id, "result": tool_result}
+
+
 def _decorate_mcp_tool_result(tool_name: str, result):
     """Attach MCP transport-only diagnostics outside handle_request complexity."""
 
@@ -685,6 +717,23 @@ def _normalize_envelope(request: dict) -> "tuple[str, dict]":
         params = {}
 
     return method, params
+
+
+def _tool_catalog_entry(name: str, tool: dict) -> dict:
+    """Build one tools/list row, including MCP ToolAnnotations when set.
+
+    Plan modes, read-only subagents, and schema-pruning harnesses use
+    ``annotations.readOnlyHint`` to admit inspection tools without a
+    host-side allowlist.
+    """
+    entry = {
+        "name": name,
+        "description": tool["description"],
+        "inputSchema": tool["input_schema"],
+    }
+    if tool.get("read_only"):
+        entry["annotations"] = {"readOnlyHint": True}
+    return entry
 
 
 def handle_request(request):
@@ -729,7 +778,7 @@ def handle_request(request):
             "id": req_id,
             "result": {
                 "tools": [
-                    {"name": n, "description": t["description"], "inputSchema": t["input_schema"]}
+                    _tool_catalog_entry(n, t)
                     for n, t in TOOLS.items()
                     if not (_READ_ONLY and n in _READ_ONLY_REFUSED_TOOLS)
                 ]
@@ -835,15 +884,7 @@ def handle_request(request):
                     tool_name, TOOLS[tool_name]["handler"](**tool_args)
                 )
 
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "content": [
-                        {"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}
-                    ]
-                },
-            }
+            return _tool_call_response(req_id, result)
         except TypeError as e:
             # Qualname match prevents leaking internal helper/param names raised
             # inside the handler body — see test_handler_internal_signature_shape_stays_generic.
@@ -908,9 +949,9 @@ _WARMUP_PROBE_TEXT = "__mempalace_warmup_probe__"
 def _describe_device_safe() -> str:
     """Return ``embedding.describe_device()`` value or ``"unknown"`` on failure.
 
-    Used only inside warmup-failure log lines; the import is deferred so
-    that an embedding-stack import error cannot itself crash the warmup
-    diagnostic path.
+    Used in warmup-failure log lines and ``mempalace_status``; the import is
+    deferred so that an embedding-stack import error cannot itself crash
+    either.
     """
     try:
         from ..embedding import describe_device
@@ -1179,6 +1220,37 @@ def _start_write_stall_watchdog() -> None:
     t.start()
 
 
+def _exit_running_registered_cleanup() -> None:
+    """Exit the process from a daemon thread, WITH the `atexit` handlers.
+
+    `os._exit` alone skipped them, so the idle watchdog left
+    `serverinfo.json` advertising a dead PID -- measured in #2500 at 2 days
+    8 hours of a stale record. Two handlers are registered by the time this
+    can fire: `server_registry.clear_serverinfo` (http.py) and
+    `_release_mcp_writer_lock` (_guards.py).
+
+    NOT `sys.exit(0)`, which #2500 suggests. This runs in a DAEMON THREAD,
+    where `SystemExit` unwinds that thread and nothing else -- measured: the
+    process stays alive and the watchdog, having returned out of its own
+    loop, never fires again. That trades a stale `serverinfo.json` for the
+    file-handle accumulation the watchdog exists to prevent (#1552).
+
+    `atexit._run_exitfuncs` is private, and deliberate: the public surface
+    has no "run the handlers now" and the alternative -- calling the two
+    known handlers directly from here -- silently drops any third one a
+    later change registers. A handler that raises must not keep the process
+    alive either, so the exit is in a `finally`.
+    """
+    import atexit
+
+    try:
+        atexit._run_exitfuncs()
+    except Exception:  # noqa: BLE001 - the exit is the point; cleanup is best-effort
+        logger.exception("idle-exit cleanup raised; exiting anyway")
+    finally:
+        os._exit(0)
+
+
 def _start_idle_exit_watchdog() -> None:
     """Start a daemon thread that exits the process after an idle period.
 
@@ -1204,7 +1276,7 @@ def _start_idle_exit_watchdog() -> None:
                     idle / 3600,
                     timeout / 3600,
                 )
-                os._exit(0)
+                _exit_running_registered_cleanup()
 
     t = threading.Thread(target=_watchdog, name="mcp-idle-watchdog", daemon=True)
     t.start()

@@ -738,6 +738,83 @@ def test_a_rename_the_directory_refuses_falls_back(temp_registry, monkeypatch, c
     assert leftovers == [], leftovers
 
 
+def test_a_refused_temporary_name_is_not_retried_into_a_sweep(temp_registry, monkeypatch, capsys):
+    """The permission error has to reach the caller, not restart the search.
+
+    ``mkstemp`` answers a Windows ``PermissionError`` by trying the next name,
+    ``tempfile.TMP_MAX`` times -- 2_147_483_647 of them on Python 3.12 and
+    earlier, hours of them. The fallback below only runs because the search is
+    bounded, and asserting the fallback ran does not show that: on an
+    interpreter where ``TMP_MAX`` is 20 a sweep passes too. Counting the
+    attempts is what separates them. (#2530)
+    """
+    temp_registry.write_text(json.dumps({"people": ["Alice"]}))
+    real_open = os.open
+    attempts = []
+
+    def not_permitted(path, *args, **kwargs):
+        name = os.path.basename(str(path))
+        if name.startswith(temp_registry.name + ".") or name.startswith(
+            "." + temp_registry.name + "."
+        ):
+            attempts.append(name)
+            raise PermissionError(errno.EPERM, "Operation not permitted")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", not_permitted)
+    miner.add_to_known_entities({"people": ["Dana"]})
+
+    assert len(attempts) <= miner._TEMP_NAME_ATTEMPTS + 1, len(attempts)
+    data = json.loads(temp_registry.read_text())
+    assert sorted(data["people"]) == ["Alice", "Dana"]
+    assert "written in place" in capsys.readouterr().err
+
+
+def test_a_taken_temporary_name_is_retried(temp_registry, monkeypatch):
+    """A name already in use is the case the retry is for, so it still runs."""
+    temp_registry.write_text(json.dumps({"people": ["Alice"]}))
+    real_open = os.open
+    taken = {"left": 3}
+
+    def occupied(path, *args, **kwargs):
+        name = os.path.basename(str(path))
+        # The pid-named file is tried first and would succeed. Refusing it is
+        # what sends the write to a name the directory picks, which is the one
+        # the retry belongs to.
+        if name == f"{temp_registry.name}.tmp-{os.getpid()}":
+            raise FileExistsError(errno.EEXIST, "File exists")
+        if name.startswith("." + temp_registry.name + ".") and taken["left"]:
+            taken["left"] -= 1
+            raise FileExistsError(errno.EEXIST, "File exists")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", occupied)
+    miner.add_to_known_entities({"people": ["Dana"]})
+
+    assert taken["left"] == 0
+    data = json.loads(temp_registry.read_text())
+    assert sorted(data["people"]) == ["Alice", "Dana"]
+
+
+def test_every_temporary_name_taken_raises_rather_than_sweeping(tmp_path, monkeypatch):
+    """Exhausting the attempts answers the way ``mkstemp`` does."""
+    real_open = os.open
+    calls = {"n": 0}
+
+    def always_exists(path, *args, **kwargs):
+        if os.path.basename(str(path)).startswith("probe."):
+            calls["n"] += 1
+            raise FileExistsError(errno.EEXIST, "File exists")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", always_exists)
+
+    with pytest.raises(FileExistsError):
+        miner._open_new_temp_file(tmp_path, prefix="probe.")
+
+    assert calls["n"] == miner._TEMP_NAME_ATTEMPTS
+
+
 def test_eperm_on_both_names_falls_back_too(temp_registry, monkeypatch, capsys):
     """``EPERM`` reaches the gate from a filesystem that refuses the operation
     rather than the caller, an NFS export among them. It belongs beside

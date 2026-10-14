@@ -209,6 +209,15 @@ messages between machines.
   `/statusz` follows the bearer-token policy because it exposes operational
   metadata; it is not a public liveness probe. Probe traffic does **not**
   count as activity for the idle watchdog below; only MCP requests do.
+- **Waiting for the writer lease**: a writable server that finds another
+  process holding the palace's writer lease (a session's MCP server, a hook
+  mine, a CLI write) waits for it instead of refusing at once, retrying with
+  backoff for `MEMPALACE_MCP_WRITER_WAIT_SECONDS` (default `120`). It logs
+  once when the wait starts. If the lease is still held when the wait runs
+  out, it exits with status `2`, which the systemd template does not restart,
+  so the unit lands in `failed` with the reason in the journal. Set it to `0`
+  to refuse immediately. A backend or lock-directory failure is never waited
+  on.
 - **Idle shutdown**: the server exits by itself once `MEMPALACE_MCP_IDLE_HOURS`
   have passed with no MCP request (default `8`). That default is there to reap
   the per-session stdio servers that would otherwise pile up holding ChromaDB

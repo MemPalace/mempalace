@@ -417,3 +417,107 @@ class TestSweeperDuplicateMessageIds:
         assert repeated_document == "USER: second copy, same uuid"
         assert repeated_metadata["timestamp"] == "2020-01-01T00:00:02.000Z"
         assert by_id[assistant_id][0] == "ASSISTANT: ok"
+
+
+class TestSweptDrawersCarryTheirDirectory:
+    """A swept drawer and a mined one describe the same source file, so sync
+    has to be able to decide them the same way (#2320). A palace where only
+    some paths record it is a palace where the user cannot know which of
+    their drawers is protected."""
+
+    def test_sweep_records_the_directory_it_read_from(self, mock_claude_jsonl, tmp_path):
+        import chromadb
+
+        from mempalace import source_identity as si
+        from mempalace.sweeper import sweep
+
+        palace_path = str(tmp_path / "palace")
+        sweep(str(mock_claude_jsonl), palace_path)
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        metas = col.get(include=["metadatas"])["metadatas"]
+        expected = si.directory_identity(mock_claude_jsonl.parent)
+
+        assert metas, "the sweep filed nothing"
+        assert expected is not None
+        assert all(m.get("source_dir_ino") == expected for m in metas), metas
+
+    def test_the_identity_describes_the_directory_the_drawer_names(
+        self, mock_claude_jsonl, tmp_path
+    ):
+        """``source_label`` renames the source, and the identity has to follow
+        it rather than the file the sweep happened to read.
+
+        ``sync`` looks for corroborating neighbours in the directory named by
+        ``source_file``, so an identity taken from a different directory would
+        be compared against neighbours it never described.
+        """
+        import shutil
+
+        import chromadb
+
+        from mempalace import source_identity as si
+        from mempalace.sweeper import sweep
+
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        label = elsewhere / mock_claude_jsonl.name
+        shutil.copy(mock_claude_jsonl, label)
+
+        palace_path = str(tmp_path / "palace")
+        sweep(str(mock_claude_jsonl), palace_path, source_label=str(label))
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        metas = col.get(include=["metadatas"])["metadatas"]
+        assert metas, "the sweep filed nothing"
+
+        labelled = si.directory_identity(elsewhere)
+        read_from = si.directory_identity(mock_claude_jsonl.parent)
+        assert labelled is not None and labelled != read_from, (
+            "the two directories have to differ for this test to prove anything"
+        )
+        for m in metas:
+            assert m.get("source_file") == str(label)
+            assert m.get("source_dir_ino") == labelled
+
+    def test_a_directory_that_answers_nothing_leaves_the_key_out(
+        self, mock_claude_jsonl, tmp_path, monkeypatch
+    ):
+        """A directory that cannot be stat'ed is not an identity, and a drawer
+        that carries none is decided by corroboration alone, exactly as every
+        drawer filed before this existed. Storing the failure under the key
+        would be a third state for ``sync`` to read."""
+        import chromadb
+
+        from mempalace import sweeper as sweeper_mod
+
+        monkeypatch.setattr(sweeper_mod, "source_directory_identity", lambda _path: None)
+        palace_path = str(tmp_path / "palace")
+        sweeper_mod.sweep(str(mock_claude_jsonl), palace_path)
+
+        client = chromadb.PersistentClient(path=palace_path)
+        metas = client.get_collection("mempalace_drawers").get(include=["metadatas"])["metadatas"]
+
+        assert metas, "the sweep filed nothing"
+        assert all("source_dir_ino" not in m for m in metas), metas
+
+    def test_sweep_writes_nothing_into_the_transcript_directory(self, mock_claude_jsonl, tmp_path):
+        """``~/.claude/projects`` belongs to another product, and the README
+        promises mining never writes to the source."""
+        import shutil
+
+        from mempalace.sweeper import sweep
+
+        # The transcript gets a directory of its own so the palace, which this
+        # test does write, cannot be mistaken for something the sweep left.
+        transcripts = tmp_path / "transcripts"
+        transcripts.mkdir()
+        transcript = transcripts / mock_claude_jsonl.name
+        shutil.copy(mock_claude_jsonl, transcript)
+        before = sorted(p.name for p in transcripts.iterdir())
+
+        sweep(str(transcript), str(tmp_path / "palace"))
+
+        assert sorted(p.name for p in transcripts.iterdir()) == before

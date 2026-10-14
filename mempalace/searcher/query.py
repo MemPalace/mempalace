@@ -18,7 +18,12 @@ def _open_search_collection(palace_path: str, collection_name: str):
             "No palace found",
             hint="Run: mempalace init <dir> && mempalace mine <dir>",
         )
-    except BackendError as e:
+    except (UnknownEmbeddingModelError, BackendError) as e:
+        # A misspelled model, or a palace built with a different embedding
+        # model: the message names the fix (revert the model, or re-embed).
+        refused = model_error_result(e, palace_path=palace_path, log=logger)
+        if refused is not None:
+            return None, _search_error_result(refused.pop("error"), **refused)
         logger.error("Backend error opening palace at %s: %s", palace_path, e)
         return None, _search_error_result(
             "Backend error",
@@ -50,7 +55,7 @@ def _query_drawers_with_filter_fallback(
     try:
         return drawers_col.query(**dkwargs)
     except Exception as filter_err:
-        if not where:
+        if not where or _model_error_class(filter_err) is not None:
             raise
         logger.warning(
             "Filtered search failed (%s); falling back to unfiltered + post-filter",
@@ -140,6 +145,33 @@ def _closet_boosts(closets_col, *, query: str, n_results: int, where: dict) -> d
     return boosts
 
 
+# Folding copies can leave fewer distinct passages than asked for while the
+# vector pool was full, so more candidates exist. The search then repeats with
+# a pool four times larger, up to _MAX_POOL_SCALE times the normal pool and
+# never past _MAX_FOLD_POOL candidates.
+_MAX_POOL_SCALE = 16
+_MAX_FOLD_POOL = 500
+
+
+def _scaled_pool_limits(limits: tuple, scale: int) -> tuple:
+    if scale <= 1:
+        return limits
+    pool_size, pre_enrichment_limit = limits
+    return (
+        min(pool_size * scale, max(_MAX_FOLD_POOL, pool_size)),
+        min(pre_enrichment_limit * scale, max(_MAX_FOLD_POOL, pre_enrichment_limit)),
+    )
+
+
+def _copies_left_results_short(hits, n_results, candidates_fetched, pool_size) -> bool:
+    """Whether folded copies left the page short while the pool was full."""
+    return (
+        len(hits) < n_results
+        and candidates_fetched >= pool_size
+        and any(hit.get("also_in") for hit in hits)
+    )
+
+
 def search_memories(
     query: str,
     palace_path: str,
@@ -154,6 +186,9 @@ def search_memories(
     candidate_strategy: str = "vector",
     collection_name: str = None,
     lang: Optional[str] = None,
+    _pool_scale: int = 1,
+    include_media: bool = False,
+    query_task: str = "search",
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
 
@@ -220,6 +255,28 @@ def search_memories(
     # the BM25-only fallback below.
     _validate_candidate_strategy(candidate_strategy)
 
+    if include_media or query_task != "search":
+        if vector_disabled:
+            return _search_error_result(
+                "Media/code vector search is disabled until the index is repaired"
+            )
+        from .media_search import search_with_media
+
+        return search_with_media(
+            query,
+            palace_path,
+            include_media=include_media,
+            query_task=query_task,
+            n_results=n_results,
+            wing=wing,
+            room=room,
+            source_file=source_file,
+            since=since,
+            before=before,
+            max_distance=max_distance,
+            collection_name=collection_name,
+        )
+
     # Resolve stop words once up-front so every BM25 site (the vector path's
     # `_hybrid_rank`, the `vector_disabled` fallback, and the union-merge
     # candidate gather) tokenizes against the same locale.
@@ -255,10 +312,9 @@ def search_memories(
     # This avoids the "weak-closets regression" where narrative content
     # produces low-signal closets (regex extraction matches few topics)
     # and closet-first routing hides drawers that direct search would find.
-    pool_size, pre_enrichment_limit = _candidate_pool_limits(
-        candidate_strategy,
-        n_results,
-        date_window_active,
+    pool_size, pre_enrichment_limit = _scaled_pool_limits(
+        _candidate_pool_limits(candidate_strategy, n_results, date_window_active),
+        _pool_scale,
     )
     try:
         dkwargs = {
@@ -272,6 +328,11 @@ def search_memories(
             drawers_col, dkwargs, query, n_results, wing, room, source_file
         )
     except Exception as e:
+        # The configured embedding function could not be built: the
+        # read-only open succeeded, but embedding the query refused (C).
+        refused = model_error_result(e, palace_path=palace_path, log=logger)
+        if refused is not None:
+            return _search_error_result(refused.pop("error"), **refused)
         return _search_error_result(f"Search error: {e}")
 
     # Gather closet hits (best-per-source) to build a boost lookup.
@@ -390,7 +451,8 @@ def search_memories(
     if strategy_error:
         return strategy_error
 
-    return _search_result_envelope(
+    candidates_fetched = len(_first_or_empty(drawer_results, "documents"))
+    envelope = _search_result_envelope(
         query=query,
         wing=wing,
         room=room,
@@ -398,10 +460,30 @@ def search_memories(
         since=since,
         before=before,
         hits=hits,
-        candidates_fetched=len(_first_or_empty(drawer_results, "documents")),
+        candidates_fetched=candidates_fetched,
         pool_size=pool_size,
         date_window_active=date_window_active,
     )
+    if _copies_left_results_short(hits, n_results, candidates_fetched, pool_size):
+        if _pool_scale < _MAX_POOL_SCALE and pool_size < _MAX_FOLD_POOL:
+            return search_memories(
+                query,
+                palace_path,
+                wing=wing,
+                room=room,
+                source_file=source_file,
+                since=since,
+                before=before,
+                n_results=n_results,
+                max_distance=max_distance,
+                vector_disabled=vector_disabled,
+                candidate_strategy=candidate_strategy,
+                collection_name=collection_name,
+                lang=lang,
+                _pool_scale=_pool_scale * 4,
+            )
+        envelope["distinct_results_truncated"] = True
+    return envelope
 
 
 # ─────────────────────────────────────────────────────────────────────────────

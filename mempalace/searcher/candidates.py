@@ -255,6 +255,63 @@ def _dedupe_rendered_hits(
     return unique
 
 
+# Shorter identical passages are too likely to be coincidence ("Yes.", "ok,
+# ship it") to present as one passage stored in several files.
+_FOLD_MIN_CHARS = 100
+
+
+def _fold_copies_across_sources(hits: list, source_of, ref_of) -> list:
+    """Fold hits whose text is identical but comes from different source files.
+
+    Backups, autosaves, recovered copies, and re-exports put the same passage
+    in several files, and each copy took a result slot of its own. Identical
+    wording is only folded at ``_FOLD_MIN_CHARS`` or more, where coincidence is
+    implausible; it is grouping by identical text, not a verified shared
+    origin, so the kept hit lists every other occurrence under ``also_in``
+    (``ref_of(hit)``, with its chunk position) and none is hidden.
+
+    Occurrence k of a passage in any one file folds into the k-th shown hit
+    for that passage, so a passage a file repeats stays that many hits
+    whatever order the ranking produced. Slots freed here go to the next
+    distinct passages in ``hits``; the caller cuts to ``n_results`` after this
+    and still has only the passages its pool fetched.
+    """
+    kept = []
+    shown_by_text: dict = {}
+    seen_by_text: dict = {}
+    for hit in hits:
+        text = hit.get("text")
+        source = source_of(hit)
+        if not isinstance(text, str) or len(text.strip()) < _FOLD_MIN_CHARS or not source:
+            kept.append(hit)
+            continue
+        shown = shown_by_text.setdefault(text, [])
+        seen = seen_by_text.setdefault(text, {})
+        occurrence = seen[source] = seen.get(source, 0) + 1
+        if occurrence > len(shown):
+            shown.append(hit)
+            kept.append(hit)
+        else:
+            shown[occurrence - 1].setdefault("also_in", []).append(ref_of(hit))
+    return kept
+
+
+def _search_hit_source(hit: dict):
+    return hit.get("_source_file_full") or hit.get("source_path")
+
+
+def _search_hit_ref(hit: dict) -> dict:
+    """What ``also_in`` records for a folded copy of a search hit."""
+    return {
+        "drawer_id": hit.get("drawer_id"),
+        "source_file": hit.get("source_file"),
+        "source_path": _search_hit_source(hit),
+        "wing": hit.get("wing"),
+        "room": hit.get("room"),
+        "chunk_index": hit.get("_chunk_index"),
+    }
+
+
 # Strategy dispatch — keeps search_memories' branch count under the
 # project's complexity ceiling (C901 max-complexity=25). New strategies
 # register here.
@@ -358,7 +415,9 @@ def _finalize_candidate_hits(
         metric=_metric_for_collection(drawers_col),
         stop_words=stop_words,
     )
-    hits = _dedupe_rendered_hits(ranked)[:n_results]
+    hits = _fold_copies_across_sources(
+        _dedupe_rendered_hits(ranked), _search_hit_source, _search_hit_ref
+    )[:n_results]
 
     for hit in hits:
         hit.pop("_sort_key", None)

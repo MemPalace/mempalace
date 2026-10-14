@@ -24,6 +24,7 @@ Commands:
     mempalace wake-up                     Show L0 + L1 wake-up context
     mempalace wake-up --wing my_app       Wake-up for a specific project
     mempalace status                      Show what's been filed
+    mempalace audit                       Score how well organized the palace is
 
 Examples:
     mempalace init ~/projects/my_app
@@ -87,6 +88,11 @@ _FRAGMENTS = (
     "cmd_mine.py",
     "cmd_sync.py",
     "cmd_query.py",
+    "cmd_audit.py",
+    "cmd_rooms.py",
+    "cmd_wings.py",
+    "cmd_kg.py",
+    "cmd_tunnels.py",
     "cmd_update.py",
     "cmd_coord.py",
     "cmd_repair.py",

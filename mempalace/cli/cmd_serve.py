@@ -21,7 +21,7 @@ def cmd_rules(args):
     """Output the shared-brain agent rules block for a given agent identity."""
     from ..instructions_cli import run_rules
 
-    run_rules(agent_id=args.agent)
+    run_rules(host=args.host, harness=args.harness, project=args.project, mcp=args.mcp)
 
 
 def cmd_mcp(args):

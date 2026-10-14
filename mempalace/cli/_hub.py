@@ -42,6 +42,8 @@ def _hub_forward_disabled() -> bool:
 
 def _search_args_forwardable(args) -> bool:
     """Return whether ``mempalace_search`` preserves this CLI search exactly."""
+    if getattr(args, "include_media", False) or getattr(args, "query_task", "search") != "search":
+        return False
     if _backend_arg(args) or not 1 <= args.results <= _HUB_SEARCH_MAX_RESULTS:
         return False
     if any(os.environ.get(name, "").strip() for name in _SEARCH_OVERRIDE_ENV_VARS):
@@ -248,14 +250,16 @@ def _forward_search_to_hub(args, palace_path: str) -> bool:
 def _mine_args_forwardable(args, include_ignored) -> bool:
     """Only forward mines the ``mempalace_mine`` MCP tool can express.
 
-    Flags the tool has no parameters for (kg-extract, gitignore handling,
+    Flags the tool has no parameters for (kg-extract, disabling gitignore,
     chunking overrides, origin redetection, explicit backend) keep the
     direct path — where a held writer lease still surfaces as the existing
     MineAlreadyRunning error rather than being silently dropped.
     """
     if getattr(args, "kg_extract", False) or getattr(args, "redetect_origin", False):
         return False
-    if args.no_gitignore or include_ignored:
+    if args.no_gitignore:
+        return False
+    if include_ignored and (getattr(args, "mode", None) or "projects") != "projects":
         return False
     if getattr(args, "max_chunks_per_file", None) is not None:
         return False
@@ -264,7 +268,7 @@ def _mine_args_forwardable(args, include_ignored) -> bool:
     return True
 
 
-def _forward_mine_to_hub(args, palace_path: str) -> bool:
+def _forward_mine_to_hub(args, palace_path: str, *, include_ignored=None) -> bool:
     """Run this mine inside the palace's HTTP hub, if one is alive.
 
     A long-lived hub (``mempalace serve``) holds the MCP writer lease for
@@ -303,9 +307,30 @@ def _forward_mine_to_hub(args, palace_path: str) -> bool:
     except (urllib.error.URLError, OSError, ValueError):
         return False
 
+    mode = getattr(args, "mode", None) or "projects"
+    # Only the convo miner reads this flag; the direct path ignores it in the
+    # other modes, so only a convos mine carries it to the hub.
+    include_subagents = mode == "convos" and bool(getattr(args, "include_subagents", False))
+
+    # Older hubs cannot express these overrides. Never discard one or compete
+    # with their lifetime writer lease by silently opening a local writer.
+    capabilities = info.get("capabilities") or []
+    for requested, capability, flag in (
+        (include_ignored, "mine_include_ignored", "--include-ignored"),
+        (include_subagents, "mine_include_subagents", "--include-subagents"),
+    ):
+        if requested and capability not in capabilities:
+            print(
+                f"mempalace: palace hub {base_url} (pid {info.get('pid')}) does not support "
+                f"{flag}; upgrade MemPalace in the hub's environment and restart "
+                "the hub before retrying. No mine was submitted or run locally.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
     arguments = {
         "source": os.path.abspath(os.path.expanduser(args.dir)),
-        "mode": args.mode,
+        "mode": mode,
         "agent": args.agent,
         "limit": args.limit or 0,
         "dry_run": bool(args.dry_run),
@@ -313,6 +338,10 @@ def _forward_mine_to_hub(args, palace_path: str) -> bool:
     }
     if args.wing:
         arguments["wing"] = args.wing
+    if include_ignored:
+        arguments["include_ignored"] = include_ignored
+    if include_subagents:
+        arguments["include_subagents"] = True
     body = json.dumps(
         {
             "jsonrpc": "2.0",

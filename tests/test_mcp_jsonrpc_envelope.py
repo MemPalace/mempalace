@@ -14,6 +14,7 @@ import sys
 import pytest
 
 import mempalace.mcp_server as mcp
+from _mcp_server_helpers import _UNLOADABLE_JSON_KINDS, _unloadable_json_line
 
 
 def _run_loop(monkeypatch, lines):
@@ -146,6 +147,21 @@ class TestStdioLoopAlwaysResponds:
             "error": {"code": -32700, "message": "Parse error"},
         }
         # The loop stays alive and serves the next line.
+        assert responses[1]["id"] == 2
+
+    @pytest.mark.parametrize("kind", _UNLOADABLE_JSON_KINDS)
+    def test_a_line_json_loads_rejects_gets_parse_error(self, monkeypatch, kind):
+        """json.loads raises RecursionError or ValueError here, not JSONDecodeError,
+        and either one used to end the server."""
+        line = _unloadable_json_line(kind)
+
+        responses = _run_loop(monkeypatch, [line, '{"jsonrpc":"2.0","id":2,"method":"ping"}'])
+
+        assert responses[0] == {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": "Parse error"},
+        }
         assert responses[1]["id"] == 2
 
     def test_non_string_method_is_answered_over_stdio(self, monkeypatch):

@@ -8,12 +8,14 @@ Load only what you need, when you need it.
     Layer 0: Identity       (~100 tokens)   — Always loaded. "Who am I?"
     Layer 1: Essential Story (~500-800)      — Always loaded. Top moments from the palace.
     Layer 2: On-Demand      (~200-500 each)  — Loaded when a topic/wing comes up.
-    Layer 3: Deep Search    (unlimited)      — Full ChromaDB semantic search.
+    Layer 3: Deep Search    (unlimited)      — Full semantic search.
 
 Wake-up cost: ~600-900 tokens (L0+L1). Leaves 95%+ of context free.
 
-Reads directly from ChromaDB (mempalace_drawers)
-and ~/.mempalace/identity.txt.
+Reads through the configured storage backend (ChromaDB default, pluggable)
+via ``palace.get_collection`` and ~/.mempalace/identity.txt. This stack never
+writes, and every open asks for ``read_only=True``; see ``_open_for_read`` for
+which backends honour that.
 """
 
 import os
@@ -22,13 +24,49 @@ from pathlib import Path
 from collections import defaultdict
 
 from .config import MempalaceConfig
-from .palace import get_collection as _get_collection
+from .palace import MineAlreadyRunning, get_collection as _get_collection
 from .searcher import (
     _distance_to_similarity,
     _first_or_empty,
     _metric_for_collection,
     build_where_filter,
 )
+
+
+def _open_for_read(palace_path: str):
+    """Open the drawers collection for a pure read.
+
+    The whole stack below only reads, so it asks for ``read_only=True``. On
+    ``sqlite_exact`` a writable open takes the palace mine lock to initialise its
+    schema, and every one of these call sites runs while some other MemPalace
+    process may legitimately hold that lock — the hub, a daemon, a long mine.
+    The failure was silent and actively misleading: the ``except Exception``
+    around each call turned the lock conflict into "No palace found. Run:
+    mempalace mine <dir>", which invited a re-mine of a perfectly healthy palace.
+
+    ``read_only`` is a request, not a guarantee. Backends that support it open
+    without schema initialization, migrations, or metadata writes, and take no
+    lock. ChromaDB ignores it; its collection open takes no mine lock either,
+    though its client still writes ``chroma.sqlite3``.
+    """
+    return _get_collection(palace_path, create=False, read_only=True)
+
+
+def _read_open_failure(exc: Exception) -> str:
+    """Explain a failed read-open honestly instead of blaming a missing palace.
+
+    A genuinely absent palace keeps the historical wording — callers and tests
+    match on it. Only a lock conflict, which the old wording misreported as a
+    missing palace (inviting a pointless re-mine), gets its own message.
+    """
+    if isinstance(exc, MineAlreadyRunning):
+        return (
+            "## Palace is busy — another MemPalace process holds the write lock.\n"
+            f"{exc}\n"
+            "This backend could not open the palace without that lock; "
+            "stop that process or wait for it to finish."
+        )
+    return "No palace found. Run: mempalace mine <dir>"
 
 
 # ---------------------------------------------------------------------------
@@ -146,9 +184,10 @@ class Layer1:
     def generate(self) -> str:
         """Pull top drawers from the palace and format as compact L1 text."""
         try:
-            col = _get_collection(self.palace_path, create=False)
-        except Exception:
-            return "## L1 — No palace found. Run: mempalace mine <dir>"
+            col = _open_for_read(self.palace_path)
+        except Exception as exc:
+            message = _read_open_failure(exc)
+            return message if message.startswith("## ") else f"## L1 — {message}"
 
         docs, metas = self._fetch_candidates(col)
 
@@ -249,9 +288,9 @@ class Layer2:
     def retrieve(self, wing: str = None, room: str = None, n_results: int = 10) -> str:
         """Retrieve drawers filtered by wing and/or room."""
         try:
-            col = _get_collection(self.palace_path, create=False)
-        except Exception:
-            return "No palace found."
+            col = _open_for_read(self.palace_path)
+        except Exception as exc:
+            return _read_open_failure(exc)
 
         where = build_where_filter(wing, room)
 
@@ -308,9 +347,9 @@ class Layer3:
     def search(self, query: str, wing: str = None, room: str = None, n_results: int = 5) -> str:
         """Semantic search, returns compact result text."""
         try:
-            col = _get_collection(self.palace_path, create=False)
-        except Exception:
-            return "No palace found."
+            col = _open_for_read(self.palace_path)
+        except Exception as exc:
+            return _read_open_failure(exc)
 
         where = build_where_filter(wing, room)
 
@@ -363,8 +402,11 @@ class Layer3:
     ) -> list:
         """Return raw dicts instead of formatted text."""
         try:
-            col = _get_collection(self.palace_path, create=False)
-        except Exception:
+            col = _open_for_read(self.palace_path)
+        except Exception as exc:
+            # The contract here is a list, so the reason goes to stderr rather
+            # than into a return value a caller would parse as a result row.
+            print(_read_open_failure(exc), file=sys.stderr)
             return []
 
         where = build_where_filter(wing, room)
@@ -485,10 +527,12 @@ class MemoryStack:
 
         # Count drawers
         try:
-            col = _get_collection(self.palace_path, create=False)
+            col = _open_for_read(self.palace_path)
             count = col.count()
             result["total_drawers"] = count
-        except Exception:
+        except Exception as exc:
+            # Zero is indistinguishable from an empty palace, so say why.
+            print(_read_open_failure(exc), file=sys.stderr)
             result["total_drawers"] = 0
 
         return result

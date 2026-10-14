@@ -944,3 +944,384 @@ class TestTunnelDynamicsIntegration:
         assert recreated["stability"] == DEFAULT_STABILITY
         assert recreated["access_count"] == 0
         assert "last_activated" in recreated
+
+
+class TestEntityTunnelFilters:
+    """Audit repair session, 2026-09-21: generic tokens, weak links and spelling variants
+    must not become tunnels; the strongest shared entities win the per-wing cap."""
+
+    def test_candidates_drop_generic_and_weak_and_merge_spellings(self):
+        hallways = [
+            {
+                "wing": "a",
+                "entity_a": "content",
+                "entity_b": "ChatStore",
+                "co_occurrence_count": 50,
+            },
+            {
+                "wing": "b",
+                "entity_a": "content",
+                "entity_b": "ChatStore.swift",
+                "co_occurrence_count": 40,
+            },
+            {"wing": "a", "entity_a": "RootView", "entity_b": "swim.zig", "co_occurrence_count": 2},
+            {
+                "wing": "b",
+                "entity_a": "RootView",
+                "entity_b": "codec.zig",
+                "co_occurrence_count": 9,
+            },
+        ]
+        cands = palace_graph.entity_tunnel_candidates(hallways, min_count=3)
+        assert set(cands) == {"ChatStore"}  # generic dropped; RootView too weak in wing a
+        assert cands["ChatStore"] == {"a": ("a", 50), "b": ("b", 40)}
+
+    def test_candidates_drop_stoplisted_and_ubiquitous_entities(self):
+        wings = [f"w{i}" for i in range(12)]
+        hallways = []
+        for w in wings:  # "Server" and "WebFetch" everywhere; "pool.ts" in two wings only
+            hallways.append(
+                {"wing": w, "entity_a": "Server", "entity_b": "Thing", "co_occurrence_count": 90}
+            )
+            hallways.append(
+                {"wing": w, "entity_a": "WebFetch", "entity_b": "Thing", "co_occurrence_count": 90}
+            )
+        hallways.append(
+            {"wing": "w0", "entity_a": "pool.ts", "entity_b": "Q", "co_occurrence_count": 9}
+        )
+        hallways.append(
+            {"wing": "w1", "entity_a": "pool.ts", "entity_b": "Q", "co_occurrence_count": 9}
+        )
+        cands = palace_graph.entity_tunnel_candidates(hallways, min_count=3)
+        assert set(cands) == {"pool.ts", "Q"}  # Server, WebFetch: stoplisted; Thing: ubiquitous
+
+    def test_per_wing_cap_keeps_strongest(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        hallways = []
+        for i in range(30):
+            hallways.append(
+                {
+                    "wing": "a",
+                    "entity_a": f"Sym{i}",
+                    "entity_b": "X",
+                    "co_occurrence_count": 100 - i,
+                }
+            )
+            hallways.append(
+                {
+                    "wing": "b",
+                    "entity_a": f"Sym{i}",
+                    "entity_b": "Y",
+                    "co_occurrence_count": 100 - i,
+                }
+            )
+        created = palace_graph.entity_tunnels_for_wing("a", hallways, max_per_wing=5)
+        names = sorted(t["source"]["room"] for t in created)
+        assert names == ["entity:Sym0", "entity:Sym1", "entity:Sym2", "entity:Sym3", "entity:Sym4"]
+
+
+class TestTraversalRecording:
+    def test_follow_tunnels_potentiates_each_tunnel_crossed(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        palace_graph.create_tunnel("wing_code", "auth", "wing_people", "users", label="x")
+        palace_graph.create_tunnel("wing_code", "auth", "wing_ops", "oncall", label="y")
+        palace_graph.create_tunnel("wing_docs", "readme", "wing_ops", "oncall", label="z")
+
+        before = {t["id"]: t for t in palace_graph._load_tunnels()}
+        assert all(t["access_count"] == 0 for t in before.values())
+
+        out = palace_graph.follow_tunnels("wing_code", "auth")
+        assert len(out) == 2
+
+        after = {t["id"]: t for t in palace_graph._load_tunnels()}
+        crossed = {c["tunnel_id"] for c in out}
+        for tid, t in after.items():
+            if tid in crossed:
+                assert t["access_count"] == 1
+                assert t["strength"] > before[tid]["strength"]
+            else:
+                assert t["access_count"] == 0
+
+        palace_graph.follow_tunnels("wing_code", "auth")
+        assert all(
+            t["access_count"] == 2 for t in palace_graph._load_tunnels() if t["id"] in crossed
+        )
+
+    def test_follow_tunnels_record_off_leaves_file_untouched(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        palace_graph.create_tunnel("wing_code", "auth", "wing_people", "users", label="x")
+        out = palace_graph.follow_tunnels("wing_code", "auth", record=False)
+        assert len(out) == 1
+        assert palace_graph._load_tunnels()[0]["access_count"] == 0
+
+    def test_record_failure_never_breaks_the_read(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        palace_graph.create_tunnel("wing_code", "auth", "wing_people", "users", label="x")
+        monkeypatch.setattr(
+            palace_graph, "_save_tunnels", lambda *a, **k: (_ for _ in ()).throw(OSError("ro"))
+        )
+        out = palace_graph.follow_tunnels("wing_code", "auth")
+        assert len(out) == 1
+        assert palace_graph.record_tunnel_traversal([out[0]["tunnel_id"]]) == 0
+
+    def test_record_ignores_unknown_ids(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        assert palace_graph.record_tunnel_traversal([]) == 0
+        assert palace_graph.record_tunnel_traversal(["nope"]) == 0
+
+
+class TestEntityTunnelIdentityAndCap:
+    def _h(self, wing, a, b, n=10):
+        return {"wing": wing, "entity_a": a, "entity_b": b, "co_occurrence_count": n}
+
+    def test_same_basename_in_two_wings_is_not_a_shared_entity(self):
+        hallways = [
+            self._h("alpha", "src/models/user.py", "Router"),
+            self._h("beta", "tests/fixtures/user.py", "Scheduler"),
+        ]
+        assert palace_graph.entity_tunnel_candidates(hallways, min_count=1) == {}
+
+    def test_one_file_spelled_two_ways_still_links(self):
+        hallways = [
+            self._h("alpha", "src/codec.zig", "Router"),
+            self._h("beta", "codec.zig", "Scheduler"),
+            self._h("alpha", "ChatStore.swift", "Router"),
+            self._h("beta", "ChatStore", "Scheduler"),
+        ]
+        out = palace_graph.entity_tunnel_candidates(hallways, min_count=1)
+        assert set(out) == {"src/codec.zig", "ChatStore"}
+        assert set(out["src/codec.zig"]) == {"alpha", "beta"}
+
+    def test_bare_names_in_two_wings_do_not_hide_two_different_files(self):
+        """Records carry the qualified path, so a hallway miner that saw
+        ``src/models/user.py`` and one that saw ``tests/fixtures/user.py`` hand
+        the tunnel builder two distinct files, not two bare ``user.py``."""
+        from mempalace.hallways import canonical_entities
+
+        wing_a = canonical_entities(["src/models/user.py", "user.py"])
+        wing_b = canonical_entities(["tests/fixtures/user.py", "user.py"])
+        assert wing_a == ["src/models/user.py"] and wing_b == ["tests/fixtures/user.py"]
+        hallways = [
+            self._h("alpha", wing_a[0], "Router"),
+            self._h("beta", wing_b[0], "Scheduler"),
+        ]
+        assert palace_graph.entity_tunnel_candidates(hallways, min_count=1) == {}
+
+    def test_per_wing_cap_counts_links_not_entities(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        # One entity in three wings is two links from "alpha".
+        hallways = [
+            self._h("alpha", "WebAuthn", "Router", 30),
+            self._h("beta", "WebAuthn", "Scheduler", 20),
+            self._h("gamma", "WebAuthn", "Billing", 10),
+            self._h("delta", "Kiosk", "Router", 1),
+        ]
+        created = palace_graph.entity_tunnels_for_wing(
+            "alpha", hallways, min_count=1, max_per_wing=1
+        )
+        assert len(created) == 1
+        # The strongest link survives the cap: alpha<->beta (weaker side 20).
+        assert {created[0]["source"]["wing"], created[0]["target"]["wing"]} == {"alpha", "beta"}
+        assert len(palace_graph.entity_tunnels_for_wing("alpha", hallways, min_count=1)) == 2
+
+
+class TestTunnelBatch:
+    """``tunnel_batch`` (#2683): the mine's tunnel passes load tunnels.json
+    once and save it once instead of once per tunnel, and store exactly the
+    records the per-call path stores."""
+
+    _TIMESTAMPS = ("created_at", "updated_at", "last_activated")
+
+    def _hallways(self):
+        def h(wing, ent, n):
+            return {"wing": wing, "entity_a": ent, "entity_b": "Other", "co_occurrence_count": n}
+
+        return [
+            h("wing_alpha", "Ben", 9),
+            h("wing_alpha", "WebAuthn", 8),
+            h("wing_alpha", "Kiosk", 7),
+            h("wing_beta", "Ben", 5),
+            h("wing_beta", "Kiosk", 4),
+            h("wing_gamma", "Ben", 3),
+            h("wing_gamma", "WebAuthn", 6),
+            h("wing-delta", "WebAuthn", 2),
+        ]
+
+    def _topics(self):
+        # ``wing-gamma`` and ``wing_gamma`` normalize to one wing, so the same
+        # tunnel id is created twice in one pass: the update path inside a batch.
+        return {
+            "wing_alpha": ["Auth", "OpenAPI", "Kafka"],
+            "wing_beta": ["auth", "openapi"],
+            "wing_gamma": ["Kafka"],
+            "wing-gamma": ["KAFKA"],
+            "wing_delta": [],
+        }
+
+    def _mine_pass(self):
+        created = palace_graph.entity_tunnels_for_wing("wing_alpha", self._hallways(), min_count=1)
+        created += palace_graph.topic_tunnels_for_wing("wing_alpha", self._topics())
+        return created
+
+    def _strip(self, records):
+        return sorted(
+            ({k: ("<ts>" if k in self._TIMESTAMPS else v) for k, v in r.items()} for r in records),
+            key=lambda r: (r["id"], sorted(r), r["label"]),
+        )
+
+    def _count_io(self, monkeypatch):
+        counts = {"load": 0, "save": 0}
+        real_load, real_save = palace_graph._load_tunnels, palace_graph._save_tunnels
+
+        def load(*a, **kw):
+            counts["load"] += 1
+            return real_load(*a, **kw)
+
+        def save(*a, **kw):
+            counts["save"] += 1
+            return real_save(*a, **kw)
+
+        monkeypatch.setattr(palace_graph, "_load_tunnels", load)
+        monkeypatch.setattr(palace_graph, "_save_tunnels", save)
+        return counts
+
+    def test_batched_mine_stores_same_tunnels_as_per_call(self, tmp_path, monkeypatch):
+        import contextlib
+
+        batched_dir = tmp_path / "batched"
+        plain_dir = tmp_path / "plain"
+        batched_dir.mkdir()
+        plain_dir.mkdir()
+
+        _use_tmp_tunnel_file(monkeypatch, batched_dir)
+        # Two passes: the second refreshes every tunnel (the update path).
+        batched_returns = [self._mine_pass(), self._mine_pass()]
+        batched = palace_graph._load_tunnels()
+
+        _use_tmp_tunnel_file(monkeypatch, plain_dir)
+        monkeypatch.setattr(
+            palace_graph, "tunnel_batch", lambda config=None: contextlib.nullcontext()
+        )
+        plain_returns = [self._mine_pass(), self._mine_pass()]
+        plain = palace_graph._load_tunnels()
+
+        assert len(batched) >= 6, "the fixture must produce several tunnels"
+        assert {t["kind"] for t in batched} == {"entity", "topic"}
+        assert {t["id"] for t in batched} == {t["id"] for t in plain}
+        assert [t["id"] for t in batched] == [t["id"] for t in plain]
+        assert self._strip(batched) == self._strip(plain)
+        for got, want in zip(batched_returns, plain_returns):
+            assert self._strip(got) == self._strip(want)
+
+    def test_mine_pass_loads_once_and_saves_once(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        counts = self._count_io(monkeypatch)
+        created = palace_graph.entity_tunnels_for_wing("wing_alpha", self._hallways(), min_count=1)
+        assert len(created) > 2
+        assert counts == {"load": 1, "save": 1}
+
+        counts.update(load=0, save=0)
+        created = palace_graph.topic_tunnels_for_wing("wing_alpha", self._topics())
+        assert len(created) > 2
+        assert counts == {"load": 1, "save": 1}
+
+    def test_batch_with_nothing_to_create_touches_no_file(self, tmp_path, monkeypatch):
+        tunnel_file = _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        counts = self._count_io(monkeypatch)
+        topics = {"wing_alpha": ["a"], "wing_beta": ["z"]}
+        assert palace_graph.topic_tunnels_for_wing("wing_alpha", topics) == []
+        with palace_graph.tunnel_batch():
+            pass
+        assert counts == {"load": 0, "save": 0}
+        assert not tunnel_file.exists()
+
+    def test_nested_batch_reuses_outer(self, tmp_path, monkeypatch):
+        tunnel_file = _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        counts = self._count_io(monkeypatch)
+        with palace_graph.tunnel_batch():
+            outer = palace_graph._active_tunnel_batch(str(tunnel_file))
+            palace_graph.create_tunnel("wa", "r1", "wb", "r1", kind="topic")
+            with palace_graph.tunnel_batch():
+                assert palace_graph._active_tunnel_batch(str(tunnel_file)) is outer
+                palace_graph.create_tunnel("wa", "r2", "wb", "r2", kind="topic")
+            # The inner exit must not save: the outer batch owns persistence.
+            assert counts["save"] == 0
+            assert not tunnel_file.exists()
+            palace_graph.create_tunnel("wa", "r3", "wb", "r3", kind="topic")
+        assert palace_graph._active_tunnel_batch(str(tunnel_file)) is None
+        assert counts == {"load": 1, "save": 1}
+        assert len(palace_graph._load_tunnels()) == 3
+
+    def test_exception_inside_batch_still_saves(self, tmp_path, monkeypatch):
+        tunnel_file = _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        with pytest.raises(RuntimeError, match="boom"):
+            with palace_graph.tunnel_batch():
+                palace_graph.create_tunnel("wa", "r1", "wb", "r1", kind="topic")
+                palace_graph.create_tunnel("wa", "r2", "wb", "r2", kind="topic")
+                raise RuntimeError("boom")
+        assert palace_graph._active_tunnel_batch(str(tunnel_file)) is None
+        assert {t["source"]["room"] for t in palace_graph._load_tunnels()} == {"r1", "r2"}
+
+    def test_create_tunnel_outside_batch_loads_and_saves_per_call(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        counts = self._count_io(monkeypatch)
+        first = palace_graph.create_tunnel("wa", "r1", "wb", "r1", label="one")
+        assert counts == {"load": 1, "save": 1}
+        assert palace_graph._load_tunnels()[0]["id"] == first["id"]
+        second = palace_graph.create_tunnel("wb", "r1", "wa", "r1", label="two")
+        assert second["id"] == first["id"]
+        assert second["created_at"] == first["created_at"]
+        assert "updated_at" in second
+        # Three loads: the two create_tunnel calls plus the check above.
+        assert counts == {"load": 3, "save": 2}
+
+    def test_batch_update_preserves_created_at_and_dynamics(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        first = palace_graph.create_tunnel("wa", "r1", "wb", "r1", label="one", kind="topic")
+        stored = palace_graph._load_tunnels()
+        stored[0].update(strength=2.5, access_count=7)
+        palace_graph._save_tunnels(stored)
+
+        with palace_graph.tunnel_batch():
+            again = palace_graph.create_tunnel("wb", "r1", "wa", "r1", label="two", kind="topic")
+            last = palace_graph.create_tunnel("wa", "r1", "wb", "r1", label="three", kind="topic")
+        # Returned dicts are snapshots, like the per-call path's.
+        assert again["label"] == "two"
+        assert last["label"] == "three"
+        (record,) = palace_graph._load_tunnels()
+        assert record["id"] == first["id"]
+        assert record["label"] == "three"
+        assert record["created_at"] == first["created_at"]
+        assert record["strength"] == 2.5
+        assert record["access_count"] == 7
+        assert "updated_at" in record
+
+    def test_batch_is_invisible_to_other_threads(self, tmp_path, monkeypatch):
+        import threading
+
+        tunnel_file = _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        seen = []
+        with palace_graph.tunnel_batch():
+            t = threading.Thread(
+                target=lambda: seen.append(palace_graph._active_tunnel_batch(str(tunnel_file)))
+            )
+            t.start()
+            t.join()
+            assert palace_graph._active_tunnel_batch(str(tunnel_file)) is not None
+        assert seen == [None]
+
+    def test_batches_on_different_files_nest_independently(self, tmp_path):
+        from mempalace.config import MempalaceConfig
+
+        cfg_a = MempalaceConfig(palace_path=tmp_path / "a" / "palace")
+        cfg_b = MempalaceConfig(palace_path=tmp_path / "b" / "palace")
+        with palace_graph.tunnel_batch(cfg_a):
+            palace_graph.create_tunnel("wa", "r1", "wb", "r1", kind="topic", config=cfg_a)
+            with palace_graph.tunnel_batch(cfg_b):
+                palace_graph.create_tunnel("wa", "r2", "wb", "r2", kind="topic", config=cfg_b)
+                # File A from inside B's batch still goes to A's open batch
+                # rather than taking A's lock again.
+                palace_graph.create_tunnel("wa", "r3", "wb", "r3", kind="topic", config=cfg_a)
+            assert [t["source"]["room"] for t in palace_graph._load_tunnels(cfg_b)] == ["r2"]
+            assert palace_graph._load_tunnels(cfg_a) == []
+        assert [t["source"]["room"] for t in palace_graph._load_tunnels(cfg_a)] == ["r1", "r3"]

@@ -82,6 +82,18 @@ _EXPLICIT_BACKEND_ENV = "MEMPALACE_BACKEND_EXPLICIT"
 #               drawers stored system tags / hook chrome verbatim.
 NORMALIZE_VERSION = 2
 
+# Revision of the conversation exchange chunker (``convo_miner.chunk_exchanges``),
+# stamped on exchange-mode convo rows as ``convo_chunker_version``. The
+# mined-set checks treat an older (or missing) revision the way they treat a
+# stale ``normalize_version``, but only for exchange-mode rows — bumping
+# NORMALIZE_VERSION instead would re-mine every project file too.
+#
+# v2 (2026-09): the chunker stopped discarding text (anything after a ``---``
+#               line in a response, text before the first user turn, and units
+#               at or below the min chunk size) and splits oversized units at
+#               whitespace instead of mid-word.
+CONVO_CHUNKER_VERSION = 2
+
 
 # (palace_id, collection_name, model_name) tuples already validated this
 # process, so the identity check (one metadata read) runs at most once per

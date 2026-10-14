@@ -54,11 +54,8 @@ the same embedding model used for ingestion. The example `[1,0]` is for a
 2-dimensional fixture. This executable does not embed text. The default collection
 is `mempalace_drawers`; use `--collection` to select another explicitly.
 
-## Performance evidence
+## Performance
 
-The initial Windows benchmark reported 557 MB RSS for the Python/Rust engine
-versus 2,430 MB for the Python baseline on a database with 334,224 rows. Reported
-warm native latencies were 7.2-11.8 ms across 168k and 334k-row workloads. These
-are historical measurements, not guarantees for this revision, other machines,
-or queries that fall back to Python. Correctness tests use synthetic data; the
-private corpus benchmark has not been rerun for the hardening changes.
+No benchmark figures are published for this revision. Earlier measurements predate the correctness hardening and have been withdrawn. To measure the engine on your own data, run
+`mempalace-native bench --db /path/to/sqlite_exact.sqlite3`. Correctness tests use synthetic
+data.

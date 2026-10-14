@@ -1247,6 +1247,34 @@ def test_run_mcp_tool_dispatches_write_tool(monkeypatch):
     assert captured["arguments"] == {"x": 1}
 
 
+def test_mcp_tool_knowledge_graph_writes_land_beside_the_daemons_palace(monkeypatch, tmp_path):
+    """A daemon serves the one palace it was started for, so a knowledge-graph
+    tool it runs writes beside that palace, as a server started with
+    ``--palace`` does, and not into the per-user default graph."""
+    from _mcp_server_helpers import _keep_server_command_line_state
+    import mempalace.mcp_server as mcp
+    from mempalace import service
+
+    _keep_server_command_line_state(monkeypatch)
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    # run_server points the whole daemon process at its palace.
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(palace))
+    monkeypatch.setattr(mcp, "_palace_flag_given", False)
+
+    out = service.execute_job(
+        "mcp_tool",
+        {
+            "name": "mempalace_kg_add",
+            "arguments": {"subject": "alice", "predicate": "likes", "object": "tea"},
+            "palace_path": str(palace),
+        },
+    )
+
+    assert out["success"] is True, out
+    assert (palace / "knowledge_graph.sqlite3").is_file()
+
+
 def test_run_diary_write_forwards_args_and_sets_exit_code(monkeypatch):
     import mempalace.mcp_server as mcp
     from mempalace import service
@@ -1567,6 +1595,151 @@ def test_start_daemon_refuses_to_replace_a_live_but_busy_daemon(tmp_path, monkey
     # Registration is intact, so the live owner stays reachable once it answers again.
     assert daemon.endpoint_path(str(palace)).exists()
     assert daemon.pid_path(str(palace)).exists()
+
+
+def _backdate_registration(palace, seconds_before):
+    """Make the registration look written ``seconds_before`` this process started."""
+    started = daemon._process_start_time(os.getpid())
+    if started is None:
+        pytest.skip("process start time is not readable on this platform")
+    stamp = started - seconds_before
+    for path in (daemon.endpoint_path(str(palace)), daemon.pid_path(str(palace))):
+        os.utime(path, (stamp, stamp))
+
+
+def test_process_start_time_reads_this_process():
+    started = daemon._process_start_time(os.getpid())
+    if started is None:
+        pytest.skip("process start time is not readable on this platform")
+    assert started <= time.time()
+    assert started > time.time() - 7 * 24 * 3600
+
+
+def test_process_start_time_fallback_readers_without_psutil(monkeypatch):
+    """Installs without psutil use /proc, GetProcessTimes or ps instead."""
+    psutil = pytest.importorskip("psutil")
+    expected = psutil.Process(os.getpid()).create_time()
+    monkeypatch.setitem(sys.modules, "psutil", None)
+
+    started = daemon._process_start_time(os.getpid())
+
+    assert started is not None
+    # ps reports whole seconds; the other readers agree to within a tick.
+    assert abs(started - expected) < 2.0
+
+
+def test_start_daemon_foreground_refuses_a_live_but_busy_daemon(tmp_path, monkeypatch):
+    palace = _fake_registration(tmp_path, monkeypatch, os.getpid())
+    monkeypatch.setattr(
+        daemon,
+        "run_server",
+        lambda *a, **kw: pytest.fail("must not serve beside a live registered daemon"),
+    )
+
+    with pytest.raises(daemon.DaemonError, match="busy or wedged"):
+        daemon.start_daemon(str(palace), foreground=True)
+    assert daemon.endpoint_path(str(palace)).exists()
+
+
+def test_stop_daemon_keeps_a_registration_published_after_it_looked(tmp_path, monkeypatch):
+    """Stop removes only the registration it classified as stale."""
+    palace = _fake_registration(tmp_path, monkeypatch, os.getpid())
+    # The files now name a different pid than the one stop classified.
+    monkeypatch.setattr(daemon, "_registration_state", lambda palace_path: ("stale", 4194303))
+
+    assert daemon.stop_daemon(str(palace)) is False
+    assert daemon.endpoint_path(str(palace)).exists()
+    assert daemon.pid_path(str(palace)).exists()
+
+
+@pytest.mark.skipif(daemon._fcntl is None, reason="the spawn lock is POSIX-only")
+def test_stop_daemon_leaves_stale_files_to_a_start_in_flight(tmp_path, monkeypatch):
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    palace = _fake_registration(tmp_path, monkeypatch, dead.pid)
+
+    with open(daemon.state_dir(str(palace)) / "start.lock", "w") as held:
+        daemon._fcntl.flock(held.fileno(), daemon._fcntl.LOCK_EX)
+        assert daemon.stop_daemon(str(palace)) is False
+        assert daemon.endpoint_path(str(palace)).exists()
+
+    assert daemon.stop_daemon(str(palace)) is False
+    assert not daemon.endpoint_path(str(palace)).exists()
+
+
+def test_start_daemon_replaces_a_registration_whose_pid_was_reused(tmp_path, monkeypatch):
+    """After a crash the pid can belong to an unrelated process started later.
+
+    That process is alive, but it started after the registration was written,
+    so it cannot be the daemon: start must not refuse forever.
+    """
+    palace = _fake_registration(tmp_path, monkeypatch, os.getpid())
+    _backdate_registration(palace, 3600)
+    spawned = []
+
+    def fake_popen(*a, **kw):
+        spawned.append(a)
+        assert not daemon.endpoint_path(str(palace)).exists()
+        assert not daemon.pid_path(str(palace)).exists()
+        raise OSError("stop here")
+
+    monkeypatch.setattr(daemon.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(OSError, match="stop here"):
+        daemon.start_daemon(str(palace), timeout=0.05)
+    assert spawned
+
+
+def test_start_daemon_treats_an_unreadable_start_time_as_live(tmp_path, monkeypatch):
+    palace = _fake_registration(tmp_path, monkeypatch, os.getpid())
+    monkeypatch.setattr(daemon, "_process_start_time", lambda pid: None)
+    monkeypatch.setattr(
+        daemon.subprocess,
+        "Popen",
+        lambda *a, **kw: pytest.fail("must not spawn when ownership cannot be ruled out"),
+    )
+
+    with pytest.raises(daemon.DaemonError, match="busy or wedged"):
+        daemon.start_daemon(str(palace), timeout=0.05)
+    assert daemon.endpoint_path(str(palace)).exists()
+
+
+def test_stop_daemon_removes_a_dead_registration(tmp_path, monkeypatch):
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    palace = _fake_registration(tmp_path, monkeypatch, dead.pid)
+
+    assert daemon.stop_daemon(str(palace)) is False
+    assert not daemon.endpoint_path(str(palace)).exists()
+    assert not daemon.pid_path(str(palace)).exists()
+
+
+def test_stop_daemon_removes_a_registration_whose_pid_was_reused(tmp_path, monkeypatch):
+    palace = _fake_registration(tmp_path, monkeypatch, os.getpid())
+    _backdate_registration(palace, 3600)
+
+    assert daemon.stop_daemon(str(palace)) is False
+    assert not daemon.endpoint_path(str(palace)).exists()
+    assert not daemon.pid_path(str(palace)).exists()
+
+
+def test_stop_daemon_explains_an_unresponsive_live_daemon(tmp_path, monkeypatch):
+    """A wedged daemon keeps its registration and the error names the process."""
+    palace = _fake_registration(tmp_path, monkeypatch, os.getpid())
+
+    with pytest.raises(daemon.DaemonError, match=rf"pid {os.getpid()} is registered and running"):
+        daemon.stop_daemon(str(palace))
+    assert daemon.endpoint_path(str(palace)).exists()
+    assert daemon.pid_path(str(palace)).exists()
+
+
+def test_stop_daemon_without_a_registration_reports_not_running(tmp_path, monkeypatch):
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    monkeypatch.setattr(daemon, "get_client_if_running", lambda *a, **kw: None)
+
+    assert daemon.stop_daemon(str(palace)) is False
 
 
 def test_start_daemon_replaces_a_dead_registration(tmp_path, monkeypatch):

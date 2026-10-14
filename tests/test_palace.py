@@ -8,6 +8,7 @@ import pytest
 
 from mempalace.backends import CollectionNotInitializedError, PalaceNotFoundError
 from mempalace.palace import (
+    ASSETS_COLLECTION_NAME,
     CLOSETS_COLLECTION_NAME,
     CollectionNameMismatchError,
     _allowed_wrapper_collection_names,
@@ -183,6 +184,35 @@ def test_open_collection_or_explain_state_e_unexpected_error(tmp_path, monkeypat
     assert result is None
     assert any("Error opening palace" in line for line in lines)
     assert any("repair-status" in line for line in lines)
+
+
+@pytest.mark.parametrize(
+    "error, shown",
+    [
+        (RuntimeError("index segment missing\nrun repair"), "index segment missing\nrun repair"),
+        (OSError(5, "Input/output error"), "[Errno 5] Input/output error"),
+        (RuntimeError(), "RuntimeError"),
+    ],
+)
+def test_open_collection_or_explain_prints_the_message_not_its_repr(
+    tmp_path, monkeypatch, error, shown
+):
+    """State E prints str(e): a repr escaped newlines and quotes and wrapped
+    the message in the class name (``RuntimeError('...\\n...')``)."""
+    emit, lines = _capture()
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    make_minimal_chroma_sqlite(palace)
+
+    def boom(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr("mempalace.palace.get_collection", boom)
+
+    assert _open_collection_or_explain(str(palace), out=emit) is None
+    message = next(line for line in lines if "Error opening palace" in line)
+    assert message.endswith(f": {shown}")
+    assert "\\n" not in message and "Error(" not in message
 
 
 def test_open_collection_or_explain_default_sink_is_print(tmp_path, capsys):
@@ -366,8 +396,9 @@ class TestGetCollectionNameValidation:
         with pytest.raises(CollectionNameMismatchError):
             get_collection(str(palace), collection_name="mempalace_drawers", create=True)
 
-    def test_allowed_names_helper_lists_both(self):
+    def test_allowed_names_helper_lists_all_supported_collections(self):
         allowed = _allowed_wrapper_collection_names()
         assert "mempalace_drawers" in allowed
         assert "mempalace_closets" in allowed
-        assert len(allowed) == 2
+        assert ASSETS_COLLECTION_NAME in allowed
+        assert len(allowed) == 3

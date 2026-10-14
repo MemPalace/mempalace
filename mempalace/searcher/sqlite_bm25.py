@@ -61,6 +61,51 @@ def _window_sql_prefilters(since_dt, before_dt) -> list:
     return prefilters
 
 
+def _flag_truncations(result: dict, window_pool_truncated: bool, candidates_truncated: bool):
+    """Mark a fallback result whose candidate pool was cut short."""
+    if window_pool_truncated:
+        result["date_filter_pool_truncated"] = True
+    if candidates_truncated:
+        # A missing whole word was searched for past the ranked window and
+        # the read budget ran out: drawers holding it may not have been seen.
+        result["candidates_truncated"] = True
+    return result
+
+
+def _pick_fts_candidates(
+    conn, collection_name, query, *, max_candidates, scope, fts_filter, row_filter, stop_words
+) -> list[int]:
+    """Row ids for the BM25 re-rank, whole-word matches first.
+
+    The trigram index matches inside words, and the first matches in storage
+    order were the oldest substring hits. A scope filter matching few drawers
+    is read directly (``row_filter`` refers to ``e.id``) instead of ranking
+    the palace-wide match set (``fts_filter``).
+    """
+    equalities = [(key, value) for key, value in scope.items() if value]
+    candidate_ids = _filtered_candidate_rows(
+        conn,
+        collection_name,
+        query,
+        limit=max_candidates,
+        equalities=equalities,
+        filter_sql=row_filter[0],
+        filter_params=row_filter[1],
+        stop_words=stop_words,
+    )
+    if candidate_ids is None:
+        candidate_ids = _fts_candidate_rows(
+            conn,
+            collection_name,
+            query,
+            limit=max_candidates,
+            filter_sql=fts_filter[0],
+            filter_params=fts_filter[1],
+            stop_words=stop_words,
+        )
+    return candidate_ids
+
+
 def _bm25_only_via_sqlite(
     query: str,
     palace_path: str,
@@ -141,7 +186,7 @@ def _bm25_only_via_sqlite(
         return "".join(clauses), params
 
     try:
-        conn = connect_sqlite_read(db_path)
+        conn = open_palace_reader(db_path)
     except sqlite3.Error as e:
         return _search_error_result(f"sqlite open failed: {e}")
 
@@ -151,26 +196,22 @@ def _bm25_only_via_sqlite(
         # shorter than 3 chars (trigram tokenizer can't match them).
         tokens = [t for t in _tokenize(query) if len(t) >= 3]
         candidate_ids: list[int] = []
+        candidates_truncated = False
         use_recency_fallback = not tokens
         if tokens:
-            fts_query = " OR ".join(tokens)
             filter_sql, filter_params = _metadata_filter_sql("embedding_fulltext_search.rowid")
             try:
-                rows = conn.execute(
-                    f"""
-                    SELECT embedding_fulltext_search.rowid
-                    FROM embedding_fulltext_search
-                    JOIN embeddings e ON e.id = embedding_fulltext_search.rowid
-                    JOIN segments s ON e.segment_id = s.id
-                    JOIN collections c ON s.collection = c.id
-                    WHERE embedding_fulltext_search MATCH ?
-                      AND c.name = ?
-                    {filter_sql}
-                    LIMIT ?
-                    """,
-                    (fts_query, collection_name, *filter_params, max_candidates),
-                ).fetchall()
-                candidate_ids = [r[0] for r in rows]
+                candidate_ids = _pick_fts_candidates(
+                    conn,
+                    collection_name,
+                    query,
+                    max_candidates=max_candidates,
+                    scope={"wing": wing, "room": room, "source_file": source_file},
+                    fts_filter=(filter_sql, filter_params),
+                    row_filter=_metadata_filter_sql("e.id"),
+                    stop_words=stop_words,
+                )
+                candidates_truncated = getattr(candidate_ids, "truncated", False)
             except sqlite3.Error:
                 # FTS5 tokenizer mismatch or syntax error — fall through
                 # to the recency-window selector below.
@@ -318,7 +359,7 @@ def _bm25_only_via_sqlite(
         c["bm25_score"] = round(raw, 3)
         c["_score"] = (raw / max_bm25) if max_bm25 > 0 else 0.0
     candidates.sort(key=lambda c: c["_score"], reverse=True)
-    hits = candidates[:n_results]
+    hits = _fold_copies_across_sources(candidates, _search_hit_source, _search_hit_ref)[:n_results]
     for h in hits:
         h.pop("_score", None)
         # Strip internal fields by default so the public BM25-only fallback
@@ -336,9 +377,7 @@ def _bm25_only_via_sqlite(
         "fallback": "bm25_only_via_sqlite",
         "fallback_reason": "vector_search_disabled",
     }
-    if window_pool_truncated:
-        result["date_filter_pool_truncated"] = True
-    return result
+    return _flag_truncations(result, window_pool_truncated, candidates_truncated)
 
 
 def _merge_bm25_union_candidates(

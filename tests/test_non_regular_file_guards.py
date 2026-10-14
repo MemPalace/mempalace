@@ -13,8 +13,9 @@ hang the suite (an unbounded blocking open would otherwise stall pytest
 itself, which reports as "still running", not as a failure).
 :func:`hard_timeout` is that deadline wherever the block would happen in a
 call Python makes. Where it happens inside a C library that restarts the
-syscall itself, :func:`_repair_status_bounded` runs the call in a child
-process instead, for the reason its docstring records.
+syscall itself, :func:`_repair_status_bounded` and
+:func:`_integrity_probe_bounded` run the call in a child process instead, for
+the reason the second one's docstring records.
 """
 
 import argparse
@@ -22,6 +23,7 @@ import errno
 import hashlib
 import json
 import os
+import select
 import signal
 import socket
 import stat as stat_module
@@ -68,15 +70,16 @@ posix_only = pytest.mark.skipif(
 # below breaks: the state these tests need cannot be built as root, they do
 # not merely pass vacuously there. ``tests/test_backups.py`` gates the same
 # way and additionally excludes Windows, which it has to because it carries
-# no ``posix_only``; every use here already sits under ``posix_only``.
+# no ``posix_only``; every use here also carries ``posix_only`` or ``needs_fifo``,
+# and both of those exclude Windows.
 needs_unprivileged_posix = pytest.mark.skipif(
     hasattr(os, "geteuid") and os.geteuid() == 0,
     reason="directory permission bits do not gate root",
 )
 
-# The three ``repair.status`` tests need a FIFO but deliberately avoid SIGALRM
-# -- running in a child process is what replaces it there -- so they carry this
-# rather than ``posix_only``, which bundles the two.
+# The ``repair.status`` and integrity-probe tests need a FIFO but deliberately
+# avoid SIGALRM -- running in a child process is what replaces it there -- so
+# they carry this rather than ``posix_only``, which bundles the two.
 needs_fifo = pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX FIFOs")
 
 TIMEOUT_SECONDS = 10.0
@@ -354,6 +357,298 @@ def test_repair_status_rejects_a_symlink_to_a_fifo(tmp_path):
 
     assert answer["status"] == "unknown"
     assert "named pipe" in answer["message"]
+
+
+_NAMED_PIPE_INTEGRITY_ERROR = (
+    "PRAGMA quick_check failed: chroma.sqlite3 resolves to a named pipe, not a database"
+)
+
+_INTEGRITY_PROBE_IN_A_CHILD = """
+import json, sys
+
+sys.path.insert(0, sys.argv[2])
+import mempalace.repair as repair
+
+palace = sys.argv[1]
+if sys.argv[4] == "status":
+    found = repair.sqlite_integrity_status(palace)
+    answer = {"checked": found.checked, "errors": list(found.errors), "reason": found.reason}
+elif sys.argv[4] == "errors":
+    answer = {"errors": repair.sqlite_integrity_errors(palace)}
+else:
+    raise SystemExit(f"unknown probe {sys.argv[4]!r}")
+sys.stderr.write(sys.argv[3] + json.dumps(answer))
+"""
+
+
+def _integrity_probe_bounded(
+    palace: Path, probe: str, script: str = _INTEGRITY_PROBE_IN_A_CHILD
+) -> dict:
+    """Run an integrity probe in a child with a kill deadline.
+
+    Beside a ``-wal`` or ``-shm`` sidecar the open that parks on the pipe is sqlite3's own,
+    and SIGALRM does not end it there; a kill deadline does, as in
+    :func:`_repair_status_bounded`.
+    """
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            script,
+            str(palace),
+            _tree_under_test(),
+            _ANSWER_MARKER,
+            probe,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=CHILD_DEADLINE_SECONDS,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert _ANSWER_MARKER in proc.stderr, proc.stderr
+    return json.loads(proc.stderr.split(_ANSWER_MARKER, 1)[1])
+
+
+@needs_fifo
+def test_sqlite_integrity_status_reports_a_fifo_named_chroma_sqlite3(tmp_path):
+    """The MCP integrity gate's probe must name the pipe rather than open it.
+
+    It runs under the gate's refresh lock, which gated tool calls wait on, so a
+    probe parked on the pipe left those calls waiting with it.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    make_fifo(palace, "chroma.sqlite3")
+
+    answer = _integrity_probe_bounded(palace, "status")
+
+    assert answer == {"checked": True, "errors": [_NAMED_PIPE_INTEGRITY_ERROR], "reason": ""}
+
+
+@needs_fifo
+def test_sqlite_integrity_status_reports_a_symlink_to_a_fifo(tmp_path):
+    """The open follows the link, so the type check has to follow it too."""
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").symlink_to(make_fifo(tmp_path, "elsewhere.fifo"))
+
+    answer = _integrity_probe_bounded(palace, "status")
+
+    assert answer == {"checked": True, "errors": [_NAMED_PIPE_INTEGRITY_ERROR], "reason": ""}
+
+
+@needs_fifo
+@pytest.mark.parametrize("sidecar", ["-wal", "-shm"])
+def test_sqlite_integrity_status_reports_a_fifo_beside_a_sidecar(tmp_path, sidecar):
+    """With a ``-wal`` or ``-shm`` present, ``connect_sqlite_read`` skips its header read.
+
+    The open that would park is then the one inside sqlite3.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    make_fifo(palace, "chroma.sqlite3")
+    (palace / f"chroma.sqlite3{sidecar}").write_bytes(b"")
+
+    answer = _integrity_probe_bounded(palace, "status")
+
+    assert answer == {"checked": True, "errors": [_NAMED_PIPE_INTEGRITY_ERROR], "reason": ""}
+
+
+@needs_fifo
+def test_sqlite_integrity_status_leaves_a_fifo_with_a_writer_unread(tmp_path):
+    """The verdict comes from the file type, not from whether a read would park.
+
+    With a writer attached nothing parks, and the pipe is still refused without
+    a byte of it read.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    fifo = make_fifo(palace, "chroma.sqlite3")
+    # PIPE_BUF bytes, the most POSIX guarantees a non-blocking write takes whole.
+    payload = b"\x00" * select.PIPE_BUF
+    # The read end first: a non-blocking open for writing needs a reader.
+    reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        writer = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            assert os.write(writer, payload) == len(payload)
+
+            answer = _integrity_probe_bounded(palace, "status")
+
+            try:
+                left_in_the_pipe = os.read(reader, 2 * len(payload))
+            except BlockingIOError:  # the probe read every byte
+                left_in_the_pipe = b""
+        finally:
+            os.close(writer)
+    finally:
+        os.close(reader)
+    assert left_in_the_pipe == payload
+    assert answer == {"checked": True, "errors": [_NAMED_PIPE_INTEGRITY_ERROR], "reason": ""}
+
+
+_INTEGRITY_STATUS_WITH_A_MIDCALL_CHMOD_IN_A_CHILD = """
+import json, os, stat, sys
+
+sys.path.insert(0, sys.argv[2])
+import mempalace.repair as repair
+
+palace = sys.argv[1]
+probe = repair._quick_check_errors
+was = stat.S_IMODE(os.stat(palace).st_mode)
+reached = []
+
+
+def reachable_only_now(sqlite_path):
+    # Everything above the probe looked at an unreachable path; the probe does not.
+    reached.append(sqlite_path)
+    os.chmod(palace, was)
+    return probe(sqlite_path)
+
+
+repair._quick_check_errors = reachable_only_now
+os.chmod(palace, 0o000)
+try:
+    os.stat(os.path.join(palace, "chroma.sqlite3"))
+except PermissionError:
+    unreachable = True
+else:  # mode bits do not gate this process, so the world below was never built
+    unreachable = False
+found = repair.sqlite_integrity_status(palace)
+answer = {
+    "unreachable_before_the_probe": unreachable,
+    "probe_reached_once": len(reached) == 1,
+    "checked": found.checked,
+    "errors": list(found.errors),
+    "reason": found.reason,
+}
+sys.stderr.write(sys.argv[3] + json.dumps(answer))
+"""
+
+
+@needs_unprivileged_posix
+@needs_fifo
+def test_sqlite_integrity_status_checks_the_type_next_to_the_open(tmp_path):
+    """The type check belongs in ``_quick_check_errors``, not further up.
+
+    Under a directory this process may not enter, a check made further up gets
+    a failing ``stat`` and answers False by design; if the directory becomes
+    traversable before the open, the open is handed the pipe.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    make_fifo(palace, "chroma.sqlite3")
+    original_mode = stat_module.S_IMODE(palace.stat().st_mode)
+
+    try:
+        answer = _integrity_probe_bounded(
+            palace, "status", _INTEGRITY_STATUS_WITH_A_MIDCALL_CHMOD_IN_A_CHILD
+        )
+    finally:
+        # A child that stops before its wrapper runs leaves the directory at 0o000.
+        os.chmod(palace, original_mode)
+
+    assert answer == {
+        "unreachable_before_the_probe": True,
+        "probe_reached_once": True,
+        "checked": True,
+        "errors": [_NAMED_PIPE_INTEGRITY_ERROR],
+        "reason": "",
+    }
+
+
+@needs_fifo
+def test_sqlite_integrity_errors_reports_a_fifo_named_chroma_sqlite3(tmp_path):
+    """``python -m mempalace.repair rebuild`` reaches the probe through this one."""
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    make_fifo(palace, "chroma.sqlite3")
+
+    assert _integrity_probe_bounded(palace, "errors") == {"errors": [_NAMED_PIPE_INTEGRITY_ERROR]}
+
+
+_MCP_SESSION_REQUESTS = [
+    {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "non-regular-file-guards", "version": "0"},
+        },
+    },
+    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+    {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {"name": "mempalace_list_wings", "arguments": {}},
+    },
+    {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {"name": "mempalace_status", "arguments": {}},
+    },
+    {"jsonrpc": "2.0", "id": 4, "method": "ping"},
+]
+
+_MCP_SERVER_IN_A_CHILD = (
+    "import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); "
+    "runpy.run_module('mempalace.mcp_server', run_name='__main__')"
+)
+
+
+@needs_fifo
+def test_mcp_server_keeps_answering_with_a_fifo_named_chroma_sqlite3(tmp_path):
+    """A stdio session on such a palace refuses gated tools, reports status and answers ping.
+
+    Before, a gated tool call waited on the probe, and a stdio server reads its
+    next request only after answering the current one.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    make_fifo(palace, "chroma.sqlite3")
+    # A backend named by MEMPALACE_BACKEND, or by a config.json found through
+    # MEMPALACE_CONFIG_DIR, HOME or XDG_CONFIG_HOME, would route the server past
+    # the gate under test, so it sees none of them.
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith("MEMPALACE_") and name != "XDG_CONFIG_HOME"
+    }
+    env["HOME"] = str(home)
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _MCP_SERVER_IN_A_CHILD,
+            _tree_under_test(),
+            "--palace",
+            str(palace),
+        ],
+        input="".join(json.dumps(request) + "\n" for request in _MCP_SESSION_REQUESTS),
+        capture_output=True,
+        text=True,
+        timeout=CHILD_DEADLINE_SECONDS,
+        env=env,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    responses = {reply["id"]: reply for reply in map(json.loads, proc.stdout.splitlines())}
+    assert sorted(responses) == [1, 2, 3, 4], proc.stderr
+    assert responses[2].get("error", {}).get("code") == -32002, responses[2]
+    assert responses[2]["error"]["data"]["errors"] == [_NAMED_PIPE_INTEGRITY_ERROR]
+    status = json.loads(responses[3]["result"]["content"][0]["text"])
+    assert status["sqlite_integrity"]["ok"] is False
+    assert status["sqlite_integrity"]["errors"] == [_NAMED_PIPE_INTEGRITY_ERROR]
+    assert responses[4]["result"] == {}
 
 
 @posix_only
