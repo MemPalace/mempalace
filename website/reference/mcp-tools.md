@@ -356,8 +356,10 @@ Chronological timeline of facts.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `entity` | string | No | Entity to get timeline for (omit for full timeline) |
+| `limit` | integer | No | Max facts per page (default 100, max 100) |
+| `offset` | integer | No | Offset for pagination (default 0) |
 
-**Returns:** `{ entity, timeline: [{ subject, predicate, object, valid_from, valid_to, current }], count }`
+**Returns:** `{ entity, timeline: [{ subject, predicate, object, valid_from, valid_to, current, confidence, source_closet, source_file }], count, total, offset, limit }`
 
 ---
 
