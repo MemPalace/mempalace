@@ -1835,3 +1835,41 @@ def test_sqlite_wing_source_counts_is_scoped_to_the_collection(tmp_path):
     assert sqlite_wing_source_counts(str(tmp_path), "mempalace_closets") == [("convos", src, 1)]
     assert sqlite_wing_source_counts(str(tmp_path), "nope") is None
     assert sqlite_wing_source_counts(str(tmp_path / "missing"), "mempalace_drawers") is None
+
+
+def test_sqlite_exact_fts_rowid_map_backfills_and_tracks_writes(tmp_path):
+    backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b"],
+        documents=["alpha needle", "beta needle"],
+        metadatas=[{}, {}],
+        embeddings=[[1.0, 0.0], [0.0, 1.0]],
+    )
+    backend.close_palace(str(tmp_path))
+    # Simulate a palace written before docs_fts_rowid, with a duplicate FTS row.
+    db = os.path.join(str(tmp_path), "sqlite_exact.sqlite3")
+    conn = sqlite3.connect(db)
+    conn.execute("DROP TABLE docs_fts_rowid")
+    conn.execute("DELETE FROM meta WHERE key = 'fts_rowid_map'")
+    conn.execute(
+        "INSERT INTO docs_fts(collection_id, doc_id, document) "
+        "SELECT collection_id, doc_id, 'stale alpha' FROM docs_fts WHERE doc_id = 'a'"
+    )
+    conn.commit()
+    conn.close()
+
+    backend, col = _collection(tmp_path, create=False)
+    col.upsert(ids=["a"], documents=["alpha fresh"], metadatas=[{}], embeddings=[[1.0, 0.0]])
+    col.delete(ids=["b"])
+    col.add(ids=["c"], documents=["gamma needle"], metadatas=[{}], embeddings=[[0.5, 0.5]])
+    backend.close_palace(str(tmp_path))
+
+    conn = sqlite3.connect(db)
+    fts = dict(conn.execute("SELECT doc_id, document FROM docs_fts").fetchall())
+    mapped = conn.execute(
+        "SELECT m.doc_id FROM docs_fts_rowid m JOIN docs_fts f ON f.rowid = m.fts_rowid "
+        "ORDER BY m.doc_id"
+    ).fetchall()
+    conn.close()
+    assert fts == {"a": "alpha fresh", "c": "gamma needle"}
+    assert [r[0] for r in mapped] == ["a", "c"]

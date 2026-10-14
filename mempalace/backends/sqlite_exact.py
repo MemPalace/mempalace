@@ -689,16 +689,33 @@ class SQLiteExactCollection(BaseCollection):
                 (self._embedder_meta_key(), str(identity.model_name)),
             )
 
+    @staticmethod
+    def _delete_fts(cur, collection_id: int, doc_id: str) -> None:
+        # collection_id/doc_id are UNINDEXED in docs_fts, so filtering on them
+        # scans every FTS row; docs_fts_rowid turns the delete into a rowid hit.
+        row = cur.execute(
+            "SELECT fts_rowid FROM docs_fts_rowid WHERE collection_id = ? AND doc_id = ?",
+            (collection_id, doc_id),
+        ).fetchone()
+        if row is None:
+            return
+        cur.execute("DELETE FROM docs_fts WHERE rowid = ?", (row[0],))
+        cur.execute(
+            "DELETE FROM docs_fts_rowid WHERE collection_id = ? AND doc_id = ?",
+            (collection_id, doc_id),
+        )
+
     def _replace_fts(self, cur, collection_id: int, doc_id: str, document: str) -> None:
         if not self._fts_available(cur):
             return
-        cur.execute(
-            "DELETE FROM docs_fts WHERE collection_id = ? AND doc_id = ?",
-            (collection_id, doc_id),
-        )
+        self._delete_fts(cur, collection_id, doc_id)
         cur.execute(
             "INSERT INTO docs_fts(collection_id, doc_id, document) VALUES (?, ?, ?)",
             (collection_id, doc_id, document),
+        )
+        cur.execute(
+            "INSERT INTO docs_fts_rowid(collection_id, doc_id, fts_rowid) VALUES (?, ?, ?)",
+            (collection_id, doc_id, cur.lastrowid),
         )
 
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
@@ -1323,10 +1340,7 @@ class SQLiteExactCollection(BaseCollection):
                     (collection_id, doc_id),
                 )
                 if self._fts_available(cur):
-                    cur.execute(
-                        "DELETE FROM docs_fts WHERE collection_id = ? AND doc_id = ?",
-                        (collection_id, doc_id),
-                    )
+                    self._delete_fts(cur, collection_id, doc_id)
 
     def count(self) -> int:
         with self._cursor() as cur:
@@ -1763,6 +1777,7 @@ class SQLiteExactBackend(BaseBackend):
                 USING fts5(collection_id UNINDEXED, doc_id UNINDEXED, document)
                 """
             )
+            self._ensure_fts_rowid_map(conn)
             conn.execute(
                 """
                 INSERT INTO meta(key, value)
@@ -1779,6 +1794,36 @@ class SQLiteExactBackend(BaseBackend):
                 """
             )
         conn.commit()
+
+    @staticmethod
+    def _ensure_fts_rowid_map(conn: sqlite3.Connection) -> None:
+        """Create and backfill docs_fts_rowid, the index _delete_fts uses.
+
+        Backfill runs once per palace (one FTS scan); a duplicate FTS row for
+        the same document, which the old scan-delete would also have removed,
+        is dropped so it cannot linger as a stale hit.
+        """
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS docs_fts_rowid (
+                collection_id INTEGER NOT NULL,
+                doc_id TEXT NOT NULL,
+                fts_rowid INTEGER NOT NULL,
+                PRIMARY KEY (collection_id, doc_id)
+            )
+            """
+        )
+        if conn.execute("SELECT 1 FROM meta WHERE key = 'fts_rowid_map'").fetchone():
+            return
+        conn.execute("DELETE FROM docs_fts_rowid")
+        conn.execute(
+            "INSERT OR REPLACE INTO docs_fts_rowid(collection_id, doc_id, fts_rowid) "
+            "SELECT collection_id, doc_id, rowid FROM docs_fts ORDER BY rowid"
+        )
+        conn.execute(
+            "DELETE FROM docs_fts WHERE rowid NOT IN (SELECT fts_rowid FROM docs_fts_rowid)"
+        )
+        conn.execute("INSERT INTO meta(key, value) VALUES ('fts_rowid_map', '1')")
 
     @staticmethod
     def _ensure_locus_columns(conn: sqlite3.Connection) -> None:
@@ -1978,6 +2023,10 @@ class SQLiteExactBackend(BaseBackend):
             try:
                 handle.conn.execute(
                     "DELETE FROM docs_fts WHERE collection_id = ?",
+                    (collection_id,),
+                )
+                handle.conn.execute(
+                    "DELETE FROM docs_fts_rowid WHERE collection_id = ?",
                     (collection_id,),
                 )
             except sqlite3.OperationalError:
