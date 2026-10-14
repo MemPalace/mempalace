@@ -2839,6 +2839,32 @@ def test_rebuild_from_sqlite_in_place_keeps_replica_id(tmp_path):
     assert get_replica_id(str(palace)) == replica_before
 
 
+def test_preserve_logstream_and_replica_copies_wal_and_shm(tmp_path):
+    """A live logstream can hold uncheckpointed writes in its -wal file, so
+    the sidecars travel with the database, as they do for the KG."""
+    src = tmp_path / "source"
+    dest = tmp_path / "dest"
+    src.mkdir()
+    dest.mkdir()
+
+    (src / "logstream.sqlite3").write_text("ls-db", encoding="utf-8")
+    (src / "logstream.sqlite3-wal").write_text("ls-wal", encoding="utf-8")
+    (src / "logstream.sqlite3-shm").write_text("ls-shm", encoding="utf-8")
+    (src / "replica.json").write_text("replica", encoding="utf-8")
+
+    copied = repair._preserve_logstream_and_replica(str(src), str(dest))
+
+    assert copied == [
+        "logstream.sqlite3",
+        "logstream.sqlite3-wal",
+        "logstream.sqlite3-shm",
+        "replica.json",
+    ]
+    assert (dest / "logstream.sqlite3-wal").read_text(encoding="utf-8") == "ls-wal"
+    assert (dest / "logstream.sqlite3-shm").read_text(encoding="utf-8") == "ls-shm"
+    assert (dest / "replica.json").read_text(encoding="utf-8") == "replica"
+
+
 def test_rebuild_from_sqlite_in_place_refuses_without_archive_flag(tmp_path):
     """Source == dest without archive flag must abort untouched. The
     most catastrophic possible regression of this code path is silently
