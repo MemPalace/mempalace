@@ -1,9 +1,17 @@
 # Authored dates and search-result provenance
 
-Conversation transcripts carry a per-line ISO-8601 `timestamp` (both Claude Code and
-Codex JSONL). The miner records the most recent one per file as the drawer's
-**`authored_at`**. Where transcript timestamps are available, this records a
-source timestamp rather than the time the transcript was imported.
+Conversation transcripts carry a per-line `timestamp`. Claude Code and Codex
+JSONL write it as an ISO-8601 string; WorkBuddy writes it as epoch
+milliseconds. The miner records the most recent one per file as the drawer's
+**`authored_at`**, normalising the numeric form to the same ISO-8601 shape.
+Where transcript timestamps are available, this records a source timestamp
+rather than the time the transcript was imported.
+
+Numeric values outside the plausible epoch-millisecond window
+(2001-09-09 through 2100-01-01) are skipped rather than guessed, so a bare `1`
+or a seconds-precision epoch falls back to `filed_at` instead of being dated
+to 1970. See [`workbuddy-support.md`](workbuddy-support.md) for the bounds and
+the measured result.
 
 This is distinct from the ingest date:
 

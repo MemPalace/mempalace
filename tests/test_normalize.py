@@ -4,10 +4,15 @@ from unittest.mock import patch
 
 from mempalace.normalize import (
     _SLACK_PROVENANCE_FOOTER,
+    _WORKBUDDY_TAG_PATTERNS,
+    _WORKBUDDY_TEXT_BLOCKS,
     _extract_content,
     _format_tool_result,
     _format_tool_use,
     _messages_to_transcript,
+    _peel_user_query,
+    _strip_history_echo,
+    _strip_summary_echo,
     _try_chatgpt_export_json_split,
     _try_chatgpt_json,
     _try_claude_ai_json,
@@ -20,6 +25,7 @@ from mempalace.normalize import (
     _try_normalize_json_split,
     _try_pi_jsonl,
     _try_slack_json,
+    _try_workbuddy_jsonl,
     normalize,
     normalize_conversations,
     strip_noise,
@@ -112,6 +118,14 @@ def test_extract_content_none():
 def test_extract_content_mixed_list():
     blocks = ["plain", {"type": "text", "text": "block"}]
     assert _extract_content(blocks) == "plain\nblock"
+
+
+def test_extract_content_ignores_foreign_text_blocks_by_default():
+    """WorkBuddy's ``input_text`` / ``output_text`` blocks are opt-in per call
+    site — the shared helper must not start claiming them for every format."""
+    blocks = [{"type": "input_text", "text": "foreign"}]
+    assert _extract_content(blocks) == ""
+    assert _extract_content(blocks, extra_text_blocks=_WORKBUDDY_TEXT_BLOCKS) == "foreign"
 
 
 # ── _format_tool_use ──────────────────────────────────────────────────
@@ -2166,3 +2180,180 @@ def test_pi_jsonl_invalid_lines_skipped():
     ]
     result = _try_pi_jsonl("\n".join(lines))
     assert result is not None
+
+
+# ── _try_workbuddy_jsonl ───────────────────────────────────────────────
+#
+# WorkBuddy (Tencent's CodeBuddy-derived CLI) writes each row as
+# ``{"type": ..., "role": ..., "content": [...]}`` with ``role``/``content``
+# at the top level, and block types ``input_text`` / ``output_text`` rather
+# than Claude's ``text``. Its user turns additionally wrap the human's words
+# in ``<user_query>`` and re-inject the whole prior history each turn inside
+# ``<previous_*>` blocks.
+
+
+def _wb_lines(*rows):
+    return "\n".join(json.dumps(r) for r in rows)
+
+
+def test_workbuddy_jsonl_valid():
+    lines = _wb_lines(
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "What is X?"}],
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "X is Y."}],
+        },
+    )
+    result = _try_workbuddy_jsonl(lines)
+    assert result is not None
+    assert "> What is X?" in result
+    assert "X is Y." in result
+
+
+def test_workbuddy_jsonl_too_few_messages():
+    result = _try_workbuddy_jsonl(
+        _wb_lines(
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "only"}]}
+        )
+    )
+    assert result is None
+
+
+def test_workbuddy_jsonl_rejects_plain_text_blocks():
+    """Claude's ``text`` block type must not be claimed by the WorkBuddy
+    branch — the dispatcher relies on that signature to stay unambiguous."""
+    lines = _wb_lines(
+        {"type": "message", "role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {"type": "message", "role": "assistant", "content": [{"type": "text", "text": "yo"}]},
+    )
+    assert _try_workbuddy_jsonl(lines) is None
+
+
+def test_workbuddy_jsonl_invalid_json_lines():
+    lines = "\n".join(
+        [
+            "not json",
+            json.dumps(
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Q"}],
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "A"}],
+                }
+            ),
+        ]
+    )
+    result = _try_workbuddy_jsonl(lines)
+    assert result is not None
+    assert "> Q" in result
+
+
+# ── WorkBuddy noise handling ───────────────────────────────────────────
+
+
+def test_workbuddy_user_query_shell_stripped_words_kept():
+    """``<user_query>`` is the frame around the human's real words: the shell
+    must go, the words must stay verbatim."""
+    text = "<user_query>\nkeep these exact words\n</user_query>"
+    out = _peel_user_query(text)
+    assert "keep these exact words" in out
+    assert "<user_query>" not in out
+
+
+def test_workbuddy_user_query_inline_mention_preserved():
+    """A line-internal mention (documenting the tag) is prose, not a shell."""
+    text = "The words live in the `<user_query>` tag."
+    assert _peel_user_query(text) == text
+
+
+def test_workbuddy_history_echo_stripped():
+    text = "> User:\n<previous_user_message>\nold turn\n</previous_user_message>\n> fresh words"
+    out = _strip_history_echo(text)
+    assert "old turn" not in out
+    assert "fresh words" in out
+
+
+def test_workbuddy_history_echo_does_not_cross_pair():
+    """A ``<previous_user_message>`` must not be closed by a
+    ``</previous_tool_call>`` — the backreference keeps each name paired with
+    itself, so a crossed pair cannot silently eat the prose between them."""
+    text = "<previous_user_message>\nREAL WORDS\n</previous_tool_call>\n> still here"
+    out = _strip_history_echo(text)
+    assert "REAL WORDS" in out
+    assert "still here" in out
+
+
+def test_workbuddy_history_echo_nested_pair_removed():
+    text = (
+        "<previous_user_message>\n"
+        "outer start\n"
+        "<previous_assistant_message>\ninner\n</previous_assistant_message>\n"
+        "outer end\n"
+        "</previous_user_message>\n> after"
+    )
+    out = _strip_history_echo(text)
+    assert "inner" not in out
+    assert "after" in out
+
+
+def test_workbuddy_summary_echo_stripped():
+    """The compression summary is re-injected every turn and is the single
+    largest source of duplicate drawers."""
+    text = "<cb_summary>\nlong carried-over summary\n</cb_summary>\n> real words"
+    out = _strip_summary_echo(text)
+    assert "long carried-over summary" not in out
+    assert "real words" in out
+
+
+def test_workbuddy_conversation_history_summary_stripped():
+    text = "<conversation_history_summary>\ncarried over\n</conversation_history_summary>\n> real"
+    out = _strip_summary_echo(text)
+    assert "carried over" not in out
+    assert "real" in out
+
+
+def test_workbuddy_multiparagraph_block_is_matchable():
+    """WorkBuddy's injected blocks span blank lines; the upstream blank-line
+    ban would leave them filed verbatim, which is why the WorkBuddy pattern
+    set opts out of it."""
+    text = (
+        "> User:\n"
+        "<system-reminder>\nfirst paragraph\n\nsecond paragraph\n</system-reminder>\n"
+        "> real words"
+    )
+    out = strip_noise(text, _WORKBUDDY_TAG_PATTERNS)
+    assert "first paragraph" not in out
+    assert "second paragraph" not in out
+    assert "real words" in out
+
+
+def test_workbuddy_marker_does_not_leak_into_default_patterns():
+    """The default pattern set must keep the upstream blank-line ban — the
+    multi-paragraph shape must NOT be stripped there."""
+    text = (
+        "> User:\n"
+        "<system-reminder>\nfirst paragraph\n\nsecond paragraph\n</system-reminder>\n"
+        "> real words"
+    )
+    out = strip_noise(text)
+    assert "first paragraph" in out
+
+
+def test_workbuddy_default_strip_noise_unchanged():
+    """Calling ``strip_noise`` without the WorkBuddy patterns keeps the exact
+    upstream behaviour other platforms rely on."""
+    text = "> User:\n<system-reminder>junk</system-reminder>\n> Real."
+    out = strip_noise(text)
+    assert "junk" not in out
+    assert "Real." in out

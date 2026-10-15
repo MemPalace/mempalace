@@ -14,6 +14,7 @@ Supported:
     - Gemini CLI / Google AI Studio JSON sessions (contents / messages / flat list)
     - Continue.dev session JSON (~/.continue/sessions/*.json)
     - Slack JSON export
+    - WorkBuddy / CodeBuddy engine JSONL
     - Plain text (pass through for paragraph chunking)
 
 No API key. No internet. Everything local.
@@ -58,17 +59,71 @@ _NOISE_TAGS = (
 )
 
 
-def _tag_pattern(name: str) -> "re.Pattern[str]":
+def _tag_pattern(name: str, cross_blank_lines: bool = False) -> "re.Pattern[str]":
     # Opening tag must begin a line (optionally after a `> ` blockquote marker,
-    # since _messages_to_transcript prefixes lines with `> `). Body is lazy but
-    # forbidden from crossing a blank line, so a dangling open tag can't span
-    # multiple messages. Closing tag eats optional trailing whitespace + newline.
-    return re.compile(
-        rf"(?m)^(?:> )?<{name}(?:\s[^>]*)?>" rf"(?:(?!\n\s*\n)[\s\S])*?" rf"</{name}>[ \t]*\n?"
-    )
+    # since _messages_to_transcript prefixes lines with `> `). Closing tag eats
+    # optional trailing whitespace + newline.
+    #
+    # Default (cross_blank_lines=False) reproduces the upstream safety rule
+    # verbatim: the body is lazy but forbidden from crossing a blank line, so
+    # a stray unclosed tag in one message can never eat content from a
+    # neighbouring message. Upstream states the bias plainly — "Verbatim is
+    # sacred ... When in doubt, leave text alone" — and that rule applies to
+    # every platform whose injection blocks are single-paragraph.
+    #
+    # WorkBuddy opts out (cross_blank_lines=True). Its injected blocks
+    # (<system-reminder>, <identity_context>, ...) are multi-paragraph, so the
+    # blank-line ban makes them unmatchable and files them verbatim: measured on
+    # a live corpus, not one of them matches under the ban, and nearly all of
+    # them strip once the boundary is swapped (docs/workbuddy-support.md). The
+    # opt-out is scoped to `_try_workbuddy_jsonl` via `_WORKBUDDY_TAG_PATTERNS`,
+    # so no other platform's parsing changes.
+    #
+    # ⚠️ KNOWN BOUNDARY (accepted 2026-09-27, WorkBuddy only) — why the guard
+    # watches openers but NOT closers, and why that is safe HERE:
+    #
+    # The guard stops the body at the next line-initial OPENER; it does not
+    # recognise `</name>` closers. A dangling opener followed by bare prose and
+    # then a DISTANT same-name closer would therefore still be swallowed. That
+    # shape DOES reproduce by construction (`<system-reminder>\nSYS\n\nPROSE\n
+    # </system-reminder>` -> PROSE eaten). It does NOT occur in real transcripts,
+    # and the reason is structural, not luck: every real WorkBuddy turn carries
+    # an opener before the user's words (`<user_query>` and friends), so the body
+    # hits that opener and stops before any distant closer is reachable.
+    # Corpus check (live corpus, line-anchored in the stripper's own domain):
+    # the open/close counts pair to within a fraction of a percent and no
+    # nesting occurs, so the dangling-opener shape this guard is built around is
+    # rare in practice. See docs/workbuddy-support.md for the measured counts.
+    #
+    # Deliberately NOT fixed by also matching `</…>` as a boundary: that would
+    # stop the body at any closer too, and a legitimate multi-paragraph block
+    # whose closer sits after a nested same-name mention would then be left
+    # un-stripped — trading a no-op-in-practice hole for a real under-stripping
+    # regression. Under "verbatim is sacred" the current form errs the safe way.
+    # Revisit only if a real WorkBuddy transcript shows prose with NO opener
+    # ahead of it AND a distant closer behind it (none seen as of 2026-09-27).
+    #
+    # If no closer exists before the boundary, the whole match fails and the
+    # open tag is left in place (per the module's "verbatim is sacred" bias)
+    # rather than guessed at.
+    if cross_blank_lines:
+        guard = "|".join(re.escape(t) for t in _NOISE_TAGS)
+        body = rf"(?:(?!\n(?:> )?<(?:{guard})(?:\s[^>]*)?>)[\s\S])*?"
+    else:
+        body = r"(?:(?!\n\s*\n)[\s\S])*?"
+    return re.compile(rf"(?m)^(?:> )?<{name}(?:\s[^>]*)?>" rf"{body}" rf"</{name}>[ \t]*\n?")
 
 
+# Default set — upstream behaviour, blank-line ban intact. Used by every
+# platform except WorkBuddy.
 _NOISE_TAG_PATTERNS = [_tag_pattern(t) for t in _NOISE_TAGS]
+
+# WorkBuddy-only variant — blank-line ban lifted so multi-paragraph injected
+# blocks are matchable. Kept as a separate list rather than by mutating
+# `_NOISE_TAG_PATTERNS` so the wider body can never leak into another
+# platform's parsing (Claude Code ships single-paragraph `<system-reminder>`
+# blocks; it keeps the ban).
+_WORKBUDDY_TAG_PATTERNS = [_tag_pattern(t, cross_blank_lines=True) for t in _NOISE_TAGS]
 
 # Strings that identify an entire noise line when found at its start.
 # Matched case-sensitively and anchored to line-start so user prose mentioning
@@ -100,14 +155,147 @@ _HOOK_LINE_RE = re.compile(
 # "… +N lines" collapsed-output marker, line-anchored.
 _COLLAPSED_LINES_RE = re.compile(r"(?m)^(?:> )?…\s*\+\d+ lines.*\n?")
 
+# WorkBuddy / CodeBuddy text-block signatures. No other supported schema uses
+# these names — Claude Code and Pi both emit `text` — so their presence is what
+# identifies a WorkBuddy transcript (see `_try_workbuddy_jsonl`).
+_WORKBUDDY_TEXT_BLOCKS = frozenset(("input_text", "output_text"))
 
-def strip_noise(text: str) -> str:
+# WorkBuddy wraps the user's actual utterance in `<user_query>...</user_query>`
+# inside the user turn, with system injections (identity files, `<user_info>`,
+# `<previous_*>` history echoes) around it. The tag itself is noise, but its
+# PAYLOAD is the user's own words and must be preserved.
+#
+# This is deliberately peeled at the platform layer — during
+# `_try_workbuddy_jsonl` — rather than by adding `user_query` to
+# `_NOISE_TAGS`. The payload is genuine user speech (long pastes, design
+# questions to the assistant), so it must survive; the tag also gets mentioned
+# *inline* in prose and in code ("the user's words are in the
+# `<user_query>` tag" / `grep -oP '<user_query>(.*?)</user_query>'`), so a
+# line-anchored generic strip would eat those mentions too. Peeling here is
+# exact: shell gone, payload kept, inline mentions untouched.
+_WORKBUDDY_USER_QUERY_RE = re.compile(
+    r"(?m)^[ \t]*<user_query(?:\s[^>]*)?>[ \t]*\n?"
+    r"([\s\S]*?)"
+    r"\n?[ \t]*</user_query>[ \t]*\n?"
+)
+
+
+def _peel_user_query(text: str) -> str:
+    """Unwrap WorkBuddy `<user_query>` shells, keeping the user's own words.
+
+    Non-greedy and paired-only: a dangling open tag (or an inline mention) is
+    left alone rather than guessed at, matching this module's "verbatim is
+    sacred" bias.
+
+    The replacement re-inserts a newline after each payload so that adjacent
+    shells do not fuse (`<user_query>a</user_query><user_query>b</user_query>`
+    must stay two turns, not become `ab`). The shell's own trailing newline is
+    consumed by the pattern, so it is restored here rather than left to
+    whatever happened to follow.
+    """
+    return _WORKBUDDY_USER_QUERY_RE.sub(lambda m: m.group(1) + "\n", text)
+
+
+# WorkBuddy re-injects the prior conversation history into every user turn,
+# wrapped in `<previous_user_message>` / `<previous_assistant_message>` /
+# `<previous_tool_call>`. These are COPIES of turns this module has already
+# seen (or will see) at their original site, so keeping them files an echo of
+# every exchange — measured on a live corpus, these echoes plus the compaction
+# summaries are the large majority of the parsed text (see
+# docs/workbuddy-support.md). Same class of problem as
+# `<user_query>`, opposite fix: the payload is NOT new speech, so tag AND
+# payload both go.
+#
+# Placed at the platform layer rather than in `_NOISE_TAGS` for the same
+# reason as `_peel_user_query`: these names are WorkBuddy-specific, and the
+# official tag list is other platforms' API surface (see the note above
+# `_tag_pattern` about why a shared list must stay untouched).
+#
+# Pairing measured on a live corpus: the opens and closes differ by a fraction
+# of a percent, 0% nesting. The closing tag uses a backreference so a block can
+# only close with its OWN name. An independently-enumerated closer (the obvious
+# `(?:a|b|c)`) would
+# let `<previous_user_message> ... </previous_tool_call>` match and silently
+# delete everything between — including real user speech, verified by
+# construction. A dangling open tag is left alone rather than guessed at.
+_WORKBUDDY_HISTORY_RE = re.compile(
+    r"(?m)^[ \t]*<(?P<tag>previous_(?:user_message|assistant_message|tool_call))"
+    r"(?:\s[^>]*)?>[\s\S]*?</(?P=tag)>[ \t]*\n?"
+)
+
+
+def _strip_history_echo(text: str) -> str:
+    """Drop WorkBuddy's re-injected history blocks (tag + payload).
+
+    Paired-only: an unclosed block survives rather than risk eating real
+    content after it — the same conservative bias as `_peel_user_query`.
+    """
+    return _WORKBUDDY_HISTORY_RE.sub("", text)
+
+
+# WorkBuddy/CodeBuddy injects its own context-compaction summary into the
+# `user` turn's `input_text` block, wrapped in `<cb_summary>...</cb_summary>`
+# (older sessions use `<conversation_history_summary>`). The payload opens with
+# the fixed line "Summary of the conversation so far:". It is large, and it is
+# RE-INJECTED on every subsequent turn after each compaction,
+# so the same text gets chunked into the store over and over and retrieval
+# returns rooms full of md5-identical duplicate drawers. Like
+# `<previous_*>` — and unlike `<user_query>` — the payload is a copy of
+# conversation already seen at its original site, so tag AND payload both go.
+#
+# Two spellings, one paired-only rule. Measured on a live corpus in the
+# stripper's own domain (line-anchored): the opens and closes pair to within a
+# fraction of a percent for both spellings, with zero nesting. The handful of
+# unpaired openers is left verbatim rather than guessed at — a non-paired rule
+# would have eaten the real prose that follows them. See
+# docs/workbuddy-support.md for the counts.
+#
+# The closing tag uses a BACKREFERENCE (`</(?P=tag)>`) for the same reason as
+# `_WORKBUDDY_HISTORY_RE`: an independently-enumerated closer
+# (`(?:cb_summary|conversation_history_summary)`) lets
+# `<cb_summary> ... </conversation_history_summary>` cross-pair and silently
+# deletes everything between two real blocks. Verified by construction.
+#
+# Line-anchored for the same reason as the other two strippers: `cb_summary`
+# is discussed *inline* in prose and code ("the `<cb_summary>` shell wraps…"),
+# and those mentions are real content. Non-greedy `[\s\S]*?` so a block closes
+# on the first matching closer rather than the last.
+_WORKBUDDY_SUMMARY_RE = re.compile(
+    r"(?m)^[ \t]*<(?P<tag>cb_summary|conversation_history_summary)"
+    r"(?:\s[^>]*)?>[\s\S]*?</(?P=tag)>[ \t]*\n?"
+)
+
+
+def _strip_summary_echo(text: str) -> str:
+    """Drop WorkBuddy's re-injected compaction-summary shell (tag + payload).
+
+    Must run BEFORE `_peel_user_query` and `_strip_history_echo`: the injected
+    scaffolding re-emits user turns, so the parsed text holds far more
+    `<user_query>` shells than there are user turns (measured in
+    docs/workbuddy-support.md). Peeling first would unwrap those copies and
+    preserve them as if they were genuine user speech, which is exactly the
+    duplicate-drawer problem this strip exists to fix.
+
+    Paired-only: an unclosed shell survives rather than risk eating real
+    content after it. The replacement re-inserts a newline so that adjacent
+    blocks do not fuse, matching `_peel_user_query`.
+    """
+    return _WORKBUDDY_SUMMARY_RE.sub("\n", text)
+
+
+def strip_noise(text: str, tag_patterns=None) -> str:
     """Remove system tags, hook output, and Claude Code UI chrome from text.
 
     All patterns are line-anchored. User prose that happens to mention these
     strings inline (e.g., documenting them) is preserved verbatim.
+
+    ``tag_patterns`` selects the tag-stripping set. The default
+    (``_NOISE_TAG_PATTERNS``) keeps the upstream blank-line ban. WorkBuddy
+    passes ``_WORKBUDDY_TAG_PATTERNS``, whose blocks are multi-paragraph and
+    would otherwise never match. The line/UI-chrome patterns below are
+    shared by both.
     """
-    for pat in _NOISE_TAG_PATTERNS:
+    for pat in tag_patterns if tag_patterns is not None else _NOISE_TAG_PATTERNS:
         text = pat.sub("", text)
     for pat in _NOISE_LINE_PATTERNS:
         text = pat.sub("", text)
@@ -270,6 +458,10 @@ def _try_normalize_json_split(content: str) -> Optional[list]:
         return [normalized]
 
     normalized = _try_pi_jsonl(content)
+    if normalized:
+        return [normalized]
+
+    normalized = _try_workbuddy_jsonl(content)
     if normalized:
         return [normalized]
 
@@ -521,6 +713,98 @@ def _try_pi_jsonl(content: str) -> Optional[str]:
     if len(messages) >= 2 and has_session_header:
         return _messages_to_transcript(messages)
     return None
+
+
+def _try_workbuddy_jsonl(content: str) -> Optional[str]:
+    """WorkBuddy / CodeBuddy engine session JSONL.
+
+    Format: ``~/.workbuddy/.../<sessionId>.jsonl`` (also mirrored under a
+    ``journal/`` export dir). One JSON object per line. Differing from
+    Claude Code in three places:
+
+      1. ``role`` / ``content`` sit at the TOP level (no ``"message"`` wrapper).
+      2. Text blocks are typed ``input_text`` (user) / ``output_text``
+         (assistant) instead of ``text``.
+      3. ``timestamp`` is a millisecond integer, not an ISO-8601 string.
+
+    There is NO session header entry: ``session-meta`` carries platform
+    metadata only (no conversation), and every other non-``message`` line
+    (``reasoning``, ``function_call``, ``function_call_result``,
+    ``file-history-snapshot``, ``ai-title``, ``resend-fork-notice``) is
+    operational and skipped — matching how ``_try_pi_jsonl`` skips
+    ``toolResult``. Detection therefore keys on the block type signature
+    (``input_text`` / ``output_text``), which no other supported schema uses.
+
+    A stray ``message`` line whose ``content`` is a bare string (rare, but
+    present in real exports) is tolerated via ``_extract_content``.
+    """
+    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    messages = []
+    wb_marked = False
+
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+
+        if entry.get("type", "") != "message":
+            continue
+
+        role = entry.get("role", "")
+        block_types = _workbuddy_block_types(entry.get("content"))
+        if block_types & _WORKBUDDY_TEXT_BLOCKS:
+            wb_marked = True
+
+        text = _extract_content(entry.get("content", ""), extra_text_blocks=_WORKBUDDY_TEXT_BLOCKS)
+        if not text:
+            continue
+
+        if role == "user":
+            # Order matters: the compaction-summary shell is stripped FIRST.
+            # Its payload holds thousands of `<user_query>` /
+            # `<previous_user_message>` COPIES, so peeling before it would
+            # unwrap those copies into apparently-genuine user turns.
+            #
+            # `_WORKBUDDY_TAG_PATTERNS` (blank-line ban lifted) is scoped to
+            # this parser only — WorkBuddy's injected blocks are
+            # multi-paragraph, unlike every other platform's.
+            text = _strip_summary_echo(text)
+            text = _strip_history_echo(text)
+            text = _peel_user_query(strip_noise(text, _WORKBUDDY_TAG_PATTERNS))
+            messages.append(("user", text))
+        elif role == "assistant":
+            text = _strip_summary_echo(text)
+            text = _strip_history_echo(text)
+            messages.append(("assistant", strip_noise(text, _WORKBUDDY_TAG_PATTERNS)))
+
+    # Require both the multi-turn shape and the WorkBuddy block signature, so
+    # a same-shaped schema cannot be adopted by mistake. Claude Code keeps
+    # ``type`` as ``"user"`` / ``"assistant"`` and types text blocks ``text``;
+    # only WorkBuddy puts ``type`` at ``"message"`` while naming the blocks
+    # ``input_text`` / ``output_text``. The block signature is the load-bearing
+    # discriminator here — ``len(messages) >= 2`` alone would also match a
+    # bare two-line JSONL, which is why both are required.
+    if len(messages) >= 2 and wb_marked:
+        return _messages_to_transcript(messages)
+    return None
+
+
+def _workbuddy_block_types(content) -> set:
+    """Collect the ``type`` values of top-level content blocks.
+
+    Returns an empty set for a bare-string or plain-dict content, neither of
+    which can carry the WorkBuddy signature.
+    """
+    if not isinstance(content, list):
+        return set()
+    types = set()
+    for item in content:
+        if isinstance(item, dict):
+            types.add(item.get("type"))
+    return types
 
 
 def _try_gemini_json(data) -> Optional[str]:
@@ -851,13 +1135,16 @@ def _try_continue_json(data) -> Optional[str]:
     return None
 
 
-def _extract_content(content, tool_use_map: dict = None) -> str:
+def _extract_content(content, tool_use_map: dict = None, extra_text_blocks=None) -> str:
     """Pull text from content — handles str, list of blocks, or dict.
 
     Args:
         content: Message content — string, list of content blocks, or dict.
         tool_use_map: Optional mapping of tool_use_id → tool_name, used to
                       select the right formatting strategy for tool_result blocks.
+        extra_text_blocks: Optional additional block types to treat exactly like
+                      ``text``. Off by default, so every other format keeps its
+                      current handling; WorkBuddy passes ``_WORKBUDDY_TEXT_BLOCKS``.
     """
     if isinstance(content, str):
         return content.strip()
@@ -869,6 +1156,11 @@ def _extract_content(content, tool_use_map: dict = None) -> str:
             elif isinstance(item, dict):
                 block_type = item.get("type")
                 if block_type == "text":
+                    parts.append(item.get("text", ""))
+                elif extra_text_blocks and block_type in extra_text_blocks:
+                    # WorkBuddy / CodeBuddy: input_text (user) / output_text
+                    # (assistant). Same shape as `text`, different tag. Opt-in
+                    # per call site, so no other format changes behaviour.
                     parts.append(item.get("text", ""))
                 elif block_type == "tool_use":
                     parts.append(_format_tool_use(item))
