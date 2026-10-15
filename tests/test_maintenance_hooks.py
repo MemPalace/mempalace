@@ -120,17 +120,21 @@ def test_sqlite_unknown_kind_raises(tmp_path):
 
 
 class _FakeClient:
-    def __init__(self, has_index=False):
+    def __init__(self, has_index=False, lexical_stats=(7, 4.0)):
         self.has_index = has_index
         self.locked = False
         self.created = 0
         self.analyzed = 0
+        self.lexical_stats = lexical_stats
 
     def table_exists(self, table):
         return True
 
     def count_rows(self, table):
         return 7
+
+    def lexical_corpus_stats(self, table, where):
+        return self.lexical_stats
 
     def has_vector_index(self, table):
         return self.has_index
@@ -213,6 +217,12 @@ def test_pgvector_maintenance_state_reports_index():
     state = col.maintenance_state()
     assert state["row_count"] == 7
     assert state["vector_index"] == "hnsw" and state["index_build_complete"] is True
+    assert state["lexical_pushdown"] is True
+    # A collection whose rows predate the token_count column reports the slow path.
+    assert (
+        _pg_collection(_FakeClient(lexical_stats=None)).maintenance_state()["lexical_pushdown"]
+        is False
+    )
 
 
 def test_pgvector_maintenance_noop_when_table_missing():
