@@ -7,6 +7,7 @@ from mempalace.searcher import (
     _aligned_query_ids,
     _finalize_candidate_hits,
     _query_drawers_with_filter_fallback,
+    drawer_search_where,
     search,
     search_memories,
 )
@@ -378,7 +379,7 @@ def test_cli_scoped_search_uses_existing_filter_fallback(capsys):
     assert drawers_col.query.call_count == 2
 
     filtered_call, fallback_call = drawers_col.query.call_args_list
-    assert filtered_call.kwargs["where"] == {"$and": [{"wing": "keep"}, {"room": "notes"}]}
+    assert filtered_call.kwargs["where"] == drawer_search_where(wing="keep", room="notes")
     assert "where" not in fallback_call.kwargs
     assert fallback_call.kwargs["n_results"] == 30
 

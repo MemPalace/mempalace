@@ -124,7 +124,9 @@ def _translate_field(field: str, expected: Any) -> str:
                 if not isinstance(operand, list) or not operand:
                     raise UnsupportedFilterError(f"$nin requires a non-empty list for {field!r}")
                 items = ", ".join(_quote_value(item) for item in operand)
-                parts.append(f"{field} not in [{items}]")
+                # Match the portable ``$nin`` rule: a missing key stays.
+                # Milvus drops a dynamic field that is simply ``not in``.
+                parts.append(f"({field} not in [{items}] or {field} is null)")
             elif op == "$gt":
                 parts.append(f"{field} > {_quote_value(operand)}")
             elif op == "$gte":

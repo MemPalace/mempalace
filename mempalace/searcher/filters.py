@@ -23,6 +23,18 @@ def build_where_filter(wing: str = None, room: str = None, source_file: str = No
     return {"$and": clauses}
 
 
+def drawer_search_where(wing: str = None, room: str = None, source_file: str = None) -> dict:
+    """Drawer-search where: caller scope plus registry-sentinel exclusion.
+
+    Closet queries stay on ``build_where_filter``. Registry rows live in
+    the drawer collection only.
+    """
+    return and_where(
+        build_where_filter(wing, room, source_file),
+        {"$and": registry_exclusion_clauses()},
+    )
+
+
 def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
     """Parse all `→drawer_id_a,drawer_id_b` pointers out of a closet document.
 

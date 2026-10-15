@@ -1,10 +1,82 @@
 import os
+from unittest.mock import Mock
 
 import pytest
 
 from mempalace.backends import available_backends, get_backend
 from mempalace.backends.base import PalaceRef
 from mempalace.backends.rust_exact import RustExactBackend, RustExactCollection
+
+
+@pytest.mark.parametrize("wing", [None, "project"])
+def test_registry_exclusion_preserves_native_dispatch(tmp_path, monkeypatch, wing):
+    import mempalace.backends.rust_exact as rust
+    from mempalace.searcher import drawer_search_where
+
+    monkeypatch.setattr(rust, "_NativeVectorIndex", object())
+    backend = RustExactBackend()
+    try:
+        col = backend.get_collection(
+            palace=PalaceRef(id=str(tmp_path), local_path=str(tmp_path)),
+            collection_name="test",
+            create=True,
+        )
+        native = Mock(
+            return_value=rust.QueryResult(ids=[[]], documents=[[]], metadatas=[[]], distances=[[]])
+        )
+        monkeypatch.setattr(col, "_query_native", native)
+        col.query(query_embeddings=[[1.0, 0.0]], where=drawer_search_where(wing=wing))
+        assert native.call_count == 1
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("wing", [None, "project"])
+def test_native_registry_exclusion_keeps_full_top_k(tmp_path, monkeypatch, wing):
+    import mempalace.backends.rust_exact as rust
+    from mempalace.searcher import drawer_search_where
+
+    hits = [(doc_id, float(i)) for i, doc_id in enumerate(["reg-room", "reg-mode", "a", "b"])]
+    index = Mock()
+    index.is_empty.return_value = False
+    index.query_parallel.side_effect = lambda q, k, scope: hits[:k]
+    loader = Mock()
+    loader.load_from_sqlite.return_value = index
+    monkeypatch.setattr(rust, "_NativeVectorIndex", loader)
+    backend = RustExactBackend()
+    try:
+        col = backend.get_collection(
+            palace=PalaceRef(id=str(tmp_path), local_path=str(tmp_path)),
+            collection_name="test",
+            create=True,
+        )
+        col.add(
+            ids=[h[0] for h in hits],
+            documents=["path", "path", "alpha", "beta"],
+            embeddings=[[1.0, 0.0]] * 4,
+            metadatas=[
+                {"wing": "project", "room": "_registry"},
+                {"wing": "project", "ingest_mode": "registry"},
+                {"wing": "project"},
+                {"wing": "project"},
+            ],
+        )
+        for _ in range(2):
+            result = col.query(
+                query_embeddings=[[1.0, 0.0]], n_results=2, where=drawer_search_where(wing=wing)
+            )
+            assert result.ids == [["a", "b"]]
+            assert result.documents == [["alpha", "beta"]]
+            assert result.distances == [[2.0, 3.0]]
+        assert loader.load_from_sqlite.call_count == 1
+        index.query_parallel.assert_called_with([1.0, 0.0], 4, wing)
+        # Metadata changes invalidate both the index and its exclusion set.
+        col.update(ids=["reg-room"], metadatas=[{"wing": "project", "room": "notes"}])
+        result = col.query(query_embeddings=[[1.0, 0.0]], n_results=2)
+        assert result.ids == [["reg-room", "a"]]
+        assert loader.load_from_sqlite.call_count == 2
+    finally:
+        backend.close()
 
 
 def test_registry_exposes_rust_exact():

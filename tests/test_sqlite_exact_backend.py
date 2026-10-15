@@ -1223,6 +1223,35 @@ def test_sqlite_exact_query_where_uses_cached_matrix(tmp_path):
     assert ranked.documents[0] == ["keep me"]
 
 
+def test_registry_exclusion_reuses_cached_matrix_and_invalidates(tmp_path):
+    from mempalace.searcher import drawer_search_where
+
+    backend, col = _collection(tmp_path)
+    try:
+        col.add(
+            ids=["real", "registry"],
+            documents=["memory", "path"],
+            metadatas=[{}, {"room": "_registry"}],
+            embeddings=[[0.0, 1.0], [1.0, 0.0]],
+        )
+        with col._cursor() as cur:
+            collection_id = col._collection_id(cur)
+            first = col._rank_vectors(
+                cur, collection_id, where=drawer_search_where(), where_document=None
+            )
+            second = col._rank_vectors(
+                cur, collection_id, where=drawer_search_where(), where_document=None
+            )
+        assert first[0] == ["real"]
+        assert first[1] is second[1], "Repeated search must reuse the filtered vector matrix"
+        assert first[2] is second[2]
+        assert col.get(ids=["registry"]).ids == ["registry"]
+        col.update(ids=["registry"], metadatas=[{"room": "conversations"}])
+        assert col.query(query_embeddings=[[1.0, 0.0]], n_results=1).ids == [["registry"]]
+    finally:
+        backend.close()
+
+
 def test_sqlite_exact_query_cache_invalidates_on_add(tmp_path):
     _backend, col = _collection(tmp_path)
     col.add(

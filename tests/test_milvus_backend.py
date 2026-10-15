@@ -53,6 +53,10 @@ def test_translate_where_supports_portable_filter_subset():
     assert translate_where({"rank": {"$gte": 2}}) == "rank >= 2"
     assert translate_where({"wing": {"$in": ["a", "b"]}}) == 'wing in ["a", "b"]'
     assert (
+        translate_where({"ingest_mode": {"$nin": ["registry"]}})
+        == '(ingest_mode not in ["registry"] or ingest_mode is null)'
+    )
+    assert (
         translate_where({"$and": [{"wing": "p"}, {"room": "r"}]}) == '(wing == "p" and room == "r")'
     )
     assert (
