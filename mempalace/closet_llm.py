@@ -56,6 +56,7 @@ from .palace import (
     purge_file_closets,
     upsert_closet_lines,
 )
+from .user_agent import USER_AGENT
 
 MAX_CONTENT_CHARS = 30000
 MAX_OUTPUT_TOKENS = 1500
@@ -152,7 +153,7 @@ def _call_llm(cfg: LLMConfig, source_file: str, wing: str, room: str, content: s
         }
     ).encode("utf-8")
 
-    headers = {"Content-Type": "application/json"}
+    headers = {"User-Agent": USER_AGENT, "Content-Type": "application/json"}
     if cfg.key:
         headers["Authorization"] = f"Bearer {cfg.key}"
 
