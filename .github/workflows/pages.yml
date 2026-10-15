@@ -1,0 +1,97 @@
+name: Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Build static landing page from README
+        run: |
+          python -m pip install --upgrade pip markdown
+          python <<'PY'
+          from pathlib import Path
+          import markdown
+
+          root = Path('.')
+          site = root / 'site'
+          site.mkdir(exist_ok=True)
+
+          readme = (root / 'README.md').read_text(encoding='utf-8')
+          html = markdown.markdown(
+              readme,
+              extensions=['extra', 'tables', 'fenced_code', 'toc'],
+              output_format='html5',
+          )
+
+          (site / 'index.html').write_text(f'''<!doctype html>
+          <html lang="en">
+            <head>
+              <meta charset="utf-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1">
+              <title>MemPalace</title>
+              <meta name="description" content="MemPalace, a local AI memory system.">
+              <link rel="preconnect" href="https://fonts.googleapis.com">
+              <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+              <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.8.1/github-markdown-light.min.css">
+              <style>
+                :root {{ color-scheme: light dark; }}
+                body {{ margin: 0; background: #f6f8fa; }}
+                .markdown-body {{ box-sizing: border-box; min-width: 200px; max-width: 980px; margin: 0 auto; padding: 32px 16px 64px; }}
+                @media (prefers-color-scheme: dark) {{
+                  body {{ background: #0d1117; }}
+                }}
+              </style>
+            </head>
+            <body>
+              <article class="markdown-body">
+                {html}
+              </article>
+            </body>
+          </html>
+          ''', encoding='utf-8')
+
+          assets_src = root / 'assets'
+          assets_dst = site / 'assets'
+          if assets_src.exists():
+              import shutil
+              if assets_dst.exists():
+                  shutil.rmtree(assets_dst)
+              shutil.copytree(assets_src, assets_dst)
+
+          (site / '.nojekyll').write_text('', encoding='utf-8')
+          PY
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
