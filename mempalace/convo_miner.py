@@ -183,13 +183,9 @@ _LINE_GROUP_SIZE = 25  # lines per fallback group when no paragraph breaks
 _LINE_FALLBACK_MIN_NEWLINES = 20  # trigger line-group fallback above this newline count
 DRAWER_UPSERT_BATCH_SIZE = 1000
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
-# Matches miner.py at 500 MB. Long Claude Code sessions, multi-year
-# ChatGPT exports, and lifetime Slack dumps routinely exceed 10 MB; the
-# cap at that level silently dropped them with `continue`. Per-drawer
-# size is bounded by CHUNK_SIZE, but larger source files still produce
-# more drawers and therefore more embedding/storage work — and content
-# is normalized and loaded fully into memory before chunking, so memory
-# use also scales with source size.
+# Matches miner.py. Streaming recognized JSONL avoids retaining the complete
+# source string, but normalized conversation text is still materialized before
+# chunking, so every format stays behind the same conservative input cap.
 
 
 def _path_within_root(path: Path, root: Path) -> bool:
@@ -619,10 +615,11 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
                         )
                         continue
                     file_size = file_stat.st_size
-                    if file_size > MAX_FILE_SIZE:
+                    file_size_limit = MAX_FILE_SIZE
+                    if file_size > file_size_limit:
                         print(
                             f"  SKIP: {filepath.name} ({file_size / (1024 * 1024):.1f} MB)"
-                            f" exceeds {MAX_FILE_SIZE // (1024 * 1024)} MB limit",
+                            f" exceeds {file_size_limit // (1024 * 1024)} MB limit",
                             file=sys.stderr,
                         )
                         continue
@@ -1038,9 +1035,12 @@ def _normalize_convo_conversations(
     except UnparsedCodexTranscriptError as exc:
         logger.warning("Skipping %s: %s; source remains eligible for retry", filepath, exc)
         return None
-    except (OSError, ValueError):
-        if not dry_run:
-            _register_file(collection, source_file, wing, agent, extract_mode)
+    except (OSError, ValueError) as exc:
+        # A normalization failure is not an empty, successfully processed
+        # transcript. Registering a sentinel here makes the unchanged source
+        # look permanently mined, so future runs never retry after format,
+        # permission, or size-limit failures.
+        print(f"  SKIP: {filepath.name} (normalize error: {exc})", file=sys.stderr)
         return None
 
     if not any(c.strip() for c in conversations):
