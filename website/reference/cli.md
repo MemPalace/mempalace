@@ -155,15 +155,55 @@ Creates a backup at `<palace_path>.backup` before rebuilding, replacing any back
 | Flag | Description |
 |------|-------------|
 | `rebuild-index` | Positional alias for `--mode from-sqlite --archive-existing` |
-| `--mode` | `legacy` (default), `max-seq-id`, or `from-sqlite` |
+| `--mode` | `legacy` (default), `max-seq-id`, `from-sqlite`, or offline `salvage-sqlite` |
 | `--dry-run` | Print what the repair would do and exit without modifying the palace |
 | `--yes` | Skip confirmation for destructive changes |
 | `--backup` | Back up SQLite before mutation (default: on) |
-| `--source` | Source palace for `--mode from-sqlite` (defaults to `--palace`) |
+| `--source` | Source palace for `from-sqlite` (defaults to `--palace`); required archived source for `salvage-sqlite` |
+| `--salvage-timeout` | Combined SQLite subprocess timeout for `salvage-sqlite`, in seconds (default: 300) |
 | `--archive-existing` | Rename the existing palace to `<palace>.pre-rebuild-<timestamp>` first |
 | `--segment` | Segment UUID filter for `--mode max-seq-id` |
 | `--from-sidecar` | Pre-corruption `chroma.sqlite3` to copy clean `max_seq_id` values from |
 | `--confirm-truncation-ok` | Override the truncation safety guard. Disables the abort that protects you when the collection layer returns fewer drawers than SQLite holds |
+
+### Unreadable SQLite: offline salvage
+
+If a damaged `chroma.sqlite3` header prevents SQLite from opening it, preserve
+the original palace and stop its writers. Try recovery from an archived copy
+into a **new, absent directory**:
+
+```bash
+mempalace repair --mode salvage-sqlite --source /path/to/archived-palace \
+  --palace /path/to/new-salvage --dry-run
+# Remove --dry-run to attempt recovery.
+```
+
+This optional mode uses a local `sqlite3` CLI with working `.recover` and `-safe`
+support. It snapshots SQLite and any WAL/SHM sidecars under the existing writer
+lease, detects file changes during copying, and runs recovery against that
+private copy. A live cooperating writer prevents the snapshot. Paths cannot
+alias or nest inside one another; database and sidecar symlinks are refused.
+Dry-run writes nothing and launches no SQLite process.
+
+Some system SQLite builds list `.recover` in help but lack its required
+`sqlite_dbpage` extension. Such a build cannot perform salvage; the command
+reports the SQLite error and preserves its forensic snapshot. Use a local CLI
+with the recovery extension enabled, as described in
+[SQLite's recovery build requirements](https://www.sqlite.org/recovery.html#source_code_files).
+
+The result contains `chroma.sqlite3`, `recovery.sql`, the source snapshot, and
+`salvage-manifest.json` with input/output hashes, integrity results, recovered
+collection/text counts and queued/unassigned record counts. Failures leave
+forensic staging files at the printed location. The command never opens Chroma,
+loads an embedding model, overwrites the source, or activates the result.
+
+Recovery is best effort: [SQLite's recovery documentation](https://www.sqlite.org/recovery.html)
+explains that records may be missing, changed, or resurrected. A clean integrity
+check proves database structure, not complete original text. Compare the
+recovered text with backups and transcripts, and review queued writes before
+using `repair --mode from-sqlite --source /path/to/new-salvage --palace
+/path/to/another-new-palace`. Knowledge graph and media files need separate
+recovery. Missing document text cannot be reconstructed from HNSW vectors.
 
 ## `mempalace mcp`
 

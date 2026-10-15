@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- Add opt-in offline SQLite salvage for palaces whose damaged database header
+  cannot be opened (#585). Recovery runs only on a stable private snapshot,
+  preserves original files, validates recovered schema and stored text, and
+  writes a forensic manifest into a fresh directory without activating it.
 
 ---
 

@@ -192,7 +192,34 @@ def _legacy_repair_after_prompt(backend, palace_path, collection_name, args):
         raise SystemExit(2) from exc
 
 
+def _cmd_sqlite_salvage(args):
+    """Create an offline salvage artifact without entering normal repair paths."""
+    from ..sqlite_salvage import SQLiteSalvageError, salvage_sqlite
+
+    if getattr(args, "repair_action", None) or getattr(args, "archive_existing", False):
+        print("  Salvage cannot be combined with rebuild-index or --archive-existing.")
+        raise SystemExit(2)
+    try:
+        salvage_sqlite(
+            getattr(args, "source", None),
+            getattr(args, "palace", None),
+            dry_run=getattr(args, "dry_run", False),
+            timeout=getattr(args, "salvage_timeout", 300),
+        )
+    except SQLiteSalvageError as exc:
+        print(f"  SQLite salvage stopped: {exc}")
+        raise SystemExit(2) from exc
+
+
 def cmd_repair(args):
+    """Dispatch ordinary repair or explicitly requested offline SQLite salvage."""
+    if getattr(args, "mode", "legacy") == "salvage-sqlite":
+        _cmd_sqlite_salvage(args)
+    else:
+        _cmd_regular_repair(args)
+
+
+def _cmd_regular_repair(args):
     """Rebuild palace vector index from SQLite metadata.
 
     On success the palace SQLite file is VACUUMed and the FTS5 index is

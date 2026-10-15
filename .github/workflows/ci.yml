@@ -19,6 +19,18 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
       - run: pip install -e ".[dev]"
+      # The distro sqlite3 lacks a working .recover (no sqlite_dbpage), so the
+      # real-CLI salvage tests skipped. Use the official CLI build, pinned by
+      # hash, and make those tests fail instead of skip if it is unusable.
+      - name: Install a recover-capable sqlite3 CLI
+        run: |
+          curl -sSfL -o /tmp/sqlite-tools.zip https://www.sqlite.org/2025/sqlite-tools-linux-x64-3500400.zip
+          echo "2c61fe3f6bfcf4ab0cad6c4edf1fa1cae93bbb816b744bef52a4bdde5bf7bf38  /tmp/sqlite-tools.zip" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/sqlite-tools"
+          unzip -q /tmp/sqlite-tools.zip sqlite3 -d "$RUNNER_TEMP/sqlite-tools"
+          echo "$RUNNER_TEMP/sqlite-tools" >> "$GITHUB_PATH"
+          echo "MEMPALACE_REQUIRE_SQLITE_RECOVER=1" >> "$GITHUB_ENV"
+      - run: sqlite3 -version
       - run: python -m pytest tests/ -v --ignore=tests/benchmarks --cov=mempalace --cov-report=term-missing --cov-fail-under=80 --durations=10
 
   test-windows:

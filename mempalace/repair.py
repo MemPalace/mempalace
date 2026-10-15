@@ -1157,6 +1157,12 @@ def print_sqlite_integrity_abort(palace_path: str, errors: list[str]) -> None:
     print("    4. Recreate the FTS5 virtual table from intact embedding_metadata rows.")
     print("    5. Verify `PRAGMA integrity_check` returns `ok`.")
     print("    6. Re-run `mempalace repair --yes`.")
+    print()
+    print("  For an unreadable SQLite file, you can first create an offline salvage artifact:")
+    print("    mempalace repair --mode salvage-sqlite --source <archived-palace>")
+    print("      --palace <fresh-salvage-directory> --dry-run")
+    print("  Remove --dry-run to attempt salvage. Review its manifest and recovered text")
+    print("  before rebuilding into another fresh palace; salvage does not prove completeness.")
 
 
 # quick_check's wording for a corrupt FTS5 inverted index differs by SQLite

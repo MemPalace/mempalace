@@ -477,24 +477,38 @@ def main():
         ),
     )
     p_repair.add_argument(
+        "--palace",
+        default=argparse.SUPPRESS,
+        help="Palace path, or the required fresh destination for --mode salvage-sqlite",
+    )
+    p_repair.add_argument(
         "--mode",
-        choices=["legacy", "max-seq-id", "from-sqlite"],
+        choices=["legacy", "max-seq-id", "from-sqlite", "salvage-sqlite"],
         default="legacy",
         help=(
             "legacy: full-palace rebuild via the chromadb client (default). "
             "max-seq-id: un-poison max_seq_id rows corrupted by the legacy 0.6.x shim. "
             "from-sqlite: rebuild by reading rows directly from chroma.sqlite3, "
             "bypassing the chromadb client. Use when legacy mode bails because the "
-            "chromadb client cannot open the collection."
+            "chromadb client cannot open the collection. "
+            "salvage-sqlite: recover unreadable SQLite pages into a fresh offline "
+            "directory using local sqlite3; requires explicit --source and --palace."
         ),
     )
     p_repair.add_argument(
         "--source",
         default=None,
         help=(
-            "Source palace path for --mode from-sqlite (defaults to --palace). "
+            "Source palace path for --mode from-sqlite (defaults to --palace), "
+            "or the required archived source for --mode salvage-sqlite. "
             "Use when extracting from an archived corrupt palace into a new location."
         ),
+    )
+    p_repair.add_argument(
+        "--salvage-timeout",
+        type=float,
+        default=300,
+        help="Combined sqlite3 subprocess timeout in seconds for --mode salvage-sqlite (300)",
     )
     p_repair.add_argument(
         "--archive-existing",
