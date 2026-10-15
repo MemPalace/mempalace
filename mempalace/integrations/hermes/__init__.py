@@ -17,12 +17,18 @@ Design notes
 * Per-turn writes go through a bounded background queue. The agent loop
   never blocks on ChromaDB or SQLite.
 
-* ``sync_turn`` is the **sole** filing path. ``on_session_end`` and
-  ``on_pre_compress`` intentionally file nothing: re-filing the raw
-  message list duplicates every turn ``sync_turn`` already stored —
-  ``filed_at`` is hashed into the drawer id, so upserts cannot collapse
-  the copies. Any future safety net here must first scan what is
-  already filed and add only what is missing.
+* ``sync_turn`` is the **primary** filing path. ``on_session_end`` and
+  ``on_pre_compress`` are scan-based safety nets: they segment the raw
+  message list into turns, scan the session's existing drawers (plus
+  /branch ancestors), and file only uncovered turns. Coverage is tracked
+  by a ``turn_fp`` fingerprint of the raw user message (survives
+  representation differences, restarts, and compression) with exact-text
+  matching as a fallback. Empty session_id or a failed scan disables
+  dedup — the failure direction is a duplicate drawer, never a lost
+  turn. Interrupted turns, which Hermes never syncs (hermes-agent
+  #15218), are captured here. ``on_delegation`` synthetic turns overlap
+  raw tool results by design; convo-miner ingest of Hermes transcripts
+  from disk files under a different source_file and is not deduped.
 
 * The provider is **inactive** under ``agent_context in {"cron", "flush"}``
   or ``platform == "cron"``. Cron-context turns are system-generated and
@@ -66,7 +72,8 @@ import os
 import queue
 import re
 import threading
-from collections import deque
+import time
+from collections import Counter, deque
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -79,6 +86,7 @@ from mempalace.config import (
     sanitize_name,
 )
 from mempalace.convo_miner import file_conversation_exchange
+from mempalace.ids import make_turn_fingerprint
 from mempalace.knowledge_graph import KnowledgeGraph
 from mempalace.layers import Layer0
 from mempalace.searcher import search_memories
@@ -288,6 +296,91 @@ def _normalize_content(content: Any) -> str:
                     parts.append(text)
         return "\n".join(parts)
     return str(content)
+
+
+def _is_real_user_message(msg: Dict[str, Any]) -> bool:
+    """True for user messages a human actually authored this turn.
+
+    Anthropic-format tool results arrive as ``role == "user"`` messages
+    whose content is exclusively ``tool_result`` blocks — those anchor
+    no turn. A message mixing tool_result blocks with any other part
+    still counts as real (the user typed alongside the result).
+    """
+    if msg.get("role") != "user":
+        return False
+    content = msg.get("content")
+    if isinstance(content, list):
+        return any(
+            not (isinstance(block, dict) and block.get("type") == "tool_result")
+            for block in content
+        )
+    return bool(content)
+
+
+def _turn_fingerprint_from_messages(messages: List[Dict[str, Any]]) -> str:
+    """Fingerprint of the LAST real user message in a snapshot.
+
+    ``sync_turn`` receives the full messages snapshot at end of turn, so
+    the last real user message is this turn's anchor. The fingerprint is
+    computed over ``_normalize_content`` of the raw dict — the identical
+    dict ``_segment_turns`` sees later — so coverage checks correlate
+    byte-exactly despite ``sync_turn``'s cleaned/stripped text arguments.
+    """
+    for msg in reversed(messages or []):
+        if _is_real_user_message(msg):
+            normalized = _normalize_content(msg.get("content"))
+            if normalized:
+                return make_turn_fingerprint(normalized)
+            # an empty-text anchor fingerprints nothing; don't scan further —
+            # _segment_turns gives that segment turn_fp == "" too, so the call
+            # sites stay consistent
+            return ""
+    return ""
+
+
+def _segment_turns(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Segment a raw message list into turns anchored at real user messages.
+
+    A turn spans one real user message plus everything (assistant
+    replies, tool_use, tool results) up to the next real user message —
+    folded into the segment's ``assistant`` side in order. Messages
+    before the first real user message form an anchorless preamble
+    segment (``turn_fp == ""``), which downstream dedup can only match
+    by exact text. Segments empty on both sides are dropped.
+    """
+    segments: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+    for msg in messages or []:
+        if _is_real_user_message(msg):
+            user_text = _normalize_content(msg.get("content"))
+            current = {
+                "user": user_text,
+                "parts": [],
+                "turn_fp": make_turn_fingerprint(user_text) if user_text else "",
+            }
+            segments.append(current)
+            continue
+        part = _normalize_content(msg.get("content"))
+        if not part:
+            continue
+        if current is None:
+            current = {"user": "", "parts": [], "turn_fp": ""}
+            segments.append(current)
+        current["parts"].append(part)
+    result: List[Dict[str, str]] = []
+    for seg in segments:
+        # double-blank separates whole messages; _normalize_content uses single \n within one message
+        assistant = "\n\n".join(seg["parts"])
+        if not seg["user"] and not assistant:
+            continue
+        result.append({"user": seg["user"], "assistant": assistant, "turn_fp": seg["turn_fp"]})
+    return result
+
+
+def _compose_exchange_text(user: str, assistant: str) -> str:
+    """The exact drawer text ``_file_turn`` writes. Dedup compares against
+    this composition, so there must be precisely one implementation."""
+    return f"User: {user}\n\nAssistant: {assistant}".strip()
 
 
 # ---------------------------------------------------------------------------
@@ -626,6 +719,16 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
     DEFAULT_PALACE_PATH = "~/.mempalace/palace"
     DEFAULT_IDENTITY_PATH = "~/.mempalace/identity.txt"
     WORKER_QUEUE_MAX = 500
+    # on_session_end blocks up to this long to enqueue its safety-net scan:
+    # the session is ending, so there is no later retry — briefly blocking
+    # the agent thread beats permanently dropping unchecked turns. Mid-
+    # conversation hooks (sync_turn, on_pre_compress) stay non-blocking.
+    SESSION_END_ENQUEUE_TIMEOUT = 5.0
+    # Transient "database is locked" retries for palace writes. Chroma's
+    # sqlite locks briefly under concurrent readers (notably on Windows);
+    # a dropped turn over a momentary lock breaks the verbatim promise.
+    FILE_TURN_LOCK_RETRIES = 3
+    FILE_TURN_LOCK_BACKOFF = 0.25  # seconds; doubled per attempt
     # Cap for status-style metadata scans. On large palaces (200k+ drawers)
     # an unbounded ``col.get(include=["metadatas"])`` would materialize every
     # row into Python memory just to compute counts — multi-second hangs and
@@ -651,6 +754,13 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         self._session_id: str = ""
         self._hermes_home: str = ""
         self._turn_count = 0
+        # Ancestor session ids whose drawers cover this conversation's
+        # inherited transcript (grows only on /branch; unbounded — one entry
+        # per ancestor). Worker code must NEVER read this directly: it is
+        # mutated by on_session_switch while the queue drains, and a stale
+        # populated read would false-dedup (data loss). Snapshot it into the
+        # task payload at enqueue time (see on_session_end / on_pre_compress).
+        self._session_lineage: List[str] = []
 
         # ChromaDB access through mempalace's own backend (matches embedding
         # function, fixes the dim-mismatch bug from prior PRs).
@@ -865,6 +975,10 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                         "user": user_text,
                         "assistant": assistant_text,
                         "session_id": session_id or self._session_id,
+                        # Correlation key for the session_end / pre_compress
+                        # safety nets — computed from the raw snapshot, the
+                        # same dicts _segment_turns hashes later.
+                        "turn_fp": _turn_fingerprint_from_messages(messages or []),
                     },
                 )
             )
@@ -883,19 +997,47 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         self._turn_count = turn_number
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        # Skip when the provider never came up — enqueueing to a queue whose
+        # worker never started would silently fill the bounded buffer.
         if self._cron_skipped or not self._initialized:
             return
-        # Intentionally no filing here. ``sync_turn`` has already filed every
-        # completed turn, and re-filing the message list mints duplicate
-        # drawers: ``filed_at`` is part of the drawer-id hash, so the upsert
-        # cannot collapse the re-file into the original.
-        # Regenerate the AAAK wake-up cache for the next session.
+        # Safety net, not a second filing path: the worker scans what
+        # sync_turn already filed and captures only what is missing.
+        try:
+            self._worker_queue.put(
+                (
+                    "session_end",
+                    {
+                        "messages": list(messages or []),
+                        "session_id": self._session_id,
+                        "lineage": list(self._session_lineage),
+                    },
+                ),
+                timeout=self.SESSION_END_ENQUEUE_TIMEOUT,
+            )
+        except queue.Full:
+            logger.warning(
+                "MemPalace queue full at session_end — %d messages not checked for gaps",
+                len(messages or []),
+            )
+        # Regenerate the AAAK wake-up cache for the next session — routed
+        # through the worker AFTER the safety-net task so this ChromaDB
+        # reader never races the safety net's writes. Chroma's sqlite locks
+        # under concurrent access (notably on Windows), and a locked write
+        # drops a turn. Clear the done-flag before enqueueing so readers that
+        # wait on it observe "refresh pending" for the whole queued interval,
+        # not just while the refresh itself runs.
         self._wake_up_done.clear()
-        threading.Thread(
-            target=self._refresh_wake_up_cache,
-            daemon=True,
-            name="mempalace-wakeup",
-        ).start()
+        try:
+            self._worker_queue.put_nowait(("wakeup", {}))
+        except queue.Full:
+            # Best-effort fallback: refresh concurrently rather than not at
+            # all; the _file_turn lock retries absorb the reader race.
+            threading.Thread(
+                target=self._refresh_wake_up_cache,
+                daemon=True,
+                name="mempalace-wakeup",
+            ).start()
 
     def on_session_switch(
         self,
@@ -908,19 +1050,67 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
     ) -> None:
         # Repoint subsequent writes at the new session. /reset and /new flush
         # per-session counters; /resume and /branch keep them.
+        # "branch" / "resume" are Hermes-protocol reason strings (see the
+        # on_session_switch call sites in hermes-agent's cli.py). If Hermes
+        # renames them, the branch arm silently falls to the else (clears →
+        # re-files, duplication-safe but noisy) — a rename upstream must
+        # update this match.
+        reason = str(kwargs.get("reason", "") or "")
+        if reset:
+            # Fresh conversation — no inherited transcript.
+            self._session_lineage = []
+        elif reason == "branch" and parent_session_id:
+            # The branch carries the parent transcript forward; the parent's
+            # drawers cover those turns, so the dedup scan must include them.
+            self._session_lineage.append(parent_session_id)
+        elif rewound or new_session_id == self._session_id:
+            # Same conversation (rewind / no-op switch) — ancestry unchanged.
+            pass
+        else:
+            # /resume or unknown transition: parent_session_id is the session
+            # being LEFT, not transcript ancestry. Stale lineage in the scan
+            # would false-dedup against unrelated drawers — clear it. Failure
+            # direction on a lost real ancestry is duplication, never loss.
+            # A "branch" with an empty parent_session_id also lands here —
+            # with no ancestor to record, clearing is the loss-safe default.
+            self._session_lineage = []
         self._session_id = new_session_id or ""
         if reset:
             self._turn_count = 0
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
-        """Intentionally a no-op that returns no hint.
+        """Capture turns the primary path missed, then hint the summarizer.
 
-        Blind-filing the compression window duplicates every turn
-        ``sync_turn`` already filed. Returning ``""`` keeps the
-        summarizer on its default conservative discarding — a hint must
-        never promise persistence this provider hasn't performed.
+        The hint is **only** returned when the worker can actually process
+        the payload — if the backend never came up or the queue is
+        saturated, say nothing so the summarizer falls back to its default
+        conservative discarding rather than acting on a false promise.
         """
-        return ""
+        if self._cron_skipped or not self._initialized:
+            return ""
+        try:
+            self._worker_queue.put_nowait(
+                (
+                    "pre_compress",
+                    {
+                        "messages": list(messages or []),
+                        "session_id": self._session_id,
+                        "lineage": list(self._session_lineage),
+                    },
+                )
+            )
+        except queue.Full:
+            logger.warning(
+                "MemPalace queue full at pre_compress — %d messages not checked for gaps",
+                len(messages or []),
+            )
+            return ""
+        return (
+            "MemPalace has every conversation turn in this window filed "
+            "verbatim. Compressed content remains searchable via the "
+            "`mempalace_search` tool — the summarizer can be aggressive "
+            "about discarding raw turns."
+        )
 
     def on_memory_write(
         self,
@@ -1264,35 +1454,253 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         if not user_msg and not assistant_msg:
             return
         # Classify outside the lock — pure CPU / config, no Chroma access.
-        text = f"User: {user_msg}\n\nAssistant: {assistant_msg}".strip()
+        text = _compose_exchange_text(user_msg, assistant_msg)
         wing = self._classify_wing(text)
+        # Always file under a stable room name ("conversations"). Using
+        # session_id here would mint one room per session — pollutes
+        # ``mempalace_list_rooms`` and splits live writes from backfill
+        # drawers (which also write to "conversations"). The session id
+        # stays available on the dedicated metadata field below.
         session_id = payload.get("session_id") or ""
         extra: Dict[str, Any] = {"source": "hermes"}
         if session_id:
             extra["session_id"] = session_id
-        # Hold the collection lock across the whole upsert so wake-up L1
-        # scans (same client) never interleave with writes mid-compactor.
-        try:
-            with self._collection_lock:
-                col = self._collection
-                if col is None:
-                    return
-                # Always file under a stable room name ("conversations"). Using
-                # session_id here would mint one room per session — pollutes
-                # ``mempalace_list_rooms`` and splits live writes from backfill
-                # drawers (which also write to "conversations"). The session id
-                # stays available on the dedicated metadata field below.
-                file_conversation_exchange(
-                    col,
-                    wing=wing,
-                    room="conversations",
-                    text=text,
-                    source_file=f"hermes-session:{session_id or 'unknown'}",
-                    agent="hermes",
-                    extra_metadata=extra,
+        turn_fp = payload.get("turn_fp") or ""
+        if turn_fp:
+            extra["turn_fp"] = turn_fp
+        # Each attempt holds the collection lock across the whole upsert so
+        # wake-up L1 scans (same client) never interleave with a write
+        # mid-compactor. The backoff sleep stays OUTSIDE the lock — the lock
+        # only serializes in-process access, and holding it while waiting out
+        # a cross-process sqlite lock would stall readers for no benefit.
+        for attempt in range(self.FILE_TURN_LOCK_RETRIES + 1):
+            try:
+                with self._collection_lock:
+                    col = self._collection
+                    if col is None:
+                        return
+                    file_conversation_exchange(
+                        col,
+                        wing=wing,
+                        room="conversations",
+                        text=text,
+                        source_file=f"hermes-session:{session_id or 'unknown'}",
+                        agent="hermes",
+                        extra_metadata=extra,
+                    )
+                return
+            except Exception as exc:
+                # Chroma's sqlite briefly locks under concurrent readers
+                # (notably on Windows). Losing a turn over a transient lock
+                # breaks the verbatim promise — retry with backoff before
+                # giving up.
+                transient = "database is locked" in str(exc).lower()
+                if transient and attempt < self.FILE_TURN_LOCK_RETRIES:
+                    time.sleep(self.FILE_TURN_LOCK_BACKOFF * (2**attempt))
+                    continue
+                # warning, not debug — a failed palace write is a broken
+                # verbatim promise, never log noise.
+                logger.warning("MemPalace _file_turn error — turn not persisted: %s", exc)
+                return
+
+    def _scan_filed(self, col: Any, source_files: List[str]) -> Counter:
+        """Multiset of (turn_fp, document text) pairs already filed.
+
+        One counter entry per PHYSICAL drawer — dedup consumes a whole
+        drawer atomically, never its fingerprint and text separately
+        (independent counters let one drawer protect two segments, which
+        under-files and loses a turn). Paginated per source_file; the FIFO
+        worker guarantees every earlier file_turn upsert has landed before
+        this runs, so the scan is authoritative.
+        """
+        pair_counts: Counter = Counter()
+        for source_file in source_files:
+            offset = 0
+            while True:
+                batch = col.get(
+                    where={"source_file": source_file},
+                    limit=1000,
+                    offset=offset,
+                    include=["documents", "metadatas"],
                 )
-        except Exception as exc:
-            logger.debug("MemPalace _file_turn error: %s", exc)
+                batch_ids = batch.get("ids") or []
+                documents = batch.get("documents") or []
+                metadatas = batch.get("metadatas") or []
+                for doc, meta in zip(documents, metadatas):
+                    if doc:
+                        pair_counts[((meta or {}).get("turn_fp") or "", doc)] += 1
+                if not batch_ids:
+                    break
+                offset += len(batch_ids)
+        return pair_counts
+
+    def _file_missing_exchanges(self, payload: Dict[str, Any]) -> None:
+        """Safety net for session_end / pre_compress: file only uncovered turns.
+
+        sync_turn is the primary filing path. This scans what's already in
+        the palace for this session (plus branch ancestors) and files only
+        segments not covered. Matching runs in three passes, each consuming
+        one physical drawer atomically across all indexes (the pair
+        multiset), so one drawer can never protect two segments:
+
+        1. Exact ``(turn_fp, text)`` matches for EVERY segment — before any
+           donor arm runs, so a donor can never steal a drawer an exact
+           match needs.
+        2. Fingerprint coverage, grouped per fingerprint (correlates
+           sync_turn's clean pair with the raw turn despite representation
+           differences). When same-fingerprint occurrences outnumber their
+           drawers we cannot tell WHICH are covered — file them ALL:
+           bounded duplication of a covered turn is acceptable; guessing
+           risks losing the missed one, which is not.
+        3. Exact-text coverage for anchorless segments and fp-missed
+           segments (catches a re-fired session_end and
+           pre_compress/session_end overlap, which compose byte-identically;
+           identical texts are interchangeable, so donor choice is
+           immaterial).
+
+        Donor lookups scan the pair multiset — O(segments × pairs) worst
+        case, on the background worker with session-bounded input; deep
+        /branch lineage chains are the pathological case.
+
+        Loss-safe by construction: empty session_id or a failed scan means
+        NO dedup (blind-file). The failure direction is always a duplicate
+        drawer, never a lost turn — with ONE known, accepted residual:
+        fingerprint coverage cannot see occurrences compression removed
+        from the window. If a byte-identical user prompt ("continue",
+        "go") recurs after its synced occurrence was compressed away, and
+        the recurrence was never synced (interrupted), the stale drawer
+        fp-skips it and the recurrence's partial ASSISTANT output is not
+        captured (the user's words are already in the palace from the
+        synced occurrence). Undecidable with occurrence counting alone —
+        Hermes message dicts carry no per-message identity — and closing
+        it by dropping fp-skip would re-file every tool-shaped turn.
+        Pinned by test_truncated_window_fp_coverage_is_accepted_limit.
+        """
+        messages = payload.get("messages", []) or []
+        session_id = payload.get("session_id", "") or ""
+        lineage = payload.get("lineage", []) or []
+        segments = _segment_turns(messages)
+        if not segments:
+            return
+        pair_counts: Counter = Counter()
+        if session_id:
+            # Hold the collection lock across the whole scan — it reads the
+            # same long-lived Chroma client that _file_turn writes through and
+            # the wake-up L1 refresh scans, and every access to that client is
+            # serialized on this lock. Released before the filing loop below;
+            # _file_turn re-takes it per attempt (the lock is not reentrant).
+            sources = [f"hermes-session:{sid}" for sid in [session_id, *lineage]]
+            try:
+                with self._collection_lock:
+                    col = self._collection
+                    if col is not None:
+                        pair_counts = self._scan_filed(col, sources)
+            except Exception as exc:
+                logger.warning(
+                    "MemPalace dedup scan failed — filing without dedup "
+                    "(duplicates possible, nothing lost): %s",
+                    exc,
+                )
+        fp_totals: Counter = Counter()
+        text_totals: Counter = Counter()
+        for (pair_fp, pair_text), count in pair_counts.items():
+            if pair_fp:
+                fp_totals[pair_fp] += count
+            text_totals[pair_text] += count
+
+        def consume(pair: tuple[str, str]) -> None:
+            # One physical drawer leaves ALL indexes at once — the invariant
+            # that makes over-skipping (data loss) impossible: skips map 1:1
+            # onto distinct filed drawers. It also guarantees the donor
+            # next(...) lookups below: a positive total implies a positive
+            # pair count exists (totals are sums of non-negatives kept in
+            # lockstep here).
+            pair_counts[pair] -= 1
+            if pair[0]:
+                fp_totals[pair[0]] -= 1
+            text_totals[pair[1]] -= 1
+
+        # ---- Pass 1: exact (fp, text) matches, for EVERY segment, before
+        # any donor arm runs. A greedy single pass let an earlier segment's
+        # fingerprint-donor arm steal the drawer a later segment would have
+        # exact-matched — re-filing the covered turn and silently losing the
+        # missed one (see
+        # test_interrupted_then_retried_identical_prompt_keeps_both).
+        remaining: List[Dict[str, str]] = []
+        for seg in segments:
+            pair = (seg["turn_fp"], _compose_exchange_text(seg["user"], seg["assistant"]))
+            if pair_counts.get(pair, 0) > 0:
+                consume(pair)
+            else:
+                remaining.append(seg)
+
+        # ---- Pass 2: fingerprint coverage, grouped per fingerprint.
+        # Same-fp segments are occurrences of the same user turn; D drawers
+        # with that fp attest D covered occurrences. When occurrences
+        # outnumber drawers we cannot tell WHICH are covered — file them
+        # ALL: bounded duplication of a covered turn is acceptable; guessing
+        # risks losing the missed one, which is not.
+        to_file: List[Dict[str, str]] = []
+        text_pass: List[Dict[str, str]] = []
+        by_fp: Dict[str, List[Dict[str, str]]] = {}
+        for seg in remaining:
+            if seg["turn_fp"]:
+                by_fp.setdefault(seg["turn_fp"], []).append(seg)
+            else:
+                text_pass.append(seg)
+        for fp, group in by_fp.items():
+            available = fp_totals.get(fp, 0)
+            if available == 0:
+                # No fp coverage — these may still text-match a drawer whose
+                # fingerprint differs (sync_turn saw an injected snapshot).
+                text_pass.extend(group)
+            elif len(group) <= available:
+                for index in range(len(group)):
+                    donor_text = next(
+                        (t for (f, t), c in pair_counts.items() if f == fp and c > 0),
+                        None,
+                    )
+                    if donor_text is None:
+                        # Unreachable while consume() keeps totals and pairs
+                        # in lockstep — if a future edit breaks that, filing
+                        # is the loss-safe answer.
+                        to_file.extend(group[index:])
+                        break
+                    consume((fp, donor_text))
+            else:
+                to_file.extend(group)
+
+        # ---- Pass 3: exact-text coverage for anchorless segments and
+        # fp-missed segments. Identical texts are byte-identical content,
+        # so which occurrence a donor drawer covers is immaterial.
+        by_text: Dict[str, List[Dict[str, str]]] = {}
+        for seg in text_pass:
+            by_text.setdefault(_compose_exchange_text(seg["user"], seg["assistant"]), []).append(
+                seg
+            )
+        for text, group in by_text.items():
+            available = min(len(group), text_totals.get(text, 0))
+            covered = 0
+            while covered < available:
+                donor_fp = next(
+                    (f for (f, t), c in pair_counts.items() if t == text and c > 0),
+                    None,
+                )
+                if donor_fp is None:
+                    break  # invariant breach — fall through to filing (loss-safe)
+                consume((donor_fp, text))
+                covered += 1
+            to_file.extend(group[covered:])
+
+        for seg in to_file:
+            self._file_turn(
+                {
+                    "user": seg["user"],
+                    "assistant": seg["assistant"],
+                    "session_id": session_id,
+                    "turn_fp": seg["turn_fp"],
+                }
+            )
 
     def _mirror_mem_write(self, payload: Dict[str, Any]) -> None:
         # target "user" carries facts about the user; target "memory" carries
@@ -1334,10 +1742,20 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             try:
                 if task == "file_turn":
                     self._file_turn(payload)
+                elif task in ("session_end", "pre_compress"):
+                    # Safety nets share one path: scan what sync_turn already
+                    # filed, capture only what's missing.
+                    self._file_missing_exchanges(payload)
+                elif task == "wakeup":
+                    # Sequenced behind session_end so this reader never
+                    # races the safety net's writes.
+                    self._refresh_wake_up_cache()
                 elif task == "mem_write":
                     self._mirror_mem_write(payload)
             except Exception as exc:
-                logger.debug("MemPalace worker task %s error: %s", task, exc)
+                # warning, not debug — an aborted worker task can mean lost
+                # turns, the one failure class this provider must not bury.
+                logger.warning("MemPalace worker task %s error: %s", task, exc)
             finally:
                 try:
                     self._worker_queue.task_done()
