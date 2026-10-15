@@ -1277,6 +1277,43 @@ _FTS5_REBUILD_SQL = (
     "INSERT INTO embedding_fulltext_search(embedding_fulltext_search) VALUES('rebuild')"  # noqa: E501
 )
 
+# FTS5's own consistency check, and the only one that answers for this index on
+# every SQLite build. ``PRAGMA quick_check``/``integrity_check`` walk the FTS5
+# shadow tables only where the amalgamation was built to do so: measured on
+# 3.43.2 a malformed inverted index passes both, while 3.53.1 reports it. A
+# gate that used one of them would hand back a palace the server refuses
+# whenever repair ran under the blind build (#2707), and #2240's "autoheal
+# unreachable due to interpreter-SQLite differences" is the same split seen
+# from the other side. This statement is FTS5's own, so its verdict does not
+# depend on the build.
+#
+# It raises on a malformed index and returns a row (``integrity-check`` is a
+# no-op SELECT-shaped command) when the index agrees with its content table.
+# Naming a table that does not exist raises ``OperationalError`` too, which is
+# why every caller checks for the table first: a palace without an FTS5 index
+# has nothing to verify and must not be failed for it.
+_FTS5_INTEGRITY_CHECK_SQL = (
+    "INSERT INTO embedding_fulltext_search(embedding_fulltext_search) VALUES('integrity-check')"
+)
+
+
+def _fts5_integrity_check_errors(conn: sqlite3.Connection) -> list[str]:
+    """Return what FTS5's own integrity check says about the inverted index.
+
+    Empty means the index is consistent with ``embedding_fulltext_search``'s
+    content table. A non-empty list carries the exception FTS5 raised.
+
+    The table's existence must be established by the caller — see
+    ``_FTS5_INTEGRITY_CHECK_SQL``. This function does not test for it, because
+    the two callers already hold the table census they need and a second probe
+    would be a second thing to keep in step.
+    """
+    try:
+        conn.execute(_FTS5_INTEGRITY_CHECK_SQL)
+    except sqlite3.DatabaseError as exc:
+        return [str(exc)]
+    return []
+
 
 def _errors_are_isolated_fts5(errors: list[str]) -> bool:
     """True when every quick_check error is a malformed FTS5 inverted index.
@@ -1666,7 +1703,17 @@ def _vacuum_and_rebuild_fts5(
     warning and return because their primary rebuild has already succeeded.
     SQLite recovery passes ``strict=True`` because its bulk upserts can leave
     this derived index malformed; that path must not report success until the
-    rebuild, VACUUM, and a final quick_check all complete.
+    rebuild, VACUUM, and a final FTS5 integrity check all complete.
+
+    The strict gate finishes with FTS5's own ``integrity-check`` rather than
+    ``PRAGMA quick_check``. quick_check only covers the FTS5 shadow tables on
+    some SQLite builds (see ``_FTS5_INTEGRITY_CHECK_SQL``), so gating on it let
+    a malformed index pass here and reach the caller's "Rebuild complete"
+    (#2707) — the palace was then refused by the server's own preflight, which
+    is the one pair of outcomes that must not both be possible. quick_check is
+    still run, after the FTS5 check, because it covers the rest of the file and
+    the rebuild/VACUUM in this function are perfectly capable of leaving
+    page-level damage behind.
     """
     sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.exists(sqlite_path):
@@ -1680,7 +1727,11 @@ def _vacuum_and_rebuild_fts5(
             tables = {
                 r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
             }
-            if "embedding_fulltext_search" in tables:
+            # Bound once and reused: the strict gate below must not re-test for
+            # the table, or a palace could be failed for an absence the earlier
+            # census already answered.
+            has_fts5 = "embedding_fulltext_search" in tables
+            if has_fts5:
                 conn.execute(
                     "INSERT INTO embedding_fulltext_search"
                     "(embedding_fulltext_search) VALUES('rebuild')"
@@ -1689,15 +1740,6 @@ def _vacuum_and_rebuild_fts5(
                 progress("  FTS5 index rebuilt.")
             conn.execute("VACUUM")
             progress("  SQLite VACUUM complete.")
-            if strict:
-                rows = conn.execute("PRAGMA quick_check").fetchall()
-                errors = [str(row[0]) for row in rows if row and str(row[0]).lower() != "ok"]
-                if errors:
-                    raise sqlite3.DatabaseError(
-                        f"post-recovery quick_check failed (SQLite {sqlite3.sqlite_version}): "
-                        + "; ".join(errors[:3])
-                    )
-                progress(f"  quick_check is clean (SQLite {sqlite3.sqlite_version}).")
     except Exception as exc:
         if strict:
             # Preserve the concrete SQLite/filesystem exception for callers
@@ -1706,6 +1748,54 @@ def _vacuum_and_rebuild_fts5(
             # print the same failure twice.
             raise
         progress(f"  Warning: post-repair cleanup failed (non-fatal): {exc}")
+        return
+
+    if not strict:
+        return
+
+    # The verdict is taken on a connection opened AFTER the last write, on
+    # purpose. SQLite keeps a warm page cache for pages a connection has
+    # touched, so the writer that just rebuilt the index can sit on stale
+    # pages and report "clean" for damage that is already on disk -- measured
+    # directly, with the same corruption reported clean by the writer and
+    # malformed by a fresh handle. Reading cold is what makes this a statement
+    # about the bytes the caller is handed back rather than about one
+    # connection's view of them. It also covers damage that predates the call
+    # for free, since nothing here has cached the file.
+    #
+    # Nothing writes to ``chroma.sqlite3`` after this point: the caller's
+    # success message is printed only once this function returns.
+    #
+    # FTS5's ``integrity-check`` is issued as an INSERT into the virtual table,
+    # so it needs a writable connection even though it changes no row. It is
+    # opened fresh all the same: what must be fresh is the page cache, not the
+    # write permission.
+    try:
+        with closing(open_palace_writer(sqlite_path, isolation_level=None)) as conn:
+            fts5_errors = _fts5_integrity_check_errors(conn) if has_fts5 else []
+            rows = conn.execute("PRAGMA quick_check").fetchall()
+            errors = [str(row[0]) for row in rows if row and str(row[0]).lower() != "ok"]
+    except sqlite3.Error as exc:
+        # A check that could not run is not a clean verdict, and must not read
+        # as one: a vanished file or a denied read reaches here.
+        raise sqlite3.DatabaseError(
+            f"post-recovery integrity check could not run (SQLite {sqlite3.sqlite_version}): {exc}"
+        ) from exc
+
+    if has_fts5:
+        if fts5_errors:
+            raise sqlite3.DatabaseError(
+                "post-recovery FTS5 integrity-check failed "
+                f"(SQLite {sqlite3.sqlite_version}): " + "; ".join(fts5_errors[:3])
+            )
+        progress(f"  FTS5 integrity-check is clean (SQLite {sqlite3.sqlite_version}).")
+
+    if errors:
+        raise sqlite3.DatabaseError(
+            f"post-recovery quick_check failed (SQLite {sqlite3.sqlite_version}): "
+            + "; ".join(errors[:3])
+        )
+    progress(f"  quick_check is clean (SQLite {sqlite3.sqlite_version}).")
 
 
 def _post_rebuild_cleanup(palace_path: str, backend: "ChromaBackend", progress=print) -> None:

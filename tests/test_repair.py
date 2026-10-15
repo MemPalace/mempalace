@@ -4223,3 +4223,214 @@ def test_rebuild_from_sqlite_preserves_knowledge_graph_sidecar(tmp_path):
     assert (dest / "knowledge_graph.sqlite3").read_text(encoding="utf-8") == "kg-db"
     assert (dest / "knowledge_graph.sqlite3-wal").read_text(encoding="utf-8") == "kg-wal"
     assert (dest / "knowledge_graph.sqlite3-shm").read_text(encoding="utf-8") == "kg-shm"
+
+
+def _fts5_check_errors(palace_path) -> list:
+    """Run FTS5's own integrity-check; return its errors ([] when clean).
+
+    Deliberately NOT ``PRAGMA integrity_check``/``quick_check``: whether those
+    walk the FTS5 shadow tables varies by SQLite build (3.43.2 does not,
+    3.53.1 does), so they cannot be the assertion a fix is pinned to. This
+    probe reports what FTS5 itself says on every build.
+    """
+    with closing(sqlite3.connect(os.path.join(str(palace_path), "chroma.sqlite3"))) as conn:
+        try:
+            conn.execute(
+                "INSERT INTO embedding_fulltext_search(embedding_fulltext_search)"
+                " VALUES('integrity-check')"
+            )
+        except sqlite3.DatabaseError as exc:
+            return [str(exc)]
+    return []
+
+
+def _corrupt_fts5_data_leaf(palace_path) -> int:
+    """Garbage one leaf page of the FTS5 *inverted index* b-tree.
+
+    Reproduces the reporter's fault (``malformed inverted index for FTS5
+    table main.embedding_fulltext_search``) while leaving the content table
+    intact, which is what makes it recoverable by ``rebuild``. Pages are
+    located with ``dbstat`` rather than assumed, and the root page (3) is
+    skipped so the whole b-tree does not come apart.
+    """
+    sqlite_path = os.path.join(str(palace_path), "chroma.sqlite3")
+    with closing(sqlite3.connect(sqlite_path)) as conn:
+        pages = [
+            row[0]
+            for row in conn.execute(
+                "SELECT pageno FROM dbstat WHERE name = 'embedding_fulltext_search_data'"
+            )
+        ]
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+    # Skip the root (3) and keep to the interior/leaf pages after it.
+    pages = sorted(p for p in pages if p > 3)
+    if not pages:
+        pytest.skip("FTS5 inverted index is a single page; nothing to corrupt in isolation")
+    target = pages[len(pages) // 2]
+    with open(sqlite_path, "r+b") as handle:
+        handle.seek((target - 1) * page_size + 64)
+        handle.write(b"\xde\xad\xbe\xef" * 20)
+    return target
+
+
+def test_vacuum_and_rebuild_fts5_strict_uses_the_fts5_check(tmp_path):
+    """#2707: the strict gate must run FTS5's own check, not just quick_check.
+
+    ``PRAGMA quick_check`` covers the FTS5 shadow tables on some SQLite builds
+    and not others (3.43.2 reports a malformed inverted index as ``ok``;
+    3.53.1 reports it). The recovery path gates success on this function, so a
+    build-blind gate lets a palace the server will refuse be reported as
+    repaired -- the pair of outcomes the issue says must not both be possible.
+
+    Asserting the *call* rather than a resulting corruption keeps this
+    deterministic across builds: which corruption survives to the gate depends
+    on the build and on where in the sequence it lands (VACUUM regenerates the
+    index, so damage before it does not survive), and a test pinned to one
+    build's behaviour would silently pass on the other.
+    """
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(sqlite_path))) as conn:
+        conn.execute("CREATE TABLE embeddings (id INTEGER PRIMARY KEY)")
+        conn.execute(
+            "CREATE VIRTUAL TABLE embedding_fulltext_search"
+            " USING fts5(string_value, tokenize='trigram')"
+        )
+        conn.execute("INSERT INTO embedding_fulltext_search(rowid, string_value) VALUES (1, 'hi')")
+        conn.commit()
+
+    statements = []
+    real_check = repair._fts5_integrity_check_errors
+    real_open_writer = repair.open_palace_writer
+
+    def _recording_check(conn):
+        statements.append("fts5-integrity-check")
+        return real_check(conn)
+
+    def _recording_writer(*args, **kwargs):
+        conn = real_open_writer(*args, **kwargs)
+
+        class _RecordingConn:
+            def __getattr__(self, name):
+                return getattr(conn, name)
+
+            def execute(self, sql, *rest):
+                if "quick_check" in sql.lower():
+                    statements.append("quick-check")
+                return conn.execute(sql, *rest)
+
+        return _RecordingConn()
+
+    with patch.object(repair, "_fts5_integrity_check_errors", _recording_check):
+        with patch.object(repair, "open_palace_writer", _recording_writer):
+            repair._vacuum_and_rebuild_fts5(str(tmp_path), strict=True, progress=lambda *_: None)
+
+    assert "fts5-integrity-check" in statements, (
+        "the strict gate never ran FTS5's own integrity check; a malformed "
+        f"inverted index would pass it on a build-blind SQLite. Ran: {statements}"
+    )
+    # Still ordered before quick_check: the FTS5 verdict is the one that
+    # answers for the index this function just rebuilt.
+    assert statements.index("fts5-integrity-check") < statements.index("quick-check"), statements
+
+
+def test_vacuum_and_rebuild_fts5_strict_fails_loudly_on_a_malformed_index(tmp_path):
+    """#2707: a malformed index must make the strict gate raise, not pass.
+
+    Feeds the gate a malformed index by making the FTS5 check observe one
+    regardless of where the damage lands, so the assertion holds on every
+    SQLite build. The raising path is what stops the caller printing
+    "Rebuild complete" over a palace the server will refuse.
+    """
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(sqlite_path))) as conn:
+        conn.execute("CREATE TABLE embeddings (id INTEGER PRIMARY KEY)")
+        conn.execute(
+            "CREATE VIRTUAL TABLE embedding_fulltext_search"
+            " USING fts5(string_value, tokenize='trigram')"
+        )
+        conn.execute("INSERT INTO embedding_fulltext_search(rowid, string_value) VALUES (1, 'hi')")
+        conn.commit()
+
+    def _always_malformed(_conn):
+        return ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
+
+    with patch.object(repair, "_fts5_integrity_check_errors", _always_malformed):
+        with pytest.raises(sqlite3.DatabaseError) as excinfo:
+            repair._vacuum_and_rebuild_fts5(str(tmp_path), strict=True, progress=lambda *_: None)
+
+    # The refusal must name the FTS5-specific check. Naming quick_check would
+    # send an operator to a check this fault is known to pass on some builds.
+    message = str(excinfo.value)
+    assert "FTS5 integrity-check" in message, message
+
+
+def test_vacuum_and_rebuild_fts5_without_an_fts5_table_skips_the_check(tmp_path):
+    """A palace with no FTS5 index has nothing to verify and must not be failed.
+
+    ``INSERT ... VALUES('integrity-check')`` against a missing table raises
+    ``OperationalError``, which is a ``DatabaseError`` subclass -- the same
+    class the check treats as "malformed". Without the table census gating it,
+    every palace that simply has no FTS5 index would be refused.
+    """
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(sqlite_path))) as conn:
+        conn.execute("CREATE TABLE dummy (id INTEGER PRIMARY KEY)")
+        conn.commit()
+
+    repair._vacuum_and_rebuild_fts5(str(tmp_path), strict=True, progress=lambda *_: None)
+
+
+def test_vacuum_and_rebuild_fts5_strict_check_reads_the_file_cold(tmp_path):
+    """#2707: the strict verdict must be taken on a fresh connection.
+
+    SQLite keeps a warm page cache for pages a connection has touched, so the
+    writer that just rebuilt the index can report "clean" for damage that is
+    already on disk -- measured directly, the same corruption reads clean
+    through the writer and malformed through a fresh handle. A verdict taken
+    through the writer is therefore a statement about that connection's view,
+    not about the bytes the caller is handed back.
+
+    Forces exactly that shape: damage lands after the final VACUUM while the
+    writing connection is still open. A gate that reuses that connection
+    accepts the palace; a gate that reopens the file refuses it.
+    """
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(sqlite_path))) as conn:
+        conn.execute("CREATE TABLE embeddings (id INTEGER PRIMARY KEY)")
+        conn.execute(
+            "CREATE VIRTUAL TABLE embedding_fulltext_search"
+            " USING fts5(string_value, tokenize='trigram')"
+        )
+        rows = [(i, f"drawer {i} some content words here") for i in range(1, 4001)]
+        conn.executemany(
+            "INSERT INTO embedding_fulltext_search(rowid, string_value) VALUES(?, ?)", rows
+        )
+        conn.commit()
+
+    real_open_writer = repair.open_palace_writer
+    damage = []
+
+    def _open_writer_then_damage(*args, **kwargs):
+        conn = real_open_writer(*args, **kwargs)
+
+        class _DamagingConn:
+            def __getattr__(self, name):
+                return getattr(conn, name)
+
+            def execute(self, sql, *rest):
+                result = conn.execute(sql, *rest)
+                # After the last write the function makes on this connection.
+                if sql.strip() == "VACUUM" and not damage:
+                    conn.commit()
+                    damage.append(_corrupt_fts5_data_leaf(tmp_path))
+                return result
+
+        return _DamagingConn()
+
+    with patch.object(repair, "open_palace_writer", _open_writer_then_damage):
+        with pytest.raises(sqlite3.DatabaseError) as excinfo:
+            repair._vacuum_and_rebuild_fts5(str(tmp_path), strict=True, progress=lambda *_: None)
+
+    assert damage, "the VACUUM never ran; the test proved nothing"
+    assert "FTS5 integrity-check failed" in str(excinfo.value), str(excinfo.value)
+    assert _fts5_check_errors(tmp_path) != [], "the palace really was left malformed"
