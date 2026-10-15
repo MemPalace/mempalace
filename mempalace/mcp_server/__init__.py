@@ -117,6 +117,10 @@ from ..embedding import (  # noqa: E402
     model_error_result,
 )
 from ..date_window import filed_at_in_window, parse_date_bound  # noqa: E402
+from ..dedup import (  # noqa: E402
+    DEFAULT_THRESHOLD as DEDUP_DEFAULT_THRESHOLD,
+    find_duplicate_clusters,
+)
 from ..query_sanitizer import sanitize_query  # noqa: E402
 from ..source_identity import identity_metadata  # noqa: E402
 from ..searcher import (  # noqa: E402
