@@ -23,6 +23,8 @@ conformance suite can locate and apply them.
 
 from __future__ import annotations
 
+import json as _json
+
 import re
 from typing import Protocol, Union
 
@@ -151,6 +153,145 @@ def synthesized_marker(text: str) -> str:
 def speaker_role_assignment(text: str) -> str:
     """Adapter-supplied: multi-party speakers alternately assigned user/assistant."""
     return text
+
+
+# ---------------------------------------------------------------------------
+# Adapter-namespaced reference implementations
+# ---------------------------------------------------------------------------
+#
+# Per RFC 002 §7.3, custom (non-reserved) transformations declared by an
+# adapter MUST expose a reference implementation under
+# ``mempalace.sources.transforms.<adapter_name>_<transform_name>`` so the
+# conformance suite can locate and apply them by attribute lookup. The
+# implementations below are the OpenCode adapter's; future adapters add
+# their own under their own ``<name>_`` prefix.
+#
+# The OpenCode adapter's canonical source bytes for one session are the
+# newline-joined JSON-encoded ``part.data`` rows in
+# ``(message.time_created, part.time_created)`` order, each row prefixed with
+# its message's ``role`` field as ``"<role>\t<part_json>"``. That format is
+# what ``canonical_source_bytes`` returns to the conformance suite, and is
+# what the chain of transformations below collapses into the drawer content.
+
+
+def opencode_extract_text_parts(text: str) -> str:
+    """Pluck ``data.text`` from each JSON-blob line where ``data.type == "text"``.
+
+    Input lines are ``"<role>\\t<part_json>"``. The output preserves the
+    ``<role>\\t`` prefix on each kept line so downstream merge and format
+    transformations can still see roles. Tool-input, tool-output, and
+    whitespace-only ``text`` parts are dropped — same skip the live
+    extraction path applies.
+    """
+    out: list[str] = []
+    for line in text.split("\n"):
+        if not line:
+            continue
+        # Split role from JSON; first \t is the separator.
+        role, _, part_json = line.partition("\t")
+        if not part_json:
+            continue
+        try:
+            obj = _json.loads(part_json)
+        except (ValueError, TypeError):
+            continue
+        if obj.get("type") != "text":
+            continue
+        body = obj.get("text") or ""
+        if not body.strip():
+            continue
+        out.append(f"{role}\t{body}")
+    return "\n".join(out)
+
+
+_TOOL_ECHO_NEEDLE = " tool with the following input"
+
+
+def opencode_skip_tool_echo(text: str) -> str:
+    """Drop user-turn echoes of tool invocations (``Called the X tool ...``).
+
+    Operates on the role-prefixed line stream produced by
+    :func:`opencode_extract_text_parts`. A line whose body (everything after
+    the first tab) opens with ``Called the …  tool with the following input``
+    is dropped wholesale.
+    """
+    kept: list[str] = []
+    for line in text.split("\n"):
+        _, _, body = line.partition("\t")
+        body_lstripped = body.lstrip()
+        if body_lstripped.startswith("Called the ") and _TOOL_ECHO_NEEDLE in body_lstripped:
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def opencode_skip_file_injection(text: str) -> str:
+    """Drop ``<path>…</path>`` file-context injections wrapped around context."""
+    kept: list[str] = []
+    for line in text.split("\n"):
+        _, _, body = line.partition("\t")
+        body_lstripped = body.lstrip()
+        if body_lstripped.startswith("<path>") and "<type>file</type>" in body_lstripped:
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def opencode_role_coerce(text: str) -> str:
+    """Coerce non-``user`` roles to ``assistant``.
+
+    OpenCode emits a small handful of role values (``user``, ``assistant``,
+    occasionally ``system`` or ``tool``). For transcript-shaped storage the
+    adapter only distinguishes ``user`` from everything-else.
+    """
+    out: list[str] = []
+    for line in text.split("\n"):
+        role, sep, body = line.partition("\t")
+        if not sep:
+            out.append(line)
+            continue
+        coerced = "user" if role == "user" else "assistant"
+        out.append(f"{coerced}\t{body}")
+    return "\n".join(out)
+
+
+def opencode_same_role_merge(text: str) -> str:
+    """Merge consecutive same-role lines into a single line with ``\\n\\n`` joiner."""
+    out: list[tuple[str, str]] = []
+    for line in text.split("\n"):
+        role, sep, body = line.partition("\t")
+        if not sep:
+            continue
+        if out and out[-1][0] == role:
+            prev_role, prev_body = out[-1]
+            out[-1] = (prev_role, prev_body + "\n\n" + body)
+        else:
+            out.append((role, body))
+    return "\n".join(f"{r}\t{b}" for r, b in out)
+
+
+def opencode_format_exchange(text: str) -> str:
+    """Reformat role-prefixed lines as ``convo_miner`` exchange-pair markdown.
+
+    ``user`` lines become ``> <body>``; ``assistant`` lines become the body
+    on its own paragraph. Pairs are separated by blank lines. The output of
+    this is what ``mempalace.convo_miner.chunk_exchanges`` recognises as an
+    exchange transcript.
+    """
+    blocks: list[str] = []
+    for line in text.split("\n"):
+        role, sep, body = line.partition("\t")
+        if not sep:
+            continue
+        body = body.strip()
+        if not body:
+            continue
+        if role == "user":
+            quoted = "\n".join(f"> {ln}" for ln in body.split("\n"))
+            blocks.append(quoted)
+        else:
+            blocks.append(body)
+    return "\n\n".join(blocks)
 
 
 # ---------------------------------------------------------------------------

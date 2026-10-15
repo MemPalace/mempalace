@@ -1352,6 +1352,7 @@ def test_no_internal_coordination_jargon_in_source_or_tests():
         "mempalace/knowledge_graph.py",
         "mempalace/i18n/",
         "tests/test_sources.py",
+        "tests/test_sources_opencode.py",
         "tests/test_i18n_lang_case.py",
     )
     # Allowlist for self-reference: this test file mentions the leak
