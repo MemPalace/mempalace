@@ -1495,3 +1495,40 @@ def test_init_writes_xdg_aware_palace_path(tmp_path):
     with open(tmp_path / "config.json") as f:
         written = json.load(f)
     assert written["palace_path"] == str(tmp_path / "palace")
+
+
+def test_qdrant_api_key_from_file(tmp_path, monkeypatch):
+    key_file = tmp_path / "qdrant_key"
+    key_file.write_text("file-key\n", encoding="utf-8")
+    monkeypatch.delenv("MEMPALACE_QDRANT_API_KEY", raising=False)
+    monkeypatch.setenv("MEMPALACE_QDRANT_API_KEY_FILE", str(key_file))
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    assert cfg.qdrant_api_key == "file-key"
+
+
+def test_qdrant_api_key_and_key_file_together_are_refused(tmp_path, monkeypatch):
+    key_file = tmp_path / "qdrant_key"
+    key_file.write_text("file-key", encoding="utf-8")
+    monkeypatch.setenv("MEMPALACE_QDRANT_API_KEY", "env-key")
+    monkeypatch.setenv("MEMPALACE_QDRANT_API_KEY_FILE", str(key_file))
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    with pytest.raises(ValueError, match="MEMPALACE_QDRANT_API_KEY_FILE"):
+        cfg.qdrant_api_key
+
+
+def test_search_fingerprint_records_a_bad_qdrant_key_file(tmp_path, monkeypatch):
+    # The fingerprint must not crash the CLI before the direct-path fallback,
+    # and the bad setting must still change it (recorded as a config error).
+    monkeypatch.setenv("MEMPALACE_BACKEND", "qdrant")
+    monkeypatch.delenv("MEMPALACE_QDRANT_API_KEY", raising=False)
+    monkeypatch.delenv("MEMPALACE_QDRANT_API_KEY_FILE", raising=False)
+    clean = MempalaceConfig(config_dir=str(tmp_path)).search_config_fingerprint
+
+    monkeypatch.setenv("MEMPALACE_QDRANT_API_KEY_FILE", str(tmp_path / "missing"))
+    bad = MempalaceConfig(config_dir=str(tmp_path)).search_config_fingerprint
+
+    assert bad and bad != clean
