@@ -315,6 +315,80 @@ def test_enforcement_model_swap_raises(tmp_path, monkeypatch, clear_identity_cac
         P.get_collection(str(tmp_path), collection_name="mempalace_drawers", create=False)
 
 
+def test_enforcement_fp16_variant_rejects_legacy_q8_palace(
+    tmp_path, monkeypatch, clear_identity_cache
+):
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "embeddinggemma")
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", "fp16")
+    from mempalace import palace as P
+
+    _seed_sqlite_with_identity(tmp_path, "embeddinggemma")
+    P._VALIDATED_IDENTITY.clear()
+
+    with pytest.raises(EmbedderIdentityMismatchError):
+        P.get_collection(str(tmp_path), collection_name="mempalace_drawers", create=False)
+
+
+def test_default_q8_variant_keeps_legacy_embeddinggemma_identity(monkeypatch):
+    """Characterize the pre-variant identity so existing palaces still open."""
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "embeddinggemma")
+    monkeypatch.delenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", raising=False)
+    from mempalace.embedding import current_model_name
+
+    assert current_model_name() == "embeddinggemma"
+
+
+@pytest.mark.parametrize(
+    ("model", "variant", "matches"),
+    [("embeddinggemma", "fp16", True), ("embeddinggemma", "q8", False), ("minilm", "q8", False)],
+)
+def test_recorded_fp16_palace_only_opens_with_fp16(
+    tmp_path, monkeypatch, clear_identity_cache, model, variant, matches
+):
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", model)
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", variant)
+    from mempalace import palace as P
+
+    _seed_sqlite_with_identity(tmp_path, "embeddinggemma:fp16")
+    if matches:
+        collection = P.get_collection(str(tmp_path), create=False)
+        assert collection.get_stored_embedder_identity().model_name == "embeddinggemma:fp16"
+    else:
+        with pytest.raises(EmbedderIdentityMismatchError):
+            P.get_collection(str(tmp_path), create=False)
+
+
+@pytest.mark.parametrize("create", [False, True], ids=["read", "write"])
+def test_fp16_refuses_populated_palace_without_recorded_identity(
+    tmp_path, monkeypatch, clear_identity_cache, create
+):
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "embeddinggemma")
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", "fp16")
+    from mempalace import palace as P
+
+    _seed_sqlite_with_identity(tmp_path, None)
+    with pytest.raises(EmbedderIdentityMismatchError, match="Rebuild.*FP16"):
+        P.get_collection(str(tmp_path), create=create)
+    collection = _sqlite_collection(tmp_path)
+    assert collection.count() == 1
+    assert collection.get_stored_embedder_identity() is None
+
+
+def test_set_recorded_fp16_identity_does_not_require_force_for_same_variant(
+    tmp_path, monkeypatch, clear_identity_cache
+):
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "minilm")
+    from mempalace import palace as P
+
+    _seed_sqlite_with_identity(tmp_path, "embeddinggemma:fp16")
+    old, new = P.set_palace_embedder_identity(str(tmp_path), model="embeddinggemma:fp16")
+    assert old.model_name == new.model_name == "embeddinggemma:fp16"
+
+
 def test_enforcement_brand_new_records_current_model(tmp_path, monkeypatch, clear_identity_cache):
     monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
     monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "minilm")
@@ -387,6 +461,34 @@ def test_set_palace_identity_override_requires_force(tmp_path, monkeypatch, clea
     assert old.model_name == "minilm" and new.model_name == "embeddinggemma"
 
 
+def test_set_palace_identity_canonicalizes_explicit_embeddinggemma_q8(
+    tmp_path, monkeypatch, clear_identity_cache
+):
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "minilm")
+    from mempalace import palace as P
+
+    old, new = P.set_palace_embedder_identity(str(tmp_path), model="embeddinggemma:q8", force=True)
+
+    assert old is None
+    assert new.model_name == "embeddinggemma"
+    stored = _sqlite_collection(tmp_path).get_stored_embedder_identity()
+    assert stored is not None and stored.model_name == "embeddinggemma"
+
+
+def test_set_palace_identity_rejects_unknown_embeddinggemma_variant(
+    tmp_path, monkeypatch, clear_identity_cache
+):
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "minilm")
+    from mempalace import palace as P
+
+    with pytest.raises(ValueError, match="EmbeddingGemma identity variant.*fp16.*q8"):
+        P.set_palace_embedder_identity(str(tmp_path), model="embeddinggemma:fp32", force=True)
+
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_set_palace_identity_empty_target_raises(tmp_path, monkeypatch):
     # No model given and none configured: recording is a no-op in every backend,
     # so refuse rather than claim a phantom success.
@@ -395,6 +497,40 @@ def test_set_palace_identity_empty_target_raises(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError):
         P.set_palace_embedder_identity(str(tmp_path), model=None)
+
+
+@pytest.mark.parametrize("local_model", ["embeddinggemma", "embeddinggemma2"])
+def test_server_embedder_override_ignores_invalid_local_precision_settings(
+    tmp_path, monkeypatch, local_model
+):
+    from types import SimpleNamespace
+
+    from mempalace import palace as P
+
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", local_model)
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", "fp32")
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA2_REVISION", "invalid-revision")
+
+    class ServerCollection:
+        stored = None
+
+        def effective_embedder_identity(self):
+            return EmbedderIdentity("server-custom", 768)
+
+        def get_stored_embedder_identity(self):
+            return self.stored
+
+        def set_embedder_identity(self, identity):
+            self.stored = identity
+
+    collection = ServerCollection()
+    backend = SimpleNamespace(capabilities=frozenset({"server_embedder"}))
+    monkeypatch.setattr(P, "get_backend_for_palace", lambda *_a, **_kw: backend)
+    monkeypatch.setattr(P, "get_collection", lambda *_a, **_kw: collection)
+    old, new = P.set_palace_embedder_identity(str(tmp_path), model="server-custom")
+    assert old is None
+    assert new == EmbedderIdentity("server-custom", 0)
+    assert collection.stored == new
 
 
 def test_enforcement_prefers_effective_identity(monkeypatch, clear_identity_cache):

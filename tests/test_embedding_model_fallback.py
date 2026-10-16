@@ -341,6 +341,26 @@ def test_rebuild_with_a_near_miss_refuses_before_archiving(unknown_model_palace)
     assert _recorded_identity(palace)["mempalace_drawers"]["model_name"] == "minilm"
 
 
+@pytest.mark.parametrize("unknown_model_palace", ["minilm"], indirect=True)
+def test_rebuild_with_invalid_embeddinggemma_variant_refuses_before_archiving(
+    unknown_model_palace, monkeypatch
+):
+    from mempalace.miner import mine
+    from mempalace.repair import rebuild_from_sqlite
+
+    project, palace, config = unknown_model_palace
+    mine(str(project), str(palace))
+    before = sorted(p.name for p in palace.parent.iterdir())
+    _set_model(config, palace, "embeddinggemma")
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", "fp32")
+
+    with pytest.raises(ValueError, match="embeddinggemma_variant"):
+        rebuild_from_sqlite(str(palace), str(palace), archive_existing_dest=True)
+    assert sorted(p.name for p in palace.parent.iterdir()) == before
+    assert (palace / "chroma.sqlite3").is_file()
+    assert _recorded_identity(palace)["mempalace_drawers"]["model_name"] == "minilm"
+
+
 def _search_warnings(query, palace):
     import warnings
 

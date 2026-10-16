@@ -193,6 +193,12 @@ def _enforce_embedder_identity(
                 except Exception:
                     logger.debug("embedder-identity record failed", exc_info=True)
         elif has_rows:
+            if core_embedder and model_name == "embeddinggemma:fp16":
+                raise EmbedderIdentityMismatchError(
+                    f"collection {collection_name!r} has vectors but no recorded embedding identity; "
+                    "the vectors may come from a different EmbeddingGemma variant. "
+                    "Rebuild the index before using it with EmbeddingGemma FP16."
+                )
             if model_name.startswith("embeddinggemma2:"):
                 raise EmbedderIdentityMismatchError(
                     f"collection {collection_name!r} has vectors but no recorded embedding identity; "
@@ -431,12 +437,14 @@ def set_palace_embedder_identity(
     from ..embedding import (
         _normalize_stored_model_name,
         _resolve_embedding_model,
+        canonical_model_name,
         current_model_name,
         get_embedder_identity,
         get_embedding_function,
     )
 
-    configured = MempalaceConfig().embedding_model
+    server_embedder = _backend_has_server_embedder(palace_path, backend)
+    configured = MempalaceConfig().embedding_model if server_embedder else current_model_name()
     requested = (model or "").strip().lower()
     target = requested or (configured or "").strip().lower()
     if not target:
@@ -445,11 +453,14 @@ def set_palace_embedder_identity(
         raise ValueError(
             "no embedder model to record: pass --model NAME or configure MEMPALACE_EMBEDDING_MODEL"
         )
-    if requested and not _backend_has_server_embedder(palace_path, backend):
+    if requested and not server_embedder:
         # Refuse a misspelled --model (UnknownEmbeddingModelError) before the
         # open below can create the palace folder, chroma.sqlite3 or a
         # collection. A server embedder's names are its own and skip this.
-        _resolve_embedding_model(requested)
+        if requested.startswith("embeddinggemma:"):
+            canonical_model_name(requested)
+        else:
+            _resolve_embedding_model(requested)
     collection = get_collection(
         palace_path,
         collection_name=collection_name,
@@ -462,7 +473,11 @@ def set_palace_embedder_identity(
         # Record the model the name embeds with, as the factory resolves it:
         # `--model all-minilm-l6-v2` is minilm. A server embedder's names are
         # its own and are recorded as given.
-        target = _resolve_embedding_model(requested)
+        target = (
+            canonical_model_name(requested)
+            if requested.startswith("embeddinggemma:")
+            else _resolve_embedding_model(requested)
+        )
     if target == (configured or "").strip().lower():
         # Recording the in-use model — probe its dimension (already loaded).
         new = get_embedder_identity()

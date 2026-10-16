@@ -14,7 +14,7 @@ def cmd_palace_set_embedder(args):
     """
     from ..backends.base import EmbedderIdentityMismatchError, EmbedderIdentityRecordError
     from ..embedding import UnknownEmbeddingModelError
-    from ..palace import set_palace_embedder_identity
+    from ..palace import _backend_has_server_embedder, set_palace_embedder_identity
 
     config = MempalaceConfig()
     palace_path = os.path.abspath(
@@ -46,14 +46,31 @@ def cmd_palace_set_embedder(args):
             f"  ✓ embedder identity changed: {old.model_name} → {new.model_name} "
             f"(dim={new.dimension})"
         )
+    if _backend_has_server_embedder(palace_path, _backend_arg(args)):
+        # Server-side model names and settings are owned by the backend.
+        return
     # set-embedder records the palace's identity; it does not change the
     # configured model. If they differ, the next normal open would mismatch —
     # tell the user how to align them.
-    configured = config.embedding_model
+    from ..embedding import current_model_name
+
+    configured = current_model_name()
     if new.model_name and configured and new.model_name != configured:
+        if new.model_name.startswith("embeddinggemma:"):
+            _, variant = new.model_name.split(":", 1)
+            settings = (
+                "MEMPALACE_EMBEDDING_MODEL=embeddinggemma and "
+                f"MEMPALACE_EMBEDDINGGEMMA_VARIANT={variant}"
+            )
+        elif new.model_name == "embeddinggemma":
+            settings = (
+                "MEMPALACE_EMBEDDING_MODEL=embeddinggemma and MEMPALACE_EMBEDDINGGEMMA_VARIANT=q8"
+            )
+        else:
+            settings = f"MEMPALACE_EMBEDDING_MODEL={new.model_name}"
         print(
-            f"  ⚠ configured model is {configured!r}; set MEMPALACE_EMBEDDING_MODEL="
-            f"{new.model_name} (or run onboarding) so normal opens of this palace match."
+            f"  ⚠ configured model is {configured!r}; set {settings} (or run onboarding) "
+            "so normal opens of this palace match."
         )
 
 
