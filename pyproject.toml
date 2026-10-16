@@ -256,11 +256,26 @@ filterwarnings = [
 
 [tool.coverage.run]
 source = ["mempalace"]
+# pymilvus ships in the milvus extra, not in dev. Counting this module in the
+# default total (it sits near 20% without the extra) pulls the package gate
+# under its threshold. The test-milvus job measures it instead.
+omit = [
+    "*/mempalace/backends/milvus.py",
+]
 
 [tool.coverage.report]
 fail_under = 85
+# Match the two decimals pytest-cov prints. Precision 0 would round 84.59 up
+# to 85 and the gate would pass.
+precision = 2
 show_missing = true
 exclude_lines = [
     "if __name__",
     "pragma: no cover",
 ]
+
+[tool.mempalace.coverage]
+# Windows gate (ChromaDB file-lock cleanup). tests/coverage_gate.py applies
+# this over fail_under when sys.platform == "win32". Local pytest and CI both
+# read it; neither passes --cov-fail-under.
+fail_under_windows = 80

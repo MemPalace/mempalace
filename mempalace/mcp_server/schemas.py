@@ -1125,29 +1125,15 @@ TOOLS = {
     },
 }
 
-# MCP ToolAnnotations.readOnlyHint for clients that hide mutating tools
-# (plan modes, read-only subagents). Only tools that do not change state
-# belong here. Server --read-only uses the wider _READ_ONLY_REFUSED_TOOLS
-# set: mempalace_memories_filed_away unlinks the checkpoint ack file, so it
-# stays refused there and must not advertise readOnlyHint (MCP default is
-# false when the annotation is omitted).
-for _read_only_name in (
-    "mempalace_status",
-    "mempalace_list_wings",
-    "mempalace_list_rooms",
-    "mempalace_get_taxonomy",
-    "mempalace_get_aaak_spec",
-    "mempalace_search",
-    "mempalace_check_duplicate",
-    "mempalace_get_drawer",
-    "mempalace_get_drawers",
-    "mempalace_list_drawers",
-    "mempalace_diary_read",
-    "mempalace_kg_query",
-    "mempalace_kg_timeline",
-    "mempalace_kg_stats",
-):
-    TOOLS[_read_only_name]["read_only"] = True
+
+# Read/write class and gate flags live in mempalace.tool_capabilities, which the
+# daemon and CLI import without this package. Every tool needs a row there.
+if set(TOOLS) != set(_tool_capabilities.TOOL_CAPABILITIES):
+    raise RuntimeError(
+        "mempalace.tool_capabilities does not match TOOLS: "
+        f"missing={sorted(set(TOOLS) - set(_tool_capabilities.TOOL_CAPABILITIES))} "
+        f"extra={sorted(set(_tool_capabilities.TOOL_CAPABILITIES) - set(TOOLS))}"
+    )
 
 
 SUPPORTED_PROTOCOL_VERSIONS = [

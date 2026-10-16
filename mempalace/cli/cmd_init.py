@@ -75,28 +75,29 @@ def cmd_init(args):
                     # shell env). Explicit --llm-api-key (api_key_source ==
                     # "flag") means the user already opted in.
                     # --accept-external-llm bypasses for CI / non-interactive.
+                    from ..llm_client import require_external_consent
+
                     api_key_source = getattr(candidate, "api_key_source", None)
                     accept_flag = getattr(args, "accept_external_llm", False)
                     if api_key_source == "env" and not accept_flag:
-                        try:
-                            answer = (
-                                input(
-                                    "  Your API key was loaded from the environment "
-                                    "(not passed via --llm-api-key). Continue with "
-                                    "external LLM? [y/N] "
-                                )
-                                .strip()
-                                .lower()
-                            )
-                        except EOFError:
-                            answer = ""
-                        if answer != "y":
+                        allowed = require_external_consent(
+                            candidate,
+                            interactive=True,
+                            prompt=(
+                                "  Your API key was loaded from the environment "
+                                "(not passed via --llm-api-key). Continue with "
+                                "external LLM? [y/N] "
+                            ),
+                        )
+                        if not allowed:
                             print(
                                 "  Declined — falling back to heuristics-only. "
                                 "Pass --llm-api-key explicitly or "
                                 "--accept-external-llm to skip this prompt."
                             )
                             llm_provider = None
+                    else:
+                        require_external_consent(candidate, accept=True)
             else:
                 print(
                     f"  No LLM provider reachable ({msg}). "

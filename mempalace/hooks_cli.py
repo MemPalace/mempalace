@@ -26,6 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from mempalace._proc import pid_alive as _pid_alive
 from mempalace.config import MempalaceConfig
 from mempalace.write_routing import (
     ResolvedWriteRoutingPolicy,
@@ -364,39 +365,6 @@ def _pid_file_for_cmd(cmd: list[str]) -> Path:
         key = " ".join(cmd)
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
     return _MINE_PID_DIR / f"mine_{digest}.pid"
-
-
-def _pid_alive(pid: int) -> bool:
-    """Cross-platform existence check for a PID.
-
-    On POSIX, ``os.kill(pid, 0)`` is the well-known no-op existence probe.
-    On Windows, ``os.kill`` maps to ``TerminateProcess(handle, sig)`` and
-    would *terminate* the target process with exit code ``sig`` — using
-    it here would kill our own mine child (or worse, the caller itself).
-    Use ``OpenProcess`` + ``GetExitCodeProcess`` via ctypes instead.
-    """
-    if sys.platform == "win32":
-        import ctypes
-        from ctypes import wintypes
-
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        STILL_ACTIVE = 259
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return False
-        try:
-            code = wintypes.DWORD()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                return False
-            return code.value == STILL_ACTIVE
-        finally:
-            kernel32.CloseHandle(handle)
-    try:
-        os.kill(pid, 0)
-        return True
-    except (OSError, ValueError):
-        return False
 
 
 def _mine_already_running(cmd: list[str]) -> bool:

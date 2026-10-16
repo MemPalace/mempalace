@@ -46,6 +46,11 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 _DB_FILENAME = "sqlite_exact.sqlite3"
+# Compared by immutable readers. A leaf commit does not change the SQLite
+# header fields those readers already probe, and the filesystem clock can
+# stamp the checkpoint with the same mtime as the previous one.
+_WRITE_GENERATION_KEY = "write_generation"
+_WRITE_GENERATION_SQL = "SELECT value FROM meta WHERE key = ?"
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 _SUPPORTED_OPERATORS = frozenset(
     {"$eq", "$ne", "$in", "$nin", "$and", "$or", "$contains", "$gt", "$gte", "$lt", "$lte"}
@@ -54,6 +59,18 @@ _SUPPORTED_OPERATORS = frozenset(
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _bump_write_generation(executor) -> None:
+    """Advance the immutable-reader generation inside the open write transaction."""
+    executor.execute(
+        """
+        INSERT INTO meta(key, value) VALUES (?, '1')
+        ON CONFLICT(key) DO UPDATE SET
+            value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+        """,
+        (_WRITE_GENERATION_KEY,),
+    )
 
 
 def _json_dumps(obj: Any) -> str:
@@ -602,6 +619,10 @@ class SQLiteExactCollection(BaseCollection):
                 self._handle.conn.rollback()
                 raise
             else:
+                # No-op write cursors never start a transaction. Bumping them
+                # would drop a warm immutable snapshot that still matches disk.
+                if write and self._handle.conn.in_transaction:
+                    _bump_write_generation(cur)
                 self._handle.conn.commit()
                 if write:
                     self._handle._vector_cache.clear()
@@ -689,17 +710,44 @@ class SQLiteExactCollection(BaseCollection):
                 (self._embedder_meta_key(), str(identity.model_name)),
             )
 
-    def _replace_fts(self, cur, collection_id: int, doc_id: str, document: str) -> None:
-        if not self._fts_available(cur):
+    def _replace_fts(
+        self,
+        cur,
+        collection_id: int,
+        doc_id: str,
+        document: str,
+        *,
+        doc_rowid: Optional[int] = None,
+        existed: bool = True,
+        fts_enabled: Optional[bool] = None,
+    ) -> None:
+        if fts_enabled is None:
+            fts_enabled = self._fts_available(cur)
+        if not fts_enabled:
             return
-        cur.execute(
-            "DELETE FROM docs_fts WHERE collection_id = ? AND doc_id = ?",
-            (collection_id, doc_id),
-        )
-        cur.execute(
-            "INSERT INTO docs_fts(collection_id, doc_id, document) VALUES (?, ?, ?)",
-            (collection_id, doc_id, document),
-        )
+        if doc_rowid is None:
+            row = cur.execute(
+                "SELECT rowid FROM documents WHERE collection_id = ? AND id = ?",
+                (collection_id, doc_id),
+            ).fetchone()
+            if row is not None:
+                doc_rowid = int(row[0])
+        if doc_rowid is not None:
+            if existed:
+                cur.execute("DELETE FROM docs_fts WHERE rowid = ?", (doc_rowid,))
+            cur.execute(
+                "INSERT INTO docs_fts(rowid, collection_id, doc_id, document) VALUES (?, ?, ?, ?)",
+                (doc_rowid, collection_id, doc_id, document),
+            )
+        else:
+            cur.execute(
+                "DELETE FROM docs_fts WHERE collection_id = ? AND doc_id = ?",
+                (collection_id, doc_id),
+            )
+            cur.execute(
+                "INSERT INTO docs_fts(collection_id, doc_id, document) VALUES (?, ?, ?)",
+                (collection_id, doc_id, document),
+            )
 
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
         _validate_write_batch(
@@ -719,6 +767,7 @@ class SQLiteExactCollection(BaseCollection):
                 arr = _as_vector_array(emb)
                 prepared.append((doc_id, doc, meta, arr.tobytes(), int(arr.size)))
             self._ensure_collection_dimension(cur, collection_id, [item[4] for item in prepared])
+            fts_enabled = self._fts_available(cur)
             for doc_id, doc, meta, emb_blob, dim in prepared:
                 cur.execute(
                     """
@@ -737,7 +786,15 @@ class SQLiteExactCollection(BaseCollection):
                         now,
                     ),
                 )
-                self._replace_fts(cur, collection_id, doc_id, doc)
+                self._replace_fts(
+                    cur,
+                    collection_id,
+                    doc_id,
+                    doc,
+                    doc_rowid=int(cur.lastrowid),
+                    existed=False,
+                    fts_enabled=fts_enabled,
+                )
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
         _validate_write_batch(
@@ -757,31 +814,65 @@ class SQLiteExactCollection(BaseCollection):
                 arr = _as_vector_array(emb)
                 prepared.append((doc_id, doc, meta, arr.tobytes(), int(arr.size)))
             self._ensure_collection_dimension(cur, collection_id, [item[4] for item in prepared])
+            fts_enabled = self._fts_available(cur)
             for doc_id, doc, meta, emb_blob, dim in prepared:
-                cur.execute(
-                    """
-                    INSERT INTO documents
-                        (collection_id, id, document, metadata_json, embedding, dim, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(collection_id, id) DO UPDATE SET
-                        document = excluded.document,
-                        metadata_json = excluded.metadata_json,
-                        embedding = excluded.embedding,
-                        dim = excluded.dim,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
+                existing = cur.execute(
+                    "SELECT rowid FROM documents WHERE collection_id = ? AND id = ?",
+                    (collection_id, doc_id),
+                ).fetchone()
+                if existing is None:
+                    cur.execute(
+                        """
+                        INSERT INTO documents
+                            (collection_id, id, document, metadata_json, embedding, dim, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            collection_id,
+                            doc_id,
+                            doc,
+                            _json_dumps(meta),
+                            emb_blob,
+                            dim,
+                            now,
+                            now,
+                        ),
+                    )
+                    self._replace_fts(
+                        cur,
                         collection_id,
                         doc_id,
                         doc,
-                        _json_dumps(meta),
-                        emb_blob,
-                        dim,
-                        now,
-                        now,
-                    ),
-                )
-                self._replace_fts(cur, collection_id, doc_id, doc)
+                        doc_rowid=int(cur.lastrowid),
+                        existed=False,
+                        fts_enabled=fts_enabled,
+                    )
+                else:
+                    doc_rowid = int(existing[0])
+                    cur.execute(
+                        """
+                        UPDATE documents
+                        SET document = ?, metadata_json = ?, embedding = ?, dim = ?, updated_at = ?
+                        WHERE rowid = ?
+                        """,
+                        (
+                            doc,
+                            _json_dumps(meta),
+                            emb_blob,
+                            dim,
+                            now,
+                            doc_rowid,
+                        ),
+                    )
+                    self._replace_fts(
+                        cur,
+                        collection_id,
+                        doc_id,
+                        doc,
+                        doc_rowid=doc_rowid,
+                        existed=True,
+                        fts_enabled=fts_enabled,
+                    )
 
     def update(self, *, ids, documents=None, metadatas=None, embeddings=None):
         if documents is None and metadatas is None and embeddings is None:
@@ -823,7 +914,7 @@ class SQLiteExactCollection(BaseCollection):
             for idx, doc_id in enumerate(ids):
                 row = cur.execute(
                     """
-                    SELECT document, metadata_json, embedding, dim
+                    SELECT rowid, document, metadata_json, embedding, dim
                     FROM documents
                     WHERE collection_id = ? AND id = ?
                     """,
@@ -831,8 +922,9 @@ class SQLiteExactCollection(BaseCollection):
                 ).fetchone()
                 if row is None:
                     continue
-                doc = documents[idx] if documents is not None else row[0]
-                meta = _json_loads(row[1])
+                doc_rowid = int(row[0])
+                doc = documents[idx] if documents is not None else row[1]
+                meta = _json_loads(row[2])
                 if metadatas is not None:
                     meta.update(metadatas[idx] or {})
                 if embeddings is not None:
@@ -840,22 +932,31 @@ class SQLiteExactCollection(BaseCollection):
                     emb_blob = arr.tobytes()
                     dim = int(arr.size)
                 else:
-                    emb_blob = row[2]
-                    dim = row[3]
-                updates.append((doc_id, doc, meta, emb_blob, dim))
+                    emb_blob = row[3]
+                    dim = row[4]
+                updates.append((doc_rowid, doc_id, doc, meta, emb_blob, dim))
             if embeddings is not None:
-                self._ensure_collection_dimension(cur, collection_id, [item[4] for item in updates])
-            for doc_id, doc, meta, emb_blob, dim in updates:
+                self._ensure_collection_dimension(cur, collection_id, [item[5] for item in updates])
+            fts_enabled = self._fts_available(cur) if documents is not None else False
+            for doc_rowid, doc_id, doc, meta, emb_blob, dim in updates:
                 cur.execute(
                     """
                     UPDATE documents
                     SET document = ?, metadata_json = ?, embedding = ?, dim = ?, updated_at = ?
-                    WHERE collection_id = ? AND id = ?
+                    WHERE rowid = ?
                     """,
-                    (doc, _json_dumps(meta), emb_blob, dim, _utcnow(), collection_id, doc_id),
+                    (doc, _json_dumps(meta), emb_blob, dim, _utcnow(), doc_rowid),
                 )
                 if documents is not None:
-                    self._replace_fts(cur, collection_id, doc_id, doc)
+                    self._replace_fts(
+                        cur,
+                        collection_id,
+                        doc_id,
+                        doc,
+                        doc_rowid=doc_rowid,
+                        existed=True,
+                        fts_enabled=fts_enabled,
+                    )
 
     def _rows(
         self,
@@ -1317,15 +1418,30 @@ class SQLiteExactCollection(BaseCollection):
             if ids is None:
                 rows = self._rows(cur, where=where)
                 ids = [row["id"] for row in rows]
-            for doc_id in ids or []:
+            target_ids = list(ids or [])
+            if not target_ids:
+                return
+            fts_enabled = self._fts_available(cur)
+            rowids: list[int] = []
+            for start in range(0, len(target_ids), 900):
+                chunk = target_ids[start : start + 900]
+                placeholders = ",".join("?" for _ in chunk)
+                found = cur.execute(
+                    f"SELECT rowid FROM documents WHERE collection_id = ? AND id IN ({placeholders})",
+                    (collection_id, *chunk),
+                ).fetchall()
+                rowids.extend(int(r[0]) for r in found)
+            for start in range(0, len(rowids), 900):
+                chunk = rowids[start : start + 900]
+                placeholders = ",".join("?" for _ in chunk)
                 cur.execute(
-                    "DELETE FROM documents WHERE collection_id = ? AND id = ?",
-                    (collection_id, doc_id),
+                    f"DELETE FROM documents WHERE rowid IN ({placeholders})",
+                    chunk,
                 )
-                if self._fts_available(cur):
+                if fts_enabled:
                     cur.execute(
-                        "DELETE FROM docs_fts WHERE collection_id = ? AND doc_id = ?",
-                        (collection_id, doc_id),
+                        f"DELETE FROM docs_fts WHERE rowid IN ({placeholders})",
+                        chunk,
                     )
 
     def count(self) -> int:
@@ -1566,10 +1682,11 @@ class SQLiteExactBackend(BaseBackend):
         """Detect completed writer/checkpoint cycles, even with unchanged size.
 
         Stat identity and times detect replacement and updates between
-        checkpoints; the header fields SQLite exposes through pragmas
-        (schema cookie, page count, freelist count, user version, application
-        id) cover the page-1 changes a checkpoint can land without touching the
-        size. Never return a cached snapshot after a failed filesystem read.
+        checkpoints. The header pragmas cover page-1 changes. A leaf commit
+        changes neither, and the filesystem clock can reuse ``st_mtime_ns``,
+        so the header tuple ends with ``meta.write_generation``, advanced on
+        each write transaction. Never return a cached snapshot after a failed
+        filesystem read.
 
         The header is read through a throwaway ``immutable=1`` connection, not
         a plain ``open()``: closing a non-SQLite descriptor on the database
@@ -1578,7 +1695,10 @@ class SQLiteExactBackend(BaseBackend):
         :mod:`mempalace.backends._magic`.
         """
         stat = os.stat(db_path)
-        header = read_header_fields(db_path)
+        header = read_header_fields(
+            db_path,
+            extra=(_WRITE_GENERATION_SQL, (_WRITE_GENERATION_KEY,)),
+        )
         return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, header)
 
     @staticmethod
@@ -1770,6 +1890,7 @@ class SQLiteExactBackend(BaseBackend):
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """
             )
+            self._ensure_fts_rowid_sync(conn)
         except sqlite3.OperationalError:
             conn.execute(
                 """
@@ -1779,6 +1900,67 @@ class SQLiteExactBackend(BaseBackend):
                 """
             )
         conn.commit()
+
+    @staticmethod
+    def _ensure_fts_rowid_sync(conn: sqlite3.Connection) -> None:
+        """Ensure ``docs_fts.rowid`` matches ``documents.rowid`` for O(log N) updates.
+
+        Prior to v3.11.1, ``_replace_fts`` inserted into ``docs_fts`` without an
+        explicit ``rowid`` and deleted by ``UNINDEXED`` ``(collection_id, doc_id)``
+        columns, causing a full-table FTS5 scan on every write. Synchronizing
+        ``docs_fts.rowid = documents.rowid`` allows ``DELETE FROM docs_fts WHERE
+        rowid = ?`` to use the FTS5 B-tree primary key directly.
+        """
+        synced = conn.execute("SELECT value FROM meta WHERE key = 'fts5_rowid_synced'").fetchone()
+        if synced is not None and synced[0] == "1":
+            return
+        doc_count = int(conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
+        if doc_count > 0:
+            fts_count = int(conn.execute("SELECT COUNT(*) FROM docs_fts").fetchone()[0])
+            mismatch = doc_count != fts_count
+            if not mismatch:
+                mismatch_row = conn.execute(
+                    """
+                    SELECT 1
+                    FROM documents d
+                    LEFT JOIN docs_fts f ON f.rowid = d.rowid
+                    WHERE f.rowid IS NULL
+                       OR CAST(f.collection_id AS INTEGER) != d.collection_id
+                       OR f.doc_id != d.id
+                    LIMIT 1
+                    """
+                ).fetchone()
+                mismatch = mismatch_row is not None
+            if mismatch:
+                conn.execute(
+                    """
+                    DELETE FROM docs_fts
+                    WHERE rowid IN (
+                        SELECT f.rowid
+                        FROM docs_fts f
+                        LEFT JOIN documents d ON d.rowid = f.rowid
+                        WHERE d.rowid IS NULL
+                           OR CAST(f.collection_id AS INTEGER) != d.collection_id
+                           OR f.doc_id != d.id
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO docs_fts(rowid, collection_id, doc_id, document)
+                    SELECT d.rowid, d.collection_id, d.id, d.document
+                    FROM documents d
+                    LEFT JOIN docs_fts f ON f.rowid = d.rowid
+                    WHERE f.rowid IS NULL
+                    """
+                )
+        conn.execute(
+            """
+            INSERT INTO meta(key, value)
+            VALUES ('fts5_rowid_synced', '1')
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """
+        )
 
     @staticmethod
     def _ensure_locus_columns(conn: sqlite3.Connection) -> None:
@@ -1846,6 +2028,7 @@ class SQLiteExactBackend(BaseBackend):
                         "INSERT INTO collections(name, created_at) VALUES (?, ?)",
                         (collection_name, _utcnow()),
                     )
+                    _bump_write_generation(handle.conn)
                     handle.conn.commit()
         return SQLiteExactCollection(handle, collection_name, backend=self)
 
@@ -1974,15 +2157,21 @@ class SQLiteExactBackend(BaseBackend):
             if row is None:
                 raise CollectionNotInitializedError(collection_name)
             collection_id = int(row[0])
-            handle.conn.execute("DELETE FROM documents WHERE collection_id = ?", (collection_id,))
             try:
                 handle.conn.execute(
-                    "DELETE FROM docs_fts WHERE collection_id = ?",
+                    """
+                    DELETE FROM docs_fts
+                    WHERE rowid IN (
+                        SELECT rowid FROM documents WHERE collection_id = ?
+                    )
+                    """,
                     (collection_id,),
                 )
             except sqlite3.OperationalError:
                 pass
+            handle.conn.execute("DELETE FROM documents WHERE collection_id = ?", (collection_id,))
             handle.conn.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
+            _bump_write_generation(handle.conn)
             handle.conn.commit()
 
 

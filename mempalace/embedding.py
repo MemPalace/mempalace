@@ -761,6 +761,24 @@ _EF_API_BATCH = 64
 _EF_API_TIMEOUT = 120
 
 
+_external_embedding_warned = False
+
+
+def _warn_if_external_embedding(url: str) -> None:
+    """Warn once when an embedding URL would send document text off-machine."""
+    global _external_embedding_warned
+    from mempalace.llm_client import endpoint_is_local
+
+    if not url or endpoint_is_local(url) or _external_embedding_warned:
+        return
+    _external_embedding_warned = True
+    logger.warning(
+        "Embedding endpoint %s is outside the local network. "
+        "Document text sent there leaves this machine.",
+        url,
+    )
+
+
 class EmbeddingAPIError(RuntimeError):
     """Raised when the embedding API is unreachable or returns an invalid body.
 
@@ -791,20 +809,14 @@ class OpenAICompatEmbeddingFunction:
         self._url = self._resolve_url(base_url)
         self._model = model
         self._api_key = api_key
+        _warn_if_external_embedding(base_url)
 
     @staticmethod
     def _resolve_url(base_url: str) -> str:
-        """Accept a base host, a ``/v1`` base, or a full endpoint URL.
+        """Accept a base host, a ``/v1`` base, or a full endpoint URL."""
+        from mempalace.llm_client import resolve_openai_url
 
-        Mirrors ``llm_client.OpenAICompatProvider._resolve_url`` so both sides
-        treat an ``http://host:port`` endpoint the same way.
-        """
-        url = base_url.rstrip("/")
-        if url.endswith("/embeddings"):
-            return url
-        if url.endswith("/v1"):
-            return f"{url}/embeddings"
-        return f"{url}/v1/embeddings"
+        return resolve_openai_url(base_url, "embeddings")
 
     def name(self) -> str:
         # Encode the model so switching it changes the persisted EF identity

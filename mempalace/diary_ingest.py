@@ -211,10 +211,9 @@ def ingest_diaries(
 
             # Per-entry drawers, with character chunking inside any entry
             # whose serialized text exceeds chunk_size. ``chunk_index`` is
-            # a global counter across the file so the searcher's
-            # ``_expand_with_neighbors`` (which queries by source_file +
-            # chunk_index) can stitch sibling chunks back together
-            # regardless of entry boundary. ``entry_index`` and
+            # a global counter across the file so the searcher's closet
+            # enrichment (which orders a source's chunks by chunk_index) can
+            # show sibling chunks as context regardless of entry boundary. ``entry_index`` and
             # ``entry_chunk_index`` are preserved for entry-grouping
             # consumers.
             #
@@ -274,9 +273,8 @@ def ingest_diaries(
                     entry_idx = offset if full_rebuild else prev_entry_count + offset
                     entry_text = f"{header}\n{body}" if body else header
                     # Closet references the canonical (entry_chunk_idx=0)
-                    # drawer for the entry. Searcher._expand_with_neighbors
-                    # stitches sibling chunks back via the
-                    # (source_file, chunk_index) pair.
+                    # drawer for the entry. Search enrichment finds sibling
+                    # chunks via the (source_file, chunk_index) pair.
                     entry_drawer_id = _diary_drawer_id_entry(wing, date_str, entry_idx, 0)
                     entry_lines = build_closet_lines(
                         source_file, [entry_drawer_id], entry_text, wing, "daily"

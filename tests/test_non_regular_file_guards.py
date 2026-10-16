@@ -861,14 +861,14 @@ def test_split_mega_files_skips_fifo(tmp_path, capsys, monkeypatch):
 
 
 @posix_only
-def test_split_file_skips_a_fifo_at_its_own_output_name(tmp_path, capsys):
+def test_split_file_writes_beside_a_fifo_at_its_own_output_name(tmp_path):
     """The walk gate covers the source; the output name is built here.
 
     ``split_file`` synthesises each per-session filename from the transcript
     and writes it into the source directory, so nothing has vetted that path.
-    A pre-existing FIFO sitting at one of those names turned the write into a
-    blocking open — the same hang, in the one path the discovery gate cannot
-    reach.
+    A pre-existing FIFO sitting at one of those names once turned the write
+    into a blocking open. Now the pipe is left alone and the chunk takes the
+    next free name, so no session is lost.
     """
     session = "Claude Code v1.0\n" + "content line\n" * 14 + "\n" * 5
     source = write_regular(tmp_path, "real.txt", session * 2)
@@ -880,22 +880,21 @@ def test_split_file_skips_a_fifo_at_its_own_output_name(tmp_path, capsys):
     with hard_timeout(TIMEOUT_SECONDS, "split_file writing over a FIFO output"):
         written = split_file(str(source), None, dry_run=False)
 
-    out = capsys.readouterr().out
-    assert f"SKIP: {blocked.name} (not a regular file)" in out
+    assert stat_module.S_ISFIFO(os.lstat(blocked).st_mode)
     assert blocked not in written
-    # The pipe must cost only its own chunk: every other session still lands.
-    assert len(written) == len(planned) - 1
+    assert blocked.with_name(f"{blocked.stem}-2{blocked.suffix}") in written
+    assert len(written) == len(planned)
     assert all(path.is_file() for path in written)
 
 
 @posix_only
-def test_split_file_skips_a_dangling_symlink_at_its_own_output_name(tmp_path, capsys):
+def test_split_file_writes_beside_a_dangling_symlink_at_its_own_output_name(tmp_path):
     """A broken link at an output name must not redirect the write.
 
     ``os.path.exists`` follows the link and answers False for a dangling one,
-    so the type gate would wave it through — and ``write_text`` then CREATES
-    the target, landing a chunk wherever the link points instead of in the
-    output directory. The gate has to ask about the link itself.
+    and writing through it CREATES the target, landing a chunk wherever the
+    link points instead of in the output directory. The link is left alone
+    and the chunk takes the next free name.
     """
     session = "Claude Code v1.0\n" + "content line\n" * 14 + "\n" * 5
     source = write_regular(tmp_path, "real.txt", session * 2)
@@ -910,11 +909,11 @@ def test_split_file_skips_a_dangling_symlink_at_its_own_output_name(tmp_path, ca
     with hard_timeout(TIMEOUT_SECONDS, "split_file writing over a dangling symlink"):
         written = split_file(str(source), None, dry_run=False)
 
-    out = capsys.readouterr().out
-    assert f"SKIP: {blocked.name} (not a regular file)" in out
-    assert blocked not in written
     assert not outside.exists(), "a chunk was written through the link, outside the output dir"
-    assert len(written) == len(planned) - 1
+    assert os.path.islink(blocked)
+    assert blocked not in written
+    assert blocked.with_name(f"{blocked.stem}-2{blocked.suffix}") in written
+    assert len(written) == len(planned)
 
 
 @posix_only

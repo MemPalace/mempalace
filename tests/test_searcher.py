@@ -320,7 +320,7 @@ class TestSearchMemories:
         assert hits[0]["closet_boost"] == pytest.approx(0.4)
         assert hits[0]["similarity"] == pytest.approx(0.92)
 
-    def test_closet_boosted_hits_deduped_by_source_before_hydration(self):
+    def test_closet_boosted_hits_keep_each_drawer_and_fetch_source_once(self):
         jsonl = "C:/convo/big.jsonl"
         other = "notes.md"
         extra = "extra.md"
@@ -388,13 +388,12 @@ class TestSearchMemories:
         ):
             result = search_memories("query term", "/fake/path", n_results=3)
 
-        sources = [hit["source_path"] for hit in result["results"]]
-        assert sources.count(jsonl) == 1, sources
-        assert other in sources
-        assert extra in sources
+        hits = result["results"]
+        assert [hit["source_path"] for hit in hits] == [jsonl, jsonl, jsonl]
+        assert [hit["drawer_id"] for hit in hits] == ["d0", "d1", "d2"]
+        assert [hit["text"] for hit in hits] == ["j0", "j1", "j2"]
         assert get_sources.count(jsonl) == 1, get_sources
-        jsonl_hit = next(hit for hit in result["results"] if hit["source_path"] == jsonl)
-        assert jsonl_hit["similarity"] == pytest.approx(0.6)
+        assert hits[0]["similarity"] == pytest.approx(0.6)
 
 
 # ── BM25 internals: None / empty document safety ─────────────────────

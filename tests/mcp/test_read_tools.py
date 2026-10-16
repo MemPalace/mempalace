@@ -1273,3 +1273,32 @@ class TestFetchDrawerRowsDelegation:
         assert ids == ["a"]
         assert documents == ["doc a"]
         assert metadatas == [{"wing": "w"}]
+
+
+def test_follow_tunnels_records_without_the_writer_lease(monkeypatch):
+    """Recording takes the tunnel file's own lock, so a session that holds no
+    writer lease (never tried a mutation, or lost it to a peer) still records."""
+    from mempalace import mcp_server
+
+    captured = {}
+
+    def _fake_follow(wing, room, col=None, record=True):
+        captured["record"] = record
+        return [{"tunnel_id": "t1"}]
+
+    monkeypatch.setattr(mcp_server, "follow_tunnels", _fake_follow)
+    monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: object())
+    monkeypatch.setattr(mcp_server, "_READ_ONLY", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
+
+    for peer_holds_lease in (False, True):
+        monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", peer_holds_lease)
+        assert mcp_server.tool_follow_tunnels("wing_a", "room_a") == [{"tunnel_id": "t1"}]
+        assert captured["record"] is True
+
+    mcp_server.tool_follow_tunnels("wing_a", "room_a", record=False)
+    assert captured["record"] is False
+
+    monkeypatch.setattr(mcp_server, "_READ_ONLY", True)
+    mcp_server.tool_follow_tunnels("wing_a", "room_a", record=True)
+    assert captured["record"] is False

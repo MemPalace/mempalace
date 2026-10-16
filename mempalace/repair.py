@@ -2224,38 +2224,40 @@ def extract_via_sqlite(palace_path: str, collection_name: str) -> Iterator[tuple
         conn.close()
 
 
+def _copy_sqlite_db(src: str, dst: str) -> None:
+    """Copy a SQLite database through the backup API.
+
+    A live writer's WAL is folded into one consistent file, where copying
+    the main file and its ``-wal``/``-shm`` one by one can tear. A file
+    SQLite cannot read is copied as bytes.
+    """
+    try:
+        with closing(connect_sqlite_read(src)) as source, closing(sqlite3.connect(dst)) as dest:
+            source.backup(dest)
+    except sqlite3.DatabaseError:
+        _copy_file_no_follow(src, dst, replace=True)
+
+
 def _preserve_knowledge_graph_sqlite(source_palace: str, dest_palace: str) -> list[str]:
-    """Copy KG SQLite sidecars when rebuilding a palace from chroma.sqlite3.
+    """Copy the KG database when rebuilding a palace from chroma.sqlite3.
 
     rebuild_from_sqlite reconstructs Chroma collections into a fresh
     destination directory. The knowledge graph is a separate SQLite database,
     so it must be copied explicitly or the repair succeeds while silently
     dropping KG state (#1816).
     """
+    filename = "knowledge_graph.sqlite3"
+    src = os.path.join(source_palace, filename)
+    dst = os.path.join(dest_palace, filename)
+    if os.path.islink(src) or not os.path.isfile(src):
+        return []
+    if os.path.abspath(src) == os.path.abspath(dst):
+        return []
 
-    copied: list[str] = []
-
-    for suffix in ("", "-wal", "-shm"):
-        filename = f"knowledge_graph.sqlite3{suffix}"
-        src = os.path.join(source_palace, filename)
-        dst = os.path.join(dest_palace, filename)
-
-        if not os.path.isfile(src):
-            continue
-        if os.path.abspath(src) == os.path.abspath(dst):
-            continue
-
-        os.makedirs(dest_palace, exist_ok=True)
-        try:
-            _copy_file_no_follow(src, dst, replace=True)
-        except RuntimeError:
-            continue
-        copied.append(filename)
-
-    if copied:
-        print(" Preserved knowledge graph: " + ", ".join(copied))
-
-    return copied
+    os.makedirs(dest_palace, exist_ok=True)
+    _copy_sqlite_db(src, dst)
+    print(" Preserved knowledge graph: " + filename)
+    return [filename]
 
 
 def rebuild_from_sqlite(

@@ -1359,18 +1359,7 @@ def tool_list_drawers(
         return {"error": str(e)}
 
     try:
-        where = None
-        conditions = []
-
-        if wing:
-            conditions.append({"wing": wing})
-        if room:
-            conditions.append({"room": room})
-
-        if len(conditions) == 1:
-            where = conditions[0]
-        elif len(conditions) > 1:
-            where = {"$and": conditions}
+        where = build_where_filter(wing, room) or None
 
         def make_page(ids, metadatas):
             drawers = _collapse_drawer_rows(ids, [], metadatas)

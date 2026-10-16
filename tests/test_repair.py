@@ -4209,17 +4209,31 @@ def test_rebuild_from_sqlite_preserves_knowledge_graph_sidecar(tmp_path):
     src.mkdir()
     dest.mkdir()
 
+    kg = sqlite3.connect(str(src / "knowledge_graph.sqlite3"))
+    kg.execute("PRAGMA journal_mode=WAL")
+    kg.execute("PRAGMA wal_autocheckpoint=0")
+    kg.execute("CREATE TABLE t (v TEXT)")
+    kg.execute("INSERT INTO t VALUES ('only in the wal')")
+    kg.commit()
+    try:
+        copied = repair._preserve_knowledge_graph_sqlite(str(src), str(dest))
+    finally:
+        kg.close()
+
+    # One consistent file: the open writer's WAL is folded in, not copied.
+    assert copied == ["knowledge_graph.sqlite3"]
+    assert not (dest / "knowledge_graph.sqlite3-wal").exists()
+    with closing(sqlite3.connect(str(dest / "knowledge_graph.sqlite3"))) as conn:
+        assert conn.execute("SELECT v FROM t").fetchone() == ("only in the wal",)
+
+
+def test_preserve_knowledge_graph_copies_an_unreadable_file_as_bytes(tmp_path):
+    src = tmp_path / "source"
+    dest = tmp_path / "dest"
+    src.mkdir()
     (src / "knowledge_graph.sqlite3").write_text("kg-db", encoding="utf-8")
-    (src / "knowledge_graph.sqlite3-wal").write_text("kg-wal", encoding="utf-8")
-    (src / "knowledge_graph.sqlite3-shm").write_text("kg-shm", encoding="utf-8")
 
-    copied = repair._preserve_knowledge_graph_sqlite(str(src), str(dest))
-
-    assert copied == [
-        "knowledge_graph.sqlite3",
-        "knowledge_graph.sqlite3-wal",
-        "knowledge_graph.sqlite3-shm",
+    assert repair._preserve_knowledge_graph_sqlite(str(src), str(dest)) == [
+        "knowledge_graph.sqlite3"
     ]
     assert (dest / "knowledge_graph.sqlite3").read_text(encoding="utf-8") == "kg-db"
-    assert (dest / "knowledge_graph.sqlite3-wal").read_text(encoding="utf-8") == "kg-wal"
-    assert (dest / "knowledge_graph.sqlite3-shm").read_text(encoding="utf-8") == "kg-shm"

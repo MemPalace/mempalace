@@ -3,26 +3,6 @@ if __name__ != "mempalace.searcher":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.searcher")
 
 
-def build_where_filter(wing: str = None, room: str = None, source_file: str = None) -> dict:
-    """Build a ChromaDB where filter from optional wing/room/source_file.
-
-    ChromaDB needs a ``$and`` only when ≥2 clauses are present; a single
-    clause is returned bare and zero clauses yield an empty filter (#1815).
-    """
-    clauses = []
-    if wing:
-        clauses.append({"wing": wing})
-    if room:
-        clauses.append({"room": room})
-    if source_file:
-        clauses.append({"source_file": source_file})
-    if not clauses:
-        return {}
-    if len(clauses) == 1:
-        return clauses[0]
-    return {"$and": clauses}
-
-
 def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
     """Parse all `→drawer_id_a,drawer_id_b` pointers out of a closet document.
 
@@ -60,81 +40,6 @@ def _scoped_source_filter(source_file: str, parent_drawer_id=None) -> dict:
             ]
         }
     return {"source_file": source_file}
-
-
-def _expand_with_neighbors(drawers_col, matched_doc: str, matched_meta: dict, radius: int = 1):
-    """Expand a matched drawer with its ±radius sibling chunks in the same source file.
-
-    Motivation — "drawer-grep context" feature: a closet hit returns one
-    drawer, but the chunk boundary may clip mid-thought (e.g., the matched
-    chunk says "here's a breakdown:" and the actual breakdown lives in the
-    next chunk). Fetching the small neighborhood around the match gives
-    callers enough context without forcing a follow-up ``get_drawer`` call.
-
-    Returns a dict with:
-        ``text``            combined chunks in chunk_index order
-        ``drawer_index``    the matched chunk's index in the source file
-        ``total_drawers``   total drawer count for the source file (or None)
-
-    On any ChromaDB failure or missing metadata, falls back to returning the
-    matched drawer alone so search never breaks because neighbor expansion
-    failed.
-    """
-    src = matched_meta.get("source_file")
-    chunk_idx = matched_meta.get("chunk_index")
-    if not src or not isinstance(chunk_idx, int):
-        return {"text": matched_doc, "drawer_index": chunk_idx, "total_drawers": None}
-
-    # Narrow by ``parent_drawer_id`` when present so chunks from unrelated
-    # logical drawers sharing ``source_file`` do not stitch (#1580). See
-    # ``_scoped_source_filter`` for the contract.
-    parent_id = matched_meta.get("parent_drawer_id")
-    target_indexes = [chunk_idx + offset for offset in range(-radius, radius + 1)]
-    neighbor_clauses = [
-        {"source_file": src},
-        {"chunk_index": {"$in": target_indexes}},
-    ]
-    if parent_id:
-        neighbor_clauses.append({"parent_drawer_id": parent_id})
-    try:
-        neighbors = drawers_col.get(
-            where={"$and": neighbor_clauses},
-            include=["documents", "metadatas"],
-        )
-    except Exception:
-        return {"text": matched_doc, "drawer_index": chunk_idx, "total_drawers": None}
-
-    indexed_docs = []
-    for doc, meta in zip(neighbors.documents, neighbors.metadatas):
-        ci = meta.get("chunk_index")
-        if isinstance(ci, int):
-            indexed_docs.append((ci, doc))
-    indexed_docs.sort(key=lambda pair: pair[0])
-
-    if not indexed_docs:
-        combined_text = matched_doc
-    else:
-        combined_text = "\n\n".join(doc for _, doc in indexed_docs)
-
-    # Cheap total_drawers lookup. When ``parent_drawer_id`` is present the
-    # count is scoped to that group so the returned number matches the
-    # text the caller gets back. Without a parent id, the legacy
-    # file-global count is preserved.
-    total_drawers = None
-    try:
-        all_meta = drawers_col.get(
-            where=_scoped_source_filter(src, parent_id),
-            include=["metadatas"],
-        )
-        total_drawers = len(all_meta.ids) if all_meta.ids else None
-    except Exception:
-        logger.debug("total_drawers lookup failed for %s", src, exc_info=True)
-
-    return {
-        "text": combined_text,
-        "drawer_index": chunk_idx,
-        "total_drawers": total_drawers,
-    }
 
 
 def _warn_if_legacy_metric(col) -> None:

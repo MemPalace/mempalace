@@ -258,17 +258,22 @@ def test_palace_wrapper_embeds_for_milvus(tmp_path, monkeypatch):
     import mempalace.backends.embedding_wrapper as embedding_wrapper
     from mempalace import palace
     from mempalace.backends import reset_backends
+    from mempalace.config import get_configured_collection_name
 
     monkeypatch.setattr(
         embedding_wrapper,
         "_embed_texts",
-        lambda texts: [[1.0, 0.0] for _ in texts],
+        lambda texts, **_kwargs: [[1.0, 0.0] for _ in texts],
     )
     monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "milvus")
     monkeypatch.setenv("MEMPALACE_BACKEND", "milvus")
     reset_backends()
     try:
-        col = palace.get_collection(str(tmp_path / "wrapped"), "drawers", create=True)
+        col = palace.get_collection(
+            str(tmp_path / "wrapped"),
+            get_configured_collection_name(),
+            create=True,
+        )
         col.add(documents=["wrapped milvus document"], ids=["wrapped"], metadatas=[{"wing": "w"}])
         result = col.query(query_texts=["wrapped"], n_results=1)
         assert result.ids == [["wrapped"]]

@@ -580,7 +580,11 @@ def main():
     p_serve.add_argument(
         "--backend", default=None, help="Storage backend (default: config/env/detected)"
     )
-    p_serve.add_argument("--palace", default=None, help="Palace path (overrides config/env)")
+    p_serve.add_argument(
+        "--palace",
+        default=argparse.SUPPRESS,
+        help="Palace path (overrides config/env); may be passed before or after the subcommand",
+    )
     p_serve.add_argument(
         "--token",
         default=None,
