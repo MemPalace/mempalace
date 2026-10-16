@@ -33,10 +33,14 @@ def _meta_is_current(meta: dict, extract_mode: Optional[str]) -> bool:
     exchange scope a missing ``convo_chunker_version`` is stale too, so a
     chunker fix re-mines conversation files without touching project files.
     """
-    if meta.get("normalize_version", 1) < NORMALIZE_VERSION:
+    # An explicit null (or any non-number) is stale, never a TypeError that
+    # aborts the whole prefetch: file_already_mined treats it as stale too.
+    version = meta.get("normalize_version", 1)
+    if not _is_plain_number(version) or version < NORMALIZE_VERSION:
         return False
     if extract_mode == "exchange":
-        return meta.get("convo_chunker_version", 1) >= CONVO_CHUNKER_VERSION
+        chunker = meta.get("convo_chunker_version", 1)
+        return _is_plain_number(chunker) and chunker >= CONVO_CHUNKER_VERSION
     return True
 
 
@@ -64,17 +68,17 @@ class MinedSetUnavailable(RuntimeError):
 
 
 def _fast_collection_metadata(collection, keys, require_key=None, equals=None):
-    """Chroma's one-pass sqlite metadata stream, or ``None`` for other backends.
+    """One-pass metadata stream from backends that implement ``iter_metadata``.
 
-    Paging ``get(limit, offset)`` costs a SQL ``OFFSET`` per page, which
-    re-walks every skipped row, and ``count()`` on a fresh client loads the
-    whole HNSW index first: on a 360k-drawer palace one such scan took 138 s,
-    and it grows with the square of the palace.
+    Paging ``get(limit, offset)`` costs a SQL ``OFFSET`` (or repeated scroll
+    from offset 0) per page, which re-walks every skipped row, and ``count()``
+    on a fresh Chroma client loads the whole HNSW index first: on a 360k-drawer
+    palace one such scan took 138 s, and it grows with the square of the palace.
     """
-    from ..backends.chroma import ChromaCollection
+    from ..backends.base import BaseCollection
 
     inner = collection._inner if isinstance(collection, EmbeddingCollection) else collection
-    if isinstance(inner, ChromaCollection):
+    if isinstance(inner, BaseCollection) and hasattr(inner, "iter_metadata"):
         if equals is None:
             return inner.iter_metadata(keys, require_key=require_key)
         return inner.iter_metadata(keys, require_key=require_key, equals=equals)
@@ -374,10 +378,22 @@ def prefetch_complete_mtimes(collection, source_files) -> Optional[dict[str, tup
     Chroma's sqlite stream, or when the stream fails, so the caller keeps
     the per-file check for every file.
     """
-    rows = _fast_collection_metadata(collection, _PROJECT_MINED_KEYS, require_key="source_file")
+    wanted = set(source_files)
+    from ..backends.sqlite_exact import SQLiteExactCollection
+
+    inner = collection._inner if isinstance(collection, EmbeddingCollection) else collection
+    scope = (
+        {"source_file": wanted}
+        if isinstance(inner, SQLiteExactCollection)
+        and 1 <= len(wanted) <= 5000
+        and all(isinstance(x, str) for x in wanted)
+        else None
+    )
+    rows = _fast_collection_metadata(
+        collection, _PROJECT_MINED_KEYS, require_key="source_file", equals=scope
+    )
     if rows is None:
         return None
-    wanted = set(source_files)
     # Per source_file: stored mtime -> [drawer count, largest chunk_total,
     # whether some drawer has no chunk_total].
     groups: dict[str, dict] = {}
