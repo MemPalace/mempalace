@@ -722,6 +722,7 @@ def tool_search(
         candidate_strategy=candidate_strategy,
         collection_name=_config.collection_name,
         **experimental,
+        allow_narrow=False,
     )
     if _is_transient_index_error(result):
         # Post-bulk-write HNSW flush window (#1315): drop caches, give
@@ -744,6 +745,7 @@ def tool_search(
             candidate_strategy=candidate_strategy,
             collection_name=_config.collection_name,
             **experimental,
+            allow_narrow=True,
         )
         if not _is_transient_index_error(result):
             result["index_recovered"] = True
