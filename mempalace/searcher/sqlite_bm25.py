@@ -426,10 +426,13 @@ def _merge_bm25_union_candidates(
         return
 
     metric = _metric_for_collection(drawers_col)
-    lexical_distances = (
-        _lexical_hit_vector_distances(drawers_col, query, lexical.hits, metric)
-        if max_distance > 0.0
-        else {}
+    # Vector distances for lexical hits are always resolved when stored
+    # embeddings exist: without them a BM25-recovered drawer re-enters with
+    # distance=None and is scored on BM25 alone, making union results depend
+    # on n_results (#2660). The max_distance gate below still controls
+    # admission; this only fills in the score signal.
+    lexical_distances = _lexical_hit_vector_distances(
+        drawers_col, query, lexical.hits, metric
     )
 
     bm25_extra = []
