@@ -103,7 +103,7 @@ hooks/                   # Claude Code hook scripts
 - **Formatter**: ruff format, double quotes
 - **Commits**: conventional commits (`fix:`, `feat:`, `test:`, `docs:`, `ci:`)
 - **Tests**: `tests/test_*.py`, fixtures in `tests/conftest.py`
-- **Coverage**: 85% threshold (80% on Windows due to ChromaDB file lock cleanup)
+- **Coverage**: pytest reads the gate from `pyproject.toml` (`[tool.coverage.report] fail_under`; on Windows, `[tool.mempalace.coverage] fail_under_windows`, because ChromaDB file-lock cleanup leaves lines unexecuted).
 
 ## Architecture
 

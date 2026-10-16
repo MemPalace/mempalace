@@ -29,14 +29,16 @@ def _metadata_matches_extract_mode(meta: dict, extract_mode: Optional[str]) -> b
 def _meta_is_current(meta: dict, extract_mode: Optional[str]) -> bool:
     """True when a drawer was filed by the current pipeline for its scope.
 
-    Pre-v2 drawers have no ``normalize_version`` and count as stale. In the
-    exchange scope a missing ``convo_chunker_version`` is stale too, so a
-    chunker fix re-mines conversation files without touching project files.
+    Pre-v2 drawers have no ``normalize_version`` and count as stale. In a
+    convo scope with a ``CHUNKER_VERSIONS`` entry a missing or older stamp
+    is stale too, so a chunker fix re-mines conversation files without
+    touching project files.
     """
     if meta.get("normalize_version", 1) < NORMALIZE_VERSION:
         return False
-    if extract_mode == "exchange":
-        return meta.get("convo_chunker_version", 1) >= CONVO_CHUNKER_VERSION
+    if extract_mode in CHUNKER_VERSIONS:
+        key, current = CHUNKER_VERSIONS[extract_mode]
+        return meta.get(key, 1) >= current
     return True
 
 
@@ -49,6 +51,7 @@ _MINED_SCAN_KEYS = (
     "ingest_mode",
     "normalize_version",
     "convo_chunker_version",
+    "general_extractor_version",
     "content_hash",
     "wing",
 )
@@ -139,8 +142,8 @@ def file_already_mined(
       - no drawers exist for this source_file
       - the stored `normalize_version` is missing or older than the current
         schema (triggers silent rebuild after a normalization upgrade), or,
-        for extract_mode="exchange", the stored `convo_chunker_version` is
-        missing or older than CONVO_CHUNKER_VERSION
+        for a convo extract_mode in CHUNKER_VERSIONS, its chunker stamp is
+        missing or older than the current revision
       - `check_mtime=True` and the file's mtime differs from the stored one
 
     When check_mtime=True (used by the project miner, and by the convo

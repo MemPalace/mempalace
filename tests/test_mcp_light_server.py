@@ -380,7 +380,7 @@ class TestLightMcpPreflightAndGates:
             called_args["apply"] = apply
             return {"synced": True}
 
-        monkeypatch.setattr(mcp_server, "tool_sync", mock_tool_sync)
+        monkeypatch.setitem(mcp_server.TOOLS["mempalace_sync"], "handler", mock_tool_sync)
         req = {
             "jsonrpc": "2.0",
             "id": 71,
@@ -461,7 +461,7 @@ class TestUnwrapAndStructuredMerge:
             captured.update(kwargs)
             return {"results": []}
 
-        monkeypatch.setattr(mcp_server, "tool_search", fake_search)
+        monkeypatch.setitem(mcp_server.TOOLS["mempalace_search"], "handler", fake_search)
         req = {
             "jsonrpc": "2.0",
             "id": 80,
@@ -919,8 +919,11 @@ def test_light_server_applies_the_flags_it_shares_with_the_full_server(monkeypat
 
 @pytest.mark.parametrize("kind", _UNLOADABLE_JSON_KINDS)
 def test_a_line_json_loads_rejects_does_not_end_the_light_server(monkeypatch, tmp_path, kind):
-    """json.loads raises RecursionError or ValueError here, not JSONDecodeError,
-    and either one used to end the server; the next request has to be served."""
+    """json.loads raises RecursionError or ValueError here, not JSONDecodeError.
+
+    Either one used to end the server, and a parse failure used to produce no
+    reply. The bad line gets -32700 and the next request is still served.
+    """
     from _mcp_server_helpers import _keep_server_command_line_state
 
     _keep_server_command_line_state(monkeypatch)
@@ -940,4 +943,186 @@ def test_a_line_json_loads_rejects_does_not_end_the_light_server(monkeypatch, tm
     mcp_light_server.main()
 
     responses = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
-    assert [response.get("id") for response in responses] == [2]
+    assert [response.get("id") for response in responses] == [None, 2]
+    assert responses[0]["error"]["code"] == -32700
+    assert responses[1]["result"] == {}
+
+
+def test_palace_allowlists_name_registered_tools_only():
+    """Every rewritten palace_* name is a real tool, and query cannot name a write."""
+    for mapping in (
+        mcp_light_server._QUERY_TARGET_TO_TOOL,
+        mcp_light_server._EXEC_ACTION_TO_TOOL,
+        mcp_light_server._COORD_ACTION_TO_TOOL,
+    ):
+        assert mapping
+        for tool_name in mapping.values():
+            assert tool_name in mcp_server.TOOLS
+    query_tools = set(mcp_light_server._QUERY_TARGET_TO_TOOL.values())
+    for forbidden in (
+        "mempalace_delete_drawer",
+        "mempalace_delete_by_source",
+        "mempalace_add_drawer",
+    ):
+        assert forbidden not in query_tools
+    assert mcp_light_server._COORD_ACTION_TO_TOOL["peers"] == "mempalace_mesh_peers"
+    assert mcp_light_server._COORD_ACTION_TO_TOOL["mesh_peers"] == "mempalace_mesh_peers"
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["delete_drawer", "delete_by_source", "add_drawer"],
+)
+def test_palace_query_rejects_write_targets_on_the_production_path(monkeypatch, target):
+    """The stdio rewrite is the path production runs. A read-only query must not
+    become mempalace_delete_drawer / delete_by_source / add_drawer."""
+    forwarded = []
+
+    def _forbid(request):
+        forwarded.append(request)
+        raise AssertionError(f"forwarded {request['params']['name']}")
+
+    monkeypatch.setattr(mcp_server, "_dispatch_stdio_request", _forbid)
+    for tool_attr in ("tool_delete_drawer", "tool_delete_by_source", "tool_add_drawer"):
+        monkeypatch.setattr(
+            mcp_server,
+            tool_attr,
+            lambda **_kwargs: (_ for _ in ()).throw(AssertionError("handler ran")),
+        )
+
+    response = mcp_light_server.dispatch_light_stdio_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "tools/call",
+            "params": {
+                "name": "palace_query",
+                "arguments": {"target": target, "drawer_id": "drawer-1", "dry_run": False},
+            },
+        }
+    )
+
+    assert forwarded == []
+    assert response["id"] == 41
+    assert response["error"]["code"] == -32602
+    assert response["error"]["message"] == "unknown target"
+    assert (
+        mcp_light_server._classify_underlying_tool(
+            "palace_query", {"target": target, "drawer_id": "drawer-1"}
+        )
+        is None
+    )
+
+
+def test_palace_query_write_target_is_refused_on_the_handler_path_too():
+    """handle_light_request shares the allowlist, so the untested path cannot
+    dispatch a write the production rewrite refuses."""
+    response = mcp_light_server.handle_light_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/call",
+            "params": {
+                "name": "palace_query",
+                "arguments": {"target": "delete_drawer", "drawer_id": "drawer-1"},
+            },
+        }
+    )
+    assert response["error"]["code"] == -32602
+    assert response["error"]["message"] == "unknown target"
+
+
+def test_palace_exec_unknown_action_is_not_a_tool_name(monkeypatch):
+    forwarded = []
+    monkeypatch.setattr(
+        mcp_server,
+        "_dispatch_stdio_request",
+        lambda request: forwarded.append(request["params"]["name"]),
+    )
+    response = mcp_light_server.dispatch_light_stdio_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 43,
+            "method": "tools/call",
+            "params": {"name": "palace_exec", "arguments": {"action": "drop_database"}},
+        }
+    )
+    assert forwarded == []
+    assert response["error"]["code"] == -32602
+    assert response["error"]["message"] == "unknown target"
+
+
+def test_palace_query_settings_forwards_no_arguments(monkeypatch):
+    """palace_query reads settings; a silent_save argument must not write config.json."""
+    captured = {}
+
+    def _capture(request):
+        captured.update(request["params"])
+        return {
+            "jsonrpc": "2.0",
+            "id": request.get("id"),
+            "result": {"content": [{"type": "text", "text": "{}"}]},
+        }
+
+    monkeypatch.setattr(mcp_server, "_dispatch_stdio_request", _capture)
+    mcp_light_server.dispatch_light_stdio_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 45,
+            "method": "tools/call",
+            "params": {
+                "name": "palace_query",
+                "arguments": {"target": "settings", "silent_save": False},
+            },
+        }
+    )
+    assert captured == {"name": "mempalace_hook_settings", "arguments": {}}
+
+
+def test_palace_coordinate_peers_rewrites_to_mesh_peers(monkeypatch):
+    captured = {}
+
+    def _capture(request):
+        captured["name"] = request["params"]["name"]
+        return {
+            "jsonrpc": "2.0",
+            "id": request.get("id"),
+            "result": {"content": [{"type": "text", "text": "{}"}]},
+        }
+
+    monkeypatch.setattr(mcp_server, "_dispatch_stdio_request", _capture)
+    response = mcp_light_server.dispatch_light_stdio_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 44,
+            "method": "tools/call",
+            "params": {"name": "palace_coordinate", "arguments": {"action": "peers"}},
+        }
+    )
+    assert response["id"] == 44
+    assert "error" not in response
+    assert captured["name"] == "mempalace_mesh_peers"
+
+
+def test_light_stdio_dispatch_exception_replies():
+    def _boom(_request):
+        raise RuntimeError("dispatch failed")
+
+    payload = mcp_server._stdio_reply('{"jsonrpc": "2.0", "id": 9, "method": "ping"}', _boom)
+    response = json.loads(payload)
+    assert response["id"] == 9
+    assert response["error"]["code"] == -32603
+    assert response["error"]["message"] == "Internal error"
+
+    notified = mcp_server._stdio_reply(
+        '{"jsonrpc": "2.0", "method": "notifications/cancelled"}', _boom
+    )
+    assert notified is None
+
+
+def test_light_stdio_parse_error_is_32700():
+    payload = mcp_server._stdio_reply("{", mcp_light_server.dispatch_light_stdio_request)
+    response = json.loads(payload)
+    assert response["id"] is None
+    assert response["error"]["code"] == -32700
+    assert response["jsonrpc"] == "2.0"

@@ -36,6 +36,17 @@ class _RWLock:
             if self._handoff:
                 self._cond.notify_all()
 
+    def try_acquire_read(self) -> bool:
+        """Take the read side only if that needs no wait."""
+        with self._cond:
+            if self._writer or (self._waiting_writers and not self._handoff):
+                return False
+            self._readers += 1
+            return True
+
+    def owns_write(self) -> bool:
+        return self._writer and self._writer_ident == threading.get_ident()
+
     def release_read(self) -> None:
         with self._cond:
             self._readers -= 1
@@ -131,20 +142,11 @@ _HTTP_MINE_LOCK = threading.Lock()
 # and holding an MCP request open that long would time the client out with
 # no explanation.
 _HTTP_RECONNECT_MINE_WAIT_S = 10.0
-# Tools that hold the request lock exclusively for a long run but reach
-# mine_yield_point() between files, where waiting requests may run.
-_HTTP_YIELDING_TOOLS = frozenset({"mempalace_mine"})
-# Tools whose handler makes one request-local embedding call before an
-# otherwise independent backend operation. Holding ``_HTTP_REQUEST_LOCK``
-# through that inference stalls unrelated requests for the whole model call.
-# Compound read-modify-write tools stay fully serialized.
-_HTTP_EMBEDDING_RELEASE_TOOLS = frozenset(
-    {
-        "mempalace_search",
-        "mempalace_check_duplicate",
-        "mempalace_diary_write",
-    }
-)
+# Lock-free, yielding, and embedding-release tools: see the flags in
+# mempalace.tool_capabilities.
+_HTTP_LOCK_FREE_TOOLS = _tool_capabilities.HTTP_LOCK_FREE_TOOLS
+_HTTP_YIELDING_TOOLS = _tool_capabilities.HTTP_YIELDING_TOOLS
+_HTTP_EMBEDDING_RELEASE_TOOLS = _tool_capabilities.HTTP_EMBEDDING_RELEASE_TOOLS
 # Reserved before a request releases the request lock mid-embedding so
 # ``mempalace_reconnect`` cannot close backend handles during that window.
 # Reconnect acquires this before the request lock; embedding reacquires the
@@ -156,34 +158,6 @@ _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 _HTTP_ACTIVE_CLIENT_WINDOW_S = 120.0
 
 _HTTP_PROTOCOL_METHODS = frozenset({"initialize", "ping", "tools/list"})
-
-# RFC 003 phase 5: logstream tools touch only logstream.sqlite3 (its own WAL
-# database with internal locking) — never Chroma or the KG. Dispatching them
-# outside _HTTP_REQUEST_LOCK keeps a five-minute mempalace_event_wait
-# long-poll from stalling every other agent on a shared hub, and lets the
-# SSE stream coexist with normal tool traffic.
-# Knowledge-graph tools use their own SQLite database and lock. Mesh peers
-# and the AAAK spec are process-local reads.
-_HTTP_LOCK_FREE_TOOLS = frozenset(
-    {
-        "mempalace_event_append",
-        "mempalace_task_create",
-        "mempalace_event_list",
-        "mempalace_event_wait",
-        "mempalace_event_ack",
-        "mempalace_artifact_put",
-        "mempalace_artifact_get",
-        "mempalace_patch_submit",
-        "mempalace_kg_query",
-        "mempalace_kg_add",
-        "mempalace_kg_invalidate",
-        "mempalace_kg_supersede",
-        "mempalace_kg_timeline",
-        "mempalace_kg_stats",
-        "mempalace_mesh_peers",
-        "mempalace_get_aaak_spec",
-    }
-)
 
 # SSE stream limits (GET /logstream/stream). Each connected client holds one
 # handler thread, so the cap is a thread-exhaustion guard, not a rate limit.
@@ -585,11 +559,7 @@ def _http_dispatch(request):
         return handle_request(request)
     if tool_name in _HTTP_LOCK_FREE_TOOLS:
         return handle_request(request)
-    # service.classify_tool is the authoritative read/write registry. The
-    # lock-free set above is a storage-boundary override for independent DBs.
-    from ..service import classify_tool
-
-    if classify_tool(tool_name) == "read":
+    if _tool_capabilities.classify_tool(tool_name) == "read":
         release_mode = _embedding_release_mode(tool_name, request, "read")
         if release_mode:
             with _http_embedding_release_installed(release_mode), _HTTP_REQUEST_LOCK.read_lock():
@@ -725,6 +695,7 @@ def _http_serve_sync(handler, path: str) -> bool:
 # Written by the sync loop after every round, read by /sync/peers. Values
 # are whole-entry replacements under the GIL, so readers never see a
 # half-updated peer record.
+_MESH_STATE_LOCK = threading.RLock()
 _PEER_SYNC_STATE: dict = {}
 
 # Node profiles learned from peers (their self-descriptions, relayed
@@ -741,6 +712,31 @@ _node_profile_cache: dict = {}
 _ACCELERATOR_NAMES = {"cuda": "CUDA", "dml": "DirectML", "coreml": "CoreML", "cpu": "CPU"}
 
 
+_last_profile_drawer_count = None
+
+
+def _drawer_count_for_profile():
+    """Drawer count for the node profile.
+
+    ``_get_collection`` writes the process-wide collection cache, so the count
+    needs the request lock's read side. Lock-free routes (/sync/version_vector,
+    mempalace_mesh_peers) call this and must not queue behind a write, so when
+    the read side is not free at once they get the last count taken.
+    """
+    global _last_profile_drawer_count
+    lock = _HTTP_REQUEST_LOCK
+    owned = lock.owns_write()
+    if not owned and not lock.try_acquire_read():
+        return _last_profile_drawer_count
+    try:
+        col = _get_collection(create=False)
+        _last_profile_drawer_count = None if col is None else col.count()
+    finally:
+        if not owned:
+            lock.release_read()
+    return _last_profile_drawer_count
+
+
 def _node_profile() -> dict:
     """This node's self-described profile — every field is pure derivation
     (palace presence, logstream authorship, resolved onnxruntime provider),
@@ -754,9 +750,8 @@ def _node_profile() -> dict:
     roles = []
     drawers = None
     try:
-        col = _get_collection(create=False)
-        if col is not None:
-            drawers = col.count()
+        drawers = _drawer_count_for_profile()
+        if drawers is not None:
             roles.append("replica")
     except Exception:
         logger.debug("node profile: drawer count unavailable", exc_info=True)
@@ -796,13 +791,14 @@ def _merge_known_profiles(profiles: dict) -> None:
     """Fold relayed profiles in, last-writer-wins by advertised_at."""
     if not isinstance(profiles, dict):
         return
-    for origin, profile in profiles.items():
-        if not isinstance(origin, str) or not isinstance(profile, dict):
-            continue
-        prior = _KNOWN_PROFILES.get(origin)
-        if prior and (prior.get("advertised_at") or "") >= (profile.get("advertised_at") or ""):
-            continue
-        _KNOWN_PROFILES[origin] = profile
+    with _MESH_STATE_LOCK:
+        for origin, profile in profiles.items():
+            if not isinstance(origin, str) or not isinstance(profile, dict):
+                continue
+            prior = _KNOWN_PROFILES.get(origin)
+            if prior and (prior.get("advertised_at") or "") >= (profile.get("advertised_at") or ""):
+                continue
+            _KNOWN_PROFILES[origin] = profile
 
 
 def _known_profiles_snapshot(published: dict = None) -> dict:
@@ -814,8 +810,10 @@ def _known_profiles_snapshot(published: dict = None) -> dict:
     """
     if published is None:
         published = _published_mesh_state()
+    with _MESH_STATE_LOCK:
+        learned = dict(_KNOWN_PROFILES)
     snapshot = dict(published.get("profiles") or {})
-    snapshot.update(_KNOWN_PROFILES)
+    snapshot.update(learned)
     try:
         snapshot[_call_logstream(lambda ls: ls.replica_id)] = _node_profile()
     except Exception:
@@ -836,10 +834,13 @@ def _publish_mesh_state(palace_path: str) -> None:
     from .. import server_registry
 
     try:
+        with _MESH_STATE_LOCK:
+            peers = dict(_PEER_SYNC_STATE)
+            profiles = dict(_KNOWN_PROFILES)
         server_registry.write_mesh_state(
             palace_path,
-            peers=dict(_PEER_SYNC_STATE),
-            profiles=dict(_KNOWN_PROFILES),
+            peers=peers,
+            profiles=profiles,
         )
     except Exception:
         logger.debug("mesh state publish failed", exc_info=True)
@@ -863,6 +864,11 @@ def _record_peer_sync(stats: dict) -> None:
     """Fold one peer's round outcome into the estate state."""
     name = stats.get("peer_name") or stats.get("peer_url") or "?"
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    with _MESH_STATE_LOCK:
+        _record_peer_sync_locked(stats, name, now)
+
+
+def _record_peer_sync_locked(stats: dict, name: str, now: str) -> None:
     prior = _PEER_SYNC_STATE.get(name) or {}
     if stats.get("error"):
         entry = {
@@ -919,11 +925,14 @@ def _mesh_peers_payload() -> dict:
     # back to the published estate per peer.
     published = _published_mesh_state()
     published_peers = published.get("peers") or {}
+    with _MESH_STATE_LOCK:
+        local_peers = {key: dict(value) for key, value in _PEER_SYNC_STATE.items()}
+        in_process = bool(local_peers)
     named_origins = {replica_id}
     peers = []
     for peer in configured:
         name = peer.get("name") or peer["url"]
-        state = dict(_PEER_SYNC_STATE.get(name) or published_peers.get(name) or {})
+        state = dict(local_peers.get(name) or published_peers.get(name) or {})
         state.pop("url", None)  # peers.json is authoritative for the url
         if state.get("replica_id"):
             named_origins.add(state["replica_id"])
@@ -948,7 +957,7 @@ def _mesh_peers_payload() -> dict:
         # the hub at published_at, and writer_alive says whether that hub is
         # still running (a dead hub leaves a last-known-good reading).
         "estate_source": {
-            "in_process": bool(_PEER_SYNC_STATE),
+            "in_process": in_process,
             "published_at": published.get("written_at"),
             "writer_alive": published.get("writer_alive", False),
         },

@@ -14,16 +14,18 @@ chooses. Core memory operations remain API-free by design (see CLAUDE.md,
 
 The endpoint is any OpenAI-compatible Chat Completions URL:
 
-    LLM_ENDPOINT=http://localhost:11434/v1   # Ollama
-    LLM_ENDPOINT=http://localhost:8000/v1    # vLLM, llama.cpp
-    LLM_ENDPOINT=https://api.openai.com/v1
-    LLM_ENDPOINT=https://openrouter.ai/api/v1
-    LLM_ENDPOINT=https://api.anthropic.com/v1  # when proxied through a compat layer
+    MEMPALACE_LLM_ENDPOINT=http://localhost:11434/v1   # Ollama
+    MEMPALACE_LLM_ENDPOINT=http://localhost:8000/v1    # vLLM, llama.cpp
+    MEMPALACE_LLM_ENDPOINT=https://api.openai.com/v1
 
 Set:
-    LLM_ENDPOINT — base URL (required)
-    LLM_KEY      — bearer token (optional; local inference usually doesn't need it)
-    LLM_MODEL    — model name (required), e.g. "gpt-4o-mini", "llama3:8b", "qwen2.5:7b"
+    MEMPALACE_LLM_ENDPOINT — base URL (required)
+    MEMPALACE_LLM_KEY      — bearer token (optional; local inference usually doesn't need it)
+    MEMPALACE_LLM_MODEL    — model name (required), e.g. "llama3:8b", "qwen2.5:7b"
+
+A non-local endpoint also needs ``--accept-external-llm`` or
+``MEMPALACE_ACCEPT_EXTERNAL_LLM=1``. Generic ``LLM_ENDPOINT`` / ``LLM_KEY`` /
+``LLM_MODEL`` variables are ignored.
 
 Or pass flags on the CLI (flags win over env):
 
@@ -47,6 +49,7 @@ import urllib.error
 from datetime import datetime
 from typing import Optional
 
+from .llm_client import endpoint_is_local, external_use_accepted_by_env
 from .palace import (
     NORMALIZE_VERSION,
     get_closets_collection,
@@ -100,34 +103,51 @@ class LLMConfig:
         endpoint: Optional[str] = None,
         key: Optional[str] = None,
         model: Optional[str] = None,
+        accept_external: Optional[bool] = None,
     ):
-        self.endpoint = (endpoint or os.environ.get("LLM_ENDPOINT", "")).rstrip("/")
-        self.key = key or os.environ.get("LLM_KEY", "")
-        self.model = model or os.environ.get("LLM_MODEL", "")
+        self.endpoint = (endpoint or os.environ.get("MEMPALACE_LLM_ENDPOINT", "")).rstrip("/")
+        self.key = key or os.environ.get("MEMPALACE_LLM_KEY", "")
+        self.model = model or os.environ.get("MEMPALACE_LLM_MODEL", "")
+        if accept_external is None:
+            accept_external = external_use_accepted_by_env()
+        self.accept_external = bool(accept_external)
         if self.endpoint:
             # Privacy-by-architecture: reject file:// and other non-HTTP schemes
             # so a misconfigured endpoint cannot exfiltrate local files.
             scheme = urllib.parse.urlparse(self.endpoint).scheme.lower()
             if scheme not in ("http", "https"):
                 raise ValueError(
-                    f"LLM_ENDPOINT must use http:// or https:// (got scheme {scheme!r})"
+                    f"MEMPALACE_LLM_ENDPOINT must use http:// or https:// (got scheme {scheme!r})"
                 )
 
     def missing(self) -> list:
         missing = []
         if not self.endpoint:
-            missing.append("LLM_ENDPOINT (or --endpoint)")
+            missing.append("MEMPALACE_LLM_ENDPOINT (or --endpoint)")
         if not self.model:
-            missing.append("LLM_MODEL (or --model)")
+            missing.append("MEMPALACE_LLM_MODEL (or --model)")
         # key is optional — local inference servers (Ollama, vLLM) often don't require one
         return missing
+
+    def egress_error(self) -> Optional[str]:
+        """Why this config must not receive drawer content, or None when it may."""
+        if not self.endpoint or endpoint_is_local(self.endpoint) or self.accept_external:
+            return None
+        return (
+            "Refusing to send drawer content to a non-local endpoint "
+            f"({self.endpoint}). Pass --accept-external-llm or set "
+            "MEMPALACE_ACCEPT_EXTERNAL_LLM=1."
+        )
 
 
 def _call_llm(cfg: LLMConfig, source_file: str, wing: str, room: str, content: str):
     """Single LLM call via OpenAI-compatible /chat/completions.
 
     Returns (parsed_json_dict_or_None, usage_dict_or_None).
+    A non-local endpoint is not contacted unless consent was set on ``cfg``.
     """
+    if cfg.egress_error():
+        return None, None
     try:
         from mempalace.i18n import t
 
@@ -223,9 +243,22 @@ def regenerate_closets(
     missing = cfg.missing()
     if missing:
         print("Error: missing configuration: " + ", ".join(missing))
-        print("Set env vars LLM_ENDPOINT / LLM_MODEL (and optionally LLM_KEY),")
+        legacy = [name for name in ("LLM_ENDPOINT", "LLM_MODEL", "LLM_KEY") if os.environ.get(name)]
+        if legacy:
+            # Generic names are often set for other tools; reading them is how
+            # drawer content could reach an endpoint nobody chose for MemPalace.
+            print(
+                "Found " + ", ".join(legacy) + ", which closet_llm no longer reads. "
+                "Rename them to " + ", ".join("MEMPALACE_" + name for name in legacy) + "."
+            )
+        print("Set env vars MEMPALACE_LLM_ENDPOINT / MEMPALACE_LLM_MODEL")
+        print("(and optionally MEMPALACE_LLM_KEY),")
         print("or pass --endpoint / --model / --key on the CLI.")
         return {"error": "missing-config", "missing": missing}
+    blocked = cfg.egress_error()
+    if blocked:
+        print(blocked)
+        return {"error": "external-endpoint", "endpoint": cfg.endpoint}
 
     # A full regeneration is one long-lived read/LLM/purge/upsert operation.
     # Acquire ownership before opening either collection or calling the LLM so
@@ -380,21 +413,31 @@ if __name__ == "__main__":
     parser.add_argument(
         "--endpoint",
         default=None,
-        help="LLM base URL (overrides $LLM_ENDPOINT), e.g. http://localhost:11434/v1",
+        help="LLM base URL (overrides $MEMPALACE_LLM_ENDPOINT), e.g. http://localhost:11434/v1",
     )
     parser.add_argument(
         "--key",
         default=None,
-        help="LLM bearer token (overrides $LLM_KEY). Optional for local inference.",
+        help="LLM bearer token (overrides $MEMPALACE_LLM_KEY). Optional for local inference.",
     )
     parser.add_argument(
         "--model",
         default=None,
-        help='LLM model name (overrides $LLM_MODEL), e.g. "gpt-4o-mini" or "llama3:8b"',
+        help='LLM model name (overrides $MEMPALACE_LLM_MODEL), e.g. "llama3:8b"',
+    )
+    parser.add_argument(
+        "--accept-external-llm",
+        action="store_true",
+        help="Allow a non-local endpoint to receive drawer content",
     )
     args = parser.parse_args()
 
-    cfg = LLMConfig(endpoint=args.endpoint, key=args.key, model=args.model)
+    cfg = LLMConfig(
+        endpoint=args.endpoint,
+        key=args.key,
+        model=args.model,
+        accept_external=True if args.accept_external_llm else None,
+    )
     regenerate_closets(
         args.palace, wing=args.wing, sample=args.sample, dry_run=args.dry_run, cfg=cfg
     )

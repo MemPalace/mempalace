@@ -31,6 +31,8 @@ import os
 import time
 from pathlib import Path
 
+from mempalace._proc import pid_alive as _pid_alive
+
 logger = logging.getLogger(__name__)
 
 # Bind-address wildcards: a hub bound to "all interfaces" is dialed via
@@ -204,29 +206,6 @@ def clear_serverinfo(palace_path: str) -> None:
         path.unlink()
     except OSError:
         logger.debug("serverinfo cleanup failed for %s", path, exc_info=True)
-
-
-def _pid_alive(pid) -> bool:
-    if not isinstance(pid, int) or pid <= 0:
-        return False
-    if os.name == "nt":  # pragma: no cover - exercised on Windows CI only
-        import ctypes
-
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return False
-        ctypes.windll.kernel32.CloseHandle(handle)
-        return True
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
 
 
 def read_live_serverinfo(palace_path: str):

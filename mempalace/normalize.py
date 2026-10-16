@@ -25,7 +25,7 @@ import os
 import re
 import stat
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 
 class UnparsedCodexTranscriptError(ValueError):
@@ -126,6 +126,14 @@ def _read_transcript_file(filepath: str) -> str:
     and normalize_conversations() both need: no symlinks, regular files only,
     size-capped, BOM-tolerant.
     """
+    return _read_transcript_file_with_mtime(filepath)[0]
+
+
+def _read_transcript_file_with_mtime(filepath: str) -> Tuple[str, float]:
+    """``_read_transcript_file`` plus the mtime from the ``fstat`` taken
+    before the read. A stat after the read can record an mtime for bytes
+    the read never saw, and the next mine then skips the appended tail.
+    """
     # O_NONBLOCK keeps the "not a regular file" check below reachable: a
     # blocking open of a FIFO waits in the kernel for a writer, so the
     # S_ISREG test never runs. See ``miner._read_text_no_follow``, including
@@ -151,7 +159,7 @@ def _read_transcript_file(filepath: str) -> str:
             raise IOError(f"file too large ({file_stat.st_size // (1024 * 1024)} MB)")
         with os.fdopen(fd, "r", encoding="utf-8-sig", errors="replace") as f:
             fd = -1
-            return f.read()
+            return f.read(), file_stat.st_mtime
     except OSError as e:
         raise IOError(f"Could not read {filepath}: {e}") from e
     finally:
@@ -209,22 +217,27 @@ def normalize_conversations(filepath: str) -> list:
     always normalize to one conversation, so this returns a one-element
     list for those — identical dedup granularity to before.
     """
-    content = _read_transcript_file(filepath)
+    return normalize_conversations_with_mtime(filepath)[0]
+
+
+def normalize_conversations_with_mtime(filepath: str) -> Tuple[list, float]:
+    """``normalize_conversations`` plus the mtime of the bytes it read."""
+    content, mtime = _read_transcript_file_with_mtime(filepath)
 
     if not content.strip():
-        return []
+        return [], mtime
 
     lines = content.split("\n")
     if sum(1 for line in lines if line.strip().startswith(">")) >= 3:
-        return [content]
+        return [content], mtime
 
     ext = Path(filepath).suffix.lower()
     if ext in (".json", ".jsonl") or content.strip()[:1] in ("{", "["):
         split = _try_normalize_json_split(content)
         if split:
-            return split
+            return split, mtime
 
-    return [content]
+    return [content], mtime
 
 
 def _try_normalize_json(content: str) -> Optional[str]:

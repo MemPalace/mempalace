@@ -24,13 +24,19 @@ from pathlib import Path
 from collections import defaultdict
 
 from .config import MempalaceConfig
-from .palace import MineAlreadyRunning, get_collection as _get_collection
-from .searcher import (
+from .search_util import (
     _distance_to_similarity,
     _first_or_empty,
     _metric_for_collection,
     build_where_filter,
 )
+
+
+def _get_collection(*args, **kwargs):
+    """Open a collection. The palace package is imported on first use."""
+    from .palace import get_collection
+
+    return get_collection(*args, **kwargs)
 
 
 def _open_for_read(palace_path: str):
@@ -59,6 +65,8 @@ def _read_open_failure(exc: Exception) -> str:
     match on it. Only a lock conflict, which the old wording misreported as a
     missing palace (inviting a pointless re-mine), gets its own message.
     """
+    from .palace import MineAlreadyRunning
+
     if isinstance(exc, MineAlreadyRunning):
         return (
             "## Palace is busy — another MemPalace process holds the write lock.\n"

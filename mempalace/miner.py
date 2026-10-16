@@ -2564,9 +2564,9 @@ def _mine_impl(
         )
         raise
     finally:
-        # Clean up the hooks-side PID lock if it points at us. Stale
-        # entries already pass _pid_alive() == False on POSIX, but
-        # actively removing the file makes the state observable
+        # Clean up the hooks-side PID lock if it points at us. A stale
+        # entry already fails _pid_alive(), but actively removing the
+        # file makes the state observable
         # (callers can stat it) and avoids accidental PID reuse on
         # short-lived test runs. Only remove if the file claims our
         # own PID — never another process's.

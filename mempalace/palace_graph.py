@@ -926,9 +926,9 @@ def follow_tunnels(wing: str, room: str, col=None, config=None, record: bool = T
 
     Given a location (wing/room), finds all tunnels leading from or to it,
     and optionally fetches the connected drawer content. Following a tunnel
-    is a traversal: unless ``record`` is off (a read-only server, a peer
-    that does not hold the writer lock), each tunnel crossed is
-    potentiated so navigation weights and the audit reflect real use.
+    is a traversal: unless ``record`` is off (a read-only server), each
+    tunnel crossed is potentiated so navigation weights and the audit
+    reflect real use.
     """
     # Fall back to raw ``wing`` so an empty/whitespace query string still
     # produces a value to compare with; ``_normalize_wing`` returns ``None``

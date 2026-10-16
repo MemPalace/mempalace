@@ -76,8 +76,10 @@ from .palace import (
     file_already_mined,
     get_collection,
     mine_lock,
+    mine_palace_lock,
     mine_yield_point,
     palace_write_serial,
+    raise_if_files_failed,
 )
 
 # Module-level imports from .miner so tests can patch them via
@@ -85,6 +87,7 @@ from .palace import (
 # expose these as attributes of this module, breaking the test seams.
 from .config import MempalaceConfig, normalize_wing_name
 from .collision_scan import assert_no_collisions
+from .convo_miner import _source_file_delete_ids
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
 from .source_identity import identity_metadata, source_directory_identity
 from .miner import (
@@ -539,7 +542,12 @@ def _print_mine_summary(
 
 
 def _register_skip_sentinel_if_appropriate(
-    collection, source_file: str, wing: str, agent: str, status: ExtractionStatus
+    collection,
+    source_file: str,
+    wing: str,
+    agent: str,
+    status: ExtractionStatus,
+    source_mtime: Optional[float] = None,
 ) -> None:
     """Write the ``file_already_mined`` sentinel ONLY when the skip is durable.
 
@@ -548,43 +556,62 @@ def _register_skip_sentinel_if_appropriate(
     NOT mark the file as mined — installing the missing extra later (or
     reconnecting the network) should let the next mine pass pick it up.
     Per PR #1555 review (Copilot #14).
+
+    Only a file that extracted to nothing (``OK`` or ``SKIP_EMPTY``) loses its
+    earlier format drawers. A failed extraction keeps the last good text.
     """
     if status in _TRANSIENT_MISSING_DEP_STATUSES:
         return
-    _register_file(collection, source_file, wing, agent)
+    empty = status in (ExtractionStatus.OK, ExtractionStatus.SKIP_EMPTY)
+    _register_file(collection, source_file, wing, agent, source_mtime, empty=empty)
 
 
-def _register_file(collection, source_file: str, wing: str, agent: str) -> None:
+def _register_file(
+    collection,
+    source_file: str,
+    wing: str,
+    agent: str,
+    source_mtime: Optional[float] = None,
+    *,
+    empty: bool = False,
+) -> None:
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
 
     Without this, files that extract to nothing (or hit a SKIP status) get
     rescanned on every re-mine. The sentinel preserves the no-op outcome.
-    Mirrors the helper of the same name in convo_miner.py.
+    Mirrors the helper of the same name in convo_miner.py. It carries the
+    mtime read before extraction, which ``file_already_mined(check_mtime=True)``
+    needs to match it.
+
+    ``empty`` means the file now holds no text, so its earlier format drawers
+    are stale and are deleted first.
     """
     sentinel_id = f"sentinel_{wing}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
+    if empty:
+        ids = _source_file_delete_ids(collection, source_file, "format")
+        stale = [i for i in ids if i != sentinel_id]
+        if stale:
+            collection.delete(ids=stale)
+    meta = {
+        "wing": wing,
+        "room": "documents",
+        "source_file": source_file,
+        "chunk_index": -1,
+        "added_by": agent,
+        "filed_at": datetime.now().isoformat(),
+        "ingest_mode": "extract",
+        "extract_mode": "format",
+        "normalize_version": NORMALIZE_VERSION,
+        "is_sentinel": True,
+        # The sentinel names a real source file and ``sync`` reads it as an
+        # ordinary drawer, so it needs the identity for the same reason the
+        # file's own drawers do (#2320).
+        **identity_metadata(source_file),
+    }
+    if source_mtime is not None:
+        meta["source_mtime"] = source_mtime
     try:
-        collection.upsert(
-            documents=["[empty]"],
-            ids=[sentinel_id],
-            metadatas=[
-                {
-                    "wing": wing,
-                    "room": "documents",
-                    "source_file": source_file,
-                    "chunk_index": -1,
-                    "added_by": agent,
-                    "filed_at": datetime.now().isoformat(),
-                    "ingest_mode": "extract",
-                    "extract_mode": "format",
-                    "normalize_version": NORMALIZE_VERSION,
-                    "is_sentinel": True,
-                    # The sentinel names a real source file and ``sync`` reads
-                    # it as an ordinary drawer, so it needs the identity for
-                    # the same reason the file's own drawers do (#2320).
-                    **identity_metadata(source_file),
-                }
-            ],
-        )
+        collection.upsert(documents=["[empty]"], ids=[sentinel_id], metadatas=[meta])
     except Exception:
         logger.debug("Sentinel write failed for %s", source_file, exc_info=True)
 
@@ -600,11 +627,13 @@ def _file_chunks_locked(
     content: Optional[str] = None,
     source_dir_ino: Optional[str] = None,
 ):
-    """Lock the source file, purge stale drawers, and upsert fresh chunks.
+    """Lock the source file, upsert fresh chunks, then drop stale drawers.
 
-    Mirrors the canonical convo_miner pattern (locked purge + batched upsert)
-    but with ``ingest_mode="extract"`` so format-mined drawers are
-    distinguishable from project / convo drawers in the palace.
+    New drawers land before any previous format drawer is deleted, and they
+    carry ``chunk_total`` one higher than their count until the stale ones
+    are gone, so ``file_already_mined`` reads a crash anywhere in between as
+    unfinished and the next mine redoes the file. Only this file's format
+    drawers are replaced; project and convo drawers for the same path stay.
 
     Each drawer's metadata includes:
       - ``source_mtime`` — for mtime-based idempotency (file_already_mined
@@ -645,11 +674,9 @@ def _file_chunks_locked(
         if file_already_mined(collection, source_file, check_mtime=True, extract_mode="format"):
             return 0, True
 
-        try:
-            collection.delete(where={"source_file": source_file})
-        except Exception:
-            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
-
+        old_ids = _source_file_delete_ids(collection, source_file, "format")
+        new_ids: list = []
+        new_metas: list = []
         filed_at = datetime.now().isoformat()
         for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
             batch_docs: list = []
@@ -670,6 +697,7 @@ def _file_chunks_locked(
                     "normalize_version": NORMALIZE_VERSION,
                     "hall": detect_hall(content),
                     "id_recipe": ID_RECIPE,
+                    "chunk_total": len(chunks) + 1,
                 }
                 if source_mtime is not None:
                     meta["source_mtime"] = source_mtime
@@ -707,6 +735,20 @@ def _file_chunks_locked(
             except Exception as exc:
                 if "already exists" not in str(exc).lower():
                     raise
+            new_ids += batch_ids
+            new_metas += batch_metas
+
+        fresh = set(new_ids)
+        stale = [drawer_id for drawer_id in old_ids if drawer_id not in fresh]
+        if stale:
+            collection.delete(ids=stale)
+        # Metadata only: the documents and their embeddings are already stored.
+        for batch_start in range(0, len(new_ids), DRAWER_UPSERT_BATCH_SIZE):
+            batch = slice(batch_start, batch_start + DRAWER_UPSERT_BATCH_SIZE)
+            collection.update(
+                ids=new_ids[batch],
+                metadatas=[{**meta, "chunk_total": len(chunks)} for meta in new_metas[batch]],
+            )
     return drawers_added, False
 
 
@@ -767,13 +809,28 @@ def mine_formats(
       threaded into chunking; the load is wired so future ``chunk_text``
       refactors that accept per-call sizing pick this up automatically.
     - Each per-file step is wrapped so one malformed file can't crash the
-      whole mine; the loop continues with the next file and logs the
-      offender.
-    - ``KeyboardInterrupt`` is caught at the orchestrator level so the
-      summary still prints on Ctrl-C; partial progress is safe to leave
-      in place because drawer IDs are deterministic (re-mining
-      upserts to the same rows).
+      whole mine; the loop continues with the next file, and the mine ends
+      with ``MineFileErrors`` after the summary when any file failed.
+    - On Ctrl-C the summary still prints and ``KeyboardInterrupt`` is then
+      re-raised; partial progress is safe to leave in place because drawer
+      IDs are deterministic (re-mining upserts to the same rows).
+    - A real mine holds ``mine_palace_lock`` for its whole run, like the
+      project and conversation miners.
     """
+    if dry_run:
+        return _mine_formats_impl(format_dir, palace_path, wing, agent, limit, dry_run)
+    with mine_palace_lock(palace_path):
+        return _mine_formats_impl(format_dir, palace_path, wing, agent, limit, dry_run)
+
+
+def _mine_formats_impl(
+    format_dir: str,
+    palace_path: str,
+    wing: Optional[str],
+    agent: str,
+    limit: int,
+    dry_run: bool,
+) -> None:
     # MempalaceConfig + chunk_text are imported at module level (above) so
     # tests can patch ``mempalace.format_miner.MempalaceConfig`` and
     # ``mempalace.format_miner.chunk_text`` directly. Hoisted as part of the
@@ -826,9 +883,10 @@ def mine_formats(
     files_mined = 0
     files_skipped = 0
     files_with_text = 0
-    files_errored = 0
+    files_failed: list = []
     files_processed = 0
     status_counts: dict = defaultdict(int)
+    interrupted = None
 
     try:
         # Use the resolved ``format_path``, not the raw ``format_dir``, so that
@@ -883,7 +941,7 @@ def mine_formats(
                 if status != ExtractionStatus.OK or not text:
                     if not dry_run:
                         _register_skip_sentinel_if_appropriate(
-                            collection, source_file, wing, agent, status
+                            collection, source_file, wing, agent, status, source_mtime
                         )
                     print(f"  - [{i:4}/{len(files)}] {filepath.name[:50]:50} {status.name}")
                     continue
@@ -900,7 +958,9 @@ def mine_formats(
                 )
                 if not chunks:
                     if not dry_run:
-                        _register_file(collection, source_file, wing, agent)
+                        _register_file(
+                            collection, source_file, wing, agent, source_mtime, empty=True
+                        )
                     print(f"  - [{i:4}/{len(files)}] {filepath.name[:50]:50} EMPTY_AFTER_CHUNK")
                     continue
 
@@ -941,7 +1001,7 @@ def mine_formats(
             except Exception as exc:
                 # Log and continue — one malformed file shouldn't kill the
                 # whole mine. Mirrors miner.py's per-file recovery.
-                files_errored += 1
+                files_failed.append(source_file)
                 logger.warning(
                     "mine_formats: error processing %s — %s: %s",
                     source_file,
@@ -952,27 +1012,11 @@ def mine_formats(
                     f"  ! [{i:4}/{len(files)}] {filepath.name[:50]:50} ERROR: {type(exc).__name__}"
                 )
                 continue
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
         # Partial progress is safe — deterministic drawer IDs mean a re-mine
-        # upserts to the same rows. Print a clean summary and exit.
+        # upserts to the same rows. Print the summary, then re-raise.
         print("\n  Mine interrupted by user (Ctrl-C).")
-    except Exception as exc:
-        # Defense in depth — the per-file try/except above catches most
-        # realistic crashes, but a programming error in the outer-loop
-        # plumbing (file enumeration, scan_formats itself, etc.) would
-        # otherwise propagate as a bare traceback. Catch it here so the
-        # summary still prints and the PID-file finally-block still runs.
-        # Per PR #1555 review (Gemini #5). Mirrors miner.py's belt-and-
-        # suspenders pattern.
-        logger.warning(
-            "mine_formats: unexpected outer-loop exception — %s: %s",
-            type(exc).__name__,
-            str(exc)[:200],
-        )
-        print(
-            f"\n  Mine aborted by exception ({type(exc).__name__}: {str(exc)[:120]})",
-            file=sys.stderr,
-        )
+        interrupted = exc
     else:
         # All files processed without interruption — compute cross-wing topic
         # tunnels linking this wing to others that share confirmed topics.
@@ -1020,7 +1064,10 @@ def mine_formats(
         files_seen=files_processed,
         files_with_text=files_with_text,
         files_skipped=files_skipped,
-        files_errored=files_errored,
+        files_errored=len(files_failed),
         total_drawers=total_drawers,
         status_counts=status_counts,
     )
+    if interrupted is not None:
+        raise interrupted
+    raise_if_files_failed(files_failed, files_processed)

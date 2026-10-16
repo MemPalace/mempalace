@@ -688,24 +688,11 @@ class TestHandleRequest:
         must not advertise the hint (omitted means the MCP default, false).
         The same rule covers every tool --read-only refuses.
         """
-        from mempalace.mcp_server import _READ_ONLY_REFUSED_TOOLS, handle_request
+        from mempalace.mcp_server import TOOLS, _READ_ONLY_REFUSED_TOOLS, handle_request
 
-        expected = {
-            "mempalace_status",
-            "mempalace_list_wings",
-            "mempalace_list_rooms",
-            "mempalace_get_taxonomy",
-            "mempalace_get_aaak_spec",
-            "mempalace_search",
-            "mempalace_check_duplicate",
-            "mempalace_get_drawer",
-            "mempalace_get_drawers",
-            "mempalace_list_drawers",
-            "mempalace_diary_read",
-            "mempalace_kg_query",
-            "mempalace_kg_timeline",
-            "mempalace_kg_stats",
-        }
+        from mempalace.service import classify_tool
+
+        expected = {name for name in TOOLS if classify_tool(name) == "read"}
         resp = handle_request({"method": "tools/list", "id": 2, "params": {}})
         tools = resp["result"]["tools"]
         hinted = {t["name"] for t in tools if t.get("annotations", {}).get("readOnlyHint") is True}

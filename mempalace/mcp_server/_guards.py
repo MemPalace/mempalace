@@ -160,34 +160,18 @@ _sqlite_integrity_check_error = ""
 # probe's size limit (#2240) — so the status payload can report an absence
 # rather than a clean bill of health.
 _sqlite_integrity_no_verdict_reason = ""
+# The four fields above as one value, published by each refresh once it has
+# written them, and a count of those publications. A reader that overlaps a
+# refresh answers from this tuple instead of a half-written set of globals.
+_sqlite_integrity_verdict = None
+_sqlite_integrity_generation = 0
 # Serializes quick_check runs between the async startup preflight thread and
 # lazy consumers on the protocol thread (double-checked in
 # _ensure_sqlite_integrity_status) so the O(database size) probe never runs
 # twice concurrently.
 _sqlite_integrity_refresh_lock = threading.Lock()
 _SQLITE_INTEGRITY_ERROR_CODE = -32002
-_SQLITE_INTEGRITY_ALLOWED_TOOLS = frozenset(
-    {
-        "mempalace_status",
-        "mempalace_reconnect",
-        # RFC 003: logstream lives in its own logstream.sqlite3 with no
-        # Chroma/FTS5 dependency, so agent coordination stays available
-        # even while the main palace index is corrupt and under repair.
-        "mempalace_event_append",
-        "mempalace_task_create",
-        "mempalace_event_list",
-        "mempalace_event_wait",
-        "mempalace_event_ack",
-        "mempalace_artifact_put",
-        "mempalace_artifact_get",
-        "mempalace_patch_submit",
-        # RFC 004: the estate is observability — logstream + sync state +
-        # peers.json, no FTS5 dependency (the profile's drawer count
-        # degrades gracefully). A damaged palace is exactly when mesh
-        # visibility matters most; caught live on the third replica.
-        "mempalace_mesh_peers",
-    }
-)
+_SQLITE_INTEGRITY_ALLOWED_TOOLS = _tool_capabilities.SQLITE_INTEGRITY_ALLOWED_TOOLS
 
 # The startup probe above runs PRAGMA quick_check, which reads every page of
 # chroma.sqlite3 and is therefore O(database size). On multi-GB palaces it can
@@ -217,125 +201,12 @@ _MCP_WRITER_LOCK_ERROR = ""
 _MCP_WRITER_ATEXIT_REGISTERED = False
 _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
 
-_MUTATING_TOOLS = frozenset(
-    {
-        "mempalace_kg_add",
-        "mempalace_kg_invalidate",
-        "mempalace_kg_supersede",
-        "mempalace_create_tunnel",
-        "mempalace_delete_tunnel",
-        "mempalace_delete_hallway",
-        "mempalace_add_drawer",
-        "mempalace_delete_drawer",
-        "mempalace_delete_drawers",
-        "mempalace_checkpoint",
-        "mempalace_delete_by_source",
-        "mempalace_mine",
-        "mempalace_sync",
-        "mempalace_update_drawer",
-        "mempalace_diary_write",
-        "mempalace_event_append",
-        "mempalace_task_create",
-        "mempalace_event_ack",
-        "mempalace_artifact_put",
-        "mempalace_patch_submit",
-    }
-)
-
-# Tools exempt from the peer-writer lease.
-#
-# Logstream mutating tools (RFC 003) write only to logstream.sqlite3 — an
-# independent WAL database with no Chroma/HNSW in-memory state — so the
-# peer-writer lease that protects Chroma does not apply to them. Exempting
-# them keeps agent coordination alive while a CLI mine or a peer stdio
-# writer holds the palace lock.
-#
-# Knowledge-graph tools (#2297): KnowledgeGraph opens its own
-# knowledge_graph.sqlite3 in WAL mode with its own threading.Lock.
-# None of these paths touch Chroma or the HNSW segment, so the
-# peer-writer lease — which exists to serialise two Chroma
-# PersistentClients against the same palace — has no claim on them.
-# Gate them through the lease and a second session loses the ability
-# to record durable facts for the lifetime of the other session,
-# even though the write is provably safe.
-#
-# All exempted tools remain in _MUTATING_TOOLS so operator
-# read-only mode (--read-only / MEMPALACE_MCP_READ_ONLY) still hides and
-# refuses them.
-_PEER_WRITER_EXEMPT_TOOLS = frozenset(
-    {
-        "mempalace_event_append",
-        "mempalace_task_create",
-        "mempalace_event_ack",
-        "mempalace_artifact_put",
-        "mempalace_patch_submit",
-        "mempalace_kg_add",
-        "mempalace_kg_invalidate",
-        "mempalace_kg_supersede",
-    }
-)
-
-# The subset of _MUTATING_TOOLS whose write path reaches the chroma vector
-# segment. Deliberately narrower: the knowledge-graph and tunnel/hallway tools
-# keep their own sqlite/JSON state and never touch HNSW, so an unusable vector
-# index has no say over them.
-#
-# The distinction earns its keep because a write into a diverged HNSW segment
-# does not fail — it blocks inside chromadb's Rust upsert with no timeout of its
-# own, for the life of the process, while this server holds the palace mine lock
-# and the writer lease. One stuck call becomes a palace-wide outage that a still
-# healthy handshake hides.
-_VECTOR_WRITE_TOOLS = frozenset(
-    {
-        "mempalace_add_drawer",
-        "mempalace_update_drawer",
-        "mempalace_delete_drawer",
-        "mempalace_delete_drawers",
-        "mempalace_delete_by_source",
-        "mempalace_diary_write",
-        "mempalace_checkpoint",
-        "mempalace_mine",
-        "mempalace_sync",
-    }
-)
-
+# Gate sets, derived in mempalace.tool_capabilities (see the flags there).
+_MUTATING_TOOLS = _tool_capabilities.MUTATING_TOOLS
+_PEER_WRITER_EXEMPT_TOOLS = _tool_capabilities.PEER_WRITER_EXEMPT_TOOLS
+_VECTOR_WRITE_TOOLS = _tool_capabilities.VECTOR_WRITE_TOOLS
 _DIVERGED_INDEX_ERROR_CODE = -32004
-
-# Read-only mode (#1877) refuses a wider set than the peer-writer guard above.
-#
-# _MUTATING_TOOLS is the *palace-write* set: _mcp_peer_writer_refusal consults it
-# to decide which calls need this process to hold the palace mine lock. A tool
-# that never touches Chroma or the knowledge graph has to stay out of that set,
-# or a server that lost the lease to a peer would start refusing calls the lease
-# has no say over.
-#
-# Two tools are exactly that shape, and read-only has to name both because it is
-# a capability boundary rather than a lock: it exists so a shared server can
-# serve recall to a client that must not change server state.
-#
-#   mempalace_hook_settings, given an argument, writes the server's
-#   ~/.mempalace/config.json through MempalaceConfig.set_hook_setting.
-#   service.WRITE_TOOLS already classifies it as a write, which the daemon uses
-#   as an allowlist, so read-only was the odd one out.
-#
-#   mempalace_memories_filed_away unlinks ~/.mempalace/hook_state/last_checkpoint
-#   on both of its branches. Consuming the file is the contract of the tool, but
-#   it is still a delete of state that outlives the process, on behalf of a
-#   client with no write access. (service.classify_tool calls this one "read",
-#   which is wrong for the same reason.)
-#
-# mempalace_reconnect is deliberately NOT here even though it is not write-free:
-# it clears ChromaBackend._quarantined_paths, so the reopen that follows can let
-# quarantine_stale_hnsw rename a segment directory. It is the only way to pick up
-# an external writer's changes, and _SQLITE_INTEGRITY_ALLOWED_TOOLS already keeps
-# it reachable for recovery, so gating it would strand a read-only server on a
-# stale index. This set means "refuse what a client asked to change", not
-# "nothing past here touches the disk" -- opening the palace or the knowledge
-# graph materialises files on its own, which no name-based gate can express.
-_READ_ONLY_REFUSED_TOOLS = _MUTATING_TOOLS | {
-    "mempalace_hook_settings",
-    "mempalace_memories_filed_away",
-}
+_READ_ONLY_REFUSED_TOOLS = _tool_capabilities.READ_ONLY_REFUSED_TOOLS
 
 
 # Stale-library write gate (#899).
@@ -761,6 +632,7 @@ def _refresh_sqlite_integrity_status_locked() -> None:
         _sqlite_integrity_errors = []
         _sqlite_integrity_check_error = ""
         _sqlite_integrity_no_verdict_reason = ""
+        _publish_sqlite_integrity_verdict()
         return
 
     max_bytes = _startup_integrity_size_limit_bytes()
@@ -785,6 +657,10 @@ def _refresh_sqlite_integrity_status_locked() -> None:
                 f"({_STARTUP_INTEGRITY_MAX_MB_ENV}); no quick_check has run "
                 "against this palace. Run `mempalace repair` for a full check."
             )
+            _sqlite_integrity_checked = True
+            _sqlite_integrity_errors = []
+            _sqlite_integrity_check_error = ""
+            _publish_sqlite_integrity_verdict()
             logger.warning(
                 "SQLite startup integrity check skipped: %s is %s MB "
                 "(> %s MB limit); PRAGMA quick_check would block MCP "
@@ -795,9 +671,6 @@ def _refresh_sqlite_integrity_status_locked() -> None:
                 limit_mb,
                 _STARTUP_INTEGRITY_MAX_MB_ENV,
             )
-            _sqlite_integrity_checked = True
-            _sqlite_integrity_errors = []
-            _sqlite_integrity_check_error = ""
             return
 
     try:
@@ -812,19 +685,11 @@ def _refresh_sqlite_integrity_status_locked() -> None:
         _sqlite_integrity_no_verdict_reason = ""
     else:
         fresh_errors = [str(error) for error in status.errors if str(error)]
-        # _sqlite_integrity_payload reads these globals without the lock, so
-        # the order within each branch is chosen to keep that branch's own
-        # window on the safer side: entering "no verdict" records the reason
-        # before the list it explains, and leaving it clears the reason only
-        # once the fresh errors are in place.
-        #
-        # No write order makes the payload safe, and this one does not claim
-        # to. That reader loads the error list more than once, so a refresh
-        # landing between two of its loads can still publish `ok: true` for a
-        # palace with no database. The way to close that is to publish the
-        # verdict as one value, which is a change to what this gate stores
-        # rather than to
-        # the order it stores it in.
+        # Entering "no verdict" records the reason before the list it explains,
+        # and leaving it clears the reason only once the fresh errors are in
+        # place. The payload reads the published tuple, not these globals one
+        # by one; the order still keeps a lock-free reader of the globals on
+        # the safer side of each branch.
         if status.checked:
             _sqlite_integrity_errors = fresh_errors
             _sqlite_integrity_no_verdict_reason = ""
@@ -834,6 +699,7 @@ def _refresh_sqlite_integrity_status_locked() -> None:
         _sqlite_integrity_check_error = ""
 
     _sqlite_integrity_checked = True
+    _publish_sqlite_integrity_verdict()
 
     if _sqlite_integrity_errors:
         logger.error(
@@ -855,23 +721,46 @@ def _ensure_sqlite_integrity_status() -> None:
             _refresh_sqlite_integrity_status_locked()
 
 
+def _publish_sqlite_integrity_verdict() -> None:
+    # Callers hold _sqlite_integrity_refresh_lock and have written every field.
+    global _sqlite_integrity_verdict, _sqlite_integrity_generation
+    _sqlite_integrity_verdict = (
+        _sqlite_integrity_checked,
+        _sqlite_integrity_errors,
+        _sqlite_integrity_check_error,
+        _sqlite_integrity_no_verdict_reason,
+    )
+    _sqlite_integrity_generation += 1
+
+
+def _sqlite_integrity_view():
+    """One whole verdict: the globals, or the published tuple during a refresh.
+
+    The globals are read once each. If a refresh was writing them meanwhile,
+    it either still holds the refresh lock or has published since, and the
+    published tuple is the last verdict it wrote in full.
+    """
+    generation = _sqlite_integrity_generation
+    checked = _sqlite_integrity_checked
+    errors = _sqlite_integrity_errors
+    check_error = _sqlite_integrity_check_error
+    reason = _sqlite_integrity_no_verdict_reason
+    verdict = _sqlite_integrity_verdict
+    if verdict is not None and (
+        _sqlite_integrity_refresh_lock.locked() or generation != _sqlite_integrity_generation
+    ):
+        checked, errors, check_error, reason = _sqlite_integrity_verdict
+    if not isinstance(errors, (list, tuple)):
+        errors = ()
+    else:
+        errors = tuple(errors)
+    return checked, errors, check_error or "", reason or ""
+
+
 def _sqlite_integrity_payload() -> dict:
     _ensure_sqlite_integrity_status()
+    checked, errors, check_error, reason = _sqlite_integrity_view()
 
-    # These globals are read one at a time, without the refresh lock, as they
-    # have always been, and a refresh landing between two of those reads can
-    # make this function publish a verdict the gate never held. Both directions
-    # produce one: reading through, as here, can answer `ok: true` for a palace
-    # with no database, because the error list the branch below tests is read
-    # again when the payload is built; snapshotting into locals first can answer
-    # `ok: true` for a palace whose corruption the refresh had just found,
-    # because separate loads stay separate moments either way. A snapshot
-    # therefore trades one window for another of the same class rather than
-    # closing anything, which is why it is not taken here. Holding the refresh
-    # lock across this function would close it, at the cost of serialising every
-    # status read behind an O(database size) probe; publishing the verdict as
-    # one value closes it without that, and is the change worth making.
-    #
     # The integrity gate only knows how to check chroma.sqlite3, and
     # _refresh_sqlite_integrity_status short-circuits for non-chroma backends,
     # so on a non-chroma backend no quick_check runs. Reporting checked/ok true
@@ -879,8 +768,9 @@ def _sqlite_integrity_payload() -> dict:
     # chroma.sqlite3 the active backend does not use (#1931). Recorded errors
     # only ever come from the chroma path, so surface them regardless of the
     # backend lookup (which may itself fail); only the clean case is
-    # reclassified as not-applicable.
-    if not _sqlite_integrity_errors:
+    # reclassified as not-applicable. ``errors`` is the generation captured
+    # above: the backend lookup must not observe a later refresh.
+    if not errors:
         try:
             backend_name = _selected_backend_name()
         except Exception:
@@ -915,7 +805,7 @@ def _sqlite_integrity_payload() -> dict:
         # Asked after the backend and not before it: both reasons describe a
         # chroma path, so a server running something else has to be told that
         # rather than handed a reason about a chroma.sqlite3 it never uses.
-        if _sqlite_integrity_no_verdict_reason:
+        if reason:
             return {
                 "checked": False,
                 "ok": None,
@@ -926,12 +816,12 @@ def _sqlite_integrity_payload() -> dict:
                 else "",
                 "error_count": 0,
                 "errors": [],
-                "reason": _sqlite_integrity_no_verdict_reason,
+                "reason": reason,
             }
 
     payload = {
-        "checked": _sqlite_integrity_checked,
-        "ok": not _sqlite_integrity_errors,
+        "checked": checked,
+        "ok": not errors,
         # Which SQLite produced this verdict. An "ok" from a build that cannot
         # detect a given FTS5 fault is not the same claim as an "ok" from one
         # that can, and the two are otherwise indistinguishable here (#2240).
@@ -940,15 +830,15 @@ def _sqlite_integrity_payload() -> dict:
         "sqlite_path": os.path.join(_config.palace_path, "chroma.sqlite3")
         if _config.palace_path
         else "",
-        "error_count": len(_sqlite_integrity_errors),
-        "errors": _sqlite_integrity_errors[:10],
+        "error_count": len(errors),
+        "errors": list(errors[:10]),
     }
 
-    if len(_sqlite_integrity_errors) > 10:
-        payload["truncated"] = len(_sqlite_integrity_errors) - 10
+    if len(errors) > 10:
+        payload["truncated"] = len(errors) - 10
 
-    if _sqlite_integrity_check_error:
-        payload["check_error"] = _sqlite_integrity_check_error
+    if check_error:
+        payload["check_error"] = check_error
 
     return payload
 
@@ -958,8 +848,9 @@ def _mcp_sqlite_integrity_refusal(req_id, tool_name: str):
         return None
 
     _ensure_sqlite_integrity_status()
+    errors = _sqlite_integrity_view()[1]
 
-    if not _sqlite_integrity_errors:
+    if not errors:
         return None
 
     return {
@@ -979,8 +870,8 @@ def _mcp_sqlite_integrity_refusal(req_id, tool_name: str):
                     if _config.palace_path
                     else ""
                 ),
-                "errors": _sqlite_integrity_errors[:10],
-                "error_count": len(_sqlite_integrity_errors),
+                "errors": list(errors[:10]),
+                "error_count": len(errors),
                 # This is the payload an operator is most likely to paste into
                 # a report, so it carries the build behind the verdict too.
                 "sqlite_version": sqlite3.sqlite_version,

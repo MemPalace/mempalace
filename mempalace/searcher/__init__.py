@@ -43,6 +43,12 @@ from ..palace import (
     get_collection,
     resolve_backend_name,
 )
+from ..search_util import (
+    _distance_to_similarity,
+    _first_or_empty,
+    _metric_for_collection,
+    build_where_filter,
+)
 
 # Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
 # Multiple lines may join with newlines inside one closet document.

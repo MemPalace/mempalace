@@ -54,204 +54,123 @@ def _candidate_pool_limits(
     return widened, widened
 
 
-def _enrich_closet_hits(
-    hits: list,
-    drawers_col,
-    query: str,
-    stop_words: frozenset = frozenset(),
-) -> list:
-    """Hydrate closet-boosted hits and memoise each source/group fetch."""
-    query_terms = set(
-        _tokenize(
-            query,
-            stop_words,
+def _source_chunk_index(metadata, fallback: int) -> int:
+    if isinstance(metadata, dict):
+        chunk_index = metadata.get("chunk_index", fallback)
+    else:
+        chunk_index = fallback
+    return chunk_index if isinstance(chunk_index, int) else fallback
+
+
+def _ordered_source_chunks(source_drawers) -> list:
+    docs = list(getattr(source_drawers, "documents", None) or [])
+    metadatas = list(getattr(source_drawers, "metadatas", None) or [])
+    indexed = []
+    for index, (document, metadata) in enumerate(zip(docs, metadatas)):
+        indexed.append((_source_chunk_index(metadata, index), document or ""))
+    indexed.sort(key=lambda pair: pair[0])
+    return indexed
+
+
+def _load_source_chunks(cache: dict, drawers_col, full_source: str, parent_drawer_id):
+    cache_key = (full_source, parent_drawer_id)
+    if cache_key in cache:
+        return cache[cache_key]
+    try:
+        source_drawers = drawers_col.get(
+            where=_scoped_source_filter(full_source, parent_drawer_id),
+            include=["documents", "metadatas"],
         )
-    )
+    except Exception:
+        logger.debug("Neighbor fetch failed for %s", full_source, exc_info=True)
+        cache[cache_key] = None
+        return None
+    cache[cache_key] = _ordered_source_chunks(source_drawers)
+    return cache[cache_key]
+
+
+def _matched_chunk_offset(hit: dict, indexed: list):
+    """Position of this hit's own chunk, never a query-term guess."""
+    chunk_index = hit.get("_chunk_index")
+    if isinstance(chunk_index, int):
+        for offset, (stored_index, _document) in enumerate(indexed):
+            if stored_index == chunk_index:
+                return offset
+    text = hit.get("text") or ""
+    for offset, (_stored_index, document) in enumerate(indexed):
+        if document == text:
+            return offset
+    return None
+
+
+def _neighbor_context(indexed: list, matched: int) -> str:
+    start = max(0, matched - 1)
+    end = min(len(indexed), matched + 2)
+    neighbors = [
+        document
+        for offset, (_stored_index, document) in enumerate(indexed[start:end], start)
+        if offset != matched and document
+    ]
+    context = "\n\n".join(neighbors)
+    if len(context) > _MAX_HYDRATION_CHARS:
+        context = context[:_MAX_HYDRATION_CHARS] + (
+            f"\n\n[...truncated. {len(indexed)} total drawers. "
+            "Use mempalace_get_drawer for full content.]"
+        )
+    return context
+
+
+def _enrich_closet_hits(hits: list, drawers_col) -> list:
+    """Keep each closet hit's own drawer text and attach neighbor context.
+
+    ``text`` is the matched drawer, verbatim. Chunks beside that drawer's
+    own chunk index go in ``context``. Closets boost ranking; they do not
+    replace the drawer they pointed at.
+    """
     source_cache: dict = {}
 
     for hit in hits:
         if hit.get("matched_via") == "drawer":
             continue
-
         full_source = hit.get("_source_file_full") or ""
-
         if not full_source:
             continue
-
-        parent_drawer_id = hit.get("_parent_drawer_id") or None
-        cache_key = (
+        indexed = _load_source_chunks(
+            source_cache,
+            drawers_col,
             full_source,
-            parent_drawer_id,
+            hit.get("_parent_drawer_id") or None,
         )
-
-        if cache_key not in source_cache:
-            try:
-                source_drawers = drawers_col.get(
-                    where=(
-                        _scoped_source_filter(
-                            full_source,
-                            parent_drawer_id,
-                        )
-                    ),
-                    include=[
-                        "documents",
-                        "metadatas",
-                    ],
-                )
-            except Exception:
-                logger.debug(
-                    "Neighbor fetch failed for %s",
-                    full_source,
-                    exc_info=True,
-                )
-                source_cache[cache_key] = None
-            else:
-                source_cache[cache_key] = (
-                    list(
-                        getattr(
-                            source_drawers,
-                            "documents",
-                            None,
-                        )
-                        or []
-                    ),
-                    list(
-                        getattr(
-                            source_drawers,
-                            "metadatas",
-                            None,
-                        )
-                        or []
-                    ),
-                )
-
-        cached = source_cache[cache_key]
-
-        if cached is None:
+        if not indexed or len(indexed) <= 1:
             continue
-
-        docs, metadatas = cached
-
-        if len(docs) <= 1:
+        matched = _matched_chunk_offset(hit, indexed)
+        if matched is None:
             continue
-
-        indexed = []
-
-        for index, (
-            document,
-            metadata,
-        ) in enumerate(
-            zip(
-                docs,
-                metadatas,
-            )
-        ):
-            chunk_index = (
-                metadata.get(
-                    "chunk_index",
-                    index,
-                )
-                if isinstance(
-                    metadata,
-                    dict,
-                )
-                else index
-            )
-
-            if not isinstance(
-                chunk_index,
-                int,
-            ):
-                chunk_index = index
-
-            indexed.append(
-                (
-                    chunk_index,
-                    document or "",
-                )
-            )
-
-        indexed.sort(key=lambda pair: pair[0])
-        ordered_docs = [document for _, document in indexed]
-
-        best_index = 0
-        best_score = -1
-
-        for index, document in enumerate(ordered_docs):
-            lowered = document.lower()
-            score = sum(1 for term in query_terms if term in lowered)
-
-            if score > best_score:
-                best_score = score
-                best_index = index
-
-        start = max(
-            0,
-            best_index - 1,
-        )
-        end = min(
-            len(ordered_docs),
-            best_index + 2,
-        )
-        expanded = "\n\n".join(ordered_docs[start:end])
-
-        if len(expanded) > _MAX_HYDRATION_CHARS:
-            expanded = expanded[:_MAX_HYDRATION_CHARS] + (
-                f"\n\n[...truncated. "
-                f"{len(ordered_docs)} total drawers. "
-                "Use mempalace_get_drawer "
-                "for full content.]"
-            )
-
-        hit["text"] = expanded
-        hit["drawer_index"] = best_index
-        hit["total_drawers"] = len(ordered_docs)
-
+        context = _neighbor_context(indexed, matched)
+        if context:
+            hit["context"] = context
+        hit["drawer_index"] = indexed[matched][0]
+        hit["total_drawers"] = len(indexed)
     return hits
 
 
-def _dedupe_rendered_hits(
-    hits: list,
-) -> list:
-    """Drop repeated closet-rendered passages while preserving rank order.
+def _dedupe_rendered_hits(hits: list) -> list:
+    """Drop a later hit only when it is the same stored chunk again.
 
-    Plain drawer hits retain their historical behavior, including legitimate
-    exact repeats at different source positions. A duplicate is removed only
-    when either occurrence came through closet enrichment.
+    The key is the drawer id, chunk index and text. Chunks of one logical
+    drawer share its id, so the id alone would drop distinct chunk hits.
+    A hit with no drawer_id is kept.
     """
     unique = []
-    first_by_key: dict = {}
-
+    seen = set()
     for hit in hits:
-        source = hit.get("_source_file_full") or hit.get("source_path") or hit.get("source_file")
-        text = hit.get("text")
-
-        if not source or not isinstance(
-            text,
-            str,
-        ):
-            unique.append(hit)
-            continue
-
-        key = (
-            source,
-            text,
-        )
-        previous = first_by_key.get(key)
-
-        if previous is None:
-            first_by_key[key] = hit
-            unique.append(hit)
-            continue
-
-        previous_is_closet = previous.get("matched_via") == "drawer+closet"
-        current_is_closet = hit.get("matched_via") == "drawer+closet"
-
-        if previous_is_closet or current_is_closet:
-            continue
-
+        drawer_id = hit.get("drawer_id")
+        if drawer_id:
+            key = (drawer_id, hit.get("_chunk_index"), hit.get("text"))
+            if key in seen:
+                continue
+            seen.add(key)
         unique.append(hit)
-
     return unique
 
 

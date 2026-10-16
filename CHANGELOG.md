@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **`closet_llm` reads `MEMPALACE_LLM_ENDPOINT`, `MEMPALACE_LLM_MODEL` and
+  `MEMPALACE_LLM_KEY` instead of the generic `LLM_ENDPOINT`, `LLM_MODEL` and
+  `LLM_KEY`.** Generic names are often set for other tools, and reading them
+  could send drawer content to an endpoint nobody chose for MemPalace. Rename the
+  variables; when only the old names are set, the command says so. A non-local
+  endpoint also needs `--accept-external-llm` or `MEMPALACE_ACCEPT_EXTERNAL_LLM=1`,
+  the same consent `init`, `rooms propose` and `kg normalize` ask for, and every
+  LLM provider now refuses a non-local endpoint until that consent is given.
+
 ### Added
 
 - **`kg_timeline` and `KnowledgeGraph.query_relationship` return each fact's `confidence`,
@@ -15,7 +26,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   the timeline and relationship reads dropped all three, so a fact's provenance depended
   on which read path surfaced it. The three keys now carry the stored values on every
   fact those reads return, and no existing key changes. (#2749)
-
 
 ---
 

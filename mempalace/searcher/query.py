@@ -417,14 +417,7 @@ def search_memories(
     scored.sort(key=lambda h: h["_sort_key"])
     hits = scored[:pre_enrichment_limit]
 
-    # Drawer-grep enrichment: retain the wider pool until repeated
-    # closet-rendered passages can be replaced by distinct candidates.
-    _enrich_closet_hits(
-        hits,
-        drawers_col,
-        query,
-        stop_words=stop_words,
-    )
+    hits = _enrich_closet_hits(hits, drawers_col)
 
     # Candidate strategy hook: optionally widen the rerank pool's *source*
     # before ranking. Default ("vector") is a no-op; "union" merges top-K
