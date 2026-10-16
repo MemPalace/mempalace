@@ -1,5 +1,6 @@
 """MCP server tests — protocol, dispatch, and session cache."""
 
+import re
 import json
 import os
 import subprocess
@@ -525,10 +526,14 @@ class TestColdStartDiagnostics:
         assert "MEMPALACE-DOTTED-LINE-xyz" in body, body
         assert "MEMPALACE-FLAT-LINE-xyz" in body, body
         assert "HOST-ONLY-LINE-xyz" not in body, body
-        # Format is "%(message)s" in the embedded path too: the line is the bare
-        # message with no "LEVEL:name:" prefix (the file handler sets its own
-        # formatter, independent of basicConfig which never runs here).
-        assert any(line == "MEMPALACE-FLAT-LINE-xyz" for line in body.splitlines()), body
+        # The file handler stamps time and level on each line (#2620), so a
+        # server-side record can be ordered and matched against a client-side
+        # timeout. basicConfig never runs here, so this format comes from the
+        # file handler's own formatter, not the host's.
+        stamped = re.compile(
+            r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} INFO MEMPALACE-FLAT-LINE-xyz$"
+        )
+        assert any(stamped.match(line) for line in body.splitlines()), body
 
     def test_embedded_host_warning_root_gates_mempalace_info(self, tmp_path):
         """Documents the intentional embedded-mode level-gating tradeoff: when
