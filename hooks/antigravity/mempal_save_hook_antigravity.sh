@@ -226,9 +226,15 @@ mempal_log "stop" "$CONVERSATION_ID" "TRIGGERING SAVE wing=$WING transcript_dir=
 mempal_log "stop" "$CONVERSATION_ID" "spawning background mine wing=$WING transcript_dir=$TRANSCRIPT_DIR"
 (
     if "$MEMPAL_PYTHON_BIN" -m mempalace --version >/dev/null 2>&1; then
+        # Route via --daemon when one is up (MemPalace/mempalace#2326).
+        MEMPAL_MINE_ROUTE=""
+        if "$MEMPAL_PYTHON_BIN" -m mempalace.hook_shell daemon-available >/dev/null 2>&1; then
+            MEMPAL_MINE_ROUTE="--daemon"
+        fi
         "$MEMPAL_PYTHON_BIN" -m mempalace mine "$TRANSCRIPT_DIR" \
             --mode convos \
             --wing "$WING" \
+            $MEMPAL_MINE_ROUTE \
             >> "$MEMPAL_AGY_LOG" 2>&1 < /dev/null
         mempal_log "stop" "$CONVERSATION_ID" "background mine finished wing=$WING"
     else

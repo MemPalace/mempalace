@@ -5,6 +5,11 @@ if __name__ != "mempalace.cli":
 
 def cmd_hook(args):
     """Run hook logic: reads JSON from stdin, outputs JSON to stdout."""
+    if getattr(args, "hook_action", None) == "daemon-available":
+        from ..hook_shell import main as hook_shell_main
+
+        sys.exit(hook_shell_main(["daemon-available"]))
+
     from ..hooks_cli import run_hook
 
     run_hook(hook_name=args.hook, harness=args.harness)

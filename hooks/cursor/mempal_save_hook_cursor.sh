@@ -238,18 +238,29 @@ mempal_log "stop" "$MEMPAL_CONV_ID" "TRIGGERING SAVE at counter=$NEXT"
 # without the CLI on PATH (e.g. a fresh GUI-launched session) does
 # not see a noisy error.
 if command -v mempalace >/dev/null 2>&1; then
-    if mempal_is_valid_transcript "$MEMPAL_TRANSCRIPT" \
-        && [ -f "$MEMPAL_TRANSCRIPT" ]; then
-        ( mempalace mine "$(dirname "$MEMPAL_TRANSCRIPT")" --mode convos \
-            >> "$MEMPAL_CURSOR_LOG" 2>&1 ) &
-    elif [ -n "$MEMPAL_TRANSCRIPT" ]; then
-        mempal_log "stop" "$MEMPAL_CONV_ID" \
-            "skipping invalid transcript path: $MEMPAL_TRANSCRIPT"
-    fi
-    if [ -n "$MEMPAL_DIR" ] && [ -d "$MEMPAL_DIR" ]; then
-        ( mempalace mine "$MEMPAL_DIR" --mode projects \
-            >> "$MEMPAL_CURSOR_LOG" 2>&1 ) &
-    fi
+    # Probe and mine in the background so Stop never waits for daemon health.
+    (
+        # Route via --daemon when one is up (MemPalace/mempalace#2326).
+        MEMPAL_MINE_ROUTE=""
+        if mempalace hook daemon-available >/dev/null 2>&1; then
+            MEMPAL_MINE_ROUTE="--daemon"
+        fi
+        if mempal_is_valid_transcript "$MEMPAL_TRANSCRIPT" \
+            && [ -f "$MEMPAL_TRANSCRIPT" ]; then
+            ( mempalace mine "$(dirname "$MEMPAL_TRANSCRIPT")" --mode convos \
+                $MEMPAL_MINE_ROUTE \
+                >> "$MEMPAL_CURSOR_LOG" 2>&1 ) &
+        elif [ -n "$MEMPAL_TRANSCRIPT" ]; then
+            mempal_log "stop" "$MEMPAL_CONV_ID" \
+                "skipping invalid transcript path: $MEMPAL_TRANSCRIPT"
+        fi
+        if [ -n "$MEMPAL_DIR" ] && [ -d "$MEMPAL_DIR" ]; then
+            ( mempalace mine "$MEMPAL_DIR" --mode projects \
+                $MEMPAL_MINE_ROUTE \
+                >> "$MEMPAL_CURSOR_LOG" 2>&1 ) &
+        fi
+    ) </dev/null >> "$MEMPAL_CURSOR_LOG" 2>&1 &
+
 else
     mempal_log "stop" "$MEMPAL_CONV_ID" \
         "mempalace CLI not on PATH; skipping background mine"

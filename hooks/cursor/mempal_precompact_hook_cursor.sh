@@ -93,9 +93,18 @@ mempal_log "preCompact" "$MEMPAL_CONV_ID" \
 # below is the backstop: the next `stop` hook re-mines and nudges a
 # verbatim save regardless of whether this mine completed.
 if command -v mempalace >/dev/null 2>&1; then
+    # Route via --daemon when one is up (MemPalace/mempalace#2326).
+    MEMPAL_MINE_ROUTE=""
+    if { mempal_is_valid_transcript "$MEMPAL_TRANSCRIPT" && [ -f "$MEMPAL_TRANSCRIPT" ]; } \
+        || { [ -n "$MEMPAL_DIR" ] && [ -d "$MEMPAL_DIR" ]; }; then
+        if mempalace hook daemon-available >/dev/null 2>&1; then
+            MEMPAL_MINE_ROUTE="--daemon"
+        fi
+    fi
     if mempal_is_valid_transcript "$MEMPAL_TRANSCRIPT" \
         && [ -f "$MEMPAL_TRANSCRIPT" ]; then
         mempalace mine "$(dirname "$MEMPAL_TRANSCRIPT")" --mode convos \
+            $MEMPAL_MINE_ROUTE \
             >> "$MEMPAL_CURSOR_LOG" 2>&1 || \
             mempal_log "preCompact" "$MEMPAL_CONV_ID" \
                 "WARN: mempalace mine convos returned non-zero"
@@ -105,6 +114,7 @@ if command -v mempalace >/dev/null 2>&1; then
     fi
     if [ -n "$MEMPAL_DIR" ] && [ -d "$MEMPAL_DIR" ]; then
         mempalace mine "$MEMPAL_DIR" --mode projects \
+            $MEMPAL_MINE_ROUTE \
             >> "$MEMPAL_CURSOR_LOG" 2>&1 || \
             mempal_log "preCompact" "$MEMPAL_CONV_ID" \
                 "WARN: mempalace mine projects returned non-zero"

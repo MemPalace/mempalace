@@ -129,12 +129,18 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv:
         print(
-            "usage: python -m mempalace.hook_shell <parse-stop|parse-precompact|count-human-messages>",
+            "usage: python -m mempalace.hook_shell "
+            "<parse-stop|parse-precompact|count-human-messages|daemon-available>",
             file=sys.stderr,
         )
         return 2
 
     command = argv[0]
+
+    if command == "daemon-available":
+        from .hooks_cli import _daemon_available
+
+        return 0 if _daemon_available() else 1
 
     if command == "parse-stop":
         session_id, stop_hook_active, transcript_path = parse_stop_payload(_load_stdin_json())
