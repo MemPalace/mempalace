@@ -128,7 +128,11 @@ def sanitize_kg_value(value: str, field_name: str = "value") -> str:
     value = value.strip()
 
     if len(value) > MAX_NAME_LENGTH:
-        raise ValueError(f"{field_name} exceeds maximum length of {MAX_NAME_LENGTH} characters")
+        raise ValueError(
+            f"{field_name} exceeds maximum length of {MAX_NAME_LENGTH} characters; "
+            f"{field_name} is an entity name — split multi-item content into "
+            "separate facts, or file a drawer and store a pointer"
+        )
 
     if "\x00" in value:
         raise ValueError(f"{field_name} contains null bytes")
