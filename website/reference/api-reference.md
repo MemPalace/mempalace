@@ -277,6 +277,7 @@ Reads from `~/.mempalace/config.json` and environment variables.
 |----------|------|---------|-------------|
 | `palace_path` | `str` | `~/.mempalace/palace` | ChromaDB storage path |
 | `collection_name` | `str` | `mempalace_drawers` | ChromaDB collection name |
+| `hallways_enabled` | `bool` | `True` | Whether hallway construction and automatic entity-tunnel derivation are enabled. Overridden by `MEMPALACE_KG_HALLWAYS_ENABLED`; existing records remain readable. |
 
 | Method | Description |
 |--------|-------------|
