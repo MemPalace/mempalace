@@ -15,6 +15,7 @@ from typing import Any, Optional
 
 from .base import (
     DimensionMismatchError,
+    dimension_mismatch_message,
     QueryResult,
     _IncludeSpec,
 )
@@ -140,8 +141,9 @@ class RustExactCollection(SQLiteExactCollection):
                 q = _as_vector_array(query_vector)
                 if expected_dim is not None and int(q.size) != expected_dim:
                     raise DimensionMismatchError(
-                        f"rust_exact collection {self._collection_name!r} expects "
-                        f"embedding dimension {expected_dim}, got {int(q.size)}"
+                        dimension_mismatch_message(
+                            "rust_exact", self._collection_name, expected_dim, int(q.size)
+                        )
                     )
                 if native.is_empty() or n_results == 0:
                     outer_ids.append([])

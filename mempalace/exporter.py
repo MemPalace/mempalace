@@ -17,6 +17,7 @@ import re
 from collections import defaultdict
 from datetime import datetime
 
+from .backends.base import PalaceNotFoundError
 from .palace import get_collection
 
 
@@ -80,8 +81,13 @@ def export_palace(palace_path: str, output_dir: str, format: str = "markdown") -
     Returns:
         Stats dict: {"wings": N, "rooms": N, "drawers": N}
     """
-    col = get_collection(palace_path)
-    total = col.count()
+    # A read: never create a collection, and never take the write path that
+    # refuses a palace whose embedder identity is unconfirmed.
+    try:
+        col = get_collection(palace_path, create=False)
+    except PalaceNotFoundError:  # includes CollectionNotInitializedError
+        col = None
+    total = col.count() if col is not None else 0
 
     if total == 0:
         print("  Palace is empty -- nothing to export.")

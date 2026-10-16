@@ -376,9 +376,14 @@ def _record_rebuilt_embedder_identity(collection, palace_path: str) -> None:
     except EmbedderIdentityRecordError as exc:
         # The rebuilt rows are verified and kept; only the record failed.
         # Say so loudly instead of leaving the palace unrecorded in silence.
+        import shlex
+
+        from .palace import _set_embedder_model_arg
+
+        model = _set_embedder_model_arg(identity.model_name)
         print(
             f"  WARNING: {exc}\n  Once fixed, record it with: mempalace --palace "
-            f"{palace_path} palace set-embedder --model {identity.model_name.split(':')[0]}"
+            f"{shlex.quote(str(palace_path))} palace set-embedder --model {shlex.quote(model)}"
         )
     clear_validated_embedder_identity(palace_path)
 
@@ -1722,15 +1727,18 @@ def _post_rebuild_cleanup(palace_path: str, backend: "ChromaBackend", progress=p
 
 
 def _require_valid_embedding_model() -> None:
-    """Refuse a misspelled ``embedding_model`` before anything is archived or created.
+    """Refuse an unusable embedder before anything is archived or created.
 
     Reading the config raises :class:`~mempalace.embedding.UnknownEmbeddingModelError`
-    for a near miss; without this the rebuild would archive the palace and
-    only fail once the first collection asks for its embedding function.
+    for a near miss, and a probe embed raises for an embedder that cannot be
+    built or an endpoint that does not answer. Without this the rebuild
+    archived the palace and only failed at its first upsert.
     """
     from .config import MempalaceConfig
+    from .embedding import require_working_embedder
 
     MempalaceConfig().embedding_model
+    require_working_embedder()
 
 
 def rebuild_index(

@@ -58,6 +58,7 @@ from .base import (
     BaseCollection,
     CollectionNotInitializedError,
     DimensionMismatchError,
+    dimension_mismatch_message,
     GetResult,
     HealthStatus,
     LexicalHit,
@@ -1102,8 +1103,9 @@ class PgVectorCollection(BaseCollection):
             if self._known_dimension is not None:
                 if self._known_dimension != dimension:
                     raise DimensionMismatchError(
-                        f"pgvector collection {self._collection_name!r} expects "
-                        f"embedding dimension {self._known_dimension}, got {dimension}"
+                        dimension_mismatch_message(
+                            "pgvector", self._collection_name, self._known_dimension, dimension
+                        )
                     )
                 return
             if not self._table_exists():
@@ -1113,8 +1115,9 @@ class PgVectorCollection(BaseCollection):
             existing_dim = self._client.table_dimension(self._table)
             if existing_dim is not None and existing_dim != dimension:
                 raise DimensionMismatchError(
-                    f"pgvector collection {self._collection_name!r} expects "
-                    f"embedding dimension {existing_dim}, got {dimension}"
+                    dimension_mismatch_message(
+                        "pgvector", self._collection_name, existing_dim, dimension
+                    )
                 )
             self._known_dimension = existing_dim or dimension
 
@@ -1349,8 +1352,9 @@ class PgVectorCollection(BaseCollection):
                 self._known_dimension = self._client.table_dimension(self._table)
             if self._known_dimension is not None and int(q.size) != self._known_dimension:
                 raise DimensionMismatchError(
-                    f"pgvector collection {self._collection_name!r} expects "
-                    f"embedding dimension {self._known_dimension}, got {int(q.size)}"
+                    dimension_mismatch_message(
+                        "pgvector", self._collection_name, self._known_dimension, int(q.size)
+                    )
                 )
             rows = self._client.query_rows(
                 self._table,

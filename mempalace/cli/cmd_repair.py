@@ -11,49 +11,116 @@ def cmd_palace_set_embedder(args):
     change the configured model — when the two differ it prints how to align
     ``MEMPALACE_EMBEDDING_MODEL``. ``--force`` overwrites an existing,
     differently-named identity.
+
+    The drawers collection is always recorded (and created if missing); the
+    closets and media assets collections are recorded too when they exist,
+    because a write refuses on any collection whose identity is unconfirmed
+    and ``mine`` writes closets as well as drawers.
     """
     from ..backends.base import EmbedderIdentityMismatchError, EmbedderIdentityRecordError
-    from ..embedding import UnknownEmbeddingModelError
-    from ..palace import set_palace_embedder_identity
+    from ..embedding import (
+        EmbeddingFunctionUnavailableError,
+        current_model_name,
+        openai_compat_api_model,
+    )
+    from ..palace import (
+        ASSETS_COLLECTION_NAME,
+        CLOSETS_COLLECTION_NAME,
+        MineAlreadyRunning,
+        _set_embedder_model_arg,
+        set_palace_embedder_identity,
+    )
 
     config = MempalaceConfig()
     palace_path = os.path.abspath(
         os.path.expanduser(args.palace) if args.palace else config.palace_path
     )
     model = getattr(args, "model", None)
+    refusals = (
+        EmbedderIdentityMismatchError,
+        EmbedderIdentityRecordError,
+        # The configured function cannot be built (chroma opens with it).
+        EmbeddingFunctionUnavailableError,
+        # UnknownEmbeddingModelError, and nothing to record (no model, or
+        # openai-compat without an endpoint model).
+        ValueError,
+        # A backend that holds the palace for its writer (sqlite_exact while
+        # an MCP server or a mine has it open): nothing was recorded.
+        MineAlreadyRunning,
+    )
+    report: dict = {}
     try:
         old, new = set_palace_embedder_identity(
             palace_path,
             model=model,
             force=getattr(args, "force", False),
             backend=_backend_arg(args),
+            report=report,
         )
-    except (
-        EmbedderIdentityMismatchError,
-        EmbedderIdentityRecordError,
-        UnknownEmbeddingModelError,
-    ) as exc:
+    except refusals as exc:
         # A misspelled --model (or configured model) is refused before the
         # palace is opened, so nothing was created.
         print(f"  ✗ {exc}")
         raise SystemExit(2) from exc
-    if old is None:
-        print(f"  ✓ recorded embedder identity: {new.model_name} (dim={new.dimension})")
-    elif old.model_name == new.model_name:
-        print(f"  ✓ embedder identity unchanged: {new.model_name} (dim={new.dimension})")
-    else:
-        print(
-            f"  ✓ embedder identity changed: {old.model_name} → {new.model_name} "
-            f"(dim={new.dimension})"
-        )
+    _print_recorded_identity(old, new, report)
+    failed = False
+    for name in (CLOSETS_COLLECTION_NAME, ASSETS_COLLECTION_NAME):
+        report = {}
+        try:
+            recorded = set_palace_embedder_identity(
+                palace_path,
+                model=model,
+                force=getattr(args, "force", False),
+                backend=_backend_arg(args),
+                collection_name=name,
+                only_if_exists=True,
+                report=report,
+            )
+        except refusals as exc:
+            print(f"  ✗ {name}: {exc}")
+            failed = True
+            continue
+        if recorded is not None:
+            _print_recorded_identity(*recorded, report, collection=name)
     # set-embedder records the palace's identity; it does not change the
     # configured model. If they differ, the next normal open would mismatch —
     # tell the user how to align them.
-    configured = config.embedding_model
+    try:
+        configured = current_model_name()
+    except Exception:
+        configured = config.embedding_model
     if new.model_name and configured and new.model_name != configured:
+        api_model = openai_compat_api_model(new.model_name)
+        if api_model:
+            align = (
+                f"set MEMPALACE_EMBEDDING_MODEL=openai-compat and "
+                f"MEMPALACE_EMBEDDING_API_MODEL={api_model} (or embedding_api_model in config.json)"
+            )
+        else:
+            # The configurable name, never a recorded identity (an
+            # EmbeddingGemma 2 identity is refused as embedding_model).
+            name = _set_embedder_model_arg(new.model_name)
+            align = f"set MEMPALACE_EMBEDDING_MODEL={name} (or run onboarding)"
         print(
-            f"  ⚠ configured model is {configured!r}; set MEMPALACE_EMBEDDING_MODEL="
-            f"{new.model_name} (or run onboarding) so normal opens of this palace match."
+            f"  ⚠ configured model is {configured!r}; {align} so normal opens of this palace match."
+        )
+    if failed:
+        raise SystemExit(2)
+
+
+def _print_recorded_identity(old, new, report, collection=None):
+    """One ``palace set-embedder`` result line (the drawers line has no prefix)."""
+    prefix = f"{collection}: " if collection else ""
+    if report.get("unreadable"):
+        print(f"  ⚠ {prefix}the previous record was unreadable: {report['unreadable']}")
+    if old is None:
+        print(f"  ✓ {prefix}recorded embedder identity: {new.model_name} (dim={new.dimension})")
+    elif old.model_name == new.model_name:
+        print(f"  ✓ {prefix}embedder identity unchanged: {new.model_name} (dim={new.dimension})")
+    else:
+        print(
+            f"  ✓ {prefix}embedder identity changed: {old.model_name} → {new.model_name} "
+            f"(dim={new.dimension})"
         )
 
 
@@ -238,6 +305,8 @@ def cmd_repair(args):
 
     if not getattr(args, "dry_run", False):
         _exit_on_misspelled_embedding_model()
+        # Before the backup, the archive and the confirmation prompt.
+        _exit_on_unusable_embedder()
 
     if getattr(args, "mode", "legacy") == "from-sqlite":
         from ..migrate import confirm_destructive_action

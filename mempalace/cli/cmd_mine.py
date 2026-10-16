@@ -80,6 +80,10 @@ def cmd_mine(args):
     # with nothing printed or created.
     _exit_on_misspelled_embedding_model()
 
+    # A palace folder this command creates is removed again if the mine
+    # fails before anything is filed (see _discard_unused_new_palace).
+    palace_is_new = not args.dry_run and not os.path.lexists(palace_path)
+
     if source_adapter:
         try:
             drawers_written = mine_source_adapter(
@@ -109,6 +113,8 @@ def cmd_mine(args):
             print(f"mempalace: {exc}", file=sys.stderr)
             sys.exit(1)
         except (*model_errors, EmbeddingAPIError) as exc:
+            if palace_is_new:
+                _discard_unused_new_palace(palace_path)
             print(f"mempalace: {exc}", file=sys.stderr)
             sys.exit(1)
         suffix = " would be written" if args.dry_run else " written"
@@ -190,6 +196,8 @@ def cmd_mine(args):
         # A misspelled model, or a model that differs from the one the palace
         # was built with: nothing was written. Print the fix, as search does,
         # instead of a traceback.
+        if palace_is_new:
+            _discard_unused_new_palace(palace_path)
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(1)
     except EmbeddingAPIError as exc:
@@ -197,6 +205,8 @@ def cmd_mine(args):
         # something other than embeddings. The miner has already printed its
         # "Mine aborted" summary (drawers filed so far are kept, and a re-run
         # resumes); the cause needs one line, not a traceback.
+        if palace_is_new:
+            _discard_unused_new_palace(palace_path)
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(1)
     except MineValidationError as exc:
@@ -217,6 +227,48 @@ def cmd_mine(args):
             file=sys.stderr,
         )
         sys.exit(1)
+
+
+def _discard_unused_new_palace(palace_path: str) -> None:
+    """Remove a palace folder that this mine created and left without data.
+
+    A first mine that fails at its first embed (a dead endpoint, a refused
+    model) has already opened the palace: the folder holds an empty database
+    and an identity record, so the next open treats it as an existing palace.
+    The caller only passes a folder that did not exist when the command
+    started. It is removed only when both the drawers and the closets
+    collection still count zero rows; if the count cannot be read the folder
+    stays. Remote backends keep their (empty) server-side collections.
+    """
+    import shutil
+
+    from ..backends.base import CollectionNotInitializedError
+    from ..backends import registry as _backend_registry
+    from ..palace import get_collection
+
+    for name in (None, "mempalace_closets"):
+        try:
+            col = get_collection(
+                palace_path, collection_name=name, create=False, _skip_identity_check=True
+            )
+            if col is not None and col.count():
+                return
+        except CollectionNotInitializedError:
+            continue  # never created (e.g. no closets yet): nothing to keep
+        except Exception:
+            return
+    # Release only this palace's handles before removing the files. A full
+    # reset_backends() would replace the process-wide backend instances and
+    # leave palace._DEFAULT_BACKEND pointing at a closed, detached one.
+    from ..backends.base import PalaceRef
+
+    ref = PalaceRef(id=palace_path, local_path=palace_path)
+    for backend in list(_backend_registry._instances.values()):
+        try:
+            backend.close_palace(ref)
+        except Exception:
+            return  # a handle could not be released: keep the folder
+    shutil.rmtree(palace_path, ignore_errors=True)
 
 
 class UnknownSourceAdapterError(ValueError):
@@ -468,6 +520,21 @@ def cmd_sweep(args):
             auto_start=routing.decision.auto_start_daemon,
         )
         return
+    from ..embedding import _model_error_class
+
+    try:
+        _sweep_target(target, palace_path, sweep, sweep_directory)
+    except Exception as exc:
+        if _model_error_class(exc) is None:
+            raise
+        # A misspelled model, an embedder that cannot be built or reached,
+        # or a palace built with another model: one line, as mine prints.
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _sweep_target(target, palace_path, sweep, sweep_directory):
+    """``cmd_sweep``'s direct route: sweep ``target`` and print the tally."""
     if os.path.isfile(target):
         result = sweep(target, palace_path)
         print(

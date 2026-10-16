@@ -1247,6 +1247,27 @@ def test_run_mcp_tool_dispatches_write_tool(monkeypatch):
     assert captured["arguments"] == {"x": 1}
 
 
+def test_run_mcp_tool_reports_a_model_refusal_as_a_failed_job(monkeypatch):
+    """A refused write (here an unconfirmed embedder identity) is a failed
+    daemon job, exit 1, and keeps the error class an MCP client sees."""
+    import mempalace.mcp_server as mcp
+    from mempalace import service
+    from mempalace.backends.base import EmbedderIdentityUnconfirmedError
+    from mempalace.embedding import model_error_result
+
+    refusal = model_error_result(EmbedderIdentityUnconfirmedError("confirm the model first"))
+
+    monkeypatch.setattr(
+        mcp, "TOOLS", {"mempalace_add_drawer": {"handler": lambda **_: dict(refusal)}}
+    )
+    out = service.run_mcp_tool({"name": "mempalace_add_drawer", "arguments": {}})
+    assert out["success"] is False
+    assert out["exit_code"] == 1
+    assert out["error"] == "Embedder identity unconfirmed"
+    assert out["error_class"] == "EmbedderIdentityUnconfirmedError"
+    assert mcp._tool_result_is_error(out)
+
+
 def test_mcp_tool_knowledge_graph_writes_land_beside_the_daemons_palace(monkeypatch, tmp_path):
     """A daemon serves the one palace it was started for, so a knowledge-graph
     tool it runs writes beside that palace, as a server started with

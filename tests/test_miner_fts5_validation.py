@@ -40,6 +40,11 @@ def _build_palace_with_drawer(palace_path: Path) -> None:
         )
     finally:
         backend.close()
+    # A palace built below the miners records no embedder identity, and a
+    # write into a populated, unrecorded collection refuses: confirm it.
+    from mempalace.palace import set_palace_embedder_identity
+
+    set_palace_embedder_identity(str(palace_path))
 
 
 def _page_mangle(sqlite_path: Path) -> int:

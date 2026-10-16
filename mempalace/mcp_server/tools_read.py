@@ -331,6 +331,11 @@ def tool_status():
     # bootstraps the ChromaDB collection on a valid-but-empty palace without
     # accidentally creating a palace in a non-existent directory (#830).
     col = _get_collection(create=db_exists)
+    if not col and db_exists and _identity_unconfirmed_open_error():
+        # A write open refuses a collection whose embedder identity is
+        # unconfirmed, but status only reads: open it read-only instead, so
+        # the counts (and the warning) still come through.
+        col = _get_collection(create=False)
     if not col:
         return _collection_error_or_no_palace()
     count = col.count()

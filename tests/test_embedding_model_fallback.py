@@ -1151,7 +1151,10 @@ def _openai_compat_palace_with_a_dead_endpoint(unknown_model_palace, monkeypatch
         server.shutdown()
         server.server_close()
         thread.join()
-    assert _recorded_identity(palace)["mempalace_drawers"]["model_name"] == "openai-compat"
+    assert (
+        _recorded_identity(palace)["mempalace_drawers"]["model_name"]
+        == "openai-compat:text-embed-a"
+    )
     return palace
 
 

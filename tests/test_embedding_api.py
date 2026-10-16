@@ -350,3 +350,20 @@ def test_describe_device_reports_openai_compat_endpoint(monkeypatch):
 def test_describe_device_openai_compat_without_url(monkeypatch):
     monkeypatch.setattr("mempalace.config.MempalaceConfig", lambda *a, **k: _FakeCfg(None, "small"))
     assert embedding.describe_device() == "openai-compat"
+
+
+def test_invalid_utf8_body_is_a_bad_response_not_unavailable(monkeypatch):
+    import io
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _Resp(b"\xff\xfe\xfa"))
+    ef = embedding.OpenAICompatEmbeddingFunction("http://h", "m")
+    with pytest.raises(embedding.EmbeddingAPIError, match="not JSON") as info:
+        ef(["x"])
+    assert info.value.reason == embedding.API_BAD_RESPONSE
