@@ -66,6 +66,34 @@ class TestPalaceQueryParser:
         assert target == "search"
         assert params["query"] == "status: active"
 
+    def test_search_keeps_lowercase_words_as_text(self):
+        """Only the upper-case spelling of a PQL keyword is a keyword."""
+        for text in [
+            "notes in the auth service",
+            "source of truth for the refund policy",
+            "rate limit 5 requests per user",
+            "context switch overhead in the runtime",
+            "what strategy did we choose for the migration",
+            "since the before state was lost",
+        ]:
+            target, params = parse_query_input(text)
+            assert target == "search"
+            assert params == {"query": text}, text
+
+    def test_search_quoted_keyword_word_stays_text(self):
+        target, params = parse_query_input('FIND "SOURCE" material for the audit')
+        assert target == "search"
+        assert params["query"] == "SOURCE material for the audit"
+        assert "source_file" not in params
+
+    def test_search_uppercase_keywords_still_filter(self):
+        target, params = parse_query_input("auth notes IN backend LIMIT 5 SOURCE auth.py")
+        assert target == "search"
+        assert params["query"] == "auth notes"
+        assert params["wing"] == "backend"
+        assert params["limit"] == 5
+        assert params["source_file"] == "auth.py"
+
     def test_taxonomy_and_wings(self):
         target, params = parse_query_input("TAXONOMY")
         assert target == "taxonomy"
