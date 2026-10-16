@@ -11,6 +11,7 @@ policy until an exclusive-maintenance protocol exists.
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import dataclass
 
 from .config import MempalaceConfig
@@ -21,6 +22,47 @@ from .write_routing import (
     WriteRoutingPolicy,
     choose_write_route,
 )
+
+_CLI_ROUTING_SCOPE_ENV = "MEMPALACE_CLI_ROUTING_SCOPE"
+_VALID_CLI_ROUTING_SCOPES = ("cli", "hooks")
+
+
+def _cli_routing_scope() -> str:
+    """Which named write-routing scope a routine CLI write resolves against.
+
+    Defaults to ``cli``. The portable shell hooks under ``hooks/`` shell out
+    to ``mempalace mine`` instead of writing in-process through
+    :mod:`mempalace.hooks_cli`, so they set
+    ``MEMPALACE_CLI_ROUTING_SCOPE=hooks`` before invoking it: without this,
+    a ``write_routing.hooks`` policy configured to keep hook-triggered
+    writes on the daemon is silently ignored for every shell-hook mine,
+    which instead reads ``write_routing.cli`` (default direct).
+
+    Only ``mine`` honors ``hooks``. An unrecognized value fails closed
+    rather than silently selecting ``cli``.
+    """
+
+    raw = os.environ.get(_CLI_ROUTING_SCOPE_ENV, "cli")
+    value = raw.strip().lower()
+    if value not in _VALID_CLI_ROUTING_SCOPES:
+        raise WriteRoutingError(
+            f"{_CLI_ROUTING_SCOPE_ENV} must be one of {', '.join(_VALID_CLI_ROUTING_SCOPES)}, not {raw!r}"
+        )
+    return value
+
+
+def _daemon_already_running() -> bool:
+    """True when a daemon is already up. Never starts one."""
+
+    from .daemon import HOOK_PROBE_TIMEOUT, get_client_if_running
+
+    try:
+        return (
+            get_client_if_running(MempalaceConfig().palace_path, health_timeout=HOOK_PROBE_TIMEOUT)
+            is not None
+        )
+    except Exception:
+        return False
 
 
 @dataclass(frozen=True)
@@ -99,6 +141,7 @@ def resolve_cli_write_routing(
     if force_daemon and force_direct:
         raise WriteRoutingError(f"{operation}: --daemon and --direct are mutually exclusive")
 
+    requested_scope = "cli"
     if force_daemon:
         resolved = ResolvedWriteRoutingPolicy(
             policy=WriteRoutingPolicy.REQUIRE,
@@ -112,14 +155,33 @@ def resolve_cli_write_routing(
         )
         explicit = True
     else:
-        resolved = MempalaceConfig().resolve_write_routing("cli")
+        requested_scope = _cli_routing_scope()
+        scope = requested_scope
+        if scope == "hooks" and operation != "mine":
+            scope = "cli"
+        resolved = MempalaceConfig().resolve_write_routing(scope)
         explicit = False
 
-    decision = choose_write_route(
-        resolved.policy,
-        daemon_available=False,
-        daemon_can_start=True,
+    hooks_scope = (
+        requested_scope == "hooks" and operation == "mine" and not force_daemon and not force_direct
     )
+    if hooks_scope:
+        # Hook writes must not cold-start a daemon. prefer falls back to
+        # direct; require blocks. A daemon that is already up is reused.
+        daemon_available = False
+        if resolved.policy is not WriteRoutingPolicy.DIRECT:
+            daemon_available = _daemon_already_running()
+        decision = choose_write_route(
+            resolved.policy,
+            daemon_available=daemon_available,
+            daemon_can_start=False,
+        )
+    else:
+        decision = choose_write_route(
+            resolved.policy,
+            daemon_available=False,
+            daemon_can_start=True,
+        )
 
     if background and not decision.use_daemon:
         raise WriteRoutingError(
