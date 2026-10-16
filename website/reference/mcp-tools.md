@@ -298,7 +298,9 @@ Query entity relationships with time filtering.
 | `as_of` | string | No | Date filter — only facts valid at this date (YYYY-MM-DD) |
 | `direction` | string | No | `outgoing`, `incoming`, or `both` (default: `both`) |
 
-**Returns:** `{ entity, as_of, facts: [{ direction, subject, predicate, object, valid_from, valid_to, current }], count }`
+**Returns:** `{ entity, as_of, facts: [{ direction, subject, predicate, object, valid_from, valid_to, created_by, ended_by, current }], count }`
+
+`created_by` and `ended_by` are caller-supplied labels, not authenticated identities. `null` means unknown, including facts from older graphs. They also appear in incoming, resolved-name and historical reads.
 
 ---
 
@@ -313,6 +315,7 @@ Add a fact to the knowledge graph.
 | `object` | string | **Yes** | The entity being connected to |
 | `valid_from` | string | No | When this became true (YYYY-MM-DD) |
 | `source_closet` | string | No | Closet ID where this fact appears |
+| `created_by` | string | No | Writer label, for example `mac:codex:myapp`; omit when unknown (maximum 128 characters) |
 
 **Returns:** `{ success, triple_id, fact }`
 
@@ -328,6 +331,7 @@ Mark a fact as no longer true.
 | `predicate` | string | **Yes** | Relationship |
 | `object` | string | **Yes** | Connected entity |
 | `ended` | string | No | When it stopped being true (default: today) |
+| `ended_by` | string | No | Label of who ended the fact; omit when unknown |
 
 **Returns:** `{ success, fact, ended }`
 
@@ -344,8 +348,11 @@ Atomically replace a fact with its successor at a single shared boundary. Use wh
 | `old_object` | string | **Yes** | Value being replaced |
 | `new_object` | string | **Yes** | New value |
 | `at` | string | No | Boundary instant (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ; default: now UTC) |
+| `by` | string | No | Caller label; becomes the old fact's `ended_by` and a new successor's `created_by` atomically |
 
 **Returns:** `{ success, triple_id, fact, superseded }`
+
+Retries preserve attribution: adding an existing fact does not replace its creator, and invalidating an already-ended fact does not change its ending actor. If a successor already exists, superseding returns it with its original creator. The daemon `mcp_tool` route and lightweight `palace_exec` structured payloads accept the same optional actor fields.
 
 ---
 
@@ -357,7 +364,7 @@ Chronological timeline of facts.
 |-----------|------|----------|-------------|
 | `entity` | string | No | Entity to get timeline for (omit for full timeline) |
 
-**Returns:** `{ entity, timeline: [{ subject, predicate, object, valid_from, valid_to, current }], count }`
+**Returns:** `{ entity, timeline: [{ subject, predicate, object, valid_from, valid_to, created_by, ended_by, current }], count }`
 
 ---
 

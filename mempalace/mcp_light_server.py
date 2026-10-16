@@ -565,6 +565,21 @@ LIGHT_TOOLS = {
                     "description": "KG fact end / invalidate ended (optional)",
                 },
                 "ended": {"type": "string", "description": "KG invalidate end date (optional)"},
+                "created_by": {
+                    "type": "string",
+                    "description": "KG add: caller-supplied writer label, not authenticated (optional)",
+                    "maxLength": 128,
+                },
+                "ended_by": {
+                    "type": "string",
+                    "description": "KG invalidate: caller-supplied writer label, not authenticated (optional)",
+                    "maxLength": 128,
+                },
+                "by": {
+                    "type": "string",
+                    "description": "KG supersede: caller-supplied label for both sides of the transition (optional)",
+                    "maxLength": 128,
+                },
                 "project": {
                     "type": "string",
                     "description": "Project directory for mine/sync (optional)",

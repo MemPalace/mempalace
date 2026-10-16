@@ -90,6 +90,7 @@ def tool_kg_add(
     source_closet: str = None,
     source_file: str = None,
     source_drawer_id: str = None,
+    created_by: str = None,
 ):
     """Add a relationship to the knowledge graph.
 
@@ -106,6 +107,7 @@ def tool_kg_add(
         object = sanitize_kg_value(object, "object")
         valid_from = sanitize_iso_temporal(valid_from, "valid_from")
         valid_to = sanitize_iso_temporal(valid_to, "valid_to")
+        created_by = validate_kg_actor(created_by, "created_by")
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
@@ -120,6 +122,7 @@ def tool_kg_add(
             "source_closet": source_closet,
             "source_file": source_file,
             "source_drawer_id": source_drawer_id,
+            "created_by": created_by,
         },
     )
 
@@ -134,6 +137,7 @@ def tool_kg_add(
                 source_closet=source_closet,
                 source_file=source_file,
                 source_drawer_id=source_drawer_id,
+                created_by=created_by,
             )
         )
     except Exception as e:
@@ -153,7 +157,9 @@ def tool_kg_add(
     return outcome
 
 
-def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
+def tool_kg_invalidate(
+    subject: str, predicate: str, object: str, ended: str = None, ended_by: str = None
+):
     """Mark a fact as no longer true.
 
     Returns the actual ``ended`` date/time that was stored. When the caller
@@ -168,6 +174,7 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
         predicate = sanitize_name(predicate, "predicate")
         object = sanitize_kg_value(object, "object")
         ended = sanitize_iso_temporal(ended, "ended")
+        ended_by = validate_kg_actor(ended_by, "ended_by")
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
@@ -180,10 +187,15 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
             "predicate": predicate,
             "object": object,
             "ended": resolved_ended,
+            "ended_by": ended_by,
         },
     )
 
-    _call_kg(lambda kg: kg.invalidate(subject, predicate, object, ended=resolved_ended))
+    _call_kg(
+        lambda kg: kg.invalidate(
+            subject, predicate, object, ended=resolved_ended, ended_by=ended_by
+        )
+    )
     return {
         "success": True,
         "fact": f"{subject} → {predicate} → {object}",
@@ -197,6 +209,7 @@ def tool_kg_supersede(
     old_object: str,
     new_object: str,
     at: str = None,
+    by: str = None,
 ):
     """Atomically replace one fact with another at a single shared boundary.
 
@@ -215,6 +228,7 @@ def tool_kg_supersede(
         old_object = sanitize_kg_value(old_object, "old_object")
         new_object = sanitize_kg_value(new_object, "new_object")
         at = sanitize_iso_temporal(at, "at")
+        by = validate_kg_actor(by, "by")
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
@@ -226,6 +240,7 @@ def tool_kg_supersede(
             "old_object": old_object,
             "new_object": new_object,
             "at": at,
+            "by": by,
         },
     )
 
@@ -233,7 +248,9 @@ def tool_kg_supersede(
     # bubble to the dispatcher, matching tool_kg_add / tool_kg_invalidate: the
     # -32000 response carries error_class + message in error.data. Only input
     # sanitization above returns the {success: False} envelope.
-    triple_id = _call_kg(lambda kg: kg.supersede(subject, predicate, old_object, new_object, at=at))
+    triple_id = _call_kg(
+        lambda kg: kg.supersede(subject, predicate, old_object, new_object, at=at, by=by)
+    )
     return {
         "success": True,
         "triple_id": triple_id,

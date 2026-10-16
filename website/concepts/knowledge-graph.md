@@ -13,6 +13,18 @@ Subject → Predicate → Object [valid_from → valid_to]
 Facts have time windows. When something stops being true, you invalidate it — and historical queries still find it.
 When a single-valued fact changes, supersede it so the old and new values meet at one precise boundary.
 
+In a shared palace, pass `created_by` when asserting a fact, `ended_by` when ending it, and `by` when superseding it:
+
+```python
+kg.add_triple("Kai", "works_on", "Orion", created_by="mac:codex:orion")
+kg.supersede("Kai", "works_on", "Orion", "Atlas", by="windows:claude:orion")
+kg.invalidate("Kai", "works_on", "Atlas", ended_by="mac:codex:orion")
+```
+
+Query and timeline records return both actor fields. These labels describe the caller; the server does not authenticate or invent them. Omitted fields and migrated facts remain `None`, meaning unknown. Duplicate assertions and repeated endings preserve the original attribution. Predicate normalization retains the original creator, and facts with distinct creators are not merged by that rewrite. Hermes graph assertions record `created_by="hermes"` and its invalidations record `ended_by="hermes"`, independently of whether the fact describes the user or the agent.
+
+Actor labels travel with knowledge-graph snapshots between upgraded peers. A legacy snapshot that lacks these fields does not erase attribution already stored at its destination.
+
 ## Usage
 
 ### Python API

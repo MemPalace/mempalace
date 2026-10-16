@@ -581,6 +581,7 @@ def test_kg_add_persists_to_palace_sibling_sqlite(initialized_provider, palace_p
     assert any(
         (r.get("predicate") == "likes" and r.get("object") == "coffee") for r in (relations or [])
     )
+    assert relations[0]["created_by"] == "hermes"
 
 
 def test_kg_query_tool_rejects_missing_entity(initialized_provider):
@@ -886,6 +887,22 @@ def test_kg_tools_all_use_provider_sibling_kg(initialized_provider, palace_path)
     )
     assert inv["success"] is True
 
+    ended_facts = json.loads(
+        initialized_provider.handle_tool_call("mempalace_kg_timeline", {"entity": "user"})
+    )["timeline"]
+    tea = next(f for f in ended_facts if f["predicate"] == "drinks" and f["object"] == "tea")
+    assert tea["created_by"] == tea["ended_by"] == "hermes"
+    assert tea["valid_to"] == inv["ended"]
+    # A retried ending cannot rewrite the recorded transition date or actor.
+    initialized_provider.handle_tool_call(
+        "mempalace_kg_invalidate",
+        {"subject": "user", "predicate": "drinks", "object": "tea", "ended": "2099-01-01"},
+    )
+    retried = json.loads(
+        initialized_provider.handle_tool_call("mempalace_kg_timeline", {"entity": "user"})
+    )["timeline"]
+    assert retried == ended_facts
+
     # And the file itself lives next to the palace dir.
     assert (Path(palace_path).parent / "knowledge_graph.sqlite3").exists()
 
@@ -925,10 +942,12 @@ def test_on_memory_write_mirrors_both_targets(initialized_provider, palace_path)
         r.get("predicate") == "asserted" and r.get("object") == "lives in Boston"
         for r in user_relations
     )
+    assert all(r["created_by"] == "hermes" for r in user_relations)
     assert any(
         r.get("predicate") == "noted" and r.get("object") == "repo uses uv for deps"
         for r in agent_relations
     )
+    assert all(r["created_by"] == "hermes" for r in agent_relations)
 
 
 def test_on_memory_write_skips_unknown_target_and_non_add(initialized_provider):

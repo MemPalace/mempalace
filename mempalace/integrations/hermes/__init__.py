@@ -1310,6 +1310,7 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 subject=subject,
                 predicate=predicate,
                 obj=payload.get("content", ""),
+                created_by="hermes",
             )
         except Exception as exc:
             logger.debug("MemPalace _mirror_mem_write error: %s", exc)
@@ -1489,7 +1490,7 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             return {"error": "subject, predicate, object are all required"}
         kg = KnowledgeGraph(db_path=self._kg_db_path())
         try:
-            kg.add_triple(subject=subject, predicate=predicate, obj=obj)
+            kg.add_triple(subject=subject, predicate=predicate, obj=obj, created_by="hermes")
         finally:
             try:
                 kg.close()
@@ -1516,7 +1517,7 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         resolved_ended = ended or date.today().isoformat()
         kg = KnowledgeGraph(db_path=self._kg_db_path())
         try:
-            kg.invalidate(subject, predicate, obj, ended=resolved_ended)
+            kg.invalidate(subject, predicate, obj, ended=resolved_ended, ended_by="hermes")
         finally:
             try:
                 kg.close()

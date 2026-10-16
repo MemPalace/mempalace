@@ -151,7 +151,10 @@ Memory (recall + writing):
 - File durable outcomes (decisions, conclusions, learned facts) with
   mempalace_add_drawer. New KG facts: mempalace_kg_add. When a
   single-valued fact changes: mempalace_kg_supersede. When a fact ended
-  without replacement: mempalace_kg_invalidate. Don't file secrets or
+  without replacement: mempalace_kg_invalidate. On KG writes, use the
+  active identity as created_by (add), ended_by (invalidate), or by
+  (supersede); these are caller labels, not authenticated identities.
+  Don't file secrets or
   tokens.
 
 Coordination (logstream):

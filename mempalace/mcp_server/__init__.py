@@ -141,7 +141,7 @@ from ..hallways import (  # noqa: E402
     delete_hallway,
 )
 
-from ..knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH  # noqa: E402
+from ..knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH, validate_kg_actor  # noqa: E402
 from ..logstream import LOGSTREAM_DB_FILENAME, Logstream  # noqa: E402
 from ..collision_scan import assert_no_collisions  # noqa: E402
 from ..ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402

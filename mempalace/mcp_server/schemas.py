@@ -89,6 +89,11 @@ TOOLS = {
                     "type": "string",
                     "description": "Drawer ID the fact was extracted from (optional, RFC 002 provenance)",
                 },
+                "created_by": {
+                    "type": "string",
+                    "description": "Caller-supplied writer label (e.g. host:harness:project), not authenticated. Omit when unknown.",
+                    "maxLength": 128,
+                },
             },
             "required": ["subject", "predicate", "object"],
         },
@@ -105,6 +110,11 @@ TOOLS = {
                 "ended": {
                     "type": "string",
                     "description": "When it stopped being true (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, default: today)",
+                },
+                "ended_by": {
+                    "type": "string",
+                    "description": "Caller-supplied label of who ended the fact, not authenticated. Omit when unknown.",
+                    "maxLength": 128,
                 },
             },
             "required": ["subject", "predicate", "object"],
@@ -126,6 +136,11 @@ TOOLS = {
                 "at": {
                     "type": "string",
                     "description": "Boundary instant (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional; defaults to now UTC)",
+                },
+                "by": {
+                    "type": "string",
+                    "description": "Caller-supplied writer label, stored as ended_by on the old fact and created_by on a new successor. Not authenticated.",
+                    "maxLength": 128,
                 },
             },
             "required": ["subject", "predicate", "old_object", "new_object"],

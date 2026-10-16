@@ -42,12 +42,29 @@ import threading
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
-from .config import sanitize_iso_temporal
+from .config import MAX_NAME_LENGTH, sanitize_iso_temporal, sanitize_kg_value
 from .ids import make_triple_id
 
 
 DEFAULT_KG_PATH = os.path.expanduser("~/.mempalace/knowledge_graph.sqlite3")
 _MIN_ENTITY_CANDIDATE_LEN = 3
+
+
+def validate_kg_actor(value: Optional[str], field_name: str) -> Optional[str]:
+    """Validate an optional caller label without changing its spelling.
+
+    Labels describe who made a write; they are not authenticated identities.
+    None means unknown, including on facts migrated from older graphs.
+    """
+    if value is not None:
+        sanitize_kg_value(value, field_name)
+        if len(value) > MAX_NAME_LENGTH:
+            raise ValueError(f"{field_name} exceeds maximum length of {MAX_NAME_LENGTH} characters")
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError(f"{field_name} must be valid UTF-8 text") from None
+    return value
 
 
 def _escape_like(value: str) -> str:
@@ -177,6 +194,8 @@ class KnowledgeGraph:
                 source_file TEXT,
                 source_drawer_id TEXT,
                 adapter_name TEXT,
+                created_by TEXT,
+                ended_by TEXT,
                 extracted_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (subject) REFERENCES entities(id),
                 FOREIGN KEY (object) REFERENCES entities(id)
@@ -194,17 +213,43 @@ class KnowledgeGraph:
         """Backwards-compatible schema migration for older triples tables.
 
         Fresh palaces get ``source_drawer_id`` / ``adapter_name`` (RFC 002 §5.5)
-        directly from the canonical ``CREATE TABLE`` above, so this path is a
-        no-op on new installs. It exists for palaces that were created before
+        and nullable actor labels directly from the canonical ``CREATE TABLE``
+        above, so this path is a no-op on new installs. Existing actor values
+        remain NULL (unknown); no writer is inferred from source pointers.
+        It exists for palaces that were created before
         those columns were added: SQLite has no ``ADD COLUMN IF NOT EXISTS``,
         so we introspect the schema and only issue the ALTER when the column
         is missing.
         """
+        columns = ("source_drawer_id", "adapter_name", "created_by", "ended_by")
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(triples)")}
-        if "source_drawer_id" not in existing:
-            conn.execute("ALTER TABLE triples ADD COLUMN source_drawer_id TEXT")
-        if "adapter_name" not in existing:
-            conn.execute("ALTER TABLE triples ADD COLUMN adapter_name TEXT")
+        if all(column in existing for column in columns):
+            return  # Opening an upgraded graph remains a read, even beside a writer.
+
+        # Separate constructors have separate Python locks. Reserve SQLite's
+        # writer and re-read the schema before ALTER: another constructor may
+        # have finished its migration since the read-only precheck above.
+        # When a caller already owns a transaction, a savepoint keeps its work
+        # pending and confines any migration rollback to the new columns.
+        outer_transaction = conn.in_transaction
+        savepoint = "mempalace_kg_schema"
+        conn.execute(f"SAVEPOINT {savepoint}" if outer_transaction else "BEGIN IMMEDIATE")
+        try:
+            existing = {row["name"] for row in conn.execute("PRAGMA table_info(triples)")}
+            for column in columns:
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE triples ADD COLUMN {column} TEXT")
+            if outer_transaction:
+                conn.execute(f"RELEASE {savepoint}")
+            else:
+                conn.commit()
+        except BaseException:
+            if outer_transaction:
+                conn.execute(f"ROLLBACK TO {savepoint}")
+                conn.execute(f"RELEASE {savepoint}")
+            else:
+                conn.rollback()
+            raise
 
     def _conn(self):
         if self._connection is None:
@@ -259,6 +304,7 @@ class KnowledgeGraph:
         source_file: str = None,
         source_drawer_id: str = None,
         adapter_name: str = None,
+        created_by: str = None,
     ):
         """
         Add a relationship triple: subject → predicate → object.
@@ -268,6 +314,9 @@ class KnowledgeGraph:
         they default to ``None`` so every existing caller stays
         source-compatible.
 
+        ``created_by`` is an optional caller-supplied writer label. A duplicate
+        assertion keeps the original label, including None for an unknown writer.
+
         Examples:
             add_triple("Max", "child_of", "Alice", valid_from="2015-04-01")
             add_triple("Max", "does", "swimming", valid_from="2025-01-01")
@@ -276,6 +325,7 @@ class KnowledgeGraph:
 
         valid_from = sanitize_iso_temporal(valid_from, "valid_from")
         valid_to = sanitize_iso_temporal(valid_to, "valid_to")
+        created_by = validate_kg_actor(created_by, "created_by")
 
         # Reject inverted intervals. Use temporal comparison keys rather than
         # raw string comparison so legacy date-only values and canonical UTC
@@ -322,8 +372,8 @@ class KnowledgeGraph:
                     """INSERT INTO triples (
                         id, subject, predicate, object, valid_from, valid_to,
                         confidence, source_closet, source_file,
-                        source_drawer_id, adapter_name
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        source_drawer_id, adapter_name, created_by
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         triple_id,
                         sub_id,
@@ -336,16 +386,23 @@ class KnowledgeGraph:
                         source_file,
                         source_drawer_id,
                         adapter_name,
+                        created_by,
                     ),
                 )
                 return triple_id
 
-    def invalidate(self, subject: str, predicate: str, obj: str, ended: str = None):
-        """Mark a relationship as no longer valid (set valid_to date/time)."""
+    def invalidate(
+        self, subject: str, predicate: str, obj: str, ended: str = None, ended_by: str = None
+    ):
+        """End an open relationship, optionally recording its caller label.
+
+        An already-ended fact is untouched, so retries cannot change ended_by.
+        """
         sub_id = self._entity_id(subject)
         obj_id = self._entity_id(obj)
         pred = predicate.lower().replace(" ", "_")
         ended = sanitize_iso_temporal(ended or date.today().isoformat(), "ended")
+        ended_by = validate_kg_actor(ended_by, "ended_by")
 
         with self._lock:
             conn = self._conn()
@@ -367,9 +424,9 @@ class KnowledgeGraph:
                         )
 
                 conn.execute(
-                    "UPDATE triples SET valid_to=? "
+                    "UPDATE triples SET valid_to=?, ended_by=? "
                     "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
-                    (ended, sub_id, pred, obj_id),
+                    (ended, ended_by, sub_id, pred, obj_id),
                 )
 
     def supersede(
@@ -384,6 +441,7 @@ class KnowledgeGraph:
         source_file: str = None,
         source_drawer_id: str = None,
         adapter_name: str = None,
+        by: str = None,
     ):
         """Atomically replace one fact with another at a single shared boundary.
 
@@ -406,6 +464,8 @@ class KnowledgeGraph:
 
         Returns the new triple's id. If no open ``old_obj`` triple exists the
         successor is still opened, so ``supersede`` degrades to ``add_triple``.
+        ``by`` records the caller on both sides of a new transition. An already
+        open successor keeps its original created_by rather than being relabelled.
         """
         if at is None:
             boundary = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -414,6 +474,7 @@ class KnowledgeGraph:
         else:
             boundary = at
         boundary = sanitize_iso_temporal(boundary, "at")
+        by = validate_kg_actor(by, "by")
 
         sub_id = self._entity_id(subject)
         old_id = self._entity_id(old_obj)
@@ -452,9 +513,9 @@ class KnowledgeGraph:
 
                 # Close the open old fact at the shared boundary.
                 conn.execute(
-                    "UPDATE triples SET valid_to=? "
+                    "UPDATE triples SET valid_to=?, ended_by=? "
                     "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
-                    (boundary, sub_id, pred, old_id),
+                    (boundary, by, sub_id, pred, old_id),
                 )
 
                 # Open the successor at the same instant (idempotent if already open).
@@ -473,8 +534,8 @@ class KnowledgeGraph:
                     """INSERT INTO triples (
                         id, subject, predicate, object, valid_from, valid_to,
                         confidence, source_closet, source_file,
-                        source_drawer_id, adapter_name
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        source_drawer_id, adapter_name, created_by
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         triple_id,
                         sub_id,
@@ -487,6 +548,7 @@ class KnowledgeGraph:
                         source_file,
                         source_drawer_id,
                         adapter_name,
+                        by,
                     ),
                 )
                 return triple_id
@@ -515,7 +577,7 @@ class KnowledgeGraph:
 
         The successor inherits the original's ``confidence`` and provenance
         (``source_closet``, ``source_file``, ``source_drawer_id``,
-        ``adapter_name``): rewording a predicate is not new evidence, and a
+        ``adapter_name``, ``created_by``): rewording a predicate is not new evidence, and a
         normalized fact must still point at the drawer it came from.
         ``source_file`` here is only a fallback for an original carrying none.
         """
@@ -534,7 +596,7 @@ class KnowledgeGraph:
             with conn:
                 row = conn.execute(
                     "SELECT subject, valid_from, confidence, source_closet, source_file, "
-                    "source_drawer_id, adapter_name FROM triples "
+                    "source_drawer_id, adapter_name, created_by FROM triples "
                     "WHERE id=? AND valid_to IS NULL",
                     (triple_id,),
                 ).fetchone()
@@ -561,7 +623,7 @@ class KnowledgeGraph:
                     "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL "
                     f"AND (valid_from IS NULL OR {_sql_temporal_start_expr('valid_from')} <= ?) "
                     "AND confidence IS ? AND source_closet IS ? AND source_file IS ? "
-                    "AND source_drawer_id IS ? AND adapter_name IS ?",
+                    "AND source_drawer_id IS ? AND adapter_name IS ? AND created_by IS ?",
                     (
                         sub_id,
                         pred,
@@ -572,6 +634,7 @@ class KnowledgeGraph:
                         row["source_file"] or source_file,
                         row["source_drawer_id"],
                         row["adapter_name"],
+                        row["created_by"],
                     ),
                 ).fetchone()
                 if existing:
@@ -581,8 +644,8 @@ class KnowledgeGraph:
                     """INSERT INTO triples (
                         id, subject, predicate, object, valid_from, valid_to,
                         confidence, source_closet, source_file,
-                        source_drawer_id, adapter_name
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        source_drawer_id, adapter_name, created_by
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         new_id,
                         sub_id,
@@ -595,6 +658,7 @@ class KnowledgeGraph:
                         row["source_file"] or source_file,
                         row["source_drawer_id"],
                         row["adapter_name"],
+                        row["created_by"],
                     ),
                 )
                 return new_id
@@ -638,6 +702,8 @@ class KnowledgeGraph:
                             "valid_to": row["valid_to"],
                             "confidence": row["confidence"],
                             "source_closet": row["source_closet"],
+                            "created_by": row["created_by"],
+                            "ended_by": row["ended_by"],
                             "current": row["valid_to"] is None,
                         }
                     )
@@ -660,6 +726,8 @@ class KnowledgeGraph:
                             "valid_to": row["valid_to"],
                             "confidence": row["confidence"],
                             "source_closet": row["source_closet"],
+                            "created_by": row["created_by"],
+                            "ended_by": row["ended_by"],
                             "current": row["valid_to"] is None,
                         }
                     )
@@ -744,6 +812,8 @@ class KnowledgeGraph:
                         "valid_to": row["valid_to"],
                         "confidence": row["confidence"],
                         "source_closet": row["source_closet"],
+                        "created_by": row["created_by"],
+                        "ended_by": row["ended_by"],
                         "current": row["valid_to"] is None,
                     }
                 )
@@ -763,6 +833,8 @@ class KnowledgeGraph:
                         "valid_to": row["valid_to"],
                         "confidence": row["confidence"],
                         "source_closet": row["source_closet"],
+                        "created_by": row["created_by"],
+                        "ended_by": row["ended_by"],
                         "current": row["valid_to"] is None,
                     }
                 )
@@ -798,6 +870,8 @@ class KnowledgeGraph:
                         "object": row["obj_name"],
                         "valid_from": row["valid_from"],
                         "valid_to": row["valid_to"],
+                        "created_by": row["created_by"],
+                        "ended_by": row["ended_by"],
                         "current": row["valid_to"] is None,
                     }
                 )
@@ -849,6 +923,8 @@ class KnowledgeGraph:
                 "object": r["obj_name"],
                 "valid_from": r["valid_from"],
                 "valid_to": r["valid_to"],
+                "created_by": r["created_by"],
+                "ended_by": r["ended_by"],
                 "current": r["valid_to"] is None,
             }
             for r in rows
@@ -886,6 +962,8 @@ class KnowledgeGraph:
             "source_file",
             "source_drawer_id",
             "adapter_name",
+            "created_by",
+            "ended_by",
             "extracted_at",
         ),
     }
@@ -920,10 +998,19 @@ class KnowledgeGraph:
             raise ValueError(f"table must be one of {sorted(self._REPLICATION_TABLES)}")
         if not row.get("id"):
             raise ValueError("replicated row is missing 'id'")
-        values = [row.get(col) for col in columns]
         with self._lock:
             conn = self._conn()
             with conn:
+                # A pre-attribution peer has no actor keys in its snapshots.
+                # Replaying one must not erase labels already stored here.
+                actor_defaults = {}
+                if table == "triples" and any(key not in row for key in ("created_by", "ended_by")):
+                    previous = conn.execute(
+                        "SELECT created_by, ended_by FROM triples WHERE id=?", (row["id"],)
+                    ).fetchone()
+                    if previous is not None:
+                        actor_defaults = dict(previous)
+                values = [row.get(col, actor_defaults.get(col)) for col in columns]
                 conn.execute(
                     f"INSERT OR REPLACE INTO {table} ({', '.join(columns)}) "
                     f"VALUES ({', '.join('?' for _ in columns)})",
