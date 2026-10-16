@@ -422,6 +422,13 @@ def seeded_collection(collection):
     return collection
 
 
+def pytest_configure(config):
+    """On Windows, replace coverage's fail_under with the pyproject Windows gate."""
+    from coverage_gate import apply_platform_threshold
+
+    apply_platform_threshold(config)
+
+
 @pytest.fixture
 def kg(tmp_dir):
     """An isolated KnowledgeGraph using a temp SQLite file."""
