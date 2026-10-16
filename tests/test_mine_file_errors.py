@@ -154,14 +154,14 @@ def test_convo_mine_counts_purge_failures_as_errors_and_fails(
             f"> Why {name}?\nBecause {name} must be filed as at least one drawer.\n",
             encoding="utf-8",
         )
-    real = convo_miner._source_file_delete_ids
+    real = convo_miner._additive_history_delete_ids
 
-    def delete_ids(collection, source_file, extract_mode):
+    def delete_ids(collection, source_file, extract_mode, pass_contents):
         if os.path.basename(source_file) == "b.txt":
             raise RuntimeError("simulated closed backend handle")
-        return real(collection, source_file, extract_mode)
+        return real(collection, source_file, extract_mode, pass_contents)
 
-    monkeypatch.setattr(convo_miner, "_source_file_delete_ids", delete_ids)
+    monkeypatch.setattr(convo_miner, "_additive_history_delete_ids", delete_ids)
 
     with pytest.raises(Exception) as excinfo:
         convo_miner.mine_convos(str(src), palace_path, wing="w")

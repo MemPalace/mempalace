@@ -42,6 +42,7 @@ from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
     _metadata_matches_extract_mode,
+    _meta_is_current,
     _validate_palace_fts5_after_mine,
     file_already_mined,
     get_collection,
@@ -288,6 +289,70 @@ def _register_file(
         ids=[sentinel_id],
         metadatas=[meta],
     )
+
+
+def _additive_history_delete_ids(
+    collection,
+    source_file: str,
+    extract_mode: str,
+    pass_contents: set[str],
+) -> list[str]:
+    """Collect drawer IDs to delete on a re-mine, preserving additive history.
+
+    Supersedes the blanket :func:`_source_file_delete_ids` purge for the
+    normal (non-crash) path. A stored drawer for this source file is deleted
+    when it is any of:
+
+    * **stale** -- filed at an older ``normalize_version`` or an older
+      (or missing) chunker revision for this extraction scope. A schema
+      bump supersedes everything, so prior-generation content is rebuilt
+      fresh at the current schema rather than rescued (``_meta_is_current``).
+    * **redundant** -- its verbatim content is re-derived in this pass
+      (present in ``pass_contents``), so the upsert recreates it; keeping
+      the old copy would duplicate it.
+    * **blank** -- it carries no verbatim content (a genuine orphan with
+      nothing to preserve).
+
+    A stored drawer that is at the current schema, carries verbatim content,
+    and whose content is *not* re-derived in this pass is the additive
+    history of a surviving turn (the classic shrink case: the file shrank so
+    the turn sits at a chunk_index this pass no longer assigns). It is kept
+    rather than blanket-purged. This is the normative rule from issue
+    #1593 / #2793: version-identity tells a "superseded" drawer from a
+    "still-valid prior generation" one, so re-mining a shrunk transcript
+    preserves surviving turns while a schema bump or grow still cleans up.
+    """
+    delete_ids: list[str] = []
+    offset = 0
+    while True:
+        batch = collection.get(
+            where={"source_file": source_file},
+            limit=1000,
+            offset=offset,
+            include=["metadatas", "documents"],
+        )
+        batch_ids = batch.get("ids") or []
+        metadatas = batch.get("metadatas") or []
+        documents = batch.get("documents") or []
+        if len(documents) < len(batch_ids):
+            # A backend that returned fewer documents than ids (should not
+            # happen for paginated chroma gets) -- be conservative and treat
+            # the missing content as blank (deleted below), never kept.
+            documents += [None] * (len(batch_ids) - len(documents))
+        for drawer_id, meta, content in zip(batch_ids, metadatas, documents):
+            meta = meta or {}
+            if not _metadata_matches_extract_mode(meta, extract_mode):
+                continue
+            content = (content or "").strip() if isinstance(content, str) else ""
+            stale = not _meta_is_current(meta, extract_mode)
+            redundant = bool(content) and content in pass_contents
+            blank = not content
+            if stale or redundant or blank:
+                delete_ids.append(drawer_id)
+        if not batch_ids:
+            break
+        offset += len(batch_ids)
+    return delete_ids
 
 
 def _source_file_delete_ids(collection, source_file: str, extract_mode: str) -> list[str]:
@@ -724,10 +789,15 @@ def _file_chunks_locked(
         if file_already_mined(collection, source_file, check_mtime=True, extract_mode=extract_mode):
             return 0, room_counts_delta, True
 
-        # Purge stale drawers first. Fires both on a normalize-schema bump
-        # (file_already_mined() returned False for pre-v2 drawers) and on a
-        # changed/grown transcript (mtime differs) — clean them out so the
-        # source doesn't end up with mixed old/new drawers.
+        # Purge stale/redundant/blank drawers first, but keep additive history.
+        # Fires both on a normalize-schema bump (``file_already_mined()``
+        # returned False for pre-v2 drawers) and on a changed/shrunk/grown
+        # transcript (mtime differs). The classifier
+        # (:func:`_additive_history_delete_ids`) distinguishes delete-able
+        # rows — stale (superseded schema), redundant (content re-derived
+        # this pass), and blank (genuine orphan) — from the additive history
+        # of surviving turns (current schema, verbatim content *not* re-derived
+        # this pass), which is preserved (#1593 / #2793).
         #
         # A failed purge must abort this file's mine attempt rather than
         # fall through to upsert: proceeding on top of an unpurged (or
@@ -738,7 +808,10 @@ def _file_chunks_locked(
         # drawers' stored mtime untouched, so the next mine still sees a
         # mismatch and retries.
         try:
-            delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
+            pass_contents = {chunk["content"] for chunk in chunks}
+            delete_ids = _additive_history_delete_ids(
+                collection, source_file, extract_mode, pass_contents
+            )
             if delete_ids:
                 collection.delete(ids=delete_ids)
         except Exception as exc:
