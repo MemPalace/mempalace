@@ -392,6 +392,31 @@ def test_extract_recent_messages_skips_additional_harness_wrappers(tmp_path):
     assert _extract_recent_messages(str(transcript)) == ["now wire the checkpoint to the deck"]
 
 
+def test_extract_recent_messages_skips_subagent_handback_and_resume_notice(tmp_path):
+    """Claude Code desktop injections reported in #2696."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {
+                "message": {
+                    "role": "user",
+                    "content": "Another Claude session sent a message:\nthe refactor is done",
+                }
+            },
+            {
+                "message": {
+                    "role": "user",
+                    "content": "The app was quit while you were working. "
+                    "Please continue from where you left off.",
+                }
+            },
+            {"message": {"role": "user", "content": "now wire the checkpoint to the deck"}},
+        ],
+    )
+    assert _extract_recent_messages(str(transcript)) == ["now wire the checkpoint to the deck"]
+
+
 def test_is_harness_boilerplate_is_anchored_to_the_message_opening():
     """The unit contract: a leading wrapper is boilerplate, a quote is not."""
     assert _is_harness_boilerplate("<system-reminder>do the thing</system-reminder>")
