@@ -966,7 +966,14 @@ def test_register_file_sentinel_includes_source_mtime():
         client = chromadb.PersistentClient(path=palace_path)
         col = client.get_or_create_collection("mempalace_drawers")
 
-        _register_file(col, str(tiny_file), "test", "mempalace", "exchange")
+        _register_file(
+            col,
+            str(tiny_file),
+            "test",
+            "mempalace",
+            "exchange",
+            source_metadata={"source_mtime": tiny_file.stat().st_mtime},
+        )
 
         mined = prefetch_mined_set(col, extract_mode="exchange")
         assert str(tiny_file) in mined
@@ -1091,10 +1098,16 @@ def test_mine_convos_scopes_mined_set_prefetch_to_candidate_files(monkeypatch):
         seen = {}
         real_prefetch_mined_set = convo_miner_module.prefetch_mined_set
 
-        def _spy_mined_set(collection, extract_mode=None, source_files=None):
+        def _spy_mined_set(
+            collection, extract_mode=None, source_files=None, *, source_fingerprints=False
+        ):
             seen["mined_set_source_files"] = source_files
+            seen["mined_set_source_fingerprints"] = source_fingerprints
             return real_prefetch_mined_set(
-                collection, extract_mode=extract_mode, source_files=source_files
+                collection,
+                extract_mode=extract_mode,
+                source_files=source_files,
+                source_fingerprints=source_fingerprints,
             )
 
         monkeypatch.setattr(convo_miner_module, "prefetch_mined_set", _spy_mined_set)
@@ -1103,6 +1116,7 @@ def test_mine_convos_scopes_mined_set_prefetch_to_candidate_files(monkeypatch):
 
         resolved = str(convo_path.resolve())
         assert seen["mined_set_source_files"] == [resolved]
+        assert seen["mined_set_source_fingerprints"] is True
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1422,10 +1436,10 @@ def test_one_bad_transcript_does_not_abort_the_mine(tmp_path, monkeypatch):
     bad.write_text("[]", encoding="utf-8")
     real = convo_miner.normalize_conversations_with_mtime
 
-    def flaky(filepath):
+    def flaky(filepath, **kwargs):
         if filepath.endswith("bad.json"):
             raise TypeError("expected string or bytes-like object, got 'NoneType'")
-        return real(filepath)
+        return real(filepath, **kwargs)
 
     monkeypatch.setattr(convo_miner, "normalize_conversations_with_mtime", flaky)
     palace = tmp_path / "palace"
