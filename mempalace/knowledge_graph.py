@@ -863,6 +863,9 @@ class KnowledgeGraph:
                         "valid_from": row["valid_from"],
                         "valid_to": row["valid_to"],
                         "current": row["valid_to"] is None,
+                        "confidence": row["confidence"],
+                        "source_closet": row["source_closet"],
+                        "source_file": row["source_file"],
                     }
                 )
         return results
@@ -914,6 +917,9 @@ class KnowledgeGraph:
                 "valid_from": r["valid_from"],
                 "valid_to": r["valid_to"],
                 "current": r["valid_to"] is None,
+                "confidence": r["confidence"],
+                "source_closet": r["source_closet"],
+                "source_file": r["source_file"],
             }
             for r in rows
         ]

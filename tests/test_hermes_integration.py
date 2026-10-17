@@ -555,6 +555,26 @@ def test_list_rooms_tool_marks_truncated_without_wing_total(provider_on_seeded_p
 # ----- Knowledge-graph tool handlers --------------------------------------
 
 
+def test_kg_timeline_tool_returns_provenance(initialized_provider, palace_path):
+    from mempalace.knowledge_graph import KnowledgeGraph
+
+    db_path = str(Path(palace_path).parent / "knowledge_graph.sqlite3")
+    writer = KnowledgeGraph(db_path=db_path)
+    try:
+        writer.add_triple(
+            "user", "likes", "coffee", confidence=0.5, source_closet="chat", source_file="chat.md"
+        )
+    finally:
+        writer.close()
+
+    result = json.loads(initialized_provider.handle_tool_call("mempalace_kg_timeline", {}))
+
+    (fact,) = result["timeline"]
+    assert fact["confidence"] == 0.5
+    assert fact["source_closet"] == "chat"
+    assert fact["source_file"] == "chat.md"
+
+
 def test_kg_add_persists_to_palace_sibling_sqlite(initialized_provider, palace_path):
     """The provider writes to ``<palace_path>/../knowledge_graph.sqlite3``."""
     from mempalace.knowledge_graph import KnowledgeGraph

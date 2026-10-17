@@ -276,6 +276,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   The built-in backends already skipped missing ids; the default that
   third-party backends inherit wrote them as empty records.
 
+### Added
+
+- **`kg_timeline` and `KnowledgeGraph.query_relationship` return each fact's `confidence`,
+  `source_closet` and `source_file`.** `query_entity` already returned the first two, but
+  the timeline and relationship reads dropped all three, so a fact's provenance depended
+  on which read path surfaced it. The three keys now carry the stored values on every
+  fact those reads return, and no existing key changes. (#2749)
+
 ---
 
 ## [3.11.0] — 2026-10-12
