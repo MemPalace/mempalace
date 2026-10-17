@@ -276,6 +276,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   The built-in backends already skipped missing ids; the default that
   third-party backends inherit wrote them as empty records.
 
+### Added
+
+- **`kg_query` and `KnowledgeGraph.query_entity` return each fact's triple `id` and
+  its `source_file`.** The `id` is the one `add_triple`, `kg_add` and `kg_supersede`
+  return, so a caller can match a fact it reads back to the id a write returned for
+  it, including when several rows share a subject, predicate and object and two of
+  them carry identical dates. `source_file` was stored on write but dropped on read.
+  On `kg_query` facts both keys are present on outgoing and incoming facts, including
+  those found through the candidate-name fallback, and no existing key changes.
+  `kg_timeline` and `query_relationship` facts gain the `id`. (#2184)
+
 ---
 
 ## [3.11.0] — 2026-10-12
