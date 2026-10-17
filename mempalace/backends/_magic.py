@@ -84,7 +84,7 @@ def _stat_regular_file(db_path: str) -> Optional[os.stat_result]:
     return st
 
 
-def read_header_fields(db_path: str) -> Optional[tuple[int, ...]]:
+def read_header_fields(db_path: str, *, extra: Optional[tuple] = None) -> Optional[tuple]:
     """Return SQLite header fields of ``db_path`` without a plain descriptor.
 
     Reads page 1 through a throwaway ``immutable=1`` connection, which is the
@@ -92,6 +92,12 @@ def read_header_fields(db_path: str) -> Optional[tuple[int, ...]]:
     process may hold POSIX locks on. Returns ``None`` when the file is empty
     or is not a SQLite database. Raises ``OSError`` when the file cannot be
     stat'ed, matching the old ``open()``-based readers.
+
+    ``extra``, when given, is ``(sql, params)`` executed on that same
+    connection. The first column of the first row is appended to the tuple.
+    A missing row or a failed query appends None and still returns the header
+    fields: a leaf commit does not change those pragmas, so callers probe a
+    generation row here instead of opening a second connection.
     """
     st = os.stat(db_path)
     if not stat.S_ISREG(st.st_mode) or st.st_size == 0:
@@ -104,7 +110,17 @@ def read_header_fields(db_path: str) -> Optional[tuple[int, ...]]:
     except sqlite3.Error:
         return None
     try:
-        return tuple(int(conn.execute(f"PRAGMA {name}").fetchone()[0]) for name in _HEADER_PRAGMAS)
+        fields = tuple(
+            int(conn.execute(f"PRAGMA {name}").fetchone()[0]) for name in _HEADER_PRAGMAS
+        )
+        if extra is None:
+            return fields
+        sql, params = extra
+        try:
+            row = conn.execute(sql, params).fetchone()
+        except sqlite3.Error:
+            row = None
+        return (*fields, None if row is None else row[0])
     except sqlite3.Error:
         return None
     finally:

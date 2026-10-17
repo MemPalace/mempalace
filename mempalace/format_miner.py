@@ -58,6 +58,7 @@ These get reported and skipped.
 
 from __future__ import annotations
 
+import contextlib
 import enum
 import hashlib
 import logging
@@ -70,21 +71,25 @@ from pathlib import Path
 from typing import Optional, Union
 
 from .palace import (
+    MINE_ABORTS,
     NORMALIZE_VERSION,
     SKIP_DIRS,
     _validate_palace_fts5_after_mine,
     file_already_mined,
     get_collection,
     mine_lock,
+    mine_palace_lock,
     mine_yield_point,
+    open_aaak_collection,
     palace_write_serial,
+    raise_if_files_failed,
+    write_file_drawers,
 )
 
 # Module-level imports from .miner so tests can patch them via
 # mempalace.format_miner.<name>. Lazy imports inside functions would not
 # expose these as attributes of this module, breaking the test seams.
 from .config import MempalaceConfig, normalize_wing_name
-from .collision_scan import assert_no_collisions
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
 from .source_identity import identity_metadata, source_directory_identity
 from .miner import (
@@ -105,9 +110,6 @@ __all__ = [
     "mine_formats",
 ]
 
-
-# Same batch size as miner.py / convo_miner.py — bounds memory + Chroma payload.
-DRAWER_UPSERT_BATCH_SIZE = 1000
 
 # Minimum chunk size (chars) — drawers below this are dropped as not useful.
 MIN_CHUNK_SIZE = 50
@@ -539,7 +541,14 @@ def _print_mine_summary(
 
 
 def _register_skip_sentinel_if_appropriate(
-    collection, source_file: str, wing: str, agent: str, status: ExtractionStatus
+    collection,
+    source_file: str,
+    wing: str,
+    agent: str,
+    status: ExtractionStatus,
+    source_mtime: Optional[float] = None,
+    *,
+    aaak_col=None,
 ) -> None:
     """Write the ``file_already_mined`` sentinel ONLY when the skip is durable.
 
@@ -548,45 +557,68 @@ def _register_skip_sentinel_if_appropriate(
     NOT mark the file as mined — installing the missing extra later (or
     reconnecting the network) should let the next mine pass pick it up.
     Per PR #1555 review (Copilot #14).
+
+    Only a file that extracted to nothing (``OK`` or ``SKIP_EMPTY``) loses its
+    earlier format drawers. A failed extraction keeps the last good text.
     """
     if status in _TRANSIENT_MISSING_DEP_STATUSES:
         return
-    _register_file(collection, source_file, wing, agent)
+    empty = status in (ExtractionStatus.OK, ExtractionStatus.SKIP_EMPTY)
+    _register_file(
+        collection, source_file, wing, agent, source_mtime, empty=empty, aaak_col=aaak_col
+    )
 
 
-def _register_file(collection, source_file: str, wing: str, agent: str) -> None:
+def _register_file(
+    collection,
+    source_file: str,
+    wing: str,
+    agent: str,
+    source_mtime: Optional[float] = None,
+    *,
+    empty: bool = False,
+    aaak_col=None,
+) -> None:
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
 
     Without this, files that extract to nothing (or hit a SKIP status) get
     rescanned on every re-mine. The sentinel preserves the no-op outcome.
-    Mirrors the helper of the same name in convo_miner.py.
+    Mirrors the helper of the same name in convo_miner.py. It carries the
+    mtime read before extraction, which ``file_already_mined(check_mtime=True)``
+    needs to match it.
+
+    ``empty`` means the file now holds no text, so its earlier format drawers
+    are stale and are replaced by the sentinel.
     """
     sentinel_id = f"sentinel_{wing}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
-    try:
-        collection.upsert(
-            documents=["[empty]"],
-            ids=[sentinel_id],
-            metadatas=[
-                {
-                    "wing": wing,
-                    "room": "documents",
-                    "source_file": source_file,
-                    "chunk_index": -1,
-                    "added_by": agent,
-                    "filed_at": datetime.now().isoformat(),
-                    "ingest_mode": "extract",
-                    "extract_mode": "format",
-                    "normalize_version": NORMALIZE_VERSION,
-                    "is_sentinel": True,
-                    # The sentinel names a real source file and ``sync`` reads
-                    # it as an ordinary drawer, so it needs the identity for
-                    # the same reason the file's own drawers do (#2320).
-                    **identity_metadata(source_file),
-                }
-            ],
+    meta = {
+        "wing": wing,
+        "room": "documents",
+        "source_file": source_file,
+        "chunk_index": -1,
+        "added_by": agent,
+        "filed_at": datetime.now().isoformat(),
+        "ingest_mode": "extract",
+        "extract_mode": "format",
+        "normalize_version": NORMALIZE_VERSION,
+        "is_sentinel": True,
+        # The sentinel names a real source file and ``sync`` reads it as an
+        # ordinary drawer, so it needs the identity for the same reason the
+        # file's own drawers do (#2320).
+        **identity_metadata(source_file),
+    }
+    if source_mtime is not None:
+        meta["source_mtime"] = source_mtime
+    # Replacing the file's drawers takes the same lock a real re-mine does.
+    with mine_lock(source_file) if empty else contextlib.nullcontext():
+        write_file_drawers(
+            collection,
+            source_file,
+            [(sentinel_id, "[empty]", meta)],
+            extract_mode="format",
+            prune=empty,
+            aaak_col=aaak_col,
         )
-    except Exception:
-        logger.debug("Sentinel write failed for %s", source_file, exc_info=True)
 
 
 def _file_chunks_locked(
@@ -599,12 +631,13 @@ def _file_chunks_locked(
     source_mtime: Optional[float] = None,
     content: Optional[str] = None,
     source_dir_ino: Optional[str] = None,
+    aaak_col=None,
 ):
-    """Lock the source file, purge stale drawers, and upsert fresh chunks.
+    """Lock the source file and replace its format drawers with fresh chunks.
 
-    Mirrors the canonical convo_miner pattern (locked purge + batched upsert)
-    but with ``ingest_mode="extract"`` so format-mined drawers are
-    distinguishable from project / convo drawers in the palace.
+    ``write_file_drawers`` files the new drawers before any previous format
+    drawer is deleted. Only this file's format drawers are replaced; project
+    and convo drawers for the same path stay.
 
     Each drawer's metadata includes:
       - ``source_mtime`` — for mtime-based idempotency (file_already_mined
@@ -630,14 +663,10 @@ def _file_chunks_locked(
         source_file, content or ""
     )
 
-    drawers_added = 0
     with mine_lock(source_file):
         # Re-check after lock — another agent may have just finished this file.
         # Use check_mtime=True so an updated source file is re-mined even
         # though a prior drawer set exists (matches miner.py semantics).
-        # palace.file_already_mined reads current mtime from disk and compares
-        # against the stored source_mtime metadata, so the caller just toggles
-        # the flag; no need to pass mtime explicitly.
         # ``extract_mode="format"`` scopes the idempotency check to format-mode
         # drawers only — drawers from convo_miner / project miner on the same
         # source_file don't falsely indicate "already mined" to the format
@@ -645,69 +674,64 @@ def _file_chunks_locked(
         if file_already_mined(collection, source_file, check_mtime=True, extract_mode="format"):
             return 0, True
 
-        try:
-            collection.delete(where={"source_file": source_file})
-        except Exception:
-            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
-
         filed_at = datetime.now().isoformat()
-        for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
-            batch_docs: list = []
-            batch_ids: list = []
-            batch_metas: list = []
-            for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                drawer_id = make_drawer_id_from_chunk(wing, room, source_file, chunk["chunk_index"])
-                content = chunk["content"]
-                meta: dict = {
-                    "wing": wing,
-                    "room": room,
-                    "source_file": source_file,
-                    "chunk_index": chunk["chunk_index"],
-                    "added_by": agent,
-                    "filed_at": filed_at,
-                    "ingest_mode": "extract",
-                    "extract_mode": "format",
-                    "normalize_version": NORMALIZE_VERSION,
-                    "hall": detect_hall(content),
-                    "id_recipe": ID_RECIPE,
-                }
-                if source_mtime is not None:
-                    meta["source_mtime"] = source_mtime
-                if source_dir_ino:
-                    # Which directory this file was read from, so ``sync``
-                    # can tell a neighbour in the same directory from one on
-                    # a volume mounted there since (#2320).
-                    meta["source_dir_ino"] = source_dir_ino
-                # Tier 6a — propagate line range from chunk dict into drawer
-                # metadata so closet pointers can carry "where in source"
-                # info. Chunks emitted by older code paths without these
-                # keys produce drawers without the keys (graceful fallback).
-                if chunk.get("line_start") is not None:
-                    meta["line_start"] = chunk["line_start"]
-                if chunk.get("line_end") is not None:
-                    meta["line_end"] = chunk["line_end"]
-                # Tier 6a content-date: shared across all chunks of the file.
-                if file_content_date:
-                    meta["content_date"] = file_content_date
-                    meta["content_date_source"] = file_content_date_source
-                entities = _extract_entities_for_metadata(content)
-                if entities:
-                    meta["entities"] = entities
-                batch_docs.append(content)
-                batch_ids.append(drawer_id)
-                batch_metas.append(meta)
-            assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
-            try:
-                collection.upsert(
-                    documents=batch_docs,
-                    ids=batch_ids,
-                    metadatas=batch_metas,
-                )
-                drawers_added += len(batch_docs)
-            except Exception as exc:
-                if "already exists" not in str(exc).lower():
-                    raise
+        drawers = []
+        for chunk in chunks:
+            text = chunk["content"]
+            meta: dict = {
+                "wing": wing,
+                "room": room,
+                "source_file": source_file,
+                "chunk_index": chunk["chunk_index"],
+                "added_by": agent,
+                "filed_at": filed_at,
+                "ingest_mode": "extract",
+                "extract_mode": "format",
+                "normalize_version": NORMALIZE_VERSION,
+                "hall": detect_hall(text),
+                "id_recipe": ID_RECIPE,
+            }
+            if source_mtime is not None:
+                meta["source_mtime"] = source_mtime
+            if source_dir_ino:
+                # Which directory this file was read from, so ``sync`` can
+                # tell a neighbour in the same directory from one on a volume
+                # mounted there since (#2320).
+                meta["source_dir_ino"] = source_dir_ino
+            # Tier 6a — propagate line range from chunk dict into drawer
+            # metadata so closet pointers can carry "where in source" info.
+            # Chunks emitted by older code paths without these keys produce
+            # drawers without the keys (graceful fallback).
+            if chunk.get("line_start") is not None:
+                meta["line_start"] = chunk["line_start"]
+            if chunk.get("line_end") is not None:
+                meta["line_end"] = chunk["line_end"]
+            # Tier 6a content-date: shared across all chunks of the file.
+            if file_content_date:
+                meta["content_date"] = file_content_date
+                meta["content_date_source"] = file_content_date_source
+            entities = _extract_entities_for_metadata(text)
+            if entities:
+                meta["entities"] = entities
+            drawer_id = make_drawer_id_from_chunk(wing, room, source_file, chunk["chunk_index"])
+            drawers.append((drawer_id, text, meta))
+        drawers_added = write_file_drawers(
+            collection, source_file, drawers, extract_mode="format", aaak_col=aaak_col
+        )
     return drawers_added, False
+
+
+def _yield_and_reopen(palace_path: str, collection):
+    """Pass a file boundary, reopening the collection if requests ran in it.
+
+    A request in the hub's handoff may close the backend under this handle (a
+    search resets the Chroma caches after a transient index error). Reopening
+    returns the cached collection when nothing closed it. A dry run holds no
+    collection and gets ``None`` back.
+    """
+    if not mine_yield_point() or collection is None:
+        return collection
+    return get_collection(palace_path)
 
 
 def mine_formats(
@@ -754,13 +778,28 @@ def mine_formats(
       threaded into chunking; the load is wired so future ``chunk_text``
       refactors that accept per-call sizing pick this up automatically.
     - Each per-file step is wrapped so one malformed file can't crash the
-      whole mine; the loop continues with the next file and logs the
-      offender.
-    - ``KeyboardInterrupt`` is caught at the orchestrator level so the
-      summary still prints on Ctrl-C; partial progress is safe to leave
-      in place because drawer IDs are deterministic (re-mining
-      upserts to the same rows).
+      whole mine; the loop continues with the next file, and the mine ends
+      with ``MineFileErrors`` after the summary when any file failed.
+    - On Ctrl-C the summary still prints and ``KeyboardInterrupt`` is then
+      re-raised; partial progress is safe to leave in place because drawer
+      IDs are deterministic (re-mining upserts to the same rows).
+    - A real mine holds ``mine_palace_lock`` for its whole run, like the
+      project and conversation miners.
     """
+    if dry_run:
+        return _mine_formats_impl(format_dir, palace_path, wing, agent, limit, dry_run)
+    with mine_palace_lock(palace_path):
+        return _mine_formats_impl(format_dir, palace_path, wing, agent, limit, dry_run)
+
+
+def _mine_formats_impl(
+    format_dir: str,
+    palace_path: str,
+    wing: Optional[str],
+    agent: str,
+    limit: int,
+    dry_run: bool,
+) -> None:
     # MempalaceConfig + chunk_text are imported at module level (above) so
     # tests can patch ``mempalace.format_miner.MempalaceConfig`` and
     # ``mempalace.format_miner.chunk_text`` directly. Hoisted as part of the
@@ -809,13 +848,15 @@ def mine_formats(
     # (Gemini #5).
     files: list = []
     collection = None
+    aaak_col = None
     total_drawers = 0
     files_mined = 0
     files_skipped = 0
     files_with_text = 0
-    files_errored = 0
+    files_failed: list = []
     files_processed = 0
     status_counts: dict = defaultdict(int)
+    interrupted = None
 
     try:
         # Use the resolved ``format_path``, not the raw ``format_dir``, so that
@@ -836,9 +877,10 @@ def mine_formats(
         print(f"{'-' * 55}\n")
 
         collection = get_collection(palace_path) if not dry_run else None
+        aaak_col = open_aaak_collection(palace_path) if not dry_run else None
 
         for i, filepath in enumerate(files, 1):
-            mine_yield_point()
+            collection = _yield_and_reopen(palace_path, collection)
             files_processed = i
             source_file = str(filepath)
 
@@ -848,10 +890,9 @@ def mine_formats(
                 # Cheap mtime read up-front — used as the idempotency key on
                 # subsequent re-mines (check_mtime=True compares stored vs.
                 # current mtime).
-                try:
-                    source_mtime: Optional[float] = os.path.getmtime(source_file)
-                except OSError:
-                    source_mtime = None
+                source_mtime: Optional[float] = None
+                with contextlib.suppress(OSError):
+                    source_mtime = os.path.getmtime(source_file)
 
                 # Pass extract_mode="format" so format-mode idempotency is
                 # scoped to its own drawer set — drawers from convo_miner /
@@ -870,7 +911,13 @@ def mine_formats(
                 if status != ExtractionStatus.OK or not text:
                     if not dry_run:
                         _register_skip_sentinel_if_appropriate(
-                            collection, source_file, wing, agent, status
+                            collection,
+                            source_file,
+                            wing,
+                            agent,
+                            status,
+                            source_mtime,
+                            aaak_col=aaak_col,
                         )
                     print(f"  - [{i:4}/{len(files)}] {filepath.name[:50]:50} {status.name}")
                     continue
@@ -887,7 +934,15 @@ def mine_formats(
                 )
                 if not chunks:
                     if not dry_run:
-                        _register_file(collection, source_file, wing, agent)
+                        _register_file(
+                            collection,
+                            source_file,
+                            wing,
+                            agent,
+                            source_mtime,
+                            empty=True,
+                            aaak_col=aaak_col,
+                        )
                     print(f"  - [{i:4}/{len(files)}] {filepath.name[:50]:50} EMPTY_AFTER_CHUNK")
                     continue
 
@@ -915,6 +970,7 @@ def mine_formats(
                     source_mtime=source_mtime,
                     content=text,
                     source_dir_ino=source_directory_identity(filepath),
+                    aaak_col=aaak_col,
                 )
                 if skipped:
                     files_skipped += 1
@@ -925,10 +981,12 @@ def mine_formats(
                 print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
                 if limit > 0 and files_mined >= limit:
                     break
+            except MINE_ABORTS:
+                raise
             except Exception as exc:
                 # Log and continue — one malformed file shouldn't kill the
                 # whole mine. Mirrors miner.py's per-file recovery.
-                files_errored += 1
+                files_failed.append(source_file)
                 logger.warning(
                     "mine_formats: error processing %s — %s: %s",
                     source_file,
@@ -939,27 +997,11 @@ def mine_formats(
                     f"  ! [{i:4}/{len(files)}] {filepath.name[:50]:50} ERROR: {type(exc).__name__}"
                 )
                 continue
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
         # Partial progress is safe — deterministic drawer IDs mean a re-mine
-        # upserts to the same rows. Print a clean summary and exit.
+        # upserts to the same rows. Print the summary, then re-raise.
         print("\n  Mine interrupted by user (Ctrl-C).")
-    except Exception as exc:
-        # Defense in depth — the per-file try/except above catches most
-        # realistic crashes, but a programming error in the outer-loop
-        # plumbing (file enumeration, scan_formats itself, etc.) would
-        # otherwise propagate as a bare traceback. Catch it here so the
-        # summary still prints and the PID-file finally-block still runs.
-        # Per PR #1555 review (Gemini #5). Mirrors miner.py's belt-and-
-        # suspenders pattern.
-        logger.warning(
-            "mine_formats: unexpected outer-loop exception — %s: %s",
-            type(exc).__name__,
-            str(exc)[:200],
-        )
-        print(
-            f"\n  Mine aborted by exception ({type(exc).__name__}: {str(exc)[:120]})",
-            file=sys.stderr,
-        )
+        interrupted = exc
     else:
         # All files processed without interruption — compute cross-wing topic
         # tunnels linking this wing to others that share confirmed topics.
@@ -1007,7 +1049,10 @@ def mine_formats(
         files_seen=files_processed,
         files_with_text=files_with_text,
         files_skipped=files_skipped,
-        files_errored=files_errored,
+        files_errored=len(files_failed),
         total_drawers=total_drawers,
         status_counts=status_counts,
     )
+    if interrupted is not None:
+        raise interrupted
+    raise_if_files_failed(files_failed, files_processed)

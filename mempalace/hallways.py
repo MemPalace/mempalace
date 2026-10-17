@@ -37,13 +37,15 @@ import json
 import re
 import logging
 import os
-import tempfile
 from collections import defaultdict
 from datetime import datetime, timezone
 from itertools import combinations
 from typing import Optional
 
 from .dynamics import initialize_dynamics_fields
+from .fsio import atomic_write_json as _atomic_write_json
+from .fsio import read_json_for_update as _read_json_for_update
+from .fsio import refuse_unparsed as _refuse_unparsed
 
 logger = logging.getLogger("mempalace_hallways")
 
@@ -97,6 +99,25 @@ def _legacy_hallway_file() -> str:
     return os.path.join(os.path.expanduser("~"), ".mempalace", "hallways.json")
 
 
+def _load_hallways_for_write(config=None) -> list[dict]:
+    """Hallway records a save is allowed to replace.
+
+    Missing is an empty list. A file that does not parse, or is not the
+    hallway document, is moved aside and the save is refused. A read that
+    only lists hallways stays on :func:`_load_hallways` and does not move
+    the file.
+    """
+    path = _get_hallway_file(config)
+    loaded = _read_json_for_update(path)
+    if loaded is None:
+        return []
+    if isinstance(loaded, dict) and isinstance(loaded.get("hallways"), list):
+        return loaded["hallways"]
+    if isinstance(loaded, list):
+        return loaded
+    _refuse_unparsed(path, "is not a hallway document")
+
+
 def _load_hallways(config=None) -> list[dict]:
     """Read all hallway records. Returns ``[]`` if the file is missing or corrupt.
 
@@ -148,22 +169,7 @@ def _save_hallways(hallways: list[dict], config=None) -> None:
         "schema_version": _SCHEMA_VERSION,
         "hallways": list(hallways),
     }
-    fd, tmp_path = tempfile.mkstemp(prefix=".hallways-", suffix=".tmp", dir=directory)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
-        try:
-            os.chmod(tmp_path, 0o600)
-        except OSError:
-            # Non-POSIX systems may not support chmod; not fatal.
-            pass
-        os.replace(tmp_path, hallway_file)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    _atomic_write_json(hallway_file, payload)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -568,6 +574,7 @@ def _wing_metadata_from_sqlite(col, wing: str) -> Optional[list]:
     drawers at all.
     """
     from .palace import _fast_collection_metadata
+    from .backends.chroma import MetadataRecoveryPending
 
     scope = {"wing": wing}
     try:
@@ -583,6 +590,9 @@ def _wing_metadata_from_sqlite(col, wing: str) -> Optional[list]:
                 probe.close()
             if isinstance(first, dict) and first.get("wing") == wing:
                 metadatas = [first]
+    except MetadataRecoveryPending:
+        logger.debug("compute_hallways_for_wing: metadata recovery pending for %s", wing)
+        return None
     except Exception:
         logger.warning(
             "compute_hallways_for_wing: sqlite metadata scan failed for %s; paging instead",
@@ -782,7 +792,7 @@ def compute_hallways_for_wing(
     # Load → materialize → save under the hallway-file lock, or a mine of
     # another wing in between rewrites the file without this wing's records.
     with _hallway_file_lock(config):
-        existing = _load_hallways(config)
+        existing = _load_hallways_for_write(config)
         existing_dynamics_lookup: dict = {}
         for h in existing:
             if h.get("wing") != wing:
@@ -948,7 +958,7 @@ def _merge_variant_group(members: list[dict], kept: list[dict], duplicates: list
 
 
 def _prune_spelling_hallways_locked(config, apply: bool) -> dict:
-    hallways = _load_hallways(config)
+    hallways = _load_hallways_for_write(config) if apply else _load_hallways(config)
     self_links = [h for h in hallways if is_self_link(h)]
     candidates = [h for h in hallways if isinstance(h, dict) and not is_self_link(h)]
     duplicates: list[dict] = []
@@ -981,7 +991,7 @@ def _prune_spelling_hallways_locked(config, apply: bool) -> dict:
 def delete_hallway(hallway_id: str, config=None) -> bool:
     """Remove one hallway record by id. Returns True if a record was removed."""
     with _hallway_file_lock(config):
-        hallways = _load_hallways(config)
+        hallways = _load_hallways_for_write(config)
         filtered = [h for h in hallways if h.get("id") != hallway_id]
         if len(filtered) == len(hallways):
             return False

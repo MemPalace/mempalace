@@ -16,7 +16,7 @@ from mempalace.searcher import (
 )
 
 
-def test_rendered_dedup_preserves_first_ranked_closet_hit_and_plain_repeats():
+def test_rendered_dedup_keeps_distinct_drawers_and_plain_repeats():
     hits = [
         {
             "drawer_id": "closet-first",
@@ -59,6 +59,7 @@ def test_rendered_dedup_preserves_first_ranked_closet_hit_and_plain_repeats():
 
     assert [hit["drawer_id"] for hit in result] == [
         "closet-first",
+        "closet-later",
         "other-path",
         "plain-repeat-1",
         "plain-repeat-2",
@@ -104,6 +105,7 @@ def test_closet_enrichment_memoises_by_source_and_parent_group():
             "matched_via": ("drawer+closet"),
             "_source_file_full": ("/shared/log.md"),
             "_parent_drawer_id": ("parent-a"),
+            "_chunk_index": 0,
         },
         {
             "drawer_id": "a-1",
@@ -111,6 +113,7 @@ def test_closet_enrichment_memoises_by_source_and_parent_group():
             "matched_via": ("drawer+closet"),
             "_source_file_full": ("/shared/log.md"),
             "_parent_drawer_id": ("parent-a"),
+            "_chunk_index": 1,
         },
         {
             "drawer_id": "b-0",
@@ -118,20 +121,21 @@ def test_closet_enrichment_memoises_by_source_and_parent_group():
             "matched_via": ("drawer+closet"),
             "_source_file_full": ("/shared/log.md"),
             "_parent_drawer_id": ("parent-b"),
+            "_chunk_index": 0,
         },
     ]
 
-    _enrich_closet_hits(
-        hits,
-        drawers_col,
-        "token",
-    )
+    _enrich_closet_hits(hits, drawers_col)
 
     assert drawers_col.get.call_count == 2
-    assert hits[0]["text"] == hits[1]["text"]
-    assert "parent-a" in hits[0]["text"]
-    assert "parent-b" in hits[2]["text"]
-    assert hits[0]["text"] != hits[2]["text"]
+    assert hits[0]["text"] == "raw a0"
+    assert hits[1]["text"] == "raw a1"
+    assert hits[2]["text"] == "raw b0"
+    assert hits[0]["drawer_index"] == 0
+    assert hits[1]["drawer_index"] == 1
+    assert "parent-a neighboring context" in hits[0]["context"]
+    assert "parent-b neighboring context" in hits[2]["context"]
+    assert hits[0]["context"] != hits[2]["context"]
 
 
 def test_search_promotes_distinct_results_from_wider_pool_and_fetches_source_once():
@@ -258,10 +262,11 @@ def test_search_promotes_distinct_results_from_wider_pool_and_fetches_source_onc
 
     assert len(hits) == 5
     assert len(rendered_keys) == 5
-    assert hits[0]["drawer_id"] == "same-0"
+    assert [hit["drawer_id"] for hit in hits] == [f"same-{index}" for index in range(5)]
+    assert [hit["text"] for hit in hits] == repeated_documents
     assert drawers_col.query.call_args.kwargs["n_results"] == 20
     assert drawers_col.get.call_count == 1
-    assert sum(hit["source_path"] == repeated_source for hit in hits) == 1
+    assert sum(hit["source_path"] == repeated_source for hit in hits) == 5
 
 
 def test_process_file_preserves_legitimate_exact_repeats_at_different_positions(
@@ -396,6 +401,77 @@ def test_real_chromadb_source_scoped_search_returns_no_duplicate_rendered_passag
             for hit in hits
         }
     )
+
+
+def test_two_closet_drawers_come_back_as_themselves_not_chunk_one():
+    """Two closet hits return their own drawers, and both survive dedupe."""
+    source = "/proj/notes.md"
+    chunks = [
+        "chunk 0 intro",
+        "chunk 1 alpha beta the query lives here",
+        "chunk 2 drawer d7 talks about shipping",
+        "chunk 3 bridge",
+        "chunk 4 drawer d4 talks about billing",
+    ]
+    drawers_col = MagicMock()
+    drawers_col.get.return_value = SimpleNamespace(
+        documents=chunks,
+        metadatas=[{"chunk_index": index} for index in range(len(chunks))],
+    )
+    hits = [
+        {
+            "drawer_id": "d7",
+            "text": chunks[2],
+            "matched_via": "drawer+closet",
+            "_source_file_full": source,
+            "_chunk_index": 2,
+            "_parent_drawer_id": None,
+        },
+        {
+            "drawer_id": "d4",
+            "text": chunks[4],
+            "matched_via": "drawer+closet",
+            "_source_file_full": source,
+            "_chunk_index": 4,
+            "_parent_drawer_id": None,
+        },
+        {
+            "drawer_id": "d7",
+            "text": chunks[2],
+            "matched_via": "drawer+closet",
+            "_source_file_full": source,
+            "_chunk_index": 2,
+            "_parent_drawer_id": None,
+        },
+    ]
+
+    enriched = _enrich_closet_hits(hits, drawers_col)
+
+    assert enriched[0]["text"] == chunks[2]
+    assert enriched[1]["text"] == chunks[4]
+    assert chunks[2] in enriched[0]["text"]
+    assert chunks[4] in enriched[1]["text"]
+    assert enriched[0]["drawer_index"] == 2
+    assert enriched[1]["drawer_index"] == 4
+    assert enriched[0]["drawer_id"] == "d7"
+    assert enriched[1]["drawer_id"] == "d4"
+    assert "alpha beta" not in enriched[0]["text"]
+    assert "alpha beta" not in enriched[1]["text"]
+    assert "chunk 1 alpha beta" in enriched[0]["context"]
+    assert enriched[0]["text"] not in enriched[0]["context"]
+    assert [hit["drawer_id"] for hit in _dedupe_rendered_hits(enriched)] == ["d7", "d4"]
+
+
+def test_dedupe_keeps_distinct_chunks_of_one_logical_drawer():
+    """Chunk hits report their parent's drawer_id; only a repeat of the same
+    chunk is dropped."""
+    hits = [
+        {"drawer_id": "parent", "_chunk_index": 0, "text": "first part"},
+        {"drawer_id": "parent", "_chunk_index": 1, "text": "second part"},
+        {"drawer_id": "parent", "_chunk_index": 0, "text": "first part"},
+    ]
+
+    assert [hit["text"] for hit in _dedupe_rendered_hits(hits)] == ["first part", "second part"]
 
 
 def test_candidate_pool_limits_widen_only_default_vector_strategy():

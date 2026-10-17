@@ -240,6 +240,85 @@ def purge_file_closets(closets_col, source_file: str) -> None:
         logger.debug("Closet purge failed for %s", source_file, exc_info=True)
 
 
+def open_aaak_collection(palace_path: str):
+    """The AAAK collection, or None when ``compress`` never created it."""
+    try:
+        return get_aaak_collection(palace_path, create=False)
+    except (CollectionNotInitializedError, PalaceNotFoundError):
+        return None
+
+
+def purge_aaak_rows(aaak_col, *, source_file=None, drawer_ids=(), batch_size: int = 500) -> int:
+    """Delete the AAAK summaries of deleted or rewritten drawers.
+
+    A summary quotes its drawer, so it goes with it: rows keyed by any of
+    ``drawer_ids`` and every row of ``source_file``. Returns the number deleted.
+    """
+    if aaak_col is None:
+        return 0
+    ids = set()
+    drawer_ids = list(dict.fromkeys(drawer_ids))
+    for start in range(0, len(drawer_ids), batch_size):
+        batch = drawer_ids[start : start + batch_size]
+        ids.update(aaak_col.get(ids=batch, include=[]).get("ids") or [])
+    if source_file:
+        ids.update(aaak_col.get(where={"source_file": source_file}, include=[]).get("ids") or [])
+    ordered = sorted(ids)
+    for start in range(0, len(ordered), batch_size):
+        aaak_col.delete(ids=ordered[start : start + batch_size])
+    return len(ordered)
+
+
+def is_aaak_row(metadata) -> bool:
+    """Whether a row is an AAAK summary rather than a closet pointer.
+
+    ``mempalace compress`` used to write its summaries into the closets
+    collection. Those rows carry ``compression_ratio``, which no closet writer
+    sets; rows in the AAAK collection carry ``kind="aaak"``.
+    """
+    meta = metadata or {}
+    return meta.get("kind") == "aaak" or "compression_ratio" in meta
+
+
+def move_aaak_out_of_closets(palace_path: str, batch_size: int = 500) -> int:
+    """Move AAAK summaries left in the closets collection to the AAAK collection.
+
+    Every row is stored in the AAAK collection before any is deleted from the
+    closets, so an interrupted move leaves a copy in both and the next call
+    finishes it. Returns the number of rows moved.
+    """
+    try:
+        closets_col = get_closets_collection(palace_path, create=False)
+    except CollectionNotInitializedError:
+        return 0
+    found = []
+    offset = 0
+    while True:
+        page = closets_col.get(include=["documents", "metadatas"], limit=batch_size, offset=offset)
+        ids = page.get("ids") or []
+        if not ids:
+            break
+        for row_id, doc, meta in zip(ids, page.get("documents") or [], page.get("metadatas") or []):
+            if is_aaak_row(meta):
+                found.append((row_id, doc, {**(meta or {}), "kind": "aaak"}))
+        offset += len(ids)
+        if len(ids) < batch_size:
+            break
+    if not found:
+        return 0
+    aaak_col = get_aaak_collection(palace_path, create=True)
+    for start in range(0, len(found), batch_size):
+        batch = found[start : start + batch_size]
+        aaak_col.upsert(
+            ids=[row[0] for row in batch],
+            documents=[row[1] for row in batch],
+            metadatas=[row[2] for row in batch],
+        )
+    for start in range(0, len(found), batch_size):
+        closets_col.delete(ids=[row[0] for row in found[start : start + batch_size]])
+    return len(found)
+
+
 def upsert_closet_lines(closets_col, closet_id_base, lines, metadata):
     """Write topic lines to closets, packed greedily without splitting a line.
 

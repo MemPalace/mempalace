@@ -27,6 +27,7 @@ from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
     MineValidationError,
+    StaleDrawerPurgeFailed,
     _candidate_entity_words,
     _open_collection_or_explain,
     _validate_palace_fts5_after_mine,
@@ -37,19 +38,29 @@ from .palace import (
     mine_lock,
     mine_palace_lock,
     mine_yield_point,
+    open_aaak_collection,
     palace_write_serial,
     prefetch_complete_mtimes,
+    print_files_failed,
     purge_file_closets,
+    raise_if_files_failed,
     upsert_closet_lines,
+    write_file_drawers,
 )
 
 # Module-level import so tests can patch it as
 # ``mempalace.miner.compute_hallways_for_wing``. The integration call
 # lives at the end of _mine_impl, alongside the existing
 # ``_compute_topic_tunnels_for_wing`` post-mine block.
-from .collision_scan import assert_no_collisions
 from .hallways import compute_hallways_for_wing
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
+
+# Re-exported: callers and tests import these from the miner (#2676).
+from .project_config import (  # noqa: F401
+    MEMPALACE_PROJECT_FILES,
+    PROJECT_CONFIG_FILENAMES,
+    find_project_config,
+)
 from .source_identity import source_directory_identity
 
 logger = logging.getLogger("mempalace_mcp")
@@ -181,14 +192,14 @@ READABLE_EXTENSIONS = {
     ".sln",
     ".razor",
     ".cshtml",
+    # Dynamics 365 Business Central (AL language) source, #278.
+    ".al",
+    # PowerShell scripts, the Windows counterpart of ``.sh`` above.
+    ".ps1",
 } | PHP_EXTENSIONS
 
 SKIP_FILENAMES = {
-    "entities.json",
-    "mempalace.yaml",
-    "mempalace.yml",
-    "mempal.yaml",
-    "mempal.yml",
+    *MEMPALACE_PROJECT_FILES,
     ".gitignore",
     "package-lock.json",
     "pnpm-lock.yaml",
@@ -205,7 +216,6 @@ from .config import (  # noqa: E402  (kept here for the legacy alias)
     DEFAULT_MIN_CHUNK_SIZE as MIN_CHUNK_SIZE,
 )
 
-DRAWER_UPSERT_BATCH_SIZE = 1000
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
 # A safety rail against pathological generated artifacts (lockfiles not in
 # SKIP_FILENAMES, vendored data dumps, etc.). Originally 500 to bound ONNX
@@ -521,47 +531,43 @@ def _apply_exclude_patterns_to_prescanned_files(
 
 
 def load_config(project_dir: str) -> dict:
-    """Load mempalace.yaml from project directory (falls back to mempal.yaml)."""
+    """Load the project config from ``project_dir``.
+
+    Resolution order is :data:`PROJECT_CONFIG_FILENAMES`: ``mempalace.yaml``,
+    ``mempalace.yml``, then the legacy ``mempal.yaml`` and ``mempal.yml``.
+    Without any of them the auto-detected defaults are returned.
+    """
     import yaml
 
     resolved_project_dir = Path(project_dir).expanduser().resolve()
-    config_path = resolved_project_dir / "mempalace.yaml"
-    # ``is_file()`` rather than ``exists()``: the latter is true for a FIFO,
-    # and the ``open`` at the end of this function would then block in the
-    # kernel until a writer appears. A config that is not a regular file is
-    # treated as absent, which lands on the auto-detected defaults below.
-    if not config_path.is_file():
-        # Fallback to legacy name
-        legacy_path = resolved_project_dir / "mempal.yaml"
-        if legacy_path.is_file():
-            config_path = legacy_path
-        else:
-            from .config import normalize_wing_name
+    config_path = find_project_config(resolved_project_dir)
+    if config_path is None:
+        from .config import normalize_wing_name
 
-            # Normalize the dirname-derived fallback wing the same way
-            # ``cmd_init`` and ``room_detector_local`` do — otherwise a
-            # hyphenated project mined without a yaml file lands under a
-            # raw-name wing while ``topics_by_wing`` was keyed under the
-            # normalized slug, silently dropping every topic tunnel
-            # (the no-yaml branch of issue #1194).
-            wing_name = normalize_wing_name(resolved_project_dir.name)
-            print(
-                f"  No mempalace.yaml found in {resolved_project_dir} "
-                f"— using auto-detected defaults (wing='{wing_name}'). "
-                "Directories with the same basename will share a wing; "
-                "add mempalace.yaml to disambiguate.",
-                file=sys.stderr,
-            )
-            return {
-                "wing": wing_name,
-                "rooms": [
-                    {
-                        "name": "general",
-                        "description": "All project files",
-                        "keywords": ["general"],
-                    }
-                ],
-            }
+        # Normalize the dirname-derived fallback wing the same way
+        # ``cmd_init`` and ``room_detector_local`` do — otherwise a
+        # hyphenated project mined without a yaml file lands under a
+        # raw-name wing while ``topics_by_wing`` was keyed under the
+        # normalized slug, silently dropping every topic tunnel
+        # (the no-yaml branch of issue #1194).
+        wing_name = normalize_wing_name(resolved_project_dir.name)
+        print(
+            f"  No mempalace.yaml found in {resolved_project_dir} "
+            f"— using auto-detected defaults (wing='{wing_name}'). "
+            "Directories with the same basename will share a wing; "
+            "add mempalace.yaml to disambiguate.",
+            file=sys.stderr,
+        )
+        return {
+            "wing": wing_name,
+            "rooms": [
+                {
+                    "name": "general",
+                    "description": "All project files",
+                    "keywords": ["general"],
+                }
+            ],
+        }
     with open(config_path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
@@ -1742,7 +1748,6 @@ def _build_drawer_metadata(
     line_start: Optional[int] = None,
     line_end: Optional[int] = None,
     content_date: Optional[str] = None,
-    chunk_total: Optional[int] = None,
     content_date_source: Optional[str] = None,
     source_dir_ino: Optional[str] = None,
 ) -> dict:
@@ -1773,13 +1778,7 @@ def _build_drawer_metadata(
     and the key is then absent, which leaves that drawer exactly where it
     was.
 
-    ``chunk_total`` — the total number of chunks this mining pass expects
-    to write for ``source_file`` (see #21). Every chunk of the same pass
-    carries the same value so ``file_already_mined`` can tell "N of N
-    batches committed" from "crashed after batch 1 of N", instead of
-    treating any surviving drawer with a matching mtime as proof the file
-    is fully mined. ``None`` for legacy callers (e.g. ``add_drawer``,
-    which is inherently a single atomic write with no partial-batch risk).
+    ``chunk_total`` (see #21) is stamped by ``write_file_drawers``, not here.
     """
     metadata = {
         "wing": wing,
@@ -1800,8 +1799,6 @@ def _build_drawer_metadata(
     if content_date:
         metadata["content_date"] = content_date
         metadata["content_date_source"] = content_date_source or "unknown"
-    if chunk_total is not None:
-        metadata["chunk_total"] = chunk_total
     if source_dir_ino:
         metadata["source_dir_ino"] = source_dir_ino
     metadata["hall"] = detect_hall(content)
@@ -1883,6 +1880,7 @@ def process_file(
     min_chunk_size: int = None,
     max_chunks_per_file: Optional[int] = None,
     mined_mtimes: Optional[dict] = None,
+    aaak_col=None,
 ) -> tuple:
     """Read, chunk, route, and file one file.
 
@@ -1891,7 +1889,10 @@ def process_file(
     filed (pre- or post-lock re-check), unreadable (``OSError``), or
     too-short content (below ``min_chunk_size``). It is ``"chunk_cap"``
     when the per-file chunk cap aborted the file. Callers use the tag to
-    surface a separate counter in the mine summary (see #1455).
+    surface a separate counter in the mine summary (see #1455). It is
+    ``"purge_failed"`` when the stale-drawer purge raised: the new drawers
+    stay marked unfinished, and the mine counts it as an error rather than a
+    skip.
 
     ``mined_mtimes`` is :func:`prefetch_complete_mtimes`'s map for this
     mine. A file it proves already filed is skipped without querying the
@@ -1944,37 +1945,12 @@ def process_file(
         print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
         return len(chunks), room, None
 
-    # Lock this file so concurrent agents don't interleave delete+insert.
-    # Without the lock, two agents can both pass file_already_mined(),
-    # both delete, and both insert — creating duplicates or losing data.
+    # Lock this file so concurrent agents don't interleave their writes and
+    # prunes. Without the lock, two agents can both pass file_already_mined()
+    # and both file the file — creating duplicates or losing data.
     with mine_lock(source_file):
         # Re-check after acquiring lock — another agent may have just finished
         if file_already_mined(collection, source_file, check_mtime=True):
-            return 0, room, None
-
-        # Purge stale drawers for this file before re-inserting the fresh chunks.
-        # Converts modified-file re-mines from upsert-over-existing-IDs (which hits
-        # hnswlib's thread-unsafe updatePoint path and can segfault on macOS ARM
-        # with chromadb 0.6.3) into a clean delete+insert, bypassing the update
-        # path entirely.
-        #
-        # A failed purge must abort this file's mine attempt rather than fall
-        # through to upsert: proceeding would either leave stale tail entries
-        # as permanent orphans (old chunk count > new) or silently overwrite
-        # only the overlapping chunk_index positions (not a real re-mine) --
-        # see #23. Returning here (without touching source_mtime/chunk_total)
-        # leaves the old drawers' stored mtime untouched, so the next mine
-        # still sees a mismatch against the current on-disk mtime and retries.
-        try:
-            collection.delete(where={"source_file": source_file})
-        except Exception as exc:
-            print(
-                f"  ! [skip] {filepath.name[:50]:50} stale-drawer purge failed "
-                f"({exc!r}); leaving existing drawers untouched, will retry "
-                f"on the next mine",
-                file=sys.stderr,
-            )
-            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
             return 0, room, None
 
         # source_mtime is the mtime paired with the content actually read
@@ -2001,92 +1977,55 @@ def process_file(
             source_file, content
         )
 
-        drawers_added = 0
-        # Accumulate drawer metadata across batches so the closet emitter
-        # below can consume it (Tier 6a date+line locators). Without this,
-        # the new ``drawer_metas`` kwarg never reaches ``build_closet_lines``
-        # in production and the 4-segment pointer form lives only in tests.
-        # Per PR #1584 review (Igor, 2026-05-22).
-        all_metas: list = []
-        try:
-            for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
-                batch_docs: list = []
-                batch_ids: list = []
-                batch_metas: list = []
-                for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                    drawer_id = make_drawer_id_from_chunk(
-                        wing, room, source_file, chunk["chunk_index"]
-                    )
-                    batch_docs.append(chunk["content"])
-                    batch_ids.append(drawer_id)
-                    batch_metas.append(
-                        _build_drawer_metadata(
-                            wing,
-                            room,
-                            source_file,
-                            chunk["chunk_index"],
-                            agent,
-                            chunk["content"],
-                            source_mtime,
-                            line_start=chunk.get("line_start"),
-                            line_end=chunk.get("line_end"),
-                            content_date=file_content_date,
-                            chunk_total=len(chunks),
-                            content_date_source=file_content_date_source,
-                            source_dir_ino=source_dir_ino,
-                        )
-                    )
-                assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
-                collection.upsert(
-                    documents=batch_docs,
-                    ids=batch_ids,
-                    metadatas=batch_metas,
-                )
-                drawers_added += len(batch_docs)
-                all_metas.extend(batch_metas)
-        except Exception:
-            # A successful earlier batch has the source's current mtime (and
-            # often chunk_total). Leaving those drawers behind would make the
-            # next run skip this incomplete rebuild when chunk_total is absent
-            # on legacy rows, and would leave partial content searchable until
-            # the next mine. The source lock prevents this cleanup from
-            # deleting another miner's work for the same file. (#2122)
-            try:
-                collection.delete(where={"source_file": source_file})
-            except Exception:
-                logger.warning(
-                    "Failed to clean partial drawers after upsert error for %s",
+        drawers = [
+            (
+                make_drawer_id_from_chunk(wing, room, source_file, chunk["chunk_index"]),
+                chunk["content"],
+                _build_drawer_metadata(
+                    wing,
+                    room,
                     source_file,
-                    exc_info=True,
-                )
-            if closets_col:
-                purge_file_closets(closets_col, source_file)
-            raise
+                    chunk["chunk_index"],
+                    agent,
+                    chunk["content"],
+                    source_mtime,
+                    line_start=chunk.get("line_start"),
+                    line_end=chunk.get("line_end"),
+                    content_date=file_content_date,
+                    content_date_source=file_content_date_source,
+                    source_dir_ino=source_dir_ino,
+                ),
+            )
+            for chunk in chunks
+        ]
+        # Every drawer for this path is replaced, whichever miner filed it.
+        # A failed stale-drawer purge is an error the mine counts, not a skip.
+        try:
+            drawers_added = write_file_drawers(collection, source_file, drawers, aaak_col=aaak_col)
+        except StaleDrawerPurgeFailed as exc:
+            print(f"  ! [error] {filepath.name[:50]:50} {exc}", file=sys.stderr)
+            return 0, room, "purge_failed"
 
         # Build closet — the searchable index pointing to these drawers.
-        # Purge unconditionally: the old drawers this closet pointed at were
-        # already deleted above regardless of how many chunks survived this
-        # pass's own length filter, so a re-mine that ends up with zero filed
-        # drawers must still end up with zero closets, not stale ones
-        # dangling on deleted drawer IDs (see #24). Only the closet
-        # rebuild itself is conditional on there being new drawers to point at.
+        # Purge unconditionally: the old drawers this closet pointed at are
+        # gone, so a re-mine that ends up with zero filed drawers must still
+        # end up with zero closets, not stale ones dangling on deleted drawer
+        # IDs (see #24). Only the closet rebuild itself is conditional on
+        # there being new drawers to point at.
         if closets_col:
             purge_file_closets(closets_col, source_file)
         if closets_col and drawers_added > 0:
-            drawer_ids = [
-                make_drawer_id_from_chunk(wing, room, source_file, c["chunk_index"]) for c in chunks
-            ]
             # Pass drawer_metas so build_closet_lines can emit the Tier 6a
             # 4-segment pointer (``topic|entities|YYYY-MM-DD:Lstart-Lend|→ids``)
             # when line_start / line_end / content_date are present. Falls
             # back to the legacy 3-segment form automatically when not.
             closet_lines = build_closet_lines(
                 source_file,
-                drawer_ids,
+                [drawer_id for drawer_id, _, _ in drawers],
                 content,
                 wing,
                 room,
-                drawer_metas=all_metas,
+                drawer_metas=[meta for _, _, meta in drawers],
             )
             closet_id_base = (
                 f"closet_{wing}_{room}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
@@ -2338,6 +2277,9 @@ def _mine_impl(
 
     from .embedding import describe_device
 
+    # Resolved before the header: an explicit device torch cannot use warns
+    # here, so the warning is printed above the header, not inside it.
+    device = describe_device()
     print(f"\n{'=' * 55}")
     print("  MemPalace Mine")
     print(f"{'=' * 55}")
@@ -2346,7 +2288,7 @@ def _mine_impl(
     limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
     print(f"  Files:   {len(files)}{limit_suffix}")
     print(f"  Palace:  {palace_path}")
-    print(f"  Device:  {describe_device()}")
+    print(f"  Device:  {device}")
     if dry_run:
         print("  DRY RUN -- nothing will be filed")
     if not respect_gitignore:
@@ -2358,6 +2300,7 @@ def _mine_impl(
     if not dry_run:
         collection = get_collection(palace_path)
         closets_col = get_closets_collection(palace_path)
+        aaak_col = open_aaak_collection(palace_path)
         # One sqlite pass instead of one get(where=source_file) per file,
         # which costs ~0.1 s each on a 1M-drawer palace (#2684). None on
         # other backends: every file then takes the per-file check.
@@ -2365,12 +2308,14 @@ def _mine_impl(
     else:
         collection = None
         closets_col = None
+        aaak_col = None
         mined_mtimes = None
 
     total_drawers = 0
     files_mined = 0
     files_skipped = 0
     files_skipped_chunk_cap = 0
+    files_failed: list = []
     files_processed = 0
     last_file = None
     room_counts = defaultdict(int)
@@ -2378,7 +2323,7 @@ def _mine_impl(
 
     try:
         for i, filepath in enumerate(files, 1):
-            mine_yield_point()
+            collection, closets_col = _yield_and_reopen(palace_path, collection, closets_col)
             try:
                 drawers, room, skip_reason = process_file(
                     filepath=filepath,
@@ -2389,6 +2334,7 @@ def _mine_impl(
                     agent=agent,
                     dry_run=dry_run,
                     closets_col=closets_col,
+                    aaak_col=aaak_col,
                     chunk_size=cfg_chunk_size,
                     chunk_overlap=cfg_chunk_overlap,
                     min_chunk_size=cfg_min_chunk_size,
@@ -2410,8 +2356,11 @@ def _mine_impl(
             # modes so the summary "Files processed" arithmetic and the
             # residual-skip counter stay honest under ``--dry-run`` too. The
             # chunk-cap counter is partitioned out for its dedicated
-            # summary line (see #1455 + Gemini review on PR #1554).
-            if drawers == 0:
+            # summary line (see #1455 + Gemini review on PR #1554). A file
+            # that failed is neither skipped nor mined.
+            if skip_reason == "purge_failed":
+                files_failed.append(str(filepath))
+            elif drawers == 0:
                 files_skipped += 1
                 if skip_reason == "chunk_cap":
                     files_skipped_chunk_cap += 1
@@ -2480,7 +2429,8 @@ def _mine_impl(
 
         print(f"\n{'=' * 55}")
         print("  Done.")
-        print(f"  Files processed: {files_processed - files_skipped}")
+        print(f"  Files processed: {files_processed - files_skipped - len(files_failed)}")
+        print_files_failed(files_failed)
         # The residual skip bucket label depends on mode: dry-run bypasses
         # the already-mined check, so the only paths producing (0, room,
         # None) under dry_run are OSError / too-short / post-lock re-check
@@ -2502,9 +2452,7 @@ def _mine_impl(
                 f"set 0 to disable)"
             )
         print(f"  Drawers filed: {total_drawers}")
-        print("\n  By room:")
-        for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
-            print(f"    {room:20} {count} files")
+        _print_room_counts(room_counts)
         print('\n  Next: mempalace search "what you\'re looking for"')
         print(f"{'=' * 55}\n")
     except KeyboardInterrupt:
@@ -2548,13 +2496,35 @@ def _mine_impl(
         )
         raise
     finally:
-        # Clean up the hooks-side PID lock if it points at us. Stale
-        # entries already pass _pid_alive() == False on POSIX, but
-        # actively removing the file makes the state observable
+        # Clean up the hooks-side PID lock if it points at us. A stale
+        # entry already fails _pid_alive(), but actively removing the
+        # file makes the state observable
         # (callers can stat it) and avoids accidental PID reuse on
         # short-lived test runs. Only remove if the file claims our
         # own PID — never another process's.
         _cleanup_mine_pid_file()
+
+    # After the summary, so the operator still sees what was filed.
+    raise_if_files_failed(files_failed, files_processed)
+
+
+def _print_room_counts(room_counts) -> None:
+    print("\n  By room:")
+    for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
+        print(f"    {room:20} {count} files")
+
+
+def _yield_and_reopen(palace_path, collection, closets_col):
+    """Pass a file boundary, reopening the collections if requests ran in it.
+
+    A request in the hub's handoff may close the backend under these handles
+    (a search resets the Chroma caches after a transient index error).
+    Reopening returns the cached collection when nothing closed it. A dry run
+    holds no collections and gets ``None`` back.
+    """
+    if not mine_yield_point() or collection is None:
+        return collection, closets_col
+    return get_collection(palace_path), get_closets_collection(palace_path)
 
 
 def _cleanup_mine_pid_file() -> None:
@@ -2704,10 +2674,23 @@ def status(palace_path: str):
     _print_status(total, wing_rooms)
 
 
+def _describe_device_or_none() -> Optional[str]:
+    """The embedding device label for status output, or None if it cannot be resolved."""
+    from .embedding import describe_device
+
+    try:
+        return describe_device()
+    except Exception:
+        return None
+
+
 def _print_status(total: int, wing_rooms: dict[str, dict[str, int]]) -> None:
     """Render the wing/room histogram shared by both status code paths."""
     print(f"\n{'=' * 55}")
     print(f"  MemPalace Status -- {total} drawers")
+    device = _describe_device_or_none()
+    if device:
+        print(f"  Device:  {device}")
     print(f"{'=' * 55}\n")
     for wing, rooms in sorted(wing_rooms.items()):
         print(f"  WING: {wing}")

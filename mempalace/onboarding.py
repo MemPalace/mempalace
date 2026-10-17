@@ -18,6 +18,7 @@ Usage:
 
 from pathlib import Path
 from mempalace.entity_registry import EntityRegistry
+from mempalace.fsio import CorruptStateError
 from mempalace.entity_detector import detect_entities, scan_for_detection
 
 
@@ -463,7 +464,10 @@ def run_onboarding(
 
     # Build and save registry
     registry = EntityRegistry.load(config_dir)
-    registry.seed(mode=mode, people=people, projects=projects, aliases=aliases)
+    try:
+        registry.seed(mode=mode, people=people, projects=projects, aliases=aliases)
+    except CorruptStateError as exc:
+        raise SystemExit(f"\n  ! {exc}\n  Fix or remove that file, then run setup again.") from exc
 
     # Generate AAAK entity registry + critical facts bootstrap
     _generate_aaak_bootstrap(people, projects, wings, mode, config_dir)

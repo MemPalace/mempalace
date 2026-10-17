@@ -48,12 +48,17 @@ from urllib import parse as urlparse
 
 import numpy as np
 
-from ..config import strip_lone_surrogates
+from ..stored_text import decode_record, decode_value, encode_filter, prepare_stored_write
+from ._remote_common import (
+    RemoteMarkerMixin,
+    as_vector_array,
+    jsonable_metadata,
+    normalize_vectors,
+)
 from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
     BackendClosedError,
     BackendError,
-    BackendMismatchError,
     BaseBackend,
     BaseCollection,
     CollectionNotInitializedError,
@@ -119,42 +124,6 @@ def _utcnow() -> str:
 
 def _json_dumps(obj: Any) -> str:
     return json.dumps(obj or {}, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-
-
-def _strip_nul(value: Any) -> Any:
-    """Recursively strip NUL (0x00) from strings, list/tuple items, and dict keys
-    and values so pgvector can store the result.
-
-    PostgreSQL cannot store NUL in ``text`` or ``jsonb``: psycopg rejects a raw
-    NUL in a text column ("PostgreSQL text fields cannot contain NUL (0x00)
-    bytes"), and a NUL in metadata serializes to a JSON unicode escape that the
-    ``jsonb`` cast rejects ("unsupported Unicode escape sequence"). A single
-    transcript that captured NUL in tool output would otherwise abort the whole
-    mine run (#1829). ChromaDB and the SQLite backend store the byte verbatim,
-    so stripping only here keeps the same inputs ingestible.
-
-    Applied to id, document, and metadata in :meth:`_PgVectorClient.upsert_rows`
-    so the write path never carries a NUL into Postgres. Only ``str`` values are
-    rewritten; the ``int``/``float``/``bool``/``None`` scalars JSON metadata
-    normalizes to pass through unchanged. Stripping is not injective, so two keys
-    (or ids)
-    differing only by a NUL collapse to one (last wins); this does not occur in
-    practice because drawer ids are SHA-256 hashes and metadata keys are fixed
-    field names, so only transcript-derived values are ever actually changed.
-    Unlike ``config.sanitize_content`` (which rejects NUL in user-supplied
-    content), the bulk-mine path strips so one stray byte cannot abort a whole
-    backfill. ``str.replace`` returns the original string when it holds no NUL,
-    so a clean document is not reallocated.
-    """
-    if isinstance(value, str):
-        return value.replace("\x00", "")
-    if isinstance(value, dict):
-        return {_strip_nul(key): _strip_nul(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_strip_nul(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_strip_nul(item) for item in value)
-    return value
 
 
 def _tokenize(text: str) -> list[str]:
@@ -345,39 +314,10 @@ def _validate_write_batch(
         raise ValueError(f"embeddings length {len(embeddings)} does not match ids length {n}")
 
 
-def _as_vector_array(vector: list[float]) -> np.ndarray:
-    arr = np.asarray(vector, dtype=np.float32)
-    if arr.ndim != 1 or arr.size == 0:
-        raise ValueError("embedding must be a non-empty 1D vector")
-    return arr
-
-
-def _normalize_vectors(embeddings: list[list[float]]) -> tuple[list[list[float]], int]:
-    vectors = []
-    dims = set()
-    for embedding in embeddings:
-        arr = _as_vector_array(embedding)
-        vectors.append(arr.astype(float).tolist())
-        dims.add(int(arr.size))
-    if len(dims) > 1:
-        raise DimensionMismatchError(
-            f"pgvector batch cannot mix embedding dimensions {sorted(dims)}"
-        )
-    return vectors, dims.pop() if dims else 0
-
-
-def _jsonable_metadata(meta: dict | None) -> dict:
-    try:
-        value = json.loads(json.dumps(meta or {}, ensure_ascii=False))
-    except (TypeError, ValueError):
-        value = {}
-    return value if isinstance(value, dict) else {}
-
-
 def _vector_distance(query: np.ndarray, vector: list[float] | None) -> Optional[float]:
     if vector is None:
         return None
-    vec = _as_vector_array(vector)
+    vec = as_vector_array(vector)
     if vec.size != query.size:
         return None
     denom = float(np.linalg.norm(query)) * float(np.linalg.norm(vec))
@@ -584,7 +524,7 @@ def _where_to_sql(where: Optional[dict], params: list) -> str:
             continue
         if key.startswith("$"):  # pragma: no cover - guarded upstream
             raise UnsupportedFilterError(f"operator {key!r} not pushed down by pgvector")
-        clauses.append(_field_sql(key, expected, params))
+        clauses.append(_field_sql(key, encode_filter(expected), params))
     return " AND ".join(clauses) if clauses else "TRUE"
 
 
@@ -835,27 +775,20 @@ class _PgVectorClient:
             "document = EXCLUDED.document, metadata = EXCLUDED.metadata, "
             "embedding = EXCLUDED.embedding, updated_at = EXCLUDED.updated_at"
         )
+        documents, ids, metadatas = prepare_stored_write(
+            [row["document"] for row in rows],
+            [row["id"] for row in rows],
+            [row.get("metadata") for row in rows],
+        )
         params = [
             (
-                # Strip both unstorable byte classes Postgres rejects before
-                # binding, so one stray byte in a transcript cannot abort the
-                # whole mine (#1829 NUL, #1833 lone surrogate).
-                #
-                # Order matters for metadata: NUL must be stripped *before*
-                # serialization (json escapes it to \\u0000, which the jsonb cast
-                # rejects), while a lone surrogate must be stripped *after*
-                # serialization (json.dumps(ensure_ascii=False) leaves it raw, so
-                # one pass over the serialized string cleans it without walking
-                # the dict). id/document are plain strings, so the two passes
-                # commute there. ids are NUL- and surrogate-free in practice, so
-                # those passes are defensive no-ops on the ON CONFLICT key.
-                strip_lone_surrogates(_strip_nul(row["id"])),
-                strip_lone_surrogates(_strip_nul(row["document"])),
-                strip_lone_surrogates(_json_dumps(_strip_nul(row.get("metadata")))),
+                doc_id,
+                document,
+                _json_dumps(meta),
                 _vector_literal(row["embedding"]),
                 row.get("updated_at") or _utcnow(),
             )
-            for row in rows
+            for doc_id, document, meta, row in zip(ids, documents, metadatas, rows)
         ]
         self._execute(sql, params, many=True)
 
@@ -892,6 +825,7 @@ class _PgVectorClient:
         table: str,
         *,
         where: Optional[dict] = None,
+        ids: Optional[list] = None,
         with_embedding: bool = False,
         with_document: bool = True,
         limit: Optional[int] = None,
@@ -900,7 +834,12 @@ class _PgVectorClient:
     ) -> list[dict]:
         qi = _quote_identifier(table)
         params: list = []
+        if ids is not None and not ids:
+            return []
         where_sql = _where_to_sql(where, params) if where else "TRUE"
+        if ids is not None:
+            where_sql = f"({where_sql}) AND id = ANY(%s)"
+            params.append([str(item) for item in ids])
         # Project NULL into the document slot when the caller only needs
         # metadata (e.g. mempalace_status's wing/room tally). Keeps the
         # positional _row parser unchanged — document remains record[1] —
@@ -982,7 +921,7 @@ class _PgVectorClient:
         # Exclude NULL bucket: matches Qdrant's facet semantics; mcp_server
         # reconciles missing values into "unknown" via the count diff
         # (count(*) - sum(facet_values)).
-        return {str(row[0]): int(row[1]) for row in rows if row[0] is not None}
+        return {str(decode_value(row[0])): int(row[1]) for row in rows if row[0] is not None}
 
     def drop_table(self, table: str) -> None:
         self._execute(f"DROP TABLE IF EXISTS {_quote_identifier(table)}")
@@ -1037,12 +976,16 @@ class _PgVectorClient:
     @staticmethod
     def _row(record, *, with_embedding: bool, with_distance: bool) -> dict:
         record = list(record)
-        row = {
-            "id": str(record[0]),
-            "document": record[1] if record[1] is not None else "",
-            "metadata": record[2]
+        document, metadata = decode_record(
+            record[1] if record[1] is not None else "",
+            record[2]
             if isinstance(record[2], dict)
             else (json.loads(record[2]) if record[2] else {}),
+        )
+        row = {
+            "id": str(record[0]),
+            "document": document,
+            "metadata": metadata,
             "embedding": None,
             "distance": None,
         }
@@ -1122,6 +1065,7 @@ class PgVectorCollection(BaseCollection):
         self,
         *,
         where=None,
+        ids=None,
         with_embedding=False,
         with_document=True,
         limit=None,
@@ -1136,6 +1080,7 @@ class PgVectorCollection(BaseCollection):
         return self._client.scroll_rows(
             self._table,
             where=where,
+            ids=ids,
             with_embedding=with_embedding,
             with_document=with_document,
             limit=limit,
@@ -1181,14 +1126,15 @@ class PgVectorCollection(BaseCollection):
     ) -> list[dict]:
         _validate_where(where)
         _validate_where(where_document)
+        # ``id`` is the primary key. Push it as ``id = ANY(%s)`` so add/update
+        # do not read the rest of the table. A where that SQL cannot express
+        # stays a local filter on that already-narrow result.
         pushdown = None if _requires_local_filter(where, where_document) else where
-        rows = self._scroll(where=pushdown, with_embedding=with_embedding)
-        id_set = set(ids) if ids is not None else None
+        rows = self._scroll(where=pushdown, ids=ids, with_embedding=with_embedding)
         return [
             row
             for row in rows
-            if (id_set is None or row["id"] in id_set)
-            and _matches_where(row["metadata"], where)
+            if _matches_where(row["metadata"], where)
             and _matches_where_document(row["document"], where_document)
         ]
 
@@ -1211,14 +1157,14 @@ class PgVectorCollection(BaseCollection):
         )
         if embeddings is None:
             raise ValueError("pgvector requires explicit embeddings")
-        vectors, dimension = _normalize_vectors(embeddings)
+        vectors, dimension = normalize_vectors(embeddings, "pgvector")
         self._ensure_table(dimension)
         metadatas = metadatas or [{} for _ in ids]
         rows = [
             {
                 "id": str(doc_id),
                 "document": str(doc),
-                "metadata": _jsonable_metadata(meta),
+                "metadata": jsonable_metadata(meta),
                 "embedding": vector,
                 "updated_at": _utcnow(),
             }
@@ -1279,7 +1225,7 @@ class PgVectorCollection(BaseCollection):
         outer_dists: list[list[float]] = []
         outer_embeds: list[list[list[float]]] = []
         for query_vector in query_embeddings:
-            q = _as_vector_array(query_vector)
+            q = as_vector_array(query_vector)
             scored = []
             for row in rows:
                 distance = _vector_distance(q, row["embedding"])
@@ -1344,7 +1290,7 @@ class PgVectorCollection(BaseCollection):
         outer_dists: list[list[float]] = []
         outer_embeds: list[list[list[float]]] = []
         for query_vector in query_embeddings:
-            q = _as_vector_array(query_vector)
+            q = as_vector_array(query_vector)
             if self._known_dimension is None:
                 self._known_dimension = self._client.table_dimension(self._table)
             if self._known_dimension is not None and int(q.size) != self._known_dimension:
@@ -1706,8 +1652,10 @@ class PgVectorCollection(BaseCollection):
             self._client.advisory_unlock(classid, objid)
 
 
-class PgVectorBackend(BaseBackend):
+class PgVectorBackend(RemoteMarkerMixin, BaseBackend):
     name = "pgvector"
+    marker_filename = _MARKER_FILENAME
+    marker_hint = "keep MEMPALACE_PGVECTOR_DSN and namespace consistent"
     capabilities = frozenset(
         {
             "requires_explicit_embeddings",
@@ -1738,10 +1686,6 @@ class PgVectorBackend(BaseBackend):
     # ------------------------------------------------------------------
     # Marker / mismatch protection (mirrors the Qdrant local marker).
     # ------------------------------------------------------------------
-    @staticmethod
-    def _marker_path(palace_path: str) -> str:
-        return os.path.join(palace_path, _MARKER_FILENAME)
-
     @staticmethod
     def _palace_hash(palace: PalaceRef) -> str:
         return sha256(palace.id.encode("utf-8", errors="surrogatepass")).hexdigest()[:16]
@@ -1814,66 +1758,6 @@ class PgVectorBackend(BaseBackend):
             }
         )
         return target
-
-    def _marker_exists(self, palace: PalaceRef) -> bool:
-        return bool(palace.local_path and os.path.isfile(self._marker_path(palace.local_path)))
-
-    def _read_marker(self, palace: PalaceRef) -> Optional[dict]:
-        if not palace.local_path:
-            return None
-        marker_path = self._marker_path(palace.local_path)
-        if not os.path.isfile(marker_path):
-            return None
-        try:
-            with open(marker_path, encoding="utf-8") as f:
-                marker = json.load(f)
-        except (OSError, json.JSONDecodeError) as exc:
-            raise BackendMismatchError(f"pgvector marker is unreadable: {marker_path}") from exc
-        return marker if isinstance(marker, dict) else {}
-
-    def _validate_marker_target(self, palace: PalaceRef, config: _PgVectorConfig) -> None:
-        marker = self._read_marker(palace)
-        if marker is None:
-            return
-        if marker.get("backend") != self.name:
-            raise BackendMismatchError("pgvector marker does not identify the pgvector backend")
-        expected = self._marker_target(palace, config)
-        actual = marker.get("pgvector")
-        if not isinstance(actual, dict):
-            raise BackendMismatchError("pgvector marker is missing target metadata")
-        mismatched = [
-            key for key, expected_value in expected.items() if actual.get(key) != expected_value
-        ]
-        if mismatched:
-            details = ", ".join(mismatched)
-            raise BackendMismatchError(
-                "pgvector marker target does not match current configuration "
-                f"({details}); keep MEMPALACE_PGVECTOR_DSN and namespace consistent "
-                "or use a fresh palace directory"
-            )
-
-    def _write_marker(self, palace: PalaceRef, config: _PgVectorConfig) -> None:
-        if not palace.local_path:
-            return
-        os.makedirs(palace.local_path, exist_ok=True)
-        try:
-            os.chmod(palace.local_path, 0o700)
-        except (OSError, NotImplementedError):
-            pass
-        marker = {
-            "backend": self.name,
-            "schema_version": 1,
-            "created_at": _utcnow(),
-            "palace_id": palace.id,
-            "pgvector": self._marker_target(palace, config),
-        }
-        marker_path = self._marker_path(palace.local_path)
-        with open(marker_path, "w", encoding="utf-8") as f:
-            json.dump(marker, f, indent=2, ensure_ascii=False)
-        try:
-            os.chmod(marker_path, 0o600)
-        except (OSError, NotImplementedError):
-            pass
 
     # Embedder identity lives in a sidecar, NOT the backend marker: the marker's
     # presence signals "palace initialized" (reads raise CollectionNotInitialized

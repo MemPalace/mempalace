@@ -45,7 +45,7 @@ from .hallways import (
     association_groups,
 )
 from .palace_graph import _load_tunnels
-from .tunnels_tool import LinkIndex, tunnel_endpoints
+from .tunnels_tool import connection_index, tunnel_endpoints
 
 # Rooms the transcript classifier falls back to. A drawer in one of these
 # rooms is findable by search, not by walking the palace.
@@ -407,7 +407,8 @@ def _analyze_tunnels(
     generic = []
     dangling = 0
     duplicates = 0
-    seen_pairs = LinkIndex()
+    # Use every spelling for ambiguity, but start with no seen links.
+    seen_pairs = connection_index(tunnels, seed=False)
     artifacts = 0
     tunneled_wings: set = set()
     records = sorted(
@@ -439,7 +440,7 @@ def _analyze_tunnels(
         # normalized, spellings of one file match, two files that only share
         # a basename do not.
         ends = tunnel_endpoints(t)
-        if ends is not None:
+        if ends is not None and not bad:
             if seen_pairs.contains(ends):
                 bad = True
                 duplicates += 1

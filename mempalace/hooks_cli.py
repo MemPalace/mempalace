@@ -26,6 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from mempalace._proc import pid_alive as _pid_alive
 from mempalace.config import MempalaceConfig
 from mempalace.write_routing import (
     ResolvedWriteRoutingPolicy,
@@ -366,39 +367,6 @@ def _pid_file_for_cmd(cmd: list[str]) -> Path:
     return _MINE_PID_DIR / f"mine_{digest}.pid"
 
 
-def _pid_alive(pid: int) -> bool:
-    """Cross-platform existence check for a PID.
-
-    On POSIX, ``os.kill(pid, 0)`` is the well-known no-op existence probe.
-    On Windows, ``os.kill`` maps to ``TerminateProcess(handle, sig)`` and
-    would *terminate* the target process with exit code ``sig`` — using
-    it here would kill our own mine child (or worse, the caller itself).
-    Use ``OpenProcess`` + ``GetExitCodeProcess`` via ctypes instead.
-    """
-    if sys.platform == "win32":
-        import ctypes
-        from ctypes import wintypes
-
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        STILL_ACTIVE = 259
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return False
-        try:
-            code = wintypes.DWORD()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                return False
-            return code.value == STILL_ACTIVE
-        finally:
-            kernel32.CloseHandle(handle)
-    try:
-        os.kill(pid, 0)
-        return True
-    except (OSError, ValueError):
-        return False
-
-
 def _mine_already_running(cmd: list[str]) -> bool:
     """Return True if a previous mine for ``cmd``'s target is still alive.
 
@@ -505,8 +473,10 @@ def _claim_mine_slot(cmd: list[str]) -> Optional[Path]:
         return None
 
 
-def _spawn_mine(cmd: list) -> None:
+def _spawn_mine(cmd: list) -> bool:
     """Spawn a mine subprocess if no live mine is already targeting it.
+
+    Returns whether a process was started.
 
     The PID slot is claimed atomically *before* the spawn, so two near-
     simultaneous hook fires can't both proceed — the second sees the
@@ -519,7 +489,7 @@ def _spawn_mine(cmd: list) -> None:
     pid_file = _claim_mine_slot(cmd)
     if pid_file is None:
         _log(f"Skipping mine: target already running ({' '.join(cmd[-3:])})")
-        return
+        return False
     child_env = os.environ.copy()
     child_env[_MINE_PID_FILE_ENV] = str(pid_file)
     with open(log_path, "a") as log_f:
@@ -543,6 +513,7 @@ def _spawn_mine(cmd: list) -> None:
         pid_file.write_text(f"{proc.pid} {int(time.time())}")
     except OSError:
         pass
+    return True
 
 
 def _hooks_daemon_enabled() -> bool:
@@ -1022,6 +993,120 @@ def _extract_themes(messages: list[str], max_themes: int = 3) -> list[str]:
     return [w for w, _ in words.most_common(max_themes)]
 
 
+def _diary_checkpoint_path(session_id: str) -> Path:
+    return STATE_DIR / f"diary_checkpoint_{_sanitize_session_id(session_id)}.json"
+
+
+def _diary_checkpoint_argv(payload_path: Path) -> list[str]:
+    # The entry stays in the payload file. It must not appear on argv.
+    return [
+        _mempalace_python(),
+        "-c",
+        "import sys; from mempalace.hooks_cli import run_detached_diary_checkpoint; "
+        "run_detached_diary_checkpoint(sys.argv[1])",
+        str(payload_path),
+    ]
+
+
+def _queue_diary_checkpoint(payload: dict) -> bool:
+    """Detach the diary write. The foreground must not import mcp_server."""
+    from .fsio import atomic_write_json
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    payload_path = _diary_checkpoint_path(str(payload.get("session_id") or "unknown"))
+    cmd = _diary_checkpoint_argv(payload_path)
+    # Checked before the write so a running child's payload is not replaced.
+    if _mine_already_running(cmd):
+        _log("Skipping diary checkpoint: already running")
+        return False
+    atomic_write_json(payload_path, payload)
+    return _spawn_mine(cmd)
+
+
+# Waits for a palace lock held by another writer: about 30s in all.
+_DIARY_LOCK_RETRY_DELAYS = (1, 2, 4, 8, 16)
+
+
+def run_detached_diary_checkpoint(payload_path: str) -> None:
+    """Child entry: file the checkpoint, then start the mines the hook deferred.
+
+    The mines start only after the diary write, so they never hold the palace
+    lock that write needs.
+    """
+    from .miner import _cleanup_mine_pid_file
+
+    path = Path(payload_path)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        _log(f"Diary checkpoint payload unreadable: {type(exc).__name__}")
+        payload = None
+    try:
+        if payload is not None:
+            _apply_diary_checkpoint(payload)
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        _cleanup_mine_pid_file()
+    if payload is None:
+        return
+    with _hook_write_routing_context():
+        transcript = payload.get("ingest_transcript")
+        if isinstance(transcript, str) and transcript:
+            _ingest_transcript(transcript)
+        _maybe_auto_ingest()
+
+
+def _apply_diary_checkpoint(payload: dict) -> bool:
+    """File the checkpoint and write its ack. Only the child imports mcp_server."""
+    from .daemon import LOCK_REFUSAL_ERROR_CLASS
+    from .mcp_server import tool_diary_write
+
+    entry = payload.get("entry")
+    if not isinstance(entry, str) or not entry:
+        return False
+    for delay in _DIARY_LOCK_RETRY_DELAYS + (None,):
+        result = tool_diary_write(
+            agent_name=str(payload.get("agent_name") or "claude"),
+            entry=entry,
+            topic=str(payload.get("topic") or "checkpoint"),
+            wing=str(payload.get("wing") or ""),
+        )
+        if not isinstance(result, dict):
+            result = {}
+        if result.get("success") or result.get("error_class") != LOCK_REFUSAL_ERROR_CLASS:
+            break
+        if delay is not None:
+            time.sleep(delay)
+    if not result.get("success"):
+        # The save marker stays put, so the next Stop files a fresh checkpoint.
+        _log(f"Diary checkpoint failed: {result.get('error', 'unknown')}")
+        return False
+    _log(f"Diary checkpoint saved: {result.get('entry_id', '?')}")
+    messages_folded = int(payload.get("messages_folded") or 0)
+    try:
+        (STATE_DIR / "last_checkpoint").write_text(
+            json.dumps({"msgs": messages_folded, "ts": payload.get("ack_ts") or ""}),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+    exchange_count = payload.get("exchange_count")
+    if isinstance(exchange_count, int) and not isinstance(exchange_count, bool):
+        session_id = _sanitize_session_id(str(payload.get("session_id") or "unknown"))
+        try:
+            (STATE_DIR / f"{session_id}_last_save").write_text(
+                str(exchange_count), encoding="utf-8"
+            )
+        except OSError:
+            pass
+    if payload.get("toast"):
+        _desktop_toast(f"Checkpoint saved \u2014 {messages_folded} messages archived")
+    return True
+
+
 def _save_diary_direct(
     transcript_path: str,
     session_id: str,
@@ -1029,8 +1114,15 @@ def _save_diary_direct(
     toast: bool = False,
     *,
     agent_name: str,
+    exchange_count: Optional[int] = None,
 ) -> dict:
-    """Write a diary checkpoint by calling the tool function directly (no MCP roundtrip).
+    """Queue a diary checkpoint without importing ``mempalace.mcp_server``.
+
+    The daemon path still waits on a job. The direct path spawns a detached
+    child (``run_detached_diary_checkpoint``) and returns immediately with
+    ``checkpoint_queued`` and ``drawers_filed`` 0. The child files the drawer,
+    writes the ack and the save marker, and then runs the transcript and
+    project mines, so the caller must not start them itself.
 
     The entry is filed under `agent_name` so the agent that later calls
     `mempalace_diary_read(agent_name=...)` discovers it (#1693). If `wing` is
@@ -1117,32 +1209,31 @@ def _save_diary_direct(
             _log(f"Daemon diary checkpoint failed: {result.get('error', job.get('error'))}")
             return {"drawers_filed": 0, "messages_folded": 0}
 
-        from .mcp_server import tool_diary_write
-
-        result = tool_diary_write(
-            agent_name=agent_name,
-            entry=entry,
-            topic="checkpoint",
-            wing=wing,
+        queued = _queue_diary_checkpoint(
+            {
+                "agent_name": agent_name,
+                "entry": entry,
+                "topic": "checkpoint",
+                "wing": wing,
+                "toast": bool(toast),
+                "messages_folded": len(messages),
+                "themes": themes,
+                "session_id": session_id,
+                "exchange_count": exchange_count,
+                "ack_ts": now.isoformat(),
+                "ingest_transcript": transcript_path,
+            }
         )
-        if result.get("success"):
-            _log(f"Diary checkpoint saved: {result.get('entry_id', '?')}")
-            # Write state for ack tool to read
-            try:
-                ack_file = STATE_DIR / "last_checkpoint"
-                ack_file.write_text(
-                    json.dumps({"msgs": len(messages), "ts": now.isoformat()}),
-                    encoding="utf-8",
-                )
-            except OSError:
-                pass
-            if toast:
-                _desktop_toast(f"Checkpoint saved \u2014 {len(messages)} messages archived")
-            return {"drawers_filed": 1, "messages_folded": len(messages), "themes": themes}
-        else:
-            _log(f"Diary checkpoint failed: {result.get('error', 'unknown')}")
+        if queued:
+            _log("Diary checkpoint queued")
+            return {
+                "drawers_filed": 0,
+                "messages_folded": len(messages),
+                "themes": themes,
+                "checkpoint_queued": True,
+            }
     except Exception as e:
-        _log(f"Diary checkpoint error: {e}")
+        _log(f"Diary checkpoint error: {type(e).__name__}")
     return {"drawers_filed": 0, "messages_folded": 0}
 
 
@@ -1509,27 +1600,35 @@ def hook_stop(data: dict, harness: str):
                         wing=project_wing,
                         toast=toast,
                         agent_name=_diary_agent_for_harness(harness),
+                        exchange_count=exchange_count,
                     )
-                    _ingest_transcript(transcript_path)
-                _maybe_auto_ingest()
+                queued = result.get("checkpoint_queued", False)
+                if not queued:
+                    if transcript_path:
+                        _ingest_transcript(transcript_path)
+                    _maybe_auto_ingest()
                 # Only advance the save marker after a genuine drawer was filed
                 # (#2303): the legacy "count" was the compressed-message count and
-                # was misread as a storage count. Report each unit truthfully.
+                # was misread as a storage count. Report each unit truthfully. A
+                # queued checkpoint's child advances the marker once it has filed.
                 drawers_filed = result.get("drawers_filed", 0)
+                messages_folded = result.get("messages_folded", 0)
+                themes = result.get("themes", [])
+                tag = " \u2014 " + ", ".join(themes) if themes else ""
                 if drawers_filed > 0:
                     try:
                         last_save_file.write_text(str(exchange_count), encoding="utf-8")
                     except OSError:
                         pass
-                    messages_folded = result.get("messages_folded", 0)
-                    themes = result.get("themes", [])
-                    if themes:
-                        tag = " \u2014 " + ", ".join(themes)
-                    else:
-                        tag = ""
                     _output(
                         {
                             "systemMessage": f"\u2726 {drawers_filed} checkpoint saved \u2014 {messages_folded} messages woven into the palace{tag}",
+                        }
+                    )
+                elif queued:
+                    _output(
+                        {
+                            "systemMessage": f"\u2726 checkpoint queued \u2014 {messages_folded} messages being woven into the palace{tag}",
                         }
                     )
                 else:
@@ -1604,13 +1703,10 @@ def hook_session_end(data: dict, harness: str):
     plugin-provided hooks do not raise the budget"
     (https://code.claude.com/docs/en/hooks). A cold ``mempalace`` start alone
     exceeds 1.5s, so this handler must never mine in the hook foreground. The
-    shell wrapper backgrounds it and returns immediately; the heavy capture is
-    spawned *detached* via ``_ingest_transcript`` / ``_maybe_auto_ingest`` (both
-    route through ``_spawn_mine`` / ``_detached_popen_kwargs``). On POSIX that
-    detached child reliably outlives the session (verified). On Windows only the
-    mine grandchild (spawned with detached-process flags) is designed to break
-    away from the session; the backgrounded hook process and the in-process
-    diary write are best-effort there (no Windows CI coverage yet). This
+    shell wrapper backgrounds it and returns immediately; the diary write and
+    the heavy capture are spawned *detached* (all through ``_spawn_mine`` /
+    ``_detached_popen_kwargs``), so they outlive the session on POSIX and are
+    designed to break away from it on Windows. This
     honors the "background everything / hooks under 500ms" budget. SessionEnd
     has no decision control, so this only ever saves; it never emits a block
     payload.
@@ -1661,11 +1757,10 @@ def hook_session_end(data: dict, harness: str):
             else:
                 valid_transcript = str(validated)
 
-        # Flush. The diary checkpoint (in-process ChromaDB write) runs FIRST,
-        # before any detached mine is spawned, so it never contends for the
-        # palace lock; this handler is already backgrounded by the wrapper, so it
-        # is not under the SessionEnd budget and has time to finish. The detached
-        # transcript ingest follows; re-mining a transcript ``Stop`` already
+        # Flush. The diary checkpoint is filed before any mine starts, so the
+        # mines never hold the palace lock it needs: a queued checkpoint's
+        # detached child runs the mines itself after its write, and the daemon
+        # serializes its own jobs. Re-mining a transcript ``Stop`` already
         # captured is a near no-op (deterministic convo IDs + ``file_already_mined``
         # short-circuit + upsert). ``reason`` is intentionally not branched on:
         # every clean-exit reason (incl. ``/clear`` / ``resume``) warrants the
@@ -1676,16 +1771,19 @@ def hook_session_end(data: dict, harness: str):
                 _output(_blocked_hook_output(routing))
                 return
 
+            result = {}
             if valid_transcript:
-                _save_diary_direct(
+                result = _save_diary_direct(
                     valid_transcript,
                     session_id,
                     wing=_wing_from_transcript_path(valid_transcript),
                     toast=toast,
                     agent_name=_diary_agent_for_harness(harness),
                 )
-                _ingest_transcript(valid_transcript)
-            _maybe_auto_ingest()
+            if not result.get("checkpoint_queued"):
+                if valid_transcript:
+                    _ingest_transcript(valid_transcript)
+                _maybe_auto_ingest()
 
         _output({})
     finally:

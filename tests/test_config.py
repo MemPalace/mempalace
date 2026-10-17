@@ -1489,9 +1489,41 @@ def test_relative_xdg_config_home_is_ignored(monkeypatch, tmp_path):
     assert _default_config_dir() == fake_home / ".config" / "mempalace"
 
 
-def test_init_writes_xdg_aware_palace_path(tmp_path):
+def test_init_leaves_the_default_palace_path_implicit(tmp_path):
     cfg = MempalaceConfig(config_dir=str(tmp_path))
     cfg.init()
     with open(tmp_path / "config.json") as f:
         written = json.load(f)
-    assert written["palace_path"] == str(tmp_path / "palace")
+    assert written == {}
+    assert MempalaceConfig(config_dir=str(tmp_path)).palace_path == str(tmp_path / "palace")
+
+
+def test_init_leaves_defaults_out_so_later_defaults_apply(tmp_path, monkeypatch):
+    MempalaceConfig(config_dir=str(tmp_path)).init()
+    import mempalace.config as config_module
+
+    monkeypatch.setattr(config_module, "DEFAULT_TOPIC_WINGS", ["only_this_wing"])
+    assert MempalaceConfig(config_dir=str(tmp_path)).topic_wings == ["only_this_wing"]
+
+
+def test_init_records_an_explicit_palace_path(tmp_path):
+    palace = tmp_path / "chosen-palace"
+    MempalaceConfig(config_dir=str(tmp_path)).init(palace_path=str(palace))
+    with open(tmp_path / "config.json") as f:
+        assert json.load(f) == {"palace_path": str(palace)}
+
+
+def test_init_never_rewrites_an_existing_config(tmp_path):
+    (tmp_path / "config.json").write_text('{"collection_name": "mine"}', encoding="utf-8")
+    MempalaceConfig(config_dir=str(tmp_path)).init(palace_path=str(tmp_path / "p"))
+    with open(tmp_path / "config.json") as f:
+        assert json.load(f) == {"collection_name": "mine"}
+
+
+def test_a_setter_after_init_keeps_what_init_recorded(tmp_path):
+    palace = tmp_path / "chosen-palace"
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    cfg.init(palace_path=str(palace))
+    cfg.set_entity_languages(["en", "pt"])
+    with open(tmp_path / "config.json") as f:
+        assert json.load(f) == {"palace_path": str(palace), "entity_languages": ["en", "pt"]}

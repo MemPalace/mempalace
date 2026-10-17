@@ -8,11 +8,12 @@ def cmd_wings(args):
         load_split_plan,
         plan_split,
         plan_targets,
+        assert_split_pending_matches_plan,
         save_split_plan,
         split_pending_path,
         split_plan_path,
+        write_split_pending,
     )
-    from datetime import datetime, timezone
 
     action = getattr(args, "wings_action", None)
     if action != "split":
@@ -98,10 +99,16 @@ def cmd_wings(args):
         marker = split_pending_path(config, wing)
         resuming = os.path.exists(marker)
         if resuming:
+            # Pin was written when the split first started; a hand-edited plan
+            # must not finish the remainder against different targets.
+            try:
+                assert_split_pending_matches_plan(config, wing, plan)
+            except ValueError as exc:
+                print(f"  {exc}")
+                sys.exit(1)
             print("  Resuming an interrupted split: finishing drawers, closets and hallways.")
-        os.makedirs(os.path.dirname(marker), exist_ok=True)
-        with open(marker, "w", encoding="utf-8") as f:
-            f.write(datetime.now(timezone.utc).isoformat() + "\n")
+        else:
+            write_split_pending(config, wing, plan)
         try:
             result = apply_split(
                 col, plan, config=config, closets_col=closets_col, resuming=resuming

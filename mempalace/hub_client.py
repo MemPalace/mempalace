@@ -13,6 +13,78 @@ logger = logging.getLogger(__name__)
 HUB_FORWARD_ENV = "MEMPALACE_HUB_FORWARD"
 HUB_PROXY_TIMEOUT_S = 600.0
 
+# Every setting that changes what a hub search returns, as
+# (MempalaceConfig attribute, env vars that override it, scope). The CLI keeps
+# a search local while any of these env vars is set, and the hub's registered
+# search fingerprint hashes the resolved values in scope, so a setting added
+# here reaches both checks. Scope is None (always), ("backend", name), or
+# ("embedding", model); a model prefixed with "!" means every other model.
+SEARCH_SETTINGS = (
+    ("collection_name", (), None),
+    ("lang_explicit", ("MEMPALACE_LANG", "MEMPAL_LANG"), None),
+    ("hybrid_rank_vector_weight", ("MEMPALACE_HYBRID_VECTOR_WEIGHT",), None),
+    ("hybrid_rank_bm25_weight", ("MEMPALACE_HYBRID_BM25_WEIGHT",), None),
+    ("embedding_api_key", ("MEMPALACE_EMBEDDING_API_KEY",), ("embedding", "openai-compat")),
+    ("embedding_api_model", ("MEMPALACE_EMBEDDING_API_MODEL",), ("embedding", "openai-compat")),
+    ("embedding_api_url", ("MEMPALACE_EMBEDDING_API_URL",), ("embedding", "openai-compat")),
+    (
+        "embeddinggemma2_dimension",
+        ("MEMPALACE_EMBEDDINGGEMMA2_DIMENSION",),
+        ("embedding", "embeddinggemma2"),
+    ),
+    (
+        "embeddinggemma2_modalities",
+        ("MEMPALACE_EMBEDDINGGEMMA2_MODALITIES",),
+        ("embedding", "embeddinggemma2"),
+    ),
+    (
+        "embeddinggemma2_revision",
+        ("MEMPALACE_EMBEDDINGGEMMA2_REVISION",),
+        ("embedding", "embeddinggemma2"),
+    ),
+    ("embedding_device", ("MEMPALACE_EMBEDDING_DEVICE",), ("embedding", "!openai-compat")),
+    ("embedding_threads", ("MEMPALACE_EMBEDDING_THREADS",), ("embedding", "!openai-compat")),
+    ("qdrant_api_key", ("MEMPALACE_QDRANT_API_KEY",), ("backend", "qdrant")),
+    ("qdrant_namespace", ("MEMPALACE_QDRANT_NAMESPACE",), ("backend", "qdrant")),
+    ("qdrant_timeout", ("MEMPALACE_QDRANT_TIMEOUT",), ("backend", "qdrant")),
+    ("qdrant_url", ("MEMPALACE_QDRANT_URL",), ("backend", "qdrant")),
+    ("milvus_consistency_level", ("MEMPALACE_MILVUS_CONSISTENCY_LEVEL",), ("backend", "milvus")),
+    ("milvus_db_name", ("MEMPALACE_MILVUS_DB_NAME",), ("backend", "milvus")),
+    ("milvus_namespace", ("MEMPALACE_MILVUS_NAMESPACE",), ("backend", "milvus")),
+    ("milvus_token", ("MEMPALACE_MILVUS_TOKEN",), ("backend", "milvus")),
+    ("milvus_uri", ("MEMPALACE_MILVUS_URI",), ("backend", "milvus")),
+    ("pgvector_dsn", ("MEMPALACE_PGVECTOR_DSN",), ("backend", "pgvector")),
+    ("pgvector_namespace", ("MEMPALACE_PGVECTOR_NAMESPACE",), ("backend", "pgvector")),
+    (
+        "pgvector_shared_namespace",
+        ("MEMPALACE_PGVECTOR_SHARED_NAMESPACE",),
+        ("backend", "pgvector"),
+    ),
+)
+
+# Env vars that pick the backend or the embedder itself. The fingerprint hashes
+# the resolved backend and model directly rather than through the table.
+SEARCH_SELECTOR_ENV_VARS = (
+    "MEMPALACE_BACKEND",
+    "MEMPALACE_BACKEND_EXPLICIT",
+    "MEMPALACE_EMBEDDING_MODEL",
+)
+
+SEARCH_OVERRIDE_ENV_VARS = SEARCH_SELECTOR_ENV_VARS + tuple(
+    name for _attr, env_names, _scope in SEARCH_SETTINGS for name in env_names
+)
+
+
+def search_setting_in_scope(scope, backend: str, embedding_model: str) -> bool:
+    """Whether a ``SEARCH_SETTINGS`` row applies to this backend and model."""
+    if scope is None:
+        return True
+    kind, value = scope
+    current = backend if kind == "backend" else embedding_model
+    if value.startswith("!"):
+        return current != value[1:]
+    return current == value
+
 
 def _forwarding_disabled() -> bool:
     return os.environ.get(HUB_FORWARD_ENV, "").strip().lower() in {

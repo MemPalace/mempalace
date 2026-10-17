@@ -12,7 +12,6 @@ import errno
 import os
 import sys
 import json
-import hashlib
 import logging
 import stat
 from pathlib import Path
@@ -22,34 +21,40 @@ from typing import Optional
 
 from ._source_state import source_fingerprint
 from .backends import PalaceNotFoundError
-from .collision_scan import assert_no_collisions
 from .ids import (
     ID_RECIPE,
     make_convo_drawer_id,
     make_convo_sentinel_id,
     make_exchange_drawer_id,
 )
-from .normalize import UnparsedCodexTranscriptError, normalize_conversations
+from .normalize import (
+    UnparsedCodexTranscriptError,
+    normalize_conversations_with_mtime,
+    recording_transforms,
+)
 from .source_identity import identity_metadata, source_directory_identity
 from .entities import entities_metadata
 from .palace import (
+    CHUNKER_VERSIONS,
     CONVO_CHUNKER_VERSION,
+    MINE_ABORTS,
     NORMALIZE_VERSION,
     SKIP_DIRS,
-    _metadata_matches_extract_mode,
     _validate_palace_fts5_after_mine,
     file_already_mined,
     get_collection,
     mine_lock,
     mine_palace_lock,
     mine_yield_point,
+    open_aaak_collection,
     palace_write_serial,
-    prefetch_content_hashes,
     prefetch_mined_set,
+    print_files_failed,
+    raise_if_files_failed,
+    write_file_drawers,
 )
 
 logger = logging.getLogger("mempalace_mcp")
-
 
 # Cached hall keywords — avoids re-reading config per drawer
 _HALL_KEYWORDS_CACHE = None
@@ -176,7 +181,6 @@ MIN_CHUNK_SIZE = 30
 CHUNK_SIZE = 800  # chars per drawer — align with miner.py
 _LINE_GROUP_SIZE = 25  # lines per fallback group when no paragraph breaks
 _LINE_FALLBACK_MIN_NEWLINES = 20  # trigger line-group fallback above this newline count
-DRAWER_UPSERT_BATCH_SIZE = 1000
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
 # Matches miner.py at 500 MB. Long Claude Code sessions, multi-year
 # ChatGPT exports, and lifetime Slack dumps routinely exceed 10 MB; the
@@ -230,7 +234,7 @@ def _register_file(
     wing: str,
     agent: str,
     extract_mode: str,
-    content_hash: Optional[str] = None,
+    source_mtime: Optional[float] = None,
     source_metadata: Optional[dict] = None,
 ):
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
@@ -243,11 +247,6 @@ def _register_file(
     grows past the min-chunk-size floor (e.g. a short session that gets
     extended) is correctly detected as changed on the next mine instead of
     being skipped forever by this sentinel.
-
-    Also used to register a file recognized as a content-duplicate of an
-    already-mined transcript under a different path (see
-    ``prefetch_content_hashes``) — stamping it here means the next run skips
-    it via the cheap fingerprint check instead of re-normalizing and re-hashing it.
     """
     sentinel_id = make_convo_sentinel_id(source_file, extract_mode)
     meta = {
@@ -261,43 +260,19 @@ def _register_file(
         "normalize_version": NORMALIZE_VERSION,
         "id_recipe": ID_RECIPE,
     }
-    if extract_mode == "exchange":
-        meta["convo_chunker_version"] = CONVO_CHUNKER_VERSION
+    if extract_mode in CHUNKER_VERSIONS:
+        key, version = CHUNKER_VERSIONS[extract_mode]
+        meta[key] = version
+    if source_mtime is not None:
+        meta["source_mtime"] = source_mtime
     meta.update(source_metadata or {})
-    if content_hash is not None:
-        meta["content_hash"] = content_hash
-    collection.upsert(
-        documents=[f"[registry] {source_file}"],
-        ids=[sentinel_id],
-        metadatas=[meta],
+    write_file_drawers(
+        collection,
+        source_file,
+        [(sentinel_id, f"[registry] {source_file}", meta)],
+        extract_mode=extract_mode,
+        prune=False,
     )
-
-
-def _source_file_delete_ids(collection, source_file: str, extract_mode: str) -> list[str]:
-    """Collect drawer IDs for one source file and extraction mode.
-
-    Legacy conversation drawers did not carry extract_mode; treat those as
-    exchange-mode rows so schema rebuilds can still clean them up without
-    deleting newer general-mode drawers for the same transcript.
-    """
-    ids: list[str] = []
-    offset = 0
-    while True:
-        batch = collection.get(
-            where={"source_file": source_file},
-            limit=1000,
-            offset=offset,
-            include=["metadatas"],
-        )
-        batch_ids = batch.get("ids") or []
-        metadatas = batch.get("metadatas") or []
-        for drawer_id, meta in zip(batch_ids, metadatas):
-            if _metadata_matches_extract_mode(meta or {}, extract_mode):
-                ids.append(drawer_id)
-        if not batch_ids:
-            break
-        offset += len(batch_ids)
-    return ids
 
 
 # =============================================================================
@@ -679,28 +654,30 @@ def _file_chunks_locked(
     agent,
     extract_mode,
     authored_at=None,
-    content_hash=None,
     source_dir_ino=None,
-    source_metadata=None,
+    source_mtime: Optional[float] = None,
+    source_metadata: Optional[dict] = None,
+    transforms: str = "",
+    aaak_col=None,
 ):
-    """Lock the source file, purge stale drawers, and upsert fresh chunks.
+    """Lock the source file and replace its drawers in this extraction mode.
 
-    Combines the per-file serialization that prevents concurrent agents from
-    duplicating work (via mine_lock) with the rebuild contract
-    (purge-before-insert so stale drawers never survive) that fires on
-    either a normalize-version bump OR a changed/grown source file (fingerprint
-    differs from what's stored) -- transcripts are not assumed immutable,
-    since a Claude Code session keeps appending to its own file while
-    active and /compact or /clear can rewrite one in place.
+    The lock stops concurrent agents from duplicating work, and
+    ``write_file_drawers`` files the fresh chunks before it drops the stale
+    ones. That rebuild fires on either a normalize-version bump or a
+    changed/grown source file (fingerprint differs from what's stored) --
+    transcripts are not assumed immutable, since a Claude Code session keeps
+    appending to its own file while active and /compact or /clear can rewrite
+    one in place.
 
-    Returns (drawers_added, room_counts_delta, skipped).
+    Returns (drawers_added, room_counts_delta, skipped). Raises
+    ``StaleDrawerPurgeFailed`` when the stale drawers could not be removed,
+    which the mine counts as an error.
     """
     room_counts_delta: dict = defaultdict(int)
-    drawers_added = 0
     with mine_lock(source_file):
         # Re-check after lock — another agent may have just finished this file
-        # at the current schema/fingerprint. A stale hit here returns False, so we
-        # still fall through to the purge+rebuild path below.
+        # at the current schema/fingerprint.
         if file_already_mined(
             collection,
             source_file,
@@ -710,118 +687,52 @@ def _file_chunks_locked(
         ):
             return 0, room_counts_delta, True
 
-        # Purge stale drawers first. Fires both on a normalize-schema bump
-        # (file_already_mined() returned False for pre-v2 drawers) and on a
-        # changed/grown transcript (fingerprint differs) — clean them out so the
-        # source doesn't end up with mixed old/new drawers.
-        #
-        # A failed purge must abort this file's mine attempt rather than
-        # fall through to upsert: proceeding on top of an unpurged (or
-        # partially purged) set produces duplicate/stale drawers under
-        # mixed schema versions, with no operator-visible signal beyond a
-        # debug log (#105 — convo_miner's own instance of the same swallow
-        # already fixed for miner.py at #23). Returning here leaves the old
-        # drawers' stored fingerprint untouched, so the next mine still sees a
-        # mismatch and retries.
-        try:
-            delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
-            if delete_ids:
-                collection.delete(ids=delete_ids)
-        except Exception as exc:
-            print(
-                f"  ! [skip] stale-drawer purge failed for {source_file!r} "
-                f"({exc!r}); leaving existing drawers untouched, will retry "
-                f"on the next mine",
-                file=sys.stderr,
-            )
-            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
-            return 0, room_counts_delta, True
-
-        # Batch chunks into bounded upserts so large transcripts keep most of
-        # the embedding speedup without one huge Chroma/SQLite request. Keep
-        # one filed_at per source file so all transcript drawers share an
-        # ingest timestamp.
-        #
-        # Every drawer of this pass carries ``chunk_total`` so
-        # ``file_already_mined`` / ``prefetch_mined_set`` can tell a complete
-        # multi-batch mine from one that crashed mid-file (#2183). Without it
-        # an unchanged fingerprint + any surviving drawer permanently skips the file
-        # and the missing exchanges never come back.
+        # One filed_at per source file so all transcript drawers share an
+        # ingest timestamp. Prefer the mtime captured with the read: a fresh
+        # stat here can observe an append that this pass did not ingest.
         filed_at = datetime.now().isoformat()
-        chunk_total = len(chunks)
-        try:
-            for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
-                batch_docs: list = []
-                batch_ids: list = []
-                batch_metas: list = []
-                for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                    chunk_room = (
-                        chunk.get("memory_type", room) if extract_mode == "general" else room
-                    )
-                    if extract_mode == "general":
-                        room_counts_delta[chunk_room] += 1
-                    drawer_id = make_convo_drawer_id(
-                        wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
-                    )
-                    batch_docs.append(chunk["content"])
-                    batch_ids.append(drawer_id)
-                    meta = {
-                        "wing": wing,
-                        "room": chunk_room,
-                        "hall": _detect_hall_cached(chunk["content"]),
-                        "source_file": source_file,
-                        "chunk_index": chunk["chunk_index"],
-                        "added_by": agent,
-                        "filed_at": filed_at,
-                        "entities": entities_metadata(chunk["content"]),
-                        "authored_at": authored_at if authored_at is not None else filed_at,
-                        "ingest_mode": "convos",
-                        "extract_mode": extract_mode,
-                        "normalize_version": NORMALIZE_VERSION,
-                        "id_recipe": ID_RECIPE,
-                        "chunk_total": chunk_total,
-                    }
-                    if extract_mode == "exchange":
-                        meta["convo_chunker_version"] = CONVO_CHUNKER_VERSION
-                    meta.update(source_metadata or {})
-                    if source_dir_ino:
-                        # Which directory this transcript was read from, so
-                        # ``sync`` can tell a neighbour in the same directory
-                        # from one on a volume mounted there since (#2320).
-                        meta["source_dir_ino"] = source_dir_ino
-                    # Stamp content_hash only on chunk 0 so multi-conversation
-                    # privacy-export hashes are not O(N²)-duplicated across every
-                    # chunk row. ``prefetch_content_hashes`` still finds them —
-                    # it scans all drawers and splits comma-joined hash fields.
-                    if content_hash is not None and chunk.get("chunk_index", 0) == 0:
-                        meta["content_hash"] = content_hash
-                    batch_metas.append(meta)
-                assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
-                try:
-                    collection.upsert(
-                        documents=batch_docs,
-                        ids=batch_ids,
-                        metadatas=batch_metas,
-                    )
-                    drawers_added += len(batch_docs)
-                except Exception as e:
-                    if "already exists" not in str(e).lower():
-                        raise
-        except Exception:
-            # A successful earlier batch has the source snapshot's fingerprint and
-            # chunk_total. Leaving those drawers behind would make the next
-            # run treat the incomplete set as fully filed (#2183 / #2122).
-            try:
-                delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
-                if delete_ids:
-                    collection.delete(ids=delete_ids)
-            except Exception:
-                logger.warning(
-                    "Failed to clean partial convo drawers after upsert error for %s",
-                    source_file,
-                    exc_info=True,
-                )
-            raise
+        drawers = []
+        for chunk in chunks:
+            chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
+            if extract_mode == "general":
+                room_counts_delta[chunk_room] += 1
+            meta = {
+                "wing": wing,
+                "room": chunk_room,
+                "hall": _detect_hall_cached(chunk["content"]),
+                "source_file": source_file,
+                "chunk_index": chunk["chunk_index"],
+                "added_by": agent,
+                "filed_at": filed_at,
+                "entities": entities_metadata(chunk["content"]),
+                "authored_at": authored_at if authored_at is not None else filed_at,
+                "ingest_mode": "convos",
+                "extract_mode": extract_mode,
+                "normalize_version": NORMALIZE_VERSION,
+                "id_recipe": ID_RECIPE,
+            }
+            if extract_mode in CHUNKER_VERSIONS:
+                key, version = CHUNKER_VERSIONS[extract_mode]
+                meta[key] = version
+            if source_mtime is not None:
+                meta["source_mtime"] = source_mtime
+            meta.update(source_metadata or {})
+            if transforms:
+                # Every drawer of a file whose parse changed its text: the
+                # RFC 002 transformations it applied.
+                meta["transforms"] = transforms
+            if source_dir_ino:
+                # Which directory this transcript was read from, so ``sync``
+                # can tell a neighbour in the same directory from one on a
+                # volume mounted there since (#2320).
+                meta["source_dir_ino"] = source_dir_ino
+            drawer_id = make_convo_drawer_id(
+                wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
+            )
+            drawers.append((drawer_id, chunk["content"], meta))
+        drawers_added = write_file_drawers(
+            collection, source_file, drawers, extract_mode=extract_mode, aaak_col=aaak_col
+        )
     return drawers_added, room_counts_delta, False
 
 
@@ -852,32 +763,6 @@ def _is_ai_tool_path(path: Path) -> bool:
         if parts[i] == ".claude" and parts[i + 1] == "projects":
             return True
     return False
-
-
-def _split_new_and_duplicate_conversations(
-    conversations: list,
-    wing: str,
-    source_file: str,
-    mined_content_hashes: dict,
-) -> tuple:
-    """Hash each conversation and split them into (new, duplicate) lists.
-
-    A conversation is a duplicate when its hash is already registered under
-    a *different* source_file in the same wing — mining the same transcript
-    into a second wing is a deliberate re-file, not a repeat, so the lookup
-    is scoped to (wing, hash). Returns ([(hash, text), ...] new, [(hash,
-    dup_source_file), ...] duplicates).
-    """
-    new_items = []
-    duplicates = []
-    for conversation in conversations:
-        content_hash = hashlib.sha256(conversation.strip().encode("utf-8")).hexdigest()
-        dup_source = mined_content_hashes.get((wing, content_hash))
-        if dup_source is None or dup_source == source_file:
-            new_items.append((content_hash, conversation))
-        else:
-            duplicates.append((content_hash, dup_source))
-    return new_items, duplicates
 
 
 def _is_unchanged_since_last_mine(source_file: str, mined_fingerprints: dict) -> bool:
@@ -1005,25 +890,23 @@ def _normalize_convo_conversations(
     extract_mode: str,
     dry_run: bool,
     source_metadata: Optional[dict] = None,
-) -> Optional[list]:
+) -> Optional[tuple[list, float]]:
     """Normalize a transcript file into its individual conversations,
     registering it as filed when there's nothing worth mining. Returns None
     when the caller should skip the file (normalize failed, or the normalized
     content is only whitespace). A short transcript is still mined: the
     chunker keeps text below the min chunk size rather than dropping it.
 
-    Kept as separate conversations rather than joined into one string so
-    dedup can hash and skip per conversation — a Claude.ai privacy export
-    bundles every conversation into a single file, and hashing the joined
-    bundle means one new conversation added to a re-export changes the
-    whole-file hash and hides the conversations that didn't change.
+    On success the second item is the mtime from the same ``fstat`` as the
+    read. Callers stamp that value; they must not stat the file again.
     """
     if source_metadata is None:
         source_metadata = {}
     try:
-        conversations = [
-            c for c in normalize_conversations(str(filepath), source_metadata=source_metadata) if c
-        ]
+        conversations, source_mtime = normalize_conversations_with_mtime(
+            str(filepath), source_metadata=source_metadata
+        )
+        conversations = [c for c in conversations if c]
     except (OSError, UnparsedCodexTranscriptError) as exc:
         logger.warning("Skipping %s: %s; source remains eligible for retry", filepath, exc)
         return None
@@ -1037,11 +920,36 @@ def _normalize_convo_conversations(
     if not any(c.strip() for c in conversations):
         if not dry_run:
             _register_file(
-                collection, source_file, wing, agent, extract_mode, source_metadata=source_metadata
+                collection,
+                source_file,
+                wing,
+                agent,
+                extract_mode,
+                source_mtime=source_mtime,
+                source_metadata=source_metadata,
             )
         return None
 
-    return conversations
+    return conversations, source_mtime
+
+
+def _print_room_counts(room_counts) -> None:
+    if room_counts:
+        print("\n  By room:")
+        for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
+            print(f"    {room:20} {count} files")
+
+
+def _yield_and_reopen(palace_path: str, collection, dry_run: bool):
+    """Pass a file boundary, reopening the collection if requests ran in it.
+
+    A request in the hub's handoff may close the backend under this handle (a
+    search resets the Chroma caches after a transient index error). Reopening
+    returns the cached collection when nothing closed it.
+    """
+    if not mine_yield_point() or dry_run:
+        return collection
+    return _open_convo_collection(palace_path, dry_run=False)
 
 
 def _open_convo_collection(
@@ -1080,6 +988,7 @@ def _mine_convos_impl(
     writes_at_start = palace_write_serial()
     palace_config = MempalaceConfig(palace_path=palace_path)
     cfg_chunk_size = palace_config.chunk_size
+    spellcheck = palace_config.convo_spellcheck
     # Only override convo_miner's MIN_CHUNK_SIZE when the user has set
     # min_chunk_size explicitly. min_chunk_size_explicit returns the
     # validated value or None — None keeps convo's lower 30-char floor
@@ -1112,6 +1021,7 @@ def _mine_convos_impl(
         palace_path,
         dry_run=dry_run,
     )
+    aaak_col = None if dry_run else open_aaak_collection(palace_path)
 
     # Bulk pre-fetch already-mined source_file -> verified fingerprint in one
     # paginated pass instead of `len(files)` separate WHERE-source_file
@@ -1130,174 +1040,145 @@ def _mine_convos_impl(
         if collection is not None
         else {}
     )
-    # content_hash -> source_file for transcripts already filed. Repeated
-    # exports from Claude/ChatGPT commonly land under a new filename each
-    # run even when the conversation itself is unchanged, so the
-    # source_file-keyed skip above never recognizes them —
-    # this catches the same conversation reappearing at a new path. Not
-    # scoped to candidate_source_files: see prefetch_content_hashes's
-    # docstring for why that would silently miss bundle rows.
-    mined_content_hashes: dict = (
-        prefetch_content_hashes(collection, extract_mode=extract_mode)
-        if collection is not None
-        else {}
-    )
 
     total_drawers = 0
     files_mined = 0
     files_skipped = 0
+    files_failed: list = []
     files_processed = 0
     room_counts = defaultdict(int)
 
     for i, filepath in enumerate(files, 1):
-        mine_yield_point()
+        collection = _yield_and_reopen(palace_path, collection, dry_run)
         files_processed = i
         source_file = str(filepath)
 
-        # Skip only if already filed at the current NORMALIZE_VERSION AND
-        # unchanged on disk since. Transcripts are NOT assumed immutable:
-        # a Claude Code session keeps appending to the same file while
-        # active, and /compact or /clear can rewrite one in place -- so
-        # "we've seen this source_file before" alone is not sufficient.
-        # Falling through re-mines: _file_chunks_locked purges this
-        # source_file's stale drawers before inserting fresh ones, so this
-        # never leaves duplicates behind.
-        if _is_unchanged_since_last_mine(source_file, mined_fingerprints):
-            files_skipped += 1
-            continue
+        try:
+            # Skip only if already filed at the current NORMALIZE_VERSION AND
+            # unchanged on disk since. Transcripts are NOT assumed immutable:
+            # a Claude Code session keeps appending to the same file while
+            # active, and /compact or /clear can rewrite one in place -- so
+            # "we've seen this source_file before" alone is not sufficient.
+            # Falling through re-mines: _file_chunks_locked drops this
+            # source_file's stale drawers once the fresh ones are filed, so
+            # this never leaves duplicates behind.
+            if _is_unchanged_since_last_mine(source_file, mined_fingerprints):
+                files_skipped += 1
+                continue
 
-        if not _is_regular_source_file(filepath, Path(convo_dir).expanduser().resolve()):
-            files_skipped += 1
-            continue
+            if not _is_regular_source_file(filepath, Path(convo_dir).expanduser().resolve()):
+                files_skipped += 1
+                continue
 
-        source_metadata: dict = {}
-        conversations = _normalize_convo_conversations(
-            filepath,
-            source_file,
-            collection,
-            wing,
-            agent,
-            extract_mode,
-            dry_run,
-            source_metadata=source_metadata,
-        )
-        if conversations is None:
-            continue
-
-        # Hash and dedup per conversation, not per file: a Claude/ChatGPT
-        # privacy export bundles every conversation into one file, so a
-        # re-export that adds one new conversation changes the whole-file
-        # hash and would hide the conversations that didn't change if we
-        # hashed the joined bundle. Conversations whose hash is already
-        # filed under a different source_file in this wing are dropped;
-        # the rest are re-joined and mined as usual.
-        new_items, duplicates = _split_new_and_duplicate_conversations(
-            conversations, wing, source_file, mined_content_hashes
-        )
-        if not new_items:
-            if not dry_run:
-                _register_file(
-                    collection,
+            source_metadata: dict = {}
+            with recording_transforms(spellcheck=spellcheck) as normalize_run:
+                normalized = _normalize_convo_conversations(
+                    filepath,
                     source_file,
+                    collection,
                     wing,
                     agent,
                     extract_mode,
+                    dry_run,
                     source_metadata=source_metadata,
                 )
-            dup_source = duplicates[0][1]
-            print(
-                f"  = [{i:4}/{len(files)}] {filepath.name[:50]:50} "
-                f"duplicate of {Path(dup_source).name}"
-            )
-            files_skipped += 1
-            continue
+            if normalized is None:
+                continue
+            conversations, source_mtime = normalized
 
-        content = "\n\n".join(text for _, text in new_items)
-        content_hash = ",".join(h for h, _ in new_items)
+            # Each file keeps its own drawers even when another file holds the
+            # same conversation: dropping the copy would hide it from anything
+            # scoped to this source.
+            content = "\n\n".join(conversations)
 
-        # Chunk — either exchange pairs or general extraction
-        if extract_mode == "general":
-            from .general_extractor import extract_memories
+            # Chunk — either exchange pairs or general extraction
+            if extract_mode == "general":
+                from .general_extractor import extract_memories
 
-            chunks = extract_memories(content, chunk_size=cfg_chunk_size)
-            # Each chunk already has memory_type; use it as the room name
-        else:
-            chunks = chunk_exchanges(
-                content,
-                chunk_size=cfg_chunk_size,
-                min_chunk_size=cfg_min_chunk_size,
-            )
-
-        if not chunks:
-            if not dry_run:
-                _register_file(
-                    collection,
-                    source_file,
-                    wing,
-                    agent,
-                    extract_mode,
-                    source_metadata=source_metadata,
+                chunks = extract_memories(content, chunk_size=cfg_chunk_size)
+                # Each chunk already has memory_type; use it as the room name
+            else:
+                chunks = chunk_exchanges(
+                    content,
+                    chunk_size=cfg_chunk_size,
+                    min_chunk_size=cfg_min_chunk_size,
                 )
-            continue
 
-        # Detect room from content (general mode uses memory_type instead)
-        if extract_mode != "general":
-            room = detect_convo_room(content)
-        else:
-            room = None  # set per-chunk below
+            if not chunks:
+                if not dry_run:
+                    _register_file(
+                        collection,
+                        source_file,
+                        wing,
+                        agent,
+                        extract_mode,
+                        source_mtime=source_mtime,
+                        source_metadata=source_metadata,
+                    )
+                continue
 
-        if dry_run:
-            if extract_mode == "general":
-                from collections import Counter
-
-                type_counts = Counter(c.get("memory_type", "general") for c in chunks)
-                types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
-                print(f"    [DRY RUN] {filepath.name} -> {len(chunks)} memories ({types_str})")
+            # Detect room from content (general mode uses memory_type instead)
+            if extract_mode != "general":
+                room = detect_convo_room(content)
             else:
-                print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
-            total_drawers += len(chunks)
-            # Track room counts
-            if extract_mode == "general":
-                for c in chunks:
-                    room_counts[c.get("memory_type", "general")] += 1
-            else:
+                room = None  # set per-chunk below
+
+            if dry_run:
+                if extract_mode == "general":
+                    from collections import Counter
+
+                    type_counts = Counter(c.get("memory_type", "general") for c in chunks)
+                    types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
+                    print(f"    [DRY RUN] {filepath.name} -> {len(chunks)} memories ({types_str})")
+                    for t, n in type_counts.items():
+                        room_counts[t] += n
+                else:
+                    print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
+                    room_counts[room] += 1
+                total_drawers += len(chunks)
+                files_mined += 1
+                if limit > 0 and files_mined >= limit:
+                    break
+                continue
+
+            if extract_mode != "general":
                 room_counts[room] += 1
+
+            # Lock + file fresh chunks + drop stale ones. Lock serializes
+            # concurrent agents; the prune removes pre-v2 drawers so the schema
+            # bump applies. A failed prune raises into the per-file handler.
+            drawers_added, room_delta, skipped = _file_chunks_locked(
+                collection,
+                source_file,
+                chunks,
+                wing,
+                room,
+                agent,
+                extract_mode,
+                authored_at=_extract_authored_at(filepath),
+                source_dir_ino=source_directory_identity(filepath),
+                source_mtime=source_mtime,
+                source_metadata=source_metadata,
+                transforms=normalize_run.transforms,
+                aaak_col=aaak_col,
+            )
+            if skipped:
+                files_skipped += 1
+                continue
+            for r, n in room_delta.items():
+                room_counts[r] += n
+
+            total_drawers += drawers_added
             files_mined += 1
+            print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
             if limit > 0 and files_mined >= limit:
                 break
+        except MINE_ABORTS:
+            raise
+        except Exception as exc:
+            files_failed.append(source_file)
+            print(f"  ! [error] {filepath.name}: {type(exc).__name__}: {exc}", file=sys.stderr)
             continue
-
-        if extract_mode != "general":
-            room_counts[room] += 1
-
-        # Lock + purge stale + file fresh chunks. Lock serializes concurrent
-        # agents; purge removes pre-v2 drawers so the schema bump applies.
-        drawers_added, room_delta, skipped = _file_chunks_locked(
-            collection,
-            source_file,
-            chunks,
-            wing,
-            room,
-            agent,
-            extract_mode,
-            authored_at=_extract_authored_at(filepath),
-            content_hash=content_hash,
-            source_dir_ino=source_directory_identity(filepath),
-            source_metadata=source_metadata,
-        )
-        if skipped:
-            files_skipped += 1
-            continue
-        for r, n in room_delta.items():
-            room_counts[r] += n
-
-        for h, _ in new_items:
-            mined_content_hashes[(wing, h)] = source_file
-        total_drawers += drawers_added
-        files_mined += 1
-        print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
-        if limit > 0 and files_mined >= limit:
-            break
 
     if not dry_run:
         # Compute hallways before the FTS5 validation: the latter opens a direct sqlite
@@ -1308,15 +1189,15 @@ def _mine_convos_impl(
 
     print(f"\n{'=' * 55}")
     print("  Done.")
-    print(f"  Files processed: {files_processed - files_skipped}")
+    print(f"  Files processed: {files_processed - files_skipped - len(files_failed)}")
+    print_files_failed(files_failed)
     print(f"  Files skipped (already filed): {files_skipped}")
     print(f"  Drawers filed: {total_drawers}")
-    if room_counts:
-        print("\n  By room:")
-        for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
-            print(f"    {room:20} {count} files")
+    _print_room_counts(room_counts)
     print('\n  Next: mempalace search "what you\'re looking for"')
     print(f"{'=' * 55}\n")
+    # After the summary, so the operator still sees what was filed.
+    raise_if_files_failed(files_failed, files_processed)
 
 
 if __name__ == "__main__":

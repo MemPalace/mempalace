@@ -29,17 +29,17 @@ from mempalace.closet_llm import (
 
 class TestLLMConfig:
     def test_reads_env_vars(self, monkeypatch):
-        monkeypatch.setenv("LLM_ENDPOINT", "http://localhost:11434/v1")
-        monkeypatch.setenv("LLM_KEY", "sk-abc")
-        monkeypatch.setenv("LLM_MODEL", "llama3:8b")
+        monkeypatch.setenv("MEMPALACE_LLM_ENDPOINT", "http://localhost:11434/v1")
+        monkeypatch.setenv("MEMPALACE_LLM_KEY", "sk-abc")
+        monkeypatch.setenv("MEMPALACE_LLM_MODEL", "llama3:8b")
         c = LLMConfig()
         assert c.endpoint == "http://localhost:11434/v1"
         assert c.key == "sk-abc"
         assert c.model == "llama3:8b"
 
     def test_cli_flags_override_env(self, monkeypatch):
-        monkeypatch.setenv("LLM_ENDPOINT", "http://env-endpoint/v1")
-        monkeypatch.setenv("LLM_MODEL", "env-model")
+        monkeypatch.setenv("MEMPALACE_LLM_ENDPOINT", "http://env-endpoint/v1")
+        monkeypatch.setenv("MEMPALACE_LLM_MODEL", "env-model")
         c = LLMConfig(endpoint="http://flag-endpoint/v1", model="flag-model")
         assert c.endpoint == "http://flag-endpoint/v1"
         assert c.model == "flag-model"
@@ -49,19 +49,22 @@ class TestLLMConfig:
         assert c.endpoint == "http://foo/v1"
 
     def test_missing_reports_required(self, monkeypatch):
-        monkeypatch.delenv("LLM_ENDPOINT", raising=False)
-        monkeypatch.delenv("LLM_KEY", raising=False)
-        monkeypatch.delenv("LLM_MODEL", raising=False)
+        monkeypatch.delenv("MEMPALACE_LLM_ENDPOINT", raising=False)
+        monkeypatch.delenv("MEMPALACE_LLM_KEY", raising=False)
+        monkeypatch.delenv("MEMPALACE_LLM_MODEL", raising=False)
+        monkeypatch.setenv("LLM_ENDPOINT", "https://api.openai.com/v1")
+        monkeypatch.setenv("LLM_MODEL", "gpt-4o-mini")
         c = LLMConfig()
         missing = c.missing()
         assert any("ENDPOINT" in m for m in missing)
         assert any("MODEL" in m for m in missing)
         # key is optional
         assert not any("KEY" in m for m in missing)
+        assert c.endpoint == ""
 
     def test_key_is_optional(self, monkeypatch):
-        monkeypatch.delenv("LLM_KEY", raising=False)
-        c = LLMConfig(endpoint="http://local/v1", model="m")
+        monkeypatch.delenv("MEMPALACE_LLM_KEY", raising=False)
+        c = LLMConfig(endpoint="http://127.0.0.1:11434/v1", model="m")
         assert c.missing() == []
 
 
@@ -235,8 +238,8 @@ class TestCallLLM:
 
 class TestRegenerateClosets:
     def test_missing_config_returns_error(self, monkeypatch):
-        monkeypatch.delenv("LLM_ENDPOINT", raising=False)
-        monkeypatch.delenv("LLM_MODEL", raising=False)
+        monkeypatch.delenv("MEMPALACE_LLM_ENDPOINT", raising=False)
+        monkeypatch.delenv("MEMPALACE_LLM_MODEL", raising=False)
         with tempfile.TemporaryDirectory() as palace:
             result = regenerate_closets(palace)
             assert result["error"] == "missing-config"
@@ -271,7 +274,7 @@ with mine_palace_lock(sys.argv[1]):
         try:
             assert holder.stdout is not None
             assert holder.stdout.readline().strip() == "ready"
-            cfg = LLMConfig(endpoint="http://local/v1", model="m")
+            cfg = LLMConfig(endpoint="http://127.0.0.1:11434/v1", model="m")
             with (
                 patch.object(
                     closet_llm_mod,
@@ -352,7 +355,7 @@ with mine_palace_lock(sys.argv[1]):
             },
         )
 
-        cfg = LLMConfig(endpoint="http://local/v1", model="llama3:8b")
+        cfg = LLMConfig(endpoint="http://127.0.0.1:11434/v1", model="llama3:8b")
 
         def fake_urlopen(req, timeout=None):
             return _FakeResp(
@@ -457,7 +460,7 @@ with mine_palace_lock(sys.argv[1]):
                 }
             )
 
-        cfg = LLMConfig(endpoint="http://local/v1", model="m")
+        cfg = LLMConfig(endpoint="http://127.0.0.1:11434/v1", model="m")
 
         with (
             patch.object(closet_llm_mod, "get_collection", return_value=fake_drawers),
@@ -544,7 +547,7 @@ with mine_palace_lock(sys.argv[1]):
                 {"prompt_tokens": 1, "completion_tokens": 1},
             )
 
-        cfg = LLMConfig(endpoint="http://local/v1", model="m")
+        cfg = LLMConfig(endpoint="http://127.0.0.1:11434/v1", model="m")
 
         with (
             patch.object(closet_llm_mod, "get_collection", return_value=FakeDrawersCol()),
@@ -586,7 +589,7 @@ with mine_palace_lock(sys.argv[1]):
             metadatas=[{"wing": "w", "room": "r", "source_file": source, "entities": ""}],
         )
 
-        cfg = LLMConfig(endpoint="http://local/v1", model="m")
+        cfg = LLMConfig(endpoint="http://127.0.0.1:11434/v1", model="m")
 
         def fake_urlopen(req, timeout=None):
             return _FakeResp(
@@ -609,3 +612,73 @@ with mine_palace_lock(sys.argv[1]):
         for cid in ids:
             assert "/" not in cid
             assert "mydoc.md" in cid
+
+
+class TestNoSilentExternal:
+    def test_generic_env_endpoint_is_not_contacted(self, monkeypatch):
+        monkeypatch.setenv("LLM_ENDPOINT", "https://api.openai.com/v1")
+        monkeypatch.setenv("LLM_KEY", "sk-stray")
+        monkeypatch.setenv("LLM_MODEL", "gpt-4o-mini")
+        monkeypatch.delenv("MEMPALACE_LLM_ENDPOINT", raising=False)
+        monkeypatch.delenv("MEMPALACE_LLM_MODEL", raising=False)
+
+        def boom(*_args, **_kwargs):
+            raise AssertionError("contacted a generic LLM_ENDPOINT")
+
+        cfg = LLMConfig()
+        with patch("urllib.request.urlopen", side_effect=boom):
+            parsed, usage = _call_llm(cfg, "notes.md", "w", "r", "drawer text")
+        assert parsed is None and usage is None
+        assert cfg.missing()
+
+    def test_generic_env_names_are_reported_as_renamed(self, monkeypatch, capsys):
+        monkeypatch.setenv("LLM_ENDPOINT", "http://localhost:11434/v1")
+        monkeypatch.setenv("LLM_MODEL", "llama3:8b")
+        monkeypatch.delenv("LLM_KEY", raising=False)
+        monkeypatch.delenv("MEMPALACE_LLM_ENDPOINT", raising=False)
+        monkeypatch.delenv("MEMPALACE_LLM_MODEL", raising=False)
+
+        result = regenerate_closets("/tmp/does-not-matter", cfg=LLMConfig())
+
+        assert result["error"] == "missing-config"
+        out = capsys.readouterr().out
+        assert "Found LLM_ENDPOINT, LLM_MODEL" in out
+        assert "MEMPALACE_LLM_ENDPOINT, MEMPALACE_LLM_MODEL" in out
+
+    def test_non_local_endpoint_is_not_contacted_without_consent(self, monkeypatch):
+        monkeypatch.delenv("MEMPALACE_ACCEPT_EXTERNAL_LLM", raising=False)
+        cfg = LLMConfig(endpoint="https://api.openai.com/v1", model="gpt-4o-mini", key="sk-test")
+
+        def boom(*_args, **_kwargs):
+            raise AssertionError("contacted a non-local endpoint")
+
+        with patch("urllib.request.urlopen", side_effect=boom):
+            parsed, _usage = _call_llm(cfg, "notes.md", "w", "r", "secret drawer text")
+            result = regenerate_closets("/tmp/does-not-matter", cfg=cfg)
+        assert parsed is None
+        assert result["error"] == "external-endpoint"
+
+    def test_non_local_endpoint_is_contacted_when_explicitly_accepted(self):
+        cfg = LLMConfig(
+            endpoint="https://api.openai.com/v1",
+            model="gpt-4o-mini",
+            key="sk-test",
+            accept_external=True,
+        )
+        called = {}
+
+        def fake_urlopen(req, timeout=None):
+            called["url"] = req.full_url
+            return _FakeResp(
+                {
+                    "choices": [
+                        {"message": {"content": '{"topics":["t"],"quotes":[],"summary":""}'}}
+                    ],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                }
+            )
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            parsed, _usage = _call_llm(cfg, "notes.md", "w", "r", "drawer text")
+        assert called["url"] == "https://api.openai.com/v1/chat/completions"
+        assert parsed["topics"] == ["t"]

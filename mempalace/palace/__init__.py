@@ -26,6 +26,7 @@ from .._source_state import source_fingerprint
 
 from ..backends import (
     BackendClosedError,
+    BackendError,
     BackendMismatchError,
     CollectionNotInitializedError,
     PalaceNotFoundError,
@@ -37,6 +38,7 @@ from ..backends import (
     resolve_backend_for_palace,
 )
 from ..backends.embedding_wrapper import EmbeddingCollection
+from ..collision_scan import CollisionError, assert_no_collisions
 from ..entity_detector import (
     _apply_known_systems_prepass,
     _collapse_long_ascii_runs,
@@ -96,6 +98,19 @@ NORMALIZE_VERSION = 2
 #               whitespace instead of mid-word.
 CONVO_CHUNKER_VERSION = 2
 
+# Revision of ``general_extractor.extract_memories``, stamped on general-mode
+# convo rows as ``general_extractor_version`` under the same rule.
+#
+# v2 (2026-10): paragraphs that match no marker, or are under 20 characters,
+#               are kept as ``general`` instead of dropped.
+GENERAL_EXTRACTOR_VERSION = 2
+
+# Per-mode chunker stamp: extract_mode -> (metadata key, current revision).
+CHUNKER_VERSIONS = {
+    "exchange": ("convo_chunker_version", CONVO_CHUNKER_VERSION),
+    "general": ("general_extractor_version", GENERAL_EXTRACTOR_VERSION),
+}
+
 
 # (palace_id, collection_name, model_name) tuples already validated this
 # process, so the identity check (one metadata read) runs at most once per
@@ -113,6 +128,7 @@ _FRAGMENTS = (
     "mine_lock.py",
     "palace_lock.py",
     "mined.py",
+    "writes.py",
 )
 
 

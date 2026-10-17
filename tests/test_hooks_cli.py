@@ -517,7 +517,12 @@ def test_stop_hook_saves_silently_at_interval(tmp_path):
     assert "hooks" in result["systemMessage"]
     # tmp_path has no "-Projects-" segment, so _wing_from_transcript_path falls back to "wing_sessions"
     mock_save.assert_called_once_with(
-        str(transcript), "test", wing="wing_sessions", toast=False, agent_name="claude"
+        str(transcript),
+        "test",
+        wing="wing_sessions",
+        toast=False,
+        agent_name="claude",
+        exchange_count=SAVE_INTERVAL,
     )
 
 
@@ -538,7 +543,12 @@ def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
             state_dir=tmp_path,
         )
     mock_save.assert_called_once_with(
-        str(transcript), "test", wing="wing_myproject", toast=False, agent_name="claude"
+        str(transcript),
+        "test",
+        wing="wing_myproject",
+        toast=False,
+        agent_name="claude",
+        exchange_count=SAVE_INTERVAL,
     )
 
 
@@ -654,9 +664,38 @@ def test_stop_hook_checkpoint_visible_to_diary_read(monkeypatch, config, palace_
         [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(5)],
     )
 
+    spawned = {}
+
+    def _fake_popen(cmd, **kwargs):
+        spawned["cmd"] = list(cmd)
+
+        class _Proc:
+            pid = os.getpid()
+
+        return _Proc()
+
     agent = _diary_agent_for_harness("claude-code")
-    res = _save_diary_direct(str(transcript), "sess1", wing="wing_.claude", agent_name=agent)
-    assert res["drawers_filed"] > 0
+    with patch("mempalace.hooks_cli.subprocess.Popen", _fake_popen):
+        res = _save_diary_direct(str(transcript), "sess1", wing="wing_.claude", agent_name=agent)
+    assert res.get("checkpoint_queued") is True
+    assert res["drawers_filed"] == 0
+    argv = " ".join(spawned["cmd"])
+    assert "run_detached_diary_checkpoint" in argv
+    assert "CHECKPOINT" not in argv
+
+    # The child starts the transcript mine only after the diary entry is filed.
+    filed_before_ingest = []
+
+    def _ingest(path):
+        filed_before_ingest.append(tool_diary_read(agent_name="claude").get("total", 0) >= 1)
+
+    with (
+        patch("mempalace.hooks_cli._ingest_transcript", side_effect=_ingest) as ingest,
+        patch("mempalace.hooks_cli._maybe_auto_ingest"),
+    ):
+        hooks_cli_mod.run_detached_diary_checkpoint(spawned["cmd"][-1])
+    ingest.assert_called_once_with(str(transcript))
+    assert filed_before_ingest == [True]
 
     visible = tool_diary_read(agent_name="claude")
     assert visible.get("total", 0) >= 1
@@ -665,6 +704,140 @@ def test_stop_hook_checkpoint_visible_to_diary_read(monkeypatch, config, palace_
     # The legacy identity no longer captures hook checkpoints.
     legacy = tool_diary_read(agent_name="session-hook")
     assert legacy.get("entries") == []
+
+
+def test_stop_foreground_does_not_import_mcp_server(tmp_path):
+    """The default Stop path must stay inside the 500ms budget.
+
+    Importing mempalace.mcp_server alone is about half a second. The
+    foreground queues a detached child and must not import it.
+    """
+    import time
+
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    removed = {
+        key: sys.modules.pop(key)
+        for key in list(sys.modules)
+        if key == "mempalace.mcp_server" or key.startswith("mempalace.mcp_server.")
+    }
+    try:
+        started = time.perf_counter()
+        result = _capture_hook_output(
+            hook_stop,
+            {
+                "session_id": "budget",
+                "stop_hook_active": False,
+                "transcript_path": str(transcript),
+            },
+            state_dir=tmp_path,
+        )
+        elapsed = time.perf_counter() - started
+        assert "mempalace.mcp_server" not in sys.modules
+        assert "checkpoint queued" in result["systemMessage"]
+        assert elapsed < 0.5, f"foreground stop took {elapsed:.3f}s"
+    finally:
+        sys.modules.update(removed)
+
+
+def test_stop_leaves_the_mines_to_a_queued_checkpoint(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    queued = {"drawers_filed": 0, "messages_folded": 3, "checkpoint_queued": True}
+    with (
+        patch("mempalace.hooks_cli._save_diary_direct", return_value=queued),
+        patch("mempalace.hooks_cli._ingest_transcript") as ingest,
+        patch("mempalace.hooks_cli._maybe_auto_ingest") as auto_ingest,
+    ):
+        _capture_hook_output(
+            hook_stop,
+            {"session_id": "q", "stop_hook_active": False, "transcript_path": str(transcript)},
+            state_dir=tmp_path,
+        )
+    ingest.assert_not_called()
+    auto_ingest.assert_not_called()
+    # The child advances the marker once it has filed, not the foreground.
+    assert not (tmp_path / "q_last_save").exists()
+
+
+def test_queue_reports_nothing_when_no_child_started(tmp_path):
+    with (
+        patch.object(hooks_cli_mod, "STATE_DIR", tmp_path),
+        patch.object(hooks_cli_mod, "_MINE_PID_DIR", tmp_path / "mine_pids"),
+        patch("mempalace.hooks_cli._claim_mine_slot", return_value=None),
+        patch("mempalace.hooks_cli.subprocess.Popen") as popen,
+    ):
+        assert hooks_cli_mod._queue_diary_checkpoint({"session_id": "s", "entry": "x"}) is False
+    popen.assert_not_called()
+
+
+def test_checkpoint_child_waits_out_a_held_palace_lock(tmp_path):
+    from mempalace.daemon import LOCK_REFUSAL_ERROR_CLASS
+
+    refused = {"success": False, "error": "busy", "error_class": LOCK_REFUSAL_ERROR_CLASS}
+    filed = {"success": True, "entry_id": "e1"}
+    with (
+        patch.object(hooks_cli_mod, "STATE_DIR", tmp_path),
+        patch("mempalace.mcp_server.tool_diary_write", side_effect=[refused, refused, filed]) as w,
+        patch("mempalace.hooks_cli.time.sleep") as sleep,
+    ):
+        ok = hooks_cli_mod._apply_diary_checkpoint(
+            {"entry": "CHECKPOINT:x", "session_id": "s", "exchange_count": 15}
+        )
+    assert ok is True
+    assert w.call_count == 3
+    assert sleep.call_count == 2
+    assert (tmp_path / "s_last_save").read_text(encoding="utf-8") == "15"
+
+
+def test_daemon_available_probe_stays_under_hook_budget(tmp_path, monkeypatch):
+    import socket
+    import threading
+    import time
+
+    from mempalace import daemon
+
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "daemon-state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(palace))
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+
+    def _hang():
+        try:
+            conn, _addr = server.accept()
+            time.sleep(2)
+            conn.close()
+        except OSError:
+            pass
+
+    threading.Thread(target=_hang, daemon=True).start()
+    try:
+        daemon.ensure_token(str(palace))
+        endpoint = daemon.state_dir(str(palace)) / "endpoint.json"
+        endpoint.write_text(
+            json.dumps({"host": "127.0.0.1", "port": port, "pid": os.getpid()}),
+            encoding="utf-8",
+        )
+        started = time.perf_counter()
+        available = hooks_cli_mod._daemon_available()
+        elapsed = time.perf_counter() - started
+    finally:
+        server.close()
+
+    assert available is False
+    assert daemon.HOOK_PROBE_TIMEOUT <= 0.15
+    assert elapsed < 0.5, f"hook probe took {elapsed:.3f}s"
+    assert elapsed < daemon.HOOK_PROBE_TIMEOUT + 0.2
 
 
 def test_save_diary_direct_daemon_opt_in_submits_job(tmp_path):
@@ -2526,15 +2699,39 @@ def test_session_end_checkpoint_visible_to_diary_read(
     with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
         mock_cfg_cls.return_value.hooks_auto_save = True
         mock_cfg_cls.return_value.hook_desktop_toast = False
-        # Mock only the detached subprocess mines; run the REAL diary write.
+        spawned = {}
+
+        def _fake_popen(cmd, **kwargs):
+            spawned.setdefault("cmds", []).append(list(cmd))
+
+            class _Proc:
+                pid = os.getpid()
+
+            return _Proc()
+
+        # Mines stay detached. The diary child is recorded, then filed here
+        # so the test does not wait on a second interpreter.
         with (
             patch("mempalace.hooks_cli._ingest_transcript"),
             patch("mempalace.hooks_cli._maybe_auto_ingest"),
+            patch("mempalace.hooks_cli.subprocess.Popen", _fake_popen),
         ):
             hook_session_end(
                 {"session_id": "sessX", "transcript_path": str(transcript)},
                 "claude-code",
             )
+    diary_cmds = [
+        cmd for cmd in spawned.get("cmds", []) if "run_detached_diary_checkpoint" in " ".join(cmd)
+    ]
+    assert diary_cmds
+    # The foreground left the mines to the child.
+    assert len(spawned["cmds"]) == 1
+    with (
+        patch("mempalace.hooks_cli._ingest_transcript") as ingest,
+        patch("mempalace.hooks_cli._maybe_auto_ingest"),
+    ):
+        hooks_cli_mod.run_detached_diary_checkpoint(diary_cmds[0][-1])
+    ingest.assert_called_once_with(str(transcript))
 
     visible = tool_diary_read(agent_name="claude")
     assert visible.get("total", 0) >= 1

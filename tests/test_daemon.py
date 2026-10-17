@@ -1229,6 +1229,94 @@ def test_run_mcp_tool_rejects_non_dict_arguments():
     assert out["exit_code"] == 2
 
 
+def test_run_mcp_tool_refuses_a_write_when_the_server_is_read_only(monkeypatch):
+    """mcp_tool jobs go through the dispatcher, so read-only mode refuses writes."""
+    import mempalace.mcp_server as mcp
+    from mempalace import service
+
+    called = {"n": 0}
+
+    def handler(**_arguments):
+        called["n"] += 1
+        return {"success": True}
+
+    real = mcp.TOOLS["mempalace_add_drawer"]
+    monkeypatch.setitem(
+        mcp.TOOLS,
+        "mempalace_add_drawer",
+        {**real, "handler": handler},
+    )
+    monkeypatch.setattr(mcp, "_READ_ONLY", True)
+
+    out = service.run_mcp_tool(
+        {
+            "name": "mempalace_add_drawer",
+            "arguments": {"wing": "w", "room": "r", "content": "must not be filed"},
+        }
+    )
+
+    assert called["n"] == 0
+    assert out["success"] is False
+    assert out["exit_code"] == 1
+    assert out["jsonrpc_code"] == -32003
+    assert "read-only" in out["error"]
+    assert out["tool"] == "mempalace_add_drawer"
+
+
+def test_run_mcp_tool_keeps_the_tool_exception_detail(monkeypatch):
+    import mempalace.mcp_server as mcp
+    from mempalace import service
+
+    def handler(**_arguments):
+        raise ValueError("disk full")
+
+    monkeypatch.setattr(
+        mcp,
+        "TOOLS",
+        {"mempalace_add_drawer": {"handler": handler, "input_schema": {"properties": {}}}},
+    )
+    out = service.run_mcp_tool({"name": "mempalace_add_drawer", "arguments": {}})
+
+    assert out["success"] is False
+    assert out["jsonrpc_code"] == -32000
+    assert out["error_class"] == "ValueError"
+    assert out["error"] == "disk full"
+
+
+def test_run_mcp_tool_defers_when_a_peer_writer_holds_the_palace(monkeypatch):
+    import mempalace.mcp_server as mcp
+    from mempalace import service
+    from mempalace.daemon import LOCK_REFUSAL_ERROR_CLASS
+
+    monkeypatch.setattr(
+        mcp,
+        "TOOLS",
+        {
+            "mempalace_add_drawer": {
+                "handler": lambda **kw: {"success": True},
+                "input_schema": {"properties": {}},
+            }
+        },
+    )
+    monkeypatch.setattr(
+        mcp,
+        "_mcp_tool_preflight_refusal",
+        lambda req_id, tool_name: {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {
+                "code": -32001,
+                "message": "Peer MCP writer active",
+                "data": {"tool": tool_name, "failure_kind": "peer_contention"},
+            },
+        },
+    )
+    out = service.run_mcp_tool({"name": "mempalace_add_drawer", "arguments": {}})
+
+    assert out["success"] is False
+    assert out["error_class"] == LOCK_REFUSAL_ERROR_CLASS
+
+
 def test_run_mcp_tool_dispatches_write_tool(monkeypatch):
     import mempalace.mcp_server as mcp
     from mempalace import service
@@ -1239,7 +1327,16 @@ def test_run_mcp_tool_dispatches_write_tool(monkeypatch):
         captured["arguments"] = arguments
         return {"success": True, "written": True}
 
-    monkeypatch.setattr(mcp, "TOOLS", {"mempalace_add_drawer": {"handler": fake_handler}})
+    monkeypatch.setattr(
+        mcp,
+        "TOOLS",
+        {
+            "mempalace_add_drawer": {
+                "handler": fake_handler,
+                "input_schema": {"type": "object", "properties": {"x": {"type": "integer"}}},
+            }
+        },
+    )
     out = service.run_mcp_tool({"name": "mempalace_add_drawer", "arguments": {"x": 1}})
     assert out["success"] is True
     assert out["written"] is True
@@ -1314,7 +1411,14 @@ def test_execute_job_dispatches_diary_write_mcp_tool_and_unknown(monkeypatch):
 
     monkeypatch.setattr(mcp, "tool_diary_write", lambda **kw: {"success": True})
     monkeypatch.setattr(
-        mcp, "TOOLS", {"mempalace_add_drawer": {"handler": lambda **kw: {"success": True}}}
+        mcp,
+        "TOOLS",
+        {
+            "mempalace_add_drawer": {
+                "handler": lambda **kw: {"success": True},
+                "input_schema": {"type": "object", "properties": {}},
+            }
+        },
     )
     assert service.execute_job("diary_write", {"entry": "x"})["success"] is True
     assert (
@@ -1478,7 +1582,12 @@ def test_run_mcp_tool_marks_bare_error_dict_as_failure(monkeypatch):
     monkeypatch.setattr(
         mcp,
         "TOOLS",
-        {"mempalace_create_tunnel": {"handler": lambda **kw: {"error": "bad endpoint"}}},
+        {
+            "mempalace_create_tunnel": {
+                "handler": lambda **kw: {"error": "bad endpoint"},
+                "input_schema": {"type": "object", "properties": {}},
+            }
+        },
     )
     out = service.run_mcp_tool({"name": "mempalace_create_tunnel", "arguments": {}})
     assert out["success"] is False
@@ -1487,7 +1596,14 @@ def test_run_mcp_tool_marks_bare_error_dict_as_failure(monkeypatch):
 
     # A result with neither an explicit success flag nor an error is a success.
     monkeypatch.setattr(
-        mcp, "TOOLS", {"mempalace_create_tunnel": {"handler": lambda **kw: {"tunnel_id": "t1"}}}
+        mcp,
+        "TOOLS",
+        {
+            "mempalace_create_tunnel": {
+                "handler": lambda **kw: {"tunnel_id": "t1"},
+                "input_schema": {"type": "object", "properties": {}},
+            }
+        },
     )
     out = service.run_mcp_tool({"name": "mempalace_create_tunnel", "arguments": {}})
     assert out["success"] is True
@@ -1509,10 +1625,51 @@ def test_get_client_if_running_uses_short_probe_timeout(monkeypatch):
 
     monkeypatch.setattr(daemon, "DaemonClient", _FakeClient)
 
-    assert daemon.HOOK_PROBE_TIMEOUT <= 0.5
+    assert daemon.HOOK_PROBE_TIMEOUT <= 0.15
     client = daemon.get_client_if_running("/p", health_timeout=daemon.HOOK_PROBE_TIMEOUT)
     assert client is not None
     assert captured["timeout"] == daemon.HOOK_PROBE_TIMEOUT
+
+
+def test_wedged_daemon_probe_stays_under_hook_budget(tmp_path, monkeypatch):
+    """A socket that accepts and never answers must not burn the 500ms budget."""
+    import socket
+
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+
+    def _hang():
+        try:
+            conn, _addr = server.accept()
+            time.sleep(2)
+            conn.close()
+        except OSError:
+            pass
+
+    threading.Thread(target=_hang, daemon=True).start()
+    try:
+        daemon.ensure_token(str(palace))
+        endpoint = daemon.state_dir(str(palace)) / "endpoint.json"
+        endpoint.write_text(
+            json.dumps({"host": "127.0.0.1", "port": port, "pid": os.getpid()}),
+            encoding="utf-8",
+        )
+        started = time.perf_counter()
+        client = daemon.get_client_if_running(str(palace), health_timeout=daemon.HOOK_PROBE_TIMEOUT)
+        elapsed = time.perf_counter() - started
+    finally:
+        server.close()
+
+    assert client is None
+    assert daemon.HOOK_PROBE_TIMEOUT <= 0.15
+    assert elapsed < 0.5, f"probe used {elapsed:.3f}s of the 500ms hook budget"
+    # The timeout is the bound; allow a little scheduler slack, not 500ms.
+    assert elapsed < daemon.HOOK_PROBE_TIMEOUT + 0.2
 
 
 # --- _detached_kwargs ---

@@ -82,7 +82,7 @@ def _pick_fts_candidates(
     is read directly (``row_filter`` refers to ``e.id``) instead of ranking
     the palace-wide match set (``fts_filter``).
     """
-    equalities = [(key, value) for key, value in scope.items() if value]
+    equalities = [(key, encode_filter(value)) for key, value in scope.items() if value]
     candidate_ids = _filtered_candidate_rows(
         conn,
         collection_name,
@@ -169,7 +169,7 @@ def _bm25_only_via_sqlite(
                 )
                 """
             )
-            params.extend([key, value])
+            params.extend([key, encode_filter(value)])
         for op, sql_bound in _window_sql_prefilters(since_dt, before_dt):
             clauses.append(
                 f"""
@@ -318,7 +318,7 @@ def _bm25_only_via_sqlite(
     # entries from other wings).
     candidates = []
     for d in drawers.values():
-        meta = d["metadata"]
+        text, meta = decode_record(d["text"], d["metadata"])
         if wing and meta.get("wing") != wing:
             continue
         if room and meta.get("room") != room:
@@ -331,7 +331,7 @@ def _bm25_only_via_sqlite(
         candidates.append(
             {
                 "drawer_id": _result_drawer_id(meta, d["_stored_drawer_id"]),
-                "text": d["text"],
+                "text": text,
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
                 "source_file": Path(full_source).name if full_source else "?",
@@ -392,6 +392,8 @@ def _merge_bm25_union_candidates(
     stop_words: frozenset = frozenset(),
     since_dt=None,
     before_dt=None,
+    stats: dict = None,
+    known_distances: dict = None,
 ) -> None:
     """Append top-K backend lexical candidates into ``hits`` in place.
 
@@ -406,12 +408,18 @@ def _merge_bm25_union_candidates(
     contributing chunk M of the same file. Falls back to ``source_file``
     only when full-path/chunk metadata is absent.
 
-    BM25-only additions carry ``distance=None`` unless a strict
-    ``max_distance`` threshold is set. Under a threshold, union mode loads
-    stored embeddings for lexical hits and computes their vector distance
-    before admitting them, preserving the same distance guarantee as the
-    vector-only path.
+    BM25-only additions carry ``distance=None`` unless a ``max_distance``
+    cutoff is set. Under a cutoff, union mode loads stored embeddings for
+    lexical hits and computes their vector distance; a hit past the cutoff is
+    dropped and counted in ``stats["filtered_by_max_distance"]``. A hit whose
+    distance cannot be computed is kept with ``distance=None`` and
+    ``fallback_reason="distance_unavailable"`` rather than lost. A hit the
+    vector path already measured reuses that distance from
+    ``known_distances``; if the vector path dropped it, it stays dropped and
+    is not counted twice.
     """
+    stats = {} if stats is None else stats
+    known_distances = known_distances or {}
     where = build_where_filter(wing, room, source_file)
     try:
         lexical = drawers_col.lexical_search(
@@ -422,13 +430,15 @@ def _merge_bm25_union_candidates(
     except UnsupportedCapabilityError:
         raise
     except Exception:
-        logger.debug("candidate_strategy=union: lexical fetch failed", exc_info=True)
+        logger.warning("candidate_strategy=union: lexical fetch failed", exc_info=True)
+        stats["candidate_strategy_fallback"] = "lexical_search_failed"
         return
 
     metric = _metric_for_collection(drawers_col)
+    unmeasured = [hit for hit in lexical.hits if hit.id not in known_distances]
     lexical_distances = (
-        _lexical_hit_vector_distances(drawers_col, query, lexical.hits, metric)
-        if max_distance > 0.0
+        _lexical_hit_vector_distances(drawers_col, query, unmeasured, metric)
+        if _has_distance_cutoff(max_distance) and unmeasured
         else {}
     )
 
@@ -443,34 +453,42 @@ def _merge_bm25_union_candidates(
         ):
             continue
         full_source = meta.get("source_file", "") or ""
-        distance = lexical_distances.get(hit.id)
-        if max_distance > 0.0:
-            if distance is None or distance > max_distance:
+        if hit.id in known_distances:
+            distance = known_distances[hit.id]
+            if _beyond_max_distance(distance, max_distance, metric):
+                continue  # the vector path already dropped and counted it
+        else:
+            distance = lexical_distances.get(hit.id)
+            if distance is not None and _beyond_max_distance(distance, max_distance, metric):
+                stats["filtered_by_max_distance"] = stats.get("filtered_by_max_distance", 0) + 1
                 continue
+        if distance is not None:
             distance = round(distance, 4)
-        bm25_extra.append(
-            {
-                "drawer_id": _result_drawer_id(meta, hit.id),
-                "text": hit.document or "",
-                "wing": meta.get("wing", "unknown"),
-                "room": meta.get("room", "unknown"),
-                "source_file": Path(full_source).name if full_source else "?",
-                "source_path": full_source,
-                **_result_date_fields(meta),
-                "similarity": (
-                    None
-                    if distance is None
-                    else round(_distance_to_similarity(distance, metric), 3)
-                ),
-                "distance": distance,
-                "effective_distance": distance,
-                "closet_boost": 0.0,
-                "matched_via": "bm25_backend",
-                "bm25_score": round(float(hit.score), 3),
-                "_source_file_full": full_source,
-                "_chunk_index": meta.get("chunk_index"),
-            }
-        )
+        entry = {
+            "drawer_id": _result_drawer_id(meta, hit.id),
+            "text": hit.document or "",
+            "wing": meta.get("wing", "unknown"),
+            "room": meta.get("room", "unknown"),
+            "source_file": Path(full_source).name if full_source else "?",
+            "source_path": full_source,
+            **_result_date_fields(meta),
+            "similarity": (
+                None if distance is None else round(_distance_to_similarity(distance, metric), 3)
+            ),
+            "distance": distance,
+            "effective_distance": (
+                None if distance is None else round(_cosine_scale_distance(distance, metric), 4)
+            ),
+            "closet_boost": 0.0,
+            "matched_via": "bm25_backend",
+            "bm25_score": round(float(hit.score), 3),
+            "_source_file_full": full_source,
+            "_chunk_index": meta.get("chunk_index"),
+        }
+        if distance is None and _has_distance_cutoff(max_distance):
+            # The cutoff could not be checked; keep the hit and say why.
+            entry["fallback_reason"] = "distance_unavailable"
+        bm25_extra.append(entry)
 
     def _dedup_key(entry: dict):
         full = entry.get("_source_file_full")

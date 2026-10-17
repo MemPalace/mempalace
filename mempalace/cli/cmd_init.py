@@ -14,10 +14,16 @@ def cmd_init(args):
     # flag and always used ~/.mempalace. Mirror the env-var pattern used by
     # mcp_server.py so every downstream read of ``cfg.palace_path`` (Pass 0,
     # cfg.init(), the post-init mine) routes to the user-specified location.
+    explicit_palace = None
     if getattr(args, "palace", None):
-        os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(os.path.expanduser(args.palace))
+        explicit_palace = os.path.abspath(os.path.expanduser(args.palace))
+        os.environ["MEMPALACE_PALACE_PATH"] = explicit_palace
 
     cfg = MempalaceConfig()
+    # Before any setter below writes the file, so a new config.json records
+    # --palace too. Only explicit choices are written: a MEMPALACE_PALACE_PATH
+    # set in the shell keeps applying from the environment, not frozen here.
+    cfg.init(palace_path=explicit_palace)
 
     # Resolve entity-detection languages: --lang overrides config.
     lang_arg = getattr(args, "lang", None)
@@ -75,28 +81,29 @@ def cmd_init(args):
                     # shell env). Explicit --llm-api-key (api_key_source ==
                     # "flag") means the user already opted in.
                     # --accept-external-llm bypasses for CI / non-interactive.
+                    from ..llm_client import require_external_consent
+
                     api_key_source = getattr(candidate, "api_key_source", None)
                     accept_flag = getattr(args, "accept_external_llm", False)
                     if api_key_source == "env" and not accept_flag:
-                        try:
-                            answer = (
-                                input(
-                                    "  Your API key was loaded from the environment "
-                                    "(not passed via --llm-api-key). Continue with "
-                                    "external LLM? [y/N] "
-                                )
-                                .strip()
-                                .lower()
-                            )
-                        except EOFError:
-                            answer = ""
-                        if answer != "y":
+                        allowed = require_external_consent(
+                            candidate,
+                            interactive=True,
+                            prompt=(
+                                "  Your API key was loaded from the environment "
+                                "(not passed via --llm-api-key). Continue with "
+                                "external LLM? [y/N] "
+                            ),
+                        )
+                        if not allowed:
                             print(
                                 "  Declined — falling back to heuristics-only. "
                                 "Pass --llm-api-key explicitly or "
                                 "--accept-external-llm to skip this prompt."
                             )
                             llm_provider = None
+                    else:
+                        require_external_consent(candidate, accept=True)
             else:
                 print(
                     f"  No LLM provider reachable ({msg}). "
@@ -143,8 +150,10 @@ def cmd_init(args):
         # separately so the miner can later compute cross-wing tunnels
         # from shared topics (see palace_graph.compute_topic_tunnels).
         if confirmed["people"] or confirmed["projects"] or confirmed.get("topics"):
+            from ..project_config import ENTITIES_FILENAME
+
             project_path = Path(args.dir).expanduser().resolve()
-            entities_path = project_path / "entities.json"
+            entities_path = project_path / ENTITIES_FILENAME
             # Opening a pre-existing FIFO for writing blocks in the kernel
             # until a reader appears. Only a regular file is a valid target
             # for the per-project audit trail; the global registry merge
@@ -152,6 +161,14 @@ def cmd_init(args):
             if entities_path.exists() and not entities_path.is_file():
                 print(
                     f"  ! Not writing entities: {entities_path} is not a regular file",
+                    file=sys.stderr,
+                )
+            elif _is_dialect_entity_config(entities_path):
+                # Same name as the AAAK entity codes ``mempalace compress``
+                # reads; those are the user's own, so they are not replaced.
+                print(
+                    f"  ! Not writing entities: {entities_path} holds AAAK entity "
+                    "codes for `mempalace compress`",
                     file=sys.stderr,
                 )
             else:
@@ -184,7 +201,6 @@ def cmd_init(args):
         # message beats the traceback this used to produce.
         print(f"\n  ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
-    cfg.init()
     backend = _backend_arg(args)
     if backend:
         cfg.set_backend(backend)
@@ -198,6 +214,18 @@ def cmd_init(args):
     # `--auto-mine` skips the prompt and mines automatically; `--yes` is
     # SCOPED to entity auto-accept and does NOT imply mining.
     _maybe_run_mine_after_init(args, cfg)
+
+
+def _is_dialect_entity_config(path) -> bool:
+    """True when ``path`` is an AAAK config (``{"entities": {...}}``), not
+    the people/projects record ``mempalace init`` writes."""
+    import json
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and "entities" in data and "people" not in data
 
 
 def _format_size_mb(num_bytes: int) -> str:

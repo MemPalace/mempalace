@@ -3,21 +3,6 @@ if __name__ != "mempalace.searcher":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.searcher")
 
 
-def _first_or_empty(results, key: str) -> list:
-    """Return the first inner list of a query result field, or [].
-
-    Accepts both the typed :class:`QueryResult` (attribute access) and the
-    pre-typed chroma dict shape; this polymorphism is retained so test mocks
-    still work and callers mid-migration do not crash. Preserves the empty-
-    collection semantics from issue #195: when no queries returned hits, the
-    outer list may be empty and indexing ``[0]`` would raise.
-    """
-    outer = getattr(results, key, None) if not isinstance(results, dict) else results.get(key)
-    if not outer:
-        return []
-    return outer[0] or []
-
-
 def _aligned_query_ids(results, document_count: int) -> list:
     """Return query IDs padded to match the document result column.
 
@@ -198,69 +183,24 @@ def _bm25_scores(
     return scores
 
 
-def _distance_to_similarity(distance, metric: str = "cosine") -> float:
-    """Map a backend-reported ``distance`` to a [0, 1]-ish similarity.
-
-    The backend contract for the ``distances`` field is *lower = closer*
-    regardless of metric (RFC 001, backend metric declaration), so every
-    mapping here is monotonic decreasing in ``distance``. The output stays
-    bounded so it is
-    commensurable with the min-max-normalized BM25 term in
-    :func:`_hybrid_rank`.
-
-    * ``cosine`` — distance ∈ [0, 2], 0 = identical: ``max(0, 1 - d)``.
-    * ``l2`` — Euclidean ∈ [0, ∞): ``1 / (1 + d)`` (1 at d=0, →0 as d→∞).
-    * ``ip`` — inner-product distance (e.g. pgvector ``<#>`` = -dot, lower =
-      closer), unbounded and signed: logistic squash ``1 / (1 + e^d)``.
-      Provisional until a real ip backend exercises it; no in-tree backend
-      uses ip today.
-
-    ``distance is None`` (vector-unknown, e.g. a BM25-only candidate) maps to
-    0.0 so the candidate scores on its BM25 contribution alone.
-    """
-    if distance is None:
-        return 0.0
-    m = (metric or "cosine").lower()
-    if m == "l2":
-        return 1.0 / (1.0 + max(0.0, distance))
-    if m == "ip":
-        # Clamp the exponent so a large positive distance can't overflow.
-        return 1.0 / (1.0 + math.exp(min(60.0, distance)))
-    # cosine (default)
-    return max(0.0, 1.0 - distance)
-
-
-def _metric_for_collection(col) -> str:
-    """Resolve a collection's declared distance metric, defaulting to cosine.
-
-    Reads the ``distance_metric`` exposed by the backend collection (the
-    RFC 001 backend metric declaration). ``EmbeddingCollection`` delegates the
-    attribute to its inner collection; legacy Chroma palaces report their
-    actual ``hnsw:space``.
-    Any failure falls back to ``"cosine"`` — the value all in-tree backends
-    use and the only metric MemPalace created palaces with historically.
-    """
-    try:
-        metric = getattr(col, "distance_metric", "cosine")
-    except Exception:
-        return "cosine"
-    metric = str(metric or "cosine").lower()
-    return metric if metric in ("cosine", "l2", "ip") else "cosine"
-
-
 def _vector_distance(
     query_vector: list[float], candidate_vector: list[float], metric: str
 ) -> float:
-    """Return a backend-style distance between two already-normalized vectors."""
+    """Return the distance Chroma's own query reports for ``metric``.
+
+    Chroma's ``l2`` space reports squared Euclidean distance and its ``ip``
+    space reports ``1 - dot``, so a recomputed candidate ranks and filters on
+    the same scale as a queried one.
+    """
     if not query_vector or not candidate_vector or len(query_vector) != len(candidate_vector):
         raise ValueError("embedding dimensions do not match")
 
     if metric == "l2":
-        return math.sqrt(sum((a - b) ** 2 for a, b in zip(query_vector, candidate_vector)))
+        return sum((a - b) ** 2 for a, b in zip(query_vector, candidate_vector))
 
     dot = sum(a * b for a, b in zip(query_vector, candidate_vector))
     if metric == "ip":
-        return -dot
+        return 1.0 - dot
 
     q_norm = math.sqrt(sum(a * a for a in query_vector))
     c_norm = math.sqrt(sum(b * b for b in candidate_vector))
@@ -278,7 +218,7 @@ def _lexical_hit_vector_distances(drawers_col, query: str, lexical_hits: list, m
     try:
         from ..backends.embedding_wrapper import _embed_texts
 
-        query_vector = _embed_texts([query])[0]
+        query_vector = _embed_texts([query], query=True)[0]
         stored = drawers_col.get(ids=ids, include=["embeddings"])
     except Exception:
         logger.debug(
@@ -325,6 +265,10 @@ def _hybrid_rank(
       themselves. Since the absolute scale is unbounded, BM25 is min-max
       normalized within the candidate set so weights are commensurable.
 
+    * A candidate with a ``closet_boost`` is scored from its boosted
+      distance (cosine scale, taken back to ``metric``'s scale), the distance
+      the vector pass ranked it by, so re-scoring doesn't drop the boost.
+
     Candidates with ``distance=None`` are treated as vector-unknown
     (no vector signal available) and scored on BM25 contribution alone.
     Used by candidate-union mode to merge BM25-only candidates that the
@@ -343,18 +287,26 @@ def _hybrid_rank(
 
     scored = []
     for r, raw, norm in zip(results, bm25_raw, bm25_norm):
-        vec_sim = _distance_to_similarity(r.get("distance"), metric)
+        distance = r.get("distance")
+        boost = r.get("closet_boost") or 0.0
+        if boost and distance is not None:
+            boosted = _boosted_cosine_distance(distance, boost, metric)
+            distance = _metric_scale_distance(boosted, metric)
+        vec_sim = _distance_to_similarity(distance, metric)
         r["bm25_score"] = round(raw, 3)
         scored.append((vector_weight * vec_sim + bm25_weight * norm, r))
 
-    # Break exact score ties toward the more recently authored drawer so equal-score
-    # candidates rank chronologically instead of in arbitrary backend order. ISO-8601
-    # ``authored_at`` strings sort chronologically; missing dates sort oldest.
+    # Break exact score ties by raw vector distance first: boosted drawers closer
+    # than their boost all clamp to the same score and must keep vector order.
+    # Then toward the more recently authored drawer, so equal-score candidates rank
+    # chronologically instead of in arbitrary backend order. ISO-8601 ``authored_at``
+    # strings sort chronologically; missing dates and distances sort last.
     # authored_at lives at the top level on the search_memories path and nested under
     # "metadata" on the candidate-union path; check both so the tie-break works for each.
     scored.sort(
         key=lambda pair: (
             pair[0],
+            -pair[1]["distance"] if pair[1].get("distance") is not None else -math.inf,
             pair[1].get("authored_at") or pair[1].get("metadata", {}).get("authored_at") or "",
         ),
         reverse=True,

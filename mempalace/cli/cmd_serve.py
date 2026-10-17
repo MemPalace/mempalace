@@ -212,7 +212,7 @@ def cmd_serve(args):
 def cmd_compress(args):
     """Compress drawers in a wing using AAAK Dialect."""
     from ..dialect import Dialect
-    from ..palace import get_closets_collection
+    from ..palace import AAAK_COLLECTION_NAME, get_aaak_collection, move_aaak_out_of_closets
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
 
@@ -311,21 +311,28 @@ def cmd_compress(args):
     # Store compressed versions (unless dry-run)
     if not args.dry_run:
         try:
-            # Route through palace.get_closets_collection so the shared
-            # _DEFAULT_BACKEND is reused (avoids a redundant ChromaBackend
-            # instance and its potential WAL-lock contention on Windows).
-            comp_col = get_closets_collection(palace_path, create=True)
-            for doc_id, compressed, meta, stats in compressed_entries:
-                comp_meta = dict(meta)
-                comp_meta["compression_ratio"] = round(stats["size_ratio"], 1)
-                comp_meta["original_tokens"] = stats["original_tokens_est"]
+            moved = move_aaak_out_of_closets(palace_path)
+            if moved:
+                print(f"  Moved {moved} older AAAK rows out of the closets collection.")
+            comp_col = get_aaak_collection(palace_path, create=True)
+            for start in range(0, len(compressed_entries), _BATCH):
+                batch = compressed_entries[start : start + _BATCH]
                 comp_col.upsert(
-                    ids=[doc_id],
-                    documents=[compressed],
-                    metadatas=[comp_meta],
+                    ids=[doc_id for doc_id, _, _, _ in batch],
+                    documents=[compressed for _, compressed, _, _ in batch],
+                    metadatas=[
+                        {
+                            **meta,
+                            "kind": "aaak",
+                            "compression_ratio": round(stats["size_ratio"], 1),
+                            "original_tokens": stats["original_tokens_est"],
+                        }
+                        for _, _, meta, stats in batch
+                    ],
                 )
             print(
-                f"  Stored {len(compressed_entries)} compressed drawers in 'mempalace_closets' collection."
+                f"  Stored {len(compressed_entries)} compressed drawers in "
+                f"'{AAAK_COLLECTION_NAME}' collection."
             )
         except Exception as e:
             print(f"  Error storing compressed drawers: {e}")

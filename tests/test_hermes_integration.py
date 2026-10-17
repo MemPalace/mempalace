@@ -356,9 +356,8 @@ def test_shutdown_drains_running_worker(provider):
 # ---------------------------------------------------------------------------
 # End-to-end integration: real palace via mempalace's own fixtures.
 #
-# These exercise the ChromaBackend code path that fixes the dim-mismatch bug
-# from prior in-tree Hermes PRs, and run the tool handlers against the
-# `seeded_collection` / `seeded_kg` fixtures from `tests/conftest.py`.
+# These open the palace through palace.get_collection and run the tool
+# handlers against the `seeded_collection` / `seeded_kg` fixtures.
 # ---------------------------------------------------------------------------
 
 
@@ -385,13 +384,11 @@ def _collection_snapshot(provider):
         return col.get(include=["metadatas"]).get("metadatas") or []
 
 
-def test_initialize_opens_chroma_via_backend(initialized_provider):
-    """The dim-mismatch fix: collection access goes through ChromaBackend."""
-    from mempalace.backends.chroma import ChromaBackend
-
+def test_initialize_opens_configured_collection(initialized_provider):
+    """Open the palace through palace.get_collection, not a raw ChromaBackend."""
     assert initialized_provider._initialized is True
     assert initialized_provider._collection is not None
-    assert isinstance(initialized_provider._backend, ChromaBackend)
+    assert not hasattr(initialized_provider, "_backend")
 
 
 def test_get_tool_schemas_returns_full_surface_after_initialize(initialized_provider):
@@ -466,8 +463,7 @@ def provider_on_seeded_palace(seeded_collection, provider, palace_path, tmp_dir)
     """Provider pointed at the same palace_path that ``seeded_collection`` filled.
 
     ``seeded_collection`` writes 4 drawers via raw ``chromadb.PersistentClient``;
-    we then have the provider open the same path via ``ChromaBackend`` — the
-    fact that this round-trips at all is the dim-mismatch regression check.
+    the provider then opens the same path through ``palace.get_collection``.
     """
     (Path(tmp_dir) / "mempalace.json").write_text(json.dumps({"palace_path": palace_path}))
     provider.initialize("s1", hermes_home=str(tmp_dir))
@@ -618,6 +614,147 @@ def test_diary_write_read_roundtrip(initialized_provider):
 def test_diary_read_empty_when_no_writes(initialized_provider):
     result = json.loads(initialized_provider.handle_tool_call("mempalace_diary_read", {}))
     assert result["entries"] == []
+
+
+def test_diary_write_files_a_drawer(initialized_provider):
+    text = "verbatim diary line for the drawer test"
+    write = json.loads(
+        initialized_provider.handle_tool_call("mempalace_diary_write", {"entry": text})
+    )
+    assert write["status"] == "ok"
+    assert write["success"] is True
+
+    read = json.loads(initialized_provider.handle_tool_call("mempalace_diary_read", {"n": 5}))
+    assert any(
+        item.get("entry") == text and item.get("source") == "drawer" for item in read["entries"]
+    )
+
+
+def _write_legacy_diary(provider, entries):
+    legacy = Path(provider._palace_path).parent / "diary.jsonl"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(
+        "".join(
+            json.dumps({"ts": f"2020-01-01T00:00:{i:02d}+00:00", "entry": e}) + "\n"
+            for i, e in enumerate(entries)
+        ),
+        encoding="utf-8",
+    )
+    return legacy
+
+
+def test_diary_read_keeps_the_newest_entries_beside_a_legacy_jsonl(initialized_provider):
+    _write_legacy_diary(initialized_provider, [f"old {i}" for i in range(12)])
+    for i in range(3):
+        initialized_provider.handle_tool_call("mempalace_diary_write", {"entry": f"new {i}"})
+
+    read = json.loads(initialized_provider.handle_tool_call("mempalace_diary_read", {"n": 5}))
+
+    assert [item["entry"] for item in read["entries"]] == [
+        "old 10",
+        "old 11",
+        "new 0",
+        "new 1",
+        "new 2",
+    ]
+    assert [item["source"] for item in read["entries"]][-3:] == ["drawer"] * 3
+
+
+def test_legacy_diary_import_runs_once_and_keeps_the_file(initialized_provider):
+    legacy = _write_legacy_diary(initialized_provider, ["legacy verbatim", "second line"])
+
+    first = json.loads(
+        initialized_provider.handle_tool_call(
+            "mempalace_diary_read", {"n": 10, "import_legacy": True}
+        )
+    )
+    second = json.loads(
+        initialized_provider.handle_tool_call(
+            "mempalace_diary_read", {"n": 10, "import_legacy": True}
+        )
+    )
+
+    assert first["imported"] == 2
+    assert second["imported"] == 0
+    assert not legacy.exists()
+    kept = legacy.with_name("diary.jsonl.imported")
+    assert "legacy verbatim" in kept.read_text(encoding="utf-8")
+    entries = [(item["entry"], item["source"]) for item in second["entries"]]
+    assert entries == [("legacy verbatim", "drawer"), ("second line", "drawer")]
+
+
+def test_legacy_diary_import_resumes_after_a_failed_write(initialized_provider, monkeypatch):
+    legacy = _write_legacy_diary(initialized_provider, ["one", "two", "three"])
+    real_write = initialized_provider._tool_diary_write
+    calls = []
+
+    def flaky(entry):
+        calls.append(entry)
+        if entry == "two" and calls.count("two") == 1:
+            return {"error": "diary write failed"}
+        return real_write(entry)
+
+    monkeypatch.setattr(initialized_provider, "_tool_diary_write", flaky)
+    assert initialized_provider._import_legacy_diary() == 1
+    assert legacy.exists()
+    assert initialized_provider._import_legacy_diary() == 2
+    assert calls == ["one", "two", "two", "three"]
+
+
+def test_file_turn_failure_warning_omits_verbatim(
+    provider, integration_module, monkeypatch, caplog
+):
+    import logging
+
+    secret = "user said the secret phrase"
+
+    def boom(*args, **kwargs):
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(integration_module, "file_conversation_exchange", boom)
+    provider._collection = object()
+    with caplog.at_level(logging.DEBUG, logger="mempalace.hermes"):
+        provider._file_turn({"user": secret, "assistant": "noted"})
+    assert provider._write_failures == 1
+    assert secret not in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+def test_file_turn_waits_out_a_held_palace_lock(provider, integration_module, monkeypatch):
+    from mempalace.palace import MineAlreadyRunning
+
+    filed = []
+
+    def busy_then_file(*args, **kwargs):
+        if len(filed) < 2:
+            filed.append("refused")
+            raise MineAlreadyRunning("mine in progress")
+        filed.append(kwargs["text"])
+
+    sleeps = []
+    monkeypatch.setattr(integration_module, "file_conversation_exchange", busy_then_file)
+    monkeypatch.setattr(integration_module.time, "sleep", sleeps.append)
+    provider._collection = object()
+    provider._file_turn({"user": "hello", "assistant": "hi"})
+    assert filed[:2] == ["refused", "refused"]
+    assert len(filed) == 3
+    assert sleeps == [1, 2]
+    assert provider._write_failures == 0
+
+
+def test_status_surfaces_write_failure_counter(provider):
+    class _Col:
+        def count(self):
+            return 1
+
+        def get(self, **kwargs):
+            return {"metadatas": [{"wing": "notes"}]}
+
+    provider._collection = _Col()
+    provider._palace_path = "/tmp/palace"
+    provider._write_failures = 4
+    assert provider._tool_status()["write_failures"] == 4
 
 
 # ----- Config-load path ---------------------------------------------------

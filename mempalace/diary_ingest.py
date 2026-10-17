@@ -31,6 +31,8 @@ from .palace import (
     get_closets_collection,
     get_collection,
     mine_lock,
+    open_aaak_collection,
+    purge_aaak_rows,
     purge_file_closets,
     upsert_closet_lines,
 )
@@ -82,6 +84,25 @@ def _diary_drawer_id_entry(wing: str, date_str: str, entry_idx: int, entry_chunk
     return f"drawer_diary_v2_{suffix}"
 
 
+def _purge_prior_drawers(drawers_col, aaak_col, source_file: str) -> None:
+    """Drop a rebuilt diary file's earlier drawers and their AAAK summaries."""
+    try:
+        drawers_col.delete(where={"source_file": source_file})
+    except Exception as exc:
+        # ChromaDB ``delete(where=...)`` against an empty collection
+        # returns silently rather than raising, so this catch only
+        # fires on real backend errors (locked DB, schema mismatch,
+        # transient I/O). Log at debug to preserve diagnostics
+        # without aborting the rebuild: the upsert below is the
+        # load-bearing write, and if it also fails the state file
+        # is left unchanged so the next pass retries cleanly.
+        logger.debug("legacy purge skipped for %s: %s", source_file, exc, exc_info=True)
+    try:
+        purge_aaak_rows(aaak_col, source_file=source_file)
+    except Exception:
+        logger.warning("AAAK purge failed for %s", source_file, exc_info=True)
+
+
 def _diary_closet_id_base(wing: str, date_str: str) -> str:
     suffix = hashlib.sha256(f"{wing}|{date_str}".encode()).hexdigest()[:24]
     return f"closet_diary_{suffix}"
@@ -121,6 +142,7 @@ def ingest_diaries(
 
     drawers_col = get_collection(palace_path)
     closets_col = get_closets_collection(palace_path)
+    aaak_col = open_aaak_collection(palace_path)
     chunk_size = MempalaceConfig().chunk_size
 
     days_updated = 0
@@ -192,29 +214,13 @@ def ingest_diaries(
             # deletion would otherwise leave trailing orphan drawers), and
             # (c) in-place edits that shift content across entry boundaries.
             if full_rebuild:
-                try:
-                    drawers_col.delete(where={"source_file": source_file})
-                except Exception as exc:
-                    # ChromaDB ``delete(where=...)`` against an empty collection
-                    # returns silently rather than raising, so this catch only
-                    # fires on real backend errors (locked DB, schema mismatch,
-                    # transient I/O). Log at debug to preserve diagnostics
-                    # without aborting the rebuild: the upsert below is the
-                    # load-bearing write, and if it also fails the state file
-                    # is left unchanged so the next pass retries cleanly.
-                    logger.debug(
-                        "legacy purge skipped for %s: %s",
-                        source_file,
-                        exc,
-                        exc_info=True,
-                    )
+                _purge_prior_drawers(drawers_col, aaak_col, source_file)
 
             # Per-entry drawers, with character chunking inside any entry
             # whose serialized text exceeds chunk_size. ``chunk_index`` is
-            # a global counter across the file so the searcher's
-            # ``_expand_with_neighbors`` (which queries by source_file +
-            # chunk_index) can stitch sibling chunks back together
-            # regardless of entry boundary. ``entry_index`` and
+            # a global counter across the file so the searcher's closet
+            # enrichment (which orders a source's chunks by chunk_index) can
+            # show sibling chunks as context regardless of entry boundary. ``entry_index`` and
             # ``entry_chunk_index`` are preserved for entry-grouping
             # consumers.
             #
@@ -274,9 +280,8 @@ def ingest_diaries(
                     entry_idx = offset if full_rebuild else prev_entry_count + offset
                     entry_text = f"{header}\n{body}" if body else header
                     # Closet references the canonical (entry_chunk_idx=0)
-                    # drawer for the entry. Searcher._expand_with_neighbors
-                    # stitches sibling chunks back via the
-                    # (source_file, chunk_index) pair.
+                    # drawer for the entry. Search enrichment finds sibling
+                    # chunks via the (source_file, chunk_index) pair.
                     entry_drawer_id = _diary_drawer_id_entry(wing, date_str, entry_idx, 0)
                     entry_lines = build_closet_lines(
                         source_file, [entry_drawer_id], entry_text, wing, "daily"

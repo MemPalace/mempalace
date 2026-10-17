@@ -238,7 +238,7 @@ Adapters MAY define their own transformation names for behaviors the reserved li
 | Module | Declared transformations |
 |---|---|
 | `filesystem` (current `miner.py`) | `utf8_replace_invalid`, `whitespace_trim` |
-| `conversations` (current `convo_miner.py` + `normalize.py`) | `utf8_replace_invalid`, `newline_normalize`, `line_trim`, `line_join_spaces`, `blank_line_drop`, `whitespace_collapse_internal`, `strip_tool_chrome`, `tool_result_truncate`, `tool_result_omitted`, `spellcheck_user`, `synthesized_marker`, `speaker_role_assignment` |
+| `conversations` (current `convo_miner.py` + `normalize.py`) | `utf8_replace_invalid`, `newline_normalize`, `line_trim`, `line_join_spaces`, `blank_line_drop`, `whitespace_collapse_internal`, `strip_tool_chrome`, `tool_result_truncate`, `tool_result_omitted`, `spellcheck_user`, `synthesized_marker`, `speaker_role_assignment`, `conversations.tool_input_summarize`, `conversations.content_block_drop` |
 
 The filesystem adapter is nearly byte-preserving today; the conversations adapter is extensively transformed. Both are honest after this spec lands because both are fully declared.
 

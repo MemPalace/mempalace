@@ -67,7 +67,7 @@ class TestReadTools:
         monkeypatch.setattr(
             embedding_wrapper,
             "_embed_texts",
-            lambda texts: [[float(len(text)), 1.0] for text in texts],
+            lambda texts, **_kwargs: [[float(len(text)), 1.0] for text in texts],
         )
         col = get_collection(palace_path, create=True)
         col.add(
@@ -100,7 +100,7 @@ class TestReadTools:
         monkeypatch.setattr(
             embedding_wrapper,
             "_embed_texts",
-            lambda texts: [[float(len(text)), 1.0] for text in texts],
+            lambda texts, **_kwargs: [[float(len(text)), 1.0] for text in texts],
         )
         col = palace.get_collection(palace_path, create=True)
         col.add(
@@ -159,7 +159,7 @@ class TestReadTools:
         monkeypatch.setattr(
             embedding_wrapper,
             "_embed_texts",
-            lambda texts: [[float(len(text)), 1.0] for text in texts],
+            lambda texts, **_kwargs: [[float(len(text)), 1.0] for text in texts],
         )
         col = palace.get_collection(palace_path, create=True)
         col.add(
@@ -261,7 +261,7 @@ with mine_palace_lock(sys.argv[1]):
         monkeypatch.setattr(
             embedding_wrapper,
             "_embed_texts",
-            lambda texts: [[float(len(text)), 1.0] for text in texts],
+            lambda texts, **_kwargs: [[float(len(text)), 1.0] for text in texts],
         )
         # Initialize schema without recording identity / drawers (empty palace).
         col = palace.get_collection(palace_path, create=True, _skip_identity_check=True)
@@ -312,8 +312,9 @@ with mine_palace_lock(sys.argv[1]):
             # Force a peer-writer-coexistence read (opens query_only handle).
             result = mcp_server.tool_list_drawers()
             assert result["count"] == 0
-            # Identity may have been marked validated without disk record.
-            assert any(key[0] == palace_path for key in palace._VALIDATED_IDENTITY)
+            # A read open of an empty, unrecorded collection records nothing,
+            # so it is not cached as validated either.
+            assert not any(key[0] == palace_path for key in palace._VALIDATED_IDENTITY)
 
             assert holder.stdin is not None
             holder.stdin.close()
@@ -634,9 +635,13 @@ with mine_palace_lock(sys.argv[1]):
 
         scans = [s for s in statements if "FROM embeddings" in s and "ORDER BY e.id" in s]
         assert scans, f"no listing scan observed in {statements}"
-        scan = scans[0]
-        # Documents are excluded from the scan and the filter is pushed down.
-        assert "chroma:document" in scan and "!=" in scan
+        # Initialization can also scan metadata without a wing filter. Locate
+        # the filtered listing query, then verify that it excludes the entire
+        # reserved namespace (which includes chroma:document).
+        filtered_scans = [s for s in scans if "f0.string_value" in s]
+        assert filtered_scans, f"listing did not push its filter into SQL: {scans}"
+        scan = filtered_scans[0]
+        assert "substr(m.key, 1, 7) != 'chroma:'" in scan
         assert scan.count("JOIN embedding_metadata") >= 2, scan
         assert "string_value = " in scan or "string_value = ?" in scan
 
@@ -1268,3 +1273,32 @@ class TestFetchDrawerRowsDelegation:
         assert ids == ["a"]
         assert documents == ["doc a"]
         assert metadatas == [{"wing": "w"}]
+
+
+def test_follow_tunnels_records_without_the_writer_lease(monkeypatch):
+    """Recording takes the tunnel file's own lock, so a session that holds no
+    writer lease (never tried a mutation, or lost it to a peer) still records."""
+    from mempalace import mcp_server
+
+    captured = {}
+
+    def _fake_follow(wing, room, col=None, record=True):
+        captured["record"] = record
+        return [{"tunnel_id": "t1"}]
+
+    monkeypatch.setattr(mcp_server, "follow_tunnels", _fake_follow)
+    monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: object())
+    monkeypatch.setattr(mcp_server, "_READ_ONLY", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
+
+    for peer_holds_lease in (False, True):
+        monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", peer_holds_lease)
+        assert mcp_server.tool_follow_tunnels("wing_a", "room_a") == [{"tunnel_id": "t1"}]
+        assert captured["record"] is True
+
+    mcp_server.tool_follow_tunnels("wing_a", "room_a", record=False)
+    assert captured["record"] is False
+
+    monkeypatch.setattr(mcp_server, "_READ_ONLY", True)
+    mcp_server.tool_follow_tunnels("wing_a", "room_a", record=True)
+    assert captured["record"] is False

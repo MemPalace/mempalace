@@ -24,6 +24,8 @@ from .palace import (
     get_closets_collection,
     get_collection,
     mine_palace_lock,
+    open_aaak_collection,
+    purge_aaak_rows,
 )
 from .source_identity import directory_identity
 
@@ -962,6 +964,11 @@ def sync_palace(
             return report
 
         report["removed_drawers"] = _delete_in_batches(col, removable_ids, batch_size, wal_log)
+        try:
+            purge_aaak_rows(open_aaak_collection(palace_path), drawer_ids=removable_ids)
+        except Exception as exc:
+            # The drawers are already gone, so this is reported, not raised.
+            logger.warning("AAAK purge failed after a sync prune: %s", exc)
 
         closets_removed = 0
         try:

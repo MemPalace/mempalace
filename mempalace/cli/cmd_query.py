@@ -10,6 +10,11 @@ def cmd_search(args):
 
     from ..searcher import search, SearchError
 
+    experimental = {}
+    if getattr(args, "include_media", False):
+        experimental["include_media"] = True
+    if getattr(args, "query_task", "search") != "search":
+        experimental["query_task"] = args.query_task
     try:
         search(
             query=args.query,
@@ -19,6 +24,7 @@ def cmd_search(args):
             n_results=args.results,
             since=args.since,
             before=args.before,
+            **experimental,
         )
     except SearchError:
         sys.exit(1)

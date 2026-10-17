@@ -13,6 +13,9 @@ import json
 import os
 from typing import Optional
 
+from ..fsio import atomic_write_json as _atomic_write_json
+from ..fsio import read_json_for_update as _read_json_for_update
+
 EMBEDDER_SIDECAR_FILENAME = "mempalace_embedder.json"
 
 
@@ -46,26 +49,49 @@ def write_embedder_sidecar(path: Optional[str], collection_name: Optional[str], 
     """Record ``identity`` for ``collection_name`` in the sidecar, creating it if needed.
 
     No-ops for a missing path, missing collection name, or a nameless identity.
-    Preserves other collections' entries; never raises on I/O failure.
+    Preserves other collections' entries. Creates the palace directory when it
+    does not exist yet: qdrant and pgvector record a new palace's identity on
+    its first open, before their first upsert creates the folder, and the
+    write used to fail there silently, leaving the palace unrecorded for good.
+
+    The file is replaced atomically, so a failed write keeps the previous
+    one, and a failure raises
+    :class:`~mempalace.backends.base.EmbedderIdentityRecordError` instead of
+    passing silently. Only write paths record an identity, so read-only opens
+    are unaffected.
     """
     if not path or not collection_name or not identity or not getattr(identity, "model_name", ""):
         return
-    data: dict = {}
-    if os.path.isfile(path):
+    directory = os.path.dirname(path) or "."
+    if not os.path.isdir(directory):
         try:
-            with open(path, encoding="utf-8") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict):
-                data = loaded
-        except (OSError, json.JSONDecodeError):
-            data = {}
-    data[collection_name] = {
-        "model_name": str(identity.model_name),
-        "dimension": int(identity.dimension or 0),
-    }
+            os.makedirs(directory, exist_ok=True)
+        except OSError as exc:
+            raise _record_error(path, collection_name, exc) from exc
+        try:
+            os.chmod(directory, 0o700)
+        except (OSError, NotImplementedError):
+            pass
+    from ..palace import mine_lock
+
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        os.chmod(path, 0o600)
-    except (OSError, NotImplementedError):
-        pass
+        with mine_lock(path):
+            # A sidecar that does not parse is moved aside and the write refused.
+            data = dict(_read_json_for_update(path, expect=dict) or {})
+            data[collection_name] = {
+                "model_name": str(identity.model_name),
+                "dimension": int(identity.dimension or 0),
+            }
+            _atomic_write_json(path, data)
+    except (OSError, NotImplementedError, TypeError, ValueError) as exc:
+        raise _record_error(path, collection_name, exc) from exc
+
+
+def _record_error(path: str, collection_name: str, exc: BaseException):
+    from .base import EmbedderIdentityRecordError
+
+    return EmbedderIdentityRecordError(
+        f"could not record the embedder identity of collection {collection_name!r} "
+        f"in {path}: {type(exc).__name__}: {exc}. Without it a later model swap "
+        "would not be detected; check that the palace directory is writable and retry."
+    )

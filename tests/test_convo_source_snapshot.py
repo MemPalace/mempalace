@@ -8,6 +8,8 @@ from mempalace import convo_miner
 from mempalace import normalize as normalize_module
 from mempalace._source_state import source_fingerprint
 from mempalace.palace import (
+    CHUNKER_VERSIONS,
+    MinedSetUnavailable,
     CONVO_CHUNKER_VERSION,
     NORMALIZE_VERSION,
     file_already_mined,
@@ -41,7 +43,7 @@ def test_append_after_read_is_recovered_on_next_mine(tmp_path, monkeypatch, init
     source.write_text(initial, encoding="utf-8")
     original_stat = source.stat()
     palace = tmp_path / "palace"
-    original_normalize = convo_miner.normalize_conversations
+    original_normalize = convo_miner.normalize_conversations_with_mtime
     appended = False
 
     def normalize_then_append(filepath, *args, **kwargs):
@@ -57,7 +59,7 @@ def test_append_after_read_is_recovered_on_next_mine(tmp_path, monkeypatch, init
         return result
 
     with monkeypatch.context() as race:
-        race.setattr(convo_miner, "normalize_conversations", normalize_then_append)
+        race.setattr(convo_miner, "normalize_conversations_with_mtime", normalize_then_append)
         _mine(source, palace)
 
     assert appended, "the source append was not interleaved after normalization"
@@ -239,7 +241,7 @@ def test_legacy_mtime_only_rows_upgrade_once_then_skip(tmp_path, monkeypatch):
     assert all("source_fingerprint" not in meta for meta in legacy_rows["metadatas"])
     assert all("source_mtime" in meta for meta in legacy_rows["metadatas"])
 
-    original_normalize = convo_miner.normalize_conversations
+    original_normalize = convo_miner.normalize_conversations_with_mtime
     normalizations = 0
 
     def counted_normalize(*args, **kwargs):
@@ -247,7 +249,7 @@ def test_legacy_mtime_only_rows_upgrade_once_then_skip(tmp_path, monkeypatch):
         normalizations += 1
         return original_normalize(*args, **kwargs)
 
-    monkeypatch.setattr(convo_miner, "normalize_conversations", counted_normalize)
+    monkeypatch.setattr(convo_miner, "normalize_conversations_with_mtime", counted_normalize)
     _mine(source, palace)
     assert normalizations == 1, "legacy mtime-only rows must be verified once"
     upgraded = get_collection(str(palace)).get(include=["metadatas"])
@@ -292,6 +294,7 @@ def test_scoped_prefetch_preserves_fingerprints_and_legacy_metadata(collection, 
                 "source_file": str(source),
                 "extract_mode": "general",
                 "source_fingerprint": "other-mode-snapshot",
+                CHUNKER_VERSIONS["general"][0]: CHUNKER_VERSIONS["general"][1],
             },
             {**common, "source_file": "sweep.txt", "ingest_mode": "sweep"},
             {**common, "source_file": "outside.txt", "extract_mode": "exchange"},
@@ -514,13 +517,13 @@ def test_large_sweep_skips_verified_sources_and_recovers_one_append(tmp_path, mo
     _mine(source_dir, palace)
     before = _rows(palace)
     normalized = []
-    original_normalize = convo_miner.normalize_conversations
+    original_normalize = convo_miner.normalize_conversations_with_mtime
 
     def counted_normalize(filepath, **kwargs):
         normalized.append(filepath)
         return original_normalize(filepath, **kwargs)
 
-    monkeypatch.setattr(convo_miner, "normalize_conversations", counted_normalize)
+    monkeypatch.setattr(convo_miner, "normalize_conversations_with_mtime", counted_normalize)
     _mine(source_dir, palace)
     assert normalized == [], "an unchanged bulk sweep must not re-normalize verified files"
     assert _rows(palace) == before
@@ -621,7 +624,7 @@ def test_inplace_rewrite_with_same_size_and_restored_mtime_is_remined(tmp_path, 
     def unexpected_normalization(*args, **kwargs):
         pytest.fail("a stable source was normalized again after a read-only access")
 
-    monkeypatch.setattr(convo_miner, "normalize_conversations", unexpected_normalization)
+    monkeypatch.setattr(convo_miner, "normalize_conversations_with_mtime", unexpected_normalization)
     _mine(source, palace)
 
 
@@ -704,3 +707,69 @@ def test_restored_mtime_rewrite_during_read_preserves_prior_drawers(tmp_path, mo
     docs = [document for document, _ in _rows(palace).values()]
     assert any("DECISION_NEW" in doc for doc in docs)
     assert not any("DECISION_OLD" in doc for doc in docs)
+
+
+@pytest.mark.parametrize("scoped", [False, True], ids=["full", "scoped"])
+@pytest.mark.parametrize("totals", [(1, 3), (3, 1), (1, "bad")])
+def test_snapshot_checks_read_all_rows_before_trusting_completion(tmp_path, totals, scoped):
+    """Fingerprint grouping must retain upstream's whole-scan completeness rule."""
+    source = tmp_path / "session.txt"
+    source.write_text(_INITIAL, encoding="utf-8")
+    fingerprint = source_fingerprint(source.stat())
+    collection = get_collection(str(tmp_path / "palace"))
+    common = {
+        "source_file": str(source),
+        "source_mtime": source.stat().st_mtime,
+        "source_fingerprint": fingerprint,
+        "normalize_version": NORMALIZE_VERSION,
+        "convo_chunker_version": CONVO_CHUNKER_VERSION,
+        "extract_mode": "exchange",
+    }
+    collection.add(
+        ids=["first", "second"],
+        documents=["first exchange", "second exchange"],
+        metadatas=[{**common, "chunk_total": total} for total in totals],
+    )
+    assert (
+        prefetch_mined_set(
+            collection,
+            extract_mode="exchange",
+            source_files=[str(source)] if scoped else None,
+            source_fingerprints=True,
+        )
+        == {}
+    )
+    assert not file_already_mined(
+        collection, str(source), extract_mode="exchange", check_source_fingerprint=True
+    )
+
+
+def test_snapshot_read_failure_aborts_instead_of_returning_a_partial_registry(tmp_path):
+    """Even a current first page cannot hide a backend error on a later page."""
+    source = tmp_path / "session.txt"
+    source.write_text(_INITIAL, encoding="utf-8")
+    meta = {
+        "source_file": str(source),
+        "source_mtime": source.stat().st_mtime,
+        "source_fingerprint": source_fingerprint(source.stat()),
+        "normalize_version": NORMALIZE_VERSION,
+        "convo_chunker_version": CONVO_CHUNKER_VERSION,
+        "extract_mode": "exchange",
+        "chunk_total": 1,
+    }
+
+    class BrokenLaterPage:
+        def count(self):
+            return 1001
+
+        def get(self, **kwargs):
+            if kwargs.get("offset", 0):
+                raise RuntimeError("injected later-page backend failure")
+            return {"ids": [f"row-{i}" for i in range(1000)], "metadatas": [meta] * 1000}
+
+    with pytest.raises(MinedSetUnavailable):
+        file_already_mined(
+            BrokenLaterPage(), str(source), extract_mode="exchange", check_source_fingerprint=True
+        )
+    with pytest.raises(MinedSetUnavailable):
+        prefetch_mined_set(BrokenLaterPage(), extract_mode="exchange", source_fingerprints=True)

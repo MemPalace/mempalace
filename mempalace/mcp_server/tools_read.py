@@ -56,7 +56,7 @@ def _tool_status_via_sqlite() -> dict:
                     """,
                     (collection_name, key),
                 ):
-                    target[value] = count
+                    target[decode_value(value)] = count
         finally:
             conn.close()
     except _sqlite3.Error:
@@ -324,6 +324,7 @@ def tool_status():
             "protocol": PALACE_PROTOCOL,
             "aaak_dialect": AAAK_SPEC,
             "backend": _selected_backend_name(),
+            "embedding_device": _describe_device_safe(),
         }
 
     # Use create=True only when a palace DB already exists on disk -- this
@@ -342,6 +343,7 @@ def tool_status():
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
         "backend": _selected_backend_name(),
+        "embedding_device": _describe_device_safe(),
     }
     try:
         if _supports_metadata_facets(col):
@@ -577,6 +579,11 @@ def tool_get_taxonomy():
     return result
 
 
+# The cosine distance ``min_similarity >= 1.0`` maps to: float error on an
+# identical vector stays below it.
+_EXACT_MATCH_DISTANCE = 1e-5
+
+
 def tool_search(
     query: str,
     limit: int = 5,
@@ -590,6 +597,8 @@ def tool_search(
     context: str = None,
     candidate_strategy: str = "vector",
     cli_compatible: bool = False,
+    include_media: bool = False,
+    query_task: str = "search",
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
@@ -603,6 +612,22 @@ def tool_search(
     candidate_strategy = candidate_strategy or "vector"
     if not isinstance(candidate_strategy, str) or candidate_strategy not in {"vector", "union"}:
         return {"error": "candidate_strategy must be one of ('vector', 'union')"}
+    if (
+        not isinstance(include_media, bool)
+        or not isinstance(query_task, str)
+        or query_task not in {"search", "code"}
+    ):
+        return {"error": "include_media must be boolean and query_task must be 'search' or 'code'"}
+    if cli_compatible and (include_media or query_task != "search"):
+        return {"error": "cli_compatible cannot be combined with media/code task search"}
+    experimental = {
+        name: value
+        for name, value, default in (
+            ("include_media", include_media, False),
+            ("query_task", query_task, "search"),
+        )
+        if value != default
+    }
     # Mitigate system prompt contamination (Issue #333)
     sanitized = sanitize_query(query)
     if cli_compatible:
@@ -649,7 +674,7 @@ def tool_search(
                             repeat_unknown_warning=True,
                         )
                     except (EmbedderIdentityMismatchError, DimensionMismatchError) as exc:
-                        return {"error": "Embedder identity mismatch", "details": str(exc)}
+                        return _model_mismatch_error(exc)
                 _, output = _capture_fd_stdout(
                     lambda: cli_search(
                         query=query,
@@ -670,10 +695,13 @@ def tool_search(
         return result
 
     # Backwards compat: convert old similarity scale (higher=stricter) to
-    # distance scale (lower=stricter). Similarity 0.8 → distance 0.2.
-    dist = (1.0 - min_similarity) if min_similarity is not None else max_distance
-    if dist is None:
-        dist = 1.5
+    # distance scale (lower=stricter). Similarity 0.8 → distance 0.2, and
+    # 1.0 or more means exact matches only, not "no cutoff".
+    # No cutoff unless the caller asks for one.
+    if min_similarity is not None:
+        dist = max(1.0 - min_similarity, _EXACT_MATCH_DISTANCE)
+    else:
+        dist = max_distance
 
     # Ensure the vector-disabled probe has been run via the safe
     # sqlite/pickle path before we touch chromadb. Calling _get_client()
@@ -693,6 +721,7 @@ def tool_search(
         vector_disabled=_vector_disabled,
         candidate_strategy=candidate_strategy,
         collection_name=_config.collection_name,
+        **experimental,
     )
     if _is_transient_index_error(result):
         # Post-bulk-write HNSW flush window (#1315): drop caches, give
@@ -714,6 +743,7 @@ def tool_search(
             vector_disabled=_vector_disabled,
             candidate_strategy=candidate_strategy,
             collection_name=_config.collection_name,
+            **experimental,
         )
         if not _is_transient_index_error(result):
             result["index_recovered"] = True
@@ -784,7 +814,10 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
             "is_duplicate": len(duplicates) > 0,
             "matches": duplicates,
         }
-    except Exception:
+    except Exception as e:
+        refused = _model_mismatch_error(e)
+        if refused is not None:
+            return refused
         logger.exception("check_duplicate failed")
         return {"error": "Duplicate check failed"}
 
@@ -940,7 +973,8 @@ def tool_follow_tunnels(wing: str, room: str, record: bool = True):
     recorded (``access_count`` / ``strength``). Internal callers that only
     decorate another result, such as the light server's search enrichment,
     pass ``record=False``: a search hit is not a crossing. A read-only
-    server or a peer without the writer lock never writes the tunnel file.
+    server never writes the tunnel file. Recording needs no writer lease:
+    it takes the tunnel file's own lock and never touches the vector store.
     """
     try:
         wing = sanitize_name(wing, "wing")
@@ -950,6 +984,4 @@ def tool_follow_tunnels(wing: str, room: str, record: bool = True):
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
-    return follow_tunnels(
-        wing, room, col=col, record=record and not (_READ_ONLY or _MCP_WRITER_READ_ONLY)
-    )
+    return follow_tunnels(wing, room, col=col, record=bool(record) and not _READ_ONLY)

@@ -3,6 +3,12 @@ if __name__ != "mempalace.mcp_server":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.mcp_server")
 
 
+# ``error`` of a collection that will not open after the retry. Like a model
+# error (``error_class`` in MODEL_ERROR_CLASS_NAMES), it refuses every call
+# until fixed, so protocol.py sets MCP's ``isError`` for both.
+BACKEND_OPEN_FAILED_ERROR = "Backend open failed"
+
+
 def _stat_palace_db() -> tuple:
     """Return ``(st_ino, st_mtime)`` of the palace's chroma.sqlite3, or ``(0, 0.0)``."""
     try:
@@ -283,6 +289,26 @@ def _get_collection(create=False):
                 _collection_cache_palace = None
                 _invalidate_overview_caches()
                 return None
+            except (UnknownEmbeddingModelError, EmbeddingFunctionUnavailableError) as exc:
+                _collection_open_error = _unknown_embedding_model_error(exc)
+                _collection_cache = None
+                _collection_cache_backend = None
+                _collection_cache_palace = None
+                _invalidate_overview_caches()
+                return None
+            except (
+                EmbedderIdentityMismatchError,
+                DimensionMismatchError,
+                EmbedderIdentityRecordError,
+            ) as exc:
+                # palace.get_collection's identity check: a different model
+                # built this palace. Retrying cannot help.
+                _collection_open_error = _model_mismatch_error(exc)
+                _collection_cache = None
+                _collection_cache_backend = None
+                _collection_cache_palace = None
+                _invalidate_overview_caches()
+                return None
             except Exception:
                 logger.exception(
                     "_get_collection generic attempt %d/2 failed (palace=%s, create=%s)",
@@ -295,7 +321,7 @@ def _get_collection(create=False):
                 _collection_cache_palace = None
                 _invalidate_overview_caches()
                 _collection_open_error = {
-                    "error": "Backend open failed",
+                    "error": BACKEND_OPEN_FAILED_ERROR,
                     "details": "Could not open the selected backend collection.",
                     "hint": "Run: mempalace status or mempalace repair-status for diagnostics.",
                 }
@@ -320,6 +346,11 @@ def _get_collection(create=False):
                 _collection_cache = None
                 _collection_cache_backend = None
                 _collection_cache_palace = None
+            if create or _collection_cache is None:
+                # Resolve the configured model before _get_client(): building
+                # the client creates the palace folder, and a misspelled model
+                # (UnknownEmbeddingModelError) must leave nothing behind.
+                _config.embedding_model
             client = _get_client()
             # ChromaDB 1.x persists the EF *identity* (its ``name()``) with the
             # collection but not the EF *instance/configuration*. So a reader or
@@ -338,8 +369,9 @@ def _get_collection(create=False):
             # zero-cost. Reuse the backend helper so the two call sites can't
             # drift on logging or fallback semantics.
             if create:
-                ef = ChromaBackend._resolve_embedding_function()
-                ef_kwargs = {"embedding_function": ef} if ef is not None else {}
+                # Raises EmbeddingFunctionUnavailableError rather than letting
+                # chromadb embed the write with its default function (S2).
+                ef_kwargs = {"embedding_function": ChromaBackend._resolve_embedding_function()}
                 # hnsw:num_threads=1 disables ChromaDB's multi-threaded ParallelFor
                 # HNSW insert path, which has a race in repairConnectionsForUpdate /
                 # addPoint (see issues #974, #965). Set via metadata on fresh
@@ -365,22 +397,20 @@ def _get_collection(create=False):
                         **ef_kwargs,
                     )
                 _pin_hnsw_threads(raw)
-                _collection_cache = ChromaCollection(
-                    raw, palace_path=_config.palace_path, backend=_SessionFreshness
-                )
+                _collection_cache = _checked_chroma_collection(raw, create=True)
                 _restamp_palace_db()
                 _collection_cache_backend = "chroma"
                 _collection_cache_palace = _config.palace_path
                 _collection_open_error = None
                 _invalidate_overview_caches()
             elif _collection_cache is None:
-                ef = ChromaBackend._resolve_embedding_function()
-                ef_kwargs = {"embedding_function": ef} if ef is not None else {}
+                # Reads that never embed keep working; an embed refuses.
+                ef_kwargs = {
+                    "embedding_function": ChromaBackend._resolve_embedding_function(read_only=True)
+                }
                 raw = client.get_collection(_config.collection_name, **ef_kwargs)
                 _pin_hnsw_threads(raw)
-                _collection_cache = ChromaCollection(
-                    raw, palace_path=_config.palace_path, backend=_SessionFreshness
-                )
+                _collection_cache = _checked_chroma_collection(raw, create=False)
                 _restamp_palace_db()
                 _collection_cache_backend = "chroma"
                 _collection_cache_palace = _config.palace_path
@@ -403,7 +433,42 @@ def _get_collection(create=False):
             _palace_db_mtime = 0.0
             _invalidate_overview_caches()
             return None
-        except Exception:
+        except (UnknownEmbeddingModelError, EmbeddingFunctionUnavailableError) as exc:
+            # Deterministic config error: retrying cannot help, and the
+            # generic "Backend open failed" would hide the fix.
+            _collection_open_error = _unknown_embedding_model_error(exc)
+            _client_cache = None
+            _collection_cache = None
+            _collection_cache_backend = None
+            _collection_cache_palace = None
+            _invalidate_overview_caches()
+            return None
+        except (
+            EmbedderIdentityMismatchError,
+            DimensionMismatchError,
+            EmbedderIdentityRecordError,
+        ) as exc:
+            # The palace records a different model than the configured one.
+            # Deterministic, like the error above: refuse without retrying and
+            # without caching the collection, so every call refuses.
+            _collection_open_error = _model_mismatch_error(exc)
+            _collection_cache = None
+            _collection_cache_backend = None
+            _collection_cache_palace = None
+            _invalidate_overview_caches()
+            return None
+        except Exception as exc:
+            explained = ChromaBackend._explain_ef_mismatch(exc, _config.palace_path)
+            if explained is not None:
+                # Chroma refused the configured embedding function by name.
+                _collection_open_error = _model_mismatch_error(
+                    EmbeddingFunctionMismatchError(explained)
+                )
+                _collection_cache = None
+                _collection_cache_backend = None
+                _collection_cache_palace = None
+                _invalidate_overview_caches()
+                return None
             logger.exception(
                 "_get_collection attempt %d/2 failed (palace=%s, create=%s)",
                 attempt + 1,
@@ -423,7 +488,7 @@ def _get_collection(create=False):
                 _palace_db_mtime = 0.0
                 _invalidate_overview_caches()
                 _collection_open_error = {
-                    "error": "Backend open failed",
+                    "error": BACKEND_OPEN_FAILED_ERROR,
                     "details": "Could not open the Chroma collection.",
                     "hint": "Run: mempalace repair-status for diagnostics.",
                 }
@@ -435,11 +500,53 @@ def _get_collection(create=False):
     _palace_db_mtime = 0.0
     _invalidate_overview_caches()
     _collection_open_error = _collection_open_error or {
-        "error": "Backend open failed",
+        "error": BACKEND_OPEN_FAILED_ERROR,
         "details": "Could not open the selected backend collection.",
         "hint": "Run: mempalace status or mempalace repair-status for diagnostics.",
     }
     return None
+
+
+def _checked_chroma_collection(raw, *, create):
+    """Wrap a raw Chroma collection and run the RFC 001 identity check on it.
+
+    The same check palace.get_collection runs for the CLI: a palace recorded
+    with a different model raises EmbedderIdentityMismatchError before any
+    write, a brand-new empty collection records the current model, and a
+    write open (``create``) rewrites a legacy raw stored name as minilm.
+    """
+    from ..palace import _enforce_embedder_identity
+
+    collection = ChromaCollection(raw, palace_path=_config.palace_path, backend=_SessionFreshness)
+    _enforce_embedder_identity(
+        collection, _config.palace_path, _config.collection_name, create=create
+    )
+    return collection
+
+
+def _model_mismatch_error(exc) -> dict:
+    """The tool result for a model error (a palace built with another model,
+    or a misspelled embedding_model). Logs one line, no traceback: the full
+    message once per palace and message, then a short line per refusal."""
+    return model_error_result(exc, palace_path=_config.palace_path, log=logger)
+
+
+_unknown_embedding_model_error = _model_mismatch_error
+
+
+def _embed_failure(exc, **fields) -> dict:
+    """The result for a tool whose embed or write raised ``exc``.
+
+    A model error raised while embedding (an openai-compat endpoint that
+    refuses the connection, say) keeps its ``error_class`` so MCP sets
+    ``isError``, as a refusal at open does; any other failure stays the
+    plain ``{"error": str(exc)}`` it always was. ``fields`` (such as
+    ``success=False``) lead the result.
+    """
+    refused = _model_mismatch_error(exc)
+    if refused is not None:
+        return {**fields, **refused}
+    return {**fields, "error": str(exc)}
 
 
 def _no_palace():

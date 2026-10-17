@@ -28,6 +28,8 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 from urllib.parse import parse_qs, urlparse
 
+from ._proc import kernel32 as _kernel32
+from ._proc import pid_alive as _pid_alive
 from .config import MempalaceConfig
 from .palace import (
     MineAlreadyRunning,
@@ -40,10 +42,10 @@ HOST = "127.0.0.1"
 STATE_ROOT_ENV = "MEMPALACE_DAEMON_STATE_ROOT"
 DEFAULT_WAIT_TIMEOUT = 60.0 * 60.0
 # Liveness-probe timeout for the hook "is a daemon already running?" precheck.
-# Kept well under the ~500ms hook budget so a wedged daemon can't stall the hook
-# (it falls back to the direct/spawn path instead). A healthy local daemon
+# 0.15s stays well under the 500ms hook budget: a wedged daemon must not
+# consume the whole budget before the hook falls back. A healthy local daemon
 # answers /health in single-digit ms, so this rarely false-negatives.
-HOOK_PROBE_TIMEOUT = 0.5
+HOOK_PROBE_TIMEOUT = 0.15
 TERMINAL_STATES = {"succeeded", "failed", "cancelled"}
 MAX_ATTEMPTS = 3
 # ``error_class`` marking a job refused the per-palace write lock. The lock
@@ -180,66 +182,6 @@ def _read_endpoint(palace_path: str) -> dict[str, Any]:
             return json.load(fh)
     except (OSError, json.JSONDecodeError) as exc:
         raise DaemonError("daemon endpoint not found") from exc
-
-
-def _pid_alive_windows(pid: int) -> bool:
-    """Liveness probe for Windows that never sends a console control event.
-
-    ``os.kill(pid, 0)`` is NOT a harmless existence check on Windows: signal 0
-    is ``signal.CTRL_C_EVENT``, so Python routes it to
-    ``GenerateConsoleCtrlEvent`` and sends a Ctrl-C to the target's process
-    group instead of probing the pid. On a process with an attached console
-    (e.g. a CI runner) that Ctrl-C is delivered back to *this* interpreter and
-    surfaces as a spurious ``KeyboardInterrupt`` — exactly the hang seen when
-    ``DaemonClient`` polled a same-process endpoint. Probe via the Win32 process
-    handle API instead, which has no signalling side effects.
-    """
-    import ctypes
-    from ctypes import wintypes
-
-    SYNCHRONIZE = 0x00100000
-    WAIT_TIMEOUT = 0x00000102
-    ERROR_ACCESS_DENIED = 5
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.OpenProcess.restype = wintypes.HANDLE
-    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-    kernel32.WaitForSingleObject.restype = wintypes.DWORD
-    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
-    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-
-    handle = kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
-    if not handle:
-        # No handle: access-denied means the process exists but isn't ours to
-        # open; any other error (invalid parameter / not found) means it's gone.
-        return ctypes.get_last_error() == ERROR_ACCESS_DENIED
-    try:
-        # A live process is not signalled, so the zero-timeout wait returns
-        # WAIT_TIMEOUT; an exited process is signalled and returns WAIT_OBJECT_0.
-        return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
-    finally:
-        kernel32.CloseHandle(handle)
-
-
-def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        try:
-            return _pid_alive_windows(pid)
-        except OSError:
-            # If the Win32 probe itself fails, assume alive rather than risk
-            # discarding a healthy endpoint — and never fall back to os.kill.
-            return True
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
 
 
 @dataclass
@@ -1277,9 +1219,7 @@ def _process_start_time_windows(pid: int) -> float | None:
     from ctypes import wintypes
 
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.OpenProcess.restype = wintypes.HANDLE
-    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32 = _kernel32()
     filetime_p = ctypes.POINTER(wintypes.FILETIME)
     kernel32.GetProcessTimes.restype = wintypes.BOOL
     kernel32.GetProcessTimes.argtypes = (
@@ -1289,7 +1229,6 @@ def _process_start_time_windows(pid: int) -> float | None:
         filetime_p,
         filetime_p,
     )
-    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
 
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
     if not handle:

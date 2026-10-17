@@ -45,10 +45,11 @@ def test_hall_keywords_default(tmp_path):
 def test_init_idempotent(tmp_path):
     cfg = MempalaceConfig(config_dir=str(tmp_path))
     cfg.init()
+    (tmp_path / "config.json").write_text('{"palace_path": "/edited"}', encoding="utf-8")
     cfg.init()  # second call should not overwrite
     with open(tmp_path / "config.json") as f:
         data = json.load(f)
-    assert "palace_path" in data
+    assert data == {"palace_path": "/edited"}
 
 
 def test_save_people_map(tmp_path):

@@ -16,10 +16,13 @@ Usage:
 """
 
 import json
-import os
 import re
 from pathlib import Path
 from typing import Optional
+
+from .fsio import CorruptStateError
+from .fsio import atomic_write_text as _atomic_write_text
+from .fsio import refuse_unparsed as _refuse_unparsed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -159,66 +162,46 @@ class EntityRegistry:
     def __init__(self, data: dict, path: Path):
         self._data = data
         self._path = path
+        # Set by ``load`` when the file on disk could not be used: ``save``
+        # then refuses rather than replacing it with this empty registry.
+        self._unparsed: Optional[str] = None
+        self._unreadable: Optional[str] = None
 
     # ── Load / Save ──────────────────────────────────────────────────────────
 
     @classmethod
     def load(cls, config_dir: Optional[Path] = None) -> "EntityRegistry":
         path = (Path(config_dir) / "entity_registry.json") if config_dir else cls.DEFAULT_PATH
-        if path.exists():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                return cls(data, path)
-            except (json.JSONDecodeError, OSError):
-                pass
-        return cls(cls._empty(), path)
+        registry = cls(cls._empty(), path)
+        if not path.exists():
+            return registry
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8-sig"))
+        except ValueError:
+            registry._unparsed = "does not parse"
+        except OSError as exc:
+            registry._unreadable = f"could not be read ({exc})"
+        else:
+            if isinstance(loaded, dict):
+                registry._data = loaded
+            else:
+                registry._unparsed = "is not a JSON object"
+        return registry
 
     def save(self):
+        if self._unparsed:
+            _refuse_unparsed(self._path, self._unparsed)
+        if self._unreadable:
+            raise CorruptStateError(self._path, self._unreadable)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         try:
             self._path.parent.chmod(0o700)
         except (OSError, NotImplementedError):
             pass
-        # Atomic write: serialize to a sibling temp file in the same dir
-        # (so os.replace stays on one filesystem), fsync, then rename over
-        # the target. A crash mid-write leaves the previous registry intact
-        # instead of a half-written file or an empty file from the truncate.
-        payload = json.dumps(self._data, indent=2)
-        tmp_path = self._path.with_name(self._path.name + ".tmp")
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write(payload)
-                f.flush()
-                os.fsync(f.fileno())
-            try:
-                tmp_path.chmod(0o600)
-            except (OSError, NotImplementedError):
-                pass
-            os.replace(tmp_path, self._path)
-        except BaseException:
-            # Disk full, perms flip, broken FUSE mount, IO error, KeyboardInterrupt
-            # mid-write — unlink the .tmp sidecar so it does not litter the palace
-            # directory or confuse diagnostics. The previous registry is intact
-            # because os.replace is atomic on POSIX/NTFS.
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
-        # On ext4 (and similar) the rename's durability across power loss
-        # requires an additional fsync on the parent directory. Without it,
-        # the kernel can ack the rename and a crash reverts to the state
-        # where the temp file is present and the target is at the old version.
-        try:
-            dir_fd = os.open(str(self._path.parent), os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            # Windows and some special filesystems reject directory fds — they
-            # have different durability semantics on rename anyway.
-            pass
+        # Publish through the shared writer. A crash mid-serialize leaves
+        # the previous registry in place; a file this load could not parse
+        # never reaches here.
+        _atomic_write_text(self._path, json.dumps(self._data, indent=2))
 
     @staticmethod
     def _empty() -> dict:

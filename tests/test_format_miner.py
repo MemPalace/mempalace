@@ -11,10 +11,13 @@ Run with:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+from mempalace.palace import MineFileErrors
 
 
 from mempalace.format_miner import (  # noqa: E402
@@ -662,6 +665,7 @@ def _mine_formats_mocks(tmp_path: Path):
     collection = MagicMock()
     collection.delete = MagicMock()
     collection.upsert = MagicMock()
+    collection.get.return_value = {"ids": [], "metadatas": []}
 
     @contextmanager
     def _fake_lock(source_file):
@@ -670,6 +674,7 @@ def _mine_formats_mocks(tmp_path: Path):
     with (
         patch("mempalace.format_miner.get_collection", return_value=collection) as p_coll,
         patch("mempalace.format_miner.mine_lock", side_effect=_fake_lock) as p_lock,
+        patch("mempalace.format_miner.mine_palace_lock", side_effect=_fake_lock),
         patch("mempalace.format_miner.file_already_mined", return_value=False) as p_mined,
     ):
         yield {
@@ -1022,9 +1027,11 @@ def test_mine_formats_continues_after_per_file_error(_mine_formats_mocks):
         # ``mempalace.miner.chunk_text`` no longer works because
         # format_miner now binds chunk_text at its own module scope.
         patch("mempalace.format_miner.chunk_text", side_effect=chunk_text_first_fails),
+        pytest.raises(MineFileErrors) as exc_info,
     ):
-        # Must not raise
         mine_formats(format_dir=str(tmp), palace_path=str(tmp / "palace"))
+
+    assert list(exc_info.value.failed_files) == [str(bad)]
 
     # The second file should still have produced an upsert
     upsert_calls = _mine_formats_mocks["collection"].upsert.call_args_list
@@ -1450,17 +1457,9 @@ def test_mine_formats_does_not_write_sentinel_for_skip_missing_format_deps(
     )
 
 
-def test_mine_formats_catches_unexpected_exception_and_prints_summary(
-    monkeypatch, tmp_path: Path, capsys
-):
-    """If an unexpected error happens during mining (something the
-    per-file try/except doesn't catch — e.g., the topic-tunnel block
-    blowing up in a way the inner handler misses), mine_formats must
-    catch it at the outer level, print a partial-progress summary, and
-    clean up the PID file. Not crash with a traceback to the user.
-
-    Per PR #1555 review (Gemini #5).
-    """
+def test_mine_formats_propagates_an_outer_loop_error(monkeypatch, tmp_path: Path):
+    """An error outside the per-file handler is not swallowed: a mine that
+    never reached its files must not exit 0."""
     from mempalace.format_miner import mine_formats
 
     tmp = tmp_path / "src"
@@ -1473,18 +1472,14 @@ def test_mine_formats_catches_unexpected_exception_and_prints_summary(
         "rooms": [{"name": "documents", "keywords": ["documents"]}],
     }
 
-    # Patch the file enumeration step to raise something unexpected —
-    # this fires OUTSIDE the per-file try/except. Without an outer
-    # ``except Exception`` clause, the traceback propagates and the
-    # summary block never prints.
     def angry_enumerate(*args, **kwargs):
         raise RuntimeError("simulated outer-loop explosion")
 
     with (
         patch("mempalace.format_miner.scan_formats", side_effect=angry_enumerate),
         patch("mempalace.format_miner.load_config", return_value=fake_config),
+        pytest.raises(RuntimeError, match="outer-loop explosion"),
     ):
-        # Must NOT raise — outer except Exception should catch.
         mine_formats(format_dir=str(tmp), palace_path=str(tmp / "palace"), wing="wing_test")
 
 
@@ -1579,6 +1574,9 @@ def test_file_chunks_locked_stamps_the_source_filesystem_identity(monkeypatch, t
         def upsert(self, documents, ids, metadatas):
             self.metadatas.extend(metadatas)
 
+        def update(self, ids, metadatas):
+            pass
+
     col = FakeCol()
     monkeypatch.setattr(
         format_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
@@ -1636,3 +1634,176 @@ def test_mine_formats_passes_the_directory_it_read_from(tmp_path, monkeypatch):
     format_miner.mine_formats(str(docs), str(tmp_path / "palace"))
 
     assert seen.get("source_dir_ino") == si.directory_identity(docs)
+
+
+_SHORT_TEXT = "SHORT_VERSION_MARKER is all that is left of this document."
+_LONG_TEXT = "LONG_VERSION_MARKER " + "The quick brown fox jumps over the lazy dog. " * 120
+
+
+class _RealPalace:
+    """One document mined into a real palace, with a switchable extractor."""
+
+    def __init__(self, tmp_path, monkeypatch):
+        from mempalace import format_miner
+
+        self.fm = format_miner
+        self.src = (tmp_path / "docs").resolve()
+        self.src.mkdir()
+        self.doc = self.src / "notes.docx"
+        self.doc.write_bytes(b"PK stub")
+        self.palace = str(tmp_path / "palace")
+        self.text = _LONG_TEXT
+        self.status = format_miner.ExtractionStatus.OK
+        self.extracted = 0
+
+        def extract(path, max_file_size=format_miner.DEFAULT_MAX_FILE_SIZE):
+            self.extracted += 1
+            ok = self.status == format_miner.ExtractionStatus.OK
+            return (self.text if ok else None), self.status
+
+        monkeypatch.setattr(format_miner, "extract_text", extract)
+
+    def mine(self):
+        self.fm.mine_formats(str(self.src), self.palace, wing="w")
+
+    def touch(self):
+        st = self.doc.stat()
+        os.utime(self.doc, (st.st_atime, st.st_mtime + 10))
+
+    def rows(self):
+        from mempalace.palace import get_collection
+
+        got = get_collection(self.palace).get(
+            where={"source_file": str(self.doc)}, include=["documents", "metadatas"]
+        )
+        return list(zip(got["documents"], got["metadatas"]))
+
+
+def test_remine_of_a_shorter_file_leaves_only_its_new_drawers(tmp_path, monkeypatch):
+    palace = _RealPalace(tmp_path, monkeypatch)
+    palace.mine()
+    assert len(palace.rows()) > 1
+
+    palace.text = _SHORT_TEXT
+    palace.touch()
+    palace.mine()
+
+    rows = palace.rows()
+    assert [doc for doc, _ in rows] == [palace.text]
+    assert rows[0][1]["chunk_total"] == 1
+
+
+def test_a_failed_extraction_keeps_the_previous_drawers(tmp_path, monkeypatch):
+    palace = _RealPalace(tmp_path, monkeypatch)
+    palace.mine()
+    before = sorted(doc for doc, _ in palace.rows())
+
+    palace.status = palace.fm.ExtractionStatus.SKIP_EXTRACTION_ERROR
+    palace.touch()
+    palace.mine()
+
+    after = sorted(doc for doc, meta in palace.rows() if not meta.get("is_sentinel"))
+    assert after == before
+
+
+def test_an_emptied_file_drops_its_drawers_and_is_not_reextracted(tmp_path, monkeypatch):
+    palace = _RealPalace(tmp_path, monkeypatch)
+    palace.mine()
+
+    palace.text = ""
+    palace.touch()
+    palace.mine()
+    rows = palace.rows()
+    assert [meta.get("is_sentinel") for _, meta in rows] == [True]
+    assert rows[0][1]["source_mtime"] == pytest.approx(palace.doc.stat().st_mtime, abs=1e-3)
+
+    extracted = palace.extracted
+    palace.mine()
+    assert palace.extracted == extracted
+
+
+def test_a_crash_before_the_stale_delete_reads_as_unfinished(tmp_path, monkeypatch):
+    from mempalace.palace import file_already_mined, get_collection
+
+    palace = _RealPalace(tmp_path, monkeypatch)
+    palace.mine()
+    palace.text = _SHORT_TEXT
+    palace.touch()
+
+    real_delete = type(get_collection(palace.palace)).delete
+
+    def crash(self, *args, **kwargs):
+        raise RuntimeError("killed before the stale delete")
+
+    monkeypatch.setattr(type(get_collection(palace.palace)), "delete", crash)
+    with pytest.raises(MineFileErrors):
+        palace.mine()
+    col = get_collection(palace.palace)
+    assert not file_already_mined(col, str(palace.doc), check_mtime=True, extract_mode="format")
+
+    monkeypatch.setattr(type(col), "delete", real_delete)
+    palace.mine()
+    assert [doc for doc, _ in palace.rows()] == [palace.text]
+
+
+def test_format_remine_leaves_other_modes_for_the_same_file(tmp_path, monkeypatch):
+    from mempalace.palace import get_collection
+
+    palace = _RealPalace(tmp_path, monkeypatch)
+    col = get_collection(palace.palace, create=True)
+    col.upsert(
+        ids=["project_row"],
+        documents=["PROJECT_ROW_MARKER"],
+        metadatas=[{"source_file": str(palace.doc), "wing": "w", "room": "r"}],
+    )
+    palace.mine()
+    palace.text = _SHORT_TEXT
+    palace.touch()
+    palace.mine()
+
+    assert "PROJECT_ROW_MARKER" in [doc for doc, _ in palace.rows()]
+
+
+def test_mine_formats_holds_the_palace_lock_only_for_a_real_mine(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    from mempalace import format_miner
+
+    held = []
+
+    @contextmanager
+    def lock(path):
+        held.append(path)
+        yield
+
+    monkeypatch.setattr(format_miner, "mine_palace_lock", lock)
+    monkeypatch.setattr(format_miner, "scan_formats", lambda *a, **k: [])
+    format_miner.mine_formats(str(tmp_path), str(tmp_path / "palace"), dry_run=True)
+    assert held == []
+    format_miner.mine_formats(str(tmp_path), str(tmp_path / "palace"))
+    assert held == [str(tmp_path / "palace")]
+
+
+def test_an_unreadable_mined_set_aborts_the_format_mine(tmp_path, monkeypatch):
+    from mempalace.palace import MinedSetUnavailable, get_collection
+
+    palace = _RealPalace(tmp_path, monkeypatch)
+    palace.mine()
+    before = palace.rows()
+    extracted = palace.extracted
+
+    col_type = type(get_collection(palace.palace))
+    real_get = col_type.get
+
+    def failing_get(self, *args, **kwargs):
+        if "source_file" in (kwargs.get("where") or {}):
+            raise RuntimeError("palace read failed")
+        return real_get(self, *args, **kwargs)
+
+    monkeypatch.setattr(col_type, "get", failing_get)
+    with pytest.raises(MinedSetUnavailable):
+        palace.mine()
+    monkeypatch.setattr(col_type, "get", real_get)
+
+    assert palace.extracted == extracted
+    assert palace.rows() == before

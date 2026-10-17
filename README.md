@@ -295,7 +295,7 @@ Usage and tool reference:
 
 ## MCP server
 
-45 MCP tools cover palace reads/writes, knowledge-graph operations,
+47 MCP tools cover palace reads/writes, knowledge-graph operations,
 cross-wing navigation, drawer management, agent diaries, and agent
 coordination (logstream events + artifact handoffs). Installation
 and the full tool list:

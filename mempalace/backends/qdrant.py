@@ -24,11 +24,17 @@ from urllib import request as urlrequest
 
 import numpy as np
 
+from ..stored_text import decode_record, decode_value, encode_filter, prepare_stored_write
 from ..version import __version__
+from ._remote_common import (
+    RemoteMarkerMixin,
+    as_vector_array,
+    jsonable_metadata,
+    normalize_vectors,
+)
 from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
     BackendClosedError,
-    BackendMismatchError,
     BackendError,
     BaseBackend,
     BaseCollection,
@@ -234,33 +240,6 @@ def _validate_write_batch(
         raise ValueError(f"embeddings length {len(embeddings)} does not match ids length {n}")
 
 
-def _as_vector_array(vector: list[float]) -> np.ndarray:
-    arr = np.asarray(vector, dtype=np.float32)
-    if arr.ndim != 1 or arr.size == 0:
-        raise ValueError("embedding must be a non-empty 1D vector")
-    return arr
-
-
-def _normalize_vectors(embeddings: list[list[float]]) -> tuple[list[list[float]], int]:
-    vectors = []
-    dims = set()
-    for embedding in embeddings:
-        arr = _as_vector_array(embedding)
-        vectors.append(arr.astype(float).tolist())
-        dims.add(int(arr.size))
-    if len(dims) > 1:
-        raise DimensionMismatchError(f"qdrant batch cannot mix embedding dimensions {sorted(dims)}")
-    return vectors, dims.pop() if dims else 0
-
-
-def _jsonable_metadata(meta: dict | None) -> dict:
-    try:
-        value = json.loads(json.dumps(meta or {}, ensure_ascii=False))
-    except (TypeError, ValueError):
-        value = {}
-    return value if isinstance(value, dict) else {}
-
-
 def _point_id(doc_id: str) -> str:
     return str(uuid.uuid5(_POINT_NAMESPACE, str(doc_id)))
 
@@ -282,9 +261,10 @@ def _payload_row(point: dict) -> dict:
     vector = point.get("vector")
     if isinstance(vector, dict):
         vector = vector.get("") or vector.get("default") or next(iter(vector.values()), None)
+    document, meta = decode_record(str(payload.get(_PAYLOAD_DOCUMENT) or ""), meta)
     return {
         "id": str(payload.get(_PAYLOAD_ID) or point.get("id") or ""),
-        "document": str(payload.get(_PAYLOAD_DOCUMENT) or ""),
+        "document": document,
         "metadata": meta,
         "embedding": vector if isinstance(vector, list) else None,
         "score": point.get("score"),
@@ -294,7 +274,7 @@ def _payload_row(point: dict) -> dict:
 def _vector_distance(query: np.ndarray, vector: list[float] | None) -> Optional[float]:
     if vector is None:
         return None
-    vec = _as_vector_array(vector)
+    vec = as_vector_array(vector)
     if vec.size != query.size:
         return None
     denom = float(np.linalg.norm(query)) * float(np.linalg.norm(vec))
@@ -575,7 +555,7 @@ class _QdrantRESTClient:
         hits = result.get("hits") or []
 
         return {
-            str(hit["value"]): int(hit.get("count") or 0)
+            str(decode_value(hit["value"])): int(hit.get("count") or 0)
             for hit in hits
             if hit.get("value") is not None
         }
@@ -653,7 +633,7 @@ def _qdrant_filter(where: Optional[dict]) -> Optional[dict]:
             return None
         if key.startswith("$"):
             return None
-        condition, not_conditions = _condition(key, expected)
+        condition, not_conditions = _condition(key, encode_filter(expected))
         if condition is None:
             return None
         must.append(condition)
@@ -853,9 +833,11 @@ class QdrantCollection(BaseCollection):
         )
         if embeddings is None:
             raise ValueError("qdrant requires explicit embeddings")
-        vectors, dimension = _normalize_vectors(embeddings)
+        vectors, dimension = normalize_vectors(embeddings, "qdrant")
         self._ensure_remote_collection(dimension)
-        metadatas = metadatas or [{} for _ in ids]
+        documents, ids, metadatas = prepare_stored_write(
+            documents, ids, metadatas or [{} for _ in ids]
+        )
         points = []
         for doc_id, doc, meta, vector in zip(ids, documents, metadatas, vectors):
             points.append(
@@ -865,7 +847,7 @@ class QdrantCollection(BaseCollection):
                     "payload": {
                         _PAYLOAD_ID: str(doc_id),
                         _PAYLOAD_DOCUMENT: str(doc),
-                        _PAYLOAD_METADATA: _jsonable_metadata(meta),
+                        _PAYLOAD_METADATA: jsonable_metadata(meta),
                         "updated_at": _utcnow(),
                     },
                 }
@@ -937,7 +919,7 @@ class QdrantCollection(BaseCollection):
         outer_dists: list[list[float]] = []
         outer_embeds: list[list[list[float]]] = []
         for query_vector in query_embeddings:
-            q = _as_vector_array(query_vector)
+            q = as_vector_array(query_vector)
             scored = []
             for row in rows:
                 distance = _vector_distance(q, row["embedding"])
@@ -1001,7 +983,7 @@ class QdrantCollection(BaseCollection):
         outer_dists: list[list[float]] = []
         outer_embeds: list[list[list[float]]] = []
         for query_vector in query_embeddings:
-            q = _as_vector_array(query_vector)
+            q = as_vector_array(query_vector)
             if self._known_dimension is None:
                 self._known_dimension = self._remote_dimension()
             if self._known_dimension is not None and int(q.size) != self._known_dimension:
@@ -1217,8 +1199,10 @@ class QdrantCollection(BaseCollection):
         return HealthStatus.healthy()
 
 
-class QdrantBackend(BaseBackend):
+class QdrantBackend(RemoteMarkerMixin, BaseBackend):
     name = "qdrant"
+    marker_filename = _MARKER_FILENAME
+    marker_hint = "keep MEMPALACE_QDRANT_URL and namespace consistent"
     capabilities = frozenset(
         {
             "requires_explicit_embeddings",
@@ -1240,10 +1224,6 @@ class QdrantBackend(BaseBackend):
         self._closed = False
 
     @staticmethod
-    def _marker_path(palace_path: str) -> str:
-        return os.path.join(palace_path, _MARKER_FILENAME)
-
-    @staticmethod
     def _palace_hash(palace: PalaceRef) -> str:
         return sha256(palace.id.encode("utf-8", errors="surrogatepass")).hexdigest()[:16]
 
@@ -1261,66 +1241,6 @@ class QdrantBackend(BaseBackend):
             "palace_hash": self._palace_hash(palace),
             "remote_prefix": self._remote_collection_prefix(palace=palace, config=config),
         }
-
-    def _marker_exists(self, palace: PalaceRef) -> bool:
-        return bool(palace.local_path and os.path.isfile(self._marker_path(palace.local_path)))
-
-    def _read_marker(self, palace: PalaceRef) -> Optional[dict]:
-        if not palace.local_path:
-            return None
-        marker_path = self._marker_path(palace.local_path)
-        if not os.path.isfile(marker_path):
-            return None
-        try:
-            with open(marker_path, encoding="utf-8") as f:
-                marker = json.load(f)
-        except (OSError, json.JSONDecodeError) as exc:
-            raise BackendMismatchError(f"qdrant marker is unreadable: {marker_path}") from exc
-        return marker if isinstance(marker, dict) else {}
-
-    def _validate_marker_target(self, palace: PalaceRef, config: _QdrantConfig) -> None:
-        marker = self._read_marker(palace)
-        if marker is None:
-            return
-        if marker.get("backend") != self.name:
-            raise BackendMismatchError("qdrant marker does not identify the qdrant backend")
-        expected = self._marker_target(palace, config)
-        actual = marker.get("qdrant")
-        if not isinstance(actual, dict):
-            raise BackendMismatchError("qdrant marker is missing remote target metadata")
-        mismatched = [
-            key for key, expected_value in expected.items() if actual.get(key) != expected_value
-        ]
-        if mismatched:
-            details = ", ".join(mismatched)
-            raise BackendMismatchError(
-                "qdrant marker remote target does not match current configuration "
-                f"({details}); keep MEMPALACE_QDRANT_URL and namespace consistent "
-                "or use a fresh palace directory"
-            )
-
-    def _write_marker(self, palace: PalaceRef, config: _QdrantConfig) -> None:
-        if not palace.local_path:
-            return
-        os.makedirs(palace.local_path, exist_ok=True)
-        try:
-            os.chmod(palace.local_path, 0o700)
-        except (OSError, NotImplementedError):
-            pass
-        marker = {
-            "backend": self.name,
-            "schema_version": 1,
-            "created_at": _utcnow(),
-            "palace_id": palace.id,
-            "qdrant": self._marker_target(palace, config),
-        }
-        marker_path = self._marker_path(palace.local_path)
-        with open(marker_path, "w", encoding="utf-8") as f:
-            json.dump(marker, f, indent=2, ensure_ascii=False)
-        try:
-            os.chmod(marker_path, 0o600)
-        except (OSError, NotImplementedError):
-            pass
 
     # Embedder identity lives in a sidecar, NOT the backend marker: the marker's
     # presence signals "palace initialized" (reads raise CollectionNotInitialized

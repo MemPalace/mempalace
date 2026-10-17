@@ -13,19 +13,18 @@ with back-compat for existing installs:
   4. ~/.config/mempalace (XDG default fallback)
 """
 
-import errno
 import hashlib
 import json
 import math
+import logging
 import os
-import stat
 import re
 import sys
-import tempfile
 from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
 
+from . import fsio
 from .write_routing import (
     ResolvedWriteRoutingPolicy,
     RoutingPolicyCandidate,
@@ -52,22 +51,6 @@ _LONE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 def strip_lone_surrogates(text: str) -> str:
     """Replace lone UTF-16 surrogates with U+FFFD so the string is legal UTF-8 (#1235)."""
     return _LONE_SURROGATE_RE.sub("�", text)
-
-
-# Tool output mined from real transcripts routinely embeds a NUL character
-# (U+0000) — e.g. captured Bash output where a reader raced a background
-# writer, or genuine binary/NUL-delimited command output. A document
-# containing one is otherwise valid, well-formed text (unlike a lone
-# surrogate, which is invalid UTF-8), but handing it to ChromaDB's
-# SQLite/FTS5 layer can corrupt the FTS5 inverted index for the *whole*
-# collection (``PRAGMA quick_check`` reports "malformed inverted index for
-# FTS5 table"), not just fail to store that one document. Stripping it
-# before it reaches the chromadb client is the same defense-in-depth this
-# module already applies to lone surrogates (#1235) — sanitize input we
-# don't control before it reaches a datastore we don't control.
-def strip_nul_bytes(text: str) -> str:
-    """Replace embedded NUL characters with U+FFFD before ChromaDB storage."""
-    return text.replace("\x00", "�")
 
 
 def normalize_wing_name(name: str) -> str:
@@ -281,6 +264,14 @@ def _default_config_dir() -> Path:
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
 DEFAULT_BACKEND = "chroma"
+DEFAULT_EMBEDDINGGEMMA2_REVISION = "914f7f89142e33e77833254d9c9b90c3cef7303b"
+logger = logging.getLogger(__name__)
+_EMBEDDINGGEMMA2_DIMENSIONS = frozenset({768, 512, 256, 128})
+# Upper bound for embeddinggemma2_batch_size: larger values are almost
+# certainly a typo and would allocate far beyond any GPU's memory.
+_EMBEDDINGGEMMA2_MAX_BATCH_SIZE = 1024
+_BATCH_SIZE_WARNED: set = set()
+_EMBEDDINGGEMMA2_MODALITIES = frozenset({"text", "text+vision", "text+audio", "all"})
 DEFAULT_MILVUS_CONSISTENCY_LEVEL = "Strong"
 _MILVUS_CONSISTENCY_LEVELS = {
     "strong": "Strong",
@@ -459,85 +450,6 @@ DEFAULT_HALL_KEYWORDS = {
 }
 
 
-def _write_target(path: Path) -> Path:
-    """The file a write should replace, following a symlink to it.
-
-    A config kept in a dotfiles checkout is reached through a link, and the
-    setters wrote through it. Replacing the link itself would leave the real
-    file holding what it held and send this setting, and every later one,
-    somewhere the user is not looking, so the temporary file, the rename and
-    the quarantine all happen at the target instead. ``realpath`` follows the
-    whole chain rather than one link, which is the file the reader would have
-    got.
-
-    A link this call cannot ``lstat`` is not reported as "not a link": that
-    reading would send the write through ``os.replace`` and put a regular file
-    where the link was. The error is raised instead, since the caller has to
-    write somewhere and there is no safe guess about where.
-    """
-    try:
-        is_link = stat.S_ISLNK(os.lstat(str(path)).st_mode)
-    except FileNotFoundError:
-        return path
-    if is_link:
-        return Path(os.path.realpath(str(path)))
-    return path
-
-
-def _fsync_directory(directory: Path) -> None:
-    """Make the rename itself durable.
-
-    ``EntityRegistry.save`` spells out why: on ext4 the kernel can acknowledge
-    a rename and, after a crash, come back to the temporary file present and
-    the target still holding the old bytes. Windows cannot open a directory
-    this way at all, and answering nothing there is the same as answering
-    nothing on a filesystem that does not implement it.
-    """
-    try:
-        fd = os.open(str(directory), os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
-
-
-def _keep_unreadable_file(path: Path):
-    """Move a file whose contents did not parse aside, keeping its bytes.
-
-    Renaming needs write permission on the directory rather than on the file,
-    and the caller is left with a free name to write. ``FileNotFoundError``
-    from the rename is the one outcome that establishes there was nothing to
-    keep; every other failure leaves the file where it is and is raised,
-    because a file that could not be moved is not one to write over.
-
-    A file this process could not read at all never reaches here: that state
-    declines the write outright rather than renaming anything.
-
-    Returns the path the old file now lives at, or ``None`` when there was
-    nothing there.
-    """
-    path = _write_target(path)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    fd, target = tempfile.mkstemp(
-        dir=str(path.parent),
-        prefix=f"{path.name}.unreadable-{stamp}-",
-    )
-    os.close(fd)
-    try:
-        os.replace(str(path), target)
-    except FileNotFoundError:
-        _unlink_quietly(target)
-        return None
-    except OSError:
-        _unlink_quietly(target)
-        raise
-    return target
-
-
 def _make_config_dir(directory: Path) -> None:
     """Create the config directory, restricted to the owner when this call makes it.
 
@@ -563,150 +475,38 @@ def _make_config_dir(directory: Path) -> None:
             pass  # Windows has no Unix permission bits; init() tolerates this too.
 
 
-def _unlink_quietly(path) -> None:
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
+def _json_type_name(value) -> str:
+    """Name a decoded JSON value by its JSON type, for messages."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    return type(value).__name__
 
 
-def _write_json_in_place(path: Path, payload) -> None:
-    """Write without the rename, for a directory that refuses a new name.
-
-    This is what the setters did before this module wrote atomically. It is
-    kept for the one case where the atomic write cannot run at all, since a
-    setting that is lost outright is worse than one written without
-    crash-safety.
-    """
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-        f.flush()
-        os.fsync(f.fileno())
-    try:
-        os.chmod(path, 0o600)
-    except (OSError, NotImplementedError):
-        pass
+# (path, problem) pairs already reported by this process. MempalaceConfig is
+# built many times per process (CLI, MCP, hooks, search), and one unusable
+# file should be one line on stderr, not one per construction.
+_WARNED_UNUSABLE_CONFIGS: set = set()
 
 
-def _atomic_write_json(path: Path, payload) -> None:
-    """Serialize ``payload`` into ``path`` through a temporary file.
-
-    The rename is what publishes the new contents, so an interrupted write
-    leaves the previous file exactly where it was rather than emptied or half
-    serialized, and the directory is synced afterwards so the rename itself
-    survives a crash, the way ``EntityRegistry.save`` does.
-
-    The temporary file carries this process's pid, so two processes writing
-    the same config never share one. A run killed between the write and the
-    rename leaves that file behind, and nothing here removes it. It is opened
-    ``O_NOFOLLOW``, so a symlink dropped at that name is not written through,
-    and anything else in the way of that name sends the write to a name the
-    directory picks rather than to a write without the rename.
-
-    A directory that will not take a name it chose itself is the one case that
-    falls back to writing in place: a read-only config directory whose config
-    is still writable is what reaches it, and the setters wrote into it
-    without complaint before this.
-    """
-    path = _write_target(path)
-    tmp = str(path.with_name(f"{path.name}.tmp-{os.getpid()}"))
-    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(tmp, flags, 0o600)
-        if os.fstat(fd).st_nlink > 1:
-            # A hard link at that name is not a symlink, so ``O_NOFOLLOW`` lets
-            # it through, and truncating through it would empty a file nobody
-            # named here. The truncate happens below, after this has ruled that
-            # out, and the write goes to a name the directory chose instead.
-            os.close(fd)
-            raise OSError(errno.EMLINK, "temporary name has another link", tmp)
-    except OSError:
-        # This errno belongs to the name, not to the directory. An orphan
-        # another user's run left at that name, a directory dropped there, and
-        # a symlink planted there all answer the way a directory that takes no
-        # new names answers, and giving up the rename on that reading is how
-        # the atomic write turns itself off where it was needed. Ask the
-        # directory for a name of its own instead: what it says about a name
-        # it chooses is about the directory.
-        try:
-            fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
-        except OSError as exc:
-            if exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
-                raise
-            # The message follows the write rather than announcing it: a
-            # directory that refuses the temporary file often refuses the
-            # write too, and saying the file was written in place before
-            # finding that out is how the caller's failure message ends up
-            # contradicted.
-            _write_json_in_place(path, payload)
-            print(
-                f"  ! {path.parent} would not take a temporary file, so {path.name} was "
-                "written in place and an interrupted write can truncate it",
-                file=sys.stderr,
-            )
-            return
-    try:
-        # The mode is set before anything is written rather than after: under a
-        # umask that clears the owner's write bit, ``O_CREAT`` leaves the file
-        # at 0400, and one left behind by a killed run is then a name its own
-        # owner cannot open next time.
-        try:
-            os.chmod(tmp, 0o600)
-        except (OSError, NotImplementedError):
-            pass
-        os.ftruncate(fd, 0)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-    except BaseException:
-        _unlink_quietly(tmp)
-        raise
-    try:
-        os.replace(tmp, str(path))
-    except BaseException as exc:
-        if not isinstance(exc, OSError):
-            # A signal between the write and the rename leaves the temporary
-            # file behind for no reason: nothing has been published yet.
-            _unlink_quietly(tmp)
-            raise
-        # Opening a temporary file that already exists needs the file, not the
-        # directory, so a run that reused an orphan at the pid name never asked
-        # the directory anything. The rename is where the directory answers,
-        # and a read-only one answers here rather than above.
-        if exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
-            _unlink_quietly(tmp)
-            raise
-        # The temporary file holds this write, complete and fsynced. Removing
-        # it before writing in place would trade a finished copy for a write
-        # that truncates first, so it is removed after that write returns, and
-        # named if it could not be.
-        try:
-            _write_json_in_place(path, payload)
-        except BaseException:
-            # That write truncates before it serializes, so what was there is
-            # gone whether or not this one finished.
-            print(
-                f"  ! {path.name} was not written and may have been truncated; "
-                f"{tmp} holds what this call was asked to save",
-                file=sys.stderr,
-            )
-            raise
-        _unlink_quietly(tmp)
-        if os.path.exists(tmp):
-            # Removing it needs the directory too, which is what just refused.
-            print(
-                f"  ! {tmp} holds a copy of what was written and could not be "
-                "removed; nothing here removes it later either",
-                file=sys.stderr,
-            )
-        print(
-            f"  ! {path.parent} would not take the rename, so {path.name} was "
-            "written in place and an interrupted write can truncate it",
-            file=sys.stderr,
-        )
+def _warn_unusable_config_once(config_file: Path, problem: str) -> None:
+    """Say on stderr that ``config_file`` is being ignored, once per process."""
+    key = (str(config_file), problem)
+    if key in _WARNED_UNUSABLE_CONFIGS:
         return
-    _fsync_directory(path.parent)
+    _WARNED_UNUSABLE_CONFIGS.add(key)
+    print(
+        f"  ! {config_file} {problem}; ignoring it and using default settings. "
+        "Fix or remove it; the next settings write keeps it aside and starts a new one.",
+        file=sys.stderr,
+    )
 
 
 class MempalaceConfig:
@@ -749,6 +549,8 @@ class MempalaceConfig:
         #              declines rather than writing defaults into it
         self._file_config_state = "absent"
         self._file_config_error = None
+        # Why an "unparsed" file was set aside, for the warnings below.
+        self._file_config_problem = None
         try:
             raw = self._config_file.read_bytes()
         except FileNotFoundError:
@@ -771,12 +573,24 @@ class MempalaceConfig:
             except ValueError:
                 # JSONDecodeError and UnicodeDecodeError are both ValueErrors:
                 # text that is not JSON, and bytes that are not UTF-8.
-                loaded = None
-            if isinstance(loaded, dict):
-                self._file_config = loaded
-                self._file_config_state = "read"
-            else:
                 self._file_config_state = "unparsed"
+                self._file_config_problem = "does not parse"
+            else:
+                if isinstance(loaded, dict):
+                    self._file_config = loaded
+                    self._file_config_state = "read"
+                else:
+                    # Valid JSON whose top level is not an object (``null``,
+                    # ``[]``, ``"x"``, ``42``, ``true``). Every setting reads
+                    # it through ``.get()``, so it is treated exactly like a
+                    # file that does not parse: defaults now, kept aside by
+                    # the first setter (#2234).
+                    self._file_config_state = "unparsed"
+                    self._file_config_problem = (
+                        f"is a JSON {_json_type_name(loaded)}, not an object"
+                    )
+            if self._file_config_state == "unparsed":
+                _warn_unusable_config_once(self._config_file, self._file_config_problem)
 
     @property
     def search_config_fingerprint(self) -> str:
@@ -788,9 +602,10 @@ class MempalaceConfig:
         back to the direct path instead of querying stale Hub state.
 
         Hash only resolved settings that affect the currently selected search
-        backend.  This detects relevant file edits and Hub-start environment
-        overrides without treating hook/UI settings or inactive-backend values
-        as stale search state.  The digest keeps secrets out of the registry.
+        backend, as listed in ``hub_client.SEARCH_SETTINGS``.  This detects
+        relevant file edits and Hub-start environment overrides without
+        treating hook/UI settings or inactive-backend values as stale search
+        state.  The digest keeps secrets out of the registry.
         """
         try:
             # Match the backend selection used by palace.get_collection(),
@@ -805,53 +620,34 @@ class MempalaceConfig:
             # normal backend opening reports the actionable error.
             backend = self.backend
             backend_resolution_error = f"{type(exc).__name__}: {exc}"
-        embedding_model = self.embedding_model
-        effective = {
-            "backend": backend,
-            "collection_name": self.collection_name,
-            "embedding_model": embedding_model,
-            "lang_explicit": self.lang_explicit,
-        }
+        from .embedding import UnknownEmbeddingModelError
+
+        embedding_model_error = None
+        try:
+            embedding_model = self.embedding_model
+        except UnknownEmbeddingModelError as exc:
+            # Same contract as the backend: stay total and let the direct path
+            # report the misspelled model.
+            embedding_model = self._configured_embedding_model()
+            embedding_model_error = f"{type(exc).__name__}: {exc}"
+        from .hub_client import SEARCH_SETTINGS, search_setting_in_scope
+
+        effective = {"backend": backend, "embedding_model": embedding_model}
         if backend_resolution_error is not None:
             effective["backend_resolution_error"] = backend_resolution_error
-        if embedding_model == "openai-compat":
-            effective.update(
-                embedding_api_key=self.embedding_api_key,
-                embedding_api_model=self.embedding_api_model,
-                embedding_api_url=self.embedding_api_url,
-            )
-        else:
-            effective.update(
-                embedding_device=self.embedding_device,
-                embedding_threads=self.embedding_threads,
-            )
-        try:
-            if backend == "qdrant":
-                effective.update(
-                    qdrant_api_key=self.qdrant_api_key,
-                    qdrant_namespace=self.qdrant_namespace,
-                    qdrant_timeout=self.qdrant_timeout,
-                    qdrant_url=self.qdrant_url,
-                )
-            elif backend == "milvus":
-                effective.update(
-                    milvus_consistency_level=self.milvus_consistency_level,
-                    milvus_db_name=self.milvus_db_name,
-                    milvus_namespace=self.milvus_namespace,
-                    milvus_token=self.milvus_token,
-                    milvus_uri=self.milvus_uri,
-                )
-            elif backend == "pgvector":
-                effective.update(
-                    pgvector_dsn=self.pgvector_dsn,
-                    pgvector_namespace=self.pgvector_namespace,
-                )
-        except (TypeError, ValueError) as exc:
-            # Invalid active-backend settings still need a stable digest. The
-            # backend will report their validation error if search reaches it;
-            # fingerprinting must never turn an unrelated config edit into a
-            # CLI crash before the direct-path fallback can be selected.
-            effective["backend_config_error"] = f"{type(exc).__name__}: {exc}"
+        if embedding_model_error is not None:
+            effective["embedding_model_error"] = embedding_model_error
+        for attr, _env_names, scope in SEARCH_SETTINGS:
+            if not search_setting_in_scope(scope, backend, embedding_model):
+                continue
+            try:
+                effective[attr] = getattr(self, attr)
+            except (TypeError, ValueError) as exc:
+                # An invalid value still needs a stable digest; the backend or
+                # embedder reports it if the search reaches them, and the
+                # fingerprint must never crash the CLI before the direct-path
+                # fallback is chosen.
+                effective[f"{attr}_error"] = f"{type(exc).__name__}: {exc}"
         payload = json.dumps(
             effective, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
@@ -889,10 +685,10 @@ class MempalaceConfig:
             return
         if self._file_config_state == "unparsed":
             try:
-                kept = _keep_unreadable_file(self._config_file)
+                kept = fsio.move_aside(self._config_file, label="unreadable")
             except OSError as exc:
                 print(
-                    f"  ! Not writing {self._config_file}: it does not parse "
+                    f"  ! Not writing {self._config_file}: it {self._file_config_problem} "
                     f"and could not be moved aside ({exc})",
                     file=sys.stderr,
                 )
@@ -900,12 +696,12 @@ class MempalaceConfig:
             self._file_config_state = "read"
             if kept is not None:
                 print(
-                    f"  ! {self._config_file} does not parse; kept it as {kept} "
+                    f"  ! {self._config_file} {self._file_config_problem}; kept it as {kept} "
                     "and started a new one",
                     file=sys.stderr,
                 )
         try:
-            _atomic_write_json(self._config_file, self._file_config)
+            fsio.atomic_write_json(self._config_file, self._file_config)
         except OSError as exc:
             print(f"  ! Could not write {self._config_file}: {exc}", file=sys.stderr)
 
@@ -1142,6 +938,23 @@ class MempalaceConfig:
         return hooks.get("auto_save", True)
 
     @property
+    def convo_spellcheck(self):
+        """Whether the conversation miner spell-corrects user turns. Off by default.
+
+        Opt in with ``convo.spellcheck`` or ``MEMPALACE_CONVO_SPELLCHECK``.
+        Every drawer from a file whose text the speller changed carries
+        ``transforms: "spellcheck_user"``.
+        """
+        env_val = os.environ.get("MEMPALACE_CONVO_SPELLCHECK")
+        if env_val is not None:
+            return env_val.lower() in ("true", "1", "yes", "on")
+        convo = self._file_config.get("convo")
+        value = convo.get("spellcheck", False) if isinstance(convo, dict) else False
+        if isinstance(value, str):
+            return value.lower() in ("true", "1", "yes", "on")
+        return value is True
+
+    @property
     def topic_wings(self):
         """List of topic wing names."""
         return self._file_config.get("topic_wings", DEFAULT_TOPIC_WINGS)
@@ -1298,7 +1111,8 @@ class MempalaceConfig:
         """Hardware device for the ONNX embedding model.
 
         Values: ``"auto"`` (default), ``"cpu"``, ``"cuda"``, ``"coreml"``,
-        ``"dml"``. Read from env ``MEMPALACE_EMBEDDING_DEVICE`` first, then
+        ``"dml"``; ``embeddinggemma2`` (PyTorch) takes ``"auto"``, ``"cpu"``,
+        ``"cuda"`` and ``"mps"`` (see :mod:`mempalace.embedding`). Read from env ``MEMPALACE_EMBEDDING_DEVICE`` first, then
         ``embedding_device`` in ``config.json``, then ``"auto"``.
 
         ``auto`` resolves to the first available accelerator at runtime via
@@ -1316,7 +1130,8 @@ class MempalaceConfig:
 
         Values: ``"minilm"`` (ChromaDB's all-MiniLM-L6-v2 — English-only),
         ``"embeddinggemma"`` (multilingual, 100+ languages, default for
-        new installs since onboarding writes the choice), or
+        new installs since onboarding writes the choice),
+        ``"embeddinggemma2"`` (Google EmbeddingGemma 2), or
         ``"openai-compat"`` (embeddings served by an OpenAI-compatible
         ``/v1/embeddings`` endpoint — see ``embedding_api_url`` /
         ``embedding_api_model`` / ``embedding_api_key``). Read from env
@@ -1328,11 +1143,30 @@ class MempalaceConfig:
         (different vector space) — ChromaDB rejects reads when the persisted
         EF name doesn't match. Run ``mempalace repair rebuild-index`` after
         changing this value.
+
+        The value is resolved to the embedder that will actually be built
+        (:func:`mempalace.embedding._resolve_embedding_model`): an
+        unrecognized name (including ``""`` and a JSON ``null``) is logged
+        once with the configured value and reads as ``"minilm"``, so the
+        identity a palace records and checks is the model that embeds it. A
+        near miss of a supported name (``"embeddinggemm2"``, ``"openai"``)
+        raises :class:`~mempalace.embedding.UnknownEmbeddingModelError`.
+        """
+        from .embedding import _resolve_embedding_model
+
+        return _resolve_embedding_model(self._configured_embedding_model())
+
+    def _configured_embedding_model(self) -> "str | None":
+        """``embedding_model`` as configured (env first), stripped and lowercased.
+
+        A JSON ``null`` in config.json stays ``None`` (not the string
+        ``"none"``) so the fallback warning can show it as ``null``.
         """
         env_val = os.environ.get("MEMPALACE_EMBEDDING_MODEL")
         if env_val:
             return env_val.strip().lower()
-        return str(self._file_config.get("embedding_model", "minilm")).strip().lower()
+        value = self._file_config.get("embedding_model", "minilm")
+        return None if value is None else str(value).strip().lower()
 
     @property
     def embedding_threads(self) -> int:
@@ -1393,6 +1227,105 @@ class MempalaceConfig:
         return val if val > 0 else _EMBEDDINGGEMMA_BATCH_SIZE
 
     @property
+    def embeddinggemma2_batch_size(self) -> "int | None":
+        """Documents per encode() call for EmbeddingGemma 2, or None for the default.
+
+        The default depends on the device the model runs on (32 on CUDA, 4 on
+        CPU and MPS; ``mempalace.embeddinggemma2``). Read from env
+        ``MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE`` first, then
+        ``embeddinggemma2_batch_size`` in ``config.json``; a set value wins on
+        every device. Separate from ``embeddinggemma_batch_size``, which sizes
+        ONNX runs of the first EmbeddingGemma model. A value that is not an
+        integer from 1 to 1024 logs one warning per process and value and
+        means the per-device default.
+        """
+        source = "MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE"
+        raw = os.environ.get(source)
+        if raw is None:
+            source = "embeddinggemma2_batch_size"
+            raw = self._file_config.get(source)
+        if raw is None:
+            return None
+        val = None
+        if not isinstance(raw, (bool, float)):
+            try:
+                val = int(str(raw).strip())
+            except (TypeError, ValueError):
+                val = None
+        if val is not None and 1 <= val <= _EMBEDDINGGEMMA2_MAX_BATCH_SIZE:
+            return val
+        key = (source, repr(raw))
+        if key not in _BATCH_SIZE_WARNED:
+            _BATCH_SIZE_WARNED.add(key)
+            logger.warning(
+                "%s=%r is not an integer from 1 to %d; EmbeddingGemma 2 uses the "
+                "per-device default batch size (32 on CUDA, 4 on CPU/MPS).",
+                source,
+                raw,
+                _EMBEDDINGGEMMA2_MAX_BATCH_SIZE,
+            )
+        return None
+
+    @property
+    def embeddinggemma2_dimension(self) -> int:
+        """EmbeddingGemma 2 output dimension (768, 512, 256, or 128).
+
+        Read from ``MEMPALACE_EMBEDDINGGEMMA2_DIMENSION`` first, then
+        ``embeddinggemma2_dimension`` in ``config.json``, then 768. Invalid
+        values raise ``ValueError`` so the selected model cannot silently use
+        a dimension different from the configured vector space.
+        """
+        raw = os.environ.get("MEMPALACE_EMBEDDINGGEMMA2_DIMENSION")
+        if raw is None:
+            raw = self._file_config.get("embeddinggemma2_dimension", 768)
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "embeddinggemma2_dimension must be one of 768, 512, 256, or 128"
+            ) from exc
+        if value not in _EMBEDDINGGEMMA2_DIMENSIONS:
+            raise ValueError("embeddinggemma2_dimension must be one of 768, 512, 256, or 128")
+        return value
+
+    @property
+    def embeddinggemma2_modalities(self) -> str:
+        """Enabled modalities: text, text+vision, text+audio, or all.
+
+        Read from ``MEMPALACE_EMBEDDINGGEMMA2_MODALITIES`` first, then
+        ``embeddinggemma2_modalities`` in ``config.json``, then ``"text"``.
+        Values are normalized to lowercase and invalid values raise
+        ``ValueError``.
+        """
+        raw = os.environ.get("MEMPALACE_EMBEDDINGGEMMA2_MODALITIES")
+        if raw is None:
+            raw = self._file_config.get("embeddinggemma2_modalities", "text")
+        value = str(raw).strip().lower()
+        if value not in _EMBEDDINGGEMMA2_MODALITIES:
+            allowed = ", ".join(sorted(_EMBEDDINGGEMMA2_MODALITIES))
+            raise ValueError(f"embeddinggemma2_modalities must be one of: {allowed}")
+        return value
+
+    @property
+    def embeddinggemma2_revision(self) -> str:
+        """Immutable Hugging Face commit pinned for reproducible model loading.
+
+        Read from ``MEMPALACE_EMBEDDINGGEMMA2_REVISION`` first, then
+        ``embeddinggemma2_revision`` in ``config.json``, then the pinned
+        default. Only a full 40-character hexadecimal commit is accepted;
+        branch names and tags are mutable and rejected.
+        """
+        raw = os.environ.get("MEMPALACE_EMBEDDINGGEMMA2_REVISION")
+        if raw is None:
+            raw = self._file_config.get(
+                "embeddinggemma2_revision", DEFAULT_EMBEDDINGGEMMA2_REVISION
+            )
+        value = str(raw).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", value):
+            raise ValueError("embeddinggemma2_revision must be a 40-character hexadecimal commit")
+        return value
+
+    @property
     def hybrid_rank_vector_weight(self) -> float:
         """Weight of the vector (embedding-similarity) signal in the hybrid
         re-rank (``searcher._hybrid_rank``).
@@ -1430,10 +1363,11 @@ class MempalaceConfig:
     def set_embedding_model(self, model: str) -> None:
         """Persist the embedding-model choice to ``config.json``.
 
-        Onboarding calls this once on first run. Accepts ``"minilm"`` or
-        ``"embeddinggemma"``; other values are normalized to lowercase and
-        passed through (``embedding.get_embedding_function`` falls back to
-        minilm for unrecognized values).
+        Onboarding calls this once on first run. Accepts ``"minilm"``,
+        ``"embeddinggemma"``, ``"embeddinggemma2"``, or ``"openai-compat"``;
+        other values are normalized to lowercase and persisted
+        (:attr:`embedding_model` then reads unrecognized values as minilm,
+        with a warning, and refuses near misses of supported names).
         """
         self._file_config["embedding_model"] = str(model).strip().lower()
         # ``develop`` created the directory here, outside any ``try``, so this
@@ -1775,8 +1709,15 @@ class MempalaceConfig:
         self._file_config["hooks"][key] = value
         self._persist_file_config()
 
-    def init(self):
-        """Create config directory and write default config.json if it doesn't exist."""
+    def init(self, palace_path=None):
+        """Create the config directory, and ``config.json`` if it doesn't exist.
+
+        A new file records only what was chosen explicitly: ``palace_path``
+        (or the constructor's ``palace_path``). Defaults are left out, so a
+        later release's defaults and the environment keep applying (env, then
+        file, then default), and the default palace keeps following the
+        config directory. An existing file is never rewritten.
+        """
         self._config_dir.mkdir(parents=True, exist_ok=True)
         # Restrict directory permissions to owner only (Unix)
         try:
@@ -1784,22 +1725,13 @@ class MempalaceConfig:
         except (OSError, NotImplementedError):
             pass  # Windows doesn't support Unix permissions
         if not self._config_file.exists():
-            # Chunking parameters (chunk_size, chunk_overlap, min_chunk_size)
-            # are intentionally NOT written here — convo_miner.py distinguishes
-            # "user has tuned this" from "user is on defaults" by checking
-            # ``_file_config.get("min_chunk_size") is None``. Writing the
-            # miner.py defaults (50) into config.json breaks that detection
-            # and silently overrides convo_miner's stricter 30-char floor,
-            # dropping legitimate short conversation exchanges. Module-level
-            # defaults already apply correctly when these keys are absent.
-            default_config = {
-                "palace_path": self.palace_path,
-                "collection_name": DEFAULT_COLLECTION_NAME,
-                "topic_wings": DEFAULT_TOPIC_WINGS,
-                "hall_keywords": DEFAULT_HALL_KEYWORDS,
-            }
-            with open(self._config_file, "w", encoding="utf-8") as f:
-                json.dump(default_config, f, indent=2)
+            chosen = {}
+            explicit_palace = palace_path if palace_path is not None else self._palace_path_override
+            if explicit_palace is not None:
+                chosen["palace_path"] = os.path.abspath(os.path.expanduser(str(explicit_palace)))
+            fsio.atomic_write_json(self._config_file, chosen)
+            self._file_config = dict(chosen)
+            self._file_config_state = "read"
             # Restrict config file to owner read/write only
             try:
                 self._config_file.chmod(0o600)
@@ -1814,5 +1746,5 @@ class MempalaceConfig:
             people_map: Dict mapping name variants to canonical names.
         """
         _make_config_dir(self._config_dir)
-        _atomic_write_json(self._people_map_file, people_map)
+        fsio.atomic_write_json(self._people_map_file, people_map)
         return self._people_map_file

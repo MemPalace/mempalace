@@ -135,10 +135,30 @@ class TestSearchTool:
         result = tool_search(query="JWT", min_similarity=1.5)
         assert "results" in result
 
-        # Old name takes precedence when both provided
-        result_strict = tool_search(query="JWT", max_distance=999.0, min_similarity=0.01)
-        result_loose = tool_search(query="JWT", max_distance=0.01, min_similarity=999.0)
-        assert len(result_strict["results"]) <= len(result_loose["results"])
+        # Old name takes precedence when both provided. Similarity 0.01 is
+        # distance 0.99; similarity at or above 1.0 means exact matches only.
+        result_wide = tool_search(query="JWT", max_distance=0.01, min_similarity=0.01)
+        result_exact = tool_search(query="JWT", max_distance=999.0, min_similarity=999.0)
+        assert result_wide["results"]
+        assert result_exact["results"] == []
+
+    def test_search_min_similarity_of_one_is_exact_match_not_no_cutoff(
+        self, monkeypatch, config, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        seen = {}
+
+        def fake_search(*args, **kwargs):
+            seen["max_distance"] = kwargs.get("max_distance")
+            return {"results": []}
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+
+        mcp_server.tool_search(query="needle", min_similarity=1.0)
+
+        assert 0.0 < seen["max_distance"] < 0.001
 
     def test_search_passes_candidate_strategy(self, monkeypatch, config, kg):
         """MCP callers can opt into backend BM25/vector union candidate gathering."""
@@ -158,7 +178,7 @@ class TestSearchTool:
         assert "error" not in result
         assert seen["candidate_strategy"] == "union"
 
-    def test_search_preserves_default_max_distance(self, monkeypatch, config, kg):
+    def test_search_applies_no_default_max_distance(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server
 
@@ -173,7 +193,7 @@ class TestSearchTool:
         result = mcp_server.tool_search(query="needle")
 
         assert "error" not in result
-        assert seen["max_distance"] == 1.5
+        assert seen["max_distance"] is None
 
     def test_search_cli_compatible_reuses_hub_collection(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)

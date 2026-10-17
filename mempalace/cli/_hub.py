@@ -3,7 +3,10 @@ if __name__ != "mempalace.cli":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.cli")
 
 
-_HUB_FORWARD_ENV = "MEMPALACE_HUB_FORWARD"
+from ..hub_client import HUB_FORWARD_ENV as _HUB_FORWARD_ENV
+from ..hub_client import SEARCH_OVERRIDE_ENV_VARS as _SEARCH_OVERRIDE_ENV_VARS
+from ..hub_client import _forwarding_disabled as _hub_forward_disabled
+
 _HUB_HEALTH_TIMEOUT_S = 0.75
 # A backfill mine over a large transcript tree can legitimately run for many
 # minutes inside the hub; the forwarder is a background/CLI process, not a
@@ -11,37 +14,12 @@ _HUB_HEALTH_TIMEOUT_S = 0.75
 _HUB_MINE_TIMEOUT_S = 3600.0
 _HUB_SEARCH_TIMEOUT_S = 600.0
 _HUB_SEARCH_MAX_RESULTS = 100
-_SEARCH_OVERRIDE_ENV_VARS = (
-    "MEMPALACE_BACKEND",
-    "MEMPALACE_BACKEND_EXPLICIT",
-    "MEMPALACE_EMBEDDING_API_KEY",
-    "MEMPALACE_EMBEDDING_API_MODEL",
-    "MEMPALACE_EMBEDDING_API_URL",
-    "MEMPALACE_EMBEDDING_DEVICE",
-    "MEMPALACE_EMBEDDING_MODEL",
-    "MEMPALACE_EMBEDDING_THREADS",
-    "MEMPALACE_LANG",
-    "MEMPAL_LANG",
-    "MEMPALACE_MILVUS_CONSISTENCY_LEVEL",
-    "MEMPALACE_MILVUS_DB_NAME",
-    "MEMPALACE_MILVUS_NAMESPACE",
-    "MEMPALACE_MILVUS_TOKEN",
-    "MEMPALACE_MILVUS_URI",
-    "MEMPALACE_PGVECTOR_DSN",
-    "MEMPALACE_PGVECTOR_NAMESPACE",
-    "MEMPALACE_QDRANT_API_KEY",
-    "MEMPALACE_QDRANT_NAMESPACE",
-    "MEMPALACE_QDRANT_TIMEOUT",
-    "MEMPALACE_QDRANT_URL",
-)
-
-
-def _hub_forward_disabled() -> bool:
-    return os.environ.get(_HUB_FORWARD_ENV, "").strip().lower() in {"0", "false", "no", "off"}
 
 
 def _search_args_forwardable(args) -> bool:
     """Return whether ``mempalace_search`` preserves this CLI search exactly."""
+    if getattr(args, "include_media", False) or getattr(args, "query_task", "search") != "search":
+        return False
     if _backend_arg(args) or not 1 <= args.results <= _HUB_SEARCH_MAX_RESULTS:
         return False
     if any(os.environ.get(name, "").strip() for name in _SEARCH_OVERRIDE_ENV_VARS):
@@ -305,20 +283,30 @@ def _forward_mine_to_hub(args, palace_path: str, *, include_ignored=None) -> boo
     except (urllib.error.URLError, OSError, ValueError):
         return False
 
-    # Older hubs cannot express this override. Never discard it or compete
+    mode = getattr(args, "mode", None) or "projects"
+    # Only the convo miner reads this flag; the direct path ignores it in the
+    # other modes, so only a convos mine carries it to the hub.
+    include_subagents = mode == "convos" and bool(getattr(args, "include_subagents", False))
+
+    # Older hubs cannot express these overrides. Never discard one or compete
     # with their lifetime writer lease by silently opening a local writer.
-    if include_ignored and "mine_include_ignored" not in (info.get("capabilities") or []):
-        print(
-            f"mempalace: palace hub {base_url} (pid {info.get('pid')}) does not support "
-            "--include-ignored; upgrade MemPalace in the hub's environment and restart "
-            "the hub before retrying. No mine was submitted or run locally.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    capabilities = info.get("capabilities") or []
+    for requested, capability, flag in (
+        (include_ignored, "mine_include_ignored", "--include-ignored"),
+        (include_subagents, "mine_include_subagents", "--include-subagents"),
+    ):
+        if requested and capability not in capabilities:
+            print(
+                f"mempalace: palace hub {base_url} (pid {info.get('pid')}) does not support "
+                f"{flag}; upgrade MemPalace in the hub's environment and restart "
+                "the hub before retrying. No mine was submitted or run locally.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     arguments = {
         "source": os.path.abspath(os.path.expanduser(args.dir)),
-        "mode": args.mode,
+        "mode": mode,
         "agent": args.agent,
         "limit": args.limit or 0,
         "dry_run": bool(args.dry_run),
@@ -328,6 +316,8 @@ def _forward_mine_to_hub(args, palace_path: str, *, include_ignored=None) -> boo
         arguments["wing"] = args.wing
     if include_ignored:
         arguments["include_ignored"] = include_ignored
+    if include_subagents:
+        arguments["include_subagents"] = True
     body = json.dumps(
         {
             "jsonrpc": "2.0",

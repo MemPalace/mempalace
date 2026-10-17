@@ -91,7 +91,7 @@ Imports conversation exports (Claude, ChatGPT, Slack, Markdown, plaintext). Chun
 
 ### `normalize.py` — Format Converter
 
-Converts 5 chat formats to a standard transcript format before mining.
+Converts 5 chat formats to a standard transcript format before mining. The conversation miner records which lossy steps a file's parse applied (tool output truncated or omitted, tool calls summarized, UI chrome stripped, non-text blocks dropped, Slack roles assigned) and stamps them, sorted and comma-joined, in the `transforms` metadata of every drawer from that file, using the RFC 002 transformation names.
 
 ### `general_extractor.py` — Memory Type Extraction
 
@@ -127,4 +127,4 @@ Interactive setup wizard for `mempalace init`. Generates AAAK bootstrap and wing
 
 ### `spellcheck.py` — Spell Checking
 
-Optional spell checking utility (requires `autocorrect` package).
+Optional spell checking utility (requires `autocorrect` package). The conversation miner uses it only when `convo.spellcheck` (or `MEMPALACE_CONVO_SPELLCHECK`) is on, corrects user messages only, and adds `spellcheck_user` to the `transforms` stamp of every drawer from a file whose text the speller changed.

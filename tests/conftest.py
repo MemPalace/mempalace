@@ -42,6 +42,10 @@ _REAL_EMBEDDING_TEST_MODULES = {
     "test_embedding",
     "test_embedding_api",
     "test_embeddinggemma",
+    "test_embeddinggemma2",
+    "test_embeddinggemma2_device",
+    "test_embeddinggemma2_integration",
+    "test_embedding_model_fallback",
 }
 
 
@@ -136,9 +140,9 @@ def _stable_embedding_function_for_tests(request, monkeypatch):
     )
     monkeypatch.setattr(embedding_mod, "get_embedding_function", lambda *_, **__: ef)
     monkeypatch.setattr(
-        chroma_mod.ChromaBackend, "_resolve_embedding_function", staticmethod(lambda: ef)
+        chroma_mod.ChromaBackend, "_resolve_embedding_function", staticmethod(lambda **_: ef)
     )
-    monkeypatch.setattr(embedding_wrapper, "_embed_texts", lambda texts: ef(input=list(texts)))
+    monkeypatch.setattr(embedding_wrapper, "_embed_texts", lambda texts, **_: ef(input=list(texts)))
     yield
 
 
@@ -416,6 +420,13 @@ def seeded_collection(collection):
         ],
     )
     return collection
+
+
+def pytest_configure(config):
+    """On Windows, replace coverage's fail_under with the pyproject Windows gate."""
+    from coverage_gate import apply_platform_threshold
+
+    apply_platform_threshold(config)
 
 
 @pytest.fixture

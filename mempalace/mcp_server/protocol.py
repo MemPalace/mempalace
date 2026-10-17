@@ -651,6 +651,36 @@ def _mcp_tool_preflight_refusal(req_id, tool_name: str, *, check_writer: bool = 
     return _mcp_peer_writer_refusal(req_id, tool_name) if check_writer else None
 
 
+def _tool_result_is_error(result) -> bool:
+    """Whether a tool result reports an error the MCP client should flag.
+
+    Tool errors are otherwise plain ``{"error": ...}`` results. The failures
+    that refuse every read and write until the config or the palace is fixed
+    (a misspelled ``embedding_model``, a palace built with a different
+    model, a collection that will not open), and an openai-compat endpoint
+    that cannot be reached, also set MCP's ``isError`` for clients that only
+    check the flag. Model errors are matched by the
+    exception class they were built from (``error_class``, set by
+    ``embedding.model_error_result``); an open failure by its ``error``.
+    """
+    if not isinstance(result, dict):
+        return False
+    return (
+        result.get("error_class") in MODEL_ERROR_CLASS_NAMES
+        or result.get("error") == BACKEND_OPEN_FAILED_ERROR
+    )
+
+
+def _tool_call_response(req_id, result) -> dict:
+    """The JSON-RPC response carrying a tool's result as MCP text content."""
+    tool_result = {
+        "content": [{"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}]
+    }
+    if _tool_result_is_error(result):
+        tool_result["isError"] = True
+    return {"jsonrpc": "2.0", "id": req_id, "result": tool_result}
+
+
 def _decorate_mcp_tool_result(tool_name: str, result):
     """Attach MCP transport-only diagnostics outside handle_request complexity."""
 
@@ -701,9 +731,124 @@ def _tool_catalog_entry(name: str, tool: dict) -> dict:
         "description": tool["description"],
         "inputSchema": tool["input_schema"],
     }
-    if tool.get("read_only"):
+    if _tool_capabilities.classify_tool(name) == "read":
         entry["annotations"] = {"readOnlyHint": True}
     return entry
+
+
+def call_tool(req_id, params: dict):
+    """Validate, gate, and run one tools/call.
+
+    Returns ``(error_response, None)`` when the call is refused or fails, and
+    ``(None, result)`` with the handler's raw result otherwise. The stdio and
+    HTTP transports wrap the result as MCP text content; the daemon keeps the
+    dict as its job result.
+    """
+    if not isinstance(params, dict) or "name" not in params:
+        return _json_rpc_error(
+            req_id, -32602, "Invalid params: 'name' is required for tools/call"
+        ), None
+    if _tool_call_members_invalid(params):
+        return _json_rpc_error(
+            req_id,
+            -32602,
+            "Invalid params: 'name' must be a string and 'arguments' an object",
+        ), None
+    tool_name = params.get("name")
+    tool_args = params.get("arguments") or {}
+    if tool_name not in TOOLS:
+        return _json_rpc_error(req_id, -32601, f"Unknown tool: {tool_name}"), None
+    # Whitelist arguments to declared schema properties only.
+    # Prevents callers from spoofing internal params like added_by/source_file.
+    # Skip filtering if handler explicitly accepts **kwargs (pass-through).
+    # Default to filtering on inspect failure (safe fallback).
+    import inspect
+
+    schema_props = TOOLS[tool_name]["input_schema"].get("properties", {})
+    try:
+        handler = TOOLS[tool_name]["handler"]
+        sig = inspect.signature(handler)
+        accepts_var_keyword = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+    except (ValueError, TypeError):
+        accepts_var_keyword = False
+    if not accepts_var_keyword:
+        # An unknown kwarg here is almost always a wrong parameter *name*
+        # (e.g. text= instead of content=). Silently dropping it makes the
+        # cause surface only indirectly as a later "Missing required 'X'",
+        # so name it explicitly — symmetric with the missing-required path
+        # below. wait_for_previous is an internal transport kwarg in no
+        # tool schema; it is popped before dispatch further down, so it
+        # must not be reported as unknown here.
+        unknown = [k for k in tool_args if k not in schema_props and k != "wait_for_previous"]
+        if unknown:
+            quoted = ", ".join(f"'{k}'" for k in unknown)
+            word = "parameter" if len(unknown) == 1 else "parameters"
+            logger.debug("Tool %s: unknown %s %s", tool_name, word, quoted)
+            return _json_rpc_error(
+                req_id, -32602, f"Unknown {word} {quoted} for tool {tool_name}"
+            ), None
+        tool_args = {k: v for k, v in tool_args.items() if k in schema_props}
+    # Coerce argument types based on input_schema.
+    # MCP JSON transport may deliver integers as floats or strings;
+    # ChromaDB and Python slicing require native int.
+    for key, value in list(tool_args.items()):
+        prop_schema = schema_props.get(key, {})
+        declared_type = prop_schema.get("type")
+        try:
+            if declared_type == "integer" and not isinstance(value, int):
+                tool_args[key] = int(value)
+            elif declared_type == "number" and not isinstance(value, (int, float)):
+                tool_args[key] = float(value)
+        except (ValueError, TypeError):
+            return _json_rpc_error(req_id, -32602, f"Invalid value for parameter '{key}'"), None
+    tool_args.pop("wait_for_previous", None)
+    preflight_error = _mcp_tool_preflight_refusal(req_id, tool_name)
+    if preflight_error is not None:
+        return preflight_error, None
+
+    # 'content' is an accepted alias for diary_write's 'entry' (callers often
+    # reuse add_drawer's 'content' name). Map it in here, before dispatch, so a
+    # content-only call still satisfies the required 'entry' param while the
+    # signature-based missing-parameter diagnostic (-32602) keeps working.
+    # 'entry' wins if both are supplied.
+    if tool_name == "mempalace_diary_write" and "content" in tool_args:
+        content_val = tool_args.pop("content")
+        # Only fill from the alias when the caller did not supply 'entry' at
+        # all (or passed it as null). An explicit entry — even "" — wins.
+        if "entry" not in tool_args or tool_args["entry"] is None:
+            tool_args["entry"] = content_val
+    try:
+        with _write_stall_watch(tool_name):
+            return None, _decorate_mcp_tool_result(
+                tool_name, TOOLS[tool_name]["handler"](**tool_args)
+            )
+    except TypeError as e:
+        # Qualname match prevents leaking internal helper/param names raised
+        # inside the handler body — see test_handler_internal_signature_shape_stays_generic.
+        msg = str(e)
+        handler = TOOLS[tool_name]["handler"]
+        handler_qn = getattr(handler, "__qualname__", None) or getattr(handler, "__name__", "")
+        # Qualname can include "<locals>" for nested defs and "<lambda>"
+        # for lambdas — accept Python's TypeError emit verbatim.
+        m_missing = re.match(
+            r"^([\w\.<>]+)\(\) missing \d+ required "
+            r"(?:positional |keyword-only )?arguments?: (.+)$",
+            msg,
+        )
+        if m_missing and m_missing.group(1) == handler_qn:
+            names = re.findall(r"'(\w+)'", m_missing.group(2))
+            if names:
+                quoted = ", ".join(f"'{n}'" for n in names)
+                word = "parameter" if len(names) == 1 else "parameters"
+                logger.debug("Tool %s: missing required %s %s", tool_name, word, quoted)
+                return _json_rpc_error(
+                    req_id, -32602, f"Missing required {word} {quoted} for tool {tool_name}"
+                ), None
+        return _internal_tool_error(req_id, tool_name, e), None
+    except Exception as exc:
+        return _internal_tool_error(req_id, tool_name, exc), None
 
 
 def handle_request(request):
@@ -755,144 +900,8 @@ def handle_request(request):
             },
         }
     elif method == "tools/call":
-        if not isinstance(params, dict) or "name" not in params:
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "error": {
-                    "code": -32602,
-                    "message": "Invalid params: 'name' is required for tools/call",
-                },
-            }
-        if _tool_call_members_invalid(params):
-            return _json_rpc_error(
-                req_id,
-                -32602,
-                "Invalid params: 'name' must be a string and 'arguments' an object",
-            )
-        tool_name = params.get("name")
-        tool_args = params.get("arguments") or {}
-        if tool_name not in TOOLS:
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"},
-            }
-        # Whitelist arguments to declared schema properties only.
-        # Prevents callers from spoofing internal params like added_by/source_file.
-        # Skip filtering if handler explicitly accepts **kwargs (pass-through).
-        # Default to filtering on inspect failure (safe fallback).
-        import inspect
-
-        schema_props = TOOLS[tool_name]["input_schema"].get("properties", {})
-        try:
-            handler = TOOLS[tool_name]["handler"]
-            sig = inspect.signature(handler)
-            accepts_var_keyword = any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-            )
-        except (ValueError, TypeError):
-            accepts_var_keyword = False
-        if not accepts_var_keyword:
-            # An unknown kwarg here is almost always a wrong parameter *name*
-            # (e.g. text= instead of content=). Silently dropping it makes the
-            # cause surface only indirectly as a later "Missing required 'X'",
-            # so name it explicitly — symmetric with the missing-required path
-            # below. wait_for_previous is an internal transport kwarg in no
-            # tool schema; it is popped before dispatch further down, so it
-            # must not be reported as unknown here.
-            unknown = [k for k in tool_args if k not in schema_props and k != "wait_for_previous"]
-            if unknown:
-                quoted = ", ".join(f"'{k}'" for k in unknown)
-                word = "parameter" if len(unknown) == 1 else "parameters"
-                logger.debug("Tool %s: unknown %s %s", tool_name, word, quoted)
-                return {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {
-                        "code": -32602,
-                        "message": f"Unknown {word} {quoted} for tool {tool_name}",
-                    },
-                }
-            tool_args = {k: v for k, v in tool_args.items() if k in schema_props}
-        # Coerce argument types based on input_schema.
-        # MCP JSON transport may deliver integers as floats or strings;
-        # ChromaDB and Python slicing require native int.
-        for key, value in list(tool_args.items()):
-            prop_schema = schema_props.get(key, {})
-            declared_type = prop_schema.get("type")
-            try:
-                if declared_type == "integer" and not isinstance(value, int):
-                    tool_args[key] = int(value)
-                elif declared_type == "number" and not isinstance(value, (int, float)):
-                    tool_args[key] = float(value)
-            except (ValueError, TypeError):
-                return {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {"code": -32602, "message": f"Invalid value for parameter '{key}'"},
-                }
-        tool_args.pop("wait_for_previous", None)
-        preflight_error = _mcp_tool_preflight_refusal(req_id, tool_name)
-        if preflight_error is not None:
-            return preflight_error
-
-        # 'content' is an accepted alias for diary_write's 'entry' (callers often
-        # reuse add_drawer's 'content' name). Map it in here, before dispatch, so a
-        # content-only call still satisfies the required 'entry' param while the
-        # signature-based missing-parameter diagnostic (-32602) keeps working.
-        # 'entry' wins if both are supplied.
-        if tool_name == "mempalace_diary_write" and "content" in tool_args:
-            content_val = tool_args.pop("content")
-            # Only fill from the alias when the caller did not supply 'entry' at
-            # all (or passed it as null). An explicit entry — even "" — wins.
-            if "entry" not in tool_args or tool_args["entry"] is None:
-                tool_args["entry"] = content_val
-        try:
-            with _write_stall_watch(tool_name):
-                result = _decorate_mcp_tool_result(
-                    tool_name, TOOLS[tool_name]["handler"](**tool_args)
-                )
-
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "content": [
-                        {"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}
-                    ]
-                },
-            }
-        except TypeError as e:
-            # Qualname match prevents leaking internal helper/param names raised
-            # inside the handler body — see test_handler_internal_signature_shape_stays_generic.
-            msg = str(e)
-            handler = TOOLS[tool_name]["handler"]
-            handler_qn = getattr(handler, "__qualname__", None) or getattr(handler, "__name__", "")
-            # Qualname can include "<locals>" for nested defs and "<lambda>"
-            # for lambdas — accept Python's TypeError emit verbatim.
-            m_missing = re.match(
-                r"^([\w\.<>]+)\(\) missing \d+ required "
-                r"(?:positional |keyword-only )?arguments?: (.+)$",
-                msg,
-            )
-            if m_missing and m_missing.group(1) == handler_qn:
-                names = re.findall(r"'(\w+)'", m_missing.group(2))
-                if names:
-                    quoted = ", ".join(f"'{n}'" for n in names)
-                    word = "parameter" if len(names) == 1 else "parameters"
-                    logger.debug("Tool %s: missing required %s %s", tool_name, word, quoted)
-                    return {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "error": {
-                            "code": -32602,
-                            "message": f"Missing required {word} {quoted} for tool {tool_name}",
-                        },
-                    }
-            return _internal_tool_error(req_id, tool_name, e)
-        except Exception as exc:
-            return _internal_tool_error(req_id, tool_name, exc)
+        refusal, result = call_tool(req_id, params)
+        return refusal if refusal is not None else _tool_call_response(req_id, result)
 
     # Notifications (missing id) must never get a response
     if req_id is None:
@@ -927,9 +936,9 @@ _WARMUP_PROBE_TEXT = "__mempalace_warmup_probe__"
 def _describe_device_safe() -> str:
     """Return ``embedding.describe_device()`` value or ``"unknown"`` on failure.
 
-    Used only inside warmup-failure log lines; the import is deferred so
-    that an embedding-stack import error cannot itself crash the warmup
-    diagnostic path.
+    Used in warmup-failure log lines and ``mempalace_status``; the import is
+    deferred so that an embedding-stack import error cannot itself crash
+    either.
     """
     try:
         from ..embedding import describe_device

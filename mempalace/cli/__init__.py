@@ -59,8 +59,6 @@ from ..llm_client import LLMError, get_provider
 from ..version import __version__
 
 
-_MEMPALACE_PROJECT_FILES = ("mempalace.yaml", "entities.json")
-
 # Pass 0 corpus-origin sampling caps. Tier 1 reads FULL file content (no
 # front-bias sampling) but bounds total memory on enormous corpora. Tier 2
 # trims to a smaller view because LLM context windows are finite.

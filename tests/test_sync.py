@@ -411,6 +411,33 @@ class TestSyncPalace:
         finally:
             del client
 
+    def test_aaak_summaries_of_pruned_drawers_go_with_them(self, synced_world):
+        """A summary quotes its drawer, so a prune must not leave it behind."""
+        from mempalace.sync import sync_palace
+
+        client = chromadb.PersistentClient(path=synced_world["palace_path"])
+        aaak = client.get_or_create_collection("mempalace_aaak", metadata={"hnsw:space": "cosine"})
+        aaak.add(
+            ids=["drawer_gitignored_dir", "drawer_keep"],
+            documents=["IGNORED|★", "KEEP|★"],
+            embeddings=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            metadatas=[{"kind": "aaak", "wing": "demo"}, {"kind": "aaak", "wing": "demo"}],
+        )
+        del client
+
+        sync_palace(
+            palace_path=synced_world["palace_path"],
+            project_dirs=[synced_world["repo_path"]],
+            dry_run=False,
+        )
+
+        client = chromadb.PersistentClient(path=synced_world["palace_path"])
+        try:
+            aaak = client.get_collection("mempalace_aaak")
+            assert aaak.get(include=[])["ids"] == ["drawer_keep"]
+        finally:
+            del client
+
     def test_handles_empty_palace(self, palace_path):
         from mempalace.sync import sync_palace
 

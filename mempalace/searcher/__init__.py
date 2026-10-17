@@ -35,13 +35,25 @@ from ..backends._inproc_sqlite import open_reader as open_palace_reader
 from ..backends.chroma import _filtered_candidate_rows, _fts_candidate_rows
 from ..config import MempalaceConfig
 from ..date_window import filed_at_in_window, parse_window
+from ..embedding import UnknownEmbeddingModelError, _model_error_class, model_error_result
 from ..i18n import _canonical_lang, get_stopwords
 from ..palace import (
     _open_collection_or_explain,
     get_closets_collection,
     get_collection,
+    is_aaak_row,
     resolve_backend_name,
 )
+from ..search_util import (
+    _boosted_cosine_distance,
+    _cosine_scale_distance,
+    _distance_to_similarity,
+    _first_or_empty,
+    _metric_for_collection,
+    _metric_scale_distance,
+    build_where_filter,
+)
+from ..stored_text import decode_record, encode_filter
 
 # Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
 # Multiple lines may join with newlines inside one closet document.

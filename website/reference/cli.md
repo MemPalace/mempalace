@@ -67,6 +67,8 @@ mempalace mine <dir> --wing myapp
 | `--no-gitignore` | — | Don't respect .gitignore |
 | `--include-ignored` | — | Always scan these paths even if ignored |
 
+Exits `1` when one or more files could not be mined (a stale-drawer purge failed). The summary shows `Files failed: N`, and stderr reports the failed files. Those files keep their existing drawers and are retried by the next mine.
+
 ## `mempalace search`
 
 Find anything by semantic search.
@@ -118,7 +120,9 @@ mempalace wake-up --wing driftwood
 
 ## `mempalace compress`
 
-Compress drawers using AAAK Dialect.
+Compress drawers using AAAK Dialect. Summaries go to the `mempalace_aaak`
+collection, keyed by drawer id, and never into the closets that search reads.
+Drawers are not changed.
 
 ```bash
 mempalace compress --wing myapp

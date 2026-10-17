@@ -162,6 +162,34 @@ def _dispatch_stdio_request(request: dict):
         }
 
 
+def _stdio_reply(line: str, dispatch) -> Optional[str]:
+    """The JSON-RPC text owed for one stdio line, or None when none is owed.
+
+    Shared by this server and the light server's stdio loop.
+    """
+    try:
+        request = json.loads(line)
+    except Exception as exc:
+        # ValueError (digit limit) and RecursionError (nesting) are still
+        # parse failures, so answer -32700 with a null id the way the HTTP
+        # transport does. The type is in the log because MemoryError has
+        # no message of its own.
+        logger.error("Server error: %s: %s", type(exc).__name__, exc)
+        return json.dumps(_json_rpc_parse_error(), ensure_ascii=False)
+    try:
+        response = dispatch(request)
+    except Exception:
+        # Log with the traceback: the client only gets a generic -32603, so
+        # the stack is the only record of what failed.
+        logger.exception("Server error")
+        req_id = request.get("id") if isinstance(request, dict) else None
+        if req_id is None:
+            # A notification is owed no response, failure included.
+            return None
+        return json.dumps(_json_rpc_internal_error(req_id), ensure_ascii=False)
+    return None if response is None else json.dumps(response, ensure_ascii=False)
+
+
 def _run_stdio_loop() -> None:
     _restore_stdout()
 
@@ -225,35 +253,10 @@ def _run_stdio_loop() -> None:
         if not line:
             continue
 
-        payload = None
         try:
-            request = json.loads(line)
+            payload = _stdio_reply(line, _dispatch_stdio_request)
         except KeyboardInterrupt:
             break
-        except Exception as exc:
-            # ValueError (digit limit) and RecursionError (nesting) are still
-            # parse failures, so answer -32700 with a null id the way the HTTP
-            # transport does. The type is in the log because MemoryError has
-            # no message of its own.
-            logger.error("Server error: %s: %s", type(exc).__name__, exc)
-            payload = json.dumps(_json_rpc_parse_error(), ensure_ascii=False)
-        else:
-            try:
-                response = _dispatch_stdio_request(request)
-                if response is not None:
-                    payload = json.dumps(response, ensure_ascii=False)
-            except KeyboardInterrupt:
-                break
-            except Exception:
-                # Log with the traceback: the client only gets a generic
-                # -32603, so the stack is the only record of what failed.
-                logger.exception("Server error")
-                req_id = request.get("id") if isinstance(request, dict) else None
-                if req_id is None:
-                    # A notification is owed no response, failure included.
-                    continue
-                payload = json.dumps(_json_rpc_internal_error(req_id), ensure_ascii=False)
-
         if payload is None:
             continue
         try:
