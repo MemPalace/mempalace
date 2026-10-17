@@ -2854,6 +2854,83 @@ def _missing_dimensionality_appears_recoverable(
         return False
 
 
+_INVALID_HNSW_METADATA_RECHECK_DELAY = 0.5
+_TRANSIENT_METADATA_READ = object()
+
+
+def _metadata_file_signature(meta_path: str) -> Optional[tuple[int, int, int]]:
+    try:
+        st = os.stat(meta_path)
+    except OSError:
+        return None
+    return st.st_ino, st.st_size, st.st_mtime_ns
+
+
+def _invalid_hnsw_metadata_reason(meta_path: str, seg_dir: str) -> object:
+    """Read and validate one segment's ``index_metadata.pickle``.
+
+    Returns ``None`` when the metadata is acceptable, ``_TRANSIENT_METADATA_READ``
+    when the read failed in a way that is known to be transient, or a string
+    describing why the segment looks invalid.
+    """
+    reason = None
+    try:
+        persisted = _SafePersistentDataUnpickler.load(meta_path)
+    except (EOFError, OSError):
+        logger.debug(
+            "Skipping invalid-HNSW quarantine for transient metadata read in %s",
+            meta_path,
+            exc_info=True,
+        )
+        return _TRANSIENT_METADATA_READ
+    except pickle.UnpicklingError as exc:
+        if "truncated" in str(exc).lower() or "ran out of input" in str(exc).lower():
+            logger.debug(
+                "Skipping invalid-HNSW quarantine for transient metadata read in %s",
+                meta_path,
+                exc_info=True,
+            )
+            return _TRANSIENT_METADATA_READ
+        reason = f"invalid index_metadata.pickle: {exc}"
+    except Exception as exc:
+        reason = f"invalid index_metadata.pickle: {exc}"
+    else:
+        if not isinstance(persisted, dict) and not (
+            hasattr(persisted, "dimensionality") or hasattr(persisted, "id_to_label")
+        ):
+            reason = f"unrecognized index_metadata.pickle payload: {type(persisted).__name__}"
+        else:
+            dimensionality, id_to_label = _persisted_metadata_fields(persisted)
+            if id_to_label is not None and not isinstance(id_to_label, dict):
+                reason = f"invalid id_to_label type {type(id_to_label).__name__}"
+            else:
+                has_labels = bool(id_to_label)
+                if (
+                    has_labels
+                    and dimensionality is None
+                    and not _missing_dimensionality_appears_recoverable(
+                        persisted, id_to_label, seg_dir
+                    )
+                ):
+                    reason = (
+                        "labels present but dimensionality is missing or invalid "
+                        f"({dimensionality!r})"
+                    )
+                elif (
+                    has_labels
+                    and dimensionality is not None
+                    and not _valid_dimensionality(dimensionality)
+                ):
+                    reason = (
+                        "labels present but dimensionality is missing or invalid "
+                        f"({dimensionality!r})"
+                    )
+                elif dimensionality is not None and not _valid_dimensionality(dimensionality):
+                    reason = f"invalid dimensionality {dimensionality!r}"
+
+    return reason
+
+
 def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
     """Quarantine segment dirs whose ``index_metadata.pickle`` is unreadable or invalid.
 
@@ -2880,63 +2957,30 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
         if not os.path.isfile(meta_path):
             continue
 
-        reason = None
-        try:
-            persisted = _SafePersistentDataUnpickler.load(meta_path)
-        except (EOFError, OSError):
+        signature = _metadata_file_signature(meta_path)
+        reason = _invalid_hnsw_metadata_reason(meta_path, seg_dir)
+        if reason is None or reason is _TRANSIENT_METADATA_READ:
+            continue
+
+        # One failed read is not proof of corruption: the pickle can be read
+        # mid-rewrite, and a torn read does not reliably fail as EOF or
+        # "truncated" (#2742). Quarantine only when a second read of the same,
+        # unchanged file fails too.
+        time.sleep(_INVALID_HNSW_METADATA_RECHECK_DELAY)
+        recheck = _invalid_hnsw_metadata_reason(meta_path, seg_dir)
+        if (
+            recheck is None
+            or recheck is _TRANSIENT_METADATA_READ
+            or signature is None
+            or _metadata_file_signature(meta_path) != signature
+        ):
             logger.debug(
-                "Skipping invalid-HNSW quarantine for transient metadata read in %s",
+                "Skipping invalid-HNSW quarantine for unconfirmed metadata read in %s: %s",
                 meta_path,
-                exc_info=True,
+                reason,
             )
             continue
-        except pickle.UnpicklingError as exc:
-            if "truncated" in str(exc).lower() or "ran out of input" in str(exc).lower():
-                logger.debug(
-                    "Skipping invalid-HNSW quarantine for transient metadata read in %s",
-                    meta_path,
-                    exc_info=True,
-                )
-                continue
-            reason = f"invalid index_metadata.pickle: {exc}"
-        except Exception as exc:
-            reason = f"invalid index_metadata.pickle: {exc}"
-        else:
-            if not isinstance(persisted, dict) and not (
-                hasattr(persisted, "dimensionality") or hasattr(persisted, "id_to_label")
-            ):
-                reason = f"unrecognized index_metadata.pickle payload: {type(persisted).__name__}"
-            else:
-                dimensionality, id_to_label = _persisted_metadata_fields(persisted)
-                if id_to_label is not None and not isinstance(id_to_label, dict):
-                    reason = f"invalid id_to_label type {type(id_to_label).__name__}"
-                else:
-                    has_labels = bool(id_to_label)
-                    if (
-                        has_labels
-                        and dimensionality is None
-                        and not _missing_dimensionality_appears_recoverable(
-                            persisted, id_to_label, seg_dir
-                        )
-                    ):
-                        reason = (
-                            "labels present but dimensionality is missing or invalid "
-                            f"({dimensionality!r})"
-                        )
-                    elif (
-                        has_labels
-                        and dimensionality is not None
-                        and not _valid_dimensionality(dimensionality)
-                    ):
-                        reason = (
-                            "labels present but dimensionality is missing or invalid "
-                            f"({dimensionality!r})"
-                        )
-                    elif dimensionality is not None and not _valid_dimensionality(dimensionality):
-                        reason = f"invalid dimensionality {dimensionality!r}"
-
-        if reason is None:
-            continue
+        reason = recheck
 
         stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         target = f"{seg_dir}.corrupt-{stamp}"

@@ -2361,6 +2361,81 @@ def test_quarantine_invalid_hnsw_metadata_skips_truncated_pickle(tmp_path, monke
     assert seg.exists()
 
 
+def _utf8_decode_error():
+    return UnicodeDecodeError("utf-8", b"\xf7", 0, 1, "invalid start byte")
+
+
+def test_quarantine_invalid_hnsw_metadata_keeps_segment_when_reread_succeeds(tmp_path, monkeypatch):
+    # One failed read of a valid pickle must not cost the whole segment (#2742).
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    (seg / "index_metadata.pickle").write_bytes(b"valid")
+    monkeypatch.setattr("mempalace.backends.chroma.time.sleep", lambda seconds: None)
+    calls = []
+
+    def _load(path):
+        calls.append(path)
+        if len(calls) == 1:
+            raise _utf8_decode_error()
+        return {"dimensionality": 384, "id_to_label": {"a": 1}}
+
+    monkeypatch.setattr("mempalace.backends.chroma._SafePersistentDataUnpickler.load", _load)
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert moved == []
+    assert seg.exists()
+    assert len(calls) == 2
+
+
+def test_quarantine_invalid_hnsw_metadata_keeps_segment_when_file_changes_during_read(
+    tmp_path, monkeypatch
+):
+    # A failure while the pickle is being rewritten says nothing about the
+    # finished file, so it is not grounds for quarantine.
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    meta = seg / "index_metadata.pickle"
+    meta.write_bytes(b"old")
+    monkeypatch.setattr("mempalace.backends.chroma.time.sleep", lambda seconds: None)
+
+    def _load(path):
+        with open(path, "ab") as f:
+            f.write(b"more")
+        raise _utf8_decode_error()
+
+    monkeypatch.setattr("mempalace.backends.chroma._SafePersistentDataUnpickler.load", _load)
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert moved == []
+    assert seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_renames_on_repeated_decode_error(tmp_path, monkeypatch):
+    # A decode error that repeats on an unchanged file is real corruption.
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    (seg / "index_metadata.pickle").write_bytes(b"bad")
+    monkeypatch.setattr("mempalace.backends.chroma.time.sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        "mempalace.backends.chroma._SafePersistentDataUnpickler.load",
+        lambda path: (_ for _ in ()).throw(_utf8_decode_error()),
+    )
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert len(moved) == 1
+    assert ".corrupt-" in moved[0]
+    assert not seg.exists()
+
+
 def test_chroma_backend_preflights_metadata_before_persistent_client(tmp_path, monkeypatch):
     palace = tmp_path / "palace"
     palace.mkdir()
