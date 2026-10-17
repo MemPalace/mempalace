@@ -2954,6 +2954,78 @@ def test_rebuild_from_sqlite_in_place_archives_when_opted_in(tmp_path):
     assert rebuilt.count() == 15
 
 
+def _seed_palace_with_logstream_event(palace):
+    from mempalace.logstream import Logstream
+
+    rows = [(f"d{i}", f"body {i}", {"wing": "w", "room": "r"}) for i in range(3)]
+    _seed_palace(palace, "mempalace_drawers", rows)
+    with Logstream(db_path=str(palace / "logstream.sqlite3")) as ls:
+        return ls.append_event(
+            type="task.request",
+            stream="project/garden",
+            room="delegation",
+            from_agent="alice",
+            body="Water the tomatoes before nine.",
+        )
+
+
+def test_rebuild_from_sqlite_in_place_keeps_logstream_events(tmp_path):
+    """An in-place rebuild re-embeds drawers; it must not leave the
+    coordination log behind in the archive (#2746)."""
+    from mempalace.logstream import Logstream
+
+    palace = tmp_path / "palace"
+    event = _seed_palace_with_logstream_event(palace)
+
+    counts = repair.rebuild_from_sqlite(str(palace), str(palace), archive_existing_dest=True)
+    assert counts["mempalace_drawers"] == 3
+
+    with Logstream(db_path=str(palace / "logstream.sqlite3")) as ls:
+        events = ls.list_events()
+    assert [e["id"] for e in events] == [event["id"]]
+    assert events[0]["body"] == "Water the tomatoes before nine."
+
+
+def test_rebuild_from_sqlite_in_place_keeps_replica_id(tmp_path):
+    """The replica id names this machine's copy of the palace and must not
+    be re-minted by a rebuild (#2746)."""
+    from mempalace.replica import get_replica_id
+
+    palace = tmp_path / "palace"
+    _seed_palace_with_logstream_event(palace)
+    replica_before = get_replica_id(str(palace))
+
+    repair.rebuild_from_sqlite(str(palace), str(palace), archive_existing_dest=True)
+
+    assert get_replica_id(str(palace)) == replica_before
+
+
+def test_preserve_logstream_and_replica_copies_wal_and_shm(tmp_path):
+    """A live logstream can hold uncheckpointed writes in its -wal file, so
+    the sidecars travel with the database, as they do for the KG."""
+    src = tmp_path / "source"
+    dest = tmp_path / "dest"
+    src.mkdir()
+    dest.mkdir()
+
+    (src / "logstream.sqlite3").write_text("ls-db", encoding="utf-8")
+    (src / "logstream.sqlite3-wal").write_text("ls-wal", encoding="utf-8")
+    (src / "logstream.sqlite3-shm").write_text("ls-shm", encoding="utf-8")
+    (src / "replica.json").write_text("replica", encoding="utf-8")
+
+    copied = repair._preserve_logstream_and_replica(str(src), str(dest))
+
+    assert copied == [
+        "logstream.sqlite3",
+        "logstream.sqlite3-wal",
+        "logstream.sqlite3-shm",
+        "replica.json",
+    ]
+    assert (dest / "logstream.sqlite3-wal").read_text(encoding="utf-8") == "ls-wal"
+    assert (dest / "logstream.sqlite3-shm").read_text(encoding="utf-8") == "ls-shm"
+    assert (dest / "replica.json").read_text(encoding="utf-8") == "replica"
+
+
 def test_rebuild_from_sqlite_in_place_refuses_without_archive_flag(tmp_path):
     """Source == dest without archive flag must abort untouched. The
     most catastrophic possible regression of this code path is silently
