@@ -143,6 +143,8 @@ READABLE_EXTENSIONS = {
     ".sh",
     ".csv",
     ".sql",
+    # Prisma schema, #2675.
+    ".prisma",
     ".toml",
     ".tex",
     ".bib",
