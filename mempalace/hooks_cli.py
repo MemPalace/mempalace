@@ -198,8 +198,8 @@ def _count_human_messages(transcript_path: str) -> int:
                             if "<command-message>" in text:
                                 continue
                         count += 1
-                    # Also handle Codex CLI transcript format
-                    # {"type": "event_msg", "payload": {"type": "user_message", "message": "..."}}
+                    # Codex CLI transcripts nest a user turn as an event_msg
+                    # whose payload has type user_message and a message field.
                     elif entry.get("type") == "event_msg":
                         payload = entry.get("payload", {})
                         if isinstance(payload, dict) and payload.get("type") == "user_message":

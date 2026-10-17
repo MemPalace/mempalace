@@ -65,7 +65,7 @@ def test_assert_no_collisions_passes_for_clean_batch():
         ("drawer_c", {"source_file": "/file_b.md", "chunk_index": 0}),
     ]
     col = _MockCollection()
-    assert_no_collisions(proposed, col) is None
+    assert assert_no_collisions(proposed, col) is None
 
 
 def test_assert_no_collisions_passes_for_clean_batch_with_existing_drawers():
@@ -81,7 +81,7 @@ def test_assert_no_collisions_passes_for_clean_batch_with_existing_drawers():
             "drawer_old_2": {"source_file": "/old.md", "chunk_index": 1},
         }
     )
-    assert_no_collisions(proposed, col) is None
+    assert assert_no_collisions(proposed, col) is None
 
 
 def test_assert_no_collisions_treats_idempotent_re_mine_as_clean():
@@ -97,7 +97,7 @@ def test_assert_no_collisions_treats_idempotent_re_mine_as_clean():
             "drawer_same": {"source_file": "/file.md", "chunk_index": 5},
         }
     )
-    assert_no_collisions(proposed, col) is None
+    assert assert_no_collisions(proposed, col) is None
 
 
 # ── Incoming-vs-incoming collisions ──────────────────────────────────
@@ -133,7 +133,7 @@ def test_assert_no_collisions_passes_on_incoming_duplicate_with_same_metadata():
         ("drawer_X", {"source_file": "/file.md", "chunk_index": 5}),
     ]
     col = _MockCollection()
-    assert_no_collisions(proposed, col) is None
+    assert assert_no_collisions(proposed, col) is None
 
 
 # ── Incoming-vs-existing collisions ──────────────────────────────────
@@ -192,7 +192,7 @@ def test_assert_no_collisions_passes_for_empty_batch():
     """An empty mining batch is trivially collision-free — the scan
     must not raise on len(proposed) == 0 so callers don't have to guard
     the call site."""
-    assert_no_collisions([], _MockCollection()) is None
+    assert assert_no_collisions([], _MockCollection()) is None
 
 
 def test_assert_no_collisions_handles_metadata_without_chunk_index():

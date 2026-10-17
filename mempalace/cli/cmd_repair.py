@@ -116,7 +116,7 @@ def _finish_legacy_repair(backend, palace_path, collection_name, col, total, arg
                 "  Backup validation failed: backup path exists but does not contain chroma.sqlite3. "
                 f"Please remove or rename: {backup_path}"
             )
-            return
+            return None
         shutil.rmtree(backup_path)
     print(f"  Backing up to {backup_path}...")
     copy_palace_dir(palace_path, backup_path, log=print)
@@ -426,7 +426,7 @@ def cmd_repair(args):
     except MineAlreadyRunning as exc:
         print(f"  Another writer already holds this palace: {exc}")
         print("  Repair stopped before reading or copying anything; nothing changed.")
-        raise SystemExit(2)
+        raise SystemExit(2) from None
 
     if not assume_yes:
         finished = _legacy_repair_after_prompt(backend, palace_path, collection_name, args)

@@ -1041,12 +1041,12 @@ def handle_request(request):
                 "serverInfo": {"name": "mempalace", "version": __version__},
             },
         }
-    elif method == "ping":
+    if method == "ping":
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
-    elif method.startswith("notifications/"):
+    if method.startswith("notifications/"):
         # Notifications (no id) never get a response per JSON-RPC spec
         return None
-    elif method == "tools/list":
+    if method == "tools/list":
         # In read-only mode, hide the refused tools so clients don't advertise
         # write capabilities they can't use (dispatch also refuses them).
         # Same set on both sides, or a tool would be listed and then rejected.
@@ -1061,7 +1061,7 @@ def handle_request(request):
                 ]
             },
         }
-    elif method == "tools/call":
+    if method == "tools/call":
         refusal, result = call_tool(req_id, params)
         return refusal if refusal is not None else _tool_call_response(req_id, result)
 
@@ -1254,7 +1254,8 @@ _WRITE_STALL_EXIT_DEFAULT = 0.0
 _WRITE_STALL_EXIT_CODE = 75
 
 _write_stall_lock = threading.Lock()
-# Optional[dict]: {"tool": str, "since": float(monotonic), "warned": bool}
+# None, or the write in flight: its tool name, its monotonic start time
+# ("since") and whether a stall warning was already logged ("warned").
 _write_stall_inflight: Optional[dict] = None
 
 

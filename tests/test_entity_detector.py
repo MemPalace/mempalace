@@ -1154,7 +1154,7 @@ def test_entity_extraction_no_redos_on_adversarial_ascii_run():
     except subprocess.TimeoutExpired:
         raise AssertionError(
             "entity extraction hung on an adversarial ASCII run — ReDoS regression (#2063)"
-        )
+        ) from None
     assert result.returncode == 0, result.stderr
     assert "OK" in result.stdout
 

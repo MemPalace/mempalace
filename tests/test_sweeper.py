@@ -48,7 +48,7 @@ def mock_claude_jsonl(tmp_path):
             "uuid": "a-1",
             "message": {"role": "assistant", "content": [{"type": "text", "text": "Paris."}]},
         },
-        # Noise: file-history-snapshot
+        # Noise record, a file history snapshot.
         {"type": "file-history-snapshot", "messageId": "abc-snap"},
         # Second user/assistant exchange
         {

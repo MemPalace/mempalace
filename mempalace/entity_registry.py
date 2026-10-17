@@ -380,7 +380,7 @@ class EntityRegistry:
                 "needs_disambiguation": False,
                 "disambiguated_by": "context_patterns",
             }
-        elif concept_score > person_score:
+        if concept_score > person_score:
             return {
                 "type": "concept",
                 "confidence": min(0.90, 0.7 + concept_score * 0.1),

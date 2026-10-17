@@ -228,7 +228,7 @@ def search(
                 print(hit["text"])
         if not result["results"]:
             print("No results found.")
-        return
+        return None
     # Resolved before the fence below: both exits from this function rank by
     # BM25, so the filter has to be in hand on either branch.
     stop_words = _resolve_stop_words(None)
@@ -312,7 +312,7 @@ def search(
     hits = hits[:n_results]
     if not hits:
         print(f'\n  No results found for: "{query}"')
-        return
+        return None
 
     print(f"\n{'=' * 60}")
     print(f'  Results for: "{query}"')

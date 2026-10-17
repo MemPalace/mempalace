@@ -463,7 +463,7 @@ def collect_corpus_text(
     if not root.is_dir():
         return ""
     candidates: list[tuple[float, Path]] = []
-    for dirpath, dirs, files in _walk_prose(root, SKIP_DIRS):
+    for dirpath, _dirs, files in _walk_prose(root, SKIP_DIRS):
         for fname in files:
             p = dirpath / fname
             if p.suffix.lower() not in PROSE_EXTENSIONS:

@@ -139,10 +139,15 @@ def test_hallway_explicit_extensions_survive_all_paths(exts, tmp_path):
         ]
 
         class Collection:
-            def get(self, limit, offset, **kwargs):
-                return {"metadatas": metadata[offset : offset + limit]}
+            def __init__(self, metadata):
+                self.metadata = metadata
 
-        rebuilt = hw.compute_hallways_for_wing("alpha", col=Collection(), min_count=1, config=cfg)
+            def get(self, limit, offset, **kwargs):
+                return {"metadatas": self.metadata[offset : offset + limit]}
+
+        rebuilt = hw.compute_hallways_for_wing(
+            "alpha", col=Collection(metadata), min_count=1, config=cfg
+        )
         pairs = {
             tuple(sorted((h["entity_a"], h["entity_b"]))): h["co_occurrence_count"] for h in rebuilt
         }

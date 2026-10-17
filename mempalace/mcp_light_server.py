@@ -759,11 +759,11 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "serverInfo": {"name": "mempalace-light", "version": __version__},
             },
         }
-    elif method == "ping":
+    if method == "ping":
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
-    elif method.startswith("notifications/"):
+    if method.startswith("notifications/"):
         return None
-    elif method == "tools/list":
+    if method == "tools/list":
         # In read-only mode, only palace_query is exposed
         tools_list = []
         for name, tool_def in LIGHT_TOOLS.items():
@@ -781,7 +781,7 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "id": req_id,
             "result": {"tools": tools_list},
         }
-    elif method == "tools/call":
+    if method == "tools/call":
         if not isinstance(params, dict) or "name" not in params:
             return {
                 "jsonrpc": "2.0",

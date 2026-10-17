@@ -245,7 +245,7 @@ def _get_sentiment(text: str) -> str:
     neg = len(words & NEGATIVE_WORDS)
     if pos > neg:
         return "positive"
-    elif neg > pos:
+    if neg > pos:
         return "negative"
     return "neutral"
 

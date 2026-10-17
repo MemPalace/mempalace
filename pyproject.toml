@@ -198,8 +198,12 @@ target-version = "py39"
 extend-exclude = ["benchmarks", "*.md"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "C901", "I", "RUF100"]
-ignore = ["E501"]
+select = ["E", "F", "W", "C901", "I", "RUF100", "B", "RET", "ERA"]
+# RET501: an explicit `return None` in a no-op default or a test fake shows
+# the reader it stands in for a call that returns a value.
+# RET503: every hit ends in a call that always raises, a retry loop whose last
+# attempt re-raises, or an endless generator; an added `return` would be dead.
+ignore = ["E501", "RET501", "RET503"]
 # Codes of rules planned for later lint stages. Their noqa marks are
 # deliberate, so RUF100 must not strip them before those rules are on.
 external = ["A002", "ARG001", "ARG002", "BLE001", "S310"]
@@ -234,6 +238,11 @@ combine-as-imports = true
 # palace fragments exec into the package namespace.
 "mempalace/palace/__init__.py" = ["F401"]
 "mempalace/palace/*.py" = ["F821"]
+# pytest idioms: `pytest.raises(Exception)` around backends that raise their
+# own driver errors, and bare attribute reads inside `pytest.raises` blocks.
+"tests/**" = ["B017", "B018"]
+# The comment blocks document transcript formats with sample JSON lines.
+"tests/test_normalize.py" = ["ERA001"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 25

@@ -1440,8 +1440,8 @@ _SLASH_DATE_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b")
 # already validated.
 #
 # Three accepted shapes (all require a 4-digit year explicitly):
-#   1. Numeric: 4-digit year + separator + 1-2 digit month + separator + 1-2 digit day
-#      ("2024-11-08", "2024 11 08", "2024/06/15", "2024.11.08")
+#   1. Numeric: 4-digit year + separator + 1-2 digit month + separator + 1-2 digit day,
+#      for example 2024-11-08, 2024 11 08, 2024/06/15 or 2024.11.08
 #   2. Month-name + day + year: "November 8 2024", "Nov 8 2024", "Apr 6 2011"
 #   3. Day + month-name + year: "8 November 2024", "8 Nov 2024", "6 April 2011"
 #
@@ -2151,7 +2151,7 @@ def scan_project(
 
 
 # =============================================================================
-# MAIN: MINE
+# The project mine
 # =============================================================================
 
 

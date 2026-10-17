@@ -54,11 +54,8 @@ def test_empty(tmp_path):
 
 def test_normalize_io_error():
     """normalize raises IOError for unreadable file."""
-    try:
+    with pytest.raises(IOError, match="Could not read"):
         normalize("/nonexistent/path/file.txt")
-        assert False, "Should have raised"
-    except IOError as e:
-        assert "Could not read" in str(e)
 
 
 def test_normalize_already_has_markers(tmp_path):
@@ -1925,11 +1922,8 @@ def test_normalize_rejects_large_file(tmp_path):
         st_size = 600 * 1024 * 1024
 
     with patch("mempalace.normalize.os.fstat", return_value=_HugeStat()):
-        try:
+        with pytest.raises(IOError, match="(?i)too large"):
             normalize(str(big))
-            assert False, "Should have raised IOError"
-        except IOError as e:
-            assert "too large" in str(e).lower()
 
 
 # ── strip_noise() — verbatim-safety boundary tests ─────────────────────

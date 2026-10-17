@@ -259,7 +259,7 @@ def _json_object(text: str) -> dict:
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if not match:
-            raise ValueError("LLM response held no JSON object")
+            raise ValueError("LLM response held no JSON object") from None
         data = json.loads(match.group(0))
     return data
 
@@ -569,35 +569,35 @@ def plan_rooms(
         nonlocal total, kept, below, missing
         if not batch:
             return
+
+        def stayed(source, old):
+            """Record a drawer that keeps its room, for the closet layer."""
+            if source:
+                source_moves.setdefault((source, old), Counter())[""] += 1
+
         for row, (room, confidence) in zip(batch, decider.decide(batch)):
             total += 1
             old = str(row["metadata"].get("room") or "")
             source = str(row["metadata"].get("source_file") or "")
-
-            def stayed():
-                """Record a drawer that keeps its room, for the closet layer."""
-                if source:
-                    source_moves.setdefault((source, old), Counter())[""] += 1
-
             if from_rooms is not None and old not in from_rooms:
                 kept += 1
                 per_room[old] = per_room.get(old, 0) + 1
-                stayed()
+                stayed(source, old)
                 continue
             if not room:
                 missing += 1
                 per_room[old] = per_room.get(old, 0) + 1
-                stayed()
+                stayed(source, old)
                 continue
             if confidence < threshold:
                 below += 1
                 per_room[old] = per_room.get(old, 0) + 1
-                stayed()
+                stayed(source, old)
                 continue
             per_room[room] = per_room.get(room, 0) + 1
             if room == old:
                 kept += 1
-                stayed()
+                stayed(source, old)
             else:
                 changes.append((row["id"], old, room))
                 if source:

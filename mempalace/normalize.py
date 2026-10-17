@@ -784,7 +784,7 @@ def _chatgpt_root_path(mapping: dict) -> list:
             if node.get("message") is None:
                 root_id = node_id
                 break
-            elif fallback_root is None:
+            if fallback_root is None:
                 fallback_root = node_id
     path = []
     visited = set()

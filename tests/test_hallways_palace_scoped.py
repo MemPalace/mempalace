@@ -22,7 +22,7 @@ with patch.dict("sys.modules", {"chromadb": MagicMock()}):
 
 
 # =============================================================================
-# Resolver: MempalaceConfig.hallway_file + _get_hallway_file
+# Resolving the hallway file through MempalaceConfig and _get_hallway_file
 # =============================================================================
 
 

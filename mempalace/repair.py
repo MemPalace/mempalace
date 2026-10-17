@@ -228,8 +228,7 @@ def _get_palace_path():
 
         return MempalaceConfig().palace_path
     except Exception:
-        default = os.path.join(os.path.expanduser("~"), ".mempalace", "palace")
-        return default
+        return os.path.join(os.path.expanduser("~"), ".mempalace", "palace")
 
 
 def _paginate_ids(col, where=None):
@@ -241,7 +240,7 @@ def _paginate_ids(col, where=None):
     while True:
         try:
             r = col.get(where=where, include=[], limit=page, offset=offset)
-        except Exception:
+        except Exception as offset_exc:
             try:
                 r = col.get(where=where, include=[], limit=page)
             except Exception as fallback_exc:
@@ -303,7 +302,7 @@ def _paginate_ids(col, where=None):
                             f"ID list -- investigate the collection, or use a "
                             f"repair mode that does not depend on offset "
                             f"paging (e.g. --mode from-sqlite)."
-                        )
+                        ) from offset_exc
                 break
             ids.extend(new_ids)
             seen.update(new_ids)
@@ -422,7 +421,7 @@ def _embed_asset_rows(embedder, rows):
 
     vectors = []
     refreshed = []
-    for doc, meta in zip(rows[0], rows[1]):
+    for _doc, meta in zip(rows[0], rows[1]):
         source_path = meta.get("source_path") or meta.get("source_file")
         media_type = str(meta.get("media_type", "")).strip().lower()
         if not isinstance(source_path, str) or not source_path:
@@ -1185,10 +1184,10 @@ def print_sqlite_integrity_abort(palace_path: str, errors: list[str]) -> None:
 
 # quick_check's wording for a corrupt FTS5 inverted index differs by SQLite
 # version — both forms describe the same recoverable condition:
-#   "malformed inverted index for FTS5 table main.embedding_fulltext_search"
-#     (older SQLite)
-#   "fts5: corruption found reading blob N from table \"embedding_fulltext_search\""
-#     (SQLite >= ~3.5x, confirmed on 3.53.2 / Python 3.13.7 — the exact
+#   older SQLite says: malformed inverted index for FTS5 table
+#     main.embedding_fulltext_search
+#   SQLite >= ~3.5x says: fts5: corruption found reading blob N from table
+#     embedding_fulltext_search (confirmed on 3.53.2 / Python 3.13.7, the exact
 #     message this repo's own test fixture produces on that build)
 # Either failure says the index and the ``embedding_fulltext_search_content``
 # shadow table disagree; neither names the side that is damaged. Concurrent
@@ -1758,7 +1757,7 @@ def _require_valid_embedding_model() -> None:
     """
     from .config import MempalaceConfig
 
-    MempalaceConfig().embedding_model
+    _ = MempalaceConfig().embedding_model
 
 
 def rebuild_index(

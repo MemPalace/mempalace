@@ -258,7 +258,7 @@ def _exit_on_misspelled_embedding_model():
     from ..embedding import UnknownEmbeddingModelError
 
     try:
-        MempalaceConfig().embedding_model
+        _ = MempalaceConfig().embedding_model  # reading it validates the name
     except UnknownEmbeddingModelError as exc:
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(1)

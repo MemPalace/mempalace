@@ -1675,7 +1675,7 @@ def test_max_seq_id_detects_poison_rows(tmp_path):
         seg["closets_vec"],
         seg["closets_meta"],
     }
-    for sid, val in found:
+    for _sid, val in found:
         assert val > repair.MAX_SEQ_ID_SANITY_THRESHOLD
     assert "seg-clean" not in ids
 

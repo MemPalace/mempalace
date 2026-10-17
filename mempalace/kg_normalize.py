@@ -98,7 +98,7 @@ def _json_object(text: str) -> dict:
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if not match:
-            raise ValueError("LLM response held no JSON object")
+            raise ValueError("LLM response held no JSON object") from None
         return json.loads(match.group(0))
 
 

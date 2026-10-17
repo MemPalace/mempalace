@@ -70,7 +70,7 @@ def _distance_to_similarity(distance, metric: str = "cosine") -> float:
     if m == "ip":
         # Clamp the exponent so a large positive distance can't overflow.
         return 1.0 / (1.0 + math.exp(min(60.0, distance)))
-    # cosine (default)
+    # Cosine is the default metric.
     return max(0.0, 1.0 - distance)
 
 

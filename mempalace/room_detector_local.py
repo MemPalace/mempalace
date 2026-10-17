@@ -21,8 +21,8 @@ from .project_config import find_project_config
 
 logger = logging.getLogger(__name__)
 
-# Common room patterns — detected from folder names and filenames
-# Format: {folder_keyword: room_name}
+# Common room patterns, detected from folder names and filenames. Each key
+# is a folder keyword and its value the room it maps to.
 FOLDER_ROOM_MAP = {
     "frontend": "frontend",
     "front-end": "frontend",

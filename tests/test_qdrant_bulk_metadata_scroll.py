@@ -539,28 +539,7 @@ class TestScrollPageSizeBump:
 # this is a deliberate, explicitly-labeled VERBATIM COPY of the real
 # function -- not a live import. If mcp_server._fetch_all_metadata() is
 # ever edited, this copy must be updated to match by hand; there is no
-# automatic link between the two. (Diagnosed during review on #1832 after
-# two successive ImportErrors chasing the stub graph -- see PR discussion.)
-#
-# Real source as of this writing (mempalace/mcp_server.py):
-#
-#     def _fetch_all_metadata(col, where=None):
-#         get_all = getattr(col, "get_all_metadata", None)
-#         if callable(get_all):
-#             return get_all(where=where)
-#         total = col.count()
-#         all_meta = []
-#         offset = 0
-#         while offset < total:
-#             kwargs = {"include": ["metadatas"], "limit": 1000, "offset": offset}
-#             if where:
-#                 kwargs["where"] = where
-#             batch = col.get(**kwargs)
-#             if not batch["metadatas"]:
-#                 break
-#             all_meta.extend(batch["metadatas"])
-#             offset += len(batch["metadatas"])
-#         return all_meta
+# automatic link between the two.
 
 
 def _fetch_all_metadata_under_test(col, where=None):

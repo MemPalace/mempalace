@@ -1069,9 +1069,8 @@ def test_mine_formats_calls_detect_room_per_file(_mine_formats_mocks):
     ):
         mine_formats(format_dir=str(tmp), palace_path=str(tmp / "palace"))
     p_room.assert_called_once()
-    # First positional arg should be the file Path; last arg should be project_path
+    # detect_room takes the file path, its content, the rooms and the project path.
     call_args = p_room.call_args
-    # detect_room(filepath, content, rooms, project_path)
     assert len(call_args.args) == 4 or "filepath" in call_args.kwargs
 
 

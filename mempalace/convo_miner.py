@@ -296,8 +296,7 @@ def chunk_exchanges(
 
     if quote_lines >= 3:
         return _chunk_by_exchange(lines, chunk_size, min_chunk_size)
-    else:
-        return _chunk_by_paragraph(content, chunk_size, min_chunk_size)
+    return _chunk_by_paragraph(content, chunk_size, min_chunk_size)
 
 
 def _chunk_by_exchange(lines: list, chunk_size: int, min_chunk_size: int) -> list:

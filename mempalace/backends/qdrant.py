@@ -797,14 +797,13 @@ class QdrantCollection(BaseCollection):
             qdrant_filter=q_filter, with_vector=with_vector, max_rows=bounded_rows
         )
         id_set = None if ids is None else set(ids)
-        rows = [
+        return [
             row
             for row in rows
             if (id_set is None or row["id"] in id_set)
             and _matches_where(row["metadata"], where)
             and _matches_where_document(row["document"], where_document)
         ]
-        return rows
 
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
         _validate_write_batch(
